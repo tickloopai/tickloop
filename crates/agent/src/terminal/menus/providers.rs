@@ -436,7 +436,7 @@ impl Menus {
     pub(super) fn show_providers(
         &mut self,
         console: &Console,
-        chat: Uuid,
+        target: ConfigTarget,
         choices: Vec<ProviderModels>,
         selected: usize,
         id: Uuid,
@@ -481,7 +481,7 @@ impl Menus {
                 confirmation: false,
             },
             Selection::Provider {
-                chat,
+                target,
                 choices,
                 rows,
             },
@@ -491,11 +491,11 @@ impl Menus {
     pub(super) fn back_to_providers(
         &mut self,
         console: &Console,
-        chat: Uuid,
+        target: ConfigTarget,
     ) -> Result<(), String> {
         self.show_providers(
             console,
-            chat,
+            target,
             self.provider_choices.clone(),
             self.provider_group
                 .as_ref()
@@ -684,7 +684,7 @@ impl Menus {
         &mut self,
         agent: &Agent,
         console: &Console,
-        chat: Uuid,
+        target: ConfigTarget,
     ) -> Result<(), String> {
         let providers: Vec<_> = self
             .provider_choices
@@ -709,7 +709,7 @@ impl Menus {
                 .map(|provider| (provider, Err("Account model check not requested".into())))
                 .collect();
             return self
-                .configured_model_choices(agent, console, chat, directories)
+                .configured_model_choices(agent, console, target, directories)
                 .await;
         }
         let id = Uuid::new_v4();
@@ -723,7 +723,7 @@ impl Menus {
                 selected: 0,
                 confirmation: false,
             },
-            Selection::Discovery { chat },
+            Selection::Discovery { target },
         )?;
         let root = self.config_root.clone();
         let cache = self.model_discovery.clone();
@@ -763,7 +763,7 @@ impl Menus {
         });
         self.discovery_flow = Some(DiscoveryFlow {
             id,
-            chat,
+            target,
             providers,
             cancel,
             task,
@@ -776,11 +776,11 @@ impl Menus {
         &mut self,
         agent: &Agent,
         console: &Console,
-        chat: Uuid,
+        target: ConfigTarget,
         directories: ModelDirectories,
     ) -> Result<(), String> {
         let snapshot = agent
-            .snapshot(chat)
+            .configuration(target)
             .await
             .map_err(|error| error.to_string())?;
         self.current_model = Some((
@@ -857,11 +857,11 @@ impl Menus {
                 .iter()
                 .any(|candidate| candidate.models[0].provider_id == provider)
         {
-            return self.show_provider_models(console, chat, &provider, focus.as_ref());
+            return self.show_provider_models(console, target, &provider, focus.as_ref());
         }
         self.show_model_providers(
             console,
-            chat,
+            target,
             focus.as_ref().map(|(provider, _)| provider.as_str()),
         )
     }
@@ -881,7 +881,7 @@ impl Menus {
     pub(super) fn show_model_providers(
         &mut self,
         console: &Console,
-        chat: Uuid,
+        target: ConfigTarget,
         focused: Option<&str>,
     ) -> Result<(), String> {
         self.model_provider = None;
@@ -921,14 +921,14 @@ impl Menus {
                 selected,
                 confirmation: false,
             },
-            Selection::ModelProviders { chat },
+            Selection::ModelProviders { target },
         )
     }
 
     pub(super) fn show_provider_models(
         &mut self,
         console: &Console,
-        chat: Uuid,
+        target: ConfigTarget,
         provider: &str,
         focused: Option<&(String, String)>,
     ) -> Result<(), String> {
@@ -948,14 +948,14 @@ impl Menus {
             })
             .unwrap_or(0);
         self.model_provider = Some(provider.into());
-        self.show_model_choices(console, chat, choices, selected, Uuid::new_v4())
+        self.show_model_choices(console, target, choices, selected, Uuid::new_v4())
     }
 
     pub(super) async fn refresh_model_choices(
         &mut self,
         agent: &Agent,
         console: &Console,
-        chat: Uuid,
+        target: ConfigTarget,
     ) -> Result<(), String> {
         if let Some(provider) = &self.model_provider {
             self.model_discovery.invalidate(provider);
@@ -968,13 +968,13 @@ impl Menus {
             choices: self.model_choices.clone(),
             provider: self.model_provider.clone(),
         });
-        self.configured_models(agent, console, chat).await
+        self.configured_models(agent, console, target).await
     }
 
     pub(super) fn open_model_provider_configuration(
         &mut self,
         console: &Console,
-        chat: Uuid,
+        target: ConfigTarget,
         provider: Option<&str>,
     ) -> Result<(), String> {
         self.model_return = Some(ModelPickerDraft {
@@ -987,7 +987,7 @@ impl Menus {
         if let Some(provider) = provider {
             self.focus_provider_configuration(provider);
         }
-        self.back_to_providers(console, chat)?;
+        self.back_to_providers(console, target)?;
         Ok(())
     }
 
@@ -995,19 +995,19 @@ impl Menus {
         &mut self,
         agent: &Agent,
         console: &Console,
-        chat: Uuid,
+        target: ConfigTarget,
     ) -> Result<(), String> {
         if self.model_return.is_some() {
-            self.configured_models(agent, console, chat).await
+            self.configured_models(agent, console, target).await
         } else {
-            self.back_to_providers(console, chat)
+            self.back_to_providers(console, target)
         }
     }
 
     pub(super) fn open_model_providers(
         &mut self,
         console: &Console,
-        chat: Uuid,
+        target: ConfigTarget,
         choices: Vec<ModelChoice>,
         index: usize,
     ) -> Result<(), String> {
@@ -1031,7 +1031,7 @@ impl Menus {
         if let Some(provider) = provider {
             self.focus_provider_configuration(&provider);
         }
-        self.back_to_providers(console, chat)
+        self.back_to_providers(console, target)
     }
 
     fn focus_provider_configuration(&mut self, id: &str) {
@@ -1054,7 +1054,7 @@ impl Menus {
     pub(super) fn show_model_choices(
         &mut self,
         console: &Console,
-        chat: Uuid,
+        target: ConfigTarget,
         choices: Vec<ModelChoice>,
         selected: usize,
         id: Uuid,
@@ -1137,7 +1137,7 @@ impl Menus {
                 selected,
                 confirmation: false,
             },
-            Selection::Model { chat, choices },
+            Selection::Model { target, choices },
         )
     }
 
@@ -1155,7 +1155,7 @@ impl Menus {
         let (_, selection) = self.active.take().unwrap();
         match selection {
             Selection::Provider {
-                chat,
+                target,
                 choices,
                 rows,
             } => {
@@ -1165,13 +1165,13 @@ impl Menus {
                     self.provider_selected = index;
                 }
                 if index >= rows.len() {
-                    self.show_providers(console, chat, choices, index, menu_id)?;
+                    self.show_providers(console, target, choices, index, menu_id)?;
                     return Ok(MenuOutcome::default());
                 }
                 let provider_index = match rows[index].clone() {
                     ProviderRow::Group(name) => {
                         self.provider_group = Some((name, 0));
-                        self.show_providers(console, chat, choices, 0, menu_id)?;
+                        self.show_providers(console, target, choices, 0, menu_id)?;
                         return Ok(MenuOutcome::default());
                     }
                     ProviderRow::Provider(provider_index) => provider_index,
@@ -1186,8 +1186,8 @@ impl Menus {
                         let provider = provider.clone();
                         self.provider_choices = choices.clone();
                         // Keep the selection recoverable if clearing a credential fails.
-                        self.show_providers(console, chat, choices, index, menu_id)?;
-                        if let Some(target) =
+                        self.show_providers(console, target, choices, index, menu_id)?;
+                        if let Some(sign_in) =
                             SignInTarget::from_auth(provider.models[0].auth_source)
                         {
                             if matches!(
@@ -1195,10 +1195,10 @@ impl Menus {
                                 PickerAction::Reauthenticate | PickerAction::SignOut
                             ) {
                                 self.dismiss(console)?;
-                                self.login_return = Some((chat, provider));
+                                self.login_return = Some((target, provider));
                                 return Ok(MenuOutcome {
                                     provider_logout: true,
-                                    logout_target: target,
+                                    logout_target: sign_in,
                                     reauthenticate_after_logout: action
                                         == PickerAction::Reauthenticate,
                                     ..Default::default()
@@ -1206,9 +1206,9 @@ impl Menus {
                             }
                             return self.begin_provider_login(
                                 console,
-                                chat,
+                                target,
                                 provider,
-                                target.login_method(),
+                                sign_in.login_method(),
                             );
                         }
                         if provider.models[0].auth_source == ModelAuthSource::CodexSubscription {
@@ -1217,7 +1217,7 @@ impl Menus {
                                 PickerAction::Reauthenticate | PickerAction::SignOut
                             ) {
                                 self.dismiss(console)?;
-                                self.login_return = Some((chat, provider));
+                                self.login_return = Some((target, provider));
                                 return Ok(MenuOutcome {
                                     provider_logout: true,
                                     logout_target: SignInTarget::Codex,
@@ -1228,7 +1228,7 @@ impl Menus {
                             }
                             return self.begin_provider_login(
                                 console,
-                                chat,
+                                target,
                                 provider,
                                 super::super::login::LoginMethod::Device,
                             );
@@ -1251,34 +1251,37 @@ impl Menus {
                                 &provider.models[0].api_key_env,
                             )
                             .map_err(|error| error.to_string())?;
-                            self.provider_api_key(console, chat, provider)?;
+                            self.provider_api_key(console, target, provider)?;
                         }
                         return Ok(MenuOutcome::default());
                     }
                     _ => {}
                 }
                 self.provider_choices = choices.clone();
-                self.show_providers(console, chat, choices, index, menu_id)?;
+                self.show_providers(console, target, choices, index, menu_id)?;
             }
-            Selection::ModelProviders { chat } => {
+            Selection::ModelProviders { target } => {
                 if action == PickerAction::ConfigureProvider {
                     let provider = self
                         .model_providers
                         .get(index)
                         .map(|provider| provider.models[0].provider_id.clone());
-                    self.open_model_provider_configuration(console, chat, provider.as_deref())?;
+                    self.open_model_provider_configuration(console, target, provider.as_deref())?;
                 } else {
-                    self.active = Some((menu_id, Selection::ModelProviders { chat }));
+                    self.active = Some((menu_id, Selection::ModelProviders { target }));
                 }
             }
-            Selection::Model { chat, mut choices } => {
+            Selection::Model {
+                target,
+                mut choices,
+            } => {
                 if action == PickerAction::RefreshAccountModels {
                     self.remember_model_drafts(&choices);
-                    self.refresh_model_choices(agent, console, chat).await?;
+                    self.refresh_model_choices(agent, console, target).await?;
                     return Ok(MenuOutcome::default());
                 }
                 if action == PickerAction::ConfigureProvider {
-                    self.open_model_providers(console, chat, choices, index)?;
+                    self.open_model_providers(console, target, choices, index)?;
                     return Ok(MenuOutcome::default());
                 }
                 if let Some(choice) = choices.get_mut(index) {
@@ -1294,7 +1297,7 @@ impl Menus {
                     };
                     choice.thinking = levels[position];
                 }
-                self.show_model_choices(console, chat, choices, index, menu_id)?;
+                self.show_model_choices(console, target, choices, index, menu_id)?;
             }
             other => self.active = Some((menu_id, other)),
         }
@@ -1304,44 +1307,44 @@ impl Menus {
     pub(super) fn provider_auth(
         &mut self,
         console: &Console,
-        chat: Uuid,
+        target: ConfigTarget,
         provider: ProviderModels,
     ) -> Result<MenuOutcome, String> {
         if provider.models[0].auth_source == ModelAuthSource::GoogleCloud {
-            self.provider_service_account(console, chat, provider, None)?;
+            self.provider_service_account(console, target, provider, None)?;
             return Ok(MenuOutcome::default());
         }
-        if let Some(target) = SignInTarget::from_auth(provider.models[0].auth_source) {
-            return self.begin_provider_login(console, chat, provider, target.login_method());
+        if let Some(sign_in) = SignInTarget::from_auth(provider.models[0].auth_source) {
+            return self.begin_provider_login(console, target, provider, sign_in.login_method());
         }
         if provider.models[0].auth_source == ModelAuthSource::CodexSubscription {
             return self.begin_provider_login(
                 console,
-                chat,
+                target,
                 provider,
                 super::super::login::LoginMethod::Browser,
             );
         }
         if provider.models[0].api_key_env.is_empty() {
-            self.back_to_providers(console, chat)?;
+            self.back_to_providers(console, target)?;
             return Ok(MenuOutcome {
                 status: Some("Local connection requires no credentials.".into()),
                 ..Default::default()
             });
         }
-        self.provider_api_key(console, chat, provider)?;
+        self.provider_api_key(console, target, provider)?;
         Ok(MenuOutcome::default())
     }
 
     pub(super) fn begin_provider_login(
         &mut self,
         console: &Console,
-        chat: Uuid,
+        target: ConfigTarget,
         provider: ProviderModels,
         method: super::super::login::LoginMethod,
     ) -> Result<MenuOutcome, String> {
         self.dismiss(console)?;
-        self.login_return = Some((chat, provider));
+        self.login_return = Some((target, provider));
         Ok(MenuOutcome {
             provider_login: Some(method),
             ..Default::default()
@@ -1351,7 +1354,7 @@ impl Menus {
     pub(super) fn provider_service_account(
         &mut self,
         console: &Console,
-        chat: Uuid,
+        target: ConfigTarget,
         provider: ProviderModels,
         entered_path: Option<&str>,
     ) -> Result<(), String> {
@@ -1384,14 +1387,14 @@ impl Menus {
             "JSON file path",
             entered_path.or(saved.as_deref()).unwrap_or(""),
         )?;
-        self.active = Some((id, Selection::ServiceAccount { chat, provider }));
+        self.active = Some((id, Selection::ServiceAccount { target, provider }));
         Ok(())
     }
 
     pub(super) fn provider_api_key(
         &mut self,
         console: &Console,
-        chat: Uuid,
+        target: ConfigTarget,
         provider: ProviderModels,
     ) -> Result<(), String> {
         let root = self
@@ -1422,7 +1425,7 @@ impl Menus {
         self.dismiss(console)?;
         let id = menu.id;
         console.show_secret_menu(menu)?;
-        self.active = Some((id, Selection::ApiKey { chat, provider }));
+        self.active = Some((id, Selection::ApiKey { target, provider }));
         Ok(())
     }
 
@@ -1432,12 +1435,12 @@ impl Menus {
         console: &Console,
         succeeded: bool,
     ) -> Result<(), String> {
-        if let Some((chat, provider)) = self.login_return.take() {
+        if let Some((target, provider)) = self.login_return.take() {
             if succeeded {
                 self.model_discovery
                     .invalidate(&provider.models[0].provider_id);
             }
-            self.finish_provider_configuration(agent, console, chat)
+            self.finish_provider_configuration(agent, console, target)
                 .await?;
         }
         Ok(())
@@ -1465,7 +1468,7 @@ impl Menus {
         self.configured_model_choices(
             agent,
             console,
-            flow.chat,
+            flow.target,
             result.unwrap_or_else(|| {
                 flow.providers
                     .clone()
@@ -1503,7 +1506,7 @@ impl Drop for ModelWarmup {
 
 pub(super) struct DiscoveryFlow {
     id: Uuid,
-    chat: Uuid,
+    target: ConfigTarget,
     pub(super) providers: Vec<ProviderModels>,
     cancel: tokio_util::sync::CancellationToken,
     task: tokio::task::JoinHandle<()>,

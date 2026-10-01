@@ -141,13 +141,6 @@ impl Editor {
         }
     }
 
-    /// 换用另一个编辑器的上箭头历史；浏览中的历史条目留作当前草稿。
-    pub(super) fn take_history_from(&mut self, other: &mut Editor) {
-        self.history = std::mem::take(&mut other.history);
-        self.leave_history();
-        other.leave_history();
-    }
-
     pub(super) fn forget_latest_history(&mut self, submitted: &str) {
         if self.history.last().is_some_and(|entry| entry == submitted) {
             self.history.pop();

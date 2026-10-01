@@ -44,6 +44,10 @@ impl Terminal {
             })
             .unwrap();
         let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_tickloop"));
+        command.env(
+            "TICKLOOP_AGENT_RUNTIME_DIR",
+            support::cli_runtime::directory(),
+        );
         command.args(["--working-directory-is-trusted", "--mode", "acceptEdits"]);
         command.arg("--cwd");
         command.arg(workdir);
@@ -169,8 +173,16 @@ impl Terminal {
     }
 
     fn close_model_picker(&mut self) {
+        let frame = screen::visible_screen(&self.output.lock().unwrap(), 120, 38);
+        if frame.contains("Choose model ·") {
+            let mark = self.mark();
+            self.send(b"\x1b");
+            self.wait_for_frame_after(mark, "model Provider returned", |frame| {
+                frame.contains("Choose model Provider")
+            });
+        }
         let mark = self.mark();
-        self.send(b"\x1b\x1b");
+        self.send(b"\x1b");
         self.wait_for_frame_after(mark, "model picker closed", |frame| {
             !frame.contains("Choose model")
         });

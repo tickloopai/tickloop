@@ -1,0 +1,1636 @@
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::{Arc, Weak},
+};
+
+use async_trait::async_trait;
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    net::{
+        UnixListener, UnixStream,
+        unix::{OwnedReadHalf, OwnedWriteHalf},
+    },
+    sync::{Mutex, mpsc, oneshot},
+    task::AbortHandle,
+};
+use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
+
+use super::{
+    AgentAccess, Observation,
+    chunked::{EncodedResponse, IncomingTransfer, response_kind},
+    protocol::*,
+};
+
+#[derive(Clone)]
+pub struct LocalAgentClient {
+    inner: Arc<ClientInner>,
+}
+
+struct ClientInner {
+    writer: Mutex<OwnedWriteHalf>,
+    hello: ServerHello,
+    pending: Mutex<HashMap<Uuid, oneshot::Sender<Result<Reply, AccessError>>>>,
+    subscriptions: Mutex<HashMap<Uuid, Subscription>>,
+    cancel: CancellationToken,
+}
+
+struct Subscription {
+    sender: mpsc::Sender<ObservationUpdate>,
+    cancel: CancellationToken,
+    terminal_error: Arc<std::sync::Mutex<Option<AccessError>>>,
+}
+
+/// An observation feed a connection is writing. Cancelling an observation on a live connection
+/// stops its task between frames; aborting is reserved for connections that are closing, because
+/// an aborted write would leave part of a frame on the shared stream.
+struct FeedTask {
+    stop: CancellationToken,
+    task: AbortHandle,
+}
+
+struct ConnectionCleanup {
+    writer: Arc<Mutex<OwnedWriteHalf>>,
+    observations: Arc<Mutex<HashMap<Uuid, FeedTask>>>,
+    access: Arc<dyn AgentAccess>,
+    cancel: CancellationToken,
+    session_id: Uuid,
+}
+
+#[cfg(test)]
+struct ObservationTestHooks {
+    next: std::sync::atomic::AtomicBool,
+    opened: tokio::sync::Notify,
+    canceled: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+}
+impl Drop for ConnectionCleanup {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        let writer = self.writer.clone();
+        let observations = self.observations.clone();
+        let access = self.access.clone();
+        let session_id = self.session_id;
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                for (_, feed) in observations.lock().await.drain() {
+                    feed.task.abort();
+                }
+                let _ = writer.lock().await.shutdown().await;
+                let _ = access
+                    .show_view(DisplayUpdate::SessionClosed { session_id })
+                    .await;
+            });
+        }
+    }
+}
+
+enum Reply {
+    Message(ServerMessage),
+    Opened {
+        initial: ObservationValue,
+        cursor: Cursor,
+        reset: Option<ResetReason>,
+        changes: Option<mpsc::Receiver<ObservationUpdate>>,
+        terminal_error: Option<Arc<std::sync::Mutex<Option<AccessError>>>>,
+    },
+}
+
+impl Drop for ClientInner {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
+impl LocalAgentClient {
+    pub async fn connect(path: impl AsRef<Path>) -> Result<Self, AccessError> {
+        let mut stream = UnixStream::connect(path)
+            .await
+            .map_err(|error| AccessError::unavailable(error.to_string()))?;
+        verify_peer(&stream)?;
+        write_frame(
+            &mut stream,
+            &ClientMessage::Hello {
+                major: PROTOCOL_MAJOR,
+                minor: PROTOCOL_MINOR,
+            },
+        )
+        .await?;
+        let hello = match read_frame::<_, ServerMessage>(&mut stream).await? {
+            Some(ServerMessage::Hello(hello)) if hello.major == PROTOCOL_MAJOR => hello,
+            Some(ServerMessage::Error { error, .. }) => return Err(error),
+            _ => {
+                return Err(AccessError::new(
+                    AccessErrorCode::VersionMismatch,
+                    "owner did not complete protocol negotiation",
+                ));
+            }
+        };
+        let (reader, writer) = stream.into_split();
+        let inner = Arc::new(ClientInner {
+            writer: Mutex::new(writer),
+            hello,
+            pending: Mutex::new(HashMap::new()),
+            subscriptions: Mutex::new(HashMap::new()),
+            cancel: CancellationToken::new(),
+        });
+        tokio::spawn(read_responses(
+            reader,
+            Arc::downgrade(&inner),
+            inner.cancel.clone(),
+        ));
+        Ok(Self { inner })
+    }
+    pub fn is_connected(&self) -> bool {
+        !self.inner.cancel.is_cancelled()
+    }
+
+    pub fn owner_epoch(&self) -> Uuid {
+        self.inner.hello.owner_epoch
+    }
+    pub fn protocol(&self) -> &ServerHello {
+        &self.inner.hello
+    }
+    pub async fn shutdown_owner(&self) -> Result<(), AccessError> {
+        let request_id = Uuid::new_v4();
+        match self
+            .request(
+                request_id,
+                ClientMessage::ShutdownOwner {
+                    request_id,
+                    owner_epoch: self.owner_epoch(),
+                },
+            )
+            .await?
+        {
+            Reply::Message(ServerMessage::OwnerStopped { .. }) => Ok(()),
+            _ => Err(AccessError::invalid(
+                "server returned an invalid owner shutdown reply",
+            )),
+        }
+    }
+
+    pub fn server_process_id(&self) -> u32 {
+        self.inner.hello.process_id
+    }
+
+    pub fn session_id(&self) -> Uuid {
+        self.inner.hello.session_id
+    }
+
+    async fn request(
+        &self,
+        request_id: Uuid,
+        message: ClientMessage,
+    ) -> Result<Reply, AccessError> {
+        if self.inner.cancel.is_cancelled() {
+            return Err(AccessError::unavailable("owner connection is closed"));
+        }
+        let (sender, receiver) = oneshot::channel();
+        self.inner.pending.lock().await.insert(request_id, sender);
+        if let Err(error) = write_frame(&mut *self.inner.writer.lock().await, &message).await {
+            self.inner.pending.lock().await.remove(&request_id);
+            // A failed write can leave part of a frame behind and usually means the peer is gone,
+            // so close now instead of waiting for the reader to see end of stream.
+            if error.code == AccessErrorCode::Unavailable {
+                self.inner.cancel.cancel();
+            }
+            return Err(error);
+        }
+        receiver
+            .await
+            .map_err(|_| AccessError::unavailable("owner disconnected before returning a result"))?
+    }
+}
+
+#[async_trait]
+impl AgentAccess for LocalAgentClient {
+    async fn observe(&self, query: ObservationRequest) -> Result<Observation, AccessError> {
+        let request_id = Uuid::new_v4();
+        match self
+            .request(request_id, ClientMessage::Observe { request_id, query })
+            .await?
+        {
+            Reply::Opened {
+                initial,
+                cursor,
+                reset,
+                changes,
+                terminal_error,
+            } => Ok(Observation {
+                initial,
+                cursor,
+                reset,
+                changes,
+                terminal_error,
+            }),
+            _ => Err(AccessError::invalid(
+                "owner returned the wrong observation reply",
+            )),
+        }
+    }
+    async fn execute(&self, command: CommandEnvelope) -> Result<CommandReceipt, AccessError> {
+        let request_id = Uuid::new_v4();
+        match self
+            .request(
+                request_id,
+                ClientMessage::Execute {
+                    request_id,
+                    command,
+                },
+            )
+            .await
+        {
+            Ok(Reply::Message(ServerMessage::Receipt { receipt, .. })) => Ok(receipt),
+            Err(error) if error.code == AccessErrorCode::Unavailable => Err(AccessError::new(
+                AccessErrorCode::OutcomeUnknown,
+                "owner disconnected; query the original CommandId before retrying",
+            )),
+            Err(error) => Err(error),
+            _ => Err(AccessError::invalid(
+                "owner returned the wrong command reply",
+            )),
+        }
+    }
+    async fn show_view(&self, update: DisplayUpdate) -> Result<DisplayReceipt, AccessError> {
+        let request_id = Uuid::new_v4();
+        match self
+            .request(request_id, ClientMessage::ShowView { request_id, update })
+            .await?
+        {
+            Reply::Message(ServerMessage::Display { receipt, .. }) => Ok(receipt),
+            _ => Err(AccessError::invalid(
+                "owner returned the wrong display reply",
+            )),
+        }
+    }
+}
+
+async fn read_responses(
+    mut reader: OwnedReadHalf,
+    inner: Weak<ClientInner>,
+    cancel: CancellationToken,
+) {
+    let mut transfer: Option<IncomingTransfer> = None;
+    loop {
+        let response = tokio::select! { _ = cancel.cancelled() => break, response = read_frame::<_, ServerMessage>(&mut reader) => response };
+        let Ok(Some(response)) = response else {
+            break;
+        };
+        let Some(inner) = inner.upgrade() else {
+            break;
+        };
+        let response = match response {
+            ServerMessage::ResponseStart {
+                request_id,
+                transfer_id,
+                kind,
+                total_bytes,
+                chunk_bytes,
+            } => {
+                if inner.hello.minor < MIN_CHUNKED_RESPONSE_MINOR
+                    || !inner
+                        .hello
+                        .capabilities
+                        .contains(&AccessCapability::ChunkedResponses)
+                    || transfer.is_some()
+                    || !inner.pending.lock().await.contains_key(&request_id)
+                {
+                    break;
+                }
+                match IncomingTransfer::new(transfer_id, request_id, kind, total_bytes, chunk_bytes)
+                {
+                    Ok(started) => transfer = Some(started),
+                    Err(_) => break,
+                }
+                continue;
+            }
+            ServerMessage::ResponseChunk {
+                transfer_id,
+                offset,
+                base64,
+            } => {
+                if transfer
+                    .as_mut()
+                    .is_none_or(|transfer| transfer.append(transfer_id, offset, base64).is_err())
+                {
+                    break;
+                }
+                continue;
+            }
+            ServerMessage::ResponseEnd {
+                transfer_id,
+                total_bytes,
+                sha256,
+            } => {
+                let Some(transfer) = transfer.take() else {
+                    break;
+                };
+                match tokio::task::spawn_blocking(move || {
+                    transfer.finish(transfer_id, total_bytes, sha256)
+                })
+                .await
+                {
+                    Ok(Ok(response)) => response,
+                    _ => break,
+                }
+            }
+            _ if transfer.is_some() => break,
+            response => response,
+        };
+        match response {
+            ServerMessage::Opened {
+                request_id,
+                observation_id,
+                initial,
+                cursor,
+                reset,
+                feed,
+            } => {
+                let terminal_error = Arc::new(std::sync::Mutex::new(None));
+                let changes = if feed {
+                    let (sender, receiver) = mpsc::channel(FEED_CAPACITY);
+                    let subscription_cancel = CancellationToken::new();
+                    inner.subscriptions.lock().await.insert(
+                        observation_id,
+                        Subscription {
+                            sender: sender.clone(),
+                            cancel: subscription_cancel.clone(),
+                            terminal_error: terminal_error.clone(),
+                        },
+                    );
+                    let client = Arc::downgrade(&inner);
+                    tokio::spawn(async move {
+                        tokio::select! { _ = sender.closed() => {}, _ = subscription_cancel.cancelled() => return };
+                        if let Some(client) = client.upgrade() {
+                            client.subscriptions.lock().await.remove(&observation_id);
+                            let _ = write_frame(
+                                &mut *client.writer.lock().await,
+                                &ClientMessage::CancelObservation { observation_id },
+                            )
+                            .await;
+                        }
+                    });
+                    Some(receiver)
+                } else {
+                    None
+                };
+                if let Some(sender) = inner.pending.lock().await.remove(&request_id) {
+                    let _ = sender.send(Ok(Reply::Opened {
+                        initial,
+                        cursor,
+                        reset,
+                        changes,
+                        terminal_error: feed.then_some(terminal_error),
+                    }));
+                }
+            }
+            ServerMessage::ObservationClosed {
+                observation_id,
+                error,
+            } => {
+                if let Some(subscription) = inner.subscriptions.lock().await.remove(&observation_id)
+                {
+                    *subscription.terminal_error.lock().unwrap() = Some(error);
+                    subscription.cancel.cancel();
+                }
+            }
+            ServerMessage::Changed {
+                observation_id,
+                update,
+            } => {
+                let sender = inner
+                    .subscriptions
+                    .lock()
+                    .await
+                    .get(&observation_id)
+                    .map(|subscription| subscription.sender.clone());
+                if let Some(sender) = sender
+                    && sender.try_send(super::bounded_update(update)).is_err()
+                {
+                    if let Some(subscription) =
+                        inner.subscriptions.lock().await.remove(&observation_id)
+                    {
+                        subscription.cancel.cancel();
+                    }
+                    let _ = write_frame(
+                        &mut *inner.writer.lock().await,
+                        &ClientMessage::CancelObservation { observation_id },
+                    )
+                    .await;
+                }
+            }
+            ServerMessage::Error {
+                request_id: Some(request_id),
+                error,
+            } => {
+                if let Some(sender) = inner.pending.lock().await.remove(&request_id) {
+                    let _ = sender.send(Err(error));
+                }
+            }
+            response @ (ServerMessage::Receipt { request_id, .. }
+            | ServerMessage::OwnerStopped { request_id }
+            | ServerMessage::Display { request_id, .. }) => {
+                if let Some(sender) = inner.pending.lock().await.remove(&request_id) {
+                    let _ = sender.send(Ok(Reply::Message(response)));
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(inner) = inner.upgrade() {
+        inner.cancel.cancel();
+        for (_, sender) in inner.pending.lock().await.drain() {
+            let _ = sender.send(Err(AccessError::unavailable("owner connection closed")));
+        }
+        for (_, subscription) in inner.subscriptions.lock().await.drain() {
+            subscription.cancel.cancel();
+        }
+    }
+}
+
+pub async fn serve_listener(
+    listener: UnixListener,
+    access: Arc<dyn AgentAccess>,
+    epoch: Uuid,
+) -> Result<(), AccessError> {
+    loop {
+        let (stream, _) = listener
+            .accept()
+            .await
+            .map_err(|error| AccessError::unavailable(error.to_string()))?;
+        let access = access.clone();
+        tokio::spawn(async move {
+            let _ = serve_connection(stream, access, epoch).await;
+        });
+    }
+}
+
+pub async fn serve_owner_listener(
+    listener: UnixListener,
+    access: Arc<dyn AgentAccess>,
+    epoch: Uuid,
+) -> Result<(), AccessError> {
+    let shutdown = CancellationToken::new();
+    loop {
+        let incoming = tokio::select! { _ = shutdown.cancelled() => return Ok(()), incoming = listener.accept() => incoming };
+        let (stream, _) = incoming.map_err(|error| AccessError::unavailable(error.to_string()))?;
+        let access = access.clone();
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            let _ = serve_connection_mode(
+                stream,
+                access,
+                epoch,
+                false,
+                Some(shutdown),
+                #[cfg(test)]
+                None,
+            )
+            .await;
+        });
+    }
+}
+
+pub async fn serve_worker_listener(
+    listener: UnixListener,
+    access: Arc<dyn AgentAccess>,
+    epoch: Uuid,
+) -> Result<(), AccessError> {
+    loop {
+        let (stream, _) = listener
+            .accept()
+            .await
+            .map_err(|error| AccessError::unavailable(error.to_string()))?;
+        let access = access.clone();
+        tokio::spawn(async move {
+            let _ = serve_connection_mode(
+                stream,
+                access,
+                epoch,
+                true,
+                None,
+                #[cfg(test)]
+                None,
+            )
+            .await;
+        });
+    }
+}
+
+pub async fn serve_connection(
+    stream: UnixStream,
+    access: Arc<dyn AgentAccess>,
+    epoch: Uuid,
+) -> Result<(), AccessError> {
+    serve_connection_mode(
+        stream,
+        access,
+        epoch,
+        false,
+        None,
+        #[cfg(test)]
+        None,
+    )
+    .await
+}
+
+async fn serve_connection_mode(
+    mut stream: UnixStream,
+    access: Arc<dyn AgentAccess>,
+    epoch: Uuid,
+    forwarded_sessions: bool,
+    owner_shutdown: Option<CancellationToken>,
+    #[cfg(test)] observation_hooks: Option<Arc<ObservationTestHooks>>,
+) -> Result<(), AccessError> {
+    verify_peer(&stream)?;
+    let hello = read_frame::<_, ClientMessage>(&mut stream).await?;
+    let minor = match hello {
+        Some(ClientMessage::Hello {
+            major: PROTOCOL_MAJOR,
+            minor,
+        }) => minor.min(PROTOCOL_MINOR),
+        _ => {
+            write_frame(
+                &mut stream,
+                &ServerMessage::Error {
+                    request_id: None,
+                    error: AccessError::new(
+                        AccessErrorCode::VersionMismatch,
+                        "incompatible AgentAccess protocol major",
+                    ),
+                },
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    let session_id = Uuid::new_v4();
+    let mut capabilities = vec![
+        AccessCapability::Overview,
+        AccessCapability::AgentDetails,
+        AccessCapability::Records,
+        AccessCapability::Receipts,
+        AccessCapability::Create,
+        AccessCapability::LoadRecord,
+        AccessCapability::Submit,
+        AccessCapability::ContinueLoop,
+        AccessCapability::DecidePermission,
+        AccessCapability::AnswerQuestion,
+        AccessCapability::Configure,
+        AccessCapability::EditHistory,
+        AccessCapability::ManageLoop,
+        AccessCapability::ManageTask,
+        AccessCapability::EnqueueAfterTurn,
+        AccessCapability::RefreshConfiguration,
+        AccessCapability::FlushTranscripts,
+        AccessCapability::DisplayRegistration,
+    ];
+    let mut limits = ProtocolLimits::current();
+    if minor >= MIN_CHUNKED_RESPONSE_MINOR {
+        capabilities.push(AccessCapability::TrustWorkingDirectory);
+        capabilities.push(AccessCapability::ChunkedResponses);
+    } else {
+        limits.chunk_bytes = 0;
+    }
+    write_frame(
+        &mut stream,
+        &ServerMessage::Hello(ServerHello {
+            major: PROTOCOL_MAJOR,
+            minor,
+            owner_epoch: epoch,
+            process_id: std::process::id(),
+            session_id,
+            capabilities,
+            limits: Some(limits),
+        }),
+    )
+    .await?;
+    let (mut reader, writer) = stream.into_split();
+    let writer = Arc::new(Mutex::new(writer));
+    let observations: Arc<Mutex<HashMap<Uuid, FeedTask>>> = Arc::new(Mutex::new(HashMap::new()));
+    let cancel = owner_shutdown
+        .as_ref()
+        .map_or_else(CancellationToken::new, CancellationToken::child_token);
+    let _cleanup = ConnectionCleanup {
+        writer: writer.clone(),
+        observations: observations.clone(),
+        access: access.clone(),
+        cancel: cancel.clone(),
+        session_id,
+    };
+    let result = loop {
+        let incoming = tokio::select! { _ = cancel.cancelled() => break Ok(()), incoming = read_frame::<_, ClientMessage>(&mut reader) => incoming };
+        let message = match incoming {
+            Ok(Some(message)) => message,
+            Ok(None) => break Ok(()),
+            Err(error) => break Err(error),
+        };
+        if let ClientMessage::ShutdownOwner {
+            request_id,
+            owner_epoch,
+        } = message
+        {
+            if owner_epoch != epoch {
+                write_frame(
+                    &mut *writer.lock().await,
+                    &ServerMessage::Error {
+                        request_id: Some(request_id),
+                        error: AccessError::new(
+                            AccessErrorCode::EpochChanged,
+                            "owner shutdown belongs to another epoch",
+                        ),
+                    },
+                )
+                .await?;
+            } else if let Some(shutdown) = &owner_shutdown {
+                write_frame(
+                    &mut *writer.lock().await,
+                    &ServerMessage::OwnerStopped { request_id },
+                )
+                .await?;
+                shutdown.cancel();
+                break Ok(());
+            } else {
+                write_frame(
+                    &mut *writer.lock().await,
+                    &ServerMessage::Error {
+                        request_id: Some(request_id),
+                        error: AccessError::new(
+                            AccessErrorCode::Unsupported,
+                            "this endpoint does not expose owner administration",
+                        ),
+                    },
+                )
+                .await?;
+            }
+            continue;
+        }
+        if let ClientMessage::CancelObservation { observation_id } = message {
+            if let Some(feed) = observations.lock().await.remove(&observation_id) {
+                feed.stop.cancel();
+            }
+            #[cfg(test)]
+            if let Some(hooks) = &observation_hooks {
+                hooks.canceled.notify_one();
+            }
+            continue;
+        }
+        let request_id = match &message {
+            ClientMessage::Observe { request_id, .. }
+            | ClientMessage::Execute { request_id, .. }
+            | ClientMessage::ShowView { request_id, .. } => *request_id,
+            _ => continue,
+        };
+        let access = access.clone();
+        let writer = writer.clone();
+        let observations = observations.clone();
+        let cancel = cancel.clone();
+        #[cfg(test)]
+        let observation_hooks = observation_hooks.clone();
+        tokio::spawn(async move {
+            let command_response = matches!(&message, ClientMessage::Execute { .. });
+            let response = match message {
+                ClientMessage::Observe { request_id, query } => match access.observe(query).await {
+                    Ok(observation) if !cancel.is_cancelled() => {
+                        let observation_id = Uuid::new_v4();
+                        let feed = observation.changes.is_some();
+                        let terminal_error = observation.terminal_error.clone();
+                        let response = ServerMessage::Opened {
+                            request_id,
+                            observation_id,
+                            initial: observation.initial,
+                            cursor: observation.cursor,
+                            reset: observation.reset,
+                            feed,
+                        };
+                        let start = if let Some(mut changes) = observation.changes {
+                            let (start, started) = oneshot::channel();
+                            let writer = writer.clone();
+                            let cancel = cancel.clone();
+                            let stop = CancellationToken::new();
+                            let task_stop = stop.clone();
+                            let active = observations.clone();
+                            let task = tokio::spawn(async move {
+                                let ready = tokio::select! {
+                                    _ = cancel.cancelled() => return,
+                                    _ = task_stop.cancelled() => return,
+                                    ready = started => ready,
+                                };
+                                if ready.is_err() {
+                                    return;
+                                }
+                                loop {
+                                    // Stopping is checked only here, never while a frame is being
+                                    // written.
+                                    let update = tokio::select! {
+                                        biased;
+                                        _ = cancel.cancelled() => break,
+                                        _ = task_stop.cancelled() => break,
+                                        update = changes.recv() => update,
+                                    };
+                                    let Some(update) = update else {
+                                        let error = terminal_error
+                                            .as_ref()
+                                            .and_then(|error| error.lock().unwrap().clone())
+                                            .unwrap_or_else(|| {
+                                                AccessError::unavailable(
+                                                    "execution observation ended",
+                                                )
+                                            });
+                                        if write_frame(
+                                            &mut *writer.lock().await,
+                                            &ServerMessage::ObservationClosed {
+                                                observation_id,
+                                                error,
+                                            },
+                                        )
+                                        .await
+                                        .is_err()
+                                        {
+                                            cancel.cancel();
+                                        }
+                                        break;
+                                    };
+                                    if write_frame(
+                                        &mut *writer.lock().await,
+                                        &ServerMessage::Changed {
+                                            observation_id,
+                                            update: super::bounded_update(update),
+                                        },
+                                    )
+                                    .await
+                                    .is_err()
+                                    {
+                                        cancel.cancel();
+                                        break;
+                                    }
+                                }
+                                active.lock().await.remove(&observation_id);
+                            });
+                            observations.lock().await.insert(
+                                observation_id,
+                                FeedTask {
+                                    stop,
+                                    task: task.abort_handle(),
+                                },
+                            );
+                            Some(start)
+                        } else {
+                            None
+                        };
+                        if !write_response(
+                            &mut *writer.lock().await,
+                            response,
+                            request_id,
+                            false,
+                            minor >= MIN_CHUNKED_RESPONSE_MINOR,
+                            &cancel,
+                        )
+                        .await
+                        {
+                            if let Some(feed) = observations.lock().await.remove(&observation_id) {
+                                feed.task.abort();
+                            }
+                            return;
+                        }
+                        #[cfg(test)]
+                        if let Some(hooks) = observation_hooks
+                            && hooks.next.swap(false, std::sync::atomic::Ordering::SeqCst)
+                        {
+                            hooks.opened.notify_one();
+                            hooks.resume.notified().await;
+                        }
+                        if let Some(start) = start {
+                            let _ = start.send(());
+                        }
+                        return;
+                    }
+                    Ok(_) => return,
+                    Err(error) => ServerMessage::Error {
+                        request_id: Some(request_id),
+                        error,
+                    },
+                },
+                ClientMessage::Execute {
+                    request_id,
+                    command,
+                } => match if !forwarded_sessions
+                    && super::views::command_origin(&command.command)
+                        .is_some_and(|source| source.view.session_id != session_id)
+                {
+                    Err(AccessError::new(
+                        AccessErrorCode::AccessDenied,
+                        "input source does not belong to this connection session",
+                    ))
+                } else {
+                    access.execute(command).await
+                } {
+                    Ok(receipt) => ServerMessage::Receipt {
+                        request_id,
+                        receipt,
+                    },
+                    Err(error) => ServerMessage::Error {
+                        request_id: Some(request_id),
+                        error,
+                    },
+                },
+                ClientMessage::ShowView { request_id, update } => {
+                    let view_session = match &update {
+                        DisplayUpdate::Displayed { view, .. }
+                        | DisplayUpdate::Scene { view, .. }
+                        | DisplayUpdate::Renew { view, .. }
+                        | DisplayUpdate::Left { view, .. } => Some(view.session_id),
+                        DisplayUpdate::SessionClosed { .. } => None,
+                    };
+                    if (!forwarded_sessions && view_session != Some(session_id))
+                        || cancel.is_cancelled()
+                    {
+                        ServerMessage::Error {
+                            request_id: Some(request_id),
+                            error: AccessError::new(
+                                AccessErrorCode::AccessDenied,
+                                "View does not belong to this connection session",
+                            ),
+                        }
+                    } else {
+                        match access.show_view(update).await {
+                            Ok(receipt) => ServerMessage::Display {
+                                request_id,
+                                receipt,
+                            },
+                            Err(error) => ServerMessage::Error {
+                                request_id: Some(request_id),
+                                error,
+                            },
+                        }
+                    }
+                }
+                _ => return,
+            };
+            write_response(
+                &mut *writer.lock().await,
+                response,
+                request_id,
+                command_response,
+                minor >= MIN_CHUNKED_RESPONSE_MINOR,
+                &cancel,
+            )
+            .await;
+        });
+    };
+    cancel.cancel();
+    for (_, feed) in observations.lock().await.drain() {
+        feed.task.abort();
+    }
+    let _ = access
+        .show_view(DisplayUpdate::SessionClosed { session_id })
+        .await;
+    result
+}
+
+async fn write_response<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    response: ServerMessage,
+    request_id: Uuid,
+    command_response: bool,
+    chunked_responses: bool,
+    cancel: &CancellationToken,
+) -> bool {
+    let kind = response_kind(&response);
+    let mut encoding_failed = false;
+    let result = if let Some(kind) = kind {
+        let encoding_cancel = cancel.clone();
+        let encoded =
+            tokio::task::spawn_blocking(move || EncodedResponse::new(response, encoding_cancel))
+                .await;
+        encoding_failed = !matches!(&encoded, Ok(Ok(_)));
+        match encoded {
+            Ok(Ok(encoded)) if encoded.total_bytes <= MAX_FRAME_BYTES as u64 => {
+                write_encoded_frame(writer, encoded).await
+            }
+            Ok(Ok(encoded)) if chunked_responses => {
+                write_chunked_response(writer, encoded, request_id, kind, cancel).await
+            }
+            Ok(Ok(_)) => Err(AccessError::new(
+                AccessErrorCode::PayloadTooLarge,
+                "AgentAccess frame exceeds the transport limit",
+            )),
+            Ok(Err(error)) => Err(error),
+            Err(error) => Err(AccessError::invalid(format!(
+                "AgentAccess response could not be encoded: {error}"
+            ))),
+        }
+    } else {
+        write_frame(writer, &response).await
+    };
+    match result {
+        Ok(()) => true,
+        Err(error)
+            if encoding_failed
+                || matches!(
+                    error.code,
+                    AccessErrorCode::PayloadTooLarge | AccessErrorCode::Invalid
+                ) =>
+        {
+            let message = if error.code == AccessErrorCode::PayloadTooLarge {
+                "AgentAccess response exceeds the transport limit; query the original CommandId before repeating any command"
+            } else {
+                "AgentAccess response could not be encoded; query the original CommandId before repeating any command"
+            };
+            if write_frame(
+                writer,
+                &ServerMessage::Error {
+                    request_id: Some(request_id),
+                    error: AccessError::new(
+                        if command_response {
+                            AccessErrorCode::OutcomeUnknown
+                        } else {
+                            error.code
+                        },
+                        message,
+                    ),
+                },
+            )
+            .await
+            .is_err()
+            {
+                cancel.cancel();
+            }
+            false
+        }
+        Err(_) => {
+            cancel.cancel();
+            false
+        }
+    }
+}
+
+async fn write_encoded_frame<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    encoded: EncodedResponse,
+) -> Result<(), AccessError> {
+    writer
+        .write_u32(encoded.total_bytes as u32)
+        .await
+        .map_err(|error| AccessError::unavailable(error.to_string()))?;
+    let mut file = tokio::fs::File::from_std(encoded.file);
+    tokio::io::copy(&mut file, writer)
+        .await
+        .map_err(|error| AccessError::unavailable(error.to_string()))?;
+    writer
+        .flush()
+        .await
+        .map_err(|error| AccessError::unavailable(error.to_string()))
+}
+
+async fn write_chunked_response<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    encoded: EncodedResponse,
+    request_id: Uuid,
+    kind: ChunkedResponseKind,
+    cancel: &CancellationToken,
+) -> Result<(), AccessError> {
+    let transfer_id = Uuid::new_v4();
+    let total_bytes = encoded.total_bytes;
+    let sha256 = encoded.sha256;
+    let mut file = tokio::fs::File::from_std(encoded.file);
+    let transfer = async {
+        write_frame(
+            writer,
+            &ServerMessage::ResponseStart {
+                request_id,
+                transfer_id,
+                kind,
+                total_bytes,
+                chunk_bytes: RESPONSE_CHUNK_BYTES,
+            },
+        )
+        .await?;
+        let mut offset = 0;
+        let mut bytes = vec![0; RESPONSE_CHUNK_BYTES];
+        while offset < total_bytes {
+            let length = (total_bytes - offset).min(RESPONSE_CHUNK_BYTES as u64) as usize;
+            file.read_exact(&mut bytes[..length])
+                .await
+                .map_err(|error| AccessError::unavailable(error.to_string()))?;
+            write_frame(
+                writer,
+                &ServerMessage::ResponseChunk {
+                    transfer_id,
+                    offset,
+                    base64: BASE64.encode(&bytes[..length]),
+                },
+            )
+            .await?;
+            offset += length as u64;
+        }
+        write_frame(
+            writer,
+            &ServerMessage::ResponseEnd {
+                transfer_id,
+                total_bytes,
+                sha256,
+            },
+        )
+        .await
+    };
+    tokio::select! { _ = cancel.cancelled() => Err(AccessError::unavailable("response transfer canceled")), result = transfer => result }
+}
+
+pub(crate) async fn write_frame<W: AsyncWrite + Unpin, T: serde::Serialize>(
+    writer: &mut W,
+    value: &T,
+) -> Result<(), AccessError> {
+    let bytes =
+        serde_json::to_vec(value).map_err(|error| AccessError::invalid(error.to_string()))?;
+    if bytes.len() > MAX_FRAME_BYTES {
+        return Err(AccessError::new(
+            AccessErrorCode::PayloadTooLarge,
+            "AgentAccess frame exceeds the transport limit",
+        ));
+    }
+    writer
+        .write_u32(bytes.len() as u32)
+        .await
+        .map_err(|error| AccessError::unavailable(error.to_string()))?;
+    writer
+        .write_all(&bytes)
+        .await
+        .map_err(|error| AccessError::unavailable(error.to_string()))?;
+    writer
+        .flush()
+        .await
+        .map_err(|error| AccessError::unavailable(error.to_string()))
+}
+
+pub(crate) async fn read_frame<R: AsyncRead + Unpin, T: serde::de::DeserializeOwned>(
+    reader: &mut R,
+) -> Result<Option<T>, AccessError> {
+    let length = match reader.read_u32().await {
+        Ok(length) => length as usize,
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(error) => return Err(AccessError::unavailable(error.to_string())),
+    };
+    if length > MAX_FRAME_BYTES {
+        return Err(AccessError::new(
+            AccessErrorCode::PayloadTooLarge,
+            "AgentAccess frame exceeds the transport limit",
+        ));
+    }
+    let mut bytes = vec![0; length];
+    reader
+        .read_exact(&mut bytes)
+        .await
+        .map_err(|error| AccessError::unavailable(error.to_string()))?;
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|error| AccessError::invalid(error.to_string()))
+}
+
+fn verify_peer(stream: &UnixStream) -> Result<(), AccessError> {
+    let credentials = stream
+        .peer_cred()
+        .map_err(|error| AccessError::new(AccessErrorCode::AccessDenied, error.to_string()))?;
+    if credentials.uid() != unsafe { libc::geteuid() } {
+        return Err(AccessError::new(
+            AccessErrorCode::AccessDenied,
+            "AgentAccess permits only the current user",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct ControlledFeed {
+        sender: Mutex<Option<mpsc::Sender<ObservationUpdate>>>,
+        epoch: Uuid,
+        initial: Option<ObservationValue>,
+    }
+
+    #[async_trait]
+    impl AgentAccess for ControlledFeed {
+        async fn observe(&self, query: ObservationRequest) -> Result<Observation, AccessError> {
+            let (initial, changes) = if matches!(query, ObservationRequest::Receipt { .. }) {
+                (ObservationValue::Receipt(None), None)
+            } else {
+                let (sender, changes) = mpsc::channel(FEED_CAPACITY);
+                *self.sender.lock().await = Some(sender);
+                (
+                    self.initial
+                        .clone()
+                        .unwrap_or_else(|| ObservationValue::Overview(Vec::new())),
+                    Some(changes),
+                )
+            };
+            Ok(Observation {
+                initial,
+                cursor: Cursor {
+                    owner_epoch: self.epoch,
+                    execution: None,
+                    sequence: 0,
+                },
+                reset: None,
+                changes,
+                terminal_error: None,
+            })
+        }
+        async fn execute(&self, _: CommandEnvelope) -> Result<CommandReceipt, AccessError> {
+            Err(AccessError::invalid("fixture does not execute commands"))
+        }
+        async fn show_view(&self, _: DisplayUpdate) -> Result<DisplayReceipt, AccessError> {
+            Err(AccessError::invalid("fixture has no display"))
+        }
+    }
+
+    /// Shrinks a server socket's send buffer so one feed frame cannot fit in the kernel, and
+    /// returns the size the kernel applied.
+    fn shrink_send_buffer(stream: &UnixStream) -> usize {
+        use std::os::fd::AsRawFd;
+        let requested: libc::c_int = 2048;
+        let option_size = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        let set = unsafe {
+            libc::setsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                (&requested as *const libc::c_int).cast(),
+                option_size,
+            )
+        };
+        assert_eq!(set, 0, "cannot shrink the server send buffer");
+        let mut applied: libc::c_int = 0;
+        let mut applied_size = option_size;
+        let read = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                (&mut applied as *mut libc::c_int).cast(),
+                &mut applied_size,
+            )
+        };
+        assert_eq!(read, 0, "cannot read the server send buffer");
+        applied as usize
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn canceling_an_observation_mid_frame_never_corrupts_the_shared_connection() {
+        let temporary = tempfile::tempdir_in("/tmp").unwrap();
+        let socket = temporary.path().join("cancel-mid-frame.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let epoch = Uuid::new_v4();
+        let source = Arc::new(ControlledFeed {
+            sender: Mutex::new(None),
+            epoch,
+            initial: None,
+        });
+        let hooks = Arc::new(ObservationTestHooks {
+            next: std::sync::atomic::AtomicBool::new(false),
+            opened: tokio::sync::Notify::new(),
+            canceled: tokio::sync::Notify::new(),
+            resume: tokio::sync::Notify::new(),
+        });
+        let (buffer_sender, buffer_size) = oneshot::channel();
+        let server_source = source.clone();
+        let server_hooks = hooks.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = buffer_sender.send(shrink_send_buffer(&stream));
+            let _ = serve_connection_mode(
+                stream,
+                server_source,
+                epoch,
+                false,
+                None,
+                Some(server_hooks),
+            )
+            .await;
+        });
+        let mut stream = UnixStream::connect(&socket).await.unwrap();
+        write_frame(
+            &mut stream,
+            &ClientMessage::Hello {
+                major: PROTOCOL_MAJOR,
+                minor: PROTOCOL_MINOR,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_frame::<_, ServerMessage>(&mut stream).await.unwrap(),
+            Some(ServerMessage::Hello(_))
+        ));
+        let send_buffer = buffer_size.await.unwrap();
+        let feed_request = Uuid::new_v4();
+        write_frame(
+            &mut stream,
+            &ClientMessage::Observe {
+                request_id: feed_request,
+                query: ObservationRequest::Overview {
+                    filter: AgentFilter::default(),
+                    page: Page::default(),
+                    after: None,
+                },
+            },
+        )
+        .await
+        .unwrap();
+        let observation_id = loop {
+            if let Some(ServerMessage::Opened {
+                request_id,
+                observation_id,
+                ..
+            }) = read_frame::<_, ServerMessage>(&mut stream).await.unwrap()
+                && request_id == feed_request
+            {
+                break observation_id;
+            }
+        };
+        let update = |sequence, text: &str| ObservationUpdate {
+            cursor: Cursor {
+                owner_epoch: epoch,
+                execution: None,
+                sequence,
+            },
+            change: ObservationChange::Event(crate::runtime::Event {
+                sequence,
+                chat_id: Uuid::nil(),
+                loop_id: Uuid::nil(),
+                run_id: Uuid::nil(),
+                kind: crate::runtime::EventKind::Text(text.into()),
+            }),
+        };
+        // The largest update the feed forwards unchanged, so one frame is as long as possible.
+        let overhead = serde_json::to_vec(&update(1, "")).unwrap().len();
+        let text = "x".repeat(FEED_MAX_BYTES / FEED_CAPACITY - overhead - 64);
+        let sender = source.sender.lock().await.take().unwrap();
+        sender.send(update(1, &text)).await.unwrap();
+        sender.send(update(2, &text)).await.unwrap();
+        // Reading the length prefix proves the server is inside the first frame's write. Linux
+        // can buffer up to one and a half send buffers of data, so a longer body cannot fit: the
+        // write stays in progress until this client reads again.
+        let length = tokio::time::timeout(std::time::Duration::from_secs(10), stream.read_u32())
+            .await
+            .expect("the server starts writing the first update")
+            .unwrap() as usize;
+        assert!(
+            send_buffer * 3 / 2 + 4 < length,
+            "a {length}-byte frame must not fit a {send_buffer}-byte send buffer"
+        );
+        let (mut reader, mut writer) = stream.into_split();
+        write_frame(
+            &mut writer,
+            &ClientMessage::CancelObservation { observation_id },
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            hooks.canceled.notified(),
+        )
+        .await
+        .expect("the server handles the cancel while the frame is still being written");
+        let later_request = Uuid::new_v4();
+        write_frame(
+            &mut writer,
+            &ClientMessage::Observe {
+                request_id: later_request,
+                query: ObservationRequest::Receipt {
+                    epoch,
+                    command_id: Uuid::new_v4(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+        let (in_progress, next) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).await.unwrap();
+            let in_progress = serde_json::from_slice::<ServerMessage>(&body)
+                .expect("the frame being written when the cancel arrived is whole");
+            (
+                in_progress,
+                read_frame::<_, ServerMessage>(&mut reader).await,
+            )
+        })
+        .await
+        .expect("canceling an observation left a partial frame on the connection");
+        assert!(
+            matches!(
+                &in_progress,
+                ServerMessage::Changed { observation_id: changed, update }
+                    if *changed == observation_id
+                        && update.cursor.sequence == 1
+                        && matches!(
+                            &update.change,
+                            ObservationChange::Event(crate::runtime::Event {
+                                kind: crate::runtime::EventKind::Text(sent),
+                                ..
+                            }) if *sent == text
+                        )
+            ),
+            "{in_progress:?}"
+        );
+        assert!(
+            matches!(
+                &next,
+                Ok(Some(ServerMessage::Opened { request_id, .. })) if *request_id == later_request
+            ),
+            "the canceled feed writes nothing more, and the later request is answered on the same connection: {next:?}"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), sender.closed())
+            .await
+            .expect("a canceled feed closes its source");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn cancel_immediately_after_opened_closes_the_source_before_feed_start() {
+        let temporary = tempfile::tempdir_in("/tmp").unwrap();
+        let socket = temporary.path().join("cancel.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let epoch = Uuid::new_v4();
+        let source = Arc::new(ControlledFeed {
+            sender: Mutex::new(None),
+            epoch,
+            initial: None,
+        });
+        let hooks = Arc::new(ObservationTestHooks {
+            next: std::sync::atomic::AtomicBool::new(true),
+            opened: tokio::sync::Notify::new(),
+            canceled: tokio::sync::Notify::new(),
+            resume: tokio::sync::Notify::new(),
+        });
+        let server_source = source.clone();
+        let server_hooks = hooks.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            serve_connection_mode(
+                stream,
+                server_source,
+                epoch,
+                false,
+                None,
+                Some(server_hooks),
+            )
+            .await
+            .unwrap();
+        });
+        let client = LocalAgentClient::connect(socket).await.unwrap();
+        let observation = client
+            .observe(ObservationRequest::Overview {
+                filter: AgentFilter::default(),
+                page: Page {
+                    offset: 0,
+                    limit: 256,
+                },
+                after: None,
+            })
+            .await
+            .unwrap();
+        hooks.opened.notified().await;
+        let sender = source.sender.lock().await.take().unwrap();
+        drop(observation);
+        tokio::time::timeout(std::time::Duration::from_secs(2), hooks.canceled.notified())
+            .await
+            .unwrap();
+        let canceled =
+            tokio::time::timeout(std::time::Duration::from_secs(2), sender.closed()).await;
+        hooks.resume.notify_one();
+        assert!(
+            canceled.is_ok(),
+            "a canceled source must close before its feed starts"
+        );
+        assert!(client.is_connected());
+        let receipt = client
+            .observe(ObservationRequest::Receipt {
+                epoch,
+                command_id: Uuid::new_v4(),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(receipt.initial, ObservationValue::Receipt(None)));
+        drop(client);
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn disconnect_during_chunked_open_cancels_the_source_before_any_opened_is_published() {
+        let temporary = tempfile::tempdir_in("/tmp").unwrap();
+        let socket = temporary.path().join("chunk-cancel.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let epoch = Uuid::new_v4();
+        let source = Arc::new(ControlledFeed {
+            sender: Mutex::new(None),
+            epoch,
+            initial: Some(ObservationValue::Transcript(Box::new(RecordedTranscript {
+                record: TranscriptRef {
+                    store_root: temporary.path().to_path_buf(),
+                    chat_id: Uuid::new_v4(),
+                },
+                title: None,
+                workdir: temporary.path().to_path_buf(),
+                messages: vec![RecordedMessage {
+                    id: Uuid::new_v4(),
+                    message: crate::model::Message {
+                        role: crate::model::Role::User,
+                        content: vec![crate::model::Content::Text {
+                            text: "x".repeat(MAX_FRAME_BYTES),
+                        }],
+                    },
+                    loop_id: None,
+                    run_id: None,
+                    timestamp: String::new(),
+                }],
+                total_messages: 1,
+                warnings: Vec::new(),
+            }))),
+        });
+        let server_source = source.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            serve_connection(stream, server_source, epoch)
+                .await
+                .unwrap();
+        });
+        let mut stream = UnixStream::connect(&socket).await.unwrap();
+        write_frame(
+            &mut stream,
+            &ClientMessage::Hello {
+                major: PROTOCOL_MAJOR,
+                minor: PROTOCOL_MINOR,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_frame::<_, ServerMessage>(&mut stream).await.unwrap(),
+            Some(ServerMessage::Hello(_))
+        ));
+        write_frame(
+            &mut stream,
+            &ClientMessage::Observe {
+                request_id: Uuid::new_v4(),
+                query: ObservationRequest::Overview {
+                    filter: AgentFilter::default(),
+                    page: Page::default(),
+                    after: None,
+                },
+            },
+        )
+        .await
+        .unwrap();
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            read_frame::<_, ServerMessage>(&mut stream),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            response,
+            Some(ServerMessage::ResponseStart {
+                kind: ChunkedResponseKind::Opened,
+                ..
+            })
+        ));
+        let sender = source.sender.lock().await.take().unwrap();
+        drop(stream);
+        tokio::time::timeout(std::time::Duration::from_secs(5), sender.closed())
+            .await
+            .expect("a canceled partial snapshot must close its source feed");
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    /// Answers every overview request with `rows` as raw JSON, the way an owner built before
+    /// a summary field existed would, after the same 1.1 handshake.
+    async fn serve_legacy_overview(listener: UnixListener, epoch: Uuid, rows: serde_json::Value) {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let _: Option<serde_json::Value> = read_frame(&mut stream).await.unwrap();
+        write_frame(
+            &mut stream,
+            &ServerMessage::Hello(ServerHello {
+                process_id: 0,
+                major: PROTOCOL_MAJOR,
+                minor: 1,
+                owner_epoch: epoch,
+                session_id: Uuid::new_v4(),
+                capabilities: Vec::new(),
+                limits: None,
+            }),
+        )
+        .await
+        .unwrap();
+        while let Ok(Some(message)) = read_frame::<_, ClientMessage>(&mut stream).await {
+            if let ClientMessage::Observe { request_id, .. } = message {
+                let opened = serde_json::json!({
+                    "Opened": {
+                        "request_id": request_id,
+                        "observation_id": Uuid::new_v4(),
+                        "initial": { "Overview": rows.clone() },
+                        "cursor": { "owner_epoch": epoch, "execution": null, "sequence": 0 },
+                        "reset": null,
+                        "feed": false,
+                    }
+                });
+                write_frame(&mut stream, &opened).await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn legacy_summary_missing_work_fact_is_unknown() {
+        use crate::agent_console::AttentionGroup;
+        let temporary = tempfile::tempdir_in("/tmp").unwrap();
+        let socket = temporary.path().join("legacy.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let epoch = Uuid::new_v4();
+        let summary = |has_work: Option<bool>| AgentSummary {
+            availability: ExecutionAvailability::Live,
+            execution: ExecutionRef {
+                owner_epoch: epoch,
+                agent_id: Uuid::new_v4(),
+                generation: 1,
+            },
+            chat_id: Uuid::new_v4(),
+            workdir: temporary.path().to_path_buf(),
+            state: crate::runtime::LoopState::Idle,
+            title: "New Agent".into(),
+            has_work,
+            updated_at: None,
+            preview: None,
+            waiting_permissions: 0,
+            waiting_questions: 0,
+            parent: None,
+            record: None,
+            workspace: None,
+            capabilities: Vec::new(),
+            views: Vec::new(),
+        };
+        // The same Idle `New Agent` title three ways: an older producer's summary without the
+        // fact, and current summaries that report it as false and as true.
+        let (legacy, empty, worked) = (summary(None), summary(Some(false)), summary(Some(true)));
+        let mut legacy_json = serde_json::to_value(summary(Some(false))).unwrap();
+        legacy_json["execution"] = serde_json::to_value(legacy.execution).unwrap();
+        legacy_json.as_object_mut().unwrap().remove("has_work");
+        let server = tokio::spawn(serve_legacy_overview(
+            listener,
+            epoch,
+            serde_json::json!([
+                legacy_json,
+                serde_json::to_value(&empty).unwrap(),
+                serde_json::to_value(&worked).unwrap(),
+            ]),
+        ));
+        let client = Arc::new(LocalAgentClient::connect(&socket).await.unwrap());
+        let mut console = crate::agent_console::AgentConsole::new(
+            client,
+            epoch,
+            temporary.path().to_path_buf(),
+            None,
+        );
+        let projection = console.refresh().await.unwrap();
+        let row = |execution: ExecutionRef| {
+            projection
+                .rows
+                .iter()
+                .find(|row| row.execution == execution)
+                .unwrap()
+        };
+        let forwarded = serde_json::to_value(row(legacy.execution)).unwrap();
+        assert!(
+            forwarded.get("has_work").is_none(),
+            "a decoded legacy summary must not be re-sent with an invented work fact: {forwarded}"
+        );
+        assert_eq!(row(legacy.execution).has_work, None);
+        assert_eq!(
+            AttentionGroup::of(row(legacy.execution)),
+            AttentionGroup::Unknown,
+            "a summary without the fact is neither known worked Idle nor known Empty"
+        );
+        assert_eq!(row(empty.execution).has_work, Some(false));
+        assert_eq!(
+            AttentionGroup::of(row(empty.execution)),
+            AttentionGroup::Empty
+        );
+        assert_eq!(
+            serde_json::to_value(row(worked.execution)).unwrap()["has_work"],
+            true
+        );
+        assert_eq!(
+            AttentionGroup::of(row(worked.execution)),
+            AttentionGroup::Idle,
+            "the `New Agent` title alone never makes a worked Agent empty"
+        );
+        server.abort();
+    }
+}

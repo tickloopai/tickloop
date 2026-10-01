@@ -3,7 +3,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
@@ -26,7 +28,7 @@ impl PermissionOwner {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct WorkspaceScope {
     workdir: PathBuf,
     additional_directories: Vec<PathBuf>,
@@ -55,6 +57,26 @@ pub(crate) struct SessionPermissionOperation {
     /// rules name one aspect of it, such as the host a `WebFetch` call fetches.
     identity: Value,
     workspace: WorkspaceScope,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct SessionPermissionDenial {
+    tool: String,
+    identity_sha256: String,
+    workspace: WorkspaceScope,
+}
+
+impl SessionPermissionDenial {
+    pub(crate) fn matches(&self, operation: &SessionPermissionOperation) -> bool {
+        self.tool == operation.tool
+            && self.workspace == operation.workspace
+            && self.identity_sha256 == identity_digest(&operation.identity)
+    }
+}
+
+fn identity_digest(identity: &Value) -> String {
+    let digest = Sha256::digest(serde_json::to_vec(identity).expect("normalized input serializes"));
+    format!("{digest:x}")
 }
 
 impl SessionPermissionOperation {
@@ -157,6 +179,21 @@ pub(crate) struct SessionPermissionContext {
 }
 
 impl SessionPermissionContext {
+    pub(crate) fn freeze_denials(&self, owner: PermissionOwner) -> Vec<SessionPermissionDenial> {
+        let owners = self.owner_ancestors(owner);
+        self.grants
+            .iter()
+            .filter(|grant| {
+                owners.contains(&grant.owner) && grant.decision == SessionPermissionDecision::Deny
+            })
+            .map(|grant| SessionPermissionDenial {
+                tool: grant.operation.tool.clone(),
+                identity_sha256: identity_digest(&grant.operation.identity),
+                workspace: grant.operation.workspace.clone(),
+            })
+            .collect()
+    }
+
     pub(crate) fn revision(&self) -> SessionPermissionRevision {
         SessionPermissionRevision(self.revision)
     }

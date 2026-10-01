@@ -6,17 +6,15 @@ impl Menus {
         &mut self,
         agent: &Agent,
         console: &Console,
-        chat: Uuid,
+        subject: PermissionsSubject,
         select_reviewer: bool,
-        revision: PermissionsRevision,
     ) -> Result<(), String> {
         self.judgment_settings(
             agent,
             console,
             JudgmentReturn::AutoSettings {
-                chat,
+                subject,
                 select_reviewer,
-                revision,
             },
         )
         .await
@@ -111,13 +109,26 @@ impl Menus {
         return_to: JudgmentReturn,
     ) -> Result<(), String> {
         match return_to {
-            JudgmentReturn::Providers { chat } => self.back_to_providers(console, chat),
-            JudgmentReturn::AutoSettings { chat, .. } => {
+            JudgmentReturn::Providers { target } => self.back_to_providers(console, target),
+            JudgmentReturn::AutoSettings {
+                subject: PermissionsSubject::Agent { chat, .. },
+                ..
+            } => {
                 let view = agent
                     .permissions_view(chat)
                     .await
                     .map_err(|error| error.to_string())?;
                 console.permissions_refreshed(view)
+            }
+            JudgmentReturn::AutoSettings {
+                subject: PermissionsSubject::NewDraft { project, .. },
+                ..
+            } => {
+                let page = agent
+                    .draft_permissions(&project)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                console.permissions_refreshed(page)
             }
         }
     }
@@ -129,8 +140,16 @@ impl Menus {
         return_to: JudgmentReturn,
         key_saved: bool,
     ) -> Result<(), String> {
-        let JudgmentReturn::AutoSettings { chat, revision, .. } = return_to else {
+        let JudgmentReturn::AutoSettings { subject, .. } = return_to else {
             return self.return_from_judgment(agent, console, return_to).await;
+        };
+        let (chat, revision) = match subject {
+            PermissionsSubject::Agent { chat, revision } => (chat, revision),
+            PermissionsSubject::NewDraft { project, revision } => {
+                return self
+                    .finish_draft_judgment_selection(agent, console, &project, &revision, key_saved)
+                    .await;
+            }
         };
         match agent
             .apply_permission_change(
@@ -161,6 +180,49 @@ impl Menus {
                     console.permissions_key_saved_choice_failed(view, safe_text(&error.to_string()))
                 } else {
                     console.permissions_refreshed(view)?;
+                    console.permissions_error(safe_text(&error.to_string()))
+                }
+            }
+        }
+    }
+    /// Selects Jev for the New Agent screen: the reviewer is a saved Auto setting, written now
+    /// against the revision the view was read at; no Agent is created.
+    async fn finish_draft_judgment_selection(
+        &mut self,
+        agent: &Agent,
+        console: &Console,
+        project: &std::path::Path,
+        revision: &super::super::permissions_surface::DraftPolicyRevision,
+        key_saved: bool,
+    ) -> Result<(), String> {
+        use super::super::execution::DraftPermissionsError;
+        match agent
+            .change_draft_permissions(
+                project,
+                revision,
+                PermissionChange::SelectReviewer {
+                    reviewer: AutoReviewerPreference::Jev,
+                },
+            )
+            .await
+        {
+            Ok(change) if key_saved => console.permissions_key_and_reviewer_saved(change.page),
+            Ok(change) => console.permissions_saved(change.page),
+            Err(DraftPermissionsError::Conflict(latest)) if key_saved => console
+                .permissions_key_saved_choice_failed(
+                    *latest,
+                    "settings changed elsewhere; review and retry".into(),
+                ),
+            Err(DraftPermissionsError::Conflict(latest)) => console.permissions_conflict(*latest),
+            Err(DraftPermissionsError::Rejected(error)) => {
+                let page = agent
+                    .draft_permissions(project)
+                    .await
+                    .map_err(|refresh_error| refresh_error.to_string())?;
+                if key_saved {
+                    console.permissions_key_saved_choice_failed(page, safe_text(&error.to_string()))
+                } else {
+                    console.permissions_refreshed(page)?;
                     console.permissions_error(safe_text(&error.to_string()))
                 }
             }

@@ -1,3 +1,4 @@
+use super::execution::ConsoleExecution as Agent;
 use std::collections::HashMap;
 use std::time::SystemTime;
 
@@ -5,7 +6,7 @@ use tickloop_agent::{
     model::{Content, Role},
     permissions::ExecutionMode,
     runtime::{
-        Agent, BranchPublicItem, BranchPublicSource, ChatSnapshot, EventKind,
+        BranchPublicItem, BranchPublicSource, ChatSnapshot, EventKind,
         FOLDED_TICK_REPLY_CHARACTERS, InputContext, LocalMessage, LoopState, Receipt, SavedChat,
         UserShellRecord, UserShellState,
     },
@@ -958,6 +959,17 @@ pub(super) fn public_history(chat: &ChatSnapshot, display: DisplayProfile) -> St
 }
 
 pub(super) fn write_public_history(console: &Console, chat: &ChatSnapshot) -> Result<(), String> {
+    if let Some(delegation) = &chat.delegation {
+        let task = single_line(&delegation.task);
+        if console.is_interactive() {
+            console.write(&format!("Delegated Agent · {task}\n"))?;
+        } else {
+            console.write(&format!(
+                "Agent family · root {} / child {}\nTask: {}\n",
+                delegation.parent_chat_id, chat.id, task
+            ))?;
+        }
+    }
     let pieces = public_history_pieces(chat, console.display_profile()?, console.image_links()?);
     console.write_pieces(&pieces)
 }
@@ -1706,6 +1718,7 @@ mod tests {
             state: LoopState::Running,
             run_id: Some(streaming_run),
             trigger: None,
+            state_since: None,
         });
         for kind in [EventKind::Started, EventKind::Text(unfinished.into())] {
             streaming.last_sequence += 1;

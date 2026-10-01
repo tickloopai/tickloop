@@ -22,12 +22,66 @@ use crate::output_style::OutputStyle;
 use crate::permissions::{Decision, PermissionRule};
 use crate::settings::{LoadedSettings, ProjectRuleChanges, SettingsError, UserSettings};
 
-/// 按项目分区（规范化的工作目录）的持久规则改动。
+/// Persistent rule changes partitioned by canonical project working directory.
 pub(super) type RuleChanges = BTreeMap<PathBuf, ProjectRuleChanges>;
 
 pub(super) struct SelectedModel {
     pub(super) config: ModelConfig,
     pub(super) client: Arc<dyn ModelClient>,
+}
+
+/// Defaults for a new root Chat from user settings and host options. Without saved settings,
+/// only execution mode follows host options; other fields keep the empty Chat defaults.
+/// The New Agent draft uses the same rules to preview its first creation.
+pub(crate) struct NewChatSettings {
+    pub(crate) execution_mode: crate::permissions::ExecutionMode,
+    pub(crate) reasoning_effort: Option<ReasoningEffort>,
+    pub(crate) thinking_enabled: bool,
+    pub(crate) context_window_tokens: Option<usize>,
+}
+
+pub(crate) fn new_chat_settings(
+    saved: Option<&mut LoadedSettings>,
+    host_options: &super::AgentHostOptions,
+    model: &ModelConfig,
+) -> NewChatSettings {
+    let host_mode = host_options.execution_mode_override;
+    let Some(saved) = saved else {
+        return NewChatSettings {
+            execution_mode: host_mode.unwrap_or(crate::permissions::ExecutionMode::Auto),
+            reasoning_effort: None,
+            thinking_enabled: true,
+            context_window_tokens: None,
+        };
+    };
+    let execution_mode = host_mode
+        .or_else(|| saved.default_execution_mode())
+        .unwrap_or(crate::permissions::ExecutionMode::Auto);
+    let context_window_tokens = if model.maximum_context_window_tokens().is_some() {
+        None
+    } else {
+        saved
+            .context_window_tokens()
+            .filter(|tokens| super::context::is_usable_context_window(*tokens, model))
+    };
+    let reasoning_effort = match saved.reasoning_effort() {
+        Some(effort) if validate_reasoning_effort(model, Some(effort)).is_ok() => Some(effort),
+        Some(effort) => {
+            saved.warn(format!(
+                "`effortLevel` {} is unsupported by {}; using auto",
+                effort.label(),
+                model.model
+            ));
+            None
+        }
+        None => None,
+    };
+    NewChatSettings {
+        execution_mode,
+        reasoning_effort,
+        thinking_enabled: saved.thinking_enabled(),
+        context_window_tokens,
+    }
 }
 
 impl Agent {
@@ -63,50 +117,18 @@ impl Agent {
     }
 
     pub(super) fn apply_new_chat_settings(&self, snapshot: &mut ChatSnapshot) -> OutputStyle {
-        if let Some(settings) = &self.inner.settings {
-            let mut saved = settings.load();
-            snapshot.policy.mode = self
-                .inner
-                .host_options
-                .execution_mode_override
-                .or_else(|| saved.default_execution_mode())
-                .unwrap_or(crate::permissions::ExecutionMode::Auto);
-            snapshot.context_window_tokens =
-                if snapshot.model.maximum_context_window_tokens().is_some() {
-                    None
-                } else {
-                    saved.context_window_tokens().filter(|tokens| {
-                        super::context::is_usable_context_window(*tokens, &snapshot.model)
-                    })
-                };
-            snapshot.reasoning_effort = match saved.reasoning_effort() {
-                Some(effort)
-                    if validate_reasoning_effort(&snapshot.model, Some(effort)).is_ok() =>
-                {
-                    Some(effort)
-                }
-                Some(effort) => {
-                    saved.warn(format!(
-                        "`effortLevel` {} is unsupported by {}; using auto",
-                        effort.label(),
-                        snapshot.model.model
-                    ));
-                    None
-                }
-                None => None,
-            };
-            snapshot.thinking_enabled = saved.thinking_enabled();
-            let output_style = saved.output_style();
-            self.replace_persistent_rules(snapshot, saved);
-            output_style
-        } else {
-            snapshot.policy.mode = self
-                .inner
-                .host_options
-                .execution_mode_override
-                .unwrap_or(crate::permissions::ExecutionMode::Auto);
-            OutputStyle::default()
-        }
+        let mut saved = self.inner.settings.as_ref().map(UserSettings::load);
+        let defaults = new_chat_settings(saved.as_mut(), &self.inner.host_options, &snapshot.model);
+        snapshot.policy.mode = defaults.execution_mode;
+        let Some(mut saved) = saved else {
+            return OutputStyle::default();
+        };
+        snapshot.context_window_tokens = defaults.context_window_tokens;
+        snapshot.reasoning_effort = defaults.reasoning_effort;
+        snapshot.thinking_enabled = defaults.thinking_enabled;
+        let output_style = saved.output_style();
+        self.replace_persistent_rules(snapshot, saved);
+        output_style
     }
 
     /// 在阻塞线程中读取用户设置；不读写设置的 Agent 返回 `None`。
@@ -126,6 +148,9 @@ impl Agent {
         snapshot: &mut ChatSnapshot,
         mut saved: LoadedSettings,
     ) {
+        if snapshot.delegation.is_some() {
+            return;
+        }
         let rules = saved.permission_rules(&snapshot.workdir);
         snapshot.policy.rules.retain(|rule| !rule.persistent);
         snapshot.persistent_rule_projects = rules
@@ -293,7 +318,7 @@ impl Agent {
             return;
         }
         for (chat_id, chat) in chats.iter_mut() {
-            if Some(*chat_id) == skip {
+            if Some(*chat_id) == skip || chat.snapshot.delegation.is_some() {
                 continue;
             }
             if let Some(change) = changes.get(&chat.snapshot.workdir) {
@@ -304,6 +329,16 @@ impl Agent {
     }
 
     pub(super) async fn refresh_project_rules(&self, chat_id: ChatId) -> Result<(), AgentError> {
+        let is_delegated = self
+            .inner
+            .chats
+            .lock()
+            .await
+            .get(&chat_id)
+            .ok_or(AgentError::NotFound)?
+            .snapshot
+            .delegation
+            .is_some();
         let Some(settings) = self.inner.settings.clone() else {
             return Ok(());
         };
@@ -318,11 +353,14 @@ impl Agent {
                 .clone()
         };
         let project = workdir.clone();
-        let (rules, warnings, _) =
+        let (mut rules, warnings, _) =
             tokio::task::spawn_blocking(move || settings.project_rules_with_revision(&project))
                 .await
                 .map_err(|error| AgentError::Storage(error.to_string()))?
                 .map_err(|error| AgentError::Storage(error.to_string()))?;
+        if is_delegated {
+            rules.retain(|rule| matches!(rule.decision, Decision::Ask | Decision::Deny));
+        }
         if !warnings.is_empty() {
             return Err(AgentError::Storage(format!(
                 "project permission rules are unavailable: {}",

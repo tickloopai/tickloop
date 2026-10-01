@@ -104,7 +104,7 @@ pub(super) enum RunStateChange {
     Ended,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum LoopTriggerNoticeKind {
     /// 另一个 Tick Loop 进程持有该 Loop 的 Trigger，本进程等待接手。
     HeldByAnotherProcess,
@@ -113,7 +113,7 @@ pub enum LoopTriggerNoticeKind {
 }
 
 /// 宿主状态中需要让用户看到的 Trigger 租约情况。
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct LoopTriggerNotice {
     pub chat_id: ChatId,
     pub loop_id: LoopId,

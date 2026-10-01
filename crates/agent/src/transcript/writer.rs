@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use uuid::Uuid;
 
-use super::entry::{BranchOriginEntry, CustomTitleEntry, LastPromptEntry, Line};
+use super::entry::{BranchOriginEntry, CustomTitleEntry, DelegationEntry, LastPromptEntry, Line};
 use super::listing::{LITE_READ_BUF_SIZE, last_json_string_field};
 use crate::private_fs::{PRIVATE_FILE_MODE, create_private_directory};
 
@@ -19,6 +19,7 @@ pub(crate) struct CachedMetadata {
     pub custom_title: Option<CustomTitleEntry>,
     pub last_prompt: Option<LastPromptEntry>,
     pub branch_origin: Option<BranchOriginEntry>,
+    pub delegation: Option<DelegationEntry>,
 }
 
 impl CachedMetadata {
@@ -27,6 +28,7 @@ impl CachedMetadata {
             Line::CustomTitle(entry) => self.custom_title = Some(entry.clone()),
             Line::LastPrompt(entry) => self.last_prompt = Some(entry.clone()),
             Line::BranchOrigin(entry) => self.branch_origin = Some(entry.clone()),
+            Line::Delegation(entry) => self.delegation = Some(entry.clone()),
             _ => {}
         }
     }
@@ -38,6 +40,7 @@ impl CachedMetadata {
             .into_iter()
             .chain(self.last_prompt.clone().map(Line::LastPrompt))
             .chain(self.branch_origin.clone().map(Line::BranchOrigin))
+            .chain(self.delegation.clone().map(Line::Delegation))
             .collect()
     }
 }

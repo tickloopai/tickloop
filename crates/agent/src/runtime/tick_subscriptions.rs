@@ -46,14 +46,14 @@ pub struct TickSubscription {
     pub every_seconds: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TickSubscriptionChange {
     Cadence(u64),
     Cancel,
 }
 
 /// Whether a subscription currently reaches its Tick Instance.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TickLinkState {
     #[default]
     Initializing,
@@ -64,7 +64,7 @@ pub enum TickLinkState {
 }
 
 /// One row of the Chat's subscription view.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TickSubscriptionStatus {
     pub id: Uuid,
     pub loop_id: LoopId,

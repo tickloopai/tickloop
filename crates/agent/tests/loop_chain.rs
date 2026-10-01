@@ -167,6 +167,145 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+fn transcript_files(directory: &std::path::Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(directory).unwrap().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            files.extend(transcript_files(&path));
+        } else if path
+            .extension()
+            .is_some_and(|extension| extension == "jsonl")
+        {
+            files.push(path);
+        }
+    }
+    files
+}
+
+/// A finished Loop's state time is written with its Loop record and read back on restart;
+/// records written before the field existed restore the same Loop with the time unknown, never
+/// the restart time.
+#[tokio::test]
+async fn loop_state_times_survive_restart_and_legacy_records_stay_unknown() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("root");
+    let agent = Agent::open_embedded(root.clone(), config(), EchoModel::new()).unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let started = now_ms();
+    let finished = complete_turn(&agent, chat, None, "finish once").await;
+    let snapshot = agent.snapshot(chat).await.unwrap();
+    let goal = find_loop(&snapshot, finished.loop_id);
+    assert_eq!(goal.state, LoopState::Completed);
+    let finished_at = goal.state_since.expect("a finish records its time");
+    assert!(finished_at >= started && finished_at <= now_ms());
+    agent.shutdown().await;
+    drop(agent);
+
+    let transcripts = transcript_files(&root);
+    assert!(
+        transcripts.iter().any(|path| std::fs::read_to_string(path)
+            .unwrap()
+            .contains(&format!("\"stateSince\":{finished_at}"))),
+        "the Loop record carries the time on disk"
+    );
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let restarted = Agent::open_embedded(root.clone(), config(), EchoModel::new()).unwrap();
+    let restored = restarted.resume_chat(chat).await.unwrap();
+    let goal = find_loop(&restored, finished.loop_id);
+    assert_eq!(goal.state, LoopState::Completed);
+    assert_eq!(
+        goal.state_since,
+        Some(finished_at),
+        "restart keeps the original time"
+    );
+    restarted.shutdown().await;
+    drop(restarted);
+
+    for path in &transcripts {
+        let legacy = std::fs::read_to_string(path)
+            .unwrap()
+            .replace(&format!(",\"stateSince\":{finished_at}"), "");
+        std::fs::write(path, legacy).unwrap();
+    }
+    let reopened = Agent::open_embedded(root, config(), EchoModel::new()).unwrap();
+    let restored = reopened.resume_chat(chat).await.unwrap();
+    let goal = find_loop(&restored, finished.loop_id);
+    assert_eq!(goal.state, LoopState::Completed);
+    assert_eq!(
+        goal.state_since, None,
+        "a legacy record leaves the time unknown"
+    );
+    reopened.shutdown().await;
+}
+
+/// Restoring converts a Loop that was waiting or running before the restart into Interrupted or
+/// Expired. Nobody knows when that happened, so the converted Loop's time becomes unknown; a Loop
+/// whose persisted state survives unchanged keeps its recorded time.
+#[tokio::test]
+async fn recovery_conversions_leave_their_state_time_unknown() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("root");
+    let agent = Agent::open_embedded(root.clone(), config(), EchoModel::new()).unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let kept = complete_turn(&agent, chat, None, "kept goal").await;
+    let scheduled = complete_turn(&agent, chat, None, "scheduled goal").await;
+    agent
+        .configure_trigger(
+            chat,
+            scheduled.loop_id,
+            Some(periodic("scheduled check", Some(60))),
+        )
+        .await
+        .unwrap();
+    let deadline = complete_turn(&agent, chat, None, "deadline goal").await;
+    agent
+        .configure_trigger(
+            chat,
+            deadline.loop_id,
+            Some(Trigger {
+                expires_at_ms: Some(now_ms() + 1_000),
+                ..periodic("deadline check", None)
+            }),
+        )
+        .await
+        .unwrap();
+    let before = agent.snapshot(chat).await.unwrap();
+    let kept_at = find_loop(&before, kept.loop_id).state_since;
+    assert_eq!(find_loop(&before, kept.loop_id).state, LoopState::Completed);
+    assert!(kept_at.is_some());
+    for converted in [scheduled.loop_id, deadline.loop_id] {
+        let goal = find_loop(&before, converted);
+        assert_eq!(goal.state, LoopState::WaitingTrigger);
+        assert!(
+            goal.state_since.is_some(),
+            "the waiting state has a known time"
+        );
+    }
+    agent.shutdown().await;
+    drop(agent);
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+
+    let restarted = Agent::open_embedded(root, config(), EchoModel::new()).unwrap();
+    let restored = restarted.resume_chat(chat).await.unwrap();
+    let interrupted = find_loop(&restored, scheduled.loop_id);
+    assert_eq!(interrupted.state, LoopState::Interrupted);
+    assert_eq!(
+        interrupted.state_since, None,
+        "a recovery conversion does not reuse the waiting state's time"
+    );
+    let expired = find_loop(&restored, deadline.loop_id);
+    assert_eq!(expired.state, LoopState::Expired);
+    assert_eq!(expired.state_since, None);
+    let unchanged = find_loop(&restored, kept.loop_id);
+    assert_eq!(unchanged.state, LoopState::Completed);
+    assert_eq!(
+        unchanged.state_since, kept_at,
+        "an unchanged persisted state keeps its recorded time"
+    );
+    restarted.shutdown().await;
+}
+
 #[tokio::test]
 async fn rewinding_before_a_loop_start_removes_it_and_earlier_loops_stay_after_restart() {
     let directory = tempfile::tempdir().unwrap();

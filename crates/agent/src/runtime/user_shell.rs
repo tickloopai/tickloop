@@ -36,6 +36,8 @@ impl Agent {
                 "shell command cannot be empty or contain NUL".into(),
             ));
         }
+        self.check_delegated_user_shell(chat_id, loop_id, &command)
+            .await?;
         let command_id = Uuid::new_v4();
         let (tools, should_watch, record) = {
             let mut chats = self.inner.chats.lock().await;
@@ -69,6 +71,7 @@ impl Agent {
                 output_ref: None,
                 output_bytes: 0,
                 submitted_at_message: snapshot.messages.len(),
+                state_since: Some(crate::private_fs::unix_time_milliseconds()),
             };
             snapshot.user_shells.push(record.clone());
             self.save(&snapshot);
@@ -119,7 +122,7 @@ impl Agent {
     ) -> Result<UserShellRecord, AgentError> {
         if let Some(record) = self
             .update_queued_user_shell(chat_id, command_id, |record| {
-                record.state = UserShellState::Failed;
+                record.set_state(UserShellState::Failed);
                 record.reason = Some("cancelled before execution".into());
             })
             .await?
@@ -282,7 +285,7 @@ impl Agent {
                         // 命令输入在结束或转入后台时与结果一起写入；此前暂存的消息先写出，保持先后顺序。
                         self.flush_deferred_messages(chat, MessageBoundary::Idle)?;
                         let record = &mut chat.snapshot.user_shells[index];
-                        record.state = UserShellState::Running;
+                        record.set_state(UserShellState::Running);
                         Some((chat.tools.clone(), record.clone()))
                     }
                 } else {
@@ -293,6 +296,14 @@ impl Agent {
                 return self.start_next_agent_run(chat_id).await;
             };
             let _ = self.inner.user_shell_events.send(record.clone());
+            if let Err(error) = self
+                .check_delegated_user_shell(chat_id, record.loop_id, &record.command)
+                .await
+            {
+                self.fail_user_shell(chat_id, record.id, error.to_string())
+                    .await?;
+                continue;
+            }
             let result = tools
                 .execute_user_shell(
                     &record.cwd,
@@ -374,7 +385,7 @@ impl Agent {
                 record.output_bytes = record.output_bytes.max(command.output_bytes);
                 (record.clone(), false)
             } else {
-                record.state = map_state(&command.state);
+                record.set_state(map_state(&command.state));
                 record.pid = command.pid;
                 record.exit_code = command.exit_code;
                 record.signal = command.signal;
@@ -477,7 +488,7 @@ impl Agent {
             .iter_mut()
             .find(|record| record.id == command_id)
             .ok_or(AgentError::NotFound)?;
-        record.state = UserShellState::Failed;
+        record.set_state(UserShellState::Failed);
         record.reason = Some(reason.clone());
         let record = record.clone();
         self.append_foreground_shell_messages(

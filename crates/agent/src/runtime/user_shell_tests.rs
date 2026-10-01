@@ -136,6 +136,7 @@ async fn restart_discards_a_stale_trigger_input_and_a_resumed_schedule_ticks_aga
             state: LoopState::WaitingTrigger,
             run_id: None,
             trigger: Some(trigger.clone()),
+            state_since: None,
         });
         // Transcript 在第一条对话消息写入时才创建，没有消息的 Chat 不会被保存。
         for (role, text) in [

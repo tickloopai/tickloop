@@ -6,7 +6,14 @@ fn main() {
         .enable_all()
         .build()
         .expect("cannot start the Agent terminal runtime");
-    if let Err(error) = runtime.block_on(tickloop_agent::terminal::run()) {
+    let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+    let result = runtime.block_on(async {
+        match tickloop_agent::agent_daemon::run_internal(&arguments).await {
+            Some(result) => result,
+            None => tickloop_agent::terminal::run().await,
+        }
+    });
+    if let Err(error) = result {
         eprintln!("Error: {}", tickloop_agent::terminal::safe_text(&error));
         std::process::exit(1);
     }

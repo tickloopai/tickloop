@@ -27,7 +27,7 @@ const BACKGROUND_COMMAND_SUMMARY_PREFIX: &str = "Background command ";
 /// A reply this short to a Tick Update delivery folds into one muted line.
 pub const FOLDED_TICK_REPLY_CHARACTERS: usize = 160;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum TaskNotificationStatus {
     Completed,
     Failed,
@@ -54,7 +54,7 @@ impl TaskNotificationStatus {
 }
 
 /// 后台 Shell 任务结束后写入所属 Chat 的任务通知。
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TaskNotification {
     pub chat_id: ChatId,
     pub task_id: Uuid,

@@ -135,7 +135,7 @@ impl RequestUsageRecord {
 
 /// 本进程内的请求用量账本。照 Claude Code，用量只记在 assistant 消息上并随对话保存；
 /// 账本不持久化，恢复的 Chat 从空账本开始。
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RequestUsageLedger {
     last_sequence: u64,
     entries: Vec<RequestUsageRecord>,

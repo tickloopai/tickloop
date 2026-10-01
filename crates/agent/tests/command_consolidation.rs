@@ -27,7 +27,9 @@ fn retired_commands_do_not_execute_or_become_prompts() {
         "/subs",
         "/quit",
     ];
+    let runtime_directory = support::cli_runtime::directory();
     let mut child = Command::new(env!("CARGO_BIN_EXE_tickloop"))
+        .env("TICKLOOP_AGENT_RUNTIME_DIR", &runtime_directory)
         .args(["--working-directory-is-trusted", "--no-session-persistence"])
         .current_dir(directory.path())
         .env("TICKLOOP_CONFIG_DIR", directory.path().join("state"))
@@ -52,9 +54,39 @@ fn retired_commands_do_not_execute_or_become_prompts() {
     );
     assert!(stdout.contains("/rule allow|ask|deny"));
     assert!(stdout.contains("/interrupt"));
-    assert!(stdout.contains("0 queued"));
+    // No retired command created an Agent or queued input: the New Agent screen still has none.
+    assert!(stdout.contains("No Chat is selected."), "{stdout}");
+    assert!(!stdout.contains("Chat: "), "{stdout}");
     assert!(!stdout.contains("Accepted: Goal"));
     assert!(!stdout.contains("Codex login removed"));
+    use tickloop_agent::agent_access::{
+        AgentAccess as _, LocalAgentClient, ObservationRequest, ObservationValue, Page,
+    };
+    let catalog = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let client = LocalAgentClient::connect(runtime_directory.join("owner.sock"))
+                .await
+                .unwrap();
+            client
+                .observe(ObservationRequest::Overview {
+                    filter: Default::default(),
+                    page: Page {
+                        offset: 0,
+                        limit: 50,
+                    },
+                    after: None,
+                })
+                .await
+                .unwrap()
+                .initial
+        });
+    let ObservationValue::Overview(agents) = catalog else {
+        panic!("expected the owner catalog");
+    };
+    assert!(agents.is_empty(), "{agents:?}");
 }
 
 #[tokio::test]
@@ -93,7 +125,9 @@ async fn loops_pipe_controls_preserve_history_scope_and_trigger_capabilities() {
     let commands = format!(
         "/loops {goal}\n/events keep explicit events\n/loops schedule {goal} 86400 --for 604800 scheduled review\n/loops trigger {goal}\n/loops schedule {other_goal} 86400 wrong chat\n/loops {other_goal}\n/loops schedule {goal} 0 invalid\n/loops trigger\n/loops new\n/loops\n/exit\n"
     );
+    let runtime_directory = support::cli_runtime::directory();
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_tickloop"))
+        .env("TICKLOOP_AGENT_RUNTIME_DIR", &runtime_directory)
         .args([
             "--working-directory-is-trusted",
             "--chat-id",
@@ -138,6 +172,9 @@ async fn loops_pipe_controls_preserve_history_scope_and_trigger_capabilities() {
         "{stdout}"
     );
     assert!(!stdout.contains("Accepted: Goal"), "{stdout}");
+    support::cli_runtime::flush_transcripts(&runtime_directory)
+        .await
+        .unwrap();
     let agent = Agent::open_embedded(
         archive,
         support::config(),

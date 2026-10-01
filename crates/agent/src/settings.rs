@@ -100,7 +100,7 @@ pub enum AutoReviewerPreference {
     Jev,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AutoSettingsRevision(String);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -209,6 +209,19 @@ pub struct DisplayPreferences {
 }
 
 impl LoadedSettings {
+    pub fn status_lines(&mut self) -> Option<Vec<String>> {
+        let value = self.settings.get("statusLines")?.clone();
+        match serde_json::from_value::<Vec<String>>(value) {
+            Ok(lines) => Some(lines),
+            Err(error) => {
+                self.warn(format!(
+                    "`statusLines` must be an array of strings and is ignored ({error})"
+                ));
+                None
+            }
+        }
+    }
+
     pub fn jev_config(&self) -> Result<crate::judgment::JevConfig, String> {
         if let Some(error) = &self.read_error {
             return Err(error.clone());

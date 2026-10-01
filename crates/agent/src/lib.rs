@@ -1,5 +1,8 @@
 extern crate self as tickloop_agent;
 
+pub mod agent_access;
+pub mod agent_console;
+pub mod agent_daemon;
 pub mod auth;
 pub mod cleanup;
 pub mod file_change;

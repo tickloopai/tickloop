@@ -19,6 +19,13 @@ pub struct HerdrContext {
 }
 
 impl HerdrContext {
+    pub fn without_view(socket: PathBuf) -> Self {
+        Self {
+            socket,
+            caller_pane: String::new(),
+        }
+    }
+
     pub fn from_environment() -> Result<Option<Self>, String> {
         if std::env::var("HERDR_ENV").as_deref() != Ok("1") {
             return Ok(None);

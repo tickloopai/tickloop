@@ -19,18 +19,30 @@ fn trust_working_directory(config_root: &std::path::Path, workdir: &std::path::P
 
 fn trusted_agent_command() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_tickloop"));
+    command.env(
+        "TICKLOOP_AGENT_RUNTIME_DIR",
+        support::cli_runtime::directory(),
+    );
     command.args(["--working-directory-is-trusted", "--mode", "acceptEdits"]);
     command
 }
 
 fn trusted_async_agent_command() -> tokio::process::Command {
     let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_tickloop"));
+    command.env(
+        "TICKLOOP_AGENT_RUNTIME_DIR",
+        support::cli_runtime::directory(),
+    );
     command.args(["--working-directory-is-trusted", "--mode", "acceptEdits"]);
     command
 }
 
 fn product_async_agent_command() -> tokio::process::Command {
     let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_tickloop"));
+    command.env(
+        "TICKLOOP_AGENT_RUNTIME_DIR",
+        support::cli_runtime::directory(),
+    );
     command.arg("--working-directory-is-trusted");
     command
 }
@@ -42,6 +54,10 @@ fn malformed_auto_settings_do_not_exit_the_terminal_on_permissions_commands() {
     std::fs::create_dir_all(&config_root).unwrap();
     std::fs::write(config_root.join("settings.json"), r#"{"autoApproval":{"rules":{"softDeny":{"includeBuiltins":false,"custom":[{"id":"invalid","text":"rule"}]}}}}"#).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_tickloop"))
+        .env(
+            "TICKLOOP_AGENT_RUNTIME_DIR",
+            support::cli_runtime::directory(),
+        )
         .args(["--working-directory-is-trusted", "--no-session-persistence"])
         .env("TICKLOOP_CONFIG_DIR", &config_root)
         .current_dir(directory.path())
@@ -54,7 +70,7 @@ fn malformed_auto_settings_do_not_exit_the_terminal_on_permissions_commands() {
                 .stdin
                 .take()
                 .unwrap()
-                .write_all(b"/permissions\n/rules\n/exit\n")?;
+                .write_all(b"/permissions\n/rules\n!true\n/rules\n/exit\n")?;
             child.wait_with_output()
         })
         .unwrap();
@@ -68,7 +84,17 @@ fn malformed_auto_settings_do_not_exit_the_terminal_on_permissions_commands() {
         stdout.contains("Permissions view requires a terminal"),
         "{stdout}"
     );
-    assert!(stdout.contains("Cannot list permission rules"), "{stdout}");
+    let (before_first_input, after_first_input) = stdout
+        .split_once("Chat: ")
+        .expect("the first input creates the Agent");
+    assert!(
+        before_first_input.contains("Permission rules for the New Agent"),
+        "configuration before the first input reads no saved Auto policy: {stdout}"
+    );
+    assert!(
+        after_first_input.contains("Cannot list permission rules"),
+        "the created Agent still reports the malformed saved policy without exiting: {stdout}"
+    );
 }
 
 #[test]
@@ -86,6 +112,10 @@ fn interactive_pty_trusts_the_directory_and_cycles_all_execution_modes() {
     let mut reader = pty.master.try_clone_reader().unwrap();
     let mut writer = pty.master.take_writer().unwrap();
     let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_tickloop"));
+    command.env(
+        "TICKLOOP_AGENT_RUNTIME_DIR",
+        support::cli_runtime::directory(),
+    );
     command.cwd(directory.path());
     command.env("TICKLOOP_CONFIG_DIR", &config_root);
     command.env("TICKLOOP_AGENT_TUI", "inline");
@@ -182,6 +212,10 @@ fn interactive_pty_opens_the_subscription_view_and_closes_it_with_escape() {
     let mut reader = pty.master.try_clone_reader().unwrap();
     let mut writer = pty.master.take_writer().unwrap();
     let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_tickloop"));
+    command.env(
+        "TICKLOOP_AGENT_RUNTIME_DIR",
+        support::cli_runtime::directory(),
+    );
     command.cwd(directory.path());
     command.env("TICKLOOP_CONFIG_DIR", &config_root);
     command.env("TICKLOOP_AGENT_TUI", "inline");
@@ -222,6 +256,14 @@ fn interactive_pty_opens_the_subscription_view_and_closes_it_with_escape() {
     };
 
     wait_for_output("⏵⏵ Auto · deepseek-flash", 0);
+    let configured_at = output.lock().unwrap().len();
+    writer.write_all(b"/mode auto\r").unwrap();
+    writer.flush().unwrap();
+    wait_for_output("Execution mode: Auto", configured_at);
+    let created_at = output.lock().unwrap().len();
+    writer.write_all(b"!printf 'first-%s' input\r").unwrap();
+    writer.flush().unwrap();
+    wait_for_output("first-input", created_at);
     let opened_at = output.lock().unwrap().len();
     writer.write_all(b"/subscriptions\r").unwrap();
     writer.flush().unwrap();
@@ -289,6 +331,10 @@ fn startup_rejects_invalid_working_directories_before_creating_storage() {
 fn noninteractive_startup_rejects_an_untrusted_current_directory() {
     let directory = tempfile::tempdir().unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_tickloop"))
+        .env(
+            "TICKLOOP_AGENT_RUNTIME_DIR",
+            support::cli_runtime::directory(),
+        )
         .env("TICKLOOP_CONFIG_DIR", directory.path().join("config-root"))
         .current_dir(directory.path())
         .env_remove("DEEPSEEK_API_KEY")
@@ -457,6 +503,10 @@ fn chat_id_opens_the_exact_chat_identity() {
     let directory = tempfile::tempdir().unwrap();
     let chat_id = "00000000-0000-4000-8000-000000000123";
     let output = Command::new(env!("CARGO_BIN_EXE_tickloop"))
+        .env(
+            "TICKLOOP_AGENT_RUNTIME_DIR",
+            support::cli_runtime::directory(),
+        )
         .env("TICKLOOP_CONFIG_DIR", directory.path().join("config-root"))
         .arg("--working-directory-is-trusted")
         .arg("--cwd")
@@ -1184,6 +1234,127 @@ async fn restart_lists_saved_chats_without_running_until_manual_resume_and_input
 }
 
 #[tokio::test]
+async fn a_run_whose_worker_is_lost_is_reported_and_the_cli_exits_at_end_of_input() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    // The model takes the request and never answers, so the run stays in progress.
+    let (arrived, request) = tokio::sync::oneshot::channel::<tokio::net::TcpStream>();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        read_request(&mut socket).await;
+        let _ = arrived.send(socket);
+    });
+    let directory = tempfile::tempdir().unwrap();
+    local_model_config(directory.path(), address);
+    let mut command = trusted_async_agent_command();
+    let runtime_directory = support::cli_runtime::command_directory(command.as_std());
+    let mut child = command
+        .env("TICKLOOP_CONFIG_DIR", directory.path().join("config-root"))
+        .arg("--config")
+        .arg(directory.path().join("model.json"))
+        .arg("--cwd")
+        .arg(directory.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let mut output = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
+    let mut transcript = Vec::new();
+    input
+        .write_all(b"Keep working until the worker is lost\n")
+        .await
+        .unwrap();
+    wait_for_line(&mut output, &mut transcript, |line| {
+        line.starts_with("Accepted: Goal")
+    })
+    .await;
+    let _held = tokio::time::timeout(INTERACTION_TIMEOUT, request)
+        .await
+        .unwrap()
+        .unwrap();
+    // The peer of the unique socket in this fixture's private directory is its worker.
+    let workers = std::fs::read_dir(&runtime_directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("w-")
+                && path
+                    .extension()
+                    .is_some_and(|extension| extension == "sock")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(workers.len(), 1, "{workers:?}");
+    let worker = tokio::net::UnixStream::connect(&workers[0]).await.unwrap();
+    let credentials = worker.peer_cred().unwrap();
+    assert_eq!(credentials.uid(), unsafe { libc::geteuid() });
+    let worker_pid = credentials
+        .pid()
+        .expect("the worker socket identifies its peer");
+    assert!(worker_pid > 0);
+    assert_ne!(Some(worker_pid as u32), child.id());
+    assert_eq!(unsafe { libc::kill(worker_pid, libc::SIGKILL) }, 0);
+    drop(input);
+    let status = finish_process(child, output, &mut transcript).await;
+    assert!(!status.success(), "{transcript:?}");
+    assert!(
+        transcript.iter().any(|line| {
+            line.contains("unknown outcome") && line.contains("execution was lost")
+        }),
+        "the run's lost execution is reported instead of awaited: {transcript:?}"
+    );
+    assert!(
+        transcript
+            .iter()
+            .filter(|line| line.starts_with("Accepted: Goal"))
+            .nth(1)
+            .is_none(),
+        "nothing is resent: {transcript:?}"
+    );
+    use tickloop_agent::agent_access::AgentAccess as _;
+    let client = tickloop_agent::agent_access::LocalAgentClient::connect(
+        runtime_directory.join("owner.sock"),
+    )
+    .await
+    .unwrap();
+    let catalog = client
+        .observe(tickloop_agent::agent_access::ObservationRequest::Overview {
+            filter: Default::default(),
+            page: tickloop_agent::agent_access::Page {
+                offset: 0,
+                limit: 50,
+            },
+            after: None,
+        })
+        .await
+        .unwrap();
+    let tickloop_agent::agent_access::ObservationValue::Overview(rows) = catalog.initial else {
+        panic!("expected the owner catalog");
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].availability,
+        tickloop_agent::agent_access::ExecutionAvailability::Lost,
+        "the owner does not present the lost worker as live"
+    );
+    server.abort();
+    client.shutdown_owner().await.unwrap();
+    tokio::time::timeout(INTERACTION_TIMEOUT, async {
+        while runtime_directory.join("owner.sock").exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the test's private owner removes its socket after shutdown");
+}
+
+#[tokio::test]
 async fn resuming_history_does_not_restore_a_failed_partial_reply() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -1695,6 +1866,10 @@ async fn terminal_auto_mode_reviews_with_the_current_chat_model_by_default() {
 fn legacy_independent_reviewer_flags_report_the_permissions_migration() {
     for flag in ["--auto-reviewer-config", "--permission-checker-config"] {
         let output = Command::new(env!("CARGO_BIN_EXE_tickloop"))
+            .env(
+                "TICKLOOP_AGENT_RUNTIME_DIR",
+                support::cli_runtime::directory(),
+            )
             .args([flag, "legacy.json"])
             .output()
             .unwrap();
@@ -1941,6 +2116,76 @@ async fn explicit_provider_yaml_starts_with_an_invalid_saved_model_selection() {
         .unwrap()
         .unwrap();
     assert_eq!(requests[0]["model"], "explicit-model");
+}
+
+#[tokio::test]
+async fn a_new_agent_model_path_whose_save_fails_leaves_no_provider_or_default_behind() {
+    let directory = tempfile::tempdir().unwrap();
+    let config_root = directory.path().join("config-root");
+    let external = directory.path().join("external.yaml");
+    std::fs::write(
+        &external,
+        "id: unsaved-provider\ndefault_model: unsaved-model\ndisplay_name: Unsaved provider\nauth: api_key_env\napi_key_env: UNSAVED_TEST_KEY\nendpoints:\n  messages: http://127.0.0.1:9\nmodels:\n  - id: unsaved-model\n    service_model_id: unsaved-service-model\n    display_name: Unsaved model\n    adapter: messages\n    max_output_tokens: 512\n",
+    )
+    .unwrap();
+    trust_working_directory(&config_root, directory.path());
+    let mut child = trusted_async_agent_command()
+        .env("TICKLOOP_CONFIG_DIR", &config_root)
+        .env("UNSAVED_TEST_KEY", "test-key")
+        .arg("--cwd")
+        .arg(directory.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let mut output = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
+    let mut transcript = Vec::new();
+    input.write_all(b"/status\n").await.unwrap();
+    wait_for_line(&mut output, &mut transcript, |line| {
+        line.starts_with("No Chat")
+    })
+    .await;
+    // Saving a provider card fails while `providers` is a file.
+    let providers = config_root.join("providers");
+    std::fs::write(&providers, "not a directory").unwrap();
+    input
+        .write_all(format!("/model {}\n", external.display()).as_bytes())
+        .await
+        .unwrap();
+    wait_for_line(&mut output, &mut transcript, |line| {
+        line.starts_with("Cannot select model")
+    })
+    .await;
+    std::fs::remove_file(&providers).unwrap();
+    input.write_all(b"/model\ncancel\n/exit\n").await.unwrap();
+    drop(input);
+    let status = finish_process(child, output, &mut transcript).await;
+    assert!(status.success(), "{transcript:?}");
+    let after_failure = transcript
+        .iter()
+        .skip_while(|line| !line.starts_with("Cannot select model"))
+        .skip(1)
+        .collect::<Vec<_>>();
+    assert!(
+        after_failure
+            .iter()
+            .any(|line| line.contains("● DeepSeek-V4.1-Flash")),
+        "the New Agent keeps its model: {transcript:?}"
+    );
+    assert!(
+        !after_failure.iter().any(|line| line.contains("Unsaved")),
+        "a provider whose save failed is not left registered for this View: {transcript:?}"
+    );
+    let settings = std::fs::read(config_root.join("settings.json"))
+        .map(|bytes| serde_json::from_slice::<Value>(&bytes).unwrap())
+        .unwrap_or(Value::Null);
+    assert_ne!(
+        settings["defaultModel"]["provider"], "unsaved-provider",
+        "{settings}"
+    );
 }
 
 #[tokio::test]
@@ -2709,7 +2954,9 @@ async fn resuming_recovered_queued_input_starts_no_work_and_exits_at_eof() {
         .unwrap(),
     )
     .unwrap();
-    let mut child = trusted_async_agent_command()
+    let mut command = trusted_async_agent_command();
+    let runtime_directory = support::cli_runtime::command_directory(command.as_std());
+    let mut child = command
         .env("TICKLOOP_CONFIG_DIR", directory.path().join("config-root"))
         .arg("--config")
         .arg(config)
@@ -2749,10 +2996,18 @@ async fn resuming_recovered_queued_input_starts_no_work_and_exits_at_eof() {
     })
     .await
     .expect("the second input must be accepted before the crash");
-    // Transcript 每 100ms 批量追加；等待一次冲刷后再强制结束进程。
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    child.kill().await.unwrap();
+    support::cli_runtime::flush_transcripts(&runtime_directory)
+        .await
+        .unwrap();
+    input.write_all(b"/exit\n").await.unwrap();
     drop(input);
+    tokio::time::timeout(INTERACTION_TIMEOUT, child.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    support::cli_runtime::shutdown_owner(&runtime_directory)
+        .await
+        .unwrap();
     drop(socket);
 
     let result = run_with_config(directory.path(), &[], &format!("/resume {chat}\n")).await;
@@ -2788,7 +3043,9 @@ async fn operations_from_a_crashed_process_are_not_listed_after_resume() {
     let directory = tempfile::tempdir().unwrap();
     let config = directory.path().join("model.json");
     std::fs::write(&config,serde_json::to_vec(&json!({"name":"fixture","protocol":"messages","base_url":format!("http://{address}"),"model":"fixture","api_key_env":"","max_output_tokens":256})).unwrap()).unwrap();
-    let mut child = trusted_async_agent_command()
+    let mut command = trusted_async_agent_command();
+    let runtime_directory = support::cli_runtime::command_directory(command.as_std());
+    let mut child = command
         .env("TICKLOOP_CONFIG_DIR", directory.path().join("config-root"))
         .arg("--config")
         .arg(config)
@@ -2825,10 +3082,18 @@ async fn operations_from_a_crashed_process_are_not_listed_after_resume() {
     })
     .await
     .unwrap();
-    // Transcript 每 100ms 批量追加；等待一次冲刷后再强制结束进程。
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    child.kill().await.unwrap();
+    support::cli_runtime::flush_transcripts(&runtime_directory)
+        .await
+        .unwrap();
+    input.write_all(b"/exit\n").await.unwrap();
     drop(input);
+    tokio::time::timeout(INTERACTION_TIMEOUT, child.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    support::cli_runtime::shutdown_owner(&runtime_directory)
+        .await
+        .unwrap();
     server.await.unwrap();
     assert!(!goal.is_empty());
     let result = run_with_config(
@@ -2948,7 +3213,9 @@ async fn run_with_config(
     text: &str,
 ) -> std::process::Output {
     trust_working_directory(&directory.join("config-root"), directory);
-    let mut child = trusted_async_agent_command()
+    let mut command = trusted_async_agent_command();
+    let runtime_directory = support::cli_runtime::command_directory(command.as_std());
+    let mut child = command
         .env("TICKLOOP_CONFIG_DIR", directory.join("config-root"))
         .arg("--config")
         .arg(directory.join("model.json"))
@@ -2968,10 +3235,16 @@ async fn run_with_config(
         .write_all(text.as_bytes())
         .await
         .unwrap();
-    tokio::time::timeout(INTERACTION_TIMEOUT, child.wait_with_output())
+    let output = tokio::time::timeout(INTERACTION_TIMEOUT, child.wait_with_output())
         .await
         .unwrap()
-        .unwrap()
+        .unwrap();
+    if runtime_directory.join("owner.sock").exists() {
+        support::cli_runtime::flush_transcripts(&runtime_directory)
+            .await
+            .unwrap();
+    }
+    output
 }
 
 #[tokio::test]
@@ -3091,6 +3364,25 @@ async fn read_request(socket: &mut tokio::net::TcpStream) -> Value {
                 return serde_json::from_slice(&bytes[end + 4..end + 4 + body_length]).unwrap();
             }
         }
+    }
+}
+
+/// The first input that creates the new Agent after `/clear` or a staged `/mode`; the new Agent's
+/// configuration waits for it.
+const NEW_AGENT_INPUT: &str = "Start the new Agent";
+
+/// Accepts the next model request that is not the new Agent's first input, answering those first.
+async fn accept_skipping_new_agent(
+    listener: &tokio::net::TcpListener,
+) -> (tokio::net::TcpStream, Value) {
+    loop {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let request = read_request(&mut socket).await;
+        if request["messages"].to_string().contains(NEW_AGENT_INPUT) {
+            respond_with(&mut socket, &messages_stream("New Agent ready.")).await;
+            continue;
+        }
+        return (socket, request);
     }
 }
 
@@ -3417,8 +3709,17 @@ async fn clear_starts_a_new_chat_and_stops_the_foreground_shell_command() {
     })
     .await
     .expect("the foreground command did not start");
-    input.write_all(b"/clear\n").await.unwrap();
+    input
+        .write_all(format!("/clear\n/mode fullAccess\n{NEW_AGENT_INPUT}\n").as_bytes())
+        .await
+        .unwrap();
     drop(input);
+    let new_agent = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let request = read_request(&mut socket).await;
+        respond_with(&mut socket, &messages_stream("New Agent ready.")).await;
+        (listener, request)
+    });
     tokio::time::timeout(INTERACTION_TIMEOUT, async {
         while let Some(line) = output.next_line().await.unwrap() {
             transcript.push(line);
@@ -3426,6 +3727,13 @@ async fn clear_starts_a_new_chat_and_stops_the_foreground_shell_command() {
     })
     .await
     .expect("the cleared Chat's foreground command kept the process alive");
+    let (listener, new_agent_request) = new_agent.await.unwrap();
+    assert!(
+        new_agent_request["messages"]
+            .to_string()
+            .contains(NEW_AGENT_INPUT),
+        "the only model request after /clear is the new Agent's first input"
+    );
     tokio::time::timeout(INTERACTION_TIMEOUT, child.wait())
         .await
         .unwrap()
@@ -3464,8 +3772,13 @@ async fn process_registration_follows_the_foreground_chat_and_is_removed_at_exit
     let stale = sessions.join(format!("{exited_pid}.json"));
     std::fs::write(&stale, r#"{"pid":1}"#).unwrap();
 
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    local_model_config(directory.path(), listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { accept_skipping_new_agent(&listener).await });
     let mut child = trusted_async_agent_command()
         .env("TICKLOOP_CONFIG_DIR", &config_root)
+        .arg("--config")
+        .arg(directory.path().join("model.json"))
         .arg("--cwd")
         .arg(directory.path())
         .stdin(Stdio::piped())
@@ -3483,6 +3796,10 @@ async fn process_registration_follows_the_foreground_chat_and_is_removed_at_exit
             .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
             .and_then(|record| record["chatId"].as_str().map(str::to_owned))
     };
+    input
+        .write_all(format!("/mode fullAccess\n{NEW_AGENT_INPUT}\n").as_bytes())
+        .await
+        .unwrap();
     let first_chat = next_chat_line(&mut output).await;
     tokio::time::timeout(INTERACTION_TIMEOUT, async {
         while registered_chat(&registration).as_deref() != Some(first_chat.as_str())
@@ -3505,7 +3822,10 @@ async fn process_registration_follows_the_foreground_chat_and_is_removed_at_exit
         "the exited process's registration was not removed"
     );
 
-    input.write_all(b"/clear\n").await.unwrap();
+    input
+        .write_all(format!("/clear\n/mode fullAccess\n{NEW_AGENT_INPUT}\n").as_bytes())
+        .await
+        .unwrap();
     let second_chat = next_chat_line(&mut output).await;
     assert_ne!(second_chat, first_chat);
     tokio::time::timeout(INTERACTION_TIMEOUT, async {
@@ -3523,6 +3843,7 @@ async fn process_registration_follows_the_foreground_chat_and_is_removed_at_exit
         .unwrap();
     assert!(status.success());
     assert!(!registration.exists());
+    server.abort();
 }
 
 async fn next_chat_line(
@@ -3605,15 +3926,17 @@ async fn a_background_chat_permission_request_is_announced_and_answered_by_reque
     std::fs::write(&external_path, "approved background note").unwrap();
     let tool_input = json!({"file_path":external_path});
     let (release, wait) = tokio::sync::oneshot::channel::<()>();
+    let (final_sender, final_request) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
         read_request(&mut socket).await;
         wait.await.unwrap();
         respond_with(&mut socket, &tool_stream("Read", tool_input)).await;
-        let (mut socket, _) = listener.accept().await.unwrap();
-        let final_request = read_request(&mut socket).await;
+        let (mut socket, request) = accept_skipping_new_agent(&listener).await;
         respond_with(&mut socket, &messages_stream("Background note read.")).await;
-        final_request
+        final_sender.send(request).unwrap();
+        // The new Agent's first request may come after the background Chat's.
+        accept_skipping_new_agent(&listener).await;
     });
     let directory = tempfile::tempdir().unwrap();
     local_model_config(directory.path(), address);
@@ -3621,9 +3944,10 @@ async fn a_background_chat_permission_request_is_announced_and_answered_by_reque
     let mut input = child.stdin.take().unwrap();
     let mut output = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
     let mut transcript = Vec::new();
+    input.write_all(b"Read the external note\n").await.unwrap();
     let original_chat = next_chat_line(&mut output).await;
     input
-        .write_all(b"Read the external note\n/clear\n")
+        .write_all(format!("/clear\n/mode fullAccess\n{NEW_AGENT_INPUT}\n").as_bytes())
         .await
         .unwrap();
     wait_for_line(&mut output, &mut transcript, |line| {
@@ -3662,14 +3986,197 @@ async fn a_background_chat_permission_request_is_announced_and_answered_by_reque
             .any(|line| line == "Permission decision accepted."),
         "{transcript:?}"
     );
-    let final_request = tokio::time::timeout(INTERACTION_TIMEOUT, server)
+    let final_request = tokio::time::timeout(INTERACTION_TIMEOUT, final_request)
         .await
         .unwrap()
         .unwrap();
+    server.abort();
     assert!(
         final_request["messages"]
             .to_string()
             .contains("approved background note")
+    );
+}
+
+/// Plain terminal output read as raw bytes, so text streamed without a line feed is visible.
+struct RawOutput {
+    stdout: tokio::process::ChildStdout,
+    bytes: Vec<u8>,
+}
+
+impl RawOutput {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.bytes).into_owned()
+    }
+    async fn read_until(&mut self, done: impl Fn(&str) -> bool) {
+        let mut chunk = [0_u8; 4096];
+        let waited = tokio::time::timeout(INTERACTION_TIMEOUT, async {
+            while !done(&self.text()) {
+                let read = self.stdout.read(&mut chunk).await.unwrap();
+                assert!(read > 0, "output ended early: {}", self.text());
+                self.bytes.extend_from_slice(&chunk[..read]);
+            }
+        })
+        .await;
+        assert!(
+            waited.is_ok(),
+            "expected output did not appear: {}",
+            self.text()
+        );
+    }
+    /// Waits for a complete line containing `needle` and returns it.
+    async fn line_containing(&mut self, needle: &str) -> String {
+        let complete_line = |text: &str| {
+            text.rsplit_once('\n').and_then(|(complete, _)| {
+                complete
+                    .lines()
+                    .find(|line| line.contains(needle))
+                    .map(str::to_owned)
+            })
+        };
+        self.read_until(|text| complete_line(text).is_some()).await;
+        complete_line(&self.text()).unwrap()
+    }
+    async fn finish(
+        mut self,
+        mut child: tokio::process::Child,
+    ) -> (std::process::ExitStatus, String) {
+        let read = tokio::time::timeout(
+            INTERACTION_TIMEOUT,
+            self.stdout.read_to_end(&mut self.bytes),
+        )
+        .await;
+        assert!(
+            read.is_ok(),
+            "the process kept its output open: {}",
+            self.text()
+        );
+        let status = tokio::time::timeout(INTERACTION_TIMEOUT, child.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        (status, self.text())
+    }
+}
+
+#[tokio::test]
+async fn a_background_permission_answered_during_a_partial_foreground_reply_gets_its_own_lines() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let external_path = outside.path().join("note.txt");
+    std::fs::write(&external_path, "approved background note").unwrap();
+    let tool_input = json!({"file_path":external_path});
+    let (release_tool, tool_released) = tokio::sync::oneshot::channel::<()>();
+    let (release_reply, reply_released) = tokio::sync::oneshot::channel::<()>();
+    let follow_ups = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let answered = follow_ups.clone();
+    let server = tokio::spawn(async move {
+        let mut tool_released = Some(tool_released);
+        let mut reply_released = Some(reply_released);
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut socket).await;
+            let messages = request["messages"].to_string();
+            if messages.contains("approved background note") {
+                answered.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                respond_with(&mut socket, &messages_stream("Background note read.")).await;
+            } else if messages.contains(NEW_AGENT_INPUT) {
+                // The foreground reply streams its first line without a line feed and then waits.
+                let released = reply_released.take().expect("the new Agent asks once");
+                tokio::spawn(async move {
+                    let stream = messages_stream("Foreground reply");
+                    let events = stream.split_inclusive("\n\n").collect::<Vec<_>>();
+                    socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n").await.unwrap();
+                    socket
+                        .write_all(events[..3].concat().as_bytes())
+                        .await
+                        .unwrap();
+                    let _ = released.await;
+                    socket
+                        .write_all(events[3..].concat().as_bytes())
+                        .await
+                        .unwrap();
+                });
+            } else {
+                let released = tool_released.take().expect("the original Chat asks once");
+                let tool_input = tool_input.clone();
+                tokio::spawn(async move {
+                    let _ = released.await;
+                    respond_with(&mut socket, &tool_stream("Read", tool_input)).await;
+                });
+            }
+        }
+    });
+    let directory = tempfile::tempdir().unwrap();
+    local_model_config(directory.path(), address);
+    let mut child = spawn_piped_terminal(directory.path());
+    let mut input = child.stdin.take().unwrap();
+    let mut output = RawOutput {
+        stdout: child.stdout.take().unwrap(),
+        bytes: Vec::new(),
+    };
+    input.write_all(b"Read the external note\n").await.unwrap();
+    let original_chat = output.line_containing("Chat: ").await["Chat: ".len()..].to_owned();
+    input
+        .write_all(format!("/clear\n/mode fullAccess\n{NEW_AGENT_INPUT}\n").as_bytes())
+        .await
+        .unwrap();
+    output
+        .read_until(|text| {
+            text.lines().any(|line| {
+                line.strip_prefix("Chat: ")
+                    .is_some_and(|chat| chat != original_chat)
+            })
+        })
+        .await;
+    output
+        .read_until(|text| text.contains("Foreground reply"))
+        .await;
+    release_tool.send(()).unwrap();
+    let original_label = format!("Background Chat {}", &original_chat.replace('-', "")[..8]);
+    let request_notice = format!("{original_label} · permission request ");
+    let notice = output.line_containing(&request_notice).await;
+    let request_id = notice
+        .split(&request_notice)
+        .nth(1)
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_owned();
+    input
+        .write_all(format!("/allow {request_id}\n").as_bytes())
+        .await
+        .unwrap();
+    output
+        .line_containing("Permission decision accepted.")
+        .await;
+    output
+        .line_containing(&format!("{original_label} · reply completed"))
+        .await;
+    release_reply.send(()).unwrap();
+    drop(input);
+    let (status, text) = output.finish(child).await;
+    server.abort();
+    assert!(status.success(), "{text}");
+    let lines = text.lines().collect::<Vec<_>>();
+    assert!(
+        lines.contains(&"Foreground reply"),
+        "the streamed reply keeps its text: {text}"
+    );
+    assert!(
+        lines.iter().any(|line| line.starts_with(&request_notice)),
+        "the background request starts its own line: {text}"
+    );
+    assert!(
+        lines.contains(&"Permission decision accepted."),
+        "the decision receipt starts its own line: {text}"
+    );
+    assert_eq!(
+        follow_ups.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the approved tool result reached the model once: {text}"
     );
 }
 
@@ -3681,24 +4188,36 @@ async fn queued_input_merged_after_its_chat_was_cleared_away_lets_the_process_ex
     std::fs::write(directory.path().join("note.txt"), "local note").unwrap();
     let tool_input = json!({"file_path":directory.path().join("note.txt")});
     let (release, wait) = tokio::sync::oneshot::channel::<()>();
+    let (merged_sender, merged) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
         read_request(&mut socket).await;
         wait.await.unwrap();
         respond_with(&mut socket, &tool_stream("Read", tool_input)).await;
-        let (mut socket, _) = listener.accept().await.unwrap();
-        let merged_request = read_request(&mut socket).await;
+        let (mut socket, merged_request) = accept_skipping_new_agent(&listener).await;
         respond_with(&mut socket, &messages_stream("Correction applied.")).await;
-        merged_request
+        merged_sender.send(merged_request).unwrap();
+        // The new Agent's first request may come after the merged one.
+        accept_skipping_new_agent(&listener).await;
     });
     local_model_config(directory.path(), address);
     let mut child = spawn_piped_terminal(directory.path());
     let mut input = child.stdin.take().unwrap();
     let mut output = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
     let mut transcript = Vec::new();
-    let original_chat = next_chat_line(&mut output).await;
+    input.write_all(b"Read the note\n").await.unwrap();
+    let original_chat = wait_for_line(&mut output, &mut transcript, |line| {
+        line.starts_with("Chat: ")
+    })
+    .await
+    .strip_prefix("Chat: ")
+    .unwrap()
+    .to_owned();
     input
-        .write_all(b"Read the note\nAlso apply this correction\n/clear\n")
+        .write_all(
+            format!("Also apply this correction\n/clear\n/mode fullAccess\n{NEW_AGENT_INPUT}\n")
+                .as_bytes(),
+        )
         .await
         .unwrap();
     wait_for_line(&mut output, &mut transcript, |line| {
@@ -3718,10 +4237,11 @@ async fn queued_input_merged_after_its_chat_was_cleared_away_lets_the_process_ex
     drop(input);
     let status = finish_process(child, output, &mut transcript).await;
     assert!(status.success(), "{transcript:?}");
-    let merged_request = tokio::time::timeout(INTERACTION_TIMEOUT, server)
+    let merged_request = tokio::time::timeout(INTERACTION_TIMEOUT, merged)
         .await
         .unwrap()
         .unwrap();
+    server.abort();
     assert!(
         merged_request["messages"]
             .to_string()
@@ -3757,4 +4277,129 @@ fn a_zero_cleanup_period_explains_why_chats_cannot_be_resumed() {
     let help = trusted_agent_command().arg("--help").output().unwrap();
     let text = String::from_utf8(help.stdout).unwrap();
     assert!(text.contains("cleanupPeriodDays"), "{text}");
+}
+
+async fn owner_catalog(
+    runtime_directory: &std::path::Path,
+) -> Vec<tickloop_agent::agent_access::AgentSummary> {
+    use tickloop_agent::agent_access::{
+        AgentAccess, AgentFilter, LocalAgentClient, ObservationRequest, ObservationValue, Page,
+    };
+    let client = LocalAgentClient::connect(runtime_directory.join("owner.sock"))
+        .await
+        .unwrap();
+    let observation = client
+        .observe(ObservationRequest::Overview {
+            filter: AgentFilter::default(),
+            page: Page {
+                offset: 0,
+                limit: 64,
+            },
+            after: None,
+        })
+        .await
+        .unwrap();
+    let ObservationValue::Overview(rows) = observation.initial else {
+        panic!("expected the owner catalog");
+    };
+    rows
+}
+
+#[tokio::test]
+async fn new_agent_configuration_waits_for_the_first_input_to_create_the_agent() {
+    let directory = tempfile::tempdir().unwrap();
+    let config_root = directory.path().join("config-root");
+    let mut command = trusted_async_agent_command();
+    command
+        .env("TICKLOOP_CONFIG_DIR", &config_root)
+        .arg("--cwd")
+        .arg(directory.path())
+        .env("DEEPSEEK_API_KEY", "fixture-menu-key")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let runtime_directory = support::cli_runtime::command_directory(command.as_std());
+    let mut child = command.spawn().unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(
+            b"/mode auto\n/thinking\ncancel\n/settings\ncancel\n/permissions\n/rules\n/exit\n",
+        )
+        .await
+        .unwrap();
+    let output = tokio::time::timeout(INTERACTION_TIMEOUT, child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    let transcript = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(
+        output.status.success(),
+        "{transcript}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!transcript.contains("Chat: "), "{transcript}");
+    assert!(
+        owner_catalog(&runtime_directory).await.is_empty(),
+        "configuring the New Agent registers no execution: {transcript}"
+    );
+
+    let mut child = trusted_async_agent_command()
+        .env("TICKLOOP_AGENT_RUNTIME_DIR", &runtime_directory)
+        .env("TICKLOOP_CONFIG_DIR", &config_root)
+        .arg("--cwd")
+        .arg(directory.path())
+        .env("DEEPSEEK_API_KEY", "fixture-menu-key")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"/mode auto\n!printf first-input\n/exit\n")
+        .await
+        .unwrap();
+    let output = tokio::time::timeout(INTERACTION_TIMEOUT, child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    let transcript = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(output.status.success(), "{transcript}");
+    let rows = owner_catalog(&runtime_directory).await;
+    assert_eq!(
+        rows.len(),
+        1,
+        "the first input creates exactly one Agent: {transcript}"
+    );
+    assert_eq!(rows[0].has_work, Some(true));
+    let client = tickloop_agent::agent_access::LocalAgentClient::connect(
+        runtime_directory.join("owner.sock"),
+    )
+    .await
+    .unwrap();
+    let observation = tickloop_agent::agent_access::AgentAccess::observe(
+        &client,
+        tickloop_agent::agent_access::ObservationRequest::Agent {
+            execution: rows[0].execution,
+            detail: tickloop_agent::agent_access::AgentDetailQuery::Snapshot,
+            after: None,
+        },
+    )
+    .await
+    .unwrap();
+    let tickloop_agent::agent_access::ObservationValue::Agent(snapshot) = observation.initial
+    else {
+        panic!("expected the created Agent");
+    };
+    assert_eq!(
+        snapshot.policy.mode,
+        tickloop_agent::permissions::ExecutionMode::Auto,
+        "the staged mode replaces the startup acceptEdits mode before the first input runs"
+    );
 }

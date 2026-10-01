@@ -181,6 +181,8 @@ impl Agent {
                 "branch request and source Chat IDs must be non-nil".into(),
             ));
         }
+        self.require_root_chat(request.source_chat_id, "create a Branch")
+            .await?;
         let requested_name = normalize_requested_name(request.name.as_deref())?;
         let saved_titles = self.saved_titles_near(request.source_chat_id).await;
         let _settings_gate = self.inner.settings_writes.lock().await;
@@ -229,6 +231,7 @@ impl Agent {
         }
 
         let child_chat_id = unused_chat_id(&chats);
+        let retention = self.retain_chat(child_chat_id)?;
         let name = branch_title(
             requested_name.as_deref(),
             &public_seed,
@@ -270,6 +273,7 @@ impl Agent {
             request_usage: RequestUsageLedger::new(),
             id: child_chat_id,
             branch_origin: Some(origin),
+            delegation: None,
             workdir,
             model: source.snapshot.model.clone(),
             reasoning_effort: source.snapshot.reasoning_effort,
@@ -373,6 +377,7 @@ impl Agent {
             child_chat_id,
             Chat {
                 snapshot: snapshot.clone(),
+                retention,
                 // 备份在锁外复制完成之前占住子 Chat，不能开始 Run 或 rewind。
                 active: Some(tokio_util::sync::CancellationToken::new()),
                 active_run: None,
@@ -1150,6 +1155,7 @@ mod tests {
                     state: state.clone(),
                     run_id: Some(run_id),
                     trigger: None,
+                    state_since: None,
                 }),
                 Self::AgentShell(state) => {
                     chat.snapshot.commands.push(crate::tools::CommandSnapshot {
@@ -1199,6 +1205,7 @@ mod tests {
                             ),
                             output_bytes: 0,
                             submitted_at_message: 1,
+                            state_since: None,
                         });
                 }
                 Self::Operation(state) => {

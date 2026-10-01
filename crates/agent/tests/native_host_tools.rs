@@ -13,7 +13,13 @@ use tick_connect::{
     session::{SessionLaunch, TickSession},
 };
 use tickloop_agent::{
-    host_tools::{HostCallResult, HostToolPermission, HostToolProvider},
+    agent_access::{
+        AgentAccess, AgentCommand, CommandEnvelope, CommandResult, ConfigurationChange,
+        EmbeddedAgentAccess, HostWorkContext, LaunchSpec, UserInput,
+    },
+    host_tools::{
+        HerdrInteraction, HostCallContext, HostCallResult, HostToolPermission, HostToolProvider,
+    },
     judgment::{Answer, Evaluation, EvaluationRequest, JudgmentClient, JudgmentError, Question},
     model::{Content, Usage},
     native_host::NativeHostToolProvider,
@@ -31,6 +37,258 @@ struct ControlledHerdr {
     opened: AtomicBool,
     sent: Mutex<Vec<(String, Value)>>,
     protocol_instance: Mutex<Option<InstanceRef>>,
+}
+
+struct ViewlessHerdr(ControlledHerdr);
+
+#[async_trait]
+impl HerdrPort for ViewlessHerdr {
+    async fn request(
+        &self,
+        method: &str,
+        params: Value,
+        cancel: CancellationToken,
+    ) -> Result<Value, HostError> {
+        if method == "pane.current" {
+            return Err(HostError::before("TargetGone", "the Agent View was closed"));
+        }
+        self.0.request(method, params, cancel).await
+    }
+}
+
+#[tokio::test]
+async fn explicit_host_operations_continue_after_the_agent_view_closes() {
+    let directory = tempfile::tempdir().unwrap();
+    let host = Arc::new(ViewlessHerdr(ControlledHerdr {
+        replaced: AtomicBool::new(false),
+        changed_directory: AtomicBool::new(false),
+        opened: AtomicBool::new(false),
+        sent: Mutex::new(Vec::new()),
+        protocol_instance: Mutex::new(None),
+    }));
+    let model = Arc::new(ScriptedModel::new(vec![
+        call("discover", "ReadWorkspace", json!({})),
+        call(
+            "read",
+            "ReadTick",
+            json!({"workspace_id":"workspace-a","tick_instance_id":target_instance()}),
+        ),
+        call(
+            "open",
+            "ModifyTick",
+            json!({"action":"open","command":["/bin/echo","fixture"]}),
+        ),
+        call(
+            "delegate-host",
+            "DelegateAgent",
+            json!({"task":"Read the inherited host Workspace without expanding it."}),
+        ),
+        call("child-discover", "ReadWorkspace", json!({})),
+        call(
+            "child-input",
+            "ModifyTick",
+            json!({"action":"send_input","tick_instance_id":target_instance(),"text":"arbitrary input"}),
+        ),
+        call(
+            "child-cross",
+            "ReadWorkspace",
+            json!({"workspace_id":"workspace-b"}),
+        ),
+        text("The child read only the inherited host scope."),
+        text("The background operations completed."),
+    ]));
+    let agent = Agent::new_embedded(config(), model);
+    agent
+        .install_host_tools(Arc::new(
+            NativeHostToolProvider::with_trusted_adapter_identity(
+                Arc::new(TickAccess::with_host(
+                    HerdrContext::without_view("/tmp/controlled-herdr.sock".into()),
+                    host.clone(),
+                )),
+                uuid::Uuid::new_v4(),
+            ),
+        ))
+        .unwrap();
+    let access = EmbeddedAgentAccess::new(agent.clone());
+    let mut launch = LaunchSpec::embedded(directory.path().into());
+    launch.host_work_context = Some(HostWorkContext {
+        socket: "/tmp/controlled-herdr.sock".into(),
+        workspace: Some("workspace-a".into()),
+    });
+    let created = access
+        .execute(CommandEnvelope {
+            owner_epoch: access.owner_epoch(),
+            command_id: uuid::Uuid::new_v4(),
+            command: AgentCommand::Create {
+                launch,
+                initial: None,
+                origin: None,
+            },
+        })
+        .await
+        .unwrap();
+    let Some(CommandResult::Created { execution, .. }) = created.result else {
+        panic!("Create failed: {created:?}");
+    };
+    let configured = access
+        .execute(CommandEnvelope {
+            owner_epoch: access.owner_epoch(),
+            command_id: uuid::Uuid::new_v4(),
+            command: AgentCommand::Configure {
+                execution,
+                change: ConfigurationChange::ExecutionMode {
+                    mode: ExecutionMode::FullAccess,
+                },
+            },
+        })
+        .await
+        .unwrap();
+    assert!(configured.error.is_none(), "{configured:?}");
+    let mut events = agent.subscribe();
+    let submitted = access
+        .execute(CommandEnvelope {
+            owner_epoch: access.owner_epoch(),
+            command_id: uuid::Uuid::new_v4(),
+            command: AgentCommand::Submit {
+                execution,
+                target_loop: None,
+                input: UserInput::Text {
+                    text: "Discover, read and open the explicit targets.".into(),
+                    contexts: vec![],
+                    paths: vec![],
+                },
+                origin: None,
+            },
+        })
+        .await
+        .unwrap();
+    assert!(submitted.error.is_none(), "{submitted:?}");
+    let Some(CommandResult::Submitted(parent)) = submitted.result else {
+        panic!("Submit failed: {submitted:?}");
+    };
+    let mut results = BTreeMap::new();
+    loop {
+        let event = support::next_event(&mut events).await;
+        match event.kind {
+            EventKind::ToolCompleted { call_id, result } => {
+                results.insert(call_id, result);
+            }
+            EventKind::Completed { .. } if event.run_id == parent.run_id => break,
+            EventKind::Failed(error) => panic!("host task failed: {error}"),
+            _ => {}
+        }
+    }
+    agent.shutdown().await;
+    for name in [
+        "discover",
+        "read",
+        "open",
+        "child-discover",
+        "delegate-host",
+    ] {
+        let result = &results[name];
+        assert!(!result.is_error, "{name}: {}", result.content);
+    }
+    let opened: Value = serde_json::from_str(&results["open"].content).unwrap();
+    let discovered: Value = serde_json::from_str(&results["discover"].content).unwrap();
+    assert!(discovered["caller"].is_null());
+    let child_discovered: Value = serde_json::from_str(&results["child-discover"].content).unwrap();
+    assert!(child_discovered["caller"].is_null());
+    assert_eq!(child_discovered["workspace_id"], "workspace-a");
+    assert!(results["child-input"].is_error);
+    assert!(results["child-input"].content.contains("Unsupported"));
+    assert!(results["child-cross"].is_error);
+    assert_eq!(opened["status"], "opened");
+    assert_eq!(opened["pane_id"], "opened");
+    assert_eq!(opened["tab_id"], "tab");
+    assert_eq!(opened["workspace_id"], "workspace-a");
+    assert!(opened["tick_instance_id"].is_string());
+    assert_eq!(host.0.sent.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn host_context_uses_the_captured_anchor_and_keeps_background_discovery_available() {
+    let directory = tempfile::tempdir().unwrap();
+    let socket = std::path::PathBuf::from("/tmp/context-herdr.sock");
+    let host = Arc::new(ViewlessHerdr(ControlledHerdr {
+        replaced: AtomicBool::new(false),
+        changed_directory: AtomicBool::new(false),
+        opened: AtomicBool::new(false),
+        sent: Mutex::new(Vec::new()),
+        protocol_instance: Mutex::new(None),
+    }));
+    let provider = NativeHostToolProvider::new(Arc::new(TickAccess::with_host(
+        HerdrContext::without_view(socket.clone()),
+        host.clone(),
+    )));
+    let chat = uuid::Uuid::new_v4();
+    let mut context = HostCallContext {
+        workdir: directory.path().into(),
+        workspace_id: None,
+        interaction: None,
+    };
+    let discovery = provider
+        .prepare_call_in_context(
+            chat,
+            &context,
+            "ReadWorkspace",
+            &json!({}),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let HostCallResult::Completed(discovery) = provider
+        .execute_prepared(chat, discovery, CancellationToken::new())
+        .await
+    else {
+        panic!("background discovery must complete")
+    };
+    let inventory: Value = serde_json::from_str(&discovery.content).unwrap();
+    assert!(inventory["caller"].is_null());
+    assert_eq!(
+        inventory["workspaces"],
+        json!(["workspace-a", "workspace-b"])
+    );
+    context.workspace_id = Some("workspace-a".into());
+    let input = json!({"action":"open","command":["/bin/echo","fixture"],"placement":{"type":"current_tab","direction":"right"}});
+    let error = provider
+        .prepare_call_in_context(
+            chat,
+            &context,
+            "ModifyTick",
+            &input,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.contains("MissingAnchor"));
+    context.interaction = Some(HerdrInteraction {
+        socket,
+        pane: host.0.pane("target", "workspace-a"),
+    });
+    let prepared = provider
+        .prepare_call_in_context(
+            chat,
+            &context,
+            "ModifyTick",
+            &input,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(prepared.input()["resolved_placement"]["pane_id"], "target");
+    assert_eq!(
+        prepared.input()["cwd"],
+        json!(directory.path().canonicalize().unwrap())
+    );
+    host.0.replaced.store(true, Ordering::SeqCst);
+    let result = provider
+        .execute_prepared(chat, prepared, CancellationToken::new())
+        .await;
+    assert!(
+        matches!(result, HostCallResult::NotDispatched(message) if message.contains("TargetChanged"))
+    );
+    assert!(host.0.sent.lock().unwrap().is_empty());
 }
 
 #[test]
@@ -1148,4 +1406,280 @@ async fn agent_places_and_moves_ticks_only_after_approval() {
             .all(|operation| operation.state == tickloop_agent::runtime::OperationState::Completed)
     );
     agent.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires TICKLOOP_TEST_HERDR_SOCKET for an isolated Herdr server"]
+async fn isolated_herdr_keeps_background_host_access_and_places_beside_the_input_view() {
+    use tick_connect::herdr::SocketHerdr;
+    use tickloop_agent::agent_access::{DisplayUpdate, HostLocation, InteractionSource, ViewRef};
+    let socket = std::path::PathBuf::from(std::env::var("TICKLOOP_TEST_HERDR_SOCKET").unwrap());
+    assert!(
+        socket
+            .to_string_lossy()
+            .contains("tickloop-herdr-implementation")
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let host = Arc::new(SocketHerdr::new(HerdrContext::without_view(socket.clone())));
+    let created = host.request("workspace.create", json!({"cwd":directory.path(),"focus":false,"label":format!("agent-host-{}",uuid::Uuid::new_v4()),"env":{"ZDOTDIR":directory.path(),"HISTFILE":"/dev/null"}}), CancellationToken::new()).await.unwrap();
+    let workspace = created["workspace"]["workspace_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let old_caller = created["root_pane"]["pane_id"].as_str().unwrap().to_owned();
+    let target = host.request("layout.apply", json!({"workspace_id":workspace,"focus":false,"root":{"type":"pane","command":["/bin/cat"],"cwd":directory.path()}}), CancellationToken::new()).await.unwrap();
+    let target_pane = target["layout"]["root"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let tick_access = Arc::new(TickAccess::with_host(
+        HerdrContext {
+            socket: socket.clone(),
+            caller_pane: old_caller.clone(),
+        },
+        host.clone(),
+    ));
+    let target_instance =
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let inventory = tick_access.discover(&workspace).await.unwrap();
+                if let Some(item) = inventory["ticks"].as_array().unwrap().iter().find(|item| {
+                    item["pane_id"] == target_pane && item["tick_instance_id"].is_string()
+                }) {
+                    break item["tick_instance_id"].clone();
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap();
+    host.request(
+        "pane.close",
+        json!({"pane_id":old_caller}),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call("discover", "ReadWorkspace", json!({})),
+        call(
+            "read",
+            "ReadTick",
+            json!({"tick_instance_id":target_instance}),
+        ),
+        call(
+            "open",
+            "ModifyTick",
+            json!({"action":"open","command":["/bin/cat"]}),
+        ),
+        call(
+            "no_anchor",
+            "ModifyTick",
+            json!({"action":"open","command":["/bin/cat"],"placement":{"type":"current_tab","direction":"right"}}),
+        ),
+        text("The background host task completed."),
+        call(
+            "beside",
+            "ModifyTick",
+            json!({"action":"open","command":["/bin/cat"],"placement":{"type":"current_tab","direction":"right"}}),
+        ),
+        text("The Tick is beside the input View."),
+    ]));
+    let runtime = Agent::new_embedded(config(), model);
+    runtime
+        .install_host_tools(Arc::new(NativeHostToolProvider::new(tick_access)))
+        .unwrap();
+    let access = EmbeddedAgentAccess::new(runtime.clone());
+    let mut launch = LaunchSpec::embedded(directory.path().into());
+    launch.host_work_context = Some(HostWorkContext {
+        socket: socket.clone(),
+        workspace: Some(workspace.clone()),
+    });
+    let receipt = access
+        .execute(CommandEnvelope {
+            owner_epoch: access.owner_epoch(),
+            command_id: uuid::Uuid::new_v4(),
+            command: AgentCommand::Create {
+                launch,
+                initial: None,
+                origin: None,
+            },
+        })
+        .await
+        .unwrap();
+    let Some(CommandResult::Created { execution, .. }) = receipt.result else {
+        panic!("{receipt:?}");
+    };
+    let configured = access
+        .execute(CommandEnvelope {
+            owner_epoch: access.owner_epoch(),
+            command_id: uuid::Uuid::new_v4(),
+            command: AgentCommand::Configure {
+                execution,
+                change: ConfigurationChange::ExecutionMode {
+                    mode: ExecutionMode::FullAccess,
+                },
+            },
+        })
+        .await
+        .unwrap();
+    assert!(configured.error.is_none(), "{configured:?}");
+    let mut events = runtime.subscribe();
+    let submitted = access
+        .execute(CommandEnvelope {
+            owner_epoch: access.owner_epoch(),
+            command_id: uuid::Uuid::new_v4(),
+            command: AgentCommand::Submit {
+                execution,
+                target_loop: None,
+                input: UserInput::Text {
+                    text: "Discover, read and open without a View.".into(),
+                    contexts: vec![],
+                    paths: vec![],
+                },
+                origin: None,
+            },
+        })
+        .await
+        .unwrap();
+    assert!(submitted.error.is_none(), "{submitted:?}");
+    let mut results = BTreeMap::new();
+    loop {
+        match support::next_event(&mut events).await.kind {
+            EventKind::ToolCompleted { call_id, result } => {
+                results.insert(call_id, result);
+            }
+            EventKind::Completed { .. } => break,
+            EventKind::Failed(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    assert!(results["no_anchor"].is_error);
+    assert!(results["no_anchor"].content.contains("MissingAnchor"));
+    for id in ["discover", "read", "open"] {
+        assert!(!results[id].is_error, "{id}: {}", results[id].content);
+    }
+    let inventory: Value = serde_json::from_str(&results["discover"].content).unwrap();
+    assert!(inventory["caller"].is_null());
+    let opened: Value = serde_json::from_str(&results["open"].content).unwrap();
+    assert_eq!(opened["status"], "opened");
+    let opened_pane = host
+        .request(
+            "pane.get",
+            json!({"pane_id":opened["pane_id"]}),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(opened["terminal_id"], opened_pane["pane"]["terminal_id"]);
+    assert_eq!(opened["tab_id"], opened_pane["pane"]["tab_id"]);
+    assert_eq!(opened["workspace_id"], opened_pane["pane"]["workspace_id"]);
+    assert_eq!(
+        opened_pane["pane"]["cwd"],
+        json!(directory.path().canonicalize().unwrap())
+    );
+    host.request(
+        "pane.focus",
+        json!({"pane_id":opened["pane_id"]}),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    let source = host
+        .request(
+            "pane.get",
+            json!({"pane_id":target_pane}),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap()["pane"]
+        .clone();
+    let view = ViewRef {
+        session_id: uuid::Uuid::new_v4(),
+        view_id: uuid::Uuid::new_v4(),
+    };
+    use std::os::unix::fs::MetadataExt;
+    let socket_metadata = std::fs::symlink_metadata(&socket).unwrap();
+    let location = HostLocation {
+        host_instance: format!("herdr:{}:{}", socket_metadata.dev(), socket_metadata.ino()),
+        socket: socket.clone(),
+        workspace: Some(workspace.clone()),
+        tab: source["tab_id"].as_str().map(str::to_owned),
+        pane: Some(target_pane.clone()),
+        terminal: source["terminal_id"].as_str().map(str::to_owned),
+        client: None,
+    };
+    let displayed = access
+        .show_view(DisplayUpdate::Displayed {
+            view,
+            expected_version: 0,
+            execution,
+            host: Some(location.clone()),
+        })
+        .await
+        .unwrap();
+    let submitted = access
+        .execute(CommandEnvelope {
+            owner_epoch: access.owner_epoch(),
+            command_id: uuid::Uuid::new_v4(),
+            command: AgentCommand::Submit {
+                execution,
+                target_loop: None,
+                input: UserInput::Text {
+                    text: "Open beside this input View.".into(),
+                    contexts: vec![],
+                    paths: vec![],
+                },
+                origin: Some(InteractionSource {
+                    view,
+                    display_version: displayed.version,
+                    host: Some(location),
+                }),
+            },
+        })
+        .await
+        .unwrap();
+    assert!(submitted.error.is_none(), "{submitted:?}");
+    access
+        .show_view(DisplayUpdate::Left {
+            view,
+            version: displayed.version,
+        })
+        .await
+        .unwrap();
+    loop {
+        match support::next_event(&mut events).await.kind {
+            EventKind::ToolCompleted { call_id, result } => {
+                results.insert(call_id, result);
+            }
+            EventKind::Completed { .. } => break,
+            EventKind::Failed(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    assert!(!results["beside"].is_error, "{}", results["beside"].content);
+    let beside: Value = serde_json::from_str(&results["beside"].content).unwrap();
+    assert_eq!(beside["tab_id"], source["tab_id"]);
+    assert_ne!(beside["tab_id"], opened["tab_id"]);
+    let neighbor = host
+        .request(
+            "pane.neighbor",
+            json!({"pane_id":target_pane,"direction":"right"}),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        neighbor["neighbor"]["neighbor_pane_id"], beside["pane_id"],
+        "{neighbor}"
+    );
+    println!("isolated-background={opened} captured-view-right={beside} neighbor={neighbor}");
+    runtime.shutdown().await;
+    host.request(
+        "workspace.close",
+        json!({"workspace_id":workspace}),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
 }

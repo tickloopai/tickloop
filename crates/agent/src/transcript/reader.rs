@@ -37,9 +37,10 @@ const COMPACT_BOUNDARY_MARKER: &[u8] = b"\"compact_boundary\"";
 const SYSTEM_LINE_PREFIX: &[u8] = b"{\"type\":\"system\"";
 /// 照 Claude Code `METADATA_TYPE_MARKERS`：边界之前仍要读取的 Chat 级元数据。Tick Loop 的 Chat 级
 /// 元数据只有标题，另外保留 Branch 来源。
-const PRE_BOUNDARY_METADATA_MARKERS: [&[u8]; 2] = [
+const PRE_BOUNDARY_METADATA_MARKERS: [&[u8]; 3] = [
     b"{\"type\":\"custom-title\"",
     b"{\"type\":\"branch-origin\"",
+    b"{\"type\":\"delegation\"",
 ];
 
 /// 照 Claude Code `loadTranscriptFile` 与 `buildConversationChain` 加载 Transcript：
@@ -181,6 +182,10 @@ fn load_lines(
             }
             Line::BranchOrigin(entry) => {
                 metadata.branch_origin = Some(entry.clone());
+                continue;
+            }
+            Line::Delegation(entry) => {
+                metadata.delegation = Some(entry.clone());
                 continue;
             }
             Line::FileHistorySnapshot(entry) => {

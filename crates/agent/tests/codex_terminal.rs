@@ -1,6 +1,8 @@
 #[path = "support/screen.rs"]
 mod screen;
 
+mod support;
+
 use std::fs::OpenOptions;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::process::Stdio;
@@ -27,6 +29,10 @@ impl TerminalFixture {
             })
             .unwrap();
         let mut command = portable_pty::CommandBuilder::new(env!("CARGO_BIN_EXE_tickloop"));
+        command.env(
+            "TICKLOOP_AGENT_RUNTIME_DIR",
+            support::cli_runtime::directory(),
+        );
         command.args(["--working-directory-is-trusted", "--mode", "acceptEdits"]);
         command.arg("--cwd");
         command.arg(root);
@@ -127,20 +133,33 @@ fn model_menu_cancellation_restores_prompt_and_allows_reopening() {
     let root = directory.path().canonicalize().unwrap();
     let mut terminal = TerminalFixture::start(&root);
     terminal.wait_for("deepseek-flash");
+    let opened_menu = terminal.output_mark();
     terminal.send(b"/model\r");
-    terminal.wait_for("Choose model");
+    terminal.wait_for_frame_after(opened_menu, "model choices opened", |frame| {
+        frame.contains("Choose model ·")
+    });
+    let returned_provider = terminal.output_mark();
+    terminal.send(b"j\x10\x1b");
+    terminal.wait_for_frame_after(returned_provider, "model Provider returned", |frame| {
+        frame.contains("Choose model Provider")
+    });
     let cancelled_menu = terminal.output_mark();
-    terminal.send(b"j\x10\x1b\x1b");
+    terminal.send(b"\x1b");
     terminal.wait_for_frame_after(cancelled_menu, "model menu closed", |frame| {
         frame.contains("deepseek-flash") && !frame.contains("Choose model")
     });
     let reopened_menu = terminal.output_mark();
     terminal.send(b"/model\r");
     terminal.wait_for_frame_after(reopened_menu, "model menu reopened", |frame| {
-        frame.contains("Choose model")
+        frame.contains("Choose model ·")
+    });
+    let returned_provider = terminal.output_mark();
+    terminal.send(b"\x1b");
+    terminal.wait_for_frame_after(returned_provider, "model Provider returned", |frame| {
+        frame.contains("Choose model Provider")
     });
     let cancelled_model = terminal.output_mark();
-    terminal.send(b"\x1b\x1b");
+    terminal.send(b"\x1b");
     terminal.wait_for_frame_after(cancelled_model, "model menu closed", |frame| {
         frame.contains("deepseek-flash") && !frame.contains("Choose model")
     });
@@ -227,6 +246,10 @@ async fn piped_commands_wait_for_logout_before_model_menu_and_exit() {
     lock.lock().unwrap();
 
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_tickloop"))
+        .env(
+            "TICKLOOP_AGENT_RUNTIME_DIR",
+            support::cli_runtime::directory(),
+        )
         .args(["--working-directory-is-trusted", "--mode", "acceptEdits"])
         .arg("--cwd")
         .arg(&root)

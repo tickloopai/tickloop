@@ -165,6 +165,18 @@ pub struct ExecutionContext {
 }
 
 impl PreparedTool {
+    pub(crate) fn is_supported_in_delegated_scope(&self, workspace: &Workspace) -> bool {
+        match &self.operation {
+            Operation::WebFetch(_) | Operation::WebSearch(_) | Operation::TaskStop(_) => true,
+            Operation::Shell(input) => {
+                self.in_workspace
+                    && (input.is_read_only(&self.resolved_path, workspace)
+                        || input.is_allowed_in_accept_edits(&self.resolved_path, workspace))
+            }
+            _ => self.in_workspace,
+        }
+    }
+
     /// Returns the resolved file edited by write tools, or `None` for other tools.
     pub fn edited_file_path(&self) -> Option<&Path> {
         matches!(self.operation, Operation::Write(_)).then_some(self.resolved_path.as_path())

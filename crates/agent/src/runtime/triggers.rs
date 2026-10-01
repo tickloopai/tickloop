@@ -45,30 +45,34 @@ pub(super) fn recover_loops(snapshot: &mut ChatSnapshot) {
                 | LoopState::WaitingPermission
                 | LoopState::WaitingQuestion
         ) {
-            goal.state = LoopState::Interrupted;
+            goal.recover_state(LoopState::Interrupted);
         }
     }
 }
 
 fn recover_triggers(snapshot: &mut ChatSnapshot) {
     for goal in &mut snapshot.loops {
+        let Some(trigger) = &goal.trigger else {
+            continue;
+        };
+        let armed = trigger.armed;
+        if !matches!(goal.state, LoopState::Stopped | LoopState::Expired)
+            && trigger
+                .expires_at_ms
+                .is_some_and(|deadline| deadline <= crate::private_fs::unix_time_milliseconds())
+        {
+            goal.recover_state(LoopState::Expired);
+        }
+        if matches!(goal.state, LoopState::Stopped | LoopState::Expired) {
+            snapshot.resume_triggers.retain(|id| *id != goal.id);
+        } else if armed && !snapshot.resume_triggers.contains(&goal.id) {
+            snapshot.resume_triggers.push(goal.id);
+        }
         if let Some(trigger) = &mut goal.trigger {
-            if !matches!(goal.state, LoopState::Stopped | LoopState::Expired)
-                && trigger
-                    .expires_at_ms
-                    .is_some_and(|deadline| deadline <= crate::private_fs::unix_time_milliseconds())
-            {
-                goal.state = LoopState::Expired;
-            }
-            if matches!(goal.state, LoopState::Stopped | LoopState::Expired) {
-                snapshot.resume_triggers.retain(|id| *id != goal.id);
-            } else if trigger.armed && !snapshot.resume_triggers.contains(&goal.id) {
-                snapshot.resume_triggers.push(goal.id);
-            }
             trigger.armed = false;
-            if goal.state == LoopState::WaitingTrigger {
-                goal.state = LoopState::Interrupted;
-            }
+        }
+        if goal.state == LoopState::WaitingTrigger {
+            goal.recover_state(LoopState::Interrupted);
         }
     }
     snapshot.pending_inputs.retain(|pending| {
@@ -87,6 +91,20 @@ impl Agent {
         loop_id: LoopId,
         trigger: Option<Trigger>,
     ) -> Result<(), AgentError> {
+        if let Some(trigger) = &trigger {
+            let chats = self.inner.chats.lock().await;
+            let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
+            if chat.snapshot.delegation.as_ref().is_some_and(|delegation| {
+                trigger.subscriptions.iter().any(|subscription| {
+                    !delegation
+                        .ceiling
+                        .tick_instances
+                        .contains(&subscription.instance)
+                })
+            }) {
+                return Err(AgentError::Invalid("Unsupported: Tick Subscription is outside the inherited delegated instance scope".into()));
+            }
+        }
         if let Some(trigger) = &trigger
             && (trigger.prompt.trim().is_empty()
                 || trigger.interval_seconds == Some(0)
@@ -122,11 +140,11 @@ impl Agent {
         if goal.state == LoopState::Completed
             && trigger.as_ref().is_some_and(|trigger| trigger.armed)
         {
-            goal.state = LoopState::WaitingTrigger;
+            goal.set_state(LoopState::WaitingTrigger);
         } else if goal.state == LoopState::WaitingTrigger
             && trigger.as_ref().is_none_or(|trigger| !trigger.armed)
         {
-            goal.state = LoopState::Completed;
+            goal.set_state(LoopState::Completed);
         }
         snapshot.pending_inputs.retain(|pending| {
             pending.receipt.loop_id != loop_id || pending.trigger_source.is_none()
@@ -178,7 +196,7 @@ impl Agent {
                 trigger.armed = false;
             }
             if goal.state == LoopState::WaitingTrigger {
-                goal.state = LoopState::Completed;
+                goal.set_state(LoopState::Completed);
             }
         }
         snapshot.pending_inputs.retain(|pending| {
@@ -351,7 +369,7 @@ impl Agent {
             run_id: goal.run_id.unwrap_or_else(Uuid::new_v4),
         };
         let is_active = chat.active_run == Some(receipt.run_id);
-        goal.state = state.clone();
+        goal.set_state(state.clone());
         if let Some(trigger) = &mut goal.trigger {
             trigger.armed = false;
         }

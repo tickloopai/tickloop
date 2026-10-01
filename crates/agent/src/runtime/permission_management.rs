@@ -9,14 +9,14 @@ use crate::settings::{AutoReviewerPreference, AutoSettings, AutoSettingsRevision
 
 use super::{Agent, AgentError, AutoReviewerHealth, ChatId, ChatSnapshot};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PermissionsRevision {
     local: u64,
     project_rules: String,
     auto_settings: AutoSettingsRevision,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct PermissionsView {
     pub chat_id: ChatId,
     pub revision: PermissionsRevision,
@@ -35,7 +35,7 @@ pub struct PermissionsView {
     pub warnings: Vec<String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PermissionRuleSource {
     ChatSession,
     ProjectUser,
@@ -43,14 +43,14 @@ pub enum PermissionRuleSource {
     ManagedConstraint,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PermissionRuleScope {
     Chat,
     Loop(Uuid),
     Project(PathBuf),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct PermissionRuleView {
     pub rule: PermissionRule,
     pub source: PermissionRuleSource,
@@ -59,7 +59,7 @@ pub struct PermissionRuleView {
     pub effective_note: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum PermissionChange {
     UpsertRule { rule: PermissionRule },
     RemoveRule { id: Uuid },
@@ -112,7 +112,9 @@ impl Agent {
         if chat.snapshot.workdir != workdir {
             return Err(AgentError::Busy);
         }
-        if let Some(saved_rules) = saved_rules.filter(|_| warnings.is_empty()) {
+        if let Some(saved_rules) =
+            saved_rules.filter(|_| warnings.is_empty() && chat.snapshot.delegation.is_none())
+        {
             let current = chat
                 .snapshot
                 .policy
@@ -153,6 +155,8 @@ impl Agent {
         change: PermissionChange,
         expected_revision: PermissionsRevision,
     ) -> Result<PermissionsView, PermissionChangeError> {
+        self.require_root_chat(chat_id, "change permission rules or directories")
+            .await?;
         let _settings_gate = self.inner.settings_writes.lock().await;
         let latest = self.permissions_view_locked(chat_id).await?;
         if latest.revision != expected_revision {
@@ -405,6 +409,53 @@ impl Agent {
     }
 }
 
+/// How the Permissions view lists rules, for a visible Agent and for the New Agent screen.
+pub(crate) fn rule_views(
+    rules: &[PermissionRule],
+    rule_project: impl Fn(&PermissionRule) -> PathBuf,
+    workdir: &std::path::Path,
+    mode: ExecutionMode,
+    project_constraints: &[PermissionRule],
+    managed_constraints: &[PermissionRule],
+) -> Vec<PermissionRuleView> {
+    rules
+        .iter()
+        .map(|rule| PermissionRuleView {
+            rule: rule.clone(),
+            source: if rule.persistent {
+                PermissionRuleSource::ProjectUser
+            } else {
+                PermissionRuleSource::ChatSession
+            },
+            scope: if rule.persistent {
+                PermissionRuleScope::Project(rule_project(rule))
+            } else if let Some(loop_id) = rule.loop_id {
+                PermissionRuleScope::Loop(loop_id)
+            } else {
+                PermissionRuleScope::Chat
+            },
+            editable: true,
+            effective_note: (mode == ExecutionMode::Auto
+                && crate::permissions::bypasses_auto_classifier(rule))
+            .then(|| "broad Allow does not bypass Auto review".into()),
+        })
+        .chain(project_constraints.iter().map(|rule| PermissionRuleView {
+            rule: rule.clone(),
+            source: PermissionRuleSource::ProjectConstraint,
+            scope: PermissionRuleScope::Project(workdir.to_path_buf()),
+            editable: false,
+            effective_note: Some("project constraint cannot be edited here".into()),
+        }))
+        .chain(managed_constraints.iter().map(|rule| PermissionRuleView {
+            rule: rule.clone(),
+            source: PermissionRuleSource::ManagedConstraint,
+            scope: PermissionRuleScope::Project(workdir.to_path_buf()),
+            editable: false,
+            effective_note: Some("managed constraint cannot be edited here".into()),
+        }))
+        .collect()
+}
+
 struct AutoViewState {
     settings: AutoSettings,
     revision: AutoSettingsRevision,
@@ -425,62 +476,20 @@ fn view_from_snapshot(
         key_status: jev_key_status,
         health: auto_reviewer_health,
     } = auto;
-    let rules = snapshot
-        .policy
-        .rules
-        .iter()
-        .map(|rule| PermissionRuleView {
-            rule: rule.clone(),
-            source: if rule.persistent {
-                PermissionRuleSource::ProjectUser
-            } else {
-                PermissionRuleSource::ChatSession
-            },
-            scope: if rule.persistent {
-                PermissionRuleScope::Project(
-                    snapshot
-                        .persistent_rule_projects
-                        .get(&rule.id)
-                        .cloned()
-                        .unwrap_or_else(|| snapshot.workdir.clone()),
-                )
-            } else if let Some(loop_id) = rule.loop_id {
-                PermissionRuleScope::Loop(loop_id)
-            } else {
-                PermissionRuleScope::Chat
-            },
-            editable: true,
-            effective_note: (snapshot.policy.mode == ExecutionMode::Auto
-                && crate::permissions::bypasses_auto_classifier(rule))
-            .then(|| "broad Allow does not bypass Auto review".into()),
-        })
-        .chain(
+    let rules = rule_views(
+        &snapshot.policy.rules,
+        |rule| {
             snapshot
-                .policy
-                .project_constraints
-                .iter()
-                .map(|rule| PermissionRuleView {
-                    rule: rule.clone(),
-                    source: PermissionRuleSource::ProjectConstraint,
-                    scope: PermissionRuleScope::Project(snapshot.workdir.clone()),
-                    editable: false,
-                    effective_note: Some("project constraint cannot be edited here".into()),
-                }),
-        )
-        .chain(
-            snapshot
-                .policy
-                .managed_constraints
-                .iter()
-                .map(|rule| PermissionRuleView {
-                    rule: rule.clone(),
-                    source: PermissionRuleSource::ManagedConstraint,
-                    scope: PermissionRuleScope::Project(snapshot.workdir.clone()),
-                    editable: false,
-                    effective_note: Some("managed constraint cannot be edited here".into()),
-                }),
-        )
-        .collect();
+                .persistent_rule_projects
+                .get(&rule.id)
+                .cloned()
+                .unwrap_or_else(|| snapshot.workdir.clone())
+        },
+        &snapshot.workdir,
+        snapshot.policy.mode,
+        &snapshot.policy.project_constraints,
+        &snapshot.policy.managed_constraints,
+    );
     PermissionsView {
         chat_id: snapshot.id,
         revision: PermissionsRevision {
@@ -504,7 +513,7 @@ fn view_from_snapshot(
     }
 }
 
-fn validate_rule(rule: &PermissionRule) -> Result<(), PermissionChangeError> {
+pub(crate) fn validate_rule(rule: &PermissionRule) -> Result<(), PermissionChangeError> {
     if rule.tool.is_empty() || rule.decision == Decision::Check {
         return Err(PermissionChangeError::Invalid(
             "rules require a tool and allow, ask or deny decision".into(),
@@ -554,7 +563,7 @@ fn validate_editable_rule(
     Ok(())
 }
 
-fn canonical_directory(path: PathBuf) -> Result<PathBuf, PermissionChangeError> {
+pub(crate) fn canonical_directory(path: PathBuf) -> Result<PathBuf, PermissionChangeError> {
     let path = path
         .canonicalize()
         .map_err(|_| PermissionChangeError::Invalid("directory is unavailable".into()))?;

@@ -2,6 +2,7 @@
 pub(super) enum FooterItemId {
     Tasks,
     Todo,
+    Agents,
 }
 
 impl FooterItemId {
@@ -9,6 +10,7 @@ impl FooterItemId {
         match self {
             Self::Tasks => "Tasks",
             Self::Todo => "Todo",
+            Self::Agents => "Agents",
         }
     }
 }
@@ -40,6 +42,8 @@ pub(super) struct FooterFrameItem {
 pub(super) struct FooterFrame {
     pub(super) items: Vec<FooterFrameItem>,
     pub(super) selected: Option<FooterItemId>,
+    /// Whether keys move within the open list rather than across the summary row.
+    pub(super) list_focused: bool,
 }
 
 #[derive(Default)]
@@ -84,6 +88,7 @@ impl FooterState {
                 })
                 .collect(),
             selected: self.selected,
+            list_focused: false,
         }
     }
 
@@ -190,6 +195,7 @@ mod tests {
                     },
                 ],
                 selected: Some(FooterItemId::Tasks),
+                list_focused: false,
             }
         );
     }

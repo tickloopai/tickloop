@@ -1080,7 +1080,7 @@ fn render_task_row(task: &ShellTaskView, view_chat_id: Uuid, width: usize) -> St
     let owner = if task.chat_id == view_chat_id {
         String::new()
     } else {
-        format!("{} · ", other_chat_label(task.chat_id))
+        format!("{OTHER_AGENT} · ")
     };
     let prefix = format!(
         "{origin} {} {status} · {owner}{} B · ",
@@ -1099,10 +1099,9 @@ fn render_task_row(task: &ShellTaskView, view_chat_id: Uuid, width: usize) -> St
     )
 }
 
-fn other_chat_label(chat_id: Uuid) -> String {
-    let chat_id = chat_id.simple().to_string();
-    format!("Chat {}", &chat_id[..8])
-}
+/// A task this View's Agent does not own; its owner is named in the Agents overview, not by a
+/// generated identifier here.
+const OTHER_AGENT: &str = "other Agent";
 
 fn status_label(status: TaskStatus) -> &'static str {
     match status {
@@ -1325,8 +1324,7 @@ impl<'a> DetailLayout<'a> {
             (false, true) => "Action: stop",
             (false, false) => "Actions: none",
         };
-        let owner =
-            (self.task.chat_id != self.view_chat_id).then(|| other_chat_label(self.task.chat_id));
+        let owner = (self.task.chat_id != self.view_chat_id).then(|| OTHER_AGENT.to_owned());
         let mut metadata_row = 0;
         for text in [origin.as_bytes(), id.as_bytes()]
             .into_iter()

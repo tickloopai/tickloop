@@ -5,9 +5,10 @@ use tickloop_agent::{
     model::credentials::ApiKeyStatus,
     permissions::{Decision, ExecutionMode, PermissionRule, is_supported_rule_content},
     runtime::{
-        AutoEnvironmentSource, AutoReviewerHealth, AutoReviewerPreference, AutoRuleChange,
-        AutoRuleKind, AutoRuleSource, PermissionChange, PermissionRuleScope, PermissionRuleSource,
-        PermissionsView,
+        AutoEnvironmentSource, AutoPolicy, AutoReviewerHealth, AutoReviewerPreference,
+        AutoRuleChange, AutoRuleKind, AutoRuleSettings, AutoRuleSource, AutoSettingsRevision,
+        PermissionChange, PermissionRuleScope, PermissionRuleSource, PermissionRuleView,
+        PermissionsRevision, PermissionsView,
     },
     tools::WEB_FETCH_TOOL_NAME,
 };
@@ -499,8 +500,100 @@ pub(super) enum PermissionsReturn {
     ModePicker { settings: bool },
 }
 
+/// The saved-policy revisions a New Agent Permissions view was read at. A saved edit from that
+/// view is refused when either changed, like a visible Agent's `PermissionsRevision`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct DraftPolicyRevision {
+    pub(super) project_rules: String,
+    pub(super) auto_settings: AutoSettingsRevision,
+}
+
+/// Whose permissions a surface shows: a visible Agent at the revision its view was read, or the
+/// New Agent screen for a project at the saved-policy revisions its view was read.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum PermissionsSubject {
+    Agent {
+        chat: Uuid,
+        revision: PermissionsRevision,
+    },
+    NewDraft {
+        project: PathBuf,
+        revision: DraftPolicyRevision,
+    },
+}
+
+impl PermissionsSubject {
+    pub(super) fn chat(&self) -> Option<Uuid> {
+        match self {
+            Self::Agent { chat, .. } => Some(*chat),
+            Self::NewDraft { .. } => None,
+        }
+    }
+
+    /// Whether `other` is a newer view of the same Agent or New Agent screen.
+    fn same_target(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Agent { chat, .. }, Self::Agent { chat: other, .. }) => chat == other,
+            (Self::NewDraft { project, .. }, Self::NewDraft { project: other, .. }) => {
+                project == other
+            }
+            _ => false,
+        }
+    }
+}
+
+/// What the surface shows: a `PermissionsView` without its identity. Reviewer health and Loops
+/// exist only once an Agent runs, so a New Agent has none.
+#[derive(Clone, Debug)]
+pub(super) struct PermissionsContent {
+    pub(super) execution_mode: ExecutionMode,
+    pub(super) chat_model_label: String,
+    pub(super) preferred_reviewer: AutoReviewerPreference,
+    pub(super) auto_policy: AutoPolicy,
+    pub(super) auto_rule_settings: AutoRuleSettings,
+    pub(super) jev_key_status: ApiKeyStatus,
+    pub(super) auto_reviewer_health: Option<AutoReviewerHealth>,
+    pub(super) selected_loop_id: Option<Uuid>,
+    pub(super) rules: Vec<PermissionRuleView>,
+    pub(super) working_directory: PathBuf,
+    pub(super) additional_directories: Vec<PathBuf>,
+    pub(super) warnings: Vec<String>,
+}
+
+/// A Permissions view with the subject it belongs to.
+pub(super) struct PermissionsPage {
+    pub(super) subject: PermissionsSubject,
+    pub(super) content: PermissionsContent,
+}
+
+impl From<PermissionsView> for PermissionsPage {
+    fn from(view: PermissionsView) -> Self {
+        Self {
+            subject: PermissionsSubject::Agent {
+                chat: view.chat_id,
+                revision: view.revision,
+            },
+            content: PermissionsContent {
+                execution_mode: view.execution_mode,
+                chat_model_label: view.chat_model_label,
+                preferred_reviewer: view.preferred_reviewer,
+                auto_policy: view.auto_policy,
+                auto_rule_settings: view.auto_rule_settings,
+                jev_key_status: view.jev_key_status,
+                auto_reviewer_health: Some(view.auto_reviewer_health),
+                selected_loop_id: view.selected_loop_id,
+                rules: view.rules,
+                working_directory: view.working_directory,
+                additional_directories: view.additional_directories,
+                warnings: view.warnings,
+            },
+        }
+    }
+}
+
 pub(super) struct PermissionsSurface {
-    view: PermissionsView,
+    subject: PermissionsSubject,
+    view: PermissionsContent,
     denials: DenialsSurface,
     page: Page,
     selected: usize,
@@ -510,12 +603,28 @@ pub(super) struct PermissionsSurface {
     focus: Focus,
     destination: PermissionsReturn,
     message: Option<String>,
+    /// Neutral information about the last change, shown when there is no status to report; the
+    /// next key clears it.
+    notice: Option<String>,
+    /// Why rules, directories and Auto settings cannot change here; activity stays readable.
+    read_only: Option<&'static str>,
 }
 
+/// Footer hints that open an editing form; a read-only surface never offers them.
+const EDITING_HINTS: &[&str] = &[
+    "a add",
+    "e edit",
+    "d remove",
+    "Enter edit/preview",
+    "Enter configure",
+];
+
 impl PermissionsSurface {
-    pub(super) fn open(view: PermissionsView, destination: PermissionsReturn) -> Self {
+    pub(super) fn open(page: impl Into<PermissionsPage>, destination: PermissionsReturn) -> Self {
+        let PermissionsPage { subject, content } = page.into();
         Self {
-            view,
+            subject,
+            view: content,
             denials: DenialsSurface::default(),
             page: Page::RecentlyDenied,
             selected: 0,
@@ -525,7 +634,14 @@ impl PermissionsSurface {
             focus: Focus::List,
             destination,
             message: None,
+            notice: None,
+            read_only: None,
         }
+    }
+
+    pub(super) fn make_read_only(&mut self, reason: &'static str) {
+        self.read_only = Some(reason);
+        self.message = Some(format!("Read-only: {reason}"));
     }
 
     pub(super) fn open_auto(&mut self) {
@@ -535,15 +651,26 @@ impl PermissionsSurface {
         self.focus = Focus::List;
     }
 
-    pub(super) fn chat_id(&self) -> Uuid {
-        self.view.chat_id
+    pub(super) fn chat_id(&self) -> Option<Uuid> {
+        self.subject.chat()
     }
 
-    pub(super) fn revision(&self) -> tickloop_agent::runtime::PermissionsRevision {
-        self.view.revision.clone()
+    pub(super) fn subject(&self) -> &PermissionsSubject {
+        &self.subject
     }
 
-    pub(super) fn replace_view(&mut self, view: PermissionsView) {
+    /// Whether `page` is a newer view of what this surface shows.
+    pub(super) fn shows(&self, page: &PermissionsPage) -> bool {
+        self.subject.same_target(&page.subject)
+    }
+
+    fn set_page(&mut self, page: impl Into<PermissionsPage>) {
+        let PermissionsPage { subject, content } = page.into();
+        self.subject = subject;
+        self.view = content;
+    }
+
+    pub(super) fn replace_view(&mut self, view: impl Into<PermissionsPage>) {
         let next_focus = match std::mem::replace(&mut self.focus, Focus::List) {
             Focus::AutoDraft(draft) => match draft.purpose {
                 AutoDraftPurpose::Environment => Focus::AutoEnvironment {
@@ -582,36 +709,40 @@ impl PermissionsSurface {
             },
             _ => Focus::List,
         };
-        self.view = view;
+        self.set_page(view);
         self.message = Some("Permissions saved".into());
         self.focus = next_focus;
         self.clamp_selection();
     }
 
-    pub(super) fn refresh_view(&mut self, view: PermissionsView) {
-        self.view = view;
+    pub(super) fn refresh_view(&mut self, view: impl Into<PermissionsPage>) {
+        self.set_page(view);
         self.focus = Focus::List;
         self.clamp_selection();
     }
 
-    pub(super) fn key_and_reviewer_saved(&mut self, view: PermissionsView) {
-        self.view = view;
+    pub(super) fn key_and_reviewer_saved(&mut self, view: impl Into<PermissionsPage>) {
+        self.set_page(view);
         self.focus = Focus::List;
         self.message = Some(
             "Jev (TypeSafe) key saved and selected; authentication has not been verified".into(),
         );
     }
 
-    pub(super) fn key_saved_choice_failed(&mut self, view: PermissionsView, reason: String) {
-        self.view = view;
+    pub(super) fn key_saved_choice_failed(
+        &mut self,
+        view: impl Into<PermissionsPage>,
+        reason: String,
+    ) {
+        self.set_page(view);
         self.focus = Focus::ReviewerChoice(1);
         self.message = Some(format!(
             "Jev (TypeSafe) key saved; reviewer choice not applied: {reason}"
         ));
     }
 
-    pub(super) fn conflict(&mut self, view: PermissionsView) {
-        self.view = view;
+    pub(super) fn conflict(&mut self, view: impl Into<PermissionsPage>) {
+        self.set_page(view);
         if let Focus::AutoPreview { change, .. } = &self.focus {
             let refreshed = self.preview_removed(change);
             if let Focus::AutoPreview {
@@ -642,6 +773,15 @@ impl PermissionsSurface {
 
     pub(super) fn error(&mut self, message: String) {
         self.message = Some(message);
+    }
+
+    pub(super) fn notice(&mut self, notice: String) {
+        self.message = None;
+        self.notice = Some(notice);
+    }
+
+    fn has_status_row(&self) -> bool {
+        self.message.is_some() || self.notice.is_some() || !self.view.warnings.is_empty()
     }
 
     pub(super) fn paste(&mut self, text: &str) {
@@ -990,7 +1130,45 @@ impl PermissionsSurface {
             .is_some_and(|entry| entry.editable)
     }
 
+    /// Routes `key`; a read-only surface never enters an editing form or emits a change.
     pub(super) fn key(&mut self, key: KeyEvent) -> PermissionsEffect {
+        self.notice = None;
+        let Some(reason) = self.read_only else {
+            return self.route_key(key);
+        };
+        let typing = matches!(self.focus, Focus::Search(_) | Focus::AutoGroupSearch { .. });
+        if !typing
+            && self.page != Page::RecentlyDenied
+            && key.modifiers.difference(KeyModifiers::SHIFT).is_empty()
+            && matches!(key.code, KeyCode::Char('a' | 'e' | 'd'))
+        {
+            self.message = Some(format!("Read-only: {reason}"));
+            return PermissionsEffect::None;
+        }
+        let effect = self.route_key(key);
+        let editing = matches!(
+            self.focus,
+            Focus::RuleForm(_)
+                | Focus::DirectoryForm(_)
+                | Focus::ConfirmDelete(_)
+                | Focus::ReviewerChoice(_)
+                | Focus::AutoDraft(_)
+                | Focus::AutoPreview { .. }
+        );
+        if editing
+            || matches!(
+                effect,
+                PermissionsEffect::Apply(_) | PermissionsEffect::OpenJudgmentSettings { .. }
+            )
+        {
+            self.focus = Focus::List;
+            self.message = Some(format!("Read-only: {reason}"));
+            return PermissionsEffect::None;
+        }
+        effect
+    }
+
+    fn route_key(&mut self, key: KeyEvent) -> PermissionsEffect {
         if self.page == Page::RecentlyDenied {
             if !self.denials.is_detail() && matches!(key.code, KeyCode::Left | KeyCode::Right) {
                 self.switch_page(if key.code == KeyCode::Left { -1 } else { 1 });
@@ -1503,15 +1681,16 @@ impl PermissionsSurface {
             let status = match self.view.preferred_reviewer {
                 AutoReviewerPreference::Llm => "LLM reviews with this Chat model".to_owned(),
                 AutoReviewerPreference::Jev => match self.view.auto_reviewer_health {
-                    AutoReviewerHealth::Ready => {
+                    Some(AutoReviewerHealth::Ready) => {
                         "Jev ready · LLM fallback on service failure".into()
                     }
-                    AutoReviewerHealth::CoolingDown { remaining_seconds } => {
+                    Some(AutoReviewerHealth::CoolingDown { remaining_seconds }) => {
                         format!("Jev cooling down {remaining_seconds}s · LLM reviewing")
                     }
-                    AutoReviewerHealth::Probing => {
+                    Some(AutoReviewerHealth::Probing) => {
                         "Jev recovery probe · LLM reviews concurrently".into()
                     }
+                    None => "Jev selected · its status appears once the Agent runs".into(),
                 },
             };
             body.push(muted_row(status));
@@ -1643,7 +1822,7 @@ impl PermissionsSurface {
         height: usize,
         body: &mut Vec<RoleLine>,
     ) {
-        let reserved = 2 + usize::from(self.message.is_some() || !self.view.warnings.is_empty());
+        let reserved = 2 + usize::from(self.has_status_row());
         let available = height.saturating_sub(body.len() + reserved).max(1);
         if self.selected < self.scroll {
             self.scroll = self.selected;
@@ -1920,11 +2099,7 @@ impl PermissionsSurface {
         let replace_row = rules.len() + 1;
         let restore_row = replace_row + 1;
         let available = height
-            .saturating_sub(
-                body.len()
-                    + 2
-                    + usize::from(self.message.is_some() || !self.view.warnings.is_empty()),
-            )
+            .saturating_sub(body.len() + 2 + usize::from(self.has_status_row()))
             .max(1);
         let start = group
             .scroll
@@ -1972,6 +2147,11 @@ impl PermissionsSurface {
             .message
             .as_ref()
             .map(|message| RoleLine::role(format!("Status: {message}"), Role::Warning))
+            .or_else(|| {
+                self.notice
+                    .as_ref()
+                    .map(|notice| RoleLine::role(notice.clone(), Role::MutedText))
+            })
             .or_else(|| {
                 self.view
                     .warnings
@@ -2050,7 +2230,16 @@ impl PermissionsSurface {
         } else {
             self.styled_detail(width, height, &mut body)
         };
-        self.finish_styled_frame(title, body, muted_row(footer), width, height)
+        let footer = if self.read_only.is_some() {
+            footer
+                .split(" · ")
+                .filter(|hint| !EDITING_HINTS.contains(hint))
+                .collect::<Vec<_>>()
+                .join(" · ")
+        } else {
+            footer.to_owned()
+        };
+        self.finish_styled_frame(title, body, muted_row(&footer), width, height)
     }
 
     #[cfg(test)]

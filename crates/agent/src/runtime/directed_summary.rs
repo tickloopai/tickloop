@@ -52,7 +52,7 @@ pub enum ActiveConversationItem {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DirectedSummaryDraft {
     pub prompt: String,
     pub contexts: Vec<InputContext>,
@@ -118,6 +118,8 @@ impl Agent {
         chat_id: ChatId,
         request: DirectedSummaryRequest,
     ) -> Result<DirectedSummaryOutcome, AgentError> {
+        self.require_root_chat(chat_id, "rewrite history with a directed summary")
+            .await?;
         let mut tasks = self.inner.tasks.lock().await;
         let (plan, sequence, client, cancel) = {
             let mut chats = self.inner.chats.lock().await;

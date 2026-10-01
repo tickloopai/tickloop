@@ -29,7 +29,87 @@ pub(super) struct CommandSpec {
     pub menu_group: Option<CommandGroup>,
 }
 
+/// Where a typed command would act: a root Agent, a delegated child, or the overview, which has
+/// no Agent of its own and dispatches Skills to new Agents.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) enum CommandScope {
+    #[default]
+    Root,
+    Child,
+    Overview,
+}
+
+/// Commands the overview handles itself, with what they do there.
+const OVERVIEW_COMMANDS: &[(&str, &str)] = &[
+    (
+        "/acknowledge-create",
+        "Stops tracking this overview's unconfirmed New Agent dispatch; nothing is resent.",
+    ),
+    ("/clear", "Leaves the overview for a new Agent draft."),
+    ("/cwd", "Shows or sets the directory for new Agents."),
+    ("/exit", "Leaves this View; Agents keep running."),
+    ("/help", "Shows overview keys and commands."),
+    ("/resume", "Opens saved Agent history."),
+    ("/tickloop", "Starts a new Agent with the Tick Loop Skill."),
+];
+
+const OVERVIEW_AGENT_COMMAND: &str =
+    "acts on an open Agent; Enter opens the selected Agent, /clear starts a new draft";
+const CHILD_HISTORY_FIXED: &str = "a child Agent's history is fixed by its delegation";
+pub(super) const CHILD_AUTHORIZATION_FIXED: &str =
+    "a child Agent's authorization is fixed by its parent";
+
+pub(super) fn command_refusal(scope: CommandScope, command: &str, reason: &str) -> String {
+    let prefix = if scope == CommandScope::Child {
+        "Parent fixed · "
+    } else {
+        ""
+    };
+    format!("{prefix}{command} is unavailable here: {reason}")
+}
+
 impl CommandSpec {
+    /// Why this command cannot act in `scope`, when it cannot; the owner still validates the rest.
+    pub(super) fn unavailable_in(&self, scope: CommandScope) -> Option<&'static str> {
+        match scope {
+            CommandScope::Root => None,
+            CommandScope::Overview => (!OVERVIEW_COMMANDS
+                .iter()
+                .any(|(command, _)| *command == self.command))
+            .then_some(OVERVIEW_AGENT_COMMAND),
+            CommandScope::Child => match self.command {
+                "/clear" | "/branch" | "/rewind" | "/compact" => Some(CHILD_HISTORY_FIXED),
+                "/mode" | "/plan" | "/rule" | "/add-dir" | "/approve-plan" => {
+                    Some(CHILD_AUTHORIZATION_FIXED)
+                }
+                _ => None,
+            },
+        }
+    }
+
+    pub(super) fn description_in(&self, scope: CommandScope) -> String {
+        if scope == CommandScope::Child && self.command == "/permissions" {
+            return "Shows current mode and recent activity; child permissions are read-only."
+                .into();
+        }
+        if scope == CommandScope::Child && self.command == "/cwd" {
+            return format!(
+                "Shows the working directory; setting one is unavailable: {CHILD_AUTHORIZATION_FIXED}."
+            );
+        }
+        if scope == CommandScope::Overview
+            && let Some((_, description)) = OVERVIEW_COMMANDS
+                .iter()
+                .find(|(command, _)| *command == self.command)
+        {
+            return (*description).into();
+        }
+        match self.unavailable_in(scope) {
+            Some(reason) => format!("Unavailable: {reason}."),
+            None => self.description.into(),
+        }
+    }
+
     pub(super) fn syntax(&self) -> String {
         if self.arguments.is_empty() {
             self.command.to_owned()
@@ -49,13 +129,13 @@ const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         command: "/tickloop",
         arguments: "[REQUEST]",
-        description: "Loads the Tick Loop Workspace Skill.",
+        description: "Loads the Tick Loop Skill.",
         menu_group: Some(CommandGroup::Skills),
     },
     CommandSpec {
         command: "/clear",
         arguments: "",
-        description: "Starts a new Chat; this Chat's background work keeps running.",
+        description: "Starts a New Agent from your next input; this Agent keeps running.",
         menu_group: Some(CommandGroup::Conversation),
     },
     CommandSpec {
@@ -269,6 +349,18 @@ const COMMANDS: &[CommandSpec] = &[
         menu_group: Some(CommandGroup::Advanced),
     },
     CommandSpec {
+        command: "/acknowledge-input",
+        arguments: "COMMAND_ID",
+        description: "Stops waiting on an input whose acceptance is unknown; nothing is resent.",
+        menu_group: Some(CommandGroup::Advanced),
+    },
+    CommandSpec {
+        command: "/acknowledge-create",
+        arguments: "COMMAND_ID",
+        description: "Stops tracking an unknown or failed New Agent command; nothing is resent.",
+        menu_group: Some(CommandGroup::Advanced),
+    },
+    CommandSpec {
         command: "/help",
         arguments: "[advanced]",
         description: "Show public commands and Skills, or the advanced reference.",
@@ -277,13 +369,29 @@ const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         command: "/exit",
         arguments: "",
-        description: "Cancel work and exit this Agent process.",
+        description: "Leaves this View; the Agent keeps running.",
         menu_group: Some(CommandGroup::Conversation),
     },
 ];
 
 pub(super) fn builtin_commands() -> &'static [CommandSpec] {
     COMMANDS
+}
+
+/// The built-in command a submitted line names, and why it cannot act in `scope`.
+pub(super) fn unavailable_command(
+    line: &str,
+    scope: CommandScope,
+) -> Option<(&'static str, &'static str)> {
+    let mut words = line.split_whitespace();
+    let name = words.next()?;
+    if scope == CommandScope::Child && name == "/cwd" && words.next().is_some() {
+        return Some(("/cwd PATH", CHILD_AUTHORIZATION_FIXED));
+    }
+    COMMANDS
+        .iter()
+        .find(|spec| spec.command == name)
+        .and_then(|spec| Some((spec.command, spec.unavailable_in(scope)?)))
 }
 
 pub(super) fn command_help(advanced: bool) -> String {
@@ -313,6 +421,7 @@ pub(super) enum CompletionAction {
 
 #[derive(Debug, Default)]
 pub(super) struct Completion {
+    scope: CommandScope,
     matches: Vec<usize>,
     selected: Option<usize>,
     draft: String,
@@ -323,11 +432,12 @@ pub(super) struct Completion {
 impl Completion {
     #[cfg(test)]
     fn update(&mut self, draft: &str) {
-        self.update_at(draft, draft.len());
+        self.update_at(draft, draft.len(), CommandScope::Root);
     }
 
-    pub(super) fn update_at(&mut self, draft: &str, cursor: usize) {
+    pub(super) fn update_at(&mut self, draft: &str, cursor: usize, scope: CommandScope) {
         self.dismiss();
+        self.scope = scope;
 
         let Some((token_start, token_end)) = command_token(draft, cursor) else {
             return;
@@ -342,6 +452,7 @@ impl Completion {
                 .filter(|(_, spec)| {
                     spec.menu_group != Some(CommandGroup::Advanced)
                         && spec.command[1..].starts_with(query)
+                        && (scope != CommandScope::Overview || spec.unavailable_in(scope).is_none())
                 })
                 .map(|(index, _)| index),
         );
@@ -371,6 +482,13 @@ impl Completion {
 
     pub(super) fn candidates(&self) -> impl ExactSizeIterator<Item = &'static CommandSpec> + '_ {
         self.matches.iter().map(|index| &COMMANDS[*index])
+    }
+
+    /// Candidate syntax with the description that holds where the command would act.
+    pub(super) fn described_candidates(&self) -> Vec<(String, String)> {
+        self.candidates()
+            .map(|spec| (spec.syntax(), spec.description_in(self.scope)))
+            .collect()
     }
 
     pub(super) fn selected_index(&self) -> Option<usize> {
@@ -487,13 +605,13 @@ mod tests {
         let mut completion = Completion::default();
         completion.update("/");
         assert_eq!(completion.candidates().len(), 21);
-        assert_eq!(builtin_commands().len(), 40);
+        assert_eq!(builtin_commands().len(), 42);
         assert_eq!(
             builtin_commands()
                 .iter()
                 .filter(|spec| spec.menu_group == Some(CommandGroup::Advanced))
                 .count(),
-            19
+            21
         );
         assert_eq!(completion.selected_index(), None);
         for command in ["/help", "/tasks", "/cwd", "/details", "/tickloop"] {
@@ -719,7 +837,7 @@ mod tests {
         let draft = "研究一下\u{3000}/mo 保留后缀";
         let cursor = "研究一下\u{3000}/mo".len();
         let mut completion = Completion::default();
-        completion.update_at(draft, cursor);
+        completion.update_at(draft, cursor, CommandScope::Root);
         completion.handle_key(CompletionKey::Next);
         completion.handle_key(CompletionKey::Next);
 
@@ -737,7 +855,7 @@ mod tests {
         let draft = "before /modelish after";
         let cursor = "before /mo".len();
         let mut completion = Completion::default();
-        completion.update_at(draft, cursor);
+        completion.update_at(draft, cursor, CommandScope::Root);
         completion.handle_key(CompletionKey::Next);
         completion.handle_key(CompletionKey::Next);
 
@@ -755,7 +873,7 @@ mod tests {
         let draft = "第一行\n/mo\n第二行";
         let cursor = "第一行\n/mo".len();
         let mut completion = Completion::default();
-        completion.update_at(draft, cursor);
+        completion.update_at(draft, cursor, CommandScope::Root);
         completion.handle_key(CompletionKey::Next);
         completion.handle_key(CompletionKey::Next);
 
@@ -774,7 +892,7 @@ mod tests {
         completion.update("prefix/mo");
         assert!(!completion.is_open());
 
-        completion.update_at("中/mo", 1);
+        completion.update_at("中/mo", 1, CommandScope::Root);
         assert!(!completion.is_open());
     }
 

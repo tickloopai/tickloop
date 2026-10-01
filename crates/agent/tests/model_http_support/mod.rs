@@ -46,6 +46,39 @@ pub async fn serve_responses(
     (format!("http://{address}/anthropic"), receiver)
 }
 
+pub async fn serve_responses_with_gated_response(
+    responses: Vec<(u16, String)>,
+    gated_response_index: usize,
+) -> (
+    String,
+    mpsc::UnboundedReceiver<(String, Value)>,
+    oneshot::Sender<()>,
+) {
+    assert!(gated_response_index < responses.len());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (sender, receiver) = mpsc::unbounded_channel();
+    let (release, gate) = oneshot::channel();
+    tokio::spawn(async move {
+        let mut gate = Some(gate);
+        for (index, (status, body)) in responses.into_iter().enumerate() {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _ = sender.send(read_request(&mut socket).await);
+            if index == gated_response_index {
+                let gate = gate.take().unwrap();
+                tokio::spawn(async move {
+                    if gate.await.is_ok() {
+                        write_response(&mut socket, status, "", &body).await;
+                    }
+                });
+            } else {
+                write_response(&mut socket, status, "", &body).await;
+            }
+        }
+    });
+    (format!("http://{address}/anthropic"), receiver, release)
+}
+
 fn header_lines(headers: &[(&str, &str)]) -> String {
     headers
         .iter()

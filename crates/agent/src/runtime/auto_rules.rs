@@ -99,7 +99,7 @@ pub struct AutoRuleSettings {
     pub environment_replacement: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum AutoRuleChange {
     Add {
         kind: AutoRuleKind,

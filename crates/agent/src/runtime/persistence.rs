@@ -31,10 +31,11 @@ use crate::private_fs::unix_time_milliseconds;
 use crate::transcript::{
     BranchOriginEntry, COMPACT_BOUNDARY_SUBTYPE, CachedMetadata, ChainEntry, CompactMetadata,
     CompactTriggerEntry, ContentReplacementEntry, ContentReplacementRecord, CustomTitleEntry,
-    FLUSH_INTERVAL, FileHistorySnapshotEntry, ForkedFrom, LOOP_CREATED_SUBTYPE, LOOP_ENDED_SUBTYPE,
-    LOOP_STATE_SUBTYPE, LOOP_TRIGGER_SUBTYPE, LastPromptEntry, Line, LoadedTranscript, LoopRecord,
-    PartialCompactDirection, SummarizeMetadataEntry, TranscriptWriter, format_timestamp,
-    list_project, load, locate, project_directory, transcript_path,
+    DelegationEntry, FLUSH_INTERVAL, FileHistorySnapshotEntry, ForkedFrom, LOOP_CREATED_SUBTYPE,
+    LOOP_ENDED_SUBTYPE, LOOP_STATE_SUBTYPE, LOOP_TRIGGER_SUBTYPE, LastPromptEntry, Line,
+    LoadedTranscript, LoopRecord, PartialCompactDirection, SummarizeMetadataEntry,
+    TranscriptWriter, format_timestamp, list_project, load, locate, project_directory,
+    transcript_path,
 };
 
 /// 照 Claude Code：恢复时末尾是工具结果，追加这条 meta user 消息表示从中断处继续。
@@ -45,7 +46,7 @@ const NO_RESPONSE_REQUESTED: &str = "No response requested.";
 const UNTITLED_BRANCH_NAME: &str = "Branch";
 
 /// 一个 Transcript 在项目目录中的摘要，供 Chat 选择器使用。
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct SavedChat {
     pub id: ChatId,
     pub title: Option<String>,
@@ -967,6 +968,7 @@ fn loop_entry_content(snapshot: &ChatSnapshot, goal: &LoopSnapshot) -> LoopEntry
             trigger_awaits_resume: snapshot.resume_triggers.contains(&goal.id),
             plan_version: None,
             progress: None,
+            state_since: goal.state_since.map(serde_json::Value::from),
         },
         goal.run_id,
     )
@@ -1451,6 +1453,12 @@ fn recover_transcript(
         .unwrap_or_default();
     let mut snapshot = super::empty_snapshot(chat_id, workdir, super::unselected_model());
     snapshot.branch_origin = restored_branch_origin(loaded, source_chat_id);
+    snapshot.delegation = loaded
+        .metadata
+        .delegation
+        .as_ref()
+        .filter(|entry| entry.chat_id == source_chat_id)
+        .map(|entry| entry.delegation.clone());
     kept.fill_conversation(&mut snapshot);
     recover_snapshot_for_resume(snapshot, kept.meta_messages.clone())
 }
@@ -1540,6 +1548,10 @@ impl RestoredChain {
                 state,
                 run_id: *run_id,
                 trigger,
+                state_since: record
+                    .state_since
+                    .as_ref()
+                    .and_then(serde_json::Value::as_u64),
             };
             match snapshot
                 .loops
@@ -1687,6 +1699,25 @@ fn file_history_snapshots(loaded: &LoadedTranscript) -> Vec<FileHistorySnapshot>
 }
 
 impl Agent {
+    pub(super) fn record_delegation(
+        &self,
+        child_id: ChatId,
+        delegation: super::DelegationMetadata,
+    ) {
+        if let Some(recorder) = &self.inner.recorder {
+            let logs = recorder.logs.lock().unwrap();
+            if let Some(log) = logs.get(&child_id) {
+                recorder.writer.enqueue(
+                    &log.path,
+                    vec![Line::Delegation(DelegationEntry {
+                        chat_id: child_id,
+                        delegation,
+                    })],
+                );
+            }
+        }
+    }
+
     /// 持久化入口：只把 Chat 标脏，由后台冲刷任务写入 Transcript。
     pub(super) fn save(&self, snapshot: &ChatSnapshot) {
         if let Some(recorder) = &self.inner.recorder {
@@ -1943,8 +1974,9 @@ impl Agent {
         if let Some(chat) = self.inner.chats.lock().await.get(&chat_id) {
             return Ok(chat.snapshot.clone());
         }
+        let retention = self.retain_chat(chat_id)?;
         let (path, loaded) = self.load_saved_transcript(chat_id).await?;
-        self.insert_restored_chat(chat_id, loaded, RestoreTarget::Resume(path))
+        self.insert_restored_chat(chat_id, loaded, RestoreTarget::Resume(path), retention)
             .await
     }
 
@@ -1958,8 +1990,12 @@ impl Agent {
             return Err(AgentError::NotFound);
         };
         let _resume = recorder.resume_lock.lock().await;
+        let _source_retention = self.retain_chat(source_chat_id)?;
         self.flush_transcripts().await;
         let (_, loaded) = self.load_saved_transcript(source_chat_id).await?;
+        if loaded.metadata.delegation.is_some() {
+            return Err(AgentError::Invalid("Unsupported: a delegated Transcript cannot be copied into an unrestricted new Agent".into()));
+        }
         let new_chat_id = loop {
             let candidate = Uuid::new_v4();
             if !self.inner.chats.lock().await.contains_key(&candidate) {
@@ -1972,6 +2008,7 @@ impl Agent {
             RestoreTarget::NewChat {
                 source: source_chat_id,
             },
+            self.retain_chat(new_chat_id)?,
         )
         .await
     }
@@ -1999,6 +2036,7 @@ impl Agent {
         chat_id: ChatId,
         loaded: LoadedTranscript,
         target: RestoreTarget,
+        retention: Option<Arc<crate::transcript::retention::RetentionGuard>>,
     ) -> Result<ChatSnapshot, AgentError> {
         let recorder = self.inner.recorder.as_ref().ok_or(AgentError::NotFound)?;
         // 替换决定、文件回滚备份与元数据都属于写入这份 Transcript 的 Chat：恢复时是自己，以新 chatId 恢复时是源 Chat。
@@ -2034,6 +2072,11 @@ impl Agent {
         // 与设置写入互斥到 Chat 加入本进程为止，期间写入的持久规则改动不会漏掉这个 Chat。
         let _settings_gate = self.inner.settings_writes.lock().await;
         let (client, output_style) = self.apply_chat_defaults(&mut snapshot);
+        if let Some(delegation) = &snapshot.delegation {
+            snapshot.workdir = delegation.ceiling.workdir.clone();
+            snapshot.additional_directories = delegation.ceiling.additional_directories.clone();
+            snapshot.policy = delegation.ceiling.policy.clone();
+        }
         let mut file_history = FileHistory::restore(
             self.file_history_directory(source_chat_id, &snapshot.workdir),
             file_history_snapshots(&loaded),
@@ -2095,6 +2138,7 @@ impl Agent {
             chat_id,
             Chat {
                 snapshot: snapshot.clone(),
+                retention,
                 active: None,
                 active_run: None,
                 parked: HashMap::new(),
@@ -2117,8 +2161,39 @@ impl Agent {
                 denial_window,
             },
         );
+        if let Some(context) = snapshot
+            .delegation
+            .as_ref()
+            .and_then(|delegation| delegation.ceiling.host_context.clone())
+        {
+            self.set_host_work_context(chat_id, context).await?;
+        }
         self.save(&snapshot);
         Ok(snapshot)
+    }
+
+    pub(super) fn retain_chat(
+        &self,
+        chat_id: ChatId,
+    ) -> Result<Option<Arc<crate::transcript::retention::RetentionGuard>>, AgentError> {
+        self.inner
+            .recorder
+            .as_ref()
+            .map(|recorder| recorder.root.as_path())
+            .or_else(|| {
+                self.inner
+                    .settings
+                    .as_ref()
+                    .and_then(crate::settings::UserSettings::root)
+            })
+            .map(|root| {
+                crate::transcript::retention::RetentionGuard::shared(root, chat_id)
+                    .map(Arc::new)
+                    .map_err(|error| {
+                        AgentError::Storage(format!("cannot retain live Chat {chat_id}: {error}"))
+                    })
+            })
+            .transpose()
     }
 }
 

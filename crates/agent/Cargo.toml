@@ -35,6 +35,7 @@ time = { version = "0.3", features = ["formatting"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 tokio-tungstenite = { version = "0.27", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 tokio-util = "0.7"
+tempfile = "3"
 uuid = { version = "1", features = ["v4", "serde"] }
 
 regex = "1"
@@ -50,4 +51,3 @@ shell-words = "1"
 
 [dev-dependencies]
 portable-pty = "0.9"
-tempfile = "3"

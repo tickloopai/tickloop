@@ -4,7 +4,7 @@
 
 运行环境和接入状态会提供给模型；Herdr 接入可用时，首个对话请求前自动加载内置 `tickloop` Skill。Tick 的内容和工具由实例动态声明，查看股价或 K 线默认优先通过 Tick 展示。tmux、Zellij 当前提示尚未接入，独立运行不提供跨 Tick 能力。
 
-通用 Agent 的 Rust library 与完整交互式终端。Agent 在原生 Herdr 内通过 HostToolProvider 与 Tick Subscription 接入运行中的 Tick，由 Herdr 持有布局与终端生命周期。
+通用 Agent 的 Rust library 与完整交互式终端。默认 CLI 是本机 daemon 的 View；每次独立根任务由受监督 worker 持有 runtime。多个 View 可连接同一执行，各自草稿独立。Herdr 持有布局与终端生命周期；HostToolProvider 与 Tick Subscription 使用 Agent 工作上下文，界面离开后执行继续。
 
 从仓库根目录启动：
 
@@ -16,7 +16,14 @@ cargo run -p tickloop-agent
 
 省略 `--cwd` 时使用当前目录。需要指定工作目录时，传入一个已经存在的实际目录，例如 `--cwd "$PWD"`；程序不会创建工作目录。
 
-照 Claude Code，不带参数启动直接进入新 Chat。`-c`／`--continue` 继续本目录最近活动的 Chat；`-r`／`--resume CHAT` 按 id 恢复，省略 id 时打开 Chat 选择器；`--fork-session` 只能与 `-c` 或 `-r` 一起使用，把恢复的对话复制成新 Chat 并写入新的 Transcript，原记录不变。自动化可用 `--chat-id CHAT` 打开或创建一个固定身份，不与上述恢复参数或 `--no-session-persistence` 组合。`--no-session-persistence` 让本次运行不保存 Chat，也不在工作目录留下文件；`settings.json` 中 `cleanupPeriodDays` 为 0 时同样不保存 Chat（见下文“过期文件清理”）。一个进程同一时间只有一个前台 Chat。
+不带参数启动进入空白新 Agent 输入，首次发送才创建执行；空输入按 Left 进入本机全部 Agent 总览。总览输入创建新 Agent，提交后留在总览，默认目录取本次 CLI 启动 cwd；项目／Workspace 筛选不改变派发目录，`/cwd PATH` 可显式替代。总览按状态区分待审批与待回答，根行下展开真实 child；`r` 打开历史选择器。`-c`／`--continue` 继续本目录最近活动的 Chat；`-r`／`--resume CHAT` 按 id 恢复，省略 id 时打开 Chat 选择器；`--fork-session` 只能与 `-c` 或 `-r` 一起使用，把恢复的对话复制成新 Chat 并写入新的 Transcript，原记录不变。自动化可用 `--chat-id CHAT` 打开或创建一个固定身份，不与上述恢复参数或 `--no-session-persistence` 组合。`--no-session-persistence` 让本次运行不保存 Chat，也不在工作目录留下文件；`settings.json` 中 `cleanupPeriodDays` 为 0 时同样不保存 Chat（见下文“过期文件清理”）。一个 View 同一时间显示一个 Agent；已接受任务不因切换或关闭该 View 停止。
+
+
+总览与输入下方 Agents 树都来自真实执行目录。进入当前 Agent 的后代始终原位；其他 Agent 若在同一 Herdr 实例有活 View，优先经核实的 Pane 导航，多位置无法确定首选时选择。否则缓存当前界面后原位连接。进入 child 后，家族仍显示 root／parent 关系，后续文字作用于可见 child；审批／问题附近面板标实际 requester。`DelegateAgent` 创建真实独立 Chat／Loop，后续输入保持冻结授权上限；嵌套委派、团队调度、child 历史改写及 Agent／家族 stop 暂不提供，拒绝不会转发给 parent。
+
+owner 自动启动使用当前登录用户私有 Unix socket，启动锁协调并发 CLI，不安装 launchd 服务。关闭终端／Pane、`/exit` 或 View EOF 只撤界面；owner／worker 退出后旧 execution 失效。`/resume` 打开历史不执行，明确向原 Loop Continue 才恢复其原有效 Trigger；没有自动崩溃续跑或跨崩溃 exactly-once 承诺。确认丢失先查询原 CommandId，创建仍未知时保留输入并阻止盲目重复创建；检查总览与历史后，可按提示 `/acknowledge-create COMMAND_ID` 显式承认未知，以允许另一条新提交，此动作不重放旧命令。New Agent 的暂存选择逐条以回执证明后才提交首个输入，未知或被拒的选择不会重发，也不会让输入落到配置不全的 Agent；同一命令可取消其余选择。普通输入结果未知时原样恢复到输入区，在不改动的情况下再次 Enter 只读取原收据：已被接受就采纳原结果、不再发送；改动后的输入等原结果确定后作为新输入发送；`/acknowledge-input COMMAND_ID` 只停止跟踪、不重发。
+
+输入区自然增长并独立滚动，正文使用底部真实占位后的空间。下方展开 Tasks／Todo／Agents 会缩小正文；帮助按宽度使用一至三列，并临时替换 status 和任务区。条件顶栏只摘要当前正在阅读且 user 消息已滚出视口的回合。`settings.json` 的可选 `statusLines` 是字符串数组，未配置使用默认状态行，空数组隐藏普通状态行，最多显示三条物理行；必要连接／未知提示仍占一行，帮助或请求界面临时隐藏普通 status。预算、焦点与可交互原型见[布局契约](../../.scratch/agent-layout-redesign/layout-contract.md)，真实运行与未测边界见[实施记录](../../.scratch/agent-layout-redesign/implementation.md)。
 
 使用默认 API Key 模式时，可以先启动 Agent，在 `/provider` 中选择连接；没有凭据时会自动要求输入并保存 Key。输入内容以星号遮蔽，不进入对话或输入历史。Key 保存到 Agent 状态目录的 `.env`（文件权限 `0600`），保存后立即生效，重启继续可用。也支持启动前设置 `DEEPSEEK_API_KEY` 等环境变量；同名变量以已保存的 `.env` 值优先。模型 YAML 只保存变量名称，不保存凭据值。未保存模型选择时，默认模型为 DeepSeek 的 `deepseek-flash`，使用 OpenAI Chat Completions。已有模型配置继续按保存的协议读取。
 
@@ -179,17 +186,17 @@ Rewind 同时提供 `Summarize from here` 和 `Summarize up to here`，照 Claud
 
 `/diff` 打开本地变更总览。`Current` 实时显示 Git working tree，逐轮 `Agent` source 只显示本进程运行期间已经成功执行并保存的文件操作，重启后不再列出；Left／Right 切换 source，`j/k` 或 Up／Down 选择文件，Enter 打开详情，Esc 或 Left 返回。该视图不调用模型、不修改文件，也不执行 Git 写操作；review artifact 缺失或损坏只影响对应条目。
 
-文本输入只有一种普通编辑模式（照 Claude Code 普通模式，不提供 Vim 模式，见 [ADR 0010](../../docs/adr/0010-no-vim-mode-in-text-input.md)），底栏不显示编辑模式标签。普通编辑采用 Readline emacs 风格：`Ctrl+A/E` 行首尾，`Ctrl+B/F` 按字符移动，`Alt+B/F`、`Ctrl／Alt+←/→` 按词移动，`Ctrl+P/N` 视觉行上下，`Ctrl+H`／Backspace 与 `Ctrl+D`／Delete 删除字符，`Ctrl+K/U/W`、`Alt+D`、`Alt／Ctrl+Backspace`、`Alt+Delete` 删除并进入 kill ring，`Ctrl+Y` yank、`Alt+Y` 轮换，`Ctrl+_`（含终端把 0x1F 报成的 `Ctrl+7`）或 `Ctrl+Shift+-` 撤销，`Ctrl+S` 暂存草稿；照 Claude Code `useInputBuffer`，1 秒内连续输入合并为一次撤销，粘贴与其他编辑各自成组，撤销记录最多保留 50 条；`Ctrl+J`、`Ctrl+S`、`Ctrl+O` 沿用 Claude Code 含义而非 Readline；到达输入边界后才浏览历史，Down 恢复未提交草稿。
+文本输入只有一种普通编辑模式（照 Claude Code 普通模式，不提供 Vim 模式，见 [ADR 0010](../../docs/adr/0010-no-vim-mode-in-text-input.md)），底栏不显示编辑模式标签。普通编辑采用 Readline emacs 风格：`Ctrl+A/E` 行首尾，`Ctrl+B/F` 按字符移动，`Alt+B/F`、`Ctrl／Alt+←/→` 按词移动，`Ctrl+P/N` 视觉行上下，`Ctrl+H`／Backspace 与 `Ctrl+D`／Delete 删除字符，`Ctrl+K/U/W`、`Alt+D`、`Alt／Ctrl+Backspace`、`Alt+Delete` 删除并进入 kill ring，`Ctrl+Y` yank、`Alt+Y` 轮换，`Ctrl+_`（含终端把 0x1F 报成的 `Ctrl+7`）或 `Ctrl+Shift+-` 撤销，`Ctrl+S` 暂存完整未发送输入，空输入时再次按下恢复文字、光标、图片、折叠粘贴、文件提及与 Shell 输入模式；暂存属于当前 View 的逐 Agent 缓存，退出界面后不保留；照 Claude Code `useInputBuffer`，1 秒内连续输入合并为一次撤销，粘贴与其他编辑各自成组，撤销记录最多保留 50 条；`Ctrl+J`、`Ctrl+S`、`Ctrl+O` 沿用 Claude Code 含义而非 Readline；到达输入边界后才浏览历史，Down 恢复未提交草稿。
 
 输入区显示真实多行并向上扩展，保留中文、制表符和换行；长行按终端列宽折行，resize 后围绕同一光标位置重排。Ctrl+J 或终端能识别的 Alt／Shift+Enter 插入换行。输入 `/` 或命令前缀会在输入区上方显示实际命令候选；输入 `@` 与部分路径会异步显示当前工作目录及附加目录中的文件／目录。Tab 填入首项，方向键或 `Ctrl+N/P` 选择后 Enter 只填入，未选择时 Enter 仍提交草稿。只有经候选接受并在提交时再次验证的 `@` 路径会作为独立、不受信任的模型上下文读取；普通 `@text` 仍是普通文字。聚焦的候选和菜单支持 `j/k` 与 `Ctrl+N/P`。异步菜单保留草稿并阻止补全按键泄漏；Tab 在输入区与菜单间切换。Ctrl+C 优先清空草稿或中断当前运行；空输入时 Ctrl+C／Ctrl+D 需要在 800ms 内再次按下才退出，非空输入的 Ctrl+D 只向前删除字符。输入框中的 Esc 先关闭候选或弹层，其后按中断、清空草稿或 Rewind 逐层处理；菜单中的 Esc 只取消或拒绝当前菜单。
 
 `Ctrl+R` 打开独立历史搜索。`Ctrl+S` 在当前 session、当前项目和全部项目间切换范围，方向键或 `Ctrl+N/P` 选择，Enter／Tab 只把结果放回输入框，Esc 恢复原草稿和光标。历史保存在状态根目录的 `history.jsonl`（默认 `~/.tickloop`，可用 `TICKLOOP_CONFIG_DIR` 指定）；若持久目录不可写则退回当前进程内存，不影响 Agent 启动。
 
-空输入开头键入或粘贴 `!` 会进入 Shell mode，命令由当前 TTY 用户直接执行，不经过模型或 Agent 工具授权。Tab 补全当前项目的 Shell history 和路径；空 Shell 输入用 Esc／Backspace／Ctrl+U 返回普通 Prompt。前台命令运行时 Ctrl+B 或 Ctrl+X Ctrl+B 转后台、Ctrl+C 停止，`/tasks` 可继续查看输出或控制同一进程。普通 prompt、pipe 和菜单回填中的 `!` 不会进入直接执行入口。照 Claude Code，命令执行期间不向 Chat 写消息；前台结束、转入后台或启动失败时，`<bash-input>` user 消息与结果一起加入 Chat：结束时以 `<bash-stdout>`／`<bash-stderr>` user 消息记录有界输出（失败时输出与退出码记入 stderr，被 Ctrl+C 停止时改记中断标记，启动失败记 `Command failed`），转入后台时记录后台提示，后台结束后改由任务通知说明结果。命令运行期间到达的任务通知排在这组消息之后。这些消息随 Chat 保存，对话中按 `! 命令` 与 `⎿` 输出块显示；照 Claude Code，后台命令结束时任务通知会继续启动它的 Loop，模型据此决定是否读取输出；Chat 正忙时排在当前一轮之后，多个任务同时结束只继续一轮。新 Chat 不会为 Shell 结果隐式创建 Loop，没有归属 Loop 的 `!` 命令只写通知消息，继续输入问题后模型才能解释结果。
+空输入开头键入或粘贴 `!` 会进入 Shell mode，根 Agent 的命令由创建它的用户环境执行，不经过模型工具审批；child 的直接 Shell 仍受冻结的委派范围限制，无法证明范围的操作明确拒绝。Tab 补全当前项目的 Shell history 和路径；空 Shell 输入用 Esc／Backspace／Ctrl+U 返回普通 Prompt。前台命令运行时 Ctrl+B 或 Ctrl+X Ctrl+B 转后台、Ctrl+C 停止，`/tasks` 可继续查看输出或控制同一进程。普通 prompt、pipe 和菜单回填中的 `!` 不会进入直接执行入口。照 Claude Code，命令执行期间不向 Chat 写消息；前台结束、转入后台或启动失败时，`<bash-input>` user 消息与结果一起加入 Chat：结束时以 `<bash-stdout>`／`<bash-stderr>` user 消息记录有界输出（失败时输出与退出码记入 stderr，被 Ctrl+C 停止时改记中断标记，启动失败记 `Command failed`），转入后台时记录后台提示，后台结束后改由任务通知说明结果。命令运行期间到达的任务通知排在这组消息之后。这些消息随 Chat 保存，对话中按 `! 命令` 与 `⎿` 输出块显示；照 Claude Code，后台命令结束时任务通知会继续启动它的 Loop，模型据此决定是否读取输出；Chat 正忙时排在当前一轮之后，多个任务同时结束只继续一轮。新 Chat 不会为 Shell 结果隐式创建 Loop，没有归属 Loop 的 `!` 命令只写通知消息，继续输入问题后模型才能解释结果。
 
-`/tasks` 打开同一个 Shell 任务界面，模型响应期间也可立即进入；存在运行中的后台任务时，Shift+↑／Shift+↓ 也可直接打开。列表和详情贴在屏幕底部，最多占半屏，保留上方的 Chat 内容。单任务直接打开详情，多任务先显示列表；`j/k`、方向键或 Ctrl+N/P 选择，Enter 查看，`b` 转后台，`x` 停止可控任务。详情支持逐行、翻页与 Home/End；向上浏览时保持位置并累计未读输出，End 恢复尾随。Left 返回列表，Esc／Enter／Space 关闭详情，Ctrl+O 查看完整记录。后台输出留在任务详情中；后台 Shell（User 或 Agent）结束后，所属 Chat 收到一条 `<task-notification>` user 消息，包含任务 id、Agent 任务的 tool-use id、输出文件、状态（completed／failed／killed）和摘要，对话中显示为 `● 摘要`，下一次模型请求会带上它。Shell 任务状态与按操作查看的输出只在本进程内可用，重启后不再保留。
+`/tasks` 打开同一个 Shell 任务界面，模型响应期间也可立即进入；存在运行中的后台任务时，Shift+↑／Shift+↓ 也可直接打开。列表和详情贴在屏幕底部，最多占半屏，保留上方的 Chat 内容。单任务直接打开详情，多任务先显示列表；`j/k`、方向键或 Ctrl+N/P 选择，Enter 查看，`b` 转后台，`x` 停止可控任务。详情支持逐行、翻页与 Home/End；向上浏览时保持位置并累计未读输出，End 恢复尾随。Left 返回列表，Esc／Enter／Space 关闭详情，Ctrl+O 查看完整记录。后台输出留在任务详情中；后台 Shell（User 或 Agent）结束后，所属 Chat 收到一条 `<task-notification>` user 消息，包含任务 id、Agent 任务的 tool-use id、输出文件、状态（completed／failed／killed）和摘要，对话中显示为 `● 摘要`，下一次模型请求会带上它。Shell 任务状态与输出读取依赖所属执行 worker，View 退出不丢失；worker 退出后历史不重建活任务。
 
-底部导航仅显示有内容的 Tasks／Todo 标签，默认收起列表。输入光标位于最后视觉行且历史已到底时，Down 聚焦第一个可见项；Enter 或 Space 展开，Space 再次收起，点击标签也能切换展开状态。`h/l` 或左右键切换标签；展开后 `j/k` 或 Ctrl+N/P 在 Tasks 中选任务、在 Todo 中滚动，Enter 打开所选任务的详情，`x` 停止所选任务，Esc 收起并返回输入。可打印字符回到输入框并继续作为文字输入。关闭详情后恢复草稿、光标和 Chat 浏览位置；再次打开保留同一 Chat 的任务浏览状态。差异视图通过独立 `/diff` 命令打开；候选、弹层和阅读界面继续独占各自按键。
+底部仅显示有数据的 Tasks／Todo／Agents 标签，分别表示 Shell 任务、当前 Loop 清单与同根 Agent 家族。列表默认收起；输入光标在最后视觉行且历史已到底时，首次 Down 选中并原位展开标签，再次 Down 进入列表；Enter 进入首项，Space 收起，Esc 返回输入。`h/l` 或左右键切换标签；展开后 `j/k` 或 Ctrl+N/P 在 Tasks 中选任务、在 Todo 中滚动，Enter 打开所选任务的详情，`x` 停止所选任务，Esc 收起并返回输入。可打印字符回到输入框并继续作为文字输入。关闭详情后恢复草稿、光标和 Chat 浏览位置；再次打开保留同一 Chat 的任务浏览状态。差异视图通过独立 `/diff` 命令打开；候选、弹层和阅读界面继续独占各自按键。
 
 超过 800 字符或超过 3 行的 bracketed paste 在输入区折叠为一个块，左右移动和删除把它视为一个单元，提交仍使用完整原文。输入框可编辑时 Ctrl+G 随时使用 VISUAL／EDITOR 打开外部编辑器（可以是 Vim）；返回后用编辑结果更新草稿，并恢复底部输入、raw mode 和 bracketed paste。从输入历史取回（包括重启后）的粘贴恢复为完整原文，超过 1024 字符的原文保存在状态根目录的 `paste-cache/`；取回时不恢复折叠块。Ctrl+V 把剪贴板图片附加为 `[Image #N]`，与折叠粘贴共用编号并同样整块移动和删除，删除占位符即移除图片；发送时图片按占位符顺序随消息提交，输入历史只保留占位符文字。当前模型未在 `input_modalities` 中声明 `image` 时不附加并提示；通过 SSH 运行时读取的是远程主机的剪贴板，可改用 `@路径`。把 png、jpg、jpeg、gif 或 webp 文件拖入终端或粘贴其路径（支持引号、shell 转义、`file://`、`~/`，相对路径按 Chat 工作目录解析）时同样附加为 `[Image #N]`，混合粘贴中的其余文字保持原样；路径不存在或不是图片时按文字粘贴。macOS 上剪贴板是图片时 Cmd+V 产生的空粘贴会读取剪贴板图片。
 
@@ -202,8 +209,8 @@ Model Card 与单模型配置的 `input_modalities` 声明模型接受的输入�
 | 分类 | 命令 | 行为 |
 | --- | --- | --- |
 | 公开 | `/loops new` | 下一条输入建立新的目标，保留当前 Chat 历史 |
-| 公开 | `/clear` | 开始新 Chat；照 Claude Code 停止原 Chat 中未转入后台的 Shell 任务，原 Chat 的目标继续在本进程运行 |
-| 公开 | `/branch [NAME]` | 从当前 Chat 末尾创建并切换到独立 child；标题照 Claude Code 为 "NAME (Branch)"（未指定名称时用首条提示），重名时为 "(Branch 2)" 等；`/fork` 不是别名 |
+| 公开 | `/clear` | 开始新 Chat；照 Claude Code 停止原 Chat 中未转入后台的 Shell 任务，原 Chat 的目标继续在 daemon 运行；新输入首次发送才创建独立根 Agent，child 暂不支持此命令 |
+| 公开 | `/branch [NAME]` | 从当前 Chat 末尾创建并切换到独立根 Chat（不是委派 child）；标题照 Claude Code 为 "NAME (Branch)"（未指定名称时用首条提示），重名时为 "(Branch 2)" 等；`/fork` 不是别名 |
 | 公开 | `/resume` | 打开 Chat 选择器：按最近活动列出本项目已保存的 Chat，显示标题或首条提示、相对时间、git 分支与 Branch 来源；打开历史不会自动执行 |
 | 公开 | `/resume CHAT` | 按 id 切换前台 Chat；再次输入消息才开始运行 |
 | 公开 | `/loops [GOAL_ID]` | 无参数打开 Loops；详情显示 Trigger 与定时设置，选择 Use this goal 后用于后续输入；给 ID 直接选择 |
@@ -225,17 +232,19 @@ Model Card 与单模型配置的 `input_modalities` 声明模型接受的输入�
 | 高级 | `/interrupt` | 打断当前运行，之后可以补充输入继续目标 |
 | 公开 | `/stop [GOAL]` | 停止指定目标及其后续输入；列出仍未确认完成的操作 |
 | 公开 | `/plan` | 独立进入只读规划；有当前计划时继续审阅或批准并开始执行；`/plan GOAL` 查看指定计划 |
-| 公开 | `/tasks` | 打开本进程内全部 Chat 的 User／Agent Shell 任务列表与实时输出详情，其他 Chat 的任务标注所属 Chat，按来源转后台或停止；无法确认结束时显示 Unknown，重启后不保留 |
+| 公开 | `/tasks` | 打开本机执行目录中活 Agent 的 User／Agent Shell 任务列表与实时输出详情，其他 Chat 的任务标注所属 Chat，按来源转后台或停止；无法确认结束时显示 Unknown，重启后不保留 |
 | 高级 | `/command-output OPERATION [OFFSET] [LIMIT]` | 有限读取本进程内的命令输出，并显示完整输出引用；重启后不可用 |
 | 高级 | `/search-config FILE`、`/search-config off` | 配置或关闭搜索服务；文件包含 `endpoint` 和可选 `api_key_env` |
 | 高级 | `/events PROMPT`、`/trigger SOURCE [JSON]` | 为所选目标开启显式事件，或递交带来源与数据的事件 |
 | 公开 | `/loops schedule GOAL_ID SECONDS [--for DURATION_SECONDS] PROMPT` | 设置本机定时执行，可选到期时长 |
 | 公开 | `/loops trigger [GOAL_ID]` | 查看指定或所选目标的 Trigger，不改变选择 |
 | 高级 | `/clear-trigger` | 关闭所选目标的整个 Trigger，包含定时、事件与订阅 |
+| 高级 | `/acknowledge-input COMMAND_ID` | 停止等待结果未知的输入，不重发；之后可以发送新输入 |
+| 高级 | `/acknowledge-create COMMAND_ID` | 停止跟踪未知或失败的创建（交回草稿），或取消首个输入前未确认的其余选择；不重放任何命令 |
 | 公开 | `/compact [INSTRUCTIONS]` | 主动压缩；补充说明只用于本次摘要请求。自动压缩使用当前模型的已知上下文窗口 |
 | 高级 | `/operations` | 查看本进程内记录的工具操作及结果；重启后不保留 |
 | 公开 | `/help` | 显示入口与命令说明 |
-| 公开 | `/exit` | 取消进行中的工作并退出 Agent 进程 |
+| 公开 | `/exit` | 关闭当前 View；Agent 与已接受任务继续 |
 | 公开 | `/subscriptions` | 查看当前 Chat 的 Tick Subscription，调整 cadence 或取消 |
 | 高级 | `/tui [inline\|fullscreen]` | 查看或切换终端渲染器 |
 | 高级 | `/status` | 查看当前 Chat、模型、执行模式与队列 |
@@ -249,9 +258,9 @@ Loops 的 Configure timer 把当前配置填入主输入框，使用同一套普
 
 交互菜单仅在 stdin 和 stdout 都是终端时启用。管道输入保持按行命令和详细事件输出，不输出终端控制码；模型／设置选择可以输入菜单编号或 `cancel`。原有 `/model CONFIG_FILE`、`/allow REQUEST`、`/loops UUID`、`/background OPERATION`、`/stop-command OPERATION`、`/approve-plan GOAL VERSION MODE` 等显式参数形式继续可用，适合脚本及高级操作。高级 `/approve-plan` 仅批准版本，再次输入才开始；菜单“批准并开始”明确执行这两步。
 
-管道输入的 EOF 会等待已提交的输入按序完成；模型失败时以非零状态退出。显式 `/exit` 会立即取消当前工作。
+管道输入的 EOF 会等待已提交的输入按序完成；模型失败时以非零状态退出。显式 `/exit` 立即离开 View，已接受工作继续。
 
-运行中的补充输入立即由 Agent 受理，并在可以构造完整模型请求时按序执行。等待权限时不会自动批准；若输入流已关闭，则提示无法回答权限请求并结束此次宿主。
+运行中的补充输入立即由 Agent 受理，并在可以构造完整模型请求时按序执行。等待权限时不会自动批准；若输入流已关闭，则提示当前 View 无法回答并离开；daemon 保留真实等待请求，其他 View 可以处理。
 
 交互权限菜单的 `Allow once` 和 `Deny` 支持按 `Tab` 编辑附言，再按 `Tab` 收起并保留文字，或按 `Enter` 连同选择提交。批准附言在工具结果之后交给模型；带附言拒绝把理由交给模型并继续当前轮；无附言拒绝或停止当前轮正在等待的前台命令等同中断，结束当前轮。照 Claude Code，工具执行失败以及被规则、Plan 模式或自动审查拒绝时，错误作为工具结果交给模型，当前轮继续。会话和持久授权选项不接受附言，附言不会扩大授权范围。
 
@@ -269,9 +278,9 @@ Jev 非敏感服务配置仍可写在用户 `settings.json` 的 `jev`，例如 `
 
 首次进入未知的规范化工作目录时，交互终端会在加载项目内容或创建 Chat 前要求信任；拒绝不会发起模型或工具请求。信任保存在用户本地 `settings.json`，等价符号链接共享同一目录身份。非交互启动默认拒绝未知目录；外部宿主已经独立建立信任时才使用 `--working-directory-is-trusted` 明确声明该前提。
 
-搜索配置示例为 `examples/mwmbl-search-config.json`，指向公开的 Mwmbl 搜索接口。设置服务地址不等于授予联网权限；工具执行前仍按当前规则检查。定时任务、后台进程与切走的 Chat 中的执行都依赖当前宿主存活，退出宿主后停止。
+搜索配置示例为 `examples/mwmbl-search-config.json`，指向公开的 Mwmbl 搜索接口。设置服务地址不等于授予联网权限；工具执行前仍按当前规则检查。定时任务、后台进程与切走的 Chat 依赖本机 daemon／worker 存活。退出 View 不停止执行；所有者或机器退出后的恢复需要显式装载与 Continue。
 
-每个 Chat 的对话照 Claude Code 写成只追加的 Transcript：`<root>/projects/<项目目录名>/<chatId>.jsonl`，状态根目录默认为 `~/.tickloop`，可用 `TICKLOOP_CONFIG_DIR` 指定，`--no-session-persistence` 关闭持久保存。项目目录名由工作目录的 canonical 路径生成，文件在第一条消息写入时创建，之后 `/cwd` 改变工作目录也不移动文件。条目每 100ms 批量追加，不加锁；进程被强制结束时最多丢失最后一批。同一目录可以同时运行多个 `tickloop`；两个进程继续同一个 Chat 时 Transcript 会分叉，下次恢复进入最近活动的一支，另一支仍留在文件中。
+每个 Chat 的对话照 Claude Code 写成只追加的 Transcript：`<root>/projects/<项目目录名>/<chatId>.jsonl`，状态根目录默认为 `~/.tickloop`，可用 `TICKLOOP_CONFIG_DIR` 指定，`--no-session-persistence` 关闭持久保存。项目目录名由工作目录的 canonical 路径生成，文件在第一条消息写入时创建，之后 `/cwd` 改变工作目录也不移动文件。条目每 100ms 批量追加，不加锁；进程被强制结束时最多丢失最后一批。同一目录可以同时运行多个 `tickloop` View；同一 owner 仲裁同 store＋Chat 的装载并返回同一个活执行。独立 Embedded 容器继续保留原文件分叉约定，最近活动链用于恢复；这不是全局 Transcript 写锁。
 
 压缩照 Claude Code 写成压缩边界：`/compact` 与自动压缩在对话末尾追加一个 `compact_boundary` system 条目（父指针为空，逻辑父指针指向压缩前最后一条）和一条压缩摘要 user 消息，之后的消息接在摘要后面；模型只看到最后一个边界之后的消息。本进程内边界之前的消息仍在 Ctrl+O 的完整记录中，rewind 到边界之前的提示时边界随之丢弃，模型重新看到原始对话，下一条消息在 Transcript 中从边界之前分叉（重新出现的私有推理按目标来源投影，原始块仍保留）；恢复 Chat 时模型对话链在边界处断开，边界之前的提示不再作为模型历史加载。审批依据另行保留真实用户输入及来源：新边界记录压缩前的原始输入，旧边界从当前对话链的 Transcript 记录恢复；摘要、工具结果、Agent 叙述或其他 Loop 的消息不因此获得授权效力，来源缺失则转人工。定向摘要不照 Claude Code 写保留区段（叠加摘要或 rewind 到保留消息的第一条提示后，区段重接会丢失或复活消息），保留的消息直线重写在新边界之后，恢复时沿最新叶子自然只得到新链；读取 Claude Code 格式、带保留区段的文件时仍按区段重接并清零保留 assistant 消息的用量，只有最新叶子的对话链经过文件中最后一个边界时才删除该边界之前的其他内容，区段校验失败时加载完整历史并在打开 Chat 时显示警告。超过 5MB 的 Transcript 只加载最后一个不带保留区段、父指针为空的边界之后的模型历史，边界之前只读取标题和 Branch 来源；审批所需原始输入仍从边界元数据或旧文件的当前链定向恢复。最新叶子的对话链走到被跳过的内容（rewind 越过该边界后继续的分支）时改为加载完整文件。自动压缩的摘要消息照 Claude Code 带继续指令，要求模型不再提问、直接接着做；手动 `/compact` 不带。压缩后元数据重新追加到文件末尾。
 
@@ -281,11 +290,11 @@ Chat 的附属文件照 Claude Code 放在 Transcript 同级的 `<chatId>/` 目�
 
 计划属于 Loop，照 Claude Code 写入 `<root>/plans/<slug>-loop-<loopId>.md`：slug 在 Chat 第一次进入 Plan 模式时生成（形容词-动词-名词），记录在之后的每个 Transcript 条目中，恢复时按第一个有效的 slug 找回计划文件（slug 只接受以连字符连接的小写字母单词、最长 64 字节；链上没有有效 slug 时警告并换用新的 slug）。模型可以调用 `EnterPlanMode` 请求进入 Plan 模式，经用户确认后生效。Plan 模式下每次请求的系统提示写明当前 Loop 计划文件的绝对路径，这是唯一允许 `Write`／`Edit` 的文件；模型写好计划后调用 `ExitPlanMode` 提交审批，文件不存在或为空时报错。提交时宿主在计划文件首行写入 `<!-- tickloop plan version: N sha256: <正文摘要> -->` 注释（Markdown 渲染时不可见），版本号与内容一起先写入同目录临时文件（0600）并同步到磁盘，再改名替换，写入中途失败不会留下半截文件；读取不跟随符号链接，只接受普通文件、不超过 64KB 的正文，`plans/` 须是当前用户私有（0700、非符号链接）的目录。计划菜单的“批准并开始”照 Claude Code `ExitPlanMode` 的批准结果，把 `User has approved your plan. You can now start coding. …`、计划文件路径与批准的计划正文作为下一条输入交给模型。计划版本与待办不另存：恢复时沿对话链取该 Loop 成功的 `ExitPlanMode` 调用结果中的版本，以及最后一次成功的 `TodoWrite` 调用的输入；压缩、rewind 截断、`/branch` 与 `--fork-session` 使之前的调用不在链上时，Loop 状态条目会带上当时的计划版本与待办。恢复时核对计划文件：版本行中的版本等于重建的版本、且摘要与正文相符才沿用该版本；否则（例如提交后文件又被编辑、结果写入 Transcript 之前进程崩溃，或文件在对话之外被修改）计划以大于文件与链上版本的新版本恢复为未批准，按旧版本号的批准一律被拒，并显示加载警告。链上没有记录、也没有版本行的文件是从未提交的草稿，不恢复为计划。计划文件缺失或不可读时该 Loop 暂无计划并显示警告，但保留已知的最高版本，下一次提交从更大的版本继续，版本号不会被复用。`/approve-plan GOAL VERSION MODE` 在恢复后按重建的版本批准；批准选择的模式与 Execution Mode 一样只在本进程内有效，恢复后需要重新批准。rewind 不回退计划文件与版本（照 Claude Code 计划文件不随 rewind 恢复），版本号不会被复用。`/branch` 与 `--fork-session` 生成新的 slug 并复制已提交的计划，之后双方修改互不影响。不保存 Chat 时（`--no-session-persistence` 或 `cleanupPeriodDays` 为 0）计划文件照 File History 放在系统临时目录的 `tickloop-<uid>/<项目目录名>/plans/`。
 
-过期文件清理照 Claude Code：保留天数取状态根目录 `settings.json` 的 `cleanupPeriodDays`，默认 30。交互界面第一次提交输入（提示或 `!` Shell 命令）10 分钟后在后台线程清理一次（非交互输入时从启动开始计时），那时最近一分钟内有按键、粘贴或鼠标操作就再推迟 10 分钟，不阻塞界面与 Agent；恢复旧 Chat 后只浏览不提交时不会清理。清理按修改时间删除保留期之前的 `projects/*/<chatId>.jsonl`、`<chatId>` Chat 目录中 `tool-results/` 下的文件、`plans/*.md`、整个 `file-history/<chatId>/` 目录与 `paste-cache/*.txt`（只认 UUID 形式的 chatId，其他同名文件与目录不动），之后删除清空的工具结果目录、Chat 目录、项目目录、`plans/` 与 `file-history/`；`file-changes/`、Loop 租约、`history.jsonl`、进程登记、设置文件与系统临时目录中的 Shell 输出不清理。只看修改时间，不检查文件是否正被使用：对话中的 Chat 每次写入都会更新 Transcript 的修改时间，但在保留期内一直没有新条目的 Chat 即使仍在某个进程中打开也会被删除；此后该进程不再重建这份记录，状态栏与退出时提示 Transcript 已被删除、后续内容不再保存。文件回滚备份目录与计划文件不随对话更新修改时间，因此 Transcript 仍未过期的 Chat 保留其 `file-history/<chatId>/`，未过期 Transcript 中记录的计划前缀对应的 `plans/<slug>-loop-<loopId>.md` 也保留（超大 Transcript 头尾各 64KB 没有前缀且超过 64MB 时，本次不删除任何这类计划文件）。符号链接一律跳过，不删除链接，也不进入或删除它指向的内容。`settings.json` 有任何无效内容（清理天数本身、模型、上下文窗口或权限规则）且显式写了 `cleanupPeriodDays` 时，本次不清理，并与其他设置问题一样显示警告；文件不是合法 JSON 时只要其中出现 `"cleanupPeriodDays"` 就不清理，文件不可读时也不清理。`cleanupPeriodDays` 为 0 时 Agent 启动后不写 Transcript（大工具结果、文件回滚备份与 Shell 输出放在系统临时目录，计划只在内存中，与 `--no-session-persistence` 相同），`-c`／`-r` 会提示原因；用户设置与输入历史照常读写；后台清理把修改时间早于清理时刻的上述文件全部删除。是否写 Transcript 在启动时按当时的设置决定，运行中改为 0 或从 0 改回在下次启动生效；清理天数在清理时读取。
+过期文件清理照 Claude Code：保留天数取状态根目录 `settings.json` 的 `cleanupPeriodDays`，默认 30。daemon worker 在首个实际 run／Shell 开始后计时，10 分钟后在后台线程清理一次，不依赖前台 View；仅装载历史不启动清理。活记录由 retention 锁保护；worker 不接收本地草稿、按键或鼠标活动。Embedded 调用者仍可沿原 HousekeepingSchedule 自行记录交互并推迟清理。清理按修改时间删除保留期之前的 `projects/*/<chatId>.jsonl`、`<chatId>` Chat 目录中 `tool-results/` 下的文件、`plans/*.md`、整个 `file-history/<chatId>/` 目录与 `paste-cache/*.txt`（只认 UUID 形式的 chatId，其他同名文件与目录不动），之后删除清空的工具结果目录、Chat 目录、项目目录、`plans/` 与 `file-history/`；`file-changes/`、Loop 租约、`history.jsonl`、进程登记、设置文件与系统临时目录中的 Shell 输出不清理。活 runtime 为每个已加载 Chat 持有私有 retention flock；清理只有在取得独占锁后才按原 TTL 删除记录与附件。共享存活期间保留，即使没有近期输出；最后 shutdown 或进程退出后由内核释放，后续清理沿原期限。锁不是 Agent 身份、数据库或持久 journal。手动删除记录仍会提示后续无法保存。文件回滚备份目录与计划文件不随对话更新修改时间，因此 Transcript 仍未过期的 Chat 保留其 `file-history/<chatId>/`，未过期 Transcript 中记录的计划前缀对应的 `plans/<slug>-loop-<loopId>.md` 也保留（超大 Transcript 头尾各 64KB 没有前缀且超过 64MB 时，本次不删除任何这类计划文件）。符号链接一律跳过，不删除链接，也不进入或删除它指向的内容。`settings.json` 有任何无效内容（清理天数本身、模型、上下文窗口或权限规则）且显式写了 `cleanupPeriodDays` 时，本次不清理，并与其他设置问题一样显示警告；文件不是合法 JSON 时只要其中出现 `"cleanupPeriodDays"` 就不清理，文件不可读时也不清理。`cleanupPeriodDays` 为 0 时 Agent 启动后不写 Transcript（大工具结果、文件回滚备份与 Shell 输出放在系统临时目录，计划只在内存中，与 `--no-session-persistence` 相同），`-c`／`-r` 会提示原因；用户设置与输入历史照常读写；后台清理把修改时间早于清理时刻的上述文件全部删除。是否写 Transcript 在启动时按当时的设置决定，运行中改为 0 或从 0 改回在下次启动生效；清理天数在清理时读取。
 
-用 `/resume` 或 `/clear` 切走的 Chat 留在本进程内，其中的目标、定时与事件触发继续运行，结果只写入它自己的 Transcript；前台只显示当前 Chat 的事件，后台 Chat 的回复结束或 Shell 任务完成时只在状态栏提示，不插入前台对话。退出进程时停止全部 Chat 的工作。
+用 `/resume` 或 `/clear` 切走的 Chat 留在本机 daemon 内，其中的目标、定时与事件触发继续运行，结果只写入它自己的 Transcript；前台只显示当前 Chat 的事件，后台 Chat 的回复结束或 Shell 任务完成时只在状态栏提示，不插入前台对话。退出 View 只撤显示登记；明确的 run interrupt／Loop stop 才停止相应工作，不向 child／家族传播。
 
-照 Claude Code，每个进程在 `<root>/sessions/<pid>.json` 登记 pid、当前前台 chatId、工作目录、启动时间、类型与入口；切换前台 Chat 时改写，正常退出时删除。启动登记后会检查其他登记文件，删除已退出进程留下的文件。
+View 的兼容诊断记录仍在 `<root>/sessions/<pid>.json` 登记 pid、当前前台 chatId、工作目录、启动时间、类型与入口；切换前台 Chat 时改写，正常退出时删除。启动登记后会检查其他登记文件，删除已退出进程留下的文件。
 
 ```sh
 printf '记住验收词紫罗兰。\n刚才的验收词是什么？\n' | \

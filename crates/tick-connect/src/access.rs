@@ -24,6 +24,13 @@ pub struct TickLocation {
 }
 
 #[derive(Clone, Debug)]
+pub struct AccessContext {
+    pub workdir: PathBuf,
+    pub workspace_id: Option<String>,
+    pub interaction: Option<Pane>,
+}
+
+#[derive(Clone, Debug)]
 pub struct TickSnapshot {
     pub instance: InstanceRef,
     pub data: Value,
@@ -46,6 +53,9 @@ pub struct PreparedOperation {
     pub workspace: String,
     launch: Option<PreparedLaunch>,
     placement: PreparedPlacement,
+    interaction: Option<Pane>,
+    uses_legacy_caller: bool,
+    socket_identity: Option<(u64, u64)>,
 }
 
 #[derive(Debug)]
@@ -62,6 +72,7 @@ struct PreparedLaunch {
     command: Vec<String>,
     cwd: PathBuf,
     executable_identity: (u64, u64, i64, i64),
+    directory_identity: (u64, u64),
 }
 
 struct PreparedTickTool {
@@ -107,6 +118,12 @@ impl TickAccess {
     }
 
     pub async fn caller(&self) -> Result<Pane, HostError> {
+        if self.context.caller_pane.is_empty() {
+            return Err(HostError::before(
+                "MissingAnchor",
+                "this Agent has no interaction View",
+            ));
+        }
         let response = self
             .host
             .request(
@@ -212,8 +229,14 @@ impl TickAccess {
     }
 
     pub async fn discover(&self, workspace: &str) -> Result<Value, HostError> {
+        self.discover_scope(Some(workspace)).await
+    }
+
+    async fn discover_scope(&self, workspace: Option<&str>) -> Result<Value, HostError> {
         let mut ticks = Vec::new();
-        for pane in self.panes(Some(workspace)).await? {
+        let mut workspaces = std::collections::BTreeSet::new();
+        for pane in self.panes(workspace).await? {
+            workspaces.insert(pane.workspace_id.clone());
             match self.identify(pane.clone()).await {
                 Ok(location) => {
                     self.known.lock().await.insert(location.instance.clone(), location.clone());
@@ -236,7 +259,9 @@ impl TickAccess {
                 Err(error) => ticks.push(json!({"pane_id":pane.pane_id,"workspace_id":pane.workspace_id,"state":"identity_uncertain","error":error.to_string()})),
             }
         }
-        Ok(json!({"host":"herdr","workspace_id":workspace,"ticks":ticks}))
+        Ok(
+            json!({"host":"herdr","host_instance":self.context.socket,"workspace_id":workspace,"workspaces":workspaces,"ticks":ticks}),
+        )
     }
 
     async fn prepare_placement(
@@ -245,6 +270,7 @@ impl TickAccess {
         workspace: &str,
         is_open: bool,
         source: Option<&TickLocation>,
+        context: Option<&AccessContext>,
     ) -> Result<PreparedPlacement, HostError> {
         let placement = input.get("placement");
         let kind = match placement {
@@ -316,7 +342,12 @@ impl TickAccess {
                         "current_tab cannot specify pane_id",
                     ));
                 }
-                self.caller().await?
+                match context {
+                    Some(context) => context.interaction.clone().ok_or_else(|| {
+                        HostError::before("MissingAnchor", "this operation has no interaction View; specify a target Pane or use new_tab")
+                    })?,
+                    None => self.caller().await?,
+                }
             }
             "pane" => {
                 let pane_id = object
@@ -482,7 +513,11 @@ impl TickAccess {
         .map_err(session_error)
     }
 
-    async fn prepare_launch(&self, input: &Value) -> Result<PreparedLaunch, HostError> {
+    async fn prepare_launch(
+        &self,
+        input: &Value,
+        context: Option<&AccessContext>,
+    ) -> Result<PreparedLaunch, HostError> {
         let command: Vec<String> =
             serde_json::from_value(input["command"].clone()).map_err(|error| {
                 HostError::before(
@@ -496,18 +531,22 @@ impl TickAccess {
                 "command must contain an executable and no NUL bytes",
             ));
         }
-        let caller = self.caller().await?;
-        let cwd = input
-            .get("cwd")
-            .and_then(Value::as_str)
-            .map(PathBuf::from)
-            .or_else(|| caller.foreground_cwd.or(caller.cwd).map(PathBuf::from))
-            .ok_or_else(|| {
-                HostError::before(
-                    "InvalidArguments",
-                    "specify cwd; caller working directory is unavailable",
-                )
-            })?;
+        let cwd = match input.get("cwd").and_then(Value::as_str) {
+            Some(cwd) => Some(PathBuf::from(cwd)),
+            None => match context {
+                Some(context) => Some(context.workdir.clone()),
+                None => {
+                    let caller = self.caller().await?;
+                    caller.foreground_cwd.or(caller.cwd).map(PathBuf::from)
+                }
+            },
+        }
+        .ok_or_else(|| {
+            HostError::before(
+                "InvalidArguments",
+                "specify cwd; caller working directory is unavailable",
+            )
+        })?;
         let cwd = cwd.canonicalize().map_err(|error| {
             HostError::before(
                 "InvalidArguments",
@@ -524,10 +563,13 @@ impl TickAccess {
         let mut command = command;
         command[0] = executable.to_string_lossy().into_owned();
         let executable_identity = executable_identity(&executable)?;
+        let directory = std::fs::metadata(&cwd)
+            .map_err(|error| HostError::before("InvalidArguments", error.to_string()))?;
         Ok(PreparedLaunch {
             command,
             cwd,
             executable_identity,
+            directory_identity: (directory.dev(), directory.ino()),
         })
     }
 
@@ -637,14 +679,87 @@ impl TickAccess {
     }
 
     pub async fn prepare(&self, name: &str, input: &Value) -> Result<PreparedOperation, HostError> {
+        self.prepare_internal(name, input, None).await
+    }
+
+    pub async fn prepare_in_context(
+        &self,
+        name: &str,
+        input: &Value,
+        context: &AccessContext,
+    ) -> Result<PreparedOperation, HostError> {
+        self.prepare_internal(name, input, Some(context)).await
+    }
+
+    async fn prepare_internal(
+        &self,
+        name: &str,
+        input: &Value,
+        context: Option<&AccessContext>,
+    ) -> Result<PreparedOperation, HostError> {
         let mut normalized = input.as_object().cloned().ok_or_else(|| {
             HostError::before(
                 "InvalidArguments",
                 "host operation arguments must be an object",
             )
         })?;
-        let workspace = self.workspace(input).await?;
-        normalized.insert("workspace_id".into(), json!(workspace));
+        let workspace = match context {
+            None => self.workspace(input).await?,
+            Some(context) => {
+                if input.get("workspace_id").is_some()
+                    && input["workspace_id"].as_str().is_none_or(str::is_empty)
+                {
+                    return Err(HostError::before(
+                        "InvalidArguments",
+                        "workspace_id must be a nonempty string",
+                    ));
+                }
+                let relative_to_view = input["placement"]["type"] == "current_tab"
+                    || (name == "modify_tick"
+                        && input["action"] == "move"
+                        && input.get("placement").is_none());
+                let workspace = input["workspace_id"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .or_else(|| {
+                        relative_to_view
+                            .then(|| {
+                                context
+                                    .interaction
+                                    .as_ref()
+                                    .map(|pane| pane.workspace_id.clone())
+                            })
+                            .flatten()
+                    })
+                    .or_else(|| context.workspace_id.clone());
+                match workspace {
+                    Some(workspace) => workspace,
+                    None if name == "read_workspace" => String::new(),
+                    None if input.get("tick_instance_id").is_some() => {
+                        let instance: InstanceRef =
+                            serde_json::from_value(input["tick_instance_id"].clone()).map_err(
+                                |error| HostError::before("InvalidArguments", error.to_string()),
+                            )?;
+                        self.resolve(&instance).await?.pane.workspace_id
+                    }
+                    None if input["placement"]["type"] == "pane" => {
+                        let pane = input["placement"]["pane_id"].as_str().ok_or_else(|| {
+                            HostError::before("InvalidArguments", "placement.pane_id is required")
+                        })?;
+                        self.get_pane(pane).await?.workspace_id
+                    }
+                    None => {
+                        return Err(HostError::before(
+                            "ScopeRequired",
+                            "specify workspace_id; no default Workspace is configured",
+                        ));
+                    }
+                }
+            }
+        };
+        if !workspace.is_empty() {
+            normalized.insert("workspace_id".into(), json!(workspace));
+        }
         let mut target = None;
         let mut launch = None;
         let mut placement = PreparedPlacement::NewTab;
@@ -652,9 +767,9 @@ impl TickAccess {
             "read_workspace" => AccessPermission::ReadOnly,
             "modify_tick" if input["action"] == "open" => {
                 placement = self
-                    .prepare_placement(input, &workspace, true, None)
+                    .prepare_placement(input, &workspace, true, None, context)
                     .await?;
-                let prepared_launch = self.prepare_launch(input).await?;
+                let prepared_launch = self.prepare_launch(input, context).await?;
                 normalized.insert("command".into(), json!(prepared_launch.command));
                 normalized.insert("cwd".into(), json!(prepared_launch.cwd));
                 launch = Some(prepared_launch);
@@ -687,7 +802,7 @@ impl TickAccess {
             Self::validate_modification(input, target.as_ref())?;
             if input["action"] == "move" {
                 placement = self
-                    .prepare_placement(input, &workspace, false, target.as_ref())
+                    .prepare_placement(input, &workspace, false, target.as_ref(), context)
                     .await?;
             } else if input["action"] != "open" && input.get("placement").is_some() {
                 return Err(HostError::before(
@@ -695,6 +810,9 @@ impl TickAccess {
                     "placement is only valid for open or move",
                 ));
             }
+        }
+        if context.is_some() {
+            self.revalidate_placement(&placement).await?;
         }
         let placement_summary = match &placement {
             PreparedPlacement::NewTab => json!({"type":"new_tab"}),
@@ -721,14 +839,34 @@ impl TickAccess {
             workspace,
             launch,
             placement,
+            interaction: context.and_then(|context| context.interaction.clone()),
+            uses_legacy_caller: context.is_none(),
+            socket_identity: std::fs::metadata(&self.context.socket)
+                .ok()
+                .map(|metadata| (metadata.dev(), metadata.ino())),
         })
     }
 
     pub async fn revalidate(&self, prepared: &PreparedOperation) -> Result<(), HostError> {
+        if let Some(expected) = prepared.socket_identity {
+            let current = std::fs::metadata(&self.context.socket)
+                .ok()
+                .map(|metadata| (metadata.dev(), metadata.ino()));
+            if current != Some(expected) {
+                return Err(HostError::before(
+                    "TargetChanged",
+                    "host endpoint changed after preparation",
+                ));
+            }
+        }
         if let Some(launch) = &prepared.launch
             && (executable_identity(std::path::Path::new(&launch.command[0]))?
                 != launch.executable_identity
-                || !launch.cwd.is_dir())
+                || std::fs::metadata(&launch.cwd)
+                    .ok()
+                    .filter(|metadata| metadata.is_dir())
+                    .map(|metadata| (metadata.dev(), metadata.ino()))
+                    != Some(launch.directory_identity))
         {
             return Err(HostError::before(
                 "TargetChanged",
@@ -787,9 +925,21 @@ impl TickAccess {
         self.revalidate(&prepared).await?;
         match prepared.name.as_str() {
             "read_workspace" => {
-                let mut result = self.discover(&prepared.workspace).await?;
-                let caller = self.caller().await?;
-                result["caller"] = json!({"pane_id":caller.pane_id,"tab_id":caller.tab_id,"workspace_id":caller.workspace_id});
+                let mut result = self
+                    .discover_scope(
+                        (!prepared.workspace.is_empty()).then_some(prepared.workspace.as_str()),
+                    )
+                    .await?;
+                let caller = match prepared.interaction {
+                    Some(expected) => self.get_pane(&expected.pane_id).await.ok().filter(|pane| {
+                        pane.terminal_id == expected.terminal_id
+                            && pane.tab_id == expected.tab_id
+                            && pane.workspace_id == expected.workspace_id
+                    }),
+                    None if prepared.uses_legacy_caller => self.caller().await.ok(),
+                    None => None,
+                };
+                result["caller"] = caller.map_or(Value::Null, |caller| json!({"pane_id":caller.pane_id,"tab_id":caller.tab_id,"workspace_id":caller.workspace_id}));
                 Ok(result)
             }
             "read_tick" => {
@@ -929,61 +1079,75 @@ impl TickAccess {
             let staged = match self.get_pane(&pane_id).await {
                 Ok(staged) if staged.workspace_id == workspace => staged,
                 Ok(_) => {
-                    return Ok(created_not_placed(
-                        &pane_id,
-                        workspace,
-                        &HostError::before(
-                            "TargetChanged",
-                            "created Pane was not in the approved Workspace",
-                        ),
-                    ));
+                    return Ok(self
+                        .created_not_placed(
+                            &pane_id,
+                            workspace,
+                            &HostError::before(
+                                "TargetChanged",
+                                "created Pane was not in the approved Workspace",
+                            ),
+                        )
+                        .await);
                 }
-                Err(error) => return Ok(created_not_placed(&pane_id, workspace, &error)),
+                Err(error) => {
+                    return Ok(self.created_not_placed(&pane_id, workspace, &error).await);
+                }
             };
             if let Err(error) = self.revalidate_placement(&placement).await {
-                return Ok(created_not_placed(&pane_id, workspace, &error));
+                return Ok(self.created_not_placed(&pane_id, workspace, &error).await);
             }
             if cancel.is_cancelled() {
-                return Ok(created_not_placed(
-                    &pane_id,
-                    workspace,
-                    &HostError::before("Cancelled", "placement cancelled after Pane creation"),
-                ));
+                return Ok(self
+                    .created_not_placed(
+                        &pane_id,
+                        workspace,
+                        &HostError::before("Cancelled", "placement cancelled after Pane creation"),
+                    )
+                    .await);
             }
             let moved = match self
                 .request_pane_move(&pane_id, &placement, cancel.clone())
                 .await
             {
                 Ok(moved) => moved,
-                Err(error) => return Ok(created_not_placed(&pane_id, workspace, &error)),
+                Err(error) => {
+                    return Ok(self.created_not_placed(&pane_id, workspace, &error).await);
+                }
             };
             let reported = match moved_pane(&moved) {
                 Ok(reported) => reported,
-                Err(error) => return Ok(created_not_placed(&pane_id, workspace, &error)),
+                Err(error) => {
+                    return Ok(self.created_not_placed(&pane_id, workspace, &error).await);
+                }
             };
             if reported.terminal_id != staged.terminal_id
                 || !matches_destination(&reported, &placement)
             {
-                return Ok(created_not_placed(
+                return Ok(self.created_not_placed(
                     &pane_id,
                     workspace,
                     &HostError { code:"OutcomeUnknown".into(), message:"Herdr move reply did not identify the created Pane at the approved destination".into(), dispatched:true },
-                ));
+                ).await);
             }
             pane_id = reported.pane_id.clone();
             if let Err(error) = self
                 .orient_placement(&reported, &placement, cancel.clone())
                 .await
             {
-                return Ok(created_not_placed(&pane_id, workspace, &error));
+                return Ok(self.created_not_placed(&pane_id, workspace, &error).await);
             }
         }
         let deadline = tokio::time::Instant::now() + crate::herdr::HOST_TIMEOUT;
         loop {
             if cancel.is_cancelled() || tokio::time::Instant::now() >= deadline {
-                return Ok(
-                    json!({"status":"initializing","pane_id":pane_id,"workspace_id":workspace,"stage":"discover_instance","diagnostic":"Pane was created; inspect it before retrying. Do not create a second instance."}),
+                let mut result = self.created_location(&pane_id, workspace).await;
+                result["status"] = json!("initializing");
+                result["stage"] = json!("discover_instance");
+                result["diagnostic"] = json!(
+                    "Pane was created; inspect it before retrying. Do not create a second instance."
                 );
+                return Ok(result);
             }
             let response = self
                 .host
@@ -1004,11 +1168,37 @@ impl TickAccess {
                     .await
                     .insert(target.instance.clone(), target.clone());
                 return Ok(
-                    json!({"status":"opened","tick_instance_id":target.instance,"pane_id":target.pane.pane_id,"tab_id":target.pane.tab_id,"workspace_id":target.pane.workspace_id}),
+                    json!({"host":"herdr","host_instance":self.context.socket,"observed_at":observed_now(),"status":"opened","tick_instance_id":target.instance,"pane_id":target.pane.pane_id,"terminal_id":target.pane.terminal_id,"tab_id":target.pane.tab_id,"workspace_id":target.pane.workspace_id}),
                 );
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
+    }
+
+    async fn created_not_placed(&self, pane_id: &str, workspace: &str, error: &HostError) -> Value {
+        let mut result = self.created_location(pane_id, workspace).await;
+        result["status"] = json!("created_not_placed");
+        result["stage"] = json!("move_pane");
+        result["error"] =
+            json!({"code":error.code,"message":error.message,"dispatched":error.dispatched});
+        result["diagnostic"] = json!(
+            "Pane was created, but placement was not confirmed; inspect it before retrying. Do not create a second instance."
+        );
+        result
+    }
+
+    async fn created_location(&self, pane_id: &str, workspace: &str) -> Value {
+        let mut result = json!({"host":"herdr","host_instance":self.context.socket,"pane_id":pane_id,"requested_workspace_id":workspace,"workspace_id":null,"tab_id":null,"terminal_id":null,"tick_instance_id":null});
+        if let Ok(pane) = self.get_pane(pane_id).await {
+            result["workspace_id"] = json!(pane.workspace_id);
+            result["tab_id"] = json!(pane.tab_id);
+            result["terminal_id"] = json!(pane.terminal_id);
+            if let Ok(target) = self.identify(pane).await {
+                result["tick_instance_id"] = json!(target.instance);
+            }
+        }
+        result["observed_at"] = json!(observed_now());
+        result
     }
 
     async fn request_pane_move(
@@ -1241,7 +1431,7 @@ impl TickAccess {
             });
         }
         Ok(
-            json!({"status":"moved","tick_instance_id":target.instance,"pane_id":current.pane.pane_id,"tab_id":current.pane.tab_id,"workspace_id":current.pane.workspace_id}),
+            json!({"host":"herdr","host_instance":self.context.socket,"observed_at":observed_now(),"status":"moved","tick_instance_id":target.instance,"pane_id":current.pane.pane_id,"terminal_id":current.pane.terminal_id,"tab_id":current.pane.tab_id,"workspace_id":current.pane.workspace_id}),
         )
     }
 }
@@ -1271,10 +1461,6 @@ fn matches_destination(pane: &Pane, placement: &PreparedPlacement) -> bool {
             pane.workspace_id == destination.workspace_id && pane.tab_id == destination.tab_id
         }
     }
-}
-
-fn created_not_placed(pane_id: &str, workspace: &str, error: &HostError) -> Value {
-    json!({"status":"created_not_placed","pane_id":pane_id,"workspace_id":workspace,"stage":"move_pane","error":{"code":error.code,"message":error.message,"dispatched":error.dispatched},"diagnostic":"Pane was created in a new Tab, but placement was not confirmed; inspect it before retrying. Do not create a second instance."})
 }
 
 fn resolve_executable(program: &str, cwd: &std::path::Path) -> Result<PathBuf, HostError> {
