@@ -87,6 +87,8 @@ const fn default_max_output_tokens() -> u32 {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderDefinition {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub model_aliases: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connection: Option<super::connection::ProviderConnection>,
     pub id: String,
@@ -101,6 +103,8 @@ pub struct ProviderDefinition {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderPatch {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_aliases: Option<BTreeMap<String, String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub connection: Option<super::connection::ProviderConnection>,
     pub id: String,
@@ -147,7 +151,12 @@ pub struct ModelPatch {
 }
 
 impl ProviderPatch {
-    pub fn merge_from(&mut self, next: Self) {
+    pub fn merge_from(&mut self, next: Self) -> Result<(), String> {
+        if let Some(aliases) = next.model_aliases {
+            self.model_aliases
+                .get_or_insert_with(BTreeMap::new)
+                .extend(aliases);
+        }
         if next.connection.is_some() {
             self.connection = next.connection;
         }
@@ -169,8 +178,42 @@ impl ProviderPatch {
                 .extend(endpoints);
         }
         if let Some(models) = next.models {
+            let canonical = |id: &str| {
+                self.model_aliases
+                    .as_ref()
+                    .and_then(|aliases| aliases.get(id))
+                    .map(String::as_str)
+                    .or_else(|| builtin_canonical_model_id(&self.id, id))
+                    .unwrap_or(id)
+                    .to_owned()
+            };
+            let mut effective_ids = HashSet::new();
+            let mut normalized = Vec::new();
+            for mut model in models {
+                model.id = canonical(&model.id);
+                if !effective_ids.insert(model.id.clone()) {
+                    return Err(format!(
+                        "providers[{}].models: duplicate model id or alias target `{}`",
+                        self.id, model.id
+                    ));
+                }
+                normalized.push(model);
+            }
+            let prior_ids = self
+                .models
+                .as_ref()
+                .map(|models| {
+                    models
+                        .iter()
+                        .map(|model| canonical(&model.id))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
             let existing = self.models.get_or_insert_with(Vec::new);
-            for model in models {
+            for (model, id) in existing.iter_mut().zip(prior_ids) {
+                model.id = id;
+            }
+            for model in normalized {
                 if let Some(current) = existing.iter_mut().find(|entry| entry.id == model.id) {
                     current.merge_from(model);
                 } else {
@@ -178,6 +221,7 @@ impl ProviderPatch {
                 }
             }
         }
+        Ok(())
     }
 }
 
@@ -324,6 +368,7 @@ impl ModelCatalog {
             include_str!("providers/zhipu-cn-coding.yaml"),
             include_str!("providers/zai-global-api.yaml"),
             include_str!("providers/zai-global-coding.yaml"),
+            include_str!("providers/github-copilot.yaml"),
         ]
         .into_iter()
         .map(|yaml| serde_yaml_ng::from_str(yaml).expect("bundled Provider YAML is valid"))
@@ -378,6 +423,18 @@ impl ModelCatalog {
                     ));
                 }
             }
+            let copilot_auth = provider.auth == ModelAuthSource::GithubCopilot;
+            if copilot_auth != (provider.id == super::copilot::COPILOT_PROVIDER_ID)
+                || copilot_auth
+                    && (!provider.api_key_env.is_empty()
+                        || provider.models.iter().any(|model| {
+                            !matches!(model.adapter, Adapter::Messages | Adapter::Responses)
+                        }))
+            {
+                return Err(format!(
+                    "{location}: GitHub Copilot sign-in requires the github-copilot Provider with Messages or Responses models"
+                ));
+            }
             if let Some(connection) = &provider.connection {
                 connection
                     .validate()
@@ -395,6 +452,11 @@ impl ModelCatalog {
                     {
                         return Err(format!(
                             "{location}: Codex discovery requires subscription auth"
+                        ));
+                    }
+                    super::connection::ModelDiscovery::GithubCopilot if !copilot_auth => {
+                        return Err(format!(
+                            "{location}: GitHub Copilot discovery requires Copilot sign-in"
                         ));
                     }
                     _ => {}
@@ -423,6 +485,17 @@ impl ModelCatalog {
                 return Err(format!(
                     "{location}.api_key_env: a valid environment variable name is required"
                 ));
+            }
+            for (alias, target) in &provider.model_aliases {
+                if alias.trim().is_empty()
+                    || target.trim().is_empty()
+                    || provider.models.iter().any(|model| model.id == *alias)
+                    || !provider.models.iter().any(|model| model.id == *target)
+                {
+                    return Err(format!(
+                        "{location}.model_aliases: aliases must point directly to concrete cards without shadowing card ids"
+                    ));
+                }
             }
             let mut model_ids = HashSet::new();
             for model in &provider.models {
@@ -486,6 +559,11 @@ impl ModelCatalog {
                         "{location}.adapter: Codex Responses requires the fixed endpoint"
                     ));
                 }
+                if copilot_auth && !super::copilot::is_allowed_endpoint(base_url) {
+                    return Err(format!(
+                        "{location}.adapter: GitHub Copilot sign-in requires the GitHub Copilot endpoint"
+                    ));
+                }
                 let profile = self.profile(provider, model, base_url);
                 validate_model_config(&profile).map_err(|error| format!("{location}: {error}"))?;
             }
@@ -500,7 +578,10 @@ impl ModelCatalog {
         base_url: &str,
     ) -> ModelConfig {
         ModelConfig {
-            connection: provider.connection.clone(),
+            connection: provider
+                .connection
+                .clone()
+                .or_else(|| provider_connection(&provider.id).cloned()),
             name: model.display_name.clone(),
             protocol: model.adapter.protocol(),
             base_url: base_url.into(),
@@ -569,6 +650,9 @@ impl ModelCatalog {
         for patch in providers {
             let location = format!("providers[{}]", patch.id);
             if let Some(existing) = self.providers.iter_mut().find(|entry| entry.id == patch.id) {
+                if let Some(aliases) = patch.model_aliases {
+                    existing.model_aliases.extend(aliases);
+                }
                 if let Some(value) = patch.connection {
                     existing.connection = Some(value);
                 }
@@ -585,7 +669,17 @@ impl ModelCatalog {
                     existing.endpoints.extend(endpoints);
                 }
                 if let Some(models) = patch.models {
-                    for model in models {
+                    let mut effective_ids = HashSet::new();
+                    for mut model in models {
+                        if let Some(canonical) = existing.model_aliases.get(&model.id) {
+                            model.id = canonical.clone();
+                        }
+                        if !effective_ids.insert(model.id.clone()) {
+                            return Err(format!(
+                                "{location}.models: duplicate model id or alias target `{}`",
+                                model.id
+                            ));
+                        }
                         if let Some(current) = existing
                             .models
                             .iter_mut()
@@ -605,6 +699,7 @@ impl ModelCatalog {
                     .map(|model| model.into_new(&location))
                     .collect::<Result<Vec<_>, _>>()?;
                 self.providers.push(ProviderDefinition {
+                    model_aliases: patch.model_aliases.unwrap_or_default(),
                     connection: patch.connection,
                     id: patch.id,
                     display_name: patch.display_name.ok_or_else(|| {
@@ -632,7 +727,24 @@ impl ModelCatalog {
         Ok(self)
     }
 
+    pub fn canonical_model_id(&self, provider_id: &str, model_id: &str) -> Option<&str> {
+        let provider = self
+            .providers
+            .iter()
+            .find(|provider| provider.id == provider_id)?;
+        let target = provider
+            .model_aliases
+            .get(model_id)
+            .map_or(model_id, String::as_str);
+        provider
+            .models
+            .iter()
+            .find(|model| model.id == target)
+            .map(|model| model.id.as_str())
+    }
+
     pub fn get(&self, provider_id: &str, model_id: &str) -> Option<ModelConfig> {
+        let model_id = self.canonical_model_id(provider_id, model_id)?;
         self.profiles()
             .into_iter()
             .find(|profile| profile.provider_id == provider_id && profile.model_id == model_id)
@@ -782,6 +894,23 @@ pub fn provider_connection(
         .as_ref()
 }
 
+pub fn builtin_canonical_model_id(provider_id: &str, model_id: &str) -> Option<&'static str> {
+    static DEFAULTS: OnceLock<ModelCatalog> = OnceLock::new();
+    DEFAULTS
+        .get_or_init(ModelCatalog::defaults)
+        .canonical_model_id(provider_id, model_id)
+}
+
+fn canonicalize_builtin_identity(config: &mut ModelConfig) {
+    let Some(canonical) = builtin_canonical_model_id(&config.provider_id, &config.model_id) else {
+        return;
+    };
+    config.model_id = canonical.to_owned();
+    if let Some(card) = &mut config.card {
+        card.id = canonical.to_owned();
+    }
+}
+
 pub fn provider_group(provider_id: &str) -> Option<&'static str> {
     provider_connection(provider_id).map(|connection| connection.vendor.as_str())
 }
@@ -817,6 +946,7 @@ fn legacy_builtin_name(profile: &ModelConfig) -> Option<String> {
 }
 
 pub fn migrate_legacy_model(mut config: ModelConfig) -> ModelConfig {
+    canonicalize_builtin_identity(&mut config);
     if config.card.is_some() {
         return config;
     }

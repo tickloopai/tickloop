@@ -25,6 +25,7 @@ pub mod cards;
 mod chat_completions;
 mod codex;
 pub mod connection;
+pub mod copilot;
 pub mod credentials;
 mod glm;
 pub(crate) mod history;
@@ -66,6 +67,7 @@ pub enum ModelAuthSource {
     MiniMaxOAuthCn,
     #[serde(rename = "minimax_oauth_global")]
     MiniMaxOAuthGlobal,
+    GithubCopilot,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -552,6 +554,12 @@ pub enum ModelError {
         "MiniMax credentials need renewed authorization; select its OAuth Provider and press r"
     )]
     MiniMaxAuthentication,
+    #[error("GitHub Copilot is not signed in; select its Provider in /model")]
+    CopilotNotLoggedIn,
+    #[error(
+        "GitHub Copilot sign-in needs renewed authorization; select its Provider in /model and press r"
+    )]
+    CopilotAuthentication,
     #[error(
         "Codex subscription authentication failed; select the Codex Provider in /model and press r to renew it"
     )]
@@ -646,13 +654,14 @@ impl ModelError {
             Self::Configuration(_) | Self::UnsupportedProtocol(_) => {
                 ModelFailureKind::Configuration
             }
-            Self::CodexNotLoggedIn | Self::MiniMaxNotLoggedIn => {
+            Self::CodexNotLoggedIn | Self::MiniMaxNotLoggedIn | Self::CopilotNotLoggedIn => {
                 ModelFailureKind::AuthenticationRequired
             }
             Self::Authentication
             | Self::AuthenticationAt { .. }
             | Self::CodexAuthentication
-            | Self::MiniMaxAuthentication => ModelFailureKind::AuthenticationFailed,
+            | Self::MiniMaxAuthentication
+            | Self::CopilotAuthentication => ModelFailureKind::AuthenticationFailed,
             Self::InsufficientBalance
             | Self::QuotaExhausted { .. }
             | Self::Http { status: 402 }
@@ -684,9 +693,11 @@ impl ModelError {
             Self::Configuration(_) | Self::UnsupportedProtocol(_) => {
                 ModelRequestStage::Configuration
             }
-            Self::CodexNotLoggedIn | Self::MiniMaxNotLoggedIn | Self::MiniMaxAuthentication => {
-                ModelRequestStage::Credentials
-            }
+            Self::CodexNotLoggedIn
+            | Self::MiniMaxNotLoggedIn
+            | Self::MiniMaxAuthentication
+            | Self::CopilotNotLoggedIn
+            | Self::CopilotAuthentication => ModelRequestStage::Credentials,
             Self::Authentication | Self::CodexAuthentication | Self::Connection => {
                 ModelRequestStage::Unknown
             }
@@ -805,6 +816,30 @@ pub trait ModelClient: Send + Sync {
 pub fn validate_model_config(config: &ModelConfig) -> Result<(), ModelError> {
     if let Some(connection) = &config.connection {
         connection.validate().map_err(ModelError::Configuration)?;
+        match connection.discovery {
+            connection::ModelDiscovery::OpenAiApi
+                if config.auth_source != ModelAuthSource::ApiKeyEnv =>
+            {
+                return Err(ModelError::Configuration(
+                    "OpenAI API discovery requires API key authentication".into(),
+                ));
+            }
+            connection::ModelDiscovery::Codex
+                if config.auth_source != ModelAuthSource::CodexSubscription =>
+            {
+                return Err(ModelError::Configuration(
+                    "Codex discovery requires subscription authentication".into(),
+                ));
+            }
+            connection::ModelDiscovery::GithubCopilot
+                if config.auth_source != ModelAuthSource::GithubCopilot =>
+            {
+                return Err(ModelError::Configuration(
+                    "GitHub Copilot discovery requires Copilot sign-in".into(),
+                ));
+            }
+            _ => {}
+        }
     }
     if config.protocol == Protocol::SystemOne {
         return Err(ModelError::Configuration(
@@ -836,7 +871,8 @@ pub fn validate_model_config(config: &ModelConfig) -> Result<(), ModelError> {
             ModelProvider::Api,
             ModelAuthSource::ApiKeyEnv
             | ModelAuthSource::MiniMaxOAuthCn
-            | ModelAuthSource::MiniMaxOAuthGlobal,
+            | ModelAuthSource::MiniMaxOAuthGlobal
+            | ModelAuthSource::GithubCopilot,
         ) => HttpModelClient::deferred(config.clone()).map(|_| ()),
         (ModelProvider::OpenAiCodex, ModelAuthSource::CodexSubscription) => {
             codex::validate_config(config)
@@ -858,7 +894,8 @@ pub(crate) fn validate_model_for_resume_in_root(
     validate_model_config(config)?;
     match config.provider {
         ModelProvider::Api
-            if crate::auth::minimax::MiniMaxRegion::from_auth(config.auth_source).is_some() =>
+            if crate::auth::minimax::MiniMaxRegion::from_auth(config.auth_source).is_some()
+                || config.auth_source == ModelAuthSource::GithubCopilot =>
         {
             Ok(())
         }
@@ -879,6 +916,11 @@ pub fn model_client(
             {
                 return Err(ModelError::Configuration(
                     "MiniMax OAuth requires an Agent state directory".into(),
+                ));
+            }
+            if config.auth_source == ModelAuthSource::GithubCopilot && state_dir.is_none() {
+                return Err(ModelError::Configuration(
+                    "GitHub Copilot sign-in requires an Agent state directory".into(),
                 ));
             }
             Ok(Arc::new(HttpModelClient::deferred_with_root(
@@ -1048,6 +1090,17 @@ impl HttpModelClient {
                 return Err(ModelError::Configuration("MiniMax OAuth requires its regional Messages endpoint and no API key environment variable".into()));
             }
         }
+        if config.auth_source == ModelAuthSource::GithubCopilot
+            && (!matches!(
+                config.adapter(),
+                cards::Adapter::Messages | cards::Adapter::Responses
+            ) || !config.api_key_env.is_empty()
+                || !copilot::is_allowed_endpoint(&config.base_url))
+        {
+            return Err(ModelError::Configuration(
+                "GitHub Copilot sign-in requires Messages or Responses, its endpoint and no API key environment variable".into(),
+            ));
+        }
 
         if config.provider != ModelProvider::Api
             || config.auth_source == ModelAuthSource::CodexSubscription
@@ -1148,6 +1201,8 @@ impl HttpModelClient {
         context: Option<&ModelRequestContext>,
     ) -> Result<ModelOutput, ModelError> {
         let region = crate::auth::minimax::MiniMaxRegion::from_auth(self.config.auth_source);
+        let copilot_auth = self.config.auth_source == ModelAuthSource::GithubCopilot;
+        let identity_from_sign_in = region.is_some() || copilot_auth;
         let (key, credential_identity) = if let Some(region) = region {
             let root = self.state_root.as_deref().ok_or_else(|| {
                 ModelError::Configuration("MiniMax OAuth requires an Agent state directory".into())
@@ -1184,6 +1239,24 @@ impl HttpModelClient {
                 })?;
             key.set_sensitive(true);
             (Some(key), Some(credentials.identity.to_string()))
+        } else if copilot_auth {
+            let root = self.state_root.as_deref().ok_or_else(|| {
+                ModelError::Configuration(
+                    "GitHub Copilot sign-in requires an Agent state directory".into(),
+                )
+            })?;
+            let credentials = crate::auth::copilot::CopilotAuth::new(root)
+                .resolve_credentials_with_refresh_gate(&cancel, || {
+                    context.is_none_or(ModelRequestContext::try_begin_attempt)
+                })
+                .await
+                .map_err(copilot::credential_error)?;
+            let mut key = reqwest::header::HeaderValue::from_str(&credentials.access_token)
+                .map_err(|_| {
+                    ModelError::Configuration("invalid GitHub Copilot credential header".into())
+                })?;
+            key.set_sensitive(true);
+            (Some(key), Some(credentials.identity.to_string()))
         } else {
             let key = api_key(&self.config, self.state_root.as_deref())?;
             let identity = key
@@ -1196,11 +1269,14 @@ impl HttpModelClient {
             source.credential_identity = credential_identity;
         }
         let mut request = request;
-        if region.is_some() && request.history_sources.len() != request.messages.len() {
+        if identity_from_sign_in && request.history_sources.len() != request.messages.len() {
             request.history_sources = vec![None; request.messages.len()];
         }
-        let request = history::project_request(request, &self.config, source.as_ref());
-        if region.is_none() {
+        let mut request = history::project_request(request, &self.config, source.as_ref());
+        if copilot_auth && self.config.adapter() == cards::Adapter::Responses {
+            request = copilot::without_connection_bound_reasoning(request);
+        }
+        if !identity_from_sign_in {
             self.ensure_credential_history_compatible(chat_id, &request, key.as_ref())?;
         }
         let structured_tool = messages_structured_tool(&self.config, &request);
@@ -1241,7 +1317,10 @@ impl HttpModelClient {
             .json(&body);
         if let Some(key) = key.as_ref() {
             outgoing = match self.config.protocol {
-                Protocol::Messages if self.config.adapter() != cards::Adapter::MinimaxMessages => {
+                Protocol::Messages
+                    if self.config.adapter() != cards::Adapter::MinimaxMessages
+                        && self.config.auth_source != ModelAuthSource::GithubCopilot =>
+                {
                     outgoing.header("x-api-key", key.clone())
                 }
                 _ => {
@@ -1256,6 +1335,11 @@ impl HttpModelClient {
                     outgoing.header(reqwest::header::AUTHORIZATION, value)
                 }
             };
+        }
+        if copilot_auth {
+            for (name, value) in copilot::request_headers(&body) {
+                outgoing = outgoing.header(name, value);
+            }
         }
         let started = Instant::now();
         let sent = tokio::select! {
@@ -1292,14 +1376,21 @@ impl HttpModelClient {
         let status = response.status().as_u16();
         if !(200..=299).contains(&status) {
             if status == 401 {
-                return Err(ModelError::AuthenticationAt {
-                    stage: ModelRequestStage::ResponseHeaders,
+                return Err(if copilot_auth {
+                    ModelError::CopilotAuthentication.at_stage(ModelRequestStage::ResponseHeaders)
+                } else {
+                    ModelError::AuthenticationAt {
+                        stage: ModelRequestStage::ResponseHeaders,
+                    }
                 });
             }
             if status == 403 {
-                return Err(
-                    ModelError::Http { status }.at_stage(ModelRequestStage::ResponseHeaders)
-                );
+                return Err(if copilot_auth {
+                    copilot::entitlement_denied()
+                } else {
+                    ModelError::Http { status }
+                }
+                .at_stage(ModelRequestStage::ResponseHeaders));
             }
             if status == 402 {
                 return Err(
@@ -1332,7 +1423,9 @@ impl HttpModelClient {
             {
                 return Err(error.at_stage(ModelRequestStage::ResponseHeaders));
             }
-            if body.as_ref().is_some_and(is_context_limit_error) {
+            if body.as_ref().is_some_and(is_context_limit_error)
+                || copilot_auth && body.as_ref().is_some_and(copilot::is_context_limit)
+            {
                 return Err(
                     ModelError::ResponseRejected(ModelResponseRejection::ContextLimit)
                         .at_stage(ModelRequestStage::ResponseHeaders),

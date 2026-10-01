@@ -418,6 +418,7 @@ fn encode_request(
         }
         // A user turn with images keeps its text and images together in one content array.
         let mut user_parts = Vec::new();
+        let mut assistant_phase = None;
         for content in message.content {
             let joins_user_parts = matches!(content, Content::Image { .. })
                 || has_image && matches!(content, Content::Text { .. });
@@ -431,8 +432,20 @@ fn encode_request(
                 Content::Image { source, .. } => {
                     user_parts.push(json!({"type":"input_image","image_url":source.data_url()}))
                 }
+                Content::Text { text } if message.role == Role::Assistant => {
+                    input.push(responses::assistant_text_item(text, assistant_phase.take()));
+                }
                 Content::Text { text } => {
                     input.push(json!({"type":"message","role":message.role,"content":text}))
+                }
+                Content::ProtocolData {
+                    protocol: Protocol::Responses,
+                    value,
+                } if value["type"] == responses::ASSISTANT_PHASE_TYPE
+                    && message.role == Role::Assistant
+                    && value[CODEX_ORIGIN_FIELD].as_str() == Some(origin) =>
+                {
+                    assistant_phase = Some(super::required_string(&value, "phase")?.to_owned());
                 }
                 Content::ToolUse {
                     id,
@@ -501,7 +514,8 @@ fn encode_request(
                 Content::ProtocolData {
                     protocol: Protocol::Responses,
                     value,
-                } if value["type"] == "reasoning" => {}
+                } if value["type"] == "reasoning"
+                    || value["type"] == responses::ASSISTANT_PHASE_TYPE => {}
                 _ => {
                     return Err(ModelError::Configuration(
                         "Codex subscription history contains unsupported content".into(),
@@ -607,7 +621,9 @@ fn tag_private_output(output: &mut ModelOutput, origin: &str) {
             Content::ProtocolData {
                 protocol: Protocol::Responses,
                 value,
-            } if value["type"] == "reasoning" => {
+            } if value["type"] == "reasoning"
+                || value["type"] == responses::ASSISTANT_PHASE_TYPE =>
+            {
                 if let Some(item) = value.as_object_mut() {
                     item.insert(CODEX_ORIGIN_FIELD.into(), json!(origin));
                 }
@@ -770,6 +786,58 @@ mod tests {
         assert!(body["input"][0]["id"].as_str().unwrap().starts_with("fc_"));
         assert_eq!(body["input"][1]["call_id"], call_id);
         assert_eq!(body["input"][1]["output"], "Friday");
+    }
+
+    #[test]
+    fn assistant_phase_replays_only_for_the_same_codex_origin() {
+        let config = built_in_model_profiles()
+            .into_iter()
+            .find(|profile| profile.provider == ModelProvider::OpenAiCodex)
+            .unwrap();
+        let mut output = ModelOutput {
+            private_source: None,
+            content: vec![
+                Content::ProtocolData {
+                    protocol: Protocol::Responses,
+                    value: json!({"type":responses::ASSISTANT_PHASE_TYPE,"phase":"commentary"}),
+                },
+                Content::Text {
+                    text: "Checking.".into(),
+                },
+                Content::ProtocolData {
+                    protocol: Protocol::Responses,
+                    value: json!({"type":responses::ASSISTANT_PHASE_TYPE,"phase":"final_answer"}),
+                },
+                Content::Text {
+                    text: "Done.".into(),
+                },
+                Content::Text {
+                    text: "Legacy response.".into(),
+                },
+            ],
+            usage: super::super::Usage::default(),
+            stop_reason: "end_turn".into(),
+        };
+        tag_private_output(&mut output, "account-a");
+        let mut request = simple_request();
+        request.messages = vec![crate::model::Message {
+            role: Role::Assistant,
+            content: output.content,
+        }];
+        let same = encode_request(&config, request.clone(), "account-a").unwrap();
+        assert_eq!(same["input"][0]["phase"], "commentary");
+        assert_eq!(same["input"][1]["phase"], "final_answer");
+        assert!(same["input"][2].get("phase").is_none());
+        let other = encode_request(&config, request.clone(), "account-b").unwrap();
+        assert!(
+            other["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item.get("phase").is_none())
+        );
+        assert_eq!(other["input"][0]["content"], "Checking.");
+        assert_eq!(encode_request(&config, request, "account-a").unwrap(), same);
     }
 
     #[test]

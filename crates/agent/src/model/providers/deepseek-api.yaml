@@ -1,3 +1,7 @@
+model_aliases:
+  "deepseek-flash-chat-completions": "deepseek-flash"
+  "deepseek-v4-pro-chat-completions": "deepseek-v4-pro"
+  "deepseek-v4-flash-chat-completions": "deepseek-v4-flash"
 connection:
   vendor: "DeepSeek"
   product: "Pay-as-you-go API"
@@ -42,7 +46,7 @@ models:
       - "max"
     input_modalities:
       - "text"
-  - id: "deepseek-flash-chat-completions"
+  - id: "deepseek-flash"
     service_model_id: "deepseek-flash"
     display_name: "DeepSeek-V4.1-Flash"
     adapter: "deepseek_chat_completions"
@@ -85,7 +89,7 @@ models:
       - "max"
     input_modalities:
       - "text"
-  - id: "deepseek-v4-pro-chat-completions"
+  - id: "deepseek-v4-pro"
     service_model_id: "deepseek-v4-pro"
     display_name: "DeepSeek-V4-Pro-0813"
     adapter: "deepseek_chat_completions"
@@ -127,7 +131,7 @@ models:
       - "max"
     input_modalities:
       - "text"
-  - id: "deepseek-v4-flash-chat-completions"
+  - id: "deepseek-v4-flash"
     service_model_id: "deepseek-v4-flash"
     display_name: "DeepSeek-V4.1-Flash"
     adapter: "deepseek_chat_completions"

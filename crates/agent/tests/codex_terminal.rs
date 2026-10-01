@@ -172,6 +172,8 @@ fn logout_can_be_cancelled_while_another_process_holds_the_auth_lock() {
     terminal.wait_for("deepseek-flash");
     terminal.send(b"/model\r");
     terminal.wait_for("Choose Provider");
+    terminal.send(b"j\r");
+    terminal.wait_for("Choose connection · OpenAI");
     terminal.send(b"js");
     terminal.wait_for("Removing Codex login");
     let cancelled = terminal.output_mark();
@@ -180,8 +182,10 @@ fn logout_can_be_cancelled_while_another_process_holds_the_auth_lock() {
     assert!(credentials.exists());
     drop(lock);
     terminal.wait_for_frame_after(cancelled, "Provider after logout cancellation", |frame| {
-        frame.contains("Choose Provider")
+        frame.contains("Choose connection · OpenAI")
     });
+    terminal.send(b"\x1b");
+    terminal.wait_for("Choose Provider");
     let returned = terminal.output_mark();
     terminal.send(b"\x1b");
     terminal.wait_for_frame_after(returned, "prompt after logout cancellation", |frame| {

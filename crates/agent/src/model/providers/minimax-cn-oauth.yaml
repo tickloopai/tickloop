@@ -1,3 +1,6 @@
+model_aliases:
+  "minimax-m3-messages": "MiniMax-M3"
+  "minimax-m3-1-flash-preview-messages": "MiniMax-M3.1-Flash-Preview"
 connection:
   vendor: "MiniMax"
   product: "Portal"
@@ -12,9 +15,9 @@ api_key_env: ""
 endpoints:
   minimax_messages: "https://api.minimaxi.com/anthropic"
 models:
-  - id: "minimax-m3-messages"
+  - id: "MiniMax-M3"
     service_model_id: "MiniMax-M3"
-    display_name: "MiniMax M3"
+    display_name: "MiniMax-M3"
     adapter: "minimax_messages"
     max_output_tokens: 131072
     context_window_tokens: 1000000
@@ -22,9 +25,9 @@ models:
     adaptive_by_default: false
     effort_levels: []
     input_modalities: ["text", "image"]
-  - id: "minimax-m3-1-flash-preview-messages"
+  - id: "MiniMax-M3.1-Flash-Preview"
     service_model_id: "MiniMax-M3.1-Flash-Preview"
-    display_name: "MiniMax M3.1 Flash Preview (M Plan)"
+    display_name: "MiniMax-M3.1-Flash-Preview"
     adapter: "minimax_messages"
     max_output_tokens: 131072
     context_window_tokens: 1000000

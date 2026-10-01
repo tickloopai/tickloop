@@ -1,6 +1,7 @@
 provider: "minimax-cn-api"
+notice: "API keys may carry different products and quotas; authentication alone does not establish pay-as-you-go billing."
 series:
   - id: "minimax"
     name: "MiniMax"
     version: "M3"
-    model: "minimax-m3-messages"
+    model: "MiniMax-M3"

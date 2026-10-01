@@ -20,8 +20,10 @@ pub struct ConnectionRegion {
 pub enum ModelDiscovery {
     #[default]
     Unsupported,
+    #[serde(rename = "openai_api")]
     OpenAiApi,
     Codex,
+    GithubCopilot,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

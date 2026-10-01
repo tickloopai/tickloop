@@ -1,3 +1,4 @@
+use super::super::login::SignInTarget;
 use super::*;
 use tickloop_agent::model::{
     ModelAuthSource,
@@ -69,6 +70,98 @@ mod tests {
                 "ZHIPU_CODING_API_KEY",
                 "ZAI_CODING_API_KEY"
             ]
+        );
+    }
+
+    #[test]
+    fn connection_metadata_drives_order_labels_and_old_snapshot_compatibility() {
+        let mut profiles = tickloop_agent::model::cards::built_in_model_profiles();
+        profiles.reverse();
+        let choices = ProviderModels::group(profiles);
+        let ids = provider_rows(&choices, Some("Zhipu GLM"))
+            .into_iter()
+            .map(|row| match row {
+                ProviderRow::Provider(index) => choices[index].models[0].provider_id.clone(),
+                ProviderRow::Group(_) => unreachable!(),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            [
+                "zhipu-cn-api",
+                "zai-global-api",
+                "zhipu-cn-coding",
+                "zai-global-coding"
+            ]
+        );
+        let openai = provider_rows(&choices, Some("OpenAI"));
+        let names = openai
+            .iter()
+            .map(|row| match row {
+                ProviderRow::Provider(index) => choices[*index].name(),
+                ProviderRow::Group(_) => unreachable!(),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                "Pay-as-you-go API (api.openai.com)",
+                "Codex subscription (chatgpt.com)"
+            ]
+        );
+        let mut legacy = tickloop_agent::model::cards::ModelCatalog::defaults()
+            .get("openai-api", "gpt-6-astra-responses")
+            .unwrap();
+        legacy.connection = None;
+        let rows = super::super::super::settings::model_choices_with_profiles(
+            &legacy,
+            tickloop_agent::model::cards::built_in_model_profiles(),
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|model| model.provider_id == legacy.provider_id
+                    && model.model_id == legacy.model_id)
+                .count(),
+            1
+        );
+        let old_provider = ProviderModels {
+            models: vec![legacy.clone()],
+        };
+        assert_eq!(old_provider.name(), "Pay-as-you-go API (api.openai.com)");
+        assert_eq!(provider_group(&old_provider), Some("OpenAI"));
+        legacy.base_url = "http://127.0.0.1:4321/v1".into();
+        assert_eq!(
+            ProviderModels {
+                models: vec![legacy]
+            }
+            .name(),
+            "Pay-as-you-go API (127.0.0.1:4321)"
+        );
+    }
+
+    #[test]
+    fn copilot_is_one_vendor_entry_named_by_product_and_service_host() {
+        let choices =
+            ProviderModels::group(tickloop_agent::model::cards::built_in_model_profiles());
+        let rows = provider_rows(&choices, None);
+        assert_eq!(
+            rows.iter()
+                .filter(|row| matches!(row, ProviderRow::Group(name) if name == "GitHub Copilot"))
+                .count(),
+            1
+        );
+        let connections = provider_rows(&choices, Some("GitHub Copilot"));
+        let [ProviderRow::Provider(index)] = connections.as_slice() else {
+            panic!("GitHub Copilot has exactly one connection");
+        };
+        assert_eq!(
+            choices[*index].name(),
+            "Copilot subscription (api.githubcopilot.com)"
+        );
+        assert_eq!(choices[*index].models.len(), 8);
+        assert_eq!(
+            SignInTarget::device_only(choices[*index].models[0].auth_source),
+            Some(SignInTarget::Copilot)
         );
     }
 
@@ -296,6 +389,17 @@ impl Menus {
                 })
                 .unwrap_or(Ok(false));
         }
+        if config.auth_source == ModelAuthSource::GithubCopilot {
+            return self
+                .config_root
+                .as_deref()
+                .map(|root| {
+                    crate::auth::copilot::CopilotAuth::new(root)
+                        .has_saved_login()
+                        .map_err(|error| error.to_string())
+                })
+                .unwrap_or(Ok(false));
+        }
         if config.auth_source == ModelAuthSource::CodexSubscription {
             let Some(root) = self.config_root.as_deref() else {
                 return Ok(false);
@@ -375,6 +479,17 @@ impl Menus {
         provider: ProviderModels,
         directory: Result<AccountModelDirectory, String>,
     ) -> Result<(), String> {
+        self.account_directory_status = match &directory {
+            Ok(directory) if directory.complete => "Account directory checked.".into(),
+            Ok(_) => "Account directory is incomplete; missing models remain unverified.".into(),
+            Err(_) if provider.models[0].connection().is_none_or(|connection| connection.discovery == ModelDiscovery::Unsupported) => "Account model access has not been checked.".into(),
+            Err(error) if error.contains("timed out") => "Account model check timed out. Use Refresh to retry.".into(),
+            Err(error) if error.contains("HTTP ") => {
+                let status = error.split("HTTP ").nth(1).unwrap_or("").chars().take(3).collect::<String>();
+                format!("Account model check failed (HTTP {status}). Login remains saved; use Refresh to retry.")
+            }
+            Err(_) => "Account model access could not be checked. Login remains saved; use Refresh to retry.".into(),
+        };
         let snapshot = agent
             .snapshot(chat)
             .await
@@ -451,10 +566,20 @@ impl Menus {
                 let name = tickloop_agent::model::access::AccessCatalog::defaults()
                     .series_for(&choice.config)
                     .map_or_else(|| choice.config.name.clone(), |series| series.label());
-                safe_text(&format!(
-                    "{name}    Thinking ‹ {thinking} › · {}",
-                    choice.availability.label()
-                ))
+                let status = match &choice.availability {
+                    ModelAvailability::Unavailable { reason } => {
+                        format!(" · Unavailable: {reason}")
+                    }
+                    ModelAvailability::Unknown { .. }
+                        if choices.iter().any(|choice| {
+                            matches!(choice.availability, ModelAvailability::DirectoryListed)
+                        }) =>
+                    {
+                        " · Not verified".into()
+                    }
+                    _ => String::new(),
+                };
+                safe_text(&format!("{name}    Thinking ‹ {thinking} ›{status}"))
             })
             .collect();
         if provider.models[0]
@@ -463,17 +588,15 @@ impl Menus {
         {
             options.push("Refresh account model directory".into());
         }
-        let mut context = vec!["Enter saves the model and Thinking. Esc discards changes.".into()];
+        let mut context = vec![
+            "Enter saves the model and Thinking. Esc discards changes.".into(),
+            self.account_directory_status.clone(),
+        ];
         if let Some(notice) = tickloop_agent::model::access::AccessCatalog::defaults()
             .provider(&provider.models[0].provider_id)
             .and_then(|access| access.notice.as_deref())
         {
             context.push(safe_text(notice));
-        }
-        if provider.models[0].adapter() == Adapter::MinimaxMessages
-            && provider.models[0].auth_source != ModelAuthSource::ApiKeyEnv
-        {
-            context.push("Flash Preview requires eligible M Plan access; availability is checked by MiniMax.".into());
         }
         self.show(
             console,
@@ -538,9 +661,9 @@ impl Menus {
                         self.provider_choices = choices.clone();
                         // Keep the selection recoverable if clearing a credential fails.
                         self.show_providers(console, chat, choices, index, menu_id)?;
-                        if let Some(region) = crate::auth::minimax::MiniMaxRegion::from_auth(
-                            provider.models[0].auth_source,
-                        ) {
+                        if let Some(target) =
+                            SignInTarget::device_only(provider.models[0].auth_source)
+                        {
                             if matches!(
                                 action,
                                 PickerAction::Reauthenticate | PickerAction::SignOut
@@ -549,7 +672,7 @@ impl Menus {
                                 self.login_return = Some((chat, provider));
                                 return Ok(MenuOutcome {
                                     provider_logout: true,
-                                    logout_region: Some(region),
+                                    logout_target: target,
                                     reauthenticate_after_logout: action
                                         == PickerAction::Reauthenticate,
                                     ..Default::default()
@@ -559,7 +682,7 @@ impl Menus {
                                 console,
                                 chat,
                                 provider,
-                                super::super::login::LoginMethod::MiniMax(region),
+                                target.login_method(),
                             );
                         }
                         if provider.models[0].auth_source == ModelAuthSource::CodexSubscription {
@@ -571,6 +694,7 @@ impl Menus {
                                 self.login_return = Some((chat, provider));
                                 return Ok(MenuOutcome {
                                     provider_logout: true,
+                                    logout_target: SignInTarget::Codex,
                                     reauthenticate_after_logout: action
                                         == PickerAction::Reauthenticate,
                                     ..Default::default()
@@ -641,15 +765,8 @@ impl Menus {
         chat: Uuid,
         provider: ProviderModels,
     ) -> Result<MenuOutcome, String> {
-        if let Some(region) =
-            crate::auth::minimax::MiniMaxRegion::from_auth(provider.models[0].auth_source)
-        {
-            return self.begin_provider_login(
-                console,
-                chat,
-                provider,
-                super::super::login::LoginMethod::MiniMax(region),
-            );
+        if let Some(target) = SignInTarget::device_only(provider.models[0].auth_source) {
+            return self.begin_provider_login(console, chat, provider, target.login_method());
         }
         if provider.models[0].auth_source == ModelAuthSource::CodexSubscription {
             return self.begin_provider_login(

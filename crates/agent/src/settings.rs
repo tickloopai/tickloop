@@ -615,7 +615,12 @@ fn provider_path(root: &Path, provider_id: &str) -> Result<PathBuf, String> {
 }
 
 fn provider_patch_is_empty(patch: &ProviderPatch) -> bool {
-    if patch.connection.is_some() {
+    if patch.connection.is_some()
+        || patch
+            .model_aliases
+            .as_ref()
+            .is_some_and(|aliases| !aliases.is_empty())
+    {
         return false;
     }
     patch.default_model.is_none()
@@ -729,7 +734,7 @@ fn combined_provider_patches(
     }
     for patch in directory_patches {
         if let Some(existing) = legacy.iter_mut().find(|legacy| legacy.id == patch.id) {
-            existing.merge_from(patch);
+            existing.merge_from(patch)?;
         } else {
             legacy.push(patch);
         }
@@ -1011,6 +1016,7 @@ impl UserSettings {
         }
         if let Some(card) = &model.card {
             let selected_model_patch = ProviderPatch {
+                model_aliases: None,
                 connection: model.connection.clone(),
                 id: model.provider_id.clone(),
                 default_model: None,
@@ -1163,6 +1169,7 @@ impl UserSettings {
                 .into_iter()
                 .find(|legacy| legacy.id == provider.id)
                 .unwrap_or_else(|| ProviderPatch {
+                    model_aliases: None,
                     connection: None,
                     id: provider.id.clone(),
                     default_model: None,
@@ -1173,7 +1180,12 @@ impl UserSettings {
                     models: None,
                 })
         };
-        saved.merge_from(provider);
+        saved
+            .merge_from(provider)
+            .map_err(|reason| SettingsError::InvalidProviderYaml {
+                path: path.to_path_buf(),
+                reason,
+            })?;
         let settings = self.read_object()?;
         let mut directory =
             directory_provider_patches(parent_directory(&self.path)).map_err(|reason| {
@@ -1291,6 +1303,30 @@ impl UserSettings {
                 });
             }
         };
+        let current =
+            self.model_catalog()
+                .map_err(|reason| SettingsError::InvalidProviderYaml {
+                    path: path.clone(),
+                    reason,
+                })?;
+        let canonical = current
+            .canonical_model_id(provider_id, model_id)
+            .unwrap_or(model_id);
+        let mut equivalent_ids =
+            std::collections::BTreeSet::from([model_id.to_owned(), canonical.to_owned()]);
+        if let Some(provider) = current
+            .providers
+            .iter()
+            .find(|provider| provider.id == provider_id)
+        {
+            equivalent_ids.extend(
+                provider
+                    .model_aliases
+                    .iter()
+                    .filter(|(_, target)| target.as_str() == canonical)
+                    .map(|(alias, _)| alias.clone()),
+            );
+        }
         let mut patch = if original_yaml.is_some() {
             Some(read_provider_patch(&path, provider_id).map_err(|reason| {
                 SettingsError::InvalidProviderYaml {
@@ -1302,16 +1338,17 @@ impl UserSettings {
             None
         };
         if let Some(models) = patch.as_mut().and_then(|patch| patch.models.as_mut()) {
-            models.retain(|model| model.id != model_id);
+            models.retain(|model| !equivalent_ids.contains(&model.id));
         }
         let mut preview_settings = self.read_object()?;
-        let remove_legacy =
-            remove_legacy_model_override(&mut preview_settings, provider_id, model_id).map_err(
-                |reason| SettingsError::InvalidProviderYaml {
-                    path: self.path.clone(),
-                    reason,
-                },
-            )?;
+        let mut remove_legacy = false;
+        for id in &equivalent_ids {
+            remove_legacy |= remove_legacy_model_override(&mut preview_settings, provider_id, id)
+                .map_err(|reason| SettingsError::InvalidProviderYaml {
+                path: self.path.clone(),
+                reason,
+            })?;
+        }
         let mut directory =
             directory_provider_patches(parent_directory(&self.path)).map_err(|reason| {
                 SettingsError::InvalidProviderYaml {
@@ -1346,12 +1383,14 @@ impl UserSettings {
         }
         if remove_legacy
             && let Err(error) = self.update(|settings| {
-                remove_legacy_model_override(settings, provider_id, model_id).map_err(
-                    |reason| InvalidEntry {
-                        key: PROVIDERS_KEY.into(),
-                        expected: reason,
-                    },
-                )?;
+                for id in &equivalent_ids {
+                    remove_legacy_model_override(settings, provider_id, id).map_err(|reason| {
+                        InvalidEntry {
+                            key: PROVIDERS_KEY.into(),
+                            expected: reason,
+                        }
+                    })?;
+                }
                 Ok(())
             })
         {
@@ -1920,6 +1959,36 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn saving_an_old_alias_card_canonicalizes_identity_without_replacing_overrides() {
+        let root = tempfile::tempdir().unwrap();
+        let settings = UserSettings::in_root(root.path());
+        let mut saved = ModelCatalog::defaults()
+            .get("openai-api", "gpt-6.1-sol")
+            .unwrap();
+        saved.model_id = "gpt-6.1-sol-responses".into();
+        saved.card.as_mut().unwrap().id = saved.model_id.clone();
+        saved.base_url = "https://retained.example/legacy-messages".into();
+        saved.protocol = crate::model::Protocol::Messages;
+        saved.card.as_mut().unwrap().adapter = crate::model::cards::Adapter::Messages;
+        saved.model = "private-service-version".into();
+        saved.card.as_mut().unwrap().service_model_id = saved.model.clone();
+        saved.max_output_tokens = 2048;
+        saved.card.as_mut().unwrap().max_output_tokens = 2048;
+        saved.card.as_mut().unwrap().context_window_tokens = Some(8192);
+        let original_source = saved.private_history_source();
+        settings.save_model(&saved, false).unwrap();
+        saved.model_id = "gpt-6.1-sol".into();
+        saved.card.as_mut().unwrap().id = saved.model_id.clone();
+        let restored = settings.load().configured_model().unwrap().unwrap();
+        assert_eq!(restored, saved);
+        assert_eq!(restored.private_history_source(), original_source);
+        let json: Value =
+            serde_json::from_slice(&std::fs::read(root.path().join(SETTINGS_FILE_NAME)).unwrap())
+                .unwrap();
+        assert_eq!(json[DEFAULT_MODEL_KEY]["model"], "gpt-6.1-sol");
+    }
 
     #[test]
     fn explicit_same_id_model_definition_survives_restart_and_yaml_edits() {

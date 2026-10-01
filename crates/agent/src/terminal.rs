@@ -943,7 +943,7 @@ async fn interact(
     let mut login_from_provider = false;
     let mut provider_login_succeeded = false;
     let mut reauthenticate_after_logout = false;
-    let mut logout_region = None;
+    let mut logout_target = login::SignInTarget::Codex;
     let mut logout: Option<LogoutFlow> = None;
     let mut tools = ToolPresentation::new(!interactive);
     let mut transcript_dirty = false;
@@ -1058,8 +1058,8 @@ async fn interact(
                 provider_login_succeeded = false;
                 if let Some(root) = config_root.clone() {
                     reauthenticate_after_logout = outcome.reauthenticate_after_logout;
-                    logout_region = outcome.logout_region;
-                    logout = Some(LogoutFlow::start(root, console, logout_region)?);
+                    logout_target = outcome.logout_target;
+                    logout = Some(LogoutFlow::start(root, console, logout_target)?);
                 } else {
                     outln!(
                         console,
@@ -1378,9 +1378,9 @@ async fn interact(
                 logout.take();
                 match result {
                     Ok(()) => {
-                        outln!(console, "{} login removed locally.", logout_region.map_or("Codex", crate::auth::minimax::MiniMaxRegion::label));
+                        outln!(console, "{} login removed locally.", logout_target.label());
                         if reauthenticate_after_logout && let Some(root) = config_root.clone() {
-                            match LoginFlow::start(root, console, logout_region.map_or(login::LoginMethod::Browser, login::LoginMethod::MiniMax)) {
+                            match LoginFlow::start(root, console, logout_target.login_method()) {
                                 Ok(flow) => login = Some(flow),
                                 Err(error) => outln!(console, "Cannot log in: {}", safe_text(&error)),
                             }
@@ -4459,13 +4459,24 @@ mod tests {
         .unwrap();
         let selected = super::read_config(&path).unwrap();
         assert_eq!(selected.provider_id, "deepseek-api");
-        assert_eq!(selected.model_id, "deepseek-flash-chat-completions");
+        assert_eq!(selected.model_id, "deepseek-flash");
         std::fs::write(&path, "id: deepseek-api\nmodels:\n  - id: deepseek-flash-messages\n  - id: deepseek-flash-responses\n").unwrap();
-        assert!(
-            super::read_config(&path)
-                .unwrap_err()
-                .contains("default_model")
+        assert_eq!(
+            super::read_config(&path).unwrap().model_id,
+            "deepseek-flash"
         );
+        std::fs::write(
+            &path,
+            "id: deepseek-api\ndefault_model: deepseek-flash-messages\n",
+        )
+        .unwrap();
+        let fixed = super::read_config(&path).unwrap();
+        assert_eq!(fixed.model_id, "deepseek-flash-messages");
+        assert_eq!(
+            fixed.adapter(),
+            crate::model::cards::Adapter::DeepseekMessages
+        );
+        assert_eq!(fixed.base_url, "https://api.deepseek.com/anthropic");
     }
 
     use super::InputEvent;

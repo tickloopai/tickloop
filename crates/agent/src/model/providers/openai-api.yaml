@@ -1,9 +1,13 @@
+model_aliases:
+  "gpt-6-astra-responses": "gpt-6-astra"
+  "gpt-6.1-sol-responses": "gpt-6.1-sol"
+  "gpt-6-luna-responses": "gpt-6-luna"
 connection:
   vendor: "OpenAI"
   product: "Pay-as-you-go API"
   kind: "pay_as_you_go"
   order: 0
-  discovery: "open_ai_api"
+  discovery: "openai_api"
 id: "openai-api"
 display_name: "OpenAI API"
 auth: "api_key_env"
@@ -11,7 +15,7 @@ api_key_env: "OPENAI_API_KEY"
 endpoints:
   responses: "https://api.openai.com/v1"
 models:
-  - id: "gpt-6-astra-responses"
+  - id: "gpt-6-astra"
     service_model_id: "gpt-6-astra"
     display_name: "GPT-6 Astra"
     adapter: "responses"
@@ -20,7 +24,7 @@ models:
     thinking: "always_on"
     effort_levels: ["low", "medium", "high", "xhigh", "max"]
     input_modalities: ["text", "image"]
-  - id: "gpt-6.1-sol-responses"
+  - id: "gpt-6.1-sol"
     service_model_id: "gpt-6.1-sol"
     display_name: "GPT-6.1 Sol"
     adapter: "responses"
@@ -29,7 +33,7 @@ models:
     thinking: "always_on"
     effort_levels: ["low", "medium", "high", "xhigh", "max"]
     input_modalities: ["text", "image"]
-  - id: "gpt-6-luna-responses"
+  - id: "gpt-6-luna"
     service_model_id: "gpt-6-luna"
     display_name: "GPT-6 Luna"
     adapter: "responses"

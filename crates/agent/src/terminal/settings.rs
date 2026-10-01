@@ -125,12 +125,14 @@ mod tests {
 
     #[test]
     fn default_deepseek_chat_completions_profile_matches_the_example_and_accepts_images() {
-        let example = tickloop_agent::model::cards::migrate_legacy_model(
+        let mut example = tickloop_agent::model::cards::migrate_legacy_model(
             serde_json::from_str(include_str!("../../examples/deepseek-chat-config.json")).unwrap(),
         );
         let default = tickloop_agent::model::cards::ModelCatalog::defaults()
             .get("deepseek-api", "deepseek-flash-chat-completions")
             .unwrap();
+        assert_eq!(default.connection(), example.connection());
+        example.connection = default.connection.clone();
         assert_eq!(default, example);
         assert!(default.accepts_images());
     }

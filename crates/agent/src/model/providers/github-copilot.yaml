@@ -1,0 +1,91 @@
+# Copilot publishes no per-model limits outside the account /models listing, so until that is
+# checked context windows stay unknown, the output budget is a conservative default and only
+# text input is declared. See .scratch/copilot-integration/spec.md.
+connection:
+  vendor: "GitHub Copilot"
+  product: "Copilot subscription"
+  kind: "plan"
+  order: 0
+  discovery: "github_copilot"
+id: "github-copilot"
+display_name: "GitHub Copilot"
+auth: "github_copilot"
+api_key_env: ""
+endpoints:
+  messages: "https://api.githubcopilot.com"
+  responses: "https://api.githubcopilot.com"
+models:
+  - id: "claude-sonnet-5.5"
+    service_model_id: "claude-sonnet-5.5"
+    display_name: "Claude Sonnet 5.5"
+    adapter: "messages"
+    max_output_tokens: 32000
+    context_window_tokens: null
+    thinking: "toggle"
+    adaptive_by_default: true
+    effort_levels: ["low", "medium", "high"]
+    input_modalities: ["text"]
+  - id: "claude-opus-5.5"
+    service_model_id: "claude-opus-5.5"
+    display_name: "Claude Opus 5.5"
+    adapter: "messages"
+    max_output_tokens: 32000
+    context_window_tokens: null
+    thinking: "toggle"
+    adaptive_by_default: true
+    effort_levels: ["low", "medium", "high"]
+    input_modalities: ["text"]
+  - id: "claude-fable-5.1"
+    service_model_id: "claude-fable-5.1"
+    display_name: "Claude Fable 5.1"
+    adapter: "messages"
+    max_output_tokens: 32000
+    context_window_tokens: null
+    thinking: "always_on"
+    adaptive_by_default: true
+    effort_levels: ["low", "medium", "high"]
+    input_modalities: ["text"]
+  - id: "claude-haiku-4.5"
+    service_model_id: "claude-haiku-4.5"
+    display_name: "Claude Haiku 4.5"
+    adapter: "messages"
+    max_output_tokens: 32000
+    context_window_tokens: null
+    thinking: "unsupported"
+    input_modalities: ["text"]
+  - id: "gpt-6.1-sol"
+    service_model_id: "gpt-6.1-sol"
+    display_name: "GPT-6.1 Sol"
+    adapter: "responses"
+    max_output_tokens: 32000
+    context_window_tokens: null
+    thinking: "always_on"
+    effort_levels: ["low", "medium", "high"]
+    input_modalities: ["text"]
+  - id: "gpt-6-astra"
+    service_model_id: "gpt-6-astra"
+    display_name: "GPT-6 Astra"
+    adapter: "responses"
+    max_output_tokens: 32000
+    context_window_tokens: null
+    thinking: "always_on"
+    effort_levels: ["low", "medium", "high"]
+    input_modalities: ["text"]
+  - id: "gpt-5.6-terra"
+    service_model_id: "gpt-5.6-terra"
+    display_name: "GPT-5.6 Terra"
+    adapter: "responses"
+    max_output_tokens: 32000
+    context_window_tokens: null
+    thinking: "always_on"
+    effort_levels: ["low", "medium", "high"]
+    input_modalities: ["text"]
+  - id: "gpt-6-luna"
+    service_model_id: "gpt-6-luna"
+    display_name: "GPT-6 Luna"
+    adapter: "responses"
+    max_output_tokens: 32000
+    context_window_tokens: null
+    thinking: "always_on"
+    effort_levels: ["low", "medium", "high"]
+    input_modalities: ["text"]

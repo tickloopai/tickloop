@@ -296,6 +296,7 @@ pub(super) struct Menus {
     config_root: Option<PathBuf>,
     model_discovery: tickloop_agent::model::availability::AccountModelDiscovery,
     discovery_flow: Option<providers::DiscoveryFlow>,
+    account_directory_status: String,
     font_manager: Option<NerdFontManager<SystemFontAdapter>>,
 }
 
@@ -320,6 +321,7 @@ impl Menus {
             config_root: config_root.clone(),
             model_discovery: Default::default(),
             discovery_flow: None,
+            account_directory_status: String::new(),
             font_manager: config_root.map(NerdFontManager::production),
         }
     }
@@ -334,7 +336,7 @@ impl Menus {
 #[derive(Default)]
 pub(super) struct MenuOutcome {
     pub provider_logout: bool,
-    pub logout_region: Option<crate::auth::minimax::MiniMaxRegion>,
+    pub logout_target: super::login::SignInTarget,
     pub reauthenticate_after_logout: bool,
     pub provider_login: Option<super::login::LoginMethod>,
     pub permission: Option<Uuid>,
@@ -1828,7 +1830,7 @@ impl Menus {
                             self.provider_selected = index;
                             self.dismiss(console)?;
                             self.login_return = Some((chat, provider));
-                            return Ok(MenuOutcome { provider_logout: true, ..Default::default() });
+                            return Ok(MenuOutcome { provider_logout: true, logout_target: super::login::SignInTarget::Codex, ..Default::default() });
                         }
                         if self.provider_group.is_none() && index == rows.len() {
                             self.provider_choices = choices;

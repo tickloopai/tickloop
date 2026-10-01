@@ -495,7 +495,7 @@ async fn piped_provider_model_and_settings_menus_apply_numbered_choices() {
         .take()
         .unwrap()
         .write_all(
-            b"/model\n1\n1\n/model\n1\ncancel\ncancel\n/settings\n4\n2\n/settings\ncancel\n/exit\n",
+            b"/model\n1\n1\n1\n/model\n1\ncancel\ncancel\n/settings\n4\n2\n/settings\ncancel\n/exit\n",
         )
         .await
         .unwrap();
@@ -510,7 +510,7 @@ async fn piped_provider_model_and_settings_menus_apply_numbered_choices() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        transcript.contains("DeepSeek-V4.1-Flash    Thinking"),
+        transcript.contains("DeepSeek Flash (V4.1)    Thinking"),
         "{transcript}"
     );
     assert!(

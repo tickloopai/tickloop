@@ -1,0 +1,41 @@
+default_model: "gpt-6-astra"
+connection:
+  vendor: "OpenAI"
+  product: "Pay-as-you-go API"
+  kind: "pay_as_you_go"
+  order: 0
+  discovery: "openai_api"
+id: "openai-api"
+display_name: "OpenAI API"
+auth: "api_key_env"
+api_key_env: "OPENAI_API_KEY"
+endpoints:
+  responses: "https://api.openai.com/v1"
+models:
+  - id: "gpt-6-astra"
+    service_model_id: "gpt-6-astra"
+    display_name: "GPT-6 Astra"
+    adapter: "responses"
+    max_output_tokens: 128000
+    context_window_tokens: 1050000
+    thinking: "always_on"
+    effort_levels: ["low", "medium", "high", "xhigh", "max"]
+    input_modalities: ["text", "image"]
+  - id: "gpt-6.1-sol"
+    service_model_id: "gpt-6.1-sol"
+    display_name: "GPT-6.1 Sol"
+    adapter: "responses"
+    max_output_tokens: 128000
+    context_window_tokens: 1050000
+    thinking: "always_on"
+    effort_levels: ["low", "medium", "high", "xhigh", "max"]
+    input_modalities: ["text", "image"]
+  - id: "gpt-6-luna"
+    service_model_id: "gpt-6-luna"
+    display_name: "GPT-6 Luna"
+    adapter: "responses"
+    max_output_tokens: 128000
+    context_window_tokens: 1050000
+    thinking: "toggle"
+    effort_levels: ["low", "medium", "high", "xhigh", "max"]
+    input_modalities: ["text", "image"]

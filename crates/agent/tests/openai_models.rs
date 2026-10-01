@@ -173,8 +173,14 @@ async fn real_client_encodes_api_auth_images_tools_schema_and_preserves_opaque_p
     let reasoning = json!({"type":"reasoning","id":"rs-test","status":"completed","summary":[],"encrypted_content":"opaque-api-state"});
     let tool = json!({"type":"function_call","id":"fc-test","call_id":"call-test","name":"Echo","arguments":"{\"text\":\"hello\"}","status":"completed"});
     let text = json!({"type":"message","id":"msg-test","role":"assistant","status":"completed","content":[{"type":"output_text","text":"{\"allow\":false,\"reason\":\"probe\"}"}]});
+    let commentary = json!({"type":"message","id":"msg-commentary","role":"assistant","phase":"commentary","status":"completed","content":[{"type":"output_text","text":"Checking the input."}]});
+    let final_answer = json!({"type":"message","id":"msg-answer","role":"assistant","phase":"final_answer","status":"completed","content":[{"type":"output_text","text":"Ready to call Echo."}]});
     let (endpoint, mut captured) = model_http_support::serve_responses(vec![
-        (200, stream(vec![reasoning.clone(), tool])),
+        (
+            200,
+            stream(vec![reasoning.clone(), commentary, final_answer, tool]),
+        ),
+        (200, stream(vec![text.clone()])),
         (200, stream(vec![text.clone()])),
         (200, stream(vec![text])),
     ])
@@ -232,19 +238,52 @@ async fn real_client_encodes_api_auth_images_tools_schema_and_preserves_opaque_p
         name: "probe_verdict".into(),
         schema: json!({"type":"object","properties":{"allow":{"type":"boolean"},"reason":{"type":"string"}},"required":["allow","reason"],"additionalProperties":false}),
     });
-    for _ in 0..2 {
-        let (events, _) = mpsc::unbounded_channel();
-        client
-            .complete(continuation.clone(), events, CancellationToken::new())
-            .await
-            .unwrap();
-    }
+    let (events, _) = mpsc::unbounded_channel();
+    client
+        .complete(continuation.clone(), events, CancellationToken::new())
+        .await
+        .unwrap();
+    let mut other_account = configuration.clone();
+    other_account.provider_id = "other-account-api".into();
+    other_account.api_key_env = "OTHER_ACCOUNT_KEY".into();
+    save_api_key(&root, &other_account.api_key_env, "test-other-account-key").unwrap();
+    let other = model_client(other_account, Some(&root)).unwrap();
+    let (events, _) = mpsc::unbounded_channel();
+    other
+        .complete(continuation.clone(), events, CancellationToken::new())
+        .await
+        .unwrap();
+    let (events, _) = mpsc::unbounded_channel();
+    client
+        .complete(continuation.clone(), events, CancellationToken::new())
+        .await
+        .unwrap();
     let second = captured.recv().await.unwrap().1;
+    let detour = captured.recv().await.unwrap().1;
+    assert!(!detour["input"].to_string().contains("opaque-api-state"));
+    assert!(
+        detour["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item.get("phase").is_none())
+    );
+    assert_eq!(detour["input"][1]["content"], "Checking the input.");
+    assert_eq!(detour["input"][2]["content"], "Ready to call Echo.");
     let third = captured.recv().await.unwrap().1;
     assert_eq!(second, third);
     assert_eq!(second["input"][1], reasoning);
     assert_eq!(
+        second["input"][2],
+        json!({"type":"message","role":"assistant","phase":"commentary","content":"Checking the input."})
+    );
+    assert_eq!(
         second["input"][3],
+        json!({"type":"message","role":"assistant","phase":"final_answer","content":"Ready to call Echo."})
+    );
+    assert_eq!(second["input"].as_array().unwrap().len(), 6);
+    assert_eq!(
+        second["input"][5],
         json!({"type":"function_call_output","call_id":"call-test","output":"hello"})
     );
     assert_eq!(second["text"]["format"]["type"], "json_schema");

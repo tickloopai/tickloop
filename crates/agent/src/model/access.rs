@@ -75,6 +75,7 @@ impl AccessCatalog {
                 include_str!("access/zhipu-cn-coding.yaml"),
                 include_str!("access/zai-global-api.yaml"),
                 include_str!("access/zai-global-coding.yaml"),
+                include_str!("access/github-copilot.yaml"),
             ])
             .expect("bundled access catalog YAML is valid");
             catalog
@@ -134,7 +135,11 @@ impl AccessCatalog {
                 if !series_ids.insert(&series.id) || !series_names.insert(&series.name) {
                     return Err(format!("{location}: duplicate series"));
                 }
-                if !bound_models.insert(&series.model) {
+                if !bound_models.insert(
+                    models
+                        .canonical_model_id(&access.provider, &series.model)
+                        .unwrap_or(&series.model),
+                ) {
                     return Err(format!(
                         "{location}.model: `{}` is already bound to another series",
                         series.model
@@ -161,7 +166,15 @@ impl AccessCatalog {
         self.provider(&profile.provider_id)?
             .series
             .iter()
-            .find(|series| series.model == profile.model_id)
+            .find(|series| {
+                super::cards::builtin_canonical_model_id(&profile.provider_id, &series.model)
+                    .unwrap_or(&series.model)
+                    == super::cards::builtin_canonical_model_id(
+                        &profile.provider_id,
+                        &profile.model_id,
+                    )
+                    .unwrap_or(&profile.model_id)
+            })
     }
 
     /// The first series is the Provider's default recommendation.
@@ -193,7 +206,15 @@ impl AccessCatalog {
         self.provider(&profile.provider_id)?
             .series
             .iter()
-            .position(|series| series.model == profile.model_id)
+            .position(|series| {
+                super::cards::builtin_canonical_model_id(&profile.provider_id, &series.model)
+                    .unwrap_or(&series.model)
+                    == super::cards::builtin_canonical_model_id(
+                        &profile.provider_id,
+                        &profile.model_id,
+                    )
+                    .unwrap_or(&profile.model_id)
+            })
     }
 }
 
@@ -228,11 +249,19 @@ mod tests {
                     ("GLM FlashX (5.3)".to_string(), "GLM-5.3-FlashX".to_string()),
                 ]
             );
-            assert_eq!(
-                catalog.recommended_model(provider),
-                Some("glm-5.3-chat-completions")
-            );
+            assert_eq!(catalog.recommended_model(provider), Some("glm-5.3"));
         }
         assert!(catalog.provider("deepseek-api").is_some());
+    }
+    #[test]
+    fn legacy_primary_alias_bindings_share_the_canonical_series_and_reject_duplicates() {
+        let models = ModelCatalog::defaults();
+        let catalog = AccessCatalog::from_yaml(&["provider: openai-api\nseries:\n  - {id: sol, name: Sol, version: '6.1', model: gpt-6.1-sol-responses}\n"]).unwrap();
+        catalog.validate(&models).unwrap();
+        let profile = models.get("openai-api", "gpt-6.1-sol").unwrap();
+        assert_eq!(catalog.series_for(&profile).unwrap().id, "sol");
+        assert_eq!(catalog.series_position(&profile), Some(0));
+        let duplicate = AccessCatalog::from_yaml(&["provider: openai-api\nseries:\n  - {id: sol, name: Sol, version: '6.1', model: gpt-6.1-sol-responses}\n  - {id: other, name: Other, version: '6.1', model: gpt-6.1-sol}\n"]).unwrap();
+        assert!(duplicate.validate(&models).is_err());
     }
 }

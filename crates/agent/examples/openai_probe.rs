@@ -31,9 +31,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             interrupted.cancel();
         }
     });
-    let model_id = arguments
-        .get(1)
-        .map_or("gpt-6-astra-responses", String::as_str);
+    let model_id = arguments.get(1).map_or("gpt-6-astra", String::as_str);
     let mut config = ModelCatalog::defaults()
         .get(provider, model_id)
         .ok_or("OpenAI API model missing")?;

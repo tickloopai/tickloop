@@ -1,7 +1,7 @@
 # Pins the retained GLM-5.2 card for one connection; the ordinary /model menu keeps offering
 # the series entries GLM (5.3), GLM Flash (5.3) and GLM FlashX (5.3).
 id: zhipu-cn-api
-default_model: glm-5.2-chat-completions
+default_model: glm-5.2
 models:
-  - id: glm-5.2-chat-completions
+  - id: glm-5.2
     max_output_tokens: 32768

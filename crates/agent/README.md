@@ -20,13 +20,13 @@ cargo run -p tickloop-agent
 
 使用默认 API Key 模式时，可以先启动 Agent，在 `/model` 中选择 Provider；没有凭据时会自动要求输入并保存 Key。输入内容以星号遮蔽，不进入对话或输入历史。Key 保存到 Agent 状态目录的 `.env`（文件权限 `0600`），保存后立即生效，重启继续可用。也支持启动前设置 `DEEPSEEK_API_KEY` 等环境变量；同名变量以已保存的 `.env` 值优先。模型 YAML 只保存变量名称，不保存凭据值。未保存模型选择时，默认模型为 DeepSeek 的 `deepseek-flash`，使用 OpenAI Chat Completions。已有模型配置继续按保存的协议读取。
 
-也可使用自己的 Codex 套餐：在 Agent 输入 `/model`，选择 `Codex subscription` Provider；未登录时自动打开官方授权页面。Provider 列表按 `d` 可使用设备码登录，显示地址和设备码，适合远程终端。无需额外脚本或 Codex CLI。
+也可使用自己的 Codex 套餐：在 Agent 输入 `/model`，选择 `OpenAI` → `Codex subscription (chatgpt.com)` 连接；未登录时自动打开官方授权页面。Provider 列表按 `d` 可使用设备码登录，显示地址和设备码，适合远程终端。无需额外脚本或 Codex CLI。
 
 自动打开的是程序所在机器的浏览器；若没有出现可访问的页面，在自己的设备上打开显示的地址。浏览器无法返回终端时，可在登录界面的 callback 字段粘贴包含 state 的完整重定向 URL；按 Tab 编辑，Enter 提交，Esc 先退出编辑、再取消登录。密码与账号验证只在 OpenAI 官方页面完成，Tick Loop 输入框不收集密码。
 
 如果设备码页面提示启用设备代码授权，需要本人在 ChatGPT 的 Settings → Security 中开启后，在 Provider 列表按 `d` 重试设备码方式，或回车使用浏览器方式。这个账号设置由 OpenAI 管理。官方说明见 [Codex 身份验证](https://developers.openai.com/codex/auth#login-on-headless-devices)。
 
-选择 Provider 时自动检查认证；登录成功后进入模型列表，失败或取消返回 Provider 列表。Provider 列表按 `r` 清除该 Provider 的本地凭据并重新认证；API Key 来自外部 shell 时只删除本地保存值，不修改 shell 环境。确认模型后才切换。已移除独立 `/login` 命令，认证统一从 `/model` 进入。目录中的模型是否可用取决于账户权益。Herdr 内外使用同一套 Agent 命令。
+选择 Provider 时自动检查认证；登录成功后用同连接凭据查询已支持的账号模型目录，再进入模型列表，失败或取消返回 Provider 列表。Provider 列表按 `r` 清除该 Provider 的本地凭据并重新认证；API Key 来自外部 shell 时只删除本地保存值，不修改 shell 环境。确认模型后才切换。已移除独立 `/login` 命令，认证统一从 `/model` 进入。目录中的模型是否可用取决于账户权益。Herdr 内外使用同一套 Agent 命令。
 
 同一 `TICKLOOP_CONFIG_DIR` 的 Chat 共用登录，后续模型请求读取最新账户并在到期前刷新。Provider 列表的 `Sign out · Codex subscription`（或选中 Codex 后按 `s`）仅删除本地登录，不撤销已发出的请求或远端授权。凭证单独保存在状态根目录的 `auth/openai-codex-credentials.json`，使用私有文件权限；不读取 Codex CLI 或 pi 的登录文件。不要分享这份文件；同一系统用户下已经获准执行的任意 Shell 仍可能访问本地文件。
 
@@ -35,9 +35,17 @@ cargo run -p tickloop-agent
 本地协议、终端和恢复验证与真实套餐验收分别记录在[验证记录](../../.scratch/codex-subscription/verification.md)。真实服务未验证的能力仍以该记录中的未验收项为准。
 
 
+### OpenAI API 与账号模型目录
+
+`/model` 的 OpenAI 厂商入口有两条独立连接：`Pay-as-you-go API (api.openai.com)` 与 `Codex subscription (chatgpt.com)`。按量 API 使用 `OPENAI_API_KEY`，可在菜单遮蔽输入并保存到 Agent 私有 `.env`；订阅使用独立 OAuth 凭据及套餐额度，两者不会自动回退或共用凭据。API 的主协议为 OpenAI Responses，推荐 Astra (6)、Sol (6.1)、Luna (6)，具体卡和请求分别是 `gpt-6-astra`、`gpt-6.1-sol`、`gpt-6-luna`；API 卡预算为 1,050,000 上下文与 128,000 单次输出上限。Astra/Sol 不能关闭 Thinking，Luna 可以。
+
+API 查询 `/v1/models`，Codex 订阅查询其自己的 `/backend-api/codex/models`，不交叉使用目录。“Account directory checked.” 只代表同连接目录检查成功，不代表工具、图片、额度或所有权限实测通过。缺席/失败/未提供接口均标未验证，不静默降级或换计费；明确拒绝的模型不能确认选择。发现异步执行，Esc 取消且保留登录，模型页有刷新入口；缓存五分钟并按连接、实际 origin/路由、账号隔离，登录/新 Key/注销失效，正常 token 刷新保留身份。DeepSeek/MiniMax/GLM 现有路线未提供发现，使用静态推荐及统一账号未检查说明；Copilot 独立接入通过通用发现 Seam 实施，其账户证据由对应工单记录。
+
+本次假 HTTP、配置/菜单与运行检查见[验证记录](../../.scratch/provider-hierarchy/verification.md)。无 OpenAI API Key，真实 API/Codex 发现、额度与服务端缓存未测。本人有 Key 时可选运行 `cargo run --locked -p tickloop-agent --example openai_probe -- STATE_DIRECTORY [MODEL_CARD_ID] [image]`；探针只调用无副作用 Echo 与结构化 fixture，Key 从该私有目录 `.env` 或 `OPENAI_API_KEY` 读取，输出不含 Key。
+
 ### MiniMax
 
-`/model` 一级列表显示单个 `MiniMax`，进入连接页后选择 `MiniMax China API`、`MiniMax China OAuth`、`MiniMax Global API` 和 `MiniMax Global OAuth`，四个 Provider 分别认证。API Key 使用 `MINIMAX_CN_API_KEY` 或 `MINIMAX_GLOBAL_API_KEY`，也可以在菜单遮蔽输入并保存；账户和 Key 必须对应站点。
+`/model` 一级列表显示单个 `MiniMax`，进入连接页后先选两区 `API` 或 `Portal` 产品连接，连接名显示 China / International 和实际服务 host，四个 Provider 分别认证。API Key 使用 `MINIMAX_CN_API_KEY` 或 `MINIMAX_GLOBAL_API_KEY`，也可以在菜单遮蔽输入并保存；账户和 Key 必须对应站点。
 
 OAuth 使用 Portal 设备授权，终端显示地址和用户码；在自己的浏览器完成授权，无需远程机器的回调。采用官方 OpenClaw 指南的 Portal 路线，同意页客户端显示为 OpenClaw，不是独立登记的 Tick Loop 客户端。登录文件分别为状态根 `auth/minimax-cn.json` 和 `auth/minimax-global.json`；访问 token 到期前刷新，刷新保持历史来源身份，重新登录产生新身份。Provider 列表选中后按 `s` 清除本地登录，按 `r` 清除后重新授权；不宣称撤销远端授权。
 
@@ -51,14 +59,14 @@ OAuth 使用 Portal 设备授权，终端显示地址和用户码；在自己的
 
 | 连接 | 地址 | Key 变量 |
 | --- | --- | --- |
-| `Zhipu China API`（按量） | `https://open.bigmodel.cn/api/paas/v4` | `ZHIPU_API_KEY` |
-| `Zhipu China Coding Plan` | `https://open.bigmodel.cn/api/coding/paas/v4` | `ZHIPU_CODING_API_KEY` |
-| `Z.AI Global API`（按量） | `https://api.z.ai/api/paas/v4` | `ZAI_API_KEY` |
-| `Z.AI Global Coding Plan` | `https://api.z.ai/api/coding/paas/v4` | `ZAI_CODING_API_KEY` |
+| `Pay-as-you-go API · China (open.bigmodel.cn)` | `https://open.bigmodel.cn/api/paas/v4` | `ZHIPU_API_KEY` |
+| `Pay-as-you-go API · International (api.z.ai)` | `https://api.z.ai/api/paas/v4` | `ZAI_API_KEY` |
+| `Coding Plan · China (open.bigmodel.cn)` | `https://open.bigmodel.cn/api/coding/paas/v4` | `ZHIPU_CODING_API_KEY` |
+| `Coding Plan · International (api.z.ai)` | `https://api.z.ai/api/coding/paas/v4` | `ZAI_CODING_API_KEY` |
 
 按量连接在账户没有余额或资源包时返回业务码 1113；只订阅了 GLM Coding Plan 的账户在按量连接上也会报这个码，需要改用 Coding Plan 连接。两种计费方式之间不自动探测、不回退。官方条款把 Coding Plan 额度限定在指定工具内，Tick Loop 不在名单，可能被限流或封禁；Coding Plan 模型页会显示这条提示，是否使用由用户自行决定。Coding Plan 只提供 GLM 与 GLM Flash 两个系列，FlashX 不在套餐内。智谱不提供第三方 OAuth，个人版和团队版套餐都用 API Key 认证，团队套餐 Key 与平台其他 Key 不通用。
 
-模型定义与当前接入分开维护。Provider YAML 中的 Model Card 描述具体版本 GLM-5.3、GLM-5.3-Flash、GLM-5.3-FlashX 与 GLM-5.2。当前接入目录 [src/model/access/](src/model/access/) 为每个 Provider 声明系列及推荐卡：`GLM → GLM-5.3`、`GLM Flash → GLM-5.3-Flash`、`GLM FlashX → GLM-5.3-FlashX`。模型页由这份绑定生成 `GLM (5.3)`、`GLM Flash (5.3)`、`GLM FlashX (5.3)` 三个入口；选中后保存、请求和历史记录都使用具体卡，状态栏显示实际版本。三个推荐版本均为 1M 上下文、默认单次输出上限 131,072 tokens、强制 Thinking，档位为 low/high/max（`auto` 即服务端默认 max）；Flash 与 FlashX 接收文字和图片，基础 GLM 只收文字，视频与文件不在当前输入范围。GLM-5.2 卡继续保留供已保存选择和历史使用，可开关 Thinking，档位 high/max，但不再出现在普通菜单。需要固定它时，在显式 Provider YAML 或状态目录 `providers/zhipu-cn-api.yaml` 写 `default_model: glm-5.2-chat-completions`，例见 [examples/providers/zhipu-cn-api.yaml](examples/providers/zhipu-cn-api.yaml)。新版本发布后，先新增具体卡，再更新系列绑定；已有会话、固定选择与自定义卡不会被目录更新静默切换。
+模型定义与当前接入分开维护。Provider YAML 中的 Model Card 描述具体版本 GLM-5.3、GLM-5.3-Flash、GLM-5.3-FlashX 与 GLM-5.2。当前接入目录 [src/model/access/](src/model/access/) 为每个 Provider 声明系列及推荐卡：`GLM → glm-5.3`、`GLM Flash → glm-5.3-flash`、`GLM FlashX → glm-5.3-flashx`。模型页由这份绑定生成 `GLM (5.3)`、`GLM Flash (5.3)`、`GLM FlashX (5.3)` 三个入口；选中后保存、请求和历史记录都使用具体卡，状态栏显示实际版本。三个推荐版本均为 1M 上下文、默认单次输出上限 131,072 tokens、强制 Thinking，档位为 low/high/max（`auto` 即服务端默认 max）；Flash 与 FlashX 接收文字和图片，基础 GLM 只收文字，视频与文件不在当前输入范围。GLM-5.2 卡继续保留供已保存选择和历史使用，可开关 Thinking，档位 high/max，但不再出现在普通菜单。需要固定它时，在显式 Provider YAML 或状态目录 `providers/zhipu-cn-api.yaml` 写 `default_model: glm-5.2`（旧 `glm-5.2-chat-completions` 仍由兼容别名解析），例见 [examples/providers/zhipu-cn-api.yaml](examples/providers/zhipu-cn-api.yaml)。新版本发布后，先新增具体卡，再更新系列绑定；已有会话、固定选择与自定义卡不会被目录更新静默切换。
 
 四个连接都使用 GLM 专用 OpenAI Chat Completions Adapter。请求开启 Preserved Thinking（`clear_thinking: false`），同一来源的 `reasoning_content` 原样回放以保持缓存前缀；有工具时开启流式工具参数。结构化审查使用官方 JSON mode 并由宿主严格校验。余额不足、额度耗尽和套餐/模型权限错误不重试；限流与过载按现有预算重试。官方依据与参考实现见[接入规格](../../.scratch/glm-integration/spec.md)，证据与未验收项见[验证记录](../../.scratch/glm-integration/verification.md)；真实账户可用 `cargo run -p tickloop-agent --example glm_probe -- cn|global|cn-coding|global-coding STATE_DIRECTORY` 自行验证，只调用无副作用的 Echo 与结构化 fixture。
 
@@ -83,12 +91,13 @@ cargo run -p tickloop-agent --bin tickloop -- \
 ```text
 providers/
   deepseek-api.yaml
+  openai-api.yaml
   openai-codex.yaml
 ```
 
-内置目录中的定义不代表已经配置账户或已开通服务。DeepSeek API、Codex 套餐、MiniMax 两区 API/OAuth 与智谱 GLM 两区按量 API/Coding Plan 是当前接入；`anthropic-api.yaml` 保留此前已有的 Claude Model Card，供旧配置兼容使用，不会因此自动调用 Anthropic。
+内置目录中的定义不代表已经配置账户或已开通服务。DeepSeek API、OpenAI 按量 API/Codex 套餐、MiniMax 两区 API/OAuth 与智谱 GLM 两区按量 API/Coding Plan 是当前接入；`anthropic-api.yaml` 保留此前已有的 Claude Model Card，供旧配置兼容使用，不会因此自动调用 Anthropic。
 
-完整示例见 [DeepSeek API](examples/providers/deepseek-api.yaml) 和 [Codex 套餐](examples/providers/openai-codex.yaml)。单个文件可用于 `--config` 或 `/model CONFIG_FILE`。显式加载多模型文件时，用 `default_model` 指定该 Provider 内的模型 ID；只有一个模型时可省略。 显式文件中的其他模型也会出现在本次菜单中；加载本身不写配置，确认选择后保存该 Provider 的已填写字段和模型列表。省略的字段继续继承有效用户配置与内置默认值，保存时不会被展开成固定值。
+完整示例见 [DeepSeek API](examples/providers/deepseek-api.yaml)、[OpenAI API](examples/providers/openai-api.yaml) 和 [Codex 套餐](examples/providers/openai-codex.yaml)。单个文件可用于 `--config` 或 `/model CONFIG_FILE`。显式加载多模型文件时，用 `default_model` 指定该 Provider 内的模型 ID；只有一个模型时可省略。 显式文件中的自定义模型会出现在本次菜单中；已退休内置卡继续支持固定配置/历史恢复，普通菜单仍读取每系列推荐绑定；加载本身不写配置，确认选择后保存该 Provider 的已填写字段和模型列表。省略的字段继续继承有效用户配置与内置默认值，保存时不会被展开成固定值。
 
 ```sh
 cargo run -p tickloop-agent --bin tickloop -- \
@@ -106,7 +115,7 @@ models:
 
 文件名必须与 Provider ID 一致；新增 Provider 时提供完整的身份、连接与模型定义。模型选择及权限、外观等设置继续保存在 `settings.json`，Provider 定义的新保存写入相应 YAML 文件。旧的单模型 JSON、完整目录 JSON 和 `settings.json.providers` 保留兼容读取，相同 ID 的 YAML 显式字段优先；加载不会自动改写旧文件。
 
-Provider 内的 `id` 是配置身份，`service_model_id` 是服务实际接收的模型名称；同一个服务模型可以有不同适配器条目。普通 `adapter` 为 `messages`、`responses`、`chat_completions`；DeepSeek 的协议差异由 `deepseek_messages`、`deepseek_chat_completions` 表达，MiniMax 使用 `minimax_messages`，智谱 GLM 使用 `glm_chat_completions`，Codex 使用 `codex_responses`。地址取自 Provider 的 `endpoints` 同名项。Codex 套餐结合 `codex_subscription` 认证使用专用请求处理，并限制为官方端点；普通 API 使用 `api_key_env`；MiniMax OAuth 分别使用 `minimax_oauth_cn`、`minimax_oauth_global`，只允许对应区域的 MiniMax Messages 端点。不要把套餐 token 填进 API Key 配置。
+Provider 内的 `id` 是配置身份，`service_model_id` 是服务实际接收的模型名称；同一个服务模型可以有不同适配器条目。普通 `adapter` 为 `messages`、`responses`、`chat_completions`；DeepSeek 的协议差异由 `deepseek_messages`、`deepseek_chat_completions` 表达，MiniMax 使用 `minimax_messages`，智谱 GLM 使用 `glm_chat_completions`，Codex 使用 `codex_responses`。地址取自 Provider 的 `endpoints` 同名项。可选 `connection` 声明 vendor/product/kind/order/region/discovery，厂商组织及产品优先、地区其次排序共用该配置，服务 host 取实际 endpoint；旧/自定义配置没有该字段时保留兼容行为。字段与校验见 [Model Card 配置参考](../../docs/agents/model-integration/model-card.md)。Codex 套餐结合 `codex_subscription` 认证使用专用请求处理，并限制为官方端点；普通 API 使用 `api_key_env`；MiniMax OAuth 分别使用 `minimax_oauth_cn`、`minimax_oauth_global`，只允许对应区域的 MiniMax Messages 端点。不要把套餐 token 填进 API Key 配置。
 
 | 位置 | 公开配置项 |
 | --- | --- |
@@ -279,3 +288,5 @@ cargo test -p tickloop-agent --test terminal
 ```
 
 Agent 的呈现与宿主布局分开，Herdr 负责容器外观；颜色、装饰与 Theme 不写入业务上下文和 Agent 存档。
+
+内置主协议卡 ID 采用官方原始服务 ID，保留大小写；`adapter` 表达协议，官方模型名称不添加自造协议/套餐后缀。Provider 的 `model_aliases` 保留旧 ID：例如 `gpt-6.1-sol-responses` → `gpt-6.1-sol`、`minimax-m3-messages` → `MiniMax-M3`。旧 `default_model`、补丁和保存选择可继续解析，下一次明确保存使用 canonical ID；身份规范化不会替换用户路由或能力覆盖，也不升级实际版本。DeepSeek 已有额外 Messages/Responses 卡继续保留独立旧 ID 与原 Adapter/endpoint，避免与同模型主协议卡冲突。

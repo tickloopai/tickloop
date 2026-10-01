@@ -1,10 +1,11 @@
 provider: "minimax-cn-oauth"
+notice: "Portal account product and quota apply. Flash Preview requires eligible M Plan access; authorization alone does not confirm model permission."
 series:
   - id: "minimax"
     name: "MiniMax"
     version: "M3"
-    model: "minimax-m3-messages"
+    model: "MiniMax-M3"
   - id: "minimax-flash-preview"
     name: "MiniMax Flash Preview"
     version: "M3.1"
-    model: "minimax-m3-1-flash-preview-messages"
+    model: "MiniMax-M3.1-Flash-Preview"

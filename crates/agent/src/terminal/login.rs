@@ -4,9 +4,13 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::auth::{
-    AuthError, BrowserCallback, CodexAuth,
-    minimax::{MiniMaxAuth, MiniMaxRegion},
+use crate::{
+    auth::{
+        AuthError, BrowserCallback, CodexAuth,
+        copilot::{self, CopilotAuth},
+        minimax::{MiniMaxAuth, MiniMaxRegion},
+    },
+    model::ModelAuthSource,
 };
 
 use super::{
@@ -19,13 +23,50 @@ pub(super) enum LoginMethod {
     Device,
     Browser,
     MiniMax(MiniMaxRegion),
+    Copilot,
 }
 
 impl LoginMethod {
     pub(super) fn label(self) -> &'static str {
         match self {
             Self::MiniMax(region) => region.label(),
-            _ => "Codex subscription",
+            Self::Copilot => "GitHub Copilot",
+            Self::Device | Self::Browser => "Codex subscription",
+        }
+    }
+}
+
+/// The local sign-in a logout removes and a reauthentication restarts.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) enum SignInTarget {
+    #[default]
+    Codex,
+    MiniMax(MiniMaxRegion),
+    Copilot,
+}
+
+impl SignInTarget {
+    /// Connections that sign in only through a device authorization.
+    pub(super) fn device_only(source: ModelAuthSource) -> Option<Self> {
+        if source == ModelAuthSource::GithubCopilot {
+            return Some(Self::Copilot);
+        }
+        MiniMaxRegion::from_auth(source).map(Self::MiniMax)
+    }
+
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Codex => "Codex",
+            Self::MiniMax(region) => region.label(),
+            Self::Copilot => "GitHub Copilot",
+        }
+    }
+
+    pub(super) fn login_method(self) -> LoginMethod {
+        match self {
+            Self::Codex => LoginMethod::Browser,
+            Self::MiniMax(region) => LoginMethod::MiniMax(region),
+            Self::Copilot => LoginMethod::Copilot,
         }
     }
 }
@@ -87,10 +128,30 @@ impl LoginFlow {
                 ));
                 return;
             }
+            if let LoginMethod::Copilot = method {
+                let auth = CopilotAuth::new(root);
+                let result = async {
+                    let login = auth.start_device_login(&task_cancel).await?;
+                    let address = login.verification_uri.clone();
+                    let _ = updates.send(LoginUpdate::Device { address: address.clone(), code: login.user_code.clone() });
+                    let launch = launch_browser(&address);
+                    let finish = auth.finish_device_login(login, &task_cancel);
+                    tokio::pin!(launch, finish);
+                    tokio::select! { result = &mut finish => result, () = &mut launch => finish.await }
+                }.await;
+                let _ = updates.send(LoginUpdate::Finished(
+                    result
+                        .map(|_| method.label().to_owned())
+                        .map_err(|error| error.to_string()),
+                ));
+                return;
+            }
             let auth = terminal_auth(root);
             let result = async {
                 match method {
-                    LoginMethod::MiniMax(_) => unreachable!("MiniMax uses its device flow"),
+                    LoginMethod::MiniMax(_) | LoginMethod::Copilot => {
+                        unreachable!("device-only sign-ins return before Codex login")
+                    }
                     LoginMethod::Device => {
                         let login = auth.start_device_login(&task_cancel).await?;
                         let address = login.verification_uri.clone();
@@ -166,6 +227,8 @@ impl LoginFlow {
         ];
         if let LoginMethod::MiniMax(_) = self.method {
             context.push("Approve access on the MiniMax Portal. The consent page identifies the registered Portal client.".into());
+        } else if let LoginMethod::Copilot = self.method {
+            context.push(format!("Authorize the {} GitHub App by {}. Requests use your Copilot subscription; your plan and organization policy decide which models work.", copilot::APP_NAME, copilot::APP_OWNER));
         } else {
             context.push("If OpenAI asks you to enable device code authorization, enable it in ChatGPT Settings > Security and retry Device code sign-in from this Provider, or use Browser sign-in.".into());
         }
@@ -301,25 +364,33 @@ impl LogoutFlow {
     pub(super) fn start(
         root: PathBuf,
         console: &Console,
-        region: Option<MiniMaxRegion>,
+        target: SignInTarget,
     ) -> Result<Self, String> {
-        let label = region.map_or("Codex", MiniMaxRegion::label);
         console.set_status(&format!(
-            "Removing {label} login… Esc cancels; input will run afterward"
+            "Removing {} login… Esc cancels; input will run afterward",
+            target.label()
         ))?;
         let cancel = CancellationToken::new();
         let task_cancel = cancel.clone();
         let task = tokio::spawn(async move {
-            if let Some(region) = region {
-                MiniMaxAuth::new(root, region)
+            match target {
+                SignInTarget::MiniMax(region) => MiniMaxAuth::new(root, region)
                     .logout(&task_cancel)
                     .await
                     .map_err(|error| match error {
                         crate::auth::minimax::MiniMaxAuthError::Cancelled => AuthError::Cancelled,
                         _ => AuthError::MiniMax(error.to_string()),
-                    })
-            } else {
-                terminal_auth(root).logout(&task_cancel).await
+                    }),
+                SignInTarget::Copilot => {
+                    CopilotAuth::new(root)
+                        .logout(&task_cancel)
+                        .await
+                        .map_err(|error| match error {
+                            copilot::CopilotAuthError::Cancelled => AuthError::Cancelled,
+                            _ => AuthError::Copilot(error.to_string()),
+                        })
+                }
+                SignInTarget::Codex => terminal_auth(root).logout(&task_cancel).await,
             }
         });
         Ok(Self { cancel, task })
@@ -488,6 +559,9 @@ mod tests {
         wait("Choose Provider");
         writer.write_all(b"j\r").unwrap();
         writer.flush().unwrap();
+        wait("Choose connection · OpenAI");
+        writer.write_all(b"j\r").unwrap();
+        writer.flush().unwrap();
         wait("Codex browser login");
         writer.write_all(b"\x1b").unwrap();
         writer.flush().unwrap();
@@ -496,7 +570,7 @@ mod tests {
         loop {
             let text = output.lock().unwrap();
             if let Some(cancelled) = text.rfind("Login cancelled")
-                && text[cancelled..].contains("Choose Provider")
+                && text[cancelled..].contains("Choose connection · OpenAI")
             {
                 break;
             }
@@ -514,7 +588,7 @@ mod tests {
         loop {
             let text = output.lock().unwrap();
             if let Some(failed) = text.rfind("Cannot log in:")
-                && text[failed..].contains("Choose Provider")
+                && text[failed..].contains("Choose connection · OpenAI")
             {
                 break;
             }
@@ -525,6 +599,9 @@ mod tests {
             drop(text);
             std::thread::sleep(Duration::from_millis(20));
         }
+        writer.write_all(b"\x1b").unwrap();
+        writer.flush().unwrap();
+        wait("Choose Provider");
         writer.write_all(b"\x1b").unwrap();
         writer.flush().unwrap();
         wait("Selection cancelled");
@@ -622,6 +699,10 @@ mod tests {
                     )
                 } else if headers.starts_with("POST /oauth/token ") {
                     (json!({"access_token":"ey.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdC10ZXN0In19.sig","refresh_token":"fake-refresh-never-display","expires_in":3600}).to_string(), "application/json")
+                } else if headers.starts_with("GET /codex/models?") {
+                    assert!(headers.contains("chatgpt-account-id: acct-test"));
+                    assert!(headers.contains("originator: tickloop"));
+                    (json!({"models":[{"slug":"gpt-5.5"},{"slug":"gpt-5.6-sol"},{"slug":"gpt-5.6-terra"},{"slug":"gpt-5.6-luna"}]}).to_string(), "application/json")
                 } else {
                     assert!(headers.starts_with("POST /codex/responses "), "{headers}");
                     assert!(headers.contains("chatgpt-account-id: acct-test"));
@@ -743,12 +824,12 @@ mod tests {
         writer.write_all(b"/model\r").unwrap();
         writer.flush().unwrap();
         wait("Choose Provider");
-        let keys: &[u8] = match (selected_model.is_some(), browser) {
-            (true, _) => b"\r",
-            (false, true) => b"j\r",
-            (false, false) => b"jd",
-        };
-        writer.write_all(keys).unwrap();
+        writer.write_all(b"j\r").unwrap();
+        writer.flush().unwrap();
+        wait("Choose connection · OpenAI");
+        writer
+            .write_all(if browser { b"j\r" } else { b"jd" })
+            .unwrap();
         writer.flush().unwrap();
         wait("login saved");
         wait("Codex subscription");
@@ -781,7 +862,7 @@ mod tests {
                 let before_back = output.lock().unwrap().len();
                 writer.write_all(b"\x1b").unwrap();
                 writer.flush().unwrap();
-                wait_after("Choose Provider", before_back);
+                wait_after("Choose connection · OpenAI", before_back);
                 let before_reauthentication = output.lock().unwrap().len();
                 writer.write_all(b"r").unwrap();
                 writer.flush().unwrap();

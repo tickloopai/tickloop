@@ -1,3 +1,6 @@
+model_aliases:
+  "glm-5.3-chat-completions": "glm-5.3"
+  "glm-5.3-flash-chat-completions": "glm-5.3-flash"
 connection:
   vendor: "Zhipu GLM"
   product: "Coding Plan"
@@ -12,7 +15,7 @@ api_key_env: "ZAI_CODING_API_KEY"
 endpoints:
   glm_chat_completions: "https://api.z.ai/api/coding/paas/v4"
 models:
-  - id: "glm-5.3-chat-completions"
+  - id: "glm-5.3"
     service_model_id: "glm-5.3"
     display_name: "GLM-5.3"
     adapter: "glm_chat_completions"
@@ -22,7 +25,7 @@ models:
     adaptive_by_default: false
     effort_levels: ["low", "high", "max"]
     input_modalities: ["text"]
-  - id: "glm-5.3-flash-chat-completions"
+  - id: "glm-5.3-flash"
     service_model_id: "glm-5.3-flash"
     display_name: "GLM-5.3-Flash"
     adapter: "glm_chat_completions"

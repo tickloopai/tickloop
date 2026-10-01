@@ -8,6 +8,8 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashSet};
 use tokio::sync::mpsc::UnboundedSender;
 
+pub(super) const ASSISTANT_PHASE_TYPE: &str = "_tickloop_assistant_phase";
+
 pub(super) fn encode_request(
     config: &ModelConfig,
     request: ModelRequest,
@@ -25,8 +27,18 @@ pub(super) fn encode_request(
         }
         // A user turn with images keeps its text and images together in one content array.
         let mut user_parts = Vec::new();
+        let mut assistant_phase = None;
         for content in message.content {
             match content {
+                Content::ProtocolData {
+                    protocol: Protocol::Responses,
+                    value,
+                } if value["type"] == ASSISTANT_PHASE_TYPE && message.role == Role::Assistant => {
+                    assistant_phase = Some(required_string(&value, "phase")?.to_owned());
+                }
+                Content::Text { text } if message.role == Role::Assistant => {
+                    input.push(assistant_text_item(text, assistant_phase.take()));
+                }
                 Content::Text { text } if has_image => {
                     user_parts.push(json!({"type":"input_text","text":text}))
                 }
@@ -62,6 +74,14 @@ pub(super) fn encode_request(
         });
     }
     Ok(body)
+}
+
+pub(super) fn assistant_text_item(text: String, phase: Option<String>) -> Value {
+    let mut item = json!({"type":"message","role":"assistant","content":text});
+    if let Some(phase) = phase {
+        item["phase"] = json!(phase);
+    }
+    item
 }
 
 fn input_item(role: Role, content: Content) -> Result<Value, ModelError> {
@@ -357,6 +377,12 @@ impl ResponsesStream {
                                     return Err(invalid_response(
                                         "unsupported response content type",
                                     ));
+                                }
+                                if !item["phase"].is_null() {
+                                    content.push(Content::ProtocolData {
+                                        protocol: Protocol::Responses,
+                                        value: json!({"type":ASSISTANT_PHASE_TYPE,"phase":required_string(item, "phase")?}),
+                                    });
                                 }
                                 content.push(Content::Text {
                                     text: required_string(part, "text")?.into(),

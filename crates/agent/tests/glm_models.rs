@@ -158,10 +158,7 @@ fn definition_catalog_keeps_concrete_cards_and_access_catalog_binds_one_per_seri
                 assert!(validate_reasoning_effort(card, Some(ReasoningEffort::Low)).is_ok());
             }
         }
-        assert_eq!(
-            access.recommended_model(provider),
-            Some("glm-5.3-chat-completions")
-        );
+        assert_eq!(access.recommended_model(provider), Some("glm-5.3"));
     }
 }
 
@@ -287,7 +284,7 @@ fn pinned_version_example_selects_the_retained_card_with_overrides() {
         "../examples/providers/zhipu-cn-api.yaml"
     ))
     .unwrap();
-    assert_eq!(pinned.model_id, "glm-5.2-chat-completions");
+    assert_eq!(pinned.model_id, "glm-5.2");
     assert_eq!(pinned.name, "GLM-5.2");
     assert_eq!(pinned.model, "glm-5.2");
     assert_eq!(pinned.max_output_tokens, 32768);
@@ -361,7 +358,7 @@ fn provider_yaml_without_default_model_resolves_to_the_recommended_card() {
         "id: zhipu-cn-api\nendpoints:\n  glm_chat_completions: https://gateway.example/api/paas/v4\n",
     )
     .unwrap();
-    assert_eq!(selected.model_id, "glm-5.3-chat-completions");
+    assert_eq!(selected.model_id, "glm-5.3");
     assert_eq!(selected.name, "GLM-5.3");
     assert_eq!(selected.base_url, "https://gateway.example/api/paas/v4");
     let (pinned, _) = ModelCatalog::resolved_provider_yaml(

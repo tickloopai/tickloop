@@ -14,6 +14,7 @@ use tickloop_agent::{
 
 fn custom_provider(id: &str) -> ProviderDefinition {
     ProviderDefinition {
+        model_aliases: std::collections::BTreeMap::new(),
         connection: None,
         id: id.into(),
         display_name: format!("{id} gateway"),
@@ -568,14 +569,27 @@ fn provider_yaml_rejects_unknown_fields_duplicate_models_and_bad_file_names() {
 }
 
 #[test]
-fn explicit_provider_yaml_requires_selection_when_models_are_ambiguous() {
+fn provider_yaml_uses_shared_default_but_preserves_explicit_old_selection() {
     let single = ModelCatalog::selected_provider_yaml(
         "id: deepseek-api\nmodels:\n  - id: deepseek-flash-responses\n",
     )
     .unwrap();
     assert_eq!(single.model_id, "deepseek-flash-responses");
-    let error = ModelCatalog::selected_provider_yaml("id: deepseek-api\nmodels:\n  - id: deepseek-flash-messages\n  - id: deepseek-flash-responses\n").unwrap_err();
-    assert!(error.contains("default_model"));
+    let recommended = ModelCatalog::selected_provider_yaml("id: deepseek-api\nmodels:\n  - id: deepseek-flash-messages\n  - id: deepseek-flash-responses\n").unwrap();
+    assert_eq!(recommended.model_id, "deepseek-flash");
+    let fixed = ModelCatalog::selected_provider_yaml("id: deepseek-api\ndefault_model: deepseek-flash-messages\nmodels:\n  - id: deepseek-flash-messages\n  - id: deepseek-flash-responses\n").unwrap();
+    assert_eq!(fixed.model_id, "deepseek-flash-messages");
+    assert_eq!(fixed.adapter(), Adapter::DeepseekMessages);
+    assert_eq!(fixed.base_url, "https://api.deepseek.com/anthropic");
+    let mut ambiguous = custom_patch("custom-ambiguous");
+    let mut second = ambiguous.models.as_ref().unwrap()[0].clone();
+    second.id = "second".into();
+    ambiguous.models.as_mut().unwrap().push(second);
+    assert!(
+        ModelCatalog::selected_provider_yaml(&serde_yaml_ng::to_string(&ambiguous).unwrap())
+            .unwrap_err()
+            .contains("default_model")
+    );
     let selected = ModelCatalog::selected_provider_yaml("id: deepseek-api\ndefault_model: deepseek-flash-responses\nmodels:\n  - id: deepseek-flash-messages\n  - id: deepseek-flash-responses\n").unwrap();
     assert_eq!(selected.model_id, "deepseek-flash-responses");
 }
@@ -756,4 +770,184 @@ fn legacy_json_provider_file_remains_readable() {
         },
     };
     assert_eq!(legacy.selected_model().unwrap().model, selected.model);
+}
+
+#[test]
+fn typed_connection_metadata_survives_patch_save_and_restore() {
+    let root = tempfile::tempdir().unwrap();
+    let settings = UserSettings::in_root(root.path());
+    let patch: ProviderPatch = serde_yaml_ng::from_str("id: custom-provider\nconnection:\n  vendor: Custom vendor\n  product: Developer plan\n  kind: plan\n  order: 2\n  region: {name: Private region, order: 4}\n  discovery: unsupported\n").unwrap();
+    let mut catalog = ModelCatalog::from_providers(vec![custom_provider("custom-provider")])
+        .unwrap()
+        .with_providers(vec![patch])
+        .unwrap();
+    let profile = catalog
+        .get("custom-provider", "assistant-responses")
+        .unwrap();
+    assert_eq!(profile.connection().unwrap().sort_key().1, 2);
+    assert_eq!(
+        profile.connection().unwrap().label(&profile.base_url),
+        "Developer plan · Private region (127.0.0.1:3001)"
+    );
+    let saved: ProviderPatch =
+        serde_json::from_value(serde_json::to_value(&catalog.providers[0]).unwrap()).unwrap();
+    settings.save_provider(saved).unwrap();
+    let restored = settings
+        .model_catalog()
+        .unwrap()
+        .get("custom-provider", "assistant-responses")
+        .unwrap();
+    assert_eq!(restored, profile);
+    let partial: ProviderPatch = serde_yaml_ng::from_str(
+        "id: custom-provider\nmodels:\n  - id: assistant-responses\n    max_output_tokens: 2048\n",
+    )
+    .unwrap();
+    catalog = catalog.with_providers(vec![partial]).unwrap();
+    assert_eq!(
+        catalog
+            .get("custom-provider", "assistant-responses")
+            .unwrap()
+            .connection,
+        profile.connection
+    );
+    let invalid: ProviderPatch = serde_yaml_ng::from_str(
+        "id: custom-provider\nconnection:\n  vendor: ''\n  product: API\n  kind: service\n",
+    )
+    .unwrap();
+    assert!(catalog.with_providers(vec![invalid]).is_err());
+}
+
+#[test]
+fn official_primary_ids_and_aliases_preserve_routes_and_private_sources() {
+    let catalog = ModelCatalog::defaults();
+    let mut aliases = 0;
+    for provider in &catalog.providers {
+        for (old, canonical) in &provider.model_aliases {
+            aliases += 1;
+            let profile = catalog.get(&provider.id, old).unwrap();
+            assert_eq!(profile.model_id, *canonical);
+            assert_eq!(profile, catalog.get(&provider.id, canonical).unwrap());
+            let mut saved = profile.clone();
+            saved.model_id = old.clone();
+            saved.card.as_mut().unwrap().id = old.clone();
+            saved.base_url = "https://custom.example/retained-route".into();
+            saved.model = "user-retained-service-version".into();
+            saved.card.as_mut().unwrap().service_model_id = saved.model.clone();
+            saved.max_output_tokens = 1234;
+            saved.card.as_mut().unwrap().max_output_tokens = 1234;
+            saved.card.as_mut().unwrap().context_window_tokens = Some(4321);
+            saved.name = "User retained label".into();
+            saved.card.as_mut().unwrap().display_name = saved.name.clone();
+            let source = saved.private_history_source();
+            let migrated = model_for_persistent_selection(saved.clone());
+            assert_eq!(migrated.model_id, *canonical);
+            assert_eq!(migrated.private_history_source(), source);
+            saved.model_id = canonical.clone();
+            saved.card.as_mut().unwrap().id = canonical.clone();
+            assert_eq!(migrated, saved);
+        }
+        for card in &provider.models {
+            if provider.id != "deepseek-api" || card.adapter == Adapter::DeepseekChatCompletions {
+                assert_eq!(card.id, card.service_model_id);
+            }
+        }
+    }
+    assert!(aliases >= 36);
+    for legacy_route in ["deepseek-flash-messages", "deepseek-flash-responses"] {
+        let fixed = catalog.get("deepseek-api", legacy_route).unwrap();
+        assert_eq!(fixed.model_id, legacy_route);
+    }
+}
+
+#[test]
+fn aliases_merge_across_settings_and_yaml_then_save_and_reset_by_either_id() {
+    let root = tempfile::tempdir().unwrap();
+    let settings = UserSettings::in_root(root.path());
+    std::fs::write(root.path().join("settings.json"), json!({
+        "defaultModel":{"provider":"openai-api","model":"gpt-6.1-sol-responses"},
+        "providers":[{"id":"openai-api","models":[{"id":"gpt-6.1-sol-responses","max_output_tokens":2048}]}]
+    }).to_string()).unwrap();
+    std::fs::create_dir(root.path().join("providers")).unwrap();
+    std::fs::write(
+        root.path().join("providers/openai-api.yaml"),
+        "id: openai-api\nmodels:\n  - id: gpt-6.1-sol\n    max_output_tokens: 3072\n",
+    )
+    .unwrap();
+    let selected = settings.load().configured_model().unwrap().unwrap();
+    assert_eq!(selected.model_id, "gpt-6.1-sol");
+    assert_eq!(selected.max_output_tokens, 3072);
+    for (id, limit, reset) in [
+        ("gpt-6.1-sol-responses", 4096, "gpt-6.1-sol"),
+        ("gpt-6.1-sol", 8192, "gpt-6.1-sol-responses"),
+    ] {
+        let patch: ProviderPatch = serde_yaml_ng::from_str(&format!(
+            "id: openai-api\nmodels:\n  - id: {id}\n    max_output_tokens: {limit}\n"
+        ))
+        .unwrap();
+        settings.save_provider(patch).unwrap();
+        assert_eq!(
+            settings
+                .load()
+                .configured_model()
+                .unwrap()
+                .unwrap()
+                .max_output_tokens,
+            limit
+        );
+        settings.restore_model_default("openai-api", reset).unwrap();
+        assert_eq!(
+            settings
+                .load()
+                .configured_model()
+                .unwrap()
+                .unwrap()
+                .max_output_tokens,
+            128_000
+        );
+    }
+    let duplicate: ProviderPatch = serde_yaml_ng::from_str("id: openai-api\nmodels:\n  - id: gpt-6.1-sol-responses\n    max_output_tokens: 1024\n  - id: gpt-6.1-sol\n    max_output_tokens: 2048\n").unwrap();
+    assert!(settings.save_provider(duplicate.clone()).is_err());
+    assert!(
+        ModelCatalog::defaults()
+            .with_providers(vec![duplicate])
+            .is_err()
+    );
+}
+
+#[test]
+fn aliases_validate_direct_targets_and_survive_custom_provider_save_restore() {
+    for aliases in [
+        "{old: missing}",
+        "{assistant-responses: assistant-responses}",
+        "{old: middle, middle: assistant-responses}",
+        "{'': assistant-responses}",
+    ] {
+        let patch: ProviderPatch =
+            serde_yaml_ng::from_str(&format!("id: custom-alias\nmodel_aliases: {aliases}\n"))
+                .unwrap();
+        assert!(
+            ModelCatalog::from_providers(vec![custom_provider("custom-alias")])
+                .unwrap()
+                .with_providers(vec![patch])
+                .is_err()
+        );
+    }
+    let root = tempfile::tempdir().unwrap();
+    let settings = UserSettings::in_root(root.path());
+    let mut provider = custom_patch("custom-alias");
+    provider.model_aliases = Some(BTreeMap::from([(
+        "LegacyMixedCase".into(),
+        "assistant-responses".into(),
+    )]));
+    provider.default_model = Some("LegacyMixedCase".into());
+    settings.save_provider(provider).unwrap();
+    let catalog = settings.model_catalog().unwrap();
+    assert_eq!(
+        catalog.get("custom-alias", "LegacyMixedCase"),
+        catalog.get("custom-alias", "assistant-responses")
+    );
+    let saved = std::fs::read_to_string(root.path().join("providers/custom-alias.yaml")).unwrap();
+    assert!(saved.contains("LegacyMixedCase"));
+    let selected = ModelCatalog::selected_provider_yaml(&saved).unwrap();
+    assert_eq!(selected.model_id, "assistant-responses");
 }

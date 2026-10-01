@@ -1,5 +1,6 @@
 //! Local subscription credentials.
 
+pub mod copilot;
 pub mod minimax;
 
 use std::fmt;
@@ -55,6 +56,8 @@ const CALLBACK_STATE_MISMATCH: &str = "This callback belongs to a different sign
 pub enum AuthError {
     #[error("{0}")]
     MiniMax(String),
+    #[error("{0}")]
+    Copilot(String),
     #[error("OpenAI Codex login was cancelled")]
     Cancelled,
     #[error("OpenAI Codex authorization timed out; retry from /model → Provider")]

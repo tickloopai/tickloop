@@ -118,6 +118,15 @@ impl AccountModelDiscovery {
         force: bool,
         cancel: &CancellationToken,
     ) -> Result<AccountModelDirectory, String> {
+        let strategy = config
+            .connection()
+            .map_or(ModelDiscovery::Unsupported, |connection| {
+                connection.discovery
+            });
+        if strategy == ModelDiscovery::GithubCopilot {
+            let adapter = super::copilot::CopilotDirectoryAdapter { config, root };
+            return self.discover_with(&adapter, force, cancel).await;
+        }
         self.discover_with(&OpenAiDirectoryAdapter { config, root }, force, cancel)
             .await
     }
@@ -141,15 +150,29 @@ impl AccountModelDiscovery {
         force: bool,
         cancel: &CancellationToken,
     ) -> Result<AccountModelDirectory, String> {
+        let initial_generations = self.state.lock().unwrap().generations.clone();
         let identity = adapter.identity(cancel).await?;
         if identity.provider.is_empty()
             || identity.account.is_empty()
+            || identity.resource.is_empty()
             || Url::parse(&identity.origin).is_err()
         {
             return Err("Invalid account directory identity".into());
         }
         let generation = {
             let mut state = self.state.lock().unwrap();
+            if state
+                .generations
+                .get(&identity.provider)
+                .copied()
+                .unwrap_or(0)
+                != initial_generations
+                    .get(&identity.provider)
+                    .copied()
+                    .unwrap_or(0)
+            {
+                return Err("Model discovery superseded by an authentication change".into());
+            }
             let same_identity = state
                 .identities
                 .get(&identity.provider)
@@ -228,7 +251,7 @@ impl AccountDirectoryAdapter for OpenAiDirectoryAdapter<'_> {
         Ok(DiscoveryIdentity {
             provider: self.config.provider_id.clone(),
             origin: endpoint.origin().ascii_serialization(),
-            resource: credential_fingerprint(self.config.base_url.as_bytes()),
+            resource: credential_fingerprint(endpoint.as_str().as_bytes()),
             account: auth.identity,
         })
     }
@@ -287,7 +310,9 @@ async fn resolve_auth(
             let identity = credential_fingerprint(key.as_bytes());
             (key, None, identity)
         }
-        ModelDiscovery::Unsupported => return Err("Model discovery is not provided".into()),
+        ModelDiscovery::Unsupported | ModelDiscovery::GithubCopilot => {
+            return Err("Model discovery is not provided".into());
+        }
     };
     let mut bearer = HeaderValue::from_str(&format!("Bearer {token}"))
         .map_err(|_| "Invalid discovery credentials")?;
@@ -300,8 +325,17 @@ async fn resolve_auth(
 }
 
 fn discovery_endpoint(config: &ModelConfig, strategy: ModelDiscovery) -> Result<Url, String> {
-    let mut endpoint =
-        Url::parse(&config.base_url).map_err(|_| "Invalid model discovery endpoint")?;
+    #[cfg(test)]
+    let test_endpoint = if strategy == ModelDiscovery::Codex {
+        std::env::var("TICKLOOP_TEST_CODEX_RESPONSES").ok()
+    } else {
+        None
+    };
+    #[cfg(test)]
+    let base_url = test_endpoint.as_deref().unwrap_or(&config.base_url);
+    #[cfg(not(test))]
+    let base_url = config.base_url.as_str();
+    let mut endpoint = Url::parse(base_url).map_err(|_| "Invalid model discovery endpoint")?;
     if !endpoint.username().is_empty()
         || endpoint.password().is_some()
         || endpoint.query().is_some()
@@ -318,7 +352,7 @@ fn discovery_endpoint(config: &ModelConfig, strategy: ModelDiscovery) -> Result<
             endpoint.set_path(&format!("{}/models", endpoint.path().trim_end_matches('/')));
         }
         ModelDiscovery::Codex => {
-            if !is_loopback(&endpoint) && config.base_url != super::CODEX_RESPONSES_URL {
+            if !is_loopback(&endpoint) && base_url != super::CODEX_RESPONSES_URL {
                 return Err("Codex discovery requires the subscription resource origin".into());
             }
             endpoint.set_path(&format!(
@@ -332,7 +366,9 @@ fn discovery_endpoint(config: &ModelConfig, strategy: ModelDiscovery) -> Result<
                 .query_pairs_mut()
                 .append_pair("client_version", env!("CARGO_PKG_VERSION"));
         }
-        ModelDiscovery::Unsupported => return Err("Model discovery is not provided".into()),
+        ModelDiscovery::Unsupported | ModelDiscovery::GithubCopilot => {
+            return Err("Model discovery is not provided".into());
+        }
     }
     Ok(endpoint)
 }
@@ -425,7 +461,9 @@ fn parse_directory(strategy: ModelDiscovery, body: &[u8]) -> Result<AccountModel
                 !response.has_more,
             )
         }
-        ModelDiscovery::Unsupported => return Err("Model discovery is not provided".into()),
+        ModelDiscovery::Unsupported | ModelDiscovery::GithubCopilot => {
+            return Err("Model discovery is not provided".into());
+        }
     };
     if ids.len() > MAX_DIRECTORY_MODELS
         || ids.iter().any(|id| id.trim().is_empty() || id.len() > 512)
@@ -589,6 +627,61 @@ mod tests {
             assert!(pending.await.unwrap().is_err());
             assert!(cache.state.lock().unwrap().entries.is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn logout_during_initial_identity_resolution_cannot_restore_old_evidence() {
+        struct GatedIdentity {
+            adapter: ControlledAdapter,
+            started: Notify,
+            release: Semaphore,
+        }
+        #[async_trait::async_trait]
+        impl AccountDirectoryAdapter for GatedIdentity {
+            async fn identity(
+                &self,
+                cancel: &CancellationToken,
+            ) -> Result<DiscoveryIdentity, String> {
+                self.started.notify_one();
+                self.release.acquire().await.unwrap().forget();
+                self.adapter.identity(cancel).await
+            }
+            async fn fetch(
+                &self,
+                cancel: &CancellationToken,
+            ) -> Result<AccountModelDirectory, String> {
+                self.adapter.fetch(cancel).await
+            }
+        }
+        let cache = AccountModelDiscovery::default();
+        let old = Arc::new(GatedIdentity {
+            adapter: ControlledAdapter::new("account-a", false),
+            started: Notify::new(),
+            release: Semaphore::new(0),
+        });
+        let pending_cache = cache.clone();
+        let pending_old = old.clone();
+        let pending = tokio::spawn(async move {
+            pending_cache
+                .discover_with(pending_old.as_ref(), false, &CancellationToken::new())
+                .await
+        });
+        old.started.notified().await;
+        cache.invalidate("test-provider");
+        let relogged = ControlledAdapter::new("account-a", false);
+        cache
+            .discover_with(&relogged, false, &CancellationToken::new())
+            .await
+            .unwrap();
+        old.release.add_permits(1);
+        assert!(pending.await.unwrap().is_err());
+        assert_eq!(old.adapter.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            cache.state.lock().unwrap().entries["test-provider"]
+                .directory
+                .models,
+            relogged.directory.models
+        );
     }
 
     #[test]
