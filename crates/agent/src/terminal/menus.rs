@@ -70,6 +70,10 @@ enum Selection {
         chat: Uuid,
         provider: ProviderModels,
     },
+    ServiceAccount {
+        chat: Uuid,
+        provider: ProviderModels,
+    },
     JudgmentSettings {
         return_to: JudgmentReturn,
         has_key: bool,
@@ -261,6 +265,7 @@ impl Selection {
             | Self::ModelProviders { chat }
             | Self::Discovery { chat }
             | Self::ApiKey { chat, .. }
+            | Self::ServiceAccount { chat, .. }
             | Self::Model { chat, .. }
             | Self::Effort { chat, .. }
             | Self::Settings { chat }
@@ -1904,6 +1909,9 @@ impl Menus {
                         };
                         let provider = choices.get(provider_index).ok_or("provider option does not exist")?.clone();
                         self.provider_choices = choices;
+                        if provider.models[0].auth_source == tickloop_agent::model::ModelAuthSource::GoogleCloud {
+                            return self.provider_auth(console, chat, provider);
+                        }
                         match self.provider_authenticated(&provider) {
                             Ok(true) | Ok(false) => return self.provider_auth(console, chat, provider),
                             Err(error) => {
@@ -1918,6 +1926,19 @@ impl Menus {
                     } else {
                         console.write("Selection cancelled; configuration unchanged.\n")?;
                     }
+                }
+                Selection::ServiceAccount { chat, provider } => {
+                    if index == Some(0) {
+                        let root = self.config_root.as_deref().ok_or("Cannot locate the Agent state directory; set TICKLOOP_CONFIG_DIR.")?;
+                        let path = comment.as_deref().unwrap_or("").trim();
+                        if let Err(error) = crate::auth::google::GoogleAuth::new(root).save_service_account_path(path) {
+                            self.provider_service_account(console, chat, provider, Some(path))?;
+                            return Err(error.to_string());
+                        }
+                        self.model_discovery.invalidate(&provider.models[0].provider_id);
+                        console.write("Service-account file configured.\n")?;
+                    }
+                    self.finish_provider_configuration(agent, console, chat).await?;
                 }
                 Selection::ApiKey { chat, provider } => {
                     if index == Some(0) {

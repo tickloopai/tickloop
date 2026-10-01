@@ -32,7 +32,9 @@ cargo run -p tickloop-agent
 
 Kimi 中国区使用 `MOONSHOT_CN_API_KEY`，国际区使用 `MOONSHOT_API_KEY`；两个服务分别验证 key，不自动切换地区。百炼使用 `DASHSCOPE_API_KEY` 和 `https://dashscope.aliyuncs.com/compatible-mode/v1/`；Anthropic 使用 `ANTHROPIC_API_KEY`，Gemini Developer API 使用 `GEMINI_API_KEY`，xAI API 使用 `XAI_API_KEY`。Kimi Code 和 Grok 的 OAuth 连接在 `/provider` 中使用设备授权，并在 consent 说明实际注册客户端名称。Grok OAuth 使用官方订阅代理 `cli-chat-proxy.grok.com`，独立于按量 API。
 
-Vertex service account 使用 `GOOGLE_APPLICATION_CREDENTIALS` 指向绝对路径的私有 `service_account` JSON 文件（`0600`，路径不含符号链接）；可写进 Agent 状态根的私有 `.env`。`GOOGLE_CLOUD_PROJECT` 可覆盖资源项目，`GOOGLE_CLOUD_LOCATION` 默认 `global`，选择其他位置前核对模型在该位置的支持。程序自行签名 JWT、交换及刷新短期 token。该文件路径及 key 不写入模型 YAML。
+Vertex service account 在 `/provider` → Google → Vertex service account 按 Enter，输入本机私有 `service_account` JSON 文件的绝对路径。已有路径会预填，支持普通文本编辑与 `Ctrl+G` 外部编辑器；Esc 先退出输入、再取消。程序验证文件权限（`0600`，不含符号链接）、格式和签名密钥后保存路径，失败则留在输入框且不修改已有配置。保存后返回 Provider，再通过 `/model` 选择模型；JSON 文件留在原处，不复制其内容。
+
+脚本和非交互启动仍可通过 `GOOGLE_APPLICATION_CREDENTIALS` 设置文件路径，或写入 Agent 状态根的私有 `.env`。`GOOGLE_CLOUD_PROJECT` 可覆盖文件中的资源项目，`GOOGLE_CLOUD_LOCATION` 默认 `global`，选择其他位置前核对模型在该位置的支持。程序自行签名 JWT、交换及刷新短期 token。该文件路径及 key 不写入模型 YAML。
 
 Google 用户 OAuth 使用自己的 installed-app client：在环境或私有 `.env` 设置 `GOOGLE_OAUTH_CLIENT_ID`、`GOOGLE_OAUTH_CLIENT_SECRET` 和 `GOOGLE_CLOUD_PROJECT`，再进入 Google 的 OAuth 连接授权。它使用 PKCE/state 和官方 Google token 服务；远程终端可粘贴完整 callback URL。Gemini Developer API 和 Vertex 使用独立 Provider 身份及资源路径，共享本程序的 Google 用户登录。也提供 `GoogleAuth::import_authorized_user` 显式导入私有 ADC 用户文件的 library 接口；不会自动读取其他程序的凭据。退出登录仅清除本地 token；服务账号文件由用户管理。
 

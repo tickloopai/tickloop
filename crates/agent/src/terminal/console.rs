@@ -331,6 +331,7 @@ enum MenuFocus {
     Menu,
     MenuWithLink(String),
     Secret,
+    Input(String),
     Picker(PickerKind),
     Question(QuestionMenu),
 }
@@ -518,6 +519,7 @@ struct MenuCommentState {
     editing: bool,
     cursor: usize,
     secret: bool,
+    standalone_input: bool,
 }
 
 struct MenuReviewState {
@@ -1730,6 +1732,23 @@ impl Console {
         )
     }
 
+    pub(super) fn show_input_menu(
+        &self,
+        mut menu: Menu,
+        label: &'static str,
+        value: &str,
+    ) -> Result<(), String> {
+        menu.selected = 0;
+        self.show_menu_with_comments(
+            menu,
+            Some(vec![0]),
+            Vec::new(),
+            label,
+            None,
+            MenuFocus::Input(value.into()),
+        )
+    }
+
     pub(super) fn show_login_menu(
         &self,
         menu: Menu,
@@ -1868,6 +1887,7 @@ impl Console {
             return Err("an expandable menu option does not exist".into());
         }
         let secret = matches!(&focus, MenuFocus::Secret);
+        let standalone_input = matches!(&focus, MenuFocus::Input(_));
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         if !state.interactive {
             return Err("interactive menus require a terminal".into());
@@ -1907,6 +1927,7 @@ impl Console {
                             MenuFocus::Menu
                             | MenuFocus::MenuWithLink(_)
                             | MenuFocus::Secret
+                            | MenuFocus::Input(_)
                             | MenuFocus::Picker(..) => true,
                         })
             },
@@ -1923,10 +1944,15 @@ impl Console {
             options,
             values: HashMap::new(),
             label: comment_label,
-            editing: secret,
+            editing: secret || standalone_input,
             cursor: 0,
             secret,
+            standalone_input,
         });
+        if let (Some(comment), MenuFocus::Input(value)) = (&mut state.menu_comment, &focus) {
+            comment.cursor = value.len();
+            comment.values.insert(0, value.clone());
+        }
         if let (Some(comment), MenuFocus::Question(question)) = (&mut state.menu_comment, &focus)
             && let Some(entry) = question.entry_option
             && !question.entry_text.is_empty()
@@ -1955,6 +1981,7 @@ impl Console {
             MenuFocus::WhenInputEmpty
             | MenuFocus::Menu
             | MenuFocus::Secret
+            | MenuFocus::Input(_)
             | MenuFocus::Picker(..)
             | MenuFocus::Question(_) => None,
         };
@@ -3449,6 +3476,13 @@ impl State {
                         "add context (optional) · Enter submit · Tab close · Esc close".into()
                     } else if self.question_menu.is_some() {
                         "Type your answer · Enter submit · Esc close field".into()
+                    } else if self
+                        .menu_comment
+                        .as_ref()
+                        .is_some_and(|comment| comment.standalone_input)
+                    {
+                        "Enter save · Ctrl+G external editor · Tab close field · Esc close field"
+                            .into()
                     } else {
                         "Type a comment · Enter submit · Tab close · Esc close".into()
                     }
@@ -3645,11 +3679,19 @@ impl State {
             hint
         } else if self.foreground_shell {
             "Shell running · Ctrl+B / Ctrl+X Ctrl+B background · Ctrl+C stop".into()
-        } else if self.secret_menu_active() {
-            if self.menu_comment_is_editing() {
-                "API key · Enter save · Esc close field".into()
+        } else if self.input_menu_active() {
+            let comment = self.menu_comment.as_ref().unwrap();
+            if comment.editing {
+                if comment.standalone_input {
+                    format!(
+                        "{} · Enter save · Ctrl+G external editor · Esc close field",
+                        comment.label
+                    )
+                } else {
+                    "API key · Enter save · Esc close field".into()
+                }
             } else {
-                "API key · Tab edit · Esc cancel".into()
+                format!("{} · Tab edit · Esc cancel", comment.label)
             }
         } else if self.menu_focused && self.menu_is_visible() {
             match self.picker_kind {
@@ -4443,12 +4485,12 @@ impl State {
             .is_some_and(|comment| comment.editing)
     }
 
-    fn secret_menu_active(&self) -> bool {
+    fn input_menu_active(&self) -> bool {
         self.menu.is_some()
             && self
                 .menu_comment
                 .as_ref()
-                .is_some_and(|comment| comment.secret)
+                .is_some_and(|comment| comment.secret || comment.standalone_input)
     }
 
     fn navigate_menu_review(&mut self, action: DiffNavigationAction) {
@@ -4735,6 +4777,23 @@ impl State {
             return false;
         };
         let value = comment.values.entry(selected).or_default();
+        if comment.standalone_input && key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('a') => comment.cursor = 0,
+                KeyCode::Char('e') => comment.cursor = value.len(),
+                KeyCode::Char('b') => comment.cursor = previous_boundary(value, comment.cursor),
+                KeyCode::Char('f') => comment.cursor = next_boundary(value, comment.cursor),
+                KeyCode::Char('u') => {
+                    value.drain(..comment.cursor);
+                    comment.cursor = 0;
+                }
+                KeyCode::Char('k') => {
+                    value.truncate(comment.cursor);
+                }
+                _ => {}
+            }
+            return true;
+        }
         match key.code {
             KeyCode::Left => {
                 comment.cursor = previous_boundary(value, comment.cursor);
@@ -4809,7 +4868,7 @@ impl State {
         if self.menu_submission_is_pending() {
             return;
         }
-        if self.secret_menu_active() {
+        if self.input_menu_active() {
             self.paste_menu_comment(text);
             return;
         }
@@ -5069,9 +5128,19 @@ impl State {
     }
 
     fn edit_in_external_editor(&mut self) {
+        let menu_input = self.input_menu_active()
+            && self
+                .menu_comment
+                .as_ref()
+                .is_some_and(|comment| comment.standalone_input && comment.editing);
+        let draft = if menu_input {
+            self.selected_menu_comment().unwrap_or_default()
+        } else {
+            self.editor.draft().to_owned()
+        };
         let outcome = match &self.external_editor {
             ExternalEditorLauncher::Terminal => {
-                let Some(outcome) = self.edit_prompt_in_terminal() else {
+                let Some(outcome) = self.edit_text_in_terminal(&draft) else {
                     return;
                 };
                 outcome
@@ -5081,17 +5150,27 @@ impl State {
                 opened_drafts,
                 outcome,
             } => {
-                opened_drafts
-                    .lock()
-                    .unwrap()
-                    .push(self.editor.draft().to_owned());
+                opened_drafts.lock().unwrap().push(draft.clone());
                 outcome.clone()
             }
         };
         match outcome {
             ExternalEditorOutcome::Updated { content } => {
-                self.replace_draft(content.clone(), content.len());
-                self.status = "Draft updated by external editor".into();
+                if menu_input {
+                    let content = content.trim();
+                    if content.chars().any(char::is_control) {
+                        self.status = "Enter a single file path.".into();
+                        return;
+                    }
+                    let selected = self.menu.as_ref().unwrap().selected;
+                    let comment = self.menu_comment.as_mut().unwrap();
+                    comment.values.insert(selected, content.into());
+                    comment.cursor = content.len();
+                    self.status = "File path updated by external editor".into();
+                } else {
+                    self.replace_draft(content.clone(), content.len());
+                    self.status = "Draft updated by external editor".into();
+                }
             }
             ExternalEditorOutcome::Unchanged => {
                 self.status = "External editor left the draft unchanged".into();
@@ -5110,7 +5189,7 @@ impl State {
 
     /// Returns `None` when the terminal could not be handed over or taken back;
     /// the status line then carries the reason.
-    fn edit_prompt_in_terminal(&mut self) -> Option<ExternalEditorOutcome> {
+    fn edit_text_in_terminal(&mut self, draft: &str) -> Option<ExternalEditorOutcome> {
         let working_directory = self
             .mention_roots
             .as_ref()
@@ -5139,7 +5218,7 @@ impl State {
             self.status = format!("Cannot leave raw mode for editor: {error}");
             return None;
         }
-        let outcome = edit_prompt(self.editor.draft(), &working_directory);
+        let outcome = edit_prompt(draft, &working_directory);
         let raw_result = terminal::enable_raw_mode();
         let screen_result = self.surface.take(self.renderer, &mut output);
         let paste_result = enable_input_reporting(&mut output);
@@ -5323,12 +5402,25 @@ impl State {
         if self.menu_submission_is_pending() || self.branch_submission_owns_input() {
             return None;
         }
-        if self.secret_menu_active() {
+        if self.input_menu_active() {
             self.menu_focused = true;
             self.review_focused = false;
             if key.code == KeyCode::BackTab {
                 if self.menu_comment_is_editing() {
                     self.toggle_menu_comment();
+                }
+                return None;
+            }
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && self
+                    .menu_comment
+                    .as_ref()
+                    .is_some_and(|comment| comment.standalone_input && comment.editing)
+            {
+                if key.code == KeyCode::Char('g') {
+                    self.edit_in_external_editor();
+                } else {
+                    self.edit_menu_comment(key);
                 }
                 return None;
             }
@@ -7284,6 +7376,7 @@ mod tests {
             editing: false,
             cursor: 0,
             secret: false,
+            standalone_input: false,
         });
     }
 
@@ -9069,6 +9162,41 @@ mod tests {
     }
 
     #[test]
+    fn file_path_input_uses_normal_editing_and_external_editor_without_touching_prompt() {
+        let mut state = State::new(true, 80, 24);
+        state.prompt_enabled = true;
+        state.insert("preserved draft");
+        let console = InteractiveConsoleFixture::new(state);
+        let mut selection = menu();
+        selection.options = vec!["Save service account".into(), "Cancel".into()];
+        selection.confirmation = false;
+        console
+            .show_input_menu(selection, "JSON file path", "/old.json")
+            .unwrap();
+        let mut state = console.state.lock().unwrap();
+        assert!(state.menu_comment_is_editing());
+        state.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        for character in "/newjk.json".chars() {
+            state.key(key(KeyCode::Char(character)));
+        }
+        assert_eq!(
+            state.selected_menu_comment().as_deref(),
+            Some("/newjk.json")
+        );
+        let opened = scripted_external_editor(&mut state, "/edited path.json\n");
+        state.key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
+        assert_eq!(opened.lock().unwrap().as_slice(), ["/newjk.json"]);
+        assert_eq!(
+            state.selected_menu_comment().as_deref(),
+            Some("/edited path.json")
+        );
+        assert_eq!(state.editor.draft(), "preserved draft");
+        assert!(
+            matches!(state.key(key(KeyCode::Enter)), Some(InputEvent::Choice { index: 0, comment: Some(value), .. }) if value == "/edited path.json")
+        );
+    }
+
+    #[test]
     fn secret_menu_masks_rendered_value_and_submits_exact_key() {
         let mut state = State::new(true, 80, 24);
         state.prompt_enabled = true;
@@ -9232,6 +9360,7 @@ mod tests {
             editing: true,
             cursor: 0,
             secret: true,
+            standalone_input: false,
         });
 
         state.paste("other\nkey");
@@ -9300,6 +9429,7 @@ mod tests {
             editing: false,
             cursor: 0,
             secret: false,
+            standalone_input: false,
         });
 
         assert!(state.key(key(KeyCode::Tab)).is_none());
@@ -9343,6 +9473,7 @@ mod tests {
             editing: false,
             cursor: 0,
             secret: false,
+            standalone_input: false,
         });
 
         assert!(state.key(key(KeyCode::Tab)).is_none());

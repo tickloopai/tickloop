@@ -57,6 +57,13 @@ impl Terminal {
         command.env_remove(TEST_KEY_NAME);
         command.env_remove("DEEPSEEK_API_KEY");
         command.env_remove("TYPESAFE_API_KEY");
+        for name in [
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "GOOGLE_CLOUD_PROJECT",
+            "GOOGLE_CLOUD_LOCATION",
+        ] {
+            command.env_remove(name);
+        }
         command.env_remove("TMUX");
         for name in ["HERDR_ENV", "HERDR_PANE_ID", "HERDR_SOCKET_PATH"] {
             command.env_remove(name);
@@ -103,6 +110,29 @@ impl Terminal {
         self.output.lock().unwrap().len()
     }
 
+    fn select_row(&mut self, label: &str) {
+        for _ in 0..64 {
+            let selected = {
+                let output = self.output.lock().unwrap();
+                let frame = screen::visible_screen(&output, 120, 38);
+                frame.lines().any(|line| {
+                    line.trim_start().starts_with(['❯', '›', '>']) && line.contains(label)
+                })
+            };
+            if selected {
+                self.send(b"\r");
+                return;
+            }
+            self.send(b"j");
+            thread::sleep(FRAME_SETTLE);
+        }
+        let output = self.output.lock().unwrap();
+        panic!(
+            "menu did not select {label:?}; latest frame:\n{}",
+            screen::visible_screen(&output, 120, 38)
+        );
+    }
+
     fn wait_for(&self, expected: &str) {
         let deadline = Instant::now() + TIMEOUT;
         while Instant::now() < deadline {
@@ -144,6 +174,22 @@ impl Terminal {
         self.wait_for_frame_after(mark, "model picker closed", |frame| {
             !frame.contains("Choose model")
         });
+    }
+
+    fn close_provider_picker(&mut self) {
+        for _ in 0..6 {
+            let frame = screen::visible_screen(&self.output.lock().unwrap(), 120, 38);
+            if !frame.contains("Choose Provider")
+                && !frame.contains("Choose connection")
+                && !frame.contains("Service account · Google")
+            {
+                return;
+            }
+            let mark = self.mark();
+            self.send(b"\x1b");
+            self.wait_for_frame_after(mark, "provider escape processed", |_| true);
+        }
+        panic!("Provider picker did not close");
     }
 
     fn exit(&mut self) {
@@ -231,6 +277,107 @@ fn write_saved_test_key(workdir: &Path) {
     fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
     fs::write(state.join(".env"), format!("{TEST_KEY_NAME}={TEST_KEY}\n")).unwrap();
     fs::set_permissions(state.join(".env"), fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+#[test]
+fn vertex_service_account_opens_user_configuration_and_cancel_preserves_credentials() {
+    let directory = tempfile::tempdir().unwrap();
+    let workdir = directory.path().canonicalize().unwrap();
+    write_saved_test_key(&workdir);
+    let original = fs::read(workdir.join("state/.env")).unwrap();
+    let mut terminal = Terminal::start(&workdir, None);
+    terminal.wait_for("deepseek-flash");
+    terminal.send(b"/provider\r");
+    terminal.wait_for("Choose Provider");
+    terminal.select_row("Google");
+    terminal.wait_for("Choose connection · Google");
+    terminal.select_row("Vertex service account");
+    terminal.wait_for("Service account · Google");
+    terminal.wait_for("JSON file path:");
+    let mark = terminal.mark();
+    terminal.send(b"/path/not/saved.json\x1b\x1b");
+    terminal.wait_for_frame_after(mark, "cancelled service-account entry", |frame| {
+        frame.contains("Choose connection · Google") && !frame.contains("Service account · Google")
+    });
+    assert_eq!(fs::read(workdir.join("state/.env")).unwrap(), original);
+    assert!(!workdir.join("state/settings.json").exists());
+    terminal.close_provider_picker();
+    terminal.exit();
+}
+
+#[test]
+fn vertex_service_account_save_retry_and_reconfigure_preserve_model_and_other_keys() {
+    let directory = tempfile::tempdir().unwrap();
+    let workdir = directory.path().canonicalize().unwrap();
+    write_saved_test_key(&workdir);
+    let source = workdir.join("service account.json");
+    let account = serde_json::json!({
+        "type": "service_account",
+        "project_id": "fixture-project",
+        "client_email": "fixture@fixture-project.iam.gserviceaccount.com",
+        "private_key": include_str!("fixtures/google-test-private-key.pem"),
+        "token_uri": "https://oauth2.googleapis.com/token"
+    });
+    let account_bytes = serde_json::to_vec(&account).unwrap();
+    fs::write(&source, &account_bytes).unwrap();
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o600)).unwrap();
+    let mut terminal = Terminal::start(&workdir, None);
+    terminal.wait_for("deepseek-flash");
+    terminal.send(b"/provider\r");
+    terminal.wait_for("Choose Provider");
+    terminal.select_row("Google");
+    terminal.wait_for("Choose connection · Google");
+    terminal.select_row("Vertex service account");
+    terminal.wait_for("JSON file path:");
+    terminal.send(source.to_str().unwrap().as_bytes());
+    let mark = terminal.mark();
+    terminal.send(b"\r");
+    terminal.wait_for_frame_after(mark, "configured Vertex", |frame| {
+        frame.contains("Choose connection · Google") && frame.contains("Service account configured")
+    });
+    let saved = fs::read(workdir.join("state/.env")).unwrap();
+    assert_eq!(
+        tickloop_agent::model::credentials::load_api_key(
+            &workdir.join("state"),
+            "GOOGLE_APPLICATION_CREDENTIALS"
+        )
+        .unwrap()
+        .as_deref(),
+        source.to_str()
+    );
+    assert!(String::from_utf8_lossy(&saved).contains(TEST_KEY));
+    assert!(!workdir.join("state/settings.json").exists());
+    assert_eq!(fs::read(&source).unwrap(), account_bytes);
+    assert!(!workdir.join("state/auth").exists());
+
+    let mark = terminal.mark();
+    terminal.send(b"\r");
+    terminal.wait_for_frame_after(mark, "prefilled service-account path", |frame| {
+        frame.contains("Service account · Google") && frame.contains("service account.json")
+    });
+    let mark = terminal.mark();
+    terminal.send(b"\x15/private/tmp/missing-service-account.json\r");
+    terminal.wait_for_frame_after(mark, "invalid path remains editable", |frame| {
+        frame.contains("Service account · Google")
+            && frame.contains("missing-service-account.json")
+            && frame.contains("file is missing")
+    });
+    assert_eq!(fs::read(workdir.join("state/.env")).unwrap(), saved);
+    let mark = terminal.mark();
+    terminal.send(b"\x1b\x1b");
+    terminal.wait_for_frame_after(mark, "cancel returns to connections", |frame| {
+        frame.contains("Choose connection · Google") && !frame.contains("Service account · Google")
+    });
+    fs::remove_file(&source).unwrap();
+    let mark = terminal.mark();
+    terminal.send(b"\r");
+    terminal.wait_for_frame_after(mark, "broken path remains configurable", |frame| {
+        frame.contains("Service account · Google") && frame.contains("JSON file path:")
+    });
+    terminal.close_provider_picker();
+    terminal.exit();
+    assert_eq!(fs::read(workdir.join("state/.env")).unwrap(), saved);
+    assert!(!workdir.join("state/settings.json").exists());
 }
 
 #[test]

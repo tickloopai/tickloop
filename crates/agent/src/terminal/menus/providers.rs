@@ -1308,16 +1308,8 @@ impl Menus {
         provider: ProviderModels,
     ) -> Result<MenuOutcome, String> {
         if provider.models[0].auth_source == ModelAuthSource::GoogleCloud {
-            let status = if self.provider_authenticated(&provider)? {
-                "Service-account file is configured. Select its model from /model."
-            } else {
-                "Set GOOGLE_APPLICATION_CREDENTIALS in the Agent environment or private .env to an absolute private service-account JSON path. Optional GOOGLE_CLOUD_PROJECT and GOOGLE_CLOUD_LOCATION select the billed project and resource."
-            };
-            self.back_to_providers(console, chat)?;
-            return Ok(MenuOutcome {
-                status: Some(status.into()),
-                ..Default::default()
-            });
+            self.provider_service_account(console, chat, provider, None)?;
+            return Ok(MenuOutcome::default());
         }
         if let Some(target) = SignInTarget::from_auth(provider.models[0].auth_source) {
             return self.begin_provider_login(console, chat, provider, target.login_method());
@@ -1354,6 +1346,46 @@ impl Menus {
             provider_login: Some(method),
             ..Default::default()
         })
+    }
+
+    pub(super) fn provider_service_account(
+        &mut self,
+        console: &Console,
+        chat: Uuid,
+        provider: ProviderModels,
+        entered_path: Option<&str>,
+    ) -> Result<(), String> {
+        let root = self
+            .config_root
+            .as_deref()
+            .ok_or("Cannot locate the Agent state directory; set TICKLOOP_CONFIG_DIR.")?;
+        let saved = crate::auth::google::GoogleAuth::new(root)
+            .service_account_path()
+            .map_err(|error| error.to_string())?;
+        let menu = Menu {
+            id: Uuid::new_v4(),
+            title: "Service account · Google Vertex".into(),
+            context: vec![
+                "Enter the absolute path to your service-account JSON file on this computer."
+                    .into(),
+                "The file must be private (0600). Only its path is saved; the file stays in place."
+                    .into(),
+                "The project comes from the file unless overridden. Location defaults to global."
+                    .into(),
+            ],
+            options: vec!["Save service account".into(), "Cancel".into()],
+            selected: 0,
+            confirmation: false,
+        };
+        self.dismiss(console)?;
+        let id = menu.id;
+        console.show_input_menu(
+            menu,
+            "JSON file path",
+            entered_path.or(saved.as_deref()).unwrap_or(""),
+        )?;
+        self.active = Some((id, Selection::ServiceAccount { chat, provider }));
+        Ok(())
     }
 
     pub(super) fn provider_api_key(

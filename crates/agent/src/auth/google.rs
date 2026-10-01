@@ -137,6 +137,25 @@ impl GoogleAuth {
         Ok(true)
     }
 
+    pub fn service_account_path(&self) -> Result<Option<String>, ModelError> {
+        setting(&self.root, "GOOGLE_APPLICATION_CREDENTIALS")
+    }
+
+    pub fn save_service_account_path(&self, path: &str) -> Result<(), ModelError> {
+        if !Path::new(path).is_absolute() {
+            return Err(configuration(
+                "Enter an absolute path to the service-account JSON file",
+            ));
+        }
+        let account: ServiceAccount = read_private_json(Path::new(path))
+            .map_err(|_| configuration("Choose a readable service-account JSON file with private permissions (0600) and no symbolic links"))?
+            .ok_or_else(|| configuration("Google service-account file is missing"))?;
+        validate_service_account(&account)?;
+        service_assertion(&account)?;
+        credentials::save_api_key(&self.root, "GOOGLE_APPLICATION_CREDENTIALS", path)
+            .map_err(|error| configuration(&error.to_string()))
+    }
+
     pub async fn start_browser_login(
         &self,
         cancel: &CancellationToken,
@@ -563,6 +582,76 @@ mod tests {
         auth::provider_test_support::{issuer, root},
         model::cards::ModelCatalog,
     };
+
+    #[test]
+    fn service_account_path_is_validated_before_saving_and_never_copies_credentials() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = root();
+        credentials::save_api_key(root.path(), "OTHER_PROVIDER_KEY", "preserved").unwrap();
+        let auth = GoogleAuth::new(root.path());
+        let source = root.path().join("service account.json");
+        let account = json!({
+            "type": "service_account",
+            "project_id": "fixture-project",
+            "client_email": "fixture@fixture-project.iam.gserviceaccount.com",
+            "private_key": include_str!("../../tests/fixtures/google-test-private-key.pem"),
+            "token_uri": TOKEN_URL
+        });
+        let bytes = serde_json::to_vec(&account).unwrap();
+        std::fs::write(&source, &bytes).unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600)).unwrap();
+        auth.save_service_account_path(source.to_str().unwrap())
+            .unwrap();
+        assert!(auth.service_account_configured().unwrap());
+        assert_eq!(
+            auth.service_account_path().unwrap().as_deref(),
+            source.to_str()
+        );
+        let saved = std::fs::read(root.path().join(".env")).unwrap();
+        assert_eq!(std::fs::read(&source).unwrap(), bytes);
+        assert!(!root.path().join("auth").exists());
+        assert!(!String::from_utf8_lossy(&saved).contains("PRIVATE KEY"));
+        assert_eq!(
+            credentials::load_api_key(root.path(), "OTHER_PROVIDER_KEY")
+                .unwrap()
+                .as_deref(),
+            Some("preserved")
+        );
+
+        assert!(auth.save_service_account_path("relative.json").is_err());
+        assert!(
+            auth.save_service_account_path(root.path().join("missing.json").to_str().unwrap())
+                .is_err()
+        );
+        let link = root.path().join("symlink.json");
+        std::os::unix::fs::symlink(&source, &link).unwrap();
+        assert!(
+            auth.save_service_account_path(link.to_str().unwrap())
+                .is_err()
+        );
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            auth.save_service_account_path(source.to_str().unwrap())
+                .is_err()
+        );
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600)).unwrap();
+        for (field, value) in [
+            ("type", "authorized_user"),
+            ("token_uri", "https://untrusted.example/token"),
+            ("project_id", "invalid/project"),
+            ("private_key", "invalid private key"),
+        ] {
+            let mut invalid = account.clone();
+            invalid[field] = json!(value);
+            std::fs::write(&source, serde_json::to_vec(&invalid).unwrap()).unwrap();
+            assert!(
+                auth.save_service_account_path(source.to_str().unwrap())
+                    .is_err()
+            );
+            assert_eq!(std::fs::read(root.path().join(".env")).unwrap(), saved);
+        }
+    }
 
     #[tokio::test]
     async fn own_client_pkce_login_refresh_and_logout_use_independent_credentials() {
