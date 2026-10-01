@@ -61,6 +61,9 @@ enum Selection {
         provider: ProviderModels,
         choices: Vec<ModelChoice>,
     },
+    Discovery {
+        chat: Uuid,
+    },
     ApiKey {
         chat: Uuid,
         provider: ProviderModels,
@@ -253,6 +256,7 @@ impl Selection {
             Self::Permission { chat, .. }
             | Self::PermissionRule { chat, .. }
             | Self::Provider { chat, .. }
+            | Self::Discovery { chat }
             | Self::ApiKey { chat, .. }
             | Self::Model { chat, .. }
             | Self::Effort { chat, .. }
@@ -288,8 +292,10 @@ pub(super) struct Menus {
     login_return: Option<(Uuid, ProviderModels)>,
     provider_choices: Vec<ProviderModels>,
     provider_selected: usize,
-    provider_group: Option<(&'static str, usize)>,
+    provider_group: Option<(String, usize)>,
     config_root: Option<PathBuf>,
+    model_discovery: tickloop_agent::model::availability::AccountModelDiscovery,
+    discovery_flow: Option<providers::DiscoveryFlow>,
     font_manager: Option<NerdFontManager<SystemFontAdapter>>,
 }
 
@@ -312,6 +318,8 @@ impl Menus {
             provider_selected: 0,
             provider_group: None,
             config_root: config_root.clone(),
+            model_discovery: Default::default(),
+            discovery_flow: None,
             font_manager: config_root.map(NerdFontManager::production),
         }
     }
@@ -557,6 +565,7 @@ impl Menus {
     }
 
     pub(super) fn dismiss(&mut self, console: &Console) -> Result<(), String> {
+        self.discovery_flow.take();
         if let Some((id, _)) = self.active.take() {
             console.clear_menu(id)?;
         }
@@ -775,21 +784,25 @@ impl Menus {
                             models.iter().any(|model| model.id == profile.model_id)
                         })
                 });
-                explicitly_loaded
-                    || access
-                        .ordinary_candidate(profile, &defaults)
-                        .unwrap_or_else(|| {
-                            defaults
+                access
+                    .ordinary_candidate(profile, &defaults)
+                    .unwrap_or_else(|| {
+                        explicitly_loaded
+                            || defaults
                                 .get(&profile.provider_id, &profile.model_id)
                                 .as_ref()
                                 != Some(profile)
-                                || tickloop_agent::model::cards::is_default_visible(profile)
-                        })
+                            || tickloop_agent::model::cards::is_default_visible(profile)
+                    })
             })
             .collect();
         let mut choices = settings::model_choices_with_profiles(&snapshot.model, profiles);
         if let Some(pending) = &snapshot.pending_model
             && !choices.contains(pending)
+            && tickloop_agent::model::access::AccessCatalog::defaults().ordinary_candidate(
+                pending,
+                &tickloop_agent::model::cards::ModelCatalog::defaults(),
+            ) != Some(false)
         {
             choices.push(pending.clone());
         }
@@ -1835,7 +1848,7 @@ impl Menus {
                         if let Some((_, selected)) = &mut self.provider_group { *selected = index; } else { self.provider_selected = index; }
                         let provider_index = match row {
                             ProviderRow::Group(name) => {
-                                self.provider_group = Some((*name, 0));
+                                self.provider_group = Some((name.clone(), 0));
                                 self.provider_choices = choices.clone();
                                 self.show_providers(console, chat, choices, 0, Uuid::new_v4())?;
                                 return Ok(MenuOutcome::default());
@@ -1866,6 +1879,7 @@ impl Menus {
                             self.provider_api_key(console, chat, provider)?;
                             return Err(error.to_string());
                         }
+                        self.model_discovery.invalidate(&provider.models[0].provider_id);
                         console.write("API key saved to Agent .env.\n")?;
                         self.provider_models(agent, console, chat, provider).await?;
                     } else {
@@ -1914,12 +1928,26 @@ impl Menus {
                         self.judgment_settings(agent, console, return_to).await?;
                     }
                 }
+                Selection::Discovery { chat } => {
+                    self.discovery_flow.take();
+                    self.back_to_providers(console, chat)?;
+                }
                 Selection::Model { chat, provider, choices } => {
                     let Some(index) = index else {
                         self.back_to_providers(console, chat)?;
                         return Ok(MenuOutcome::default());
                     };
+                    if index == choices.len() {
+                        self.model_discovery.invalidate(&provider.models[0].provider_id);
+                        self.provider_models(agent, console, chat, provider).await?;
+                        return Ok(MenuOutcome::default());
+                    }
                     let choice = choices.get(index).ok_or("model option does not exist")?;
+                    if !choice.availability.selectable() {
+                        let error = choice.availability.label().to_owned();
+                        self.show_model_choices(console, chat, provider, choices, index, Uuid::new_v4())?;
+                        return Err(error);
+                    }
                     let result: Result<_, String> = async {
                         let client = model_client(choice.config.clone(), self.config_root.as_deref())
                             .map_err(|error| error.to_string())?;

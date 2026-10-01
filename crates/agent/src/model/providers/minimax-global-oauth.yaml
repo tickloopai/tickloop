@@ -1,3 +1,10 @@
+connection:
+  vendor: "MiniMax"
+  product: "Portal"
+  kind: "service"
+  order: 1
+  discovery: "unsupported"
+  region: { name: "International", order: 1 }
 id: "minimax-global-oauth"
 display_name: "MiniMax Global OAuth"
 auth: "minimax_oauth_global"

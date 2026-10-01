@@ -1,5 +1,4 @@
 provider: "zai-global-api"
-group: "Zhipu GLM"
 series:
   - id: "glm"
     name: "GLM"

@@ -14,6 +14,7 @@ use tickloop_agent::{
 
 fn custom_provider(id: &str) -> ProviderDefinition {
     ProviderDefinition {
+        connection: None,
         id: id.into(),
         display_name: format!("{id} gateway"),
         auth: ModelAuthSource::ApiKeyEnv,

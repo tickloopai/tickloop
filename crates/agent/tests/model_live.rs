@@ -33,6 +33,7 @@ async fn verify_deepseek_file_round_trip(protocol: Protocol) {
         provider_id: String::new(),
         provider_name: String::new(),
         model_id: String::new(),
+        connection: None,
         card: None,
         input_modalities: vec![InputModality::Text],
     };
@@ -165,6 +166,7 @@ async fn live_deepseek_messages_reads_images_in_tool_results() {
         provider_id: String::new(),
         provider_name: String::new(),
         model_id: String::new(),
+        connection: None,
         card: None,
         input_modalities: vec![InputModality::Text, InputModality::Image],
     };
@@ -226,6 +228,7 @@ async fn live_deepseek_switches_protocols_after_public_compaction() {
         provider_id: String::new(),
         provider_name: String::new(),
         model_id: String::new(),
+        connection: None,
         card: None,
         input_modalities: vec![InputModality::Text],
     };
@@ -327,6 +330,7 @@ async fn live_deepseek_searches_and_reads_official_documentation() {
         provider_id: String::new(),
         provider_name: String::new(),
         model_id: String::new(),
+        connection: None,
         card: None,
         input_modalities: vec![InputModality::Text],
     };

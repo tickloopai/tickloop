@@ -16,7 +16,7 @@ use super::{
 #[serde(deny_unknown_fields)]
 pub struct ProviderAccess {
     pub provider: String,
-    /// Menu entry shared by this vendor's regional or authentication Providers.
+    /// Legacy grouping metadata; when present it must match the connection vendor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
     /// Plan or billing condition shown before choosing a model of this Provider.
@@ -64,6 +64,13 @@ impl AccessCatalog {
         static DEFAULTS: OnceLock<AccessCatalog> = OnceLock::new();
         DEFAULTS.get_or_init(|| {
             let catalog = Self::from_yaml(&[
+                include_str!("access/deepseek-api.yaml"),
+                include_str!("access/openai-api.yaml"),
+                include_str!("access/openai-codex.yaml"),
+                include_str!("access/minimax-cn-api.yaml"),
+                include_str!("access/minimax-global-api.yaml"),
+                include_str!("access/minimax-cn-oauth.yaml"),
+                include_str!("access/minimax-global-oauth.yaml"),
                 include_str!("access/zhipu-cn-api.yaml"),
                 include_str!("access/zhipu-cn-coding.yaml"),
                 include_str!("access/zai-global-api.yaml"),
@@ -91,6 +98,20 @@ impl AccessCatalog {
                 .any(|text| text.as_ref().is_some_and(|text| text.trim().is_empty()))
             {
                 return Err(format!("{location}: group and notice must not be empty"));
+            }
+            if let Some(provider) = models
+                .providers
+                .iter()
+                .find(|provider| provider.id == access.provider)
+                && let Some(connection) = &provider.connection
+                && access
+                    .group
+                    .as_deref()
+                    .is_some_and(|group| group != connection.vendor)
+            {
+                return Err(format!(
+                    "{location}: legacy group must match connection vendor"
+                ));
             }
             if access.series.is_empty() {
                 return Err(format!(
@@ -186,7 +207,11 @@ mod tests {
         let models = ModelCatalog::defaults();
         for provider in ["zhipu-cn-api", "zai-global-api"] {
             let access = catalog.provider(provider).unwrap();
-            assert_eq!(access.group.as_deref(), Some("Zhipu GLM"));
+            assert!(access.group.is_none());
+            assert_eq!(
+                super::super::cards::provider_group(provider),
+                Some("Zhipu GLM")
+            );
             let resolved = access
                 .series
                 .iter()
@@ -208,6 +233,6 @@ mod tests {
                 Some("glm-5.3-chat-completions")
             );
         }
-        assert!(catalog.provider("deepseek-api").is_none());
+        assert!(catalog.provider("deepseek-api").is_some());
     }
 }

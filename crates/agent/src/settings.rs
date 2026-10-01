@@ -615,6 +615,9 @@ fn provider_path(root: &Path, provider_id: &str) -> Result<PathBuf, String> {
 }
 
 fn provider_patch_is_empty(patch: &ProviderPatch) -> bool {
+    if patch.connection.is_some() {
+        return false;
+    }
     patch.default_model.is_none()
         && patch.display_name.is_none()
         && patch.auth.is_none()
@@ -1008,6 +1011,7 @@ impl UserSettings {
         }
         if let Some(card) = &model.card {
             let selected_model_patch = ProviderPatch {
+                connection: model.connection.clone(),
                 id: model.provider_id.clone(),
                 default_model: None,
                 display_name: Some(model.provider_name.clone()),
@@ -1159,6 +1163,7 @@ impl UserSettings {
                 .into_iter()
                 .find(|legacy| legacy.id == provider.id)
                 .unwrap_or_else(|| ProviderPatch {
+                    connection: None,
                     id: provider.id.clone(),
                     default_model: None,
                     display_name: None,

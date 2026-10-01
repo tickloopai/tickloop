@@ -1,3 +1,10 @@
+connection:
+  vendor: "Zhipu GLM"
+  product: "Pay-as-you-go API"
+  kind: "pay_as_you_go"
+  order: 0
+  discovery: "unsupported"
+  region: { name: "China", order: 0 }
 id: "zhipu-cn-api"
 display_name: "Zhipu China API"
 auth: "api_key_env"

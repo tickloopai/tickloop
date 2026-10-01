@@ -1,0 +1,10 @@
+provider: "minimax-cn-oauth"
+series:
+  - id: "minimax"
+    name: "MiniMax"
+    version: "M3"
+    model: "minimax-m3-messages"
+  - id: "minimax-flash-preview"
+    name: "MiniMax Flash Preview"
+    version: "M3.1"
+    model: "minimax-m3-1-flash-preview-messages"

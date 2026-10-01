@@ -9518,6 +9518,7 @@ mod tests {
             provider_id: String::new(),
             provider_name: String::new(),
             model_id: String::new(),
+            connection: None,
             card: None,
             input_modalities: vec![InputModality::Text],
         };
@@ -13036,6 +13037,7 @@ mod tests {
             provider_id: String::new(),
             provider_name: String::new(),
             model_id: String::new(),
+            connection: None,
             card: None,
             input_modalities: vec![InputModality::Text],
         };

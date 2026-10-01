@@ -1,3 +1,9 @@
+connection:
+  vendor: "DeepSeek"
+  product: "Pay-as-you-go API"
+  kind: "pay_as_you_go"
+  order: 0
+  discovery: "unsupported"
 id: "deepseek-api"
 display_name: "DeepSeek API"
 auth: "api_key_env"

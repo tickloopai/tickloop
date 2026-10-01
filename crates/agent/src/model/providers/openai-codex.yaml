@@ -1,3 +1,9 @@
+connection:
+  vendor: "OpenAI"
+  product: "Codex subscription"
+  kind: "plan"
+  order: 0
+  discovery: "codex"
 id: "openai-codex"
 display_name: "Codex subscription"
 auth: "codex_subscription"

@@ -87,6 +87,8 @@ const fn default_max_output_tokens() -> u32 {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderDefinition {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection: Option<super::connection::ProviderConnection>,
     pub id: String,
     pub display_name: String,
     pub auth: ModelAuthSource,
@@ -99,6 +101,8 @@ pub struct ProviderDefinition {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderPatch {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connection: Option<super::connection::ProviderConnection>,
     pub id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
@@ -144,6 +148,9 @@ pub struct ModelPatch {
 
 impl ProviderPatch {
     pub fn merge_from(&mut self, next: Self) {
+        if next.connection.is_some() {
+            self.connection = next.connection;
+        }
         if next.default_model.is_some() {
             self.default_model = next.default_model;
         }
@@ -307,6 +314,7 @@ impl ModelCatalog {
         let providers = [
             include_str!("providers/deepseek-api.yaml"),
             include_str!("providers/anthropic-api.yaml"),
+            include_str!("providers/openai-api.yaml"),
             include_str!("providers/openai-codex.yaml"),
             include_str!("providers/minimax-cn-api.yaml"),
             include_str!("providers/minimax-global-api.yaml"),
@@ -368,6 +376,28 @@ impl ModelCatalog {
                     return Err(format!(
                         "{location}: MiniMax OAuth requires its regional Provider and MiniMax Messages adapter"
                     ));
+                }
+            }
+            if let Some(connection) = &provider.connection {
+                connection
+                    .validate()
+                    .map_err(|error| format!("{location}: {error}"))?;
+                match connection.discovery {
+                    super::connection::ModelDiscovery::OpenAiApi
+                        if provider.auth != ModelAuthSource::ApiKeyEnv =>
+                    {
+                        return Err(format!(
+                            "{location}: OpenAI API discovery requires API key auth"
+                        ));
+                    }
+                    super::connection::ModelDiscovery::Codex
+                        if provider.auth != ModelAuthSource::CodexSubscription =>
+                    {
+                        return Err(format!(
+                            "{location}: Codex discovery requires subscription auth"
+                        ));
+                    }
+                    _ => {}
                 }
             }
             if provider.models.is_empty() {
@@ -470,6 +500,7 @@ impl ModelCatalog {
         base_url: &str,
     ) -> ModelConfig {
         ModelConfig {
+            connection: provider.connection.clone(),
             name: model.display_name.clone(),
             protocol: model.adapter.protocol(),
             base_url: base_url.into(),
@@ -538,6 +569,9 @@ impl ModelCatalog {
         for patch in providers {
             let location = format!("providers[{}]", patch.id);
             if let Some(existing) = self.providers.iter_mut().find(|entry| entry.id == patch.id) {
+                if let Some(value) = patch.connection {
+                    existing.connection = Some(value);
+                }
                 if let Some(value) = patch.display_name {
                     existing.display_name = value;
                 }
@@ -571,6 +605,7 @@ impl ModelCatalog {
                     .map(|model| model.into_new(&location))
                     .collect::<Result<Vec<_>, _>>()?;
                 self.providers.push(ProviderDefinition {
+                    connection: patch.connection,
                     id: patch.id,
                     display_name: patch.display_name.ok_or_else(|| {
                         format!("{location}.display_name: required for new provider")
@@ -733,41 +768,28 @@ pub fn built_in_model_profiles() -> Vec<ModelConfig> {
         .clone()
 }
 
-pub(crate) fn is_minimax_provider(provider_id: &str) -> bool {
-    matches!(
-        provider_id,
-        "minimax-cn-api" | "minimax-global-api" | "minimax-cn-oauth" | "minimax-global-oauth"
-    )
+/// The connection is the sole authority for vendor/product organization.
+pub fn provider_connection(
+    provider_id: &str,
+) -> Option<&'static super::connection::ProviderConnection> {
+    static DEFAULTS: OnceLock<ModelCatalog> = OnceLock::new();
+    DEFAULTS
+        .get_or_init(ModelCatalog::defaults)
+        .providers
+        .iter()
+        .find(|provider| provider.id == provider_id)?
+        .connection
+        .as_ref()
 }
 
-/// Display group for vendors whose regional or authentication Providers share one menu entry.
 pub fn provider_group(provider_id: &str) -> Option<&'static str> {
-    if is_minimax_provider(provider_id) {
-        return Some("MiniMax");
-    }
-    super::access::AccessCatalog::defaults()
-        .provider(provider_id)
-        .and_then(|access| access.group.as_deref())
+    provider_connection(provider_id).map(|connection| connection.vendor.as_str())
 }
 
 pub fn is_default_visible(profile: &ModelConfig) -> bool {
-    const VISIBLE: &[(&str, &str)] = &[
-        ("deepseek-api", "deepseek-flash-chat-completions"),
-        ("deepseek-api", "deepseek-v4-pro-chat-completions"),
-        ("openai-codex", "gpt-5.5-responses"),
-        ("openai-codex", "gpt-5.6-sol-responses"),
-        ("openai-codex", "gpt-5.6-terra-responses"),
-        ("openai-codex", "gpt-5.6-luna-responses"),
-    ];
-    VISIBLE.contains(&(profile.provider_id.as_str(), profile.model_id.as_str()))
-        || super::access::AccessCatalog::defaults()
-            .series_for(profile)
-            .is_some()
-        || is_minimax_provider(&profile.provider_id)
-            && matches!(
-                profile.model_id.as_str(),
-                "minimax-m3-messages" | "minimax-m3-1-flash-preview-messages"
-            )
+    super::access::AccessCatalog::defaults()
+        .series_for(profile)
+        .is_some()
 }
 
 fn legacy_builtin_name(profile: &ModelConfig) -> Option<String> {

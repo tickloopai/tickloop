@@ -1,3 +1,10 @@
+connection:
+  vendor: "Zhipu GLM"
+  product: "Pay-as-you-go API"
+  kind: "pay_as_you_go"
+  order: 0
+  discovery: "unsupported"
+  region: { name: "International", order: 1 }
 id: "zai-global-api"
 display_name: "Z.AI Global API"
 auth: "api_key_env"

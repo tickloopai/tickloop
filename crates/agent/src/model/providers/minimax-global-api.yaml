@@ -1,3 +1,10 @@
+connection:
+  vendor: "MiniMax"
+  product: "API (Key-specific quota)"
+  kind: "service"
+  order: 0
+  discovery: "unsupported"
+  region: { name: "International", order: 1 }
 id: "minimax-global-api"
 display_name: "MiniMax Global API"
 auth: "api_key_env"

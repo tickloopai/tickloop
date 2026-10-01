@@ -1,3 +1,10 @@
+connection:
+  vendor: "Zhipu GLM"
+  product: "Coding Plan"
+  kind: "plan"
+  order: 0
+  discovery: "unsupported"
+  region: { name: "China", order: 0 }
 id: "zhipu-cn-coding"
 display_name: "Zhipu China Coding Plan"
 auth: "api_key_env"

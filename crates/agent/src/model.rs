@@ -20,9 +20,11 @@ use crate::image::{Image, ImageMediaType};
 use crate::network::{HttpPolicy, NetworkDiagnostic, NetworkRoute, build_http_client, is_loopback};
 
 pub mod access;
+pub mod availability;
 pub mod cards;
 mod chat_completions;
 mod codex;
+pub mod connection;
 pub mod credentials;
 mod glm;
 pub(crate) mod history;
@@ -86,6 +88,8 @@ pub enum InputModality {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection: Option<connection::ProviderConnection>,
     pub name: String,
     pub protocol: Protocol,
     pub base_url: String,
@@ -115,6 +119,11 @@ fn text_only() -> Vec<InputModality> {
 }
 
 impl ModelConfig {
+    pub fn connection(&self) -> Option<&connection::ProviderConnection> {
+        self.connection
+            .as_ref()
+            .or_else(|| cards::provider_connection(&self.provider_id))
+    }
     pub fn adapter(&self) -> cards::Adapter {
         self.card
             .as_ref()
@@ -794,6 +803,9 @@ pub trait ModelClient: Send + Sync {
 }
 
 pub fn validate_model_config(config: &ModelConfig) -> Result<(), ModelError> {
+    if let Some(connection) = &config.connection {
+        connection.validate().map_err(ModelError::Configuration)?;
+    }
     if config.protocol == Protocol::SystemOne {
         return Err(ModelError::Configuration(
             "Jev is a judgment model; configure it under jev, not as a conversation model".into(),
@@ -2424,6 +2436,7 @@ mod tests {
             provider_id: String::new(),
             provider_name: String::new(),
             model_id: String::new(),
+            connection: None,
             card: None,
             input_modalities: vec![InputModality::Text],
         }
@@ -2832,6 +2845,7 @@ mod tests {
                     provider_id: String::new(),
                     provider_name: String::new(),
                     model_id: String::new(),
+                    connection: None,
                     card: None,
                     input_modalities: vec![InputModality::Text],
                 },

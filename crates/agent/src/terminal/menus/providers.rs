@@ -1,7 +1,9 @@
 use super::*;
 use tickloop_agent::model::{
     ModelAuthSource,
+    availability::{AccountModelDirectory, ModelAvailability},
     cards::Adapter,
+    connection::ModelDiscovery,
     credentials::{ApiKeyStatus, api_key_status},
 };
 
@@ -21,7 +23,7 @@ mod tests {
         let rows = provider_rows(&choices, None);
         assert_eq!(
             rows.iter()
-                .filter(|row| matches!(row, ProviderRow::Group("MiniMax")))
+                .filter(|row| matches!(row, ProviderRow::Group(name) if name == "MiniMax"))
                 .count(),
             1
         );
@@ -48,7 +50,7 @@ mod tests {
         let rows = provider_rows(&choices, None);
         assert_eq!(
             rows.iter()
-                .filter(|row| matches!(row, ProviderRow::Group("Zhipu GLM")))
+                .filter(|row| matches!(row, ProviderRow::Group(name) if name == "Zhipu GLM"))
                 .count(),
             1
         );
@@ -63,8 +65,8 @@ mod tests {
             connections,
             [
                 "ZHIPU_API_KEY",
-                "ZHIPU_CODING_API_KEY",
                 "ZAI_API_KEY",
+                "ZHIPU_CODING_API_KEY",
                 "ZAI_CODING_API_KEY"
             ]
         );
@@ -99,14 +101,18 @@ mod tests {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(super) enum ProviderRow {
     Provider(usize),
-    Group(&'static str),
+    Group(String),
 }
 
-fn provider_group(provider: &ProviderModels) -> Option<&'static str> {
-    crate::model::cards::provider_group(&provider.models[0].provider_id)
+fn provider_group(provider: &ProviderModels) -> Option<&str> {
+    let model = &provider.models[0];
+    model
+        .connection()
+        .map(|connection| connection.vendor.as_str())
+        .or_else(|| crate::model::cards::provider_group(&model.provider_id))
 }
 
 pub(super) fn provider_rows(choices: &[ProviderModels], group: Option<&str>) -> Vec<ProviderRow> {
@@ -121,7 +127,7 @@ pub(super) fn provider_rows(choices: &[ProviderModels], group: Option<&str>) -> 
                 .iter()
                 .any(|row| matches!(row, ProviderRow::Group(name) if *name == group))
             {
-                rows.push(ProviderRow::Group(group));
+                rows.push(ProviderRow::Group(group.to_owned()));
             }
         } else {
             rows.push(ProviderRow::Provider(index));
@@ -145,15 +151,22 @@ impl ProviderModels {
                 });
             }
         }
+        choices.sort_by_key(|provider| {
+            provider.models[0]
+                .connection()
+                .map(|connection| connection.sort_key())
+        });
         choices
     }
 
-    fn name(&self) -> &str {
+    fn name(&self) -> String {
         let model = &self.models[0];
-        if model.provider_name.is_empty() {
-            &model.provider_id
+        if let Some(connection) = model.connection() {
+            connection.label(&model.base_url)
+        } else if model.provider_name.is_empty() {
+            model.provider_id.clone()
         } else {
-            &model.provider_name
+            model.provider_name.clone()
         }
     }
 }
@@ -162,6 +175,7 @@ impl ProviderModels {
 pub(super) struct ModelChoice {
     pub(super) config: ModelConfig,
     pub(super) thinking: Option<ReasoningEffort>,
+    pub(super) availability: ModelAvailability,
 }
 
 pub(super) fn thinking_choices(model: &ModelConfig) -> Vec<Option<ReasoningEffort>> {
@@ -187,7 +201,7 @@ impl Menus {
         selected: usize,
         id: Uuid,
     ) -> Result<(), String> {
-        let group = self.provider_group.map(|(name, _)| name);
+        let group = self.provider_group.as_ref().map(|(name, _)| name.as_str());
         let rows = provider_rows(&choices, group);
         let mut options: Vec<String> = rows
             .iter()
@@ -213,7 +227,7 @@ impl Menus {
                 id,
                 title: group.map_or_else(|| "Choose Provider".into(), |name| format!("Choose connection · {name}")),
                 context: vec![if group.is_some() {
-                    "Choose the region and authentication method. Esc returns to Providers.".into()
+                    "Choose the product and service connection. Authentication is shown separately. Esc returns to Providers.".into()
                 } else {
                     "Choose the model used by this Chat. Judgment settings configures a separate model.".into()
                 }],
@@ -235,7 +249,8 @@ impl Menus {
             chat,
             self.provider_choices.clone(),
             self.provider_group
-                .map_or(self.provider_selected, |(_, selected)| selected),
+                .as_ref()
+                .map_or(self.provider_selected, |(_, selected)| *selected),
             Uuid::new_v4(),
         )
     }
@@ -310,6 +325,56 @@ impl Menus {
         chat: Uuid,
         provider: ProviderModels,
     ) -> Result<(), String> {
+        if provider.models[0]
+            .connection()
+            .is_some_and(|connection| connection.discovery != ModelDiscovery::Unsupported)
+        {
+            let id = Uuid::new_v4();
+            self.show(console, Menu {
+                id, title: "Discovering account models".into(),
+                context: vec![format!("Querying {} with this connection's credentials. Esc cancels; login stays saved.", provider.name())],
+                options: vec!["Cancel".into()], selected: 0, confirmation: false,
+            }, Selection::Discovery { chat })?;
+            let config = provider.models[0].clone();
+            let root = self.config_root.clone();
+            let cache = self.model_discovery.clone();
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let task_cancel = cancel.clone();
+            let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+            let task = tokio::spawn(async move {
+                let result = cache
+                    .discover(&config, root.as_deref(), false, &task_cancel)
+                    .await;
+                let _ = sender.send(result);
+            });
+            self.discovery_flow = Some(DiscoveryFlow {
+                id,
+                chat,
+                provider,
+                cancel,
+                task,
+                receiver,
+            });
+            return Ok(());
+        }
+        self.provider_model_choices(
+            agent,
+            console,
+            chat,
+            provider,
+            Err("Model discovery is not provided for this connection".into()),
+        )
+        .await
+    }
+
+    async fn provider_model_choices(
+        &mut self,
+        agent: &Agent,
+        console: &Console,
+        chat: Uuid,
+        provider: ProviderModels,
+        directory: Result<AccountModelDirectory, String>,
+    ) -> Result<(), String> {
         let snapshot = agent
             .snapshot(chat)
             .await
@@ -326,6 +391,12 @@ impl Menus {
                     Some(ReasoningEffort::Off)
                 };
                 ModelChoice {
+                    availability: directory.as_ref().map_or_else(
+                        |error| ModelAvailability::Unknown {
+                            reason: format!("Unverified · {error}"),
+                        },
+                        |directory| directory.availability(&model.model),
+                    ),
                     config: model.clone(),
                     thinking: if thinking_choices(model).contains(&preferred) {
                         preferred
@@ -351,7 +422,7 @@ impl Menus {
         selected: usize,
         id: Uuid,
     ) -> Result<(), String> {
-        let options = choices
+        let mut options: Vec<String> = choices
             .iter()
             .map(|choice| {
                 let thinking = if thinking_choices(&choice.config).len() == 1 {
@@ -380,9 +451,18 @@ impl Menus {
                 let name = tickloop_agent::model::access::AccessCatalog::defaults()
                     .series_for(&choice.config)
                     .map_or_else(|| choice.config.name.clone(), |series| series.label());
-                safe_text(&format!("{name}    Thinking ‹ {thinking} ›"))
+                safe_text(&format!(
+                    "{name}    Thinking ‹ {thinking} › · {}",
+                    choice.availability.label()
+                ))
             })
             .collect();
+        if provider.models[0]
+            .connection()
+            .is_some_and(|connection| connection.discovery != ModelDiscovery::Unsupported)
+        {
+            options.push("Refresh account model directory".into());
+        }
         let mut context = vec!["Enter saves the model and Thinking. Esc discards changes.".into()];
         if let Some(notice) = tickloop_agent::model::access::AccessCatalog::defaults()
             .provider(&provider.models[0].provider_id)
@@ -439,7 +519,7 @@ impl Menus {
                     self.show_providers(console, chat, choices, index, menu_id)?;
                     return Ok(MenuOutcome::default());
                 }
-                let provider_index = match rows[index] {
+                let provider_index = match rows[index].clone() {
                     ProviderRow::Group(name) => {
                         self.provider_group = Some((name, 0));
                         self.show_providers(console, chat, choices, 0, menu_id)?;
@@ -644,11 +724,67 @@ impl Menus {
     ) -> Result<(), String> {
         if let Some((chat, provider)) = self.login_return.take() {
             if succeeded {
+                self.model_discovery
+                    .invalidate(&provider.models[0].provider_id);
                 self.provider_models(agent, console, chat, provider).await?;
             } else {
                 self.back_to_providers(console, chat)?;
             }
         }
         Ok(())
+    }
+    pub(in crate::terminal) fn discovery_active(&self) -> bool {
+        self.discovery_flow.is_some()
+    }
+
+    pub(in crate::terminal) async fn next_discovery(
+        &mut self,
+    ) -> Option<Result<AccountModelDirectory, String>> {
+        self.discovery_flow.as_mut()?.receiver.recv().await
+    }
+
+    pub(in crate::terminal) async fn finish_discovery(
+        &mut self,
+        agent: &Agent,
+        console: &Console,
+        result: Option<Result<AccountModelDirectory, String>>,
+    ) -> Result<(), String> {
+        let Some(flow) = self.discovery_flow.take() else {
+            return Ok(());
+        };
+        if self.id() != Some(flow.id) {
+            return Ok(());
+        }
+        self.provider_model_choices(
+            agent,
+            console,
+            flow.chat,
+            flow.provider.clone(),
+            result.unwrap_or_else(|| Err("Model discovery ended without a result".into())),
+        )
+        .await
+    }
+
+    pub(in crate::terminal) fn invalidate_model_discovery(&mut self) {
+        if let Some((_, provider)) = &self.login_return {
+            self.model_discovery
+                .invalidate(&provider.models[0].provider_id);
+        }
+    }
+}
+
+pub(super) struct DiscoveryFlow {
+    id: Uuid,
+    chat: Uuid,
+    provider: ProviderModels,
+    cancel: tokio_util::sync::CancellationToken,
+    task: tokio::task::JoinHandle<()>,
+    receiver: tokio::sync::mpsc::UnboundedReceiver<Result<AccountModelDirectory, String>>,
+}
+
+impl Drop for DiscoveryFlow {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        self.task.abort();
     }
 }

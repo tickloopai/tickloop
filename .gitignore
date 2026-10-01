@@ -45,9 +45,10 @@ __pycache__/
 !/.tickloop/skills/
 /.tickloop/skills/*
 !/.tickloop/skills/model-integration/
-!/.tickloop/skills/model-integration/references/
-!/.tickloop/skills/model-integration/references/**
 /.env
 
 # Agent module implementation evidence
 /.scratch/agent-module-boundaries/results/
+
+# Provider hierarchy validation artifacts
+/.scratch/provider-hierarchy/results/

@@ -1,3 +1,10 @@
+connection:
+  vendor: "Zhipu GLM"
+  product: "Coding Plan"
+  kind: "plan"
+  order: 0
+  discovery: "unsupported"
+  region: { name: "International", order: 1 }
 id: "zai-global-coding"
 display_name: "Z.AI Global Coding Plan"
 auth: "api_key_env"

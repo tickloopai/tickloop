@@ -1,3 +1,10 @@
+connection:
+  vendor: "MiniMax"
+  product: "Portal"
+  kind: "service"
+  order: 1
+  discovery: "unsupported"
+  region: { name: "China", order: 0 }
 id: "minimax-cn-oauth"
 display_name: "MiniMax China OAuth"
 auth: "minimax_oauth_cn"

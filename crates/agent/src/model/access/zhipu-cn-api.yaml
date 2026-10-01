@@ -1,5 +1,4 @@
 provider: "zhipu-cn-api"
-group: "Zhipu GLM"
 series:
   - id: "glm"
     name: "GLM"

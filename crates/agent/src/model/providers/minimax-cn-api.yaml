@@ -1,3 +1,10 @@
+connection:
+  vendor: "MiniMax"
+  product: "API (Key-specific quota)"
+  kind: "service"
+  order: 0
+  discovery: "unsupported"
+  region: { name: "China", order: 0 }
 id: "minimax-cn-api"
 display_name: "MiniMax China API"
 auth: "api_key_env"

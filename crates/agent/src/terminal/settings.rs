@@ -30,17 +30,14 @@ pub(super) fn model_choices_with_profiles(
     {
         return profiles;
     }
-    if current.provider_id == "deepseek-api"
-        && !tickloop_agent::model::cards::is_default_visible(current)
-        && tickloop_agent::model::cards::ModelCatalog::defaults()
-            .get(&current.provider_id, &current.model_id)
-            .as_ref()
-            == Some(current)
-    {
-        return profiles;
-    }
     let mut choices = vec![current.clone()];
-    choices.extend(profiles.into_iter().filter(|profile| profile != current));
+    let mut effective_current = current.clone();
+    effective_current.connection = current.connection().cloned();
+    choices.extend(profiles.into_iter().filter(|profile| {
+        let mut effective_profile = profile.clone();
+        effective_profile.connection = profile.connection().cloned();
+        effective_profile != effective_current
+    }));
     choices
 }
 

@@ -678,7 +678,12 @@ async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Result<(
         model
     } else {
         crate::model::cards::ModelCatalog::defaults()
-            .get("deepseek-api", "deepseek-flash-chat-completions")
+            .get(
+                "deepseek-api",
+                tickloop_agent::model::access::AccessCatalog::defaults()
+                    .recommended_model("deepseek-api")
+                    .expect("built-in DeepSeek recommendation"),
+            )
             .expect("bundled default model exists")
     };
     if let (Some(settings), Some(provider)) = (&user_settings, &explicit_provider) {
@@ -1048,6 +1053,7 @@ async fn interact(
         }
         if let Some(outcome) = menu_outcome.take() {
             if outcome.provider_logout {
+                menus.invalidate_model_discovery();
                 login_from_provider = true;
                 provider_login_succeeded = false;
                 if let Some(root) = config_root.clone() {
@@ -1337,9 +1343,14 @@ async fn interact(
         let has_visible_running_task = interactive && console.has_visible_running_task()?;
         let prefers_reduced_motion =
             interactive && console.display_preferences()?.prefers_reduced_motion;
+        let discovery_active = menus.discovery_active();
         let login_active = login.is_some();
         let logout_active = logout.is_some();
         tokio::select! {
+            result = menus.next_discovery(), if discovery_active => {
+                menus.finish_discovery(agent, console, result).await?;
+                status_dirty = true;
+            },
             update = async { login.as_mut().unwrap().next().await }, if login_active => {
                 match update {
                     Some(LoginUpdate::Device { address, code }) => login.as_ref().unwrap().show_device(console, &address, &code)?,

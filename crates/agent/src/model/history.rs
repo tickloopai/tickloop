@@ -193,6 +193,7 @@ mod tests {
             provider_id: "test".into(),
             provider_name: "Test".into(),
             model_id: "test".into(),
+            connection: None,
             card: None,
             input_modalities: vec![InputModality::Text],
         }

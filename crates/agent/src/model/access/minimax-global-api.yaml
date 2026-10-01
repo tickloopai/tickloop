@@ -1,0 +1,6 @@
+provider: "minimax-global-api"
+series:
+  - id: "minimax"
+    name: "MiniMax"
+    version: "M3"
+    model: "minimax-m3-messages"

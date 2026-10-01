@@ -20,6 +20,7 @@ async fn natural_language_creates_an_independent_goal_and_waits_for_its_answer()
         provider_id: String::new(),
         provider_name: String::new(),
         model_id: String::new(),
+        connection: None,
         card: None,
         input_modalities: vec![InputModality::Text],
     };
