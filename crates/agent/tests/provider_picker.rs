@@ -159,7 +159,7 @@ impl Terminal {
             thread::sleep(Duration::from_millis(10));
         }
         let output = self.output.lock().unwrap();
-        let frame = latest_frame(&output).map(strip_ansi).unwrap_or_default();
+        let frame = screen::visible_screen(&output, 120, 38);
         panic!("terminal did not show {expected:?}; latest frame:\n{frame}");
     }
 
@@ -1311,8 +1311,11 @@ fn api_key_menu_saves_private_env_and_restarted_model_uses_it_on_loopback() {
     });
     assert!(!state.join("settings.json").exists());
     terminal.close_model_picker();
+    let mark = terminal.mark();
     terminal.send(b"/model\r");
-    terminal.wait_for("Choose model");
+    terminal.wait_for_frame_after(mark, "fresh model picker after key save", |frame| {
+        frame.contains("Choose model · Picker Fixture") && frame.contains("❯ ● Fixture Messages")
+    });
     terminal.send(b"\r");
     terminal.wait_for("Model selection:");
     terminal.send(b"Provider key first turn\r");

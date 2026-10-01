@@ -383,9 +383,18 @@ fn lost_execution_has_one_readable_notice_and_keeps_the_core_status() {
         0,
         "the raw owner-loss cause belongs in explicit details: {status}"
     );
+    let core = frame
+        .lines()
+        .find(|line| line.starts_with('─') && line.contains("⏵⏵ Auto"))
+        .unwrap();
     assert!(
-        status.contains("⏵⏵ Auto") && status.contains(LOST_MODEL) && status.contains("Context"),
-        "loss feedback must preserve readable core status at this width: {status}"
+        core.contains(LOST_MODEL) && core.contains("Context —"),
+        "loss feedback must preserve readable core status on the lower divider: {core}"
+    );
+    assert_eq!(frame.matches("⏵⏵ Auto").count(), 1, "{frame}");
+    assert!(
+        !status.contains("⏵⏵ Auto") && !status.contains(LOST_MODEL),
+        "the connection notice stays separate from floated core status: {status}"
     );
     assert!(
         !frame.contains(before["run"].as_str().unwrap()),

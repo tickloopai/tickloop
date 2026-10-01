@@ -108,8 +108,11 @@ pub(super) struct StatusArea {
     collapsed_agents: HashSet<Uuid>,
     panel_offsets: HashMap<FooterItemId, usize>,
     visible: Option<FooterItemId>,
+    manually_selected: bool,
+    pinned: bool,
     offset: usize,
     selected_task: Option<Uuid>,
+    selected_todo: usize,
     running_shimmer: RunningShimmer,
     prefers_reduced_motion: bool,
 }
@@ -152,6 +155,7 @@ impl StatusArea {
         self.context = context.filter(|(_, limit)| *limit > 0);
         self.tasks = tasks;
         self.todos = todos;
+        self.selected_todo = self.selected_todo.min(self.todos.len().saturating_sub(1));
         if !self
             .selected_task
             .is_some_and(|selected| self.tasks.iter().any(|task| task.task_id == Some(selected)))
@@ -161,24 +165,18 @@ impl StatusArea {
                 .get(selected_index.min(self.tasks.len().saturating_sub(1)))
                 .and_then(|task| task.task_id);
         }
-        if self
-            .visible
-            .is_some_and(|panel| self.item_count(panel) == 0)
-        {
-            self.visible = None;
-            self.offset = 0;
-        }
+        self.reconcile_panel();
         self.clamp_offset();
     }
 
     pub(super) fn available_panels(&self) -> impl Iterator<Item = FooterItemId> + '_ {
         [
-            FooterItemId::Tasks,
             FooterItemId::Todo,
             FooterItemId::Agents,
+            FooterItemId::Tasks,
         ]
         .into_iter()
-        .filter(|panel| self.item_count(*panel) > 0)
+        .filter(|panel| self.item_count(*panel) > 0 || self.pinned && self.visible == Some(*panel))
     }
 
     /// The reading number this family panel shows for `agent_id` when another family row reads
@@ -218,9 +216,7 @@ impl StatusArea {
                 .get(selected_index.min(self.agents.len().saturating_sub(1)))
                 .map(|row| row.agent_id);
         }
-        if self.visible == Some(FooterItemId::Agents) && self.agents.is_empty() {
-            self.collapse();
-        }
+        self.reconcile_panel();
         self.clamp_offset();
     }
 
@@ -267,7 +263,7 @@ impl StatusArea {
             FooterItemId::Agents => {
                 self.selected_agent == self.visible_agents().first().map(|row| row.agent_id)
             }
-            FooterItemId::Todo => self.offset == 0,
+            FooterItemId::Todo => self.selected_todo == 0,
         }
     }
 
@@ -290,33 +286,54 @@ impl StatusArea {
     }
 
     pub(super) fn select(&mut self, panel: FooterItemId) {
-        if self.item_count(panel) > 0 && self.visible != Some(panel) {
+        if self.item_count(panel) == 0 {
+            return;
+        }
+        self.manually_selected = true;
+        self.show_panel(Some(panel));
+    }
+
+    fn reconcile_panel(&mut self) {
+        if self.pinned {
+            return;
+        }
+        if self.manually_selected && self.visible.is_some_and(|panel| self.item_count(panel) > 0) {
+            return;
+        }
+        self.manually_selected = false;
+        let panel = self.available_panels().next();
+        self.show_panel(panel);
+    }
+
+    fn show_panel(&mut self, panel: Option<FooterItemId>) {
+        if self.visible != panel {
             if let Some(previous) = self.visible {
                 self.panel_offsets.insert(previous, self.offset);
             }
-            self.visible = Some(panel);
-            self.offset = self.panel_offsets.get(&panel).copied().unwrap_or(0);
+            self.visible = panel;
+            self.offset = panel
+                .and_then(|panel| self.panel_offsets.get(&panel).copied())
+                .unwrap_or(0);
             self.clamp_offset();
         }
     }
 
-    pub(super) fn collapse(&mut self) {
-        if let Some(previous) = self.visible {
-            self.panel_offsets.insert(previous, self.offset);
-        }
-        self.visible = None;
+    pub(super) fn pin_panel(&mut self) {
+        self.pinned = self.visible.is_some();
+        self.manually_selected = true;
     }
 
-    pub(super) fn toggle(&mut self, panel: FooterItemId) {
-        if self.visible == Some(panel) {
-            self.collapse();
-        } else {
-            self.select(panel);
-        }
+    pub(super) fn release_panel(&mut self) {
+        self.pinned = false;
+        self.reconcile_panel();
     }
 
     pub(super) fn is_open(&self) -> bool {
         self.visible.is_some()
+    }
+
+    pub(super) fn selected_panel(&self) -> Option<FooterItemId> {
+        self.visible
     }
 
     pub(super) fn scroll(&mut self, amount: isize, capacity: usize) {
@@ -329,6 +346,41 @@ impl StatusArea {
         (self.visible == Some(FooterItemId::Tasks))
             .then_some(self.selected_task)
             .flatten()
+    }
+
+    pub(super) fn task_ids(&self) -> impl Iterator<Item = Uuid> + '_ {
+        self.tasks.iter().filter_map(|task| task.task_id)
+    }
+
+    pub(super) fn single_task(&self) -> Option<Uuid> {
+        (self.tasks.len() == 1)
+            .then(|| self.tasks[0].task_id)
+            .flatten()
+    }
+
+    pub(super) fn selected_todo(&self) -> Option<(usize, &StatusItem)> {
+        (self.visible == Some(FooterItemId::Todo))
+            .then(|| {
+                self.todos
+                    .get(self.selected_todo)
+                    .map(|item| (self.selected_todo, item))
+            })
+            .flatten()
+    }
+
+    pub(super) fn move_todo_selection(&mut self, amount: isize, capacity: usize) {
+        if self.visible != Some(FooterItemId::Todo) || self.todos.is_empty() {
+            return;
+        }
+        self.selected_todo = self
+            .selected_todo
+            .saturating_add_signed(amount)
+            .min(self.todos.len() - 1);
+        if self.selected_todo < self.offset {
+            self.offset = self.selected_todo;
+        } else if self.selected_todo >= self.offset + capacity.max(1) {
+            self.offset = self.selected_todo + 1 - capacity.max(1);
+        }
     }
 
     pub(super) fn stoppable_task(&self) -> Option<Uuid> {
@@ -500,6 +552,8 @@ impl StatusArea {
                     ""
                 };
                 format!("{count} items · Enter details{action}")
+            } else if footer.list_focused && panel == FooterItemId::Todo {
+                format!("{count} items · Enter details")
             } else if summary_focused && !footer.list_focused {
                 format!("{count} items · Enter list")
             } else if count > row_count.saturating_sub(1) {
@@ -585,19 +639,24 @@ impl StatusArea {
         } else {
             self.offset
         };
-        for item in items.iter().skip(offset).take(capacity) {
+        for (index, item) in items.iter().enumerate().skip(offset).take(capacity) {
             let mut row = RoleLine::default();
-            let selected = panel == FooterItemId::Tasks
-                && footer.selected == Some(FooterItemId::Tasks)
-                && item.task_id.is_some()
-                && item.task_id == self.selected_task;
+            let selected = footer.list_focused
+                && footer.selected == Some(panel)
+                && match panel {
+                    FooterItemId::Tasks => {
+                        item.task_id.is_some() && item.task_id == self.selected_task
+                    }
+                    FooterItemId::Todo => index == self.selected_todo,
+                    FooterItemId::Agents => false,
+                };
             row.push(if selected { "› " } else { "  " }, Some(Role::Suggestion));
             row.push(format!("{}  ", item.id), Some(Role::MutedText));
             let right = format!("  {}", item.state);
             let title_width = width
                 .saturating_sub(UnicodeWidthStr::width(item.id.as_str()) + 4)
                 .saturating_sub(UnicodeWidthStr::width(right.as_str()));
-            let mut title = RoleLine::plain(item.title.clone());
+            let mut title = RoleLine::plain(item.title.replace('\n', " "));
             title.truncate(title_width);
             row.push(title.text(), Some(Role::Text));
             let padding = width
@@ -634,26 +693,27 @@ impl StatusArea {
 
     fn header_label(&self, panel: FooterItemId) -> String {
         match panel {
-            FooterItemId::Tasks => format!("Tasks {}", self.tasks.len()),
+            FooterItemId::Tasks => format!("Shell {}", self.tasks.len()),
             FooterItemId::Todo => format!("Todo {}", self.todos.len()),
             FooterItemId::Agents => format!("Agents {}", self.agents.len()),
         }
     }
 
-    pub(super) fn panel_at_column(
+    pub(super) fn panel_targets(
         &self,
         footer: &FooterFrame,
-        column: usize,
-    ) -> Option<FooterItemId> {
+        width: usize,
+    ) -> Vec<(std::ops::Range<usize>, FooterItemId)> {
         let mut start = 0;
+        let mut targets = Vec::new();
         for item in &footer.items {
             let end = start + UnicodeWidthStr::width(self.header_label(item.id).as_str());
-            if (start..end).contains(&column) {
-                return Some(item.id);
+            if end <= width {
+                targets.push((start..end, item.id));
             }
             start = end + 2;
         }
-        None
+        targets
     }
 
     fn clamp_offset(&mut self) {
@@ -825,11 +885,11 @@ mod tests {
         );
         let footer = footer(&[FooterItemId::Tasks, FooterItemId::Todo], None);
         let collapsed = area.panel_lines(&footer, 80, 24, DisplayProfile::default());
-        assert_eq!(collapsed.len(), 1);
-        assert!(collapsed[0].text().contains("Tasks 6  Todo 1"));
+        assert_eq!(collapsed.len(), 2);
+        assert!(collapsed[0].text().contains("Shell 6  Todo 1"));
         assert!(
-            collapsed[0].text().contains("↓ open"),
-            "the editor keeps Enter, so the collapsed summary names Down"
+            collapsed[0].text().contains("1 items"),
+            "automatic selection leaves editor ownership unchanged"
         );
         area.select(FooterItemId::Tasks);
         assert!(
@@ -840,7 +900,7 @@ mod tests {
         );
         let first = area.panel_lines(&footer, 80, 24, DisplayProfile::default());
         assert_eq!(first.len(), 5);
-        assert!(first[0].text().contains("Tasks 6  Todo 1"));
+        assert!(first[0].text().contains("Shell 6  Todo 1"));
         assert!(first[0].text().contains("6 items · scroll"));
         assert!(first[1].text().contains("task 1"));
         assert!(first[4].text().contains("task 4"));
@@ -854,7 +914,7 @@ mod tests {
         let todo = area.panel_lines(&footer, 80, 24, DisplayProfile::default());
         assert_eq!(todo.len(), 2);
         assert!(todo[1].text().contains("review plan"));
-        area.collapse();
+        area.release_panel();
         area.update(
             "Auto".into(),
             "model".into(),
@@ -865,7 +925,7 @@ mod tests {
         assert_eq!(
             area.panel_lines(&footer, 80, 24, DisplayProfile::default())
                 .len(),
-            1
+            2
         );
         area.select(FooterItemId::Tasks);
         assert!(

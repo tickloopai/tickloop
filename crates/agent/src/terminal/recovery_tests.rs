@@ -12,6 +12,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 mod background_request_tests;
+mod cached_navigation_tests;
 mod hidden_view_recovery_tests;
 mod lost_presentation_tests;
 mod pending_input_tests;
@@ -59,6 +60,10 @@ pub(super) enum RecoveryFact {
     },
     AgentOpened {
         chat: Uuid,
+    },
+    NavigationRejected {
+        selected_chat: Option<Uuid>,
+        visible: Option<ExecutionRef>,
     },
     Lagged,
     Buffered {

@@ -14,6 +14,7 @@ const TAB_COLUMNS: usize = 4;
 const MAX_CONSECUTIVE_ZERO_WIDTH_CHARACTERS: usize = 16;
 const OUTPUT_READ_LIMIT: usize = 64 * 1024;
 const OUTPUT_DISPLAY_MAX_BYTES: usize = OUTPUT_READ_LIMIT * 3;
+const ACTION_ERROR_TITLE_COLUMNS: usize = 40;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TaskViewport {
@@ -416,8 +417,17 @@ impl<Restore> TaskSurface<Restore> {
     }
 
     pub fn report_action_error(&mut self, task_id: Uuid, message: String) {
-        let task_id = task_id.simple().to_string();
-        self.action_error = Some(format!("Task {}: {message}", &task_id[..8]));
+        let target = self
+            .tasks
+            .iter()
+            .find(|task| task.id == task_id)
+            .map_or_else(
+                || "Shell task".to_owned(),
+                |task| {
+                    fit_visible_fragments(&[task.command.as_bytes()], ACTION_ERROR_TITLE_COLUMNS)
+                },
+            );
+        self.action_error = Some(format!("{target}: {message}"));
     }
 
     pub fn report_update_error(&mut self, message: String) {
@@ -1076,17 +1086,12 @@ fn render_task_row(task: &ShellTaskView, view_chat_id: Uuid, width: usize) -> St
         TaskOrigin::User => "User",
     };
     let status = status_label(task.state);
-    let id = task.id.simple().to_string();
     let owner = if task.chat_id == view_chat_id {
         String::new()
     } else {
         format!("{OTHER_AGENT} · ")
     };
-    let prefix = format!(
-        "{origin} {} {status} · {owner}{} B · ",
-        &id[..8],
-        task.output_bytes
-    );
+    let prefix = format!("{origin} {status} · {owner}{} B · ", task.output_bytes);
     let cwd = task.cwd.to_string_lossy();
     fit_visible_fragments(
         &[
@@ -1297,7 +1302,6 @@ impl<'a> DetailLayout<'a> {
     }
 
     fn visit(&self, visitor: &mut dyn FnMut(DetailLogicalLine<'_>) -> bool) {
-        let id = self.task.id.to_string();
         let origin = match self.task.origin {
             TaskOrigin::Agent => "Agent",
             TaskOrigin::User => "User",
@@ -1326,7 +1330,7 @@ impl<'a> DetailLayout<'a> {
         };
         let owner = (self.task.chat_id != self.view_chat_id).then(|| OTHER_AGENT.to_owned());
         let mut metadata_row = 0;
-        for text in [origin.as_bytes(), id.as_bytes()]
+        for text in [origin.as_bytes()]
             .into_iter()
             .chain(owner.as_ref().map(String::as_bytes))
         {
@@ -2410,10 +2414,7 @@ mod tests {
         surface.report_action_error(Uuid::from_u128(1), "owner mismatch".into());
         let frame = surface.frame(viewport(80, 10));
         assert_eq!(frame.selected_task_id, Some(Uuid::from_u128(1)));
-        assert_eq!(
-            frame.action_error.as_deref(),
-            Some("Task 00000000: owner mismatch")
-        );
+        assert_eq!(frame.action_error.as_deref(), Some("one: owner mismatch"));
         surface.clear_action_error();
         assert!(surface.frame(viewport(80, 10)).action_error.is_none());
     }

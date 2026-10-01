@@ -16,7 +16,11 @@ use uuid::Uuid;
 
 use super::{
     console::{Console, ConversationPiece, Menu},
-    conversation, directed_summary,
+    conversation,
+    conversation_picker::{
+        ConversationEntry, ConversationPicker, ConversationPickerPurpose, compact_line,
+    },
+    directed_summary,
     display::DisplayProfile,
     hyperlink,
     image_cache::ImageLinks,
@@ -99,14 +103,16 @@ impl Workflow {
         }
     }
 
-    /// Chat 选择器：列出本项目已保存的 Chat（不含当前前台 Chat），按最近活动排序，
-    /// 每行显示标题或首条提示、相对时间、git 分支与 Branch 来源。`as_new_chat` 时选中后复制成新 Chat（`--fork-session`）。
+    /// The saved-conversation picker: this project's saved Chats except the one in front,
+    /// newest activity first, each with its title and its known activity age, git branch and
+    /// Branch source. `as_new_chat` copies the chosen conversation into a new Chat
+    /// (`--fork-session`). Entry `i` of the picker is `choices[i]`.
     pub(super) async fn chats(
         agent: &Agent,
         workdir: &std::path::Path,
         current_chat: Option<Uuid>,
         as_new_chat: bool,
-    ) -> Result<(Menu, Self), String> {
+    ) -> Result<(ConversationPicker, Self), String> {
         let saved = agent
             .saved_chats(workdir)
             .await
@@ -118,36 +124,17 @@ impl Workflow {
         if chats.is_empty() {
             return Err("No conversations found to resume.".into());
         }
-        let options = chats
+        let entries = chats
             .iter()
-            .map(|chat| {
-                let mut row = format!(
-                    "{} · {}",
-                    saved_chat_title(chat),
-                    activity_age(chat.modified)
-                );
-                if let Some(branch) = &chat.git_branch {
-                    row.push_str(&format!(" · {}", single_line(branch)));
-                }
-                if let Some(source) = chat.branch_source {
-                    let source_title = saved
-                        .iter()
-                        .find(|candidate| candidate.id == source)
-                        .map_or_else(|| source.to_string(), saved_chat_title);
-                    row.push_str(&format!(" · Branch of {source_title}"));
-                }
-                row.push_str(&format!(" · {}", chat.id));
-                row
-            })
-            .chain(std::iter::once("Cancel".into()))
+            .map(|chat| saved_conversation_entry(chat, &saved))
             .collect();
-        let context = if as_new_chat {
-            "Choose a conversation to copy into a new Chat. The original conversation stays unchanged."
+        let purpose = if as_new_chat {
+            ConversationPickerPurpose::CopyAsNew
         } else {
-            "Choose a conversation to resume. Opening it shows its history and starts no work."
+            ConversationPickerPurpose::Resume
         };
         Ok((
-            menu("Resume Chat", vec![context.into()], options),
+            ConversationPicker::new(purpose, entries),
             Self::Chats {
                 choices: chats.into_iter().map(|chat| chat.id).collect(),
                 as_new_chat,
@@ -747,13 +734,35 @@ pub(super) fn chat_title(chat: &ChatSnapshot) -> String {
         .unwrap_or_else(|| "New conversation".into())
 }
 
-/// 选择器标题：Branch 名称或自定义标题，其次首条提示。
-pub(super) fn saved_chat_title(chat: &SavedChat) -> String {
+/// Picker title: the Branch name or custom title, otherwise the first prompt.
+fn saved_chat_title(chat: &SavedChat) -> String {
     chat.title
         .as_deref()
         .or(chat.first_prompt.as_deref())
-        .map(single_line)
+        .map(compact_line)
+        .filter(|title| !title.is_empty())
         .unwrap_or_else(|| "New conversation".into())
+}
+
+/// Shows only metadata the saved record actually has; a Branch whose source is not among
+/// this project's saved Chats omits the source rather than naming it by ID. The first prompt
+/// behind a custom title stays searchable.
+fn saved_conversation_entry(chat: &SavedChat, saved: &[SavedChat]) -> ConversationEntry {
+    let mut metadata = vec![activity_age(chat.modified)];
+    metadata.extend(chat.git_branch.clone());
+    if let Some(source_title) = chat
+        .branch_source
+        .and_then(|source| saved.iter().find(|candidate| candidate.id == source))
+        .map(saved_chat_title)
+    {
+        metadata.push(format!("Branch of {source_title}"));
+    }
+    let hidden_prompt = chat
+        .title
+        .as_ref()
+        .and(chat.first_prompt.as_deref())
+        .unwrap_or_default();
+    ConversationEntry::new(&saved_chat_title(chat), &metadata, &[hidden_prompt])
 }
 
 pub(super) fn activity_age(modified: SystemTime) -> String {
@@ -2191,15 +2200,26 @@ mod tests {
                 .unwrap();
         }
 
-        let (menu, workflow) = Workflow::chats(&agent, directory.path(), None, false)
+        let (picker, workflow) = Workflow::chats(&agent, directory.path(), None, false)
             .await
             .unwrap();
-        assert_eq!(menu.options.len(), 3);
-        assert!(menu.options[0].starts_with("child (Branch) · 1m ago"));
-        assert!(menu.options[0].contains("Branch of source prompt"));
-        assert!(menu.options[0].contains(&child.to_string()));
-        assert!(menu.options[1].starts_with("source prompt · 2h ago"));
-        assert!(!menu.options[1].contains("Branch of"));
+        let rows = picker
+            .entries()
+            .iter()
+            .map(|entry| entry.plain_row())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows,
+            vec![
+                "child (Branch) · 1m ago · Branch of source prompt".to_owned(),
+                "source prompt · 2h ago".to_owned(),
+            ]
+        );
+        assert!(
+            rows.iter()
+                .all(|row| !row.contains(&child.to_string()) && !row.contains(&source.to_string())),
+            "{rows:?}"
+        );
         let Workflow::Chats {
             choices,
             as_new_chat,
@@ -2210,11 +2230,25 @@ mod tests {
         assert_eq!(choices, vec![child, source]);
         assert!(!as_new_chat);
 
-        let (menu, _) = Workflow::chats(&agent, directory.path(), Some(child), true)
+        let (picker, workflow) = Workflow::chats(&agent, directory.path(), Some(child), true)
             .await
             .unwrap();
-        assert_eq!(menu.options.len(), 2);
-        assert!(menu.options[0].contains(&source.to_string()));
+        assert_eq!(picker.title(), "Copy Chat");
+        assert_eq!(picker.entries().len(), 1);
+        assert!(
+            matches!(workflow, Workflow::Chats { choices, as_new_chat: true } if choices == vec![source])
+        );
+
+        std::fs::remove_file(support::transcript_file(&root, source)).unwrap();
+        let (picker, workflow) = Workflow::chats(&agent, directory.path(), None, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            picker.entries()[0].plain_row(),
+            "child (Branch) · 1m ago",
+            "an unknown Branch source is omitted, never named by its ID"
+        );
+        assert!(matches!(workflow, Workflow::Chats { choices, .. } if choices == vec![child]));
         let empty = tempfile::tempdir().unwrap();
         assert_eq!(
             Workflow::chats(&agent, empty.path(), None, false)

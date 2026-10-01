@@ -420,11 +420,14 @@ fn child_fixture(directory: &Path, view: &ChildPty) -> Value {
     }
 }
 
-/// The execution mode label on the session status row.
+/// The execution mode label on the status row or lower input divider.
 fn status_mode(frame: &str) -> Option<String> {
     frame
         .lines()
-        .find_map(|line| line.trim_start().strip_prefix("⏵⏵ "))
+        .find_map(|line| {
+            line.trim_start_matches(|character: char| character.is_whitespace() || character == '─')
+                .strip_prefix("⏵⏵ ")
+        })
         .and_then(|line| line.split(" · ").next())
         .map(str::to_owned)
 }

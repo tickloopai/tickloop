@@ -9,6 +9,12 @@ mod command_feedback;
 #[path = "agent_console_pty/family_navigation.rs"]
 mod family_navigation;
 
+#[path = "agent_console_pty/resume_picker.rs"]
+mod resume_picker;
+
+#[path = "agent_console_pty/unified_footer.rs"]
+mod unified_footer;
+
 use std::{
     io::{Read, Write},
     panic::AssertUnwindSafe,
@@ -131,6 +137,21 @@ impl PtyView {
         flags: &[&str],
         environment: &[(&str, &std::path::Path)],
     ) -> Self {
+        Self::launch(fixture, flags, environment, false)
+    }
+
+    /// Keeps Chat storage on, so conversations saved under the fixture's config directory can be
+    /// listed and opened.
+    fn start_saving_chats(fixture: &PrivateFixture) -> Self {
+        Self::launch(fixture, &[], &[], true)
+    }
+
+    fn launch(
+        fixture: &PrivateFixture,
+        flags: &[&str],
+        environment: &[(&str, &std::path::Path)],
+        saves_chats: bool,
+    ) -> Self {
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows: TERMINAL_HEIGHT as u16,
@@ -142,7 +163,9 @@ impl PtyView {
         let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_tickloop"));
         command.args(["--working-directory-is-trusted", "--config"]);
         command.arg(fixture.path("model.json"));
-        command.arg("--no-session-persistence");
+        if !saves_chats {
+            command.arg("--no-session-persistence");
+        }
         command.args(flags);
         command.cwd(fixture.path("work"));
         command.env_clear();
@@ -413,7 +436,7 @@ async fn run_lifecycle(fixture: &PrivateFixture) {
     reopened
         .wait_for(
             "open live Agent exposes its real background Task",
-            |frame| frame.contains("Tasks 1") && !frame.contains("Agents · local"),
+            |frame| frame.contains("Shell 1") && !frame.contains("Agents · local"),
         )
         .await;
     let rows = catalog(&client).await;
@@ -423,25 +446,26 @@ async fn run_lifecycle(fixture: &PrivateFixture) {
     reopened.send(b"?");
     reopened
         .wait_for("help replaces the real Task summary", |frame| {
-            frame.contains("Ctrl+J newline") && !frame.contains("Tasks 1")
+            frame.contains("Ctrl+J newline") && !frame.contains("Shell 1")
         })
         .await;
     reopened.send(b"\x1b");
     reopened
         .wait_for("help restores the real Task summary", |frame| {
-            frame.contains("Tasks 1")
+            frame.contains("Shell 1")
         })
         .await;
     reopened.send(b"\x1b[B");
     reopened
-        .wait_for("first Down expands real Tasks inline", |frame| {
+        .wait_for("first Down focuses the real Shell preview", |frame| {
             frame.contains("1 items") && frame.contains("while [ ! -f finish ]")
         })
         .await;
     reopened.send(b"\x1b[B\r");
     reopened
         .wait_for("Task detail retrieves real worker output", |frame| {
-            frame.contains("Shell task ·") && frame.lines().any(|line| line.trim() == "shell began")
+            frame.lines().any(|line| line.trim() == "Shell task")
+                && frame.lines().any(|line| line.trim() == "shell began")
         })
         .await;
     std::fs::write(fixture.path("work/finish"), b"finish").unwrap();
@@ -490,12 +514,29 @@ async fn run_lifecycle(fixture: &PrivateFixture) {
             },
         )
         .await;
+    let captured_output = Arc::clone(&reopened.output);
+    let close_mark = captured_output.lock().unwrap().len();
     reopened.send(b"\x1b");
-    tokio::time::sleep(Duration::from_millis(40)).await;
+    reopened
+        .wait_for(
+            "Task detail closes before leaving its shared list",
+            |frame| {
+                let captured = captured_output.lock().unwrap();
+                let fresh = String::from_utf8_lossy(&captured[close_mark..]);
+                fresh.contains("\x1b[?2026l")
+                    && !frame.lines().any(|line| line.trim() == "Shell task")
+            },
+        )
+        .await;
     reopened.send(b"\x1b");
     reopened
         .wait_for("Task Esc returns to ordinary input", |frame| {
-            !frame.contains("Shell task ·") && !frame.contains("Shell tasks")
+            let captured = captured_output.lock().unwrap();
+            let terminal = String::from_utf8_lossy(&captured);
+            !frame.lines().any(|line| line.trim() == "Shell task")
+                && !frame.lines().any(|line| line.trim() == "Shell tasks")
+                && frame.lines().any(|line| line.trim() == "❯")
+                && terminal.rfind("\x1b[?25h") > terminal.rfind("\x1b[?25l")
         })
         .await;
     reopened.close().await;
@@ -901,7 +942,7 @@ async fn run_sustained_owner_loss(
     assert!(busy.user_shells[1].starts_in_background);
     assert!(busy.last_model_run.is_none());
     view.wait_for("actual busy Shell task is cached in the View", |frame| {
-        frame.contains("Tasks 1")
+        frame.contains("Shell 1")
     })
     .await;
     view.send(b"UNSENT-OWNER-LOSS-DRAFT-jk");
@@ -1034,7 +1075,7 @@ fn request_dialog_visible(frame: &str, question: &str, requester: &str) -> bool 
         && frame
             .lines()
             .any(|line| line.contains("Goal:") && line.contains(requester))
-        && frame.contains("Enter confirm")
+        && frame.contains("Enter select · Esc answer later")
 }
 
 async fn run_child_views(fixture: &PrivateFixture) {
@@ -1429,12 +1470,13 @@ async fn run_child_views(fixture: &PrivateFixture) {
     let captured_output = Arc::clone(&first.output);
     first
         .wait_for(
-            "opening the cached child folds its family and focuses its editor",
+            "opening the cached child retains its family and focuses its editor",
             |frame| {
                 let captured = captured_output.lock().unwrap();
                 let terminal = String::from_utf8_lossy(&captured);
                 frame.contains("CHILD-DRAFT-ONE")
-                    && !frame.contains("2 items")
+                    && frame.contains("Agents 2")
+                    && frame.contains("2 items")
                     && terminal.rfind("\x1b[?25h") > terminal.rfind("\x1b[?25l")
             },
         )
@@ -2849,7 +2891,7 @@ async fn run_filter_hidden_dispatch(fixture: &PrivateFixture) {
         .wait_for(
             "the created Agent's Shell output is actually visible",
             |frame| {
-                frame.contains("Shell task ·")
+                frame.lines().any(|line| line.trim() == "Shell task")
                     && frame
                         .lines()
                         .filter(|line| line.trim() == launch.to_str().unwrap())
@@ -2862,9 +2904,15 @@ async fn run_filter_hidden_dispatch(fixture: &PrivateFixture) {
         "W3 execution {:?} cue {label} selected and bound; actual Shell output:\n{output_frame}",
         created.execution
     );
+    let captured_output = Arc::clone(&view.output);
     view.send(b"\x1b");
     view.wait_for("Shell list returns to ordinary input", |frame| {
-        !frame.contains("Shell tasks") && !frame.contains("Shell task ·")
+        let captured = captured_output.lock().unwrap();
+        let terminal = String::from_utf8_lossy(&captured);
+        !frame.lines().any(|line| line.trim() == "Shell tasks")
+            && !frame.lines().any(|line| line.trim() == "Shell task")
+            && frame.lines().any(|line| line.trim() == "❯")
+            && terminal.rfind("\x1b[?25h") > terminal.rfind("\x1b[?25l")
     })
     .await;
     view.close().await;

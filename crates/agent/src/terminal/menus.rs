@@ -30,6 +30,7 @@ use uuid::Uuid;
 use super::{
     completion::{CommandGroup, CommandSpec, builtin_commands},
     console::{Console, Menu, PickerAction, PickerKind},
+    conversation_picker::ConversationPicker,
     diff_view::{DiffNavigation, DiffViewport, render_diff, render_error},
     display::{DisplayProfile, Glyph},
     font_manager::{FontAction, FontOutcome, NerdFontManager, SystemFontAdapter},
@@ -666,6 +667,36 @@ impl Menus {
         (menu, workflow): (Menu, Workflow),
     ) -> Result<(), String> {
         self.show(console, menu, Selection::Workflow(workflow))
+    }
+    /// Opens the saved-conversation picker. A terminal without interaction lists the complete
+    /// rows with their Chat IDs, which scripts match to `Chat:` lines, and takes a number.
+    pub(super) fn conversations(
+        &mut self,
+        console: &Console,
+        (picker, workflow): (ConversationPicker, Workflow),
+    ) -> Result<(), String> {
+        self.dismiss(console)?;
+        console.set_request_layout(None)?;
+        let id = picker.id();
+        if console.is_interactive() {
+            console.show_conversation_picker(picker)?;
+        } else if let Workflow::Chats { choices, .. } = &workflow {
+            let mut listing = format!("{}\n{}\n", picker.title(), picker.context());
+            for (number, (entry, chat)) in picker.entries().iter().zip(choices).enumerate() {
+                listing.push_str(&format!(
+                    "  {}. {} · {chat}\n",
+                    number + 1,
+                    entry.plain_row()
+                ));
+            }
+            listing.push_str(&format!(
+                "  {}. Cancel\nEnter an option number, or cancel.\n",
+                choices.len() + 1
+            ));
+            console.write(&listing)?;
+        }
+        self.active = Some((id, Selection::Workflow(workflow)));
+        Ok(())
     }
     pub(super) fn id(&self) -> Option<Uuid> {
         self.active.as_ref().map(|(id, _)| *id)

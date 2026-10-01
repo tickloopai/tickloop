@@ -26,6 +26,7 @@ mod clipboard_hint;
 mod completion;
 mod console;
 mod conversation;
+mod conversation_picker;
 pub mod diff_catalog;
 pub mod diff_dialog;
 pub mod diff_view;
@@ -1187,7 +1188,7 @@ async fn interact(
             sync_snapshot(&snapshot, &mut pending, &mut permissions, &mut questions);
         }
         StartupChat::Picker { as_new_chat } => {
-            menus.workflow(
+            menus.conversations(
                 console,
                 Workflow::chats(agent, &workdir, None, as_new_chat).await?,
             )?;
@@ -1811,6 +1812,11 @@ async fn interact(
                         let opened=match navigate_agent(&mut global, agent, console, &mut menus, effect, &displayed_sequences, &mut reply_lines).await {
                             Ok(opened)=>opened,
                             Err(error)=>{
+                                #[cfg(test)]
+                                agent.record_recovery_fact(recovery_tests::RecoveryFact::NavigationRejected {
+                                    selected_chat,
+                                    visible: global.projection().visible,
+                                });
                                 console.set_status(&format!("Cannot open the Agent · {}",safe_line(&error)))?;
                                 status_dirty = true;
                                 continue;
@@ -1867,7 +1873,7 @@ async fn interact(
                 Some(InputEvent::OpenFooter(item)) => {
                     let result = if let Some(chat) = selected_chat {
                         match item {
-                            FooterItemId::Tasks => open_tasks(&task_center,console,chat,&mut task_subscription,None).await,
+                            FooterItemId::Tasks => open_tasks(&task_center,console,chat,&mut task_subscription,None,true).await,
                             FooterItemId::Todo => Ok(()),
                             FooterItemId::Agents => Ok(()),
                         }
@@ -1877,7 +1883,9 @@ async fn interact(
                 },
                 Some(InputEvent::OpenStatusTask(task_id)) => {
                     if let Some(chat) = selected_chat {
-                        open_tasks(&task_center,console,chat,&mut task_subscription,Some(task_id)).await?;
+                        let result = open_tasks(&task_center,console,chat,&mut task_subscription,Some(task_id),true).await;
+                        console.finish_footer_open()?;
+                        result?;
                     }
                 },
                 Some(InputEvent::StopStatusTask(task_id)) => {
@@ -2274,7 +2282,7 @@ async fn interact(
                             match Workflow::chats(agent,&directory,None,false).await {
                                 Ok(workflow)=>{
                                     console.set_global_overview(None)?;global.interpret(crate::agent_console::Intent::Back).map_err(|error|error.to_string())?;
-                                    overview_active=false;history_return_overview=true;menus.workflow(console,workflow)?;
+                                    overview_active=false;history_return_overview=true;menus.conversations(console,workflow)?;
                                 },
                                 Err(error)=>console.restore_rejected_prompt(restored_contexts,&error)?,
                             }
@@ -2499,7 +2507,7 @@ async fn interact(
                             } else {outln!(console,"No Chat is selected.");}
                         },
                         "/resume" => match Workflow::chats(agent,&workdir,selected_chat,false).await {
-                            Ok(picker) => menus.workflow(console,picker)?,
+                            Ok(picker) => menus.conversations(console,picker)?,
                             Err(error) => outln!(console,"{error}"),
                         },
                         "/loops" if interactive => {
@@ -2508,7 +2516,7 @@ async fn interact(
                         },
                         command if interactive && is_task_surface_command(command) => {
                             if let Some(chat)=selected_chat {
-                                open_tasks(&task_center,console,chat,&mut task_subscription,None).await?;
+                                open_tasks(&task_center,console,chat,&mut task_subscription,None,false).await?;
                             }
                             else {outln!(console,"No Chat is selected. Enter a task first.");}
                         },
@@ -3794,6 +3802,7 @@ async fn open_tasks(
     chat_id: uuid::Uuid,
     task_subscription: &mut Option<ShellTaskSubscription>,
     selected_task: Option<uuid::Uuid>,
+    from_footer: bool,
 ) -> Result<(), String> {
     let prepared = async {
         let mut subscription = task_center.subscribe(chat_id).await?;
@@ -3803,7 +3812,9 @@ async fn open_tasks(
     .await;
     match prepared {
         Ok((subscription, snapshot)) => {
-            let effect = if let Some(task_id) = selected_task {
+            let effect = if from_footer {
+                console.show_footer_tasks_at(snapshot, selected_task)?
+            } else if let Some(task_id) = selected_task {
                 console.show_tasks_at(snapshot, Some(task_id))?
             } else {
                 console.show_tasks(snapshot)?
@@ -6177,8 +6188,8 @@ fn task_status_items(snapshot: &ShellTaskSnapshot) -> Vec<StatusItem> {
         .tasks
         .iter()
         .filter(|task| task.was_background && !task.state.is_terminal())
-        .map(|task| {
-            let id = task.id.to_string();
+        .enumerate()
+        .map(|(index, task)| {
             let (state, role) = match task.state {
                 ShellTaskState::Queued => ("queued", Role::MutedText),
                 ShellTaskState::Running | ShellTaskState::Background => {
@@ -6190,7 +6201,7 @@ fn task_status_items(snapshot: &ShellTaskSnapshot) -> Vec<StatusItem> {
                 }
             };
             StatusItem {
-                id: id[..8].to_owned(),
+                id: format!("{}.", index + 1),
                 task_id: Some(task.id),
                 can_stop: task.capabilities.can_stop,
                 title: safe_text(&task.command).replace('\n', " "),
@@ -6221,7 +6232,7 @@ fn todo_status_items(snapshot: &ChatSnapshot, current_loop: Option<uuid::Uuid>) 
                         id: format!("{}.", index + 1),
                         task_id: None,
                         can_stop: false,
-                        title: safe_text(&todo.content).replace('\n', " "),
+                        title: safe_text(&todo.content),
                         state,
                         role,
                     }
@@ -6872,7 +6883,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 ("Read the notes", "completed"),
-                ("Draft the report", "in progress"),
+                ("Draft the\nreport", "in progress"),
                 ("Check the figures", "pending"),
             ]
         );
@@ -7322,14 +7333,23 @@ mod tests {
             Arc::new(support::ScriptedModel::new(Vec::new())),
         )
         .unwrap();
-        let (menu, workflow) = Workflow::chats(&reopened, directory.path(), None, false)
+        let (picker, workflow) = Workflow::chats(&reopened, directory.path(), None, false)
             .await
             .unwrap();
-        let child_index = menu
-            .options
+        let Workflow::Chats { choices, .. } = &workflow else {
+            panic!("the Chat picker returned the wrong workflow");
+        };
+        let child_index = choices
             .iter()
-            .position(|option| option.contains(&child_chat_id.to_string()))
+            .position(|chat| *chat == child_chat_id)
             .expect("the Chat picker did not list the saved child");
+        assert!(
+            picker
+                .entries()
+                .iter()
+                .all(|entry| !entry.plain_row().contains(&child_chat_id.to_string())),
+            "picker rows must not show Chat IDs"
+        );
         let effect = workflow
             .choose(&reopened, &console, Some(child_index))
             .await

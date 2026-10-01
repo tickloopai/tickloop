@@ -8,7 +8,7 @@ pub(super) enum FooterItemId {
 impl FooterItemId {
     pub(super) fn label(self) -> &'static str {
         match self {
-            Self::Tasks => "Tasks",
+            Self::Tasks => "Shell",
             Self::Todo => "Todo",
             Self::Agents => "Agents",
         }
@@ -273,7 +273,7 @@ mod tests {
         );
         assert_eq!(footer.selected(), None);
         assert_eq!(footer.frame().items.len(), 2);
-        assert_eq!(FooterItemId::Tasks.label(), "Tasks");
+        assert_eq!(FooterItemId::Tasks.label(), "Shell");
         assert_eq!(FooterItemId::Todo.label(), "Todo");
     }
 }

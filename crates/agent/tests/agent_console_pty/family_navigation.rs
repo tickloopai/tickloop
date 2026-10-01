@@ -98,13 +98,13 @@ async fn open_family_member(
                         .iter()
                         .filter(|(agent, _)| *agent != title)
                         .all(|(_, draft)| !frame.contains(draft))
-                        && !frame.contains("3 items")
+                        && frame.contains("3 items")
                         && editor_has_focus(&captured)
                 })
                 .await;
             assert!(
-                !opened.contains("3 items") && editor_has_focus(&pty.output),
-                "opening {title} must fold the family and focus its editor: {opened}"
+                opened.contains("3 items") && editor_has_focus(&pty.output),
+                "opening {title} must retain the family panel and focus its editor: {opened}"
             );
             return version;
         }

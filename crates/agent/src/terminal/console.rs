@@ -32,8 +32,17 @@ mod agent_layout;
 #[path = "console/connection_tests.rs"]
 mod connection_tests;
 #[cfg(test)]
+#[path = "console/conversation_picker_tests.rs"]
+mod conversation_picker_tests;
+#[cfg(test)]
 #[path = "console/layout_tests.rs"]
 mod layout_tests;
+#[cfg(test)]
+#[path = "console/request_layout_tests.rs"]
+mod request_layout_tests;
+#[cfg(test)]
+#[path = "console/unified_footer_tests.rs"]
+mod unified_footer_tests;
 use agent_layout::OverviewState;
 use agent_layout::OverviewTarget;
 pub(super) use agent_layout::{
@@ -47,6 +56,7 @@ use super::{
         CHILD_AUTHORIZATION_FIXED, CommandScope, Completion, CompletionAction, CompletionKey,
         unavailable_command,
     },
+    conversation_picker::{ConversationPicker, ConversationPickerEffect},
     diff_catalog::{
         CatalogChangeDetail, ChangeCatalog, ChangeSourceId, ChangeSourceState, CurrentFileStatus,
         GitFileState,
@@ -104,6 +114,7 @@ const RESET_SCROLL_REGION: &str = "\x1b[r";
 const NEW_LOOP_TARGET: &str = "new Loop";
 const MAX_PENDING_INPUT_ROWS: usize = 4;
 const CREATION_ATTACH_UNAVAILABLE_PREFIX: &str = "New Agent created; local connection unavailable";
+const EXECUTION_CONNECTION_DETAILS_HINT: &str = "Ctrl+O details";
 
 /// Pairs the escape sequences that move between screen buffers with the record
 /// of which buffer the terminal is on, so the two cannot drift apart. The record
@@ -443,6 +454,8 @@ struct State {
     activity_interruptible: bool,
     back_to_bottom_target: Option<BackToBottomTarget>,
     back_to_bottom_pressed: bool,
+    footer_bar_target: Option<FooterBarTarget>,
+    pointer_input: Option<InputEvent>,
     completion: Completion,
     file_mentions: FileMentionState,
     input_owner: Uuid,
@@ -481,6 +494,9 @@ struct State {
     mention_roots: Option<(PathBuf, Vec<PathBuf>)>,
     menu: Option<Menu>,
     picker_kind: Option<PickerKind>,
+    /// The `/resume` picker. It owns the whole screen and every key while it is open; the
+    /// draft and conversation underneath stay untouched.
+    conversation_picker: Option<ConversationPicker>,
     menu_link: Option<(Uuid, String)>,
     menu_review: Option<MenuReviewState>,
     menu_comment: Option<MenuCommentState>,
@@ -501,6 +517,7 @@ struct State {
     diff_screen_cache: HashMap<Uuid, DiffDialog>,
     task_surface: Option<TaskSurface<Uuid>>,
     task_surface_cache: HashMap<Uuid, TaskSurface<Uuid>>,
+    todo_detail: Option<TodoDetail>,
     subscription_surface: Option<SubscriptionSurface>,
     permissions_surface: Option<PermissionsSurface>,
     footer: FooterState,
@@ -562,6 +579,7 @@ enum RenderedView {
     BottomPanel,
     Transcript,
     DiffScreen,
+    ConversationPicker,
 }
 
 #[derive(Clone, Copy)]
@@ -716,6 +734,18 @@ struct FooterOpenPending {
 struct BackToBottomTarget {
     row: usize,
     columns: std::ops::Range<usize>,
+}
+
+struct TodoDetail {
+    ordinal: usize,
+    item: StatusItem,
+    offset: usize,
+}
+
+struct FooterBarTarget {
+    row: usize,
+    inset: usize,
+    categories: Vec<(std::ops::Range<usize>, FooterItemId)>,
 }
 
 fn status_notice_line(
@@ -1082,6 +1112,7 @@ impl Console {
             && state.menu.is_none()
             && state.transcript.is_none()
             && state.task_surface.is_none()
+            && state.todo_detail.is_none()
             && state.diff_screen.is_none()
             && state.subscription_surface.is_none()
             && state.permissions_surface.is_none()
@@ -1427,7 +1458,6 @@ impl Console {
         let restored = state.chat == Some(chat) || state.view_cache.contains_key(&Some(chat));
         state.switch_view_chat(Some(chat));
         state.clear_footer_selection();
-        state.status_area.collapse();
         state.conversation_focused = false;
         Ok(restored)
     }
@@ -1627,6 +1657,23 @@ impl Console {
         snapshot: TaskSurfaceSnapshot,
         selected_task: Option<Uuid>,
     ) -> Result<TaskSurfaceEffect, String> {
+        self.show_task_surface(snapshot, selected_task, false)
+    }
+
+    pub(super) fn show_footer_tasks_at(
+        &self,
+        snapshot: TaskSurfaceSnapshot,
+        selected_task: Option<Uuid>,
+    ) -> Result<TaskSurfaceEffect, String> {
+        self.show_task_surface(snapshot, selected_task, true)
+    }
+
+    fn show_task_surface(
+        &self,
+        mut snapshot: TaskSurfaceSnapshot,
+        selected_task: Option<Uuid>,
+        from_footer: bool,
+    ) -> Result<TaskSurfaceEffect, String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         if !state.interactive {
             return Err("the Shell task center requires a terminal".into());
@@ -1639,6 +1686,16 @@ impl Console {
             return Ok(TaskSurfaceEffect::None);
         }
         state.finish_matching_footer_open(FooterItemId::Tasks);
+        state.task_footer_return = from_footer;
+        if from_footer {
+            state.filter_footer_tasks(&mut snapshot, selected_task);
+            state.status_area.select(FooterItemId::Tasks);
+            state.status_area.pin_panel();
+        } else {
+            state.status_area.release_panel();
+        }
+        let selected_task = selected_task
+            .or_else(|| (from_footer && snapshot.tasks.len() == 1).then(|| snapshot.tasks[0].id));
         let (mut surface, mut effect) =
             if let Some(mut surface) = state.task_surface_cache.remove(&chat_id) {
                 surface.clear_action_error();
@@ -1652,8 +1709,12 @@ impl Console {
         if let Some(task_id) = selected_task {
             let viewport = task_surface_content_viewport(state.width, state.height);
             effect = surface.open_detail(task_id, viewport);
+        } else if from_footer && matches!(surface.focus(), TaskSurfaceFocus::Detail { .. }) {
+            let viewport = task_surface_content_viewport(state.width, state.height);
+            effect = surface.apply(TaskSurfaceAction::Back, viewport);
         }
         state.task_surface = Some(surface);
+        state.todo_detail = None;
         state.hide_subscription_view();
         state.permissions_surface = None;
         state.clear_footer_selection();
@@ -1975,9 +2036,22 @@ impl Console {
             .map(|surface| *surface.restore()))
     }
 
-    pub fn update_tasks(&self, snapshot: TaskSurfaceSnapshot) -> Result<TaskSurfaceEffect, String> {
+    pub fn update_tasks(
+        &self,
+        mut snapshot: TaskSurfaceSnapshot,
+    ) -> Result<TaskSurfaceEffect, String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         let chat_id = snapshot.chat_id;
+        if state.task_footer_return {
+            let selected = state
+                .task_surface
+                .as_ref()
+                .and_then(|surface| match surface.focus() {
+                    TaskSurfaceFocus::Detail { task_id } => Some(task_id),
+                    TaskSurfaceFocus::List => None,
+                });
+            state.filter_footer_tasks(&mut snapshot, selected);
+        }
         if let Some(surface) = state
             .task_surface
             .as_mut()
@@ -2746,6 +2820,7 @@ impl Console {
                         state.menu_focused
                             && state.menu_is_visible()
                             && state.task_surface.is_none()
+                            && state.todo_detail.is_none()
                             && state.subscription_surface.is_none()
                             && state.transcript.is_none()
                             && state.diff_screen.is_none()
@@ -2833,6 +2908,28 @@ impl Console {
         state.menu = Some(menu);
         state.context_offset = 0;
         state.draw(&mut output).map_err(|error| error.to_string())
+    }
+
+    /// Shows the saved-conversation picker over the whole screen. Its choice and cancellation
+    /// arrive as the menu `Choice` and `Cancel` of `picker.id()`.
+    pub(super) fn show_conversation_picker(
+        &self,
+        picker: ConversationPicker,
+    ) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        if !state.interactive {
+            return Err("interactive menus require a terminal".into());
+        }
+        state.shell_background_chord_started_at = None;
+        state.completion.dismiss();
+        state.clear_footer_selection();
+        if let Some(pending) = &mut state.footer_open_pending {
+            pending.cancelled = true;
+        }
+        state.conversation_picker = Some(picker);
+        state
+            .draw(&mut io::stdout().lock())
+            .map_err(|error| error.to_string())
     }
 
     pub fn clear_menu(&self, id: Uuid) -> Result<(), String> {
@@ -3561,6 +3658,9 @@ impl State {
         self.activity_interruptible = false;
         self.back_to_bottom_target = None;
         self.back_to_bottom_pressed = false;
+        self.todo_detail = None;
+        self.hide_task_surface();
+        self.status_area.release_panel();
         let previous_chat = self.chat;
         let next = self.view_cache.remove(&chat).unwrap_or_else(|| {
             let mut next = ViewPresentation::default();
@@ -3577,10 +3677,10 @@ impl State {
         let previous = self.replace_view(next);
         self.view_cache.insert(previous_chat, previous);
         self.hide_diff_screen();
-        self.hide_task_surface();
         self.hide_subscription_view();
         self.permissions_surface = None;
         self.menu = None;
+        self.conversation_picker = None;
         self.request_layout = None;
         self.request_menu = None;
         self.question_menu = None;
@@ -3749,6 +3849,8 @@ impl State {
             activity_interruptible: false,
             back_to_bottom_target: None,
             back_to_bottom_pressed: false,
+            footer_bar_target: None,
+            pointer_input: None,
             completion: Completion::default(),
             file_mentions: FileMentionState::default(),
             input_owner: Uuid::new_v4(),
@@ -3777,6 +3879,7 @@ impl State {
             mention_roots: None,
             menu: None,
             picker_kind: None,
+            conversation_picker: None,
             menu_link: None,
             menu_review: None,
             menu_comment: None,
@@ -3797,6 +3900,7 @@ impl State {
             diff_screen_cache: HashMap::new(),
             task_surface: None,
             task_surface_cache: HashMap::new(),
+            todo_detail: None,
             subscription_surface: None,
             permissions_surface: None,
             footer: FooterState::default(),
@@ -3831,6 +3935,15 @@ impl State {
     /// Pointer input scrolls the conversation, selects text and activates the return control.
     /// Other events are captured so the terminal does not translate the wheel into arrow keys.
     fn pointer(&mut self, event: MouseEvent, output: &mut impl Write) -> bool {
+        self.pointer_input = None;
+        if self.conversation_picker.is_some()
+            && matches!(
+                event.kind,
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+            )
+        {
+            return false;
+        }
         let at = Cell {
             row: usize::from(event.row),
             column: usize::from(event.column),
@@ -3865,19 +3978,35 @@ impl State {
                     self.back_to_bottom_pressed = true;
                     return true;
                 }
-                if self.status_area.is_configured() && self.footer_items_are_visible() {
-                    let panel_rows = self.status_area.row_count(self.height);
-                    if panel_rows > 0
-                        && at.row == self.height - panel_rows
-                        && let Some(panel) = self
-                            .status_area
-                            .panel_at_column(&self.footer.frame(), at.column)
-                    {
-                        self.clear_selection();
-                        self.footer.select(panel);
-                        self.status_area.toggle(panel);
-                        return true;
+                let category = self.footer_bar_target.as_ref().and_then(|target| {
+                    (target.row == at.row)
+                        .then(|| {
+                            let column = at.column.checked_sub(target.inset)?;
+                            target.categories.iter().find_map(|(columns, category)| {
+                                columns.contains(&column).then_some(*category)
+                            })
+                        })
+                        .flatten()
+                });
+                if let Some(panel) = category {
+                    self.clear_selection();
+                    if self.todo_detail.is_some() || self.task_surface.is_some() {
+                        if self.status_area.selected_panel() == Some(panel) {
+                            return true;
+                        }
+                        self.todo_detail = None;
+                        self.hide_task_surface();
+                        self.status_area.release_panel();
                     }
+                    self.footer.select(panel);
+                    self.status_area.select(panel);
+                    self.footer_list_focused = panel == FooterItemId::Tasks;
+                    if panel == FooterItemId::Tasks
+                        && let Some(task_id) = self.status_area.single_task()
+                    {
+                        self.pointer_input = Some(self.open_footer_task(task_id));
+                    }
+                    return true;
                 }
                 self.back_to_bottom_pressed = false;
                 let had_selection = self.selection.is_some();
@@ -3906,6 +4035,7 @@ impl State {
     fn scroll_conversation(&mut self, action: ScrollAction) -> bool {
         if self.transcript.is_some()
             || self.task_surface.is_some()
+            || self.todo_detail.is_some()
             || self.subscription_surface.is_some()
             || self.diff_screen.is_some()
         {
@@ -3983,6 +4113,7 @@ impl State {
             output,
             lines.into_iter().map(RoleLine::plain).collect(),
             false,
+            false,
         )
     }
 
@@ -3991,7 +4122,7 @@ impl State {
         output: &mut impl Write,
         lines: Vec<RoleLine>,
     ) -> io::Result<()> {
-        self.draw_panel_lines(output, lines, true)
+        self.draw_panel_lines(output, lines, true, false)
     }
 
     fn draw_panel_lines(
@@ -3999,6 +4130,7 @@ impl State {
         output: &mut impl Write,
         mut lines: Vec<RoleLine>,
         themed: bool,
+        footer_header: bool,
     ) -> io::Result<()> {
         let content_width = task_surface_content_width(self.width);
         let indent = " ".repeat(TASK_SURFACE_SIDE_PADDING.min(self.width / 2));
@@ -4029,6 +4161,18 @@ impl State {
             lines.insert(0, RoleLine::default());
         }
         let start = self.height.saturating_sub(lines.len());
+        if footer_header {
+            let chrome =
+                usize::from(task_surface_panel_height(self.height) >= TASK_SURFACE_MIN_PANE_ROWS)
+                    * TASK_SURFACE_CHROME_ROWS;
+            self.footer_bar_target = Some(FooterBarTarget {
+                row: start + chrome,
+                inset: indent.len(),
+                categories: self
+                    .status_area
+                    .panel_targets(&self.footer.frame(), content_width),
+            });
+        }
         let body = self.scrollback.frame_with_motion(
             self.width,
             start,
@@ -4074,6 +4218,26 @@ impl State {
 
     fn draw_frame(&mut self, output: &mut impl Write) -> io::Result<()> {
         self.back_to_bottom_target = None;
+        self.footer_bar_target = None;
+        if let Some(picker) = &mut self.conversation_picker {
+            let frame = picker.frame(self.width, self.height, self.display);
+            let rows: Vec<String> = frame
+                .lines
+                .iter()
+                .map(|line| {
+                    line.resolve(self.display.theme(), self.width)
+                        .render(self.colour_depth)
+                })
+                .collect();
+            write!(output, "{RESET_SCROLL_REGION}")?;
+            self.paint_rows(output, RenderedView::ConversationPicker, rows, 0)?;
+            match frame.cursor {
+                Some((row, column)) => queue!(output, MoveTo(column as u16, row as u16), Show)?,
+                None => queue!(output, Hide)?,
+            }
+            self.rendered_screen = frame.lines.iter().map(RoleLine::text).collect();
+            return output.flush();
+        }
         if self.overview.projection.is_some() && self.menu.is_none() {
             let (bottom, row, column) = self.styled_frame();
             let top_height = self.height.saturating_sub(bottom.len());
@@ -4122,14 +4286,53 @@ impl State {
             let lines = subscription_surface_lines(surface, panel_content_rows, self.display);
             return self.draw_bottom_panel(output, lines);
         }
+        if let Some(detail) = &mut self.todo_detail {
+            let width = task_surface_content_width(self.width);
+            let capacity = panel_content_rows.saturating_sub(3).max(1);
+            let content = wrap_text(&detail.item.title, width);
+            detail.offset = detail.offset.min(content.len().saturating_sub(capacity));
+            let mut lines = self.status_area.panel_lines_with_rows(
+                &self.footer.frame(),
+                width,
+                1,
+                self.display,
+            );
+            let mut title = RoleLine::role(format!("Todo item {} · ", detail.ordinal), Role::Text);
+            title.push(detail.item.state, Some(detail.item.role));
+            lines.push(title);
+            lines.extend(
+                content
+                    .into_iter()
+                    .skip(detail.offset)
+                    .take(capacity)
+                    .map(|line| RoleLine::role(line, Role::Text)),
+            );
+            lines.push(RoleLine::role(
+                "Read-only · j/k scroll · Esc list",
+                Role::MutedText,
+            ));
+            lines.truncate(panel_content_rows.max(1));
+            return self.draw_panel_lines(output, lines, true, true);
+        }
         if let Some(surface) = &mut self.task_surface {
+            let from_footer = self.task_footer_return;
             let lines = task_surface_lines(
                 surface,
                 task_surface_content_width(self.width),
-                panel_content_rows,
+                panel_content_rows.saturating_sub(usize::from(from_footer)),
                 self.menu.as_ref().map(|menu| menu.title.as_str()),
                 self.display,
             );
+            if from_footer {
+                let mut panel = self.status_area.panel_lines_with_rows(
+                    &self.footer.frame(),
+                    task_surface_content_width(self.width),
+                    1,
+                    self.display,
+                );
+                panel.extend(lines.into_iter().map(RoleLine::plain));
+                return self.draw_panel_lines(output, panel, true, true);
+            }
             return self.draw_bottom_panel(output, lines);
         }
         if let Some((_, transcript)) = &mut self.transcript {
@@ -4787,7 +4990,7 @@ impl State {
                         "Type a comment · Enter submit · Tab close · Esc close".into()
                     }
                 } else if let Some(question) = &self.question_menu {
-                    question_menu_hint(question)
+                    question_menu_hint(question, menu.selected)
                 } else if menu.confirmation {
                     if self.selected_menu_can_expand() {
                         if self.menu_review.is_some() {
@@ -5080,15 +5283,81 @@ impl State {
             self.height.saturating_sub(1).max(1)
         };
         let selected = menu.selected.min(menu.options.len().saturating_sub(1));
-        let option_count = menu.options.len().min(capacity.saturating_sub(2).max(1));
-        let option_start = selected.saturating_sub(option_count.saturating_sub(1));
+        let title_rows = usize::from(capacity > 1);
+        let hint_rows = usize::from(capacity > 2);
         let comment = self.menu_comment.as_ref().filter(|comment| comment.editing);
-        let comment_rows = usize::from(comment.is_some() && capacity > 3);
-        let context_capacity = capacity.saturating_sub(2 + option_count + comment_rows);
+        let (comment_lines, comment_cursor) = comment.map_or_else(
+            || (Vec::new(), (0, 0)),
+            |comment| {
+                let value = comment
+                    .values
+                    .get(&selected)
+                    .map(String::as_str)
+                    .unwrap_or_default();
+                let prefix = format!("{}: ", comment.label);
+                let text = if comment.secret {
+                    "*".repeat(value.chars().count())
+                } else {
+                    display_text(value)
+                };
+                let before_cursor = if comment.secret {
+                    "*".repeat(value[..comment.cursor.min(value.len())].chars().count())
+                } else {
+                    display_text(&value[..comment.cursor.min(value.len())])
+                };
+                let cursor_lines = wrap_text(&format!("{prefix}{before_cursor}"), self.width);
+                let column = display_width(cursor_lines.last().expect("the field has a line"));
+                let cursor = if text
+                    .chars()
+                    .nth(before_cursor.chars().count())
+                    .is_some_and(|next| column + next.width().unwrap_or(0) > self.width)
+                {
+                    (cursor_lines.len(), 0)
+                } else {
+                    (
+                        cursor_lines.len() - 1,
+                        column.min(self.width.saturating_sub(1)),
+                    )
+                };
+                (wrap_text(&format!("{prefix}{text}"), self.width), cursor)
+            },
+        );
+        let comment_rows = comment_lines
+            .len()
+            .min(capacity.saturating_sub(title_rows + hint_rows + 1));
+        let option_capacity = capacity.saturating_sub(title_rows + hint_rows + comment_rows);
+        let options = menu
+            .options
+            .iter()
+            .enumerate()
+            .map(|(index, option)| {
+                let marker = if index == selected {
+                    self.display.glyph(Glyph::Prompt)
+                } else {
+                    " "
+                };
+                wrap_text(&format!("{marker} {}", display_text(option)), self.width)
+            })
+            .collect::<Vec<_>>();
+        let mut option_rows = options[selected].len().min(option_capacity);
+        let mut option_start = selected;
+        let mut option_end = selected + 1;
+        while option_start > 0 && option_rows + options[option_start - 1].len() <= option_capacity {
+            option_start -= 1;
+            option_rows += options[option_start].len();
+        }
+        while option_end < options.len()
+            && option_rows + options[option_end].len() <= option_capacity
+        {
+            option_rows += options[option_end].len();
+            option_end += 1;
+        }
+        let context_capacity =
+            capacity.saturating_sub(title_rows + hint_rows + option_rows + comment_rows);
         let mut lines = Vec::new();
         if capacity > 1 {
             lines.push(RoleLine::role(
-                truncate_width(&display_text(&menu.title), self.width),
+                truncate_width(&display_single_line(&menu.title), self.width),
                 Role::DialogTitle,
             ));
         }
@@ -5136,56 +5405,57 @@ impl State {
             }
         }
         let mut selected_row = lines.len();
-        for (index, option) in menu
-            .options
+        for (index, option_lines) in options
             .iter()
             .enumerate()
             .skip(option_start)
-            .take(option_count)
+            .take(option_end - option_start)
         {
             if index == selected {
                 selected_row = lines.len();
             }
-            let text = format!(
-                "{} {}",
+            lines.extend(option_lines.iter().take(option_capacity).map(|text| {
+                let line = RoleLine::role(text.clone(), Role::Text);
                 if index == selected {
-                    self.display.glyph(Glyph::Prompt)
+                    line.filled(Role::Selection)
                 } else {
-                    " "
-                },
-                display_text(option)
-            );
-            let line = RoleLine::role(truncate_width(&text, self.width), Role::Text);
-            lines.push(if index == selected {
-                line.filled(Role::Selection)
-            } else {
-                line
-            });
+                    line
+                }
+            }));
         }
         let mut cursor = (selected_row, 0);
-        if comment_rows > 0
-            && let Some(comment) = comment
-        {
-            let value = comment
-                .values
-                .get(&selected)
-                .map(String::as_str)
-                .unwrap_or_default();
-            let prefix = format!("{}: ", comment.label);
-            cursor = (
-                lines.len(),
-                (display_width(&prefix) + display_width(&value[..comment.cursor.min(value.len())]))
-                    .min(self.width.saturating_sub(1)),
+        if comment_rows > 0 {
+            let start = comment_cursor.0.saturating_sub(comment_rows - 1);
+            cursor = (lines.len() + comment_cursor.0 - start, comment_cursor.1);
+            lines.extend(
+                comment_lines
+                    .into_iter()
+                    .skip(start)
+                    .take(comment_rows)
+                    .map(RoleLine::plain),
             );
-            lines.push(RoleLine::plain(format!("{prefix}{}", display_text(value))));
         }
-        if lines.len() < capacity {
+        if hint_rows > 0 {
             let hint = if comment.is_some() {
-                "Enter save · Esc close field"
+                if self.question_menu.is_some() {
+                    "Type your answer · Enter submit · Esc close field".into()
+                } else {
+                    "Type a comment · Enter submit · Tab close · Esc close".into()
+                }
             } else if self.review_focused {
-                "PageUp/Down review · Tab actions · Esc cancel"
+                "PageUp/Down review · Tab actions · Esc deny".into()
+            } else if let Some(question) = &self.question_menu {
+                question_menu_hint(question, selected)
+            } else if menu.confirmation {
+                if self.selected_menu_can_expand() {
+                    "Enter/y exact · Tab prefixes · n/Esc deny".into()
+                } else if self.selected_menu_accepts_comment() {
+                    "Enter/y · n/Esc deny · Tab comment".into()
+                } else {
+                    "Enter/y · n/Esc deny".into()
+                }
             } else {
-                "Enter confirm · Tab comment · Esc cancel"
+                "Enter confirm · Tab comment · Esc cancel".into()
             };
             lines.push(RoleLine::role(hint, Role::MutedText));
         }
@@ -5428,14 +5698,30 @@ impl State {
                     .background_status_notice
                     .as_ref()
                     .is_some_and(|notice| notice.necessary);
+        let core_status = self
+            .status_area
+            .status_line_with_background(usize::MAX, "", None);
+        let float_core_status = !short
+            && !overview
+            && !self.help_open
+            && configured_status.is_none()
+            && self.status_area.is_configured()
+            && display_width(&core_status.text()) + 2 <= self.width;
         let mut status_rows = if self.help_open {
             usize::from(!leading_notice.is_empty() || required_status)
         } else {
             configured_status
                 .as_ref()
-                .map_or(1, Vec::len)
+                .map_or(usize::from(!float_core_status), Vec::len)
                 .max(usize::from(!leading_notice.is_empty() || required_status))
         };
+        if float_core_status {
+            status_rows = status_rows.max(usize::from(
+                self.background_status_notice.is_some()
+                    || self.footer.selected().is_some()
+                    || self.foreground_shell,
+            ));
+        }
         if separate_background_notice.is_some() {
             status_rows = status_rows.max(2);
         }
@@ -5591,7 +5877,20 @@ impl State {
             vec![RoleLine::default()]
         });
         if borders > 1 {
-            lines.push(RoleLine::role("─".repeat(self.width), border));
+            let mut divider = RoleLine::role(
+                "─".repeat(if float_core_status {
+                    self.width
+                        .saturating_sub(display_width(&core_status.text()) + 1)
+                } else {
+                    self.width
+                }),
+                border,
+            );
+            if float_core_status {
+                divider.push(" ", None);
+                divider.spans.extend(core_status.spans);
+            }
+            lines.push(divider);
         }
         if status_rows > 0 {
             let status_start = lines.len();
@@ -5658,6 +5957,7 @@ impl State {
             } else {
                 lines.push(
                     if self.status_area.is_configured()
+                        && !float_core_status
                         && !overview
                         && !self.help_open
                         && (leading_notice.is_empty()
@@ -5670,7 +5970,7 @@ impl State {
                             .status_area
                             .status_line_with_background(self.width, &notice, background);
                         if self.execution_connection_notice.is_some() {
-                            let hint = "Ctrl+O details";
+                            let hint = EXECUTION_CONNECTION_DETAILS_HINT;
                             if display_width(&line.text()) + 3 + display_width(hint) <= self.width {
                                 line.push(" · ", Some(Role::MutedText));
                                 line.push(hint, Some(Role::MutedText));
@@ -5691,7 +5991,7 @@ impl State {
                             ""
                         } else if let Some(pending) = &self.footer_open_pending {
                             if pending.item == FooterItemId::Tasks {
-                                "Opening Tasks · Esc input"
+                                "Opening Shell · Esc input"
                             } else {
                                 "Opening panel · Esc input"
                             }
@@ -5699,11 +5999,13 @@ impl State {
                             "Shell running · Ctrl+B background · Ctrl+C stop"
                         } else if let Some(selected) = self.footer.selected() {
                             match (self.footer_list_focused, selected) {
-                                (false, _) => "Enter list · Space close · Esc input",
+                                (false, _) => "Enter list · Esc input",
                                 (true, FooterItemId::Tasks) => "Enter details · Esc input",
                                 (true, FooterItemId::Agents) => "Enter open · Esc input",
-                                (true, FooterItemId::Todo) => "Esc input",
+                                (true, FooterItemId::Todo) => "Enter details · Esc input",
                             }
+                        } else if float_core_status {
+                            ""
                         } else if self.candidate_rows(1).is_empty()
                             && self.clipboard_hint.is_visible()
                         {
@@ -5751,6 +6053,19 @@ impl State {
                         }
                     },
                 );
+                if float_core_status
+                    && self.execution_connection_notice.is_some()
+                    && self.ordinary_input_is_visible()
+                    && !self.conversation_focused
+                    && let Some(line) = lines.last_mut()
+                    && display_width(&line.text())
+                        + 3
+                        + display_width(EXECUTION_CONNECTION_DETAILS_HINT)
+                        <= self.width
+                {
+                    line.push(" · ", Some(Role::MutedText));
+                    line.push(EXECUTION_CONNECTION_DETAILS_HINT, Some(Role::MutedText));
+                }
             }
             if let Some(background) = separate_background_notice {
                 lines.insert(
@@ -5759,6 +6074,7 @@ impl State {
                 );
             }
         }
+        let mut footer_bar_row = None;
         if panel_rows > 0 {
             if self.status_area.is_configured() {
                 if short
@@ -5774,6 +6090,7 @@ impl State {
                             .take(1),
                     );
                 } else {
+                    footer_bar_row = Some(lines.len());
                     lines.extend(self.status_area.panel_lines_with_rows(
                         &footer,
                         self.width,
@@ -5813,6 +6130,11 @@ impl State {
         self.back_to_bottom_target = return_control.map(|(row, columns)| BackToBottomTarget {
             row: self.height.saturating_sub(lines.len()) + row,
             columns,
+        });
+        self.footer_bar_target = footer_bar_row.map(|row| FooterBarTarget {
+            row: self.height.saturating_sub(lines.len()) + row,
+            inset: 0,
+            categories: self.status_area.panel_targets(&footer, self.width),
         });
         (
             lines,
@@ -6401,6 +6723,13 @@ impl State {
     }
 
     fn clear_menu(&mut self, id: Uuid) -> bool {
+        if self.clear_conversation_picker(id) {
+            if self.menu_submission_pending != Some(id) {
+                self.menu_submission_pending = None;
+                self.menu_submission_finished = None;
+            }
+            return true;
+        }
         if self.menu.as_ref().is_none_or(|menu| menu.id != id) {
             return false;
         }
@@ -6420,6 +6749,19 @@ impl State {
         self.menu_focused = false;
         self.review_focused = false;
         self.refresh_completion();
+        true
+    }
+
+    fn clear_conversation_picker(&mut self, id: Uuid) -> bool {
+        if self
+            .conversation_picker
+            .as_ref()
+            .is_none_or(|picker| picker.id() != id)
+        {
+            return false;
+        }
+        self.conversation_picker = None;
+        self.rendered_region = None;
         true
     }
 
@@ -6447,6 +6789,9 @@ impl State {
         };
         self.menu_submission_pending = None;
         self.menu_submission_finished = None;
+        if self.clear_conversation_picker(id) {
+            return true;
+        }
         if self.menu.as_ref().is_none_or(|menu| menu.id != id) {
             return false;
         }
@@ -6469,12 +6814,14 @@ impl State {
         let frame = self.footer.frame();
         self.height >= MIN_FOOTER_ITEMS_TERMINAL_ROWS
             && self.menu.is_none()
+            && self.conversation_picker.is_none()
             && self.overview.projection.is_none()
             && !self.help_open
             && self.history_search.is_none()
             && self.transcript.is_none()
             && self.diff_screen.is_none()
             && self.task_surface.is_none()
+            && self.todo_detail.is_none()
             && self.subscription_surface.is_none()
             && !self.foreground_shell
             && self.shell_input.kind() == InputKind::Prompt
@@ -6522,9 +6869,16 @@ impl State {
 
     fn apply_footer_action(&mut self, action: FooterAction) -> Option<InputEvent> {
         let was_open = self.status_area.is_open();
-        let effect = self.footer.apply(action);
+        let effect = if action == FooterAction::Down
+            && self.footer.selected().is_none()
+            && let Some(panel) = self.status_area.selected_panel()
+        {
+            self.footer.select(panel);
+            FooterEffect::None
+        } else {
+            self.footer.apply(action)
+        };
         if matches!(action, FooterAction::Clear) && self.status_area.is_configured() {
-            self.status_area.collapse();
             self.footer_list_focused = false;
         }
         if (was_open
@@ -6568,7 +6922,12 @@ impl State {
     }
 
     fn finish_footer_open(&mut self) -> bool {
-        self.footer_open_pending.take().is_some()
+        let finished = self.footer_open_pending.take().is_some();
+        if finished && self.task_surface.is_none() {
+            self.status_area.release_panel();
+            self.footer.update(self.status_area.available_panels());
+        }
+        finished
     }
 
     fn footer_key(&mut self, key: KeyEvent) -> Option<Option<InputEvent>> {
@@ -6597,7 +6956,9 @@ impl State {
                         FooterItemId::Tasks => {
                             self.status_area.move_task_selection(amount, capacity)
                         }
-                        FooterItemId::Todo => self.status_area.scroll(amount, capacity),
+                        FooterItemId::Todo => {
+                            self.status_area.move_todo_selection(amount, capacity)
+                        }
                         FooterItemId::Agents => {
                             self.status_area.move_agent_selection(amount, capacity)
                         }
@@ -6606,6 +6967,11 @@ impl State {
                 return Some(None);
             }
             if key.code == KeyCode::Enter && !self.footer_list_focused {
+                if selected == FooterItemId::Tasks
+                    && let Some(task_id) = self.status_area.single_task()
+                {
+                    return Some(Some(self.open_footer_task(task_id)));
+                }
                 self.footer_list_focused = true;
                 return Some(None);
             }
@@ -6613,6 +6979,15 @@ impl State {
                 return Some(self.status_area.selected_agent().map(InputEvent::OpenAgent));
             }
             if key.code == KeyCode::Enter && selected == FooterItemId::Todo {
+                if let Some((index, item)) = self.status_area.selected_todo() {
+                    self.todo_detail = Some(TodoDetail {
+                        ordinal: index + 1,
+                        item: item.clone(),
+                        offset: 0,
+                    });
+                    self.status_area.pin_panel();
+                    self.rendered_region = None;
+                }
                 return Some(None);
             }
             if key.code == KeyCode::Char(' ')
@@ -6631,12 +7006,9 @@ impl State {
                     self.status_area.select(selected);
                     return Some(None);
                 }
-                (KeyCode::Enter, _) if selected == FooterItemId::Todo => {
-                    self.status_area.collapse();
-                    return Some(None);
-                }
                 (KeyCode::Char(' '), KeyModifiers::NONE) => {
-                    self.status_area.toggle(selected);
+                    self.status_area.select(selected);
+                    self.clear_footer_selection();
                     return Some(None);
                 }
                 _ => {}
@@ -6665,9 +7037,7 @@ impl State {
         {
             match (key.code, key.modifiers) {
                 (KeyCode::Enter, _) => {
-                    self.task_footer_return = self.footer_list_focused;
-                    self.footer.apply(FooterAction::Open);
-                    return Some(Some(InputEvent::OpenStatusTask(task_id)));
+                    return Some(Some(self.open_footer_task(task_id)));
                 }
                 (KeyCode::Char('x'), KeyModifiers::NONE) => {
                     return Some(
@@ -6861,6 +7231,7 @@ impl State {
                 (KeyCode::PageDown, _) => TaskSurfaceAction::Page(1),
                 (KeyCode::Home, _) => TaskSurfaceAction::Home,
                 (KeyCode::End, _) => TaskSurfaceAction::End,
+                (KeyCode::Left, _) if self.task_footer_return => TaskSurfaceAction::Close,
                 (KeyCode::Left, _) => TaskSurfaceAction::Back,
                 (KeyCode::Esc | KeyCode::Enter, _) | (KeyCode::Char(' '), KeyModifiers::NONE) => {
                     TaskSurfaceAction::Close
@@ -6879,7 +7250,7 @@ impl State {
                 if std::mem::take(&mut self.task_footer_return) {
                     self.footer.select(FooterItemId::Tasks);
                     self.status_area.select(FooterItemId::Tasks);
-                    self.footer_list_focused = true;
+                    self.footer_list_focused = self.footer.selected() == Some(FooterItemId::Tasks);
                 }
                 self.rendered_region = None;
                 self.menu_focused = self.menu.is_some() && self.editor.draft().is_empty();
@@ -6896,7 +7267,65 @@ impl State {
     fn hide_task_surface(&mut self) {
         if let Some(surface) = self.task_surface.take() {
             self.task_surface_cache.insert(*surface.restore(), surface);
+            self.status_area.release_panel();
+            self.footer.update(self.status_area.available_panels());
         }
+    }
+
+    fn filter_footer_tasks(&self, snapshot: &mut TaskSurfaceSnapshot, selected: Option<Uuid>) {
+        let eligible = self.status_area.task_ids().collect::<HashSet<_>>();
+        snapshot
+            .tasks
+            .retain(|task| eligible.contains(&task.id) || Some(task.id) == selected);
+    }
+
+    fn open_footer_task(&mut self, task_id: Uuid) -> InputEvent {
+        self.task_footer_return = true;
+        self.status_area.select(FooterItemId::Tasks);
+        self.status_area.pin_panel();
+        self.footer_open_pending = Some(FooterOpenPending {
+            item: FooterItemId::Tasks,
+            cancelled: false,
+        });
+        self.clear_footer_selection();
+        InputEvent::OpenStatusTask(task_id)
+    }
+
+    fn todo_detail_key(&mut self, key: KeyEvent) {
+        if matches!(key.code, KeyCode::Esc | KeyCode::Left) {
+            self.todo_detail = None;
+            self.status_area.release_panel();
+            let panels = self.status_area.available_panels().collect::<Vec<_>>();
+            self.footer.update(panels);
+            self.footer.select(FooterItemId::Todo);
+            self.footer_list_focused = self.footer.selected() == Some(FooterItemId::Todo);
+            return;
+        }
+        let Some(detail) = &mut self.todo_detail else {
+            return;
+        };
+        let amount = match (key.code, key.modifiers) {
+            (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE)
+            | (KeyCode::Char('n'), KeyModifiers::CONTROL) => 1,
+            (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE)
+            | (KeyCode::Char('p'), KeyModifiers::CONTROL) => -1,
+            (KeyCode::PageDown, _) => task_surface_panel_height(self.height) as isize,
+            (KeyCode::PageUp, _) => -(task_surface_panel_height(self.height) as isize),
+            (KeyCode::Home, _) => {
+                detail.offset = 0;
+                return;
+            }
+            (KeyCode::End, _) => {
+                detail.offset = usize::MAX;
+                return;
+            }
+            _ => return,
+        };
+        let rows = wrap_text(&detail.item.title, task_surface_content_width(self.width));
+        detail.offset = detail
+            .offset
+            .saturating_add_signed(amount)
+            .min(rows.len().saturating_sub(1));
     }
 
     /// Handles the keys a question menu adds; `Some` carries the event for a handled key.
@@ -7117,6 +7546,10 @@ impl State {
         if self.menu_submission_is_pending() {
             return;
         }
+        if let Some(picker) = &mut self.conversation_picker {
+            picker.paste(text);
+            return;
+        }
         if self.input_menu_active() {
             self.paste_menu_comment(text);
             return;
@@ -7137,7 +7570,10 @@ impl State {
             surface.paste(text);
             return;
         }
-        if self.task_surface.is_some() || self.subscription_surface.is_some() {
+        if self.task_surface.is_some()
+            || self.todo_detail.is_some()
+            || self.subscription_surface.is_some()
+        {
             return;
         }
         if let Some((_, transcript)) = &mut self.transcript {
@@ -7411,21 +7847,8 @@ impl State {
         } else {
             self.editor.draft().to_owned()
         };
-        let outcome = match &self.external_editor {
-            ExternalEditorLauncher::Terminal => {
-                let Some(outcome) = self.edit_text_in_terminal(&draft) else {
-                    return;
-                };
-                outcome
-            }
-            #[cfg(test)]
-            ExternalEditorLauncher::Scripted {
-                opened_drafts,
-                outcome,
-            } => {
-                opened_drafts.lock().unwrap().push(draft.clone());
-                outcome.clone()
-            }
+        let Some(outcome) = self.run_external_editor(&draft) else {
+            return;
         };
         match outcome {
             ExternalEditorOutcome::Updated { content } => {
@@ -7456,6 +7879,22 @@ impl State {
             }
             ExternalEditorOutcome::Failed(error) => {
                 self.status = format!("External editor failed: {error}");
+            }
+        }
+    }
+
+    /// Returns `None` when the terminal could not be handed over or taken back;
+    /// the status line then carries the reason.
+    fn run_external_editor(&mut self, text: &str) -> Option<ExternalEditorOutcome> {
+        match &self.external_editor {
+            ExternalEditorLauncher::Terminal => self.edit_text_in_terminal(text),
+            #[cfg(test)]
+            ExternalEditorLauncher::Scripted {
+                opened_drafts,
+                outcome,
+            } => {
+                opened_drafts.lock().unwrap().push(text.to_owned());
+                Some(outcome.clone())
             }
         }
     }
@@ -7511,9 +7950,69 @@ impl State {
     fn can_edit_in_external_editor(&self) -> bool {
         self.prompt_enabled
             && self.menu.is_none()
+            && self.conversation_picker.is_none()
             && self.transcript.is_none()
             && self.history_search.is_none()
             && !self.foreground_shell
+    }
+
+    /// Every key belongs to the open picker, so none reaches the draft beneath it.
+    fn conversation_picker_key(&mut self, key: KeyEvent) -> Option<InputEvent> {
+        self.escape_confirmation = None;
+        self.exit_confirmation = None;
+        #[cfg(unix)]
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('z') {
+            return Some(InputEvent::Suspend);
+        }
+        let picker = self.conversation_picker.as_mut()?;
+        let menu_id = picker.id();
+        match picker.key(key) {
+            ConversationPickerEffect::None => None,
+            ConversationPickerEffect::EditQuery => {
+                self.edit_picker_query_in_external_editor();
+                None
+            }
+            ConversationPickerEffect::Open(index) => {
+                self.begin_menu_submission(menu_id);
+                Some(InputEvent::Choice {
+                    menu_id,
+                    index,
+                    comment: None,
+                })
+            }
+            ConversationPickerEffect::Cancel => {
+                self.begin_menu_submission(menu_id);
+                Some(InputEvent::Cancel { menu_id })
+            }
+        }
+    }
+
+    fn edit_picker_query_in_external_editor(&mut self) {
+        let Some(query) = self
+            .conversation_picker
+            .as_ref()
+            .map(|picker| picker.query().to_owned())
+        else {
+            return;
+        };
+        let outcome = self.run_external_editor(&query);
+        let Some(picker) = self.conversation_picker.as_mut() else {
+            return;
+        };
+        match outcome {
+            Some(ExternalEditorOutcome::Updated { content }) => picker.replace_query_text(&content),
+            Some(ExternalEditorOutcome::Unchanged) => {}
+            Some(ExternalEditorOutcome::Cancelled { signal }) => {
+                picker.set_notice(format!("External editor cancelled · signal {signal:?}"));
+            }
+            Some(ExternalEditorOutcome::Unavailable) => {
+                picker.set_notice("No external editor found; set VISUAL or EDITOR".into());
+            }
+            Some(ExternalEditorOutcome::Failed(error)) => {
+                picker.set_notice(format!("External editor failed: {error}"));
+            }
+            None => picker.set_notice(self.status.clone()),
+        }
     }
 
     fn history_search_key(&mut self, key: KeyEvent) {
@@ -7734,8 +8233,10 @@ impl State {
         self.prompt_enabled
             && self.overview.projection.is_none()
             && self.menu.is_none()
+            && self.conversation_picker.is_none()
             && self.transcript.is_none()
             && self.task_surface.is_none()
+            && self.todo_detail.is_none()
             && self.diff_screen.is_none()
             && self.subscription_surface.is_none()
             && self.permissions_surface.is_none()
@@ -7744,7 +8245,6 @@ impl State {
             && !self.foreground_shell
             && !self.review_focused
             && self.footer.selected().is_none()
-            && !self.status_area.is_open()
             && self
                 .footer_open_pending
                 .is_none_or(|pending| pending.cancelled)
@@ -7831,9 +8331,13 @@ impl State {
         if self.menu_submission_is_pending() || self.branch_submission_owns_input() {
             return None;
         }
+        if self.conversation_picker.is_some() {
+            return self.conversation_picker_key(key);
+        }
         if self.menu.is_none()
             && self.transcript.is_none()
             && self.task_surface.is_none()
+            && self.todo_detail.is_none()
             && self.diff_screen.is_none()
             && self.subscription_surface.is_none()
             && self.permissions_surface.is_none()
@@ -7921,6 +8425,7 @@ impl State {
                 || self.menu.is_some()
                 || self.diff_screen.is_some()
                 || self.task_surface.is_some()
+                || self.todo_detail.is_some()
                 || self.subscription_surface.is_some()
                 || self.permissions_surface.is_some()
                 || self.transcript.is_some()
@@ -7972,6 +8477,11 @@ impl State {
                 }
                 effect => Some(InputEvent::Permissions(effect)),
             };
+        }
+        if self.todo_detail.is_some() {
+            self.escape_confirmation = None;
+            self.todo_detail_key(key);
+            return None;
         }
         if self.task_surface.is_some() {
             self.escape_confirmation = None;
@@ -8081,7 +8591,6 @@ impl State {
                 .available_panels()
                 .any(|panel| panel == FooterItemId::Tasks)
         {
-            self.status_area.collapse();
             self.footer.select(FooterItemId::Tasks);
             return self.apply_footer_action(FooterAction::Open);
         }
@@ -8089,15 +8598,6 @@ impl State {
             && let Some(event) = self.footer_key(key)
         {
             return event;
-        }
-        if key.code == KeyCode::Esc
-            && self.status_area.is_open()
-            && self.menu.is_none()
-            && !self.foreground_shell
-            && self.shell_input.kind() == InputKind::Prompt
-        {
-            self.status_area.collapse();
-            return None;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL)
             && key.code == KeyCode::Char('g')
@@ -8819,7 +9319,7 @@ fn read_keys(
             Event::Mouse(mouse) => {
                 // Pointer input that changes nothing must not cost a frame.
                 redraw = state.pointer(mouse, &mut output);
-                None
+                state.pointer_input.take()
             }
             Event::FocusLost => {
                 state.focus_lost();
@@ -9002,10 +9502,7 @@ fn task_surface_lines(
     let selected_capabilities = frame.selected_capabilities;
     let title = match frame.focus {
         TaskSurfaceFocus::List => "Shell tasks".to_owned(),
-        TaskSurfaceFocus::Detail { task_id } => {
-            let task_id = task_id.simple().to_string();
-            format!("Shell task · {}", &task_id[..8])
-        }
+        TaskSurfaceFocus::Detail { .. } => "Shell task".to_owned(),
     };
     let mut header = title;
     if let Some(menu) = pending_menu {
@@ -9220,8 +9717,10 @@ pub(super) fn display_single_line(text: &str) -> String {
         .collect()
 }
 
-fn question_menu_hint(question: &QuestionMenu) -> String {
-    let mut hint = String::from(if question.multi_select {
+fn question_menu_hint(question: &QuestionMenu, selected: usize) -> String {
+    let mut hint = String::from(if question.entry_option == Some(selected) {
+        "Enter type answer"
+    } else if question.multi_select {
         "Space/Enter toggle"
     } else {
         "Enter select"
@@ -13658,10 +14157,20 @@ mod tests {
             Vec::new(),
         );
         assert!(!state.request_escape(EscapeAction::OpenRewind));
-        let line = status_line(&mut state);
+        let (lines, input_row, _) = state.frame();
+        let line = lines.last().unwrap();
+        assert!(line.contains("Press Esc again to rewind"), "{line:?}");
+        let core = &lines[input_row + 1];
         assert!(
-            line.contains("⏵⏵ Auto") && line.contains("Press Esc again to rewind"),
-            "{line:?}"
+            core.starts_with('─')
+                && core.contains("⏵⏵ Auto")
+                && core.contains("claude-fable-5-1")
+                && core.contains("Context —"),
+            "{core:?}"
+        );
+        assert_eq!(
+            lines.iter().filter(|row| row.contains("⏵⏵ Auto")).count(),
+            1
         );
         state.escape_confirmation = None;
 
@@ -14002,6 +14511,132 @@ mod tests {
                 "{unchanged:?}"
             );
             assert_nothing_rewritten(&unchanged, "Diff review");
+        }
+    }
+
+    #[test]
+    fn floated_connection_details_hint_follows_focus_and_ctrl_o_dispatch() {
+        for (notice, notice_text) in [
+            (ExecutionConnectionNotice::Lost, "Lost · outcome unknown"),
+            (
+                ExecutionConnectionNotice::LostHistory,
+                "Lost · cached history",
+            ),
+        ] {
+            for focus in [
+                "foreground Shell",
+                "pending footer",
+                "footer",
+                "conversation",
+            ] {
+                let mut state = State::new(true, 180, 24);
+                state.prompt_enabled = true;
+                state.execution_connection_notice = Some(notice);
+                state.status_area.update(
+                    "Auto".into(),
+                    "loss-model".into(),
+                    None,
+                    vec![StatusItem {
+                        id: "sh-1".into(),
+                        task_id: Some(Uuid::from_u128(1)),
+                        can_stop: true,
+                        title: "sleep 60".into(),
+                        state: "running",
+                        role: Role::Success,
+                    }],
+                    vec![],
+                );
+                state.insert("preserved draft");
+                let cursor = state.editor.cursor();
+                state.scrollback.append(
+                    &(0..100)
+                        .map(|index| format!("history-{index}\n"))
+                        .collect::<String>(),
+                );
+                frame_output(&mut state);
+
+                match focus {
+                    "foreground Shell" => state.set_foreground_shell(true),
+                    "pending footer" => {
+                        assert!(matches!(
+                            state.key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT)),
+                            Some(InputEvent::OpenFooter(FooterItemId::Tasks))
+                        ));
+                    }
+                    "footer" => {
+                        assert!(state.key(key(KeyCode::Down)).is_none());
+                        assert_eq!(state.footer.selected(), Some(FooterItemId::Tasks));
+                    }
+                    "conversation" => {
+                        assert!(state.key(key(KeyCode::PageUp)).is_none());
+                        assert!(state.conversation_focused);
+                        assert!(!state.scrollback.is_at_bottom());
+                    }
+                    _ => unreachable!(),
+                }
+                frame_output(&mut state);
+                let blocked = state.rendered_screen.join("\n");
+                assert!(blocked.contains(notice_text), "{focus}: {blocked}");
+                assert!(!blocked.contains("Ctrl+O details"), "{focus}: {blocked}");
+                assert!(state.key(control(KeyCode::Char('o'))).is_none(), "{focus}");
+                assert!(state.transcript.is_none(), "{focus}");
+                assert_eq!(state.editor.draft(), "preserved draft", "{focus}");
+                assert_eq!(state.editor.cursor(), cursor, "{focus}");
+
+                match focus {
+                    "foreground Shell" => {
+                        assert!(matches!(
+                            state.key(control(KeyCode::Char('b'))),
+                            Some(InputEvent::BackgroundForegroundShell)
+                        ));
+                        state.set_foreground_shell(false);
+                    }
+                    "pending footer" => {
+                        assert!(state.key(key(KeyCode::Esc)).is_none());
+                        assert!(state.footer_open_was_cancelled(FooterItemId::Tasks));
+                        assert!(state.finish_footer_open());
+                    }
+                    "footer" => {
+                        assert!(state.key(key(KeyCode::Esc)).is_none());
+                        assert_eq!(state.footer.selected(), None);
+                        assert!(state.status_area.is_open());
+                    }
+                    "conversation" => {
+                        assert!(state.key(control(KeyCode::End)).is_none());
+                        assert!(!state.conversation_focused);
+                        assert!(state.scrollback.is_at_bottom());
+                    }
+                    _ => unreachable!(),
+                }
+                frame_output(&mut state);
+                let returned = state.rendered_screen.join("\n");
+                assert!(returned.contains(notice_text), "{focus}: {returned}");
+                assert_eq!(
+                    returned.matches("Ctrl+O details").count(),
+                    1,
+                    "{focus}: {returned}"
+                );
+                assert!(
+                    returned.contains("Auto")
+                        && returned.contains("loss-model")
+                        && returned.contains("Context —"),
+                    "{focus}: {returned}"
+                );
+                assert!(
+                    state
+                        .rendered_screen
+                        .iter()
+                        .all(|line| display_width(line) <= 179)
+                );
+                let Some(InputEvent::OpenTranscript { id }) =
+                    state.key(control(KeyCode::Char('o')))
+                else {
+                    panic!("{focus}: the visible details hint did not open the transcript");
+                };
+                assert_eq!(state.transcript.as_ref().unwrap().0, id);
+                assert_eq!(state.editor.draft(), "preserved draft", "{focus}");
+                assert_eq!(state.editor.cursor(), cursor, "{focus}");
+            }
         }
     }
 
@@ -15143,7 +15778,7 @@ mod tests {
             .update([FooterItemId::Tasks, FooterItemId::Todo]);
 
         let (lines, input_row, _) = state.frame();
-        assert_eq!(lines.last().unwrap(), "  Tasks    Todo");
+        assert_eq!(lines.last().unwrap(), "  Shell    Todo");
         assert_eq!(input_row, lines.len() - 4);
         assert!(lines[lines.len() - 2].contains("Ctrl+O details"));
 
@@ -15151,13 +15786,13 @@ mod tests {
         assert_eq!(state.footer.selected(), Some(FooterItemId::Tasks));
         state.height = MIN_FOOTER_ITEMS_TERMINAL_ROWS - 1;
         let lines = state.frame().0;
-        assert!(lines.iter().all(|line| !line.contains("Tasks")));
+        assert!(lines.iter().all(|line| !line.contains("Shell")));
         assert_eq!(state.footer.selected(), None);
 
         state.height = 24;
-        state.width = display_width("  Tasks    Todo") - 1;
+        state.width = display_width("  Shell    Todo") - 1;
         let lines = state.frame().0;
-        assert!(lines.iter().any(|line| line.contains("Tasks")));
+        assert!(lines.iter().any(|line| line.contains("Shell")));
         assert!(lines.iter().all(|line| display_width(line) <= state.width));
         assert_eq!(state.footer.selected(), None);
     }
@@ -15284,37 +15919,27 @@ mod tests {
             .update([FooterItemId::Tasks, FooterItemId::Todo]);
 
         let (frame, _, _) = state.frame();
-        assert_eq!(
-            frame[frame.len() - 2],
-            "⏵⏵ Auto · gpt-5.6 · Context 21% used"
+        assert!(
+            frame
+                .iter()
+                .any(|row| row.starts_with('─') && row.contains("Context 21% used"))
         );
-        assert!(frame.last().unwrap().contains("Tasks 1  Todo 1"));
-        assert!(!frame.iter().any(|line| line.contains("cargo test")));
-
+        assert!(frame.iter().any(|row| row.contains("review results")));
+        assert!(!frame.iter().any(|row| row.contains("cargo test")));
         state.key(key(KeyCode::Down));
-        assert!(state.status_area.is_open());
-        state.key(key(KeyCode::Enter));
-        assert!(state.status_area.is_open());
-        assert!(state.frame().0.last().unwrap().contains("cargo test"));
         state.key(key(KeyCode::Right));
-        let (frame, _, _) = state.frame();
-        assert!(frame.last().unwrap().contains("review results"));
-        assert!(!frame.iter().any(|line| line.contains("cargo test")));
+        let tasks = state.frame().0;
+        assert!(tasks.iter().any(|row| row.contains("cargo test")));
+        assert!(!tasks.iter().any(|row| row.contains("review results")));
+        state.key(key(KeyCode::Left));
+        let todo = state.frame().0;
+        assert!(todo.iter().any(|row| row.contains("review results")));
+        assert!(!todo.iter().any(|row| row.contains("cargo test")));
+        assert!(state.key(key(KeyCode::Esc)).is_none());
+        assert!(state.status_area.is_open());
+        assert!(state.footer.selected().is_none());
         assert_eq!(state.editor.draft(), draft);
         assert_eq!(state.editor.cursor(), cursor);
-
-        state.key(key(KeyCode::Esc));
-        assert!(!state.status_area.is_open());
-        let (collapsed, _, _) = state.frame();
-        assert_eq!(
-            collapsed[collapsed.len() - 2],
-            "⏵⏵ Auto · gpt-5.6 · Context 21% used"
-        );
-        assert!(collapsed.last().unwrap().contains("Tasks 1  Todo 1"));
-        state.key(key(KeyCode::Down));
-        assert!(state.status_area.is_open());
-        state.key(key(KeyCode::Enter));
-        assert!(state.status_area.is_open());
     }
 
     #[test]
@@ -15412,7 +16037,7 @@ mod tests {
         };
         // The run loop answers OpenStatusTask by opening that task's details in place.
         console
-            .show_tasks_at(task_snapshot(chat_id, 6), Some(task_id))
+            .show_footer_tasks_at(task_snapshot(chat_id, 6), Some(task_id))
             .unwrap();
         let mut state = console.state.lock().unwrap();
         assert!(state.task_surface.is_some());
@@ -15433,9 +16058,12 @@ mod tests {
     }
 
     #[test]
-    fn status_panels_start_collapsed_and_toggle_by_keyboard_or_click() {
+    fn status_panels_stay_visible_when_focus_returns_to_the_editor() {
         let mut state = State::new(true, 80, 24);
         state.prompt_enabled = true;
+        state.insert("preserved draft");
+        let draft = state.editor.draft().to_owned();
+        let cursor = state.editor.cursor();
         let task = StatusItem {
             id: "sh-1".into(),
             task_id: Some(Uuid::from_u128(1)),
@@ -15459,33 +16087,69 @@ mod tests {
             .footer
             .update([FooterItemId::Tasks, FooterItemId::Todo]);
 
-        assert!(!state.status_area.is_open());
-        assert_eq!(state.status_area.row_count(state.height), 1);
+        assert!(state.status_area.is_open());
+        assert_eq!(state.status_area.row_count(state.height), 2);
+        assert_eq!(state.status_area.selected_panel(), Some(FooterItemId::Todo));
         state.key(key(KeyCode::Down));
-        assert!(state.status_area.is_open());
-        state.key(key(KeyCode::Char(' ')));
-        assert!(!state.status_area.is_open());
         state.key(key(KeyCode::Char(' ')));
         assert!(state.status_area.is_open());
-        state.key(key(KeyCode::Char(' ')));
-        assert!(!state.status_area.is_open());
+        assert!(state.footer.selected().is_none());
+        state.key(key(KeyCode::Down));
+        assert!(state.key(key(KeyCode::Esc)).is_none());
+        assert!(state.status_area.is_open());
+        assert!(state.footer.selected().is_none());
+        state.frame();
+        let target = state.footer_bar_target.as_ref().unwrap();
+        let bar = target.row;
+        let todo_column = target
+            .categories
+            .iter()
+            .find(|(_, item)| *item == FooterItemId::Todo)
+            .map(|(columns, _)| target.inset + columns.start)
+            .unwrap();
+        assert!(state.pointer(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: todo_column as u16,
+                row: bar as u16,
+                modifiers: KeyModifiers::NONE
+            },
+            &mut Vec::new()
+        ));
+        assert_eq!(state.status_area.selected_panel(), Some(FooterItemId::Todo));
+        assert_eq!(state.footer.selected(), Some(FooterItemId::Todo));
+        assert!(state.status_area.is_open());
+        assert!(state.pointer_input.is_none());
+        assert!(state.key(key(KeyCode::Esc)).is_none());
+        assert!(state.status_area.is_open());
+        assert!(state.footer.selected().is_none());
+        assert_eq!(state.editor.draft(), draft);
+        assert_eq!(state.editor.cursor(), cursor);
 
+        state.frame();
+        let target = state.footer_bar_target.as_ref().unwrap();
+        let bar = target.row;
+        let shell_column = target
+            .categories
+            .iter()
+            .find(|(_, item)| *item == FooterItemId::Tasks)
+            .map(|(columns, _)| target.inset + columns.start)
+            .unwrap();
         assert!(state.pointer(
-            mouse(MouseEventKind::Down(MouseButton::Left), 23, 3),
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: shell_column as u16,
+                row: bar as u16,
+                modifiers: KeyModifiers::NONE
+            },
             &mut Vec::new()
         ));
-        assert!(state.status_area.is_open());
-        assert!(state.pointer(
-            mouse(MouseEventKind::Down(MouseButton::Left), 22, 10),
-            &mut Vec::new()
-        ));
-        assert!(state.frame().0.last().unwrap().contains("review"));
-        assert!(state.pointer(
-            mouse(MouseEventKind::Down(MouseButton::Left), 22, 10),
-            &mut Vec::new()
-        ));
-        assert!(!state.status_area.is_open());
-        assert!(state.frame().0.last().unwrap().contains("Tasks 1  Todo 1"));
+        assert_eq!(state.footer.selected(), None);
+        assert!(
+            matches!(state.pointer_input.take(), Some(InputEvent::OpenStatusTask(id)) if id == Uuid::from_u128(1))
+        );
+        assert_eq!(state.editor.draft(), draft);
+        assert_eq!(state.editor.cursor(), cursor);
     }
 
     #[test]
@@ -15595,8 +16259,18 @@ mod tests {
         let detail_row = state
             .rendered_screen
             .iter()
-            .position(|line| line.contains("Shell task ·"))
+            .position(|line| line.trim() == "Shell task")
             .unwrap();
+        assert!(
+            state
+                .rendered_screen
+                .iter()
+                .any(|line| line.contains("printf task-0"))
+        );
+        assert!(matches!(
+            state.task_surface.as_ref().unwrap().focus(),
+            TaskSurfaceFocus::Detail { task_id } if task_id == Uuid::from_u128(1)
+        ));
         assert!(detail_row > conversation_row);
         assert!(detail_row >= 12);
         assert!(
@@ -15661,12 +16335,25 @@ mod tests {
     fn pending_footer_open_blocks_repeat_input_until_escape_or_finish() {
         let mut state = State::new(true, 80, 24);
         state.prompt_enabled = true;
-        state.footer.update([FooterItemId::Tasks]);
+        state.status_area.update(
+            "Auto".into(),
+            "model".into(),
+            None,
+            vec![StatusItem {
+                id: "sh-1".into(),
+                task_id: Some(Uuid::from_u128(1)),
+                can_stop: true,
+                title: "sleep 60".into(),
+                state: "running",
+                role: Role::Success,
+            }],
+            Vec::new(),
+        );
+        state.footer.update(state.status_area.available_panels());
         state.insert("preserved draft");
-        state.key(key(KeyCode::Down));
 
         assert!(matches!(
-            state.key(key(KeyCode::Enter)),
+            state.key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT)),
             Some(InputEvent::OpenFooter(FooterItemId::Tasks))
         ));
         assert!(
@@ -15674,7 +16361,7 @@ mod tests {
                 .frame()
                 .0
                 .iter()
-                .any(|line| line.contains("Opening Tasks"))
+                .any(|line| line.contains("Opening Shell"))
         );
         assert!(state.key(key(KeyCode::Enter)).is_none());
         #[cfg(unix)]
@@ -15888,7 +16575,7 @@ mod tests {
         state.draw(&mut output).unwrap();
         let output = String::from_utf8(output).unwrap();
         let screen = state.rendered_screen.join("\n");
-        assert!(screen.contains("Opening Tasks…"));
+        assert!(screen.contains("Opening Shell…"));
         assert!(!screen.contains("Scrolled up"));
         assert!(output.contains("\x1b[?25l"));
     }
@@ -16877,7 +17564,7 @@ mod tests {
             lines
                 .last()
                 .unwrap()
-                .contains("Error: Task 00000000: owner mismatch")
+                .contains("Error: printf task-0: owner mismatch")
         );
         surface.clear_action_error();
         let lines = task_surface_lines(&mut surface, 80, 24, None, DisplayProfile::default());

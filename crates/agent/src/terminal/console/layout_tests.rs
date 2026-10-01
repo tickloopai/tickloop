@@ -93,9 +93,14 @@ fn agent_layout_background_notice_preserves_the_regular_status_and_result() {
     let status = line_with(&frame, "⏵⏵ Auto").unwrap();
     assert!(status.contains("deepseek-flash"), "{frame:#?}");
     assert!(status.contains("Context 4% used"), "{frame:#?}");
-    assert!(status.contains("Agent Review"), "{frame:#?}");
-    assert!(status.contains("(2)"), "{frame:#?}");
-    assert!(status.contains("reply completed"), "{frame:#?}");
+    assert!(status.starts_with('─'), "{frame:#?}");
+    let notice = line_with(&frame, "reply completed").unwrap();
+    assert!(notice.contains("Agent Review"), "{frame:#?}");
+    assert!(notice.contains("(2)"), "{frame:#?}");
+    assert_eq!(
+        frame.iter().filter(|line| line.contains("⏵⏵ Auto")).count(),
+        1
+    );
     assert!(line_with(&frame, "Agents 2").is_some(), "{frame:#?}");
 }
 
@@ -191,12 +196,14 @@ fn agent_layout_background_titles_use_display_columns_and_the_family_reading_num
                 status.contains("deepseek-flash") && status.contains("Context 4% used"),
                 "{width} columns: {frame:#?}"
             );
+            assert!(status.starts_with('─'), "{width} columns: {frame:#?}");
+            let notice = line_with(&frame, "reply completed").unwrap();
             assert!(
-                status.contains("(2)") && status.contains("reply completed"),
+                notice.contains("(2)") && notice.contains("reply completed"),
                 "{width} columns: {frame:#?}"
             );
             assert!(
-                status.contains(if title.starts_with('研') {
+                notice.contains(if title.starts_with('研') {
                     "研究"
                 } else {
                     "Rev"
@@ -204,6 +211,11 @@ fn agent_layout_background_titles_use_display_columns_and_the_family_reading_num
                 "{width} columns: {frame:#?}"
             );
             assert!(display_width(status) < usize::from(width), "{frame:#?}");
+            assert!(display_width(notice) < usize::from(width), "{frame:#?}");
+            assert_eq!(
+                frame.iter().filter(|line| line.contains("⏵⏵ Auto")).count(),
+                1
+            );
             assert!(line_with(&frame, "Agents 3").is_some(), "{frame:#?}");
         }
     }
@@ -613,6 +625,9 @@ fn agent_layout_first_down_expands_and_list_keys_preserve_the_draft() {
         .footer
         .update(state.status_area.available_panels().collect::<Vec<_>>());
     state.insert("keep jk");
+    assert!(state.frame().0.iter().any(|line| line.contains("task 00")));
+    assert!(state.footer.selected().is_none());
+    assert!(!state.footer_list_focused);
     state.key(key(KeyCode::Down));
     assert_eq!(state.footer.selected(), Some(FooterItemId::Tasks));
     assert!(state.frame().0.iter().any(|line| line.contains("task 00")));
@@ -626,7 +641,8 @@ fn agent_layout_first_down_expands_and_list_keys_preserve_the_draft() {
     assert_eq!(state.editor.draft(), "keep jk");
     state.key(key(KeyCode::Esc));
     assert!(state.footer.selected().is_none());
-    assert!(!state.status_area.is_open());
+    assert!(state.status_area.is_open());
+    assert!(!state.footer_list_focused);
     state.key(key(KeyCode::Char('j')));
     state.key(key(KeyCode::Char('k')));
     assert_eq!(state.editor.draft(), "keep jkjk");
@@ -678,7 +694,11 @@ fn agent_layout_return_restores_reading_draft_and_focuses_the_editor() {
     assert_eq!(state.status_area.selected_task(), selected);
     assert!(!state.footer_list_focused);
     assert!(state.footer.selected().is_none());
-    assert!(!state.status_area.is_open());
+    assert!(state.status_area.is_open());
+    assert_eq!(
+        state.status_area.selected_panel(),
+        Some(FooterItemId::Tasks)
+    );
     assert!(!state.conversation_focused);
     drop(state);
     assert!(console.activate_agent(CHILD_AGENT).unwrap());
@@ -1502,7 +1522,7 @@ fn agent_layout_required_connection_notice_borrows_one_row_without_changing_conf
             frame.iter().any(|line| line.contains("Disconnected")),
             "{frame:?}"
         );
-        assert!(frame.iter().any(|line| line.contains("Tasks")), "{frame:?}");
+        assert!(frame.iter().any(|line| line.contains("Shell")), "{frame:?}");
         assert!(
             frame.len() <= agent_layout::bottom_capacity(usize::from(height)),
             "{frame:?}"
@@ -2072,7 +2092,7 @@ fn agent_layout_real_pty_float_return_click_and_escape_preserve_the_draft() {
     let divider_column = column + label_width + 1;
     terminal.send_and_wait(
         format!(
-            "\x1b[<0;{divider_column};{}M\x1b[<0;{divider_column};{}m",
+            "\x1b[<0;{divider_column};{}M\x1b[<0;{divider_column};{}m\x1b[D",
             row + 1,
             row + 1
         )
@@ -2087,6 +2107,7 @@ fn agent_layout_real_pty_float_return_click_and_escape_preserve_the_draft() {
                 && !frame.contains("Working fixture")
         },
     );
+    terminal.send_and_wait(b"\x1b[C");
     terminal.send_and_wait(
         format!(
             "\x1b[<0;{};{}M\x1b[<0;{};{}m",
@@ -2127,7 +2148,10 @@ fn agent_layout_real_pty_budget_and_focus_matrix() {
         for width in [40, 80, 120] {
             let mut terminal = PtyConsole::start(width, height);
             terminal.wait_for("initial", |frame| {
-                frame.contains("history 99") && frame.contains("Tasks")
+                frame.contains("history 99")
+                    && frame.contains("Shell 20")
+                    && frame.contains("child one")
+                    && !frame.contains("task 00")
             });
             terminal.send(b"draftjk");
             terminal.wait_for("text jk", |frame| frame.contains("draftjk"));
@@ -2154,17 +2178,41 @@ fn agent_layout_real_pty_budget_and_focus_matrix() {
             );
             terminal.send(b"\r");
             terminal.wait_for("submit", |frame| frame.contains("Draft submitted"));
-            terminal.send(b"\x1b[B");
-            terminal.wait_for("first Down expands", |frame| frame.contains("task 00"));
+            terminal.send(b"\x1b[B\x1b[C");
+            terminal.wait_for("explicit Shell selection opens its preview", |frame| {
+                frame.contains("task 00") && !frame.contains("child one")
+            });
             terminal.send(b"\x1b[Bjjjjjjjjjjjj");
             terminal.wait_for("list scroll", |frame| {
                 frame.contains("task 12") && !frame.contains("task 00")
             });
-            terminal.send(b"\x1b");
-            terminal.wait_for("Esc input", |frame| !frame.contains("task 12"));
+            terminal.send_and_wait(b"\x1b");
+            let output = Arc::clone(&terminal.output);
+            terminal.wait_for("Esc restores the visible editor caret", |_| {
+                let captured = output.lock().unwrap();
+                captured.rfind("\x1b[?25h").is_some_and(|shown| {
+                    captured
+                        .rfind("\x1b[?25l")
+                        .is_none_or(|hidden| shown > hidden)
+                })
+            });
+            terminal.send(b"jk");
+            let focused = terminal.wait_for("Esc restores literal editor input", |frame| {
+                frame
+                    .lines()
+                    .any(|line| line.starts_with('❯') && line.contains("jk"))
+            });
+            assert!(focused.contains("task 12"), "{focused}");
+            terminal.send(b"\x15");
+            terminal.wait_for("editor is cleared before help", |frame| {
+                frame.lines().any(|line| line.trim() == "❯")
+            });
             terminal.send(b"?");
             let frame = terminal.wait_for("help", |frame| frame.contains("Ctrl+J newline"));
-            assert!(!frame.contains("Tasks"), "{frame}");
+            assert!(
+                !frame.contains("Shell 20") && !frame.contains("task 12"),
+                "{frame}"
+            );
             let newline_help = frame
                 .lines()
                 .find(|line| line.contains("Ctrl+J newline"))
@@ -2178,7 +2226,7 @@ fn agent_layout_real_pty_budget_and_focus_matrix() {
             }
             terminal.send(b"\x1b");
             terminal.wait_for("help closed", |frame| {
-                frame.contains("Tasks") && !frame.contains("Ctrl+J newline")
+                frame.contains("Shell 20") && !frame.contains("Ctrl+J newline")
             });
             terminal.send(b"\x1b[D");
             let overview = terminal.wait_for("overview", |frame| {
@@ -3601,6 +3649,10 @@ fn agent_layout_real_pty_accepted_dispatch_cue_keeps_the_monitored_filter_and_se
 fn agent_layout_real_pty_unchanged_creation_notice_does_not_clear_or_repaint_the_view() {
     let mut terminal = PtyConsole::start(80, 24);
     terminal.wait_for("initial", |frame| frame.contains("history 99"));
+    terminal.send(b"settle-notice-layout\r");
+    terminal.wait_for("completion-status geometry is settled", |frame| {
+        frame.contains("Draft submitted")
+    });
     for (command, completion) in [
         ("repeat-empty-notice", "Empty notice refresh done"),
         ("repeat-sanitized-notice", "Same notice refresh done"),
@@ -4426,7 +4478,9 @@ fn agent_layout_session_hints_name_the_action_of_the_focused_region() {
         !editor.contains("Enter/Space expand"),
         "Enter submits from the editor, so the summary cannot promise Enter: {editor}"
     );
-    assert!(editor.contains("↓ open"), "{editor}");
+    assert!(editor.contains("task 00"), "{editor}");
+    assert!(state.footer.selected().is_none());
+    assert!(!state.footer_list_focused);
     state.insert("draft");
     state.key(key(KeyCode::Down));
     let summary = hint_frame(&mut state);
@@ -4791,7 +4845,14 @@ fn agent_layout_conversation_occupancy_expanding_tasks_avoids_whole_screen_redra
         "fixture".into(),
         None,
         status_items(),
-        Vec::new(),
+        vec![StatusItem {
+            id: "1.".into(),
+            task_id: None,
+            can_stop: false,
+            title: "short todo".into(),
+            state: "pending",
+            role: Role::MutedText,
+        }],
     );
     state
         .footer
@@ -4799,9 +4860,16 @@ fn agent_layout_conversation_occupancy_expanding_tasks_avoids_whole_screen_redra
     state.scrollback.append("first line\n");
     state.insert("draft line");
 
+    assert_eq!(state.status_area.selected_panel(), Some(FooterItemId::Todo));
     let expanded = super::tests::output_after_input_area_change(&mut state, |state| {
         state.key(key(KeyCode::Down));
+        state.key(key(KeyCode::Right));
     });
+    assert_eq!(
+        state.status_area.selected_panel(),
+        Some(FooterItemId::Tasks)
+    );
+    assert_eq!(state.editor.draft(), "draft line");
     assert!(expanded.contains("task 00"), "{expanded:?}");
 }
 
