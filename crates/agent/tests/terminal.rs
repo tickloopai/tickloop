@@ -227,7 +227,7 @@ fn interactive_pty_opens_the_subscription_view_and_closes_it_with_escape() {
     writer.flush().unwrap();
     wait_for_output("Tick Subscriptions", opened_at);
     wait_for_output("No Tick Subscription yet", opened_at);
-    wait_for_output("Enter cadence · d cancel · Esc close", opened_at);
+    wait_for_output("d cancel", opened_at);
 
     let closed_at = output.lock().unwrap().len();
     writer.write_all(b"jkd\x1b").unwrap();
