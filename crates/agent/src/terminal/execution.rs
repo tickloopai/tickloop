@@ -2524,6 +2524,53 @@ impl ConsoleExecution {
         .await
         .map(|_| ())
     }
+    pub(super) async fn add_artifact_tick(
+        &self,
+        chat: Uuid,
+        tick: crate::artifacts::ArtifactTick,
+    ) -> Result<Vec<crate::artifacts::ArtifactTick>, AgentError> {
+        let execution = self.reference(chat).await?;
+        match self
+            .command(AgentCommand::AddArtifactTick { execution, tick }, None)
+            .await?
+        {
+            CommandResult::ArtifactTicks(ticks) => Ok(ticks),
+            _ => Err(unexpected()),
+        }
+    }
+    pub(super) async fn remove_artifact_tick(
+        &self,
+        chat: Uuid,
+        instance_id: String,
+    ) -> Result<Vec<crate::artifacts::ArtifactTick>, AgentError> {
+        let execution = self.reference(chat).await?;
+        match self
+            .command(
+                AgentCommand::RemoveArtifactTick {
+                    execution,
+                    instance_id,
+                },
+                None,
+            )
+            .await?
+        {
+            CommandResult::ArtifactTicks(ticks) => Ok(ticks),
+            _ => Err(unexpected()),
+        }
+    }
+    pub(super) async fn artifact_ticks(
+        &self,
+        chat: Uuid,
+    ) -> Result<Vec<crate::artifacts::ArtifactTick>, AgentError> {
+        let execution = self.reference(chat).await?;
+        match self
+            .command(AgentCommand::ListArtifactTicks { execution }, None)
+            .await?
+        {
+            CommandResult::ArtifactTicks(ticks) => Ok(ticks),
+            _ => Err(unexpected()),
+        }
+    }
     pub(super) async fn tick_subscriptions(
         &self,
         chat: Uuid,

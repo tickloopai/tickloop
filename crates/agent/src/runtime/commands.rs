@@ -409,6 +409,7 @@ mod tests {
                 });
         }
         let mut command = CommandSnapshot {
+            updated_at_ms: None,
             operation_id,
             loop_id,
             command: "printf agent".into(),

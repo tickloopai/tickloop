@@ -1,5 +1,8 @@
 //! Observation stream between a Tick host and the Agent's Loop scheduler.
 
+mod artifact;
+pub use artifact::ArtifactTickStream;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex, MutexGuard, PoisonError},
@@ -45,7 +48,19 @@ pub enum TickConnectionState {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct TickMetadata {
+    pub title: String,
+    pub kind: ObservationKind,
+    pub updated_at_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub enum TickStreamEvent {
+    Metadata {
+        instance: InstanceRef,
+        audience: Vec<WatchId>,
+        metadata: TickMetadata,
+    },
     Ready {
         watch: WatchId,
     },
@@ -71,6 +86,7 @@ pub struct TickStreamHandle {
 
 pub trait TickStreamPort: Send + Sync + 'static {
     fn open(&self) -> TickStreamHandle;
+    fn set_cadences(&self, _cadences: BTreeMap<WatchId, u64>) {}
 }
 
 /// A finite latest-only mailbox. Producers never wait for a slow Agent: each watch keeps one
@@ -86,6 +102,7 @@ struct EventMailbox {
     ready: BTreeSet<WatchId>,
     gaps: BTreeMap<WatchId, InstanceRef>,
     states: BTreeMap<WatchId, (InstanceRef, TickConnectionState)>,
+    metadata: BTreeMap<WatchId, (InstanceRef, TickMetadata)>,
     latest: BTreeMap<WatchId, TickObservation>,
     terminal: BTreeSet<WatchId>,
 }
@@ -118,6 +135,13 @@ impl EventPublisher {
                             state,
                             audience: vec![watch],
                         })
+                    } else if let Some((watch, (instance, metadata))) = mailbox.metadata.pop_first()
+                    {
+                        Some(TickStreamEvent::Metadata {
+                            instance,
+                            metadata,
+                            audience: vec![watch],
+                        })
                     } else {
                         mailbox.latest.pop_first().map(|(watch, value)| {
                             TickStreamEvent::Observation {
@@ -143,6 +167,21 @@ impl EventPublisher {
             }
         });
         (publisher, receiver)
+    }
+
+    pub fn metadata(
+        &self,
+        instance: InstanceRef,
+        audience: impl IntoIterator<Item = WatchId>,
+        metadata: TickMetadata,
+    ) {
+        let mut mailbox = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        for watch in audience {
+            mailbox
+                .metadata
+                .insert(watch, (instance.clone(), metadata.clone()));
+        }
+        self.wake.notify_one();
     }
 
     pub fn ready(&self, watch: WatchId) {
@@ -201,6 +240,9 @@ impl EventPublisher {
 
     pub fn retain(&self, desired: &BTreeMap<WatchId, InstanceRef>) {
         let mut mailbox = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        mailbox
+            .metadata
+            .retain(|watch, _| desired.contains_key(watch));
         mailbox.ready.retain(|watch| desired.contains_key(watch));
         mailbox.gaps.retain(|watch, _| desired.contains_key(watch));
         mailbox
@@ -273,6 +315,11 @@ impl InMemoryTickStream {
     pub fn emit(&self, event: TickStreamEvent) {
         if let Some(events) = &self.state().events {
             match event {
+                TickStreamEvent::Metadata {
+                    instance,
+                    audience,
+                    metadata,
+                } => events.metadata(instance, audience, metadata),
                 TickStreamEvent::Ready { watch } => events.ready(watch),
                 TickStreamEvent::Observation { audience, value } => {
                     events.observation(&audience, value)
@@ -541,6 +588,17 @@ async fn observe_terminal(
         }
         match access.read(instance).await {
             Ok(snapshot) if snapshot.terminal => {
+                publisher.metadata(
+                    instance.clone(),
+                    targets.iter().copied(),
+                    TickMetadata {
+                        title: instance.to_string(),
+                        kind: ObservationKind::Terminal {
+                            truncated: snapshot.truncated,
+                        },
+                        updated_at_ms: None,
+                    },
+                );
                 if lost_host_events {
                     publisher.state_to(
                         instance.clone(),
@@ -659,6 +717,15 @@ async fn observe_protocol(
     };
     let mut cursors: BTreeMap<WatchId, ProtocolCursor> = BTreeMap::new();
     let initial = updates.borrow_and_update().clone();
+    publisher.metadata(
+        instance.clone(),
+        wanted.borrow().iter().copied(),
+        TickMetadata {
+            title: instance.to_string(),
+            kind: ObservationKind::Protocol,
+            updated_at_ms: None,
+        },
+    );
     let mut latest_sequence = baseline.sequence;
     let baseline_targets = wanted.borrow_and_update().clone();
     for watch in baseline_targets.iter().copied() {

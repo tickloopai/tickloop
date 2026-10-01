@@ -1559,7 +1559,7 @@ fn jev_key_editor_masks_saves_and_cancels_without_changing_the_chat_model() {
     terminal.send(b"/settings\r");
     terminal.wait_for("Settings");
     let mark = terminal.mark();
-    terminal.send(b"jjjjjjjjjjjjjjjjjjjj\r");
+    terminal.send(b"jjjjjjjjjjjj\r");
     terminal.wait_for_frame_after(mark, "permissions from Settings", |frame| {
         frame.contains("Permissions · Choose mode")
     });
@@ -1714,7 +1714,7 @@ fn permissions_panel_cancels_an_auto_environment_draft_opened_from_settings() {
     terminal.wait_for("picker-messages-service");
     terminal.send(b"/settings\r");
     terminal.wait_for("Settings");
-    terminal.send(b"jjjjjjjjjjjjjjjjjjjj\r");
+    terminal.send(b"jjjjjjjjjjjj\r");
     terminal.wait_for("Permissions · Choose mode");
     terminal.send(b"k\r");
     terminal.wait_for("[Auto mode]");

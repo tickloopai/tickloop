@@ -322,6 +322,30 @@ impl EmbeddedAgentAccess {
 
     async fn dispatch(&self, envelope: &CommandEnvelope) -> Result<CommandResult, AccessError> {
         match envelope.command.clone() {
+            AgentCommand::AddArtifactTick { execution, tick } => {
+                let chat = self.chat(execution).await?;
+                Ok(CommandResult::ArtifactTicks(
+                    self.inner.agent.add_artifact_tick(chat, tick).await?,
+                ))
+            }
+            AgentCommand::RemoveArtifactTick {
+                execution,
+                instance_id,
+            } => {
+                let chat = self.chat(execution).await?;
+                Ok(CommandResult::ArtifactTicks(
+                    self.inner
+                        .agent
+                        .remove_artifact_tick(chat, &instance_id)
+                        .await?,
+                ))
+            }
+            AgentCommand::ListArtifactTicks { execution } => {
+                let chat = self.chat(execution).await?;
+                Ok(CommandResult::ArtifactTicks(
+                    self.inner.agent.artifact_ticks(chat).await?,
+                ))
+            }
             AgentCommand::Create {
                 launch,
                 initial,

@@ -1792,6 +1792,7 @@ mod tests {
             TaskOrigin::Agent
         };
         ShellTaskView {
+            updated_at_ms: None,
             id: Uuid::from_u128(id),
             chat_id: Uuid::from_u128(100),
             origin,

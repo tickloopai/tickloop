@@ -331,6 +331,8 @@ pub struct CommandSnapshot {
     pub reason: Option<String>,
     pub output_ref: PathBuf,
     pub output_bytes: u64,
+    #[serde(default)]
+    pub updated_at_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -351,6 +353,8 @@ pub struct UserCommandSnapshot {
     pub reason: Option<String>,
     pub output_ref: PathBuf,
     pub output_bytes: u64,
+    #[serde(default)]
+    pub updated_at_ms: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -386,10 +390,13 @@ impl ProcessSnapshot {
         }
     }
 
-    fn state_mut(&mut self) -> &mut CommandState {
+    fn set_state(&mut self, state: CommandState) {
+        if self.state() != &state {
+            self.mark_updated();
+        }
         match self {
-            Self::Agent(snapshot) => &mut snapshot.state,
-            Self::User(snapshot) => &mut snapshot.state,
+            Self::Agent(snapshot) => snapshot.state = state,
+            Self::User(snapshot) => snapshot.state = state,
         }
     }
 
@@ -463,16 +470,28 @@ impl ProcessSnapshot {
                 snapshot.output_bytes = output_bytes;
             }
         }
-        *self.state_mut() = if is_success {
+        self.mark_updated();
+        self.set_state(if is_success {
             CommandState::Completed
         } else {
             CommandState::Failed
-        };
+        });
+    }
+
+    fn mark_updated(&mut self) {
+        let now = Some(crate::private_fs::unix_time_milliseconds());
+        match self {
+            Self::Agent(snapshot) => snapshot.updated_at_ms = now,
+            Self::User(snapshot) => snapshot.updated_at_ms = now,
+        }
     }
 
     fn update_output_bytes(&mut self) {
         if let Ok(metadata) = std::fs::metadata(self.output_ref()) {
             let output_bytes = metadata.len();
+            if output_bytes != self.output_bytes() {
+                self.mark_updated();
+            }
             match self {
                 Self::Agent(snapshot) => snapshot.output_bytes = output_bytes,
                 Self::User(snapshot) => snapshot.output_bytes = output_bytes,
@@ -637,7 +656,7 @@ impl Registry {
     fn move_to_background(&self, entry: &Entry, trigger: BackgroundTrigger) -> ProcessSnapshot {
         let mut update = entry.updates.borrow().clone();
         if update.snapshot.state() == &CommandState::Running {
-            *update.snapshot.state_mut() = CommandState::Background;
+            update.snapshot.set_state(CommandState::Background);
             update.snapshot.mark_backgrounded(trigger);
             entry.updates.send_replace(update.clone());
             self.emit(&update.snapshot);
@@ -686,7 +705,7 @@ impl Registry {
                 update.snapshot.state(),
                 CommandState::Running | CommandState::Background
             ) {
-                *update.snapshot.state_mut() = CommandState::Cancelling;
+                update.snapshot.set_state(CommandState::Cancelling);
                 entry.updates.send_replace(update.clone());
                 self.emit(&update.snapshot);
                 entry.cancel.cancel();
@@ -986,6 +1005,7 @@ impl Registry {
                 operation_id,
                 loop_id,
             } => ProcessSnapshot::Agent(CommandSnapshot {
+                updated_at_ms: Some(crate::private_fs::unix_time_milliseconds()),
                 operation_id,
                 loop_id,
                 command: input.command.clone(),
@@ -1005,6 +1025,7 @@ impl Registry {
                 operation_id,
                 chat_id,
             } => ProcessSnapshot::User(UserCommandSnapshot {
+                updated_at_ms: Some(crate::private_fs::unix_time_milliseconds()),
                 operation_id,
                 chat_id,
                 command: input.command.clone(),
@@ -1061,7 +1082,7 @@ impl Registry {
                         }
                         is_foreground = false;
                         if let Some(shared_snapshot) = registry.background_on_timeout(operation_id).await {
-                            *snapshot.state_mut() = shared_snapshot.state().clone();
+                            snapshot.set_state(shared_snapshot.state().clone());
                             snapshot.merge_background_history(&shared_snapshot);
                         }
                     },
@@ -1075,7 +1096,7 @@ impl Registry {
                         if let Some(shared_snapshot) = shared_snapshot
                             && matches!(shared_snapshot.state(), CommandState::Background | CommandState::Cancelling)
                         {
-                            *snapshot.state_mut() = shared_snapshot.state().clone();
+                            snapshot.set_state(shared_snapshot.state().clone());
                             snapshot.merge_background_history(&shared_snapshot);
                             is_foreground &= snapshot.state() != &CommandState::Background;
                         }
@@ -1105,12 +1126,12 @@ impl Registry {
                     snapshot.finish(status.code(), status.signal(), output_bytes);
                 }
                 Err(error) => {
-                    *snapshot.state_mut() = CommandState::Unknown;
+                    snapshot.set_state(CommandState::Unknown);
                     snapshot.set_reason(error.to_string());
                 }
             }
             if process_group_exists(pid) {
-                *snapshot.state_mut() = CommandState::Unknown;
+                snapshot.set_state(CommandState::Unknown);
                 snapshot.set_reason("shell exited while its process group still contains descendants; their result is unresolved".into());
                 terminate_process_group(pid).await;
             }
@@ -1121,11 +1142,11 @@ impl Registry {
                 let _ = output.set_len(MAX_COMMAND_OUTPUT_BYTES);
                 if snapshot.reason().is_none() {
                     snapshot.set_reason(OUTPUT_LIMIT_REASON.into());
-                    *snapshot.state_mut() = CommandState::Failed;
+                    snapshot.set_state(CommandState::Failed);
                 }
             }
             if let Err(error) = output.sync_all() {
-                *snapshot.state_mut() = CommandState::Unknown;
+                snapshot.set_state(CommandState::Unknown);
                 snapshot.set_reason(format!("cannot save command output: {error}"));
             }
             snapshot.update_output_bytes();

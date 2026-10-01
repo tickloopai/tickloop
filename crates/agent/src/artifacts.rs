@@ -21,6 +21,9 @@ use crate::{
     },
 };
 
+mod catalog;
+pub use catalog::{ArtifactMetadata, ArtifactOperation, ArtifactPage, ArtifactTick};
+
 pub const DEFAULT_ORIGIN: &str = "https://docs.tickloop.ai";
 const ORIGIN_ENV: &str = "TICKLOOP_ARTIFACT_ORIGIN";
 const MAX_RESPONSE_BYTES: usize = 16 * 1024;
@@ -54,6 +57,13 @@ pub enum ArtifactError {
     Cancelled,
     #[error("Artifact Service credential storage is unavailable or unsafe")]
     Storage,
+    #[error("Artifact Service returned HTTP {status}: {code}")]
+    Service { status: u16, code: String },
+    #[error("Artifact Service modification outcome unknown; operation {operation_id}: {outcome}")]
+    OutcomeUnknown {
+        operation_id: String,
+        outcome: String,
+    },
     #[error("Artifact Service returned HTTP {0}")]
     Http(u16),
     #[error(
@@ -131,6 +141,7 @@ struct StoredCredential {
     user: ArtifactUser,
 }
 
+#[derive(Clone)]
 pub struct ArtifactClient {
     origin: Url,
     http: Client,
@@ -154,7 +165,7 @@ impl CredentialSnapshot {
 impl ArtifactClient {
     pub(crate) fn credential_snapshot(&self) -> Result<Option<CredentialSnapshot>, ArtifactError> {
         Ok(self
-            .read()?
+            .read_credential()?
             .filter(|saved| saved.expires_at > now_seconds())
             .map(|saved| CredentialSnapshot {
                 origin: saved.origin,
@@ -298,7 +309,7 @@ impl ArtifactClient {
     }
 
     pub async fn status(&self) -> Result<Option<ArtifactUser>, ArtifactError> {
-        let Some(credential) = self.read()? else {
+        let Some(credential) = self.read_credential()? else {
             return Ok(None);
         };
         if credential.expires_at <= now_seconds() {
@@ -323,7 +334,7 @@ impl ArtifactClient {
     }
 
     pub async fn logout(&self) -> Result<LogoutOutcome, ArtifactError> {
-        let Some(credential) = self.read()? else {
+        let Some(credential) = self.read_credential()? else {
             return Ok(LogoutOutcome::AlreadySignedOut);
         };
         let response = self
@@ -382,7 +393,16 @@ impl ArtifactClient {
 
     async fn read_json<T: for<'de> Deserialize<'de>>(
         &self,
+        response: reqwest::Response,
+    ) -> Result<T, ArtifactError> {
+        self.read_json_with_limit(response, MAX_RESPONSE_BYTES)
+            .await
+    }
+
+    async fn read_json_with_limit<T: for<'de> Deserialize<'de>>(
+        &self,
         mut response: reqwest::Response,
+        limit: usize,
     ) -> Result<T, ArtifactError> {
         let mut bytes = Vec::new();
         while let Some(chunk) = response
@@ -390,7 +410,7 @@ impl ArtifactClient {
             .await
             .map_err(|_| ArtifactError::Connection)?
         {
-            if bytes.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
+            if bytes.len().saturating_add(chunk.len()) > limit {
                 return Err(ArtifactError::InvalidResponse);
             }
             bytes.extend_from_slice(&chunk);
@@ -424,7 +444,7 @@ impl ArtifactClient {
             .join(format!("{name}.json"))
     }
 
-    fn read(&self) -> Result<Option<StoredCredential>, ArtifactError> {
+    fn read_credential(&self) -> Result<Option<StoredCredential>, ArtifactError> {
         self.credential_directory()?;
         let path = self.credential_path();
         let file = match open_without_following_links(&path, OpenTarget::Entry) {
@@ -459,7 +479,7 @@ impl ArtifactClient {
     async fn save(&self, credential: &StoredCredential) -> Result<(), ArtifactError> {
         let _lock = self.lock().await?;
         self.credential_directory()?;
-        self.read()?;
+        self.read_credential()?;
         let bytes = serde_json::to_vec(credential).map_err(|_| ArtifactError::Storage)?;
         replace_file_atomically(&self.credential_path(), &bytes, PRIVATE_FILE_MODE)
             .map_err(|_| ArtifactError::Storage)
@@ -467,7 +487,10 @@ impl ArtifactClient {
 
     async fn remove_if_same(&self, token: &str) -> Result<bool, ArtifactError> {
         let _lock = self.lock().await?;
-        if self.read()?.is_none_or(|saved| saved.access_token != token) {
+        if self
+            .read_credential()?
+            .is_none_or(|saved| saved.access_token != token)
+        {
             return Ok(false);
         }
         std::fs::remove_file(self.credential_path()).map_err(|_| ArtifactError::Storage)?;
@@ -588,6 +611,128 @@ mod tests {
 
     fn user_json() -> &'static str {
         r#"{"id":"user-1","name":"A User","email":"a@example.test"}"#
+    }
+
+    async fn catalog_client(origin: &str) -> (tempfile::TempDir, ArtifactClient) {
+        let directory = tempfile::tempdir().unwrap();
+        let client =
+            ArtifactClient::for_origin(directory.path().canonicalize().unwrap(), origin).unwrap();
+        client
+            .save(&StoredCredential {
+                origin: origin.into(),
+                access_token: "test-token".into(),
+                expires_at: now_seconds() + 600,
+                user: ArtifactUser {
+                    id: "owner".into(),
+                    name: "Owner".into(),
+                    email: "owner@example.test".into(),
+                },
+            })
+            .await
+            .unwrap();
+        (directory, client)
+    }
+
+    #[tokio::test]
+    async fn catalog_allows_larger_pages_but_invalidates_only_rejected_credentials() {
+        let (origin, requests) = server(|request, _, _| {
+            if request.starts_with("GET /api/v1/artifacts?") {
+                (200, serde_json::json!({"artifacts":[{"id":"doc","title":"t".repeat(20000),"format":"markdown","access_role":"owner","url":"https://docs.example/a/doc"}],"next_cursor":"next"}).to_string())
+            } else { (401, r#"{"error":{"code":"unauthorized"}}"#.into()) }
+        }).await;
+        let (_directory, client) = catalog_client(&origin).await;
+        let page = client.list("owned", "hello", None).await.unwrap();
+        assert_eq!(page.artifacts.len(), 1);
+        assert_eq!(page.next_cursor.as_deref(), Some("next"));
+        assert!(matches!(
+            client.read("doc").await,
+            Err(ArtifactError::AccessDenied)
+        ));
+        assert!(client.credential_snapshot().unwrap().is_none());
+        assert!(
+            requests.lock().unwrap()[0]
+                .contains("ownership=owned&q=hello&limit=20&sort=updated&direction=desc")
+        );
+    }
+
+    #[tokio::test]
+    async fn uncertain_catalog_modification_queries_once_without_replaying_it() {
+        let (origin, requests) = server(|request, _, _| {
+            if request.starts_with("POST ") { (503, r#"{"error":{"code":"storage_unavailable"}}"#.into()) }
+            else { (200, serde_json::json!({"operation_id":request.lines().next().unwrap().split_whitespace().nth(1).unwrap().rsplit('/').next().unwrap(),"status":"committed","result":{"title":"renamed"}}).to_string()) }
+        }).await;
+        let (_directory, client) = catalog_client(&origin).await;
+        let operation = client.rename("doc", "renamed", 2).await.unwrap();
+        assert!(operation.recovered);
+        assert_eq!(operation.status, "committed");
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let body: serde_json::Value =
+            serde_json::from_str(requests[0].split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        let id = body["operation_id"].as_str().unwrap();
+        assert!(uuid::Uuid::parse_str(id).is_ok());
+        assert!(requests[1].starts_with(&format!("GET /api/v1/artifacts/doc/operations/{id} ")));
+    }
+
+    #[tokio::test]
+    async fn an_unknown_success_response_queries_the_original_operation_once() {
+        let (origin, requests) = server(|request, _, _| {
+            let operation = if request.starts_with("DELETE ") {
+                let body: serde_json::Value =
+                    serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+                serde_json::json!({"operation_id":body["operation_id"],"status":"unknown"})
+            } else {
+                let id = request
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap()
+                    .rsplit('/')
+                    .next()
+                    .unwrap();
+                serde_json::json!({"operation_id":id,"status":"committed"})
+            };
+            (202, operation.to_string())
+        })
+        .await;
+        let (_directory, client) = catalog_client(&origin).await;
+        let result = client.delete("doc").await.unwrap();
+        assert_eq!(result.status, "committed");
+        assert!(result.recovered);
+        assert_eq!(requests.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn catalog_limits_do_not_expand_metadata_responses_or_allow_unbounded_pages() {
+        let (origin, _) = server(|request, _, _| {
+            let size = if request.contains("q=oversize") { 300000 } else { 20000 };
+            let artifact = serde_json::json!({"id":"doc","title":"t".repeat(size),"format":"markdown","access_role":"owner","url":"https://docs.example/a/doc"});
+            (200, if request.starts_with("GET /api/v1/artifacts/pinned ") || request.contains("q=oversize") { serde_json::json!({"artifacts":[artifact],"next_cursor":null}).to_string() } else { artifact.to_string() })
+        }).await;
+        let (_directory, client) = catalog_client(&origin).await;
+        assert_eq!(client.pinned().await.unwrap().artifacts.len(), 1);
+        assert!(matches!(
+            client.read("doc").await,
+            Err(ArtifactError::InvalidResponse)
+        ));
+        assert!(matches!(
+            client.list("all", "oversize", None).await,
+            Err(ArtifactError::InvalidResponse)
+        ));
+        assert!(client.credential_snapshot().unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn catalog_conflict_is_reported_without_query_or_mutation_retry() {
+        let (origin, requests) =
+            server(|_, _, _| (409, r#"{"error":{"code":"catalog_conflict"}}"#.into())).await;
+        let (_directory, client) = catalog_client(&origin).await;
+        assert!(
+            matches!(client.list("all", "", Some("old")).await, Err(ArtifactError::Service { status:409, code }) if code == "catalog_conflict")
+        );
+        assert_eq!(requests.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -877,7 +1022,7 @@ mod protocol_regression_tests {
             .await
             .unwrap();
         assert!(client.status().await.unwrap().is_none());
-        assert!(client.read().unwrap().is_none());
+        assert!(client.read_credential().unwrap().is_none());
     }
 
     #[tokio::test]
@@ -936,7 +1081,10 @@ mod protocol_regression_tests {
             logout.await.unwrap().unwrap(),
             LogoutOutcome::NewerLoginPresent
         ));
-        assert_eq!(client.read().unwrap().unwrap().access_token, "new-token");
+        assert_eq!(
+            client.read_credential().unwrap().unwrap().access_token,
+            "new-token"
+        );
     }
 
     #[tokio::test]
@@ -969,7 +1117,7 @@ mod protocol_regression_tests {
             Err(ArtifactError::RevocationUnknown)
         ));
         assert_eq!(
-            client.read().unwrap().unwrap().access_token,
+            client.read_credential().unwrap().unwrap().access_token,
             "maybe-live-token"
         );
     }

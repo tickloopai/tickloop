@@ -75,6 +75,12 @@ pub struct TickSubscriptionStatus {
     pub accumulated: u64,
     pub last_delivery_ms: Option<u64>,
     pub last_delivery: Option<String>,
+    #[serde(default)]
+    pub kind: Option<ObservationKind>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub updated_at_ms: Option<u64>,
     pub link: TickLinkState,
 }
 
@@ -130,6 +136,7 @@ struct UnsubscribeTickInput {
 
 #[derive(Default)]
 pub(super) struct TickDeliveries {
+    port: Option<Arc<dyn TickStreamPort>>,
     desired: Option<tokio::sync::watch::Sender<BTreeMap<WatchId, InstanceRef>>>,
     subscriptions: BTreeMap<Uuid, SubscriptionRuntime>,
     pending: HashMap<(ChatId, LoopId), PendingDelivery>,
@@ -153,6 +160,9 @@ struct SubscriptionRuntime {
     gap: bool,
     last_delivery_ms: Option<u64>,
     last_delivery: Option<String>,
+    kind: Option<ObservationKind>,
+    title: Option<String>,
+    updated_at_ms: Option<u64>,
 }
 
 #[derive(Default)]
@@ -205,6 +215,15 @@ impl TickDeliveries {
     }
 
     fn publish_desired(&self) {
+        if let Some(port) = &self.port {
+            port.set_cadences(
+                self.subscriptions
+                    .values()
+                    .filter(|subscription| subscription.blocked.is_none())
+                    .map(|subscription| (subscription.watch, subscription.every_seconds))
+                    .collect(),
+            );
+        }
         let desired: BTreeMap<WatchId, InstanceRef> = self
             .subscriptions
             .values()
@@ -229,6 +248,7 @@ impl TickDeliveries {
                 && audience.contains(&subscription.watch)
                 && subscription.instance == observation.instance
         }) {
+            subscription.kind = Some(observation.kind.clone());
             let superseded = subscription.latest.replace(observation.clone());
             let replaced = superseded.map_or(0, |_| SUPERSEDED_UPDATE);
             subscription.dropped = subscription
@@ -332,6 +352,7 @@ impl Agent {
         {
             let mut deliveries = self.tick_deliveries();
             deliveries.desired = Some(handle.desired);
+            deliveries.port = Some(port);
         }
         self.inner
             .tick_stream_installed
@@ -374,6 +395,9 @@ impl Agent {
                     accumulated: runtime.map_or(0, |runtime| runtime.accumulated),
                     last_delivery_ms: runtime.and_then(|runtime| runtime.last_delivery_ms),
                     last_delivery: runtime.and_then(|runtime| runtime.last_delivery.clone()),
+                    kind: runtime.and_then(|runtime| runtime.kind.clone()),
+                    title: runtime.and_then(|runtime| runtime.title.clone()),
+                    updated_at_ms: runtime.and_then(|runtime| runtime.updated_at_ms),
                     link: runtime.map_or(TickLinkState::Initializing, |runtime| runtime.link),
                 }
             })
@@ -659,6 +683,9 @@ impl Agent {
                             gap: false,
                             last_delivery_ms: None,
                             last_delivery: None,
+                            kind: None,
+                            title: None,
+                            updated_at_ms: None,
                         },
                     );
                 }
@@ -785,6 +812,23 @@ impl Agent {
     fn apply_stream_event(&self, event: TickStreamEvent) {
         let mut deliveries = self.tick_deliveries();
         match event {
+            TickStreamEvent::Metadata {
+                instance,
+                audience,
+                metadata,
+            } => {
+                for subscription in deliveries
+                    .subscriptions
+                    .values_mut()
+                    .filter(|subscription| {
+                        audience.contains(&subscription.watch) && subscription.instance == instance
+                    })
+                {
+                    subscription.kind = Some(metadata.kind.clone());
+                    subscription.title = Some(metadata.title.clone());
+                    subscription.updated_at_ms = metadata.updated_at_ms;
+                }
+            }
             TickStreamEvent::Ready { watch } => {
                 if let Some(subscription) = deliveries
                     .subscriptions

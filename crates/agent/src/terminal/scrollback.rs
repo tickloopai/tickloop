@@ -1042,6 +1042,7 @@ mod tests {
         let nerd_font = DisplayProfile::new(tickloop_agent::settings::DisplayPreferences {
             glyph_set: tickloop_agent::settings::GlyphSet::NerdFont,
             prefers_reduced_motion: false,
+            ..Default::default()
         });
 
         scrollback.remap_display(unicode, nerd_font);
@@ -1060,6 +1061,7 @@ mod tests {
         let reduced_motion = DisplayProfile::new(tickloop_agent::settings::DisplayPreferences {
             glyph_set: tickloop_agent::settings::GlyphSet::NerdFont,
             prefers_reduced_motion: true,
+            ..Default::default()
         });
         scrollback.remap_display(nerd_font, reduced_motion);
         assert_eq!(scrollback.frame(80, 8).lines, before_reduced_motion);
@@ -1091,6 +1093,7 @@ mod tests {
         let nerd_font = DisplayProfile::new(tickloop_agent::settings::DisplayPreferences {
             glyph_set: tickloop_agent::settings::GlyphSet::NerdFont,
             prefers_reduced_motion: false,
+            ..Default::default()
         });
         scrollback.remap_display(DisplayProfile::default(), nerd_font);
         assert_eq!(linked_text(&mut scrollback, 40), ["[Image #1]"]);
@@ -1193,6 +1196,7 @@ mod tests {
         let nerd_font = DisplayProfile::new(tickloop_agent::settings::DisplayPreferences {
             glyph_set: tickloop_agent::settings::GlyphSet::NerdFont,
             prefers_reduced_motion: false,
+            ..Default::default()
         });
         scrollback.remap_display(DisplayProfile::default(), nerd_font);
         assert_eq!(scrollback.frame(20, 4).lines, ["\u{f06a9} reply"]);

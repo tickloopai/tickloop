@@ -23,7 +23,7 @@ use tickloop_agent::{
         RequestFailure, RequestKind, RequestOutcome, ResponseRejection, RewindMode, RewindOutcome,
         SummaryDirection, UsageCounter, UsageCoverage, UsageSummary,
     },
-    settings::{DisplayPreferences, GlyphSet, UserSettings},
+    settings::{DisplayPreferences, GlyphSet, StatusLinePosition, UserSettings},
 };
 use uuid::Uuid;
 
@@ -43,7 +43,14 @@ use super::{
     workflows::{self, Workflow},
 };
 
+pub(super) const STATUS_LINE_POSITION_SETTING_INDEX: usize = 10;
+pub(super) const OUTPUT_STYLE_SETTING_INDEX: usize = 11;
+pub(super) const PERMISSIONS_SETTING_INDEX: usize = 12;
+
 enum Selection {
+    ArtifactSignOut {
+        target: ConfigTarget,
+    },
     Locations {
         generation: u64,
         views: Vec<crate::agent_access::DisplayedView>,
@@ -305,6 +312,7 @@ impl Selection {
             | Self::ServiceAccount { target, .. }
             | Self::Model { target, .. }
             | Self::Effort { target, .. }
+            | Self::ArtifactSignOut { target }
             | Self::Settings { target }
             | Self::SettingsInfo { target }
             | Self::OutputStyle { target }
@@ -1109,7 +1117,7 @@ impl Menus {
             .await
             .map_err(|error| error.to_string())?;
         let mut context = vec![
-            "Model, Thinking, effort, persistent rules, context window, output style, Glyph Set and reduced motion are saved in user settings; execution mode applies to this process.".into(),
+            "Model, Thinking, effort, persistent rules, context window, output style, Glyph Set, reduced motion and status line position are saved in user settings; execution mode applies to this process.".into(),
             "Auto-scroll and Theme apply to this terminal session.".into(),
             safe_text(&format!(
                 "Current model: {}",
@@ -1123,6 +1131,20 @@ impl Menus {
                 settings::model_label(&pending)
             )));
         }
+        let artifact_account = if let Some(root) = &self.config_root {
+            match crate::artifacts::ArtifactClient::new(root) {
+                Ok(client) => match client.status().await {
+                    Ok(Some(user)) => {
+                        format!("{} · Sign out", super::safe_text(user.display_name()))
+                    }
+                    Ok(None) => "signed out · /artifacts to sign in".into(),
+                    Err(error) => format!("{} · /artifacts to retry", error),
+                },
+                Err(error) => error.to_string(),
+            }
+        } else {
+            "signed out · /artifacts to sign in".into()
+        };
         self.show(
             console,
             Menu {
@@ -1189,8 +1211,13 @@ impl Menus {
                             "Off"
                         }
                     ),
+                    format!(
+                        "Status line position: {}",
+                        console.display_preferences()?.status_line_position.label()
+                    ),
                     format!("Output style: {}", self.saved_output_style().label()),
                     "Permissions".into(),
+                    format!("Artifact Service: {artifact_account}"),
                 ],
                 selected: 0,
                 confirmation: false,
@@ -1248,6 +1275,7 @@ impl Menus {
         let nerd_font = DisplayProfile::new(DisplayPreferences {
             glyph_set: GlyphSet::NerdFont,
             prefers_reduced_motion: false,
+            ..Default::default()
         })
         .preview();
         let mut options = GlyphSet::ALL
@@ -2393,6 +2421,16 @@ impl Menus {
                         change.staged_note()
                     ))?;
                 }
+                Selection::ArtifactSignOut { target } => {
+                    if index == Some(1) {
+                        let root = self.config_root.as_ref().ok_or("Artifact Service needs a state directory")?;
+                        agent.disable_event_sources().await.map_err(|error| error.to_string())?;
+                        let client = crate::artifacts::ArtifactClient::new(root).map_err(|error| error.to_string())?;
+                        client.logout().await.map_err(|error| error.to_string())?;
+                        console.write("Artifact Service signed out.\n")?;
+                    }
+                    self.settings(agent, console, target).await?;
+                },
                 Selection::Settings { target } => match index {
                     Some(0) => self.models(agent, console, target).await?,
                     Some(1) => {
@@ -2425,8 +2463,20 @@ impl Menus {
                         self.save_display_preferences(console, preferences)?;
                         self.settings(agent, console, target).await?;
                     }
-                    Some(10) => self.output_styles(console, target)?,
-                    Some(11) => {
+                    Some(STATUS_LINE_POSITION_SETTING_INDEX) => {
+                        let mut preferences = console.display_preferences()?;
+                        preferences.status_line_position = match preferences.status_line_position {
+                            StatusLinePosition::Left => StatusLinePosition::Right,
+                            StatusLinePosition::Right => StatusLinePosition::Left,
+                        };
+                        self.save_display_preferences(console, preferences)?;
+                        self.settings(agent, console, target).await?;
+                    }
+                    Some(13) => {
+                        self.show(console, Menu { id: Uuid::new_v4(), title: "Sign out of Artifact Service?".into(), context: vec!["Stops feedback listening before revoking the credential.".into()], options: vec!["Cancel".into(), "Sign out".into()], selected: 0, confirmation: true }, Selection::ArtifactSignOut { target })?;
+                    }
+                    Some(OUTPUT_STYLE_SETTING_INDEX) => self.output_styles(console, target)?,
+                    Some(PERMISSIONS_SETTING_INDEX) => {
                         match self.permission_modes(agent, console, target, true).await {
                             Ok(()) => {}
                             Err(error) => {

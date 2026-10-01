@@ -64,7 +64,7 @@ fn artifact_commands_are_visible_and_device_login_can_be_cancelled_without_a_mod
         }
     });
     let mut stdin = child.stdin.take().unwrap();
-    stdin.write_all(b"/help\n/artifacts login\n").unwrap();
+    stdin.write_all(b"/help\n/artifacts\n").unwrap();
     stdin.flush().unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     while !output.lock().unwrap().contains("Enter code: ABCD") && Instant::now() < deadline {
@@ -92,14 +92,10 @@ fn artifact_commands_are_visible_and_device_login_can_be_cancelled_without_a_mod
     let output = output.lock().unwrap();
     assert!(status.success(), "terminal exited with {status}");
     assert!(
-        output.contains("/artifacts login|status|logout"),
+        output.contains("Choose artifacts to add to this Chat"),
         "{output}"
     );
     assert!(output.contains("Login cancelled."), "{output}");
-    assert!(output.contains("Artifact Service: signed out"), "{output}");
-    assert!(
-        output.contains("Artifact Service is already signed out."),
-        "{output}"
-    );
+    assert!(output.contains("Use /artifacts"), "{output}");
     assert!(!output.contains("private-code"), "{output}");
 }

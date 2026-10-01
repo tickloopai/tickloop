@@ -3,7 +3,7 @@ use crate::{agent_access::*, model::*, runtime};
 use async_trait::async_trait;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::{
-    io::Read,
+    io::{Read, Write},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };

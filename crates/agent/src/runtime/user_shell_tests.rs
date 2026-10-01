@@ -334,6 +334,7 @@ async fn stale_background_update_cannot_replace_a_user_terminal_fact() {
         .record_user_shell(
             chat,
             UserCommandSnapshot {
+                updated_at_ms: None,
                 operation_id: receipt.command_id,
                 chat_id: chat,
                 command: terminal.command.clone(),
@@ -469,6 +470,7 @@ async fn a_user_shell_moved_by_its_timeout_is_announced_as_running_in_the_backgr
         .record_user_shell(
             chat,
             UserCommandSnapshot {
+                updated_at_ms: None,
                 operation_id: receipt.command_id,
                 chat_id: chat,
                 command: command.into(),

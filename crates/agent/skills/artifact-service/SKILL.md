@@ -5,15 +5,17 @@ description: Create, find, organize, rename, collaboratively edit or share cloud
 
 # Artifact Service account
 
-Tick Loop's Artifact Service account is separate from model Provider sign-in. The user starts device authorization with `/artifacts login` in their own terminal, opens the displayed service URL in their own browser, signs in with Google, and approves the displayed device. `/artifacts status` checks the current service account; `/artifacts logout` revokes its credential. These commands work without Herdr.
+Tick Loop's Artifact Service account is separate from model Provider sign-in. The user opens `/artifacts` in their own terminal. It starts device authorization when signed out and opens the picker after login; the user opens the displayed service URL in their browser, signs in with Google, and approves the device. `/settings` shows the service account and its Sign out action. These commands work without Herdr.
 
 When a cloud artifact request needs sign-in, tell the user which command to run. Continue only after the service account is available. A Skill does not grant access to artifacts or bypass tool permission checks. Use only the installed artifact tools for content operations; if none are listed, explain that publishing and management are unavailable in this build.
+
+The current host state includes `artifact_ticks`: artifacts the user added to this Chat. Operate on them through the discovered MCP tools. Adding a Tick grants no permissions and establishes neither a feedback association nor a Tick Subscription.
 
 ## Connecting an existing document
 
 When the owner explicitly asks this Agent to receive feedback on an existing artifact, use `mcp__artifacts__artifact_agent_connect` with its `artifact_id` and a new `operation_id`. Connection preserves the body and published versions, including documents that have never been published. Reading a document does not connect it; publishing is reserved for intended content publication.
 
-After `prepared`, call the same tool once with `action: "check"`, the same artifact and operation ID. Report its confirmed status. `associated_current` confirms the association, not that the Agent is online. `already_associated` preserves this Chat's existing Loop and creates no receipt for the new ID. When the result offers `/artifacts resume LOOP_ID`, explain that explicit recovery step; reading or reopening history does not resume listening. A stopped or expired Loop remains ended.
+After `prepared`, call the same tool once with `action: "check"`, the same artifact and operation ID. Report its confirmed status. `associated_current` confirms the association, not that the Agent is online. `already_associated` preserves this Chat's existing Loop and creates no receipt for the new ID. When feedback listening needs recovery, tell the owner to select the artifact in the Tick List and press `f`; reading or reopening history does not resume listening. A stopped or expired Loop remains ended.
 
 For `unknown`, retain the original operation ID and report the uncertainty. Only an explicit owner retry may repeat that exact connection request; a new ID cannot resolve an earlier unknown. `not_current` means the old association has been replaced or cleared. Replacing another association requires explicit owner intent and `replace_existing: true`; a conflict requires reassessment, not automatic takeover. Connect is unavailable during claimed feedback. Continue that request through the edit, reply and completion tools instead.
 

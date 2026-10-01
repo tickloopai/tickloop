@@ -65,6 +65,8 @@ pub struct ShellTask {
     pub signal: Option<i32>,
     pub reason: Option<String>,
     pub output_bytes: u64,
+    #[serde(default)]
+    pub updated_at_ms: Option<u64>,
     pub capabilities: ShellTaskCapabilities,
 }
 
@@ -534,6 +536,7 @@ fn project_tasks(chat: &ChatSnapshot, live_agent_commands: Vec<CommandSnapshot>)
 fn agent_task(chat_id: ChatId, command: CommandSnapshot) -> ShellTask {
     let state = map_agent_state(command.state);
     ShellTask {
+        updated_at_ms: command.updated_at_ms,
         id: command.operation_id,
         chat_id,
         origin: ShellTaskOrigin::Agent,
@@ -556,6 +559,7 @@ fn agent_task(chat_id: ChatId, command: CommandSnapshot) -> ShellTask {
 fn user_task(record: &UserShellRecord) -> ShellTask {
     let state = map_user_state(&record.state);
     ShellTask {
+        updated_at_ms: record.updated_at_ms,
         id: record.id,
         chat_id: record.chat_id,
         origin: ShellTaskOrigin::User,
@@ -1091,6 +1095,7 @@ mod tests {
         let tasks = project_tasks(
             &chat,
             vec![CommandSnapshot {
+                updated_at_ms: None,
                 operation_id: command_id,
                 loop_id,
                 command: "pwd".into(),
@@ -1272,6 +1277,7 @@ mod tests {
     fn background_task(output_bytes: u64) -> ShellTask {
         let chat_id = Uuid::new_v4();
         ShellTask {
+            updated_at_ms: None,
             id: Uuid::new_v4(),
             chat_id,
             origin: ShellTaskOrigin::User,

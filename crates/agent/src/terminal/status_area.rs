@@ -170,13 +170,11 @@ impl StatusArea {
     }
 
     pub(super) fn available_panels(&self) -> impl Iterator<Item = FooterItemId> + '_ {
-        [
-            FooterItemId::Todo,
-            FooterItemId::Agents,
-            FooterItemId::Tasks,
-        ]
-        .into_iter()
-        .filter(|panel| self.item_count(*panel) > 0 || self.pinned && self.visible == Some(*panel))
+        [FooterItemId::Todo, FooterItemId::Agents]
+            .into_iter()
+            .filter(|panel| {
+                self.item_count(*panel) > 0 || self.pinned && self.visible == Some(*panel)
+            })
     }
 
     /// The reading number this family panel shows for `agent_id` when another family row reads
@@ -412,7 +410,10 @@ impl StatusArea {
     }
 
     pub(super) fn row_count(&self, height: usize) -> usize {
-        if self.tasks.is_empty() && self.todos.is_empty() && self.agents.is_empty() {
+        if self.todos.is_empty()
+            && self.agents.is_empty()
+            && self.visible != Some(FooterItemId::Tasks)
+        {
             return 0;
         }
         if height < 4 {

@@ -20,6 +20,10 @@ const NERD_FONT_SPINNER: [&str; 12] = [
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Glyph {
+    ShellTick,
+    ArtifactTick,
+    TerminalTick,
+    ProtocolTick,
     Prompt,
     Assistant,
     ToolCall,
@@ -75,6 +79,14 @@ impl DisplayProfile {
 
     pub(super) const fn glyph(self, glyph: Glyph) -> &'static str {
         match (self.preferences.glyph_set, glyph) {
+            (GlyphSet::Unicode, Glyph::ShellTick) => "$",
+            (GlyphSet::Unicode, Glyph::ArtifactTick) => "▤",
+            (GlyphSet::Unicode, Glyph::TerminalTick) => ">",
+            (GlyphSet::Unicode, Glyph::ProtocolTick) => "◉",
+            (GlyphSet::NerdFont, Glyph::ShellTick) => "\u{f489}",
+            (GlyphSet::NerdFont, Glyph::ArtifactTick) => "\u{f15c}",
+            (GlyphSet::NerdFont, Glyph::TerminalTick) => "\u{f120}",
+            (GlyphSet::NerdFont, Glyph::ProtocolTick) => "\u{f0318}",
             (GlyphSet::Unicode, Glyph::Prompt) => "❯",
             (GlyphSet::Unicode, Glyph::Assistant | Glyph::ToolCall) => "⏺",
             (GlyphSet::Unicode, Glyph::ToolResult) => "⎿",
@@ -172,6 +184,7 @@ mod tests {
         let nerd_font = DisplayProfile::new(DisplayPreferences {
             glyph_set: GlyphSet::NerdFont,
             prefers_reduced_motion: true,
+            ..Default::default()
         });
         assert_eq!(nerd_font.glyph(Glyph::Prompt), "\u{f0142}");
         assert_eq!(nerd_font.glyph(Glyph::Assistant), "\u{f06a9}");
@@ -196,16 +209,21 @@ mod tests {
             let profile = DisplayProfile::new(DisplayPreferences {
                 glyph_set,
                 prefers_reduced_motion: false,
+                ..Default::default()
             });
             let shapes = states
                 .iter()
                 .map(|glyph| profile.glyph(*glyph))
                 .collect::<std::collections::HashSet<_>>();
             assert_eq!(shapes.len(), states.len(), "{glyph_set:?}");
-            for glyph in states
-                .into_iter()
-                .chain([Glyph::Collapsed, Glyph::Expanded])
-            {
+            for glyph in states.into_iter().chain([
+                Glyph::Collapsed,
+                Glyph::Expanded,
+                Glyph::ShellTick,
+                Glyph::ArtifactTick,
+                Glyph::TerminalTick,
+                Glyph::ProtocolTick,
+            ]) {
                 assert_eq!(
                     unicode_width::UnicodeWidthStr::width(profile.glyph(glyph)),
                     1,

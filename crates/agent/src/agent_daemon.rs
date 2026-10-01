@@ -522,6 +522,7 @@ pub(crate) async fn build_runtime(launch: &LaunchSpec) -> Result<Agent, String> 
         Ok(Agent::new_with_options(model, client, launch.host_options))
     }
     .map_err(|error| error.to_string())?;
+    let mut native_stream: Option<Arc<dyn crate::tick_stream::TickStreamPort>> = None;
     let mut native_host: Option<Arc<dyn crate::host_tools::HostToolProvider>> = None;
     if let Some(work) = &launch.host_work_context {
         let access = Arc::new(tick_connect::access::TickAccess::new(
@@ -533,13 +534,17 @@ pub(crate) async fn build_runtime(launch: &LaunchSpec) -> Result<Agent, String> 
         native_host = Some(Arc::new(crate::native_host::NativeHostToolProvider::new(
             access.clone(),
         )));
-        agent
-            .install_tick_stream(Arc::new(crate::tick_stream::NativeTickStream::new(access)))
-            .await;
+        native_stream = Some(Arc::new(crate::tick_stream::NativeTickStream::new(access)));
     }
     if let Some(root) = launch.config_root.as_ref()
         && let Ok(artifact) = crate::artifacts::ArtifactClient::new(root)
     {
+        agent
+            .install_tick_stream(Arc::new(crate::tick_stream::ArtifactTickStream::new(
+                root.clone(),
+                native_stream.clone(),
+            )))
+            .await;
         agent
             .install_host_tools(Arc::new(
                 crate::mcp_tools::McpHostToolProvider::new(artifact, native_host)
@@ -548,6 +553,9 @@ pub(crate) async fn build_runtime(launch: &LaunchSpec) -> Result<Agent, String> 
             ))
             .map_err(|error| format!("cannot install MCP tools: {error}"))?;
     } else if let Some(native) = native_host {
+        if let Some(stream) = native_stream {
+            agent.install_tick_stream(stream).await;
+        }
         agent
             .install_host_tools(native)
             .map_err(|error| format!("cannot install Herdr tools: {error}"))?;

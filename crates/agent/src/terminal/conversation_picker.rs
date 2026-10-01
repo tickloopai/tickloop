@@ -160,6 +160,16 @@ impl ConversationPicker {
         }
     }
 
+    pub(super) fn replace_entries(&mut self, entries: Vec<ConversationEntry>) {
+        self.entries = entries;
+        self.refilter();
+    }
+    pub(super) fn matching_indices(&self) -> &[usize] {
+        &self.matches
+    }
+    pub(super) fn focus_list(&mut self) {
+        self.focus = ConversationPickerFocus::List;
+    }
     pub(super) fn id(&self) -> Uuid {
         self.id
     }
@@ -176,7 +186,6 @@ impl ConversationPicker {
         &self.entries
     }
 
-    #[cfg(test)]
     pub(super) fn focus(&self) -> ConversationPickerFocus {
         self.focus
     }
@@ -451,7 +460,7 @@ impl ConversationPicker {
 
     /// The search row and the column of the cursor in it. A query wider than the row scrolls
     /// so the cursor stays in view.
-    fn search_line(&self, width: usize) -> (RoleLine, usize) {
+    pub(super) fn search_line(&self, width: usize) -> (RoleLine, usize) {
         let query = self.query();
         let cursor = self.query_editor.cursor();
         let mut line = RoleLine::default();
@@ -562,7 +571,7 @@ impl ConversationPicker {
 
 /// Joins the hint parts that fit `width`, dropping the lowest priority first, and cuts what
 /// remains only when even the most important part is too wide.
-fn fit_hint(parts: &[(String, u8)], width: usize, display: DisplayProfile) -> String {
+pub(super) fn fit_hint(parts: &[(String, u8)], width: usize, display: DisplayProfile) -> String {
     let mut kept = parts
         .iter()
         .map(|(text, priority)| (display.navigation_hint(text), *priority))

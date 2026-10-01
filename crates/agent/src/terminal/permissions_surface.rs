@@ -65,37 +65,50 @@ fn page_header(active: Page, width: usize) -> String {
 }
 
 fn page_header_line(active: Page, width: usize, pages: &[Page]) -> RoleLine {
+    let labels: Vec<_> = pages.iter().map(|page| page.label()).collect();
+    tab_header_line(
+        "Permissions",
+        pages.iter().position(|page| *page == active).unwrap_or(0),
+        &labels,
+        width,
+    )
+}
+
+pub(super) fn tab_header_line(
+    title: &str,
+    active: usize,
+    labels: &[&str],
+    width: usize,
+) -> RoleLine {
     if width < 45 {
-        let compact = format!("[{}]", active.label());
-        let titled = format!("Permissions {compact}");
+        let compact = format!("[{}]", labels[active]);
+        let titled = format!("{title} {compact}");
         let mut header = RoleLine::default();
         if titled.width() <= width {
-            header.push("Permissions ", Some(Role::DialogTitle));
+            header.push(format!("{title} "), Some(Role::DialogTitle));
         }
         header.push(compact, Some(Role::Selection));
         return header;
     }
 
-    let tabs = pages
+    let tabs = labels
         .iter()
-        .map(|page| {
-            if *page == active {
-                format!("[{}]", page.label())
+        .enumerate()
+        .map(|(index, label)| {
+            if index == active {
+                format!("[{label}]")
             } else {
-                page.label().to_owned()
+                (*label).to_owned()
             }
         })
         .collect::<Vec<_>>();
-    let active_index = pages.iter().position(|page| *page == active).unwrap();
+    let active_index = active;
     let mut start = active_index;
     let mut end = active_index + 1;
     let render_window = |start: usize, end: usize| {
         let previous = if start > 0 { "‹ " } else { "" };
         let next = if end < tabs.len() { " ›" } else { "" };
-        format!(
-            "Permissions · {previous}{}{next}",
-            tabs[start..end].join("  ")
-        )
+        format!("{title} · {previous}{}{next}", tabs[start..end].join("  "))
     };
     while start > 0 && render_window(start - 1, end).width() <= width {
         start -= 1;
@@ -103,19 +116,19 @@ fn page_header_line(active: Page, width: usize, pages: &[Page]) -> RoleLine {
     while end < tabs.len() && render_window(start, end + 1).width() <= width {
         end += 1;
     }
-    let mut header = RoleLine::role("Permissions", Role::DialogTitle);
+    let mut header = RoleLine::role(title, Role::DialogTitle);
     header.push(" · ", Some(Role::MutedText));
     if start > 0 {
         header.push("‹ ", Some(Role::MutedText));
     }
-    for (index, page) in pages[start..end].iter().enumerate() {
+    for (index, page) in labels[start..end].iter().enumerate() {
         if index > 0 {
             header.push("  ", None);
         }
-        if *page == active {
-            header.push(format!("[{}]", page.label()), Some(Role::Selection));
+        if start + index == active {
+            header.push(format!("[{}]", *page), Some(Role::Selection));
         } else {
-            header.push(page.label(), Some(Role::MutedText));
+            header.push(*page, Some(Role::MutedText));
         }
     }
     if end < tabs.len() {

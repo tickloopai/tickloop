@@ -207,7 +207,7 @@ impl Outcome<'_> {
     fn association_summary(
         status: &str,
         binding: &EventSourceBinding,
-        loop_id: LoopId,
+        _loop_id: LoopId,
         loop_state: &LoopState,
     ) -> String {
         if matches!(loop_state, LoopState::Stopped | LoopState::Expired) {
@@ -216,7 +216,7 @@ impl Outcome<'_> {
             )
         } else if binding.resume_required {
             format!(
-                "{status}. Listening is not active; the owner can run /artifacts resume {loop_id}. Association does not mean the Agent is online."
+                "{status}. Listening is not active; the owner can select the artifact in the Tick List and press f to resume feedback. Association does not mean the Agent is online."
             )
         } else {
             format!("{status}. Association does not mean the Agent is online.")

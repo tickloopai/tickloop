@@ -16,6 +16,7 @@ pub(crate) const FLUSH_INTERVAL: Duration = Duration::from_millis(100);
 /// 同类元数据的最后一条；退出时重新追加到文件末尾，让列表只读尾部就能取到。
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CachedMetadata {
+    pub artifact_ticks: Option<super::entry::ArtifactTicksEntry>,
     pub custom_title: Option<CustomTitleEntry>,
     pub last_prompt: Option<LastPromptEntry>,
     pub branch_origin: Option<BranchOriginEntry>,
@@ -25,6 +26,7 @@ pub(crate) struct CachedMetadata {
 impl CachedMetadata {
     fn remember(&mut self, line: &Line) {
         match line {
+            Line::ArtifactTicks(entry) => self.artifact_ticks = Some(entry.clone()),
             Line::CustomTitle(entry) => self.custom_title = Some(entry.clone()),
             Line::LastPrompt(entry) => self.last_prompt = Some(entry.clone()),
             Line::BranchOrigin(entry) => self.branch_origin = Some(entry.clone()),
@@ -41,6 +43,7 @@ impl CachedMetadata {
             .chain(self.last_prompt.clone().map(Line::LastPrompt))
             .chain(self.branch_origin.clone().map(Line::BranchOrigin))
             .chain(self.delegation.clone().map(Line::Delegation))
+            .chain(self.artifact_ticks.clone().map(Line::ArtifactTicks))
             .collect()
     }
 }

@@ -694,3 +694,70 @@ async fn creating_with_an_unknown_skill_rejects_without_registering_an_empty_age
     assert_eq!(catalog(&access).await.len(), 1);
     runtime.shutdown().await;
 }
+
+#[tokio::test]
+async fn embedded_artifact_commands_add_list_and_remove_from_the_selected_chat() {
+    let directory = tempfile::tempdir().unwrap();
+    let runtime = Agent::new_embedded(
+        support::config(),
+        Arc::new(support::ScriptedModel::new(Vec::new())),
+    );
+    let access = EmbeddedAgentAccess::new(runtime.clone());
+    let envelope = |command| CommandEnvelope {
+        owner_epoch: access.owner_epoch(),
+        command_id: Uuid::new_v4(),
+        command,
+    };
+    let created = access
+        .execute(envelope(AgentCommand::Create {
+            launch: LaunchSpec::embedded(directory.path().into()),
+            initial: None,
+            origin: None,
+        }))
+        .await
+        .unwrap();
+    let Some(CommandResult::Created {
+        execution,
+        snapshot,
+        ..
+    }) = created.result
+    else {
+        panic!("missing created execution");
+    };
+    let tick = tickloop_agent::artifacts::ArtifactTick {
+        artifact_id: "doc".into(),
+        origin: "https://docs.example".into(),
+        title: "Research".into(),
+        format: "markdown".into(),
+        url: "https://docs.example/a/doc".into(),
+        access_role: "viewer".into(),
+        added_at_ms: 1000,
+    };
+    access
+        .execute(envelope(AgentCommand::AddArtifactTick {
+            execution,
+            tick: tick.clone(),
+        }))
+        .await
+        .unwrap();
+    let listed = access
+        .execute(envelope(AgentCommand::ListArtifactTicks { execution }))
+        .await
+        .unwrap();
+    assert!(
+        matches!(listed.result, Some(CommandResult::ArtifactTicks(ticks)) if ticks == vec![tick.clone()])
+    );
+    let removed = access
+        .execute(envelope(AgentCommand::RemoveArtifactTick {
+            execution,
+            instance_id: tick.instance_id(),
+        }))
+        .await
+        .unwrap();
+    assert!(
+        matches!(removed.result, Some(CommandResult::ArtifactTicks(ticks)) if ticks.is_empty())
+    );
+    let snapshot = runtime.snapshot(snapshot.conversation.id).await.unwrap();
+    assert!(snapshot.loops.is_empty());
+    runtime.shutdown().await;
+}

@@ -121,6 +121,12 @@ impl CommandSpec {
 
 const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
+        command: "/ticks",
+        arguments: "",
+        description: "Show or hide the Tick List.",
+        menu_group: Some(CommandGroup::ToolsAndPermissions),
+    },
+    CommandSpec {
         command: "/status",
         arguments: "",
         description: "Show the selected Chat, model, execution mode and queue.",
@@ -134,8 +140,8 @@ const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         command: "/artifacts",
-        arguments: "login|status|logout|resume LOOP_ID",
-        description: "Sign in, inspect, leave or explicitly resume Artifact Service feedback listening.",
+        arguments: "",
+        description: "Choose artifacts to add to this Chat; sign in when needed.",
         menu_group: Some(CommandGroup::ToolsAndPermissions),
     },
     CommandSpec {
@@ -610,8 +616,8 @@ mod tests {
     fn discovery_separates_public_commands_advanced_controls_and_skills() {
         let mut completion = Completion::default();
         completion.update("/");
-        assert_eq!(completion.candidates().len(), 22);
-        assert_eq!(builtin_commands().len(), 43);
+        assert_eq!(completion.candidates().len(), 23);
+        assert_eq!(builtin_commands().len(), 44);
         assert_eq!(
             builtin_commands()
                 .iter()

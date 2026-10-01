@@ -50,6 +50,7 @@ impl Agent {
             let mut snapshot = chat.snapshot.clone();
             snapshot.last_queue_sequence += 1;
             let record = UserShellRecord {
+                updated_at_ms: Some(crate::private_fs::unix_time_milliseconds()),
                 id: command_id,
                 chat_id,
                 loop_id,
@@ -380,6 +381,9 @@ impl Agent {
                 .find(|record| record.id == command.operation_id)
                 .ok_or(AgentError::NotFound)?;
             let previous = record.clone();
+            if record.output_bytes != command.output_bytes {
+                record.updated_at_ms = command.updated_at_ms;
+            }
             record.starts_in_background |= command.was_background;
             if user_shell_state_is_terminal(&previous.state) {
                 record.output_bytes = record.output_bytes.max(command.output_bytes);
@@ -562,6 +566,7 @@ fn user_shell_state_is_terminal(state: &UserShellState) -> bool {
 
 fn record_to_command_snapshot(record: &UserShellRecord) -> Option<UserCommandSnapshot> {
     Some(UserCommandSnapshot {
+        updated_at_ms: record.updated_at_ms,
         operation_id: record.id,
         chat_id: record.chat_id,
         command: record.command.clone(),

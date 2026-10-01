@@ -523,22 +523,7 @@ impl Drop for LogoutFlow {
 async fn launch_browser(address: &str) {
     #[cfg(not(test))]
     {
-        let executable = if cfg!(target_os = "macos") {
-            "open"
-        } else {
-            "xdg-open"
-        };
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            tokio::process::Command::new(executable)
-                .arg(address)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .kill_on_drop(true)
-                .status(),
-        )
-        .await;
+        let _ = launch_browser_result(address).await;
     }
     #[cfg(test)]
     if std::env::var_os("TICKLOOP_TEST_BROWSER_AUTH").is_some() {
@@ -564,6 +549,41 @@ pub(super) fn terminal_auth(root: PathBuf) -> CodexAuth {
             .expect("test loopback OAuth origin");
     }
     CodexAuth::new(root)
+}
+
+pub(super) async fn open_artifact(address: &str) -> Result<(), String> {
+    let url = reqwest::Url::parse(address).map_err(|_| "Invalid artifact link".to_owned())?;
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return Err("Only HTTPS artifact links can be opened".into());
+    }
+    launch_browser_result(address).await
+}
+
+async fn launch_browser_result(address: &str) -> Result<(), String> {
+    let executable = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        tokio::process::Command::new(executable)
+            .arg(address)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .status(),
+    )
+    .await;
+    match result {
+        Ok(Ok(status)) if status.success() => Ok(()),
+        _ => Err("Cannot open artifact in the browser".into()),
+    }
 }
 
 #[cfg(test)]

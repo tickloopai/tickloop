@@ -99,8 +99,16 @@ fn malformed_auto_settings_do_not_exit_the_terminal_on_permissions_commands() {
 
 #[test]
 fn interactive_pty_trusts_the_directory_and_cycles_all_execution_modes() {
+    use std::os::unix::fs::PermissionsExt;
     let directory = tempfile::tempdir().unwrap();
     let config_root = directory.path().join("config-root");
+    let home = directory.path().join("home");
+    let scratch = directory.path().join("scratch");
+    std::fs::create_dir(&home).unwrap();
+    std::fs::create_dir(&scratch).unwrap();
+    for path in [&home, &scratch] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     let pty = native_pty_system()
         .openpty(PtySize {
             rows: 30,
@@ -118,6 +126,8 @@ fn interactive_pty_trusts_the_directory_and_cycles_all_execution_modes() {
     );
     command.cwd(directory.path());
     command.env("TICKLOOP_CONFIG_DIR", &config_root);
+    command.env("HOME", &home);
+    command.env("TICKLOOP_TMPDIR", &scratch);
     command.env("TICKLOOP_AGENT_TUI", "inline");
     command.arg("--no-session-persistence");
     let mut child = pty.slave.spawn_command(command).unwrap();
@@ -155,8 +165,8 @@ fn interactive_pty_trusts_the_directory_and_cycles_all_execution_modes() {
         }
     };
 
-    wait_for_output("Trust working directory", 0);
-    writer.write_all(b"y\r").unwrap();
+    wait_for_output("Accessing workspace:", 0);
+    writer.write_all(b"j\r").unwrap();
     writer.flush().unwrap();
     wait_for_output("⏵⏵ Auto · deepseek-flash", 0);
     for mode in ["Ask", "Full Access", "Auto"] {
@@ -185,7 +195,7 @@ fn interactive_pty_trusts_the_directory_and_cycles_all_execution_modes() {
     let output = output.lock().unwrap().replace('\r', "");
 
     assert!(status.success(), "{status:?}\n{output}");
-    assert!(output.contains("Trust working directory"), "{output}");
+    assert!(output.contains("Accessing workspace:"), "{output}");
     assert!(
         regex::Regex::new(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
             .unwrap()

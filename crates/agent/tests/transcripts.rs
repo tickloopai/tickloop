@@ -1529,3 +1529,95 @@ async fn transcripts_hold_only_specified_entries_and_restart_rebuilds_the_chat_f
     );
     restarted.shutdown().await;
 }
+
+#[tokio::test]
+async fn artifact_ticks_survive_restart_branch_and_conversation_rewind() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("state");
+    let model = Arc::new(ScriptedModel::new(vec![text("first"), text("second")]));
+    let agent = Agent::open_embedded(root.clone(), config(), model.clone()).unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    complete_turn(&agent, chat, None, "first prompt").await;
+    let tick = tickloop_agent::artifacts::ArtifactTick {
+        artifact_id: "doc".into(),
+        origin: "https://docs.example".into(),
+        title: "Research".into(),
+        format: "markdown".into(),
+        url: "https://docs.example/a/doc".into(),
+        access_role: "owner".into(),
+        added_at_ms: 1000,
+    };
+    agent.add_artifact_tick(chat, tick.clone()).await.unwrap();
+    complete_turn(&agent, chat, None, "second prompt").await;
+    let host_request = request_text(model.requests.lock().unwrap().last().unwrap());
+    assert!(host_request.contains("artifact_ticks") && host_request.contains("Research"));
+    let points = agent.snapshot(chat).await.unwrap().rewind_points();
+    agent
+        .rewind(chat, points[1].message_id, RewindMode::Conversation)
+        .await
+        .unwrap();
+    assert_eq!(
+        agent.artifact_ticks(chat).await.unwrap(),
+        vec![tick.clone()]
+    );
+    let branch = agent
+        .branch_chat(BranchRequest {
+            request_id: Uuid::new_v4(),
+            source_chat_id: chat,
+            source_loop_id: None,
+            name: Some("artifact branch".into()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(branch.snapshot.artifact_ticks, vec![tick.clone()]);
+    agent.flush_transcripts().await;
+    agent.shutdown().await;
+    let reopened =
+        Agent::open_embedded(root, config(), Arc::new(ScriptedModel::new(Vec::new()))).unwrap();
+    assert_eq!(
+        reopened.resume_chat(chat).await.unwrap().artifact_ticks,
+        vec![tick.clone()]
+    );
+    assert_eq!(
+        reopened
+            .resume_chat(branch.child_chat_id)
+            .await
+            .unwrap()
+            .artifact_ticks,
+        vec![tick]
+    );
+    reopened.shutdown().await;
+}
+
+#[tokio::test]
+async fn artifact_tick_metadata_before_a_compaction_boundary_survives_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("state");
+    let agent = Agent::open_embedded(
+        root.clone(),
+        config(),
+        Arc::new(ScriptedModel::new(vec![text("answer"), text("summary")])),
+    )
+    .unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    complete_turn(&agent, chat, None, "a saved prompt").await;
+    let tick = tickloop_agent::artifacts::ArtifactTick {
+        artifact_id: "doc".into(),
+        origin: "https://docs.example".into(),
+        title: "Before boundary".into(),
+        format: "html".into(),
+        url: "https://docs.example/a/doc".into(),
+        access_role: "editor".into(),
+        added_at_ms: 1000,
+    };
+    agent.add_artifact_tick(chat, tick.clone()).await.unwrap();
+    agent.compact(chat).await.unwrap();
+    agent.shutdown().await;
+    let reopened =
+        Agent::open_embedded(root, config(), Arc::new(ScriptedModel::new(Vec::new()))).unwrap();
+    assert_eq!(
+        reopened.resume_chat(chat).await.unwrap().artifact_ticks,
+        vec![tick]
+    );
+    reopened.shutdown().await;
+}

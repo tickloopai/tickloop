@@ -29,13 +29,13 @@ use crate::model::{Content, Message, PrivateHistorySource, Role, Usage};
 use crate::permissions::ExecutionMode;
 use crate::private_fs::unix_time_milliseconds;
 use crate::transcript::{
-    BranchOriginEntry, COMPACT_BOUNDARY_SUBTYPE, CachedMetadata, ChainEntry, CompactMetadata,
-    CompactTriggerEntry, ContentReplacementEntry, ContentReplacementRecord, CustomTitleEntry,
-    DelegationEntry, FLUSH_INTERVAL, FileHistorySnapshotEntry, ForkedFrom, LOOP_CREATED_SUBTYPE,
-    LOOP_ENDED_SUBTYPE, LOOP_STATE_SUBTYPE, LOOP_TRIGGER_SUBTYPE, LastPromptEntry, Line,
-    LoadedTranscript, LoopRecord, PartialCompactDirection, SummarizeMetadataEntry,
-    TranscriptWriter, format_timestamp, list_project, load, locate, project_directory,
-    transcript_path,
+    ArtifactTicksEntry, BranchOriginEntry, COMPACT_BOUNDARY_SUBTYPE, CachedMetadata, ChainEntry,
+    CompactMetadata, CompactTriggerEntry, ContentReplacementEntry, ContentReplacementRecord,
+    CustomTitleEntry, DelegationEntry, FLUSH_INTERVAL, FileHistorySnapshotEntry, ForkedFrom,
+    LOOP_CREATED_SUBTYPE, LOOP_ENDED_SUBTYPE, LOOP_STATE_SUBTYPE, LOOP_TRIGGER_SUBTYPE,
+    LastPromptEntry, Line, LoadedTranscript, LoopRecord, PartialCompactDirection,
+    SummarizeMetadataEntry, TranscriptWriter, format_timestamp, list_project, load, locate,
+    project_directory, transcript_path,
 };
 
 /// 照 Claude Code：恢复时末尾是工具结果，追加这条 meta user 消息表示从中断处继续。
@@ -317,7 +317,16 @@ impl ChatRecorder {
         });
         self.writer.enqueue(
             &path,
-            custom_title.into_iter().chain(branch_origin).collect(),
+            custom_title
+                .into_iter()
+                .chain(branch_origin)
+                .chain(metadata.artifact_ticks.map(|entry| {
+                    Line::ArtifactTicks(ArtifactTicksEntry {
+                        chat_id,
+                        artifact_ticks: entry.artifact_ticks,
+                    })
+                }))
+                .collect(),
         );
     }
 
@@ -341,22 +350,26 @@ impl ChatRecorder {
             )
         };
         self.register_path(child_chat_id, path.clone());
-        self.writer.enqueue(
-            &path,
-            vec![
-                Line::BranchOrigin(BranchOriginEntry {
-                    chat_id: child_chat_id,
-                    forked_from: ForkedFrom {
-                        chat_id: source.id,
-                        message_uuid: leaf,
-                    },
-                }),
-                Line::CustomTitle(CustomTitleEntry {
-                    chat_id: child_chat_id,
-                    custom_title: title.to_owned(),
-                }),
-            ],
-        );
+        let mut lines = vec![
+            Line::BranchOrigin(BranchOriginEntry {
+                chat_id: child_chat_id,
+                forked_from: ForkedFrom {
+                    chat_id: source.id,
+                    message_uuid: leaf,
+                },
+            }),
+            Line::CustomTitle(CustomTitleEntry {
+                chat_id: child_chat_id,
+                custom_title: title.to_owned(),
+            }),
+        ];
+        if !source.artifact_ticks.is_empty() {
+            lines.push(Line::ArtifactTicks(ArtifactTicksEntry {
+                chat_id: child_chat_id,
+                artifact_ticks: source.artifact_ticks.clone(),
+            }));
+        }
+        self.writer.enqueue(&path, lines);
     }
 
     /// 照 Claude Code `recordContentReplacement`：替换决定作为元数据条目追加到 Chat 的 Transcript。
@@ -1487,6 +1500,12 @@ fn recover_transcript(
         .as_ref()
         .filter(|entry| entry.chat_id == source_chat_id)
         .map(|entry| entry.delegation.clone());
+    snapshot.artifact_ticks = loaded
+        .metadata
+        .artifact_ticks
+        .as_ref()
+        .map(|entry| entry.artifact_ticks.clone())
+        .unwrap_or_default();
     kept.fill_conversation(&mut snapshot);
     recover_snapshot_for_resume(snapshot, kept.meta_messages.clone())
 }
@@ -1754,6 +1773,24 @@ impl Agent {
         .await
         .map_err(|error| error.to_string())?
         .map_err(|error| error.to_string())
+    }
+
+    pub(super) fn record_artifact_ticks(
+        &self,
+        chat_id: ChatId,
+        artifact_ticks: Vec<crate::artifacts::ArtifactTick>,
+    ) {
+        if let Some(recorder) = &self.inner.recorder
+            && let Some(log) = recorder.logs.lock().unwrap().get(&chat_id)
+        {
+            recorder.writer.enqueue(
+                &log.path,
+                vec![Line::ArtifactTicks(ArtifactTicksEntry {
+                    chat_id,
+                    artifact_ticks,
+                })],
+            );
+        }
     }
 
     pub(super) fn record_delegation(

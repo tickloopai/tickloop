@@ -13,6 +13,7 @@ pub(crate) enum Line {
     User(ChainEntry),
     Assistant(ChainEntry),
     System(ChainEntry),
+    ArtifactTicks(ArtifactTicksEntry),
     CustomTitle(CustomTitleEntry),
     LastPrompt(LastPromptEntry),
     BranchOrigin(BranchOriginEntry),
@@ -424,4 +425,11 @@ mod tests {
         let line: Line = serde_json::from_str(r#"{"type":"future-kind","value":1}"#).unwrap();
         assert!(matches!(line, Line::Unknown));
     }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ArtifactTicksEntry {
+    pub chat_id: Uuid,
+    pub artifact_ticks: Vec<crate::artifacts::ArtifactTick>,
 }

@@ -953,6 +953,7 @@ mod tests {
 
     fn shell(state: UserShellState, starts_in_background: bool) -> UserShellRecord {
         UserShellRecord {
+            updated_at_ms: None,
             id: Uuid::new_v4(),
             chat_id: Uuid::new_v4(),
             loop_id: None,

@@ -200,6 +200,17 @@ pub struct CommandEnvelope {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 #[allow(clippy::large_enum_variant)]
 pub enum AgentCommand {
+    AddArtifactTick {
+        execution: ExecutionRef,
+        tick: crate::artifacts::ArtifactTick,
+    },
+    RemoveArtifactTick {
+        execution: ExecutionRef,
+        instance_id: String,
+    },
+    ListArtifactTicks {
+        execution: ExecutionRef,
+    },
     Create {
         launch: LaunchSpec,
         initial: Option<UserInput>,
@@ -272,6 +283,9 @@ impl AgentCommand {
             | Self::EditHistory { execution, .. }
             | Self::ManageLoop { execution, .. }
             | Self::ManageTask { execution, .. }
+            | Self::AddArtifactTick { execution, .. }
+            | Self::RemoveArtifactTick { execution, .. }
+            | Self::ListArtifactTicks { execution }
             | Self::EnqueueAfterTurn { execution, .. }
             | Self::RefreshConfiguration { execution } => Some(*execution),
             Self::DecidePermission { request, .. } | Self::AnswerQuestion { request, .. } => {
@@ -744,6 +758,7 @@ impl CommandReceipt {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum CommandResult {
+    ArtifactTicks(Vec<crate::artifacts::ArtifactTick>),
     Created {
         execution: ExecutionRef,
         snapshot: Box<LiveChatSnapshot>,

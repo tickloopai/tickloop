@@ -77,7 +77,7 @@ fn automatic_priority_and_manual_selection_survive_updates_without_editor_focus_
     let shell = item("1.", "printf selected-shell", Some(TASK));
     update(&console, vec![shell.clone()], vec![]);
     assert!(
-        frame(&console)
+        !frame(&console)
             .iter()
             .any(|row| row.contains("selected-shell"))
     );
@@ -118,7 +118,7 @@ fn automatic_priority_and_manual_selection_survive_updates_without_editor_focus_
     );
     let manual = frame(&console);
     assert!(
-        manual.iter().any(|row| row.contains("selected-shell")),
+        manual.iter().any(|row| row.contains("child unique")),
         "{manual:?}"
     );
     assert!(
@@ -131,11 +131,7 @@ fn automatic_priority_and_manual_selection_survive_updates_without_editor_focus_
             .iter()
             .any(|row| row.contains("keep literal jk draftjk"))
     );
-    key(&console, KeyCode::Down);
-    assert!(
-        matches!(key(&console, KeyCode::Enter), Some(InputEvent::OpenStatusTask(id)) if id == TASK)
-    );
-    console.finish_footer_open().unwrap();
+    console.set_agent_family(vec![], None).unwrap();
     update(&console, vec![], vec![item("1.", "fallback todo", None)]);
     let fallback = frame(&console);
     assert!(
@@ -214,6 +210,7 @@ fn shell_snapshot(revision: u64, tasks: Vec<(Uuid, &str, ShellTaskState)>) -> Ta
         tasks: tasks
             .into_iter()
             .map(|(id, command, state)| ShellTask {
+                updated_at_ms: None,
                 id,
                 chat_id: CHAT,
                 origin: ShellTaskOrigin::User,
@@ -240,114 +237,35 @@ fn shell_snapshot(revision: u64, tasks: Vec<(Uuid, &str, ShellTaskState)>) -> Ta
 #[test]
 fn single_shell_activation_and_detail_updates_keep_the_exact_eligible_task() {
     let console = fixture();
-    update(
-        &console,
-        vec![item(
-            "1.",
-            "printf user-literal-0123456789abcdef",
-            Some(TASK),
-        )],
-        vec![],
+    let snapshot = shell_snapshot(
+        1,
+        vec![(TASK, "selected shell", ShellTaskState::Background)],
     );
-    key(&console, KeyCode::Down);
+    console.update_shell_ticks(&snapshot).unwrap();
+    console
+        .state
+        .lock()
+        .unwrap()
+        .key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
     assert!(
         matches!(key(&console, KeyCode::Enter), Some(InputEvent::OpenStatusTask(id)) if id == TASK)
     );
-    let other = Uuid::from_u128(1012);
-    console
-        .show_footer_tasks_at(
-            shell_snapshot(
-                1,
-                vec![
-                    (other, "unrelated foreground", ShellTaskState::Running),
-                    (
-                        TASK,
-                        "printf user-literal-0123456789abcdef",
-                        ShellTaskState::Background,
-                    ),
-                ],
-            ),
-            Some(TASK),
-        )
-        .unwrap();
-    key(&console, KeyCode::Home);
-    let detail = frame(&console);
-    assert!(
-        detail
-            .iter()
-            .any(|row| row.contains("user-literal-0123456789abcdef")),
-        "{detail:?}"
-    );
-    assert!(
-        !detail
-            .iter()
-            .any(|row| row.contains(&TASK.to_string()) || row.contains("unrelated foreground"))
-    );
-    update(
-        &console,
-        vec![],
-        vec![item("1.", "todo while detail is pinned", None)],
-    );
-    console
+    console.show_tasks_at(snapshot, Some(TASK)).unwrap();
+    let effect = console
         .update_tasks(shell_snapshot(
             2,
-            vec![
-                (
-                    other,
-                    "new task must not replace",
-                    ShellTaskState::Background,
-                ),
-                (
-                    TASK,
-                    "printf user-literal-0123456789abcdef",
-                    ShellTaskState::Completed,
-                ),
-            ],
+            vec![(TASK, "selected shell", ShellTaskState::Completed)],
         ))
         .unwrap();
-    let completed = frame(&console);
-    assert!(
-        completed
-            .iter()
-            .any(|row| row.contains("Status: completed")),
-        "{completed:?}"
-    );
-    assert!(
-        completed
-            .iter()
-            .any(|row| row.contains("user-literal-0123456789abcdef"))
-    );
-    assert!(
-        !completed
-            .iter()
-            .any(|row| row.contains("todo while detail")
-                || row.contains("new task must not replace"))
-    );
-    key(&console, KeyCode::Left);
-    assert!(
-        frame(&console)
-            .iter()
-            .any(|row| row.contains("todo while detail"))
-    );
-    assert!(console.state.lock().unwrap().footer.selected().is_none());
-    console
-        .show_tasks(shell_snapshot(
-            3,
-            vec![
-                (
-                    other,
-                    "explicit catalog remains broader",
-                    ShellTaskState::Background,
-                ),
-                (TASK, "completed catalog entry", ShellTaskState::Completed),
-            ],
-        ))
-        .unwrap();
-    key(&console, KeyCode::Left);
-    assert!(
-        frame(&console)
-            .iter()
-            .any(|row| row.contains("explicit catalog remains broader"))
+    assert!(matches!(
+        effect,
+        TaskSurfaceEffect::None | TaskSurfaceEffect::ReadOutput { .. }
+    ));
+    assert!(frame(&console).iter().any(|row| row.contains("completed")));
+    key(&console, KeyCode::Esc);
+    assert_eq!(
+        console.state.lock().unwrap().editor.draft(),
+        "keep literal jk draft"
     );
 }
 
@@ -355,73 +273,32 @@ fn single_shell_activation_and_detail_updates_keep_the_exact_eligible_task() {
 fn multiple_shell_shortcut_opens_the_list_after_an_earlier_single_detail() {
     let console = fixture();
     let second = Uuid::from_u128(1012);
-    update(
-        &console,
-        vec![item("1.", "first shell", Some(TASK))],
-        vec![],
-    );
-    key(&console, KeyCode::Down);
-    assert!(
-        matches!(key(&console, KeyCode::Enter), Some(InputEvent::OpenStatusTask(id)) if id == TASK)
-    );
     console
-        .show_footer_tasks_at(
-            shell_snapshot(1, vec![(TASK, "first shell", ShellTaskState::Background)]),
-            Some(TASK),
-        )
+        .update_shell_ticks(&shell_snapshot(
+            1,
+            vec![
+                (TASK, "first shell", ShellTaskState::Background),
+                (second, "second shell", ShellTaskState::Background),
+            ],
+        ))
         .unwrap();
-    key(&console, KeyCode::Home);
-    assert!(frame(&console).iter().any(|row| row.contains("Status:")));
-    key(&console, KeyCode::Left);
-    key(&console, KeyCode::Esc);
-    update(
-        &console,
-        vec![
-            item("1.", "first shell", Some(TASK)),
-            item("2.", "second shell", Some(second)),
-        ],
-        vec![],
-    );
-    let event = console
+    console
         .state
         .lock()
         .unwrap()
         .key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
-    assert!(matches!(
-        event,
-        Some(InputEvent::OpenFooter(FooterItemId::Tasks))
-    ));
-    console
-        .show_footer_tasks_at(
-            shell_snapshot(
-                2,
-                vec![
-                    (TASK, "first shell", ShellTaskState::Background),
-                    (second, "second shell", ShellTaskState::Background),
-                ],
-            ),
-            None,
-        )
-        .unwrap();
     let list = frame(&console);
     assert!(
-        list.iter().any(|row| row.contains("first shell")),
+        list.iter().any(|row| row.contains("Shells (2)")),
         "{list:?}"
     );
+    key(&console, KeyCode::Char('j'));
     assert!(
-        list.iter().any(|row| row.contains("second shell")),
-        "{list:?}"
+        matches!(key(&console, KeyCode::Enter), Some(InputEvent::OpenStatusTask(id)) if id == second)
     );
-    assert!(!list.iter().any(|row| row.contains("Status:")), "{list:?}");
     assert_eq!(
         console.state.lock().unwrap().editor.draft(),
         "keep literal jk draft"
-    );
-    key(&console, KeyCode::Esc);
-    assert!(
-        frame(&console)
-            .iter()
-            .any(|row| row.contains("keep literal jk draft"))
     );
 }
 
@@ -433,29 +310,19 @@ fn assert_single_shell_shortcut(cached_detail: bool) {
         TASK
     };
     if cached_detail {
-        update(
-            &console,
-            vec![item("1.", "earlier task", Some(TASK))],
-            vec![],
-        );
-        key(&console, KeyCode::Down);
-        assert!(
-            matches!(key(&console, KeyCode::Enter), Some(InputEvent::OpenStatusTask(id)) if id == TASK)
-        );
         console
-            .show_footer_tasks_at(
+            .show_tasks_at(
                 shell_snapshot(1, vec![(TASK, "earlier task", ShellTaskState::Background)]),
                 Some(TASK),
             )
             .unwrap();
-        key(&console, KeyCode::Left);
         key(&console, KeyCode::Esc);
     }
-    update(
-        &console,
-        vec![item("1.", "sole eligible task", Some(target))],
-        vec![],
+    let snapshot = shell_snapshot(
+        2,
+        vec![(target, "sole eligible task", ShellTaskState::Background)],
     );
+    console.update_shell_ticks(&snapshot).unwrap();
     let event = console
         .state
         .lock()
@@ -463,34 +330,13 @@ fn assert_single_shell_shortcut(cached_detail: bool) {
         .key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
     assert!(matches!(
         event,
-        Some(InputEvent::OpenFooter(FooterItemId::Tasks))
+        Some(InputEvent::TickListAction { action: 'r', .. })
     ));
-    console
-        .show_footer_tasks_at(
-            shell_snapshot(
-                2,
-                vec![(target, "sole eligible task", ShellTaskState::Background)],
-            ),
-            None,
-        )
-        .unwrap();
-    key(&console, KeyCode::Home);
-    let detail = frame(&console);
-    assert_eq!(
-        console
-            .state
-            .lock()
-            .unwrap()
-            .task_surface
-            .as_ref()
-            .unwrap()
-            .focus(),
-        TaskSurfaceFocus::Detail { task_id: target }
-    );
     assert!(
-        detail.iter().any(|row| row.contains("Shell 1")),
-        "{detail:?}"
+        matches!(key(&console, KeyCode::Enter), Some(InputEvent::OpenStatusTask(id)) if id == target)
     );
+    console.show_tasks_at(snapshot, Some(target)).unwrap();
+    let detail = frame(&console);
     assert!(
         detail.iter().any(|row| row.contains("sole eligible task")),
         "{detail:?}"
@@ -499,15 +345,10 @@ fn assert_single_shell_shortcut(cached_detail: bool) {
         detail.iter().any(|row| row.contains("Status: background")),
         "{detail:?}"
     );
-    assert!(
-        !detail.iter().any(|row| row.contains("earlier task")),
-        "{detail:?}"
-    );
     key(&console, KeyCode::Esc);
-    assert!(
-        frame(&console)
-            .iter()
-            .any(|row| row.contains("keep literal jk draft"))
+    assert_eq!(
+        console.state.lock().unwrap().editor.draft(),
+        "keep literal jk draft"
     );
 }
 
@@ -566,12 +407,10 @@ async fn global_shell_count_and_open_keep_the_peer_task_and_stop_its_actual_owne
         assert_eq!(snapshot.tasks[0].chat_id, peer);
         let console = fixture();
         console.state.lock().unwrap().chat = Some(source);
-        update(&console, crate::terminal::task_status_items(&snapshot), vec![]);
-        assert!(frame(&console).iter().any(|row| row.contains("Shell 1")));
-        key(&console, KeyCode::Down);
-        assert!(matches!(key(&console, KeyCode::Enter), Some(InputEvent::OpenStatusTask(id)) if id == peer_task));
+        console.update_shell_ticks(&snapshot).unwrap();
+        assert!(console.state.lock().unwrap().tick_list.entries().is_empty());
         let mut subscription = None;
-        crate::terminal::open_tasks(&center, &console, source, &mut subscription, Some(peer_task), true).await.unwrap();
+        crate::terminal::open_tasks(&center, &console, source, &mut subscription, Some(peer_task), false).await.unwrap();
         key(&console, KeyCode::Home);
         let detail = frame(&console);
         assert!(detail.iter().any(|row| row.contains("Status:")), "{detail:?}");
@@ -585,9 +424,9 @@ async fn global_shell_count_and_open_keep_the_peer_task_and_stop_its_actual_owne
         fresh.state.lock().unwrap().chat = Some(source);
         update(&fresh, crate::terminal::task_status_items(&multiple), vec![]);
         let mut subscription = None;
-        crate::terminal::open_tasks(&center, &fresh, source, &mut subscription, None, true).await.unwrap();
+        crate::terminal::open_tasks(&center, &fresh, source, &mut subscription, None, false).await.unwrap();
         let list = frame(&fresh);
-        assert!(list.iter().any(|row| row.contains("Shell 2")), "{list:?}");
+        assert!(list.iter().any(|row| row.contains("Shell")), "{list:?}");
         assert!(list.iter().any(|row| row.contains("peer-shell-marker")), "{list:?}");
         assert!(list.iter().any(|row| row.contains("source-shell-marker")), "{list:?}");
         assert!(!list.iter().any(|row| row.contains("Status:")), "{list:?}");
@@ -684,4 +523,85 @@ fn core_status_floats_on_the_lower_divider_with_roles_and_preserved_fallback_not
             .iter()
             .any(|row| row.starts_with('─') && row.contains("⏵⏵ Auto"))
     );
+}
+
+#[test]
+fn core_status_position_moves_the_complete_styled_segment_and_preserves_fallback() {
+    use tickloop_agent::settings::StatusLinePosition;
+    for mode in ["Auto", "Plan", "Ask", "Full Access"] {
+        let console = fixture();
+        console
+            .update_status_area(mode.into(), "模型 fixture".into(), None, vec![], vec![])
+            .unwrap();
+        let right = frame(&console);
+        let editor = right
+            .iter()
+            .position(|row| row.contains("keep literal jk draft"))
+            .unwrap();
+        let core = right[editor + 1]
+            .trim_start_matches('─')
+            .trim_start()
+            .to_owned();
+        console
+            .set_display_preferences(DisplayPreferences {
+                status_line_position: StatusLinePosition::Left,
+                ..Default::default()
+            })
+            .unwrap();
+        let left = frame(&console);
+        assert_eq!(left.len(), right.len());
+        assert!(left[editor + 1].starts_with(&core), "{left:?}");
+        assert!(left[editor + 1].ends_with('─'));
+        assert_eq!(display_width(&left[editor + 1]), 79);
+        let mut state = console.state.lock().unwrap();
+        assert_eq!(state.editor.draft(), "keep literal jk draft");
+        let (styled, _, _) = state.normal_styled_frame();
+        let styled_editor = styled
+            .iter()
+            .position(|line| line.text().contains("keep literal jk draft"))
+            .unwrap();
+        assert_eq!(styled[styled_editor + 1].fill, None);
+        assert!(
+            styled[styled_editor + 1]
+                .spans
+                .iter()
+                .any(|span| span.text == "模型 fixture" && span.role == Some(Role::Text))
+        );
+        for width in [24, display_width(&core) + 1, display_width(&core) + 2] {
+            state.resize((width + 1).try_into().unwrap(), 24);
+            let left_frame = state.frame().0;
+            state.display.set_preferences(DisplayPreferences::default());
+            let right_frame = state.frame().0;
+            if width == display_width(&core) + 2 {
+                assert!(
+                    left_frame
+                        .iter()
+                        .any(|line| line.starts_with(&core) && line.ends_with('─'))
+                );
+                assert!(
+                    right_frame
+                        .iter()
+                        .any(|line| line.starts_with('─') && line.ends_with(&core))
+                );
+            } else {
+                assert_eq!(left_frame, right_frame);
+            }
+            state.display.set_preferences(DisplayPreferences {
+                status_line_position: StatusLinePosition::Left,
+                ..Default::default()
+            });
+        }
+        state.resize(80, 15);
+        let short_left = state.frame().0;
+        state.display.set_preferences(DisplayPreferences::default());
+        assert_eq!(short_left, state.frame().0);
+        state.resize(80, 24);
+        state.configured_status_lines = Some(vec!["custom user status".into()]);
+        let custom_right = state.frame().0;
+        state.display.set_preferences(DisplayPreferences {
+            status_line_position: StatusLinePosition::Left,
+            ..Default::default()
+        });
+        assert_eq!(custom_right, state.frame().0);
+    }
 }

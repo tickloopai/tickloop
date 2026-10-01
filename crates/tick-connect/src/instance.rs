@@ -26,6 +26,21 @@ impl InstanceRef {
         Ok(Self(identity))
     }
 
+    pub fn artifact(origin: &str, id: &str) -> Result<Self, &'static str> {
+        if id.is_empty()
+            || id.contains('/')
+            || id.chars().any(char::is_control)
+            || !(origin.starts_with("https://") || origin.starts_with("http://"))
+            || origin.chars().any(char::is_control)
+        {
+            return Err("an Artifact Tick requires an origin and artifact identity");
+        }
+        Ok(Self(format!(
+            "artifact:{}/{id}",
+            origin.trim_end_matches('/')
+        )))
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -46,6 +61,12 @@ impl Serialize for InstanceRef {
 impl<'de> Deserialize<'de> for InstanceRef {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let identity = String::deserialize(deserializer)?;
+        if let Some(artifact) = identity.strip_prefix("artifact:") {
+            let (origin, id) = artifact
+                .rsplit_once('/')
+                .ok_or_else(|| serde::de::Error::custom("invalid Artifact Tick identity"))?;
+            return Self::artifact(origin, id).map_err(serde::de::Error::custom);
+        }
         if !identity.starts_with(HERDR_SOURCE) {
             return Err(serde::de::Error::custom(
                 "Tick Instance reference must start with herdr:",

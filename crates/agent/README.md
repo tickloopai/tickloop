@@ -34,7 +34,7 @@ This stops the service and its running Agents. Saved history is kept. `TICKLOOP_
 
 owner 自动启动使用当前登录用户私有 Unix socket，启动锁协调并发 CLI，不安装 launchd 服务。关闭终端／Pane、`/exit` 或 View EOF 只撤界面；owner／worker 退出后旧 execution 失效。`/resume` 打开历史不执行，明确向原 Loop Continue 才恢复其原有效 Trigger；没有自动崩溃续跑或跨崩溃 exactly-once 承诺。确认丢失先查询原 CommandId，创建仍未知时保留输入并阻止盲目重复创建；检查总览与历史后，可按提示 `/acknowledge-create COMMAND_ID` 显式承认未知，以允许另一条新提交，此动作不重放旧命令。New Agent 的暂存选择逐条以回执证明后才提交首个输入，未知或被拒的选择不会重发，也不会让输入落到配置不全的 Agent；同一命令可取消其余选择。普通输入结果未知时原样恢复到输入区，在不改动的情况下再次 Enter 只读取原收据：已被接受就采纳原结果、不再发送；改动后的输入等原结果确定后作为新输入发送；`/acknowledge-input COMMAND_ID` 只停止跟踪、不重发。
 
-输入区自然增长并独立滚动，正文使用底部真实占位后的空间。下方展开 Tasks／Todo／Agents 会缩小正文；帮助按宽度使用一至三列，并临时替换 status 和任务区。条件顶栏只摘要当前正在阅读且 user 消息已滚出视口的回合。`settings.json` 的可选 `statusLines` 是字符串数组，未配置使用默认状态行，空数组隐藏普通状态行，最多显示三条物理行；必要连接／未知提示仍占一行，帮助或请求界面临时隐藏普通 status。预算、焦点与可交互原型见[布局契约](../../.scratch/agent-layout-redesign/layout-contract.md)，真实运行与未测边界见[实施记录](../../.scratch/agent-layout-redesign/implementation.md)。
+输入区自然增长并独立滚动，正文使用底部真实占位后的空间。下方展开 Todo／Agents 会缩小正文；Shell Tick 在内容区右侧的 Tick 列表中显示，输入和底栏保持全宽；帮助按宽度使用一至三列，并临时替换 status 和任务区。条件顶栏只摘要当前正在阅读且 user 消息已滚出视口的回合。`settings.json` 的可选 `statusLines` 是字符串数组，未配置使用默认状态行，空数组隐藏普通状态行，最多显示三条物理行；必要连接／未知提示仍占一行，帮助或请求界面临时隐藏普通 status。预算、焦点与可交互原型见[布局契约](../../.scratch/agent-layout-redesign/layout-contract.md)，真实运行与未测边界见[实施记录](../../.scratch/agent-layout-redesign/implementation.md)。
 
 使用默认 API Key 模式时，可以先启动 Agent，在 `/provider` 中选择连接；没有凭据时会自动要求输入并保存 Key。输入内容以星号遮蔽，不进入对话或输入历史。Key 保存到 Agent 状态目录的 `.env`（文件权限 `0600`），保存后立即生效，重启继续可用。也支持启动前设置 `DEEPSEEK_API_KEY` 等环境变量；同名变量以已保存的 `.env` 值优先。模型 YAML 只保存变量名称，不保存凭据值。未保存模型选择时，默认模型为 DeepSeek 的 `deepseek-flash`，使用 OpenAI Chat Completions。已有模型配置继续按保存的协议读取。
 
@@ -161,7 +161,9 @@ Provider 内的 `id` 是配置身份，`service_model_id` 是服务实际接收�
 
 排查网络失败时，可为启动命令设置 `TICKLOOP_NETWORK_DIAGNOSTICS=1`，将标准错误重定向到本地日志。该模式记录失败阶段、目标的协议/主机/端口、代理来源、HTTP 状态和耗时，不记录 URL 路径、查询参数、认证头或请求正文；默认不输出这些诊断行。
 
-输入自然语言开始工作，再输入补充要求继续同一目标。输入区固定在终端底部，上方显示流式回复和工具摘要。单行状态栏依次显示当前 Execution Mode、模型及 `Context x% used`，重要提示优先显示；已知窗口大小且当前模型尚无请求时从 `Context 0% used` 开始；请求进行中沿用 0% 或最近一次已确认用量，窗口大小未知或请求结束后仍无已确认用量时显示 `Context —`。仍在活动状态的后台 Shell Tasks 和当前 Loop 的 Todo 共用状态栏下方的单列面板，默认只显示计数标签，点击或按 Down、Enter 展开；Tasks 可用 `j`／`k` 选中单个任务，Enter 打开详情，`x` 停止，Todo 可用相同按键滚动；Subagents 尚未接入。PgUp／PgDn 回看半页，Ctrl+Home／End 到会话首尾；上滚后新输出不会抢走阅读位置，底栏显示新消息数。`Shift+Tab` 在普通输入界面按 Auto → Ask → Full Access → Auto 循环；权限 Diff、菜单和候选打开时由当前界面优先处理。`/settings` 中的 Auto-scroll 开关只作用于当前终端客户端，关闭后手动到底也不会被之后的输出重新带走。
+输入自然语言开始工作，再输入补充要求继续同一目标。输入区固定在终端底部，上方显示流式回复和工具摘要。单行状态栏依次显示当前 Execution Mode、模型及 `Context x% used`，重要提示优先显示；已知窗口大小且当前模型尚无请求时从 `Context 0% used` 开始；请求进行中沿用 0% 或最近一次已确认用量，窗口大小未知或请求结束后仍无已确认用量时显示 `Context —`。当前 Loop 的 Todo 与同根 Agents 使用底栏面板，点击或按 Down、Enter 展开。当前 Chat 的 Shell Tick（含本进程内已结束的执行）、加入的产物和已订阅的 Tick 在内容区右侧的 Tick 列表中呈现；列表内 `j`／`k` 导航，Enter 打开目标，Shell 在详情中停止，列表 `x` 只移除已结束的 Shell。PgUp／PgDn 回看半页，Ctrl+Home／End 到会话首尾；上滚后新输出不会抢走阅读位置，底栏显示新消息数。`Shift+Tab` 在普通输入界面按 Auto → Ask → Full Access → Auto 循环；权限 Diff、菜单和候选打开时由当前界面优先处理。`/settings` 中的 Auto-scroll 开关只作用于当前终端客户端，关闭后手动到底也不会被之后的输出重新带走。
+
+`/settings` 的 Reduce motion 后有 `Status line position: Right`，Enter 切换 Left／Right并保存 `statusLinePosition`（默认 `right`）。保存成功后当前 View立即采用；新 View读取保存值，其他已打开 View不广播更新。它只移动输入框下分隔线中的完整模式、模型与 Context 片段，窄屏或短屏仍沿用独立状态行的回退，自定义 `statusLines` 和通知、任务分类不改变。
 
 输入 `/model` 在已配置 Provider → Model 两级中选择，已有选择时直接进入当前 Provider，`/provider` 也可选择连接并继续模型选择，显式重认证与配置入口保留。模型页标题显示厂商及实际产品、地区、服务域名；模型行使用完整 Model Card 名称；按固定厂商顺序、产品/地区连接顺序，再按模型系列（OpenAI 在 Claude 前）和接入目录维护的能力顺序排列。能力顺序不改变默认推荐。光标所在行用整行背景高亮，长列表跟随光标并提示上下方还有内容；当前模型用 `●` 标记，打开时定位到它，但不移到第一项。交互式 Provider 与 Model 选择器不显示序号，也不接受数字直接确认；管道模式保留编号文本选择作为非交互回退。上下键、`j`／`k`、`Ctrl+N`／`Ctrl+P` 导航，左右键或 `h`／`l` 调整 Thinking，回车应用模型与 Thinking，`Esc` 返回 Provider 层，再按 `Esc` 关闭。模型页按 `p` 打开高亮模型所属连接的配置，成功后继续该连接模型页，取消返回发起层并保留草稿；也可通过 Configure Providers 配置其他连接。新配置连接立即出现在 Provider 层，但不自动应用。`/thinking` 可单独调整当前模型的 Thinking 档位。每个模型绑定首选协议，普通菜单不提供独立 API 风格切换；DeepSeek 只列 OpenAI Chat Completions 的首选模型。两个模型共用 `DEEPSEEK_API_KEY`；当前内置 Model Card 的上下文窗口为 1M，输出限制为 64,000 tokens，可通过公开配置调整。`/settings` 集中显示模型、Execution Mode、当前会话状态、本进程用量和 Auto-scroll。照 Claude Code，`/model` 的选择、持久权限规则和 `defaultMode` 位于状态根目录的 `settings.json`；启动时 `--config` 与 `--mode` 分别优先于保存的模型和默认模式。内置默认是 Auto。Chat 内切换、会话级规则和 `/add-dir` 附加目录只在本进程内有效；新建、恢复与 Branch 使用当时的默认模式，不恢复来源 Chat 的临时模式。Auto-scroll 作用于当前终端会话；在途工作结束后模型切换才生效，历史按目标模型投影，协议变化不要求先压缩。已知模型的上下文窗口自动取该模型的最大值。
 
@@ -287,7 +289,7 @@ Jev 非敏感服务配置仍可写在用户 `settings.json` 的 `jev`，例如 `
 
 当前 Chat 的 Recent activity 页保留最多 100 条最终权限结果，包括只读工具的直接放行、LLM／Jev 审批、人工确认和拒绝。每项占一行，显示结果、判定方式和操作；`No review` 表示直接放行且未调用审批模型，`LLM`／`Jev` 表示实际完成审批的模型来源，`Manual` 表示人工决定。Enter 查看请求参数、时间、原因、规则和回退经过。请求详情保留有界的命令、路径和普通输入内容，敏感值脱敏；旧记录未保存请求时明确提示。权限放行不代表工具执行成功。启用 Chat 持久保存且记录成功时，重启恢复同一 Chat 后可继续查看；关闭持久保存时只在本次运行中保留。已有拒绝记录可继续读取，旧对话中未记录的放行不会补造。只有拒绝详情可按 `r` 请求 Agent 重新计划和审批，不能直接重放历史工具命令或建立 Allow。Allow／Ask／Deny 和 Directories 管理页本期暂不展示，既有规则与 `/rule`、`/add-dir` 等命令继续生效。明确拒绝作为可恢复工具结果；软拒绝连续达到阈值时交互 Chat 可转人工，Hard deny 不能这样放行。`--deny-on-prompt` 和 `--dangerously-skip-permissions` 是不进入普通模式选择的高级启动策略；后者只应用于外部隔离环境。
 
-首次进入未知的规范化工作目录时，交互终端会在加载项目内容或创建 Chat 前要求信任；拒绝不会发起模型或工具请求。信任保存在用户本地 `settings.json`，等价符号链接共享同一目录身份。非交互启动默认拒绝未知目录；外部宿主已经独立建立信任时才使用 `--working-directory-is-trusted` 明确声明该前提。
+首次进入未知的规范化工作目录时，先启动终端界面，再显示目录信任选择；默认选中 `No, exit`，用方向键、j/k 或 Ctrl+N/P 选择后 Enter 确认。No、Esc、Ctrl+C 或 EOF 安静退出（exit 0），不保存信任或发起模型、工具请求。明确选择 Yes 后才加载项目内容、连接执行服务并进入普通输入。信任通过用户本地 `settings.json` 保存精确目录（包括 home），等价符号链接共享同一身份，子目录不自动继承；保存失败留在选择页，可重试或取消。非交互启动默认拒绝未知目录；外部宿主已经独立建立信任时才使用 `--working-directory-is-trusted` 明确声明该前提，且该参数不保存信任。
 
 搜索配置示例为 `examples/mwmbl-search-config.json`，指向公开的 Mwmbl 搜索接口。设置服务地址不等于授予联网权限；工具执行前仍按当前规则检查。定时任务、后台进程与切走的 Chat 依赖本机 daemon／worker 存活。退出 View 不停止执行；所有者或机器退出后的恢复需要显式装载与 Continue。
 
@@ -321,3 +323,5 @@ cargo test -p tickloop-agent --test terminal
 Agent 的呈现与宿主布局分开，Herdr 负责容器外观；颜色、装饰与 Theme 不写入业务上下文和 Agent 存档。
 
 内置主协议卡 ID 采用官方原始服务 ID，保留大小写；`adapter` 表达协议，官方模型名称不添加自造协议/套餐后缀。Provider 的 `model_aliases` 保留旧 ID：例如 `gpt-6.1-sol-responses` → `gpt-6.1-sol`、`minimax-m3-messages` → `MiniMax-M3`。旧 `default_model`、补丁和保存选择可继续解析，下一次明确保存使用 canonical ID；身份规范化不会替换用户路由或能力覆盖，也不升级实际版本。DeepSeek 已有额外 Messages/Responses 卡继续保留独立旧 ID 与原 Adapter/endpoint，避免与同模型主协议卡冲突。
+
+The current Chat’s Ticks appear in a 42-column Tick List beside the conversation on wide terminals. The input, both dividers, hints and footer remain full width; narrow-terminal overlays cover only conversation content. Empty lists stay hidden. `/ticks` or the input’s `Ticks N` toggle saves visibility; `→` from an empty input focuses a nonempty list, and `Esc` returns. Shells open the task detail view; subscribed Ticks open their subscription. `/artifacts` signs in when needed and opens the All/Mine/Shared/Pinned picker. Enter adds an artifact without granting access, connecting feedback or subscribing. Artifact `f` resumes feedback or asks the Agent to connect it. Artifact Service sign-out is in `/settings`.

@@ -507,54 +507,27 @@ fn agent_layout_rejected_shell_restores_shell_mode_and_preserves_newer_text() {
 
 #[test]
 fn agent_layout_removed_footer_item_chooses_the_nearest_surviving_task() {
-    let mut state = State::new(true, 80, 24);
+    let mut state = State::new(true, 140, 24);
+    let chat = Uuid::new_v4();
+    state.chat = Some(chat);
     state.prompt_enabled = true;
-    state.status_area.update(
-        "Ask".into(),
-        "fixture".into(),
-        None,
-        status_items(),
-        Vec::new(),
-    );
-    state
-        .footer
-        .update(state.status_area.available_panels().collect::<Vec<_>>());
-    let console = super::tests::console_with_state(state);
-    let mut state = console.state.lock().unwrap();
     state.insert("cached draft");
-    state.key(key(KeyCode::Down));
-    state.key(key(KeyCode::Down));
-    for _ in 0..12 {
-        state.key(key(KeyCode::Char('j')));
-    }
-    assert_eq!(
-        state.status_area.selected_task(),
-        Some(Uuid::from_u128(212))
-    );
-    drop(state);
+    let console = super::tests::console_with_state(state);
+    let mut snapshot = super::tests::task_snapshot(chat, 20);
+    console.update_shell_ticks(&snapshot).unwrap();
+    let selected = snapshot.tasks[12].id;
     console
-        .update_status_area(
-            "Ask".into(),
-            "fixture".into(),
-            None,
-            status_items()
-                .into_iter()
-                .filter(|task| task.task_id != Some(Uuid::from_u128(212)))
-                .collect(),
-            Vec::new(),
-        )
-        .unwrap();
-    let mut state = console.state.lock().unwrap();
-    assert_eq!(
-        state.status_area.selected_task(),
-        Some(Uuid::from_u128(213))
-    );
+        .state
+        .lock()
+        .unwrap()
+        .tick_list
+        .select(&selected.to_string());
+    snapshot.tasks.retain(|task| task.id != selected);
+    console.update_shell_ticks(&snapshot).unwrap();
+    let state = console.state.lock().unwrap();
+    assert_eq!(state.tick_list.entries().len(), 19);
+    assert_ne!(state.tick_list.selected().unwrap().id, selected.to_string());
     assert_eq!(state.editor.draft(), "cached draft");
-    assert!(state.footer_list_focused);
-    assert!(state.frame().0.iter().any(|row| row.contains("task 13")));
-    assert!(
-        matches!(state.key(key(KeyCode::Enter)), Some(InputEvent::OpenStatusTask(task)) if task == Uuid::from_u128(213))
-    );
 }
 
 #[test]
@@ -592,8 +565,8 @@ fn agent_layout_footer_enters_at_the_bottom_with_following_disabled() {
         "Ask".into(),
         "fixture".into(),
         None,
-        status_items(),
         Vec::new(),
+        status_items(),
     );
     state
         .footer
@@ -604,7 +577,7 @@ fn agent_layout_footer_enters_at_the_bottom_with_following_disabled() {
     assert!(!state.scrollback.is_following());
     state.insert("keep this draft");
     state.key(key(KeyCode::Down));
-    assert_eq!(state.footer.selected(), Some(FooterItemId::Tasks));
+    assert_eq!(state.footer.selected(), Some(FooterItemId::Todo));
     assert!(state.frame().0.iter().any(|row| row.contains("task 00")));
     assert_eq!(state.editor.draft(), "keep this draft");
     assert!(!state.scrollback.is_following());
@@ -618,8 +591,8 @@ fn agent_layout_first_down_expands_and_list_keys_preserve_the_draft() {
         "Ask".into(),
         "test model".into(),
         None,
-        status_items(),
         Vec::new(),
+        status_items(),
     );
     state
         .footer
@@ -629,7 +602,7 @@ fn agent_layout_first_down_expands_and_list_keys_preserve_the_draft() {
     assert!(state.footer.selected().is_none());
     assert!(!state.footer_list_focused);
     state.key(key(KeyCode::Down));
-    assert_eq!(state.footer.selected(), Some(FooterItemId::Tasks));
+    assert_eq!(state.footer.selected(), Some(FooterItemId::Todo));
     assert!(state.frame().0.iter().any(|line| line.contains("task 00")));
     assert!(!state.footer_list_focused);
     state.key(key(KeyCode::Down));
@@ -667,8 +640,8 @@ fn agent_layout_return_restores_reading_draft_and_focuses_the_editor() {
         "Ask".into(),
         "test model".into(),
         None,
-        status_items(),
         Vec::new(),
+        status_items(),
     );
     let panels = state.status_area.available_panels().collect::<Vec<_>>();
     state.footer.update(panels);
@@ -676,7 +649,7 @@ fn agent_layout_return_restores_reading_draft_and_focuses_the_editor() {
     state.key(key(KeyCode::Down));
     state.key(key(KeyCode::Char('j')));
     state.scrollback.scroll(ScrollAction::First);
-    let selected = state.status_area.selected_task();
+    let selected = state.status_area.selected_todo().map(|(index, _)| index);
     let reading = state.scrollback.frame(width, 16).lines;
     drop(state);
     assert!(!console.activate_agent(CHILD_AGENT).unwrap());
@@ -691,14 +664,14 @@ fn agent_layout_return_restores_reading_draft_and_focuses_the_editor() {
     assert_eq!(state.editor.draft(), "parent draft");
     assert!(!state.scrollback.is_following());
     assert_eq!(state.scrollback.frame(width, 16).lines, reading);
-    assert_eq!(state.status_area.selected_task(), selected);
+    assert_eq!(
+        state.status_area.selected_todo().map(|(index, _)| index),
+        selected
+    );
     assert!(!state.footer_list_focused);
     assert!(state.footer.selected().is_none());
     assert!(state.status_area.is_open());
-    assert_eq!(
-        state.status_area.selected_panel(),
-        Some(FooterItemId::Tasks)
-    );
+    assert_eq!(state.status_area.selected_panel(), Some(FooterItemId::Todo));
     assert!(!state.conversation_focused);
     drop(state);
     assert!(console.activate_agent(CHILD_AGENT).unwrap());
@@ -903,12 +876,12 @@ fn agent_layout_float_return_keeps_input_geometry_and_escape_priorities() {
             "Ask".into(),
             "fixture".into(),
             None,
-            status_items(),
             Vec::new(),
+            status_items(),
         );
         let panels = state.status_area.available_panels().collect::<Vec<_>>();
         state.footer.update(panels);
-        state.footer.select(FooterItemId::Tasks);
+        state.footer.select(FooterItemId::Todo);
         assert!(state.key(key(KeyCode::Esc)).is_none());
         assert!(state.footer.selected().is_none());
         assert!(!state.scrollback.is_following());
@@ -1505,8 +1478,8 @@ fn agent_layout_required_connection_notice_borrows_one_row_without_changing_conf
             "Ask".into(),
             "fixture".into(),
             None,
-            status_items(),
             Vec::new(),
+            status_items(),
         );
         state
             .footer
@@ -1522,7 +1495,7 @@ fn agent_layout_required_connection_notice_borrows_one_row_without_changing_conf
             frame.iter().any(|line| line.contains("Disconnected")),
             "{frame:?}"
         );
-        assert!(frame.iter().any(|line| line.contains("Shell")), "{frame:?}");
+        assert!(frame.iter().any(|line| line.contains("Todo")), "{frame:?}");
         assert!(
             frame.len() <= agent_layout::bottom_capacity(usize::from(height)),
             "{frame:?}"
@@ -2149,7 +2122,7 @@ fn agent_layout_real_pty_budget_and_focus_matrix() {
             let mut terminal = PtyConsole::start(width, height);
             terminal.wait_for("initial", |frame| {
                 frame.contains("history 99")
-                    && frame.contains("Shell 20")
+                    && !frame.contains("Shell 20")
                     && frame.contains("child one")
                     && !frame.contains("task 00")
             });
@@ -2178,14 +2151,8 @@ fn agent_layout_real_pty_budget_and_focus_matrix() {
             );
             terminal.send(b"\r");
             terminal.wait_for("submit", |frame| frame.contains("Draft submitted"));
-            terminal.send(b"\x1b[B\x1b[C");
-            terminal.wait_for("explicit Shell selection opens its preview", |frame| {
-                frame.contains("task 00") && !frame.contains("child one")
-            });
-            terminal.send(b"\x1b[Bjjjjjjjjjjjj");
-            terminal.wait_for("list scroll", |frame| {
-                frame.contains("task 12") && !frame.contains("task 00")
-            });
+            terminal.send(b"\x1b[B\x1b[B");
+            terminal.wait_for("Agents list focus", |frame| frame.contains("child one"));
             terminal.send_and_wait(b"\x1b");
             let output = Arc::clone(&terminal.output);
             terminal.wait_for("Esc restores the visible editor caret", |_| {
@@ -2202,7 +2169,7 @@ fn agent_layout_real_pty_budget_and_focus_matrix() {
                     .lines()
                     .any(|line| line.starts_with('❯') && line.contains("jk"))
             });
-            assert!(focused.contains("task 12"), "{focused}");
+            assert!(focused.contains("child one"), "{focused}");
             terminal.send(b"\x15");
             terminal.wait_for("editor is cleared before help", |frame| {
                 frame.lines().any(|line| line.trim() == "❯")
@@ -2226,7 +2193,7 @@ fn agent_layout_real_pty_budget_and_focus_matrix() {
             }
             terminal.send(b"\x1b");
             terminal.wait_for("help closed", |frame| {
-                frame.contains("Shell 20") && !frame.contains("Ctrl+J newline")
+                !frame.contains("Shell 20") && !frame.contains("Ctrl+J newline")
             });
             terminal.send(b"\x1b[D");
             let overview = terminal.wait_for("overview", |frame| {
@@ -4467,8 +4434,8 @@ fn agent_layout_session_hints_name_the_action_of_the_focused_region() {
         "Ask".into(),
         "test model".into(),
         None,
-        status_items(),
         Vec::new(),
+        status_items(),
     );
     state
         .footer
@@ -4844,31 +4811,17 @@ fn agent_layout_conversation_occupancy_expanding_tasks_avoids_whole_screen_redra
         "Ask".into(),
         "fixture".into(),
         None,
+        Vec::new(),
         status_items(),
-        vec![StatusItem {
-            id: "1.".into(),
-            task_id: None,
-            can_stop: false,
-            title: "short todo".into(),
-            state: "pending",
-            role: Role::MutedText,
-        }],
     );
-    state
-        .footer
-        .update(state.status_area.available_panels().collect::<Vec<_>>());
+    state.footer.update(state.status_area.available_panels());
     state.scrollback.append("first line\n");
     state.insert("draft line");
-
-    assert_eq!(state.status_area.selected_panel(), Some(FooterItemId::Todo));
     let expanded = super::tests::output_after_input_area_change(&mut state, |state| {
         state.key(key(KeyCode::Down));
-        state.key(key(KeyCode::Right));
+        state.key(key(KeyCode::Enter));
     });
-    assert_eq!(
-        state.status_area.selected_panel(),
-        Some(FooterItemId::Tasks)
-    );
+    assert_eq!(state.status_area.selected_panel(), Some(FooterItemId::Todo));
     assert_eq!(state.editor.draft(), "draft line");
     assert!(expanded.contains("task 00"), "{expanded:?}");
 }

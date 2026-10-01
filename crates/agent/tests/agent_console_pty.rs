@@ -436,7 +436,7 @@ async fn run_lifecycle(fixture: &PrivateFixture) {
     reopened
         .wait_for(
             "open live Agent exposes its real background Task",
-            |frame| frame.contains("Shell 1") && !frame.contains("Agents · local"),
+            |frame| frame.contains("Ticks 1") && !frame.contains("Agents · local"),
         )
         .await;
     let rows = catalog(&client).await;
@@ -446,22 +446,22 @@ async fn run_lifecycle(fixture: &PrivateFixture) {
     reopened.send(b"?");
     reopened
         .wait_for("help replaces the real Task summary", |frame| {
-            frame.contains("Ctrl+J newline") && !frame.contains("Shell 1")
+            frame.contains("Ctrl+J newline") && !frame.contains("Ticks 1")
         })
         .await;
     reopened.send(b"\x1b");
     reopened
         .wait_for("help restores the real Task summary", |frame| {
-            frame.contains("Shell 1")
+            frame.contains("Ticks 1")
         })
         .await;
-    reopened.send(b"\x1b[B");
+    reopened.send(b"\x1b[C");
     reopened
-        .wait_for("first Down focuses the real Shell preview", |frame| {
-            frame.contains("1 items") && frame.contains("while [ ! -f finish ]")
+        .wait_for("Right focuses the real Shell Tick", |frame| {
+            frame.contains("Shells (1)")
         })
         .await;
-    reopened.send(b"\x1b[B\r");
+    reopened.send(b"\r");
     reopened
         .wait_for("Task detail retrieves real worker output", |frame| {
             frame.lines().any(|line| line.trim() == "Shell task")
@@ -942,7 +942,7 @@ async fn run_sustained_owner_loss(
     assert!(busy.user_shells[1].starts_in_background);
     assert!(busy.last_model_run.is_none());
     view.wait_for("actual busy Shell task is cached in the View", |frame| {
-        frame.contains("Shell 1")
+        frame.contains("Ticks 2")
     })
     .await;
     view.send(b"UNSENT-OWNER-LOSS-DRAFT-jk");

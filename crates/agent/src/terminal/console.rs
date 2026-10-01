@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use super::workspace_trust::{TRUST_ACCEPT_CHOICE_INDEX, TrustDecision, WorkspaceTrust};
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{
     self, DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange,
@@ -21,7 +22,7 @@ use tickloop_agent::{
         ImageContext, ImageOrigin, InputContext, QueuedInput, QueuedInputKind,
         TickSubscriptionStatus,
     },
-    settings::DisplayPreferences,
+    settings::{DisplayPreferences, StatusLinePosition},
 };
 use tokio::sync::mpsc;
 use unicode_width::UnicodeWidthChar;
@@ -41,8 +42,14 @@ mod layout_tests;
 #[path = "console/request_layout_tests.rs"]
 mod request_layout_tests;
 #[cfg(test)]
+#[path = "console/tick_list_tests.rs"]
+mod tick_list_tests;
+#[cfg(test)]
 #[path = "console/unified_footer_tests.rs"]
 mod unified_footer_tests;
+#[cfg(test)]
+#[path = "console/workspace_trust_tests.rs"]
+mod workspace_trust_tests;
 use agent_layout::OverviewState;
 use agent_layout::OverviewTarget;
 pub(super) use agent_layout::{
@@ -103,6 +110,9 @@ use super::{
     task_surface::{
         TaskOutputUpdate, TaskSurface, TaskSurfaceAction, TaskSurfaceEffect, TaskSurfaceFocus,
         TaskSurfaceSnapshot, TaskViewport,
+    },
+    tick_list::{
+        TICK_LIST_AUTO_MIN_COLUMNS, TICK_LIST_COLUMNS, TickGroup, TickList, TickListEntry,
     },
     transcript::{Transcript, TranscriptDocument, TranscriptEvent},
 };
@@ -203,6 +213,15 @@ pub(super) enum InputEvent {
     OpenOverview,
     CloseOverview,
     OpenAgent(Uuid),
+    ToggleTickList {
+        show: bool,
+    },
+    ArtifactChoice(Box<super::artifacts_picker::ArtifactChoice>),
+    TickListAction {
+        chat: Uuid,
+        id: String,
+        action: char,
+    },
     OpenStatusTask(Uuid),
     StopStatusTask(Uuid),
     TaskSurface(TaskSurfaceEffect),
@@ -248,6 +267,20 @@ pub(super) enum InputEvent {
 impl fmt::Debug for InputEvent {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ToggleTickList { show } => formatter
+                .debug_struct("ToggleTickList")
+                .field("show", show)
+                .finish(),
+            Self::ArtifactChoice(choice) => formatter
+                .debug_tuple("ArtifactChoice")
+                .field(choice)
+                .finish(),
+            Self::TickListAction { chat, id, action } => formatter
+                .debug_struct("TickListAction")
+                .field("chat", chat)
+                .field("id", id)
+                .field("action", action)
+                .finish(),
             Self::InterruptActivity => formatter.write_str("InterruptActivity"),
             Self::Line(value) => formatter.debug_tuple("Line").field(value).finish(),
             Self::Prompt {
@@ -410,6 +443,32 @@ pub(super) struct Console {
     branch_commit_failure: Arc<Mutex<Option<String>>>,
 }
 
+pub(super) struct ArtifactMetadataSink {
+    state: std::sync::Weak<Mutex<State>>,
+}
+
+impl ArtifactMetadataSink {
+    pub(super) fn update(
+        &self,
+        chat: Uuid,
+        id: String,
+        metadata: Option<crate::artifacts::ArtifactMetadata>,
+    ) {
+        let Some(state) = self.state.upgrade() else {
+            return;
+        };
+        let Ok(mut state) = state.lock() else {
+            return;
+        };
+        let list = if state.chat == Some(chat) {
+            &mut state.tick_list
+        } else {
+            &mut state.view_cache.entry(Some(chat)).or_default().tick_list
+        };
+        list.metadata.insert(id, metadata);
+    }
+}
+
 struct Lifetime {
     state: Arc<Mutex<State>>,
     stop: Arc<AtomicBool>,
@@ -419,6 +478,7 @@ struct Lifetime {
 }
 
 struct State {
+    workspace_trust: Option<WorkspaceTrust>,
     interactive: bool,
     /// Plain output ends inside a line, such as a reply streamed without its line feed yet.
     plain_line_open: bool,
@@ -454,6 +514,7 @@ struct State {
     activity_interruptible: bool,
     back_to_bottom_target: Option<BackToBottomTarget>,
     back_to_bottom_pressed: bool,
+    tick_toggle_target: Option<BackToBottomTarget>,
     footer_bar_target: Option<FooterBarTarget>,
     pointer_input: Option<InputEvent>,
     completion: Completion,
@@ -496,6 +557,7 @@ struct State {
     picker_kind: Option<PickerKind>,
     /// The `/resume` picker. It owns the whole screen and every key while it is open; the
     /// draft and conversation underneath stay untouched.
+    artifacts_picker: Option<super::artifacts_picker::ArtifactsPicker>,
     conversation_picker: Option<ConversationPicker>,
     menu_link: Option<(Uuid, String)>,
     menu_review: Option<MenuReviewState>,
@@ -515,6 +577,8 @@ struct State {
     transcript: Option<(Uuid, Transcript)>,
     diff_screen: Option<DiffScreen>,
     diff_screen_cache: HashMap<Uuid, DiffDialog>,
+    tick_list: TickList,
+    tick_list_preference: tickloop_agent::settings::TickListPreference,
     task_surface: Option<TaskSurface<Uuid>>,
     task_surface_cache: HashMap<Uuid, TaskSurface<Uuid>>,
     todo_detail: Option<TodoDetail>,
@@ -571,6 +635,7 @@ impl RenderedRegion {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RenderedView {
+    WorkspaceTrust,
     /// Conversation history in rows `0..body_rows`, the input area below them.
     Conversation {
         body_rows: usize,
@@ -642,6 +707,7 @@ impl Default for ChatInput {
 
 #[derive(Default)]
 struct ViewPresentation {
+    tick_list: TickList,
     scrollback: Scrollback,
     echoed_inputs: HashSet<Uuid>,
     awaiting_input_echoes: HashSet<Uuid>,
@@ -829,6 +895,399 @@ impl Drop for FrameHold {
 }
 
 impl Console {
+    #[cfg(test)]
+    pub(super) fn test_for_chat(chat: Uuid) -> Self {
+        let mut state = State::new(false, 140, 25);
+        state.chat = Some(chat);
+        state.prompt_enabled = true;
+        tests::console_with_state(state)
+    }
+
+    pub(super) fn artifact_metadata_sink(&self) -> ArtifactMetadataSink {
+        ArtifactMetadataSink {
+            state: Arc::downgrade(&self.state),
+        }
+    }
+
+    pub(super) fn show_artifacts_picker(
+        &self,
+        picker: super::artifacts_picker::ArtifactsPicker,
+    ) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        state.artifacts_picker = Some(picker);
+        state.rendered_region = None;
+        state
+            .draw(&mut io::stdout().lock())
+            .map_err(|error| error.to_string())
+    }
+    pub(super) fn artifacts_picker_is_open(&self) -> Result<bool, String> {
+        Ok(self
+            .state
+            .lock()
+            .map_err(|error| error.to_string())?
+            .artifacts_picker
+            .is_some())
+    }
+    pub(super) fn take_artifact_load(
+        &self,
+    ) -> Result<Option<super::artifacts_picker::ArtifactLoad>, String> {
+        Ok(self
+            .state
+            .lock()
+            .map_err(|error| error.to_string())?
+            .artifacts_picker
+            .as_mut()
+            .and_then(|picker| picker.take_load()))
+    }
+    pub(super) fn artifact_page_loaded(
+        &self,
+        request: &super::artifacts_picker::ArtifactLoad,
+        result: Result<(crate::artifacts::ArtifactPage, HashSet<String>, bool), String>,
+    ) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        if let Some(picker) = &mut state.artifacts_picker {
+            picker.loaded(request, result);
+        }
+        state
+            .draw(&mut io::stdout().lock())
+            .map_err(|error| error.to_string())
+    }
+    pub(super) fn artifact_picker_matches(&self, id: Uuid) -> Result<bool, String> {
+        let state = self.state.lock().map_err(|error| error.to_string())?;
+        Ok(state
+            .artifacts_picker
+            .as_ref()
+            .is_some_and(|picker| picker.id() == id && picker.chat == state.chat))
+    }
+    pub(super) fn artifact_picker_error(&self, error: String) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        if let Some(picker) = &mut state.artifacts_picker {
+            picker.report(error);
+        }
+        state
+            .draw(&mut io::stdout().lock())
+            .map_err(|error| error.to_string())
+    }
+    pub(super) fn refresh_artifacts_picker(&self) -> Result<(), String> {
+        if let Some(picker) = &mut self
+            .state
+            .lock()
+            .map_err(|error| error.to_string())?
+            .artifacts_picker
+        {
+            picker.refresh();
+        }
+        Ok(())
+    }
+    pub(super) fn select_artifact_tick(&self, chat: Uuid, id: &str) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        state.artifacts_picker = None;
+        state.switch_view_chat(Some(chat));
+        let overlay = state.width + 1 < TICK_LIST_AUTO_MIN_COLUMNS
+            || state.tick_list_preference == tickloop_agent::settings::TickListPreference::Hidden;
+        state.tick_list.focus(overlay, Some(TickGroup::Artifacts));
+        state.tick_list.select(id);
+        state.rendered_region = None;
+        state
+            .draw(&mut io::stdout().lock())
+            .map_err(|error| error.to_string())
+    }
+
+    pub(super) fn update_artifact_ticks(
+        &self,
+        snapshot: &tickloop_agent::runtime::ChatSnapshot,
+    ) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        let list = if state.chat == Some(snapshot.id) {
+            &mut state.tick_list
+        } else {
+            &mut state
+                .view_cache
+                .entry(Some(snapshot.id))
+                .or_default()
+                .tick_list
+        };
+        let entries = snapshot
+            .artifact_ticks
+            .iter()
+            .map(|tick| {
+                let metadata = list.metadata.get(&tick.instance_id());
+                let binding = snapshot
+                    .loops
+                    .iter()
+                    .flat_map(|goal| &goal.event_sources)
+                    .find(|source| source.source_key == tick.artifact_id);
+                let status = if metadata.is_some_and(Option::is_none) {
+                    "unavailable"
+                } else if binding.is_some_and(|source| source.resume_required) {
+                    "feedback paused"
+                } else if binding.is_some() {
+                    "feedback here"
+                } else if metadata
+                    .and_then(Option::as_ref)
+                    .is_some_and(|metadata| metadata.association.is_some())
+                {
+                    "feedback elsewhere"
+                } else {
+                    ""
+                };
+                TickListEntry {
+                    id: tick.instance_id(),
+                    group: TickGroup::Artifacts,
+                    glyph: Glyph::ArtifactTick,
+                    title: list
+                        .subscriptions
+                        .iter()
+                        .find(|row| row.instance.as_str() == tick.instance_id())
+                        .and_then(|row| row.title.clone())
+                        .or_else(|| {
+                            metadata
+                                .and_then(Option::as_ref)
+                                .map(|metadata| metadata.title.clone())
+                        })
+                        .unwrap_or_else(|| tick.title.clone()),
+                    kind: if metadata
+                        .and_then(Option::as_ref)
+                        .map(|metadata| metadata.format.as_str())
+                        .unwrap_or(&tick.format)
+                        == "html"
+                    {
+                        "Artifact·HTML"
+                    } else {
+                        "Artifact·MD"
+                    }
+                    .into(),
+                    status: {
+                        let frequencies: Vec<_> = list
+                            .subscriptions
+                            .iter()
+                            .filter(|row| row.instance.as_str() == tick.instance_id())
+                            .map(|row| format!("{}s", row.every_seconds))
+                            .collect();
+                        if frequencies.is_empty() {
+                            status.into()
+                        } else if status.is_empty() {
+                            frequencies.join(" / ")
+                        } else {
+                            format!("{status} · {}", frequencies.join(" / "))
+                        }
+                    },
+                    updated_at_ms: metadata
+                        .and_then(Option::as_ref)
+                        .and_then(|metadata| metadata.human_updated_at.as_deref())
+                        .and_then(crate::transcript::parse_timestamp_ms)
+                        .map(|value| value.max(0) as u64)
+                        .into_iter()
+                        .chain(
+                            list.subscriptions
+                                .iter()
+                                .filter(|row| row.instance.as_str() == tick.instance_id())
+                                .filter_map(|row| row.updated_at_ms),
+                        )
+                        .max(),
+                    running: false,
+                }
+            })
+            .collect();
+        list.replace(TickGroup::Artifacts, entries);
+        Ok(())
+    }
+    pub(super) fn update_artifact_metadata(
+        &self,
+        chat: Uuid,
+        id: String,
+        metadata: Option<crate::artifacts::ArtifactMetadata>,
+    ) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        let list = if state.chat == Some(chat) {
+            &mut state.tick_list
+        } else {
+            &mut state.view_cache.entry(Some(chat)).or_default().tick_list
+        };
+        list.metadata.insert(id, metadata);
+        Ok(())
+    }
+    pub(super) fn copy_artifact_link(&self, url: &str) -> Result<(), String> {
+        self.state
+            .lock()
+            .map_err(|error| error.to_string())?
+            .clipboard
+            .write(url, &mut io::stdout().lock())
+    }
+    pub(super) fn confirm_tick_removal(&self, chat: Uuid, id: String) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        if state.chat != Some(chat) {
+            return Ok(());
+        }
+        state.tick_list.confirmation = Some(id);
+        state.status =
+            "Remove artifact and cancel its Tick subscriptions? Enter confirm · Esc cancel".into();
+        Ok(())
+    }
+    pub(super) fn update_subscribed_ticks(
+        &self,
+        chat: Uuid,
+        rows: &[TickSubscriptionStatus],
+    ) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        let entries = rows
+            .iter()
+            .filter(|row| row.loop_state != tickloop_agent::runtime::LoopState::Stopped)
+            .map(|row| {
+                let artifact = row.instance.as_str().starts_with("artifact:");
+                let terminal = matches!(
+                    row.kind,
+                    Some(crate::tick_stream::ObservationKind::Terminal { .. })
+                );
+                let link = match row.link {
+                    tickloop_agent::runtime::TickLinkState::Live => "live",
+                    tickloop_agent::runtime::TickLinkState::Initializing => "initializing",
+                    tickloop_agent::runtime::TickLinkState::Disconnected => "disconnected",
+                    tickloop_agent::runtime::TickLinkState::InstanceGone => "gone",
+                    tickloop_agent::runtime::TickLinkState::IdentityUncertain => "uncertain",
+                };
+                TickListEntry {
+                    id: row.id.to_string(),
+                    group: TickGroup::Subscribed,
+                    glyph: if artifact {
+                        Glyph::ArtifactTick
+                    } else if terminal {
+                        Glyph::TerminalTick
+                    } else {
+                        Glyph::ProtocolTick
+                    },
+                    title: row
+                        .title
+                        .clone()
+                        .unwrap_or_else(|| row.instance.to_string()),
+                    kind: if artifact {
+                        "Artifact"
+                    } else if terminal {
+                        "Terminal"
+                    } else {
+                        "Tick"
+                    }
+                    .into(),
+                    status: format!("{link} · {}s", row.every_seconds),
+                    updated_at_ms: if artifact {
+                        row.updated_at_ms
+                    } else {
+                        row.last_delivery_ms
+                    },
+                    running: false,
+                }
+            })
+            .collect();
+        let list = if state.chat == Some(chat) {
+            &mut state.tick_list
+        } else {
+            &mut state.view_cache.entry(Some(chat)).or_default().tick_list
+        };
+        list.subscriptions = rows.to_vec();
+        state.update_tick_entries(chat, TickGroup::Subscribed, entries);
+        Ok(())
+    }
+    pub(super) fn show_subscriptions_at(
+        &self,
+        chat: Uuid,
+        rows: Vec<TickSubscriptionStatus>,
+        selected: Uuid,
+        cancel: bool,
+    ) -> Result<(), String> {
+        self.show_subscriptions(chat, rows)?;
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        if let Some(surface) = &mut state.subscription_surface {
+            surface.select(selected);
+            if cancel {
+                surface.apply(SubscriptionAction::RequestCancel);
+            }
+        }
+        state.tick_list.focused = false;
+        state.tick_list.overlay = false;
+        state
+            .draw(&mut io::stdout().lock())
+            .map_err(|error| error.to_string())
+    }
+
+    pub(super) fn tick_list_has_entries(&self) -> Result<bool, String> {
+        Ok(!self
+            .state
+            .lock()
+            .map_err(|error| error.to_string())?
+            .tick_list
+            .entries()
+            .is_empty())
+    }
+    pub(super) fn tick_list_is_visible(&self) -> Result<bool, String> {
+        Ok(self
+            .state
+            .lock()
+            .map_err(|error| error.to_string())?
+            .tick_list_visible())
+    }
+    pub(super) fn set_tick_list_preference(
+        &self,
+        preference: tickloop_agent::settings::TickListPreference,
+    ) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        state.tick_list_preference = preference;
+        state.tick_list.overlay = false;
+        state.tick_list.focused = false;
+        state.rendered_region = None;
+        state
+            .draw(&mut io::stdout().lock())
+            .map_err(|error| error.to_string())
+    }
+    pub(super) fn open_tick_list(&self) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        state.tick_list.overlay =
+            !state.tick_list.entries().is_empty() && state.width + 1 < TICK_LIST_AUTO_MIN_COLUMNS;
+        state.rendered_region = None;
+        state
+            .draw(&mut io::stdout().lock())
+            .map_err(|error| error.to_string())
+    }
+    pub(super) fn update_shell_ticks(
+        &self,
+        snapshot: &tickloop_agent::runtime::ShellTaskSnapshot,
+    ) -> Result<(), String> {
+        let entries = snapshot
+            .tasks
+            .iter()
+            .filter(|task| task.chat_id == snapshot.chat_id)
+            .map(|task| {
+                let status = if task.state == tickloop_agent::runtime::ShellTaskState::Unknown {
+                    "unknown".into()
+                } else if !task.state.is_terminal() {
+                    "running".into()
+                } else if let Some(signal) = task.signal {
+                    format!("signal {signal}")
+                } else if let Some(exit) = task.exit_code {
+                    format!("exit {exit}")
+                } else if task.reason.is_some() {
+                    "stopped".into()
+                } else {
+                    "unknown".into()
+                };
+                TickListEntry {
+                    id: task.id.to_string(),
+                    group: TickGroup::Shells,
+                    glyph: Glyph::ShellTick,
+                    title: task.command.lines().next().unwrap_or_default().into(),
+                    kind: "Shell".into(),
+                    status,
+                    updated_at_ms: task.updated_at_ms,
+                    running: !task.state.is_terminal(),
+                }
+            })
+            .collect();
+        self.state
+            .lock()
+            .map_err(|error| error.to_string())?
+            .update_tick_entries(snapshot.chat_id, TickGroup::Shells, entries);
+        Ok(())
+    }
+
     pub(super) fn set_background_status_notice(
         &self,
         notice: Option<BackgroundStatusNotice>,
@@ -2128,6 +2587,21 @@ impl Console {
         interactive: bool,
         preferences: DisplayPreferences,
     ) -> Result<(Self, mpsc::Receiver<InputEvent>), String> {
+        Self::start_with_startup(interactive, preferences, None)
+    }
+
+    pub(super) fn start_with_workspace_trust(
+        preferences: DisplayPreferences,
+        workdir: PathBuf,
+    ) -> Result<(Self, mpsc::Receiver<InputEvent>), String> {
+        Self::start_with_startup(true, preferences, Some(WorkspaceTrust::new(workdir)))
+    }
+
+    fn start_with_startup(
+        interactive: bool,
+        preferences: DisplayPreferences,
+        workspace_trust: Option<WorkspaceTrust>,
+    ) -> Result<(Self, mpsc::Receiver<InputEvent>), String> {
         let (width, height) = terminal::size().unwrap_or((80, 24));
         let choice =
             renderer::startup_choice(std::env::var(renderer::RENDERER_VARIABLE).ok().as_deref());
@@ -2139,6 +2613,7 @@ impl Console {
             Renderer::Inline
         };
         let mut initial = State::new_with_display(interactive, width, height, preferences);
+        initial.workspace_trust = workspace_trust;
         if interactive {
             initial.renderer = startup_renderer;
             initial.surface = TerminalSurface::new(renderer::captures_mouse());
@@ -2163,6 +2638,22 @@ impl Console {
             }
         }
         let reader_state = Arc::clone(&state);
+        if interactive
+            && state
+                .lock()
+                .map_err(|error| error.to_string())?
+                .workspace_trust
+                .is_some()
+        {
+            let initial_draw = state
+                .lock()
+                .map_err(|error| error.to_string())?
+                .draw(&mut io::stdout().lock());
+            if let Err(error) = initial_draw {
+                let _ = restore_terminal(&mut io::stdout(), &surface);
+                return Err(error.to_string());
+            }
+        }
         let reader_stop = Arc::clone(&stop);
         let reader = thread::Builder::new()
             .name("agent-console-input".into())
@@ -2173,7 +2664,12 @@ impl Console {
                     read_lines(&reader_stop, &sender)
                 };
                 if let Err(error) = result {
-                    let _ = send_input(&sender, &reader_stop, InputEvent::Error(error.to_string()));
+                    let event = if error.kind() == io::ErrorKind::UnexpectedEof {
+                        InputEvent::Eof
+                    } else {
+                        InputEvent::Error(error.to_string())
+                    };
+                    let _ = send_input(&sender, &reader_stop, event);
                 }
             });
         let reader = match reader {
@@ -2207,6 +2703,41 @@ impl Console {
 
     pub fn write(&self, text: &str) -> Result<(), String> {
         self.write_text(text, false)
+    }
+
+    pub(super) fn workspace_trust_id(&self) -> Result<Uuid, String> {
+        self.state
+            .lock()
+            .map_err(|error| error.to_string())?
+            .workspace_trust
+            .as_ref()
+            .map(|dialog| dialog.id)
+            .ok_or_else(|| "Startup trust dialog is not active".into())
+    }
+
+    pub(super) fn workspace_trust_failed(&self, error: String) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        if let Some(dialog) = &mut state.workspace_trust {
+            let id = dialog.id;
+            dialog.failed(error);
+            state.begin_menu_submission(id);
+            state.mark_menu_submission_finished(id);
+        }
+        state
+            .draw(&mut io::stdout().lock())
+            .map_err(|error| error.to_string())
+    }
+
+    pub(super) fn finish_workspace_trust(&self) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        if let Some(dialog) = state.workspace_trust.take() {
+            state.begin_menu_submission(dialog.id);
+            state.mark_menu_submission_finished(dialog.id);
+            state
+                .draw(&mut io::stdout().lock())
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
     }
 
     /// Writes `text` as a line of its own; in plain output a line left open by streamed reply
@@ -3565,11 +4096,17 @@ impl State {
     }
 
     fn focus_gained(&mut self, now: Instant) {
+        if self.workspace_trust.is_some() {
+            return;
+        }
         self.clipboard_hint.focus_gained(now);
     }
 
     /// Returns whether the clipboard image hint appeared or expired.
     fn poll_clipboard_hint(&mut self, now: Instant) -> bool {
+        if self.workspace_trust.is_some() {
+            return false;
+        }
         self.clipboard_hint
             .poll(now, self.accepts_images, &self.clipboard)
     }
@@ -3681,6 +4218,7 @@ impl State {
         self.permissions_surface = None;
         self.menu = None;
         self.conversation_picker = None;
+        self.artifacts_picker = None;
         self.request_layout = None;
         self.request_menu = None;
         self.question_menu = None;
@@ -3695,6 +4233,7 @@ impl State {
 
     fn replace_view(&mut self, next: ViewPresentation) -> ViewPresentation {
         ViewPresentation {
+            tick_list: std::mem::replace(&mut self.tick_list, next.tick_list),
             scrollback: std::mem::replace(&mut self.scrollback, next.scrollback),
             echoed_inputs: std::mem::replace(&mut self.echoed_inputs, next.echoed_inputs),
             awaiting_input_echoes: std::mem::replace(
@@ -3820,6 +4359,7 @@ impl State {
     ) -> Self {
         Self {
             interactive,
+            workspace_trust: None,
             plain_line_open: false,
             renderer: Renderer::Inline,
             surface: TerminalSurface::new(false),
@@ -3849,6 +4389,7 @@ impl State {
             activity_interruptible: false,
             back_to_bottom_target: None,
             back_to_bottom_pressed: false,
+            tick_toggle_target: None,
             footer_bar_target: None,
             pointer_input: None,
             completion: Completion::default(),
@@ -3879,6 +4420,7 @@ impl State {
             mention_roots: None,
             menu: None,
             picker_kind: None,
+            artifacts_picker: None,
             conversation_picker: None,
             menu_link: None,
             menu_review: None,
@@ -3898,6 +4440,8 @@ impl State {
             transcript: None,
             diff_screen: None,
             diff_screen_cache: HashMap::new(),
+            tick_list: TickList::default(),
+            tick_list_preference: tickloop_agent::settings::TickListPreference::Auto,
             task_surface: None,
             task_surface_cache: HashMap::new(),
             todo_detail: None,
@@ -3935,6 +4479,9 @@ impl State {
     /// Pointer input scrolls the conversation, selects text and activates the return control.
     /// Other events are captured so the terminal does not translate the wheel into arrow keys.
     fn pointer(&mut self, event: MouseEvent, output: &mut impl Write) -> bool {
+        if self.workspace_trust.is_some() {
+            return false;
+        }
         self.pointer_input = None;
         if self.conversation_picker.is_some()
             && matches!(
@@ -3973,6 +4520,14 @@ impl State {
                 self.scroll_conversation(ScrollAction::LinesDown(renderer::WHEEL_SCROLL_LINES))
             }
             MouseEventKind::Down(MouseButton::Left) => {
+                if self.tick_toggle_target.as_ref().is_some_and(|target| {
+                    target.row == at.row && target.columns.contains(&at.column)
+                }) {
+                    self.pointer_input = Some(InputEvent::ToggleTickList {
+                        show: !self.tick_list_visible(),
+                    });
+                    return true;
+                }
                 if at_return_control {
                     self.clear_selection();
                     self.back_to_bottom_pressed = true;
@@ -4216,9 +4771,89 @@ impl State {
         output.flush()
     }
 
+    fn tick_list_visible(&self) -> bool {
+        self.chat.is_some()
+            && !self.tick_list.entries().is_empty()
+            && self.overview.projection.is_none()
+            && !self.help_open
+            && self.workspace_trust.is_none()
+            && self.menu.is_none()
+            && self.conversation_picker.is_none()
+            && self.artifacts_picker.is_none()
+            && self.task_surface.is_none()
+            && self.permissions_surface.is_none()
+            && self.subscription_surface.is_none()
+            && self.transcript.is_none()
+            && self.diff_screen.is_none()
+            && (self.tick_list.overlay
+                || self.width + 1 >= TICK_LIST_AUTO_MIN_COLUMNS
+                    && self.tick_list_preference
+                        == tickloop_agent::settings::TickListPreference::Auto)
+    }
+
+    fn update_tick_entries(&mut self, chat: Uuid, group: TickGroup, entries: Vec<TickListEntry>) {
+        if self.chat == Some(chat) {
+            self.tick_list.replace(group, entries);
+        } else {
+            self.view_cache
+                .entry(Some(chat))
+                .or_default()
+                .tick_list
+                .replace(group, entries);
+        }
+    }
+
+    fn content_columns(&self) -> usize {
+        if self.tick_list_visible() && !self.tick_list.overlay {
+            self.width.saturating_sub(TICK_LIST_COLUMNS).max(2)
+        } else {
+            self.width
+        }
+    }
+
     fn draw_frame(&mut self, output: &mut impl Write) -> io::Result<()> {
+        if let Some(dialog) = &self.workspace_trust {
+            let frame = dialog.frame(self.width, self.height, self.display);
+            let mut lines = frame.lines;
+            lines.resize_with(self.height, RoleLine::default);
+            self.initialize_screen(output)?;
+            let rows = lines
+                .iter()
+                .map(|line| {
+                    line.resolve(self.display.theme(), self.width)
+                        .render(self.colour_depth)
+                })
+                .collect();
+            self.paint_rows(output, RenderedView::WorkspaceTrust, rows, 0)?;
+            self.rendered_screen = lines.iter().map(RoleLine::text).collect();
+            match frame.cursor {
+                Some((row, column)) => queue!(output, MoveTo(column as u16, row as u16), Show)?,
+                None => queue!(output, Hide)?,
+            }
+            return output.flush();
+        }
         self.back_to_bottom_target = None;
         self.footer_bar_target = None;
+        self.tick_toggle_target = None;
+        if let Some(picker) = &mut self.artifacts_picker {
+            let frame = picker.frame(self.width, self.height, self.display);
+            let rows = frame
+                .lines
+                .iter()
+                .map(|line| {
+                    line.resolve(self.display.theme(), self.width)
+                        .render(self.colour_depth)
+                })
+                .collect();
+            write!(output, "{RESET_SCROLL_REGION}")?;
+            self.paint_rows(output, RenderedView::ConversationPicker, rows, 0)?;
+            match frame.cursor {
+                Some((row, column)) => queue!(output, MoveTo(column as u16, row as u16), Show)?,
+                None => queue!(output, Hide)?,
+            }
+            self.rendered_screen = frame.lines.iter().map(RoleLine::text).collect();
+            return output.flush();
+        }
         if let Some(picker) = &mut self.conversation_picker {
             let frame = picker.frame(self.width, self.height, self.display);
             let rows: Vec<String> = frame
@@ -4385,8 +5020,9 @@ impl State {
         }
         let (lines, cursor_row, cursor_column) = self.styled_frame();
         let start = self.height - lines.len();
+        let content_columns = self.content_columns();
         let mut body = self.scrollback.frame_with_motion(
-            self.width,
+            content_columns,
             start,
             self.display.preferences().prefers_reduced_motion,
         );
@@ -4395,13 +5031,13 @@ impl State {
             && self.footer.selected().is_none()
             && self.candidate_rows(1).is_empty()
         {
-            self.scrollback.reading_prompt(self.width, start)
+            self.scrollback.reading_prompt(content_columns, start)
         } else {
             None
         };
         if let Some(prompt) = &reading_prompt {
             body = self.scrollback.frame_with_motion(
-                self.width,
+                content_columns,
                 start.saturating_sub(1),
                 self.display.preferences().prefers_reduced_motion,
             );
@@ -4409,33 +5045,61 @@ impl State {
             body.styled
                 .insert(0, RoleLine::role(prompt.clone(), Role::MutedText));
         }
-        if !self.screen_initialized {
-            // The alternate screen already starts as a blank full screen, so
-            // scrolling a screenful into view would only waste it.
-            if !self.renderer.uses_alternate_screen() {
-                write!(output, "{RESET_SCROLL_REGION}")?;
-                queue!(output, MoveTo(0, (self.height - 1) as u16))?;
-                for _ in 0..self.height {
-                    write!(output, "\r\n")?;
-                }
-            }
-            self.screen_initialized = true;
-        }
+        self.initialize_screen(output)?;
         write!(output, "{RESET_SCROLL_REGION}")?;
         let padding = start.saturating_sub(body.lines.len());
+        let side_columns = TICK_LIST_COLUMNS.min(self.width);
+        let tick_lines = self.tick_list_visible().then(|| {
+            self.tick_list.lines(
+                side_columns.saturating_sub(2),
+                start,
+                self.display,
+                crate::private_fs::unix_time_milliseconds(),
+            )
+        });
         let rows: Vec<String> = (0..start)
             .map(|row| {
-                let Some(line) = row
-                    .checked_sub(padding)
+                let line_index = row.checked_sub(padding);
+                let line = line_index
                     .and_then(|index| body.lines.get(index))
-                else {
-                    return String::new();
-                };
-                let resolved = body.styled.get(row - padding).map_or_else(
-                    || StyledLine::plain(line.as_str()),
-                    |styled| styled.resolve(self.display.theme(), self.width),
-                );
-                self.with_selection(row, resolved).render(self.colour_depth)
+                    .map(String::as_str)
+                    .unwrap_or_default();
+                let resolved = line_index
+                    .and_then(|index| body.styled.get(index))
+                    .map_or_else(
+                        || StyledLine::plain(line),
+                        |styled| styled.resolve(self.display.theme(), content_columns),
+                    );
+                let left = self.with_selection(row, resolved).render(self.colour_depth);
+                if let Some(tick_lines) = &tick_lines {
+                    let left_columns = self.width.saturating_sub(side_columns);
+                    let left_text = truncate_width(line, left_columns);
+                    let left = if self.tick_list.overlay {
+                        line_index
+                            .and_then(|index| body.styled.get(index))
+                            .map_or_else(
+                                || StyledLine::plain(&left_text),
+                                |styled| {
+                                    let mut clipped = styled.clone();
+                                    clipped.truncate(left_columns);
+                                    clipped.resolve(self.display.theme(), left_columns)
+                                },
+                            )
+                            .render(self.colour_depth)
+                    } else {
+                        left
+                    };
+                    let side = tick_lines.get(row).cloned().unwrap_or_default();
+                    format!(
+                        "{left}{}│ {}{}",
+                        " ".repeat(left_columns.saturating_sub(display_width(&left_text))),
+                        side.resolve(self.display.theme(), side_columns.saturating_sub(2))
+                            .render(self.colour_depth),
+                        " ".repeat(side_columns.saturating_sub(2 + display_width(&side.text())))
+                    )
+                } else {
+                    left
+                }
             })
             .chain(lines.iter().enumerate().map(|(index, line)| {
                 self.with_selection(
@@ -4445,7 +5109,9 @@ impl State {
                 .render(self.colour_depth)
             }))
             .collect();
-        let scroll_rows = if self.scrollback.reading_prompt(self.width, start).is_none() {
+        let scroll_rows = if !self.tick_list_visible()
+            && self.scrollback.reading_prompt(self.width, start).is_none()
+        {
             start
         } else {
             0
@@ -4458,10 +5124,22 @@ impl State {
         )?;
         self.rendered_screen = (0..start)
             .map(|row| {
-                row.checked_sub(padding)
+                let line = row
+                    .checked_sub(padding)
                     .and_then(|index| body.lines.get(index))
                     .cloned()
-                    .unwrap_or_default()
+                    .unwrap_or_default();
+                if let Some(tick_lines) = &tick_lines {
+                    let left_columns = self.width.saturating_sub(side_columns);
+                    let left = truncate_width(&line, left_columns);
+                    format!(
+                        "{left}{}│ {}",
+                        " ".repeat(left_columns.saturating_sub(display_width(&left))),
+                        tick_lines.get(row).map(RoleLine::text).unwrap_or_default()
+                    )
+                } else {
+                    line
+                }
             })
             .chain(lines.iter().map(RoleLine::text))
             .collect();
@@ -4473,6 +5151,7 @@ impl State {
             || self.footer.selected().is_some()
             || self.help_open
             || self.conversation_focused
+            || self.tick_list.focused && self.tick_list_visible()
             || self
                 .footer_open_pending
                 .is_some_and(|pending| !pending.cancelled)
@@ -4482,6 +5161,20 @@ impl State {
             queue!(output, Show)?;
         }
         output.flush()
+    }
+
+    fn initialize_screen(&mut self, output: &mut impl Write) -> io::Result<()> {
+        if !self.screen_initialized {
+            if !self.renderer.uses_alternate_screen() {
+                write!(output, "{RESET_SCROLL_REGION}")?;
+                queue!(output, MoveTo(0, (self.height - 1) as u16))?;
+                for _ in 0..self.height {
+                    write!(output, "\r\n")?;
+                }
+            }
+            self.screen_initialized = true;
+        }
+        Ok(())
     }
 
     /// Brings the screen to `rows`, one rendered row per screen row from the top.
@@ -4590,6 +5283,11 @@ impl State {
     /// Builds the fixed rows below the conversation, each row carrying the
     /// roles its parts play so the writer can apply the active theme.
     fn styled_frame(&mut self) -> (Vec<RoleLine>, usize, usize) {
+        if let Some(dialog) = &self.workspace_trust {
+            let frame = dialog.frame(self.width, self.height, self.display);
+            let (row, column) = frame.cursor.unwrap_or_default();
+            return (frame.lines, row, column);
+        }
         self.status_area
             .set_reduced_motion(self.display.preferences().prefers_reduced_motion);
         self.clear_footer_selection_if_hidden();
@@ -5216,7 +5914,11 @@ impl State {
             // prompt, menu or confirmation above keep their place.
             CLIPBOARD_IMAGE_HINT.into()
         } else {
-            "↑↓ history · Ctrl+O details · Ctrl+C interrupt".into()
+            if self.tick_list.entries().is_empty() {
+                "← Agents · ↑↓ history · Ctrl+O details".into()
+            } else {
+                "← Agents · → Ticks · ↑↓ history · Ctrl+O details".into()
+            }
         };
         let hints = self.display.navigation_hint(&hints);
         let mut footer = if self.status.is_empty() {
@@ -5843,6 +6545,7 @@ impl State {
             Role::PromptBorder
         };
         let mut return_control = None;
+        let mut tick_control = None;
         if borders > 0 {
             let can_return = self.ordinary_input_is_visible() && !self.scrollback.is_following();
             let mut reading = can_return && self.scrollback.has_hidden_tail(self.width, body_rows);
@@ -5869,6 +6572,38 @@ impl State {
             } else {
                 lines.push(RoleLine::role("─".repeat(self.width), border));
             }
+            if self.chat.is_some()
+                && self.overview.projection.is_none()
+                && !self.help_open
+                && !self.tick_list.entries().is_empty()
+            {
+                let label = format!(
+                    " {} Ticks {} ",
+                    self.display.glyph(Glyph::ProtocolTick),
+                    self.tick_list.entries().len()
+                );
+                let label_width = display_width(&label);
+                if label_width + 2 <= self.width {
+                    let column = self.width - label_width;
+                    let line = lines.last_mut().unwrap();
+                    line.truncate(column);
+                    line.push(
+                        label,
+                        Some(if self.tick_list_visible() {
+                            Role::Permission
+                        } else {
+                            Role::MutedText
+                        }),
+                    );
+                    tick_control = Some((lines.len() - 1, column..self.width));
+                    if return_control
+                        .as_ref()
+                        .is_some_and(|(_, columns)| columns.end > column)
+                    {
+                        return_control = None;
+                    }
+                }
+            }
         }
         let cursor_row = lines.len() + input.cursor_row;
         lines.extend(if self.prompt_enabled {
@@ -5887,8 +6622,18 @@ impl State {
                 border,
             );
             if float_core_status {
-                divider.push(" ", None);
-                divider.spans.extend(core_status.spans);
+                match self.display.preferences().status_line_position {
+                    StatusLinePosition::Right => {
+                        divider.push(" ", None);
+                        divider.spans.extend(core_status.spans);
+                    }
+                    StatusLinePosition::Left => {
+                        let rule_spans = divider.spans;
+                        divider.spans = core_status.spans;
+                        divider.push(" ", None);
+                        divider.spans.extend(rule_spans);
+                    }
+                }
             }
             lines.push(divider);
         }
@@ -6029,7 +6774,7 @@ impl State {
                             return_hint = self.back_to_bottom_label().unwrap_or_default();
                             return_hint.as_str()
                         } else if self.editor.draft().is_empty() {
-                            "← Agents · ? help · Ctrl+O details · Ctrl+G editor · Ctrl+C interrupt"
+                            if self.tick_list.entries().is_empty() { "← Agents · ? help · Ctrl+O details · Ctrl+G editor · Ctrl+C interrupt" } else { "← Agents · → Ticks · ? help · Ctrl+O details · Ctrl+G editor · Ctrl+C interrupt" }
                         } else {
                             "Enter send · Ctrl+G editor · Ctrl+C clear"
                         };
@@ -6127,6 +6872,10 @@ impl State {
         for line in &mut lines {
             line.truncate(self.width);
         }
+        self.tick_toggle_target = tick_control.map(|(row, columns)| BackToBottomTarget {
+            row: self.height.saturating_sub(lines.len()) + row,
+            columns,
+        });
         self.back_to_bottom_target = return_control.map(|(row, columns)| BackToBottomTarget {
             row: self.height.saturating_sub(lines.len()) + row,
             columns,
@@ -7538,12 +8287,19 @@ impl State {
     }
 
     fn paste(&mut self, text: &str) {
+        if self.workspace_trust.is_some() {
+            return;
+        }
         self.last_input_edit = Some(Instant::now());
         if self.branch_submission_owns_input() {
             return;
         }
         self.clear_footer_selection();
         if self.menu_submission_is_pending() {
+            return;
+        }
+        if let Some(picker) = &mut self.artifacts_picker {
+            picker.paste(text);
             return;
         }
         if let Some(picker) = &mut self.conversation_picker {
@@ -8321,6 +9077,19 @@ impl State {
         if key.kind == KeyEventKind::Release {
             return None;
         }
+        if let Some(dialog) = &mut self.workspace_trust {
+            if self.menu_submission_pending.is_some() {
+                return None;
+            }
+            return dialog.key(key, self.width, self.height, self.display).map(|decision| match decision {
+                TrustDecision::Accept => InputEvent::Choice {
+                    menu_id: dialog.id,
+                    index: TRUST_ACCEPT_CHOICE_INDEX,
+                    comment: None,
+                },
+                TrustDecision::Cancel => InputEvent::Cancel { menu_id: dialog.id },
+            });
+        }
         self.status_held = false;
         // Legacy terminals send Ctrl+H as 0x08; crossterm reports Ctrl+h, which Readline treats as Backspace.
         let key = if key.code == KeyCode::Char('h') && key.modifiers == KeyModifiers::CONTROL {
@@ -8331,8 +9100,134 @@ impl State {
         if self.menu_submission_is_pending() || self.branch_submission_owns_input() {
             return None;
         }
+        if let Some(picker) = &mut self.artifacts_picker {
+            return match picker.key(key) {
+                super::artifacts_picker::ArtifactPickerEffect::None => None,
+                super::artifacts_picker::ArtifactPickerEffect::Choice(choice) => {
+                    Some(InputEvent::ArtifactChoice(choice))
+                }
+                super::artifacts_picker::ArtifactPickerEffect::Close => {
+                    self.artifacts_picker = None;
+                    self.rendered_region = None;
+                    None
+                }
+                super::artifacts_picker::ArtifactPickerEffect::EditQuery => {
+                    let draft = picker.external_query();
+                    match edit_prompt(&draft, &self.history_project) {
+                        ExternalEditorOutcome::Updated { content: text } => {
+                            self.artifacts_picker.as_mut().unwrap().replace_query(&text)
+                        }
+                        ExternalEditorOutcome::Failed(error) => self
+                            .artifacts_picker
+                            .as_mut()
+                            .unwrap()
+                            .report(error.to_string()),
+                        _ => {}
+                    }
+                    None
+                }
+            };
+        }
         if self.conversation_picker.is_some() {
             return self.conversation_picker_key(key);
+        }
+        if self.tick_list_visible() && self.tick_list.focused {
+            if let Some(id) = self.tick_list.confirmation.clone() {
+                if key.code == KeyCode::Esc {
+                    self.tick_list.confirmation = None;
+                    self.status.clear();
+                } else if key.code == KeyCode::Enter {
+                    self.tick_list.confirmation = None;
+                    return self.chat.map(|chat| InputEvent::TickListAction {
+                        chat,
+                        id,
+                        action: 'X',
+                    });
+                }
+                return None;
+            }
+            match (key.code, key.modifiers) {
+                (KeyCode::Esc | KeyCode::Left, _) => {
+                    self.tick_list.focused = false;
+                    self.tick_list.overlay = false;
+                    self.rendered_region = None;
+                }
+                (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE)
+                | (KeyCode::Char('n'), KeyModifiers::CONTROL) => self.tick_list.move_selection(1),
+                (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE)
+                | (KeyCode::Char('p'), KeyModifiers::CONTROL) => self.tick_list.move_selection(-1),
+                (KeyCode::Enter, _) | (KeyCode::Char('x' | 'c' | 'f'), KeyModifiers::NONE) => {
+                    if let Some(entry) = self.tick_list.selected().cloned() {
+                        let action = if key.code == KeyCode::Enter {
+                            'o'
+                        } else if let KeyCode::Char(action) = key.code {
+                            action
+                        } else {
+                            unreachable!()
+                        };
+                        if entry.group == TickGroup::Subscribed && !matches!(action, 'o' | 'x') {
+                            return None;
+                        }
+                        if entry.group == TickGroup::Shells {
+                            if action == 'o' {
+                                self.tick_list.focused = false;
+                                self.tick_list.overlay = false;
+                                return Uuid::parse_str(&entry.id)
+                                    .ok()
+                                    .map(InputEvent::OpenStatusTask);
+                            }
+                            if action == 'x' {
+                                if entry.running {
+                                    self.status =
+                                        "Open this Shell to stop it before removing it".into();
+                                    self.status_held = true;
+                                } else {
+                                    self.tick_list.remove_shell(&entry.id);
+                                }
+                            }
+                        } else if let Some(chat) = self.chat {
+                            return Some(InputEvent::TickListAction {
+                                chat,
+                                id: entry.id,
+                                action,
+                            });
+                        }
+                    }
+                }
+                _ => {}
+            }
+            return None;
+        }
+        if self.chat.is_some()
+            && !self.tick_list.entries().is_empty()
+            && self.overview.projection.is_none()
+            && !self.help_open
+            && self.menu.is_none()
+            && self.task_surface.is_none()
+            && self.subscription_surface.is_none()
+            && self.permissions_surface.is_none()
+            && self.transcript.is_none()
+            && self.diff_screen.is_none()
+            && (self.editor.draft().is_empty() || key.modifiers == KeyModifiers::SHIFT)
+            && self.prompt_enabled
+            && !self.completion.is_open()
+            && !self.file_mentions.is_open()
+            && ((key.code == KeyCode::Right && key.modifiers == KeyModifiers::NONE)
+                || matches!(
+                    (key.code, key.modifiers),
+                    (KeyCode::Up | KeyCode::Down, KeyModifiers::SHIFT)
+                ))
+        {
+            let overlay = self.width + 1 < TICK_LIST_AUTO_MIN_COLUMNS
+                || self.tick_list_preference
+                    == tickloop_agent::settings::TickListPreference::Hidden;
+            let group = (key.modifiers == KeyModifiers::SHIFT).then_some(TickGroup::Shells);
+            self.tick_list.focus(overlay, group);
+            return self.chat.map(|chat| InputEvent::TickListAction {
+                chat,
+                id: String::new(),
+                action: 'r',
+            });
         }
         if self.menu.is_none()
             && self.transcript.is_none()
@@ -8575,24 +9470,6 @@ impl State {
                 }
                 _ => None,
             };
-        }
-        if matches!(
-            (key.code, key.modifiers),
-            (KeyCode::Up | KeyCode::Down, KeyModifiers::SHIFT)
-        ) && self.prompt_enabled
-            && self.menu.is_none()
-            && !self.review_focused
-            && self.shell_input.kind() == InputKind::Prompt
-            && self.shell_input.active_completion().is_none()
-            && !self.file_mentions.is_open()
-            && !self.completion.is_open()
-            && self
-                .status_area
-                .available_panels()
-                .any(|panel| panel == FooterItemId::Tasks)
-        {
-            self.footer.select(FooterItemId::Tasks);
-            return self.apply_footer_action(FooterAction::Open);
         }
         if self.footer.selected().is_some()
             && let Some(event) = self.footer_key(key)
@@ -9831,7 +10708,7 @@ fn display_width(text: &str) -> usize {
         .sum()
 }
 
-fn wrap_text(text: &str, width: usize) -> Vec<String> {
+pub(super) fn wrap_text(text: &str, width: usize) -> Vec<String> {
     let mut lines = vec![String::new()];
     let mut column = 0;
     for character in text.chars() {
@@ -10170,12 +11047,13 @@ mod tests {
         assert!(valid_login_link("https://user:password@auth.openai.com/").is_none());
     }
 
-    fn task_snapshot(chat_id: Uuid, count: usize) -> ShellTaskSnapshot {
+    pub(super) fn task_snapshot(chat_id: Uuid, count: usize) -> ShellTaskSnapshot {
         ShellTaskSnapshot {
             chat_id,
             live_revision: 1,
             tasks: (0..count)
                 .map(|index| ShellTask {
+                    updated_at_ms: None,
                     id: Uuid::from_u128(index as u128 + 1),
                     chat_id,
                     origin: ShellTaskOrigin::User,
@@ -10201,6 +11079,9 @@ mod tests {
 
     fn subscription_row(instance: u64) -> TickSubscriptionStatus {
         TickSubscriptionStatus {
+            title: None,
+            updated_at_ms: None,
+            kind: None,
             id: Uuid::from_u128(u128::from(instance)),
             loop_id: Uuid::from_u128(900),
             loop_state: tickloop_agent::runtime::LoopState::WaitingTrigger,
@@ -14523,12 +15404,7 @@ mod tests {
                 "Lost · cached history",
             ),
         ] {
-            for focus in [
-                "foreground Shell",
-                "pending footer",
-                "footer",
-                "conversation",
-            ] {
+            for focus in ["foreground Shell", "footer", "conversation"] {
                 let mut state = State::new(true, 180, 24);
                 state.prompt_enabled = true;
                 state.execution_connection_notice = Some(notice);
@@ -14544,7 +15420,14 @@ mod tests {
                         state: "running",
                         role: Role::Success,
                     }],
-                    vec![],
+                    vec![StatusItem {
+                        id: "todo".into(),
+                        task_id: None,
+                        can_stop: false,
+                        title: "review".into(),
+                        state: "pending",
+                        role: Role::MutedText,
+                    }],
                 );
                 state.insert("preserved draft");
                 let cursor = state.editor.cursor();
@@ -14557,7 +15440,7 @@ mod tests {
 
                 match focus {
                     "foreground Shell" => state.set_foreground_shell(true),
-                    "pending footer" => {
+                    "unused pending footer" => {
                         assert!(matches!(
                             state.key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT)),
                             Some(InputEvent::OpenFooter(FooterItemId::Tasks))
@@ -14565,7 +15448,7 @@ mod tests {
                     }
                     "footer" => {
                         assert!(state.key(key(KeyCode::Down)).is_none());
-                        assert_eq!(state.footer.selected(), Some(FooterItemId::Tasks));
+                        assert_eq!(state.footer.selected(), Some(FooterItemId::Todo));
                     }
                     "conversation" => {
                         assert!(state.key(key(KeyCode::PageUp)).is_none());
@@ -14591,7 +15474,7 @@ mod tests {
                         ));
                         state.set_foreground_shell(false);
                     }
-                    "pending footer" => {
+                    "unused pending footer" => {
                         assert!(state.key(key(KeyCode::Esc)).is_none());
                         assert!(state.footer_open_was_cancelled(FooterItemId::Tasks));
                         assert!(state.finish_footer_open());
@@ -15890,56 +16773,35 @@ mod tests {
         state.prompt_enabled = true;
         state.insert("inspect current work");
         let draft = state.editor.draft().to_owned();
-        let cursor = state.editor.cursor();
-        let task = StatusItem {
-            id: "sh-123".into(),
-            task_id: Some(Uuid::new_v4()),
-            can_stop: true,
-            title: "cargo test".into(),
-            state: "running",
-            role: Role::Success,
-        };
-        let todo = StatusItem {
-            id: "1.".into(),
-            task_id: None,
-            can_stop: false,
-            title: "review results".into(),
-            state: "in progress",
-            role: Role::Warning,
-        };
         state.status_area.update(
             "Auto".into(),
-            "gpt-5.6".into(),
-            Some((42_000, 200_000)),
-            vec![task],
-            vec![todo],
+            "model".into(),
+            Some((42000, 200000)),
+            vec![StatusItem {
+                id: "shell".into(),
+                task_id: Some(Uuid::new_v4()),
+                can_stop: true,
+                title: "cargo test".into(),
+                state: "running",
+                role: Role::Success,
+            }],
+            vec![StatusItem {
+                id: "1".into(),
+                task_id: None,
+                can_stop: false,
+                title: "review results".into(),
+                state: "pending",
+                role: Role::MutedText,
+            }],
         );
-        state
-            .footer
-            .update([FooterItemId::Tasks, FooterItemId::Todo]);
-
-        let (frame, _, _) = state.frame();
-        assert!(
-            frame
-                .iter()
-                .any(|row| row.starts_with('─') && row.contains("Context 21% used"))
-        );
-        assert!(frame.iter().any(|row| row.contains("review results")));
-        assert!(!frame.iter().any(|row| row.contains("cargo test")));
+        state.footer.update(state.status_area.available_panels());
         state.key(key(KeyCode::Down));
         state.key(key(KeyCode::Right));
-        let tasks = state.frame().0;
-        assert!(tasks.iter().any(|row| row.contains("cargo test")));
-        assert!(!tasks.iter().any(|row| row.contains("review results")));
-        state.key(key(KeyCode::Left));
-        let todo = state.frame().0;
-        assert!(todo.iter().any(|row| row.contains("review results")));
-        assert!(!todo.iter().any(|row| row.contains("cargo test")));
+        let frame = state.frame().0;
+        assert!(frame.iter().any(|row| row.contains("review results")));
+        assert!(!frame.iter().any(|row| row.contains("cargo test")));
         assert!(state.key(key(KeyCode::Esc)).is_none());
-        assert!(state.status_area.is_open());
-        assert!(state.footer.selected().is_none());
         assert_eq!(state.editor.draft(), draft);
-        assert_eq!(state.editor.cursor(), cursor);
     }
 
     #[test]
@@ -15999,62 +16861,30 @@ mod tests {
 
     #[test]
     fn closing_inline_task_details_returns_to_the_same_task_in_the_footer_list() {
-        let chat_id = Uuid::new_v4();
-        let mut state = State::new(true, 80, 24);
+        let chat = Uuid::new_v4();
+        let mut state = State::new(true, 140, 24);
         state.prompt_enabled = true;
-        state.chat = Some(chat_id);
-        let tasks = (1..=6)
-            .map(|index| StatusItem {
-                id: format!("sh-{index}"),
-                task_id: Some(Uuid::from_u128(index)),
-                can_stop: true,
-                title: format!("printf task-{}", index - 1),
-                state: "running",
-                role: Role::Success,
-            })
-            .collect();
-        state
-            .status_area
-            .update("Auto".into(), "model".into(), None, tasks, vec![]);
-        state.footer.update([FooterItemId::Tasks]);
+        state.chat = Some(chat);
         state.insert("keep this draft");
         let console = InteractiveConsoleFixture::new(state);
-        let task_id = Uuid::from_u128(5);
-        let list = {
+        let snapshot = task_snapshot(chat, 6);
+        console.update_shell_ticks(&snapshot).unwrap();
+        let task = snapshot.tasks[4].id;
+        {
             let mut state = console.state.lock().unwrap();
-            state.key(key(KeyCode::Down));
-            state.key(key(KeyCode::Enter));
-            for _ in 0..4 {
-                state.key(key(KeyCode::Char('j')));
-            }
-            assert_eq!(state.status_area.selected_task(), Some(task_id));
-            let list = state.frame().0;
-            assert!(matches!(
-                state.key(key(KeyCode::Enter)),
-                Some(InputEvent::OpenStatusTask(id)) if id == task_id
-            ));
-            list
-        };
-        // The run loop answers OpenStatusTask by opening that task's details in place.
-        console
-            .show_footer_tasks_at(task_snapshot(chat_id, 6), Some(task_id))
-            .unwrap();
+            state.tick_list.select(&task.to_string());
+            state.key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
+            state.tick_list.select(&task.to_string());
+            assert!(
+                matches!(state.key(key(KeyCode::Enter)), Some(InputEvent::OpenStatusTask(id)) if id == task)
+            );
+        }
+        console.show_tasks_at(snapshot, Some(task)).unwrap();
         let mut state = console.state.lock().unwrap();
-        assert!(state.task_surface.is_some());
-        assert!(state.key(key(KeyCode::Esc)).is_none());
+        state.key(key(KeyCode::Esc));
         assert!(state.task_surface.is_none());
-        assert_eq!(state.footer.selected(), Some(FooterItemId::Tasks));
-        assert!(
-            state.footer_list_focused,
-            "Esc returns to the list it came from"
-        );
-        assert_eq!(state.status_area.selected_task(), Some(task_id));
+        assert_eq!(state.tick_list.selected().unwrap().id, task.to_string());
         assert_eq!(state.editor.draft(), "keep this draft");
-        assert_eq!(
-            state.frame().0,
-            list,
-            "the list returns with the same selection, scroll and draft"
-        );
     }
 
     #[test]
@@ -16128,25 +16958,11 @@ mod tests {
 
         state.frame();
         let target = state.footer_bar_target.as_ref().unwrap();
-        let bar = target.row;
-        let shell_column = target
-            .categories
-            .iter()
-            .find(|(_, item)| *item == FooterItemId::Tasks)
-            .map(|(columns, _)| target.inset + columns.start)
-            .unwrap();
-        assert!(state.pointer(
-            MouseEvent {
-                kind: MouseEventKind::Down(MouseButton::Left),
-                column: shell_column as u16,
-                row: bar as u16,
-                modifiers: KeyModifiers::NONE
-            },
-            &mut Vec::new()
-        ));
-        assert_eq!(state.footer.selected(), None);
         assert!(
-            matches!(state.pointer_input.take(), Some(InputEvent::OpenStatusTask(id)) if id == Uuid::from_u128(1))
+            target
+                .categories
+                .iter()
+                .all(|(_, item)| *item != FooterItemId::Tasks)
         );
         assert_eq!(state.editor.draft(), draft);
         assert_eq!(state.editor.cursor(), cursor);
@@ -16174,32 +16990,22 @@ mod tests {
     #[test]
     fn shift_arrows_open_active_background_tasks_from_the_chat() {
         for direction in [KeyCode::Up, KeyCode::Down] {
+            let chat = Uuid::new_v4();
             let mut state = State::new(true, 80, 24);
+            state.chat = Some(chat);
             state.prompt_enabled = true;
             state.insert("draft");
-            state.status_area.update(
-                "Auto".into(),
-                "model".into(),
-                None,
-                vec![StatusItem {
-                    id: "sh-1".into(),
-                    task_id: Some(Uuid::from_u128(1)),
-                    can_stop: true,
-                    title: "sleep 60".into(),
-                    state: "running",
-                    role: Role::Success,
-                }],
-                vec![],
-            );
-            state.footer.update([FooterItemId::Tasks]);
-
+            let console = console_with_state(state);
+            console.update_shell_ticks(&task_snapshot(chat, 1)).unwrap();
+            let mut state = console.state.lock().unwrap();
             assert!(matches!(
                 state.key(KeyEvent::new(direction, KeyModifiers::SHIFT)),
-                Some(InputEvent::OpenFooter(FooterItemId::Tasks))
+                Some(InputEvent::TickListAction { action: 'r', .. })
             ));
+            assert!(state.tick_list.focused);
+            assert!(state.tick_list.overlay);
+            assert_eq!(state.tick_list.selected().unwrap().group, TickGroup::Shells);
             assert_eq!(state.editor.draft(), "draft");
-            assert_eq!(state.footer.selected(), None);
-            assert_eq!(state.footer_open_pending.unwrap().item, FooterItemId::Tasks);
         }
     }
 
@@ -16333,55 +17139,21 @@ mod tests {
 
     #[test]
     fn pending_footer_open_blocks_repeat_input_until_escape_or_finish() {
+        let chat = Uuid::new_v4();
         let mut state = State::new(true, 80, 24);
+        state.chat = Some(chat);
         state.prompt_enabled = true;
-        state.status_area.update(
-            "Auto".into(),
-            "model".into(),
-            None,
-            vec![StatusItem {
-                id: "sh-1".into(),
-                task_id: Some(Uuid::from_u128(1)),
-                can_stop: true,
-                title: "sleep 60".into(),
-                state: "running",
-                role: Role::Success,
-            }],
-            Vec::new(),
-        );
-        state.footer.update(state.status_area.available_panels());
         state.insert("preserved draft");
-
-        assert!(matches!(
-            state.key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT)),
-            Some(InputEvent::OpenFooter(FooterItemId::Tasks))
-        ));
-        assert!(
-            state
-                .frame()
-                .0
-                .iter()
-                .any(|line| line.contains("Opening Shell"))
-        );
-        assert!(state.key(key(KeyCode::Enter)).is_none());
-        #[cfg(unix)]
-        assert!(matches!(
-            state.key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL)),
-            Some(InputEvent::Suspend)
-        ));
-        state.paste(" ignored");
+        let console = console_with_state(state);
+        console.update_shell_ticks(&task_snapshot(chat, 1)).unwrap();
+        let mut state = console.state.lock().unwrap();
+        state.key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
+        assert!(state.key(key(KeyCode::Char('j'))).is_none());
         assert_eq!(state.editor.draft(), "preserved draft");
-
-        assert!(state.key(key(KeyCode::Esc)).is_none());
-        assert!(state.footer_open_was_cancelled(FooterItemId::Tasks));
+        state.key(key(KeyCode::Esc));
+        assert!(!state.tick_list.focused);
         state.key(key(KeyCode::Char('x')));
         assert_eq!(state.editor.draft(), "preserved draftx");
-        state.key(key(KeyCode::Down));
-        assert_eq!(state.footer.selected(), None);
-
-        assert!(state.finish_footer_open());
-        state.key(key(KeyCode::Down));
-        assert_eq!(state.footer.selected(), Some(FooterItemId::Tasks));
     }
 
     #[test]
@@ -17752,8 +18524,10 @@ mod tests {
                         "Theme",
                         "Glyph Set",
                         "Reduce motion",
+                        "Status line position",
                         "Output style",
                         "Permissions",
+                        "Artifact Service",
                     ]
                 );
                 settings.id
@@ -17781,6 +18555,82 @@ mod tests {
             "Settings"
         );
         assert_eq!(console.auto_scroll().unwrap(), !auto_scroll);
+        agent.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn settings_menu_status_line_position_saves_before_applying_and_keeps_later_actions() {
+        use crate::settings::{StatusLinePosition, UserSettings};
+        use crate::terminal::menus::Menus;
+        let directory = tempfile::tempdir().unwrap();
+        let settings = UserSettings::in_root(directory.path());
+        let agent = Agent::new_embedded(
+            support::config(),
+            Arc::new(support::ScriptedModel::new(Vec::new())),
+        );
+        let chat = agent.create_chat(directory.path().into()).await.unwrap();
+        let target = crate::terminal::ConfigTarget::Agent(chat);
+        let mut state = State::new(true, 100, 30);
+        state.prompt_enabled = true;
+        state.insert("keep jk draft");
+        let console = InteractiveConsoleFixture::new(state);
+        let mut menus = Menus::new(Some(settings.clone()), Some(directory.path().into()));
+        menus.settings(&agent, &console, target).await.unwrap();
+        let id = console.state.lock().unwrap().menu.as_ref().unwrap().id;
+        menus
+            .choose(&agent, &console, id, Some(10), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            console.display_preferences().unwrap().status_line_position,
+            StatusLinePosition::Left
+        );
+        assert_eq!(
+            settings.display_preferences().status_line_position,
+            StatusLinePosition::Left
+        );
+        assert_eq!(
+            console.state.lock().unwrap().editor.draft(),
+            "keep jk draft"
+        );
+
+        let id = console.state.lock().unwrap().menu.as_ref().unwrap().id;
+        std::fs::write(directory.path().join("settings.json"), "invalid JSON").unwrap();
+        assert!(
+            menus
+                .choose(&agent, &console, id, Some(10), None)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            console.display_preferences().unwrap().status_line_position,
+            StatusLinePosition::Left
+        );
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("settings.json")).unwrap(),
+            "invalid JSON"
+        );
+
+        menus.settings(&agent, &console, target).await.unwrap();
+        let id = console.state.lock().unwrap().menu.as_ref().unwrap().id;
+        menus
+            .choose(&agent, &console, id, Some(11), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            console.state.lock().unwrap().menu.as_ref().unwrap().title,
+            "Preferred output style"
+        );
+        menus.settings(&agent, &console, target).await.unwrap();
+        let id = console.state.lock().unwrap().menu.as_ref().unwrap().id;
+        menus
+            .choose(&agent, &console, id, Some(12), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            console.state.lock().unwrap().menu.as_ref().unwrap().title,
+            "Permissions · Choose mode"
+        );
         agent.shutdown().await;
     }
 

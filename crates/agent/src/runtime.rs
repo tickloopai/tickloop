@@ -33,6 +33,7 @@ pub use usage::{
     UsageSummary,
 };
 mod agent_messages;
+mod artifact_ticks;
 mod compaction;
 mod context;
 mod delegation;
@@ -310,6 +311,8 @@ impl LoopSnapshot {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ChatSnapshot {
+    #[serde(default)]
+    pub artifact_ticks: Vec<crate::artifacts::ArtifactTick>,
     /// 本进程内的请求用量账本（不持久化，照 Claude Code 用量只记在 assistant 消息上）。
     #[serde(skip)]
     pub request_usage: RequestUsageLedger,
@@ -467,6 +470,8 @@ pub struct UserShellRecord {
     pub reason: Option<String>,
     pub output_ref: Option<PathBuf>,
     pub output_bytes: u64,
+    #[serde(default)]
+    pub updated_at_ms: Option<u64>,
     /// 提交时的对话消息数，只用于 Task Center 排序。
     pub submitted_at_message: usize,
     /// Unix milliseconds when the Shell entered its current state; output growth does not move it.
@@ -480,6 +485,7 @@ impl UserShellRecord {
         if self.state != state {
             self.state = state;
             self.state_since = Some(crate::private_fs::unix_time_milliseconds());
+            self.updated_at_ms = self.state_since;
         }
     }
 }
@@ -1174,6 +1180,7 @@ fn answerable_permission_request(
 
 fn empty_snapshot(id: ChatId, workdir: PathBuf, model: ModelConfig) -> ChatSnapshot {
     ChatSnapshot {
+        artifact_ticks: Vec::new(),
         request_usage: RequestUsageLedger::new(),
         id,
         branch_origin: None,
@@ -2523,6 +2530,7 @@ impl Agent {
                 "workdir": chat.snapshot.workdir,
                 "delegation": chat.snapshot.delegation,
                 "workspace_host": workspace_host,
+                "artifact_ticks": chat.snapshot.artifact_ticks,
                 "goal": chat.snapshot.loops.iter().find(|goal| goal.id == receipt.loop_id),
                 "chat_goals": chat.snapshot.loops,
                 "execution_mode": chat.snapshot.policy.mode,

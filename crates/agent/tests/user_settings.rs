@@ -10,7 +10,7 @@ use tickloop_agent::{
     output_style::OutputStyle,
     permissions::{Decision, PermissionRule, PermissionScope, permission_rule_candidates},
     runtime::{Agent, ChatId, EventKind, ModelChange},
-    settings::{DisplayPreferences, GlyphSet, UserSettings},
+    settings::{DisplayPreferences, GlyphSet, StatusLinePosition, UserSettings},
 };
 use tokio::sync::Barrier;
 use uuid::Uuid;
@@ -39,6 +39,7 @@ fn display_preferences_round_trip_without_replacing_unrelated_settings() {
         .save_display_preferences(DisplayPreferences {
             glyph_set: GlyphSet::NerdFont,
             prefers_reduced_motion: true,
+            ..Default::default()
         })
         .unwrap();
 
@@ -47,10 +48,64 @@ fn display_preferences_round_trip_without_replacing_unrelated_settings() {
         DisplayPreferences {
             glyph_set: GlyphSet::NerdFont,
             prefers_reduced_motion: true,
+            ..Default::default()
         }
     );
     assert_eq!(settings_json(directory.path())["cleanupPeriodDays"], 7);
     assert_eq!(settings_json(directory.path())["futureSetting"], true);
+}
+
+#[test]
+fn display_preferences_status_line_position_round_trips_and_validates_without_rewriting() {
+    let directory = tempfile::tempdir().unwrap();
+    let settings = UserSettings::in_root(directory.path());
+    assert_eq!(
+        settings.display_preferences().status_line_position,
+        StatusLinePosition::Right
+    );
+    for (position, serialized) in [
+        (StatusLinePosition::Left, "left"),
+        (StatusLinePosition::Right, "right"),
+    ] {
+        settings
+            .save_display_preferences(DisplayPreferences {
+                status_line_position: position,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            UserSettings::in_root(directory.path())
+                .display_preferences()
+                .status_line_position,
+            position
+        );
+        assert_eq!(
+            settings_json(directory.path())["statusLinePosition"],
+            serialized
+        );
+    }
+    for invalid in [
+        json!("center"),
+        json!(12),
+        json!(false),
+        json!(null),
+        json!({}),
+    ] {
+        let original = json!({"statusLinePosition": invalid, "futureSetting": true});
+        std::fs::write(directory.path().join("settings.json"), original.to_string()).unwrap();
+        let mut loaded = settings.load();
+        assert_eq!(
+            loaded.display_preferences().status_line_position,
+            StatusLinePosition::Right
+        );
+        assert!(
+            loaded
+                .warnings()
+                .iter()
+                .any(|warning| warning.contains("statusLinePosition"))
+        );
+        assert_eq!(settings_json(directory.path()), original);
+    }
 }
 
 #[test]
@@ -1294,4 +1349,32 @@ async fn resuming_retains_original_reasoning_and_projects_different_model_source
         "signatures from another service must not be sent"
     );
     third.shutdown().await;
+}
+
+#[test]
+fn tick_list_preference_preserves_unknown_settings_and_defaults_invalid_values() {
+    use tickloop_agent::settings::TickListPreference;
+    let directory = tempfile::tempdir().unwrap();
+    let settings = UserSettings::in_root(directory.path());
+    std::fs::write(
+        directory.path().join("settings.json"),
+        r#"{"tickList":"invalid","futureKey":{"keep":true},"statusLinePosition":"left"}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        settings.load().tick_list_preference(),
+        TickListPreference::Auto
+    );
+    settings
+        .save_tick_list_preference(TickListPreference::Hidden)
+        .unwrap();
+    assert_eq!(
+        settings.load().tick_list_preference(),
+        TickListPreference::Hidden
+    );
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(directory.path().join("settings.json")).unwrap())
+            .unwrap();
+    assert_eq!(saved["futureKey"], json!({"keep":true}));
+    assert_eq!(saved["statusLinePosition"], "left");
 }

@@ -75,6 +75,13 @@ pub struct SubscriptionSurface {
 }
 
 impl SubscriptionSurface {
+    pub fn select(&mut self, id: Uuid) {
+        if self.rows.iter().any(|row| row.id == id) {
+            self.selected = Some(id);
+            self.top = 0;
+        }
+    }
+
     pub fn open(chat_id: Uuid, rows: Vec<TickSubscriptionStatus>) -> Self {
         let selected = rows.first().map(|row| row.id);
         Self {
@@ -366,6 +373,9 @@ mod tests {
 
     fn row(instance: u64, every_seconds: u64) -> TickSubscriptionStatus {
         TickSubscriptionStatus {
+            title: None,
+            updated_at_ms: None,
+            kind: None,
             id: Uuid::from_u128(u128::from(instance)),
             loop_id: Uuid::from_u128(900),
             loop_state: LoopState::WaitingTrigger,

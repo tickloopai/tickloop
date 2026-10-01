@@ -272,6 +272,7 @@ impl Agent {
         };
         let client = source.client.clone();
         let mut snapshot = ChatSnapshot {
+            artifact_ticks: source.snapshot.artifact_ticks.clone(),
             request_usage: RequestUsageLedger::new(),
             id: child_chat_id,
             branch_origin: Some(origin),
@@ -1173,6 +1174,7 @@ mod tests {
                 }),
                 Self::AgentShell(state) => {
                     chat.snapshot.commands.push(crate::tools::CommandSnapshot {
+                        updated_at_ms: None,
                         operation_id: Uuid::new_v4(),
                         loop_id,
                         command: "sleep 30".into(),
@@ -1197,6 +1199,7 @@ mod tests {
                     chat.snapshot
                         .user_shells
                         .push(super::super::UserShellRecord {
+                            updated_at_ms: None,
                             id: Uuid::new_v4(),
                             chat_id: chat.snapshot.id,
                             loop_id: Some(loop_id),

@@ -188,7 +188,10 @@ fn click_category(pty: &mut PtyView, label: &str) {
     let (row, column) = frame
         .lines()
         .enumerate()
-        .find_map(|(row, line)| line.find(label).map(|column| (row, column)))
+        .find_map(|(row, line)| {
+            line.find(label)
+                .map(|column| (row, unicode_width::UnicodeWidthStr::width(&line[..column])))
+        })
         .expect("rendered category exists");
     let click = format!(
         "\x1b[<0;{};{}M\x1b[<0;{};{}m",
@@ -203,12 +206,12 @@ fn click_category(pty: &mut PtyView, label: &str) {
 fn shell_panel(frame: &str) -> &str {
     let mut offset = 0;
     for line in frame.split_inclusive('\n') {
-        if line.contains("Shell 1") || line.contains("Shell 2") {
+        if line.trim() == "Shell task" || line.trim() == "Shell tasks" {
             return &frame[offset..];
         }
         offset += line.len();
     }
-    panic!("Shell classification bar is missing:\n{frame}");
+    frame
 }
 
 async fn shell_tasks(client: &LocalAgentClient, execution: ExecutionRef) -> Vec<ShellTask> {
@@ -325,71 +328,47 @@ async fn run_shell_panel(fixture: &PrivateFixture) {
         .find(|task| task.command.contains("shell-first"))
         .unwrap()
         .id;
-    pty.wait_for("one eligible Shell appears automatically", |frame| {
-        frame.contains("Shell 1") && !frame.contains("Shell 2")
+    pty.wait_for("running and completed Shell Ticks are counted", |frame| {
+        frame.contains("Ticks 2")
     })
     .await;
     wait_editor_ready(&mut pty, "background Shell releases the editor", "").await;
     pty.send(b"jk-SHELL-DRAFT");
-    pty.wait_for("Shell preview retains normal editor ownership", |frame| {
+    pty.wait_for("Shell draft remains editable", |frame| {
+        frame.contains("jk-SHELL-DRAFT")
+    })
+    .await;
+    click_category(&mut pty, "Ticks 2");
+    pty.wait_for("click opens the content-only Tick List", |frame| {
+        frame.contains("Shells (2)")
+    })
+    .await;
+    pty.send(b"\x1b[1;2B");
+    pty.wait_for("Shift Down focuses the newest Shell", |frame| {
         frame
             .lines()
-            .any(|line| line.starts_with('❯') && line.contains("jk-SHELL-DRAFT"))
+            .any(|line| line.contains("›") && line.contains("shell-first"))
     })
     .await;
-    click_category(&mut pty, "Shell 1");
-    pty.wait_for("one Shell click establishes its actual detail", |frame| {
-        shell_panel(frame)
-            .lines()
-            .any(|line| line.trim() == "Shell task")
-            && shell_panel(frame).contains("shell-first-0123456789abcdef")
-    })
-    .await;
-    pty.send(b"\x1b[H");
-    let detail = pty
-        .wait_for("one Shell click opens exactly its eligible task", |frame| {
-            let panel = shell_panel(frame);
-            panel.contains("Status:") && panel.contains("shell-first-0123456789abcdef")
-        })
-        .await;
-    let detail = shell_panel(&detail);
-    assert!(
-        !detail.contains("prior-completed") && !detail.contains(&first.to_string()),
-        "{detail}"
-    );
-    assert!(detail.contains("0123456789abcdef"));
-    pty.send(b"\x1b[D");
-    pty.wait_for("Back returns to the same shared Shell list", |frame| {
-        frame.contains("Shell 1") && !frame.contains("Status:") && frame.contains("jk-SHELL-DRAFT")
+    pty.send(b"\r");
+    pty.wait_for("Enter opens the exact first task detail", |frame| {
+        shell_panel(frame).contains("shell-first-0123456789abcdef")
+            && shell_panel(frame)
+                .lines()
+                .any(|line| line.trim() == "Shell task")
     })
     .await;
     pty.send(b"\x1b");
     wait_editor_ready(
         &mut pty,
-        "Esc returns from the Shell list to input",
+        "Esc returns to the full-width draft",
         "jk-SHELL-DRAFT",
     )
     .await;
     pty.send(b"\x15");
-    wait_editor_ready(
-        &mut pty,
-        "the Shell draft is cleared before the next command",
-        "",
-    )
-    .await;
+    wait_editor_ready(&mut pty, "draft cleared", "").await;
     pty.send(b"!printf 'shell-second\\n'; while [ ! -f second-finish ]; do sleep 0.02; done\r");
-    wait_snapshot(
-        &client,
-        execution,
-        "second real Shell is foreground-running",
-        |current| {
-            current.user_shells.iter().any(|task| {
-                task.command.contains("shell-second") && task.state == UserShellState::Running
-            })
-        },
-    )
-    .await;
-    pty.wait_for("second Shell output is visible", |frame| {
+    pty.wait_for("second Shell output", |frame| {
         frame.lines().any(|line| line.trim() == "shell-second")
     })
     .await;
@@ -397,7 +376,7 @@ async fn run_shell_panel(fixture: &PrivateFixture) {
     let multiple = wait_shell_tasks(
         &client,
         execution,
-        "two eligible Shell tasks are present",
+        "both Shells are background-running",
         |tasks| {
             tasks
                 .iter()
@@ -413,73 +392,36 @@ async fn run_shell_panel(fixture: &PrivateFixture) {
         .unwrap()
         .id;
     assert_ne!(first, second);
-    pty.wait_for("two-task count matches the shared list", |frame| {
-        frame.contains("Shell 2")
+    pty.wait_for("completed Shell remains in the Tick count", |frame| {
+        frame.contains("Ticks 3")
     })
     .await;
-    wait_editor_ready(
-        &mut pty,
-        "the second background Shell releases the editor before its category is clicked",
-        "",
-    )
+    wait_editor_ready(&mut pty, "second Shell releases input", "").await;
+    click_category(&mut pty, "Ticks 3");
+    pty.wait_for("all three Shell Ticks appear", |frame| {
+        frame.contains("Shells (3)")
+    })
     .await;
-    click_category(&mut pty, "Shell 2");
-    let list = pty
-        .wait_for("multiple Shell click stays in its eligible list", |frame| {
-            let panel = shell_panel(frame);
-            panel.contains("shell-first")
-                && panel.contains("shell-second")
-                && panel.contains("2 items · Enter details")
-                && panel.lines().any(|line| line.trim_start().starts_with('›'))
-                && !panel.contains("Status:")
-        })
-        .await;
-    let list = shell_panel(&list);
-    assert!(!list.contains("prior-completed"), "{list}");
-    let rows = list.lines().collect::<Vec<_>>();
-    let selected = rows
-        .iter()
-        .position(|line| line.trim_start().starts_with('›'))
-        .expect("the clicked shared list acknowledges focus");
-    let target = rows
-        .iter()
-        .position(|line| line.contains("shell-second"))
-        .expect("the exact second Shell appears in the eligible list");
-    if target < selected {
-        pty.send(b"k");
-    } else if target > selected {
-        pty.send(b"j");
-    }
-    pty.wait_for("second exact Shell is selected", |frame| {
-        shell_panel(frame)
+    pty.send(b"\x1b[1;2B");
+    pty.wait_for("newest exact Shell selected", |frame| {
+        frame
             .lines()
-            .any(|line| line.trim_start().starts_with('›') && line.contains("shell-second"))
+            .any(|line| line.contains("›") && line.contains("shell-second"))
     })
     .await;
     pty.send(b"\r");
-    pty.wait_for(
-        "selected second Shell establishes its actual detail",
-        |frame| {
-            let panel = shell_panel(frame);
-            panel.lines().any(|line| line.trim() == "Shell task")
-                && panel.contains("shell-second")
-                && !panel.contains("shell-first")
-        },
-    )
-    .await;
-    pty.send(b"\x1b[H");
-    pty.wait_for("selected second Shell detail opens", |frame| {
-        let panel = shell_panel(frame);
-        panel.contains("Status:")
-            && panel.contains("shell-second")
-            && !panel.contains("shell-first")
+    pty.wait_for("second exact detail", |frame| {
+        shell_panel(frame).contains("shell-second")
+            && shell_panel(frame)
+                .lines()
+                .any(|line| line.trim() == "Shell task")
     })
     .await;
     pty.send(b"x");
     let stopped = wait_shell_tasks(
         &client,
         execution,
-        "Stop affects only the selected second task",
+        "Stop affects only the selected task",
         |tasks| {
             tasks
                 .iter()
@@ -500,58 +442,50 @@ async fn run_shell_panel(fixture: &PrivateFixture) {
             .is_empty()
     );
     assert!(requests.try_recv().is_err());
-    pty.wait_for("completed detail remains the second task", |frame| {
-        let panel = shell_panel(frame);
-        panel.contains("shell-second")
-            && panel.contains("Status:")
-            && !panel.contains("shell-first")
+    pty.send(b"\x1b");
+    wait_editor_ready(&mut pty, "stopped detail closes to input", "").await;
+    click_category(&mut pty, "Ticks 3");
+    pty.wait_for("Tick List opens after saved preference", |frame| {
+        frame.contains("Shells (3)")
     })
     .await;
-    pty.send(b"\x1b");
+    pty.send(b"\x1b[C");
+    pty.wait_for("ended second Tick is ready to remove", |frame| {
+        let rows = frame.lines().collect::<Vec<_>>();
+        rows.iter().enumerate().any(|(index, line)| {
+            line.contains("›")
+                && line.contains("shell-second")
+                && rows.get(index + 1).is_some_and(|metadata| {
+                    ["exit", "signal", "stopped", "unknown"]
+                        .iter()
+                        .any(|state| metadata.contains(state))
+                })
+        })
+    })
+    .await;
+    pty.send(b"x");
     pty.wait_for(
-        "Esc returns the completed detail to its shared list",
-        |frame| {
-            frame.contains("Shell 1")
-                && !shell_panel(frame)
-                    .lines()
-                    .any(|line| line.trim() == "Shell task")
-        },
+        "ended Tick can be removed without stopping its peer",
+        |frame| frame.contains("Shells (2)"),
     )
     .await;
     pty.send(b"\x1b");
-    wait_editor_ready(
-        &mut pty,
-        "Esc restores input before the explicit task command",
-        "",
-    )
-    .await;
-    pty.send(b"\x15/tasks\r");
-    pty.wait_for("explicit tasks reopens the saved task surface", |frame| {
-        frame.contains("Shell task")
+    wait_editor_ready(&mut pty, "Tick List closes to input", "").await;
+    pty.send(b"/tasks\r");
+    pty.wait_for("Task Center retains the removed Tick's task", |frame| {
+        frame.contains("Shell task") && frame.contains("shell-second")
     })
     .await;
     pty.send(b"\x1b[D");
-    pty.wait_for(
-        "explicit tasks retains the broader completed catalog",
-        |frame| {
-            let rows = frame.lines().collect::<Vec<_>>();
-            let Some(heading) = rows.iter().position(|line| line.trim() == "Shell tasks") else {
-                return false;
-            };
-            let list = &rows[heading + 1..];
-            ["prior-completed", "shell-first", "shell-second"]
-                .iter()
-                .all(|command| list.iter().any(|line| line.contains(command)))
-        },
-    )
+    pty.wait_for("Task Center still keeps completed records", |frame| {
+        let panel = shell_panel(frame);
+        ["prior-completed", "shell-first", "shell-second"]
+            .iter()
+            .all(|command| panel.contains(command))
+    })
     .await;
     pty.send(b"\x1b");
-    wait_editor_ready(
-        &mut pty,
-        "Esc closes the broader task list before View exit",
-        "",
-    )
-    .await;
+    wait_editor_ready(&mut pty, "task list closes before exit", "").await;
     std::fs::write(fixture.path("work/first-finish"), "done").unwrap();
     std::fs::write(fixture.path("work/second-finish"), "done").unwrap();
     pty.close().await;

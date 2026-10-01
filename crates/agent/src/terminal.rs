@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    io::{IsTerminal, Write},
+    io::IsTerminal,
+    os::unix::fs::MetadataExt,
     path::PathBuf,
 };
 
@@ -21,6 +22,8 @@ use tickloop_agent::{
 };
 use tokio::sync::{broadcast, mpsc};
 
+mod artifact_ui;
+mod artifacts_picker;
 mod clipboard;
 mod clipboard_hint;
 mod completion;
@@ -81,8 +84,10 @@ mod task_surface;
 #[path = "../tests/support/mod.rs"]
 mod test_support;
 mod thinking_preview;
+mod tick_list;
 mod transcript;
 mod workflows;
+mod workspace_trust;
 
 use console::{Console, InputEvent, RendererSwitch};
 use diff_catalog::ChangeCatalog;
@@ -478,17 +483,17 @@ fn parse_execution_mode(value: &str) -> Result<(ExecutionMode, Option<&'static s
     }
 }
 
-fn ensure_startup_directory_trust(
+fn startup_directory_needs_trust(
     settings: Option<&UserSettings>,
     workdir: &std::path::Path,
     interactive: bool,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let settings = settings.ok_or_else(|| {
         "cannot record working-directory trust because the user settings directory is unavailable; set TICKLOOP_CONFIG_DIR"
             .to_owned()
     })?;
     if settings.is_working_directory_trusted(workdir) {
-        return Ok(());
+        return Ok(false);
     }
     if !interactive {
         return Err(format!(
@@ -496,25 +501,61 @@ fn ensure_startup_directory_trust(
             safe_text(&workdir.to_string_lossy())
         ));
     }
-    eprintln!(
-        "Trust working directory {}? Project content may influence Agent behavior. [y/N]",
-        safe_text(&workdir.to_string_lossy())
-    );
-    std::io::stderr()
-        .flush()
-        .map_err(|error| format!("cannot display directory trust request: {error}"))?;
-    let mut answer = String::new();
-    std::io::stdin()
-        .read_line(&mut answer)
-        .map_err(|error| format!("cannot read directory trust decision: {error}"))?;
-    if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
-        return Err(
-            "working directory was not trusted; no Chat or model request was started".into(),
-        );
+    Ok(true)
+}
+
+async fn await_startup_directory_trust(
+    console: &Console,
+    input: &mut mpsc::Receiver<InputEvent>,
+    settings: &UserSettings,
+    workdir: &std::path::Path,
+    identity: (u64, u64),
+) -> Result<bool, String> {
+    let id = console.workspace_trust_id()?;
+    loop {
+        let event = tokio::select! {
+            event = input.recv() => event,
+            _ = tokio::signal::ctrl_c() => return Ok(false),
+        };
+        match event {
+            Some(InputEvent::Choice {
+                menu_id, index: workspace_trust::TRUST_ACCEPT_CHOICE_INDEX, ..
+            }) if menu_id == id => {
+                let settings = settings.clone();
+                let workdir = workdir.to_path_buf();
+                let result = tokio::task::spawn_blocking(move || {
+                    let current = std::fs::metadata(&workdir).map_err(|error| error.to_string())?;
+                    if !current.is_dir()
+                        || (current.dev(), current.ino()) != identity
+                        || std::fs::canonicalize(&workdir).map_err(|error| error.to_string())?
+                            != workdir
+                    {
+                        return Err(
+                            "The displayed directory changed; exit and launch again to review it."
+                                .into(),
+                        );
+                    }
+                    settings
+                        .trust_working_directory(&workdir)
+                        .map_err(|error| format!("Cannot save directory trust: {error}"))
+                })
+                .await
+                .map_err(|error| error.to_string())?;
+                match result {
+                    Ok(()) => return Ok(true),
+                    Err(error) => console.workspace_trust_failed(error)?,
+                }
+            }
+            Some(InputEvent::Choice { menu_id, .. } | InputEvent::Cancel { menu_id })
+                if menu_id == id =>
+            {
+                return Ok(false);
+            }
+            Some(InputEvent::Eof | InputEvent::Interrupt) | None => return Ok(false),
+            Some(InputEvent::Error(error)) => return Err(error),
+            _ => {}
+        }
     }
-    settings
-        .trust_working_directory(workdir)
-        .map_err(|error| format!("cannot save working-directory trust: {error}"))
 }
 
 pub fn print_help() {
@@ -744,8 +785,27 @@ async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Result<(
     let user_settings = config_root
         .as_deref()
         .map(|root| UserSettings::in_root(&root.canonicalize().unwrap_or_else(|_| root.into())));
-    if !caller_managed_trust {
-        ensure_startup_directory_trust(user_settings.as_ref(), &workdir, interactive_terminal)?;
+    let mut startup_console = None;
+    if !caller_managed_trust
+        && startup_directory_needs_trust(user_settings.as_ref(), &workdir, interactive_terminal)?
+    {
+        let settings = user_settings
+            .as_ref()
+            .expect("trust gate requires user settings");
+        let (console, mut input) =
+            Console::start_with_workspace_trust(settings.display_preferences(), workdir.clone())?;
+        if !await_startup_directory_trust(
+            &console,
+            &mut input,
+            settings,
+            &workdir,
+            (metadata.dev(), metadata.ino()),
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        startup_console = Some((console, input));
     }
     // 照 Claude Code：启动参数指定的模型优先，其次是 `/model` 保存在用户设置中的选择。
     let explicit_config = config_path
@@ -785,6 +845,10 @@ async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Result<(
     let status_lines = saved_settings
         .as_mut()
         .and_then(LoadedSettings::status_lines);
+    let tick_list_preference = saved_settings
+        .as_ref()
+        .map(LoadedSettings::tick_list_preference)
+        .unwrap_or_default();
     let startup_settings_warnings = saved_settings
         .map(LoadedSettings::into_warnings)
         .unwrap_or_default();
@@ -923,12 +987,13 @@ async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Result<(
     } else {
         StartupChat::New
     };
-    let (console, input) = Console::start_with_display(
-        std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
-        display_preferences,
-    )?;
+    let (console, input) = match startup_console.take() {
+        Some(started) => started,
+        None => Console::start_with_display(interactive_terminal, display_preferences)?,
+    };
     let console = &console;
     console.set_status_lines(status_lines)?;
+    console.set_tick_list_preference(tick_list_preference)?;
     console.configure_input_history(config_root.as_deref(), &workdir)?;
     // The image cache expires with Transcripts, so a session that saves no Chats caches nothing.
     let image_cache_root = config_root
@@ -950,6 +1015,7 @@ async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Result<(
             .unwrap_or_default(),
         startup_settings_warnings,
     )?;
+    console.finish_workspace_trust()?;
     let result = interact(
         &agent,
         workdir,
@@ -1101,6 +1167,9 @@ async fn interact(
     {
         menus.add_transient_provider(provider);
     }
+    let mut artifact_loads = tokio::task::JoinSet::new();
+    let mut artifact_refresh = tokio::time::interval(std::time::Duration::from_millis(50));
+    artifact_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut login: Option<LoginFlow> = None;
     let mut login_from_provider = false;
     let mut provider_login_succeeded = false;
@@ -1435,6 +1504,11 @@ async fn interact(
                     .snapshot(chat)
                     .await
                     .map_err(|error| error.to_string())?;
+                console.update_shell_ticks(&task_snapshot)?;
+                if let Ok(rows) = agent.tick_subscriptions(chat).await {
+                    console.update_subscribed_ticks(chat, &rows)?;
+                }
+                console.update_artifact_ticks(&snapshot)?;
                 console.update_status_area(
                     snapshot.policy.mode.to_string(),
                     safe_text(&snapshot.model.model),
@@ -1687,6 +1761,15 @@ async fn interact(
         let has_visible_running_task = interactive && console.has_visible_running_task()?;
         let prefers_reduced_motion =
             interactive && console.display_preferences()?.prefers_reduced_motion;
+        if interactive
+            && let Some(request) = console.take_artifact_load()?
+            && let Some(root) = config_root.clone()
+        {
+            artifact_loads.spawn(async move {
+                let result = artifact_ui::load_page(&root, &request).await;
+                (request, result)
+            });
+        }
         let discovery_active = menus.discovery_active();
         let login_active = login.is_some();
         let logout_active = logout.is_some();
@@ -1695,6 +1778,10 @@ async fn interact(
         #[cfg(not(test))]
         let global_refresh_enabled = true;
         tokio::select! {
+            _ = artifact_refresh.tick(), if console.artifacts_picker_is_open()? => {},
+            result = artifact_loads.join_next(), if !artifact_loads.is_empty() => {
+                if let Some(Ok((request, result))) = result { console.artifact_page_loaded(&request, result)?; }
+            },
             result = menus.next_discovery(), if discovery_active => {
                 menus.finish_discovery(agent, console, result).await?;
                 status_dirty = true;
@@ -1709,7 +1796,11 @@ async fn interact(
                         flow.close(console)?;
                         match result {
                             Ok(account) => {
-                                provider_login_succeeded = true;
+                                if provider_label == "Artifact Service" {
+                                    if let Some(root) = config_root.as_deref() {
+                                        artifact_ui::open(agent, console, root, selected_chat, interactive).await?;
+                                    }
+                                } else { provider_login_succeeded = true; }
                                 outln!(console, "{} login saved · {}", provider_label, safe_text(&account));
                             }
                             Err(error) => outln!(console, "Cannot log in: {}", safe_text(&error)),
@@ -1751,6 +1842,17 @@ async fn interact(
                 if !matches!(&line,Some(InputEvent::Line(input)|InputEvent::Prompt {text:input,..}) if !input.trim_start().starts_with('/')) {
                     merged_echoes.next_submission_block();
                 }
+                let line = match line {
+                    Some(InputEvent::TickListAction { chat, id, action }) if selected_chat == Some(chat) && !overview_active && !login_active => {
+                        match artifact_ui::tick_action(agent, console, config_root.as_deref(), chat, id, action).await {
+                            Ok(Some(prompt)) => Some(prompt),
+                            Ok(None) => { status_dirty = true; continue; },
+                            Err(error) => { console.set_status(&safe_text(&error))?; status_dirty = true; continue; }
+                        }
+                    }
+                    Some(InputEvent::TickListAction { .. }) => continue,
+                    other => other,
+                };
                 match line {
                 None | Some(InputEvent::Eof) => {
                     if interactive { return Ok(()); }
@@ -1870,6 +1972,23 @@ async fn interact(
                     console.suspend()?;
                     status_dirty=true;
                 },
+                Some(InputEvent::ToggleTickList { show }) => {
+                    if let Err(error) = set_tick_list_visible(console, user_settings.as_ref(), show) { console.set_status(&safe_text(&error))?; }
+                    else if show && let Some(chat) = selected_chat { artifact_ui::refresh(agent, console, config_root.as_deref(), chat).await?; }
+                    status_dirty = true;
+                },
+                Some(InputEvent::ArtifactChoice(choice)) => {
+                    let Some(root) = config_root.as_deref() else { continue; };
+                    if !console.artifact_picker_matches(choice.picker)? { continue; }
+                    if matches!(choice.action, artifacts_picker::ArtifactPickerAction::Add) && selected_chat.is_none() {
+                        let _ = ensure_chat(console, agent, &mut selected_chat, &workdir).await?;
+                    }
+                    match artifact_ui::apply_choice(agent, console, root, selected_chat, *choice).await {
+                        Ok(()) => {}, Err(error) => console.artifact_picker_error(safe_text(&error))?,
+                    }
+                    status_dirty = true;
+                },
+                Some(InputEvent::TickListAction { .. }) => {},
                 Some(InputEvent::OpenFooter(item)) => {
                     let result = if let Some(chat) = selected_chat {
                         match item {
@@ -1883,7 +2002,7 @@ async fn interact(
                 },
                 Some(InputEvent::OpenStatusTask(task_id)) => {
                     if let Some(chat) = selected_chat {
-                        let result = open_tasks(&task_center,console,chat,&mut task_subscription,Some(task_id),true).await;
+                        let result = open_tasks(&task_center,console,chat,&mut task_subscription,Some(task_id),false).await;
                         console.finish_footer_open()?;
                         result?;
                     }
@@ -2408,57 +2527,15 @@ async fn interact(
                         "/help advanced" if interactive => menus.help_advanced(console)?,
                         "/help advanced" => outln!(console, "{}",completion::command_help(true)),
                         command if command == "/artifacts" || command.starts_with("/artifacts ") => {
-                            let Some(root) = config_root.as_ref() else {
-                                outln!(console, "Artifact Service needs a state directory; set TICKLOOP_CONFIG_DIR.");
-                                continue;
-                            };
-                            match command.strip_prefix("/artifacts").unwrap_or_default().trim() {
-                                "login" => {
-                                    match LoginFlow::start(root.clone(), console, login::LoginMethod::Artifact) {
-                                        Ok(flow) => login = Some(flow),
-                                        Err(error) => outln!(console, "Cannot start Artifact Service login: {}", safe_text(&error)),
-                                    }
-                                }
-                                "status" => {
-                                    match tickloop_agent::artifacts::ArtifactClient::new(root) {
-                                        Ok(client) => match client.status().await {
-                                            Ok(Some(user)) => outln!(console, "Artifact Service account: {} · {}", safe_text(user.display_name()), safe_text(client.origin())),
-                                            Ok(None) => outln!(console, "Artifact Service: signed out · {}. Use /artifacts login.", safe_text(client.origin())),
-                                            Err(error) => outln!(console, "Cannot check Artifact Service account: {}", safe_text(&error.to_string())),
-                                        },
-                                        Err(error) => outln!(console, "Cannot configure Artifact Service: {}", safe_text(&error.to_string())),
-                                    }
-                                }
-                                "logout" => {
-                                    if let Err(error) = agent.disable_event_sources().await {
-                                        outln!(console, "Cannot stop Artifact feedback listening before logout: {}", safe_text(&error.to_string()));
-                                        continue;
-                                    }
-                                    match tickloop_agent::artifacts::ArtifactClient::new(root) {
-                                        Ok(client) => match client.logout().await {
-                                            Ok(tickloop_agent::artifacts::LogoutOutcome::Removed) => outln!(console, "Artifact Service login revoked or invalidated and removed locally."),
-                                            Ok(tickloop_agent::artifacts::LogoutOutcome::NewerLoginPresent) => outln!(console, "Previous Artifact Service login revoked; a newer local login remains active."),
-                                            Ok(tickloop_agent::artifacts::LogoutOutcome::AlreadySignedOut) => outln!(console, "Artifact Service is already signed out."),
-                                            Err(error) => outln!(console, "Cannot log out of Artifact Service: {}", safe_text(&error.to_string())),
-                                        },
-                                        Err(error) => outln!(console, "Cannot configure Artifact Service: {}", safe_text(&error.to_string())),
-                                    }
-                                }
-                                subcommand if subcommand.starts_with("resume ") => {
-                                    let Some(chat_id) = selected_chat else {
-                                        outln!(console, "Select a Chat before resuming feedback listening.");
-                                        continue;
-                                    };
-                                    let loop_id = subcommand.strip_prefix("resume ").unwrap_or_default().trim().parse::<uuid::Uuid>();
-                                    match loop_id {
-                                        Ok(loop_id) => match agent.resume_event_sources(chat_id, loop_id).await {
-                                            Ok(count) => outln!(console, "Resumed feedback listening for Loop {} ({} source{}).", loop_id, count, if count == 1 { "" } else { "s" }),
-                                            Err(error) => outln!(console, "Cannot resume feedback listening: {}", safe_text(&error.to_string())),
-                                        },
-                                        Err(_) => outln!(console, "Use /artifacts resume LOOP_ID with the exact Loop ID shown in /loops details."),
-                                    }
-                                }
-                                _ => outln!(console, "Use /artifacts login, /artifacts status, /artifacts logout or /artifacts resume LOOP_ID."),
+                            if command.trim() != "/artifacts" { outln!(console, "Use /artifacts"); continue; }
+                            let Some(root) = config_root.as_ref() else { outln!(console, "Artifact Service needs a state directory; set TICKLOOP_CONFIG_DIR."); continue; };
+                            match tickloop_agent::artifacts::ArtifactClient::new(root).map_err(|error| error.to_string()) {
+                                Ok(client) => match client.status().await {
+                                    Ok(Some(_)) => { if let Err(error) = artifact_ui::open(agent, console, root, selected_chat, interactive).await { outln!(console, "Cannot open Artifacts: {}", safe_text(&error)); } }
+                                    Ok(None) => match LoginFlow::start(root.clone(), console, login::LoginMethod::Artifact) { Ok(flow) => login = Some(flow), Err(error) => outln!(console, "Cannot start Artifact Service login: {}", safe_text(&error)) },
+                                    Err(error) => outln!(console, "Cannot check Artifact Service account: {}", safe_text(&error.to_string())),
+                                },
+                                Err(error) => outln!(console, "Cannot configure Artifact Service: {}", safe_text(&error)),
                             }
                         },
                         command if is_rewind_command(command) => {
@@ -2525,6 +2602,11 @@ async fn interact(
                                 open_subscriptions(agent,console,chat).await?;
                             }
                             else {outln!(console,"No Chat is selected. Enter a task first.");}
+                        },
+                        "/ticks" => {
+                            let show = !console.tick_list_is_visible()?;
+                            if let Err(error) = set_tick_list_visible(console, user_settings.as_ref(), show) { outln!(console, "{}", safe_text(&error)); }
+                            else if show && let Some(chat) = selected_chat { artifact_ui::refresh(agent, console, config_root.as_deref(), chat).await?; }
                         },
                         "/plan" => {
                             let Some(chat)=selected_chat else {
@@ -3670,7 +3752,8 @@ async fn interact(
                     write_next_reply_line(console, reply)?;
                 }
             },
-            _ = subscription_refresh.tick(), if interactive && console.subscription_view_chat()?.is_some() => {
+            _ = subscription_refresh.tick(), if interactive && !overview_active && (console.tick_list_has_entries()? || console.subscription_view_chat()?.is_some()) => {
+                status_dirty |= console.tick_list_has_entries()?;
                 if let Some(chat)=console.subscription_view_chat()? {
                     refresh_subscriptions(agent,console,chat).await?;
                 }
@@ -3794,6 +3877,28 @@ async fn open_rewind(
         return Ok(Some(status.into()));
     }
     menus.rewind(console, &snapshot)
+}
+
+fn set_tick_list_visible(
+    console: &Console,
+    settings: Option<&UserSettings>,
+    show: bool,
+) -> Result<(), String> {
+    let settings = settings
+        .ok_or("No Agent state directory is configured; cannot save Tick List preference")?;
+    let preference = if show {
+        crate::settings::TickListPreference::Auto
+    } else {
+        crate::settings::TickListPreference::Hidden
+    };
+    settings
+        .save_tick_list_preference(preference)
+        .map_err(|error| format!("Cannot save Tick List preference: {error}"))?;
+    console.set_tick_list_preference(preference)?;
+    if show {
+        console.open_tick_list()?;
+    }
+    Ok(())
 }
 
 async fn open_tasks(
@@ -6815,6 +6920,7 @@ mod tests {
         .into_iter()
         .enumerate()
         .map(|(index, (was_background, state))| ShellTask {
+            updated_at_ms: None,
             id: Uuid::from_u128(index as u128 + 1),
             chat_id,
             origin: ShellTaskOrigin::User,

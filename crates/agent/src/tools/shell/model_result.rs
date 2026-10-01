@@ -288,6 +288,7 @@ mod tests {
         let output_ref = directory.join("task.output");
         std::fs::write(&output_ref, output).unwrap();
         CommandSnapshot {
+            updated_at_ms: None,
             operation_id: Uuid::nil(),
             loop_id: Uuid::nil(),
             command: command.into(),
