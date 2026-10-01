@@ -28,10 +28,10 @@ use crate::{
     host_tools::{
         ClaimedEvent, ConnectAction, ConnectSourceEffect, EventAssociationOutcome,
         EventAssociationRequest, EventClaimOutcome, EventClaimRequest, EventLeaseOutcome,
-        EventLeaseRequest, EventPendingOutcome, EventSourceLocator, HostCallResult, HostEffect,
-        HostToolPermission, HostToolProvider, PendingEvent, PreparedHostCall,
-        PublishedSourceEffect, RemoteAssociation, RemoteAssociationOperation, WorkspaceHostContext,
-        connection_result,
+        EventLeaseRequest, EventPendingOutcome, EventSourceLocator, HostCallContext,
+        HostCallResult, HostEffect, HostEndpointIdentity, HostToolPermission, HostToolProvider,
+        PendingEvent, PreparedHostCall, PublishedSourceEffect, RemoteAssociation,
+        RemoteAssociationOperation, WorkspaceHostContext, connection_result,
     },
     mcp_http::McpHttpClient,
     model::ToolDefinition,
@@ -1414,6 +1414,12 @@ impl HostToolProvider for McpHostToolProvider {
         definitions
     }
 
+    fn host_endpoint(&self) -> Result<Option<HostEndpointIdentity>, String> {
+        self.native
+            .as_ref()
+            .map_or(Ok(None), |native| native.host_endpoint())
+    }
+
     fn workspace_host_context(&self) -> Option<WorkspaceHostContext> {
         self.native
             .as_ref()
@@ -1871,6 +1877,25 @@ impl HostToolProvider for McpHostToolProvider {
                 .map_or(HostToolPermission::Reviewable, |native| {
                     native.permission(chat_id, name, input)
                 })
+        }
+    }
+
+    async fn prepare_call_in_context(
+        &self,
+        chat_id: ChatId,
+        context: &HostCallContext,
+        name: &str,
+        input: &Value,
+        cancel: CancellationToken,
+    ) -> Result<PreparedHostCall, String> {
+        if Self::is_mcp_name(name) {
+            self.prepare_call(chat_id, name, input, cancel).await
+        } else {
+            self.native
+                .as_ref()
+                .ok_or_else(|| "Host tool unavailable".to_owned())?
+                .prepare_call_in_context(chat_id, context, name, input, cancel)
+                .await
         }
     }
 

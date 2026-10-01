@@ -1,4 +1,5 @@
-use tickloop_agent::runtime::{Agent, Trigger};
+use super::execution::ConsoleExecution as Agent;
+use tickloop_agent::runtime::Trigger;
 use uuid::Uuid;
 
 use super::{current_time_ms, safe_text};
@@ -121,7 +122,16 @@ impl TimerSchedule {
             .iter()
             .find(|item| item.id == goal)
             .ok_or("Goal does not belong to the current Chat; use /loops.")?;
-        let mut trigger = selected.trigger.clone().unwrap_or(Trigger {
+        let trigger = self.prepare(selected.trigger.clone())?;
+        agent
+            .configure_trigger(chat, goal, Some(trigger.clone()))
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(trigger)
+    }
+
+    pub(super) fn prepare(self, current: Option<Trigger>) -> Result<Trigger, String> {
+        let mut trigger = current.unwrap_or(Trigger {
             id: Uuid::new_v4(),
             prompt: String::new(),
             interval_seconds: None,
@@ -135,10 +145,6 @@ impl TimerSchedule {
         trigger.interval_seconds = Some(self.interval_seconds);
         trigger.expires_at_ms = self.expires_at_ms()?;
         trigger.prompt = self.prompt;
-        agent
-            .configure_trigger(chat, goal, Some(trigger.clone()))
-            .await
-            .map_err(|error| error.to_string())?;
         Ok(trigger)
     }
 }

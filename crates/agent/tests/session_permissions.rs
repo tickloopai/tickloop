@@ -138,6 +138,59 @@ fn web_fetch_grants_cover_the_host_whatever_the_path_and_prompt() {
 }
 
 #[test]
+fn frozen_denials_preserve_normalized_host_and_workspace_without_copying_allowances() {
+    let root = tempfile::tempdir().unwrap();
+    let other_root = tempfile::tempdir().unwrap();
+    let workspace = make_workspace(root.path(), Vec::new());
+    let source_chat = Uuid::new_v4();
+    let source_loop = Uuid::new_v4();
+    let source = owner(source_chat, source_loop);
+    let fetch = |workspace: &Workspace, host: &str, path: &str| {
+        let prepared = tickloop_agent::tools::prepare(
+            workspace,
+            "WebFetch",
+            &json!({"url":format!("https://{host}/{path}"),"prompt":path}),
+        )
+        .unwrap();
+        SessionPermissionOperation::from_prepared(&prepared, workspace).unwrap()
+    };
+    let mut context = SessionPermissionContext::default();
+    context
+        .record(
+            source,
+            fetch(&workspace, "blocked.example.com", "first"),
+            SessionPermissionDecision::Deny,
+        )
+        .unwrap();
+    context
+        .record(
+            source,
+            fetch(&workspace, "allowed.example.com", "first"),
+            SessionPermissionDecision::Allow,
+        )
+        .unwrap();
+    let delegating_chat = Uuid::new_v4();
+    let delegating_loop = Uuid::new_v4();
+    context
+        .register_branch(source_chat, Some(source_loop), delegating_chat)
+        .unwrap();
+    context
+        .inherit_loop(delegating_chat, delegating_loop)
+        .unwrap();
+    let frozen = context.freeze_denials(owner(delegating_chat, delegating_loop));
+    assert_eq!(frozen.len(), 1);
+    let restored: Vec<session_permissions::SessionPermissionDenial> =
+        serde_json::from_value(serde_json::to_value(frozen).unwrap()).unwrap();
+    assert!(restored[0].matches(&fetch(&workspace, "blocked.example.com", "different")));
+    assert!(!restored[0].matches(&fetch(&workspace, "allowed.example.com", "first")));
+    assert!(!restored[0].matches(&fetch(
+        &make_workspace(other_root.path(), vec![]),
+        "blocked.example.com",
+        "first"
+    )));
+}
+
+#[test]
 fn branch_inheritance_maps_each_child_loop_to_the_selected_source() {
     let root = tempfile::tempdir().unwrap();
     let workspace = make_workspace(root.path(), Vec::new());

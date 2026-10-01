@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 
 pub(super) struct ReplyLines {
+    pub(super) chat_id: uuid::Uuid,
     pub(super) message_id: Option<String>,
     incomplete: String,
     complete: VecDeque<String>,
@@ -8,8 +9,9 @@ pub(super) struct ReplyLines {
 }
 
 impl ReplyLines {
-    pub(super) fn new(message_id: Option<String>) -> Self {
+    pub(super) fn new(chat_id: uuid::Uuid, message_id: Option<String>) -> Self {
         Self {
+            chat_id,
             message_id,
             incomplete: String::new(),
             complete: VecDeque::new(),
@@ -53,7 +55,7 @@ mod tests {
 
     #[test]
     fn waits_for_complete_lines_and_releases_one_at_a_time() {
-        let mut reply = ReplyLines::new(Some("reply".into()));
+        let mut reply = ReplyLines::new(uuid::Uuid::nil(), Some("reply".into()));
         reply.push("first li");
         assert!(!reply.has_complete_line());
         reply.push("ne\nsecond\nthird");
@@ -66,7 +68,7 @@ mod tests {
 
     #[test]
     fn completion_releases_a_reply_without_a_newline() {
-        let mut reply = ReplyLines::new(None);
+        let mut reply = ReplyLines::new(uuid::Uuid::nil(), None);
         reply.push("one ");
         reply.push("line");
         reply.finish();

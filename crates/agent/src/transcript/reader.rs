@@ -37,9 +37,10 @@ const COMPACT_BOUNDARY_MARKER: &[u8] = b"\"compact_boundary\"";
 const SYSTEM_LINE_PREFIX: &[u8] = b"{\"type\":\"system\"";
 /// 照 Claude Code `METADATA_TYPE_MARKERS`：边界之前仍要读取的 Chat 级元数据。Tick Loop 的 Chat 级
 /// 元数据只有标题，另外保留 Branch 来源。
-const PRE_BOUNDARY_METADATA_MARKERS: [&[u8]; 2] = [
+const PRE_BOUNDARY_METADATA_MARKERS: [&[u8]; 3] = [
     b"{\"type\":\"custom-title\"",
     b"{\"type\":\"branch-origin\"",
+    b"{\"type\":\"delegation\"",
 ];
 
 /// 照 Claude Code `loadTranscriptFile` 与 `buildConversationChain` 加载 Transcript：
@@ -104,6 +105,7 @@ pub(crate) fn load_original_user_inputs(
             && entry.execution_mode.is_some()
             && !entry.is_compact_summary
             && !entry.is_inherited_prompt
+            && entry.agent_message_origin.is_none()
         {
             let (Some(loop_id), Some(run_id)) = (entry.loop_id, entry.run_id) else {
                 return Ok(None);
@@ -181,6 +183,10 @@ fn load_lines(
             }
             Line::BranchOrigin(entry) => {
                 metadata.branch_origin = Some(entry.clone());
+                continue;
+            }
+            Line::Delegation(entry) => {
+                metadata.delegation = Some(entry.clone());
                 continue;
             }
             Line::FileHistorySnapshot(entry) => {
@@ -582,6 +588,7 @@ mod tests {
             execution_mode: None,
             is_inherited_prompt: false,
             original_user_message_id: None,
+            agent_message_origin: None,
             run_id: None,
             contexts: None,
             continues_message,

@@ -485,6 +485,8 @@ impl Agent {
         chat_id: ChatId,
         instructions: Option<String>,
     ) -> Result<CompactionOutcome, AgentError> {
+        self.require_root_chat(chat_id, "compact history manually")
+            .await?;
         let instructions = instructions
             .map(|instructions| instructions.trim().to_owned())
             .filter(|instructions| !instructions.is_empty());

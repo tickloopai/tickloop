@@ -1,3 +1,5 @@
+mod support;
+
 use std::{
     process::Stdio,
     sync::{
@@ -168,7 +170,9 @@ async fn console_publication_enables_feedback_and_keeps_lifecycle_tools_host_onl
         .unwrap();
     let config_path = root.join("model.json");
     std::fs::write(&config_path, serde_json::to_vec(&json!({"name":"fixture","protocol":"messages","base_url":origin,"model":"fixture","api_key_env":"","max_output_tokens":256})).unwrap()).unwrap();
+    let runtime_directory = support::cli_runtime::directory();
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_tickloop"))
+        .env("TICKLOOP_AGENT_RUNTIME_DIR", &runtime_directory)
         .args([
             "--working-directory-is-trusted",
             "--mode",
@@ -205,6 +209,9 @@ async fn console_publication_enables_feedback_and_keeps_lifecycle_tools_host_onl
     let output = tokio::time::timeout(FIXTURE_TIMEOUT, child.wait_with_output())
         .await
         .unwrap()
+        .unwrap();
+    support::cli_runtime::shutdown_owner(&runtime_directory)
+        .await
         .unwrap();
     server.abort();
     assert!(

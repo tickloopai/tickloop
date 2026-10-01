@@ -136,6 +136,7 @@ async fn fixture(checker: Arc<Checker>) -> (tempfile::TempDir, Agent, Receipt, C
             run_id: Some(receipt.run_id),
             trigger: None,
             event_sources: Vec::new(),
+            state_since: None,
         });
         chat.snapshot.message_runs.insert(0, receipt.run_id);
         chat.snapshot

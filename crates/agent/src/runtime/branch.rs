@@ -41,6 +41,8 @@ pub struct BranchSessionPermissionRegistration {
 pub struct BranchPublicSource {
     pub chat_id: ChatId,
     pub run_id: Option<RunId>,
+    #[serde(default)]
+    pub is_agent_message: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -181,6 +183,8 @@ impl Agent {
                 "branch request and source Chat IDs must be non-nil".into(),
             ));
         }
+        self.require_root_chat(request.source_chat_id, "create a Branch")
+            .await?;
         let requested_name = normalize_requested_name(request.name.as_deref())?;
         let saved_titles = self.saved_titles_near(request.source_chat_id).await;
         let _settings_gate = self.inner.settings_writes.lock().await;
@@ -229,6 +233,7 @@ impl Agent {
         }
 
         let child_chat_id = unused_chat_id(&chats);
+        let retention = self.retain_chat(child_chat_id)?;
         let name = branch_title(
             requested_name.as_deref(),
             &public_seed,
@@ -270,6 +275,7 @@ impl Agent {
             request_usage: RequestUsageLedger::new(),
             id: child_chat_id,
             branch_origin: Some(origin),
+            delegation: None,
             workdir,
             model: source.snapshot.model.clone(),
             reasoning_effort: source.snapshot.reasoning_effort,
@@ -280,6 +286,7 @@ impl Agent {
             message_contexts: BTreeMap::new(),
             denial_references: BTreeMap::new(),
             message_ids: BTreeMap::new(),
+            agent_message_origins: source.snapshot.agent_message_origins.clone(),
             original_user_message_ids: BTreeMap::new(),
             prompt_execution_modes: BTreeMap::new(),
             inherited_prompts: HashSet::new(),
@@ -373,6 +380,7 @@ impl Agent {
             child_chat_id,
             Chat {
                 snapshot: snapshot.clone(),
+                retention,
                 // 备份在锁外复制完成之前占住子 Chat，不能开始 Run 或 rewind。
                 active: Some(tokio_util::sync::CancellationToken::new()),
                 active_run: None,
@@ -514,6 +522,10 @@ fn materialize_active_items(
                         source: BranchPublicSource {
                             chat_id: snapshot.id,
                             run_id,
+                            is_agent_message: snapshot
+                                .message_ids
+                                .get(&message_index)
+                                .is_some_and(|id| snapshot.agent_message_origins.contains_key(id)),
                         },
                         message: Message {
                             role: message.role,
@@ -530,6 +542,7 @@ fn materialize_active_items(
                 source: BranchPublicSource {
                     chat_id: snapshot.id,
                     run_id: None,
+                    is_agent_message: false,
                 },
                 direction,
                 summary,
@@ -1090,11 +1103,13 @@ mod tests {
                             },
                             input: "queued work".into(),
                             contexts: Vec::new(),
+                            agent_message: None,
                             denial_reference: None,
                             trigger_source: None,
                             armed: true,
                             queued_sequence: 1,
                             task_continuation: false,
+                            is_skill_invocation: false,
                             attached_file_reads: Vec::new(),
                         });
                 }
@@ -1154,6 +1169,7 @@ mod tests {
                     run_id: Some(run_id),
                     trigger: None,
                     event_sources: Vec::new(),
+                    state_since: None,
                 }),
                 Self::AgentShell(state) => {
                     chat.snapshot.commands.push(crate::tools::CommandSnapshot {
@@ -1203,6 +1219,7 @@ mod tests {
                             ),
                             output_bytes: 0,
                             submitted_at_message: 1,
+                            state_since: None,
                         });
                 }
                 Self::Operation(state) => {
@@ -1230,6 +1247,7 @@ mod tests {
             source: BranchPublicSource {
                 chat_id: Uuid::from_u128(1),
                 run_id: Some(Uuid::from_u128(2)),
+                is_agent_message: false,
             },
             message: Message {
                 role: Role::User,

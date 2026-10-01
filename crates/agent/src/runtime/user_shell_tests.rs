@@ -137,6 +137,7 @@ async fn restart_discards_a_stale_trigger_input_and_a_resumed_schedule_ticks_aga
             run_id: None,
             trigger: Some(trigger.clone()),
             event_sources: Vec::new(),
+            state_since: None,
         });
         // Transcript 在第一条对话消息写入时才创建，没有消息的 Chat 不会被保存。
         for (role, text) in [
@@ -157,6 +158,7 @@ async fn restart_discards_a_stale_trigger_input_and_a_resumed_schedule_ticks_aga
             },
             input: trigger.prompt.clone(),
             contexts: Vec::new(),
+            agent_message: None,
             denial_reference: None,
             trigger_source: Some(TriggerSource {
                 source: "timer".into(),
@@ -165,6 +167,7 @@ async fn restart_discards_a_stale_trigger_input_and_a_resumed_schedule_ticks_aga
             armed: true,
             queued_sequence: 1,
             task_continuation: false,
+            is_skill_invocation: false,
             attached_file_reads: Vec::new(),
         });
         source.save(&chat.snapshot);

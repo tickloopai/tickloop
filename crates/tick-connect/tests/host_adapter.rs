@@ -225,7 +225,7 @@ async fn open_forwards_the_agents_locale_to_the_new_pane() {
     let listener = UnixListener::bind(&socket).unwrap();
     let server = tokio::spawn(async move {
         let mut launch_environment = None;
-        for _ in 0..3 {
+        for _ in 0..2 {
             let (stream, _) = listener.accept().await.unwrap();
             let mut reader = BufReader::new(stream);
             let mut request = String::new();

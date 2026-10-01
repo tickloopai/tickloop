@@ -379,6 +379,31 @@ impl Theme {
             .expect("every role appears in Role::ALL");
         self.name.palette()[index]
     }
+
+    /// Restyles text painted with the selection background. Several role
+    /// colours fall below 4.5:1 on the selection fill once quantised, so the
+    /// body text colour replaces them, as it does for text left in the
+    /// terminal's default colour. Dim and reverse are dropped because the
+    /// terminal, not the theme, decides how they recolour the text. A theme
+    /// without a selection fill falls back to reverse video.
+    pub(super) fn selected(self, style: Style) -> Style {
+        match self.style(Role::Selection).background {
+            Some(fill) => Style {
+                foreground: self.style(Role::Text).foreground,
+                background: Some(fill),
+                dim: false,
+                reversed: false,
+                ..style
+            },
+            None => Style {
+                foreground: None,
+                background: None,
+                dim: false,
+                reversed: true,
+                ..style
+            },
+        }
+    }
 }
 
 /// How many colours the terminal is asked to render. Matching Claude Code, 256
@@ -750,6 +775,7 @@ impl RoleLine {
     /// Resolves roles against `theme`. Every span starts from the body text
     /// role, as every Claude Code `<Text>` inherits the theme's text colour;
     /// a filled row is padded to `width` so its background spans the row.
+    /// Text on the selection background is restyled to stay readable.
     pub(super) fn resolve(&self, theme: Theme, width: usize) -> StyledLine {
         let mut base = theme.style(Role::Text);
         if let Some(fill) = self.fill {
@@ -761,7 +787,10 @@ impl RoleLine {
         };
         let mut column = 0;
         for span in &self.spans {
-            let style = span.role.map_or(base, |role| base.patch(theme.style(role)));
+            let mut style = span.role.map_or(base, |role| base.patch(theme.style(role)));
+            if self.fill == Some(Role::Selection) || span.role == Some(Role::Selection) {
+                style = theme.selected(style);
+            }
             column += span
                 .text
                 .chars()
@@ -773,6 +802,51 @@ impl RoleLine {
             line.push(Span::styled(" ".repeat(width - column), base));
         }
         line
+    }
+}
+
+/// WCAG 2 contrast ratio of the two colours the terminal is actually sent at
+/// `depth`, so tests can check emitted output rather than palette entries.
+#[cfg(test)]
+pub(super) fn emitted_contrast(foreground: Rgb, background: Rgb, depth: ColourDepth) -> f64 {
+    let sent = |colour: Rgb| match depth {
+        ColourDepth::Indexed256 => xterm_colour(indexed(colour)),
+        ColourDepth::TrueColour | ColourDepth::None => colour,
+    };
+    let luminance = |colour: Rgb| {
+        let channel = |value: u8| {
+            let value = f64::from(value) / 255.0;
+            if value <= 0.04045 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * channel(colour.red)
+            + 0.7152 * channel(colour.green)
+            + 0.0722 * channel(colour.blue)
+    };
+    let (first, second) = (luminance(sent(foreground)), luminance(sent(background)));
+    (first.max(second) + 0.05) / (first.min(second) + 0.05)
+}
+
+/// The standard xterm value of an index the quantiser can emit.
+#[cfg(test)]
+fn xterm_colour(index: u8) -> Rgb {
+    match index {
+        16..=231 => {
+            let cube = index - 16;
+            Rgb::new(
+                CUBE_LEVELS[usize::from(cube / 36)],
+                CUBE_LEVELS[usize::from(cube / 6 % 6)],
+                CUBE_LEVELS[usize::from(cube % 6)],
+            )
+        }
+        232..=255 => {
+            let level = 8 + (index - 232) * 10;
+            Rgb::new(level, level, level)
+        }
+        _ => unreachable!("the quantiser never emits the terminal-defined colours"),
     }
 }
 
@@ -878,6 +952,41 @@ mod tests {
                 .all(|span| span.style.background == background)
         );
         assert_eq!(line.render(ColourDepth::None), "❯ 中    ");
+    }
+
+    #[test]
+    fn a_selected_row_stays_readable_at_every_colour_depth() {
+        for name in ThemeName::ALL {
+            let theme = Theme::new(name);
+            let selection = theme.style(Role::Selection).background;
+            let line = RoleLine::role("❯ ", Role::Permission)
+                .with("agent", Role::Text)
+                .with(" · waiting", Role::MutedText)
+                .with(" · failed", Role::Error)
+                .with(" │", Role::QuoteBar)
+                .filled(Role::Selection)
+                .resolve(theme, 40);
+            for span in &line.spans {
+                assert_eq!(span.style.background, selection);
+                assert!(
+                    !span.style.dim && !span.style.reversed,
+                    "{name:?} {:?}",
+                    span.text
+                );
+                let foreground = span
+                    .style
+                    .foreground
+                    .expect("selected text names its colour");
+                for depth in [ColourDepth::Indexed256, ColourDepth::TrueColour] {
+                    let ratio = emitted_contrast(foreground, selection.unwrap(), depth);
+                    assert!(
+                        ratio >= 4.5,
+                        "{name:?} {depth:?} {:?}: {ratio:.2}",
+                        span.text
+                    );
+                }
+            }
+        }
     }
 
     #[test]

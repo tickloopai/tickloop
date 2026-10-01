@@ -13,19 +13,19 @@ use crate::tools::{CommandSnapshot, CommandState, ToolResult};
 pub const SHELL_TASK_OUTPUT_MAX_BYTES: usize = 65_536;
 pub const SHELL_TASK_PROMPT_QUIET_PERIOD: Duration = Duration::from_secs(45);
 
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ShellTaskOrigin {
     Agent,
     User,
 }
 
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ShellTaskOwner {
     Agent { loop_id: LoopId },
     User { chat_id: ChatId },
 }
 
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ShellTaskState {
     Queued,
     Running,
@@ -42,14 +42,14 @@ impl ShellTaskState {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ShellTaskCapabilities {
     pub can_background: bool,
     pub can_stop: bool,
     pub can_read_output: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ShellTask {
     pub id: Uuid,
     /// 任务所属的 Chat；Task Center 列出本进程全部 Chat 的任务。
@@ -68,14 +68,14 @@ pub struct ShellTask {
     pub capabilities: ShellTaskCapabilities,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ShellTaskSnapshot {
     pub chat_id: ChatId,
     pub live_revision: u64,
     pub tasks: Vec<ShellTask>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ShellTaskOutputChunk {
     pub task_id: Uuid,
     pub offset: u64,
@@ -87,13 +87,13 @@ pub struct ShellTaskOutputChunk {
     pub output: String,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ShellTaskAction {
     Background,
     Stop,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ShellTaskDelta {
     pub live_revision: u64,
     pub task: ShellTask,
@@ -101,7 +101,7 @@ pub struct ShellTaskDelta {
     pub previous_output_bytes: Option<u64>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ShellTaskSubscriptionEvent {
     Changed(ShellTaskDelta),
     ResyncRequired { last_live_revision: u64 },

@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+pub mod cli_runtime;
+
 use async_trait::async_trait;
 use std::{collections::VecDeque, sync::Mutex};
 use tickloop_agent::model::*;

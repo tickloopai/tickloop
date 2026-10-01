@@ -6,10 +6,15 @@ use std::sync::{
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use tickloop_agent::{
+    agent_access::{
+        AgentAccess, AgentCommand, CommandEnvelope, CommandResult, EmbeddedAgentAccess, LaunchSpec,
+        LocalAgentClient, LoopAction, serve_listener,
+    },
     artifacts::ArtifactClient,
     host_tools::{
-        EventLeaseOutcome, EventLeaseRequest, EventSourceLocator, HostToolPermission,
-        HostToolProvider, WorkspaceHostContext, WorkspaceHostName, WorkspaceIntegration,
+        EventLeaseOutcome, EventLeaseRequest, EventSourceLocator, HostCallContext,
+        HostEndpointIdentity, HostToolPermission, HostToolProvider, PreparedHostCall,
+        WorkspaceHostContext, WorkspaceHostName, WorkspaceIntegration,
     },
     mcp_tools::McpHostToolProvider,
     model::{
@@ -22,7 +27,7 @@ use tickloop_agent::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpListener,
+    net::{TcpListener, UnixListener},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -2514,7 +2519,35 @@ async fn explicit_resume_retries_an_association_confirmed_not_dispatched() {
             McpHostToolProvider::new(account, None).with_event_bridge("tickloop://event-bridge/v1"),
         ))
         .unwrap();
-    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let access = Arc::new(EmbeddedAgentAccess::new(agent.clone()));
+    let epoch = access.owner_epoch();
+    let socket = directory.path().join("access.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = tokio::spawn(serve_listener(listener, access, epoch));
+    let client = LocalAgentClient::connect(&socket).await.unwrap();
+    let created = client
+        .execute(CommandEnvelope {
+            owner_epoch: epoch,
+            command_id: uuid::Uuid::new_v4(),
+            command: AgentCommand::Create {
+                launch: LaunchSpec::embedded(directory.path().into()),
+                initial: None,
+                origin: None,
+            },
+        })
+        .await
+        .unwrap()
+        .into_result()
+        .unwrap();
+    let CommandResult::Created {
+        execution,
+        snapshot,
+        ..
+    } = created
+    else {
+        panic!("expected Create");
+    };
+    let chat = snapshot.conversation.id;
     let mut events = agent.subscribe();
     let first = agent.submit(chat, None, "Publish".into()).await.unwrap();
     let permission = tokio::time::timeout(std::time::Duration::from_secs(10), async {
@@ -2542,13 +2575,25 @@ async fn explicit_resume_retries_an_association_confirmed_not_dispatched() {
         .clone();
     assert_eq!(initial.association_epoch, None);
     assert!(!initial.association_unknown);
-    assert_eq!(
-        agent
-            .resume_event_sources(chat, first.loop_id)
-            .await
-            .unwrap(),
-        1
-    );
+    let resumed = client
+        .execute(CommandEnvelope {
+            owner_epoch: epoch,
+            command_id: uuid::Uuid::new_v4(),
+            command: AgentCommand::ManageLoop {
+                execution,
+                action: LoopAction::ResumeEventSources {
+                    loop_id: first.loop_id,
+                },
+            },
+        })
+        .await
+        .unwrap()
+        .into_result()
+        .unwrap();
+    assert!(matches!(
+        resumed,
+        CommandResult::EventSourcesResumed { count: 1 }
+    ));
     let snapshot = agent.snapshot(chat).await.unwrap();
     let resumed = &snapshot.loops.last().unwrap().event_sources[0];
     assert_eq!(resumed.binding_id, initial.binding_id);
@@ -2567,7 +2612,28 @@ async fn explicit_resume_retries_an_association_confirmed_not_dispatched() {
             .count(),
         1
     );
+    client
+        .execute(CommandEnvelope {
+            owner_epoch: epoch,
+            command_id: uuid::Uuid::new_v4(),
+            command: AgentCommand::ManageLoop {
+                execution,
+                action: LoopAction::DisableEventSources {
+                    loop_id: first.loop_id,
+                },
+            },
+        })
+        .await
+        .unwrap()
+        .into_result()
+        .unwrap();
+    let disabled = agent.snapshot(chat).await.unwrap();
+    let goal = disabled.loops.last().unwrap();
+    assert_eq!(goal.state, LoopState::Interrupted);
+    assert!(goal.state_since.is_some());
+    assert!(goal.event_sources[0].resume_required);
     agent.shutdown().await;
+    server.abort();
 }
 
 #[tokio::test]
@@ -3626,6 +3692,26 @@ struct NativeFixture;
 
 #[async_trait]
 impl HostToolProvider for NativeFixture {
+    fn host_endpoint(&self) -> Result<Option<HostEndpointIdentity>, String> {
+        Ok(Some(HostEndpointIdentity::TrustedAdapter {
+            scope: uuid::Uuid::nil(),
+        }))
+    }
+
+    async fn prepare_call_in_context(
+        &self,
+        chat_id: tickloop_agent::runtime::ChatId,
+        context: &HostCallContext,
+        name: &str,
+        input: &Value,
+        cancel: CancellationToken,
+    ) -> Result<PreparedHostCall, String> {
+        Ok(self
+            .prepare_call(chat_id, name, input, cancel)
+            .await?
+            .with_payload(context.clone()))
+    }
+
     fn definitions(&self) -> Vec<ToolDefinition> {
         vec![ToolDefinition {
             name: "native_fixture".into(),
@@ -3681,6 +3767,30 @@ async fn native_tools_and_workspace_metadata_survive_mcp_composition() {
     let context = provider.workspace_host_context().unwrap();
     assert_eq!(context.name, WorkspaceHostName::Herdr);
     assert_eq!(context.integration, WorkspaceIntegration::Available);
+    assert_eq!(
+        provider.host_endpoint().unwrap(),
+        NativeFixture.host_endpoint().unwrap()
+    );
+    let context = HostCallContext {
+        workdir: directory.path().into(),
+        workspace_id: Some("work-context".into()),
+        interaction: None,
+    };
+    let prepared = provider
+        .prepare_call_in_context(
+            uuid::Uuid::new_v4(),
+            &context,
+            "native_fixture",
+            &json!({}),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let captured = prepared
+        .payload::<HostCallContext>()
+        .expect("Native preparation receives its context");
+    assert_eq!(captured.workdir, context.workdir);
+    assert_eq!(captured.workspace_id, context.workspace_id);
 }
 
 #[tokio::test]

@@ -53,7 +53,7 @@ const FALLBACK_STEM: &str = "tool-result";
 impl Agent {
     /// 创建 Chat 的工具。持久化时 Chat 目录为 Transcript 同级的 `<chatId>/`
     /// （须先登记 Transcript 路径），否则位于系统临时目录的项目目录下；后台任务输出照
-    /// Claude Code 总在 `<系统临时目录>/tickloop-<uid>/<项目目录名>/<chatId>/tasks`。
+    /// `<系统临时目录>/tickloop-private-<uid>/<项目目录名>/<chatId>/tasks`。
     pub(super) fn create_chat_tools(&self, chat_id: ChatId, workdir: &Path) -> Arc<Tools> {
         let project_temp = private_project_temp_directory(workdir);
         let persistent_project = self

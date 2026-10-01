@@ -1,4 +1,8 @@
+use std::ops::Range;
+
 use unicode_width::UnicodeWidthChar;
+
+use super::style::{Role, RoleLine};
 
 const CONTINUATION_PREFIX: &str = "  ";
 const PREFIX_COLUMNS: usize = 2;
@@ -7,6 +11,7 @@ const TAB_COLUMNS: usize = 4;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct InputFrame {
     pub(crate) lines: Vec<String>,
+    pub(super) styled_lines: Vec<RoleLine>,
     pub(crate) cursor_row: usize,
     pub(crate) cursor_column: usize,
     pub(crate) first_visual_row: usize,
@@ -24,7 +29,7 @@ impl InputView {
         terminal_width: usize,
         max_rows: usize,
     ) -> InputFrame {
-        Self::frame_with_prefix(draft, cursor, terminal_width, max_rows, "> ")
+        Self::frame_with_prefix(draft, cursor, terminal_width, max_rows, "> ", &[])
     }
 
     pub(crate) fn frame_with_prompt(
@@ -34,8 +39,26 @@ impl InputView {
         max_rows: usize,
         prompt: &str,
     ) -> InputFrame {
+        Self::frame_with_prompt_and_marks(draft, cursor, terminal_width, max_rows, prompt, &[])
+    }
+
+    pub(super) fn frame_with_prompt_and_marks(
+        draft: &str,
+        cursor: usize,
+        terminal_width: usize,
+        max_rows: usize,
+        prompt: &str,
+        marks: &[(Range<usize>, Role)],
+    ) -> InputFrame {
         let first_line_prefix = format!("{prompt}\u{a0}");
-        Self::frame_with_prefix(draft, cursor, terminal_width, max_rows, &first_line_prefix)
+        Self::frame_with_prefix(
+            draft,
+            cursor,
+            terminal_width,
+            max_rows,
+            &first_line_prefix,
+            marks,
+        )
     }
 
     fn frame_with_prefix(
@@ -44,10 +67,12 @@ impl InputView {
         terminal_width: usize,
         max_rows: usize,
         first_line_prefix: &str,
+        marks: &[(Range<usize>, Role)],
     ) -> InputFrame {
         if terminal_width == 0 || max_rows == 0 {
             return InputFrame {
                 lines: Vec::new(),
+                styled_lines: Vec::new(),
                 cursor_row: 0,
                 cursor_column: 0,
                 first_visual_row: 0,
@@ -58,12 +83,12 @@ impl InputView {
         let cursor = floor_char_boundary(draft, cursor.min(draft.len()));
         let prefix_columns = PREFIX_COLUMNS.min(terminal_width.saturating_sub(1));
         let content_width = terminal_width.saturating_sub(prefix_columns).max(1);
-        let layout = layout(draft, cursor, content_width);
+        let layout = layout(draft, cursor, content_width, marks);
         let first_visual_row = layout.cursor_row.saturating_add(1).saturating_sub(max_rows);
         let last_visual_row = first_visual_row
             .saturating_add(max_rows)
             .min(layout.rows.len());
-        let lines = layout.rows[first_visual_row..last_visual_row]
+        let styled_lines = layout.rows[first_visual_row..last_visual_row]
             .iter()
             .enumerate()
             .map(|(visible_row, content)| {
@@ -73,12 +98,17 @@ impl InputView {
                 } else {
                     CONTINUATION_PREFIX
                 };
-                format!("{}{}", truncate(prefix, prefix_columns), content)
+                let mut line = RoleLine::plain(truncate(prefix, prefix_columns));
+                for span in &content.spans {
+                    line.push(span.text.clone(), span.role);
+                }
+                line
             })
-            .collect();
+            .collect::<Vec<_>>();
 
         InputFrame {
-            lines,
+            lines: styled_lines.iter().map(RoleLine::text).collect(),
+            styled_lines,
             cursor_row: layout.cursor_row.saturating_sub(first_visual_row),
             cursor_column: prefix_columns
                 .saturating_add(layout.cursor_column)
@@ -90,19 +120,28 @@ impl InputView {
 }
 
 struct Layout {
-    rows: Vec<String>,
+    rows: Vec<RoleLine>,
     cursor_row: usize,
     cursor_column: usize,
 }
 
-fn layout(draft: &str, cursor: usize, content_width: usize) -> Layout {
-    let mut rows = vec![String::new()];
+fn layout(
+    draft: &str,
+    cursor: usize,
+    content_width: usize,
+    marks: &[(Range<usize>, Role)],
+) -> Layout {
+    let mut rows = vec![RoleLine::default()];
     let mut row = 0;
     let mut column = 0;
     let mut logical_column = 0;
     let mut cursor_position = None;
 
     for (byte, character) in draft.char_indices() {
+        let role = marks
+            .iter()
+            .find(|(range, _)| range.contains(&byte))
+            .map(|(_, role)| *role);
         if character == '\n' {
             if cursor == byte {
                 cursor_position = Some(if column == content_width {
@@ -111,7 +150,7 @@ fn layout(draft: &str, cursor: usize, content_width: usize) -> Layout {
                     (row, column)
                 });
             }
-            rows.push(String::new());
+            rows.push(RoleLine::default());
             row += 1;
             column = 0;
             logical_column = 0;
@@ -119,7 +158,7 @@ fn layout(draft: &str, cursor: usize, content_width: usize) -> Layout {
         }
 
         if column == content_width {
-            rows.push(String::new());
+            rows.push(RoleLine::default());
             row += 1;
             column = 0;
         }
@@ -131,11 +170,11 @@ fn layout(draft: &str, cursor: usize, content_width: usize) -> Layout {
             let spaces = TAB_COLUMNS - logical_column % TAB_COLUMNS;
             for _ in 0..spaces {
                 if column == content_width {
-                    rows.push(String::new());
+                    rows.push(RoleLine::default());
                     row += 1;
                     column = 0;
                 }
-                rows[row].push(' ');
+                push_character(&mut rows[row], ' ', role);
                 column += 1;
                 logical_column += 1;
             }
@@ -145,18 +184,18 @@ fn layout(draft: &str, cursor: usize, content_width: usize) -> Layout {
         let displayed = safe_character(character, content_width);
         let character_width = displayed.width().unwrap_or(0);
         if column > 0 && column + character_width > content_width {
-            rows.push(String::new());
+            rows.push(RoleLine::default());
             row += 1;
             column = 0;
         }
-        rows[row].push(displayed);
+        push_character(&mut rows[row], displayed, role);
         column += character_width;
         logical_column += character_width;
     }
 
     if cursor == draft.len() {
         if column == content_width {
-            rows.push(String::new());
+            rows.push(RoleLine::default());
             row += 1;
             column = 0;
         }
@@ -168,6 +207,16 @@ fn layout(draft: &str, cursor: usize, content_width: usize) -> Layout {
         rows,
         cursor_row,
         cursor_column,
+    }
+}
+
+fn push_character(line: &mut RoleLine, character: char, role: Option<Role>) {
+    if let Some(last) = line.spans.last_mut()
+        && last.role == role
+    {
+        last.text.push(character);
+    } else {
+        line.push(character.to_string(), role);
     }
 }
 

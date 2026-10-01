@@ -584,6 +584,9 @@ mod tests {
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    const TERMINAL_CHILD_STACK_BYTES: usize = 8 * 1024 * 1024;
+    const TERMINAL_ESCAPE_KEY: &[u8] = b"\x1b[27u";
+
     #[test]
     fn terminal_child() {
         if std::env::var_os("TICKLOOP_TEST_CODEX_OAUTH").is_none() {
@@ -645,6 +648,8 @@ mod tests {
         command.env("TICKLOOP_CONFIG_DIR", directory.path().join("state"));
         command.env("TICKLOOP_TEST_CODEX_OAUTH", "http://127.0.0.1:37981");
         command.env("TICKLOOP_AGENT_TUI", "inline");
+        // The Console runs on a libtest thread instead of the CLI main thread.
+        command.env("RUST_MIN_STACK", TERMINAL_CHILD_STACK_BYTES.to_string());
         for name in ["HERDR_ENV", "HERDR_PANE_ID", "HERDR_SOCKET_PATH"] {
             command.env_remove(name);
         }
@@ -887,6 +892,7 @@ mod tests {
             format!("{origin}/codex/responses"),
         );
         command.env("TICKLOOP_AGENT_TUI", "inline");
+        command.env("RUST_MIN_STACK", TERMINAL_CHILD_STACK_BYTES.to_string());
         for name in ["HERDR_ENV", "HERDR_PANE_ID", "HERDR_SOCKET_PATH"] {
             command.env_remove(name);
         }
@@ -963,6 +969,39 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(20));
             }
         };
+        let wait_for_input_after = |offset: usize| {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let frame_end = "\x1b[?2026l";
+            loop {
+                let text = output.lock().unwrap().clone();
+                let completed = text
+                    .get(offset..)
+                    .and_then(|updates| updates.rfind(frame_end))
+                    .map(|end| &text[..offset + end + frame_end.len()]);
+                let visible = screen::visible_screen(completed.unwrap_or(&text), 150, 40);
+                let input_restored = completed.is_some()
+                    && visible.contains("Tick Loop Agent v")
+                    && visible.contains("Context —")
+                    && visible.lines().any(|line| line.trim() == "❯")
+                    && [
+                        "Choose model",
+                        "Choose Provider",
+                        "Choose connection",
+                        "Codex browser login",
+                        "Log in to Codex",
+                    ]
+                    .iter()
+                    .all(|title| !visible.contains(title));
+                if input_restored {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "PTY did not restore the input after action:\n{visible}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
         wait("Ask");
         writer.write_all(b"/provider\r").unwrap();
         writer.flush().unwrap();
@@ -976,27 +1015,23 @@ mod tests {
             .unwrap();
         writer.flush().unwrap();
         wait("Choose connection · OpenAI");
+        let before_login = output.lock().unwrap().len();
         writer
             .write_all(if browser { b"j\r" } else { b"jd" })
             .unwrap();
         writer.flush().unwrap();
-        wait("login saved");
+        wait_after("login saved", before_login);
         wait("Codex subscription");
         {
             let deadline = Instant::now() + Duration::from_secs(5);
             loop {
                 let text = output.lock().unwrap().clone();
-                let plain = ansi.replace_all(&text, "");
-                // A frame carries only the rows that changed, so the picker is
-                // back once its title was drawn after the login dialog last was.
-                let picker_returned =
-                    plain
-                        .rfind("Choose connection · OpenAI")
-                        .is_some_and(|picker| {
-                            plain
-                                .rfind("Codex browser login")
-                                .is_none_or(|login| login < picker)
-                        });
+                let updates = text.get(before_login..).unwrap_or("");
+                let visible = screen::visible_screen(&text, 150, 40);
+                let picker_returned = updates.contains("\x1b[?2026l")
+                    && visible.contains("Choose model · OpenAI")
+                    && visible.contains("Codex subscription")
+                    && !visible.contains("Codex browser login");
                 if picker_returned {
                     assert!(
                         !text.contains("Model selection:"),
@@ -1011,34 +1046,68 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(20));
             }
             if browser && selected_model.is_none() {
+                let before_configuration = output.lock().unwrap().len();
+                writer.write_all(b"p").unwrap();
+                writer.flush().unwrap();
+                wait_after("Choose connection · OpenAI", before_configuration);
                 let before_reauthentication = output.lock().unwrap().len();
                 writer.write_all(b"r").unwrap();
                 writer.flush().unwrap();
                 wait_after("Codex browser login", before_reauthentication);
                 wait_after("login saved", before_reauthentication);
-                wait_after("Choose connection · OpenAI", before_reauthentication);
+                wait_after("Choose model · OpenAI", before_reauthentication);
             }
-            writer.write_all(b"\x1b\x1b").unwrap();
+            if selected_model.is_none() {
+                assert!(!root.join("state/settings.json").exists());
+            }
+            let before_back = output.lock().unwrap().len();
+            writer.write_all(TERMINAL_ESCAPE_KEY).unwrap();
             writer.flush().unwrap();
-            wait("Selection cancelled");
+            wait_after("Choose model Provider", before_back);
+            let before_cancel = output.lock().unwrap().len();
+            writer.write_all(TERMINAL_ESCAPE_KEY).unwrap();
+            writer.flush().unwrap();
+            wait_for_input_after(before_cancel);
+            let before_saved_login = output.lock().unwrap().len();
+            writer.write_all(b"/provider\r").unwrap();
+            writer.flush().unwrap();
+            wait_after("Choose Provider", before_saved_login);
+            writer
+                .write_all(if selected_model.is_some() {
+                    b"\r"
+                } else {
+                    b"j\r"
+                })
+                .unwrap();
+            writer.flush().unwrap();
+            wait_after("Choose connection · OpenAI", before_saved_login);
+            let before_saved_connection = output.lock().unwrap().len();
+            writer.write_all(b"j\r").unwrap();
+            writer.flush().unwrap();
+            wait_after("Choose model · OpenAI", before_saved_connection);
+            assert!(
+                !output.lock().unwrap()[before_saved_connection..].contains("Codex browser login"),
+                "saved login must open models without authenticating again"
+            );
             if selected_model == Some("gpt-5.6-sol") {
                 let saved = crate::settings::UserSettings::in_root(&root.join("state"))
                     .model()
                     .unwrap();
                 assert_eq!(saved.model, "gpt-5.6-sol");
-            } else {
-                let before_models = output.lock().unwrap().len();
-                writer.write_all(b"/model\r").unwrap();
-                writer.flush().unwrap();
-                wait_after("Choose model", before_models);
-                if selected_model.is_none() {
-                    writer.write_all(b"\r").unwrap();
-                    writer.flush().unwrap();
-                }
-                wait_after("Choose model · OpenAI", before_models);
+            }
+            if selected_model.is_none() {
                 writer.write_all(b"\r").unwrap();
                 writer.flush().unwrap();
                 wait("Model selection:");
+            } else {
+                let before_model_back = output.lock().unwrap().len();
+                writer.write_all(TERMINAL_ESCAPE_KEY).unwrap();
+                writer.flush().unwrap();
+                wait_after("Choose model Provider", before_model_back);
+                let before_model_cancel = output.lock().unwrap().len();
+                writer.write_all(TERMINAL_ESCAPE_KEY).unwrap();
+                writer.flush().unwrap();
+                wait_for_input_after(before_model_cancel);
             }
         }
         writer.write_all(b"hello from terminal\r").unwrap();

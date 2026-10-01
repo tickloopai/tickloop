@@ -42,7 +42,7 @@ impl RewindMode {
 }
 
 /// rewind 与定向摘要可以选择的位置：当前对话中的一条用户提示。
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RewindPoint {
     /// 提示在 Transcript 中的 uuid，也是文件回滚快照关联的消息 id。
     pub message_id: Uuid,
@@ -53,7 +53,7 @@ pub struct RewindPoint {
     pub execution_mode: ExecutionMode,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct RewindDraft {
     pub loop_id: LoopId,
     pub prompt: String,
@@ -62,7 +62,7 @@ pub struct RewindDraft {
 
 /// 恢复代码的结果。照 Claude Code，单个文件失败时跳过该文件继续；找不到目标提示的快照时
 /// 不改动任何文件，`error` 说明原因。
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct CodeRewind {
     pub changed_files: Vec<PathBuf>,
     pub failed_files: Vec<(PathBuf, String)>,
@@ -145,6 +145,7 @@ impl Agent {
         message_id: Uuid,
         mode: RewindMode,
     ) -> Result<RewindOutcome, AgentError> {
+        self.require_root_chat(chat_id, "rewind history").await?;
         let mut tasks = self.inner.tasks.lock().await;
         let (point, history, loops_at_start) = {
             let mut chats = self.inner.chats.lock().await;
@@ -293,6 +294,7 @@ impl Agent {
         chat_id: ChatId,
         message_id: Uuid,
     ) -> Result<Option<Vec<PathBuf>>, AgentError> {
+        self.require_root_chat(chat_id, "rewind files").await?;
         let history = self
             .inner
             .chats
@@ -515,6 +517,7 @@ fn conversation_before(
         run_id: None,
         trigger: None,
         event_sources: Vec::new(),
+        state_since: None,
     });
     Ok((candidate, loop_id))
 }
@@ -967,6 +970,7 @@ mod tests {
             output_ref: None,
             output_bytes: 0,
             submitted_at_message: 0,
+            state_since: None,
         }
     }
 

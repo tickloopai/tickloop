@@ -699,6 +699,17 @@ impl Agent {
         }
         let mut chats = self.inner.chats.lock().await;
         let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
+        if chat
+            .snapshot
+            .delegation
+            .as_ref()
+            .is_some_and(|delegation| delegation.ceiling.policy.mode != mode)
+        {
+            return Err(AgentError::Invalid(
+                "Unsupported: plan approval cannot expand or replace the delegated execution mode"
+                    .into(),
+            ));
+        }
         if chat.active.is_some() {
             return Err(AgentError::Busy);
         }

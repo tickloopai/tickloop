@@ -20,6 +20,8 @@ enum ToolRoute {
     Interaction,
     Skill,
     TickSubscription,
+    Delegation,
+    AgentMessage,
     Host(Arc<dyn crate::host_tools::HostToolProvider>),
 }
 
@@ -75,6 +77,24 @@ impl ToolRegistry {
                     route: ToolRoute::Interaction,
                 }),
         );
+        if chat.snapshot.delegation.is_none() {
+            tools.extend(
+                delegation::definitions()
+                    .into_iter()
+                    .map(|definition| RegisteredTool {
+                        definition,
+                        route: ToolRoute::Delegation,
+                    }),
+            );
+        }
+        tools.extend(
+            agent_messages::definitions(chat.snapshot.delegation.is_some())
+                .into_iter()
+                .map(|definition| RegisteredTool {
+                    definition,
+                    route: ToolRoute::AgentMessage,
+                }),
+        );
         if tick_stream_installed {
             tools.extend(
                 tick_subscriptions::definitions()
@@ -99,6 +119,13 @@ impl ToolRegistry {
                 provider
                     .definitions()
                     .into_iter()
+                    .filter(|definition| {
+                        chat.snapshot.delegation.is_none()
+                            || matches!(
+                                definition.name.as_str(),
+                                "ReadWorkspace" | "ReadTick" | "CallTickTool" | "ModifyTick"
+                            )
+                    })
                     .map(|definition| RegisteredTool {
                         definition,
                         route: ToolRoute::Host(provider.clone()),
@@ -304,6 +331,25 @@ pub(super) struct ToolCallOutcome {
     pub(super) denial: Option<super::denials::DenialRecord>,
 }
 
+impl ToolCallOutcome {
+    fn not_admitted(message: String) -> Self {
+        Self {
+            result: ToolResult {
+                content: message,
+                is_error: true,
+                output_ref: None,
+            },
+            images: Vec::new(),
+            host_call_status: None,
+            host_effect: None,
+            permission_comment: None,
+            continue_after_denial: false,
+            is_rejected_by_user: false,
+            denial: None,
+        }
+    }
+}
+
 pub(super) struct ToolCallError {
     pub(super) message: String,
     pub(super) denial: Option<super::denials::DenialRecord>,
@@ -365,6 +411,20 @@ impl Agent {
         cancel: CancellationToken,
     ) -> Result<ToolResult, String> {
         match &registered.route {
+            ToolRoute::AgentMessage => {
+                self.agent_message_tool(
+                    receipt,
+                    &operation.call_id,
+                    &operation.name,
+                    &operation.input,
+                    cancel,
+                )
+                .await
+            }
+            ToolRoute::Delegation => {
+                self.delegation_tool(receipt, &operation.call_id, &operation.input, cancel)
+                    .await
+            }
             ToolRoute::Skill => self.skill_tool(receipt, &operation.input).await,
             ToolRoute::TickSubscription => {
                 self.tick_subscription_tool(receipt, &operation.name, &operation.input)
@@ -475,11 +535,36 @@ impl Agent {
                 fencing_token: active.claim.fencing_token.clone(),
             });
         let prepared_host_call = if let Some(provider) = host_tools.as_ref() {
-            match provider
-                .prepare_call(receipt.chat_id, &name, &input, cancel.clone())
+            if let Err(error) = self
+                .check_delegated_host_endpoint(receipt, provider.as_ref())
                 .await
             {
+                return Ok(ToolCallOutcome::not_admitted(error));
+            }
+            let context = self.host_call_context(receipt, &workspace.workdir);
+            let prepared = if let Some(context) = context {
+                provider
+                    .prepare_call_in_context(
+                        receipt.chat_id,
+                        &context,
+                        &name,
+                        &input,
+                        cancel.clone(),
+                    )
+                    .await
+            } else {
+                provider
+                    .prepare_call(receipt.chat_id, &name, &input, cancel.clone())
+                    .await
+            };
+            match prepared {
                 Ok(prepared) => {
+                    if let Err(error) = self
+                        .check_delegated_host_endpoint(receipt, provider.as_ref())
+                        .await
+                    {
+                        return Ok(ToolCallOutcome::not_admitted(error));
+                    }
                     if prepared.name() != name || prepared.source_input() != &input {
                         return Err("host provider prepared a different tool invocation".into());
                     }
@@ -518,6 +603,12 @@ impl Agent {
         let permission_input = prepared_host_call
             .as_ref()
             .map_or(&input, |call| call.permission_input());
+        if let Err(error) = self
+            .check_delegated_call(receipt, normalized_name, normalized_input, None)
+            .await
+        {
+            return Ok(ToolCallOutcome::not_admitted(error));
+        }
         let mut host_call_status = None;
         let mut host_effect = None;
         let result = if registration
@@ -731,9 +822,17 @@ impl Agent {
                 let validation = if let (Some(provider), Some(prepared)) =
                     (host_tools.as_ref(), prepared_host_call.as_ref())
                 {
-                    provider
-                        .revalidate_call(receipt.chat_id, prepared, cancel.clone())
+                    match self
+                        .check_delegated_host_endpoint(receipt, provider.as_ref())
                         .await
+                    {
+                        Ok(()) => {
+                            provider
+                                .revalidate_call(receipt.chat_id, prepared, cancel.clone())
+                                .await
+                        }
+                        Err(error) => Err(error),
+                    }
                 } else {
                     Ok(())
                 };
@@ -883,6 +982,17 @@ impl Agent {
             };
             match prepared {
                 Ok(prepared) => {
+                    if let Err(error) = self
+                        .check_delegated_call(
+                            receipt,
+                            &prepared.name,
+                            &prepared.input,
+                            Some(&prepared),
+                        )
+                        .await
+                    {
+                        return Ok(ToolCallOutcome::not_admitted(error));
+                    }
                     let session_operation =
                         SessionPermissionOperation::from_prepared(&prepared, &configured_workspace)
                             .map_err(|error| error.to_string())?;
@@ -1227,6 +1337,16 @@ impl Agent {
                             return Err(ToolCallError::denied(reason, record));
                         }
                         let mut chats = self.inner.chats.lock().await;
+                        let session_context = self.inner.session_permissions.lock().await;
+                        delegation::check_call(
+                            &chats,
+                            &session_context,
+                            receipt,
+                            &prepared.name,
+                            &prepared.input,
+                            Some(&prepared),
+                        )
+                        .map_err(ToolCallError::from)?;
                         let chat = chats.get_mut(&receipt.chat_id).unwrap();
                         if let Err(error) =
                             self.require_working_directory_trust(&chat.snapshot.workdir)
@@ -1246,7 +1366,6 @@ impl Agent {
                         if cancel.is_cancelled() || chat.active_run != Some(receipt.run_id) {
                             return Err("run interrupted before tool admission".into());
                         }
-                        let session_context = self.inner.session_permissions.lock().await;
                         let current_session_operation = SessionPermissionOperation::from_prepared(
                             &prepared,
                             &configured_workspace_for_chat(chat),

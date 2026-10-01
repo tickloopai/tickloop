@@ -1,21 +1,261 @@
-use std::{process::Command, sync::Arc};
+use std::{
+    path::Path,
+    process::Command,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 use async_trait::async_trait;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tick_connect::{
     access::TickAccess,
-    herdr::{HerdrContext, HerdrPort, HostError},
+    herdr::{HerdrContext, HerdrPort, HostError, Pane},
 };
 use tickloop_agent::{
-    model::{Content, Role},
+    host_tools::{
+        HerdrInteraction, HostCallContext, HostToolPermission, HostToolProvider, PreparedHostCall,
+    },
+    model::{
+        Content, ModelClient, ModelDelta, ModelError, ModelIdentity, ModelOutput, ModelRequest,
+        Role, ToolDefinition,
+    },
     native_host::NativeHostToolProvider,
     runtime::{Agent, EventKind},
     skills::SkillSource,
+    tools::ToolResult,
 };
+use tokio::sync::{Notify, mpsc::UnboundedSender};
 use tokio_util::sync::CancellationToken;
 
 mod support;
-use support::{ScriptedModel, config, text};
+use support::{ScriptedModel, call, config, next_event, text};
+
+const READ_HOST_SOURCE: &str = "ReadCapturedHostSource";
+const QUEUED_SOURCE_INPUT: &str = "Use the host source captured by this follow-up input.";
+
+struct MergedInputModel {
+    started: Notify,
+    release: Notify,
+    requests: AtomicUsize,
+    scripted: ScriptedModel,
+}
+
+impl MergedInputModel {
+    fn new() -> Self {
+        Self {
+            started: Notify::new(),
+            release: Notify::new(),
+            requests: AtomicUsize::new(0),
+            scripted: ScriptedModel::new(vec![
+                call("before-merge", READ_HOST_SOURCE, json!({"phase":"before"})),
+                call("after-merge", READ_HOST_SOURCE, json!({"phase":"after"})),
+                text("Finished reading the submitted host source."),
+            ]),
+        }
+    }
+}
+
+#[async_trait]
+impl ModelClient for MergedInputModel {
+    fn identity(&self) -> ModelIdentity {
+        self.scripted.identity()
+    }
+
+    async fn complete(
+        &self,
+        request: ModelRequest,
+        events: UnboundedSender<ModelDelta>,
+        cancel: CancellationToken,
+    ) -> Result<ModelOutput, ModelError> {
+        match self.requests.fetch_add(1, Ordering::SeqCst) {
+            0 => {
+                self.started.notify_one();
+                tokio::select! {
+                    _ = cancel.cancelled() => return Err(ModelError::Cancelled),
+                    _ = self.release.notified() => {}
+                }
+            }
+            1 => assert!(
+                request.messages.iter().any(|message| {
+                    message.role == Role::User
+                        && message.content.iter().any(|content| {
+                            matches!(content, Content::Text { text } if text == QUEUED_SOURCE_INPUT)
+                        })
+                }),
+                "the next host call must be generated after the model receives the merged input"
+            ),
+            _ => {}
+        }
+        self.scripted.complete(request, events, cancel).await
+    }
+}
+
+struct CapturedHostSource;
+
+#[async_trait]
+impl HostToolProvider for CapturedHostSource {
+    fn definitions(&self) -> Vec<ToolDefinition> {
+        vec![ToolDefinition {
+            name: READ_HOST_SOURCE.into(),
+            description: "Read the source captured when this host call was prepared.".into(),
+            input_schema: json!({
+                "type":"object",
+                "properties":{"phase":{"type":"string"}},
+                "required":["phase"],
+                "additionalProperties":false
+            }),
+        }]
+    }
+
+    fn permission(&self, _: uuid::Uuid, _: &str, _: &Value) -> HostToolPermission {
+        HostToolPermission::ReadOnly
+    }
+
+    async fn prepare_call_in_context(
+        &self,
+        _: uuid::Uuid,
+        context: &HostCallContext,
+        name: &str,
+        input: &Value,
+        _: CancellationToken,
+    ) -> Result<PreparedHostCall, String> {
+        Ok(PreparedHostCall::new(
+            name.into(),
+            input.clone(),
+            json!({"phase":input["phase"],"context":context}),
+            HostToolPermission::ReadOnly,
+            "Read captured host source".into(),
+        ))
+    }
+
+    async fn execute(
+        &self,
+        _: uuid::Uuid,
+        _: &str,
+        input: Value,
+        _: CancellationToken,
+    ) -> ToolResult {
+        ToolResult {
+            content: input.to_string(),
+            is_error: false,
+            output_ref: None,
+        }
+    }
+}
+
+fn captured_view_context(workdir: &Path, view: &str) -> HostCallContext {
+    HostCallContext {
+        workdir: workdir.into(),
+        workspace_id: Some("task-workspace".into()),
+        interaction: Some(HerdrInteraction {
+            socket: workdir.join(format!("{view}.sock")),
+            pane: Pane {
+                pane_id: format!("pane-{view}"),
+                terminal_id: format!("terminal-{view}"),
+                workspace_id: format!("view-workspace-{view}"),
+                tab_id: format!("tab-{view}"),
+                cwd: None,
+                foreground_cwd: None,
+                title: None,
+                tokens: Default::default(),
+            },
+        }),
+    }
+}
+
+async fn assert_merged_host_source(headless: bool) {
+    let directory = tempfile::tempdir().unwrap();
+    let workdir = directory.path().canonicalize().unwrap();
+    let model = Arc::new(MergedInputModel::new());
+    let agent = Agent::new_embedded(config(), model.clone());
+    agent
+        .install_host_tools(Arc::new(CapturedHostSource))
+        .unwrap();
+    let chat = agent.create_chat(workdir.clone()).await.unwrap();
+    let work_context = HostCallContext {
+        workdir: workdir.clone(),
+        workspace_id: Some("task-workspace".into()),
+        interaction: None,
+    };
+    agent
+        .set_host_work_context(chat, work_context.clone())
+        .await
+        .unwrap();
+    let first_context = captured_view_context(&workdir, "first");
+    let expected_context = if headless {
+        work_context
+    } else {
+        captured_view_context(&workdir, "second")
+    };
+    let mut events = agent.subscribe();
+    let first = agent
+        .submit_with_input_contexts_in_host_context(
+            chat,
+            None,
+            "Read the original host source.".into(),
+            Vec::new(),
+            Vec::new(),
+            Some(first_context.clone()),
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), model.started.notified())
+        .await
+        .unwrap();
+    let follow_up = agent
+        .submit_with_input_contexts_in_host_context(
+            chat,
+            Some(first.loop_id),
+            QUEUED_SOURCE_INPUT.into(),
+            Vec::new(),
+            Vec::new(),
+            (!headless).then(|| expected_context.clone()),
+        )
+        .await
+        .unwrap();
+    assert_ne!(first.run_id, follow_up.run_id);
+    model.release.notify_one();
+    let mut input_merged = false;
+    let mut results = Vec::new();
+    loop {
+        let event = next_event(&mut events).await;
+        match event.kind {
+            EventKind::InputMerged { into_run_id } if event.run_id == follow_up.run_id => {
+                assert_eq!(into_run_id, first.run_id);
+                input_merged = true;
+            }
+            EventKind::ToolCompleted { result, .. } if event.run_id == first.run_id => {
+                assert!(!result.is_error, "{}", result.content);
+                results.push(serde_json::from_str::<Value>(&result.content).unwrap());
+            }
+            EventKind::Completed { .. } if event.run_id == first.run_id => break,
+            EventKind::Failed(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    agent.shutdown().await;
+    assert!(
+        input_merged,
+        "the follow-up must be merged into the active run"
+    );
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0]["phase"], "before");
+    assert_eq!(results[0]["context"], json!(first_context));
+    assert_eq!(results[1]["phase"], "after");
+    assert_eq!(results[1]["context"], json!(expected_context));
+}
+
+#[tokio::test]
+async fn merged_input_uses_its_captured_view_source_for_subsequent_host_calls() {
+    assert_merged_host_source(false).await;
+}
+
+#[tokio::test]
+async fn merged_headless_input_clears_the_old_view_anchor_and_uses_work_context() {
+    assert_merged_host_source(true).await;
+}
 
 struct UnusedHerdrPort;
 

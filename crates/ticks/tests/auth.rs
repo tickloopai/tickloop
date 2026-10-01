@@ -13,9 +13,22 @@ const ACTIVE_TOKEN_LIFETIME_SECONDS: u64 = SDK_REFRESH_WINDOW_SECONDS + 3;
 
 #[tokio::test]
 async fn approval_is_received_after_a_dropped_connection_without_progress_flooding() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::{
+        collections::HashMap,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::{Duration, Instant},
+    };
+    const SETUP_TIMEOUT: Duration = Duration::from_secs(10);
+    const RETRY_TIMEOUT: Duration = Duration::from_secs(5);
+    let (dropped_sender, mut dropped_receiver) = tokio::sync::oneshot::channel::<Instant>();
+    let dropped_sender = Mutex::new(Some(dropped_sender));
     let ap_polls = AtomicUsize::new(0);
-    let stub = http::Stub::start_with_disconnect(move |request| {
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    let observed = observations.clone();
+    let stub = http::Stub::start_with_observer(move |request| {
         if request.contains("/register ") {
             Some((201, json!({"client_id":"client"})))
         } else if request.contains("/device/authorize ") {
@@ -29,6 +42,13 @@ async fn approval_is_received_after_a_dropped_connection_without_progress_floodi
         } else {
             Some((400, json!({"error":"authorization_pending"})))
         }
+    }, move |event| {
+        if event.phase == "connection-dropped" && event.endpoint == "token" && event.center == "ap"
+            && let Some(sender) = dropped_sender.lock().unwrap().take()
+        {
+            let _ = sender.send(event.at);
+        }
+        observed.lock().unwrap().push(event);
     }).await;
     let home = tempfile::tempdir().unwrap();
     let storage = AuthStorage::in_home(home.path());
@@ -37,20 +57,110 @@ async fn approval_is_received_after_a_dropped_connection_without_progress_floodi
         us: format!("{}/oauth2", stub.url),
     };
     let mut output = Vec::new();
-    tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        run_login(
-            &Settings::default(),
-            &home.path().join("config.toml"),
+    let started = Instant::now();
+    let mut first_dropped_at = None;
+    let mut completed_during_setup = false;
+    let result = {
+        let settings = Settings::default();
+        let config_path = home.path().join("config.toml");
+        let mut input = Cursor::new("cn\n");
+        let login = run_login(
+            &settings,
+            &config_path,
             &storage,
             Some(endpoints),
-            &mut Cursor::new("cn\n"),
+            &mut input,
             &mut output,
-        ),
-    )
-    .await
-    .expect("a brief connection failure must not abandon the approved center")
-    .unwrap();
+        );
+        tokio::pin!(login);
+        let setup_deadline = started + SETUP_TIMEOUT;
+        let setup = tokio::select! {
+            biased;
+            dropped = &mut dropped_receiver => {
+                dropped.map(|at| (at, None)).map_err(|_| "missing-disconnect")
+            }
+            completed = &mut login => {
+                match dropped_receiver.try_recv() {
+                    Ok(at) => {
+                        completed_during_setup = true;
+                        Ok((at, Some(completed)))
+                    }
+                    Err(_) => Err(if completed.is_ok() {
+                        "login-finished-before-disconnect"
+                    } else {
+                        "login-error-before-disconnect"
+                    }),
+                }
+            }
+            _ = tokio::time::sleep_until(setup_deadline.into()) => Err("setup-timeout"),
+        };
+        match setup {
+            Err(failure) => Err(failure),
+            Ok((dropped_at, completed)) => {
+                first_dropped_at = Some(dropped_at);
+                let received_at = Instant::now();
+                let retry_deadline = dropped_at + RETRY_TIMEOUT;
+                if dropped_at < started || dropped_at > setup_deadline {
+                    Err("disconnect-outside-setup-deadline")
+                } else if received_at > setup_deadline {
+                    Err("setup-deadline-exceeded")
+                } else if received_at > retry_deadline {
+                    Err("retry-deadline-already-elapsed")
+                } else {
+                    let completed = if let Some(completed) = completed {
+                        Ok(completed)
+                    } else {
+                        tokio::time::timeout_at(retry_deadline.into(), &mut login)
+                            .await
+                            .map_err(|_| "retry-timeout")
+                    };
+                    if Instant::now() > retry_deadline {
+                        Err("retry-deadline-exceeded")
+                    } else {
+                        completed
+                    }
+                }
+            }
+        }
+    };
+    let finished = Instant::now();
+    let observations = observations.lock().unwrap();
+    let mut ordinals = HashMap::new();
+    let mut connections = HashMap::new();
+    for event in observations
+        .iter()
+        .filter(|event| event.phase == "request-accepted")
+    {
+        let ordinal = ordinals.entry((event.endpoint, event.center)).or_insert(0);
+        *ordinal += 1;
+        connections.insert(event.connection, (event.endpoint, event.center, *ordinal));
+    }
+    let events: Vec<_> = observations.iter().map(|event| {
+        let (endpoint, center, ordinal) = connections.get(&event.connection).copied().unwrap_or(("unknown", "unknown", 0));
+        json!({"elapsed_us":event.at.saturating_duration_since(started).as_micros(), "connection":event.connection,
+            "phase":event.phase, "endpoint":endpoint, "center":center, "ordinal":ordinal,
+            "status":event.status, "write_ok":event.write_ok})
+    }).collect();
+    let notices = String::from_utf8_lossy(&output);
+    let outcome = match &result {
+        Err(failure) => *failure,
+        Ok(Err(_)) => "login-error",
+        Ok(Ok(())) => "success",
+    };
+    eprintln!(
+        "[DEBUG-auth-reconnect] {}",
+        json!({"setup_deadline_ms":SETUP_TIMEOUT.as_millis(), "retry_deadline_ms":RETRY_TIMEOUT.as_millis(),
+        "elapsed_us":finished.duration_since(started).as_micros(),
+        "first_drop_us":first_dropped_at.map(|at| at.saturating_duration_since(started).as_micros()),
+        "retry_elapsed_us":first_dropped_at.map(|at| finished.saturating_duration_since(at).as_micros()),
+        "completed_during_setup":completed_during_setup,
+        "outcome":outcome,
+        "notices":{"waiting":notices.matches("Waiting for Longbridge").count(), "retry":notices.matches("retrying automatically").count(),
+            "remaining":notices.matches("remaining").count(), "logged_in":notices.matches("Logged in").count()}, "events":events})
+    );
+    result
+        .expect("a brief connection failure must not abandon the approved center")
+        .unwrap();
     assert_eq!(
         storage.token().unwrap().unwrap().access_token,
         "ap_authorized"

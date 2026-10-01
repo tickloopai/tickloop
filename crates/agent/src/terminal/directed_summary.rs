@@ -1,9 +1,9 @@
+use super::execution::ConsoleExecution as Agent;
 use std::collections::HashMap;
 
 use tickloop_agent::model::ModelError;
 use tickloop_agent::runtime::{
-    Agent, AgentError, ChatSnapshot, DirectedSummaryOutcome, DirectedSummaryRequest,
-    SummaryDirection,
+    AgentError, ChatSnapshot, DirectedSummaryOutcome, DirectedSummaryRequest, SummaryDirection,
 };
 use tokio::task::{Id, JoinSet};
 use uuid::Uuid;

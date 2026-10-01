@@ -17,6 +17,7 @@ const TEMPORARY_DIRECTORY_DESCRIPTION: &str = "temporary directory";
 const MAX_SANITIZED_LENGTH: usize = 200;
 const TEMP_DIRECTORY_ENV: &str = "TICKLOOP_TMPDIR";
 const DEFAULT_TEMP_DIRECTORY: &str = "/tmp";
+const PRIVATE_TEMP_DIRECTORY_PREFIX: &str = "tickloop-private-";
 
 /// `<root>/projects/<项目目录名>`。项目目录名照 Claude Code：canonical 路径做 NFC 规范化后
 /// 替换非字母数字字符；工作目录无法解析时按原路径计算。
@@ -25,17 +26,18 @@ pub(crate) fn project_directory(root: &Path, workdir: &Path) -> PathBuf {
         .join(project_directory_name(workdir))
 }
 
-/// 照 Claude Code `getProjectTempDir`：`<临时目录>/tickloop-<uid>/<项目目录名>`。
+/// `<临时目录>/tickloop-private-<uid>/<项目目录名>`。
 /// 临时目录取 `TICKLOOP_TMPDIR`（对应 `CLAUDE_CODE_TMPDIR`），未设置时为 `/tmp`；
 /// 与 Claude Code `getClaudeTempDir` 相同，只对这个基础目录解析一次符号链接，其下各层是字面路径。
-/// 以基础临时目录为锚点，创建时逐层校验属主与权限。
+/// A separate namespace leaves legacy shared roots untouched; every new layer still requires
+/// private ownership and permissions, with no fallback when the new root is unsafe.
 pub(crate) fn private_project_temp_directory(workdir: &Path) -> PrivateDirectory {
     let base = std::env::var_os(TEMP_DIRECTORY_ENV)
         .filter(|value| !value.is_empty())
         .map_or_else(|| PathBuf::from(DEFAULT_TEMP_DIRECTORY), PathBuf::from);
     let base = base.canonicalize().unwrap_or(base);
     let path = base
-        .join(format!("tickloop-{}", current_uid()))
+        .join(format!("{PRIVATE_TEMP_DIRECTORY_PREFIX}{}", current_uid()))
         .join(project_directory_name(workdir));
     PrivateDirectory {
         anchor: Some(base),
@@ -44,7 +46,7 @@ pub(crate) fn private_project_temp_directory(workdir: &Path) -> PrivateDirectory
 }
 
 /// Tick Loop 自己写入的目录。位于用户配置目录下时照常创建；位于系统临时目录下时，
-/// 其他用户可以在共享的 `/tmp` 中抢先布置 `tickloop-<uid>` 等目录或符号链接，因此锚点以下
+/// 其他用户可以在共享的 `/tmp` 中抢先布置目录或符号链接，因此锚点以下
 /// 每一层都必须是当前用户拥有、没有 group/other 权限位的真实目录。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PrivateDirectory {

@@ -115,6 +115,10 @@ fn originals_for_active_chain_with_legacy(
         }
         if snapshot.prompt_execution_modes.contains_key(&index)
             && !snapshot.inherited_prompts.contains(&index)
+            && !snapshot
+                .message_ids
+                .get(&index)
+                .is_some_and(|id| snapshot.agent_message_origins.contains_key(id))
         {
             let Some(run_id) = snapshot.message_runs.get(&index).copied() else {
                 return Err(ApprovalContextError::MissingOriginalUserInput);
@@ -202,10 +206,31 @@ pub(super) fn capture(
 ) -> Result<ApprovalSnapshot, ApprovalContextError> {
     let originals =
         originals_for_active_chain_with_legacy(snapshot, legacy, Some(&operation.call_id))?;
-    let original_user_inputs = originals
+    let mut original_user_inputs = originals
         .into_iter()
         .filter(|input| input.chat_id == snapshot.id && input.loop_id == operation.loop_id)
         .collect::<Vec<_>>();
+    if let Some(delegation) = &snapshot.delegation {
+        let frozen = delegation
+            .trusted_user_inputs
+            .as_ref()
+            .and_then(|value| serde_json::from_value::<Vec<OriginalUserInput>>(value.clone()).ok())
+            .filter(|inputs| !inputs.is_empty())
+            .ok_or(ApprovalContextError::MissingOriginalUserInput)?;
+        let mut inherited = frozen
+            .iter()
+            .filter(|input| {
+                input.chat_id == delegation.parent_chat_id
+                    && input.loop_id == delegation.parent_loop_id
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if inherited.is_empty() {
+            return Err(ApprovalContextError::MissingOriginalUserInput);
+        }
+        inherited.append(&mut original_user_inputs);
+        original_user_inputs = inherited;
+    }
     if original_user_inputs.is_empty() {
         return Err(ApprovalContextError::MissingOriginalUserInput);
     }

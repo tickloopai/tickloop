@@ -1,14 +1,19 @@
-use std::sync::Arc;
+use std::{
+    os::unix::fs::{FileTypeExt, MetadataExt},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use tick_connect::access::{AccessPermission, PreparedOperation, TickAccess, TickLocation};
+use tick_connect::access::{
+    AccessContext, AccessPermission, PreparedOperation, TickAccess, TickLocation,
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     host_tools::{
-        HostCallResult, HostToolPermission, HostToolProvider, PreparedHostCall,
-        WorkspaceHostContext,
+        HostCallContext, HostCallResult, HostEndpointIdentity, HostToolPermission,
+        HostToolProvider, PreparedHostCall, WorkspaceHostContext,
     },
     model::ToolDefinition,
     runtime::ChatId,
@@ -17,17 +22,100 @@ use crate::{
 
 pub struct NativeHostToolProvider {
     access: Arc<TickAccess>,
+    trusted_adapter_scope: Option<uuid::Uuid>,
+}
+
+struct NativePreparedCall {
+    operation: PreparedOperation,
+    endpoint: Option<HostEndpointIdentity>,
 }
 
 const PLACEMENT_DIRECTIONS: [&str; 4] = ["left", "right", "up", "down"];
 
 impl NativeHostToolProvider {
     pub fn new(access: Arc<TickAccess>) -> Self {
-        Self { access }
+        Self {
+            access,
+            trusted_adapter_scope: None,
+        }
+    }
+
+    /// An embedding caller owns this adapter's trust boundary and must reuse its scope only for the same endpoint.
+    pub fn with_trusted_adapter_identity(access: Arc<TickAccess>, scope: uuid::Uuid) -> Self {
+        Self {
+            access,
+            trusted_adapter_scope: Some(scope),
+        }
     }
 
     pub fn access(&self) -> &Arc<TickAccess> {
         &self.access
+    }
+
+    async fn prepare_native_call(
+        &self,
+        name: &str,
+        input: &Value,
+        context: Option<&HostCallContext>,
+        cancel: CancellationToken,
+    ) -> Result<PreparedHostCall, String> {
+        if cancel.is_cancelled() {
+            return Err("Native host operation was cancelled before preparation".into());
+        }
+        let endpoint = self.host_endpoint()?;
+        let operation_name = match name {
+            "ReadWorkspace" => "read_workspace",
+            "ReadTick" => "read_tick",
+            "CallTickTool" => "call_tick_tool",
+            "ModifyTick" => "modify_tick",
+            _ => return Err(format!("unknown Native host tool: {name}")),
+        };
+        let prepared = match context {
+            Some(context) => {
+                let is_relative = input["placement"]["type"] == "current_tab"
+                    || (name == "ModifyTick"
+                        && input["action"] == "move"
+                        && input.get("placement").is_none());
+                let interaction = context
+                    .interaction
+                    .as_ref()
+                    .filter(|source| source.socket == self.access.context().socket);
+                if is_relative && context.interaction.is_some() && interaction.is_none() {
+                    return Err("interaction View belongs to a different host instance".into());
+                }
+                self.access
+                    .prepare_in_context(
+                        operation_name,
+                        input,
+                        &AccessContext {
+                            workdir: context.workdir.clone(),
+                            workspace_id: context.workspace_id.clone(),
+                            interaction: interaction.map(|source| source.pane.clone()),
+                        },
+                    )
+                    .await
+            }
+            None => self.access.prepare(operation_name, input).await,
+        }
+        .map_err(|error| error.to_string())?;
+        if self.host_endpoint()? != endpoint {
+            return Err("Native host endpoint changed during preparation".into());
+        }
+        let permission = match prepared.permission {
+            AccessPermission::ReadOnly => HostToolPermission::ReadOnly,
+            AccessPermission::Confirmation => HostToolPermission::Reviewable,
+        };
+        Ok(PreparedHostCall::new(
+            name.to_owned(),
+            input.clone(),
+            prepared.input.clone(),
+            permission,
+            prepared.summary.clone(),
+        )
+        .with_payload(NativePreparedCall {
+            operation: prepared,
+            endpoint,
+        }))
     }
 }
 
@@ -40,8 +128,8 @@ fn target_directory(target: &TickLocation) -> &str {
         .unwrap_or("")
 }
 
-fn prepared_binding(call: &PreparedHostCall) -> Result<&PreparedOperation, String> {
-    call.payload::<PreparedOperation>()
+fn prepared_binding(call: &PreparedHostCall) -> Result<&NativePreparedCall, String> {
+    call.payload::<NativePreparedCall>()
         .ok_or_else(|| "Native host operation has no prepared binding".into())
 }
 
@@ -58,6 +146,29 @@ fn placement_schema(allow_new_tab: bool) -> Value {
 
 #[async_trait]
 impl HostToolProvider for NativeHostToolProvider {
+    fn host_endpoint(&self) -> Result<Option<HostEndpointIdentity>, String> {
+        if let Some(scope) = self.trusted_adapter_scope {
+            return Ok(Some(HostEndpointIdentity::TrustedAdapter { scope }));
+        }
+        let socket = &self.access.context().socket;
+        let metadata = match std::fs::symlink_metadata(socket) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(format!("cannot verify Native host endpoint: {error}")),
+        };
+        if !metadata.file_type().is_socket() || metadata.uid() != unsafe { libc::geteuid() } {
+            return Err("Native host endpoint must be a socket owned by this user".into());
+        }
+        Ok(Some(HostEndpointIdentity::HerdrSocket {
+            path: socket
+                .canonicalize()
+                .map_err(|error| format!("cannot resolve Native host endpoint: {error}"))?,
+            owner: metadata.uid(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }))
+    }
+
     fn workspace_host_context(&self) -> Option<WorkspaceHostContext> {
         Some(WorkspaceHostContext::attached_herdr(
             tick_connect::access::bundled_tick_executable(),
@@ -68,7 +179,7 @@ impl HostToolProvider for NativeHostToolProvider {
         vec![
             ToolDefinition {
                 name: "ReadWorkspace".into(),
-                description: "List running programs in the current Herdr Workspace, or in an explicitly named Workspace. Includes the calling Agent's current Pane and Tab under caller. Each program has a stable Tick Instance reference.".into(),
+                description: "List running programs in the current Herdr Workspace, or in an explicitly named Workspace. Uses the Agent's Work Context by default; without one, discovers available Workspaces. The optional caller describes the View carrying this input, and may be null while the Agent works in the background. Each program has a stable Tick Instance reference.".into(),
                 input_schema: json!({"type":"object","properties":{"workspace_id":{"type":"string","minLength":1}},"additionalProperties":false}),
             },
             ToolDefinition {
@@ -83,7 +194,7 @@ impl HostToolProvider for NativeHostToolProvider {
             },
             ToolDefinition {
                 name: "ModifyTick".into(),
-                description: "Open a program, move an existing Tick beside another Pane while preserving its instance and subscriptions, send terminal input, or close a Pane. For open, omitted placement creates a new Tab; placement.type=current_tab places relative to this Agent, and type=pane places relative to the named Pane in the selected Workspace. Move defaults to current_tab. Direction accepts left, right, up, or down and defaults to right. For an explicit relative direction, invoke move even when the Tick is already in the target Tab. Placement is frozen before approval and never follows UI focus. Right/down do not request focus; moving a focused Pane lets Herdr choose a remaining Pane. Left/up finish focused on the anchor Pane (this Agent for current_tab, the named Pane for pane). For command[0]='tick', prefer the bundled sibling executable, then PATH. Use the tickloop Skill for guidance. Terminal input is checked before sending, without an atomic identity/send guarantee.".into(),
+                description: "Open a program, move an existing Tick beside another Pane while preserving its instance and subscriptions, send terminal input, or close a Pane. For open, omitted placement creates a new Tab; placement.type=current_tab places relative to the View captured for this input, which must still be valid, and type=pane places relative to the named Pane in the selected Workspace. Explicit targets and new_tab work without an Agent View; omitted cwd uses the Agent file work directory. Results report the verified host, Workspace, Tab, Pane, Tick Instance and state, with unknown fields left unresolved. Move defaults to current_tab. Direction accepts left, right, up, or down and defaults to right. For an explicit relative direction, invoke move even when the Tick is already in the target Tab. Placement is frozen before approval and never follows UI focus. Right/down do not request focus; moving a focused Pane lets Herdr choose a remaining Pane. Left/up finish focused on the anchor Pane (this Agent for current_tab, the named Pane for pane). For command[0]='tick', prefer the bundled sibling executable, then PATH. Use the tickloop Skill for guidance. Terminal input is checked before sending, without an atomic identity/send guarantee.".into(),
                 input_schema: json!({"type":"object","oneOf":[
                     {"type":"object","properties":{"action":{"const":"open"},"command":{"type":"array","minItems":1,"items":{"type":"string"}},"cwd":{"type":"string","minLength":1},"workspace_id":{"type":"string","minLength":1},"placement":placement_schema(true)},"required":["action","command"],"additionalProperties":false},
                     {"type":"object","properties":{"action":{"const":"move"},"tick_instance_id":{"type":"string","minLength":1},"workspace_id":{"type":"string","minLength":1},"placement":placement_schema(false)},"required":["action","tick_instance_id"],"additionalProperties":false},
@@ -108,33 +219,19 @@ impl HostToolProvider for NativeHostToolProvider {
         input: &Value,
         cancel: CancellationToken,
     ) -> Result<PreparedHostCall, String> {
-        if cancel.is_cancelled() {
-            return Err("Native host operation was cancelled before preparation".into());
-        }
-        let operation_name = match name {
-            "ReadWorkspace" => "read_workspace",
-            "ReadTick" => "read_tick",
-            "CallTickTool" => "call_tick_tool",
-            "ModifyTick" => "modify_tick",
-            _ => return Err(format!("unknown Native host tool: {name}")),
-        };
-        let prepared = self
-            .access
-            .prepare(operation_name, input)
+        self.prepare_native_call(name, input, None, cancel).await
+    }
+
+    async fn prepare_call_in_context(
+        &self,
+        _: ChatId,
+        context: &HostCallContext,
+        name: &str,
+        input: &Value,
+        cancel: CancellationToken,
+    ) -> Result<PreparedHostCall, String> {
+        self.prepare_native_call(name, input, Some(context), cancel)
             .await
-            .map_err(|error| error.to_string())?;
-        let permission = match prepared.permission {
-            AccessPermission::ReadOnly => HostToolPermission::ReadOnly,
-            AccessPermission::Confirmation => HostToolPermission::Reviewable,
-        };
-        let call = PreparedHostCall::new(
-            name.to_owned(),
-            input.clone(),
-            prepared.input.clone(),
-            permission,
-            prepared.summary.clone(),
-        );
-        Ok(call.with_payload(prepared))
     }
 
     async fn revalidate_call(
@@ -146,7 +243,11 @@ impl HostToolProvider for NativeHostToolProvider {
         if cancel.is_cancelled() {
             return Err("Native host operation was cancelled before dispatch".into());
         }
-        let prepared = prepared_binding(call)?;
+        let binding = prepared_binding(call)?;
+        if self.host_endpoint()? != binding.endpoint {
+            return Err("Native host endpoint changed before dispatch".into());
+        }
+        let prepared = &binding.operation;
         self.access
             .revalidate(prepared)
             .await
@@ -176,12 +277,12 @@ impl HostToolProvider for NativeHostToolProvider {
         if let Err(error) = self.revalidate_call(chat_id, &call, cancel.clone()).await {
             return HostCallResult::NotDispatched(error);
         }
-        let Ok(prepared) = call.into_payload::<PreparedOperation>() else {
+        let Ok(binding) = call.into_payload::<NativePreparedCall>() else {
             return HostCallResult::NotDispatched(
                 "Native host operation has no prepared binding".into(),
             );
         };
-        match self.access.execute(prepared, cancel).await {
+        match self.access.execute(binding.operation, cancel).await {
             Ok(value)
                 if value["status"] == "created_not_placed"
                     && value["error"]["dispatched"] == true =>

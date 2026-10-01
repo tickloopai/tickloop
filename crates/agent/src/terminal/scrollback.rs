@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     ops::Range,
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use tickloop_ui::{
@@ -106,7 +107,18 @@ struct Block {
     hang: usize,
 }
 
+/// Names one input echo in one scrollback. It means nothing to any other scrollback, including
+/// the fresh one a reset or reload puts in its place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct InputEcho {
+    scrollback: u64,
+    input: u64,
+}
+
+static NEXT_SCROLLBACK: AtomicU64 = AtomicU64::new(1);
+
 pub(super) struct Scrollback {
+    id: u64,
     lines: Vec<String>,
     line_styles: Vec<LineStyle>,
     block: Option<Block>,
@@ -126,11 +138,15 @@ pub(super) struct Scrollback {
     running_tool_calls: HashMap<String, usize>,
     running_shimmer: RunningShimmer,
     completion_notice: Option<Range<usize>>,
+    /// Logical lines of each input echo, oldest first.
+    inputs: Vec<(u64, Range<usize>)>,
+    next_input: u64,
 }
 
 impl Default for Scrollback {
     fn default() -> Self {
         Self {
+            id: NEXT_SCROLLBACK.fetch_add(1, Ordering::Relaxed),
             lines: vec![String::new()],
             line_styles: vec![LineStyle::default()],
             block: None,
@@ -147,11 +163,56 @@ impl Default for Scrollback {
             running_tool_calls: HashMap::new(),
             running_shimmer: RunningShimmer::default(),
             completion_notice: None,
+            inputs: Vec::new(),
+            next_input: 0,
         }
     }
 }
 
 impl Scrollback {
+    pub(super) fn is_following(&self) -> bool {
+        self.following
+    }
+
+    pub(super) fn is_at_bottom(&self) -> bool {
+        self.top_row() == self.row_count().saturating_sub(self.height)
+    }
+
+    pub(super) fn has_hidden_tail(&mut self, width: usize, height: usize) -> bool {
+        self.prepare_frame(width, height);
+        !self.is_at_bottom()
+    }
+
+    pub(super) fn activity_line(&self) -> Option<RoleLine> {
+        self.activity.clone()
+    }
+
+    pub(super) fn reading_prompt(&self, width: usize, height: usize) -> Option<String> {
+        if self.following || height < 7 || width < 24 {
+            return None;
+        }
+        let first_line = self.rows.get(self.top_row())?.start.line;
+        if self.line_styles.get(first_line)?.fill == Some(Role::UserMessageBg) {
+            return None;
+        }
+        let end = (0..first_line)
+            .rev()
+            .find(|index| self.line_styles[*index].fill == Some(Role::UserMessageBg))?;
+        let mut start = end;
+        while start > 0 && self.line_styles[start - 1].fill == Some(Role::UserMessageBg) {
+            start -= 1;
+        }
+        let summary = self.lines[start..=end]
+            .join(" ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let summary = summary.chars().take(512).collect::<String>();
+        let mut line = RoleLine::plain(summary);
+        line.truncate(width);
+        Some(line.text())
+    }
+
     pub(super) fn new() -> Self {
         Self::default()
     }
@@ -248,15 +309,89 @@ impl Scrollback {
 
     /// Hides the latest completion notice, as when another run starts.
     pub(super) fn hide_completion_notice(&mut self) {
-        let Some(notice) = self.completion_notice.take() else {
+        if let Some(notice) = self.completion_notice.take() {
+            self.hide_lines(notice);
+        }
+    }
+
+    pub(super) fn line_count(&self) -> usize {
+        self.lines.len()
+    }
+
+    pub(super) fn mark_input(&mut self, lines: Range<usize>) -> InputEcho {
+        self.next_input += 1;
+        self.inputs.push((self.next_input, lines));
+        InputEcho {
+            scrollback: self.id,
+            input: self.next_input,
+        }
+    }
+
+    /// Hides `echo`, as when its input was not sent or is shown in another view. An echo of
+    /// another scrollback names nothing here.
+    pub(super) fn hide_echo(&mut self, echo: InputEcho) {
+        if echo.scrollback != self.id {
             return;
+        }
+        if let Some(index) = self
+            .inputs
+            .iter()
+            .position(|(input, _)| *input == echo.input)
+        {
+            let (_, lines) = self.inputs.remove(index);
+            self.hide_lines(lines.start..lines.end.min(self.lines.len()));
+        }
+    }
+
+    /// Draws `current` as the continuation of `previous`, one block in the body, when `current`
+    /// directly follows `previous` here: the blank line between them is hidden and `current`'s
+    /// `prompt` lead becomes spaces of the same width. Its text, links and fill stay as they are.
+    /// Echoes with anything drawn between them, or from another scrollback, stay apart.
+    pub(super) fn join_inputs(
+        &mut self,
+        previous: InputEcho,
+        current: InputEcho,
+        prompt: &str,
+    ) -> bool {
+        let lines_of = |echo: InputEcho| {
+            (echo.scrollback == self.id)
+                .then(|| self.inputs.iter().find(|(input, _)| *input == echo.input))
+                .flatten()
+                .map(|(_, lines)| lines.clone())
         };
-        for style in &mut self.line_styles[notice.clone()] {
+        let (Some(previous), Some(current)) = (lines_of(previous), lines_of(current)) else {
+            return false;
+        };
+        let separator = previous.end;
+        let adjacent = current.start == separator + 1
+            && current.end <= self.lines.len()
+            && self.lines[separator].is_empty()
+            && !self.line_styles[separator..current.end]
+                .iter()
+                .any(|style| style.hidden);
+        if !adjacent {
+            return false;
+        }
+        self.hide_lines(separator..separator + 1);
+        let lead = " ".repeat(prompt.width());
+        remap_prefix(
+            &mut self.lines[current.start],
+            &mut self.line_styles[current.start],
+            0,
+            prompt,
+            &lead,
+            Role::Subtle,
+        );
+        true
+    }
+
+    fn hide_lines(&mut self, lines: Range<usize>) {
+        for style in &mut self.line_styles[lines.clone()] {
             style.hidden = true;
         }
         self.dirty_from = Some(
             self.dirty_from
-                .map_or(notice.start, |existing| existing.min(notice.start)),
+                .map_or(lines.start, |existing| existing.min(lines.start)),
         );
     }
 
@@ -438,12 +573,7 @@ impl Scrollback {
                 unread: self.unread,
             };
         }
-        if self.width != width {
-            self.width = width;
-            self.dirty_from = Some(0);
-        }
-        self.height = height;
-        self.refresh_rows();
+        self.prepare_frame(width, height);
         let top = self.top_row();
         if top.saturating_add(height) >= self.row_count() {
             self.unread = 0;
@@ -494,6 +624,15 @@ impl Scrollback {
         }
         rows.push(activity.clone());
         rows
+    }
+
+    fn prepare_frame(&mut self, width: usize, height: usize) {
+        if self.width != width {
+            self.width = width;
+            self.dirty_from = Some(0);
+        }
+        self.height = height;
+        self.refresh_rows();
     }
 
     fn row_count(&self) -> usize {

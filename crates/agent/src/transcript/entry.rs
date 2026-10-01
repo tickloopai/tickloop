@@ -16,6 +16,7 @@ pub(crate) enum Line {
     CustomTitle(CustomTitleEntry),
     LastPrompt(LastPromptEntry),
     BranchOrigin(BranchOriginEntry),
+    Delegation(DelegationEntry),
     /// 照 Claude Code：文件回滚快照，按消息 id 关联到链上消息。
     FileHistorySnapshot(FileHistorySnapshotEntry),
     /// 照 Claude Code：大工具结果的替换决定，恢复时重建，同一 Chat 的条目逐条累积。
@@ -77,6 +78,8 @@ pub(crate) struct ChainEntry {
     pub is_inherited_prompt: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub original_user_message_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_message_origin: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -159,6 +162,10 @@ pub(crate) struct LoopRecord {
     /// 与 `plan_version` 同时写出的进度步骤（原始 JSON）；链上之后的进度工具调用覆盖它。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub progress: Option<serde_json::Value>,
+    /// Unix milliseconds when the runtime moved the Loop into `state`, kept as raw JSON so an
+    /// unreadable value leaves the time unknown instead of dropping the record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_since: Option<serde_json::Value>,
 }
 
 impl LoopRecord {
@@ -240,6 +247,13 @@ pub(crate) struct LastPromptEntry {
 pub(crate) struct BranchOriginEntry {
     pub chat_id: Uuid,
     pub forked_from: ForkedFrom,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DelegationEntry {
+    pub chat_id: Uuid,
+    pub delegation: crate::runtime::DelegationMetadata,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

@@ -58,7 +58,13 @@ pub(crate) fn list_project(project_directory: &Path) -> io::Result<Vec<Transcrip
             cwd: first_json_string_field(&head, "cwd").map(PathBuf::from),
             title: last_json_string_field(&tail, "customTitle")
                 .or_else(|| last_json_string_field(&head, "customTitle")),
-            first_prompt: first_prompt(&head),
+            first_prompt: first_prompt(&head).or_else(|| {
+                head.lines()
+                    .find_map(|line| match serde_json::from_str::<Line>(line).ok()? {
+                        Line::Delegation(entry) => Some(entry.delegation.task),
+                        _ => None,
+                    })
+            }),
             last_prompt: last_json_string_field(&tail, "lastPrompt"),
             git_branch: last_json_string_field(&tail, "gitBranch")
                 .or_else(|| first_json_string_field(&head, "gitBranch")),
@@ -94,7 +100,7 @@ fn first_prompt(head: &str) -> Option<String> {
         .lines()
         .filter(|line| line.starts_with("{\"type\":\"user\"") && !line.contains("\"isMeta\":true"))
         .find_map(|line| match serde_json::from_str::<Line>(line).ok()? {
-            Line::User(entry) => {
+            Line::User(entry) if entry.agent_message_origin.is_none() => {
                 let texts = entry
                     .message
                     .content

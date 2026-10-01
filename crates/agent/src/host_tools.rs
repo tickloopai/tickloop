@@ -7,6 +7,33 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{model::ToolDefinition, runtime::ChatId, tools::ToolResult};
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct HostCallContext {
+    pub workdir: PathBuf,
+    pub workspace_id: Option<String>,
+    pub interaction: Option<HerdrInteraction>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct HerdrInteraction {
+    pub socket: PathBuf,
+    pub pane: tick_connect::herdr::Pane,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HostEndpointIdentity {
+    HerdrSocket {
+        path: PathBuf,
+        owner: u32,
+        device: u64,
+        inode: u64,
+    },
+    TrustedAdapter {
+        scope: uuid::Uuid,
+    },
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub enum HostToolPermission {
     ReadOnly,
@@ -438,6 +465,10 @@ pub trait HostToolProvider: Send + Sync {
         crate::runtime::validate_host_schema_input(name, schema, input)
     }
 
+    fn host_endpoint(&self) -> Result<Option<HostEndpointIdentity>, String> {
+        Ok(None)
+    }
+
     fn workspace_host_context(&self) -> Option<WorkspaceHostContext> {
         None
     }
@@ -472,6 +503,17 @@ pub trait HostToolProvider: Send + Sync {
             permission,
             format!("{name}: {input}"),
         ))
+    }
+
+    async fn prepare_call_in_context(
+        &self,
+        chat_id: ChatId,
+        _context: &HostCallContext,
+        name: &str,
+        input: &Value,
+        cancel: CancellationToken,
+    ) -> Result<PreparedHostCall, String> {
+        self.prepare_call(chat_id, name, input, cancel).await
     }
 
     async fn revalidate_call(

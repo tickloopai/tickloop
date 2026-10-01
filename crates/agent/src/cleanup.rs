@@ -4,11 +4,9 @@
 //! 计划文件、文件回滚备份目录、图片缓存目录与粘贴缓存，之后尝试删除空目录。系统临时目录中的后台
 //! 任务输出、输入历史、进程登记与设置文件不清理（与 Claude Code 一致）。
 //!
-//! 与 Claude Code 一样按修改时间判断，不检查文件是否正被使用：正在对话的 Chat 每次冲刷都会
-//! 更新 Transcript 的修改时间，因此当前 Chat（无论属于本进程还是其他进程）的记录不会过期。
-//! 在此之上，文件回滚备份目录、图片缓存目录与计划文件不随对话更新修改时间（复用备份不改目录、
-//! 图片只在粘贴时写入、计划只在写计划时保存），长期运行的 Loop 会让它们先于 Transcript 过期；因此
-//! Transcript 仍未过期的 Chat 保留这些文件（Claude Code 没有这一层）。
+//! Live runtimes hold shared retention locks for Transcripts and associated resources.
+//! Cleanup holds an exclusive lock throughout deletion and conservatively retains uncertain locks.
+//! After runtime exit, the kernel releases its lock and the existing modification-time policy applies.
 //!
 //! 只认 Tick Loop 自己写出的名称：`<chatId>.jsonl` 的 Transcript、`<chatId>` 命名的 Chat 目录、文件回滚
 //! 备份目录与图片缓存目录（连字符分隔的小写 UUID），防止配置目录被误设为主目录这类情况下删除用户
@@ -17,7 +15,7 @@
 //! 指向的内容都不删除；删除目录树用的 `remove_dir_all` 同样只删除链接本身。
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs::{self, File},
     io::{self, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
@@ -33,6 +31,7 @@ use crate::runtime::{
 };
 use crate::settings::{CleanupPeriod, UserSettings};
 use crate::terminal::{IMAGE_CACHE_DIRECTORY, PASTE_CACHE_DIRECTORY, PASTE_FILE_EXTENSION};
+use crate::transcript::retention::{RetentionGuard, prepare_directory};
 use crate::transcript::{LITE_READ_BUF_SIZE, PROJECTS_DIRECTORY, TRANSCRIPT_FILE_SUFFIX};
 
 const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
@@ -82,14 +81,14 @@ pub fn cleanup_old_message_files_in_background(root: &Path) -> CleanupOutcome {
         CleanupPeriod::SkipInvalidSettings => return CleanupOutcome::Skipped,
     };
     let cutoff = cutoff_date(days);
-    let (mut result, active_chats) = cleanup_old_transcript_files(root, cutoff);
+    let (mut result, mut active_chats) = cleanup_old_transcript_files(root, cutoff);
     result.add(cleanup_old_plan_files(root, cutoff, &active_chats));
     result.add(cleanup_old_file_history_backups(
         root,
         cutoff,
-        &active_chats,
+        &mut active_chats,
     ));
-    result.add(cleanup_old_image_caches(root, cutoff, &active_chats));
+    result.add(cleanup_old_image_caches(root, cutoff, &mut active_chats));
     result.add(cleanup_old_pastes(root, cutoff));
     CleanupOutcome::Completed(result)
 }
@@ -102,24 +101,65 @@ fn cutoff_date(days: u64) -> SystemTime {
         .unwrap_or(SystemTime::UNIX_EPOCH)
 }
 
-/// Transcript 仍未过期（或删除失败）的 Chat，以及这些 Transcript 中记录的计划文件名前缀。
-#[derive(Default)]
+/// Live, unexpired or conservatively retained Chats and their plan prefixes, with cleanup guards.
 struct ActiveChats {
     chat_ids: HashSet<Uuid>,
     /// `None`：某个 Transcript 读取失败或超过扫描上限，无法确定全部仍在使用的前缀。
     plan_slugs: Option<HashSet<String>>,
+    root: PathBuf,
+    retention: HashMap<Uuid, Option<RetentionGuard>>,
+    unavailable: bool,
+    unlocated: HashSet<Uuid>,
 }
 
 impl ActiveChats {
-    fn new() -> Self {
-        Self {
+    fn new(root: &Path) -> Self {
+        let mut active = Self {
             chat_ids: HashSet::new(),
             plan_slugs: Some(HashSet::new()),
+            root: root.into(),
+            retention: HashMap::new(),
+            unavailable: false,
+            unlocated: HashSet::new(),
+        };
+        let entries = prepare_directory(root)
+            .ok()
+            .and_then(|directory| read_real_directory(&directory));
+        let Some(entries) = entries else {
+            active.unavailable = true;
+            active.plan_slugs = None;
+            return active;
+        };
+        for entry in entries {
+            if let Some(chat_id) = chat_id_with_suffix(&entry.path, ".lock")
+                && !active.can_remove(chat_id)
+            {
+                active.chat_ids.insert(chat_id);
+                active.unlocated.insert(chat_id);
+            }
+        }
+        active
+    }
+
+    fn can_remove(&mut self, chat_id: Uuid) -> bool {
+        if self.unavailable {
+            return false;
+        }
+        self.retention
+            .entry(chat_id)
+            .or_insert_with(|| RetentionGuard::exclusive(&self.root, chat_id).ok())
+            .is_some()
+    }
+
+    fn finish_transcripts(&mut self) {
+        if !self.unlocated.is_empty() {
+            self.plan_slugs = None;
         }
     }
 
     fn record(&mut self, chat_id: Uuid, transcript: &Path) {
         self.chat_ids.insert(chat_id);
+        self.unlocated.remove(&chat_id);
         let Some(known_slugs) = &mut self.plan_slugs else {
             return;
         };
@@ -141,8 +181,12 @@ impl ActiveChats {
 /// Chat 目录与项目目录。同时收集 Transcript 仍保留的 Chat。
 fn cleanup_old_transcript_files(root: &Path, cutoff: SystemTime) -> (CleanupResult, ActiveChats) {
     let mut result = CleanupResult::default();
-    let mut active_chats = ActiveChats::new();
+    let mut active_chats = ActiveChats::new(root);
+    if active_chats.unavailable {
+        result.errors += 1;
+    }
     let Some(project_entries) = read_real_directory(&root.join(PROJECTS_DIRECTORY)) else {
+        active_chats.finish_transcripts();
         return (result, active_chats);
     };
     for project_entry in project_entries {
@@ -164,12 +208,24 @@ fn cleanup_old_transcript_files(root: &Path, cutoff: SystemTime) -> (CleanupResu
                 let Some(chat_id) = chat_id_with_suffix(&entry.path, TRANSCRIPT_FILE_SUFFIX) else {
                     continue;
                 };
-                let outcome = unlink_if_old(&entry.path, cutoff);
+                let outcome = if active_chats.can_remove(chat_id) {
+                    unlink_if_old(&entry.path, cutoff)
+                } else {
+                    Ok(false)
+                };
                 if !matches!(outcome, Ok(true)) {
                     active_chats.record(chat_id, &entry.path);
                 }
                 result.record(outcome);
             } else if entry.is_directory && chat_id_with_suffix(&entry.path, "").is_some() {
+                let chat_id = chat_id_with_suffix(&entry.path, "").unwrap();
+                if !active_chats.can_remove(chat_id) {
+                    active_chats.record(
+                        chat_id,
+                        &project_directory.join(format!("{chat_id}{TRANSCRIPT_FILE_SUFFIX}")),
+                    );
+                    continue;
+                }
                 let chat_directory = entry.path;
                 let tool_results_directory = chat_directory.join(TOOL_RESULTS_SUBDIRECTORY);
                 let Some(tool_entries) = read_real_directory(&tool_results_directory) else {
@@ -195,6 +251,9 @@ fn cleanup_old_transcript_files(root: &Path, cutoff: SystemTime) -> (CleanupResu
         }
         for path in denial_files {
             let chat_id = chat_id_with_suffix(&path, DENIAL_FILE_SUFFIX).unwrap();
+            if !active_chats.can_remove(chat_id) {
+                continue;
+            }
             let transcript = project_directory.join(format!("{chat_id}{TRANSCRIPT_FILE_SUFFIX}"));
             if !fs::symlink_metadata(&transcript)
                 .is_ok_and(|metadata| metadata.file_type().is_file())
@@ -204,6 +263,7 @@ fn cleanup_old_transcript_files(root: &Path, cutoff: SystemTime) -> (CleanupResu
         }
         try_rmdir(&project_directory);
     }
+    active_chats.finish_transcripts();
     (result, active_chats)
 }
 
@@ -242,7 +302,7 @@ fn cleanup_old_plan_files(
 fn cleanup_old_file_history_backups(
     root: &Path,
     cutoff: SystemTime,
-    active_chats: &ActiveChats,
+    active_chats: &mut ActiveChats,
 ) -> CleanupResult {
     cleanup_old_chat_directories(&root.join(FILE_HISTORY_DIRECTORY), cutoff, active_chats)
 }
@@ -253,7 +313,7 @@ fn cleanup_old_file_history_backups(
 fn cleanup_old_image_caches(
     root: &Path,
     cutoff: SystemTime,
-    active_chats: &ActiveChats,
+    active_chats: &mut ActiveChats,
 ) -> CleanupResult {
     cleanup_old_chat_directories(&root.join(IMAGE_CACHE_DIRECTORY), cutoff, active_chats)
 }
@@ -263,18 +323,22 @@ fn cleanup_old_image_caches(
 fn cleanup_old_chat_directories(
     directory: &Path,
     cutoff: SystemTime,
-    active_chats: &ActiveChats,
+    active_chats: &mut ActiveChats,
 ) -> CleanupResult {
     let mut result = CleanupResult::default();
     let Some(entries) = read_real_directory(directory) else {
         return result;
     };
-    let expirable = entries.into_iter().filter(|entry| {
-        entry.is_directory
-            && chat_id_with_suffix(&entry.path, "")
-                .is_some_and(|chat_id| !active_chats.chat_ids.contains(&chat_id))
-    });
-    for entry in expirable {
+    for entry in entries {
+        let Some(chat_id) = chat_id_with_suffix(&entry.path, "") else {
+            continue;
+        };
+        if !entry.is_directory
+            || active_chats.chat_ids.contains(&chat_id)
+            || !active_chats.can_remove(chat_id)
+        {
+            continue;
+        }
         result.record(is_old(&entry.path, cutoff).and_then(|old| {
             if old {
                 fs::remove_dir_all(&entry.path)?;

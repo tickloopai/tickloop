@@ -12,7 +12,7 @@ const ENV_FILE: &str = ".env";
 const LOCK_FILE: &str = ".env.lock";
 const MAX_ENV_FILE_BYTES: usize = 1024 * 1024;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ApiKeyStatus {
     Saved,
     Environment,

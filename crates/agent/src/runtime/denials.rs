@@ -299,7 +299,7 @@ impl ApprovalRecord {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum DenialPersistence {
     Disabled,
     Saved,
@@ -313,7 +313,7 @@ pub struct DenialsView {
     pub load_warning: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ApprovalHistoryView {
     pub records: Vec<ApprovalRecord>,
     pub persistence: DenialPersistence,

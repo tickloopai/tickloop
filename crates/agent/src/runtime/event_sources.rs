@@ -258,7 +258,7 @@ impl Agent {
         }
     }
 
-    async fn disable_event_sources_for_loop(&self, chat_id: ChatId, loop_id: LoopId) {
+    pub(crate) async fn disable_event_sources_for_loop(&self, chat_id: ChatId, loop_id: LoopId) {
         let disarm_lease = {
             let mut chats = self.inner.chats.lock().await;
             let Some(chat) = chats.get_mut(&chat_id) else {
@@ -281,7 +281,7 @@ impl Agent {
             }
             let has_trigger = goal.trigger.as_ref().is_some_and(|trigger| trigger.armed);
             if goal.state == LoopState::WaitingTrigger && !has_trigger {
-                goal.state = LoopState::Interrupted;
+                goal.set_state(LoopState::Interrupted);
             }
             if let Some(cancel) = chat.event_cancellations.remove(&loop_id) {
                 cancel.cancel();
@@ -477,7 +477,7 @@ impl Agent {
                                     goal.state,
                                     LoopState::Interrupted | LoopState::Completed
                                 ) {
-                                    goal.state = LoopState::WaitingTrigger;
+                                    goal.set_state(LoopState::WaitingTrigger);
                                 }
                                 start_watcher = true;
                             }
@@ -548,7 +548,7 @@ impl Agent {
                     "Loop changed during feedback resume".into(),
                 ));
             }
-            goal.state = LoopState::WaitingTrigger;
+            goal.set_state(LoopState::WaitingTrigger);
             self.save(&chat.snapshot);
             drop(chats);
             self.start_event_source_watcher(chat_id, loop_id).await;

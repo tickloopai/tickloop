@@ -12,6 +12,7 @@ use tickloop_agent::{
     runtime::{Agent, ChatId, EventKind, ModelChange},
     settings::{DisplayPreferences, GlyphSet, UserSettings},
 };
+use tokio::sync::Barrier;
 use uuid::Uuid;
 
 fn selected_model() -> ModelConfig {
@@ -1013,16 +1014,20 @@ async fn concurrent_instances_never_resurrect_or_lose_persistent_rules() {
     let root = directory.path().join("root");
     let workdir = directory.path().join("work");
     std::fs::create_dir_all(&workdir).unwrap();
-    let mut writers = Vec::new();
+    let model = Arc::new(ScriptedModel::new(Vec::new()));
+    let mut agents = Vec::new();
     for tool in ["Read", "Glob"] {
-        let agent = Agent::open_embedded(
-            root.clone(),
-            config(),
-            Arc::new(ScriptedModel::new(Vec::new())),
-        )
-        .unwrap();
+        let agent = Agent::open_embedded(root.clone(), config(), model.clone()).unwrap();
         let chat = agent.create_chat(workdir.clone()).await.unwrap();
+        assert!(agent.snapshot(chat).await.unwrap().policy.rules.is_empty());
+        agents.push((tool, agent, chat));
+    }
+    let start = Arc::new(Barrier::new(3));
+    let mut writers = Vec::new();
+    for (tool, agent, chat) in agents {
+        let start = start.clone();
         writers.push(tokio::spawn(async move {
+            start.wait().await;
             let kept = persistent_rule(&format!("{tool}_kept"), Decision::Allow);
             for _ in 0..ROUNDS {
                 let transient = persistent_rule(tool, Decision::Deny);
@@ -1039,6 +1044,7 @@ async fn concurrent_instances_never_resurrect_or_lose_persistent_rules() {
             kept.id
         }));
     }
+    start.wait().await;
     let mut kept = Vec::new();
     for writer in writers {
         kept.push(writer.await.unwrap());
@@ -1048,6 +1054,7 @@ async fn concurrent_instances_never_resurrect_or_lose_persistent_rules() {
     saved_ids.sort();
     kept.sort();
     assert_eq!(saved_ids, kept, "{saved:?}");
+    assert!(model.requests.lock().unwrap().is_empty());
 }
 
 /// 设置文件无效时不静默丢弃：新建与恢复 Chat 都能读到警告，写入报错且文件保持原样；

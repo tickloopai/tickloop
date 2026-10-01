@@ -44,7 +44,7 @@ pub struct QuestionOption {
 
 /// The user's answer to one question: chosen option labels, in the order they were chosen,
 /// and optional free text entered through the automatic "Other" choice.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct QuestionAnswer {
     pub options: Vec<String>,
     pub other: Option<String>,
@@ -422,6 +422,7 @@ impl Agent {
             run_id: None,
             trigger: None,
             event_sources: Vec::new(),
+            state_since: Some(crate::private_fs::unix_time_milliseconds()),
         });
         let index = snapshot
             .pending_inputs
@@ -436,11 +437,13 @@ impl Agent {
                 receipt: new_receipt.clone(),
                 input: parsed.goal,
                 contexts: Vec::new(),
+                agent_message: None,
                 denial_reference: None,
                 trigger_source: None,
                 armed: true,
                 queued_sequence,
                 task_continuation: false,
+                is_skill_invocation: false,
                 attached_file_reads: Vec::new(),
             },
         );
@@ -502,7 +505,7 @@ impl Agent {
             if goal.state != LoopState::Running {
                 return Err("goal cannot ask a question in its current state".into());
             }
-            goal.state = LoopState::WaitingQuestion;
+            goal.set_state(LoopState::WaitingQuestion);
             snapshot.questions.push(request.clone());
             self.save(&snapshot);
             chat.snapshot = snapshot;

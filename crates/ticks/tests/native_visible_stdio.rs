@@ -273,13 +273,31 @@ fn visible_kline_keyboard_and_tool_share_the_same_stdio_instance() {
     };
     assert_eq!(unmarked["params"]["data"]["marks"], json!([]));
     std::thread::sleep(Duration::from_millis(100));
-    let rendered = screen.lock().unwrap();
-    let rendered = String::from_utf8_lossy(&rendered);
+    let rendered = String::from_utf8_lossy(&screen.lock().unwrap()).into_owned();
     assert!(
         rendered.contains("5m") && rendered.contains("test"),
         "visible TTY did not show switched period and mark"
     );
+    let size = libc::winsize {
+        ws_row: 25,
+        ws_col: 81,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    assert_eq!(
+        unsafe { libc::ioctl(tty.as_raw_fd(), libc::TIOCSWINSZ, &size) },
+        0
+    );
     tty.write_all(b"q").unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while child.try_wait().unwrap().is_none() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if child.try_wait().unwrap().is_none() {
+        child.kill().unwrap();
+        child.wait().unwrap();
+        panic!("Tick did not exit after a pending terminal redraw and q");
+    }
     assert!(child.wait().unwrap().success());
 }
 

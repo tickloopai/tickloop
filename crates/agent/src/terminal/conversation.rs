@@ -453,6 +453,7 @@ pub(super) fn project_event(event: &Event) -> Option<ConversationBlock> {
         | EventKind::ModelRetry { .. }
         | EventKind::InputMerged { .. }
         | EventKind::InputTakenBack
+        | EventKind::AgentMessageQueued { .. }
         | EventKind::ConversationRewound { .. }
         | EventKind::ApprovalAssessed { .. }
         | EventKind::AutoReviewerNotice { .. }

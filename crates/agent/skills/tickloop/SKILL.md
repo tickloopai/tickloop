@@ -23,7 +23,7 @@ Ordinary questions remain available in these environments. Do not simulate a suc
 
 ## 2. Herdr: choose the requested operation
 
-Use the installed host tools as the authority for targets and capabilities. Herdr owns Workspace → Tab → Pane; a Tick Instance identifies one running program independently of its Pane. Default to the current Workspace. When the user explicitly selects another Workspace, include its `workspace_id` in discovery and subsequent operations.
+Use the installed host tools as the authority for targets and capabilities. Herdr owns Workspace → Tab → Pane; a Tick Instance identifies one running program independently of its Pane. Default to the Agent's Work Context Workspace, which stays independent of the View used to inspect it. When the user explicitly selects another Workspace, include its `workspace_id` in discovery and subsequent operations. Without a default Workspace, `ReadWorkspace({})` discovers available locations; choose an explicit Workspace for creation. An Agent can discover and operate explicit targets while it has no View.
 
 “看看特斯拉股价” requests a visible quote Tick even though the user did not say Tick. Prefer an existing matching view when the user asks to see information; open the requested view if none exists. An explicit request to open a new Tick creates a new instance. A request to see a price uses Quote; a request for K线 or a chart uses Kline. A request explicitly asking for text only can use an ordinary data lookup instead.
 
@@ -31,11 +31,11 @@ Select existing views from inventory titles and capabilities, then read relevant
 
 ### Choose where the Tick appears
 
-`ReadWorkspace` returns `caller` with this Agent's current Pane, Tab, and Workspace. “这个 Tab”, “你所在的 Tab”, and “在你旁边” refer to that location, independent of the user's focused Tab. For `ModifyTick`, select `placement` from the request:
+`ReadWorkspace` returns an optional `caller` for the View carrying this interaction. “这个 Tab”, “你所在的 Tab”, and “在你旁边” refer to that interaction location, independent of other clients' focus. The tool freezes this source for the accepted input; a background Trigger or task continuation may have no interaction source. A missing or changed source affects relative placement only: discover locations and use explicit targets within the existing task and authorization. For `ModifyTick`, select `placement` from the request:
 
 | Requested location | `placement` |
 | --- | --- |
-| Beside this Agent in its current Tab, with no direction specified | `{"type":"current_tab","direction":"right"}` |
+| Beside the View carrying this interaction, with no direction specified | `{"type":"current_tab","direction":"right"}` |
 | Left, right, above, or below this Agent | `{"type":"current_tab","direction":DIRECTION}` |
 | Left, right, above, or below a specific Pane in the selected Workspace | `{"type":"pane","pane_id":PANE_ID,"direction":DIRECTION}` |
 | New Tab | `{"type":"new_tab"}` for `open`; also the default when `open` omits placement |
@@ -48,7 +48,7 @@ For example, “就在这个tab里打开吧” after opening a news Tick means m
 
 Use `workspace_host.tick_executable` as the executable. It identifies the `tick` installed beside the Agent, or the executable found on PATH. If it is null, explain that the companion `tick` is missing and needs to be built or installed; `make build` and `make install` include both binaries. This is a missing executable, not a reason to search project source for a launcher.
 
-Call `ModifyTick` with `action: "open"`, a `command` argv array and optional `cwd`. Build the argv from the requested view:
+Call `ModifyTick` with `action: "open"`, a `command` argv array and optional `cwd`. Omitted `cwd` uses the Agent's file work directory, independently of its View position. With no View, choose an explicit Workspace and `new_tab` or a named Pane for placement. Build the argv from the requested view:
 
 | Requested view | Arguments after the executable |
 | --- | --- |
@@ -58,7 +58,7 @@ Call `ModifyTick` with `action: "open"`, a `command` argv array and optional `cw
 
 Use the broker symbol format: Tesla / 特斯拉 is `TSLA.US`, Apple / 苹果 is `AAPL.US`, and Tencent / 腾讯 is `700.HK`. Clarify an ambiguous company or market before launching. For example, “打开特斯拉K线” means `command: [TICK_EXECUTABLE, "kline", "TSLA.US"]`. Omitted chart period uses the command's default; specify `--period` when the user asks for a period. Use the executable's `--help` or `kline --help` for other options and Tick types. A real stock request uses real data; the demo is a separate, explicitly requested workflow.
 
-Bundled interactive Ticks connect automatically in Herdr. External protocol programs use `command: [TICK_EXECUTABLE, "run", "--", PROGRAM, ...ARGS]`. Ordinary programs can run directly. The host passes the Agent's Tick configuration and terminal locale when opening a Pane. Report the returned location so the user can find it.
+Bundled interactive Ticks connect automatically in Herdr. External protocol programs use `command: [TICK_EXECUTABLE, "run", "--", PROGRAM, ...ARGS]`. Ordinary programs can run directly. The host passes the Agent's Tick configuration and terminal locale when opening a Pane. Report the returned host, Workspace, Tab, Pane, Tick Instance and state that were actually verified, so the user can find it. Requested left/right placement describes intent; partial or initializing results may still have unknown fields.
 
 The host checks local prerequisites before launching a bundled Tick. If authorization is missing, report the diagnostic and the authorization command (`TICK_EXECUTABLE auth`); an authorization failure is not a successful launch. Do not read credential files. After launch, read the returned instance to confirm that the requested symbol and view are actually running. Report success only after that check. An `initializing` or partial-failure response means some steps may already have run: inspect the existing instance and its location before retrying placement. Do not create a duplicate Tick. An `OutcomeUnknown` mutation may already have executed; inspect its state instead of resending it.
 
@@ -76,4 +76,4 @@ Existing content supplies a baseline. Subsequent changes are delivered latest-on
 
 Protocol Tick Updates carry business content. Read the catalog's recovery query when history matters, respecting its limits. Ordinary Terminal Observations sample recent plain text every 5 seconds, then wait for the Loop cadence. Identical text does not trigger; sampling can miss intermediate output and cannot recover full terminal history. Reads contain at most 200 recent lines / 64 KiB; Loop deliveries may be further truncated to 16 KiB.
 
-Moving a live instance preserves its reference and subscriptions. New operations need its explicit current Workspace scope. A replaced or restarted program has a new identity: retain the old subscription's state and select the new target explicitly. Herdr detach preserves live processes; closing the Agent Pane exits that Agent.
+Moving a live instance preserves its reference and subscriptions. New operations need its explicit current Workspace scope. A replaced or restarted program has a new identity: retain the old subscription's state and select the new target explicitly. Herdr detach preserves live processes. Closing an Agent Pane closes its View while the daemon-owned Agent continues; closing an ordinary Tick Pane exits that Tick. Stop a Loop explicitly when requested.

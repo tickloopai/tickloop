@@ -421,10 +421,9 @@ async fn interactive_housekeeping_starts_counting_at_the_first_submitted_prompt(
     assert!(!exists(&transcript));
 }
 
-/// 在另一进程（清理天数为 0）的清理删除了正在对话的 Chat 的 Transcript 后，本进程继续对话既不重建断链
-/// 文件，也不写元数据空壳，并提示后续内容不再保存。
+/// External removal must not recreate a disconnected Transcript or a metadata-only shell.
 #[tokio::test]
-async fn cleaning_up_the_transcript_of_a_running_chat_stops_saving_it() {
+async fn externally_removing_the_transcript_of_a_running_chat_stops_saving_it() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("root");
     let workdir = directory.path().join("work");
@@ -443,9 +442,7 @@ async fn cleaning_up_the_transcript_of_a_running_chat_stops_saving_it() {
     agent.flush_transcripts().await;
     let transcript = support::transcript_file(&root, chat);
 
-    std::fs::write(root.join("settings.json"), r#"{"cleanupPeriodDays": 0}"#).unwrap();
-    set_age(&transcript, Duration::from_secs(1));
-    completed(cleanup_old_message_files_in_background(&root));
+    std::fs::remove_file(&transcript).unwrap();
     assert!(!exists(&transcript));
 
     complete(&agent, chat, "prompt after cleanup").await;
@@ -466,6 +463,173 @@ async fn cleaning_up_the_transcript_of_a_running_chat_stops_saving_it() {
         })
         .collect::<Vec<_>>();
     assert!(transcripts.is_empty(), "{transcripts:?}");
+}
+
+#[tokio::test]
+async fn live_runtime_retains_expired_records_until_all_holders_shut_down() {
+    use std::io::Write;
+
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("root");
+    let workdir = directory.path().join("work");
+    std::fs::create_dir_all(&workdir).unwrap();
+    let agent = Agent::open_embedded(
+        root.clone(),
+        config(),
+        Arc::new(ScriptedModel::new(vec![text("A live background task.")])),
+    )
+    .unwrap();
+    let chat = agent.create_chat(workdir).await.unwrap();
+    complete(&agent, chat, "Keep this execution available.").await;
+    agent.flush_transcripts().await;
+    let transcript = support::transcript_file(&root, chat);
+    writeln!(
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap(),
+        "{}",
+        slug_line("calm-river")
+    )
+    .unwrap();
+    let tool_result = file(
+        &transcript
+            .parent()
+            .unwrap()
+            .join(chat.to_string())
+            .join("tool-results/old.txt"),
+        EXPIRED,
+    );
+    let image = file(&root.join(format!("image-cache/{chat}/old.png")), EXPIRED);
+    let backup = file(&root.join(format!("file-history/{chat}/old@v1")), EXPIRED);
+    let plan = file(
+        &root.join(format!("plans/calm-river-loop-{}.md", Uuid::new_v4())),
+        EXPIRED,
+    );
+    set_age(image.parent().unwrap(), EXPIRED);
+    set_age(backup.parent().unwrap(), EXPIRED);
+    set_age(&transcript, EXPIRED);
+    let kept = [&transcript, &tool_result, &image, &backup, &plan];
+    completed(cleanup_old_message_files_in_background(&root));
+    for path in kept {
+        assert!(exists(path), "live record removed: {}", path.display());
+    }
+
+    let second =
+        Agent::open_embedded(root.clone(), config(), Arc::new(ScriptedModel::new(vec![]))).unwrap();
+    second.resume_chat(chat).await.unwrap();
+    agent.shutdown().await;
+    set_age(&transcript, EXPIRED);
+    completed(cleanup_old_message_files_in_background(&root));
+    for path in kept {
+        assert!(exists(path), "independent holder lost: {}", path.display());
+    }
+    second.shutdown().await;
+    set_age(&transcript, EXPIRED);
+    completed(cleanup_old_message_files_in_background(&root));
+    for path in kept {
+        assert!(
+            !exists(path),
+            "expired record retained after release: {}",
+            path.display()
+        );
+    }
+}
+
+#[test]
+fn an_unusable_retention_lock_preserves_records_without_following_links() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("root");
+    let chat = Uuid::new_v4();
+    let transcript = file(&root.join(format!("projects/-work/{chat}.jsonl")), EXPIRED);
+    let image = file(&root.join(format!("image-cache/{chat}/old.png")), EXPIRED);
+    set_age(image.parent().unwrap(), EXPIRED);
+    let outside = file(&directory.path().join("outside.txt"), EXPIRED);
+    let lock = root.join(format!("chat-retention/{chat}.lock"));
+    symlink(&outside, &lock, EXPIRED);
+    std::fs::set_permissions(
+        lock.parent().unwrap(),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    completed(cleanup_old_message_files_in_background(&root));
+    for path in [&transcript, &image, &lock, &outside] {
+        assert!(
+            exists(path),
+            "unconfirmed retention removed {}",
+            path.display()
+        );
+    }
+    assert_eq!(std::fs::read_to_string(outside).unwrap(), "content");
+}
+
+#[tokio::test]
+async fn exiting_a_worker_releases_retention_without_a_pid_liveness_check() {
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("root");
+    let agent = Agent::open_embedded(
+        root.clone(),
+        config(),
+        Arc::new(ScriptedModel::new(vec![text("A recorded task.")])),
+    )
+    .unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    complete(&agent, chat, "Record this task.").await;
+    agent.shutdown().await;
+    let transcript = support::transcript_file(&root, chat);
+    let mut worker = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "retention_worker_fixture",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("TICKLOOP_RETENTION_TEST_ROOT", &root)
+        .env("TICKLOOP_RETENTION_TEST_CHAT", chat.to_string())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut output = BufReader::new(worker.stdout.take().unwrap());
+    let mut line = String::new();
+    loop {
+        line.clear();
+        assert!(
+            output.read_line(&mut line).unwrap() > 0,
+            "worker did not retain the Chat"
+        );
+        if line.trim() == "RETENTION_READY" {
+            break;
+        }
+    }
+    set_age(&transcript, EXPIRED);
+    completed(cleanup_old_message_files_in_background(&root));
+    let retained = exists(&transcript);
+    drop(worker.stdin.take());
+    assert!(worker.wait().unwrap().success());
+    assert!(retained);
+    completed(cleanup_old_message_files_in_background(&root));
+    assert!(!exists(&transcript));
+}
+
+#[tokio::test]
+#[ignore = "subprocess fixture invoked by the retention lifecycle test"]
+async fn retention_worker_fixture() {
+    use std::io::Write;
+    let root = PathBuf::from(std::env::var_os("TICKLOOP_RETENTION_TEST_ROOT").unwrap());
+    let chat = Uuid::parse_str(&std::env::var("TICKLOOP_RETENTION_TEST_CHAT").unwrap()).unwrap();
+    let agent = Agent::open_embedded(root, config(), Arc::new(ScriptedModel::new(vec![]))).unwrap();
+    agent.resume_chat(chat).await.unwrap();
+    agent.flush_transcripts().await;
+    println!("RETENTION_READY");
+    std::io::stdout().flush().unwrap();
+    let mut input = String::new();
+    assert_eq!(std::io::stdin().read_line(&mut input).unwrap(), 0);
+    std::process::exit(0);
 }
 
 /// 文件回滚备份目录与计划文件不随对话更新修改时间：Transcript 仍未过期的 Chat 保留其备份目录，

@@ -1,3 +1,4 @@
+use super::execution::ConsoleExecution as Agent;
 mod judgment;
 mod providers;
 use providers::{ModelChoice, ProviderModels, ProviderRow};
@@ -8,19 +9,19 @@ use std::{
 };
 
 use tickloop_agent::{
+    agent_access::ConfigurationChange,
     file_change::load_file_change_review,
-    model::{ModelConfig, Protocol, ReasoningEffort, cards::ProviderPatch, model_client},
+    model::{ModelConfig, Protocol, ReasoningEffort, cards::ProviderPatch},
     output_style::OutputStyle,
     permissions::{
         ExecutionMode, PermissionRuleCandidate, PermissionScope, permission_rule_candidates,
     },
     runtime::{
-        Agent, AutoReviewerPreference, ChatSnapshot, CounterSummary, CounterTotal,
-        DirectedSummaryRequest, ENTER_PLAN_MODE_TOOL_NAME, PermissionApprovalSource,
-        PermissionChange, PermissionChangeError, PermissionRequest, PermissionsRevision,
-        ProtocolFailure, QuestionRequest, Receipt, RequestFailure, RequestKind, RequestOutcome,
-        ResponseRejection, RewindMode, RewindOutcome, SummaryDirection, UsageCounter,
-        UsageCoverage, UsageSummary,
+        AutoReviewerPreference, ChatSnapshot, CounterSummary, CounterTotal, DirectedSummaryRequest,
+        ENTER_PLAN_MODE_TOOL_NAME, PermissionApprovalSource, PermissionChange,
+        PermissionChangeError, PermissionRequest, ProtocolFailure, QuestionRequest, Receipt,
+        RequestFailure, RequestKind, RequestOutcome, ResponseRejection, RewindMode, RewindOutcome,
+        SummaryDirection, UsageCounter, UsageCoverage, UsageSummary,
     },
     settings::{DisplayPreferences, GlyphSet, UserSettings},
 };
@@ -32,6 +33,8 @@ use super::{
     diff_view::{DiffNavigation, DiffViewport, render_diff, render_error},
     display::{DisplayProfile, Glyph},
     font_manager::{FontAction, FontOutcome, NerdFontManager, SystemFontAdapter},
+    new_agent_draft::ConfigTarget,
+    permissions_surface::PermissionsSubject,
     presentation::permission_context,
     questions::{FlowUpdate, QuestionFlow, question_lines},
     safe_line, safe_text, settings,
@@ -40,10 +43,17 @@ use super::{
 };
 
 enum Selection {
+    Locations {
+        generation: u64,
+        views: Vec<crate::agent_access::DisplayedView>,
+    },
     Permission {
         chat: Uuid,
         request: PermissionRequest,
         goal: String,
+        /// Whether the requesting Agent may save a grant as a rule; a delegated child's grants
+        /// stay within its session.
+        persistent: bool,
     },
     PermissionRule {
         chat: Uuid,
@@ -52,26 +62,26 @@ enum Selection {
         candidates: Vec<PermissionRuleCandidate>,
     },
     Provider {
-        chat: Uuid,
+        target: ConfigTarget,
         choices: Vec<ProviderModels>,
         rows: Vec<ProviderRow>,
     },
     ModelProviders {
-        chat: Uuid,
+        target: ConfigTarget,
     },
     Model {
-        chat: Uuid,
+        target: ConfigTarget,
         choices: Vec<ModelChoice>,
     },
     Discovery {
-        chat: Uuid,
+        target: ConfigTarget,
     },
     ApiKey {
-        chat: Uuid,
+        target: ConfigTarget,
         provider: ProviderModels,
     },
     ServiceAccount {
-        chat: Uuid,
+        target: ConfigTarget,
         provider: ProviderModels,
     },
     JudgmentSettings {
@@ -82,40 +92,40 @@ enum Selection {
         return_to: JudgmentReturn,
     },
     Effort {
-        chat: Uuid,
+        target: ConfigTarget,
         choices: Vec<Option<ReasoningEffort>>,
     },
     Settings {
-        chat: Uuid,
+        target: ConfigTarget,
     },
     Theme {
         /// Present when opened from Settings, so confirming returns there.
-        settings_chat: Option<Uuid>,
+        settings_target: Option<ConfigTarget>,
     },
     GlyphSet {
-        chat: Uuid,
+        target: ConfigTarget,
         font_action: Option<FontAction>,
     },
     GlyphSetConfirmation {
-        chat: Uuid,
+        target: ConfigTarget,
         glyph_set: GlyphSet,
     },
     FontActionConfirmation {
-        chat: Uuid,
+        target: ConfigTarget,
         action: FontAction,
     },
     SettingsInfo {
-        chat: Uuid,
+        target: ConfigTarget,
     },
     OutputStyle {
-        chat: Uuid,
+        target: ConfigTarget,
     },
     Mode {
-        chat: Uuid,
+        target: ConfigTarget,
         choices: Vec<ExecutionMode>,
     },
     PermissionMode {
-        chat: Uuid,
+        target: ConfigTarget,
         choices: Vec<ExecutionMode>,
         current: ExecutionMode,
         return_to_settings: bool,
@@ -141,19 +151,21 @@ enum Selection {
 #[derive(Clone)]
 enum JudgmentReturn {
     Providers {
-        chat: Uuid,
+        target: ConfigTarget,
     },
+    /// Opened from a Permissions view; its subject names the Agent or New Agent screen and the
+    /// revision the view was read at.
     AutoSettings {
-        chat: Uuid,
+        subject: PermissionsSubject,
         select_reviewer: bool,
-        revision: PermissionsRevision,
     },
 }
 
 impl JudgmentReturn {
-    fn chat(&self) -> Uuid {
+    fn target(&self) -> ConfigTarget {
         match self {
-            Self::Providers { chat } | Self::AutoSettings { chat, .. } => *chat,
+            Self::Providers { target } => *target,
+            Self::AutoSettings { subject, .. } => ConfigTarget::visible(subject.chat()),
         }
     }
 }
@@ -257,34 +269,54 @@ impl RewindPoint {
 }
 
 impl Selection {
-    fn chat(&self) -> Option<Uuid> {
+    fn request_id(&self) -> Option<Uuid> {
         match self {
-            Self::Permission { chat, .. }
-            | Self::PermissionRule { chat, .. }
-            | Self::Provider { chat, .. }
-            | Self::ModelProviders { chat }
-            | Self::Discovery { chat }
-            | Self::ApiKey { chat, .. }
-            | Self::ServiceAccount { chat, .. }
-            | Self::Model { chat, .. }
-            | Self::Effort { chat, .. }
-            | Self::Settings { chat }
-            | Self::SettingsInfo { chat }
-            | Self::OutputStyle { chat }
-            | Self::GlyphSet { chat, .. }
-            | Self::GlyphSetConfirmation { chat, .. }
-            | Self::FontActionConfirmation { chat, .. }
-            | Self::Mode { chat, .. }
-            | Self::PermissionMode { chat, .. }
-            | Self::Rewind { chat, .. }
-            | Self::RewindActions { chat, .. } => Some(*chat),
-            Self::JudgmentSettings { return_to, .. } | Self::JudgmentKey { return_to } => {
-                Some(return_to.chat())
+            Self::Permission { request, .. } | Self::PermissionRule { request, .. } => {
+                Some(request.id)
             }
-            Self::Theme { settings_chat } => *settings_chat,
-            Self::Question(flow) => Some(flow.request().chat_id),
-            Self::Workflow(workflow) => workflow.chat(),
-            Self::Help { .. } | Self::HelpReference => None,
+            Self::Question(flow) => Some(flow.request().id),
+            _ => None,
+        }
+    }
+
+    /// The visible Agent a menu belongs to; New Agent menus belong to no Agent yet.
+    fn chat(&self) -> Option<Uuid> {
+        self.config_target().map_or_else(
+            || match self {
+                Self::Permission { chat, .. }
+                | Self::PermissionRule { chat, .. }
+                | Self::Rewind { chat, .. }
+                | Self::RewindActions { chat, .. } => Some(*chat),
+                Self::Question(flow) => Some(flow.request().chat_id),
+                Self::Workflow(workflow) => workflow.chat(),
+                _ => None,
+            },
+            ConfigTarget::agent,
+        )
+    }
+
+    fn config_target(&self) -> Option<ConfigTarget> {
+        match self {
+            Self::Provider { target, .. }
+            | Self::ModelProviders { target }
+            | Self::Discovery { target }
+            | Self::ApiKey { target, .. }
+            | Self::ServiceAccount { target, .. }
+            | Self::Model { target, .. }
+            | Self::Effort { target, .. }
+            | Self::Settings { target }
+            | Self::SettingsInfo { target }
+            | Self::OutputStyle { target }
+            | Self::GlyphSet { target, .. }
+            | Self::GlyphSetConfirmation { target, .. }
+            | Self::FontActionConfirmation { target, .. }
+            | Self::Mode { target, .. }
+            | Self::PermissionMode { target, .. } => Some(*target),
+            Self::JudgmentSettings { return_to, .. } | Self::JudgmentKey { return_to } => {
+                Some(return_to.target())
+            }
+            Self::Theme { settings_target } => *settings_target,
+            _ => None,
         }
     }
 }
@@ -297,7 +329,7 @@ pub(super) struct Menus {
     typed_questions: HashMap<Uuid, QuestionFlow>,
     user_settings: Option<UserSettings>,
     transient_providers: Vec<ProviderPatch>,
-    login_return: Option<(Uuid, ProviderModels)>,
+    login_return: Option<(ConfigTarget, ProviderModels)>,
     provider_choices: Vec<ProviderModels>,
     provider_selected: usize,
     provider_group: Option<(String, usize)>,
@@ -312,6 +344,9 @@ pub(super) struct Menus {
     discovery_flow: Option<providers::DiscoveryFlow>,
     model_directory_status: BTreeMap<String, String>,
     font_manager: Option<NerdFontManager<SystemFontAdapter>>,
+    /// Where the next New Agent will be created; its saved project rules are shown before the
+    /// first input.
+    new_agent_directory: Option<PathBuf>,
 }
 
 impl Default for Menus {
@@ -343,7 +378,45 @@ impl Menus {
             discovery_flow: None,
             model_directory_status: BTreeMap::new(),
             font_manager: config_root.map(NerdFontManager::production),
+            new_agent_directory: None,
         }
+    }
+
+    /// Keeps the New Agent directory current; the View sets it at startup and on `/cwd`.
+    pub(super) fn set_new_agent_directory(&mut self, directory: PathBuf) {
+        self.new_agent_directory = Some(directory);
+    }
+
+    fn new_agent_directory(&self, agent: &Agent) -> PathBuf {
+        self.new_agent_directory
+            .clone()
+            .unwrap_or_else(|| agent.launch_spec().workdir)
+    }
+
+    /// Opens the New Agent's Permissions view: saved policy and staged choices, with no activity
+    /// before the first input.
+    pub(super) async fn open_draft_permissions(
+        &mut self,
+        agent: &Agent,
+        console: &Console,
+        return_to_settings: bool,
+        auto_page: bool,
+    ) -> Result<(), String> {
+        let project = self.new_agent_directory(agent);
+        let page = agent
+            .draft_permissions(&project)
+            .await
+            .map_err(|error| error.to_string())?;
+        let history = tickloop_agent::runtime::ApprovalHistoryView {
+            records: Vec::new(),
+            persistence: if agent.saves_chats() {
+                tickloop_agent::runtime::DenialPersistence::Saved
+            } else {
+                tickloop_agent::runtime::DenialPersistence::Disabled
+            },
+            load_warning: None,
+        };
+        console.show_permissions(page, Ok(history), return_to_settings, auto_page)
     }
 
     pub(super) fn add_transient_provider(&mut self, provider: ProviderPatch) {
@@ -489,7 +562,13 @@ impl Menus {
                     context: builtin_commands()
                         .iter()
                         .filter(|command| command.menu_group == Some(CommandGroup::Advanced))
-                        .map(|command| format!("{} — {}", command.syntax(), command.description))
+                        .map(|command| {
+                            format!(
+                                "{} — {}",
+                                command.syntax(),
+                                command.description_in(console.command_scope())
+                            )
+                        })
                         .collect(),
                     options: vec!["Back to command groups".into()],
                     selected: 0,
@@ -505,7 +584,13 @@ impl Menus {
             (
                 group.title(),
                 commands_in_group(group)
-                    .map(|command| format!("{} · {}", command.description, command.syntax()))
+                    .map(|command| {
+                        format!(
+                            "{} · {}",
+                            command.description_in(console.command_scope()),
+                            command.syntax()
+                        )
+                    })
                     .collect(),
             )
         } else {
@@ -586,6 +671,44 @@ impl Menus {
         self.active.as_ref().map(|(id, _)| *id)
     }
 
+    pub(super) fn locations(
+        &mut self,
+        console: &Console,
+        generation: u64,
+        views: Vec<crate::agent_access::DisplayedView>,
+    ) -> Result<(), String> {
+        let options = views
+            .iter()
+            .map(|view| {
+                let host = view
+                    .host
+                    .as_ref()
+                    .expect("location choices have verified hosts");
+                format!(
+                    "Workspace {} · Tab {} · Pane {}",
+                    host.workspace.as_deref().unwrap_or("unknown"),
+                    host.tab.as_deref().unwrap_or("unknown"),
+                    host.pane.as_deref().unwrap_or("unknown")
+                )
+            })
+            .collect();
+        self.show(
+            console,
+            Menu {
+                id: Uuid::new_v4(),
+                title: "Choose Agent location".into(),
+                context: vec![
+                    "Several live Views exist in this Herdr instance. Choose a verified location."
+                        .into(),
+                ],
+                options,
+                selected: 0,
+                confirmation: false,
+            },
+            Selection::Locations { generation, views },
+        )
+    }
+
     pub(super) fn dismiss(&mut self, console: &Console) -> Result<(), String> {
         self.discovery_flow.take();
         if let Some((id, _)) = self.active.take() {
@@ -596,6 +719,7 @@ impl Menus {
 
     fn show(&mut self, console: &Console, menu: Menu, selection: Selection) -> Result<(), String> {
         self.dismiss(console)?;
+        console.set_request_layout(selection.request_id())?;
         if !console.is_interactive() {
             console.write(&format!("{}\n{}\n", menu.title, menu.context.join("\n")))?;
             for (index, option) in menu.options.iter().enumerate() {
@@ -628,6 +752,7 @@ impl Menus {
 
     fn show_question(&mut self, console: &Console, flow: QuestionFlow) -> Result<(), String> {
         self.dismiss(console)?;
+        console.set_request_layout(Some(flow.request().id))?;
         let (menu, keys) = flow.menu(console.display_profile()?);
         let id = menu.id;
         console.show_question_menu(menu, keys)?;
@@ -701,6 +826,7 @@ impl Menus {
         comment_options: Vec<usize>,
     ) -> Result<(), String> {
         self.dismiss(console)?;
+        console.set_request_layout(selection.request_id())?;
         if !console.is_interactive() {
             return self.show(console, menu, selection);
         }
@@ -719,6 +845,7 @@ impl Menus {
         expand_options: Vec<usize>,
     ) -> Result<(), String> {
         self.dismiss(console)?;
+        console.set_request_layout(selection.request_id())?;
         if !console.is_interactive() {
             return self.show(console, menu, selection);
         }
@@ -736,6 +863,7 @@ impl Menus {
         comment_options: Vec<usize>,
     ) -> Result<(), String> {
         self.dismiss(console)?;
+        console.set_request_layout(selection.request_id())?;
         if !console.is_interactive() {
             return self.show(console, menu, selection);
         }
@@ -754,6 +882,7 @@ impl Menus {
         review: Result<tickloop_agent::file_change::FileChangeReview, String>,
     ) -> Result<(), String> {
         self.dismiss(console)?;
+        console.set_request_layout(selection.request_id())?;
         if !console.is_interactive() {
             let viewport = DiffViewport {
                 width: 120,
@@ -778,9 +907,9 @@ impl Menus {
         Ok(())
     }
 
-    async fn load_providers(&mut self, agent: &Agent, chat: Uuid) -> Result<(), String> {
+    async fn load_providers(&mut self, agent: &Agent, target: ConfigTarget) -> Result<(), String> {
         let snapshot = agent
-            .snapshot(chat)
+            .configuration(target)
             .await
             .map_err(|error| error.to_string())?;
         let catalog = self
@@ -852,32 +981,32 @@ impl Menus {
         &mut self,
         agent: &Agent,
         console: &Console,
-        chat: Uuid,
+        target: ConfigTarget,
     ) -> Result<(), String> {
         self.model_return = None;
-        self.load_providers(agent, chat).await?;
-        self.configured_models(agent, console, chat).await
+        self.load_providers(agent, target).await?;
+        self.configured_models(agent, console, target).await
     }
 
     pub(super) async fn providers(
         &mut self,
         agent: &Agent,
         console: &Console,
-        chat: Uuid,
+        target: ConfigTarget,
     ) -> Result<(), String> {
         self.model_return = None;
-        self.load_providers(agent, chat).await?;
-        self.back_to_providers(console, chat)
+        self.load_providers(agent, target).await?;
+        self.back_to_providers(console, target)
     }
 
     pub(super) async fn efforts(
         &mut self,
         agent: &Agent,
         console: &Console,
-        chat: Uuid,
+        target: ConfigTarget,
     ) -> Result<(), String> {
         let snapshot = agent
-            .snapshot(chat)
+            .configuration(target)
             .await
             .map_err(|error| error.to_string())?;
         let choices = if tickloop_agent::model::validate_reasoning_effort(
@@ -934,7 +1063,7 @@ impl Menus {
                     .unwrap_or(0),
                 confirmation: false,
             },
-            Selection::Effort { chat, choices },
+            Selection::Effort { target, choices },
         )
     }
 
@@ -942,10 +1071,10 @@ impl Menus {
         &mut self,
         agent: &Agent,
         console: &Console,
-        chat: Uuid,
+        target: ConfigTarget,
     ) -> Result<(), String> {
         let snapshot = agent
-            .snapshot(chat)
+            .configuration(target)
             .await
             .map_err(|error| error.to_string())?;
         let mut context = vec![
@@ -955,7 +1084,7 @@ impl Menus {
                 "Current model: {}",
                 settings::model_label(&snapshot.model)
             )),
-            format!("Execution mode: {}", snapshot.policy.mode),
+            format!("Execution mode: {}", snapshot.execution_mode),
         ];
         if let Some(pending) = snapshot.pending_model {
             context.push(safe_text(&format!(
@@ -1002,7 +1131,14 @@ impl Menus {
                             .reasoning_effort
                             .map_or("auto", ReasoningEffort::label)
                     ),
-                    "Execution mode".into(),
+                    if snapshot.delegated {
+                        format!(
+                            "Execution mode: {} · fixed by parent",
+                            snapshot.execution_mode
+                        )
+                    } else {
+                        "Execution mode".into()
+                    },
                     "Session status".into(),
                     "Usage".into(),
                     format!(
@@ -1028,7 +1164,7 @@ impl Menus {
                 selected: 0,
                 confirmation: false,
             },
-            Selection::Settings { chat },
+            Selection::Settings { target },
         )
     }
 
@@ -1038,7 +1174,7 @@ impl Menus {
             .map_or_else(OutputStyle::default, UserSettings::output_style)
     }
 
-    fn output_styles(&mut self, console: &Console, chat: Uuid) -> Result<(), String> {
+    fn output_styles(&mut self, console: &Console, target: ConfigTarget) -> Result<(), String> {
         let current = self.saved_output_style();
         let options = OutputStyle::ALL
             .into_iter()
@@ -1067,11 +1203,15 @@ impl Menus {
                     .unwrap_or(0),
                 confirmation: false,
             },
-            Selection::OutputStyle { chat },
+            Selection::OutputStyle { target },
         )
     }
 
-    pub(super) async fn glyph_sets(&mut self, console: &Console, chat: Uuid) -> Result<(), String> {
+    pub(super) async fn glyph_sets(
+        &mut self,
+        console: &Console,
+        target: ConfigTarget,
+    ) -> Result<(), String> {
         let current = console.display_preferences()?.glyph_set;
         let unicode = DisplayProfile::new(DisplayPreferences::default()).preview();
         let nerd_font = DisplayProfile::new(DisplayPreferences {
@@ -1131,14 +1271,14 @@ impl Menus {
                     .unwrap_or(0),
                 confirmation: false,
             },
-            Selection::GlyphSet { chat, font_action },
+            Selection::GlyphSet { target, font_action },
         )
     }
 
     fn confirm_glyph_set(
         &mut self,
         console: &Console,
-        chat: Uuid,
+        target: ConfigTarget,
         glyph_set: GlyphSet,
     ) -> Result<(), String> {
         self.show(
@@ -1154,14 +1294,14 @@ impl Menus {
                 selected: 0,
                 confirmation: false,
             },
-            Selection::GlyphSetConfirmation { chat, glyph_set },
+            Selection::GlyphSetConfirmation { target, glyph_set },
         )
     }
 
     fn confirm_font_action(
         &mut self,
         console: &Console,
-        chat: Uuid,
+        target: ConfigTarget,
         action: FontAction,
     ) -> Result<(), String> {
         let (title, context) = match action {
@@ -1184,7 +1324,7 @@ impl Menus {
                 selected: 1,
                 confirmation: false,
             },
-            Selection::FontActionConfirmation { chat, action },
+            Selection::FontActionConfirmation { target, action },
         )
     }
 
@@ -1205,7 +1345,7 @@ impl Menus {
     pub(super) fn themes(
         &mut self,
         console: &Console,
-        settings_chat: Option<Uuid>,
+        settings_target: Option<ConfigTarget>,
     ) -> Result<(), String> {
         let current = console.theme()?;
         let options = ThemeName::ALL
@@ -1235,7 +1375,7 @@ impl Menus {
                 selected,
                 confirmation: false,
             },
-            Selection::Theme { settings_chat },
+            Selection::Theme { settings_target },
         )
     }
 
@@ -1243,9 +1383,40 @@ impl Menus {
         &mut self,
         agent: &Agent,
         console: &Console,
-        chat: Uuid,
+        target: ConfigTarget,
         usage: bool,
     ) -> Result<(), String> {
+        let ConfigTarget::Agent(chat) = target else {
+            let configuration = agent
+                .configuration(target)
+                .await
+                .map_err(|error| error.to_string())?;
+            let context = if usage {
+                vec!["No usage yet; the New Agent has not sent a request.".into()]
+            } else {
+                vec![
+                    "New Agent · created when you send the first input".into(),
+                    safe_text(&format!(
+                        "Model: {}",
+                        settings::model_label(&configuration.model)
+                    )),
+                    safe_text(&format!("Service: {}", configuration.model.base_url)),
+                    format!("Execution mode: {}", configuration.execution_mode),
+                ]
+            };
+            return self.show(
+                console,
+                Menu {
+                    id: Uuid::new_v4(),
+                    title: if usage { "Usage" } else { "Session status" }.into(),
+                    context,
+                    options: vec!["Back to settings".into()],
+                    selected: 0,
+                    confirmation: false,
+                },
+                Selection::SettingsInfo { target },
+            );
+        };
         let snapshot = agent
             .snapshot(chat)
             .await
@@ -1284,7 +1455,7 @@ impl Menus {
                 selected: 0,
                 confirmation: false,
             },
-            Selection::SettingsInfo { chat },
+            Selection::SettingsInfo { target },
         )
     }
 
@@ -1292,14 +1463,21 @@ impl Menus {
         &mut self,
         agent: &Agent,
         console: &Console,
-        chat: Uuid,
+        target: ConfigTarget,
     ) -> Result<(), String> {
-        let current = agent
-            .snapshot(chat)
+        let configuration = agent
+            .configuration(target)
             .await
-            .map_err(|error| error.to_string())?
-            .policy
-            .mode;
+            .map_err(|error| error.to_string())?;
+        let current = configuration.execution_mode;
+        if let Some(reason) =
+            configuration.unavailable_change(&ConfigurationChange::ExecutionMode { mode: current })
+        {
+            console.write(&format!(
+                "Execution mode {current} is fixed here: {reason}.\n"
+            ))?;
+            return self.settings(agent, console, target).await;
+        }
         let modes = settings::execution_modes();
         let selected = modes
             .iter()
@@ -1316,7 +1494,7 @@ impl Menus {
                 selected,
                 confirmation: false,
             },
-            Selection::Mode { chat, choices },
+            Selection::Mode { target, choices },
         )
     }
 
@@ -1324,16 +1502,20 @@ impl Menus {
         &mut self,
         agent: &Agent,
         console: &Console,
-        chat: Uuid,
+        target: ConfigTarget,
         return_to_settings: bool,
     ) -> Result<(), String> {
-        let current = agent
-            .snapshot(chat)
+        let configuration = agent
+            .configuration(target)
             .await
-            .map_err(|error| error.to_string())?
-            .policy
-            .mode;
-        let modes = settings::execution_modes();
+            .map_err(|error| error.to_string())?;
+        let current = configuration.execution_mode;
+        let fixed =
+            configuration.unavailable_change(&ConfigurationChange::ExecutionMode { mode: current });
+        let modes = settings::execution_modes()
+            .into_iter()
+            .filter(|(mode, _)| fixed.is_none() || *mode == current)
+            .collect::<Vec<_>>();
         let selected = modes
             .iter()
             .position(|(mode, _)| *mode == current)
@@ -1350,12 +1532,19 @@ impl Menus {
                 }
             })
             .collect();
-        options.push("↗ View recent activity · keep current mode".into());
-        let context = if current == ExecutionMode::Plan {
+        let fixed_context = fixed.map(|reason| {
+            format!("Mode is fixed for this child: {reason}. Rules and activity are read-only.")
+        });
+        let context = if let Some(context) = fixed_context.as_deref() {
+            context
+        } else if current == ExecutionMode::Plan {
             "Current: Plan. Choose a permission mode to leave Plan, or view activity."
+        } else if target == ConfigTarget::NewDraft {
+            "Choose a mode for the New Agent, or view its permissions without changing it."
         } else {
             "Choose a mode for this Chat, or view activity without changing it."
         };
+        options.push("↗ View recent activity · keep current mode".into());
         self.show(
             console,
             Menu {
@@ -1367,12 +1556,64 @@ impl Menus {
                 confirmation: false,
             },
             Selection::PermissionMode {
-                chat,
+                target,
                 choices,
                 current,
                 return_to_settings,
             },
         )
+    }
+
+    pub(super) async fn refresh_family_permissions(
+        &mut self,
+        agent: &Agent,
+        console: &Console,
+        family: &[Uuid],
+        pending: &HashMap<Uuid, Uuid>,
+        questions: &HashMap<Uuid, QuestionRequest>,
+    ) -> Result<(), String> {
+        if let Some((_, selection)) = &self.active {
+            if selection.request_id().is_none() {
+                return Ok(());
+            }
+            if let Some(requester) = selection
+                .chat()
+                .filter(|requester| family.contains(requester))
+            {
+                return self
+                    .refresh_permissions(agent, console, Some(requester), pending, questions)
+                    .await;
+            }
+            self.dismiss(console)?;
+        }
+        // Only an interactive View presents requests, and only ones already tracked from their
+        // events; otherwise every family snapshot below would be read for nothing, once per event.
+        if !console.is_interactive()
+            || pending.is_empty() && questions.is_empty()
+            || !console.can_present_request()?
+        {
+            return Ok(());
+        }
+        for requester in family {
+            let snapshot = agent
+                .snapshot(*requester)
+                .await
+                .map_err(|error| error.to_string())?;
+            if snapshot
+                .permissions
+                .iter()
+                .any(|request| pending.contains_key(&request.id))
+                || snapshot.questions.iter().any(|request| {
+                    questions.contains_key(&request.id)
+                        && !self.deferred_questions.contains(&request.id)
+                })
+            {
+                return self
+                    .refresh_permissions(agent, console, Some(*requester), pending, questions)
+                    .await;
+            }
+        }
+        Ok(())
     }
 
     pub(super) async fn refresh_permissions(
@@ -1406,6 +1647,7 @@ impl Menus {
                 .snapshot(chat)
                 .await
                 .map_err(|error| error.to_string())?;
+            let requester = requester_label(agent, console, &snapshot).await;
             if let Some(request) = snapshot
                 .permissions
                 .iter()
@@ -1416,11 +1658,16 @@ impl Menus {
                     .iter()
                     .find(|goal| goal.id == request.loop_id);
                 let context = safe_text(&format!(
-                    "Goal: {} · {}",
+                    "{requester} · Goal: {}",
                     goal.map(|goal| goal.goal.as_str()).unwrap_or("Task"),
-                    &request.loop_id.to_string()[..8],
                 ));
-                self.permission(console, chat, request, context)?;
+                self.permission(
+                    console,
+                    chat,
+                    request,
+                    context,
+                    snapshot.delegation.is_none(),
+                )?;
             } else if let Some(request) = snapshot.questions.iter().find(|request| {
                 !self.deferred_questions.contains(&request.id)
                     && questions.contains_key(&request.id)
@@ -1431,7 +1678,10 @@ impl Menus {
                     .find(|goal| goal.id == request.loop_id)
                     .map(|goal| goal.goal.as_str())
                     .unwrap_or("Task");
-                self.show_question(console, QuestionFlow::new(request.clone(), goal.into()))?;
+                self.show_question(
+                    console,
+                    QuestionFlow::new(request.clone(), format!("{requester} · {goal}")),
+                )?;
             }
         }
         Ok(())
@@ -1443,6 +1693,7 @@ impl Menus {
         chat: Uuid,
         request: &PermissionRequest,
         goal: String,
+        persistent: bool,
     ) -> Result<(), String> {
         if request.name == ENTER_PLAN_MODE_TOOL_NAME {
             let menu = enter_plan_mode_menu(request.id, goal.clone());
@@ -1450,6 +1701,7 @@ impl Menus {
                 chat,
                 request: request.clone(),
                 goal,
+                persistent: false,
             };
             return self.show(console, menu, selection);
         }
@@ -1479,11 +1731,17 @@ impl Menus {
                 "Yes, once".into(),
                 "No, and tell Claude what to do differently (esc)".into(),
             ]
-        } else {
+        } else if persistent {
             vec![
                 "Yes".into(),
                 "Yes, for this session".into(),
                 persistent_option,
+                "No, and tell Claude what to do differently (esc)".into(),
+            ]
+        } else {
+            vec![
+                "Yes".into(),
+                "Yes, for this session".into(),
                 "No, and tell Claude what to do differently (esc)".into(),
             ]
         };
@@ -1502,9 +1760,14 @@ impl Menus {
             chat,
             request: request.clone(),
             goal,
+            persistent,
         };
-        let denial_index = if explicit_ask { 1 } else { 3 };
-        let has_prefix_choices = !explicit_ask && rule_candidates.len() > 1;
+        let denial_index = match (explicit_ask, persistent) {
+            (true, _) => 1,
+            (false, true) => 3,
+            (false, false) => 2,
+        };
+        let has_prefix_choices = !explicit_ask && persistent && rule_candidates.len() > 1;
         match review {
             Some(review) => {
                 self.show_reviewable(console, menu, selection, vec![0, denial_index], review)
@@ -1528,6 +1791,7 @@ impl Menus {
                 chat,
                 request,
                 goal,
+                persistent,
             },
         )) = self.active.as_ref()
         else {
@@ -1535,6 +1799,7 @@ impl Menus {
         };
         if *active_id != menu_id
             || index != 2
+            || !*persistent
             || request.approval_source == PermissionApprovalSource::ExplicitAsk
         {
             return Err("this menu option cannot be expanded".into());
@@ -1589,6 +1854,12 @@ impl Menus {
         let (_, selection) = self.active.take().unwrap();
         let outcome: Result<MenuOutcome, String> = async {
             match selection {
+                Selection::Locations { generation, views } => {
+                    if let Some(index) = index {
+                        let view = views.get(index).ok_or("location no longer exists")?.view;
+                        return Ok(MenuOutcome { command: Some(format!("/agent-location {generation} {} {}", view.session_id, view.view_id)), ..Default::default() });
+                    }
+                }
                 Selection::HelpReference => self.help(console, None)?,
                 Selection::Help { section } => {
                     if let Some(index) = index {
@@ -1609,11 +1880,9 @@ impl Menus {
                         self.help(console, None)?;
                     }
                 }
-                Selection::Permission {
-                    chat,
-                    request,
-                    goal: _,
-                } if request.name == ENTER_PLAN_MODE_TOOL_NAME => {
+                Selection::Permission { chat, request, .. }
+                    if request.name == ENTER_PLAN_MODE_TOOL_NAME =>
+                {
                     let allow = match index {
                         Some(0) => true,
                         Some(1) | None => false,
@@ -1646,7 +1915,8 @@ impl Menus {
                 Selection::Permission {
                     chat,
                     request,
-                    goal: _,
+                    persistent,
+                    ..
                 } => {
                     let has_comment = comment
                         .as_ref()
@@ -1654,6 +1924,7 @@ impl Menus {
                     let explicit_ask =
                         request.approval_source == PermissionApprovalSource::ExplicitAsk;
                     if !explicit_ask
+                        && persistent
                         && index == Some(2)
                         && let Some(exact) =
                             permission_rule_candidates(&request.name, &request.input).first()
@@ -1683,11 +1954,13 @@ impl Menus {
                             _ => return Err("permission option does not exist".into()),
                         }
                     } else {
-                        match index {
-                            Some(0) => (true, PermissionScope::Once),
-                            Some(1) => (true, PermissionScope::Session),
-                            Some(2) => (true, PermissionScope::Persistent),
-                            Some(3) | None => (false, PermissionScope::Once),
+                        match (index, persistent) {
+                            (Some(0), _) => (true, PermissionScope::Once),
+                            (Some(1), _) => (true, PermissionScope::Session),
+                            (Some(2), true) => (true, PermissionScope::Persistent),
+                            (Some(3), true) | (Some(2), false) | (None, _) => {
+                                (false, PermissionScope::Once)
+                            }
                             _ => return Err("permission option does not exist".into()),
                         }
                     };
@@ -1722,12 +1995,12 @@ impl Menus {
                     candidates,
                 } => {
                     let Some(index) = index else {
-                        self.permission(console, chat, &request, goal)?;
+                        self.permission(console, chat, &request, goal, true)?;
                         return Ok(MenuOutcome::default());
                     };
                     let Some(candidate) = candidates.get(index) else {
                         if index == candidates.len() {
-                            self.permission(console, chat, &request, goal)?;
+                            self.permission(console, chat, &request, goal, true)?;
                             return Ok(MenuOutcome::default());
                         }
                         return Err("permission rule option does not exist".into());
@@ -1797,7 +2070,7 @@ impl Menus {
                         ..Default::default()
                     });
                 }
-                Selection::SettingsInfo { chat } => self.settings(agent, console, chat).await?,
+                Selection::SettingsInfo { target } => self.settings(agent, console, target).await?,
                 Selection::Rewind { chat, mut points } => {
                     match index {
                         None => console
@@ -1872,14 +2145,14 @@ impl Menus {
                         }
                     }
                 }
-                Selection::Provider { chat, choices, rows } => {
+                Selection::Provider { target, choices, rows } => {
                     if let Some(index) = index {
                         if self.provider_group.is_none() && index == rows.len() + 1 {
                             let provider = choices.iter().find(|provider| provider.models[0].auth_source == tickloop_agent::model::ModelAuthSource::CodexSubscription).cloned().ok_or("Codex subscription Provider is not configured.")?;
                             self.provider_choices = choices;
                             self.provider_selected = index;
                             self.dismiss(console)?;
-                            self.login_return = Some((chat, provider));
+                            self.login_return = Some((target, provider));
                             return Ok(MenuOutcome { provider_logout: true, logout_target: super::login::SignInTarget::Codex, ..Default::default() });
                         }
                         if self.provider_group.is_none() && index == rows.len() {
@@ -1888,10 +2161,10 @@ impl Menus {
                             if let Err(error) = self.judgment_settings(
                                 agent,
                                 console,
-                                JudgmentReturn::Providers { chat },
+                                JudgmentReturn::Providers { target },
                             )
                             .await {
-                                self.back_to_providers(console, chat)?;
+                                self.back_to_providers(console, target)?;
                                 return Err(error);
                             }
                             return Ok(MenuOutcome::default());
@@ -1902,57 +2175,63 @@ impl Menus {
                             ProviderRow::Group(name) => {
                                 self.provider_group = Some((name.clone(), 0));
                                 self.provider_choices = choices.clone();
-                                self.show_providers(console, chat, choices, 0, Uuid::new_v4())?;
+                                self.show_providers(console, target, choices, 0, Uuid::new_v4())?;
                                 return Ok(MenuOutcome::default());
                             }
                             ProviderRow::Provider(provider_index) => *provider_index,
                         };
                         let provider = choices.get(provider_index).ok_or("provider option does not exist")?.clone();
                         self.provider_choices = choices;
-                        if provider.models[0].auth_source == tickloop_agent::model::ModelAuthSource::GoogleCloud {
-                            return self.provider_auth(console, chat, provider);
-                        }
                         match self.provider_authenticated(&provider) {
-                            Ok(true) | Ok(false) => return self.provider_auth(console, chat, provider),
+                            Ok(true) if self.model_return.is_none() => {
+                                self.choose_provider_models(agent, console, target, &provider.models[0].provider_id).await?;
+                                return Ok(MenuOutcome::default());
+                            }
+                            Ok(true) | Ok(false) => return self.provider_auth(console, target, provider),
+                            Err(_) if provider.models[0].auth_source == tickloop_agent::model::ModelAuthSource::GoogleCloud => {
+                                return self.provider_auth(console, target, provider);
+                            }
                             Err(error) => {
-                                self.back_to_providers(console, chat)?;
+                                self.back_to_providers(console, target)?;
                                 return Err(error);
                             }
                         }
                     } else if self.provider_group.take().is_some() {
-                        self.back_to_providers(console, chat)?;
+                        self.back_to_providers(console, target)?;
                     } else if self.model_return.is_some() {
-                        self.configured_models(agent, console, chat).await?;
+                        self.configured_models(agent, console, target).await?;
                     } else {
                         console.write("Selection cancelled; configuration unchanged.\n")?;
                     }
                 }
-                Selection::ServiceAccount { chat, provider } => {
+                Selection::ServiceAccount { target, provider } => {
                     if index == Some(0) {
                         let root = self.config_root.as_deref().ok_or("Cannot locate the Agent state directory; set TICKLOOP_CONFIG_DIR.")?;
                         let path = comment.as_deref().unwrap_or("").trim();
                         if let Err(error) = crate::auth::google::GoogleAuth::new(root).save_service_account_path(path) {
-                            self.provider_service_account(console, chat, provider, Some(path))?;
+                            self.provider_service_account(console, target, provider, Some(path))?;
                             return Err(error.to_string());
                         }
                         self.model_discovery.invalidate(&provider.models[0].provider_id);
                         console.write("Service-account file configured.\n")?;
+                        self.choose_provider_models(agent, console, target, &provider.models[0].provider_id).await?;
+                    } else {
+                        self.finish_provider_configuration(agent, console, target).await?;
                     }
-                    self.finish_provider_configuration(agent, console, chat).await?;
                 }
-                Selection::ApiKey { chat, provider } => {
+                Selection::ApiKey { target, provider } => {
                     if index == Some(0) {
                         let root = self.config_root.as_deref().ok_or("Cannot locate the Agent state directory; set TICKLOOP_CONFIG_DIR.")?;
                         let result = tickloop_agent::model::credentials::save_api_key(root, &provider.models[0].api_key_env, comment.as_deref().unwrap_or(""));
                         if let Err(error) = result {
-                            self.provider_api_key(console, chat, provider)?;
+                            self.provider_api_key(console, target, provider)?;
                             return Err(error.to_string());
                         }
                         self.model_discovery.invalidate(&provider.models[0].provider_id);
                         console.write("API key saved to Agent .env.\n")?;
-                        self.finish_provider_configuration(agent, console, chat).await?;
+                        self.choose_provider_models(agent, console, target, &provider.models[0].provider_id).await?;
                     } else {
-                        self.finish_provider_configuration(agent, console, chat).await?;
+                        self.finish_provider_configuration(agent, console, target).await?;
                     }
                 }
                 Selection::JudgmentSettings { return_to, has_key } => {
@@ -1997,18 +2276,18 @@ impl Menus {
                         self.judgment_settings(agent, console, return_to).await?;
                     }
                 }
-                Selection::Discovery { chat } => {
+                Selection::Discovery { target } => {
                     if let Some(flow) = self.discovery_flow.take() {
                         let providers = flow.providers.clone();
                         drop(flow);
                         let directories = providers.into_iter().map(|provider| (provider, Err("Account model check cancelled".into()))).collect();
-                        self.configured_model_choices(agent, console, chat, directories).await?;
+                        self.configured_model_choices(agent, console, target, directories).await?;
                     }
                 }
-                Selection::ModelProviders { chat } => {
+                Selection::ModelProviders { target } => {
                     if let Some(index) = index {
                         if index == self.model_providers.len() {
-                            self.open_model_provider_configuration(console, chat, None)?;
+                            self.open_model_provider_configuration(console, target, None)?;
                         } else {
                             let provider = self.model_providers.get(index).ok_or("provider option does not exist")?.models[0].provider_id.clone();
                             self.model_return = Some(providers::ModelPickerDraft {
@@ -2016,105 +2295,111 @@ impl Menus {
                                 choices: self.model_choices.clone(),
                                 provider: Some(provider),
                             });
-                            self.configured_models(agent, console, chat).await?;
+                            self.configured_models(agent, console, target).await?;
                         }
                     }
                 }
-                Selection::Model { chat, choices } => {
+                Selection::Model { target, choices } => {
                     let Some(index) = index else {
                         self.remember_model_drafts(&choices);
                         let provider = self.model_provider.clone();
-                        self.show_model_providers(console, chat, provider.as_deref())?;
+                        self.show_model_providers(console, target, provider.as_deref())?;
                         return Ok(MenuOutcome::default());
                     };
                     if index == choices.len() {
-                        self.open_model_providers(console, chat, choices, index)?;
+                        self.open_model_providers(console, target, choices, index)?;
                         return Ok(MenuOutcome::default());
                     }
                     if index == choices.len() + 1 {
                         self.remember_model_drafts(&choices);
-                        self.refresh_model_choices(agent, console, chat).await?;
+                        self.refresh_model_choices(agent, console, target).await?;
                         return Ok(MenuOutcome::default());
                     }
                     let choice = choices.get(index).ok_or("model option does not exist")?;
                     if !choice.availability.selectable() {
                         let error = choice.availability.label().to_owned();
-                        self.show_model_choices(console, chat, choices, index, Uuid::new_v4())?;
+                        self.show_model_choices(console, target, choices, index, Uuid::new_v4())?;
                         return Err(error);
                     }
-                    let result: Result<_, String> = async {
-                        let client = model_client(choice.config.clone(), self.config_root.as_deref())
-                            .map_err(|error| error.to_string())?;
-                        agent.set_model_with_thinking(chat, choice.config.clone(), client, choice.thinking)
-                            .await.map_err(|error| error.to_string())
-                    }.await;
+                    let result = agent
+                        .change_configuration(
+                            target,
+                            ConfigurationChange::Model {
+                                config: choice.config.clone(),
+                                thinking: Some(choice.thinking),
+                            },
+                        )
+                        .await
+                        .map_err(|error| error.to_string());
                     match result {
-                        Ok(change) => console.write(&safe_text(&format!("Model selection: {change:?} · {} · Thinking {}\n", choice.config.name, choice.thinking.map_or("auto", ReasoningEffort::label))))?,
+                        Ok(change) => console.write(&safe_text(&format!("Model selection: {change} · {} · Thinking {}\n", choice.config.name, choice.thinking.map_or("auto", ReasoningEffort::label))))?,
                         Err(error) => {
-                            self.show_model_choices(console, chat, choices, index, Uuid::new_v4())?;
+                            self.show_model_choices(console, target, choices, index, Uuid::new_v4())?;
                             return Err(error);
                         }
                     }
                 }
                 Selection::PermissionMode {
-                    chat,
+                    target,
                     return_to_settings: true,
                     ..
-                } if index.is_none() => self.settings(agent, console, chat).await?,
+                } if index.is_none() => self.settings(agent, console, target).await?,
                 Selection::PermissionMode { .. } if index.is_none() => {},
                 _ if index.is_none() => {
                     console.write("Selection cancelled; configuration unchanged.\n")?
                 }
-                Selection::Effort { chat, choices } => {
+                Selection::Effort { target, choices } => {
                     let effort = *choices
                         .get(index.unwrap())
                         .ok_or("effort option does not exist")?;
-                    agent
-                        .set_reasoning_effort(chat, effort)
+                    let change = agent
+                        .change_configuration(target, ConfigurationChange::ReasoningEffort { effort })
                         .await
                         .map_err(|error| error.to_string())?;
                     console.write(&format!(
-                        "Thinking: {}\n",
-                        effort.map_or("auto", ReasoningEffort::label)
+                        "Thinking: {}{}\n",
+                        effort.map_or("auto", ReasoningEffort::label),
+                        change.staged_note()
                     ))?;
                 }
-                Selection::Settings { chat } => match index {
-                    Some(0) => self.models(agent, console, chat).await?,
+                Selection::Settings { target } => match index {
+                    Some(0) => self.models(agent, console, target).await?,
                     Some(1) => {
-                        let snapshot = agent.snapshot(chat).await.map_err(|error| error.to_string())?;
+                        let configuration = agent.configuration(target).await.map_err(|error| error.to_string())?;
                         if matches!(
-                            tickloop_agent::model::cards::model_card(&snapshot.model)
+                            tickloop_agent::model::cards::model_card(&configuration.model)
                                 .map(|card| card.thinking),
                             Some(tickloop_agent::model::cards::ThinkingControl::Toggle)
                         ) {
-                            agent.set_thinking_enabled(chat, !snapshot.model.thinking_enabled(snapshot.reasoning_effort, snapshot.thinking_enabled).unwrap_or(snapshot.thinking_enabled)).await.map_err(|error| error.to_string())?;
+                            let enabled = !configuration.model.thinking_enabled(configuration.reasoning_effort, configuration.thinking_enabled).unwrap_or(configuration.thinking_enabled);
+                            agent.change_configuration(target, ConfigurationChange::ThinkingEnabled { enabled }).await.map_err(|error| error.to_string())?;
                         } else {
                             console.write("Thinking toggle is unavailable for this model.\n")?;
                         }
-                        self.settings(agent, console, chat).await?;
+                        self.settings(agent, console, target).await?;
                     }
-                    Some(2) => self.efforts(agent, console, chat).await?,
-                    Some(3) => self.modes(agent, console, chat).await?,
-                    Some(4) => self.settings_info(agent, console, chat, false).await?,
-                    Some(5) => self.settings_info(agent, console, chat, true).await?,
+                    Some(2) => self.efforts(agent, console, target).await?,
+                    Some(3) => self.modes(agent, console, target).await?,
+                    Some(4) => self.settings_info(agent, console, target, false).await?,
+                    Some(5) => self.settings_info(agent, console, target, true).await?,
                     Some(6) => {
                         console.set_auto_scroll(!console.auto_scroll()?)?;
-                        self.settings(agent, console, chat).await?;
+                        self.settings(agent, console, target).await?;
                     }
-                    Some(7) => self.themes(console, Some(chat))?,
-                    Some(8) => self.glyph_sets(console, chat).await?,
+                    Some(7) => self.themes(console, Some(target))?,
+                    Some(8) => self.glyph_sets(console, target).await?,
                     Some(9) => {
                         let mut preferences = console.display_preferences()?;
                         preferences.prefers_reduced_motion = !preferences.prefers_reduced_motion;
                         self.save_display_preferences(console, preferences)?;
-                        self.settings(agent, console, chat).await?;
+                        self.settings(agent, console, target).await?;
                     }
-                    Some(10) => self.output_styles(console, chat)?,
+                    Some(10) => self.output_styles(console, target)?,
                     Some(11) => {
-                        match self.permission_modes(agent, console, chat, true).await {
+                        match self.permission_modes(agent, console, target, true).await {
                             Ok(()) => {}
                             Err(error) => {
-                                self.settings(agent, console, chat).await?;
+                                self.settings(agent, console, target).await?;
                                 console.write(&format!(
                                     "Cannot open Permissions: {}.\n",
                                     super::safe_text(&error)
@@ -2124,17 +2409,17 @@ impl Menus {
                     }
                     _ => return Err("setting does not exist".into()),
                 },
-                Selection::Theme { settings_chat } => {
+                Selection::Theme { settings_target } => {
                     let theme = *ThemeName::ALL
                         .get(index.unwrap())
                         .ok_or("theme option does not exist")?;
                     console.set_theme(theme)?;
-                    match settings_chat {
-                        Some(chat) => self.settings(agent, console, chat).await?,
+                    match settings_target {
+                        Some(target) => self.settings(agent, console, target).await?,
                         None => console.write(&format!("Theme: {}\n", theme.label()))?,
                     }
                 }
-                Selection::OutputStyle { chat } => {
+                Selection::OutputStyle { target } => {
                     let style = *OutputStyle::ALL
                         .get(index.unwrap())
                         .ok_or("output style option does not exist")?;
@@ -2143,33 +2428,33 @@ impl Menus {
                         .ok_or("cannot save the output style because the user settings directory is unavailable")?
                         .save_output_style(style)
                         .map_err(|error| error.to_string())?;
-                    self.settings(agent, console, chat).await?;
+                    self.settings(agent, console, target).await?;
                 }
-                Selection::GlyphSet { chat, font_action } => {
+                Selection::GlyphSet { target, font_action } => {
                     let selected = index.unwrap();
                     if let Some(glyph_set) = GlyphSet::ALL.get(selected).copied() {
-                        self.confirm_glyph_set(console, chat, glyph_set)?;
+                        self.confirm_glyph_set(console, target, glyph_set)?;
                     } else if selected == GlyphSet::ALL.len() {
                         self.confirm_font_action(
                             console,
-                            chat,
+                            target,
                             font_action.ok_or("font action does not exist")?,
                         )?;
                     } else {
                         return Err("Glyph Set option does not exist".into());
                     }
                 }
-                Selection::GlyphSetConfirmation { chat, glyph_set } => match index {
+                Selection::GlyphSetConfirmation { target, glyph_set } => match index {
                     Some(0) => {
                         let mut preferences = console.display_preferences()?;
                         preferences.glyph_set = glyph_set;
                         self.save_display_preferences(console, preferences)?;
-                        self.settings(agent, console, chat).await?;
+                        self.settings(agent, console, target).await?;
                     }
-                    Some(1) => self.glyph_sets(console, chat).await?,
+                    Some(1) => self.glyph_sets(console, target).await?,
                     _ => return Err("glyph confirmation option does not exist".into()),
                 },
-                Selection::FontActionConfirmation { chat, action } => match index {
+                Selection::FontActionConfirmation { target, action } => match index {
                     Some(0) => {
                         let mut preferences = console.display_preferences()?;
                         if preferences.glyph_set != GlyphSet::Unicode {
@@ -2188,29 +2473,80 @@ impl Menus {
                             | FontOutcome::Removed { message } => message,
                         };
                         console.write(&format!("{message}\n"))?;
-                        self.glyph_sets(console, chat).await?;
+                        self.glyph_sets(console, target).await?;
                     }
-                    Some(1) => self.glyph_sets(console, chat).await?,
+                    Some(1) => self.glyph_sets(console, target).await?,
                     _ => return Err("font action confirmation does not exist".into()),
                 },
-                Selection::Mode { chat, choices } => {
+                Selection::Mode { target, choices } => {
                     let mode = *choices
                         .get(index.unwrap())
                         .ok_or("execution mode does not exist")?;
-                    agent
-                        .set_execution_mode(chat, mode)
+                    let change = agent
+                        .change_configuration(target, ConfigurationChange::ExecutionMode { mode })
                         .await
                         .map_err(|error| error.to_string())?;
                     console.write(&format!(
-                        "Execution mode: {mode}. Explicit deny rules remain effective.\n"
+                        "Execution mode: {mode}. Explicit deny rules remain effective.{}\n",
+                        change.staged_note()
                     ))?;
                 }
                 Selection::PermissionMode {
-                    chat,
+                    target: ConfigTarget::NewDraft,
                     choices,
                     current,
                     return_to_settings,
                 } => {
+                    let index = index.unwrap();
+                    let is_mode_selection = index < choices.len();
+                    let mode = if is_mode_selection {
+                        choices[index]
+                    } else if index == choices.len() {
+                        current
+                    } else {
+                        return Err("permission mode does not exist".into());
+                    };
+                    let result = async {
+                        if is_mode_selection && mode != current {
+                            agent
+                                .change_configuration(
+                                    ConfigTarget::NewDraft,
+                                    ConfigurationChange::ExecutionMode { mode },
+                                )
+                                .await
+                                .map_err(|error| error.to_string())?;
+                        }
+                        console.clear_menu(menu_id)?;
+                        self.open_draft_permissions(
+                            agent,
+                            console,
+                            return_to_settings,
+                            is_mode_selection && mode == ExecutionMode::Auto,
+                        )
+                        .await
+                    }
+                    .await;
+                    if let Err(error) = result {
+                        self.permission_modes(
+                            agent,
+                            console,
+                            ConfigTarget::NewDraft,
+                            return_to_settings,
+                        )
+                        .await?;
+                        console.write(&format!(
+                            "Cannot open Permissions: {}. Fix the private Auto settings and retry.\n",
+                            super::safe_text(&error)
+                        ))?;
+                    }
+                }
+                Selection::PermissionMode {
+                    target: ConfigTarget::Agent(chat),
+                    choices,
+                    current,
+                    return_to_settings,
+                } => {
+                    let target = ConfigTarget::Agent(chat);
                     if let Some(index) = index {
                         let mode = if index == choices.len() {
                             current
@@ -2221,11 +2557,10 @@ impl Menus {
                         let result = async {
                             if is_mode_selection {
                                 let actual = agent
-                                    .snapshot(chat)
+                                    .configuration(target)
                                     .await
                                     .map_err(|error| error.to_string())?
-                                    .policy
-                                    .mode;
+                                    .execution_mode;
                                 if mode != actual {
                                     agent
                                         .set_execution_mode(chat, mode)
@@ -2257,7 +2592,7 @@ impl Menus {
                                 )?;
                             }
                             Err(error) => {
-                                self.permission_modes(agent, console, chat, return_to_settings)
+                                self.permission_modes(agent, console, target, return_to_settings)
                                     .await?;
                                 console.write(&format!(
                                     "Cannot open Permissions: {}. Fix the private Auto settings and retry.\n",
@@ -2274,6 +2609,22 @@ impl Menus {
         console.finish_menu_submission(menu_id)?;
         outcome
     }
+}
+
+/// Names a requester as its rows and background notices do: its task title, plus this View's
+/// reading number when another Agent reads alike. The request itself stays bound to its
+/// execution.
+async fn requester_label(agent: &Agent, console: &Console, snapshot: &ChatSnapshot) -> String {
+    let title = super::safe_line(&crate::agent_access::agent_title(
+        &snapshot.loops,
+        &snapshot.user_shells,
+    ));
+    agent
+        .reference(snapshot.id)
+        .await
+        .ok()
+        .and_then(|execution| console.agent_name(execution.agent_id, &title).ok())
+        .unwrap_or_else(|| format!("Agent {title}"))
 }
 
 /// The confirmation for the Agent's `EnterPlanMode` request, following Claude Code's
@@ -2592,7 +2943,7 @@ mod tests {
             .configured_model_choices(
                 &agent,
                 &console,
-                chat,
+                ConfigTarget::Agent(chat),
                 vec![
                     (
                         providers[0].clone(),
@@ -2613,9 +2964,11 @@ mod tests {
         assert_eq!(menus.model_choices.len(), 1);
         assert!(menus.model_choices[0].availability.selectable());
         assert_eq!(menus.model_choices[0].config.provider_id, "deepseek-api");
-        menus.show_model_providers(&console, chat, None).unwrap();
         menus
-            .show_provider_models(&console, chat, "openai-api", None)
+            .show_model_providers(&console, ConfigTarget::Agent(chat), None)
+            .unwrap();
+        menus
+            .show_provider_models(&console, ConfigTarget::Agent(chat), "openai-api", None)
             .unwrap();
         let (id, Selection::Model { choices, .. }) = menus.active.as_ref().unwrap() else {
             panic!("expected empty model selection for denied Provider");

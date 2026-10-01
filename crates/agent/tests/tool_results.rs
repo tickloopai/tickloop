@@ -675,14 +675,14 @@ async fn large_results_with_repeated_or_unsafe_call_ids_are_still_persisted_afte
 }
 
 /// 与 Agent 相同的用户临时目录：`TICKLOOP_TMPDIR`（未设置时 `/tmp`）解析符号链接后的
-/// `tickloop-<uid>`。
+/// `tickloop-private-<uid>`。
 fn user_temp_directory() -> PathBuf {
     let base = std::env::var_os("TICKLOOP_TMPDIR")
         .filter(|value| !value.is_empty())
         .map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
     base.canonicalize()
         .unwrap()
-        .join(format!("tickloop-{}", unsafe { libc::getuid() }))
+        .join(format!("tickloop-private-{}", unsafe { libc::getuid() }))
 }
 
 /// 与 Agent 相同的项目临时目录：`<用户临时目录>/<项目目录名>`。

@@ -1,8 +1,26 @@
+use std::path::Path;
+
 use crate::judgment::JEV_API_KEY_ENV;
 use crate::model::credentials::{ApiKeyStatus, api_key_status, save_api_key};
 use crate::settings::{AutoSettings, AutoSettingsRevision};
 
 use super::{Agent, AgentError};
+
+/// Jev key status from the credentials under `root`, or from the environment without one.
+pub(crate) fn jev_key_status_in(root: Option<&Path>) -> Result<ApiKeyStatus, AgentError> {
+    if let Some(root) = root {
+        return api_key_status(root, JEV_API_KEY_ENV)
+            .map_err(|error| AgentError::Storage(error.to_string()));
+    }
+    Ok(std::env::var(JEV_API_KEY_ENV)
+        .ok()
+        .filter(|value| {
+            !value.trim().is_empty()
+                && reqwest::header::HeaderValue::from_str(&format!("Bearer {value}")).is_ok()
+        })
+        .map(|_| ApiKeyStatus::Environment)
+        .unwrap_or(ApiKeyStatus::Missing))
+}
 
 impl Agent {
     pub(super) async fn auto_settings_snapshot(
@@ -24,21 +42,9 @@ impl Agent {
             .as_ref()
             .and_then(crate::settings::UserSettings::root)
             .map(ToOwned::to_owned);
-        if let Some(root) = root {
-            return tokio::task::spawn_blocking(move || api_key_status(&root, JEV_API_KEY_ENV))
-                .await
-                .map_err(|error| AgentError::Storage(error.to_string()))?
-                .map_err(|error| AgentError::Storage(error.to_string()));
-        }
-        let status = std::env::var(JEV_API_KEY_ENV)
-            .ok()
-            .filter(|value| {
-                !value.trim().is_empty()
-                    && reqwest::header::HeaderValue::from_str(&format!("Bearer {value}")).is_ok()
-            })
-            .map(|_| ApiKeyStatus::Environment)
-            .unwrap_or(ApiKeyStatus::Missing);
-        Ok(status)
+        tokio::task::spawn_blocking(move || jev_key_status_in(root.as_deref()))
+            .await
+            .map_err(|error| AgentError::Storage(error.to_string()))?
     }
 
     pub async fn save_jev_key(&self, value: &str) -> Result<ApiKeyStatus, AgentError> {
