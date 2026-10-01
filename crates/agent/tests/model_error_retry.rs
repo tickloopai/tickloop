@@ -74,6 +74,7 @@ impl ModelClient for FailingModel {
             Reply::Success(text) => {
                 events.send(ModelDelta::Text(text.into())).unwrap();
                 Ok(ModelOutput {
+                    private_source: None,
                     content: vec![Content::Text { text: text.into() }],
                     usage: Usage::default(),
                     stop_reason: "end_turn".into(),

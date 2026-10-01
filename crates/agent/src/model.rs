@@ -23,6 +23,7 @@ pub mod cards;
 mod chat_completions;
 mod codex;
 pub mod credentials;
+pub(crate) mod history;
 mod image_limits;
 mod responses;
 
@@ -57,6 +58,10 @@ pub enum ModelAuthSource {
     #[default]
     ApiKeyEnv,
     CodexSubscription,
+    #[serde(rename = "minimax_oauth_cn")]
+    MiniMaxOAuthCn,
+    #[serde(rename = "minimax_oauth_global")]
+    MiniMaxOAuthGlobal,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -115,9 +120,6 @@ impl ModelConfig {
     }
 
     pub fn private_history_source(&self) -> Option<PrivateHistorySource> {
-        if self.card.is_none() || self.provider_id.is_empty() {
-            return None;
-        }
         let mut endpoint = reqwest::Url::parse(&self.base_url).ok()?;
         if !endpoint.username().is_empty()
             || endpoint.password().is_some()
@@ -139,11 +141,27 @@ impl ModelConfig {
             service_model_id: self.model.clone(),
             auth_source: self.auth_source,
             credential_reference: self.api_key_env.clone(),
+            credential_identity: None,
         })
     }
 
     pub fn accepts_images(&self) -> bool {
         self.input_modalities.contains(&InputModality::Image)
+    }
+
+    pub fn thinking_enabled(&self, effort: Option<ReasoningEffort>, enabled: bool) -> Option<bool> {
+        let card = cards::model_card(self)?;
+        match card.thinking {
+            cards::ThinkingControl::Unsupported => None,
+            cards::ThinkingControl::AlwaysOn => Some(true),
+            cards::ThinkingControl::Toggle => Some(
+                enabled
+                    && effort != Some(ReasoningEffort::Off)
+                    && (self.adapter() != cards::Adapter::MinimaxMessages
+                        || effort.is_some()
+                        || card.adaptive_by_default),
+            ),
+        }
     }
 
     pub fn identity(&self) -> ModelIdentity {
@@ -169,6 +187,15 @@ pub struct PrivateHistorySource {
     pub auth_source: ModelAuthSource,
     #[serde(default)]
     pub credential_reference: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_identity: Option<String>,
+}
+
+pub(crate) fn credential_fingerprint(value: &[u8]) -> String {
+    Sha256::digest(value)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 pub fn compatible_private_history(current: &ModelConfig, selected: &ModelConfig) -> bool {
@@ -357,6 +384,7 @@ pub struct StructuredOutput {
 
 #[derive(Clone, Debug)]
 pub struct ModelRequest {
+    pub history_sources: Vec<Option<PrivateHistorySource>>,
     pub messages: Vec<Message>,
     pub tools: Vec<ToolDefinition>,
     pub structured_output: Option<StructuredOutput>,
@@ -370,6 +398,7 @@ pub struct ModelRequest {
 #[serde(rename_all = "lowercase")]
 pub enum ReasoningEffort {
     Off,
+    On,
     Low,
     Medium,
     High,
@@ -381,6 +410,7 @@ impl ReasoningEffort {
     pub fn label(self) -> &'static str {
         match self {
             Self::Off => "off",
+            Self::On => "on",
             Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",
@@ -399,6 +429,11 @@ pub fn validate_reasoning_effort(
     effort: Option<ReasoningEffort>,
 ) -> Result<(), ModelError> {
     let is_supported = effort.is_none_or(|effort| match effort {
+        ReasoningEffort::On => {
+            config.adapter() == cards::Adapter::MinimaxMessages
+                && cards::model_card(config)
+                    .is_some_and(|card| card.thinking == cards::ThinkingControl::Toggle)
+        }
         ReasoningEffort::Off => cards::model_card(config)
             .is_some_and(|card| card.thinking == cards::ThinkingControl::Toggle),
         _ => ReasoningEffort::choices(config).contains(&effort),
@@ -424,6 +459,8 @@ pub struct Usage {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ModelOutput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_source: Option<PrivateHistorySource>,
     pub content: Vec<Content>,
     pub usage: Usage,
     pub stop_reason: String,
@@ -498,6 +535,12 @@ pub enum ModelError {
     AuthenticationAt { stage: ModelRequestStage },
     #[error("Codex subscription is not logged in; use /model → Provider")]
     CodexNotLoggedIn,
+    #[error("MiniMax is not signed in; select its OAuth Provider in /model")]
+    MiniMaxNotLoggedIn,
+    #[error(
+        "MiniMax credentials need renewed authorization; select its OAuth Provider and press r"
+    )]
+    MiniMaxAuthentication,
     #[error(
         "Codex subscription authentication failed; select the Codex Provider in /model and press r to renew it"
     )]
@@ -592,10 +635,13 @@ impl ModelError {
             Self::Configuration(_) | Self::UnsupportedProtocol(_) => {
                 ModelFailureKind::Configuration
             }
-            Self::CodexNotLoggedIn => ModelFailureKind::AuthenticationRequired,
-            Self::Authentication | Self::AuthenticationAt { .. } | Self::CodexAuthentication => {
-                ModelFailureKind::AuthenticationFailed
+            Self::CodexNotLoggedIn | Self::MiniMaxNotLoggedIn => {
+                ModelFailureKind::AuthenticationRequired
             }
+            Self::Authentication
+            | Self::AuthenticationAt { .. }
+            | Self::CodexAuthentication
+            | Self::MiniMaxAuthentication => ModelFailureKind::AuthenticationFailed,
             Self::InsufficientBalance
             | Self::QuotaExhausted { .. }
             | Self::Http { status: 402 }
@@ -627,7 +673,9 @@ impl ModelError {
             Self::Configuration(_) | Self::UnsupportedProtocol(_) => {
                 ModelRequestStage::Configuration
             }
-            Self::CodexNotLoggedIn => ModelRequestStage::Credentials,
+            Self::CodexNotLoggedIn | Self::MiniMaxNotLoggedIn | Self::MiniMaxAuthentication => {
+                ModelRequestStage::Credentials
+            }
             Self::Authentication | Self::CodexAuthentication | Self::Connection => {
                 ModelRequestStage::Unknown
             }
@@ -770,9 +818,12 @@ pub fn validate_model_config(config: &ModelConfig) -> Result<(), ModelError> {
         ));
     }
     match (config.provider, config.auth_source) {
-        (ModelProvider::Api, ModelAuthSource::ApiKeyEnv) => {
-            HttpModelClient::deferred(config.clone()).map(|_| ())
-        }
+        (
+            ModelProvider::Api,
+            ModelAuthSource::ApiKeyEnv
+            | ModelAuthSource::MiniMaxOAuthCn
+            | ModelAuthSource::MiniMaxOAuthGlobal,
+        ) => HttpModelClient::deferred(config.clone()).map(|_| ()),
         (ModelProvider::OpenAiCodex, ModelAuthSource::CodexSubscription) => {
             codex::validate_config(config)
         }
@@ -792,6 +843,11 @@ pub(crate) fn validate_model_for_resume_in_root(
 ) -> Result<(), ModelError> {
     validate_model_config(config)?;
     match config.provider {
+        ModelProvider::Api
+            if crate::auth::minimax::MiniMaxRegion::from_auth(config.auth_source).is_some() =>
+        {
+            Ok(())
+        }
         ModelProvider::Api => api_key(config, state_root).map(|_| ()),
         ModelProvider::OpenAiCodex => Ok(()),
     }
@@ -803,9 +859,18 @@ pub fn model_client(
 ) -> Result<Arc<dyn ModelClient>, ModelError> {
     validate_model_config(&config)?;
     match config.provider {
-        ModelProvider::Api => Ok(Arc::new(HttpModelClient::deferred_with_root(
-            config, state_dir,
-        )?)),
+        ModelProvider::Api => {
+            if crate::auth::minimax::MiniMaxRegion::from_auth(config.auth_source).is_some()
+                && state_dir.is_none()
+            {
+                return Err(ModelError::Configuration(
+                    "MiniMax OAuth requires an Agent state directory".into(),
+                ));
+            }
+            Ok(Arc::new(HttpModelClient::deferred_with_root(
+                config, state_dir,
+            )?))
+        }
         ModelProvider::OpenAiCodex => {
             let state_dir = state_dir.ok_or_else(|| {
                 ModelError::Configuration(
@@ -881,22 +946,35 @@ impl HttpModelClient {
         let provenance = api_private_provenance()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        for content in request.messages.iter().flat_map(|message| &message.content) {
-            if matches!(
-                content,
-                Content::Thinking { .. } | Content::ProtocolData { .. }
-            ) && chat_id
-                .and_then(|chat_id| {
-                    provenance
-                        .get(&(chat_id, scope, Self::private_block_fingerprint(content)))
-                        .copied()
-                })
-                .flatten()
-                != Some(fingerprint)
-            {
-                return Err(ModelError::Configuration(
+        for (index, message) in request.messages.iter().enumerate() {
+            let persisted = request.history_sources.get(index).and_then(Option::as_ref);
+            let trusted = persisted.is_some_and(|source| {
+                source.credential_identity.as_deref()
+                    == Some(credential_fingerprint(key.as_bytes()).as_str())
+                    && {
+                        let mut expected = source.clone();
+                        expected.credential_identity = None;
+                        Some(expected) == self.config.private_history_source()
+                    }
+            });
+            for content in &message.content {
+                if matches!(
+                    content,
+                    Content::Thinking { .. } | Content::ProtocolData { .. }
+                ) && !trusted
+                    && chat_id
+                        .and_then(|chat_id| {
+                            provenance
+                                .get(&(chat_id, scope, Self::private_block_fingerprint(content)))
+                                .copied()
+                        })
+                        .flatten()
+                        != Some(fingerprint)
+                {
+                    return Err(ModelError::Configuration(
                     "the API credential source cannot prove private model history is compatible; restart from public history or compact with the original credential".into(),
                 ));
+                }
             }
         }
         Ok(())
@@ -944,7 +1022,21 @@ impl HttpModelClient {
         state_root: Option<&Path>,
     ) -> Result<Self, ModelError> {
         let config = cards::model_for_persistent_selection(config);
-        if config.provider != ModelProvider::Api || config.auth_source != ModelAuthSource::ApiKeyEnv
+        if let Some(region) = crate::auth::minimax::MiniMaxRegion::from_auth(config.auth_source) {
+            let endpoint = reqwest::Url::parse(&config.base_url)
+                .map_err(|_| ModelError::Configuration("invalid MiniMax endpoint".into()))?;
+            let testing =
+                cfg!(debug_assertions) && endpoint.scheme() == "http" && is_loopback(&endpoint);
+            if config.adapter() != cards::Adapter::MinimaxMessages
+                || !config.api_key_env.is_empty()
+                || !testing && region.validate_resource(&config.base_url).is_err()
+            {
+                return Err(ModelError::Configuration("MiniMax OAuth requires its regional Messages endpoint and no API key environment variable".into()));
+            }
+        }
+
+        if config.provider != ModelProvider::Api
+            || config.auth_source == ModelAuthSource::CodexSubscription
         {
             return Err(ModelError::Configuration(
                 "use the model factory for a Codex subscription model".into(),
@@ -970,7 +1062,10 @@ impl HttpModelClient {
                 "model name, profile name and a positive output token limit are required".into(),
             ));
         }
-        if config.api_key_env.is_empty() && !is_loopback {
+        if config.auth_source == ModelAuthSource::ApiKeyEnv
+            && config.api_key_env.is_empty()
+            && !is_loopback
+        {
             return Err(ModelError::Configuration(
                 "an API key environment variable is required for remote services".into(),
             ));
@@ -998,6 +1093,7 @@ impl HttpModelClient {
         request: ModelRequest,
         events: UnboundedSender<ModelDelta>,
         cancel: CancellationToken,
+        context: Option<&ModelRequestContext>,
     ) -> Result<ModelOutput, ModelError> {
         let mut request = without_unsupported_images(&self.config, request);
         image_limits::limit_images_per_request(&mut request.messages);
@@ -1010,11 +1106,17 @@ impl HttpModelClient {
                 events.clone(),
                 cancel.clone(),
                 image_free_request.is_some().then_some(&mut rejected_images),
+                context,
             )
             .await;
         match image_free_request {
             Some(image_free_request) if rejected_images => {
-                self.complete_once(chat_id, image_free_request, events, cancel, None)
+                if !context.is_none_or(ModelRequestContext::try_begin_attempt) {
+                    return Err(ModelError::RequestBudgetExhausted {
+                        stage: ModelRequestStage::RequestSend,
+                    });
+                }
+                self.complete_once(chat_id, image_free_request, events, cancel, None, context)
                     .await
             }
             _ => result,
@@ -1029,12 +1131,69 @@ impl HttpModelClient {
         events: UnboundedSender<ModelDelta>,
         cancel: CancellationToken,
         rejected_images: Option<&mut bool>,
+        context: Option<&ModelRequestContext>,
     ) -> Result<ModelOutput, ModelError> {
-        let key = api_key(&self.config, self.state_root.as_deref())?;
-        self.ensure_credential_history_compatible(chat_id, &request, key.as_ref())?;
-        let structured_tool = deepseek_messages_structured_tool(&self.config, &request);
+        let region = crate::auth::minimax::MiniMaxRegion::from_auth(self.config.auth_source);
+        let (key, credential_identity) = if let Some(region) = region {
+            let root = self.state_root.as_deref().ok_or_else(|| {
+                ModelError::Configuration("MiniMax OAuth requires an Agent state directory".into())
+            })?;
+            let credentials = crate::auth::minimax::MiniMaxAuth::new(root, region)
+                .resolve_credentials_with_refresh_gate(&cancel, || {
+                    context.is_none_or(ModelRequestContext::try_begin_attempt)
+                })
+                .await
+                .map_err(|error| match error {
+                    crate::auth::minimax::MiniMaxAuthError::Cancelled => ModelError::Cancelled,
+                    crate::auth::minimax::MiniMaxAuthError::NotLoggedIn => {
+                        ModelError::MiniMaxNotLoggedIn
+                    }
+                    crate::auth::minimax::MiniMaxAuthError::RefreshFailed => {
+                        ModelError::MiniMaxAuthentication
+                    }
+                    crate::auth::minimax::MiniMaxAuthError::BudgetExhausted => {
+                        ModelError::RequestBudgetExhausted {
+                            stage: ModelRequestStage::Credentials,
+                        }
+                    }
+                    crate::auth::minimax::MiniMaxAuthError::Network => ModelError::ConnectionAt {
+                        stage: ModelRequestStage::Credentials,
+                    },
+                    crate::auth::minimax::MiniMaxAuthError::Http(status) => {
+                        ModelError::Http { status }.at_stage(ModelRequestStage::Credentials)
+                    }
+                    _ => ModelError::Configuration(error.to_string()),
+                })?;
+            let mut key = reqwest::header::HeaderValue::from_str(&credentials.access_token)
+                .map_err(|_| {
+                    ModelError::Configuration("invalid MiniMax credential header".into())
+                })?;
+            key.set_sensitive(true);
+            (Some(key), Some(credentials.identity.to_string()))
+        } else {
+            let key = api_key(&self.config, self.state_root.as_deref())?;
+            let identity = key
+                .as_ref()
+                .map(|key| credential_fingerprint(key.as_bytes()));
+            (key, identity)
+        };
+        let mut source = self.config.private_history_source();
+        if let Some(source) = &mut source {
+            source.credential_identity = credential_identity;
+        }
+        let mut request = request;
+        if region.is_some() && request.history_sources.len() != request.messages.len() {
+            request.history_sources = vec![None; request.messages.len()];
+        }
+        let request = history::project_request(request, &self.config, source.as_ref());
+        if region.is_none() {
+            self.ensure_credential_history_compatible(chat_id, &request, key.as_ref())?;
+        }
+        let structured_tool = messages_structured_tool(&self.config, &request);
         let (endpoint, body) = match self.config.adapter() {
-            cards::Adapter::Messages | cards::Adapter::DeepseekMessages => {
+            cards::Adapter::Messages
+            | cards::Adapter::DeepseekMessages
+            | cards::Adapter::MinimaxMessages => {
                 ("v1/messages", messages_request(&self.config, request)?)
             }
             cards::Adapter::Responses => (
@@ -1066,7 +1225,9 @@ impl HttpModelClient {
             .json(&body);
         if let Some(key) = key.as_ref() {
             outgoing = match self.config.protocol {
-                Protocol::Messages => outgoing.header("x-api-key", key.clone()),
+                Protocol::Messages if self.config.adapter() != cards::Adapter::MinimaxMessages => {
+                    outgoing.header("x-api-key", key.clone())
+                }
                 _ => {
                     let mut value = reqwest::header::HeaderValue::from_str(&format!(
                         "Bearer {}",
@@ -1175,15 +1336,16 @@ impl HttpModelClient {
             }
             .at_stage(ModelRequestStage::ResponseHeaders));
         }
-        let output = consume_sse_response(
+        let mut output = consume_sse_response(
             response,
             self.config.protocol,
             events,
             cancel,
             structured_tool.as_deref(),
-            false,
+            self.config.adapter(),
         )
         .await?;
+        output.private_source = source;
         self.record_private_output(chat_id, key.as_ref(), &output);
         Ok(output)
     }
@@ -1208,9 +1370,9 @@ impl ModelClient for HttpModelClient {
         request: ModelRequest,
         events: UnboundedSender<ModelDelta>,
         cancel: CancellationToken,
-        _context: ModelRequestContext,
+        context: ModelRequestContext,
     ) -> Result<ModelOutput, ModelError> {
-        self.complete_inner(Some(chat_id), request, events, cancel)
+        self.complete_inner(Some(chat_id), request, events, cancel, Some(&context))
             .await
     }
 
@@ -1221,7 +1383,7 @@ impl ModelClient for HttpModelClient {
         events: UnboundedSender<ModelDelta>,
         cancel: CancellationToken,
     ) -> Result<ModelOutput, ModelError> {
-        self.complete_inner(Some(chat_id), request, events, cancel)
+        self.complete_inner(Some(chat_id), request, events, cancel, None)
             .await
     }
 
@@ -1231,7 +1393,8 @@ impl ModelClient for HttpModelClient {
         events: UnboundedSender<ModelDelta>,
         cancel: CancellationToken,
     ) -> Result<ModelOutput, ModelError> {
-        self.complete_inner(None, request, events, cancel).await
+        self.complete_inner(None, request, events, cancel, None)
+            .await
     }
 }
 
@@ -1241,8 +1404,9 @@ async fn consume_sse_response(
     events: UnboundedSender<ModelDelta>,
     cancel: CancellationToken,
     structured_tool: Option<&str>,
-    codex: bool,
+    adapter: cards::Adapter,
 ) -> Result<ModelOutput, ModelError> {
+    let codex = adapter == cards::Adapter::CodexResponses;
     let has_event_stream_content_type = response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
@@ -1267,7 +1431,10 @@ async fn consume_sse_response(
     let mut output_started = false;
     let mut stream = match protocol {
         Protocol::SystemOne => return Err(ModelError::UnsupportedProtocol(protocol)),
-        Protocol::Messages => ProtocolStream::Messages(MessagesStream::default()),
+        Protocol::Messages => ProtocolStream::Messages(MessagesStream {
+            provisional_input_usage: adapter == cards::Adapter::MinimaxMessages,
+            ..MessagesStream::default()
+        }),
         Protocol::Responses => ProtocolStream::Responses(if codex {
             responses::ResponsesStream::for_codex()
         } else {
@@ -1587,7 +1754,20 @@ fn messages_request(config: &ModelConfig, request: ModelRequest) -> Result<Value
         }
     }
     let mut body = json!({"model":config.model,"max_tokens":config.max_output_tokens,"stream":true,"messages":messages});
-    if config.adapter() == cards::Adapter::DeepseekMessages {
+    if config.adapter() == cards::Adapter::MinimaxMessages {
+        match request.reasoning_effort {
+            Some(ReasoningEffort::Off) => body["thinking"] = json!({"type":"disabled"}),
+            Some(ReasoningEffort::On) => body["thinking"] = json!({"type":"adaptive"}),
+            Some(effort) => {
+                body["thinking"] = json!({"type":"adaptive"});
+                body["output_config"] = json!({"effort":effort.label()});
+            }
+            None if cards::model_card(config).is_some_and(|card| card.adaptive_by_default) => {
+                body["thinking"] = json!({"type":"adaptive"})
+            }
+            None => {}
+        }
+    } else if config.adapter() == cards::Adapter::DeepseekMessages {
         match request.reasoning_effort {
             Some(ReasoningEffort::Off) => body["thinking"] = json!({"type":"disabled"}),
             Some(effort) => {
@@ -1614,7 +1794,19 @@ fn messages_request(config: &ModelConfig, request: ModelRequest) -> Result<Value
         body["system"] = json!(system);
     }
     if let Some(format) = request.structured_output {
-        if config.adapter() == cards::Adapter::DeepseekMessages {
+        if config.adapter() == cards::Adapter::MinimaxMessages {
+            if !request.tools.is_empty() {
+                return Err(ModelError::Configuration(
+                    "MiniMax structured output cannot be combined with executable tools".into(),
+                ));
+            }
+            body["tools"] = json!([{"name":format.name,"description":"Return exactly one structured response using this tool and no other content.","input_schema":format.schema}]);
+            body["tool_choice"] = json!({"type":"auto"});
+            if body["system"].is_null() {
+                body["system"] = json!([]);
+            }
+            body["system"].as_array_mut().expect("Messages system content is an array").push(json!({"type":"text","text":format!("Call the {} tool exactly once to return the structured response. Emit no ordinary text or other tool calls.", format.name)}));
+        } else if config.adapter() == cards::Adapter::DeepseekMessages {
             if !request.tools.is_empty() {
                 return Err(ModelError::Configuration(
                     "DeepSeek Messages cannot combine structured output with tools".into(),
@@ -1654,18 +1846,18 @@ fn messages_request(config: &ModelConfig, request: ModelRequest) -> Result<Value
     Ok(body)
 }
 
-fn deepseek_messages_structured_tool(
-    config: &ModelConfig,
-    request: &ModelRequest,
-) -> Option<String> {
-    (config.adapter() == cards::Adapter::DeepseekMessages)
-        .then(|| {
-            request
-                .structured_output
-                .as_ref()
-                .map(|format| format.name.clone())
-        })
-        .flatten()
+fn messages_structured_tool(config: &ModelConfig, request: &ModelRequest) -> Option<String> {
+    matches!(
+        config.adapter(),
+        cards::Adapter::DeepseekMessages | cards::Adapter::MinimaxMessages
+    )
+    .then(|| {
+        request
+            .structured_output
+            .as_ref()
+            .map(|format| format.name.clone())
+    })
+    .flatten()
 }
 
 fn normalize_structured_tool_output(
@@ -1751,6 +1943,7 @@ impl ProtocolStream {
 
 #[derive(Default)]
 struct MessagesStream {
+    provisional_input_usage: bool,
     started: bool,
     content: Vec<Content>,
     current: Option<PendingBlock>,
@@ -1776,12 +1969,19 @@ impl MessagesStream {
                     return Err(invalid_response("duplicate message start"));
                 }
                 self.started = true;
-                observe_usage(
+                let observed = observe_usage(
                     &mut self.usage,
                     &data["message"]["usage"],
                     Protocol::Messages,
-                    events,
-                )?;
+                    (!self.provisional_input_usage).then_some(events),
+                );
+                if self.provisional_input_usage && self.usage.output_tokens.is_some() {
+                    let _ = events.send(ModelDelta::Usage(Usage {
+                        output_tokens: self.usage.output_tokens,
+                        ..Usage::default()
+                    }));
+                }
+                observed?;
             }
             "content_block_start" => {
                 self.check_index(&data)?;
@@ -1884,7 +2084,41 @@ impl MessagesStream {
                         "message delta arrived before message start",
                     ));
                 }
-                observe_usage(&mut self.usage, &data["usage"], Protocol::Messages, events)?;
+                let mut final_usage = data["usage"].clone();
+                if self.provisional_input_usage {
+                    // MiniMax may reclassify provisional cached input as uncached at stream end.
+                    // Publish input counters only after this correction, keeping output monotonic.
+                    if final_usage.is_null() {
+                        final_usage = json!({});
+                    }
+                    for (name, provisional) in [
+                        ("input_tokens", &mut self.usage.input_tokens),
+                        (
+                            "cache_read_input_tokens",
+                            &mut self.usage.cache_read_input_tokens,
+                        ),
+                        (
+                            "cache_creation_input_tokens",
+                            &mut self.usage.cache_write_input_tokens,
+                        ),
+                    ] {
+                        if final_usage.is_object()
+                            && (final_usage.get(name).is_none()
+                                || name != "input_tokens" && final_usage[name].is_null())
+                            && let Some(value) = provisional.take()
+                        {
+                            final_usage[name] = json!(value);
+                        }
+                        *provisional = None;
+                    }
+                    self.provisional_input_usage = false;
+                }
+                observe_usage(
+                    &mut self.usage,
+                    &final_usage,
+                    Protocol::Messages,
+                    Some(events),
+                )?;
                 if self.current.is_some() {
                     return Err(invalid_response(
                         "message delta arrived before content completed",
@@ -1961,6 +2195,7 @@ impl MessagesStream {
             ));
         }
         Ok(ModelOutput {
+            private_source: None,
             content: self.content,
             usage: self.usage,
             stop_reason,
@@ -1987,7 +2222,7 @@ fn observe_usage(
     usage: &mut Usage,
     value: &Value,
     protocol: Protocol,
-    events: &UnboundedSender<ModelDelta>,
+    events: Option<&UnboundedSender<ModelDelta>>,
 ) -> Result<(), ModelError> {
     if value.is_null() {
         return Ok(());
@@ -2071,7 +2306,7 @@ fn observe_usage(
             has_observation = true;
         }
     }
-    if has_observation {
+    if has_observation && let Some(events) = events {
         // Report validated fields before a protocol failure so the host can retain them.
         let _ = events.send(ModelDelta::Usage(usage.clone()));
     }
@@ -2142,6 +2377,7 @@ mod tests {
 
     fn structured_request() -> ModelRequest {
         ModelRequest {
+            history_sources: Vec::new(),
             messages: vec![Message {
                 role: Role::User,
                 content: vec![Content::Text {
@@ -2254,6 +2490,7 @@ mod tests {
         let chat_a = uuid::Uuid::new_v4();
         let chat_b = uuid::Uuid::new_v4();
         let output = ModelOutput {
+            private_source: None,
             content: vec![private_content],
             usage: Usage::default(),
             stop_reason: "end_turn".into(),
@@ -2527,6 +2764,7 @@ mod tests {
     fn deepseek_messages_normalizes_the_forced_output_tool_to_json_text() {
         let output = normalize_structured_tool_output(
             ModelOutput {
+                private_source: None,
                 content: vec![Content::ToolUse {
                     id: "tool-1".into(),
                     name: "verdict".into(),
@@ -2594,6 +2832,7 @@ mod tests {
                 Duration::from_secs(3),
                 client.complete(
                     ModelRequest {
+                        history_sources: Vec::new(),
                         messages: vec![],
                         tools: vec![],
                         structured_output: None,
@@ -2634,6 +2873,7 @@ mod tests {
         let error = client
             .complete(
                 ModelRequest {
+                    history_sources: Vec::new(),
                     messages: vec![],
                     tools: vec![],
                     structured_output: None,

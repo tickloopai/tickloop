@@ -106,6 +106,7 @@ impl ModelClient for ChatModel {
             }
         };
         Ok(ModelOutput {
+            private_source: None,
             content,
             usage: Usage::default(),
             stop_reason: "end_turn".into(),

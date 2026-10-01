@@ -11,6 +11,69 @@ pub(super) struct ProviderModels {
     pub(super) adapter: Adapter,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn minimax_connections_collapse_without_merging_provider_identities() {
+        let choices =
+            ProviderModels::group(tickloop_agent::model::cards::built_in_model_profiles());
+        let rows = provider_rows(&choices, None);
+        assert_eq!(
+            rows.iter()
+                .filter(|row| matches!(row, ProviderRow::Group("MiniMax")))
+                .count(),
+            1
+        );
+        assert!(rows.iter().all(|row| match row {
+            ProviderRow::Provider(index) => provider_group(&choices[*index]).is_none(),
+            ProviderRow::Group(_) => true,
+        }));
+        let connections = provider_rows(&choices, Some("MiniMax"));
+        assert_eq!(connections.len(), 4);
+        let ids = connections
+            .iter()
+            .map(|row| match row {
+                ProviderRow::Provider(index) => choices[*index].models[0].provider_id.clone(),
+                ProviderRow::Group(_) => panic!("connections must reference actual Providers"),
+            })
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(ids.len(), 4);
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum ProviderRow {
+    Provider(usize),
+    Group(&'static str),
+}
+
+fn provider_group(provider: &ProviderModels) -> Option<&'static str> {
+    crate::model::cards::is_minimax_provider(&provider.models[0].provider_id).then_some("MiniMax")
+}
+
+pub(super) fn provider_rows(choices: &[ProviderModels], group: Option<&str>) -> Vec<ProviderRow> {
+    let mut rows = Vec::new();
+    for (index, provider) in choices.iter().enumerate() {
+        if let Some(group) = group {
+            if provider_group(provider) == Some(group) {
+                rows.push(ProviderRow::Provider(index));
+            }
+        } else if let Some(group) = provider_group(provider) {
+            if !rows
+                .iter()
+                .any(|row| matches!(row, ProviderRow::Group(name) if *name == group))
+            {
+                rows.push(ProviderRow::Group(group));
+            }
+        } else {
+            rows.push(ProviderRow::Provider(index));
+        }
+    }
+    rows
+}
+
 impl ProviderModels {
     pub(super) fn group(models: Vec<ModelConfig>) -> Vec<Self> {
         let mut choices: Vec<Self> = Vec::new();
@@ -55,6 +118,7 @@ fn adapter_label(adapter: Adapter) -> &'static str {
         Adapter::SystemOne => "System One",
         Adapter::Messages => "Messages",
         Adapter::DeepseekMessages => "DeepSeek Messages",
+        Adapter::MinimaxMessages => "MiniMax Messages",
         Adapter::Responses => "Responses",
         Adapter::CodexResponses => "Codex Responses",
         Adapter::ChatCompletions => "Chat Completions",
@@ -68,12 +132,15 @@ pub(super) struct ModelChoice {
     pub(super) thinking: Option<ReasoningEffort>,
 }
 
-fn thinking_choices(model: &ModelConfig) -> Vec<Option<ReasoningEffort>> {
+pub(super) fn thinking_choices(model: &ModelConfig) -> Vec<Option<ReasoningEffort>> {
     let mut choices = vec![None];
     if tickloop_agent::model::cards::model_card(model)
         .is_some_and(|card| card.thinking == tickloop_agent::model::cards::ThinkingControl::Toggle)
     {
         choices.push(Some(ReasoningEffort::Off));
+        if model.adapter() == Adapter::MinimaxMessages {
+            choices.push(Some(ReasoningEffort::On));
+        }
     }
     choices.extend(ReasoningEffort::choices(model).iter().copied().map(Some));
     choices
@@ -88,33 +155,42 @@ impl Menus {
         selected: usize,
         id: Uuid,
     ) -> Result<(), String> {
-        let mut options: Vec<String> = choices
+        let group = self.provider_group.map(|(name, _)| name);
+        let rows = provider_rows(&choices, group);
+        let mut options: Vec<String> = rows
             .iter()
-            .map(|provider| {
-                safe_text(&format!(
-                    "{} · {} · {}",
-                    provider.name(),
-                    adapter_label(provider.adapter),
-                    self.provider_auth_label(provider)
-                ))
+            .map(|row| match row {
+                ProviderRow::Group(name) => format!("{name} ›"),
+                ProviderRow::Provider(index) => {
+                    let provider = &choices[*index];
+                    safe_text(&format!(
+                        "{} · {} · {}",
+                        provider.name(),
+                        adapter_label(provider.adapter),
+                        self.provider_auth_label(provider)
+                    ))
+                }
             })
             .collect();
-        options.push("Judgment settings · Jev (TypeSafe)".into());
-        options.push("Sign out · Codex subscription".into());
+        if group.is_none() {
+            options.push("Judgment settings · Jev (TypeSafe)".into());
+            options.push("Sign out · Codex subscription".into());
+        }
         self.show(
             console,
             Menu {
                 id,
-                title: "Choose Provider".into(),
-                context: vec![
-                    "Choose the model used by this Chat. Judgment settings configures a separate model."
-                        .into(),
-                ],
+                title: group.map_or_else(|| "Choose Provider".into(), |name| format!("Choose connection · {name}")),
+                context: vec![if group.is_some() {
+                    "Choose the region and authentication method. Esc returns to Providers.".into()
+                } else {
+                    "Choose the model used by this Chat. Judgment settings configures a separate model.".into()
+                }],
                 options,
                 selected,
                 confirmation: false,
             },
-            Selection::Provider { chat, choices },
+            Selection::Provider { chat, choices, rows },
         )
     }
 
@@ -127,14 +203,15 @@ impl Menus {
             console,
             chat,
             self.provider_choices.clone(),
-            self.provider_selected,
+            self.provider_group
+                .map_or(self.provider_selected, |(_, selected)| selected),
             Uuid::new_v4(),
         )
     }
 
     fn provider_auth_label(&self, provider: &ProviderModels) -> &'static str {
         let config = &provider.models[0];
-        if config.auth_source == ModelAuthSource::CodexSubscription {
+        if config.auth_source != ModelAuthSource::ApiKeyEnv {
             return match self.provider_authenticated(provider) {
                 Ok(true) => "Signed in",
                 Ok(false) => "Sign in required",
@@ -162,6 +239,17 @@ impl Menus {
 
     pub(super) fn provider_authenticated(&self, provider: &ProviderModels) -> Result<bool, String> {
         let config = &provider.models[0];
+        if let Some(region) = crate::auth::minimax::MiniMaxRegion::from_auth(config.auth_source) {
+            return self
+                .config_root
+                .as_deref()
+                .map(|root| {
+                    crate::auth::minimax::MiniMaxAuth::new(root, region)
+                        .has_saved_login()
+                        .map_err(|error| error.to_string())
+                })
+                .unwrap_or(Ok(false));
+        }
         if config.auth_source == ModelAuthSource::CodexSubscription {
             let Some(root) = self.config_root.as_deref() else {
                 return Ok(false);
@@ -237,7 +325,25 @@ impl Menus {
                 let thinking = if thinking_choices(&choice.config).len() == 1 {
                     "unavailable"
                 } else {
-                    choice.thinking.map_or("auto", ReasoningEffort::label)
+                    choice.thinking.map_or_else(
+                        || {
+                            if choice.config.adapter() == Adapter::MinimaxMessages {
+                                if choice
+                                    .config
+                                    .card
+                                    .as_ref()
+                                    .is_some_and(|card| card.adaptive_by_default)
+                                {
+                                    "max (default)"
+                                } else {
+                                    "off (default)"
+                                }
+                            } else {
+                                "auto"
+                            }
+                        },
+                        ReasoningEffort::label,
+                    )
                 };
                 safe_text(&format!(
                     "{}    Thinking ‹ {thinking} ›",
@@ -245,15 +351,21 @@ impl Menus {
                 ))
             })
             .collect();
+        let mut context = vec![
+            format!("Adapter: {}", adapter_label(provider.adapter)),
+            "Enter saves the model and Thinking. Esc discards changes.".into(),
+        ];
+        if provider.models[0].adapter() == Adapter::MinimaxMessages
+            && provider.models[0].auth_source != ModelAuthSource::ApiKeyEnv
+        {
+            context.push("Flash Preview requires eligible M Plan access; availability is checked by MiniMax.".into());
+        }
         self.show(
             console,
             Menu {
                 id,
                 title: safe_text(&format!("Choose model · {}", provider.name())),
-                context: vec![
-                    format!("Adapter: {}", adapter_label(provider.adapter)),
-                    "Enter saves the model and Thinking. Esc discards changes.".into(),
-                ],
+                context,
                 options,
                 selected,
                 confirmation: false,
@@ -278,15 +390,31 @@ impl Menus {
         }
         let (_, selection) = self.active.take().unwrap();
         match selection {
-            Selection::Provider { chat, mut choices } => {
-                self.provider_selected = index;
-                if index >= choices.len() {
+            Selection::Provider {
+                chat,
+                mut choices,
+                rows,
+            } => {
+                if let Some((_, selected)) = &mut self.provider_group {
+                    *selected = index;
+                } else {
+                    self.provider_selected = index;
+                }
+                if index >= rows.len() {
                     self.show_providers(console, chat, choices, index, menu_id)?;
                     return Ok(MenuOutcome::default());
                 }
-                let Some(provider) = choices.get_mut(index) else {
-                    return Err("provider option does not exist".into());
+                let provider_index = match rows[index] {
+                    ProviderRow::Group(name) => {
+                        self.provider_group = Some((name, 0));
+                        self.show_providers(console, chat, choices, 0, menu_id)?;
+                        return Ok(MenuOutcome::default());
+                    }
+                    ProviderRow::Provider(provider_index) => provider_index,
                 };
+                let provider = choices
+                    .get_mut(provider_index)
+                    .ok_or("provider option does not exist")?;
                 match action {
                     PickerAction::CycleAdapter => {
                         let adapters = provider.adapters();
@@ -303,6 +431,30 @@ impl Menus {
                         self.provider_choices = choices.clone();
                         // Keep the selection recoverable if clearing a credential fails.
                         self.show_providers(console, chat, choices, index, menu_id)?;
+                        if let Some(region) = crate::auth::minimax::MiniMaxRegion::from_auth(
+                            provider.models[0].auth_source,
+                        ) {
+                            if matches!(
+                                action,
+                                PickerAction::Reauthenticate | PickerAction::SignOut
+                            ) {
+                                self.dismiss(console)?;
+                                self.login_return = Some((chat, provider));
+                                return Ok(MenuOutcome {
+                                    provider_logout: true,
+                                    logout_region: Some(region),
+                                    reauthenticate_after_logout: action
+                                        == PickerAction::Reauthenticate,
+                                    ..Default::default()
+                                });
+                            }
+                            return self.begin_provider_login(
+                                console,
+                                chat,
+                                provider,
+                                super::super::login::LoginMethod::MiniMax(region),
+                            );
+                        }
                         if provider.models[0].auth_source == ModelAuthSource::CodexSubscription {
                             if matches!(
                                 action,
@@ -326,7 +478,7 @@ impl Menus {
                         }
                         if action == PickerAction::SignOut {
                             return Ok(MenuOutcome {
-                                status: Some("Sign out applies to Codex subscription login. API keys are managed with Reauthenticate or in the Agent environment.".into()),
+                                status: Some("Sign out applies to OAuth login. API keys are managed with Reauthenticate or in the Agent environment.".into()),
                                 ..Default::default()
                             });
                         }
@@ -382,6 +534,16 @@ impl Menus {
         chat: Uuid,
         provider: ProviderModels,
     ) -> Result<MenuOutcome, String> {
+        if let Some(region) =
+            crate::auth::minimax::MiniMaxRegion::from_auth(provider.models[0].auth_source)
+        {
+            return self.begin_provider_login(
+                console,
+                chat,
+                provider,
+                super::super::login::LoginMethod::MiniMax(region),
+            );
+        }
         if provider.models[0].auth_source == ModelAuthSource::CodexSubscription {
             return self.begin_provider_login(
                 console,

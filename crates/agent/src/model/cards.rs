@@ -25,6 +25,7 @@ pub enum ThinkingControl {
 pub enum Adapter {
     Messages,
     DeepseekMessages,
+    MinimaxMessages,
     Responses,
     ChatCompletions,
     DeepseekChatCompletions,
@@ -36,7 +37,7 @@ impl Adapter {
     pub const fn protocol(self) -> Protocol {
         match self {
             Self::SystemOne => Protocol::SystemOne,
-            Self::Messages | Self::DeepseekMessages => Protocol::Messages,
+            Self::Messages | Self::DeepseekMessages | Self::MinimaxMessages => Protocol::Messages,
             Self::Responses | Self::CodexResponses => Protocol::Responses,
             Self::ChatCompletions | Self::DeepseekChatCompletions => Protocol::ChatCompletions,
         }
@@ -299,6 +300,10 @@ impl ModelCatalog {
             include_str!("providers/deepseek-api.yaml"),
             include_str!("providers/anthropic-api.yaml"),
             include_str!("providers/openai-codex.yaml"),
+            include_str!("providers/minimax-cn-api.yaml"),
+            include_str!("providers/minimax-global-api.yaml"),
+            include_str!("providers/minimax-cn-oauth.yaml"),
+            include_str!("providers/minimax-global-oauth.yaml"),
         ]
         .into_iter()
         .map(|yaml| serde_yaml_ng::from_str(yaml).expect("bundled Provider YAML is valid"))
@@ -335,6 +340,23 @@ impl ModelCatalog {
                 return Err(format!(
                     "{location}.auth: openai-codex requires Codex subscription"
                 ));
+            }
+            if let Some(region) = crate::auth::minimax::MiniMaxRegion::from_auth(provider.auth) {
+                let expected = match region {
+                    crate::auth::minimax::MiniMaxRegion::China => "minimax-cn-oauth",
+                    crate::auth::minimax::MiniMaxRegion::Global => "minimax-global-oauth",
+                };
+                if provider.id != expected
+                    || !provider.api_key_env.is_empty()
+                    || provider
+                        .models
+                        .iter()
+                        .any(|model| model.adapter != Adapter::MinimaxMessages)
+                {
+                    return Err(format!(
+                        "{location}: MiniMax OAuth requires its regional Provider and MiniMax Messages adapter"
+                    ));
+                }
             }
             if provider.models.is_empty() {
                 return Err(format!("{location}.models: at least one model is required"));
@@ -396,12 +418,18 @@ impl ModelCatalog {
                         "{location}: unsupported thinking cannot declare effort or adaptive defaults"
                     ));
                 }
-                if model.adaptive_by_default && model.adapter != Adapter::Messages {
+                if model.adaptive_by_default
+                    && !matches!(model.adapter, Adapter::Messages | Adapter::MinimaxMessages)
+                {
                     return Err(format!(
                         "{location}.adaptive_by_default: only Messages supports adaptive thinking"
                     ));
                 }
-                if model.effort_levels.contains(&ReasoningEffort::Off) {
+                if model
+                    .effort_levels
+                    .iter()
+                    .any(|effort| matches!(effort, ReasoningEffort::Off | ReasoningEffort::On))
+                {
                     return Err(format!(
                         "{location}.effort_levels: off is a thinking preference, not an effort level"
                     ));
@@ -693,6 +721,13 @@ pub fn built_in_model_profiles() -> Vec<ModelConfig> {
         .clone()
 }
 
+pub(crate) fn is_minimax_provider(provider_id: &str) -> bool {
+    matches!(
+        provider_id,
+        "minimax-cn-api" | "minimax-global-api" | "minimax-cn-oauth" | "minimax-global-oauth"
+    )
+}
+
 pub fn is_default_visible(profile: &ModelConfig) -> bool {
     const VISIBLE: &[(&str, &str)] = &[
         ("deepseek-api", "deepseek-flash-messages"),
@@ -707,6 +742,11 @@ pub fn is_default_visible(profile: &ModelConfig) -> bool {
         ("openai-codex", "gpt-5.6-luna-responses"),
     ];
     VISIBLE.contains(&(profile.provider_id.as_str(), profile.model_id.as_str()))
+        || is_minimax_provider(&profile.provider_id)
+            && matches!(
+                profile.model_id.as_str(),
+                "minimax-m3-messages" | "minimax-m3-1-flash-preview-messages"
+            )
 }
 
 fn legacy_builtin_name(profile: &ModelConfig) -> Option<String> {

@@ -227,6 +227,7 @@ fn client(state_dir: &Path, endpoint: &str) -> CodexModelClient {
 
 fn request() -> ModelRequest {
     ModelRequest {
+        history_sources: Vec::new(),
         messages: vec![crate::model::Message {
             role: Role::User,
             content: vec![Content::Text {

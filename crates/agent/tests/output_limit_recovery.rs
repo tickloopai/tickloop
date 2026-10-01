@@ -73,6 +73,7 @@ impl ModelClient for OutputLimitModel {
             Reply::CompleteWithThinking(text) => {
                 events.send(ModelDelta::Text(text.into())).unwrap();
                 Ok(ModelOutput {
+                    private_source: None,
                     content: vec![
                         Content::Thinking {
                             thinking: "private reasoning".into(),

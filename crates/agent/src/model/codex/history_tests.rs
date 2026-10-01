@@ -158,7 +158,7 @@ async fn triggered_request_after_logout(interval_seconds: Option<u64>) {
 }
 
 #[tokio::test]
-async fn compaction_allows_source_switch_but_old_private_checkpoint_stays_guarded() {
+async fn source_switch_and_rewind_preserve_original_private_checkpoint() {
     let (_directory, state) = state_with_credentials();
     let (endpoint, observed) = serve_scripted_responses(vec![
         (200, text_stream()),
@@ -194,31 +194,29 @@ async fn compaction_allows_source_switch_but_old_private_checkpoint_stays_guarde
         .unwrap();
     api.api_key_env = "CODEX_HISTORY_TEST_MISSING_API_KEY".into();
     let api_client = Arc::new(HttpModelClient::deferred(api.clone()).unwrap());
-    assert!(
-        agent
-            .set_model(chat, api.clone(), api_client.clone())
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("compact")
-    );
-    let compacted = agent.compact(chat).await.unwrap();
-    assert!(compacted.summary.contains("preserve source files"));
-    agent.set_model(chat, api, api_client).await.unwrap();
-    assert!(
-        agent
-            .rewind(chat, checkpoint.message_id, RewindMode::Conversation)
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("private")
-    );
+    agent
+        .set_model(chat, api.clone(), api_client.clone())
+        .await
+        .unwrap();
     agent
         .set_model(chat, config(), client(&state, &endpoint))
         .await
         .unwrap();
+    let compacted = agent.compact(chat).await.unwrap();
+    assert!(compacted.summary.contains("preserve source files"));
+    agent.set_model(chat, api, api_client).await.unwrap();
     agent
         .rewind(chat, checkpoint.message_id, RewindMode::Conversation)
+        .await
+        .unwrap();
+    let rewound = agent.snapshot(chat).await.unwrap();
+    assert_eq!(
+        rewound.messages,
+        before.messages[..checkpoint.message_index]
+    );
+    assert!(!rewound.message_sources.is_empty());
+    agent
+        .set_model(chat, config(), client(&state, &endpoint))
         .await
         .unwrap();
     agent

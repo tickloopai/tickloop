@@ -92,6 +92,7 @@ impl ModelClient for EchoModel {
         self.requests.lock().unwrap().push(request);
         let _ = events.send(ModelDelta::Text(reply.clone()));
         Ok(ModelOutput {
+            private_source: None,
             content: vec![Content::Text { text: reply }],
             usage: Usage::default(),
             stop_reason: "end_turn".into(),

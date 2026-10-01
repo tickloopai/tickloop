@@ -531,3 +531,119 @@ async fn three_http_protocols_switch_only_after_the_running_shell_and_old_tool_r
         agent.shutdown().await;
     }
 }
+
+fn signed_messages_reply() -> String {
+    [
+        frame("message_start", json!({"message":{"role":"assistant","content":[]}})),
+        frame("content_block_start", json!({"index":0,"content_block":{"type":"thinking","thinking":"Readable reasoning from A","signature":"original-signed-block"}})),
+        frame("content_block_stop", json!({"index":0})),
+        frame("content_block_start", json!({"index":1,"content_block":{"type":"text","text":"Original answer from A"}})),
+        frame("content_block_stop", json!({"index":1})),
+        frame("message_delta", json!({"delta":{"stop_reason":"end_turn"}})),
+        frame("message_stop", json!({})),
+    ].concat()
+}
+
+async fn finish_turn(agent: &Agent, chat: Uuid, prompt: &str) {
+    let mut events = agent.subscribe();
+    let receipt = agent.submit(chat, None, prompt.into()).await.unwrap();
+    loop {
+        let event = support::next_event(&mut events).await;
+        match event.kind {
+            EventKind::Completed { .. } if event.run_id == receipt.run_id => return,
+            EventKind::Failed(error) => panic!("{prompt}: {error}"),
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test]
+async fn messages_responses_roundtrip_and_restart_preserve_signed_cache_prefix() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap().join("state");
+    tickloop_agent::model::credentials::save_api_key(
+        &root,
+        "SIGNED_HISTORY_TEST_KEY",
+        "test-session-key",
+    )
+    .unwrap();
+    let (a_url, a_requests) = old_endpoint(vec![
+        signed_messages_reply(),
+        response(Protocol::Messages, None, "Second A answer"),
+        response(Protocol::Messages, None, "Returned to A"),
+    ])
+    .await;
+    let (b_url, b_requests) = old_endpoint(vec![
+        response(Protocol::Responses, None, "B answer"),
+        response(Protocol::Responses, None, "B after restart"),
+    ])
+    .await;
+    let mut a = profile(a_url, Protocol::Messages, "model-a");
+    a.api_key_env = "SIGNED_HISTORY_TEST_KEY".into();
+    let mut b = profile(b_url, Protocol::Responses, "model-b");
+    b.api_key_env = "SIGNED_HISTORY_TEST_KEY".into();
+    let agent = Agent::open_embedded(
+        root.clone(),
+        a.clone(),
+        tickloop_agent::model::model_client(a.clone(), Some(&root)).unwrap(),
+    )
+    .unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    finish_turn(&agent, chat, "First prompt").await;
+    finish_turn(&agent, chat, "Second prompt").await;
+    let before = agent.snapshot(chat).await.unwrap();
+    agent
+        .set_model(
+            chat,
+            b.clone(),
+            tickloop_agent::model::model_client(b.clone(), Some(&root)).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        agent.snapshot(chat).await.unwrap().messages,
+        before.messages
+    );
+    finish_turn(&agent, chat, "Use B").await;
+    let mixed = agent.snapshot(chat).await.unwrap();
+    assert_ne!(mixed.message_sources.get(&1), mixed.message_sources.get(&5));
+    agent.shutdown().await;
+    let resumed = Agent::open_embedded(
+        root.clone(),
+        b.clone(),
+        tickloop_agent::model::model_client(b.clone(), Some(&root)).unwrap(),
+    )
+    .unwrap();
+    let restored = resumed.resume_chat(chat).await.unwrap();
+    assert_eq!(restored.message_sources, mixed.message_sources);
+    assert_eq!(restored.message_models, mixed.message_models);
+    assert!(restored.messages.iter().flat_map(|message| &message.content).any(|block| matches!(block, Content::Thinking { signature: Some(value), .. } if value == "original-signed-block")));
+    finish_turn(&resumed, chat, "Continue after restart").await;
+    resumed
+        .set_model(
+            chat,
+            a.clone(),
+            tickloop_agent::model::model_client(a, Some(&root)).unwrap(),
+        )
+        .await
+        .unwrap();
+    finish_turn(&resumed, chat, "Return to A").await;
+    let a_requests = a_requests.await.unwrap();
+    let b_requests = b_requests.await.unwrap();
+    let stable_prefix = &a_requests[1].1["messages"].as_array().unwrap()[..2];
+    assert_eq!(
+        stable_prefix,
+        &a_requests[2].1["messages"].as_array().unwrap()[..2]
+    );
+    assert_eq!(
+        stable_prefix[1]["content"][0]["signature"],
+        "original-signed-block"
+    );
+    for (_, body) in &b_requests {
+        assert!(!body.to_string().contains("original-signed-block"));
+        assert!(body.to_string().contains("Readable reasoning from A"));
+        assert!(body.to_string().contains("Original answer from A"));
+    }
+    assert_eq!(a_requests[1].1["model"], a_requests[2].1["model"]);
+    resumed.shutdown().await;
+}

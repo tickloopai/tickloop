@@ -718,7 +718,7 @@ async fn rewind_across_a_compaction_boundary_drops_the_boundary_and_restores_raw
 }
 
 #[tokio::test]
-async fn rewind_cannot_reintroduce_private_history_after_a_model_switch() {
+async fn rewind_preserves_original_private_history_after_a_model_switch() {
     let directory = tempfile::tempdir().unwrap();
     let original = Arc::new(ScriptedModel::new(vec![
         vec![
@@ -757,26 +757,17 @@ async fn rewind_cannot_reintroduce_private_history_after_a_model_switch() {
     );
     let before = agent.snapshot(chat).await.unwrap();
     let points = before.rewind_points();
-    let error = agent
+    agent
         .rewind(chat, points[1].message_id, RewindMode::Conversation)
         .await
-        .unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("private reasoning or protocol state")
-    );
+        .unwrap();
     let after = agent.snapshot(chat).await.unwrap();
     assert_eq!(after.model, model_for_persistent_selection(selected));
-    assert_eq!(after.messages, before.messages);
-    assert_eq!(after.message_compactions, before.message_compactions);
-    assert!(
-        after
-            .conversation_messages()
-            .unwrap()
-            .iter()
-            .flat_map(|message| &message.content)
-            .all(|content| !matches!(content, Content::Thinking { .. }))
+    assert!(after.message_compactions.is_empty());
+    assert!(after.messages.iter().flat_map(|message| &message.content).any(|content| matches!(content, Content::Thinking { signature: Some(signature), .. } if signature == "original-signature")));
+    assert_eq!(
+        after.message_sources.get(&1),
+        before.message_sources.get(&1)
     );
     agent.shutdown().await;
 }

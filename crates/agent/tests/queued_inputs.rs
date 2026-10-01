@@ -68,6 +68,7 @@ impl ModelClient for GatedModel {
             _ = self.release.notified() => {}
         }
         Ok(ModelOutput {
+            private_source: None,
             content: text("done"),
             usage: Default::default(),
             stop_reason: "end_turn".into(),

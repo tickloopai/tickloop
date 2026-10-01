@@ -122,6 +122,7 @@ impl ModelClient for WebModel {
         self.conversation_requests.lock().unwrap().push(request);
         Ok(match self.calls.get(completed_calls) {
             Some((name, input)) => ModelOutput {
+                private_source: None,
                 content: vec![Content::ToolUse {
                     id: format!("web-call-{completed_calls}"),
                     name: (*name).into(),
@@ -137,6 +138,7 @@ impl ModelClient for WebModel {
 
 fn text_output(text: &str) -> ModelOutput {
     ModelOutput {
+        private_source: None,
         content: vec![Content::Text { text: text.into() }],
         usage: Usage::default(),
         stop_reason: "end_turn".into(),

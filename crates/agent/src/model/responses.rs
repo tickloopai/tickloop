@@ -166,7 +166,7 @@ impl ResponsesStream {
                 &mut self.usage,
                 &data["response"]["usage"],
                 Protocol::Responses,
-                events,
+                Some(events),
             )?;
         }
         if let Some(sequence) = data["sequence_number"].as_u64() {
@@ -410,6 +410,7 @@ impl ResponsesStream {
                 }
                 .into();
                 self.output = Some(ModelOutput {
+                    private_source: None,
                     content,
                     usage: self.usage.clone(),
                     stop_reason,

@@ -64,6 +64,7 @@ impl ModelClient for ConcurrentModel {
             call("read", "Read", serde_json::json!({"file_path":"value.txt"}))
         };
         Ok(ModelOutput {
+            private_source: None,
             content,
             usage: Usage::default(),
             stop_reason: "end_turn".into(),

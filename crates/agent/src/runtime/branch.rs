@@ -285,6 +285,8 @@ impl Agent {
             inherited_prompts: HashSet::new(),
             message_compactions: BTreeMap::new(),
             message_usage: BTreeMap::new(),
+            message_sources: BTreeMap::new(),
+            message_models: BTreeMap::new(),
             loops: Vec::new(),
             loop_starts: BTreeMap::new(),
             resume_triggers: Vec::new(),
@@ -560,6 +562,14 @@ fn carry_rewind_points(
     seed: &[(Message, Option<usize>)],
 ) {
     for (child_index, (_, source_index)) in seed.iter().enumerate() {
+        if let Some(index) = source_index {
+            if let Some(model) = source.message_models.get(index) {
+                child.message_models.insert(child_index, model.clone());
+            }
+            if let Some(origin) = source.message_sources.get(index) {
+                child.message_sources.insert(child_index, origin.clone());
+            }
+        }
         let Some(point) = source_index.and_then(|index| source.rewind_point_at(index)) else {
             continue;
         };

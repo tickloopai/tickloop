@@ -68,6 +68,7 @@ async fn model_clients_recognize_context_limit_http_errors() {
         let error = client
             .complete(
                 ModelRequest {
+                    history_sources: Vec::new(),
                     messages: vec![message(Role::User, "Review this action")],
                     tools: vec![],
                     structured_output: None,
@@ -104,6 +105,7 @@ async fn unrelated_bad_requests_remain_http_errors() {
     let error = client
         .complete(
             ModelRequest {
+                history_sources: Vec::new(),
                 messages: vec![message(Role::User, "Hello")],
                 tools: vec![],
                 structured_output: None,
@@ -133,6 +135,7 @@ async fn billing_failure_is_distinct_from_a_rate_limit() {
     let error = client
         .complete(
             ModelRequest {
+                history_sources: Vec::new(),
                 messages: vec![message(Role::User, "Hello")],
                 tools: vec![],
                 structured_output: None,
@@ -160,6 +163,7 @@ async fn spend_cap_429_disables_automatic_retry() {
     let error = client
         .complete(
             ModelRequest {
+                history_sources: Vec::new(),
                 messages: vec![message(Role::User, "Hello")],
                 tools: vec![],
                 structured_output: None,
@@ -189,6 +193,7 @@ async fn http_client_preserves_server_retry_instructions() {
     let error = client
         .complete(
             ModelRequest {
+                history_sources: Vec::new(),
                 messages: vec![message(Role::User, "Hello")],
                 tools: vec![],
                 structured_output: None,
@@ -243,6 +248,7 @@ async fn streamed_service_errors_keep_retryable_error_categories() {
         let error = client
             .complete(
                 ModelRequest {
+                    history_sources: Vec::new(),
                     messages: vec![message(Role::User, "Hello")],
                     tools: vec![],
                     structured_output: None,
@@ -292,6 +298,7 @@ async fn responses_client_recognizes_a_streamed_context_limit_failure() {
     let error = client
         .complete(
             ModelRequest {
+                history_sources: Vec::new(),
                 messages: vec![message(Role::User, "Review this action")],
                 tools: vec![],
                 structured_output: None,
@@ -335,6 +342,7 @@ async fn model_clients_recognize_streamed_context_limit_errors() {
         let error = client
             .complete(
                 ModelRequest {
+                    history_sources: Vec::new(),
                     messages: vec![message(Role::User, "Review this action")],
                     tools: vec![],
                     structured_output: None,
@@ -387,6 +395,7 @@ async fn responses_streams_text_with_complete_client_side_conversation_history()
     let output = client
         .complete(
             ModelRequest {
+                history_sources: Vec::new(),
                 messages: vec![
                     message(Role::System, "Be helpful."),
                     message(Role::User, "I am Sam"),
@@ -505,6 +514,7 @@ async fn responses_round_trips_multiple_calls_and_protocol_specific_reasoning() 
     let output = client
         .complete(
             ModelRequest {
+                history_sources: Vec::new(),
                 messages: vec![message(Role::User, "Read both")],
                 tools: tools.clone(),
                 structured_output: None,
@@ -552,6 +562,7 @@ async fn responses_round_trips_multiple_calls_and_protocol_specific_reasoning() 
     client
         .complete(
             ModelRequest {
+                history_sources: Vec::new(),
                 messages: vec![
                     message(Role::User, "Read both"),
                     Message {
@@ -626,6 +637,7 @@ async fn responses_rejects_repeated_incomplete_mismatched_and_failed_streams() {
             client
                 .complete(
                     ModelRequest {
+                        history_sources: Vec::new(),
                         messages: vec![message(Role::User, "Read")],
                         tools: vec![],
                         structured_output: None,
@@ -698,6 +710,7 @@ async fn chat_completions_round_trips_thinking_and_tools_then_streams_the_answer
     let output = client
         .complete(
             ModelRequest {
+                history_sources: Vec::new(),
                 messages: vec![
                     message(Role::System, "Be helpful"),
                     message(Role::User, "Read notes"),
@@ -744,6 +757,7 @@ async fn chat_completions_round_trips_thinking_and_tools_then_streams_the_answer
     let answer = client
         .complete(
             ModelRequest {
+                history_sources: Vec::new(),
                 messages: vec![
                     message(Role::User, "Read notes"),
                     Message {
@@ -799,6 +813,7 @@ async fn chat_completions_round_trips_thinking_and_tools_then_streams_the_answer
 
 fn block_tool_result_request() -> ModelRequest {
     ModelRequest {
+        history_sources: Vec::new(),
         messages: vec![
             message(Role::User, "Read notes"),
             Message {
@@ -881,6 +896,7 @@ fn tool_result_image_request() -> ModelRequest {
         input: json!({ "path": path }),
     };
     ModelRequest {
+        history_sources: Vec::new(),
         messages: vec![
             message(Role::User, "Compare the chart with the notes"),
             Message {
@@ -992,6 +1008,7 @@ fn chart_image() -> Content {
 /// A text-only user turn followed by one that carries typed text, an image label and the image.
 fn user_image_request() -> ModelRequest {
     ModelRequest {
+        history_sources: Vec::new(),
         messages: vec![
             message(Role::System, "Be helpful."),
             Message {
@@ -1086,6 +1103,7 @@ async fn responses_and_chat_completions_refuse_images_outside_user_messages() {
             let error = client
                 .complete(
                     ModelRequest {
+                        history_sources: Vec::new(),
                         messages: vec![Message {
                             role,
                             content: vec![chart_image()],
@@ -1143,6 +1161,7 @@ async fn responses_and_chat_completions_reject_invalid_cache_usage() {
         let error = client
             .complete(
                 ModelRequest {
+                    history_sources: Vec::new(),
                     messages: vec![message(Role::User, "Hello")],
                     tools: vec![],
                     structured_output: None,
@@ -1183,6 +1202,7 @@ async fn chat_completions_rejects_unfinished_duplicate_and_malformed_calls() {
             client
                 .complete(
                     ModelRequest {
+                        history_sources: Vec::new(),
                         messages: vec![message(Role::User, "Read")],
                         tools: vec![],
                         structured_output: None,
@@ -1223,6 +1243,7 @@ async fn chat_completions_rejects_noncomplete_finish_reasons_before_returning_te
             let error = client
                 .complete(
                     ModelRequest {
+                        history_sources: Vec::new(),
                         messages: vec![message(Role::User, "Continue")],
                         tools: vec![],
                         structured_output: None,

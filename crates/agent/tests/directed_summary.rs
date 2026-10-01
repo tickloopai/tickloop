@@ -109,6 +109,7 @@ impl ModelClient for SummaryBehaviorModel {
         if !request.tools.is_empty() {
             let _ = events.send(ModelDelta::Text("ordinary answer".into()));
             return Ok(ModelOutput {
+                private_source: None,
                 content: text("ordinary answer"),
                 usage: Usage::default(),
                 stop_reason: "end_turn".into(),
@@ -252,6 +253,7 @@ async fn rejected_or_failed_summaries_leave_no_trace_in_the_conversation() {
     let cases = [
         (
             SummaryBehavior::Output(ModelOutput {
+                private_source: None,
                 content: Vec::new(),
                 usage: Usage::default(),
                 stop_reason: "end_turn".into(),
@@ -260,6 +262,7 @@ async fn rejected_or_failed_summaries_leave_no_trace_in_the_conversation() {
         ),
         (
             SummaryBehavior::Output(ModelOutput {
+                private_source: None,
                 content: vec![Content::ToolUse {
                     id: "unexpected-tool".into(),
                     name: "Bash".into(),
@@ -338,6 +341,7 @@ async fn directed_summary_retries_a_transient_service_failure() {
             vec![
                 SummaryBehavior::Error(ModelError::Http { status: 503 }),
                 SummaryBehavior::Output(ModelOutput {
+                    private_source: None,
                     content: text("recovered summary"),
                     usage: Usage::default(),
                     stop_reason: "end_turn".into(),
@@ -384,6 +388,7 @@ async fn a_summary_that_exceeds_the_verified_context_keeps_the_previous_projecti
     let model = Arc::new(SummaryBehaviorModel {
         behaviors: Mutex::new(
             vec![SummaryBehavior::Output(ModelOutput {
+                private_source: None,
                 content: text(&"oversized summary ".repeat(20_000)),
                 usage: Usage::default(),
                 stop_reason: "end_turn".into(),
@@ -980,6 +985,7 @@ impl ModelClient for PausedSuccessfulSummaryModel {
             }
         }
         Ok(ModelOutput {
+            private_source: None,
             content,
             usage: Usage::default(),
             stop_reason: "end_turn".into(),
@@ -1107,22 +1113,10 @@ async fn assert_pending_model_after_summary(
                 Content::Thinking { .. } | Content::ProtocolData { .. }
             )
         });
-    if private_history_is_summarized {
-        assert!(!active_has_private);
-        assert_eq!(outcome.snapshot.model, replacement);
-        assert!(outcome.snapshot.pending_model.is_none());
-        assert!(outcome.continuation_error.is_none());
-    } else {
-        assert!(active_has_private);
-        assert_eq!(outcome.snapshot.model, before.model);
-        assert_eq!(outcome.snapshot.pending_model, Some(replacement));
-        assert!(
-            outcome
-                .continuation_error
-                .as_deref()
-                .is_some_and(|error| error.contains("private reasoning or protocol state"))
-        );
-    }
+    assert_eq!(active_has_private, !private_history_is_summarized);
+    assert_eq!(outcome.snapshot.model, replacement);
+    assert!(outcome.snapshot.pending_model.is_none());
+    assert!(outcome.continuation_error.is_none());
     agent.shutdown().await;
 }
 
@@ -1145,7 +1139,7 @@ async fn pending_adapter_applies_when_the_new_context_excludes_private_history()
 }
 
 #[tokio::test]
-async fn pending_adapter_stays_pending_when_preserved_messages_keep_private_history() {
+async fn pending_adapter_applies_and_preserves_original_private_history() {
     assert_pending_model_after_summary(
         SummaryDirection::UpToHere,
         text("first public answer"),
@@ -1243,6 +1237,7 @@ impl ModelClient for BlockingSummaryModel {
         }
         let _ = events.send(ModelDelta::Text("ordinary answer".into()));
         Ok(ModelOutput {
+            private_source: None,
             content: text("ordinary answer"),
             usage: Usage::default(),
             stop_reason: "end_turn".into(),

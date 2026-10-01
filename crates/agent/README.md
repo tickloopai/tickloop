@@ -35,6 +35,20 @@ cargo run -p tickloop-agent
 本地协议、终端和恢复验证与真实套餐验收分别记录在[验证记录](../../.scratch/codex-subscription/verification.md)。真实服务未验证的能力仍以该记录中的未验收项为准。
 
 
+### MiniMax
+
+`/model` 一级列表显示单个 `MiniMax`，进入连接页后选择 `MiniMax China API`、`MiniMax China OAuth`、`MiniMax Global API` 和 `MiniMax Global OAuth`，四个 Provider 分别认证。API Key 使用 `MINIMAX_CN_API_KEY` 或 `MINIMAX_GLOBAL_API_KEY`，也可以在菜单遮蔽输入并保存；账户和 Key 必须对应站点。
+
+OAuth 使用 Portal 设备授权，终端显示地址和用户码；在自己的浏览器完成授权，无需远程机器的回调。采用官方 OpenClaw 指南的 Portal 路线，同意页客户端显示为 OpenClaw，不是独立登记的 Tick Loop 客户端。登录文件分别为状态根 `auth/minimax-cn.json` 和 `auth/minimax-global.json`；访问 token 到期前刷新，刷新保持历史来源身份，重新登录产生新身份。Provider 列表选中后按 `s` 清除本地登录，按 `r` 清除后重新授权；不宣称撤销远端授权。
+
+内置范围为 M3 及以上。M3 支持文字和图片，1M 上下文，默认单次输出上限 131,072 tokens；默认关闭 Thinking，开启使用 adaptive，菜单提供 on/off。OAuth 目录另提供 M3.1 Flash Preview，强制 Thinking，支持 low/medium/high/xhigh/max、默认 max。预览模型暂限有相应权益的 M Plan / MiniMax Code；OAuth 登录成功不代表该账户具有模型权限。视频不在 Tick Loop 当前输入范围。
+
+使用 MiniMax 专用 Messages Adapter；API 中国站地址为 `https://api.minimax.cn/anthropic`，中国 OAuth 为 `https://api.minimaxi.com/anthropic`，国际站为 `https://api.minimax.io/anthropic`。认证、模型能力和端点依据见[接入规格](../../.scratch/minimax-integration/spec.md)，本地与真实账户证据见[验证记录](../../.scratch/minimax-integration/verification.md)。
+
+同一 Chat 可在 Messages、Chat Completions、Responses 模型间切换。原始历史逐条保留实际生成来源，每次按目标模型生成请求副本：文字、工具调用和结果继续有效；异来源可读 Thinking 转普通历史文本，签名/加密等私有状态只重放给兼容来源。切回原模型可以恢复仍保留的原始状态；重启与 rewind 保持来源。运行中或等待工具时切换延后生效，pending/OutcomeUnknown 不因切换重发工具。相同来源保留签名、块顺序、合法调用 ID 与稳定缓存前缀；实际命中以服务端 usage 为准。
+
+仓库内模型接入 SOP 位于 [.tickloop/skills/model-integration](../../.tickloop/skills/model-integration/SKILL.md)，在本项目通过 `/model-integration` 使用。
+
 自定义配置：
 
 ```sh
@@ -55,7 +69,7 @@ providers/
   openai-codex.yaml
 ```
 
-内置目录中的定义不代表已经配置账户或已开通服务。DeepSeek API 和 Codex 套餐是当前接入；`anthropic-api.yaml` 保留此前已有的 Claude Model Card，供旧配置兼容使用，不会因此自动调用 Anthropic。
+内置目录中的定义不代表已经配置账户或已开通服务。DeepSeek API、Codex 套餐与 MiniMax 两区 API/OAuth 是当前接入；`anthropic-api.yaml` 保留此前已有的 Claude Model Card，供旧配置兼容使用，不会因此自动调用 Anthropic。
 
 完整示例见 [DeepSeek API](examples/providers/deepseek-api.yaml) 和 [Codex 套餐](examples/providers/openai-codex.yaml)。单个文件可用于 `--config` 或 `/model CONFIG_FILE`。显式加载多模型文件时，用 `default_model` 指定该 Provider 内的模型 ID；只有一个模型时可省略。 显式文件中的其他模型也会出现在本次菜单中；加载本身不写配置，确认选择后保存该 Provider 的已填写字段和模型列表。省略的字段继续继承有效用户配置与内置默认值，保存时不会被展开成固定值。
 
@@ -75,7 +89,7 @@ models:
 
 文件名必须与 Provider ID 一致；新增 Provider 时提供完整的身份、连接与模型定义。模型选择及权限、外观等设置继续保存在 `settings.json`，Provider 定义的新保存写入相应 YAML 文件。旧的单模型 JSON、完整目录 JSON 和 `settings.json.providers` 保留兼容读取，相同 ID 的 YAML 显式字段优先；加载不会自动改写旧文件。
 
-Provider 内的 `id` 是配置身份，`service_model_id` 是服务实际接收的模型名称；同一个服务模型可以有不同适配器条目。普通 `adapter` 为 `messages`、`responses`、`chat_completions`；DeepSeek 的协议差异由 `deepseek_messages`、`deepseek_chat_completions` 表达，Codex 使用 `codex_responses`。地址取自 Provider 的 `endpoints` 同名项。Codex 套餐结合 `codex_subscription` 认证使用专用请求处理，并限制为官方端点；普通 API 使用 `api_key_env`。不要把套餐 token 填进 API Key 配置。
+Provider 内的 `id` 是配置身份，`service_model_id` 是服务实际接收的模型名称；同一个服务模型可以有不同适配器条目。普通 `adapter` 为 `messages`、`responses`、`chat_completions`；DeepSeek 的协议差异由 `deepseek_messages`、`deepseek_chat_completions` 表达，MiniMax 使用 `minimax_messages`，Codex 使用 `codex_responses`。地址取自 Provider 的 `endpoints` 同名项。Codex 套餐结合 `codex_subscription` 认证使用专用请求处理，并限制为官方端点；普通 API 使用 `api_key_env`；MiniMax OAuth 分别使用 `minimax_oauth_cn`、`minimax_oauth_global`，只允许对应区域的 MiniMax Messages 端点。不要把套餐 token 填进 API Key 配置。
 
 | 位置 | 公开配置项 |
 | --- | --- |
@@ -95,7 +109,7 @@ Provider 内的 `id` 是配置身份，`service_model_id` 是服务实际接收�
 
 输入自然语言开始工作，再输入补充要求继续同一目标。输入区固定在终端底部，上方显示流式回复和工具摘要。单行状态栏依次显示当前 Execution Mode、模型及 `Context x% used`，重要提示优先显示；已知窗口大小且当前模型尚无请求时从 `Context 0% used` 开始；请求进行中沿用 0% 或最近一次已确认用量，窗口大小未知或请求结束后仍无已确认用量时显示 `Context —`。仍在活动状态的后台 Shell Tasks 和当前 Loop 的 Todo 共用状态栏下方的单列面板，默认只显示计数标签，点击或按 Down、Enter 展开；Tasks 可用 `j`／`k` 选中单个任务，Enter 打开详情，`x` 停止，Todo 可用相同按键滚动；Subagents 尚未接入。PgUp／PgDn 回看半页，Ctrl+Home／End 到会话首尾；上滚后新输出不会抢走阅读位置，底栏显示新消息数。`Shift+Tab` 在普通输入界面按 Auto → Ask → Full Access → Auto 循环；权限 Diff、菜单和候选打开时由当前界面优先处理。`/settings` 中的 Auto-scroll 开关只作用于当前终端客户端，关闭后手动到底也不会被之后的输出重新带走。
 
-输入 `/model` 先选 Provider，再选模型。`/thinking` 可单独调整当前模型的 Thinking 档位。在 Provider 列表按 `a` 切换已配置的适配器，模型列表随之筛选；例如 DeepSeek 支持 Messages、Responses 或 Chat Completions。模型页只列模型，名称使用官方名称；上下键、`j`／`k`、`Ctrl+N`／`Ctrl+P` 选择模型，左右键或 `h`／`l` 调整该行 Thinking。回车同时应用并保存模型与 Thinking；浏览、调整草稿或切换适配器不修改当前配置。`Esc` 放弃草稿并返回 Provider，再按退出；无需输入配置文件路径。两个模型共用 `DEEPSEEK_API_KEY`；当前内置 Model Card 的上下文窗口为 1M，输出限制为 64,000 tokens，可通过公开配置调整。`/settings`（别名 `/config`）集中显示模型、Execution Mode、当前会话状态、本进程用量和 Auto-scroll。照 Claude Code，`/model` 的选择、持久权限规则和 `defaultMode` 位于状态根目录的 `settings.json`；启动时 `--config` 与 `--mode` 分别优先于保存的模型和默认模式。内置默认是 Auto。Chat 内切换、会话级规则和 `/add-dir` 附加目录只在本进程内有效；新建、恢复与 Branch 使用当时的默认模式，不恢复来源 Chat 的临时模式。Auto-scroll 作用于当前终端会话；在途工作结束后模型切换才生效，不兼容的历史会明确提示先压缩。已知模型的上下文窗口自动取该模型的最大值。
+输入 `/model` 先选 Provider，再选模型。`/thinking` 可单独调整当前模型的 Thinking 档位。在 Provider 列表按 `a` 切换已配置的适配器，模型列表随之筛选；例如 DeepSeek 支持 Messages、Responses 或 Chat Completions。模型页只列模型，名称使用官方名称；上下键、`j`／`k`、`Ctrl+N`／`Ctrl+P` 选择模型，左右键或 `h`／`l` 调整该行 Thinking。回车同时应用并保存模型与 Thinking；浏览、调整草稿或切换适配器不修改当前配置。`Esc` 放弃草稿并返回 Provider，再按退出；无需输入配置文件路径。两个模型共用 `DEEPSEEK_API_KEY`；当前内置 Model Card 的上下文窗口为 1M，输出限制为 64,000 tokens，可通过公开配置调整。`/settings`（别名 `/config`）集中显示模型、Execution Mode、当前会话状态、本进程用量和 Auto-scroll。照 Claude Code，`/model` 的选择、持久权限规则和 `defaultMode` 位于状态根目录的 `settings.json`；启动时 `--config` 与 `--mode` 分别优先于保存的模型和默认模式。内置默认是 Auto。Chat 内切换、会话级规则和 `/add-dir` 附加目录只在本进程内有效；新建、恢复与 Branch 使用当时的默认模式，不恢复来源 Chat 的临时模式。Auto-scroll 作用于当前终端会话；在途工作结束后模型切换才生效，历史按目标模型投影，协议变化不要求先压缩。已知模型的上下文窗口自动取该模型的最大值。
 
 六个内置 DeepSeek 配置的单次输出上限为 64,000 tokens；保存的旧内置 4096 配置在读取时升级，自定义配置与显式 `--config` 的上限保持原值。模型报告输出截断时，Agent 只用已收到的文字续接，最多再请求三次；没有完整文字可续接或次数耗尽时报告失败。上下文自动压缩独立按输入历史与上下文窗口判断。
 
@@ -222,11 +236,11 @@ Jev 非敏感服务配置仍可写在用户 `settings.json` 的 `jev`，例如 `
 
 每个 Chat 的对话照 Claude Code 写成只追加的 Transcript：`<root>/projects/<项目目录名>/<chatId>.jsonl`，状态根目录默认为 `~/.tickloop`，可用 `TICKLOOP_CONFIG_DIR` 指定，`--no-session-persistence` 关闭持久保存。项目目录名由工作目录的 canonical 路径生成，文件在第一条消息写入时创建，之后 `/cwd` 改变工作目录也不移动文件。条目每 100ms 批量追加，不加锁；进程被强制结束时最多丢失最后一批。同一目录可以同时运行多个 `tickloop`；两个进程继续同一个 Chat 时 Transcript 会分叉，下次恢复进入最近活动的一支，另一支仍留在文件中。
 
-压缩照 Claude Code 写成压缩边界：`/compact` 与自动压缩在对话末尾追加一个 `compact_boundary` system 条目（父指针为空，逻辑父指针指向压缩前最后一条）和一条压缩摘要 user 消息，之后的消息接在摘要后面；模型只看到最后一个边界之后的消息。本进程内边界之前的消息仍在 Ctrl+O 的完整记录中，rewind 到边界之前的提示时边界随之丢弃，模型重新看到原始对话，下一条消息在 Transcript 中从边界之前分叉（重新出现的私有推理若来自与当前选择不同的模型，rewind 会被拒绝）；恢复 Chat 时模型对话链在边界处断开，边界之前的提示不再作为模型历史加载。审批依据另行保留真实用户输入及来源：新边界记录压缩前的原始输入，旧边界从当前对话链的 Transcript 记录恢复；摘要、工具结果、Agent 叙述或其他 Loop 的消息不因此获得授权效力，来源缺失则转人工。定向摘要不照 Claude Code 写保留区段（叠加摘要或 rewind 到保留消息的第一条提示后，区段重接会丢失或复活消息），保留的消息直线重写在新边界之后，恢复时沿最新叶子自然只得到新链；读取 Claude Code 格式、带保留区段的文件时仍按区段重接并清零保留 assistant 消息的用量，只有最新叶子的对话链经过文件中最后一个边界时才删除该边界之前的其他内容，区段校验失败时加载完整历史并在打开 Chat 时显示警告。超过 5MB 的 Transcript 只加载最后一个不带保留区段、父指针为空的边界之后的模型历史，边界之前只读取标题和 Branch 来源；审批所需原始输入仍从边界元数据或旧文件的当前链定向恢复。最新叶子的对话链走到被跳过的内容（rewind 越过该边界后继续的分支）时改为加载完整文件。自动压缩的摘要消息照 Claude Code 带继续指令，要求模型不再提问、直接接着做；手动 `/compact` 不带。压缩后元数据重新追加到文件末尾。
+压缩照 Claude Code 写成压缩边界：`/compact` 与自动压缩在对话末尾追加一个 `compact_boundary` system 条目（父指针为空，逻辑父指针指向压缩前最后一条）和一条压缩摘要 user 消息，之后的消息接在摘要后面；模型只看到最后一个边界之后的消息。本进程内边界之前的消息仍在 Ctrl+O 的完整记录中，rewind 到边界之前的提示时边界随之丢弃，模型重新看到原始对话，下一条消息在 Transcript 中从边界之前分叉（重新出现的私有推理按目标来源投影，原始块仍保留）；恢复 Chat 时模型对话链在边界处断开，边界之前的提示不再作为模型历史加载。审批依据另行保留真实用户输入及来源：新边界记录压缩前的原始输入，旧边界从当前对话链的 Transcript 记录恢复；摘要、工具结果、Agent 叙述或其他 Loop 的消息不因此获得授权效力，来源缺失则转人工。定向摘要不照 Claude Code 写保留区段（叠加摘要或 rewind 到保留消息的第一条提示后，区段重接会丢失或复活消息），保留的消息直线重写在新边界之后，恢复时沿最新叶子自然只得到新链；读取 Claude Code 格式、带保留区段的文件时仍按区段重接并清零保留 assistant 消息的用量，只有最新叶子的对话链经过文件中最后一个边界时才删除该边界之前的其他内容，区段校验失败时加载完整历史并在打开 Chat 时显示警告。超过 5MB 的 Transcript 只加载最后一个不带保留区段、父指针为空的边界之后的模型历史，边界之前只读取标题和 Branch 来源；审批所需原始输入仍从边界元数据或旧文件的当前链定向恢复。最新叶子的对话链走到被跳过的内容（rewind 越过该边界后继续的分支）时改为加载完整文件。自动压缩的摘要消息照 Claude Code 带继续指令，要求模型不再提问、直接接着做；手动 `/compact` 不带。压缩后元数据重新追加到文件末尾。
 
 Chat 的附属文件照 Claude Code 放在 Transcript 同级的 `<chatId>/` 目录：超过阈值的工具结果（`Grep` 20K、`Bash` 30K、其余工具 50K 字符；`Read` 与含图片的结果不外存）写入 `tool-results/<调用 id>.txt`，模型收到带文件路径和 2KB 预览的 `<persisted-output>` 文本；同一轮工具结果合计超过 200K 字符时，最大的新结果也照此外存，替换决定记入 Transcript，恢复、`--fork-session` 与 `/branch` 后发给模型的内容保持不变；压缩与定向摘要写出边界时，把仍在边界之后对话中的结果的替换决定重新记录在边界之后，`--fork-session` 把替换决定写在重写的对话之后，超过 5MB 的 Transcript 跳过边界之前的内容时替换不会丢失。文件改动 review 写在 `file-changes/`。后台与前台 Shell 输出写入系统临时目录 `/tmp/tickloop-<uid>/<项目目录名>/<chatId>/tasks/<任务 id>.output`（可用 `TICKLOOP_TMPDIR` 改变 `/tmp`），每个文件最多 64 MiB，不做清理。模型读取项目目录与项目临时目录中的文件不需要授权。`--no-session-persistence` 时 Chat 目录也在上述临时目录中，工作目录下不写任何文件。
 
-启动时不列出、也不加载已保存的 Chat；`/resume` 列出当前项目的 Chat，`/resume CHAT` 或 `-r CHAT` 按 id 恢复。恢复照 Claude Code 过滤没有工具结果的 tool_use 与只含 thinking 或空白的回复，末尾是工具结果时追加 "Continue from where you left off."，末尾是 user 消息时追加不请求回复的哨兵；Loop 的创建、状态变化、Trigger 配置与结束作为 system 条目挂在对话链上（不发给模型），恢复时沿当前链重放：运行中或等待中的 Loop 转为已中断，过期的 Trigger 标为已过期，武装中的 Trigger 解除武装，向该 Loop 提交输入时重新武装，不会自动运行；压缩后为未结束的 Loop 重记完整状态。Chat 快照不整体写入磁盘，恢复时全部由对话链与元数据重建：工作目录取链上最后一个条目记录的 `cwd`（`/cwd` 之后没有新条目时，重启回到之前记录的目录），Branch 来源取 `branch-origin` 与标题元数据（Branch 的请求标识与复制时的公开对话来源只在创建它的进程内有效）。同一个 Loop 被多个进程武装时，触发前获取 `<chatId>/loops/<loopId>.lock` 的租约，只有持有者触发：锁文件独占创建，内容（chatId、pid、nonce、启动时间、主机）只作诊断，持有权由对该文件的 flock 决定，持有进程退出（包括被杀死）时由内核释放，其他进程每 5 秒重试接手；锁内容记录的主机与本机不同时不接管，并在状态栏提示。结束、解除武装与重新武装写入 `<chatId>/loops/<loopId>.state`（递增 generation，结束不可撤销，rewind 移除 Loop 视为结束），持有者每次触发前读取，Loop 已在其他进程结束或解除武装时本地同步停止或解除武装且不触发。租约被其他进程持有、租约或状态文件读写失败时，状态栏显示 `Trigger:` 提示，显式事件触发失败时返回存储错误。照 Claude Code，挂起的权限请求与提问、排队输入与命令、操作记录、事件回放和用量不随 Chat 保存，恢复后不再出现；Execution Mode 使用当前 `defaultMode` 或启动覆盖，模型使用本进程当前的选择。打开历史无需已有模型凭据，开始运行时才检查当前凭据与目录。状态根目录需要可写，否则可以用 `TICKLOOP_CONFIG_DIR` 指向另一个可写目录，或用 `--no-session-persistence` 运行而不保存 Chat。
+启动时不列出、也不加载已保存的 Chat；`/resume` 列出当前项目的 Chat，`/resume CHAT` 或 `-r CHAT` 按 id 恢复。恢复过滤没有工具结果的 tool_use 与空白回复，保留仅含 thinking/私有协议块的原始回复并按来源投影，末尾是工具结果时追加 "Continue from where you left off."，末尾是 user 消息时追加不请求回复的哨兵；Loop 的创建、状态变化、Trigger 配置与结束作为 system 条目挂在对话链上（不发给模型），恢复时沿当前链重放：运行中或等待中的 Loop 转为已中断，过期的 Trigger 标为已过期，武装中的 Trigger 解除武装，向该 Loop 提交输入时重新武装，不会自动运行；压缩后为未结束的 Loop 重记完整状态。Chat 快照不整体写入磁盘，恢复时全部由对话链与元数据重建：工作目录取链上最后一个条目记录的 `cwd`（`/cwd` 之后没有新条目时，重启回到之前记录的目录），Branch 来源取 `branch-origin` 与标题元数据（Branch 的请求标识与复制时的公开对话来源只在创建它的进程内有效）。同一个 Loop 被多个进程武装时，触发前获取 `<chatId>/loops/<loopId>.lock` 的租约，只有持有者触发：锁文件独占创建，内容（chatId、pid、nonce、启动时间、主机）只作诊断，持有权由对该文件的 flock 决定，持有进程退出（包括被杀死）时由内核释放，其他进程每 5 秒重试接手；锁内容记录的主机与本机不同时不接管，并在状态栏提示。结束、解除武装与重新武装写入 `<chatId>/loops/<loopId>.state`（递增 generation，结束不可撤销，rewind 移除 Loop 视为结束），持有者每次触发前读取，Loop 已在其他进程结束或解除武装时本地同步停止或解除武装且不触发。租约被其他进程持有、租约或状态文件读写失败时，状态栏显示 `Trigger:` 提示，显式事件触发失败时返回存储错误。照 Claude Code，挂起的权限请求与提问、排队输入与命令、操作记录、事件回放和用量不随 Chat 保存，恢复后不再出现；Execution Mode 使用当前 `defaultMode` 或启动覆盖，模型使用本进程当前的选择。打开历史无需已有模型凭据，开始运行时才检查当前凭据与目录。状态根目录需要可写，否则可以用 `TICKLOOP_CONFIG_DIR` 指向另一个可写目录，或用 `--no-session-persistence` 运行而不保存 Chat。
 
 计划属于 Loop，照 Claude Code 写入 `<root>/plans/<slug>-loop-<loopId>.md`：slug 在 Chat 第一次进入 Plan 模式时生成（形容词-动词-名词），记录在之后的每个 Transcript 条目中，恢复时按第一个有效的 slug 找回计划文件（slug 只接受以连字符连接的小写字母单词、最长 64 字节；链上没有有效 slug 时警告并换用新的 slug）。模型可以调用 `EnterPlanMode` 请求进入 Plan 模式，经用户确认后生效。Plan 模式下每次请求的系统提示写明当前 Loop 计划文件的绝对路径，这是唯一允许 `Write`／`Edit` 的文件；模型写好计划后调用 `ExitPlanMode` 提交审批，文件不存在或为空时报错。提交时宿主在计划文件首行写入 `<!-- tickloop plan version: N sha256: <正文摘要> -->` 注释（Markdown 渲染时不可见），版本号与内容一起先写入同目录临时文件（0600）并同步到磁盘，再改名替换，写入中途失败不会留下半截文件；读取不跟随符号链接，只接受普通文件、不超过 64KB 的正文，`plans/` 须是当前用户私有（0700、非符号链接）的目录。计划菜单的“批准并开始”照 Claude Code `ExitPlanMode` 的批准结果，把 `User has approved your plan. You can now start coding. …`、计划文件路径与批准的计划正文作为下一条输入交给模型。计划版本与待办不另存：恢复时沿对话链取该 Loop 成功的 `ExitPlanMode` 调用结果中的版本，以及最后一次成功的 `TodoWrite` 调用的输入；压缩、rewind 截断、`/branch` 与 `--fork-session` 使之前的调用不在链上时，Loop 状态条目会带上当时的计划版本与待办。恢复时核对计划文件：版本行中的版本等于重建的版本、且摘要与正文相符才沿用该版本；否则（例如提交后文件又被编辑、结果写入 Transcript 之前进程崩溃，或文件在对话之外被修改）计划以大于文件与链上版本的新版本恢复为未批准，按旧版本号的批准一律被拒，并显示加载警告。链上没有记录、也没有版本行的文件是从未提交的草稿，不恢复为计划。计划文件缺失或不可读时该 Loop 暂无计划并显示警告，但保留已知的最高版本，下一次提交从更大的版本继续，版本号不会被复用。`/approve-plan GOAL VERSION MODE` 在恢复后按重建的版本批准；批准选择的模式与 Execution Mode 一样只在本进程内有效，恢复后需要重新批准。rewind 不回退计划文件与版本（照 Claude Code 计划文件不随 rewind 恢复），版本号不会被复用。`/branch` 与 `--fork-session` 生成新的 slug 并复制已提交的计划，之后双方修改互不影响。不保存 Chat 时（`--no-session-persistence` 或 `cleanupPeriodDays` 为 0）计划文件照 File History 放在系统临时目录的 `tickloop-<uid>/<项目目录名>/plans/`。
 

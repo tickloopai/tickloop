@@ -23,6 +23,7 @@ Return a finding for task scope and exactly one finding for every Soft deny and 
 /// Serializes the complete trusted snapshot for the isolated LLM reviewer.
 pub(super) fn classifier_request(context: &ApprovalSnapshot) -> ModelRequest {
     ModelRequest {
+        history_sources: Vec::new(),
         messages: vec![
             Message {
                 role: Role::System,
@@ -233,6 +234,7 @@ mod tests {
 
     fn output(text: &str) -> ModelOutput {
         ModelOutput {
+            private_source: None,
             content: vec![Content::Text { text: text.into() }],
             usage: Usage::default(),
             stop_reason: "end_turn".into(),

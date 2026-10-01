@@ -603,6 +603,7 @@ async fn large_results_with_repeated_or_unsafe_call_ids_are_still_persisted_afte
 
     let snapshot = agent.snapshot(chat).await.unwrap();
     for (_, content) in tool_results(&ModelRequest {
+        history_sources: Vec::new(),
         messages: snapshot.messages.clone(),
         ..requests(&model)[0].clone()
     }) {

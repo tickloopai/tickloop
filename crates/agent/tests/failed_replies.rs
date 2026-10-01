@@ -58,6 +58,7 @@ impl ModelClient for StreamingModel {
             _ = cancel.cancelled() => return Err(ModelError::Cancelled),
         }
         Ok(ModelOutput {
+            private_source: None,
             content: reply.outcome?,
             usage: Usage::default(),
             stop_reason: "end_turn".into(),

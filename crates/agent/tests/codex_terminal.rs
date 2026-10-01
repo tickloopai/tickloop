@@ -6,7 +6,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::process::Stdio;
 use std::time::Duration;
 
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 struct TerminalFixture {
     child: Box<dyn portable_pty::Child + Send + Sync>,
@@ -235,22 +235,38 @@ async fn piped_commands_wait_for_logout_before_model_menu_and_exit() {
         .kill_on_drop(true)
         .spawn()
         .unwrap();
-    let provider_count = tickloop_agent::model::cards::built_in_model_profiles()
-        .into_iter()
-        .map(|model| model.provider_id)
-        .collect::<std::collections::HashSet<_>>()
-        .len();
-    let commands = format!(
-        "/help\n/login\n/model\n{}\ncancel\n/exit\n",
-        provider_count + 2
-    );
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(commands.as_bytes())
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(b"/help\n/login\n/model\n").await.unwrap();
+    stdin.flush().await.unwrap();
+    let mut stdout_reader = BufReader::new(child.stdout.take().unwrap());
+    let mut captured = String::new();
+    let logout_selection = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let mut line = String::new();
+            assert_ne!(stdout_reader.read_line(&mut line).await.unwrap(), 0);
+            captured.push_str(&line);
+            if line.contains("Sign out · Codex subscription") {
+                break line
+                    .trim()
+                    .split_once('.')
+                    .unwrap()
+                    .0
+                    .parse::<usize>()
+                    .unwrap();
+            }
+        }
+    })
+    .await
+    .unwrap();
+    stdin
+        .write_all(format!("{logout_selection}\ncancel\n/exit\n").as_bytes())
         .await
         .unwrap();
+    drop(stdin);
+    let stdout_task = tokio::spawn(async move {
+        stdout_reader.read_to_string(&mut captured).await.unwrap();
+        captured
+    });
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(child.try_wait().unwrap().is_none());
     assert!(credential_path.exists());
@@ -260,7 +276,7 @@ async fn piped_commands_wait_for_logout_before_model_menu_and_exit() {
         .await
         .unwrap()
         .unwrap();
-    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stdout = stdout_task.await.unwrap();
     assert!(
         output.status.success(),
         "{stdout}\n{}",

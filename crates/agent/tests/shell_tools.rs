@@ -50,6 +50,7 @@ impl ModelClient for ShellModel {
             }]
         };
         Ok(ModelOutput {
+            private_source: None,
             content,
             usage: Usage::default(),
             stop_reason: "end_turn".into(),
@@ -415,6 +416,7 @@ impl ModelClient for BackgroundModel {
             }],
         };
         Ok(ModelOutput {
+            private_source: None,
             content,
             usage: Usage::default(),
             stop_reason: "end_turn".into(),
@@ -894,6 +896,7 @@ where
         _: CancellationToken,
     ) -> Result<ModelOutput, ModelError> {
         Ok(ModelOutput {
+            private_source: None,
             content: (self.0)(&request),
             usage: Usage::default(),
             stop_reason: "end_turn".into(),

@@ -110,6 +110,7 @@ async fn fixture(model: Arc<RaceModel>) -> (tempfile::TempDir, Agent, ChatId) {
 
 fn empty_request() -> ModelRequest {
     ModelRequest {
+        history_sources: Vec::new(),
         messages: Vec::new(),
         tools: Vec::new(),
         structured_output: None,
@@ -129,6 +130,7 @@ async fn immediate_complete_response_wins_over_a_zero_length_deadline() {
     let model = Arc::new(RaceModel {
         observations: vec![usage.clone()],
         response: Some(ModelOutput {
+            private_source: None,
             content: vec![Content::Text {
                 text: "public summary".into(),
             }],

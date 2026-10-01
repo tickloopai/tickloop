@@ -37,6 +37,7 @@ impl ResponseStep {
         Self {
             observations: vec![usage.clone()],
             result: Ok(ModelOutput {
+                private_source: None,
                 stop_reason: if content
                     .iter()
                     .any(|block| matches!(block, Content::ToolUse { .. }))

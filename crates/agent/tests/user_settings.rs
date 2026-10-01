@@ -1218,10 +1218,9 @@ fn requests_contain_private_reasoning(model: &ScriptedModel) -> bool {
         })
 }
 
-/// API key 身份未写入 transcript，恢复后即使选择同一模型也无法证明旧私有推理
-/// 属于当前账号；公开回答仍保留。
+/// Raw provenance survives restart; the concrete HTTP client verifies actual credentials.
 #[tokio::test]
-async fn resuming_strips_api_private_reasoning_without_proven_credential_source() {
+async fn resuming_retains_original_reasoning_and_projects_different_model_sources() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("root");
     let workdir = directory.path().join("work");
@@ -1257,8 +1256,8 @@ async fn resuming_strips_api_private_reasoning_without_proven_credential_source(
     second.resume_chat(chat).await.unwrap();
     run_turn(&second, chat, "Continue", PermissionScope::Once).await;
     assert!(
-        !requests_contain_private_reasoning(&same),
-        "the same model cannot prove the previous API key account after restart"
+        requests_contain_private_reasoning(&same),
+        "the in-memory client reuses its matching model source after restart"
     );
     second.shutdown().await;
 

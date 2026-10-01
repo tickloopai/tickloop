@@ -446,9 +446,10 @@ fn conversation_before(
         .inherited_prompts
         .retain(|message_index| *message_index < index);
     candidate.message_usage.split_off(&index);
+    candidate.message_sources.split_off(&index);
+    candidate.message_models.split_off(&index);
     // 照 Claude Code：rewind 越过压缩边界时，边界随截断的消息一起丢弃，模型重新看到边界之前的
     // 原始对话；下一条消息在 Transcript 中从边界之前分叉。
-    let removed_boundary_model = snapshot.earliest_boundary_model_from(index);
     candidate.message_compactions.split_off(&index);
     if let Some(creation) = candidate
         .branch_origin
@@ -501,9 +502,6 @@ fn conversation_before(
     if candidate.policy.mode != point.execution_mode {
         candidate.policy.mode = point.execution_mode;
         candidate.policy.revision += 1;
-    }
-    if let Some(model) = removed_boundary_model {
-        super::context::ensure_rewind_history_compatible(&candidate, &model)?;
     }
     super::context::projected_messages(&candidate)?;
     let loop_id = Uuid::new_v4();
@@ -644,6 +642,7 @@ mod tests {
                 }],
             };
             Ok(ModelOutput {
+                private_source: None,
                 content,
                 usage: Usage::default(),
                 stop_reason: "end_turn".into(),

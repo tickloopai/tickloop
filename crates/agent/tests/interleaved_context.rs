@@ -282,6 +282,7 @@ async fn waiting_goals_project_paired_history_without_changing_raw_tool_identity
         );
         let outcome = agent.compact(chat).await.unwrap();
         assert_paired_history(&ModelRequest {
+            history_sources: Vec::new(),
             messages: outcome.snapshot.conversation_messages().unwrap(),
             tools: vec![],
             structured_output: None,

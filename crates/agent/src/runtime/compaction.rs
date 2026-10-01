@@ -108,16 +108,6 @@ impl ChatSnapshot {
             .map(|(index, _)| *index)
             .collect()
     }
-
-    /// 截断到 `message_count` 条消息时被移除的边界中，最早一个记录的压缩模型。
-    pub(super) fn earliest_boundary_model_from(&self, message_count: usize) -> Option<ModelConfig> {
-        self.message_compactions
-            .range(message_count..)
-            .find_map(|(_, marker)| match marker {
-                CompactionMarker::Boundary(boundary) => boundary.model.as_deref().cloned(),
-                CompactionMarker::Summary { .. } => None,
-            })
-    }
 }
 
 /// 压缩后对话中一条消息的来源。
@@ -179,6 +169,8 @@ impl CompactionLayout {
         compacted.inherited_prompts.clear();
         compacted.message_compactions = BTreeMap::new();
         compacted.message_usage = BTreeMap::new();
+        compacted.message_sources = BTreeMap::new();
+        compacted.message_models = BTreeMap::new();
         for (index, source) in self.sources.iter().enumerate() {
             match *source {
                 MessageSource::Existing(original) => {
@@ -215,6 +207,12 @@ impl CompactionLayout {
                     }
                     if snapshot.inherited_prompts.contains(&original) {
                         compacted.inherited_prompts.insert(index);
+                    }
+                    if let Some(source) = snapshot.message_sources.get(&original) {
+                        compacted.message_sources.insert(index, source.clone());
+                    }
+                    if let Some(model) = snapshot.message_models.get(&original) {
+                        compacted.message_models.insert(index, model.clone());
                     }
                     let usage = snapshot.message_usage.get(&original).cloned();
                     if rewrites_existing && message.role == Role::Assistant {

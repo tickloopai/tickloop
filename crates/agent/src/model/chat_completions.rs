@@ -156,7 +156,7 @@ impl ChatStream {
             &mut self.usage,
             &data["usage"],
             Protocol::ChatCompletions,
-            events,
+            Some(events),
         )?;
         if provider_failed {
             return Err(stream_provider_error(&data));
@@ -304,6 +304,7 @@ impl ChatStream {
             });
         }
         Ok(ModelOutput {
+            private_source: None,
             content,
             usage: self.usage,
             stop_reason,

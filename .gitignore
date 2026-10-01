@@ -41,7 +41,12 @@ __pycache__/
 
 # Local Agent build cache, state and credentials
 /.scratch/agent/cargo-home/
-/.tickloop/
+/.tickloop/*
+!/.tickloop/skills/
+/.tickloop/skills/*
+!/.tickloop/skills/model-integration/
+!/.tickloop/skills/model-integration/references/
+!/.tickloop/skills/model-integration/references/**
 /.env
 
 # Agent module implementation evidence

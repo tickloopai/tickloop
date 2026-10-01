@@ -938,6 +938,7 @@ async fn interact(
     let mut login_from_provider = false;
     let mut provider_login_succeeded = false;
     let mut reauthenticate_after_logout = false;
+    let mut logout_region = None;
     let mut logout: Option<LogoutFlow> = None;
     let mut tools = ToolPresentation::new(!interactive);
     let mut transcript_dirty = false;
@@ -1051,7 +1052,8 @@ async fn interact(
                 provider_login_succeeded = false;
                 if let Some(root) = config_root.clone() {
                     reauthenticate_after_logout = outcome.reauthenticate_after_logout;
-                    logout = Some(LogoutFlow::start(root, console)?);
+                    logout_region = outcome.logout_region;
+                    logout = Some(LogoutFlow::start(root, console, logout_region)?);
                 } else {
                     outln!(
                         console,
@@ -1343,11 +1345,13 @@ async fn interact(
                     Some(LoginUpdate::Device { address, code }) => login.as_ref().unwrap().show_device(console, &address, &code)?,
                     Some(LoginUpdate::Browser { address, callback }) => login.as_mut().unwrap().show_browser(console, address, callback)?,
                     Some(LoginUpdate::Finished(result)) => {
-                        login.take().unwrap().close(console)?;
+                        let flow = login.take().unwrap();
+                        let provider_label = flow.label();
+                        flow.close(console)?;
                         match result {
                             Ok(account) => {
                                 provider_login_succeeded = true;
-                                outln!(console, "Codex subscription login saved · account {}", safe_text(&account));
+                                outln!(console, "{} login saved · {}", provider_label, safe_text(&account));
                             }
                             Err(error) => outln!(console, "Cannot log in: {}", safe_text(&error)),
                         }
@@ -1363,9 +1367,9 @@ async fn interact(
                 logout.take();
                 match result {
                     Ok(()) => {
-                        outln!(console, "Codex login removed locally.");
+                        outln!(console, "{} login removed locally.", logout_region.map_or("Codex", crate::auth::minimax::MiniMaxRegion::label));
                         if reauthenticate_after_logout && let Some(root) = config_root.clone() {
-                            match LoginFlow::start(root, console, login::LoginMethod::Browser) {
+                            match LoginFlow::start(root, console, logout_region.map_or(login::LoginMethod::Browser, login::LoginMethod::MiniMax)) {
                                 Ok(flow) => login = Some(flow),
                                 Err(error) => outln!(console, "Cannot log in: {}", safe_text(&error)),
                             }

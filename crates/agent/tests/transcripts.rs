@@ -93,6 +93,7 @@ impl ModelClient for SequenceModel {
             return Err(ModelError::Cancelled);
         };
         Ok(ModelOutput {
+            private_source: None,
             content,
             usage: Usage::default(),
             stop_reason: "end_turn".into(),
@@ -397,7 +398,7 @@ async fn killed_process_resumes_from_its_flushed_transcript() {
 }
 
 #[tokio::test]
-async fn resume_post_processing_follows_claude_code_order() {
+async fn resume_post_processing_repairs_tool_pairs_and_preserves_private_history() {
     // 末尾是工具结果：先追加"从中断处继续"的 meta 消息，再追加哨兵。
     {
         let directory = tempfile::tempdir().unwrap();
@@ -479,7 +480,7 @@ async fn resume_post_processing_follows_claude_code_order() {
         );
         restored.shutdown().await;
     }
-    // 只含 thinking 的 assistant 消息被过滤。
+    // Private-only history survives restore for compatible-source replay.
     {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("root");
@@ -509,6 +510,13 @@ async fn resume_post_processing_follows_claude_code_order() {
             conversation(&model.requests.lock().unwrap()[0]),
             vec![
                 user("think only"),
+                Message {
+                    role: Role::Assistant,
+                    content: vec![Content::Thinking {
+                        thinking: "orphaned private thought".into(),
+                        signature: None,
+                    }]
+                },
                 user("answer now"),
                 assistant("visible answer"),
                 user("next prompt"),

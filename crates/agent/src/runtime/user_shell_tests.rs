@@ -48,6 +48,7 @@ impl ModelClient for BlockingModel {
         self.started.notify_one();
         self.release.notified().await;
         Ok(ModelOutput {
+            private_source: None,
             content: vec![Content::Text {
                 text: "done".into(),
             }],
@@ -76,6 +77,7 @@ impl ModelClient for CapturingModel {
     ) -> Result<ModelOutput, ModelError> {
         self.requests.lock().unwrap().push(request);
         Ok(ModelOutput {
+            private_source: None,
             content: vec![Content::Text {
                 text: "done".into(),
             }],

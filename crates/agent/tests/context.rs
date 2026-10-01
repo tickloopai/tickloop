@@ -9,6 +9,51 @@ use tickloop_agent::{
 };
 use uuid::Uuid;
 
+#[tokio::test]
+async fn minimax_thinking_toggle_and_on_preference_survive_new_chats() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let model = ModelCatalog::defaults()
+        .get("minimax-cn-api", "minimax-m3-messages")
+        .unwrap();
+    tickloop_agent::model::credentials::save_api_key(&root, &model.api_key_env, "test-minimax-key")
+        .unwrap();
+    let client = Arc::new(ScriptedModel::new(vec![text("Thinking on")]));
+    let agent = Agent::open_embedded(root.clone(), model, client.clone()).unwrap();
+    let chat = agent.create_chat(root.clone()).await.unwrap();
+    let before = agent.snapshot(chat).await.unwrap();
+    assert_eq!(
+        before
+            .model
+            .thinking_enabled(before.reasoning_effort, before.thinking_enabled),
+        Some(false)
+    );
+    agent.set_thinking_enabled(chat, true).await.unwrap();
+    let mut events = agent.subscribe();
+    agent.submit(chat, None, "Hello".into()).await.unwrap();
+    wait_for_completion(&mut events).await;
+    assert_eq!(
+        client.requests.lock().unwrap()[0].reasoning_effort,
+        Some(ReasoningEffort::On)
+    );
+    let next = agent.create_chat(root).await.unwrap();
+    let saved = agent.snapshot(next).await.unwrap();
+    assert_eq!(saved.reasoning_effort, Some(ReasoningEffort::On));
+    assert_eq!(
+        saved
+            .model
+            .thinking_enabled(saved.reasoning_effort, saved.thinking_enabled),
+        Some(true)
+    );
+    agent.set_thinking_enabled(next, false).await.unwrap();
+    agent
+        .set_reasoning_effort(next, Some(ReasoningEffort::On))
+        .await
+        .unwrap();
+    assert!(agent.snapshot(next).await.unwrap().thinking_enabled);
+    agent.shutdown().await;
+}
+
 struct PausedSummary {
     started: tokio::sync::Notify,
     release: tokio::sync::Notify,
@@ -40,6 +85,7 @@ impl tickloop_agent::model::ModelClient for PausedSummary {
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
         Ok(tickloop_agent::model::ModelOutput {
+            private_source: None,
             content: text("A complete response"),
             usage: Default::default(),
             stop_reason: "end_turn".into(),
@@ -279,34 +325,39 @@ async fn switching_model_and_thinking_during_tool_approval_waits_until_the_old_r
 }
 
 #[tokio::test]
-async fn model_switch_rejects_private_history_and_invalid_configuration_without_mutation() {
+async fn model_switch_projects_private_history_and_rejects_invalid_configuration_without_mutation()
+{
     let directory = tempfile::tempdir().unwrap();
-    let original = Arc::new(ScriptedModel::new(vec![vec![
-        Content::Thinking {
-            thinking: "private state".into(),
-            signature: Some("signature".into()),
-        },
-        Content::Text {
-            text: "Public answer".into(),
-        },
-    ]]));
-    let agent = Agent::new_embedded(config(), original);
+    let original = Arc::new(ScriptedModel::new(vec![
+        vec![
+            Content::Thinking {
+                thinking: "readable historical reasoning".into(),
+                signature: Some("signature".into()),
+            },
+            Content::Text {
+                text: "Public answer".into(),
+            },
+        ],
+        text("Back on A"),
+    ]));
+    let agent = Agent::new_embedded(config(), original.clone());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
-    agent.submit(chat, None, "My goal".into()).await.unwrap();
+    let receipt = agent.submit(chat, None, "My goal".into()).await.unwrap();
     wait_for_completion(&mut events).await;
     let before = agent.snapshot(chat).await.unwrap();
     let mut selected = config();
     selected.protocol = Protocol::Responses;
-    let replacement = Arc::new(ScriptedModel::new(vec![]));
-    assert!(
+    let replacement = Arc::new(ScriptedModel::new(vec![text("Model B reply")]));
+    assert_eq!(
         agent
             .set_model(chat, selected.clone(), replacement.clone())
             .await
-            .unwrap_err()
-            .to_string()
-            .contains("compact")
+            .unwrap(),
+        ModelChange::Applied
     );
+    let switched = agent.snapshot(chat).await.unwrap();
+    assert_eq!(before.messages, switched.messages);
     selected.base_url = "invalid".into();
     assert!(
         agent
@@ -314,11 +365,36 @@ async fn model_switch_rejects_private_history_and_invalid_configuration_without_
             .await
             .is_err()
     );
-    let after = agent.snapshot(chat).await.unwrap();
-    assert_eq!(before.model, after.model);
-    assert_eq!(before.messages, after.messages);
-    assert!(after.pending_model.is_none());
-    assert!(replacement.requests.lock().unwrap().is_empty());
+    assert_eq!(agent.snapshot(chat).await.unwrap().model, switched.model);
+    agent
+        .submit(chat, Some(receipt.loop_id), "Continue on B".into())
+        .await
+        .unwrap();
+    wait_for_completion(&mut events).await;
+    {
+        let requests = replacement.requests.lock().unwrap();
+        assert!(requests[0].messages.iter().flat_map(|message| &message.content).any(|block| matches!(block, Content::Text {text} if text == "readable historical reasoning")));
+        assert!(
+            !requests[0]
+                .messages
+                .iter()
+                .flat_map(|message| &message.content)
+                .any(|block| matches!(
+                    block,
+                    Content::Thinking { .. } | Content::ProtocolData { .. }
+                ))
+        );
+    }
+    agent
+        .set_model(chat, config(), original.clone())
+        .await
+        .unwrap();
+    agent
+        .submit(chat, Some(receipt.loop_id), "Continue on A".into())
+        .await
+        .unwrap();
+    wait_for_completion(&mut events).await;
+    assert!(original.requests.lock().unwrap()[1].messages.iter().flat_map(|message| &message.content).any(|block| matches!(block, Content::Thinking {signature:Some(signature),..} if signature == "signature")));
     agent.shutdown().await;
 }
 

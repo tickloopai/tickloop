@@ -1,4 +1,6 @@
-//! Shared, local OpenAI Codex subscription credentials.
+//! Local subscription credentials.
+
+pub mod minimax;
 
 use std::fmt;
 use std::fs::{File, OpenOptions};
@@ -51,6 +53,8 @@ const CALLBACK_STATE_MISMATCH: &str = "This callback belongs to a different sign
 
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {
+    #[error("{0}")]
+    MiniMax(String),
     #[error("OpenAI Codex login was cancelled")]
     Cancelled,
     #[error("OpenAI Codex authorization timed out; retry from /model → Provider")]

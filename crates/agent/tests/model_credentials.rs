@@ -255,6 +255,7 @@ async fn model_factory_reads_saved_key_for_each_request() {
     };
     let client = model_client(config, Some(&root)).unwrap();
     let request = || ModelRequest {
+        history_sources: Vec::new(),
         messages: vec![Message {
             role: Role::User,
             content: vec![],

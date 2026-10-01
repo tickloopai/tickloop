@@ -94,6 +94,7 @@ impl ModelClient for UsageModel {
             .ok_or_else(|| ModelError::InvalidResponse("script exhausted".into()))?;
         let _ = events.send(ModelDelta::Text(reply.clone()));
         Ok(ModelOutput {
+            private_source: None,
             content: text(&reply),
             usage: ANSWER_USAGE,
             stop_reason: "end_turn".into(),
@@ -436,6 +437,7 @@ impl ModelClient for PausedSummaryModel {
             "answer"
         };
         Ok(ModelOutput {
+            private_source: None,
             content: text(reply),
             usage: Usage::default(),
             stop_reason: "end_turn".into(),

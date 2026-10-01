@@ -238,6 +238,9 @@ impl Agent {
         snapshot
             .message_runs
             .insert(snapshot.messages.len(), receipt.run_id);
+        snapshot
+            .message_models
+            .insert(snapshot.messages.len(), snapshot.model.identity());
         snapshot.messages.push(Message {
             role: Role::Assistant,
             content: vec![Content::Text { text }],
@@ -806,6 +809,7 @@ mod tests {
                 Behavior::Complete => {}
             }
             Ok(ModelOutput {
+                private_source: None,
                 content: vec![Content::Text {
                     text: "response".into(),
                 }],
@@ -839,6 +843,7 @@ mod tests {
 
     fn empty_request() -> ModelRequest {
         ModelRequest {
+            history_sources: Vec::new(),
             messages: Vec::new(),
             tools: Vec::new(),
             structured_output: None,

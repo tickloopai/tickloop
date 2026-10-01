@@ -222,6 +222,10 @@ pub struct ChatSnapshot {
     /// assistant 消息的用量（链上字段）。定向摘要保留的消息在恢复时照 Claude Code 清零。
     #[serde(default)]
     pub message_usage: BTreeMap<usize, Usage>,
+    #[serde(default)]
+    pub message_sources: BTreeMap<usize, crate::model::PrivateHistorySource>,
+    #[serde(default)]
+    pub message_models: BTreeMap<usize, crate::model::ModelIdentity>,
     /// 链上字段：由对话链上的 Loop 条目重放得到。
     #[serde(default)]
     pub loops: Vec<LoopSnapshot>,
@@ -1009,6 +1013,8 @@ fn empty_snapshot(id: ChatId, workdir: PathBuf, model: ModelConfig) -> ChatSnaps
         inherited_prompts: HashSet::new(),
         message_compactions: BTreeMap::new(),
         message_usage: BTreeMap::new(),
+        message_sources: BTreeMap::new(),
+        message_models: BTreeMap::new(),
         loops: Vec::new(),
         loop_starts: BTreeMap::new(),
         resume_triggers: Vec::new(),
@@ -2218,7 +2224,7 @@ impl Agent {
                 record_invoked_skill(&mut chat.snapshot, invoked);
                 self.save(&chat.snapshot);
             }
-            request.messages = context::model_messages(chat)?;
+            (request.messages, request.history_sources) = context::model_history(chat)?;
             let replacements = tool_results::enforce_tool_result_budget(
                 &mut request.messages,
                 &mut chat.content_replacements,
@@ -2238,6 +2244,7 @@ impl Agent {
                 "uncertain_operations": chat.snapshot.current_operation_uncertainties(),
             });
             let plan_mode = self.plan_mode_section(chat, receipt.loop_id);
+            request.history_sources.insert(0, None);
             request.messages.insert(
                 0,
                 Message {
@@ -2324,10 +2331,12 @@ impl Agent {
                     chat.snapshot.pending_thinking.remove(&receipt.run_id);
                     drop(chats);
                     recovered_text.push_str(&attempt_text);
+                    request.history_sources.push(None);
                     request.messages.push(Message {
                         role: Role::Assistant,
                         content: vec![Content::Text { text: attempt_text }],
                     });
+                    request.history_sources.push(None);
                     request.messages.push(Message {
                         role: Role::User,
                         content: vec![Content::Text {
@@ -2569,6 +2578,11 @@ impl Agent {
                     chat.snapshot.message_runs.insert(chat.snapshot.messages.len(),receipt.run_id);
                     chat.snapshot.message_ids.insert(chat.snapshot.messages.len(),assistant_message_id);
                     chat.snapshot.message_usage.insert(chat.snapshot.messages.len(),output.usage);
+                    let index = chat.snapshot.messages.len();
+                    chat.snapshot.message_models.insert(index, chat.snapshot.model.identity());
+                    if let Some(source) = output.private_source.or_else(|| chat.snapshot.model.private_history_source()) {
+                        chat.snapshot.message_sources.insert(index, source);
+                    }
                     chat.snapshot.messages.push(Message {role:Role::Assistant,content:output.content});
                     chat.snapshot.last_model_run=Some(receipt.run_id);
                     self.save(&chat.snapshot);
@@ -2648,7 +2662,8 @@ impl Agent {
                 self.complete_file_history_snapshots(receipt.chat_id).await;
                 let chats=self.inner.chats.lock().await;
                 let chat=chats.get(&receipt.chat_id).unwrap();
-                request=ModelRequest {messages:context::model_messages(chat).map_err(|error|error.to_string())?,tools:self.tool_definitions(chat),structured_output:None,temperature:None,reasoning_effort:chat.snapshot.effective_reasoning_effort()};
+                let (messages, history_sources) = context::model_history(chat).map_err(|error|error.to_string())?;
+                request=ModelRequest { history_sources,messages,tools:self.tool_definitions(chat),structured_output:None,temperature:None,reasoning_effort:chat.snapshot.effective_reasoning_effort()};
             }
         }.await;
         let mut chats = self.inner.chats.lock().await;
@@ -2971,8 +2986,10 @@ impl Agent {
             self.append_input_message(&mut candidate, pending);
             self.save(&candidate.snapshot);
             self.emit(&mut candidate, &receipt, EventKind::Started);
+            let (messages, history_sources) = context::model_history(&candidate)?;
             let request = ModelRequest {
-                messages: context::model_messages(&candidate)?,
+                history_sources,
+                messages,
                 tools: self.tool_definitions(&candidate),
                 structured_output: None,
                 temperature: None,

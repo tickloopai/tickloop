@@ -939,12 +939,10 @@ fn chain_entry(
         }),
         is_visible_in_transcript_only: summarize_metadata.is_some_and(Option::is_none),
         usage: snapshot.message_usage.get(&index).cloned(),
-        // 进程内切换模型要求对话中没有私有推理，所以写入时 Chat 的模型就是生成带私有推理消息的模型。
-        model: is_assistant.then(|| snapshot.model.identity()),
-        private_source: (is_assistant
-            && snapshot.model.auth_source == crate::model::ModelAuthSource::CodexSubscription)
-            .then(|| snapshot.model.private_history_source())
+        model: is_assistant
+            .then(|| snapshot.message_models.get(&index).cloned())
             .flatten(),
+        private_source: snapshot.message_sources.get(&index).cloned(),
         loop_id: snapshot
             .message_runs
             .get(&index)
@@ -1160,8 +1158,8 @@ struct RestoredChain {
     inherited_prompts: HashSet<usize>,
     message_compactions: BTreeMap<usize, CompactionMarker>,
     message_usage: BTreeMap<usize, Usage>,
-    /// Assistant private history sources are used only while restoring a transcript.
     message_sources: BTreeMap<usize, PrivateHistorySource>,
+    message_models: BTreeMap<usize, crate::model::ModelIdentity>,
     links: Vec<MessageLink>,
     meta_messages: HashSet<usize>,
     message_of_entry: HashMap<Uuid, usize>,
@@ -1190,6 +1188,7 @@ fn restore_chain(chain: &[ChainEntry]) -> (RestoredChain, Vec<String>) {
         message_compactions: BTreeMap::new(),
         message_usage: BTreeMap::new(),
         message_sources: BTreeMap::new(),
+        message_models: BTreeMap::new(),
         links: Vec::new(),
         meta_messages: HashSet::new(),
         message_of_entry: HashMap::new(),
@@ -1242,6 +1241,13 @@ fn restore_chain(chain: &[ChainEntry]) -> (RestoredChain, Vec<String>) {
             continue;
         }
         let index = restored.messages.len();
+        if let Some(model) = entry
+            .model
+            .clone()
+            .filter(|_| entry.message.role == Role::Assistant)
+        {
+            restored.message_models.insert(index, model);
+        }
         if let Some(run_id) = entry.run_id {
             restored.message_runs.insert(index, run_id);
         }
@@ -1358,6 +1364,7 @@ impl RestoredChain {
             message_compactions: BTreeMap::new(),
             message_usage: BTreeMap::new(),
             message_sources: BTreeMap::new(),
+            message_models: BTreeMap::new(),
             links: Vec::new(),
             meta_messages: HashSet::new(),
             message_of_entry: HashMap::new(),
@@ -1405,6 +1412,9 @@ impl RestoredChain {
             }
             if let Some(usage) = self.message_usage.get(&original) {
                 kept.message_usage.insert(index, usage.clone());
+            }
+            if let Some(model) = self.message_models.get(&original) {
+                kept.message_models.insert(index, model.clone());
             }
             if let Some(source) = self.message_sources.get(&original) {
                 kept.message_sources.insert(index, source.clone());
@@ -1481,6 +1491,8 @@ impl RestoredChain {
         snapshot.prompt_execution_modes = self.prompt_execution_modes.clone();
         snapshot.inherited_prompts = self.inherited_prompts.clone();
         snapshot.message_usage = self.message_usage.clone();
+        snapshot.message_sources = self.message_sources.clone();
+        snapshot.message_models = self.message_models.clone();
         snapshot.message_compactions = self.message_compactions.clone();
         snapshot.run_loops = self.run_loops.clone();
         snapshot.plan_slug = self.plan_slug.clone();
@@ -1568,8 +1580,8 @@ fn recover_snapshot_for_resume(
     })
 }
 
-/// 照 Claude Code 恢复过滤：所有 tool_use 都没有结果的 assistant 消息、只含 thinking
-/// 或空白文本的 assistant 消息不再进入对话。返回要删除的消息下标。
+/// Remove unanswered tool-only turns and blank text; keep private blocks in the archive.
+/// Target projection decides whether those blocks can be sent to the selected model.
 fn unrecoverable_assistant_messages(messages: &[Message]) -> BTreeSet<usize> {
     let resolved = messages
         .iter()
@@ -1602,15 +1614,10 @@ fn is_unrecoverable_assistant(message: &Message, resolved: &HashSet<&str>) -> bo
         return tool_uses.iter().all(|id| !resolved.contains(id));
     }
     !message.content.is_empty()
-        && (message.content.iter().all(|content| {
-            matches!(
-                content,
-                Content::Thinking { .. } | Content::ProtocolData { .. }
-            )
-        }) || message
+        && message
             .content
             .iter()
-            .all(|content| matches!(content, Content::Text { text } if text.trim().is_empty())))
+            .all(|content| matches!(content, Content::Text { text } if text.trim().is_empty()))
 }
 
 /// 照 Claude Code `deserializeMessagesWithInterruptDetection`：末尾是工具结果时先追加
@@ -2027,10 +2034,6 @@ impl Agent {
         // 与设置写入互斥到 Chat 加入本进程为止，期间写入的持久规则改动不会漏掉这个 Chat。
         let _settings_gate = self.inner.settings_writes.lock().await;
         let (client, output_style) = self.apply_chat_defaults(&mut snapshot);
-        super::context::strip_private_reasoning_of_other_models(
-            &mut snapshot,
-            &restored.without(&removed).message_sources,
-        );
         let mut file_history = FileHistory::restore(
             self.file_history_directory(source_chat_id, &snapshot.workdir),
             file_history_snapshots(&loaded),
@@ -2124,4 +2127,37 @@ enum RestoreTarget {
     Resume(PathBuf),
     /// 写入新 chatId 的 Transcript。
     NewChat { source: ChatId },
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+
+    #[test]
+    fn recovery_keeps_private_only_history_for_source_projection() {
+        let messages = vec![
+            Message {
+                role: Role::Assistant,
+                content: vec![Content::Thinking {
+                    thinking: "readable".into(),
+                    signature: Some("signed".into()),
+                }],
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![Content::ProtocolData {
+                    protocol: crate::model::Protocol::Responses,
+                    value: serde_json::json!({"type":"reasoning","encrypted_content":"opaque"}),
+                }],
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![Content::Text { text: " ".into() }],
+            },
+        ];
+        assert_eq!(
+            unrecoverable_assistant_messages(&messages),
+            BTreeSet::from([2])
+        );
+    }
 }

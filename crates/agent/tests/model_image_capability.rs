@@ -117,6 +117,7 @@ fn text_stream(protocol: Protocol) -> String {
 
 fn image_request() -> ModelRequest {
     ModelRequest {
+        history_sources: Vec::new(),
         messages: vec![Message {
             role: Role::User,
             content: vec![
@@ -197,6 +198,7 @@ async fn messages_replaces_each_image_block_in_place() {
 
 fn tool_result_image_request() -> ModelRequest {
     ModelRequest {
+        history_sources: Vec::new(),
         messages: vec![
             Message {
                 role: Role::Assistant,

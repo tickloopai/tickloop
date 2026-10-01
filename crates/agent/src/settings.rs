@@ -1437,6 +1437,9 @@ impl UserSettings {
         effort: Option<ReasoningEffort>,
     ) -> Result<(), SettingsError> {
         self.update(|settings| {
+            if effort == Some(ReasoningEffort::On) {
+                settings.insert(THINKING_ENABLED_KEY.into(), Value::Bool(true));
+            }
             if settings.get(EFFORT_LEVEL_KEY) == Some(&Value::String("off".into()))
                 && !settings.contains_key(THINKING_ENABLED_KEY)
             {
@@ -1455,9 +1458,22 @@ impl UserSettings {
     }
 
     pub fn save_thinking_enabled(&self, enabled: bool) -> Result<(), SettingsError> {
+        self.save_thinking_enabled_with_effort(enabled, None)
+    }
+
+    pub(crate) fn save_thinking_enabled_with_effort(
+        &self,
+        enabled: bool,
+        effort: Option<ReasoningEffort>,
+    ) -> Result<(), SettingsError> {
         self.update(|settings| {
             settings.insert(THINKING_ENABLED_KEY.into(), Value::Bool(enabled));
-            if settings.get(EFFORT_LEVEL_KEY) == Some(&Value::String("off".into())) {
+            if let Some(effort) = effort {
+                settings.insert(
+                    EFFORT_LEVEL_KEY.into(),
+                    serde_json::to_value(effort).expect("reasoning effort serializes to JSON"),
+                );
+            } else if settings.get(EFFORT_LEVEL_KEY) == Some(&Value::String("off".into())) {
                 settings.remove(EFFORT_LEVEL_KEY);
             }
             Ok(())

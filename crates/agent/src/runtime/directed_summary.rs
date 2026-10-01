@@ -449,6 +449,7 @@ fn summary_request(plan: &DirectedSummaryPlan) -> ModelRequest {
         }],
     });
     ModelRequest {
+        history_sources: Vec::new(),
         messages,
         tools: Vec::new(),
         structured_output: None,
@@ -560,6 +561,7 @@ mod tests {
     #[test]
     fn complete_summary_keeps_text_block_boundaries() {
         let output = ModelOutput {
+            private_source: None,
             content: vec![
                 Content::Text {
                     text: "first paragraph".into(),

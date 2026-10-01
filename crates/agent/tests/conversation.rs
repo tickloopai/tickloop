@@ -37,6 +37,7 @@ impl ModelClient for ConversationModel {
         events.send(ModelDelta::Text("Hello ".into())).unwrap();
         events.send(ModelDelta::Text("Sam".into())).unwrap();
         Ok(ModelOutput {
+            private_source: None,
             content: vec![Content::Text {
                 text: "Hello Sam".into(),
             }],
@@ -239,6 +240,7 @@ async fn stopping_a_goal_cancels_its_run_and_queue_but_other_goals_continue() {
                 return Err(ModelError::Cancelled);
             }
             Ok(ModelOutput {
+                private_source: None,
                 content: vec![Content::Text {
                     text: "other goal done".into(),
                 }],

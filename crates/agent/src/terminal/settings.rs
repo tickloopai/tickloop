@@ -135,7 +135,7 @@ mod tests {
     #[test]
     fn upgrades_only_saved_legacy_builtin_profiles() {
         for mut legacy in built_in_model_profiles() {
-            if legacy.provider != tickloop_agent::model::ModelProvider::Api {
+            if legacy.provider_id != "deepseek-api" {
                 continue;
             }
             legacy.provider_id.clear();

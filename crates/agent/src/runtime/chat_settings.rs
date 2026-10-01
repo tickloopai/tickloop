@@ -80,7 +80,9 @@ impl Agent {
                     })
                 };
             snapshot.reasoning_effort = match saved.reasoning_effort() {
-                Some(effort) if ReasoningEffort::choices(&snapshot.model).contains(&effort) => {
+                Some(effort)
+                    if validate_reasoning_effort(&snapshot.model, Some(effort)).is_ok() =>
+                {
                     Some(effort)
                 }
                 Some(effort) => {
@@ -187,6 +189,9 @@ impl Agent {
         validate_reasoning_effort(&chat.snapshot.model, effort)
             .map_err(|error| AgentError::Invalid(error.to_string()))?;
         chat.snapshot.reasoning_effort = effort;
+        if effort == Some(ReasoningEffort::On) {
+            chat.snapshot.thinking_enabled = true;
+        }
         Ok(())
     }
 
@@ -196,7 +201,7 @@ impl Agent {
         enabled: bool,
     ) -> Result<(), AgentError> {
         let _settings_gate = self.inner.settings_writes.lock().await;
-        {
+        let enable_effort = {
             let chats = self.inner.chats.lock().await;
             let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
             validate_reasoning_effort(
@@ -204,9 +209,15 @@ impl Agent {
                 (!enabled).then_some(ReasoningEffort::Off),
             )
             .map_err(|error| AgentError::Invalid(error.to_string()))?;
-        }
-        self.write_user_settings(move |settings| settings.save_thinking_enabled(enabled))
-            .await?;
+            (enabled
+                && validate_reasoning_effort(&chat.snapshot.model, Some(ReasoningEffort::On))
+                    .is_ok())
+            .then_some(ReasoningEffort::On)
+        };
+        self.write_user_settings(move |settings| {
+            settings.save_thinking_enabled_with_effort(enabled, enable_effort)
+        })
+        .await?;
         let mut chats = self.inner.chats.lock().await;
         let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
         validate_reasoning_effort(
@@ -215,6 +226,9 @@ impl Agent {
         )
         .map_err(|error| AgentError::Invalid(error.to_string()))?;
         chat.snapshot.thinking_enabled = enabled;
+        if let Some(effort) = enable_effort {
+            chat.snapshot.reasoning_effort = Some(effort);
+        }
         Ok(())
     }
 

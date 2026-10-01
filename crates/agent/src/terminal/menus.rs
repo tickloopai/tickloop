@@ -1,6 +1,6 @@
 mod judgment;
 mod providers;
-use providers::{ModelChoice, ProviderModels};
+use providers::{ModelChoice, ProviderModels, ProviderRow};
 
 use std::{
     collections::{HashMap, HashSet},
@@ -54,6 +54,7 @@ enum Selection {
     Provider {
         chat: Uuid,
         choices: Vec<ProviderModels>,
+        rows: Vec<ProviderRow>,
     },
     Model {
         chat: Uuid,
@@ -287,6 +288,7 @@ pub(super) struct Menus {
     login_return: Option<(Uuid, ProviderModels)>,
     provider_choices: Vec<ProviderModels>,
     provider_selected: usize,
+    provider_group: Option<(&'static str, usize)>,
     config_root: Option<PathBuf>,
     font_manager: Option<NerdFontManager<SystemFontAdapter>>,
 }
@@ -308,6 +310,7 @@ impl Menus {
             login_return: None,
             provider_choices: Vec::new(),
             provider_selected: 0,
+            provider_group: None,
             config_root: config_root.clone(),
             font_manager: config_root.map(NerdFontManager::production),
         }
@@ -323,6 +326,7 @@ impl Menus {
 #[derive(Default)]
 pub(super) struct MenuOutcome {
     pub provider_logout: bool,
+    pub logout_region: Option<crate::auth::minimax::MiniMaxRegion>,
     pub reauthenticate_after_logout: bool,
     pub provider_login: Option<super::login::LoginMethod>,
     pub permission: Option<Uuid>,
@@ -776,6 +780,7 @@ impl Menus {
         }
         self.provider_choices = ProviderModels::group(choices);
         self.provider_selected = 0;
+        self.provider_group = None;
         self.show_providers(
             console,
             chat,
@@ -795,14 +800,23 @@ impl Menus {
             .snapshot(chat)
             .await
             .map_err(|error| error.to_string())?;
-        let choices = std::iter::once(None)
-            .chain(
-                ReasoningEffort::choices(&snapshot.model)
-                    .iter()
-                    .copied()
-                    .map(Some),
-            )
-            .collect::<Vec<_>>();
+        let choices = if tickloop_agent::model::validate_reasoning_effort(
+            &snapshot.model,
+            Some(ReasoningEffort::On),
+        )
+        .is_ok()
+        {
+            providers::thinking_choices(&snapshot.model)
+        } else {
+            std::iter::once(None)
+                .chain(
+                    ReasoningEffort::choices(&snapshot.model)
+                        .iter()
+                        .copied()
+                        .map(Some),
+                )
+                .collect::<Vec<_>>()
+        };
         if choices.len() == 1 {
             return Err(format!(
                 "{} does not support configurable Thinking",
@@ -883,7 +897,14 @@ impl Menus {
                             .map(|card| card.thinking)
                         {
                             Some(tickloop_agent::model::cards::ThinkingControl::Toggle) => {
-                                if snapshot.thinking_enabled {
+                                if snapshot
+                                    .model
+                                    .thinking_enabled(
+                                        snapshot.reasoning_effort,
+                                        snapshot.thinking_enabled,
+                                    )
+                                    .unwrap_or(false)
+                                {
                                     "On"
                                 } else {
                                     "Off"
@@ -1771,9 +1792,9 @@ impl Menus {
                         }
                     }
                 }
-                Selection::Provider { chat, choices } => {
+                Selection::Provider { chat, choices, rows } => {
                     if let Some(index) = index {
-                        if index == choices.len() + 1 {
+                        if self.provider_group.is_none() && index == rows.len() + 1 {
                             let provider = choices.iter().find(|provider| provider.models[0].auth_source == tickloop_agent::model::ModelAuthSource::CodexSubscription).cloned().ok_or("Codex subscription Provider is not configured.")?;
                             self.provider_choices = choices;
                             self.provider_selected = index;
@@ -1781,7 +1802,7 @@ impl Menus {
                             self.login_return = Some((chat, provider));
                             return Ok(MenuOutcome { provider_logout: true, ..Default::default() });
                         }
-                        if index == choices.len() {
+                        if self.provider_group.is_none() && index == rows.len() {
                             self.provider_choices = choices;
                             self.provider_selected = index;
                             if let Err(error) = self.judgment_settings(
@@ -1795,9 +1816,19 @@ impl Menus {
                             }
                             return Ok(MenuOutcome::default());
                         }
-                        let provider = choices.get(index).ok_or("provider option does not exist")?.clone();
+                        let row = rows.get(index).ok_or("provider option does not exist")?;
+                        if let Some((_, selected)) = &mut self.provider_group { *selected = index; } else { self.provider_selected = index; }
+                        let provider_index = match row {
+                            ProviderRow::Group(name) => {
+                                self.provider_group = Some((*name, 0));
+                                self.provider_choices = choices.clone();
+                                self.show_providers(console, chat, choices, 0, Uuid::new_v4())?;
+                                return Ok(MenuOutcome::default());
+                            }
+                            ProviderRow::Provider(provider_index) => *provider_index,
+                        };
+                        let provider = choices.get(provider_index).ok_or("provider option does not exist")?.clone();
                         self.provider_choices = choices;
-                        self.provider_selected = index;
                         match self.provider_authenticated(&provider) {
                             Ok(true) => self.provider_models(agent, console, chat, provider).await?,
                             Ok(false) => return self.provider_auth(console, chat, provider),
@@ -1806,6 +1837,8 @@ impl Menus {
                                 return Err(error);
                             }
                         }
+                    } else if self.provider_group.take().is_some() {
+                        self.back_to_providers(console, chat)?;
                     } else {
                         console.write("Selection cancelled; configuration unchanged.\n")?;
                     }
@@ -1917,7 +1950,7 @@ impl Menus {
                                 .map(|card| card.thinking),
                             Some(tickloop_agent::model::cards::ThinkingControl::Toggle)
                         ) {
-                            agent.set_thinking_enabled(chat, !snapshot.thinking_enabled).await.map_err(|error| error.to_string())?;
+                            agent.set_thinking_enabled(chat, !snapshot.model.thinking_enabled(snapshot.reasoning_effort, snapshot.thinking_enabled).unwrap_or(snapshot.thinking_enabled)).await.map_err(|error| error.to_string())?;
                         } else {
                             console.write("Thinking toggle is unavailable for this model.\n")?;
                         }

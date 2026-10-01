@@ -66,6 +66,7 @@ impl ModelClient for ScriptedModel {
             }
         }
         Ok(ModelOutput {
+            private_source: None,
             content,
             usage: self.usages.lock().unwrap().pop_front().unwrap_or_default(),
             stop_reason: "end_turn".into(),

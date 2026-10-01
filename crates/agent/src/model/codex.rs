@@ -164,6 +164,13 @@ impl CodexModelClient {
             })
             .await
             .map_err(|error| errors::auth_error(&error))?;
+        let mut source = self.config.private_history_source();
+        if let Some(source) = &mut source {
+            source.credential_identity = Some(super::credential_fingerprint(
+                credentials.account_id.as_bytes(),
+            ));
+        }
+        let request = super::history::project_request(request, &self.config, source.as_ref());
         let origin = codex_origin(&self.config.model, &credentials.account_id);
         let mut body = encode_request(&self.config, request, &origin)?;
         if let Some(chat) = chat_id {
@@ -214,6 +221,7 @@ impl CodexModelClient {
             )
             .await?
         };
+        output.private_source = source;
         tag_private_output(&mut output, &origin);
         match structured_tool {
             Some(name) => normalize_structured_output(output, &name),
@@ -313,7 +321,15 @@ impl CodexModelClient {
                     .at_stage(ModelRequestStage::ResponseHeaders),
             );
         }
-        consume_sse_response(response, Protocol::Responses, events, cancel, None, true).await
+        consume_sse_response(
+            response,
+            Protocol::Responses,
+            events,
+            cancel,
+            None,
+            super::cards::Adapter::CodexResponses,
+        )
+        .await
     }
 }
 
@@ -683,6 +699,7 @@ mod tests {
         let body = encode_request(
             &config,
             ModelRequest {
+                history_sources: Vec::new(),
                 messages: vec![crate::model::Message {
                     role: Role::User,
                     content: vec![Content::Text {
@@ -721,6 +738,7 @@ mod tests {
         let body = encode_request(
             &config,
             ModelRequest {
+                history_sources: Vec::new(),
                 messages: vec![
                     crate::model::Message {
                         role: Role::Assistant,
@@ -818,6 +836,7 @@ mod tests {
         let body = encode_request(
             &config,
             ModelRequest {
+                history_sources: Vec::new(),
                 messages,
                 tools: Vec::new(),
                 structured_output: None,
@@ -1136,6 +1155,7 @@ mod tests {
 
     fn simple_request() -> ModelRequest {
         ModelRequest {
+            history_sources: Vec::new(),
             messages: vec![crate::model::Message {
                 role: Role::User,
                 content: vec![Content::Text {
@@ -1436,6 +1456,7 @@ mod tests {
             .await
             .unwrap();
         let second_request = ModelRequest {
+            history_sources: Vec::new(),
             messages: vec![
                 crate::model::Message {
                     role: Role::User,
@@ -1673,6 +1694,7 @@ mod tests {
             .await
             .unwrap();
         let request = ModelRequest {
+            history_sources: Vec::new(),
             messages: vec![
                 crate::model::Message {
                     role: Role::User,

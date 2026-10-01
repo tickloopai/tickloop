@@ -4,7 +4,10 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::auth::{AuthError, BrowserCallback, CodexAuth};
+use crate::auth::{
+    AuthError, BrowserCallback, CodexAuth,
+    minimax::{MiniMaxAuth, MiniMaxRegion},
+};
 
 use super::{
     console::{Console, Menu},
@@ -15,6 +18,16 @@ use super::{
 pub(super) enum LoginMethod {
     Device,
     Browser,
+    MiniMax(MiniMaxRegion),
+}
+
+impl LoginMethod {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::MiniMax(region) => region.label(),
+            _ => "Codex subscription",
+        }
+    }
 }
 
 pub(super) enum LoginUpdate {
@@ -31,6 +44,7 @@ pub(super) enum LoginUpdate {
 
 pub(super) struct LoginFlow {
     id: Uuid,
+    method: LoginMethod,
     cancel: CancellationToken,
     task: tokio::task::JoinHandle<()>,
     updates: mpsc::UnboundedReceiver<LoginUpdate>,
@@ -48,15 +62,35 @@ impl LoginFlow {
         Self::show(
             console,
             id,
-            vec!["Starting official OpenAI authorization…".into()],
+            vec![format!("Starting {} authorization…", method.label())],
             None,
+            method.label(),
         )?;
         let task_cancel = cancel.clone();
         let (updates, receiver) = mpsc::unbounded_channel();
         let task = tokio::spawn(async move {
+            if let LoginMethod::MiniMax(region) = method {
+                let auth = MiniMaxAuth::new(root, region);
+                let result = async {
+                    let login = auth.start_device_login(&task_cancel).await?;
+                    let address = login.verification_uri.clone();
+                    let _ = updates.send(LoginUpdate::Device { address: address.clone(), code: login.user_code.clone() });
+                    let launch = launch_browser(&address);
+                    let finish = auth.finish_device_login(login, &task_cancel);
+                    tokio::pin!(launch, finish);
+                    tokio::select! { result = &mut finish => result, () = &mut launch => finish.await }
+                }.await;
+                let _ = updates.send(LoginUpdate::Finished(
+                    result
+                        .map(|_| region.label().to_owned())
+                        .map_err(|error| error.to_string()),
+                ));
+                return;
+            }
             let auth = terminal_auth(root);
             let result = async {
                 match method {
+                    LoginMethod::MiniMax(_) => unreachable!("MiniMax uses its device flow"),
                     LoginMethod::Device => {
                         let login = auth.start_device_login(&task_cancel).await?;
                         let address = login.verification_uri.clone();
@@ -98,11 +132,16 @@ impl LoginFlow {
         });
         Ok(Self {
             id,
+            method,
             cancel,
             task,
             updates: receiver,
             browser: None,
         })
+    }
+
+    pub(super) fn label(&self) -> &'static str {
+        self.method.label()
     }
 
     pub(super) fn id(&self) -> Uuid {
@@ -119,18 +158,27 @@ impl LoginFlow {
         address: &str,
         code: &str,
     ) -> Result<(), String> {
+        let mut context = vec![
+            "Opening your browser. If no page appears, open this link on your own device:".into(),
+            safe_text(address),
+            "Use your terminal's link shortcut (often Ctrl/Cmd+click), or copy the URL.".into(),
+            format!("Enter code: {}", safe_text(code)),
+        ];
+        if let LoginMethod::MiniMax(_) = self.method {
+            context.push("Approve access on the MiniMax Portal. The consent page identifies the registered Portal client.".into());
+        } else {
+            context.push("If OpenAI asks you to enable device code authorization, enable it in ChatGPT Settings > Security and retry Device code sign-in from this Provider, or use Browser sign-in.".into());
+        }
+        context.push(format!(
+            "Waiting for {} authorization. Esc cancels.",
+            self.method.label()
+        ));
         Self::show(
             console,
             self.id,
-            vec![
-                "Opening your browser. If no page appears, open this link on your own device:".into(),
-                safe_text(address),
-                "Use your terminal's link shortcut (often Ctrl/Cmd+click), or copy the URL.".into(),
-                format!("Enter code: {}", safe_text(code)),
-                "If OpenAI asks you to enable device code authorization, enable it in ChatGPT Settings > Security and retry Device code sign-in from this Provider, or use Browser sign-in.".into(),
-                "Waiting for official OpenAI authorization. Esc cancels.".into(),
-            ],
+            context,
             Some(address),
+            self.method.label(),
         )
     }
 
@@ -208,12 +256,13 @@ impl LoginFlow {
         id: Uuid,
         context: Vec<String>,
         link: Option<&str>,
+        label: &str,
     ) -> Result<(), String> {
         if console.is_interactive() {
             console.set_prompt_enabled(false)?;
             let menu = Menu {
                 id,
-                title: "Log in to Codex subscription".into(),
+                title: format!("Log in to {label}"),
                 context,
                 options: vec!["Cancel login".into()],
                 selected: 0,
@@ -249,11 +298,30 @@ pub(super) struct LogoutFlow {
 }
 
 impl LogoutFlow {
-    pub(super) fn start(root: PathBuf, console: &Console) -> Result<Self, String> {
-        console.set_status("Removing Codex login… Esc cancels; input will run afterward")?;
+    pub(super) fn start(
+        root: PathBuf,
+        console: &Console,
+        region: Option<MiniMaxRegion>,
+    ) -> Result<Self, String> {
+        let label = region.map_or("Codex", MiniMaxRegion::label);
+        console.set_status(&format!(
+            "Removing {label} login… Esc cancels; input will run afterward"
+        ))?;
         let cancel = CancellationToken::new();
         let task_cancel = cancel.clone();
-        let task = tokio::spawn(async move { terminal_auth(root).logout(&task_cancel).await });
+        let task = tokio::spawn(async move {
+            if let Some(region) = region {
+                MiniMaxAuth::new(root, region)
+                    .logout(&task_cancel)
+                    .await
+                    .map_err(|error| match error {
+                        crate::auth::minimax::MiniMaxAuthError::Cancelled => AuthError::Cancelled,
+                        _ => AuthError::MiniMax(error.to_string()),
+                    })
+            } else {
+                terminal_auth(root).logout(&task_cancel).await
+            }
+        });
         Ok(Self { cancel, task })
     }
 

@@ -83,6 +83,7 @@ async fn complete(
     let result = client
         .complete(
             ModelRequest {
+                history_sources: Vec::new(),
                 messages: vec![],
                 tools: vec![],
                 structured_output: None,

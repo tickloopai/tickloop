@@ -766,6 +766,7 @@ impl ModelClient for PartialModel {
                 Err(ModelError::StreamInterrupted)
             }
             ModelStep::Success(answer) => Ok(ModelOutput {
+                private_source: None,
                 content: vec![Content::Text {
                     text: answer.into(),
                 }],

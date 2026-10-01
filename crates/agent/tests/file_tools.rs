@@ -53,6 +53,7 @@ impl ModelClient for ToolsAndAnswer {
             self.0.clone()
         };
         Ok(ModelOutput {
+            private_source: None,
             content,
             usage: Usage::default(),
             stop_reason: "end_turn".into(),
@@ -105,6 +106,7 @@ impl ModelClient for ReadAndAnswer {
             }]
         };
         Ok(ModelOutput {
+            private_source: None,
             content,
             usage: Usage::default(),
             stop_reason: "end_turn".into(),

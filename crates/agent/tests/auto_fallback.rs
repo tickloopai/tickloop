@@ -71,6 +71,7 @@ impl ModelClient for RepeatingModel {
         }
         let index = self.normal_requests.fetch_add(1, Ordering::SeqCst);
         Ok(ModelOutput {
+            private_source: None,
             content: if index < 3 {
                 call(
                     &format!("link-{index}"),
@@ -126,6 +127,7 @@ impl ModelClient for FallbackModel {
             text("done")
         };
         Ok(ModelOutput {
+            private_source: None,
             content,
             usage: Usage::default(),
             stop_reason: "end_turn".into(),
@@ -182,6 +184,7 @@ impl ModelClient for ConversationModel {
             }
         };
         Ok(ModelOutput {
+            private_source: None,
             content,
             usage: Usage::default(),
             stop_reason: "end_turn".into(),

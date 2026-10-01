@@ -205,6 +205,7 @@ fn image(index: usize) -> Content {
 
 fn request_with_images(count: usize) -> ModelRequest {
     ModelRequest {
+        history_sources: Vec::new(),
         messages: (0..count)
             .map(|index| Message {
                 role: Role::User,
@@ -435,6 +436,7 @@ async fn a_failed_retry_reports_the_normal_error_without_retrying_again() {
 #[tokio::test]
 async fn other_rejections_and_requests_without_images_are_not_retried() {
     let text_only = ModelRequest {
+        history_sources: Vec::new(),
         messages: vec![Message {
             role: Role::User,
             content: vec![Content::Text {
