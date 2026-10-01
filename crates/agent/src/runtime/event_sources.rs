@@ -15,12 +15,21 @@ use crate::host_tools::{
 };
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const IDLE_EVENT_POLL_INTERVAL: Duration = Duration::from_secs(15);
 const CLAIM_RENEW_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_PENDING_PAGES_PER_POLL: usize = 8;
 const MAX_FINISHED_CLAIM_RECORDS: usize = 128;
 const MAX_EVENT_INPUT_BYTES: usize = 128 * 1024;
 const UNASSOCIATED_EPOCH: u64 = 0;
 const MAX_SAFE_EPOCH: u64 = 9_007_199_254_740_991;
+
+enum EventPollOutcome {
+    Stop,
+    Skipped,
+    Deferred,
+    Checked,
+    Claimed,
+}
 
 /// Saved shape of [`EventSourceBinding`]. Publication-only records keep the original three
 /// publication fields; a connected source adds a tagged origin and its frozen request. Records
@@ -600,17 +609,29 @@ impl Agent {
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(EVENT_POLL_INTERVAL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut next_poll_at = tokio::time::Instant::now();
             loop {
                 tokio::select! {
                     _ = agent.inner.shutdown.cancelled() => break,
                     _ = cancel.cancelled() => break,
                     _ = interval.tick() => {}
                 }
-                if !agent
-                    .poll_event_sources_once(chat_id, loop_id, &cancel)
+                let now = tokio::time::Instant::now();
+                match agent
+                    .poll_event_sources_once(chat_id, loop_id, now >= next_poll_at, &cancel)
                     .await
                 {
-                    break;
+                    EventPollOutcome::Stop => break,
+                    EventPollOutcome::Skipped => {
+                        next_poll_at = tokio::time::Instant::now() + EVENT_POLL_INTERVAL;
+                    }
+                    EventPollOutcome::Deferred => {}
+                    EventPollOutcome::Checked => {
+                        next_poll_at = tokio::time::Instant::now() + IDLE_EVENT_POLL_INTERVAL;
+                    }
+                    EventPollOutcome::Claimed => {
+                        next_poll_at = tokio::time::Instant::now() + EVENT_POLL_INTERVAL;
+                    }
                 }
             }
             cancel.cancel();
@@ -621,18 +642,19 @@ impl Agent {
         &self,
         chat_id: ChatId,
         loop_id: LoopId,
+        check_remote: bool,
         cancel: &CancellationToken,
-    ) -> bool {
+    ) -> EventPollOutcome {
         let sources = {
             let chats = self.inner.chats.lock().await;
             let Some(chat) = chats.get(&chat_id) else {
-                return false;
+                return EventPollOutcome::Stop;
             };
             let Some(goal) = chat.snapshot.loops.iter().find(|goal| goal.id == loop_id) else {
-                return false;
+                return EventPollOutcome::Stop;
             };
             if matches!(goal.state, LoopState::Stopped | LoopState::Expired) {
-                return false;
+                return EventPollOutcome::Stop;
             }
             if goal.state != LoopState::WaitingTrigger
                 || chat.active_run.is_some()
@@ -640,7 +662,10 @@ impl Agent {
                 || !chat.snapshot.permissions.is_empty()
                 || !chat.snapshot.questions.is_empty()
             {
-                return true;
+                return EventPollOutcome::Skipped;
+            }
+            if !check_remote {
+                return EventPollOutcome::Deferred;
             }
             goal.event_sources
                 .iter()
@@ -649,15 +674,15 @@ impl Agent {
                 .collect::<Vec<_>>()
         };
         if sources.is_empty() {
-            return false;
+            return EventPollOutcome::Stop;
         }
         match self.acquire_trigger_permit(chat_id, loop_id).await {
             TriggerPermit::Fire => {}
-            TriggerPermit::Withdrawn => return false,
-            TriggerPermit::Wait(_) | TriggerPermit::Failed(_) => return true,
+            TriggerPermit::Withdrawn => return EventPollOutcome::Stop,
+            TriggerPermit::Wait(_) | TriggerPermit::Failed(_) => return EventPollOutcome::Skipped,
         }
         let Some(provider) = self.inner.host_tools.read().unwrap().clone() else {
-            return false;
+            return EventPollOutcome::Stop;
         };
         for source in sources {
             let Some(locator) = source.locator(chat_id, loop_id) else {
@@ -675,7 +700,7 @@ impl Agent {
                 let EventPendingOutcome::Events(events, next_cursor) = pending else {
                     if !provider.event_source_credentials_match(&locator) {
                         self.disable_event_sources_for_loop(chat_id, loop_id).await;
-                        return false;
+                        return EventPollOutcome::Stop;
                     }
                     break;
                 };
@@ -684,17 +709,17 @@ impl Agent {
                     .is_some_and(|next| !seen_cursors.insert(next.clone()))
                 {
                     self.disable_event_sources_for_loop(chat_id, loop_id).await;
-                    return false;
+                    return EventPollOutcome::Stop;
                 }
                 for event in events {
                     if cancel.is_cancelled() {
-                        return false;
+                        return EventPollOutcome::Stop;
                     }
                     let operation_id = Uuid::new_v4().to_string();
                     let should_claim = {
                         let mut chats = self.inner.chats.lock().await;
                         let Some(chat) = chats.get_mut(&chat_id) else {
-                            return false;
+                            return EventPollOutcome::Stop;
                         };
                         let active_event_ids = chat
                             .active_event_claims
@@ -708,7 +733,7 @@ impl Agent {
                             .iter_mut()
                             .find(|goal| goal.id == loop_id)
                         else {
-                            return false;
+                            return EventPollOutcome::Stop;
                         };
                         if goal.state != LoopState::WaitingTrigger
                             || chat.active_run.is_some()
@@ -860,13 +885,13 @@ impl Agent {
                             .await
                         }
                     }
-                    return true;
+                    return EventPollOutcome::Claimed;
                 }
                 let has_next_page = next_cursor.is_some();
                 {
                     let mut chats = self.inner.chats.lock().await;
                     let Some(chat) = chats.get_mut(&chat_id) else {
-                        return false;
+                        return EventPollOutcome::Stop;
                     };
                     let Some(binding) = chat
                         .snapshot
@@ -881,7 +906,7 @@ impl Agent {
                             })
                         })
                     else {
-                        return false;
+                        return EventPollOutcome::Stop;
                     };
                     binding.pending_cursor = next_cursor.clone();
                     self.save(&chat.snapshot);
@@ -892,7 +917,7 @@ impl Agent {
                 }
             }
         }
-        true
+        EventPollOutcome::Checked
     }
 
     fn prune_finished_claims(

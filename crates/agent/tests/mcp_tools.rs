@@ -938,6 +938,131 @@ async fn durable_feedback_is_claimed_once_after_ordinary_chat_finishes() {
 }
 
 #[tokio::test]
+async fn idle_feedback_watcher_bounds_mcp_requests_and_recovers_a_later_comment() {
+    let (origin, requests, control) = service().await;
+    control.bridge_enabled.store(true, Ordering::SeqCst);
+    let directory = tempfile::tempdir().unwrap();
+    let account =
+        ArtifactClient::for_origin(directory.path().canonicalize().unwrap(), &origin).unwrap();
+    login(&account).await;
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "publish",
+            "mcp__artifacts__artifact_publish",
+            json!({"operation_id":"op-idle-rate","source":"# Source"}),
+        ),
+        text("Published"),
+        text("I received the later comment"),
+    ]));
+    let agent = Agent::new_embedded(config(), model.clone());
+    agent
+        .install_host_tools(Arc::new(
+            McpHostToolProvider::new(account, None).with_event_bridge("tickloop://event-bridge/v1"),
+        ))
+        .unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let mut events = agent.subscribe();
+    agent.submit(chat, None, "Publish".into()).await.unwrap();
+    let permission = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if let EventKind::PermissionRequested { request } = events.recv().await.unwrap().kind {
+                break request;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    agent
+        .answer_permission(chat, permission.id, true)
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let waiting = agent
+                .snapshot(chat)
+                .await
+                .unwrap()
+                .loops
+                .last()
+                .is_some_and(|goal| goal.state == LoopState::WaitingTrigger);
+            let polled = requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| request["body"]["params"]["name"] == "event_pending");
+            if waiting && polled {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::pause();
+    requests.lock().unwrap().clear();
+    for _ in 0..60 {
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        for _ in 0..30 {
+            tokio::task::yield_now().await;
+        }
+    }
+    let idle_requests = requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| request["path"] == "POST /mcp HTTP/1.1")
+        .cloned()
+        .collect::<Vec<_>>();
+    let count_method = |method: &str| {
+        idle_requests
+            .iter()
+            .filter(|request| request["body"]["method"] == method)
+            .count()
+    };
+    let pending_polls = idle_requests
+        .iter()
+        .filter(|request| request["body"]["params"]["name"] == "event_pending")
+        .count();
+    assert!(
+        (3..=4).contains(&pending_polls),
+        "60 seconds of idle feedback listening sent {pending_polls} pending polls"
+    );
+    assert_eq!(count_method("server/discover"), pending_polls * 2);
+    assert_eq!(count_method("tools/list"), pending_polls);
+    assert_eq!(count_method("resources/read"), pending_polls);
+    assert_eq!(count_method("tools/call"), pending_polls);
+    assert_eq!(idle_requests.len(), pending_polls * 5);
+    control.feedback_pending.store(true, Ordering::SeqCst);
+    for _ in 0..20 {
+        if model.requests.lock().unwrap().len() >= 3 {
+            break;
+        }
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        for _ in 0..30 {
+            tokio::task::yield_now().await;
+        }
+    }
+    let pending_calls = requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| request["body"]["params"]["name"] == "event_pending")
+        .count();
+    let claim_calls = requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| request["body"]["params"]["name"] == "event_claim")
+        .count();
+    assert!(
+        model.requests.lock().unwrap().len() >= 3,
+        "feedback was not recovered in 20 seconds: pending={pending_calls}, claim={claim_calls}"
+    );
+    assert_eq!(claim_calls, 1);
+    agent.shutdown().await;
+}
+
+#[tokio::test]
 async fn recovered_feedback_reaches_failed_loop_without_replaying_saved_publication() {
     assert_recovered_feedback_reaches_failed_loop(true).await;
 }
