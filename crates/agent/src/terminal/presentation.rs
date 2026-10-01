@@ -938,6 +938,7 @@ mod tests {
             state: tickloop_agent::runtime::LoopState::Running,
             run_id: Some(run_id),
             trigger: None,
+            event_sources: Vec::new(),
         });
         snapshot.last_sequence += 1;
         snapshot.events.push(Event {

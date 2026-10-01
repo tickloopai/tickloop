@@ -150,6 +150,8 @@ pub(crate) struct LoopRecord {
     /// Trigger 已解除武装、等待用户向该 Loop 提交输入时重新武装（重启恢复或 Branch 复制后）。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub trigger_awaits_resume: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub event_sources: Vec<serde_json::Value>,
     /// 写入时该 Loop 的计划版本。只在对话链上缺少之前的计划工具调用时写出（Loop 首次写入
     /// 当前链段，例如压缩、rewind 截断、Branch 与 `--fork-session` 之后），恢复时与链上的调用取较大值。
     #[serde(default, skip_serializing_if = "Option::is_none")]

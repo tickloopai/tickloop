@@ -24,6 +24,10 @@ impl ScriptedModel {
             usages: Mutex::new(usages.into()),
         }
     }
+
+    pub fn enqueue(&self, reply: Vec<Content>) {
+        self.replies.lock().unwrap().push_back(reply);
+    }
 }
 
 #[async_trait]

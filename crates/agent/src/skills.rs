@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::model::ToolDefinition;
 
 pub const TICKLOOP_SKILL: &str = include_str!("../skills/tickloop/SKILL.md");
+pub const ARTIFACT_SERVICE_SKILL: &str = include_str!("../skills/artifact-service/SKILL.md");
 pub const SKILL_TOOL_NAME: &str = "Skill";
 
 const SKILL_FILE_NAME: &str = "SKILL.md";
@@ -111,7 +112,11 @@ struct Frontmatter {
 
 impl SkillRegistry {
     pub fn discover(workdir: &Path, user_skills_directory: Option<&Path>) -> Self {
-        Self::discover_with_builtins(workdir, user_skills_directory, [TICKLOOP_SKILL])
+        Self::discover_with_builtins(
+            workdir,
+            user_skills_directory,
+            [TICKLOOP_SKILL, ARTIFACT_SERVICE_SKILL],
+        )
     }
 
     pub fn discover_with_builtins<'a>(

@@ -64,7 +64,16 @@ fn discovers_builtin_user_and_nearest_project_skills_in_stable_order() {
         .map(|skill| skill.name.as_str())
         .collect::<Vec<_>>();
 
-    assert_eq!(names, ["nearest", "personal", "root-skill", "tickloop"]);
+    assert_eq!(
+        names,
+        [
+            "artifact-service",
+            "nearest",
+            "personal",
+            "root-skill",
+            "tickloop"
+        ]
+    );
     assert!(registry.warnings().is_empty());
     assert!(matches!(
         registry

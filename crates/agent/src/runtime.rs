@@ -34,6 +34,8 @@ pub use usage::{
 mod compaction;
 mod context;
 mod denials;
+mod event_sources;
+mod source_connection;
 pub use denials::{
     ApprovalHistoryView, ApprovalPath, ApprovalRecord, ApprovalResult, DenialAutoFinding,
     DenialAutoRuleSummary, DenialCategory, DenialPersistence, DenialRecord, DenialReviewFacts,
@@ -176,6 +178,99 @@ pub struct LoopSnapshot {
     pub run_id: Option<RunId>,
     #[serde(default)]
     pub trigger: Option<Trigger>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub event_sources: Vec<EventSourceBinding>,
+}
+
+/// A feedback source of a Loop. Saved through `event_sources::EventSourceRecord`, which reads
+/// publication-only records written by earlier versions unchanged.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(
+    try_from = "event_sources::EventSourceRecord",
+    into = "event_sources::EventSourceRecord"
+)]
+pub struct EventSourceBinding {
+    pub server_id: String,
+    pub owner_account_id: String,
+    pub source_key: String,
+    /// Proof of a confirmed publication by this Chat; absent for a source that was only connected.
+    pub publication: Option<SourcePublication>,
+    /// Earlier confirmed publications for replay detection after a later publication.
+    pub publication_history: Vec<SourcePublication>,
+    /// The explicit connection that created this source and its complete frozen request.
+    pub connection: Option<SourceConnection>,
+    pub association_operation_id: String,
+    pub binding_id: Uuid,
+    pub client_instance_id: Uuid,
+    pub credential_generation: [u8; 32],
+    pub directory_fingerprint: [u8; 32],
+    pub bridge_fingerprint: [u8; 32],
+    pub association_epoch: Option<u64>,
+    pub resume_required: bool,
+    /// The association may have been dispatched without a confirmed outcome.
+    pub association_unknown: bool,
+    /// Public error code of an authenticated definite association rejection.
+    pub association_rejected: Option<String>,
+    pub pending_cursor: Option<String>,
+    pub claim_operations: Vec<EventClaimOperation>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SourcePublication {
+    pub version_id: String,
+    pub operation_id: String,
+    pub receipt: Receipt,
+}
+
+#[derive(Clone, Debug)]
+pub struct SourceConnection {
+    pub operation_id: String,
+    /// The Receipt of the run whose approved connect created this request.
+    pub receipt: Receipt,
+    pub request: FrozenAssociationRequest,
+}
+
+/// The complete association request saved before its only dispatch; an exact same-ID retry
+/// reuses it unchanged.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FrozenAssociationRequest {
+    pub server_id: String,
+    pub owner_account_id: String,
+    pub source_key: String,
+    pub operation_id: String,
+    pub binding_id: Uuid,
+    pub client_instance_id: Uuid,
+    pub chat_id: ChatId,
+    pub loop_id: LoopId,
+    pub expected_epoch: Option<u64>,
+    pub replace_existing: bool,
+    pub credential_generation: [u8; 32],
+    pub directory_fingerprint: [u8; 32],
+    pub bridge_fingerprint: [u8; 32],
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct EventClaimOperation {
+    pub event_id: String,
+    pub operation_id: String,
+    pub status: EventClaimStatus,
+    #[serde(default)]
+    pub claim_id: Option<String>,
+    #[serde(default)]
+    pub lease_expires_at: Option<String>,
+    #[serde(default)]
+    pub renewal_operation_id: Option<String>,
+    #[serde(default)]
+    pub release_operation_id: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub enum EventClaimStatus {
+    Pending,
+    Claimed,
+    Completed,
+    NeedsAttention,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -777,6 +872,9 @@ struct Chat {
     watching_user_shells: bool,
     user_shell_queue: Arc<Notify>,
     trigger_cancellations: HashMap<LoopId, CancellationToken>,
+    event_cancellations: HashMap<LoopId, CancellationToken>,
+    disabled_event_source_runs: HashSet<RunId>,
+    active_event_claims: HashMap<RunId, ActiveEventClaim>,
     /// 等待写入对话的本地消息；Chat 正在执行、等待或运行前台 `!` 命令时暂存，空闲或到达工具边界时写入。
     deferred_messages: Vec<Message>,
     /// 由用户中断或停止而取消的 Run；只有这些 Run 保留部分回复并写中断标记。
@@ -802,6 +900,13 @@ struct ParkedRun {
     sequence: u64,
 }
 
+#[derive(Clone)]
+struct ActiveEventClaim {
+    source: crate::host_tools::EventSourceLocator,
+    claim: crate::host_tools::ClaimedEvent,
+    lease_completed: bool,
+}
+
 #[derive(Default)]
 struct SubmissionOptions {
     contexts: Vec<InputContext>,
@@ -809,6 +914,7 @@ struct SubmissionOptions {
     denial_reference: Option<denials::DenialReference>,
     trigger_source: Option<TriggerSource>,
     trigger_cancel: Option<CancellationToken>,
+    event_claim: Option<ActiveEventClaim>,
     invoked_skill: Option<crate::skills::InvokedSkill>,
 }
 
@@ -1067,14 +1173,7 @@ impl Agent {
         &self,
         provider: Arc<dyn crate::host_tools::HostToolProvider>,
     ) -> Result<(), AgentError> {
-        let reserved = crate::tools::Tools::definitions()
-            .into_iter()
-            .chain(plan::definitions())
-            .chain(interaction::definitions())
-            .chain(tick_subscriptions::definitions())
-            .map(|definition| definition.name)
-            .chain(std::iter::once(crate::skills::SKILL_TOOL_NAME.into()))
-            .collect::<HashSet<_>>();
+        let reserved = reserved_host_tool_names();
         let mut names = HashSet::new();
         for definition in provider.definitions() {
             if definition.name.trim().is_empty()
@@ -1738,6 +1837,9 @@ impl Agent {
                 watching_user_shells: false,
                 user_shell_queue: Arc::new(Notify::new()),
                 trigger_cancellations: HashMap::new(),
+                event_cancellations: HashMap::new(),
+                disabled_event_source_runs: HashSet::new(),
+                active_event_claims: HashMap::new(),
                 deferred_messages: Vec::new(),
                 user_cancelled_runs: HashSet::new(),
                 output_style,
@@ -1962,6 +2064,7 @@ impl Agent {
             denial_reference,
             trigger_source,
             trigger_cancel,
+            event_claim,
             invoked_skill,
         } = options;
         if self.inner.closed.load(Ordering::SeqCst) {
@@ -1996,6 +2099,7 @@ impl Agent {
                 state: LoopState::Idle,
                 run_id: None,
                 trigger: None,
+                event_sources: Vec::new(),
             });
             id
         };
@@ -2121,6 +2225,9 @@ impl Agent {
                 attached_file_reads,
             },
         );
+        if let Some(event_claim) = event_claim {
+            chat.active_event_claims.insert(receipt.run_id, event_claim);
+        }
         let watch = (!chat.watching_commands).then(|| chat.tools.clone());
         chat.watching_commands = true;
         let mut session_context = None;
@@ -2461,6 +2568,7 @@ impl Agent {
         &self,
         receipt: &Receipt,
         operation: &OperationRecord,
+        permission_input: &serde_json::Value,
         admission: HostAdmission<'_>,
         cancel: &CancellationToken,
     ) -> Result<(), String> {
@@ -2484,7 +2592,7 @@ impl Agent {
         let session_context = self.inner.session_permissions.lock().await;
         let current_session_operation = SessionPermissionOperation::from_normalized(
             operation.name.clone(),
-            operation.input.clone(),
+            permission_input.clone(),
             WorkspaceScope::capture(&configured_workspace_for_chat(chat))
                 .map_err(|error| error.to_string())?,
         )
@@ -2492,7 +2600,7 @@ impl Agent {
         let current_decision = host_tool_decision(
             chat.snapshot.policy.explicit_decision_with_session(
                 &operation.name,
-                &operation.input,
+                permission_input,
                 receipt.loop_id,
                 admission.session_evaluation.decision,
             ),
@@ -2524,11 +2632,14 @@ impl Agent {
         let approval = ApprovalRecord::allowed(
             receipt.chat_id,
             operation,
+            permission_input,
             &chat.snapshot.policy,
-            admission.approval_path,
-            admission.direct_basis,
-            admission.approval_source,
-            admission.assessment,
+            denials::AllowedDecision {
+                path: admission.approval_path,
+                direct_basis: admission.direct_basis,
+                approval_source: admission.approval_source,
+                assessment: admission.assessment,
+            },
         );
         chat.denial_window.add_approval(approval);
         self.save(&chat.snapshot);
@@ -2556,6 +2667,10 @@ impl Agent {
         let mut result:Result<Usage,String> = async {
             loop {
                 is_awaiting_model = true;
+                let host_provider = self.inner.host_tools.read().unwrap().clone();
+                if let Some(provider) = host_provider {
+                    let _ = provider.refresh(cancel.clone()).await;
+                }
                 let registry = {
                     let chats = self.inner.chats.lock().await;
                     let chat = chats.get(&receipt.chat_id).unwrap();
@@ -2609,14 +2724,46 @@ impl Agent {
                             return Err(error.message);
                         }
                     };
-                    let ToolCallOutcome { result, host_call_status, images: result_images, permission_comment, continue_after_denial, is_rejected_by_user, denial } = outcome;
+                    let ToolCallOutcome { result, host_call_status, host_effect, images: result_images, permission_comment, continue_after_denial, is_rejected_by_user, denial } = outcome;
                     if let Some(record) = denial {
                         self.record_final_denial(record).await;
                     }
                     let command_state=if name==crate::tools::BASH_TOOL_NAME {self.command_state_for_call(&receipt,&id).await} else {None};
-                    let result=self.persist_large_tool_result(&receipt,&name,&id,result).await.map_err(|error|error.to_string())?;
+                    let (host_effect, connection_effect) = match host_effect {
+                        Some(crate::host_tools::HostEffect::ConnectSource(effect)) => (None, Some(effect)),
+                        other => (other, None),
+                    };
+                    // A connection's raw service result is replaced below before anything is persisted.
+                    let result = if connection_effect.is_some() { result } else {
+                        self.persist_large_tool_result(&receipt,&name,&id,result).await.map_err(|error|error.to_string())?
+                    };
+                    let mut association_request = None;
+                    let mut connection_dispatch = None;
+                    let mut connection_previously_unknown = false;
+                    let mut connection_watcher = None;
                     let mut chats=self.inner.chats.lock().await;
                     let chat=chats.get_mut(&receipt.chat_id).unwrap();
+                    let result = match connection_effect {
+                        Some(effect) => {
+                            let identity = effect.result_identity.clone();
+                            let activation_blocked = cancel.is_cancelled()
+                                || chat.disabled_event_source_runs.contains(&receipt.run_id)
+                                || chat.snapshot.policy.mode == ExecutionMode::Plan;
+                            let mut decision = source_connection::apply(&mut chat.snapshot, chat.active_run, &receipt, effect, activation_blocked);
+                            if let Some(request) = &decision.dispatch
+                                && let Err(error) = self.checkpoint_connection(&chat.snapshot, chat.tools.chat_directory().clone(), request.loop_id).await
+                            {
+                                source_connection::record_outcome(&mut chat.snapshot, request, crate::host_tools::EventAssociationOutcome::NotDispatched(error.clone()), decision.previously_unknown);
+                                decision.result = crate::host_tools::connection_result(&identity, "not_dispatched", serde_json::json!({"reason":"persistence_unavailable"}), true, "This attempt dispatched no association because the exact recovery request could not be saved. Any earlier unresolved attempt remains unknown.");
+                                decision.dispatch = None;
+                            }
+                            connection_dispatch = decision.dispatch;
+                            connection_previously_unknown = decision.previously_unknown;
+                            connection_watcher = decision.start_watcher;
+                            decision.result
+                        }
+                        None => result,
+                    };
                     let model_result=if !continue_after_denial {
                         permission_comment.as_deref().map_or_else(||result.content.clone(),|comment|format!("{}\n\nThe user approved this action with this comment: {comment}",result.content))
                     } else {result.content.clone()};
@@ -2641,15 +2788,130 @@ impl Agent {
                         if !matches!(operation.state,OperationState::Completed|OperationState::Failed) {operation.state=state;}
                         operation.result=Some(result.clone());
                     }
+                    if let Some(crate::host_tools::HostEffect::PublishedSource(effect)) = host_effect
+                        && !source_connection::has_recorded_publication(&chat.snapshot, &effect)
+                        && !source_connection::record_connected_publication(&mut chat.snapshot, &effect, &receipt)
+                        && let Some(goal) = chat.snapshot.loops.iter_mut().find(|goal| goal.id == receipt.loop_id)
+                    {
+                        let source_index = goal.event_sources.iter().position(|source| source.server_id == effect.server_id
+                            && source.owner_account_id == effect.owner_account_id && source.source_key == effect.source_key);
+                        let source_index = source_index.unwrap_or_else(|| {
+                            goal.event_sources.push(EventSourceBinding {
+                                server_id: effect.server_id.clone(),
+                                owner_account_id: effect.owner_account_id.clone(),
+                                source_key: effect.source_key.clone(),
+                                publication: None,
+                                publication_history: Vec::new(),
+                                connection: None,
+                                association_operation_id: Uuid::new_v4().to_string(),
+                                binding_id: Uuid::new_v4(),
+                                client_instance_id: Uuid::new_v4(),
+                                credential_generation: effect.credential_generation,
+                                directory_fingerprint: effect.directory_fingerprint,
+                                bridge_fingerprint: effect.bridge_fingerprint,
+                                association_epoch: None,
+                                resume_required: true,
+                                association_unknown: false,
+                                association_rejected: None,
+                                pending_cursor: None,
+                                claim_operations: Vec::new(),
+                            });
+                            goal.event_sources.len() - 1
+                        });
+                        let source = &mut goal.event_sources[source_index];
+                        source_connection::record_publication(source, &effect, &receipt);
+                        source.credential_generation = effect.credential_generation;
+                        source.directory_fingerprint = effect.directory_fingerprint;
+                        source.bridge_fingerprint = effect.bridge_fingerprint;
+                        // A connected source already has its own request; publication never re-associates it.
+                        if source.connection.is_none() && source.association_epoch.is_none() && !source.association_unknown {
+                            source.association_unknown = true;
+                            association_request = Some(crate::host_tools::EventAssociationRequest {
+                                server_id: source.server_id.clone(),
+                                owner_account_id: source.owner_account_id.clone(),
+                                source_key: source.source_key.clone(),
+                                binding_id: source.binding_id,
+                                client_instance_id: source.client_instance_id,
+                                chat_id: receipt.chat_id,
+                                loop_id: receipt.loop_id,
+                                operation_id: source.association_operation_id.clone(),
+                                expected_epoch: None,
+                                credential_generation: source.credential_generation,
+                                directory_fingerprint: source.directory_fingerprint,
+                                bridge_fingerprint: source.bridge_fingerprint,
+                            });
+                        }
+                    }
                     self.save(&chat.snapshot);
+                    if let Some(request) = &connection_dispatch
+                        && let Err(error) = self.checkpoint_connection(&chat.snapshot, chat.tools.chat_directory().clone(), request.loop_id).await
+                    {
+                        source_connection::record_outcome(&mut chat.snapshot, request, crate::host_tools::EventAssociationOutcome::NotDispatched(error), connection_previously_unknown);
+                        connection_dispatch = None;
+                        self.save(&chat.snapshot);
+                    }
                     self.emit(chat,&receipt,EventKind::ToolCompleted {call_id:id.clone(),result:result.clone()});
                     // Tool errors go back to the model; a bare user denial or stopped foreground command ends the run.
                     if is_rejected_by_user && !continue_after_denial {
                         chat.user_cancelled_runs.insert(receipt.run_id);
                     }
                     if chat.user_cancelled_runs.contains(&receipt.run_id) {
+                        if let Some(request) = &connection_dispatch
+                            && source_connection::record_outcome(&mut chat.snapshot, request, crate::host_tools::EventAssociationOutcome::NotDispatched("run cancelled".into()), connection_previously_unknown)
+                        {
+                            self.save(&chat.snapshot);
+                        }
                         cancel.cancel();
                         return Err(result.content);
+                    }
+                    drop(chats);
+                    let association_provider = self.inner.host_tools.read().unwrap().clone();
+                    if let Some(request) = association_request
+                        && let Some(provider) = association_provider
+                    {
+                        let outcome = provider.associate_event_source(request.clone(), cancel.clone()).await;
+                        let mut start_watcher = false;
+                        let mut chats = self.inner.chats.lock().await;
+                        if let Some(chat) = chats.get_mut(&receipt.chat_id)
+                            && let Some(goal) = chat.snapshot.loops.iter_mut().find(|goal| goal.id == receipt.loop_id)
+                            && let Some(source) = goal.event_sources.iter_mut().find(|source| source.association_operation_id == request.operation_id)
+                        {
+                            match outcome {
+                                crate::host_tools::EventAssociationOutcome::Committed(epoch) => {
+                                    source.association_epoch = Some(epoch);
+                                    source.association_unknown = false;
+                                    source.association_rejected = None;
+                                    source.resume_required = matches!(goal.state, LoopState::Stopped | LoopState::Expired) || cancel.is_cancelled();
+                                    start_watcher = !source.resume_required;
+                                }
+                                crate::host_tools::EventAssociationOutcome::OutcomeUnknown(_) => source.association_unknown = true,
+                                crate::host_tools::EventAssociationOutcome::NotDispatched(_) => source.association_unknown = false,
+                                crate::host_tools::EventAssociationOutcome::Rejected(code) => {
+                                    source.association_unknown = false;
+                                    source.association_rejected = Some(code);
+                                }
+                            }
+                            self.save(&chat.snapshot);
+                        }
+                        drop(chats);
+                        if start_watcher {
+                            self.start_event_source_watcher(receipt.chat_id, receipt.loop_id).await;
+                        }
+                    }
+                    let connection_provider = self.inner.host_tools.read().unwrap().clone();
+                    if let Some(request) = connection_dispatch
+                        && let Some(provider) = connection_provider
+                    {
+                        let outcome = provider.associate_event_source(request.clone(), cancel.clone()).await;
+                        let mut chats = self.inner.chats.lock().await;
+                        if let Some(chat) = chats.get_mut(&receipt.chat_id)
+                            && source_connection::record_outcome(&mut chat.snapshot, &request, outcome, connection_previously_unknown)
+                        {
+                            self.save(&chat.snapshot);
+                        }
+                    }
+                    if let Some(loop_id) = connection_watcher {
+                        self.start_event_source_watcher(receipt.chat_id, loop_id).await;
                     }
                 }
                 {
@@ -2669,6 +2931,7 @@ impl Agent {
         }.await;
         let mut chats = self.inner.chats.lock().await;
         let chat = chats.get_mut(&receipt.chat_id)?;
+        chat.active_event_claims.remove(&receipt.run_id);
         chat.snapshot.pending_thinking.remove(&receipt.run_id);
         if chat.active_run == Some(receipt.run_id) {
             chat.active = None;
@@ -2706,7 +2969,12 @@ impl Agent {
                         plan.loop_id == receipt.loop_id && plan.approved_execution_mode.is_none()
                     }) {
                     LoopState::WaitingPlan
-                } else if goal.trigger.as_ref().is_some_and(|trigger| trigger.armed) {
+                } else if goal.trigger.as_ref().is_some_and(|trigger| trigger.armed)
+                    || goal
+                        .event_sources
+                        .iter()
+                        .any(|source| source.association_epoch.is_some() && !source.resume_required)
+                {
                     LoopState::WaitingTrigger
                 } else {
                     LoopState::Completed
@@ -3727,6 +3995,9 @@ impl Agent {
             for waiting in chat.parked.values() {
                 waiting.cancel.cancel();
             }
+            for cancel in chat.event_cancellations.values() {
+                cancel.cancel();
+            }
         }
         let tasks = std::mem::take(&mut *self.inner.tasks.lock().await);
         for task in tasks {
@@ -3753,6 +4024,26 @@ impl Agent {
         self.inner.loop_leases.release_all();
         self.close_transcripts().await;
     }
+}
+
+pub(crate) fn validate_host_schema_input(
+    name: &str,
+    schema: &serde_json::Value,
+    input: &serde_json::Value,
+) -> Result<(), String> {
+    tool_execution::validate_schema(schema, input, "input")
+        .map_err(|reason| format!("invalid {name} input: {reason}"))
+}
+
+pub(crate) fn reserved_host_tool_names() -> HashSet<String> {
+    crate::tools::Tools::definitions()
+        .into_iter()
+        .chain(plan::definitions())
+        .chain(interaction::definitions())
+        .chain(tick_subscriptions::definitions())
+        .map(|definition| definition.name)
+        .chain(std::iter::once(crate::skills::SKILL_TOOL_NAME.into()))
+        .collect()
 }
 
 fn record_invoked_skill(snapshot: &mut ChatSnapshot, invoked: crate::skills::InvokedSkill) {

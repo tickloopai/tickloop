@@ -141,6 +141,13 @@ pub(super) enum DirectApprovalBasis {
     UnrestrictedHost,
 }
 
+pub(super) struct AllowedDecision<'a> {
+    pub path: ApprovalPath,
+    pub direct_basis: DirectApprovalBasis,
+    pub approval_source: Option<PermissionApprovalSource>,
+    pub assessment: Option<&'a ApprovalAssessmentDetails>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ApprovalRecord {
     pub id: Uuid,
@@ -247,32 +254,31 @@ impl ApprovalRecord {
     pub(super) fn allowed(
         chat_id: ChatId,
         operation: &OperationRecord,
+        permission_input: &Value,
         policy: &PermissionPolicy,
-        path: ApprovalPath,
-        direct_basis: DirectApprovalBasis,
-        approval_source: Option<PermissionApprovalSource>,
-        assessment: Option<&ApprovalAssessmentDetails>,
+        decision: AllowedDecision<'_>,
     ) -> Self {
         let sanitized = DenialCandidate::new(
             operation,
+            permission_input,
             DenialCategory::FinalAdmission,
-            approval_source,
+            decision.approval_source,
             policy,
-            assessment,
+            decision.assessment,
         )
         .finish(chat_id, operation);
         let mut record = Self::from_denial(sanitized);
         record.outcome = ApprovalResult::Allow;
-        record.path = path;
+        record.path = decision.path;
         record.denial_category = None;
-        record.reason = match path {
-            ApprovalPath::Human if assessment.is_some() => {
+        record.reason = match decision.path {
+            ApprovalPath::Human if decision.assessment.is_some() => {
                 "Human approved this operation after automatic review"
             }
             ApprovalPath::Human => "Human approved this operation",
             ApprovalPath::AutoLlm => "LLM auto approval allowed this operation",
             ApprovalPath::AutoJev => "Jev auto approval allowed this operation",
-            ApprovalPath::Direct => match direct_basis {
+            ApprovalPath::Direct => match decision.direct_basis {
                 DirectApprovalBasis::ReadOnly => {
                     "Read-only operation allowed by current permissions"
                 }
@@ -410,12 +416,14 @@ pub(super) struct DenialCandidate {
 impl DenialCandidate {
     pub fn new(
         operation: &OperationRecord,
+        permission_input: &Value,
         category: DenialCategory,
         approval_source: Option<PermissionApprovalSource>,
         policy: &PermissionPolicy,
         assessment: Option<&ApprovalAssessmentDetails>,
     ) -> Self {
-        let (matching_rules, matching_rules_truncated) = matching_rule_summaries(policy, operation);
+        let (matching_rules, matching_rules_truncated) =
+            matching_rule_summaries(policy, operation, permission_input);
         Self {
             category,
             approval_source,
@@ -519,6 +527,7 @@ impl DenialCandidate {
 fn matching_rule_summaries(
     policy: &PermissionPolicy,
     operation: &OperationRecord,
+    permission_input: &Value,
 ) -> (Vec<DenialRuleSummary>, bool) {
     let rules = policy
         .managed_constraints
@@ -545,7 +554,7 @@ fn matching_rule_summaries(
             crate::permissions::rule_matches_call(
                 rule,
                 &operation.name,
-                &operation.input,
+                permission_input,
                 operation.loop_id,
             )
         })

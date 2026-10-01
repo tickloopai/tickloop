@@ -965,6 +965,11 @@ fn loop_entry_content(snapshot: &ChatSnapshot, goal: &LoopSnapshot) -> LoopEntry
                 .as_ref()
                 .and_then(|trigger| serde_json::to_value(trigger).ok()),
             trigger_awaits_resume: snapshot.resume_triggers.contains(&goal.id),
+            event_sources: goal
+                .event_sources
+                .iter()
+                .filter_map(|source| serde_json::to_value(source).ok())
+                .collect(),
             plan_version: None,
             progress: None,
         },
@@ -1540,6 +1545,11 @@ impl RestoredChain {
                 state,
                 run_id: *run_id,
                 trigger,
+                event_sources: record
+                    .event_sources
+                    .iter()
+                    .filter_map(|source| serde_json::from_value(source.clone()).ok())
+                    .collect(),
             };
             match snapshot
                 .loops
@@ -1687,6 +1697,29 @@ fn file_history_snapshots(loaded: &LoadedTranscript) -> Vec<FileHistorySnapshot>
 }
 
 impl Agent {
+    pub(super) async fn checkpoint_connection(
+        &self,
+        snapshot: &ChatSnapshot,
+        directory: crate::transcript::PrivateDirectory,
+        loop_id: LoopId,
+    ) -> Result<(), String> {
+        let Some(recorder) = &self.inner.recorder else {
+            return Err("Connection requires a persistent Chat".into());
+        };
+        recorder.enqueue_sync(snapshot);
+        let path = recorder
+            .path_for_chat(snapshot.id)
+            .ok_or("Connection Chat has no Transcript path")?;
+        let writer = recorder.writer.clone();
+        tokio::task::spawn_blocking(move || {
+            super::loop_lease::checkpoint_connection_run_state(&directory.join("loops"), loop_id)?;
+            writer.checkpoint_blocking(&path)
+        })
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())
+    }
+
     /// 持久化入口：只把 Chat 标脏，由后台冲刷任务写入 Transcript。
     pub(super) fn save(&self, snapshot: &ChatSnapshot) {
         if let Some(recorder) = &self.inner.recorder {
@@ -2110,6 +2143,9 @@ impl Agent {
                 watching_user_shells: false,
                 user_shell_queue: Arc::new(Notify::new()),
                 trigger_cancellations: HashMap::new(),
+                event_cancellations: HashMap::new(),
+                disabled_event_source_runs: Default::default(),
+                active_event_claims: HashMap::new(),
                 deferred_messages: Vec::new(),
                 user_cancelled_runs: HashSet::new(),
                 output_style,

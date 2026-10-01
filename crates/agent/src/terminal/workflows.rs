@@ -1706,6 +1706,7 @@ mod tests {
             state: LoopState::Running,
             run_id: Some(streaming_run),
             trigger: None,
+            event_sources: Vec::new(),
         });
         for kind in [EventKind::Started, EventKind::Text(unfinished.into())] {
             streaming.last_sequence += 1;

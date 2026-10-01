@@ -158,6 +158,47 @@ impl TranscriptWriter {
         }
     }
 
+    pub(crate) fn checkpoint_blocking(&self, path: &Path) -> io::Result<()> {
+        let _io = self.io.lock().unwrap();
+        let (bytes, exists_on_disk) = {
+            let mut files = self.files.lock().unwrap();
+            let file = files
+                .get_mut(path)
+                .filter(|file| file.materialized && !file.deleted)
+                .ok_or_else(|| {
+                    io::Error::other("Transcript is unavailable for a connection checkpoint")
+                })?;
+            (std::mem::take(&mut file.queued), file.exists_on_disk)
+        };
+        if !bytes.is_empty() {
+            let outcome = append_to_transcript(path, &bytes, exists_on_disk);
+            let mut files = self.files.lock().unwrap();
+            let file = files.get_mut(path).expect("checkpoint file");
+            match outcome {
+                Ok(()) => {
+                    file.exists_on_disk = true;
+                    file.write_failure = None;
+                }
+                Err(error) => {
+                    if is_deleted(&error, exists_on_disk) {
+                        file.mark_deleted(path);
+                    } else {
+                        let mut retry = bytes;
+                        retry.append(&mut file.queued);
+                        file.queued = retry;
+                        file.write_failure = Some(describe_failure(path, &error));
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        std::fs::File::open(path)?.sync_all()?;
+        if let Some(parent) = path.parent() {
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    }
+
     /// 先冲刷，再把缓存的元数据追加到文件末尾。追加前读取尾部 64KB，
     /// 采纳其他进程写入的标题。
     pub(crate) fn reappend_metadata_blocking(&self, path: &Path) {

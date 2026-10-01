@@ -128,7 +128,7 @@ fn validate_tool_input(definition: &ToolDefinition, input: &Value) -> Result<(),
         .map_err(|reason| format!("invalid {} input: {reason}", definition.name))
 }
 
-fn validate_schema(schema: &Value, value: &Value, location: &str) -> Result<(), String> {
+pub(crate) fn validate_schema(schema: &Value, value: &Value, location: &str) -> Result<(), String> {
     let fields = schema
         .as_object()
         .ok_or_else(|| format!("{location} uses an unsupported tool schema"))?;
@@ -297,6 +297,7 @@ pub(super) struct ToolCallOutcome {
     /// Images for the model only, sent after the result text.
     pub(super) images: Vec<crate::image::Image>,
     pub(super) host_call_status: Option<crate::host_tools::HostCallStatus>,
+    pub(super) host_effect: Option<crate::host_tools::HostEffect>,
     pub(super) permission_comment: Option<String>,
     pub(super) continue_after_denial: bool,
     pub(super) is_rejected_by_user: bool,
@@ -413,7 +414,14 @@ impl Agent {
         }
         if let Some(registered) = &registration
             && registered.is_host_or_local()
-            && let Err(error) = validate_tool_input(&registered.definition, &input)
+            && let Err(error) = match &registered.route {
+                ToolRoute::Host(provider) => provider.validate_input(
+                    &registered.definition.name,
+                    &registered.definition.input_schema,
+                    &input,
+                ),
+                _ => validate_tool_input(&registered.definition, &input),
+            }
         {
             return Ok(ToolCallOutcome {
                 result: ToolResult {
@@ -423,6 +431,7 @@ impl Agent {
                 },
                 images: Vec::new(),
                 host_call_status: None,
+                host_effect: None,
                 permission_comment: None,
                 continue_after_denial: false,
                 is_rejected_by_user: false,
@@ -452,6 +461,19 @@ impl Agent {
         let host_tools = registration
             .as_ref()
             .and_then(|registered| registered.host_provider());
+        let event_context = self
+            .inner
+            .chats
+            .lock()
+            .await
+            .get(&receipt.chat_id)
+            .and_then(|chat| chat.active_event_claims.get(&receipt.run_id))
+            .map(|active| crate::host_tools::EventToolContext {
+                source: active.source.clone(),
+                event_id: active.claim.event_id.clone(),
+                claim_id: active.claim.claim_id.clone(),
+                fencing_token: active.claim.fencing_token.clone(),
+            });
         let prepared_host_call = if let Some(provider) = host_tools.as_ref() {
             match provider
                 .prepare_call(receipt.chat_id, &name, &input, cancel.clone())
@@ -461,7 +483,10 @@ impl Agent {
                     if prepared.name() != name || prepared.source_input() != &input {
                         return Err("host provider prepared a different tool invocation".into());
                     }
-                    Some(prepared)
+                    Some(match event_context {
+                        Some(context) => prepared.with_event_context(context),
+                        None => prepared,
+                    })
                 }
                 Err(error) => {
                     return Ok(ToolCallOutcome {
@@ -472,6 +497,7 @@ impl Agent {
                         },
                         images: Vec::new(),
                         host_call_status: None,
+                        host_effect: None,
                         permission_comment: None,
                         continue_after_denial: false,
                         is_rejected_by_user: false,
@@ -489,14 +515,18 @@ impl Agent {
         let normalized_input = prepared_host_call
             .as_ref()
             .map_or(&input, |call| call.input());
+        let permission_input = prepared_host_call
+            .as_ref()
+            .map_or(&input, |call| call.permission_input());
         let mut host_call_status = None;
+        let mut host_effect = None;
         let result = if registration
             .as_ref()
             .is_some_and(|registered| registered.is_host_or_local())
         {
             let session_operation = SessionPermissionOperation::from_normalized(
                 normalized_name.to_owned(),
-                normalized_input.clone(),
+                permission_input.clone(),
                 WorkspaceScope::capture(&configured_workspace)
                     .map_err(|error| error.to_string())?,
             )
@@ -535,7 +565,7 @@ impl Agent {
                     .evaluate(permission_owner, &session_operation);
                 let explicit_decision = chat.snapshot.policy.explicit_match_with_session(
                     normalized_name,
-                    normalized_input,
+                    permission_input,
                     receipt.loop_id,
                     session_evaluation.decision,
                 );
@@ -685,6 +715,7 @@ impl Agent {
                 denial = Some(
                     super::denials::DenialCandidate::new(
                         &operation,
+                        permission_input,
                         category,
                         (explicit_ask || is_rejected_by_user || assessment_details.is_some())
                             .then_some(approval_source),
@@ -712,6 +743,7 @@ impl Agent {
                             denial = Some(
                                 super::denials::DenialCandidate::new(
                                     &operation,
+                                    permission_input,
                                     super::denials::DenialCategory::FinalAdmission,
                                     final_approval_source,
                                     &policy,
@@ -732,6 +764,7 @@ impl Agent {
                                     .to_owned();
                             let record = super::denials::DenialCandidate::new(
                                 &operation,
+                                permission_input,
                                 super::denials::DenialCategory::FinalAdmission,
                                 final_approval_source,
                                 &policy,
@@ -745,6 +778,7 @@ impl Agent {
                             .admit_host_operation(
                                 receipt,
                                 &operation,
+                                permission_input,
                                 HostAdmission {
                                     session_evaluation: &session_evaluation,
                                     policy_revision: revision,
@@ -796,6 +830,7 @@ impl Agent {
                                 .clone();
                             let record = super::denials::DenialCandidate::new(
                                 &operation,
+                                permission_input,
                                 super::denials::DenialCategory::FinalAdmission,
                                 final_approval_source,
                                 &current_policy,
@@ -811,7 +846,9 @@ impl Agent {
                                 .execute_prepared(receipt.chat_id, prepared, cancel.clone())
                                 .await;
                             host_call_status = Some(host_result.status());
-                            Ok(host_result.into_tool_result())
+                            let (result, effect) = host_result.into_parts();
+                            host_effect = effect;
+                            Ok(result)
                         } else {
                             self.dispatch_registered_tool(
                                 receipt,
@@ -1037,6 +1074,7 @@ impl Agent {
                                     let reason = "Auto approval settings or local policy changed before admission; retry the operation".to_owned();
                                     let record = super::denials::DenialCandidate::new(
                                         &operation,
+                                        &operation.input,
                                         super::denials::DenialCategory::FinalAdmission,
                                         Some(PermissionApprovalSource::AutoReviewer),
                                         &policy,
@@ -1117,6 +1155,7 @@ impl Agent {
                         denial = Some(
                             super::denials::DenialCandidate::new(
                                 &operation,
+                                &operation.input,
                                 category,
                                 Some(approval_source),
                                 &policy,
@@ -1158,6 +1197,7 @@ impl Agent {
                                 let reason = "Auto approval settings changed before final admission; retry the operation".to_owned();
                                 let record = super::denials::DenialCandidate::new(
                                     &operation,
+                                    &operation.input,
                                     super::denials::DenialCategory::FinalAdmission,
                                     Some(PermissionApprovalSource::AutoReviewer),
                                     &current_policy,
@@ -1176,6 +1216,7 @@ impl Agent {
                                     .to_owned();
                             let record = super::denials::DenialCandidate::new(
                                 &operation,
+                                &operation.input,
                                 super::denials::DenialCategory::FinalAdmission,
                                 final_approval_source,
                                 &policy,
@@ -1193,6 +1234,7 @@ impl Agent {
                             let reason = error.to_string();
                             let record = super::denials::DenialCandidate::new(
                                 &operation,
+                                &operation.input,
                                 super::denials::DenialCategory::FinalAdmission,
                                 final_approval_source,
                                 &chat.snapshot.policy,
@@ -1213,6 +1255,7 @@ impl Agent {
                             let reason = error.to_string();
                             let record = super::denials::DenialCandidate::new(
                                 &operation,
+                                &operation.input,
                                 super::denials::DenialCategory::FinalAdmission,
                                 final_approval_source,
                                 &chat.snapshot.policy,
@@ -1241,6 +1284,7 @@ impl Agent {
                                     .to_owned();
                             let record = super::denials::DenialCandidate::new(
                                 &operation,
+                                &operation.input,
                                 super::denials::DenialCategory::FinalAdmission,
                                 final_approval_source,
                                 &chat.snapshot.policy,
@@ -1269,19 +1313,22 @@ impl Agent {
                         let approval = ApprovalRecord::allowed(
                             receipt.chat_id,
                             &operation,
+                            &operation.input,
                             &chat.snapshot.policy,
-                            approval_path,
-                            if prepared.is_read_only {
-                                super::denials::DirectApprovalBasis::ReadOnly
-                            } else if chat.snapshot.policy.mode == ExecutionMode::FullAccess {
-                                super::denials::DirectApprovalBasis::FullAccess
-                            } else if bypassed_by_unrestricted_host {
-                                super::denials::DirectApprovalBasis::UnrestrictedHost
-                            } else {
-                                super::denials::DirectApprovalBasis::Policy
+                            super::denials::AllowedDecision {
+                                path: approval_path,
+                                direct_basis: if prepared.is_read_only {
+                                    super::denials::DirectApprovalBasis::ReadOnly
+                                } else if chat.snapshot.policy.mode == ExecutionMode::FullAccess {
+                                    super::denials::DirectApprovalBasis::FullAccess
+                                } else if bypassed_by_unrestricted_host {
+                                    super::denials::DirectApprovalBasis::UnrestrictedHost
+                                } else {
+                                    super::denials::DirectApprovalBasis::Policy
+                                },
+                                approval_source: final_approval_source,
+                                assessment: assessment_details.as_ref(),
                             },
-                            final_approval_source,
-                            assessment_details.as_ref(),
                         );
                         chat.denial_window.add_approval(approval);
                         self.save(&chat.snapshot);
@@ -1337,6 +1384,7 @@ impl Agent {
             result,
             images,
             host_call_status,
+            host_effect,
             permission_comment,
             continue_after_denial,
             is_rejected_by_user,
@@ -1374,6 +1422,7 @@ impl Agent {
                     let reason = auto_mode::HEADLESS_CONTEXT_LIMIT_ERROR.to_owned();
                     let record = super::denials::DenialCandidate::new(
                         operation,
+                        &operation.input,
                         super::denials::DenialCategory::NoHuman,
                         Some(PermissionApprovalSource::AutoReviewer),
                         policy,
@@ -1407,6 +1456,7 @@ impl Agent {
                         let reason = auto_mode::HEADLESS_DENIAL_LIMIT_ERROR.to_owned();
                         let record = super::denials::DenialCandidate::new(
                             operation,
+                            &operation.input,
                             super::denials::DenialCategory::Automatic,
                             Some(PermissionApprovalSource::AutoReviewer),
                             policy,

@@ -193,6 +193,9 @@ impl Agent {
                     if let Some(cancel) = chat.trigger_cancellations.remove(loop_id) {
                         cancel.cancel();
                     }
+                    if let Some(cancel) = chat.event_cancellations.remove(loop_id) {
+                        cancel.cancel();
+                    }
                 }
                 let next = agent
                     .apply_pending_model(chat)
@@ -511,6 +514,7 @@ fn conversation_before(
         state: LoopState::Idle,
         run_id: None,
         trigger: None,
+        event_sources: Vec::new(),
     });
     Ok((candidate, loop_id))
 }

@@ -22,15 +22,22 @@ pub struct TriggerSource {
 }
 
 pub(super) fn can_trigger(goal: &LoopSnapshot) -> bool {
-    goal.trigger.as_ref().is_some_and(|trigger| {
+    (goal.trigger.as_ref().is_some_and(|trigger| {
         trigger.armed
             && trigger
                 .expires_at_ms
                 .is_none_or(|deadline| deadline > crate::private_fs::unix_time_milliseconds())
-    }) && matches!(
-        goal.state,
-        LoopState::Running | LoopState::Queued | LoopState::WaitingTrigger | LoopState::Completed
-    )
+    }) || goal
+        .event_sources
+        .iter()
+        .any(|source| source.association_epoch.is_some() && !source.resume_required))
+        && matches!(
+            goal.state,
+            LoopState::Running
+                | LoopState::Queued
+                | LoopState::WaitingTrigger
+                | LoopState::Completed
+        )
 }
 
 /// Loop 进入一个新进程（重启恢复、`--fork-session` 或 Branch 复制）时的恢复规则：运行或等待中的 Loop 转为
@@ -38,6 +45,22 @@ pub(super) fn can_trigger(goal: &LoopSnapshot) -> bool {
 pub(super) fn recover_loops(snapshot: &mut ChatSnapshot) {
     recover_triggers(snapshot);
     for goal in &mut snapshot.loops {
+        if !goal.event_sources.is_empty() {
+            for source in &mut goal.event_sources {
+                source.resume_required = true;
+                for operation in &mut source.claim_operations {
+                    if matches!(
+                        operation.status,
+                        EventClaimStatus::Pending | EventClaimStatus::Claimed
+                    ) {
+                        operation.status = EventClaimStatus::NeedsAttention;
+                    }
+                }
+            }
+            if goal.state == LoopState::WaitingTrigger {
+                goal.state = LoopState::Interrupted;
+            }
+        }
         if matches!(
             goal.state,
             LoopState::Running
@@ -125,11 +148,19 @@ impl Agent {
             goal.state = LoopState::WaitingTrigger;
         } else if goal.state == LoopState::WaitingTrigger
             && trigger.as_ref().is_none_or(|trigger| !trigger.armed)
+            && !goal
+                .event_sources
+                .iter()
+                .any(|source| source.association_epoch.is_some() && !source.resume_required)
         {
             goal.state = LoopState::Completed;
         }
         snapshot.pending_inputs.retain(|pending| {
-            pending.receipt.loop_id != loop_id || pending.trigger_source.is_none()
+            pending.receipt.loop_id != loop_id
+                || pending
+                    .trigger_source
+                    .as_ref()
+                    .is_none_or(|source| source.source == "mcp_event")
         });
         snapshot.resume_triggers.retain(|id| *id != loop_id);
         self.save(&snapshot);
@@ -177,12 +208,21 @@ impl Agent {
             if let Some(trigger) = &mut goal.trigger {
                 trigger.armed = false;
             }
-            if goal.state == LoopState::WaitingTrigger {
+            if goal.state == LoopState::WaitingTrigger
+                && !goal
+                    .event_sources
+                    .iter()
+                    .any(|source| source.association_epoch.is_some() && !source.resume_required)
+            {
                 goal.state = LoopState::Completed;
             }
         }
         snapshot.pending_inputs.retain(|pending| {
-            pending.receipt.loop_id != loop_id || pending.trigger_source.is_none()
+            pending.receipt.loop_id != loop_id
+                || pending
+                    .trigger_source
+                    .as_ref()
+                    .is_none_or(|source| source.source == "mcp_event")
         });
         snapshot.resume_triggers.retain(|id| *id != loop_id);
         self.save(&snapshot);
@@ -352,8 +392,35 @@ impl Agent {
         };
         let is_active = chat.active_run == Some(receipt.run_id);
         goal.state = state.clone();
+        for source in &mut goal.event_sources {
+            source.resume_required = true;
+        }
         if let Some(trigger) = &mut goal.trigger {
             trigger.armed = false;
+        }
+        let event_releases = if state == LoopState::Stopped {
+            chat.active_event_claims
+                .values()
+                .filter(|active| active.source.loop_id == loop_id && !active.lease_completed)
+                .cloned()
+                .map(|active| (active, Uuid::new_v4().to_string()))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        for (active, operation_id) in &event_releases {
+            if let Some(source) = goal
+                .event_sources
+                .iter_mut()
+                .find(|source| source.binding_id == active.source.binding_id)
+                && let Some(record) = source
+                    .claim_operations
+                    .iter_mut()
+                    .find(|record| record.event_id == active.claim.event_id)
+            {
+                record.release_operation_id = Some(operation_id.clone());
+                record.status = EventClaimStatus::NeedsAttention;
+            }
         }
         chat.snapshot
             .pending_inputs
@@ -385,6 +452,9 @@ impl Agent {
         if let Some(cancel) = chat.trigger_cancellations.remove(&loop_id) {
             cancel.cancel();
         }
+        if let Some(cancel) = chat.event_cancellations.remove(&loop_id) {
+            cancel.cancel();
+        }
         let tools = chat.tools.clone();
         self.emit(
             &mut chat,
@@ -406,6 +476,53 @@ impl Agent {
         self.inner.loop_leases.release(chat_id, loop_id);
         self.warn_loop_run_state_failure(chat_id, loop_id, recorded);
         self.sync_tick_subscriptions().await;
+        if !event_releases.is_empty() {
+            let provider = self.inner.host_tools.read().unwrap().clone();
+            if let Some(provider) = provider {
+                for (active, operation_id) in event_releases {
+                    let request = crate::host_tools::EventLeaseRequest {
+                        source: active.source,
+                        event_id: active.claim.event_id,
+                        claim_id: active.claim.claim_id,
+                        fencing_token: active.claim.fencing_token,
+                        operation_id,
+                    };
+                    let completed = matches!(
+                        tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            provider.release_event_claim(request.clone(), CancellationToken::new()),
+                        )
+                        .await,
+                        Ok(crate::host_tools::EventLeaseOutcome::Completed)
+                    );
+                    if completed {
+                        let mut chats = self.inner.chats.lock().await;
+                        if let Some(chat) = chats.get_mut(&chat_id)
+                            && let Some(record) = chat
+                                .snapshot
+                                .loops
+                                .iter_mut()
+                                .find(|goal| goal.id == loop_id)
+                                .and_then(|goal| {
+                                    goal.event_sources.iter_mut().find(|source| {
+                                        source.binding_id == request.source.binding_id
+                                    })
+                                })
+                                .and_then(|source| {
+                                    source.claim_operations.iter_mut().find(|record| {
+                                        record.event_id == request.event_id
+                                            && record.claim_id.as_deref()
+                                                == Some(request.claim_id.as_str())
+                                    })
+                                })
+                        {
+                            record.status = EventClaimStatus::Completed;
+                            self.save(&chat.snapshot);
+                        }
+                    }
+                }
+            }
+        }
         for command in tools.stop_loop(loop_id).await {
             self.record_command(chat_id, command).await?;
         }

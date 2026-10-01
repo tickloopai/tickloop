@@ -421,6 +421,7 @@ impl Agent {
             state: LoopState::Queued,
             run_id: None,
             trigger: None,
+            event_sources: Vec::new(),
         });
         let index = snapshot
             .pending_inputs

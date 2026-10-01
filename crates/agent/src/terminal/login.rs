@@ -20,6 +20,7 @@ use super::{
 
 #[derive(Clone, Copy)]
 pub(super) enum LoginMethod {
+    Artifact,
     Device,
     Browser,
     MiniMax(MiniMaxRegion),
@@ -31,6 +32,7 @@ pub(super) enum LoginMethod {
 impl LoginMethod {
     pub(super) fn label(self) -> &'static str {
         match self {
+            Self::Artifact => "Artifact Service",
             Self::MiniMax(region) => region.label(),
             Self::Copilot => "GitHub Copilot",
             Self::Google => "Google OAuth",
@@ -127,6 +129,28 @@ impl LoginFlow {
         let task_cancel = cancel.clone();
         let (updates, receiver) = mpsc::unbounded_channel();
         let task = tokio::spawn(async move {
+            if let LoginMethod::Artifact = method {
+                let result = async {
+                    let client = crate::artifacts::ArtifactClient::new(root)
+                        .map_err(|error| error.to_string())?;
+                    let device = client
+                        .start_device_login()
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    let _ = updates.send(LoginUpdate::Device {
+                        address: device.verification_uri.clone(),
+                        code: device.user_code.clone(),
+                    });
+                    client
+                        .finish_device_login(device, &task_cancel)
+                        .await
+                        .map(|user| user.display_name().to_owned())
+                        .map_err(|error| error.to_string())
+                }
+                .await;
+                let _ = updates.send(LoginUpdate::Finished(result));
+                return;
+            }
             if let LoginMethod::Google = method {
                 let auth = crate::auth::google::GoogleAuth::new(root);
                 let result = async {
@@ -201,6 +225,7 @@ impl LoginFlow {
             let result = async {
                 match method {
                     LoginMethod::MiniMax(_)
+                    | LoginMethod::Artifact
                     | LoginMethod::Copilot
                     | LoginMethod::Google
                     | LoginMethod::Subscription(_) => {
@@ -274,12 +299,19 @@ impl LoginFlow {
         code: &str,
     ) -> Result<(), String> {
         let mut context = vec![
-            "Opening your browser. If no page appears, open this link on your own device:".into(),
+            if matches!(self.method, LoginMethod::Artifact) {
+                "Open this Artifact Service link in your own browser:".into()
+            } else {
+                "Opening your browser. If no page appears, open this link on your own device:"
+                    .into()
+            },
             safe_text(address),
             "Use your terminal's link shortcut (often Ctrl/Cmd+click), or copy the URL.".into(),
             format!("Enter code: {}", safe_text(code)),
         ];
-        if let LoginMethod::MiniMax(_) = self.method {
+        if let LoginMethod::Artifact = self.method {
+            context.push("In your browser, sign in with Google and approve this device for your Artifact Service account.".into());
+        } else if let LoginMethod::MiniMax(_) = self.method {
             context.push("Approve access on the MiniMax Portal. The consent page identifies the registered Portal client.".into());
         } else if let LoginMethod::Subscription(provider) = self.method {
             context.push(provider.consent_notice().into());

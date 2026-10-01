@@ -8,6 +8,8 @@ use std::{
 use tick_connect::{access::TickAccess, herdr::HerdrContext};
 
 use tickloop_agent::{
+    host_tools::HostToolProvider,
+    mcp_tools::McpHostToolProvider,
     model::{ModelConfig, ReasoningEffort, Usage, cards::ProviderPatch, model_client},
     native_host::NativeHostToolProvider,
     permissions::{Decision, ExecutionMode, PermissionRule, PermissionScope},
@@ -110,6 +112,8 @@ const COMMAND_OUTPUT_BYTES: usize = 16 * 1024;
 const ANIMATION_FRAME_DURATION: std::time::Duration = std::time::Duration::from_millis(32);
 /// The activity shown while a run works without an in-progress todo.
 const WORKING_ACTIVITY: &str = "Working";
+const ARTIFACT_EVENT_BRIDGE_URI: &str = "tickloop://event-bridge/v2";
+const ARTIFACT_EVENT_BRIDGE_FALLBACK_URI: &str = "tickloop://event-bridge/v1";
 
 fn write_pending_reply_lines(console: &Console, reply: &mut ReplyLines) -> Result<(), String> {
     let _frame_hold = console.hold_frames()?;
@@ -176,6 +180,7 @@ fn command_timing(command: &str) -> CommandTiming {
                 | "/details"
                 | "/diff"
                 | "/status"
+                | "/artifacts"
                 | "/settings"
                 | "/permissions"
                 | "/mode"
@@ -717,20 +722,34 @@ async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Result<(
     } else {
         Agent::new_with_options(config.clone(), client, host_options)
     };
+    let mut native_host: Option<Arc<dyn HostToolProvider>> = None;
     if let Some(context) = HerdrContext::from_environment()? {
         let access = Arc::new(TickAccess::new(context));
         access
             .caller()
             .await
             .map_err(|error| format!("cannot attach to the calling Herdr Pane: {error}"))?;
-        agent
-            .install_host_tools(Arc::new(NativeHostToolProvider::new(access.clone())))
-            .map_err(|error| format!("cannot install Herdr tools: {error}"))?;
+        native_host = Some(Arc::new(NativeHostToolProvider::new(access.clone())));
         agent
             .install_tick_stream(Arc::new(
                 tickloop_agent::tick_stream::NativeTickStream::new(access),
             ))
             .await;
+    }
+    if let Some(root) = config_root.as_ref()
+        && let Ok(artifact) = tickloop_agent::artifacts::ArtifactClient::new(root)
+    {
+        agent
+            .install_host_tools(Arc::new(
+                McpHostToolProvider::new(artifact, native_host.clone())
+                    .with_event_bridge(ARTIFACT_EVENT_BRIDGE_URI)
+                    .with_event_bridge_fallback(ARTIFACT_EVENT_BRIDGE_FALLBACK_URI),
+            ))
+            .map_err(|error| format!("cannot install MCP tools: {error}"))?;
+    } else if let Some(native) = native_host {
+        agent
+            .install_host_tools(native)
+            .map_err(|error| format!("cannot install Herdr tools: {error}"))?;
     }
     if (resumes_saved_chat || exact_chat.is_some()) && !agent.saves_chats() {
         return Err(
@@ -1791,6 +1810,57 @@ async fn interact(
                         "/help" => outln!(console, "{}",help_text()),
                         "/help advanced" if interactive => menus.help_advanced(console)?,
                         "/help advanced" => outln!(console, "{}",completion::command_help(true)),
+                        command if command == "/artifacts" || command.starts_with("/artifacts ") => {
+                            let Some(root) = config_root.as_ref() else {
+                                outln!(console, "Artifact Service needs a state directory; set TICKLOOP_CONFIG_DIR.");
+                                continue;
+                            };
+                            match command.strip_prefix("/artifacts").unwrap_or_default().trim() {
+                                "login" => {
+                                    match LoginFlow::start(root.clone(), console, login::LoginMethod::Artifact) {
+                                        Ok(flow) => login = Some(flow),
+                                        Err(error) => outln!(console, "Cannot start Artifact Service login: {}", safe_text(&error)),
+                                    }
+                                }
+                                "status" => {
+                                    match tickloop_agent::artifacts::ArtifactClient::new(root) {
+                                        Ok(client) => match client.status().await {
+                                            Ok(Some(user)) => outln!(console, "Artifact Service account: {} · {}", safe_text(user.display_name()), safe_text(client.origin())),
+                                            Ok(None) => outln!(console, "Artifact Service: signed out · {}. Use /artifacts login.", safe_text(client.origin())),
+                                            Err(error) => outln!(console, "Cannot check Artifact Service account: {}", safe_text(&error.to_string())),
+                                        },
+                                        Err(error) => outln!(console, "Cannot configure Artifact Service: {}", safe_text(&error.to_string())),
+                                    }
+                                }
+                                "logout" => {
+                                    agent.disable_event_sources().await;
+                                    match tickloop_agent::artifacts::ArtifactClient::new(root) {
+                                        Ok(client) => match client.logout().await {
+                                            Ok(tickloop_agent::artifacts::LogoutOutcome::Removed) => outln!(console, "Artifact Service login revoked or invalidated and removed locally."),
+                                            Ok(tickloop_agent::artifacts::LogoutOutcome::NewerLoginPresent) => outln!(console, "Previous Artifact Service login revoked; a newer local login remains active."),
+                                            Ok(tickloop_agent::artifacts::LogoutOutcome::AlreadySignedOut) => outln!(console, "Artifact Service is already signed out."),
+                                            Err(error) => outln!(console, "Cannot log out of Artifact Service: {}", safe_text(&error.to_string())),
+                                        },
+                                        Err(error) => outln!(console, "Cannot configure Artifact Service: {}", safe_text(&error.to_string())),
+                                    }
+                                }
+                                subcommand if subcommand.starts_with("resume ") => {
+                                    let Some(chat_id) = selected_chat else {
+                                        outln!(console, "Select a Chat before resuming feedback listening.");
+                                        continue;
+                                    };
+                                    let loop_id = subcommand.strip_prefix("resume ").unwrap_or_default().trim().parse::<uuid::Uuid>();
+                                    match loop_id {
+                                        Ok(loop_id) => match agent.resume_event_sources(chat_id, loop_id).await {
+                                            Ok(count) => outln!(console, "Resumed feedback listening for Loop {} ({} source{}).", loop_id, count, if count == 1 { "" } else { "s" }),
+                                            Err(error) => outln!(console, "Cannot resume feedback listening: {}", safe_text(&error.to_string())),
+                                        },
+                                        Err(_) => outln!(console, "Use /artifacts resume LOOP_ID with the exact Loop ID shown in /loops details."),
+                                    }
+                                }
+                                _ => outln!(console, "Use /artifacts login, /artifacts status, /artifacts logout or /artifacts resume LOOP_ID."),
+                            }
+                        },
                         command if is_rewind_command(command) => {
                             let is_busy=selected_chat.is_some_and(|chat| pending.values().any(|receipt|receipt.chat_id==chat)
                                 || compaction_chats.values().any(|(candidate,_)|*candidate==chat)

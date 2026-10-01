@@ -1,5 +1,6 @@
 extern crate self as tickloop_agent;
 
+pub mod artifacts;
 pub mod auth;
 pub mod cleanup;
 pub mod file_change;
@@ -8,6 +9,8 @@ pub mod host_tools;
 pub mod housekeeping;
 pub mod image;
 pub mod judgment;
+mod mcp_http;
+pub mod mcp_tools;
 pub mod model;
 pub mod native_host;
 pub(crate) mod network;

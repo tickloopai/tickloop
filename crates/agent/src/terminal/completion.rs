@@ -53,6 +53,12 @@ const COMMANDS: &[CommandSpec] = &[
         menu_group: Some(CommandGroup::Skills),
     },
     CommandSpec {
+        command: "/artifacts",
+        arguments: "login|status|logout|resume LOOP_ID",
+        description: "Sign in, inspect, leave or explicitly resume Artifact Service feedback listening.",
+        menu_group: Some(CommandGroup::ToolsAndPermissions),
+    },
+    CommandSpec {
         command: "/clear",
         arguments: "",
         description: "Starts a new Chat; this Chat's background work keeps running.",
@@ -486,8 +492,8 @@ mod tests {
     fn discovery_separates_public_commands_advanced_controls_and_skills() {
         let mut completion = Completion::default();
         completion.update("/");
-        assert_eq!(completion.candidates().len(), 21);
-        assert_eq!(builtin_commands().len(), 40);
+        assert_eq!(completion.candidates().len(), 22);
+        assert_eq!(builtin_commands().len(), 41);
         assert_eq!(
             builtin_commands()
                 .iter()
@@ -496,7 +502,14 @@ mod tests {
             19
         );
         assert_eq!(completion.selected_index(), None);
-        for command in ["/help", "/tasks", "/cwd", "/details", "/tickloop"] {
+        for command in [
+            "/help",
+            "/tasks",
+            "/cwd",
+            "/details",
+            "/tickloop",
+            "/artifacts",
+        ] {
             assert!(command_names(&completion).contains(&command));
         }
         for command in ["/tui", "/allow", "/operations", "/interrupt"] {
