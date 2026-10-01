@@ -323,6 +323,7 @@ impl Menus {
 #[derive(Default)]
 pub(super) struct MenuOutcome {
     pub provider_logout: bool,
+    pub reauthenticate_after_logout: bool,
     pub provider_login: Option<super::login::LoginMethod>,
     pub permission: Option<Uuid>,
     pub question: Option<Uuid>,
@@ -340,6 +341,7 @@ const COMMAND_GROUPS: &[CommandGroup] = &[
     CommandGroup::ModelAndSettings,
     CommandGroup::ToolsAndPermissions,
     CommandGroup::PlanAndExecution,
+    CommandGroup::Skills,
 ];
 
 fn commands_in_group(group: CommandGroup) -> impl Iterator<Item = &'static CommandSpec> {
@@ -449,9 +451,10 @@ impl Menus {
                 console,
                 Menu {
                     id: Uuid::new_v4(),
-                    title: "All commands".into(),
+                    title: "Advanced commands".into(),
                     context: builtin_commands()
                         .iter()
+                        .filter(|command| command.menu_group == Some(CommandGroup::Advanced))
                         .map(|command| format!("{} — {}", command.syntax(), command.description))
                         .collect(),
                     options: vec!["Back to command groups".into()],
@@ -477,7 +480,7 @@ impl Menus {
                 COMMAND_GROUPS
                     .iter()
                     .map(|group| group.title().into())
-                    .chain(std::iter::once("All commands and arguments".into()))
+                    .chain(std::iter::once("Advanced commands and arguments".into()))
                     .collect(),
             )
         };
@@ -493,6 +496,50 @@ impl Menus {
             },
             Selection::Help { section },
         )
+    }
+    pub(super) fn help_advanced(&mut self, console: &Console) -> Result<(), String> {
+        self.help(console, Some(COMMAND_GROUPS.len()))
+    }
+
+    async fn edit_loop_timer(
+        &mut self,
+        agent: &Agent,
+        console: &Console,
+        chat: Uuid,
+        goal: Uuid,
+    ) -> Result<(), String> {
+        let snapshot = agent
+            .snapshot(chat)
+            .await
+            .map_err(|error| error.to_string())?;
+        let selected = snapshot
+            .loops
+            .iter()
+            .find(|item| item.id == goal)
+            .ok_or("The selected goal no longer exists.")?;
+        let trigger = selected.trigger.as_ref();
+        let seconds = trigger
+            .and_then(|trigger| trigger.interval_seconds)
+            .unwrap_or(60);
+        let duration = trigger
+            .and_then(|trigger| trigger.expires_at_ms)
+            .map(|expiry| {
+                format!(
+                    " --for {}",
+                    expiry
+                        .saturating_sub(super::current_time_ms())
+                        .div_ceil(1000)
+                        .max(1)
+                )
+            })
+            .unwrap_or_default();
+        let prompt = trigger
+            .map(|trigger| trigger.prompt.as_str())
+            .filter(|prompt| !prompt.is_empty())
+            .unwrap_or(&selected.goal);
+        console.prepare_command(format!(
+            "/loops schedule {goal} {seconds}{duration} {prompt}"
+        ))
     }
     pub(super) fn workflow(
         &mut self,
@@ -1638,6 +1685,10 @@ impl Menus {
                     if let Some(next) = effect.next {
                         self.workflow(console, next)?;
                     }
+                    if let Some((chat, goal)) = effect.timer {
+                        console.clear_menu(menu_id)?;
+                        self.edit_loop_timer(agent, console, chat, goal).await?;
+                    }
                     return Ok(MenuOutcome {
                         selection: effect.selection,
                         restored: effect.restored,
@@ -1722,6 +1773,14 @@ impl Menus {
                 }
                 Selection::Provider { chat, choices } => {
                     if let Some(index) = index {
+                        if index == choices.len() + 1 {
+                            let provider = choices.iter().find(|provider| provider.models[0].auth_source == tickloop_agent::model::ModelAuthSource::CodexSubscription).cloned().ok_or("Codex subscription Provider is not configured.")?;
+                            self.provider_choices = choices;
+                            self.provider_selected = index;
+                            self.dismiss(console)?;
+                            self.login_return = Some((chat, provider));
+                            return Ok(MenuOutcome { provider_logout: true, ..Default::default() });
+                        }
                         if index == choices.len() {
                             self.provider_choices = choices;
                             self.provider_selected = index;

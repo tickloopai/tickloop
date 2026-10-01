@@ -100,6 +100,7 @@ impl Menus {
             })
             .collect();
         options.push("Judgment settings · Jev (TypeSafe)".into());
+        options.push("Sign out · Codex subscription".into());
         self.show(
             console,
             Menu {
@@ -279,7 +280,7 @@ impl Menus {
         match selection {
             Selection::Provider { chat, mut choices } => {
                 self.provider_selected = index;
-                if index == choices.len() {
+                if index >= choices.len() {
                     self.show_providers(console, chat, choices, index, menu_id)?;
                     return Ok(MenuOutcome::default());
                 }
@@ -295,17 +296,24 @@ impl Menus {
                             .unwrap_or(0);
                         provider.adapter = adapters[(position + 1) % adapters.len()];
                     }
-                    PickerAction::Reauthenticate | PickerAction::DeviceLogin => {
+                    PickerAction::Reauthenticate
+                    | PickerAction::DeviceLogin
+                    | PickerAction::SignOut => {
                         let provider = provider.clone();
                         self.provider_choices = choices.clone();
                         // Keep the selection recoverable if clearing a credential fails.
                         self.show_providers(console, chat, choices, index, menu_id)?;
                         if provider.models[0].auth_source == ModelAuthSource::CodexSubscription {
-                            if action == PickerAction::Reauthenticate {
+                            if matches!(
+                                action,
+                                PickerAction::Reauthenticate | PickerAction::SignOut
+                            ) {
                                 self.dismiss(console)?;
                                 self.login_return = Some((chat, provider));
                                 return Ok(MenuOutcome {
                                     provider_logout: true,
+                                    reauthenticate_after_logout: action
+                                        == PickerAction::Reauthenticate,
                                     ..Default::default()
                                 });
                             }
@@ -315,6 +323,12 @@ impl Menus {
                                 provider,
                                 super::super::login::LoginMethod::Device,
                             );
+                        }
+                        if action == PickerAction::SignOut {
+                            return Ok(MenuOutcome {
+                                status: Some("Sign out applies to Codex subscription login. API keys are managed with Reauthenticate or in the Agent environment.".into()),
+                                ..Default::default()
+                            });
                         }
                         if action == PickerAction::Reauthenticate
                             && !provider.models[0].api_key_env.is_empty()

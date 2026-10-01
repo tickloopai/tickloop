@@ -688,11 +688,15 @@ mod tests {
             let deadline = Instant::now() + Duration::from_secs(5);
             loop {
                 let text = output.lock().unwrap().clone();
-                let frame = text.split("\x1b[?2026h").last().unwrap_or("");
-                if frame.contains("\x1b[?2026l")
-                    && frame.contains("Choose model")
-                    && !frame.contains("Codex browser login")
-                {
+                let plain = ansi.replace_all(&text, "");
+                // A frame carries only the rows that changed, so the picker is
+                // back once its title was drawn after the login dialog last was.
+                let picker_returned = plain.rfind("Choose model").is_some_and(|picker| {
+                    plain
+                        .rfind("Codex browser login")
+                        .is_none_or(|login| login < picker)
+                });
+                if picker_returned {
                     assert!(
                         !text.contains("Model selection:"),
                         "login must not apply a model before confirmation"

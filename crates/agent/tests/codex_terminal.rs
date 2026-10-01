@@ -1,3 +1,6 @@
+#[path = "support/screen.rs"]
+mod screen;
+
 use std::fs::OpenOptions;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::process::Stdio;
@@ -66,32 +69,16 @@ impl TerminalFixture {
     }
 
     fn wait_for_frame_after(&self, mark: usize, label: &str, matches: impl Fn(&str) -> bool) {
-        const FRAME_BEGIN: &str = "\x1b[?2026h";
-        const FRAME_END: &str = "\x1b[?2026l";
-        let ansi = regex::Regex::new(r"\x1b\[[0-?]*[ -/]*[@-~]").unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
             let output = self.output.lock().unwrap().clone();
-            let recent = &output[mark..];
-            let latest_complete_frame = recent
-                .match_indices(FRAME_BEGIN)
-                .filter_map(|(start, _)| {
-                    let frame_start = start + FRAME_BEGIN.len();
-                    let end = recent[frame_start..].find(FRAME_END)? + frame_start;
-                    Some(&recent[frame_start..end])
-                })
-                .last();
-            if let Some(frame) = latest_complete_frame
-                && matches(&ansi.replace_all(frame, ""))
-            {
+            let frame = screen::visible_screen(&output, 120, 35);
+            if output[mark..].contains("\x1b[?2026l") && matches(&frame) {
                 return;
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "missing {label} in latest frame: {}",
-                latest_complete_frame
-                    .map(|frame| ansi.replace_all(frame, "").into_owned())
-                    .unwrap_or_else(|| "<no complete frame>".into())
+                "missing {label}: {frame}"
             );
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -183,11 +170,23 @@ fn logout_can_be_cancelled_while_another_process_holds_the_auth_lock() {
     lock.lock().unwrap();
     let mut terminal = TerminalFixture::start(&root);
     terminal.wait_for("deepseek-flash");
-    terminal.send(b"/logout\r");
+    terminal.send(b"/model\r");
+    terminal.wait_for("Choose Provider");
+    terminal.send(b"js");
     terminal.wait_for("Removing Codex login");
+    let cancelled = terminal.output_mark();
     terminal.send(b"\x03");
     terminal.wait_for("Logout cancelled; saved login remains.");
     assert!(credentials.exists());
+    drop(lock);
+    terminal.wait_for_frame_after(cancelled, "Provider after logout cancellation", |frame| {
+        frame.contains("Choose Provider")
+    });
+    let returned = terminal.output_mark();
+    terminal.send(b"\x1b");
+    terminal.wait_for_frame_after(returned, "prompt after logout cancellation", |frame| {
+        !frame.contains("Choose Provider")
+    });
     terminal.exit();
 }
 
@@ -236,11 +235,20 @@ async fn piped_commands_wait_for_logout_before_model_menu_and_exit() {
         .kill_on_drop(true)
         .spawn()
         .unwrap();
+    let provider_count = tickloop_agent::model::cards::built_in_model_profiles()
+        .into_iter()
+        .map(|model| model.provider_id)
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    let commands = format!(
+        "/help\n/login\n/model\n{}\ncancel\n/exit\n",
+        provider_count + 2
+    );
     child
         .stdin
         .take()
         .unwrap()
-        .write_all(b"/help\n/login\n/logout\n/model\ncancel\n/exit\n")
+        .write_all(commands.as_bytes())
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -261,12 +269,14 @@ async fn piped_commands_wait_for_logout_before_model_menu_and_exit() {
     assert!(stdout.contains("/model → Provider"));
     assert!(!stdout.contains("/login"));
     assert!(stdout.contains("Unknown command; use /help."));
-    assert!(stdout.contains("/logout"));
+    assert!(!stdout.contains("/logout"));
+    assert!(stdout.contains("Sign out · Codex subscription"));
     assert!(stdout.contains("Codex subscription"));
     assert!(!stdout.contains("fake-refresh"));
+    assert!(!stdout.contains("Codex browser login"));
     let removed = stdout.find("Codex login removed locally").unwrap();
     let model_menu = stdout
-        .find("Choose Provider")
+        .rfind("Choose Provider")
         .unwrap_or_else(|| panic!("missing model menu: {stdout}"));
     let cancelled = stdout
         .find("Selection cancelled; configuration unchanged.")

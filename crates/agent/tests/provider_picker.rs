@@ -1,3 +1,6 @@
+#[path = "support/screen.rs"]
+mod screen;
+
 mod support;
 
 use std::{
@@ -108,8 +111,8 @@ impl Terminal {
         let deadline = Instant::now() + TIMEOUT;
         while Instant::now() < deadline {
             let output = self.output.lock().unwrap().clone();
-            if let Some(frame) = latest_frame(&output[mark..])
-                && matches(&strip_ansi(frame))
+            if output[mark..].contains("\x1b[?2026l")
+                && matches(&screen::visible_screen(&output, 120, 38))
             {
                 thread::sleep(FRAME_SETTLE);
                 return;
@@ -694,7 +697,7 @@ fn model_judgment_settings_save_key_without_changing_model_mode_or_reviewer() {
     terminal.send(b"/model\r");
     terminal.wait_for("Choose Provider");
     let mark = terminal.mark();
-    terminal.send(b"jjjjjjjj\r");
+    terminal.send(b"jjjjjjjjk\r");
     terminal.wait_for_frame_after(mark, "Judgment settings from model picker", |frame| {
         frame.contains("Judgment settings · Jev (TypeSafe)")
             && frame.contains("Jev (TypeSafe) key: Missing")
@@ -866,13 +869,15 @@ fn jev_key_editor_masks_saves_and_cancels_without_changing_the_chat_model() {
         !frame.contains("Permissions ·") && frame.contains("picker-messages-service")
     });
     let mark = terminal.mark();
-    terminal.send(b"/jev\r");
-    terminal.wait_for_frame_after(mark, "legacy alias opens Auto", |frame| {
+    terminal.send(b"/permissions\r");
+    terminal.wait_for("Permissions · Choose mode");
+    terminal.send(b"\r");
+    terminal.wait_for_frame_after(mark, "permissions opens Auto", |frame| {
         frame.contains("[Auto mode]") && frame.contains("Reviewer     Judgment · Jev (TypeSafe)")
     });
     let mark = terminal.mark();
-    terminal.send(b"\x1b");
-    terminal.wait_for_frame_after(mark, "closed alias", |frame| {
+    terminal.send(b"\x1b\x1b");
+    terminal.wait_for_frame_after(mark, "closed permissions after reopening", |frame| {
         !frame.contains("Permissions ·") && frame.contains("picker-messages-service")
     });
     terminal.send(b"/settings\r");

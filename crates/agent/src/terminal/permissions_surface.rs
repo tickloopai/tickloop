@@ -496,8 +496,6 @@ pub(super) enum PermissionsEffect {
 
 #[derive(Clone, Copy)]
 pub(super) enum PermissionsReturn {
-    Chat,
-    Settings,
     ModePicker { settings: bool },
 }
 

@@ -4,6 +4,8 @@ pub(super) enum CommandGroup {
     ModelAndSettings,
     ToolsAndPermissions,
     PlanAndExecution,
+    Advanced,
+    Skills,
 }
 
 impl CommandGroup {
@@ -13,6 +15,8 @@ impl CommandGroup {
             Self::ModelAndSettings => "Model & settings",
             Self::ToolsAndPermissions => "Tools & permissions",
             Self::PlanAndExecution => "Plan & execution",
+            Self::Advanced => "Advanced commands",
+            Self::Skills => "Skills",
         }
     }
 }
@@ -37,16 +41,16 @@ impl CommandSpec {
 
 const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
-        command: "/logout",
+        command: "/status",
         arguments: "",
-        description: "Remove the local Codex subscription login.",
-        menu_group: Some(CommandGroup::ModelAndSettings),
+        description: "Show the selected Chat, model, execution mode and queue.",
+        menu_group: Some(CommandGroup::Advanced),
     },
     CommandSpec {
         command: "/tickloop",
         arguments: "[REQUEST]",
         description: "Loads the Tick Loop Workspace Skill.",
-        menu_group: Some(CommandGroup::Conversation),
+        menu_group: Some(CommandGroup::Skills),
     },
     CommandSpec {
         command: "/clear",
@@ -61,12 +65,6 @@ const COMMANDS: &[CommandSpec] = &[
         menu_group: Some(CommandGroup::Conversation),
     },
     CommandSpec {
-        command: "/new",
-        arguments: "",
-        description: "Starts a new goal with the next input in this Chat.",
-        menu_group: Some(CommandGroup::Conversation),
-    },
-    CommandSpec {
         command: "/resume",
         arguments: "[CHAT]",
         description: "Resumes a saved Chat, or opens the Chat picker.",
@@ -74,8 +72,8 @@ const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         command: "/loops",
-        arguments: "",
-        description: "Lists or chooses a goal in the current Chat.",
+        arguments: "[ACTION|GOAL_ID]",
+        description: "Manage goals, their triggers and local timers in this Chat.",
         menu_group: Some(CommandGroup::Conversation),
     },
     CommandSpec {
@@ -85,21 +83,9 @@ const COMMANDS: &[CommandSpec] = &[
         menu_group: Some(CommandGroup::Conversation),
     },
     CommandSpec {
-        command: "/checkpoint",
-        arguments: "",
-        description: "Opens the Rewind checkpoint selector (/rewind alias).",
-        menu_group: Some(CommandGroup::Conversation),
-    },
-    CommandSpec {
-        command: "/undo",
-        arguments: "",
-        description: "Opens the Rewind checkpoint selector (/rewind alias).",
-        menu_group: Some(CommandGroup::Conversation),
-    },
-    CommandSpec {
         command: "/model",
-        arguments: "[FILE]",
-        description: "Choose a Provider and model for this Chat, or configure the separate Jev (TypeSafe) key under Judgment settings.",
+        arguments: "[CONFIG_FILE]",
+        description: "Choose a Provider and model, manage sign-in, or load a Chat configuration file.",
         menu_group: Some(CommandGroup::ModelAndSettings),
     },
     CommandSpec {
@@ -115,28 +101,16 @@ const COMMANDS: &[CommandSpec] = &[
         menu_group: Some(CommandGroup::ModelAndSettings),
     },
     CommandSpec {
-        command: "/theme",
-        arguments: "",
-        description: "Opens the theme picker for this terminal session.",
-        menu_group: Some(CommandGroup::ModelAndSettings),
-    },
-    CommandSpec {
         command: "/tui",
         arguments: "[inline|fullscreen]",
         description: "Shows or switches the terminal renderer.",
-        menu_group: Some(CommandGroup::ModelAndSettings),
+        menu_group: Some(CommandGroup::Advanced),
     },
     CommandSpec {
         command: "/cwd",
         arguments: "[PATH]",
         description: "Shows or sets the main working directory.",
         menu_group: Some(CommandGroup::ModelAndSettings),
-    },
-    CommandSpec {
-        command: "/commands",
-        arguments: "",
-        description: "Lists or manages Shell processes.",
-        menu_group: Some(CommandGroup::ToolsAndPermissions),
     },
     CommandSpec {
         command: "/details",
@@ -154,18 +128,18 @@ const COMMANDS: &[CommandSpec] = &[
         command: "/rules",
         arguments: "",
         description: "Lists permission rules for this Chat.",
-        menu_group: Some(CommandGroup::ToolsAndPermissions),
+        menu_group: Some(CommandGroup::Advanced),
     },
     CommandSpec {
         command: "/permissions",
         arguments: "",
-        description: "Manage recent denials, rules, Auto review, and directories.",
+        description: "Choose Auto, Ask or Full Access; configure Auto and review recent decisions.",
         menu_group: Some(CommandGroup::ToolsAndPermissions),
     },
     CommandSpec {
         command: "/plan",
-        arguments: "[GOAL]",
-        description: "Shows the selected goal's saved plan.",
+        arguments: "[GOAL_ID]",
+        description: "Enter Plan mode and review the selected plan; with an ID, view its saved plan.",
         menu_group: Some(CommandGroup::PlanAndExecution),
     },
     CommandSpec {
@@ -175,28 +149,16 @@ const COMMANDS: &[CommandSpec] = &[
         menu_group: Some(CommandGroup::PlanAndExecution),
     },
     CommandSpec {
-        command: "/triggers",
-        arguments: "",
-        description: "Shows the selected goal's trigger.",
-        menu_group: Some(CommandGroup::PlanAndExecution),
-    },
-    CommandSpec {
         command: "/subscriptions",
         arguments: "",
         description: "Lists this Chat's Tick Subscriptions and changes or cancels one.",
         menu_group: Some(CommandGroup::PlanAndExecution),
     },
     CommandSpec {
-        command: "/subs",
-        arguments: "",
-        description: "Lists this Chat's Tick Subscriptions and changes or cancels one.",
-        menu_group: None,
-    },
-    CommandSpec {
         command: "/interrupt",
         arguments: "",
         description: "Interrupts the current run.",
-        menu_group: Some(CommandGroup::PlanAndExecution),
+        menu_group: Some(CommandGroup::Advanced),
     },
     CommandSpec {
         command: "/stop",
@@ -205,147 +167,126 @@ const COMMANDS: &[CommandSpec] = &[
         menu_group: Some(CommandGroup::PlanAndExecution),
     },
     CommandSpec {
-        command: "/goal",
-        arguments: "[GOAL]",
-        description: "Selects a goal in the current Chat.",
-        menu_group: None,
-    },
-    CommandSpec {
         command: "/answer",
         arguments: "QUESTION ANSWER",
         description: "Replies to a clarification question.",
-        menu_group: None,
-    },
-    CommandSpec {
-        command: "/config",
-        arguments: "",
-        description: "Opens settings for this Chat.",
-        menu_group: None,
+        menu_group: Some(CommandGroup::Advanced),
     },
     CommandSpec {
         command: "/mode",
         arguments: "[auto|ask|fullAccess|plan]",
         description: "Changes execution mode; use /plan to plan a goal.",
-        menu_group: None,
+        menu_group: Some(CommandGroup::Advanced),
     },
     CommandSpec {
         command: "/allow",
         arguments: "REQUEST [once|session|persistent]",
         description: "Approves a permission request with an optional scope.",
-        menu_group: None,
+        menu_group: Some(CommandGroup::Advanced),
     },
     CommandSpec {
         command: "/deny",
         arguments: "REQUEST",
         description: "Denies a permission request.",
-        menu_group: None,
+        menu_group: Some(CommandGroup::Advanced),
     },
     CommandSpec {
         command: "/rule",
         arguments: "allow|ask|deny TOOL [session|persistent] | remove UUID",
         description: "Adds or removes a permission rule.",
-        menu_group: None,
+        menu_group: Some(CommandGroup::Advanced),
     },
     CommandSpec {
         command: "/add-dir",
         arguments: "PATH",
         description: "Adds an allowed working directory.",
-        menu_group: None,
+        menu_group: Some(CommandGroup::Advanced),
     },
     CommandSpec {
         command: "/search-config",
         arguments: "FILE|off",
         description: "Configures or disables web search.",
-        menu_group: None,
+        menu_group: Some(CommandGroup::Advanced),
     },
     CommandSpec {
         command: "/approve-plan",
         arguments: "GOAL VERSION MODE",
         description: "Approves a saved plan version for later execution.",
-        menu_group: None,
+        menu_group: Some(CommandGroup::Advanced),
     },
     CommandSpec {
         command: "/tasks",
         arguments: "",
-        description: "Lists or manages Shell processes.",
-        menu_group: None,
-    },
-    CommandSpec {
-        command: "/bashes",
-        arguments: "",
-        description: "Lists or manages Shell processes.",
-        menu_group: None,
+        description: "Manage Shell tasks across Chats in this Agent process.",
+        menu_group: Some(CommandGroup::ToolsAndPermissions),
     },
     CommandSpec {
         command: "/background",
         arguments: "OPERATION",
         description: "Moves a Shell process to the background.",
-        menu_group: None,
+        menu_group: Some(CommandGroup::Advanced),
     },
     CommandSpec {
         command: "/command-output",
         arguments: "OPERATION [OFFSET] [LIMIT]",
         description: "Reads a bounded range of Shell process output.",
-        menu_group: None,
+        menu_group: Some(CommandGroup::Advanced),
     },
     CommandSpec {
         command: "/stop-command",
         arguments: "OPERATION",
         description: "Stops a Shell process.",
-        menu_group: None,
+        menu_group: Some(CommandGroup::Advanced),
     },
     CommandSpec {
         command: "/operations",
         arguments: "",
         description: "Shows effects recorded in this process and their outcomes.",
-        menu_group: None,
+        menu_group: Some(CommandGroup::Advanced),
     },
     CommandSpec {
         command: "/events",
         arguments: "PROMPT",
         description: "Enables explicit events for the selected goal.",
-        menu_group: None,
+        menu_group: Some(CommandGroup::Advanced),
     },
     CommandSpec {
         command: "/trigger",
         arguments: "SOURCE [JSON]",
         description: "Delivers an event to the selected goal.",
-        menu_group: None,
-    },
-    CommandSpec {
-        command: "/schedule",
-        arguments: "SECONDS [--for DURATION_SECONDS] PROMPT",
-        description: "Configures a local timer for the selected goal.",
-        menu_group: None,
+        menu_group: Some(CommandGroup::Advanced),
     },
     CommandSpec {
         command: "/clear-trigger",
         arguments: "",
         description: "Removes the selected goal's trigger.",
-        menu_group: None,
+        menu_group: Some(CommandGroup::Advanced),
     },
     CommandSpec {
         command: "/help",
-        arguments: "",
-        description: "Shows command help.",
-        menu_group: None,
+        arguments: "[advanced]",
+        description: "Show public commands and Skills, or the advanced reference.",
+        menu_group: Some(CommandGroup::Conversation),
     },
     CommandSpec {
         command: "/exit",
         arguments: "",
-        description: "Cancels work and exits the host.",
-        menu_group: None,
-    },
-    CommandSpec {
-        command: "/quit",
-        arguments: "",
-        description: "Cancels work and exits the host.",
-        menu_group: None,
+        description: "Cancel work and exit this Agent process.",
+        menu_group: Some(CommandGroup::Conversation),
     },
 ];
 
 pub(super) fn builtin_commands() -> &'static [CommandSpec] {
     COMMANDS
+}
+
+pub(super) fn command_help(advanced: bool) -> String {
+    COMMANDS
+        .iter()
+        .filter(|command| (command.menu_group == Some(CommandGroup::Advanced)) == advanced)
+        .map(|command| format!("{} — {}", command.syntax(), command.description))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -392,7 +333,10 @@ impl Completion {
             COMMANDS
                 .iter()
                 .enumerate()
-                .filter(|(_, spec)| spec.command[1..].starts_with(query))
+                .filter(|(_, spec)| {
+                    spec.menu_group != Some(CommandGroup::Advanced)
+                        && spec.command[1..].starts_with(query)
+                })
                 .map(|(index, _)| index),
         );
         self.matches.sort_by(|left, right| {
@@ -533,74 +477,89 @@ mod tests {
     }
 
     #[test]
-    fn slash_shows_every_builtin_command() {
+    fn discovery_separates_public_commands_advanced_controls_and_skills() {
         let mut completion = Completion::default();
         completion.update("/");
-
-        assert_eq!(completion.candidates().len(), builtin_commands().len());
-        assert_eq!(completion.selected_index(), None);
-        assert!(command_names(&completion).contains(&"/help"));
-        assert!(command_names(&completion).contains(&"/tasks"));
-        assert!(command_names(&completion).contains(&"/bashes"));
-        assert!(command_names(&completion).contains(&"/diff"));
-        assert!(command_names(&completion).contains(&"/tui"));
+        assert_eq!(completion.candidates().len(), 20);
+        assert_eq!(builtin_commands().len(), 39);
         assert_eq!(
             builtin_commands()
                 .iter()
-                .find(|spec| spec.command == "/answer")
-                .unwrap()
-                .syntax(),
-            "/answer QUESTION ANSWER"
+                .filter(|spec| spec.menu_group == Some(CommandGroup::Advanced))
+                .count(),
+            19
         );
-    }
-
-    #[test]
-    fn only_prefix_matches_are_returned() {
-        let mut completion = Completion::default();
-        completion.update("/o");
-
-        let names = command_names(&completion);
-        assert_eq!(names.first(), Some(&"/operations"));
-        assert!(!names.contains(&"/command-output"));
-    }
-
-    #[test]
-    fn bashes_alias_is_completed_as_a_builtin_command() {
-        let mut completion = Completion::default();
-        completion.update("/bash");
-
-        assert_eq!(command_names(&completion), vec!["/bashes"]);
-    }
-
-    #[test]
-    fn rewind_and_aliases_complete_without_arguments_and_appear_in_conversation_help() {
-        for (prefix, command) in [
-            ("/rew", "/rewind"),
-            ("/checkp", "/checkpoint"),
-            ("/und", "/undo"),
-        ] {
-            let mut completion = Completion::default();
-            completion.update(prefix);
-            assert_eq!(command_names(&completion), vec![command]);
-            let spec = completion.candidates().next().unwrap();
-            assert_eq!(spec.syntax(), command);
-            assert_eq!(spec.menu_group, Some(CommandGroup::Conversation));
+        assert_eq!(completion.selected_index(), None);
+        for command in ["/help", "/tasks", "/cwd", "/details", "/tickloop"] {
+            assert!(command_names(&completion).contains(&command));
+        }
+        for command in ["/tui", "/allow", "/operations", "/interrupt"] {
+            assert!(!command_names(&completion).contains(&command));
             assert!(
-                spec.description
-                    .starts_with("Opens the Rewind checkpoint selector")
-            );
-            assert_eq!(
-                completion.handle_key(CompletionKey::Next),
-                CompletionAction::Consumed
-            );
-            assert_eq!(
-                completion.handle_key(CompletionKey::Choose),
-                CompletionAction::ReplaceDraft {
-                    draft: command.into(),
-                    cursor: command.len(),
-                }
+                builtin_commands()
+                    .iter()
+                    .any(|spec| spec.command == command)
             );
         }
+        let unique: std::collections::HashSet<_> =
+            builtin_commands().iter().map(|spec| spec.command).collect();
+        assert_eq!(unique.len(), builtin_commands().len());
+    }
+
+    #[test]
+    fn retired_names_are_neither_registered_nor_completed() {
+        for command in [
+            "/new",
+            "/goal",
+            "/theme",
+            "/logout",
+            "/triggers",
+            "/schedule",
+            "/checkpoint",
+            "/undo",
+            "/effort",
+            "/config",
+            "/jev",
+            "/commands",
+            "/bashes",
+            "/subs",
+            "/quit",
+        ] {
+            assert!(
+                !builtin_commands()
+                    .iter()
+                    .any(|spec| spec.command == command)
+            );
+            let mut completion = Completion::default();
+            completion.update(command);
+            assert!(!command_names(&completion).contains(&command));
+        }
+    }
+
+    #[test]
+    fn only_public_prefix_matches_are_returned() {
+        let mut completion = Completion::default();
+        completion.update("/s");
+        assert_eq!(
+            command_names(&completion),
+            vec!["/settings", "/stop", "/subscriptions"]
+        );
+        completion.update("/operations");
+        assert!(!completion.is_open());
+    }
+
+    #[test]
+    fn rewind_completes_without_arguments() {
+        let mut completion = Completion::default();
+        completion.update("/rew");
+        assert_eq!(command_names(&completion), vec!["/rewind"]);
+        assert_eq!(
+            completion.handle_key(CompletionKey::Complete),
+            CompletionAction::ReplaceDraft {
+                draft: "/rewind".into(),
+                cursor: 7,
+            }
+        );
     }
 
     #[test]
@@ -629,7 +588,7 @@ mod tests {
         let mut completion = Completion::default();
         completion.update("/sto");
 
-        assert_eq!(command_names(&completion), ["/stop", "/stop-command"]);
+        assert_eq!(command_names(&completion), ["/stop"]);
     }
 
     #[test]
@@ -659,7 +618,7 @@ mod tests {
         let mut completion = Completion::default();
         completion.update("/mo");
 
-        assert_eq!(command_names(&completion), ["/mode", "/model"]);
+        assert_eq!(command_names(&completion), ["/model"]);
         assert_eq!(
             completion.handle_key(CompletionKey::Next),
             CompletionAction::Consumed
@@ -674,7 +633,7 @@ mod tests {
             completion.handle_key(CompletionKey::Next),
             CompletionAction::Consumed
         );
-        assert_eq!(completion.selected_index(), Some(1));
+        assert_eq!(completion.selected_index(), Some(0));
         assert_eq!(
             completion.handle_key(CompletionKey::Choose),
             CompletionAction::ReplaceDraft {
@@ -701,13 +660,13 @@ mod tests {
     #[test]
     fn tab_preserves_a_space_for_command_arguments() {
         let mut completion = Completion::default();
-        completion.update("/ans");
+        completion.update("/thi");
 
         assert_eq!(
             completion.handle_key(CompletionKey::Complete),
             CompletionAction::ReplaceDraft {
-                draft: "/answer ".into(),
-                cursor: "/answer ".len(),
+                draft: "/thinking ".into(),
+                cursor: "/thinking ".len(),
             }
         );
 
@@ -715,8 +674,8 @@ mod tests {
         assert_eq!(
             completion.handle_key(CompletionKey::Complete),
             CompletionAction::ReplaceDraft {
-                draft: "/help".into(),
-                cursor: "/help".len(),
+                draft: "/help ".into(),
+                cursor: "/help ".len(),
             }
         );
     }

@@ -35,6 +35,10 @@ pub(super) enum Workflow {
         chat: Uuid,
         choices: Vec<Uuid>,
     },
+    Goal {
+        chat: Uuid,
+        goal: Uuid,
+    },
     Commands {
         chat: Uuid,
         choices: Vec<CommandChoice>,
@@ -79,6 +83,7 @@ pub(super) struct WorkflowEffect {
     pub(super) selection: Option<(Uuid, Option<Uuid>)>,
     pub(super) receipt: Option<Receipt>,
     pub(super) restored: Option<ChatSnapshot>,
+    pub(super) timer: Option<(Uuid, Uuid)>,
 }
 
 impl Workflow {
@@ -86,6 +91,7 @@ impl Workflow {
         match self {
             Self::Chats { .. } => None,
             Self::Goals { chat, .. }
+            | Self::Goal { chat, .. }
             | Self::Commands { chat, .. }
             | Self::Command { chat, .. }
             | Self::Plan { chat, .. } => Some(*chat),
@@ -157,19 +163,53 @@ impl Workflow {
             .loops
             .iter()
             .map(|goal| format!("{} · {:?}", single_line(&goal.goal), goal.state))
+            .chain(std::iter::once("New goal".into()))
             .chain(std::iter::once("Cancel".into()))
             .collect();
         let context = if snapshot.loops.is_empty() {
-            "This Chat has no goals yet. Enter a task to start one."
+            "Choose New goal to start another goal with your next input, keeping this Chat's history."
         } else {
-            "Select the goal for your next message. Selecting it does not start work."
+            "Choose a goal to view its trigger, configure a timer or select it for your next message."
         };
         Ok((
-            menu("Choose goal", vec![context.into()], options),
+            menu("Loops", vec![context.into()], options),
             Self::Goals {
                 chat,
                 choices: snapshot.loops.iter().map(|goal| goal.id).collect(),
             },
+        ))
+    }
+
+    pub(super) async fn goal(
+        agent: &Agent,
+        chat: Uuid,
+        goal: Uuid,
+    ) -> Result<(Menu, Self), String> {
+        let snapshot = agent
+            .snapshot(chat)
+            .await
+            .map_err(|error| error.to_string())?;
+        let selected = snapshot
+            .loops
+            .iter()
+            .find(|item| item.id == goal)
+            .ok_or("The selected goal no longer exists.")?;
+        let mut context = vec![
+            format!("{} · {:?}", single_line(&selected.goal), selected.state),
+            format!("Goal: {goal}"),
+        ];
+        context.extend(super::loops::trigger_lines(selected.trigger.as_ref()));
+        Ok((
+            menu(
+                "Loop details",
+                context,
+                vec![
+                    "Use this goal".into(),
+                    "Configure timer · edit command".into(),
+                    "Back to Loops".into(),
+                ],
+            ),
+            Self::Goal { chat, goal },
         ))
     }
 
@@ -308,7 +348,11 @@ impl Workflow {
         index: Option<usize>,
     ) -> Result<WorkflowEffect, String> {
         let Some(index) = index else {
-            return Ok(WorkflowEffect::default());
+            let mut effect = WorkflowEffect::default();
+            if let Self::Goal { chat, .. } = self {
+                effect.next = Some(Self::goals(agent, chat).await?);
+            }
+            return Ok(effect);
         };
         let mut effect = WorkflowEffect::default();
         match self {
@@ -358,9 +402,29 @@ impl Workflow {
             }
             Self::Goals { chat, choices } => {
                 if index == choices.len() {
+                    console.write("\nThe next input will start a new goal in this Chat.\n")?;
+                    effect.selection = Some((chat, None));
+                    return Ok(effect);
+                }
+                if index == choices.len() + 1 {
                     return Ok(effect);
                 }
                 let goal = *choices.get(index).ok_or("Invalid goal selection.")?;
+                effect.next = Some(Self::goal(agent, chat, goal).await?);
+            }
+            Self::Goal { chat, goal } => {
+                match index {
+                    1 => {
+                        effect.timer = Some((chat, goal));
+                        return Ok(effect);
+                    }
+                    2 => {
+                        effect.next = Some(Self::goals(agent, chat).await?);
+                        return Ok(effect);
+                    }
+                    0 => {}
+                    _ => return Err("Invalid goal action.".into()),
+                }
                 let snapshot = agent
                     .snapshot(chat)
                     .await
@@ -372,7 +436,7 @@ impl Workflow {
                     .ok_or("The selected goal no longer exists.")?;
                 let next_step = match selected.state {
                     LoopState::Stopped | LoopState::Expired => {
-                        "This goal has ended. Use /new to start another goal."
+                        "This goal has ended. Use /loops new to start another goal."
                     }
                     LoopState::WaitingPermission => {
                         "This goal is waiting for your approval in the permission menu."
@@ -1703,7 +1767,10 @@ mod tests {
             before.last_sequence
         );
         let (_, picker) = Workflow::goals(&agent, chat).await.unwrap();
-        let selected = picker.choose(&agent, &console, Some(0)).await.unwrap();
+        let details = picker.choose(&agent, &console, Some(0)).await.unwrap();
+        assert!(details.selection.is_none());
+        let (_, detail) = details.next.unwrap();
+        let selected = detail.choose(&agent, &console, Some(0)).await.unwrap();
         assert_eq!(selected.selection, Some((chat, Some(receipt.loop_id))));
         assert!(selected.restored.is_none());
         assert_eq!(model.requests.lock().unwrap().len(), 1);

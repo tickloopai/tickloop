@@ -28,7 +28,7 @@ cargo run -p tickloop-agent
 
 选择 Provider 时自动检查认证；登录成功后进入模型列表，失败或取消返回 Provider 列表。Provider 列表按 `r` 清除该 Provider 的本地凭据并重新认证；API Key 来自外部 shell 时只删除本地保存值，不修改 shell 环境。确认模型后才切换。已移除独立 `/login` 命令，认证统一从 `/model` 进入。目录中的模型是否可用取决于账户权益。Herdr 内外使用同一套 Agent 命令。
 
-同一 `TICKLOOP_CONFIG_DIR` 的 Chat 共用登录，后续模型请求读取最新账户并在到期前刷新。`/logout` 仅删除本地登录，不撤销已发出的请求或远端授权。凭证单独保存在状态根目录的 `auth/openai-codex-credentials.json`，使用私有文件权限；不读取 Codex CLI 或 pi 的登录文件。不要分享这份文件；同一系统用户下已经获准执行的任意 Shell 仍可能访问本地文件。
+同一 `TICKLOOP_CONFIG_DIR` 的 Chat 共用登录，后续模型请求读取最新账户并在到期前刷新。Provider 列表的 `Sign out · Codex subscription`（或选中 Codex 后按 `s`）仅删除本地登录，不撤销已发出的请求或远端授权。凭证单独保存在状态根目录的 `auth/openai-codex-credentials.json`，使用私有文件权限；不读取 Codex CLI 或 pi 的登录文件。不要分享这份文件；同一系统用户下已经获准执行的任意 Shell 仍可能访问本地文件。
 
 `/settings` → Usage 显示服务端实际返回的 token 用量，包括审查和压缩请求；这些数字不是套餐剩余额度或实际账单。账号失效时在 `/model` 选中 Provider 并按 `r` 重新授权；模型没有权限时在 `/model` 中自行选择可用模型；套餐额度耗尽会结束本次任务，并在服务端提供时显示重置时间。不会自动换号、切换到付费 API 或等额度重置后自行继续。
 
@@ -57,7 +57,7 @@ providers/
 
 内置目录中的定义不代表已经配置账户或已开通服务。DeepSeek API 和 Codex 套餐是当前接入；`anthropic-api.yaml` 保留此前已有的 Claude Model Card，供旧配置兼容使用，不会因此自动调用 Anthropic。
 
-完整示例见 [DeepSeek API](examples/providers/deepseek-api.yaml) 和 [Codex 套餐](examples/providers/openai-codex.yaml)。单个文件可用于 `--config` 或 `/model FILE`。显式加载多模型文件时，用 `default_model` 指定该 Provider 内的模型 ID；只有一个模型时可省略。 显式文件中的其他模型也会出现在本次菜单中；加载本身不写配置，确认选择后保存该 Provider 的已填写字段和模型列表。省略的字段继续继承有效用户配置与内置默认值，保存时不会被展开成固定值。
+完整示例见 [DeepSeek API](examples/providers/deepseek-api.yaml) 和 [Codex 套餐](examples/providers/openai-codex.yaml)。单个文件可用于 `--config` 或 `/model CONFIG_FILE`。显式加载多模型文件时，用 `default_model` 指定该 Provider 内的模型 ID；只有一个模型时可省略。 显式文件中的其他模型也会出现在本次菜单中；加载本身不写配置，确认选择后保存该 Provider 的已填写字段和模型列表。省略的字段继续继承有效用户配置与内置默认值，保存时不会被展开成固定值。
 
 ```sh
 cargo run -p tickloop-agent --bin tickloop -- \
@@ -95,7 +95,7 @@ Provider 内的 `id` 是配置身份，`service_model_id` 是服务实际接收�
 
 输入自然语言开始工作，再输入补充要求继续同一目标。输入区固定在终端底部，上方显示流式回复和工具摘要。单行状态栏依次显示当前 Execution Mode、模型及 `Context x% used`，重要提示优先显示；已知窗口大小且当前模型尚无请求时从 `Context 0% used` 开始；请求进行中沿用 0% 或最近一次已确认用量，窗口大小未知或请求结束后仍无已确认用量时显示 `Context —`。仍在活动状态的后台 Shell Tasks 和当前 Loop 的 Todo 共用状态栏下方的单列面板，默认只显示计数标签，点击或按 Down、Enter 展开；Tasks 可用 `j`／`k` 选中单个任务，Enter 打开详情，`x` 停止，Todo 可用相同按键滚动；Subagents 尚未接入。PgUp／PgDn 回看半页，Ctrl+Home／End 到会话首尾；上滚后新输出不会抢走阅读位置，底栏显示新消息数。`Shift+Tab` 在普通输入界面按 Auto → Ask → Full Access → Auto 循环；权限 Diff、菜单和候选打开时由当前界面优先处理。`/settings` 中的 Auto-scroll 开关只作用于当前终端客户端，关闭后手动到底也不会被之后的输出重新带走。
 
-输入 `/model` 先选 Provider，再选模型。`/thinking` 可单独调整当前模型的 Thinking 档位，旧 `/effort` 保留为兼容别名。在 Provider 列表按 `a` 切换已配置的适配器，模型列表随之筛选；例如 DeepSeek 支持 Messages、Responses 或 Chat Completions。模型页只列模型，名称使用官方名称；上下键、`j`／`k`、`Ctrl+N`／`Ctrl+P` 选择模型，左右键或 `h`／`l` 调整该行 Thinking。回车同时应用并保存模型与 Thinking；浏览、调整草稿或切换适配器不修改当前配置。`Esc` 放弃草稿并返回 Provider，再按退出；无需输入配置文件路径。两个模型共用 `DEEPSEEK_API_KEY`；当前内置 Model Card 的上下文窗口为 1M，输出限制为 64,000 tokens，可通过公开配置调整。`/settings`（别名 `/config`）集中显示模型、Execution Mode、当前会话状态、本进程用量和 Auto-scroll。照 Claude Code，`/model` 的选择、持久权限规则和 `defaultMode` 位于状态根目录的 `settings.json`；启动时 `--config` 与 `--mode` 分别优先于保存的模型和默认模式。内置默认是 Auto。Chat 内切换、会话级规则和 `/add-dir` 附加目录只在本进程内有效；新建、恢复与 Branch 使用当时的默认模式，不恢复来源 Chat 的临时模式。Auto-scroll 作用于当前终端会话；在途工作结束后模型切换才生效，不兼容的历史会明确提示先压缩。已知模型的上下文窗口自动取该模型的最大值。
+输入 `/model` 先选 Provider，再选模型。`/thinking` 可单独调整当前模型的 Thinking 档位。在 Provider 列表按 `a` 切换已配置的适配器，模型列表随之筛选；例如 DeepSeek 支持 Messages、Responses 或 Chat Completions。模型页只列模型，名称使用官方名称；上下键、`j`／`k`、`Ctrl+N`／`Ctrl+P` 选择模型，左右键或 `h`／`l` 调整该行 Thinking。回车同时应用并保存模型与 Thinking；浏览、调整草稿或切换适配器不修改当前配置。`Esc` 放弃草稿并返回 Provider，再按退出；无需输入配置文件路径。两个模型共用 `DEEPSEEK_API_KEY`；当前内置 Model Card 的上下文窗口为 1M，输出限制为 64,000 tokens，可通过公开配置调整。`/settings`（别名 `/config`）集中显示模型、Execution Mode、当前会话状态、本进程用量和 Auto-scroll。照 Claude Code，`/model` 的选择、持久权限规则和 `defaultMode` 位于状态根目录的 `settings.json`；启动时 `--config` 与 `--mode` 分别优先于保存的模型和默认模式。内置默认是 Auto。Chat 内切换、会话级规则和 `/add-dir` 附加目录只在本进程内有效；新建、恢复与 Branch 使用当时的默认模式，不恢复来源 Chat 的临时模式。Auto-scroll 作用于当前终端会话；在途工作结束后模型切换才生效，不兼容的历史会明确提示先压缩。已知模型的上下文窗口自动取该模型的最大值。
 
 六个内置 DeepSeek 配置的单次输出上限为 64,000 tokens；保存的旧内置 4096 配置在读取时升级，自定义配置与显式 `--config` 的上限保持原值。模型报告输出截断时，Agent 只用已收到的文字续接，最多再请求三次；没有完整文字可续接或次数耗尽时报告失败。上下文自动压缩独立按输入历史与上下文窗口判断。
 
@@ -117,7 +117,7 @@ Settings → Usage 统计本进程启动以来当前 Chat 的模型调用，按�
 
 照 Claude Code，按 Esc 或 `/interrupt` 中断时，已经流出的文字保留为一条 assistant 消息，其后记一条 `[Request interrupted by user]`；中断发生在工具执行或等待授权时，未完成的工具调用补上错误结果，并改记 `[Request interrupted by user for tool use]`。这些消息与普通对话一起发给下一次模型请求并随 Chat 保存，对话中显示为 `⎿ Interrupted · What should the Agent do instead?`。断流或请求失败时已显示的文字不写入对话。
 
-输入 `/rewind`、`/checkpoint`、`/undo`，或在空输入时连按两次 `Esc`，可以从当前对话中选择一条用户提示；排队但未执行的输入、定时与事件触发的输入、工具结果、权限附言和内部总结不列为可选位置。选择器与动作菜单支持 `j/k` 与 `Ctrl+N/P` 导航，返回时保留草稿。
+输入 `/rewind`，或在空输入时连按两次 `Esc`，可以从当前对话中选择一条用户提示；排队但未执行的输入、定时与事件触发的输入、工具结果、权限附言和内部总结不列为可选位置。选择器与动作菜单支持 `j/k` 与 `Ctrl+N/P` 导航，返回时保留草稿。
 
 照 Claude Code，Rewind 提供 Restore code and conversation、Restore conversation 和 Restore code；只有恢复代码确实会改变文件时才提供含代码的两项。恢复对话只截断内存中的对话：选中的提示及之后的消息离开对话，提示当时的 Execution Mode 被读回，提示原文与附件回填到底部输入，并绑定到新建的无 trigger Idle Loop。Loop 随对话链生效：在选中提示或之后创建的 Loop 离开当前对话，它的 Trigger 与后台 Shell 随之停止；更早创建的 Loop 保持原生命周期。下一条消息接在最后保留的消息之后，在同一 Transcript 中形成分叉，被放弃的消息仍留在文件中；不继续对话就重启时，恢复仍进入最近活动的一支。
 
@@ -137,55 +137,66 @@ Rewind 同时提供 `Summarize from here` 和 `Summarize up to here`，照 Claud
 
 空输入开头键入或粘贴 `!` 会进入 Shell mode，命令由当前 TTY 用户直接执行，不经过模型或 Agent 工具授权。Tab 补全当前项目的 Shell history 和路径；空 Shell 输入用 Esc／Backspace／Ctrl+U 返回普通 Prompt。前台命令运行时 Ctrl+B 或 Ctrl+X Ctrl+B 转后台、Ctrl+C 停止，`/tasks` 可继续查看输出或控制同一进程。普通 prompt、pipe 和菜单回填中的 `!` 不会进入直接执行入口。照 Claude Code，命令执行期间不向 Chat 写消息；前台结束、转入后台或启动失败时，`<bash-input>` user 消息与结果一起加入 Chat：结束时以 `<bash-stdout>`／`<bash-stderr>` user 消息记录有界输出（失败时输出与退出码记入 stderr，被 Ctrl+C 停止时改记中断标记，启动失败记 `Command failed`），转入后台时记录后台提示，后台结束后改由任务通知说明结果。命令运行期间到达的任务通知排在这组消息之后。这些消息随 Chat 保存，对话中按 `! 命令` 与 `⎿` 输出块显示；照 Claude Code，后台命令结束时任务通知会继续启动它的 Loop，模型据此决定是否读取输出；Chat 正忙时排在当前一轮之后，多个任务同时结束只继续一轮。新 Chat 不会为 Shell 结果隐式创建 Loop，没有归属 Loop 的 `!` 命令只写通知消息，继续输入问题后模型才能解释结果。
 
-`/tasks`、`/bashes` 和 `/commands` 打开同一个 Shell 任务界面，模型响应期间也可立即进入；存在运行中的后台任务时，Shift+↑／Shift+↓ 也可直接打开。列表和详情贴在屏幕底部，最多占半屏，保留上方的 Chat 内容。单任务直接打开详情，多任务先显示列表；`j/k`、方向键或 Ctrl+N/P 选择，Enter 查看，`b` 转后台，`x` 停止可控任务。详情支持逐行、翻页与 Home/End；向上浏览时保持位置并累计未读输出，End 恢复尾随。Left 返回列表，Esc／Enter／Space 关闭详情，Ctrl+O 查看完整记录。后台输出留在任务详情中；后台 Shell（User 或 Agent）结束后，所属 Chat 收到一条 `<task-notification>` user 消息，包含任务 id、Agent 任务的 tool-use id、输出文件、状态（completed／failed／killed）和摘要，对话中显示为 `● 摘要`，下一次模型请求会带上它。Shell 任务状态与按操作查看的输出只在本进程内可用，重启后不再保留。
+`/tasks` 打开同一个 Shell 任务界面，模型响应期间也可立即进入；存在运行中的后台任务时，Shift+↑／Shift+↓ 也可直接打开。列表和详情贴在屏幕底部，最多占半屏，保留上方的 Chat 内容。单任务直接打开详情，多任务先显示列表；`j/k`、方向键或 Ctrl+N/P 选择，Enter 查看，`b` 转后台，`x` 停止可控任务。详情支持逐行、翻页与 Home/End；向上浏览时保持位置并累计未读输出，End 恢复尾随。Left 返回列表，Esc／Enter／Space 关闭详情，Ctrl+O 查看完整记录。后台输出留在任务详情中；后台 Shell（User 或 Agent）结束后，所属 Chat 收到一条 `<task-notification>` user 消息，包含任务 id、Agent 任务的 tool-use id、输出文件、状态（completed／failed／killed）和摘要，对话中显示为 `● 摘要`，下一次模型请求会带上它。Shell 任务状态与按操作查看的输出只在本进程内可用，重启后不再保留。
 
 底部导航仅显示有内容的 Tasks／Todo 标签，默认收起列表。输入光标位于最后视觉行且历史已到底时，Down 聚焦第一个可见项；Enter 或 Space 展开，Space 再次收起，点击标签也能切换展开状态。`h/l` 或左右键切换标签；展开后 `j/k` 或 Ctrl+N/P 在 Tasks 中选任务、在 Todo 中滚动，Enter 打开所选任务的详情，`x` 停止所选任务，Esc 收起并返回输入。可打印字符回到输入框并继续作为文字输入。关闭详情后恢复草稿、光标和 Chat 浏览位置；再次打开保留同一 Chat 的任务浏览状态。差异视图通过独立 `/diff` 命令打开；候选、弹层和阅读界面继续独占各自按键。
 
 超过 800 字符或超过 3 行的 bracketed paste 在输入区折叠为一个块，左右移动和删除把它视为一个单元，提交仍使用完整原文。输入框可编辑时 Ctrl+G 随时使用 VISUAL／EDITOR 打开外部编辑器（可以是 Vim）；返回后用编辑结果更新草稿，并恢复底部输入、raw mode 和 bracketed paste。从输入历史取回（包括重启后）的粘贴恢复为完整原文，超过 1024 字符的原文保存在状态根目录的 `paste-cache/`；取回时不恢复折叠块。Ctrl+V 把剪贴板图片附加为 `[Image #N]`，与折叠粘贴共用编号并同样整块移动和删除，删除占位符即移除图片；发送时图片按占位符顺序随消息提交，输入历史只保留占位符文字。当前模型未在 `input_modalities` 中声明 `image` 时不附加并提示；通过 SSH 运行时读取的是远程主机的剪贴板，可改用 `@路径`。把 png、jpg、jpeg、gif 或 webp 文件拖入终端或粘贴其路径（支持引号、shell 转义、`file://`、`~/`，相对路径按 Chat 工作目录解析）时同样附加为 `[Image #N]`，混合粘贴中的其余文字保持原样；路径不存在或不是图片时按文字粘贴。macOS 上剪贴板是图片时 Cmd+V 产生的空粘贴会读取剪贴板图片。
 
-`/help` 或 `/` 打开按功能分组的命令菜单。`/resume`、`/loops`、`/commands` 分别选择 Chat、目标和 Shell 任务；`/plan` 独立进入只读规划，有已保存计划时打开审阅。选择历史只打开内容，不自动恢复执行；计划菜单明确标注“批准并开始”，并校验所审阅的版本。
+`/help` 或 `/` 打开按功能分组的命令菜单。普通补全显示 19 个公开命令和系统 Skill；`/help advanced` 查看 19 个高级命令，高级命令仍可直接执行。`/resume`、`/loops`、`/tasks` 分别选择 Chat、目标和 Shell 任务；`/plan` 独立进入只读规划，有已保存计划时打开审阅。选择历史只打开内容，不自动恢复执行；计划菜单明确标注“批准并开始”，并校验所审阅的版本。
 
 `examples/deepseek-responses-config.json` 与 `examples/deepseek-chat-config.json` 分别演示 Responses 和 Chat Completions 适配器配置，`examples/deepseek-v4-pro-config.json` 演示改用 `deepseek-v4-pro` 模型。协议属于模型配置；两者的 DeepSeek 服务地址为 `https://api.deepseek.com`，Messages 使用 `/anthropic` 地址。
 
 Model Card 与单模型配置的 `input_modalities` 声明模型接受的输入（`"text"`、`"image"`），未声明时只收文字。内置 Anthropic 与 Codex 模型、`deepseek-flash` 的 Messages 与 Chat Completions 条目，以及 `examples/deepseek-config.json`、`examples/deepseek-chat-config.json` 声明 `["text", "image"]`；`deepseek-v4-pro`、`deepseek-v4-flash` 与 DeepSeek Responses 只收文字。当前模型不支持图片时，带 `@图片` 的消息不会发送，草稿保留，并提示去掉 `@图片` 或用 `/model` 切换模型；历史中的图片在请求时替换为说明文字，模型会告知用户它看不到图片，Transcript 中的原图不变，切回支持图片的模型后照常发送。Agent 用 `Read` 读取 PNG、JPEG、GIF 或 WebP 图片时，模型收到图片本身，界面只显示路径、格式与尺寸；当前模型不支持图片时 `Read` 不加载图片，返回说明文字让 Agent 告知用户。
 
-| 命令 | 行为 |
-| --- | --- |
-| `/new` | 下一条输入建立新的目标，保留当前 Chat 历史 |
-| `/clear` | 开始新 Chat；照 Claude Code 停止原 Chat 中未转入后台的 Shell 任务，原 Chat 的目标继续在本进程运行 |
-| `/branch [NAME]` | 从当前 Chat 末尾创建并切换到独立 child；标题照 Claude Code 为 "NAME (Branch)"（未指定名称时用首条提示），重名时为 "(Branch 2)" 等；`/fork` 不是别名 |
-| `/resume` | 打开 Chat 选择器：按最近活动列出本项目已保存的 Chat，显示标题或首条提示、相对时间、git 分支与 Branch 来源；打开历史不会自动执行 |
-| `/resume CHAT` | 按 id 切换前台 Chat；再次输入消息才开始运行 |
-| `/loops`、`/goal` | 从菜单查看目标状态并选择接下来输入对应的目标 |
-| `/answer QUESTION ANSWER` | 回答澄清问题；只有一个可见问题时也可直接输入答案 |
-| `/allow REQUEST [once\|session\|persistent]`、`/deny REQUEST` | 回答绑定具体操作的权限请求；默认为单次 |
-| `/mode [auto\|ask\|fullAccess\|plan]` | 查看或修改当前 Chat 的模式；旧 `acceptEdits` 兼容 Ask，`manual` 与 `default` 是废弃别名；Plan 推荐使用 `/plan` |
-| `/model` | 打开模型与适配器选择器，显示当前与待生效配置；选择保存到 `settings.json`，新 Chat 与重启后生效 |
-| `/thinking [LEVEL]`（兼容 `/effort`） | 选择当前模型支持的力度；无参数打开选择器，`auto` 使用模型默认值 |
-| `/permissions` | 先选择 Auto／Ask／Full Access，或直接查看近期记录；Auto 下可配置 LLM／Jev 与 Key；Settings 中的 Permissions 打开同一入口 |
-| `/jev` | 兼容入口：Auto 下打开审批设置，其他模式回到权限首页；Key 遮盖输入，供 Auto 与其他 Jev 判断共用 |
-| `/settings`、`/config` | 模型与 adapter、Thinking 开关与档位、Execution Mode、Permissions、当前会话状态、本进程用量、客户端 Auto-scroll 与 Output style |
-| `/details`、Ctrl+O | 打开完整会话记录并浏览、搜索；Ctrl+O 返回。管道模式 `/details` 保留文本详情开关 |
-| `/rewind`、`/checkpoint`、`/undo` | 打开用户提示选择器，恢复代码、对话或两者，或执行两向定向总结；summary 行可用 Tab 添加可选 guidance |
-| Esc Esc（空输入） | 打开同一 Rewind 选择器；非空草稿连按两次 Esc 清空草稿并存入历史 |
-| `/diff` | 审阅当前 Git working tree 与本进程内已成功执行的逐轮 Agent 文件变更；支持 source、文件和完整 diff 导航 |
-| `/rules`、`/rule allow\|ask\|deny TOOL [session\|persistent]`、`/rule remove UUID` | 查看、增加与删除权限规则；session 规则覆盖本 Chat 所有目标中该工具的输入，本进程内有效；persistent 规则写入 `settings.json` 中当前工作目录的分区，对该目录的新 Chat 与重启后生效 |
-| `/cwd [PATH]`、`/add-dir PATH` | 查看或修改主目录、增加允许访问的目录；附加目录只在本进程内有效 |
-| `/interrupt` | 打断当前运行，之后可以补充输入继续目标 |
-| `/stop [GOAL]` | 停止指定目标及其后续输入；列出仍未确认完成的操作 |
-| `/plan` | 独立进入只读规划；有当前计划时继续审阅或批准并开始执行；`/plan GOAL` 查看指定计划 |
-| `/tasks`、`/bashes`、`/commands` | 打开本进程内全部 Chat 的 User／Agent Shell 任务列表与实时输出详情，其他 Chat 的任务标注所属 Chat，按来源转后台或停止；无法确认结束时显示 Unknown，重启后不保留 |
-| `/command-output OPERATION [OFFSET] [LIMIT]` | 有限读取本进程内的命令输出，并显示完整输出引用；重启后不可用 |
-| `/search-config FILE`、`/search-config off` | 配置或关闭搜索服务；文件包含 `endpoint` 和可选 `api_key_env` |
-| `/events PROMPT`、`/trigger SOURCE [JSON]` | 为所选目标开启显式事件，或递交带来源与数据的事件 |
-| `/schedule SECONDS [--for DURATION_SECONDS] PROMPT` | 设置本机定时执行，可选到期时长 |
-| `/triggers`、`/clear-trigger` | 查看或关闭所选目标的触发配置 |
-| `/compact [INSTRUCTIONS]` | 主动压缩；补充说明只用于本次摘要请求。自动压缩使用当前模型的已知上下文窗口 |
-| `/operations` | 查看本进程内记录的工具操作及结果；重启后不保留 |
-| `/help` | 显示入口与命令说明 |
-| `/exit`、`/quit` | 取消进行中的工作并退出宿主 |
+| 分类 | 命令 | 行为 |
+| --- | --- | --- |
+| 公开 | `/loops new` | 下一条输入建立新的目标，保留当前 Chat 历史 |
+| 公开 | `/clear` | 开始新 Chat；照 Claude Code 停止原 Chat 中未转入后台的 Shell 任务，原 Chat 的目标继续在本进程运行 |
+| 公开 | `/branch [NAME]` | 从当前 Chat 末尾创建并切换到独立 child；标题照 Claude Code 为 "NAME (Branch)"（未指定名称时用首条提示），重名时为 "(Branch 2)" 等；`/fork` 不是别名 |
+| 公开 | `/resume` | 打开 Chat 选择器：按最近活动列出本项目已保存的 Chat，显示标题或首条提示、相对时间、git 分支与 Branch 来源；打开历史不会自动执行 |
+| 公开 | `/resume CHAT` | 按 id 切换前台 Chat；再次输入消息才开始运行 |
+| 公开 | `/loops [GOAL_ID]` | 无参数打开 Loops；详情显示 Trigger 与定时设置，选择 Use this goal 后用于后续输入；给 ID 直接选择 |
+| 高级 | `/answer QUESTION ANSWER` | 回答澄清问题；只有一个可见问题时也可直接输入答案 |
+| 高级 | `/allow REQUEST [once\|session\|persistent]`、`/deny REQUEST` | 回答绑定具体操作的权限请求；默认为单次 |
+| 高级 | `/mode [auto\|ask\|fullAccess\|plan]` | 查看或修改当前 Chat 的模式；旧 `acceptEdits` 兼容 Ask，`manual` 与 `default` 是废弃别名；Plan 推荐使用 `/plan` |
+| 公开 | `/model` | 打开模型与适配器选择器，显示当前与待生效配置；选择保存到 `settings.json`，新 Chat 与重启后生效 |
+| 公开 | `/thinking [LEVEL]` | 选择当前模型支持的力度；无参数打开选择器，`auto` 使用模型默认值 |
+| 公开 | `/permissions` | 先选择 Auto／Ask／Full Access，或直接查看近期记录；Auto 下可配置 LLM／Jev 与 Key；Settings 中的 Permissions 打开同一入口 |
+| 公开 | `/settings` | 模型与 adapter、Thinking 开关与档位、Execution Mode、Permissions、当前会话状态、本进程用量、客户端 Auto-scroll 与 Output style |
+| 公开 | `/details`、Ctrl+O | 打开完整会话记录并浏览、搜索；Ctrl+O 返回。管道模式 `/details` 保留文本详情开关 |
+| 公开 | `/rewind` | 打开用户提示选择器，恢复代码、对话或两者，或执行两向定向总结；summary 行可用 Tab 添加可选 guidance |
+| 快捷键 | Esc Esc（空输入） | 打开同一 Rewind 选择器；非空草稿连按两次 Esc 清空草稿并存入历史 |
+| 公开 | `/diff` | 审阅当前 Git working tree 与本进程内已成功执行的逐轮 Agent 文件变更；支持 source、文件和完整 diff 导航 |
+| 高级 | `/rules`、`/rule allow\|ask\|deny TOOL [session\|persistent]`、`/rule remove UUID` | 查看、增加与删除权限规则；session 规则覆盖本 Chat 所有目标中该工具的输入，本进程内有效；persistent 规则写入 `settings.json` 中当前工作目录的分区，对该目录的新 Chat 与重启后生效 |
+| 公开 | `/cwd [PATH]` | 查看或修改主工作目录 |
+| 高级 | `/add-dir PATH` | 增加允许访问的目录；附加目录只在本进程内有效 |
+| 高级 | `/interrupt` | 打断当前运行，之后可以补充输入继续目标 |
+| 公开 | `/stop [GOAL]` | 停止指定目标及其后续输入；列出仍未确认完成的操作 |
+| 公开 | `/plan` | 独立进入只读规划；有当前计划时继续审阅或批准并开始执行；`/plan GOAL` 查看指定计划 |
+| 公开 | `/tasks` | 打开本进程内全部 Chat 的 User／Agent Shell 任务列表与实时输出详情，其他 Chat 的任务标注所属 Chat，按来源转后台或停止；无法确认结束时显示 Unknown，重启后不保留 |
+| 高级 | `/command-output OPERATION [OFFSET] [LIMIT]` | 有限读取本进程内的命令输出，并显示完整输出引用；重启后不可用 |
+| 高级 | `/search-config FILE`、`/search-config off` | 配置或关闭搜索服务；文件包含 `endpoint` 和可选 `api_key_env` |
+| 高级 | `/events PROMPT`、`/trigger SOURCE [JSON]` | 为所选目标开启显式事件，或递交带来源与数据的事件 |
+| 公开 | `/loops schedule GOAL_ID SECONDS [--for DURATION_SECONDS] PROMPT` | 设置本机定时执行，可选到期时长 |
+| 公开 | `/loops trigger [GOAL_ID]` | 查看指定或所选目标的 Trigger，不改变选择 |
+| 高级 | `/clear-trigger` | 关闭所选目标的整个 Trigger，包含定时、事件与订阅 |
+| 公开 | `/compact [INSTRUCTIONS]` | 主动压缩；补充说明只用于本次摘要请求。自动压缩使用当前模型的已知上下文窗口 |
+| 高级 | `/operations` | 查看本进程内记录的工具操作及结果；重启后不保留 |
+| 公开 | `/help` | 显示入口与命令说明 |
+| 公开 | `/exit` | 取消进行中的工作并退出 Agent 进程 |
+| 公开 | `/subscriptions` | 查看当前 Chat 的 Tick Subscription，调整 cadence 或取消 |
+| 高级 | `/tui [inline\|fullscreen]` | 查看或切换终端渲染器 |
+| 高级 | `/status` | 查看当前 Chat、模型、执行模式与队列 |
+| 高级 | `/background OPERATION`、`/stop-command OPERATION` | 后台执行或停止一个 Shell 任务 |
+| 高级 | `/approve-plan GOAL VERSION MODE` | 批准指定计划版本，下一次输入才开始执行 |
+| Skill | `/tickloop [REQUEST]` | 加载系统 Tick Loop Skill，不额外授权 |
 
-交互菜单仅在 stdin 和 stdout 都是终端时启用。管道输入保持按行命令和详细事件输出，不输出终端控制码；模型／设置选择可以输入菜单编号或 `cancel`。原有 `/model FILE`、`/allow REQUEST`、`/goal UUID`、`/background OPERATION`、`/stop-command OPERATION`、`/approve-plan GOAL VERSION MODE` 等显式参数形式继续可用，适合脚本及高级操作。高级 `/approve-plan` 仅批准版本，再次输入才开始；菜单“批准并开始”明确执行这两步。
+默认不保留 alias；本次移除的名称不再被解析，也不会自动转发。旧 `/new`、`/goal`、`/triggers`、`/schedule` 的能力归入 `/loops`；Theme 位于 `/settings → Theme`，只影响当前终端；退出 Codex 登录位于 `/model → Provider → Sign out`，不会自动重新登录。
+
+Loops 的 Configure timer 把当前配置填入主输入框，使用同一套普通编辑键与 Ctrl+G 外部编辑器。修改 `/loops schedule GOAL_ID SECONDS [--for DURATION_SECONDS] PROMPT` 后 Enter 保存，Ctrl+C 取消草稿；已有草稿不会被覆盖。无 `--for` 时移除期限。当前任务忙时排队；显式参数形式可用于管道。新目标保留当前 Chat 历史，选择目标与查看详情不自动执行任务。
+
+交互菜单仅在 stdin 和 stdout 都是终端时启用。管道输入保持按行命令和详细事件输出，不输出终端控制码；模型／设置选择可以输入菜单编号或 `cancel`。原有 `/model CONFIG_FILE`、`/allow REQUEST`、`/loops UUID`、`/background OPERATION`、`/stop-command OPERATION`、`/approve-plan GOAL VERSION MODE` 等显式参数形式继续可用，适合脚本及高级操作。高级 `/approve-plan` 仅批准版本，再次输入才开始；菜单“批准并开始”明确执行这两步。
 
 管道输入的 EOF 会等待已提交的输入按序完成；模型失败时以非零状态退出。显式 `/exit` 会立即取消当前工作。
 

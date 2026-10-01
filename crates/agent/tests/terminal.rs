@@ -54,7 +54,7 @@ fn malformed_auto_settings_do_not_exit_the_terminal_on_permissions_commands() {
                 .stdin
                 .take()
                 .unwrap()
-                .write_all(b"/permissions\n/rules\n/jev\n/exit\n")?;
+                .write_all(b"/permissions\n/rules\n/exit\n")?;
             child.wait_with_output()
         })
         .unwrap();
@@ -69,10 +69,6 @@ fn malformed_auto_settings_do_not_exit_the_terminal_on_permissions_commands() {
         "{stdout}"
     );
     assert!(stdout.contains("Cannot list permission rules"), "{stdout}");
-    assert!(
-        stdout.contains("Jev (TypeSafe) key settings require the interactive /model picker"),
-        "{stdout}"
-    );
 }
 
 #[test]
@@ -437,7 +433,7 @@ fn terminal_explains_how_to_start_without_credentials() {
     let text = String::from_utf8(output.stdout).unwrap();
     assert!(text.contains("--config"));
     assert!(text.contains("--cwd"));
-    assert!(text.contains("/new"));
+    assert!(text.contains("/loops new"));
     assert!(
         !text.contains("/ack-"),
         "removed acknowledgement commands must not be documented: {text}"
@@ -499,7 +495,7 @@ async fn piped_provider_model_and_settings_menus_apply_numbered_choices() {
         .take()
         .unwrap()
         .write_all(
-            b"/model\n1\n1\n/model\n1\ncancel\ncancel\n/settings\n4\n2\n/config\ncancel\n/exit\n",
+            b"/model\n1\n1\n/model\n1\ncancel\ncancel\n/settings\n4\n2\n/settings\ncancel\n/exit\n",
         )
         .await
         .unwrap();
@@ -558,7 +554,7 @@ async fn effort_picker_saves_a_supported_level_without_model_credentials() {
         .stdin
         .take()
         .unwrap()
-        .write_all(b"/thinking medium\n/effort\n4\n/thinking\ncancel\n/exit\n")
+        .write_all(b"/thinking medium\n/thinking\n4\n/thinking\ncancel\n/exit\n")
         .await
         .unwrap();
     let output = tokio::time::timeout(INTERACTION_TIMEOUT, child.wait_with_output())
@@ -673,7 +669,7 @@ async fn piped_effort_controls_request_and_prints_returned_thinking() {
     let output = run_with_config(
         directory.path(),
         &["--no-session-persistence"],
-        "/effort max\nCompare\n",
+        "/thinking max\nCompare\n",
     )
     .await;
     let transcript = String::from_utf8(output.stdout).unwrap();
@@ -2353,8 +2349,7 @@ async fn terminal_can_background_read_and_stop_the_same_shell_process() {
     .unwrap();
     input
         .write_all(
-            format!("/commands\n/command-output {operation}\n/stop-command {operation}\n")
-                .as_bytes(),
+            format!("/tasks\n/command-output {operation}\n/stop-command {operation}\n").as_bytes(),
         )
         .await
         .unwrap();

@@ -47,6 +47,7 @@ pub(crate) use input_history::{PASTE_CACHE_DIRECTORY, PASTE_FILE_EXTENSION};
 mod denials_surface;
 mod input_view;
 mod login;
+mod loops;
 mod menus;
 mod paste_blocks;
 mod pasted_image_paths;
@@ -164,33 +165,27 @@ enum CommandTiming {
 
 fn command_timing(command: &str) -> CommandTiming {
     let name = command.split_whitespace().next().unwrap_or(command);
+    if name == "/loops" && command.split_whitespace().nth(1) == Some("schedule") {
+        return CommandTiming::AfterTurn;
+    }
     if is_rewind_command(name)
         || matches!(
             name,
             "/exit"
-                | "/quit"
                 | "/help"
                 | "/details"
                 | "/diff"
                 | "/status"
                 | "/settings"
                 | "/permissions"
-                | "/jev"
-                | "/config"
                 | "/mode"
                 | "/model"
-                | "/logout"
-                | "/effort"
                 | "/thinking"
                 | "/loops"
-                | "/commands"
                 | "/tasks"
-                | "/bashes"
                 | "/subscriptions"
-                | "/subs"
                 | "/operations"
                 | "/rules"
-                | "/triggers"
                 | "/plan"
                 | "/interrupt"
                 | "/stop"
@@ -200,12 +195,9 @@ fn command_timing(command: &str) -> CommandTiming {
                 | "/background"
                 | "/stop-command"
                 | "/command-output"
-                | "/new"
                 | "/clear"
                 | "/branch"
                 | "/tui"
-                | "/theme"
-                | "/goal"
                 | "/resume"
         )
     {
@@ -229,15 +221,15 @@ fn tui_renderer_request(command: &str) -> Result<Option<Renderer>, &'static str>
 }
 
 fn is_task_surface_command(command: &str) -> bool {
-    matches!(command, "/commands" | "/tasks" | "/bashes")
+    command == "/tasks"
 }
 
 fn is_subscription_view_command(command: &str) -> bool {
-    matches!(command, "/subscriptions" | "/subs")
+    command == "/subscriptions"
 }
 
 fn is_rewind_command(command: &str) -> bool {
-    matches!(command, "/rewind" | "/checkpoint" | "/undo")
+    command == "/rewind"
 }
 
 fn branch_name(command: &str) -> Result<Option<String>, String> {
@@ -418,8 +410,8 @@ pub fn print_help() {
     println!("{}", help_text());
 }
 
-fn help_text() -> &'static str {
-    r#"Tick Loop Agent
+fn help_text() -> String {
+    let guidance = r#"Tick Loop Agent
 Usage: tickloop [--config FILE] [--cwd DIRECTORY]
        [--mode acceptEdits|auto|plan] [--deny-on-prompt | --dangerously-skip-permissions]
        [--working-directory-is-trusted]
@@ -437,7 +429,7 @@ Chats are saved under ~/.tickloop, or TICKLOOP_CONFIG_DIR when it is set.
 --no-session-persistence runs without saving Chats; so does cleanupPeriodDays 0 in settings.json.
 Transcripts, large tool results, plans, file backups and paste cache older than cleanupPeriodDays (default 30) are removed in the background 10 minutes after the first prompt (at start when input is not a terminal), later while you are typing.
 /model → Provider opens Codex subscription authorization; choose browser or device code there. Judgment settings manages the separate Jev (TypeSafe) key.
-/logout removes that local login; requests already sent are not revoked.
+/model → Provider: press s to sign out of Codex locally; requests already sent are not revoked.
 /model choices and persistent rules are saved in settings.json there; --config takes precedence over the saved model.
 
 Enter a task; follow-up inputs are accepted while the current run continues.
@@ -446,23 +438,22 @@ Down on the last visual input row, after history ends, selects Footer Tasks/Todo
 Footer Tasks/Todo starts folded: click a label or press Enter/Space to expand; Space folds, Esc returns to the editor.
 Footer: h/l or arrows choose; Enter on an expanded Task opens details; other typed keys return to the editor.
 Shift+Up/Down opens background Tasks directly when any are running.
-/new starts another goal in this Chat; /loops lists goals; /goal UUID selects one.
+/loops opens Loop management; /loops new starts another goal in this Chat; /loops UUID selects one.
+/loops trigger [GOAL_ID] reads its trigger.
+/loops schedule GOAL_ID SECONDS [--for DURATION_SECONDS] PROMPT sets a local timer and optional deadline.
 /clear starts a new Chat and stops this Chat's Shell tasks that are not in the background.
 /branch [NAME] copies this conversation at its current point and switches to the child Chat.
 /resume opens the Chat picker; /resume CHAT switches to that Chat without running it.
 Chats you switch away from keep running their goals in this process; /tasks lists Shell tasks from every Chat.
-/answer QUESTION ANSWER answers the next question of a clarification; ordinary input answers the next question when one clarification is visible.
 /tickloop [REQUEST] loads the system Workspace Skill; other discovered Skills also use /NAME [ARGUMENTS].
 /model opens the Provider and model picker for this Chat, with separate Judgment settings for the Jev (TypeSafe) key; /model FILE loads an advanced Chat configuration. Model choices also apply to new Chats.
-/thinking opens the Thinking picker; /thinking LEVEL sets a supported level. /effort remains a compatibility alias. Auto uses the model default; /settings toggles Thinking.
-/settings (or /config) opens settings for this Chat; /permissions shows Auto, Ask and Full Access and a separate recent-activity entry.
-/permissions → Auto opens Auto settings, where you can select LLM or Judgment, manage review rules and Environment, and open the shared Jev (TypeSafe) key settings; /jev opens Auto settings when Auto is active.
+/thinking opens the Thinking picker; /thinking LEVEL sets a supported level. Auto uses the model default; /settings toggles Thinking.
+/settings opens settings for this Chat; /permissions shows Auto, Ask and Full Access and a separate recent-activity entry.
+/permissions → Auto opens Auto settings, where you can select LLM or Judgment, manage review rules and Environment, and open the shared Jev (TypeSafe) key settings.
 Explicit Ask rules always require a human once-only answer. Auto defaults to this Chat's model; Jev technical failure falls back to it without changing the saved choice.
-/theme opens the theme picker; the choice applies to this terminal session only.
-/tui shows the terminal renderer; /tui inline or /tui fullscreen switches it without restarting.
+/settings → Theme opens the theme picker; the choice applies to this terminal session only.
 Fullscreen draws on the alternate screen; start with TICKLOOP_AGENT_TUI=inline where that is unusable, such as iTerm2 tmux -CC.
 Fullscreen reads the wheel to scroll the conversation; TICKLOOP_AGENT_DISABLE_MOUSE=1 hands the wheel back to the terminal and restores click-and-drag selection.
-/status reports the selected Chat and queue without waiting for the current turn.
 /diff opens current working-tree changes and Agent file changes saved in this process without calling the model.
 Typing / or a command prefix shows completion; Tab fills the first match.
 ↑/↓ or Ctrl+N/P selects a completion; Enter fills a selected match or sends the draft.
@@ -479,31 +470,24 @@ With an empty prompt, Ctrl+C or Ctrl+D must be pressed twice within 800ms to exi
 With a draft, Ctrl+D deletes forward instead of exiting.
 On Unix, Ctrl+Z suspends this Agent process; run fg in the shell to resume it.
 Esc twice clears a draft into history, or opens the rewind review when input is empty.
-/rewind, /checkpoint and /undo open the Rewind checkpoint selector.
+/rewind opens the Rewind checkpoint selector.
 Ctrl+O or /details opens the full conversation transcript; Ctrl+O, Esc or q returns.
 In transcript: / searches, Enter accepts, n/N moves between matches; Esc cancels search.
 j/k or arrows scroll; g/G or Home/End jumps; {/} moves between user prompts.
-/mode [auto|ask|fullAccess|plan] controls the current Chat's execution mode; new and resumed Chats use the configured default.
-/allow REQUEST [once|session|persistent] or /deny REQUEST answers permission requests.
-/rules lists rules; /rule allow|ask|deny TOOL [session|persistent] adds a rule.
 Persistent rules apply to every Chat in this working directory; session rules end with this process.
-/rule remove UUID removes a rule.
-/cwd [PATH] shows or sets the main directory; /add-dir PATH adds access.
-/search-config FILE configures web search; /search-config off disables it.
-/plan enters Plan mode and opens a saved plan for the selected goal; /plan GOAL views a specific saved plan; /approve-plan GOAL VERSION MODE approves that version.
-/tasks (or /bashes) lists Shell processes; /background OPERATION moves one to the background.
-/subscriptions (or /subs) lists this Chat's Tick Subscriptions; Enter changes a cadence, d cancels one.
-/command-output OPERATION [OFFSET] [LIMIT] reads output; /stop-command OPERATION stops it.
+/cwd [PATH] shows or sets the main directory.
+/plan enters Plan mode and opens a saved plan for the selected goal; /plan GOAL views a specific saved plan.
+/tasks lists Shell processes.
+/subscriptions lists this Chat's Tick Subscriptions; Enter changes a cadence, d cancels one.
 Shell task state and per-operation output are available only in this process; they are gone after a restart.
 Background Shell completions are added to their Chat as task notifications.
 A completion continues the goal that started the command; commands without a goal only record the notification.
-/operations lists tool effects recorded in this process; they are gone after a restart.
-/events PROMPT enables explicit events; /trigger SOURCE [JSON] delivers an event.
-/schedule SECONDS [--for DURATION_SECONDS] PROMPT configures a local timer.
-/triggers shows the selected goal's trigger; /clear-trigger removes it.
 /compact [INSTRUCTIONS] summarizes context behind a compaction boundary.
-/interrupt interrupts the current run; /stop [GOAL] stops a goal.
-/help shows this help; /exit cancels work and exits the host."#
+/help advanced lists advanced commands; /exit cancels work and exits this Agent process."#;
+    format!(
+        "{guidance}\n\nCommands and Skills:\n{}",
+        completion::command_help(false)
+    )
 }
 
 pub async fn run() -> Result<(), String> {
@@ -901,7 +885,7 @@ fn write_banner(
         );
         outln!(
             console,
-            "Service: {}\n/new starts a new goal; /help lists commands; /exit cancels and exits.",
+            "Service: {}\n/loops new starts a new goal; /help lists commands; /exit cancels and exits.",
             safe_text(&config.base_url)
         );
         return Ok(());
@@ -1066,8 +1050,13 @@ async fn interact(
                 login_from_provider = true;
                 provider_login_succeeded = false;
                 if let Some(root) = config_root.clone() {
-                    reauthenticate_after_logout = true;
+                    reauthenticate_after_logout = outcome.reauthenticate_after_logout;
                     logout = Some(LogoutFlow::start(root, console)?);
+                } else {
+                    outln!(
+                        console,
+                        "Cannot locate the Agent state directory; set TICKLOOP_CONFIG_DIR."
+                    );
                 }
             }
             if let Some(method) = outcome.provider_login {
@@ -1615,13 +1604,10 @@ async fn interact(
                 },
                 Some(InputEvent::Permissions(effect)) => {
                     match effect {
-                        PermissionsEffect::Close { destination: PermissionsReturn::Settings } => {
-                            if let Some(chat)=selected_chat { menus.settings(agent, console, chat).await?; }
-                        },
                         PermissionsEffect::Close { destination: PermissionsReturn::ModePicker { settings } } => {
                             if let Some(chat)=selected_chat { menus.permission_modes(agent, console, chat, settings).await?; }
                         },
-                        PermissionsEffect::Close { destination: PermissionsReturn::Chat } | PermissionsEffect::None => {},
+                        PermissionsEffect::None => {},
                         PermissionsEffect::Apply(change) => {
                             let Some(chat)=console.permissions_view_chat()? else {continue;};
                             let Some(revision)=console.permissions_revision()? else {continue;};
@@ -1723,11 +1709,10 @@ async fn interact(
                         _ => unreachable!(),
                     };
                     if login.is_some() {
-                        if matches!(line.trim(), "cancel" | "/cancel" | "/logout" | "/exit" | "/quit") {
+                        if matches!(line.trim(), "cancel" | "/cancel" | "/exit") {
                             login.take().unwrap().close(console)?;
                             outln!(console, "Login cancelled.");
-                            if matches!(line.trim(), "/exit" | "/quit") { return Ok(()); }
-                            if line.trim() == "/logout" { menu_commands.push_back(line); }
+                            if line.trim() == "/exit" { return Ok(()); }
                         } else if login.as_ref().unwrap().is_browser() {
                             login.as_ref().unwrap().submit_callback(console, Some(&line))?;
                         } else {
@@ -1777,14 +1762,11 @@ async fn interact(
                     }
                     if should_dismiss_menu_before_dispatch(&line) {menus.dismiss(console)?;}
                     match line.as_str() {
-                        "/exit" | "/quit" => return Ok(()),
-                        "/logout" => {
-                            if let Some(root) = config_root.clone() {
-                                logout = Some(LogoutFlow::start(root, console)?);
-                            } else { outln!(console, "Cannot locate the private state directory; set TICKLOOP_CONFIG_DIR."); }
-                        },
+                        "/exit" => return Ok(()),
                         "/help" | "/" if interactive => menus.help(console,None)?,
                         "/help" => outln!(console, "{}",help_text()),
+                        "/help advanced" if interactive => menus.help_advanced(console)?,
+                        "/help advanced" => outln!(console, "{}",completion::command_help(true)),
                         command if is_rewind_command(command) => {
                             let is_busy=selected_chat.is_some_and(|chat| pending.values().any(|receipt|receipt.chat_id==chat)
                                 || compaction_chats.values().any(|(candidate,_)|*candidate==chat)
@@ -1819,7 +1801,7 @@ async fn interact(
                             Ok(picker) => menus.workflow(console,picker)?,
                             Err(error) => outln!(console,"{error}"),
                         },
-                        "/loops" | "/goal" if interactive => {
+                        "/loops" if interactive => {
                             if let Some(chat)=selected_chat {menus.workflow(console,Workflow::goals(agent,chat).await?)?;}
                             else {outln!(console,"No Chat is selected. Enter a task first.");}
                         },
@@ -1884,7 +1866,7 @@ async fn interact(
                                 outln!(console, "No Chat is selected. Enter a task first.");
                             }
                         },
-                        "/settings" | "/config" => {
+                        "/settings" => {
                             let chat=ensure_chat(console,agent,&mut selected_chat,&workdir).await?;
                             menus.settings(agent,console,chat).await?;
                         },
@@ -1908,28 +1890,7 @@ async fn interact(
                                 Err(error) => outln!(console,"Cannot list permission rules: {}",safe_text(&error.to_string())),
                             }
                         },
-                        "/jev" => {
-                            let chat = ensure_chat(console, agent, &mut selected_chat, &workdir).await?;
-                            let mode=agent.snapshot(chat).await.map_err(|error|error.to_string())?.policy.mode;
-                            if console.is_interactive() {
-                                if mode==ExecutionMode::Auto {
-                                    match agent.permissions_view(chat).await {
-                                        Ok(view) => { menus.dismiss(console)?; console.show_auto_permissions(view,false)?; },
-                                        Err(error) => outln!(console,"Cannot open Auto settings: {}. Fix the private settings and retry.",safe_text(&error.to_string())),
-                                    }
-                                } else {
-                                    outln!(console,"Choose Auto in Permissions to select Judgment, or use /model to manage the Jev (TypeSafe) key.");
-                                    menus.permission_modes(agent,console,chat,false).await?;
-                                }
-                            } else {
-                                outln!(console,"Jev (TypeSafe) key settings require the interactive /model picker; Auto reviewer selection uses /permissions.");
-                            }
-                        },
-                        _ if line.starts_with("/jev ") => outln!(console, "Use /model for the Jev (TypeSafe) key, or /jev without arguments for Auto settings."),
-                        "/theme" => menus.themes(console, None)?,
-                        _ if line.starts_with("/theme ") => outln!(console, "/theme takes no arguments; it opens the theme picker."),
                         "" => {},
-                        "/new" => {goal=None; outln!(console, "The next input will start a new goal.");},
                         command if is_branch_command(command) => {
                             let preserve_until_summary_finishes=selected_chat
                                 .is_some_and(|chat| directed_summaries.contains(chat));
@@ -1997,9 +1958,9 @@ async fn interact(
                                 menus.models(agent,console,chat).await?;
                             }
                         },
-                        _ if line=="/thinking" || line.starts_with("/thinking ") || line=="/effort" || line.starts_with("/effort ") => {
+                        _ if line=="/thinking" || line.starts_with("/thinking ") => {
                             let chat = ensure_chat(console, agent, &mut selected_chat, &workdir).await?;
-                            if let Some(level) = line.strip_prefix("/thinking ").or_else(|| line.strip_prefix("/effort ")) {
+                            if let Some(level) = line.strip_prefix("/thinking ") {
                                 let level = level.trim();
                                 let snapshot = agent.snapshot(chat).await.map_err(|error| error.to_string())?;
                                 let supported = ReasoningEffort::choices(&snapshot.model);
@@ -2113,14 +2074,14 @@ async fn interact(
                                 }
                             } else {outln!(console, "No Chat is selected.");}
                         },
-                        _ if line=="/triggers" || line=="/clear-trigger" || line.starts_with("/events ") || line.starts_with("/schedule ") || line.starts_with("/trigger ") => {
+                        _ if line=="/clear-trigger" || line.starts_with("/events ") || line.starts_with("/trigger ") => {
                             if let (Some(chat),Some(selected_goal))=(selected_chat,goal) {
                                 match trigger_control(console, agent,chat,selected_goal,&line).await {
                                     Ok(Some(receipt))=>{outln!(console, "Accepted: Goal {} · Run {}",receipt.loop_id,receipt.run_id);pending.insert(receipt.run_id,receipt);},
                                     Ok(None)=>{},
                                     Err(error)=>outln!(console, "Trigger control failed: {}",safe_text(&error)),
                                 }
-                            } else {outln!(console, "Select a Chat and goal first; use /loops and /goal.");}
+                            } else {outln!(console, "Select a Chat and goal first; use /loops.");}
                         },
                         "/loops" => {
                             if let Some(chat) = selected_chat {
@@ -2178,7 +2139,7 @@ async fn interact(
                                             pending.retain(|_,receipt|receipt.loop_id!=selected_goal);
                                             permissions.retain(|_,run| !runs.contains(run));
                                             questions.retain(|_,question|question.chat_id!=chat||question.loop_id!=selected_goal);
-                                            outln!(console, "Stopped goal {selected_goal}. Future inputs require another goal; use /new.");
+                                            outln!(console, "Stopped goal {selected_goal}. Future inputs require another goal; use /loops new.");
                                             for operation in operations { outln!(console, "Operation {} remains {:?}: {}",operation.id,operation.state,safe_text(&operation.name)); }
                                         },
                                         Err(error) => outln!(console, "Cannot stop goal: {}",safe_text(&error.to_string())),
@@ -2186,13 +2147,41 @@ async fn interact(
                                 } else { outln!(console, "Use /stop GOAL, or select a goal first."); }
                             } else { outln!(console, "No Chat is selected."); }
                         },
-                        _ if line.starts_with("/goal ") => {
-                            if let Some(chat) = selected_chat {
-                                let snapshot = agent.snapshot(chat).await.map_err(|error|error.to_string())?;
-                                let selected_goal = line.trim_start_matches("/goal ").trim().parse::<uuid::Uuid>().ok();
-                                if let Some(id) = selected_goal.filter(|id|snapshot.loops.iter().any(|goal|goal.id==*id)) {goal=Some(id); outln!(console, "Selected goal {id}.");}
-                                else {outln!(console, "Goal does not belong to the current Chat; use /loops.");}
-                            } else { outln!(console, "No Chat is selected."); }
+                        _ if line.split_whitespace().next() == Some("/loops") => {
+                            match loops::LoopCommand::parse(&line) {
+                                Ok(loops::LoopCommand::New) => {
+                                    goal=None;
+                                    outln!(console, "The next input will start a new goal in this Chat.");
+                                },
+                                Ok(action) => {
+                                    if let Some(chat)=selected_chat {
+                                        let result = async {
+                                            match action {
+                                                loops::LoopCommand::Select(id) => {
+                                                    let snapshot=agent.snapshot(chat).await.map_err(|error|error.to_string())?;
+                                                    if !snapshot.loops.iter().any(|item|item.id==id) {return Err("Goal does not belong to the current Chat; use /loops.".to_string());}
+                                                    goal=Some(id);
+                                                    outln!(console,"Selected goal {id}.");
+                                                },
+                                                loops::LoopCommand::Trigger(id) => {
+                                                    let id=id.or(goal).ok_or("Select a goal first; use /loops.")?;
+                                                    let snapshot=agent.snapshot(chat).await.map_err(|error|error.to_string())?;
+                                                    let selected=snapshot.loops.iter().find(|item|item.id==id).ok_or("Goal does not belong to the current Chat; use /loops.")?;
+                                                    outln!(console,"Goal: {id}\n{}",loops::trigger_lines(selected.trigger.as_ref()).join("\n"));
+                                                },
+                                                loops::LoopCommand::Schedule {goal, arguments} => {
+                                                    let trigger=loops::TimerSchedule::parse(arguments)?.apply(agent,chat,goal).await?;
+                                                    print_trigger(console,&trigger)?;
+                                                },
+                                                _ => unreachable!(),
+                                            }
+                                            Ok::<_,String>(())
+                                        }.await;
+                                        if let Err(error)=result {outln!(console,"Cannot manage Loop: {}",safe_text(&error));}
+                                    } else {outln!(console,"No Chat is selected.");}
+                                },
+                                Err(error) => outln!(console,"{error}"),
+                            }
                         },
                         _ if line.starts_with("/allow ") || line.starts_with("/deny ") => {
                             match answer_permission(agent,selected_chat,&line).await {
@@ -3526,14 +3515,6 @@ async fn trigger_control(
         outln!(console, "Trigger disabled for goal {goal}.");
         return Ok(None);
     }
-    if command == "/triggers" {
-        if let Some(trigger) = current {
-            print_trigger(console, &trigger)?;
-        } else {
-            outln!(console, "No trigger is configured for goal {goal}.");
-        }
-        return Ok(None);
-    }
     let mut trigger = current.unwrap_or(Trigger {
         id: uuid::Uuid::new_v4(),
         prompt: String::new(),
@@ -3548,34 +3529,6 @@ async fn trigger_control(
     if let Some(prompt) = command.strip_prefix("/events ") {
         trigger.prompt = prompt.trim().into();
         trigger.accepts_events = true;
-    }
-    if let Some(arguments) = command.strip_prefix("/schedule ") {
-        let (seconds, prompt) = arguments
-            .split_once(' ')
-            .ok_or("use /schedule SECONDS [--for DURATION_SECONDS] PROMPT")?;
-        trigger.interval_seconds = Some(
-            seconds
-                .parse()
-                .map_err(|_| "interval must be a positive number of seconds")?,
-        );
-        trigger.expires_at_ms = None;
-        let prompt = if let Some(timed) = prompt.strip_prefix("--for ") {
-            let (duration, prompt) = timed
-                .split_once(' ')
-                .ok_or("--for requires duration seconds and a prompt")?;
-            let duration = duration
-                .parse::<u64>()
-                .map_err(|_| "duration must be a positive number of seconds")?;
-            trigger.expires_at_ms = Some(
-                current_time_ms()
-                    .checked_add(duration.checked_mul(1000).ok_or("duration is too large")?)
-                    .ok_or("duration is too large")?,
-            );
-            prompt
-        } else {
-            prompt
-        };
-        trigger.prompt = prompt.trim().into();
     }
     agent
         .configure_trigger(chat, goal, Some(trigger.clone()))
@@ -3603,7 +3556,10 @@ fn print_trigger(console: &Console, trigger: &Trigger) -> Result<(), String> {
         trigger.accepts_events
     );
     if let Some(seconds) = trigger.interval_seconds {
-        outln!(console, "Interval: {seconds} seconds while this host runs.");
+        outln!(
+            console,
+            "Interval: {seconds} seconds while this Agent runs."
+        );
     }
     if let Some(expiry) = trigger.expires_at_ms {
         outln!(
@@ -4789,7 +4745,6 @@ mod tests {
             "/interrupt",
             "/diff",
             "/tasks",
-            "/bashes",
             "/allow 00000000-0000-0000-0000-000000000000 once",
             "/status",
             "/branch experiment",
@@ -4805,7 +4760,7 @@ mod tests {
             "/cwd elsewhere",
             "/add-dir ../shared",
             "/search-config search.json",
-            "/schedule 60 check",
+            "/loops schedule 00000000-0000-0000-0000-000000000000 60 check",
         ] {
             assert_eq!(
                 command_timing(command),
@@ -5006,8 +4961,9 @@ mod tests {
     }
 
     #[test]
-    fn task_command_aliases_share_one_dispatch_class() {
-        for command in ["/commands", "/tasks", "/bashes"] {
+    fn task_command_has_one_canonical_dispatch_name() {
+        {
+            let command = "/tasks";
             assert!(is_task_surface_command(command), "{command}");
             assert_eq!(
                 command_timing(command),
@@ -5017,11 +4973,14 @@ mod tests {
         }
         assert!(!is_task_surface_command("/tasks extra"));
         assert!(!is_task_surface_command("/bash"));
+        assert!(!is_task_surface_command("/bashes"));
+        assert!(!is_task_surface_command("/commands"));
     }
 
     #[test]
-    fn subscription_view_aliases_dispatch_immediately_and_keep_their_view_open() {
-        for command in ["/subscriptions", "/subs"] {
+    fn subscription_view_dispatches_immediately_and_keeps_its_view_open() {
+        {
+            let command = "/subscriptions";
             assert!(is_subscription_view_command(command), "{command}");
             assert_eq!(
                 command_timing(command),
@@ -5035,12 +4994,14 @@ mod tests {
         }
         assert!(!is_subscription_view_command("/subscriptions extra"));
         assert!(!is_subscription_view_command("/subscribe"));
-        assert!(help_text().contains("/subscriptions (or /subs)"));
+        assert!(!is_subscription_view_command("/subs"));
+        assert!(help_text().contains("/subscriptions"));
     }
 
     #[test]
-    fn rewind_command_aliases_share_immediate_dispatch_and_help() {
-        for command in ["/rewind", "/checkpoint", "/undo"] {
+    fn rewind_command_dispatches_immediately_and_has_help() {
+        {
+            let command = "/rewind";
             assert!(is_rewind_command(command), "{command}");
             assert_eq!(
                 command_timing(command),
@@ -5049,7 +5010,15 @@ mod tests {
             );
             assert!(help_text().contains(command), "missing help for {command}");
         }
-        for command in ["/rew", "/checkpoint extra", "/undo 2", "undo", "u"] {
+        for command in [
+            "/rew",
+            "/checkpoint",
+            "/undo",
+            "/checkpoint extra",
+            "/undo 2",
+            "undo",
+            "u",
+        ] {
             assert!(!is_rewind_command(command), "unexpected alias {command}");
         }
     }
@@ -5121,7 +5090,8 @@ mod tests {
             .await
             .unwrap();
         assert!(menus.id().is_none());
-        for command in ["/rewind", "/checkpoint", "/undo"] {
+        {
+            let command = "/rewind";
             assert!(is_rewind_command(command));
             open_rewind(&agent, &console, &mut menus, Some(chat), false)
                 .await

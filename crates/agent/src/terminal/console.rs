@@ -144,8 +144,7 @@ const EXIT_CONFIRMATION_WINDOW: Duration = Duration::from_millis(800);
 const ESCAPE_CONFIRMATION_WINDOW: Duration = Duration::from_millis(800);
 const SHELL_BACKGROUND_CHORD_WINDOW: Duration = Duration::from_millis(800);
 const SECRET_PASTE_ERROR: &str = "API key paste must contain one line of text";
-const PROVIDER_PICKER_HINT: &str =
-    "↑↓ Provider · a Adapter · r Sign in again · d Device code · Enter select · Esc back";
+const PROVIDER_PICKER_HINT: &str = "↑↓ Provider · a Adapter · r Sign in again · s Sign out · d Device code · Enter select · Esc back";
 const MODEL_PICKER_HINT: &str = "↑↓ Model · ←→ Thinking · Enter apply · Esc back";
 // 照 Claude Code `shellHistoryCompletion.ts`：输入期间历史不会变化，缓存 60 秒。
 const SHELL_HISTORY_CACHE_TTL: Duration = Duration::from_secs(60);
@@ -313,6 +312,7 @@ pub(super) enum PickerAction {
     ThinkingNext,
     CycleAdapter,
     Reauthenticate,
+    SignOut,
     DeviceLogin,
 }
 
@@ -1080,23 +1080,6 @@ impl Console {
         )
     }
 
-    pub(super) fn show_auto_permissions(
-        &self,
-        view: tickloop_agent::runtime::PermissionsView,
-        return_to_settings: bool,
-    ) -> Result<(), String> {
-        self.show_permissions_at(
-            view,
-            None,
-            if return_to_settings {
-                PermissionsReturn::Settings
-            } else {
-                PermissionsReturn::Chat
-            },
-            true,
-        )
-    }
-
     fn show_permissions_at(
         &self,
         view: tickloop_agent::runtime::PermissionsView,
@@ -1823,6 +1806,22 @@ impl Console {
             None,
             MenuFocus::Question(question),
         )
+    }
+
+    pub(super) fn prepare_command(&self, command: String) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        if !state.editor.draft().is_empty() {
+            return Err(
+                "Input already has a draft. Keep or clear it before configuring a timer.".into(),
+            );
+        }
+        let cursor = command.len();
+        state.replace_draft(command, cursor);
+        state.status =
+            "Edit timer command · Enter save · Ctrl+G external editor · Ctrl+C cancel".into();
+        state
+            .draw(&mut io::stdout().lock())
+            .map_err(|error| error.to_string())
     }
 
     pub fn show_reviewable_menu(
@@ -5456,6 +5455,9 @@ impl State {
                 (Some(PickerKind::Provider), KeyCode::Char('r'), KeyModifiers::NONE) => {
                     Some(PickerAction::Reauthenticate)
                 }
+                (Some(PickerKind::Provider), KeyCode::Char('s'), KeyModifiers::NONE) => {
+                    Some(PickerAction::SignOut)
+                }
                 (Some(PickerKind::Provider), KeyCode::Char('d'), KeyModifiers::NONE) => {
                     Some(PickerAction::DeviceLogin)
                 }
@@ -6739,7 +6741,10 @@ mod tests {
         let view = agent.permissions_view(chat).await.unwrap();
         let mut state = State::new(true, 100, 30);
         state.chat = Some(chat);
-        state.permissions_surface = Some(PermissionsSurface::open(view, PermissionsReturn::Chat));
+        state.permissions_surface = Some(PermissionsSurface::open(
+            view,
+            PermissionsReturn::ModePicker { settings: false },
+        ));
         state.key(key(KeyCode::Right));
         for _ in 0..5 {
             state.key(key(KeyCode::Char('j')));
@@ -9569,6 +9574,24 @@ mod tests {
     }
 
     #[test]
+    fn prepared_timer_commands_use_normal_editing_and_preserve_existing_drafts() {
+        let mut state = State::new(true, 100, 32);
+        state.prompt_enabled = true;
+        let console = InteractiveConsoleFixture::new(state);
+        let command = "/loops schedule 00000000-0000-0000-0000-000000000001 60 review";
+        console.prepare_command(command.into()).unwrap();
+        assert!(console.prepare_command("replacement".into()).is_err());
+        let mut state = console.state.lock().unwrap();
+        assert_eq!(state.editor.draft(), command);
+        assert!(state.can_edit_in_external_editor());
+        state.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(state.editor.draft(), "");
+        state.key(key(KeyCode::Char('j')));
+        state.key(key(KeyCode::Char('k')));
+        assert_eq!(state.editor.draft(), "jk");
+    }
+
+    #[test]
     fn slash_completion_keeps_submission_and_selection_distinct() {
         let mut state = State::new(true, 80, 24);
         state.prompt_enabled = true;
@@ -9581,7 +9604,7 @@ mod tests {
 
         state.insert("/mo");
         assert!(state.key(key(KeyCode::Tab)).is_none());
-        assert_eq!(state.editor.draft(), "/mode ");
+        assert_eq!(state.editor.draft(), "/model ");
         assert!(!state.completion.is_open());
 
         state.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
@@ -9593,7 +9616,7 @@ mod tests {
         );
         assert_eq!(state.completion.selected_index(), Some(0));
         assert!(state.key(key(KeyCode::Enter)).is_none());
-        assert_eq!(state.editor.draft(), "/mode ");
+        assert_eq!(state.editor.draft(), "/model ");
     }
 
     #[test]
@@ -9605,10 +9628,10 @@ mod tests {
         state.refresh_completion();
         assert!(state.completion.is_open());
         assert!(state.key(key(KeyCode::Tab)).is_none());
-        assert_eq!(state.editor.draft(), "先检查 /command-output 然后继续");
-        assert_eq!(state.editor.cursor(), "先检查 /command-output ".len());
+        assert_eq!(state.editor.draft(), "先检查 /compact 然后继续");
+        assert_eq!(state.editor.cursor(), "先检查 /compact ".len());
         assert!(
-            matches!(state.key(key(KeyCode::Enter)), Some(InputEvent::Prompt { text, file_references, .. }) if text == "先检查 /command-output 然后继续" && file_references.is_empty())
+            matches!(state.key(key(KeyCode::Enter)), Some(InputEvent::Prompt { text, file_references, .. }) if text == "先检查 /compact 然后继续" && file_references.is_empty())
         );
     }
 
@@ -9645,7 +9668,7 @@ mod tests {
         assert!(
             frame[..cursor_row]
                 .iter()
-                .any(|line| line.contains("/add-dir PATH"))
+                .any(|line| line.contains("/branch [NAME]"))
         );
         assert!(frame[cursor_row].contains("❯\u{a0}/"));
     }
@@ -13246,6 +13269,7 @@ mod tests {
         for (code, action) in [
             (KeyCode::Char('a'), PickerAction::CycleAdapter),
             (KeyCode::Char('r'), PickerAction::Reauthenticate),
+            (KeyCode::Char('s'), PickerAction::SignOut),
             (KeyCode::Char('d'), PickerAction::DeviceLogin),
         ] {
             assert!(matches!(
@@ -13258,7 +13282,7 @@ mod tests {
             ));
         }
         let rendered = state.frame().0.join("\n");
-        assert!(rendered.contains("a Adapter · r Sign in again · d Device code"));
+        assert!(rendered.contains("a Adapter · r Sign in again · s Sign out · d Device code"));
         assert_eq!(state.editor.draft(), "");
     }
 
