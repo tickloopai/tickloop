@@ -117,12 +117,14 @@ impl DenialsSurface {
                         .as_ref()
                         .is_some_and(|record| record.outcome == ApprovalResult::Deny)
                     {
-                        "r retry"
+                        "r retry · Esc back"
                     } else {
-                        ""
+                        "Esc back"
                     }
+                } else if self.view.is_none() && self.error.is_some() {
+                    "r refresh · Esc back"
                 } else {
-                    "r refresh"
+                    "Enter details · r refresh · Esc back"
                 },
                 Role::MutedText,
             ))

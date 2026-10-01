@@ -236,14 +236,14 @@ impl StatusArea {
                 } else {
                     ""
                 };
-                format!("{count} items{action}")
+                format!("{count} items · Enter details{action}")
             } else if count > MAX_PANEL_ITEMS {
                 format!("{count} items · scroll")
             } else {
                 format!("{count} items")
             }
         } else {
-            "".to_owned()
+            "Enter/Space expand".to_owned()
         };
         let space = width
             .saturating_sub(UnicodeWidthStr::width(header.text().as_str()))
@@ -434,7 +434,7 @@ mod tests {
         let collapsed = area.panel_lines(&footer, 80, 24);
         assert_eq!(collapsed.len(), 1);
         assert!(collapsed[0].text().contains("Tasks 6  Todo 1"));
-        assert!(collapsed[0].text().contains(""));
+        assert!(collapsed[0].text().contains("Enter/Space expand"));
         area.select(FooterItemId::Tasks);
         let first = area.panel_lines(&footer, 80, 24);
         assert_eq!(first.len(), 5);

@@ -308,10 +308,10 @@ impl Transcript {
             Some((column, height - 1))
         } else {
             let footer = if self.query.is_empty() {
-                "/ find · ? help".to_owned()
+                "/ find · ? help · Esc/q close".to_owned()
             } else {
                 format!(
-                    "Search: {} · n/N next/previous · / find",
+                    "Search: {} · n/N next/previous · / find · Esc/q close",
                     expand_tabs(&self.query)
                 )
             };

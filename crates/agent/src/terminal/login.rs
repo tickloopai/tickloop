@@ -233,7 +233,7 @@ impl LoginFlow {
             context.push("If OpenAI asks you to enable device code authorization, enable it in ChatGPT Settings > Security and retry Device code sign-in from this Provider, or use Browser sign-in.".into());
         }
         context.push(format!(
-            "Waiting for {} authorization.",
+            "Waiting for {} authorization. Esc cancels.",
             self.method.label()
         ));
         Self::show(
@@ -273,7 +273,7 @@ impl LoginFlow {
             Some(Err(error)) => self.show_callback(console, Some(&error.to_string())),
             None => self.show_callback(
                 console,
-                Some("Enter the full callback URL, including state."),
+                Some("Press Tab to enter the full callback URL, including state, then Enter."),
             ),
         }
     }
@@ -291,7 +291,7 @@ impl LoginFlow {
             safe_text(address),
             "Use your terminal's link shortcut (often Ctrl/Cmd+click), or copy the URL.".into(),
             "Complete authorization in your browser. For a remote terminal, paste the full redirect URL here, or cancel and choose Device code sign-in from this Provider.".into(),
-            "Tab edits the callback URL.".into(),
+            "Tab edits the callback field; Esc leaves editing, then cancels login.".into(),
         ];
         if let Some(notice) = notice {
             context.push(safe_text(notice));
@@ -366,7 +366,10 @@ impl LogoutFlow {
         console: &Console,
         target: SignInTarget,
     ) -> Result<Self, String> {
-        console.set_status(&format!("Removing {} login…", target.label()))?;
+        console.set_status(&format!(
+            "Removing {} login… Esc cancels; input will run afterward",
+            target.label()
+        ))?;
         let cancel = CancellationToken::new();
         let task_cancel = cancel.clone();
         let task = tokio::spawn(async move {

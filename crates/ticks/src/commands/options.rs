@@ -777,7 +777,7 @@ impl LiveView for OptionsView {
             .highlight_symbol("› ");
         let mut table_state = TableState::default().with_selected(Some(state.selected));
         frame.render_stateful_widget(widget, parts[2], &mut table_state);
-        let note=self.notice.as_deref().unwrap_or(if self.research.is_some() { "b before · p after · c current · a Ask Chat\ns save CURRENT · r refresh current · h event history" } else { "[ ] expiry · r refresh · s save · h history\nNo last-price substitution; bid/ask midpoint is a pricing approximation." });
+        let note=self.notice.as_deref().unwrap_or(if self.research.is_some() { "b before · p after · c current · a Ask Chat · Enter details\ns save CURRENT · r refresh current · h event history · Esc back" } else { "[ ] expiry · Enter details · r refresh · s save · h history · Esc back\nNo last-price substitution; bid/ask midpoint is a pricing approximation." });
         frame.render_widget(
             Paragraph::new(note)
                 .style(styles.muted_text)
@@ -799,7 +799,7 @@ impl LiveView for OptionsView {
                     .scroll((self.detail_scroll, 0))
                     .block(
                         Block::default()
-                            .title(" Contract / saved snapshot ")
+                            .title(" Contract / saved snapshot · Esc back ")
                             .borders(Borders::ALL)
                             .border_style(styles.border),
                     ),

@@ -444,7 +444,7 @@ fn render<V: LiveView, B: Backend>(
             if area.width < minimum.columns || area.height < minimum.rows {
                 frame.render_widget(
                     Paragraph::new(format!(
-                        "Need {}x{}\nCurrent {}x{}\nResize panel",
+                        "Need {}x{}\nCurrent {}x{}\nResize panel · q quit",
                         minimum.columns, minimum.rows, area.width, area.height
                     ))
                     .style(styles.text.patch(styles.muted_text)),
@@ -520,7 +520,15 @@ fn render<V: LiveView, B: Backend>(
             } else {
                 format!("{icon} {}", state.availability())
             };
-            let keys = if view.captures_text() { "" } else { "? Help" };
+            let keys = if view.captures_text() && area.width >= 40 {
+                "Enter Apply  Esc Back"
+            } else if view.captures_text() {
+                "Esc Back"
+            } else if area.width >= 40 {
+                "? Help  q Quit"
+            } else {
+                "?  q Quit"
+            };
             let keys_width = width(keys, settings.ambiguous_width) as u16;
             write_text(
                 frame.buffer_mut(),
@@ -565,7 +573,7 @@ fn render<V: LiveView, B: Backend>(
                     Paragraph::new(view.help())
                         .block(
                             Block::default()
-                                .title(" Keys ")
+                                .title(" Keys · ? / Esc close ")
                                 .borders(Borders::ALL)
                                 .border_style(styles.border),
                         )

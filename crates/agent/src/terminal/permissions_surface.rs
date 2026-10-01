@@ -1549,8 +1549,9 @@ impl PermissionsSurface {
                 "Environment  ",
                 environment_source_label(&self.view.auto_policy.environment.source),
             ));
+            let footer = "Enter configure · Esc back";
             self.push_selected_rows(rows, width, height, body);
-            return "";
+            return footer;
         }
 
         let search = match &self.focus {
@@ -1629,9 +1630,9 @@ impl PermissionsSurface {
         }
         self.push_selected_rows(rows, width, height, body);
         if matches!(self.focus, Focus::Search(_)) {
-            "Search"
+            "Search · Enter apply · Esc back"
         } else {
-            "a add · / search"
+            "Enter details · a add · / search · Esc back"
         }
     }
 
@@ -1700,9 +1701,9 @@ impl PermissionsSurface {
                     }
                 }
                 if self.selected_rule_editable() {
-                    "e edit"
+                    "e edit · Esc back"
                 } else {
-                    ""
+                    "Esc back"
                 }
             }
             Focus::RuleForm(draft) => {
@@ -1745,7 +1746,7 @@ impl PermissionsSurface {
                     draft.field == 3,
                 ));
                 body.push(selected_row("Save", draft.field == 4));
-                "Ctrl+S save"
+                "Tab next · Enter next · Ctrl+S save · Esc back"
             }
             Focus::DirectoryForm(editor) => {
                 body.push(RoleLine::role(
@@ -1757,7 +1758,7 @@ impl PermissionsSurface {
                     "Path  ",
                     editor_window(editor, width.saturating_sub(7)),
                 ));
-                ""
+                "Enter save · Esc back"
             }
             Focus::ConfirmDelete(_) => {
                 body.push(RoleLine::role(
@@ -1765,7 +1766,7 @@ impl PermissionsSurface {
                     Role::DialogTitle,
                 ));
                 body.push(muted_row("This removes the selected rule or directory."));
-                ""
+                "Enter/y remove · Esc/n cancel"
             }
             Focus::ReviewerChoice(selected) => {
                 body.push(RoleLine::role("Choose Auto reviewer", Role::DialogTitle));
@@ -1805,7 +1806,7 @@ impl PermissionsSurface {
                     "    Jev (TypeSafe) · key {}",
                     key_status_label(self.view.jev_key_status)
                 )));
-                ""
+                "Enter select · Esc cancel"
             }
             Focus::AutoGroup(group) | Focus::AutoGroupSearch { group, .. } => {
                 self.styled_auto_group(width, height, group, body)
@@ -1828,13 +1829,13 @@ impl PermissionsSurface {
                     body.push(labelled_row("Source  ", auto_source_label(&rule.source)));
                     body.push(labelled_row("ID      ", &rule.id));
                     if rule.source == AutoRuleSource::User {
-                        "e edit · d remove"
+                        "e edit · d remove · Esc back"
                     } else {
-                        "Built-in read-only"
+                        "Built-in read-only · Esc back"
                     }
                 } else {
                     body.push(muted_row("Rule changed elsewhere"));
-                    ""
+                    "Esc back"
                 }
             }
             Focus::AutoEnvironment { selected, .. } => {
@@ -1848,7 +1849,7 @@ impl PermissionsSurface {
                 body.push(RoleLine::default());
                 body.push(selected_row("Replace Environment", *selected == 0));
                 body.push(selected_row("Restore built-in Environment", *selected == 1));
-                ""
+                "Enter edit/preview · Esc back"
             }
             Focus::AutoDraft(draft) => {
                 body.push(RoleLine::role(draft.purpose.title(), Role::DialogTitle));
@@ -1865,7 +1866,7 @@ impl PermissionsSurface {
                     "Text  ",
                     editor_window(&draft.editor, width.saturating_sub(8)),
                 ));
-                "Ctrl+S save"
+                "Enter/Ctrl+S save · Esc cancel"
             }
             Focus::AutoPreview { title, removed, .. } => {
                 body.push(RoleLine::role(title, Role::DialogTitle));
@@ -1881,7 +1882,7 @@ impl PermissionsSurface {
                 }
                 body.push(muted_row(format!("Will remove {} item(s)", removed.len())));
                 body.extend(removed.iter().map(|item| plain_row(format!("− {item}"))));
-                ""
+                "Enter/y confirm · Esc/n cancel"
             }
             Focus::List | Focus::Search(_) => unreachable!(),
         }
@@ -1953,9 +1954,9 @@ impl PermissionsSurface {
             body.push(selected);
         }
         if matches!(self.focus, Focus::AutoGroupSearch { .. }) {
-            "Search"
+            "Search · Enter apply · Esc back"
         } else {
-            "a add · e edit · d remove · / search"
+            "Enter details · a add · e edit · d remove · / search · Esc back"
         }
     }
 

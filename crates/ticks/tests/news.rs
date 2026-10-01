@@ -349,12 +349,7 @@ async fn news_renderer_applies_resolved_styles_to_selection_markdown_and_blank_c
     }
     assert_eq!(article[(78, 17)].symbol(), " ");
     assert_eq!(article[(78, 17)].bg, Color::Indexed(103));
-    let text = article
-        .content
-        .iter()
-        .map(|cell| cell.symbol())
-        .collect::<String>();
-    assert!(!text.contains("Esc Back"));
+    assert_eq!(rendered_cell(article, "Esc Back").fg, Color::Indexed(111));
 }
 
 fn rendered_cell<'a>(buffer: &'a ratatui::buffer::Buffer, text: &str) -> &'a ratatui::buffer::Cell {

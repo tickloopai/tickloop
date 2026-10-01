@@ -598,7 +598,7 @@ impl EarningsView {
         let label_width = tickloop_ui::format::width(&label, settings.ambiguous_width);
         let available = (line.width as usize).saturating_sub(label_width);
         let (visible, cursor) = prompt.input.viewport(available, settings.ambiguous_width);
-        let suffix = prompt.error.as_deref().unwrap_or("");
+        let suffix = prompt.error.as_deref().unwrap_or("Enter apply · Esc back");
         let text = format!("{label}{visible} · {suffix}");
         if available > 0 {
             frame.set_cursor_position((line.x + (label_width + cursor) as u16, line.y));
@@ -1039,14 +1039,16 @@ impl LiveView for EarningsView {
                         }
                     )
                 }
-                EarningsMode::Filings => {
-                    format!("{source} · filename metadata matched; body not verified")
-                }
+                EarningsMode::Filings => format!(
+                    "{source} · filename metadata matched; body not verified · Enter opens original"
+                ),
                 EarningsMode::Upcoming => format!(
                     "{source} · {observed} · awaiting actuals · refresh {}s · R refresh",
                     self.refresh_in.as_secs()
                 ),
-                _ => format!("{source} · {observed} · c compare · r reactions · [ ] periods"),
+                _ => format!(
+                    "{source} · {observed} · Enter detail · c compare · r reactions · [ ] periods"
+                ),
             };
             write_text(
                 frame.buffer_mut(),
