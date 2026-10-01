@@ -1,0 +1,9 @@
+{
+  "name": "DeepSeek",
+  "protocol": "messages",
+  "base_url": "https://api.deepseek.com/anthropic",
+  "model": "deepseek-flash",
+  "api_key_env": "DEEPSEEK_API_KEY",
+  "max_output_tokens": 64000,
+  "input_modalities": ["text", "image"]
+}

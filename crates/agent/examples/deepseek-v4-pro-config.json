@@ -1,0 +1,8 @@
+{
+  "name": "DeepSeek V4 Pro",
+  "protocol": "messages",
+  "base_url": "https://api.deepseek.com/anthropic",
+  "model": "deepseek-v4-pro",
+  "api_key_env": "DEEPSEEK_API_KEY",
+  "max_output_tokens": 64000
+}

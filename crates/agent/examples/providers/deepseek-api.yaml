@@ -1,0 +1,17 @@
+id: deepseek-api
+display_name: DeepSeek API
+auth: api_key_env
+api_key_env: DEEPSEEK_API_KEY
+default_model: deepseek-flash-messages
+endpoints:
+  deepseek_messages: https://api.deepseek.com/anthropic
+models:
+  - id: deepseek-flash-messages
+    service_model_id: deepseek-flash
+    display_name: DeepSeek
+    adapter: deepseek_messages
+    max_output_tokens: 64000
+    context_window_tokens: 1000000
+    thinking: toggle
+    adaptive_by_default: false
+    effort_levels: [low, high, max]

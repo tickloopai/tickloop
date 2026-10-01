@@ -1,0 +1,15 @@
+[package]
+name = "tickloop-ui"
+description = "Shared terminal presentation rules for Tick Commands"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "tickloop_ui"
+
+[dependencies]
+pulldown-cmark = "0.13"
+ratatui = "0.30"
+unicode-width = "0.2"
+unicode-segmentation = "1"

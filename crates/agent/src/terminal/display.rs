@@ -1,0 +1,152 @@
+use tickloop_agent::settings::{DisplayPreferences, GlyphSet};
+
+use super::style::{Theme, ThemeName};
+
+const UNICODE_SPINNER: [&str; 12] = ["·", "✢", "✳", "✶", "✻", "✽", "✽", "✻", "✶", "✳", "✢", "·"];
+const NERD_FONT_SPINNER: [&str; 12] = [
+    "\u{f0a9e}",
+    "\u{f0a9f}",
+    "\u{f0aa0}",
+    "\u{f0aa1}",
+    "\u{f0aa2}",
+    "\u{f0aa3}",
+    "\u{f0aa4}",
+    "\u{f0aa3}",
+    "\u{f0aa2}",
+    "\u{f0aa1}",
+    "\u{f0aa0}",
+    "\u{f0a9f}",
+];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Glyph {
+    Prompt,
+    Assistant,
+    ToolCall,
+    ToolResult,
+    TickDelivery,
+    Success,
+    Failure,
+    Warning,
+    ScrollUp,
+    ScrollDown,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct DisplayProfile {
+    theme: Theme,
+    preferences: DisplayPreferences,
+}
+
+impl DisplayProfile {
+    pub(super) const fn new(preferences: DisplayPreferences) -> Self {
+        Self {
+            theme: Theme::new(ThemeName::ClaudeCodeDark),
+            preferences,
+        }
+    }
+
+    pub(super) const fn theme(self) -> Theme {
+        self.theme
+    }
+
+    pub(super) fn set_theme(&mut self, name: ThemeName) {
+        self.theme = Theme::new(name);
+    }
+
+    pub(super) const fn preferences(self) -> DisplayPreferences {
+        self.preferences
+    }
+
+    pub(super) fn set_preferences(&mut self, preferences: DisplayPreferences) {
+        self.preferences = preferences;
+    }
+
+    pub(super) const fn glyph(self, glyph: Glyph) -> &'static str {
+        match (self.preferences.glyph_set, glyph) {
+            (GlyphSet::Unicode, Glyph::Prompt) => "❯",
+            (GlyphSet::Unicode, Glyph::Assistant | Glyph::ToolCall) => "⏺",
+            (GlyphSet::Unicode, Glyph::ToolResult) => "⎿",
+            (GlyphSet::Unicode, Glyph::TickDelivery) => "◉",
+            (GlyphSet::Unicode, Glyph::Success) => "✓",
+            (GlyphSet::Unicode, Glyph::Failure) => "✗",
+            (GlyphSet::Unicode, Glyph::Warning) => "!",
+            (GlyphSet::Unicode, Glyph::ScrollUp) => "↑",
+            (GlyphSet::Unicode, Glyph::ScrollDown) => "↓",
+            (GlyphSet::NerdFont, Glyph::Prompt) => "\u{f0142}",
+            (GlyphSet::NerdFont, Glyph::Assistant) => "\u{f06a9}",
+            (GlyphSet::NerdFont, Glyph::ToolCall) => "\u{f1064}",
+            (GlyphSet::NerdFont, Glyph::ToolResult) => "\u{f060c}",
+            (GlyphSet::NerdFont, Glyph::TickDelivery) => "\u{f0318}",
+            (GlyphSet::NerdFont, Glyph::Success) => "\u{f05e0}",
+            (GlyphSet::NerdFont, Glyph::Failure) => "\u{f0159}",
+            (GlyphSet::NerdFont, Glyph::Warning) => "\u{f0026}",
+            (GlyphSet::NerdFont, Glyph::ScrollUp) => "\u{f0143}",
+            (GlyphSet::NerdFont, Glyph::ScrollDown) => "\u{f0140}",
+        }
+    }
+
+    pub(super) fn spinner_frame(self, frame: usize) -> &'static str {
+        let frame = if self.preferences.prefers_reduced_motion {
+            0
+        } else {
+            frame % UNICODE_SPINNER.len()
+        };
+        match self.preferences.glyph_set {
+            GlyphSet::Unicode => UNICODE_SPINNER[frame],
+            GlyphSet::NerdFont => NERD_FONT_SPINNER[frame],
+        }
+    }
+
+    pub(super) fn navigation_hint(self, hint: &str) -> String {
+        hint.replace(
+            "↑↓",
+            &format!(
+                "{}{}",
+                self.glyph(Glyph::ScrollUp),
+                self.glyph(Glyph::ScrollDown)
+            ),
+        )
+    }
+
+    pub(super) fn preview(self) -> String {
+        let mut glyphs = vec![
+            self.glyph(Glyph::Prompt),
+            self.glyph(Glyph::Assistant),
+            self.glyph(Glyph::ToolCall),
+            self.glyph(Glyph::ToolResult),
+            self.glyph(Glyph::TickDelivery),
+            self.glyph(Glyph::Success),
+            self.glyph(Glyph::Failure),
+            self.glyph(Glyph::Warning),
+            self.glyph(Glyph::ScrollUp),
+            self.glyph(Glyph::ScrollDown),
+        ];
+        glyphs.extend((0..UNICODE_SPINNER.len()).map(|frame| self.spinner_frame(frame)));
+        glyphs.join("  ")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_profile_maps_semantic_glyphs_and_reduced_motion() {
+        let unicode = DisplayProfile::new(DisplayPreferences::default());
+        assert_eq!(unicode.glyph(Glyph::Prompt), "❯");
+        assert_eq!(unicode.glyph(Glyph::Assistant), "⏺");
+        assert_eq!(unicode.glyph(Glyph::ToolResult), "⎿");
+        assert_eq!(unicode.spinner_frame(0), "·");
+        assert_eq!(unicode.spinner_frame(1), "✢");
+
+        let nerd_font = DisplayProfile::new(DisplayPreferences {
+            glyph_set: GlyphSet::NerdFont,
+            prefers_reduced_motion: true,
+        });
+        assert_eq!(nerd_font.glyph(Glyph::Prompt), "\u{f0142}");
+        assert_eq!(nerd_font.glyph(Glyph::Assistant), "\u{f06a9}");
+        assert_eq!(nerd_font.glyph(Glyph::ToolResult), "\u{f060c}");
+        assert_eq!(nerd_font.spinner_frame(7), "\u{f0a9e}");
+    }
+}

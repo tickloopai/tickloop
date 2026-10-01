@@ -1,0 +1,1283 @@
+mod support;
+
+use std::collections::BTreeSet;
+use std::sync::Arc;
+use std::time::Duration;
+
+use serde_json::json;
+use support::*;
+use tick_connect::instance::InstanceRef;
+use tickloop_agent::runtime::{
+    ASK_USER_QUESTION_TOOL_NAME, Agent, Event, EventKind, LocalMessage, LoopState,
+    MAX_DELIVERY_PAYLOAD_BYTES, QuestionAnswer, TickLinkState, TickSubscription,
+    TickSubscriptionChange, Trigger,
+};
+use tickloop_agent::tick_stream::{
+    InMemoryTickStream, ObservationKind, TickConnectionState, TickObservation, TickStreamEvent,
+};
+use uuid::Uuid;
+
+const CADENCE: Duration = Duration::from_secs(60);
+
+fn fixture_instance(id: u64) -> InstanceRef {
+    InstanceRef::native(format!("fixture-run-{id}")).unwrap()
+}
+
+fn update(instance: u64, sequence: u64, phase: &str) -> TickObservation {
+    TickObservation {
+        instance: fixture_instance(instance),
+        sequence,
+        observed_at: "2026-09-21T03:15:00Z".into(),
+        dropped: 0,
+        data: json!({ "phase": phase }),
+        kind: ObservationKind::Protocol,
+        recover_with: None,
+        gap: false,
+    }
+}
+
+fn audience(stream: &InMemoryTickStream, instance: u64) -> Vec<Uuid> {
+    stream
+        .watches()
+        .into_iter()
+        .filter_map(|(watch, target)| (target == fixture_instance(instance)).then_some(watch))
+        .collect()
+}
+
+async fn wait_for_completion(receiver: &mut tokio::sync::broadcast::Receiver<Event>) {
+    loop {
+        if matches!(next_event(receiver).await.kind, EventKind::Completed { .. }) {
+            return;
+        }
+    }
+}
+
+/// Lets the delivery task drain everything the stream published before the test moves on.
+async fn settle() {
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+}
+
+fn last_user_text(model: &ScriptedModel) -> String {
+    let requests = model.requests.lock().unwrap();
+    let request = requests.last().expect("the model was asked at least once");
+    request
+        .messages
+        .iter()
+        .rev()
+        .find_map(|message| {
+            message.content.iter().find_map(|content| match content {
+                tickloop_agent::model::Content::Text { text }
+                    if message.role == tickloop_agent::model::Role::User =>
+                {
+                    Some(text.clone())
+                }
+                _ => None,
+            })
+        })
+        .expect("the request carries a user message")
+}
+
+async fn subscribed_agent(
+    directory: &std::path::Path,
+    model: Arc<ScriptedModel>,
+) -> (Agent, InMemoryTickStream, Uuid, Uuid) {
+    let agent = Agent::new_embedded(config(), model);
+    let stream = InMemoryTickStream::new();
+    agent.install_tick_stream(Arc::new(stream.clone())).await;
+    let chat = agent.create_chat(directory.into()).await.unwrap();
+    let mut events = agent.subscribe();
+    let receipt = agent
+        .submit(chat, None, "watch the quote panel".into())
+        .await
+        .unwrap();
+    wait_for_completion(&mut events).await;
+    (agent, stream, chat, receipt.loop_id)
+}
+
+fn subscription_tool_result(model: &ScriptedModel) -> serde_json::Value {
+    let requests = model.requests.lock().unwrap();
+    let result = requests[1]
+        .messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .find_map(|block| match block {
+            tickloop_agent::model::Content::ToolResult {
+                tool_use_id,
+                content,
+                is_error: false,
+            } if tool_use_id == "s1" => Some(content),
+            _ => None,
+        })
+        .expect("subscribe_tick result reached the model");
+    serde_json::from_str(&result.text()).unwrap()
+}
+
+#[tokio::test]
+async fn subscribe_tick_waits_for_the_watch_baseline_before_reporting_ready() {
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "s1",
+            "SubscribeTick",
+            json!({"tick_instance_id": fixture_instance(7), "every_seconds": 5}),
+        ),
+        text("watching"),
+    ]));
+    let agent = Agent::new_embedded(config(), model.clone());
+    let stream = InMemoryTickStream::manual_ready();
+    agent.install_tick_stream(Arc::new(stream.clone())).await;
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let mut events = agent.subscribe();
+    agent
+        .submit(chat, None, "watch this Tick".into())
+        .await
+        .unwrap();
+    let watch = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(watch) = stream.watches().keys().next().copied() {
+                return watch;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("subscription registered its Watch");
+    assert_eq!(model.requests.lock().unwrap().len(), 1);
+    stream.emit(TickStreamEvent::Ready { watch });
+    wait_for_completion(&mut events).await;
+    let result = subscription_tool_result(&model);
+    assert_eq!(result["armed"], true);
+    assert_eq!(result["ready"], true);
+    assert_eq!(result["tick_instance_id"], json!(fixture_instance(7)));
+    agent.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn subscribe_tick_reports_an_existing_unready_subscription_at_the_deadline() {
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "s1",
+            "SubscribeTick",
+            json!({"tick_instance_id": fixture_instance(7)}),
+        ),
+        text("waiting for the host"),
+    ]));
+    let agent = Agent::new_embedded(config(), model.clone());
+    let stream = InMemoryTickStream::manual_ready();
+    agent.install_tick_stream(Arc::new(stream.clone())).await;
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let mut events = agent.subscribe();
+    agent
+        .submit(chat, None, "watch this Tick".into())
+        .await
+        .unwrap();
+    while stream.watches().is_empty() {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::advance(Duration::from_secs(10)).await;
+    wait_for_completion(&mut events).await;
+    let result = subscription_tool_result(&model);
+    assert_eq!(result["armed"], true);
+    assert_eq!(result["ready"], false);
+    assert_eq!(result["link"], "Initializing");
+    assert!(result["subscription"].as_str().is_some());
+    assert!(result["note"].as_str().unwrap().contains("baseline"));
+    agent.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_cadence_delivers_the_latest_update_and_counts_the_ones_it_dropped() {
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "s1",
+            "SubscribeTick",
+            json!({"tick_instance_id": fixture_instance(7)}),
+        ),
+        text("watching instance 7"),
+        text("nothing notable"),
+    ]));
+    let (agent, stream, chat, loop_id) = subscribed_agent(directory.path(), model.clone()).await;
+    let mut events = agent.subscribe();
+
+    assert_eq!(stream.watched(), BTreeSet::from([fixture_instance(7)]));
+    assert_eq!(
+        agent.snapshot(chat).await.unwrap().loops[0].state,
+        LoopState::WaitingTrigger
+    );
+    let subscriptions = agent.tick_subscriptions(chat).await.unwrap();
+    assert_eq!(subscriptions.len(), 1);
+    assert_eq!(subscriptions[0].every_seconds, 60);
+    assert_eq!(subscriptions[0].loop_id, loop_id);
+
+    for (sequence, phase) in [(1, "first"), (2, "second"), (3, "third")] {
+        stream.push(update(7, sequence, phase));
+    }
+    settle().await;
+    assert_eq!(
+        agent.tick_subscriptions(chat).await.unwrap()[0].accumulated,
+        3
+    );
+
+    tokio::time::advance(CADENCE).await;
+    wait_for_completion(&mut events).await;
+
+    assert_eq!(model.requests.lock().unwrap().len(), 3);
+    let delivered = last_user_text(&model);
+    assert!(delivered.contains("\"sequence\":3"), "{delivered}");
+    assert!(delivered.contains("\"dropped\":2"), "{delivered}");
+    assert!(delivered.contains("third"), "{delivered}");
+    assert!(!delivered.contains("first"), "{delivered}");
+    assert!(
+        delivered.contains("watch the quote panel"),
+        "the Trigger prompt follows the delivery: {delivered}"
+    );
+    let Some(LocalMessage::TickDelivery { items, truncated }) = LocalMessage::parse(&delivered)
+    else {
+        panic!("a delivery renders as a Tick delivery line: {delivered}");
+    };
+    assert!(!truncated);
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].instance, fixture_instance(7));
+    assert_eq!(items[0].sequence, 3);
+    assert_eq!(items[0].dropped, 2);
+
+    let after = agent.tick_subscriptions(chat).await.unwrap();
+    assert_eq!(after[0].accumulated, 0);
+    assert_eq!(
+        after[0].last_delivery.as_deref(),
+        Some("herdr:fixture-run-7 #3 · dropped 2")
+    );
+    assert_eq!(after[0].link, TickLinkState::Live);
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_subscription_tools_reach_the_model_only_with_an_installed_stream() {
+    let directory = tempfile::tempdir().unwrap();
+    let tool_names = |model: &ScriptedModel| {
+        model.requests.lock().unwrap()[0]
+            .tools
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect::<Vec<_>>()
+    };
+
+    let model = Arc::new(ScriptedModel::new(vec![text("no stream here")]));
+    let agent = Agent::new_embedded(config(), model.clone());
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let mut events = agent.subscribe();
+    agent
+        .submit(chat, None, "watch a panel".into())
+        .await
+        .unwrap();
+    wait_for_completion(&mut events).await;
+    let without = tool_names(&model);
+    assert!(
+        !without.contains(&"SubscribeTick".to_string()),
+        "{without:?}"
+    );
+    assert!(
+        !without.contains(&"UnsubscribeTick".to_string()),
+        "{without:?}"
+    );
+    agent.shutdown().await;
+
+    let model = Arc::new(ScriptedModel::new(vec![text("stream installed")]));
+    let agent = Agent::new_embedded(config(), model.clone());
+    agent
+        .install_tick_stream(Arc::new(InMemoryTickStream::new()))
+        .await;
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let mut events = agent.subscribe();
+    agent
+        .submit(chat, None, "watch a panel".into())
+        .await
+        .unwrap();
+    wait_for_completion(&mut events).await;
+    let with = tool_names(&model);
+    assert!(with.contains(&"SubscribeTick".to_string()), "{with:?}");
+    assert!(with.contains(&"UnsubscribeTick".to_string()), "{with:?}");
+    {
+        let requests = model.requests.lock().unwrap();
+        let subscribe = requests[0]
+            .tools
+            .iter()
+            .find(|tool| tool.name == "SubscribeTick")
+            .unwrap();
+        assert_eq!(
+            subscribe.input_schema["properties"]["tick_instance_id"]["type"],
+            "string"
+        );
+    }
+    agent.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_cadence_without_updates_costs_no_model_call() {
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "s1",
+            "SubscribeTick",
+            json!({"tick_instance_id": fixture_instance(4), "every_seconds": 5}),
+        ),
+        text("watching instance 4"),
+    ]));
+    let (agent, stream, chat, _) = subscribed_agent(directory.path(), model.clone()).await;
+
+    tokio::time::advance(Duration::from_secs(60)).await;
+    settle().await;
+
+    assert_eq!(model.requests.lock().unwrap().len(), 2);
+    assert_eq!(
+        agent.tick_subscriptions(chat).await.unwrap()[0].accumulated,
+        0
+    );
+    assert!(stream.is_open());
+    agent.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_update_for_an_instance_nobody_subscribed_to_never_reaches_a_loop() {
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "s1",
+            "SubscribeTick",
+            json!({"tick_instance_id": fixture_instance(7)}),
+        ),
+        text("watching instance 7"),
+    ]));
+    let (agent, stream, chat, _) = subscribed_agent(directory.path(), model.clone()).await;
+
+    stream.push(update(9, 1, "other panel"));
+    settle().await;
+    tokio::time::advance(CADENCE).await;
+    settle().await;
+
+    assert_eq!(model.requests.lock().unwrap().len(), 2);
+    assert_eq!(
+        agent.tick_subscriptions(chat).await.unwrap()[0].accumulated,
+        0
+    );
+    agent.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn deliveries_that_arrive_during_a_run_merge_into_the_next_one() {
+    use async_trait::async_trait;
+    use tickloop_agent::model::*;
+    use tokio::sync::{Notify, mpsc::UnboundedSender};
+    use tokio_util::sync::CancellationToken;
+
+    struct Gated {
+        gate: Arc<Notify>,
+        gated_call: usize,
+        calls: std::sync::atomic::AtomicUsize,
+        model: Arc<ScriptedModel>,
+    }
+
+    #[async_trait]
+    impl ModelClient for Gated {
+        fn identity(&self) -> ModelIdentity {
+            self.model.identity()
+        }
+
+        async fn complete(
+            &self,
+            request: ModelRequest,
+            events: UnboundedSender<ModelDelta>,
+            cancel: CancellationToken,
+        ) -> Result<ModelOutput, ModelError> {
+            if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == self.gated_call {
+                self.gate.notified().await;
+            }
+            self.model.complete(request, events, cancel).await
+        }
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "s1",
+            "SubscribeTick",
+            json!({"tick_instance_id": fixture_instance(7)}),
+        ),
+        text("watching instance 7"),
+        text("first delivery handled"),
+        text("second delivery handled"),
+    ]));
+    let gate = Arc::new(Notify::new());
+    let agent = Agent::new_embedded(
+        config(),
+        Arc::new(Gated {
+            gate: gate.clone(),
+            gated_call: 2,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            model: model.clone(),
+        }),
+    );
+    let stream = InMemoryTickStream::new();
+    agent.install_tick_stream(Arc::new(stream.clone())).await;
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let mut events = agent.subscribe();
+    agent
+        .submit(chat, None, "watch the quote panel".into())
+        .await
+        .unwrap();
+    wait_for_completion(&mut events).await;
+
+    stream.push(update(7, 1, "first"));
+    settle().await;
+    tokio::time::advance(CADENCE).await;
+    settle().await;
+
+    stream.push(update(7, 2, "second"));
+    stream.push(update(7, 3, "third"));
+    settle().await;
+    tokio::time::advance(CADENCE).await;
+    settle().await;
+    assert_eq!(
+        model.requests.lock().unwrap().len(),
+        2,
+        "the held delivery does not start a second run"
+    );
+
+    gate.notify_one();
+    wait_for_completion(&mut events).await;
+    wait_for_completion(&mut events).await;
+
+    assert_eq!(model.requests.lock().unwrap().len(), 4);
+    let merged = last_user_text(&model);
+    assert!(merged.contains("\"sequence\":3"), "{merged}");
+    assert!(merged.contains("\"dropped\":1"), "{merged}");
+    agent.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_loop_waiting_for_the_user_holds_its_delivery_until_the_answer_lands() {
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "s1",
+            "SubscribeTick",
+            json!({"tick_instance_id": fixture_instance(7)}),
+        ),
+        call(
+            "q1",
+            ASK_USER_QUESTION_TOOL_NAME,
+            single_question("which market?"),
+        ),
+        text("answered"),
+        text("delivery handled"),
+    ]));
+    let agent = Agent::new_embedded(config(), model.clone());
+    let stream = InMemoryTickStream::new();
+    agent.install_tick_stream(Arc::new(stream.clone())).await;
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let mut events = agent.subscribe();
+    agent
+        .submit(chat, None, "watch the quote panel".into())
+        .await
+        .unwrap();
+    let question = loop {
+        if let EventKind::QuestionAsked { request } = next_event(&mut events).await.kind {
+            break request;
+        }
+    };
+    assert_eq!(
+        agent.snapshot(chat).await.unwrap().loops[0].state,
+        LoopState::WaitingQuestion
+    );
+
+    stream.push(update(7, 1, "moved"));
+    settle().await;
+    tokio::time::advance(CADENCE).await;
+    settle().await;
+    assert_eq!(
+        model.requests.lock().unwrap().len(),
+        2,
+        "a market move must not bypass the user's answer"
+    );
+
+    agent
+        .answer_question(chat, question.id, vec![QuestionAnswer::other("Hong Kong")])
+        .await
+        .unwrap();
+    wait_for_completion(&mut events).await;
+    tokio::time::advance(CADENCE).await;
+    wait_for_completion(&mut events).await;
+
+    assert_eq!(model.requests.lock().unwrap().len(), 4);
+    assert!(last_user_text(&model).contains("moved"));
+    agent.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn unsubscribing_and_stopping_a_loop_take_the_instance_off_the_stream() {
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "s1",
+            "SubscribeTick",
+            json!({"tick_instance_id": fixture_instance(7)}),
+        ),
+        call(
+            "s2",
+            "SubscribeTick",
+            json!({"tick_instance_id": fixture_instance(8)}),
+        ),
+        text("watching both"),
+        text("ok"),
+    ]));
+    let (agent, stream, chat, loop_id) = subscribed_agent(directory.path(), model.clone()).await;
+    assert_eq!(
+        stream.watched(),
+        BTreeSet::from([fixture_instance(7), fixture_instance(8)])
+    );
+
+    let first = agent.tick_subscriptions(chat).await.unwrap()[0].id;
+    agent
+        .update_tick_subscription(chat, first, TickSubscriptionChange::Cancel)
+        .await
+        .unwrap();
+    assert_eq!(agent.tick_subscriptions(chat).await.unwrap().len(), 1);
+    assert_eq!(stream.watched().len(), 1);
+
+    agent.stop(chat, loop_id).await.unwrap();
+    assert!(agent.tick_subscriptions(chat).await.unwrap().is_empty());
+    assert!(stream.watched().is_empty());
+    agent.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_cadence_change_from_the_view_restarts_the_timer() {
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "s1",
+            "SubscribeTick",
+            json!({"tick_instance_id": fixture_instance(7)}),
+        ),
+        text("watching instance 7"),
+        text("handled"),
+    ]));
+    let (agent, stream, chat, _) = subscribed_agent(directory.path(), model.clone()).await;
+    let subscription = agent.tick_subscriptions(chat).await.unwrap()[0].id;
+    let mut events = agent.subscribe();
+
+    agent
+        .update_tick_subscription(chat, subscription, TickSubscriptionChange::Cadence(5))
+        .await
+        .unwrap();
+    assert_eq!(
+        agent.tick_subscriptions(chat).await.unwrap()[0].every_seconds,
+        5
+    );
+
+    stream.push(update(7, 1, "moved"));
+    settle().await;
+    tokio::time::advance(Duration::from_secs(5)).await;
+    wait_for_completion(&mut events).await;
+
+    assert_eq!(model.requests.lock().unwrap().len(), 3);
+    assert!(last_user_text(&model).contains("moved"));
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_trigger_rejects_subscriptions_it_cannot_honour() {
+    let directory = tempfile::tempdir().unwrap();
+    let agent = Agent::new_embedded(
+        config(),
+        Arc::new(ScriptedModel::new(vec![text("ready to watch")])),
+    );
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let mut events = agent.subscribe();
+    let receipt = agent
+        .submit(chat, None, "watch a panel".into())
+        .await
+        .unwrap();
+    wait_for_completion(&mut events).await;
+    let trigger = |subscriptions| Trigger {
+        id: Uuid::new_v4(),
+        prompt: "check the panel".into(),
+        interval_seconds: None,
+        expires_at_ms: None,
+        accepts_events: true,
+        armed: true,
+        subscriptions,
+    };
+    let subscription = |instance: u64, every_seconds| TickSubscription {
+        id: Uuid::new_v4(),
+        instance: fixture_instance(instance),
+        every_seconds,
+    };
+
+    for rejected in [
+        vec![subscription(1, 4)],
+        vec![subscription(1, 86_401)],
+        vec![subscription(1, 60), subscription(1, 90)],
+    ] {
+        assert!(
+            agent
+                .configure_trigger(chat, receipt.loop_id, Some(trigger(rejected)))
+                .await
+                .is_err()
+        );
+    }
+    let mut events_only = trigger(vec![subscription(1, 60)]);
+    events_only.accepts_events = false;
+    events_only.interval_seconds = Some(30);
+    assert!(
+        agent
+            .configure_trigger(chat, receipt.loop_id, Some(events_only))
+            .await
+            .is_err()
+    );
+    assert!(
+        agent
+            .configure_trigger(
+                chat,
+                receipt.loop_id,
+                Some(trigger(vec![subscription(1, 60)]))
+            )
+            .await
+            .is_ok()
+    );
+    agent.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_restored_subscription_watches_again_only_after_the_user_resumes_the_goal() {
+    let directory = tempfile::tempdir().unwrap();
+    let archive = directory.path().join("archive");
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "s1",
+            "SubscribeTick",
+            json!({"tick_instance_id": fixture_instance(7)}),
+        ),
+        text("watching instance 7"),
+    ]));
+    let agent = Agent::open_embedded(archive.clone(), config(), model).unwrap();
+    let stream = InMemoryTickStream::new();
+    agent.install_tick_stream(Arc::new(stream.clone())).await;
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let mut events = agent.subscribe();
+    agent
+        .submit(chat, None, "watch the quote panel".into())
+        .await
+        .unwrap();
+    wait_for_completion(&mut events).await;
+    assert_eq!(stream.watched(), BTreeSet::from([fixture_instance(7)]));
+    agent.shutdown().await;
+
+    let model = Arc::new(ScriptedModel::new(vec![text("resumed")]));
+    let restored = Agent::open_embedded(archive, config(), model).unwrap();
+    let reopened = InMemoryTickStream::new();
+    restored
+        .install_tick_stream(Arc::new(reopened.clone()))
+        .await;
+    let snapshot = restored.resume_chat(chat).await.unwrap();
+    let goal = snapshot.loops[0].clone();
+    assert_eq!(goal.state, LoopState::Interrupted);
+    assert_eq!(
+        restored.tick_subscriptions(chat).await.unwrap().len(),
+        1,
+        "the restored Trigger keeps its Tick Subscriptions"
+    );
+    assert!(!goal.trigger.as_ref().unwrap().armed);
+    assert!(
+        reopened.watched().is_empty(),
+        "a disarmed Trigger watches nothing"
+    );
+
+    let mut events = restored.subscribe();
+    restored
+        .submit(chat, Some(goal.id), "carry on".into())
+        .await
+        .unwrap();
+    wait_for_completion(&mut events).await;
+    assert_eq!(reopened.watched(), BTreeSet::from([fixture_instance(7)]));
+    restored.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn native_subscribe_tool_keeps_the_complete_run_identity() {
+    let directory = tempfile::tempdir().unwrap();
+    let run = "herdr:session/workspace/pane/full-run-00000000-0000-0000-0000-000000000007";
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "s1",
+            "SubscribeTick",
+            json!({"tick_instance_id": run, "every_seconds": 5}),
+        ),
+        text("watching that run"),
+        text("observed"),
+    ]));
+    let agent = Agent::new_embedded(config(), model.clone());
+    let stream = InMemoryTickStream::new();
+    agent.install_tick_stream(Arc::new(stream.clone())).await;
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let mut events = agent.subscribe();
+    agent
+        .submit(chat, None, "observe this run".into())
+        .await
+        .unwrap();
+    wait_for_completion(&mut events).await;
+    let native = InstanceRef::native(run).unwrap();
+    assert_eq!(stream.watched(), BTreeSet::from([native.clone()]));
+    let row = &agent.tick_subscriptions(chat).await.unwrap()[0];
+    assert_eq!(row.instance, native);
+
+    stream.push(TickObservation {
+        instance: native,
+        sequence: 1,
+        observed_at: "2026-09-24T12:00:00Z".into(),
+        dropped: 0,
+        data: json!({"changed": true}),
+        kind: ObservationKind::Protocol,
+        recover_with: None,
+        gap: false,
+    });
+    settle().await;
+    tokio::time::advance(Duration::from_secs(5)).await;
+    wait_for_completion(&mut events).await;
+    let delivered = last_user_text(&model);
+    assert!(delivered.contains(run));
+    let Some(LocalMessage::TickDelivery { items, .. }) = LocalMessage::parse(&delivered) else {
+        panic!("Native delivery must retain its structured source: {delivered}");
+    };
+    assert_eq!(items[0].instance, InstanceRef::native(run).unwrap());
+    agent.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_cancelled_watch_cannot_deliver_late_events_to_a_new_activation() {
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "s1",
+            "SubscribeTick",
+            json!({"tick_instance_id": fixture_instance(7), "every_seconds": 5}),
+        ),
+        text("watching"),
+        text("fresh observation"),
+    ]));
+    let (agent, stream, chat, loop_id) = subscribed_agent(directory.path(), model.clone()).await;
+    let old_watch = *stream.watches().keys().next().unwrap();
+    let subscription = agent.tick_subscriptions(chat).await.unwrap()[0].id;
+    agent
+        .update_tick_subscription(chat, subscription, TickSubscriptionChange::Cancel)
+        .await
+        .unwrap();
+    let mut trigger = agent.snapshot(chat).await.unwrap().loops[0]
+        .trigger
+        .clone()
+        .unwrap();
+    trigger.subscriptions.push(TickSubscription {
+        id: subscription,
+        instance: fixture_instance(7),
+        every_seconds: 5,
+    });
+    agent
+        .configure_trigger(chat, loop_id, Some(trigger))
+        .await
+        .unwrap();
+    let new_watch = *stream.watches().keys().next().unwrap();
+    assert_ne!(old_watch, new_watch);
+
+    stream.emit(TickStreamEvent::Ready { watch: old_watch });
+    stream.emit(TickStreamEvent::Observation {
+        audience: vec![old_watch],
+        value: update(7, 1, "late"),
+    });
+    stream.emit(TickStreamEvent::Ready { watch: new_watch });
+    stream.emit(TickStreamEvent::Observation {
+        audience: vec![new_watch],
+        value: update(7, 2, "fresh"),
+    });
+    settle().await;
+    let mut events = agent.subscribe();
+    tokio::time::advance(Duration::from_secs(5)).await;
+    wait_for_completion(&mut events).await;
+    let delivered = last_user_text(&model);
+    assert!(delivered.contains("fresh"), "{delivered}");
+    assert!(!delivered.contains("late"), "{delivered}");
+    agent.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_late_loop_has_its_own_baseline_on_a_shared_instance() {
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "s1",
+            "SubscribeTick",
+            json!({"tick_instance_id": fixture_instance(7), "every_seconds": 5}),
+        ),
+        text("first watcher"),
+        call(
+            "s2",
+            "SubscribeTick",
+            json!({"tick_instance_id": fixture_instance(7), "every_seconds": 10}),
+        ),
+        text("second watcher"),
+        text("first saw earlier change"),
+        text("first saw shared change"),
+        text("second saw shared change"),
+    ]));
+    let agent = Agent::new_embedded(config(), model.clone());
+    let stream = InMemoryTickStream::new();
+    agent.install_tick_stream(Arc::new(stream.clone())).await;
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let mut events = agent.subscribe();
+    agent.submit(chat, None, "first loop".into()).await.unwrap();
+    wait_for_completion(&mut events).await;
+    let first_watch = *stream.watches().keys().next().unwrap();
+    stream.emit(TickStreamEvent::Ready { watch: first_watch });
+    stream.emit(TickStreamEvent::Observation {
+        audience: vec![first_watch],
+        value: update(7, 1, "earlier"),
+    });
+    settle().await;
+
+    agent
+        .submit(chat, None, "second loop".into())
+        .await
+        .unwrap();
+    wait_for_completion(&mut events).await;
+    let second_watch = *stream
+        .watches()
+        .keys()
+        .find(|watch| **watch != first_watch)
+        .unwrap();
+    stream.emit(TickStreamEvent::Ready {
+        watch: second_watch,
+    });
+    tokio::time::advance(Duration::from_secs(5)).await;
+    wait_for_completion(&mut events).await;
+    tokio::time::advance(Duration::from_secs(5)).await;
+    settle().await;
+    assert_eq!(
+        model.requests.lock().unwrap().len(),
+        5,
+        "the late Loop has no earlier pending content"
+    );
+    let rows = agent.tick_subscriptions(chat).await.unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows.iter()
+            .find(|row| row.every_seconds == 10)
+            .unwrap()
+            .accumulated,
+        0
+    );
+
+    stream.emit(TickStreamEvent::Observation {
+        audience: vec![first_watch, second_watch],
+        value: update(7, 2, "shared"),
+    });
+    settle().await;
+    tokio::time::advance(Duration::from_secs(5)).await;
+    wait_for_completion(&mut events).await;
+    tokio::time::advance(Duration::from_secs(5)).await;
+    wait_for_completion(&mut events).await;
+    assert_eq!(model.requests.lock().unwrap().len(), 7);
+    agent.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_lost_link_shows_in_the_subscription_snapshot() {
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "s1",
+            "SubscribeTick",
+            json!({"tick_instance_id": fixture_instance(7)}),
+        ),
+        text("watching instance 7"),
+    ]));
+    let (agent, stream, chat, _) = subscribed_agent(directory.path(), model.clone()).await;
+
+    stream.emit(TickStreamEvent::State {
+        instance: fixture_instance(7),
+        state: TickConnectionState::Disconnected,
+        audience: audience(&stream, 7),
+    });
+    settle().await;
+    assert_eq!(
+        agent.tick_subscriptions(chat).await.unwrap()[0].link,
+        TickLinkState::Disconnected
+    );
+
+    stream.emit(TickStreamEvent::State {
+        instance: fixture_instance(7),
+        state: TickConnectionState::Gone,
+        audience: audience(&stream, 7),
+    });
+    settle().await;
+    assert_eq!(
+        agent.tick_subscriptions(chat).await.unwrap()[0].link,
+        TickLinkState::InstanceGone
+    );
+    agent.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_instance_gap_marks_only_its_next_delivery() {
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "s1",
+            "SubscribeTick",
+            json!({"tick_instance_id": fixture_instance(7)}),
+        ),
+        text("watching instance 7"),
+        text("steady"),
+        text("noted the gap"),
+    ]));
+    let (agent, stream, _, _) = subscribed_agent(directory.path(), model.clone()).await;
+    let mut events = agent.subscribe();
+
+    stream.push(update(7, 9, "steady"));
+    settle().await;
+    tokio::time::advance(CADENCE).await;
+    wait_for_completion(&mut events).await;
+    assert!(last_user_text(&model).contains("\"gap\":false"));
+
+    stream.push(update(7, 11, "before the gap"));
+    let mut after_gap = update(7, 1, "after the gap");
+    after_gap.gap = true;
+    stream.push(after_gap);
+    settle().await;
+    tokio::time::advance(CADENCE).await;
+    wait_for_completion(&mut events).await;
+
+    let delivered = last_user_text(&model);
+    assert!(delivered.contains("\"gap\":true"), "{delivered}");
+    assert!(delivered.contains("\"sequence\":1"), "{delivered}");
+    assert!(delivered.contains("after the gap"), "{delivered}");
+    assert!(!delivered.contains("before the gap"), "{delivered}");
+    assert!(delivered.contains("\"dropped\":1"), "{delivered}");
+    agent.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_gone_instance_stops_being_watched_and_keeps_its_configuration() {
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "s1",
+            "SubscribeTick",
+            json!({"tick_instance_id": fixture_instance(7)}),
+        ),
+        call(
+            "s2",
+            "SubscribeTick",
+            json!({"tick_instance_id": fixture_instance(8)}),
+        ),
+        text("watching both"),
+        text("handled"),
+    ]));
+    let (agent, stream, chat, _) = subscribed_agent(directory.path(), model.clone()).await;
+    let mut events = agent.subscribe();
+    assert_eq!(
+        stream.watched(),
+        BTreeSet::from([fixture_instance(7), fixture_instance(8)])
+    );
+
+    stream.emit(TickStreamEvent::State {
+        instance: fixture_instance(7),
+        state: TickConnectionState::Gone,
+        audience: audience(&stream, 7),
+    });
+    stream.emit(TickStreamEvent::State {
+        instance: fixture_instance(8),
+        state: TickConnectionState::Live,
+        audience: audience(&stream, 8),
+    });
+    settle().await;
+
+    assert_eq!(
+        stream.watched(),
+        BTreeSet::from([fixture_instance(8)]),
+        "a gone instance stops being watched"
+    );
+    let rows = agent.tick_subscriptions(chat).await.unwrap();
+    assert_eq!(rows.len(), 2, "the configuration survives");
+    let gone = rows
+        .iter()
+        .find(|row| row.instance == fixture_instance(7))
+        .unwrap();
+    let live = rows
+        .iter()
+        .find(|row| row.instance == fixture_instance(8))
+        .unwrap();
+    assert_eq!(gone.link, TickLinkState::InstanceGone);
+    assert_eq!(live.link, TickLinkState::Live);
+
+    stream.push(update(7, 1, "from a Tick that is gone"));
+    stream.push(update(8, 1, "from the Tick that stayed"));
+    settle().await;
+    tokio::time::advance(CADENCE).await;
+    wait_for_completion(&mut events).await;
+
+    let delivered = last_user_text(&model);
+    assert!(
+        delivered.contains("from the Tick that stayed"),
+        "{delivered}"
+    );
+    assert!(
+        !delivered.contains("from a Tick that is gone"),
+        "{delivered}"
+    );
+    agent.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_fresh_subscription_can_reobserve_a_stopped_instance_without_rearming_the_old_watch() {
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "s1",
+            "SubscribeTick",
+            json!({"tick_instance_id": fixture_instance(7)}),
+        ),
+        text("watching the first Loop"),
+        call(
+            "s2",
+            "SubscribeTick",
+            json!({"tick_instance_id": fixture_instance(7)}),
+        ),
+        text("watching the new Loop"),
+        text("handled the fresh observation"),
+    ]));
+    let (agent, stream, chat, _) = subscribed_agent(directory.path(), model.clone()).await;
+    let first = *stream.watches().keys().next().unwrap();
+
+    stream.emit(TickStreamEvent::State {
+        instance: fixture_instance(7),
+        state: TickConnectionState::IdentityUncertain,
+        audience: audience(&stream, 7),
+    });
+    settle().await;
+    assert!(stream.watches().is_empty());
+
+    let mut events = agent.subscribe();
+    agent
+        .submit(
+            chat,
+            None,
+            "explicitly watch the proven same run again".into(),
+        )
+        .await
+        .unwrap();
+    wait_for_completion(&mut events).await;
+    let watches = stream.watches();
+    assert_eq!(watches.len(), 1);
+    assert!(!watches.contains_key(&first));
+    assert_eq!(watches.values().next(), Some(&fixture_instance(7)));
+    assert_eq!(agent.tick_subscriptions(chat).await.unwrap().len(), 2);
+    stream.emit(TickStreamEvent::State {
+        instance: fixture_instance(7),
+        state: TickConnectionState::IdentityUncertain,
+        audience: vec![first],
+    });
+    stream.emit(TickStreamEvent::Gap {
+        instance: fixture_instance(7),
+        audience: vec![first],
+    });
+    settle().await;
+    assert_eq!(stream.watches(), watches);
+    stream.push(update(7, 1, "fresh observation"));
+    settle().await;
+    tokio::time::advance(CADENCE).await;
+    wait_for_completion(&mut events).await;
+    assert!(last_user_text(&model).contains("\"gap\":false"));
+    agent.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_over_sized_delivery_blanks_its_largest_data_and_names_the_tool_that_recovers_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "s1",
+            "SubscribeTick",
+            json!({"tick_instance_id": fixture_instance(7)}),
+        ),
+        call(
+            "s2",
+            "SubscribeTick",
+            json!({"tick_instance_id": fixture_instance(8)}),
+        ),
+        text("watching both"),
+        text("handled"),
+    ]));
+    let (agent, stream, chat, _) = subscribed_agent(directory.path(), model.clone()).await;
+    let mut events = agent.subscribe();
+
+    let oversized = "candle".repeat(MAX_DELIVERY_PAYLOAD_BYTES);
+    stream.push(TickObservation {
+        data: json!({ "history": oversized }),
+        ..update(7, 1, "unused")
+    });
+    stream.push(update(8, 1, "small enough to keep"));
+    settle().await;
+    tokio::time::advance(CADENCE).await;
+    wait_for_completion(&mut events).await;
+
+    let delivered = last_user_text(&model);
+    assert!(delivered.contains("\"truncated\":true"), "{delivered}");
+    assert!(delivered.contains("CallTickTool"), "{delivered}");
+    assert!(delivered.contains("small enough to keep"), "{delivered}");
+    assert!(
+        !delivered.contains("candlecandle"),
+        "the largest data is blanked first"
+    );
+    assert!(
+        delivered.len() < 2 * MAX_DELIVERY_PAYLOAD_BYTES,
+        "the delivery stays within its cap"
+    );
+    let Some(LocalMessage::TickDelivery { truncated, .. }) = LocalMessage::parse(&delivered) else {
+        panic!("a delivery renders as a Tick delivery line: {delivered}");
+    };
+    assert!(truncated, "the transcript line shows the truncation");
+    assert!(
+        agent.tick_subscriptions(chat).await.unwrap()[0]
+            .last_delivery
+            .as_deref()
+            .is_some_and(|summary| summary.contains("truncated")),
+        "the subscription view reports the truncation"
+    );
+    agent.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_truncated_terminal_observation_points_to_current_text_without_promising_history() {
+    let directory = tempfile::tempdir().unwrap();
+    let run = "herdr:terminal:session:run-88";
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "s1",
+            "SubscribeTick",
+            json!({"tick_instance_id":run,"every_seconds":5}),
+        ),
+        text("watching terminal"),
+        text("handled"),
+    ]));
+    let agent = Agent::new_embedded(config(), model.clone());
+    let stream = InMemoryTickStream::new();
+    agent.install_tick_stream(Arc::new(stream.clone())).await;
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let mut events = agent.subscribe();
+    agent
+        .submit(chat, None, "watch terminal".into())
+        .await
+        .unwrap();
+    wait_for_completion(&mut events).await;
+    stream.push(TickObservation {
+        instance: InstanceRef::native(run).unwrap(),
+        sequence: 1,
+        observed_at: "2026-09-24T12:00:00Z".into(),
+        dropped: 0,
+        data: json!({"text":"log line".repeat(MAX_DELIVERY_PAYLOAD_BYTES)}),
+        kind: ObservationKind::Terminal { truncated: true },
+        recover_with: None,
+        gap: false,
+    });
+    settle().await;
+    tokio::time::advance(Duration::from_secs(5)).await;
+    wait_for_completion(&mut events).await;
+    let delivered = last_user_text(&model);
+    assert!(delivered.contains("ReadTick"), "{delivered}");
+    assert!(delivered.contains("cannot be recovered"), "{delivered}");
+    assert!(!delivered.contains("CallTickTool"), "{delivered}");
+    assert!(delivered.len() < 2 * MAX_DELIVERY_PAYLOAD_BYTES);
+    agent.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn many_subscribed_instances_still_fit_one_loop_delivery_under_sixteen_kib() {
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![text("ready"), text("received")]));
+    let agent = Agent::new_embedded(config(), model.clone());
+    let stream = InMemoryTickStream::new();
+    agent.install_tick_stream(Arc::new(stream.clone())).await;
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let mut events = agent.subscribe();
+    let receipt = agent
+        .submit(chat, None, "watch many ticks".into())
+        .await
+        .unwrap();
+    wait_for_completion(&mut events).await;
+    let instances: Vec<_> = (0..100)
+        .map(|index| InstanceRef::native(format!("bulk:{index:03}:{}", "r".repeat(60))).unwrap())
+        .collect();
+    let trigger = Trigger {
+        id: Uuid::new_v4(),
+        prompt: "inspect changes".into(),
+        interval_seconds: None,
+        expires_at_ms: None,
+        accepts_events: true,
+        armed: true,
+        subscriptions: instances
+            .iter()
+            .cloned()
+            .map(|instance| TickSubscription {
+                id: Uuid::new_v4(),
+                instance,
+                every_seconds: 5,
+            })
+            .collect(),
+    };
+    agent
+        .configure_trigger(chat, receipt.loop_id, Some(trigger))
+        .await
+        .unwrap();
+    for instance in instances {
+        stream.push(TickObservation {
+            instance,
+            sequence: 1,
+            observed_at: "2026-09-24T12:00:00Z".into(),
+            dropped: 0,
+            data: json!({"text":"x".repeat(400)}),
+            kind: ObservationKind::Protocol,
+            recover_with: None,
+            gap: false,
+        });
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let total: u64 = agent
+                .tick_subscriptions(chat)
+                .await
+                .unwrap()
+                .iter()
+                .map(|row| row.accumulated)
+                .sum();
+            if total == 100 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::advance(Duration::from_secs(5)).await;
+    wait_for_completion(&mut events).await;
+    let delivered = last_user_text(&model);
+    assert!(delivered.contains("omitted_instances"), "{delivered}");
+    assert!(
+        delivered.len() <= MAX_DELIVERY_PAYLOAD_BYTES + 500,
+        "{} bytes",
+        delivered.len()
+    );
+    agent.shutdown().await;
+}

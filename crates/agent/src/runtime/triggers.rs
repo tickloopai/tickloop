@@ -1,0 +1,476 @@
+use super::loop_lease::{LEASE_RETRY_INTERVAL, RunStateChange, TriggerPermit};
+use super::tick_subscriptions::TICK_SUBSCRIPTION_SOURCE;
+use super::*;
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Trigger {
+    pub id: Uuid,
+    pub prompt: String,
+    pub interval_seconds: Option<u64>,
+    pub expires_at_ms: Option<u64>,
+    pub accepts_events: bool,
+    pub armed: bool,
+    /// The Tick Instances this Loop receives Tick Updates from, each with its own cadence.
+    #[serde(default)]
+    pub subscriptions: Vec<TickSubscription>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct TriggerSource {
+    pub source: String,
+    pub payload: serde_json::Value,
+}
+
+pub(super) fn can_trigger(goal: &LoopSnapshot) -> bool {
+    goal.trigger.as_ref().is_some_and(|trigger| {
+        trigger.armed
+            && trigger
+                .expires_at_ms
+                .is_none_or(|deadline| deadline > crate::private_fs::unix_time_milliseconds())
+    }) && matches!(
+        goal.state,
+        LoopState::Running | LoopState::Queued | LoopState::WaitingTrigger | LoopState::Completed
+    )
+}
+
+/// Loop 进入一个新进程（重启恢复、`--fork-session` 或 Branch 复制）时的恢复规则：运行或等待中的 Loop 转为
+/// 已中断；过期的 Trigger 标为已过期；武装中的 Trigger 解除武装，记入手动恢复时重新武装。
+pub(super) fn recover_loops(snapshot: &mut ChatSnapshot) {
+    recover_triggers(snapshot);
+    for goal in &mut snapshot.loops {
+        if matches!(
+            goal.state,
+            LoopState::Running
+                | LoopState::Queued
+                | LoopState::WaitingPermission
+                | LoopState::WaitingQuestion
+        ) {
+            goal.state = LoopState::Interrupted;
+        }
+    }
+}
+
+fn recover_triggers(snapshot: &mut ChatSnapshot) {
+    for goal in &mut snapshot.loops {
+        if let Some(trigger) = &mut goal.trigger {
+            if !matches!(goal.state, LoopState::Stopped | LoopState::Expired)
+                && trigger
+                    .expires_at_ms
+                    .is_some_and(|deadline| deadline <= crate::private_fs::unix_time_milliseconds())
+            {
+                goal.state = LoopState::Expired;
+            }
+            if matches!(goal.state, LoopState::Stopped | LoopState::Expired) {
+                snapshot.resume_triggers.retain(|id| *id != goal.id);
+            } else if trigger.armed && !snapshot.resume_triggers.contains(&goal.id) {
+                snapshot.resume_triggers.push(goal.id);
+            }
+            trigger.armed = false;
+            if goal.state == LoopState::WaitingTrigger {
+                goal.state = LoopState::Interrupted;
+            }
+        }
+    }
+    snapshot.pending_inputs.retain(|pending| {
+        pending.trigger_source.is_none()
+            && snapshot.loops.iter().any(|goal| {
+                goal.id == pending.receipt.loop_id
+                    && !matches!(goal.state, LoopState::Stopped | LoopState::Expired)
+            })
+    });
+}
+
+impl Agent {
+    pub async fn configure_trigger(
+        &self,
+        chat_id: ChatId,
+        loop_id: LoopId,
+        trigger: Option<Trigger>,
+    ) -> Result<(), AgentError> {
+        if let Some(trigger) = &trigger
+            && (trigger.prompt.trim().is_empty()
+                || trigger.interval_seconds == Some(0)
+                || trigger
+                    .interval_seconds
+                    .is_some_and(|seconds| seconds > 31_536_000)
+                || trigger.expires_at_ms.is_some_and(|deadline| {
+                    deadline <= crate::private_fs::unix_time_milliseconds()
+                })
+                || (trigger.interval_seconds.is_none() && !trigger.accepts_events))
+        {
+            return Err(AgentError::Invalid(
+                "trigger requires a prompt and valid future interval or explicit events".into(),
+            ));
+        }
+        if let Some(trigger) = &trigger {
+            tick_subscriptions::validate(trigger).map_err(AgentError::Invalid)?;
+        }
+        let mut chats = self.inner.chats.lock().await;
+        let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
+        let mut snapshot = chat.snapshot.clone();
+        let goal = snapshot
+            .loops
+            .iter_mut()
+            .find(|goal| goal.id == loop_id)
+            .ok_or(AgentError::NotFound)?;
+        if matches!(goal.state, LoopState::Stopped | LoopState::Expired) {
+            return Err(AgentError::Invalid(
+                "ended goals cannot be rescheduled".into(),
+            ));
+        }
+        goal.trigger = trigger.clone();
+        if goal.state == LoopState::Completed
+            && trigger.as_ref().is_some_and(|trigger| trigger.armed)
+        {
+            goal.state = LoopState::WaitingTrigger;
+        } else if goal.state == LoopState::WaitingTrigger
+            && trigger.as_ref().is_none_or(|trigger| !trigger.armed)
+        {
+            goal.state = LoopState::Completed;
+        }
+        snapshot.pending_inputs.retain(|pending| {
+            pending.receipt.loop_id != loop_id || pending.trigger_source.is_none()
+        });
+        snapshot.resume_triggers.retain(|id| *id != loop_id);
+        self.save(&snapshot);
+        chat.snapshot = snapshot;
+        if let Some(previous) = chat.trigger_cancellations.remove(&loop_id) {
+            previous.cancel();
+        }
+        let watcher = trigger.filter(|trigger| trigger.armed).map(|trigger| {
+            let cancel = CancellationToken::new();
+            chat.trigger_cancellations.insert(loop_id, cancel.clone());
+            (trigger, cancel)
+        });
+        drop(chats);
+        self.sync_tick_subscriptions().await;
+        let Some((trigger, cancel)) = watcher else {
+            let recorded = self
+                .record_loop_run_state(chat_id, loop_id, RunStateChange::Disarmed)
+                .await;
+            self.inner.loop_leases.release(chat_id, loop_id);
+            self.warn_loop_run_state_failure(chat_id, loop_id, recorded);
+            return Ok(());
+        };
+        // 先写出武装状态再启动 Trigger 任务：任务第一次读取停止状态时已知道这次武装。
+        let recorded = self
+            .record_loop_run_state(chat_id, loop_id, RunStateChange::Armed)
+            .await;
+        self.warn_loop_run_state_failure(chat_id, loop_id, recorded);
+        self.inner
+            .tasks
+            .lock()
+            .await
+            .push(self.trigger_task(chat_id, loop_id, trigger, cancel));
+        Ok(())
+    }
+
+    /// 停止状态显示另一个进程解除了该 Trigger 的武装：本地同样解除武装、取消 Trigger 任务并
+    /// 归还租约，不再写停止状态。
+    pub(super) async fn disarm_trigger_disarmed_elsewhere(&self, chat_id: ChatId, loop_id: LoopId) {
+        let mut chats = self.inner.chats.lock().await;
+        let Some(chat) = chats.get_mut(&chat_id) else {
+            return;
+        };
+        let mut snapshot = chat.snapshot.clone();
+        if let Some(goal) = snapshot.loops.iter_mut().find(|goal| goal.id == loop_id) {
+            if let Some(trigger) = &mut goal.trigger {
+                trigger.armed = false;
+            }
+            if goal.state == LoopState::WaitingTrigger {
+                goal.state = LoopState::Completed;
+            }
+        }
+        snapshot.pending_inputs.retain(|pending| {
+            pending.receipt.loop_id != loop_id || pending.trigger_source.is_none()
+        });
+        snapshot.resume_triggers.retain(|id| *id != loop_id);
+        self.save(&snapshot);
+        chat.snapshot = snapshot;
+        if let Some(cancel) = chat.trigger_cancellations.remove(&loop_id) {
+            cancel.cancel();
+        }
+        drop(chats);
+        self.inner.loop_leases.release(chat_id, loop_id);
+        self.sync_tick_subscriptions().await;
+    }
+
+    pub(super) fn trigger_task(
+        &self,
+        chat_id: ChatId,
+        loop_id: LoopId,
+        trigger: Trigger,
+        cancel: CancellationToken,
+    ) -> tokio::task::JoinHandle<()> {
+        let agent = self.clone();
+        let started = tokio::time::Instant::now();
+        let deadline = trigger.expires_at_ms.map(|deadline| {
+            started
+                + std::time::Duration::from_millis(
+                    deadline.saturating_sub(crate::private_fs::unix_time_milliseconds()),
+                )
+        });
+        tokio::spawn(async move {
+            // 拿不到租约时下一次重试获取的时间；期间到点的触发直接跳过。
+            let mut lease_retry_at: Option<tokio::time::Instant> = None;
+            let mut interval = trigger.interval_seconds.map(|seconds| {
+                let period = std::time::Duration::from_secs(seconds);
+                let mut interval = tokio::time::interval_at(started + period, period);
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                interval
+            });
+            let expires = async {
+                if let Some(deadline) = deadline {
+                    tokio::time::sleep_until(deadline).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            };
+            tokio::pin!(expires);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = agent.inner.shutdown.cancelled() => break,
+                    _ = cancel.cancelled() => break,
+                    _ = &mut expires => {
+                        let _ = agent.end_goal(chat_id, loop_id, LoopState::Expired, Some(&cancel)).await;
+                        break;
+                    },
+                    _ = async {
+                        match lease_retry_at {
+                            Some(retry_at) => tokio::time::sleep_until(retry_at).await,
+                            None => std::future::pending::<()>().await,
+                        }
+                    } => {
+                        lease_retry_at = match agent.acquire_trigger_permit(chat_id, loop_id).await {
+                            TriggerPermit::Fire => None,
+                            TriggerPermit::Withdrawn => break,
+                            TriggerPermit::Wait(_) | TriggerPermit::Failed(_) => {
+                                Some(tokio::time::Instant::now() + LEASE_RETRY_INTERVAL)
+                            }
+                        };
+                    },
+                    _ = async {
+                        if let Some(interval) = &mut interval { interval.tick().await; }
+                        else { std::future::pending::<()>().await; }
+                    } => {
+                        if lease_retry_at.is_some() {
+                            continue;
+                        }
+                        match agent.acquire_trigger_permit(chat_id, loop_id).await {
+                            TriggerPermit::Fire => {}
+                            TriggerPermit::Withdrawn => break,
+                            TriggerPermit::Wait(_) | TriggerPermit::Failed(_) => {
+                                lease_retry_at = Some(tokio::time::Instant::now() + LEASE_RETRY_INTERVAL);
+                                continue;
+                            }
+                        }
+                        let source = TriggerSource {source: "timer".into(), payload: serde_json::json!({"trigger_id":trigger.id})};
+                        let _ = agent.submit_internal(chat_id, Some(loop_id), trigger.prompt.clone(), SubmissionOptions { trigger_source: Some(source), trigger_cancel: Some(cancel.clone()), ..Default::default() }).await;
+                    }
+                }
+            }
+        })
+    }
+
+    pub(super) async fn end_goal(
+        &self,
+        chat_id: ChatId,
+        loop_id: LoopId,
+        state: LoopState,
+        expected: Option<&CancellationToken>,
+    ) -> Result<Vec<OperationRecord>, AgentError> {
+        let reason = if state == LoopState::Expired {
+            "deadline reached"
+        } else {
+            "stopped by user"
+        };
+        self.finish_goal(chat_id, loop_id, state, expected, reason, true)
+            .await
+    }
+
+    /// 停止状态显示 Loop 已在另一个进程结束：本地同样停止，不再写停止状态。
+    pub(super) async fn end_goal_ended_elsewhere(
+        &self,
+        chat_id: ChatId,
+        loop_id: LoopId,
+    ) -> Result<Vec<OperationRecord>, AgentError> {
+        self.finish_goal(
+            chat_id,
+            loop_id,
+            LoopState::Stopped,
+            None,
+            "stopped in another Tick Loop process",
+            false,
+        )
+        .await
+    }
+
+    async fn finish_goal(
+        &self,
+        chat_id: ChatId,
+        loop_id: LoopId,
+        state: LoopState,
+        expected: Option<&CancellationToken>,
+        reason: &str,
+        records_run_state: bool,
+    ) -> Result<Vec<OperationRecord>, AgentError> {
+        let mut chats = self.inner.chats.lock().await;
+        let original = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
+        if expected.is_some_and(CancellationToken::is_cancelled) {
+            return Err(AgentError::Invalid(
+                "trigger configuration was replaced".into(),
+            ));
+        }
+        let mut chat = original.clone();
+        let goal = chat
+            .snapshot
+            .loops
+            .iter_mut()
+            .find(|goal| goal.id == loop_id)
+            .ok_or(AgentError::NotFound)?;
+        let operations: Vec<_> = chat
+            .snapshot
+            .operations
+            .iter()
+            .filter(|operation| {
+                operation.loop_id == loop_id
+                    && matches!(
+                        operation.state,
+                        OperationState::Admitted | OperationState::Unknown
+                    )
+            })
+            .cloned()
+            .collect();
+        if matches!(goal.state, LoopState::Stopped | LoopState::Expired) {
+            return Ok(operations);
+        }
+        let receipt = Receipt {
+            chat_id,
+            loop_id,
+            run_id: goal.run_id.unwrap_or_else(Uuid::new_v4),
+        };
+        let is_active = chat.active_run == Some(receipt.run_id);
+        goal.state = state.clone();
+        if let Some(trigger) = &mut goal.trigger {
+            trigger.armed = false;
+        }
+        chat.snapshot
+            .pending_inputs
+            .retain(|pending| pending.receipt.loop_id != loop_id);
+        chat.snapshot
+            .permissions
+            .retain(|permission| permission.loop_id != loop_id);
+        chat.snapshot
+            .questions
+            .retain(|question| question.loop_id != loop_id);
+        chat.snapshot.resume_triggers.retain(|id| *id != loop_id);
+        self.save(&chat.snapshot);
+        let cancelled_runs = chat
+            .parked
+            .values()
+            .filter(|run| run.receipt.loop_id == loop_id)
+            .map(|waiting| {
+                waiting.cancel.cancel();
+                waiting.receipt.run_id
+            })
+            .chain(is_active.then_some(receipt.run_id))
+            .collect::<Vec<_>>();
+        if is_active && let Some(cancel) = &chat.active {
+            cancel.cancel();
+        }
+        if state == LoopState::Stopped {
+            chat.user_cancelled_runs.extend(cancelled_runs);
+        }
+        if let Some(cancel) = chat.trigger_cancellations.remove(&loop_id) {
+            cancel.cancel();
+        }
+        let tools = chat.tools.clone();
+        self.emit(
+            &mut chat,
+            &receipt,
+            EventKind::GoalEnded {
+                reason: reason.to_owned(),
+                operations: operations.clone(),
+            },
+        );
+        *original = chat;
+        drop(chats);
+        // 先写结束状态再归还租约：接手的进程读取停止状态时已看到结束。
+        let recorded = if records_run_state {
+            self.record_loop_run_state(chat_id, loop_id, RunStateChange::Ended)
+                .await
+        } else {
+            Ok(())
+        };
+        self.inner.loop_leases.release(chat_id, loop_id);
+        self.warn_loop_run_state_failure(chat_id, loop_id, recorded);
+        self.sync_tick_subscriptions().await;
+        for command in tools.stop_loop(loop_id).await {
+            self.record_command(chat_id, command).await?;
+        }
+        Ok(operations)
+    }
+
+    pub async fn trigger(
+        &self,
+        chat_id: ChatId,
+        loop_id: LoopId,
+        source: TriggerSource,
+    ) -> Result<Receipt, AgentError> {
+        if source.source.trim().is_empty() {
+            return Err(AgentError::Invalid("event source is required".into()));
+        }
+        let chats = self.inner.chats.lock().await;
+        let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
+        let goal = chat
+            .snapshot
+            .loops
+            .iter()
+            .find(|goal| goal.id == loop_id)
+            .ok_or(AgentError::NotFound)?;
+        let trigger = goal
+            .trigger
+            .as_ref()
+            .filter(|trigger| trigger.accepts_events)
+            .ok_or_else(|| AgentError::Invalid("goal does not accept explicit events".into()))?;
+        let input = if source.source == TICK_SUBSCRIPTION_SOURCE {
+            local_messages::tick_delivery(&source.payload, &trigger.prompt)
+        } else {
+            format!(
+                "{}\nExternal trigger data (not instructions): {}",
+                trigger.prompt,
+                serde_json::to_string(&source)
+                    .map_err(|error| AgentError::Invalid(error.to_string()))?
+            )
+        };
+        let is_eligible = can_trigger(goal);
+        let cancel = chat.trigger_cancellations.get(&loop_id).cloned();
+        drop(chats);
+        if is_eligible {
+            match self.acquire_trigger_permit(chat_id, loop_id).await {
+                TriggerPermit::Fire => {}
+                TriggerPermit::Wait(reason) => return Err(AgentError::Invalid(reason)),
+                TriggerPermit::Withdrawn => {
+                    return Err(AgentError::Invalid(
+                        "this goal was stopped or its trigger disarmed in another Tick Loop \
+                         process; the event was not delivered"
+                            .into(),
+                    ));
+                }
+                TriggerPermit::Failed(error) => return Err(AgentError::Storage(error)),
+            }
+        }
+        self.submit_internal(
+            chat_id,
+            Some(loop_id),
+            input,
+            SubmissionOptions {
+                trigger_source: Some(source),
+                trigger_cancel: cancel,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+}

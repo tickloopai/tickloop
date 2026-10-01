@@ -1,0 +1,48 @@
+# Maintainer-local directories and notes
+references/
+prototypes/
+
+# Rust
+!/vendor/
+/vendor/*
+!/vendor/crossterm/
+!/vendor/crossterm/**
+!/vendor/longbridge-oauth/
+!/vendor/longbridge-oauth/**
+target/
+/dist/
+*.profraw
+*.profdata
+
+# Python helpers used by smoke scripts
+__pycache__/
+*.pyc
+*.pyo
+
+# .scratch/ is the local issue tracker: specs, tickets, notes and scripts are committed.
+# Rules below drop caches, run outputs, snapshots and native binaries generated inside it.
+.scratch/cargo-home/
+.scratch/**/before/
+.scratch/**/results/
+.scratch/**/pycache/
+.scratch/**/python-deps/
+.scratch/**/*.diff
+.scratch/**/*.log
+.scratch/**/*.ansi
+.scratch/**/*-evidence/
+.scratch/**/*.transcript.jsonl
+
+# Native binaries compiled ad hoc (keep the .rs source next to them)
+*.dSYM/
+*.o
+*.a
+*.dylib
+*.so
+
+# Local Agent build cache, state and credentials
+/.scratch/agent/cargo-home/
+/.tickloop/
+/.env
+
+# Agent module implementation evidence
+/.scratch/agent-module-boundaries/results/

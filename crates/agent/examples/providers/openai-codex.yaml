@@ -1,0 +1,15 @@
+id: openai-codex
+display_name: Codex subscription
+auth: codex_subscription
+default_model: gpt-5.6-luna-responses
+endpoints:
+  codex_responses: https://chatgpt.com/backend-api/codex/responses
+models:
+  - id: gpt-5.6-luna-responses
+    service_model_id: gpt-5.6-luna
+    display_name: Codex subscription GPT-5.6 Luna
+    adapter: codex_responses
+    max_output_tokens: 128000
+    context_window_tokens: 272000
+    thinking: toggle
+    effort_levels: [low, medium, high, xhigh, max]

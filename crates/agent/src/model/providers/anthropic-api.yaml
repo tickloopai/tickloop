@@ -1,0 +1,141 @@
+id: "anthropic-api"
+display_name: "Anthropic API"
+auth: "api_key_env"
+api_key_env: "ANTHROPIC_API_KEY"
+endpoints:
+  messages: "https://api.anthropic.com"
+models:
+  - id: "claude-opus-5-messages"
+    service_model_id: "claude-opus-5"
+    display_name: "Claude Opus 5"
+    adapter: "messages"
+    max_output_tokens: 64000
+    context_window_tokens: null
+    thinking: "toggle"
+    adaptive_by_default: true
+    effort_levels:
+      - "low"
+      - "medium"
+      - "high"
+      - "xhigh"
+      - "max"
+    input_modalities:
+      - "text"
+      - "image"
+  - id: "claude-opus-4-8-messages"
+    service_model_id: "claude-opus-4-8"
+    display_name: "Claude Opus 4.8"
+    adapter: "messages"
+    max_output_tokens: 64000
+    context_window_tokens: null
+    thinking: "toggle"
+    adaptive_by_default: true
+    effort_levels:
+      - "low"
+      - "medium"
+      - "high"
+      - "xhigh"
+      - "max"
+    input_modalities:
+      - "text"
+      - "image"
+  - id: "claude-opus-4-7-messages"
+    service_model_id: "claude-opus-4-7"
+    display_name: "Claude Opus 4.7"
+    adapter: "messages"
+    max_output_tokens: 64000
+    context_window_tokens: null
+    thinking: "toggle"
+    adaptive_by_default: true
+    effort_levels:
+      - "low"
+      - "medium"
+      - "high"
+      - "xhigh"
+      - "max"
+    input_modalities:
+      - "text"
+      - "image"
+  - id: "claude-opus-4-6-messages"
+    service_model_id: "claude-opus-4-6"
+    display_name: "Claude Opus 4.6"
+    adapter: "messages"
+    max_output_tokens: 64000
+    context_window_tokens: null
+    thinking: "toggle"
+    adaptive_by_default: true
+    effort_levels:
+      - "low"
+      - "medium"
+      - "high"
+      - "max"
+    input_modalities:
+      - "text"
+      - "image"
+  - id: "claude-sonnet-5-messages"
+    service_model_id: "claude-sonnet-5"
+    display_name: "Claude Sonnet 5"
+    adapter: "messages"
+    max_output_tokens: 64000
+    context_window_tokens: null
+    thinking: "toggle"
+    adaptive_by_default: true
+    effort_levels:
+      - "low"
+      - "medium"
+      - "high"
+      - "xhigh"
+      - "max"
+    input_modalities:
+      - "text"
+      - "image"
+  - id: "claude-sonnet-4-6-messages"
+    service_model_id: "claude-sonnet-4-6"
+    display_name: "Claude Sonnet 4.6"
+    adapter: "messages"
+    max_output_tokens: 64000
+    context_window_tokens: null
+    thinking: "toggle"
+    adaptive_by_default: true
+    effort_levels:
+      - "low"
+      - "medium"
+      - "high"
+      - "max"
+    input_modalities:
+      - "text"
+      - "image"
+  - id: "claude-fable-5-1-messages"
+    service_model_id: "claude-fable-5-1"
+    display_name: "Claude Fable 5.1"
+    adapter: "messages"
+    max_output_tokens: 64000
+    context_window_tokens: null
+    thinking: "always_on"
+    adaptive_by_default: true
+    effort_levels:
+      - "low"
+      - "medium"
+      - "high"
+      - "xhigh"
+      - "max"
+    input_modalities:
+      - "text"
+      - "image"
+  - id: "claude-fable-5-messages"
+    service_model_id: "claude-fable-5"
+    display_name: "Claude Fable 5"
+    adapter: "messages"
+    max_output_tokens: 64000
+    context_window_tokens: null
+    thinking: "always_on"
+    adaptive_by_default: true
+    effort_levels:
+      - "low"
+      - "medium"
+      - "high"
+      - "xhigh"
+      - "max"
+    input_modalities:
+      - "text"
+      - "image"

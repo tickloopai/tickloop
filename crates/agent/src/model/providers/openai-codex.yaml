@@ -1,0 +1,75 @@
+id: "openai-codex"
+display_name: "Codex subscription"
+auth: "codex_subscription"
+api_key_env: ""
+endpoints:
+  codex_responses: "https://chatgpt.com/backend-api/codex/responses"
+models:
+  - id: "gpt-5.5-responses"
+    service_model_id: "gpt-5.5"
+    display_name: "GPT-5.5"
+    adapter: "codex_responses"
+    max_output_tokens: 128000
+    context_window_tokens: 272000
+    thinking: "toggle"
+    adaptive_by_default: false
+    effort_levels:
+      - "low"
+      - "medium"
+      - "high"
+      - "xhigh"
+      - "max"
+    input_modalities:
+      - "text"
+      - "image"
+  - id: "gpt-5.6-sol-responses"
+    service_model_id: "gpt-5.6-sol"
+    display_name: "GPT-5.6 Sol"
+    adapter: "codex_responses"
+    max_output_tokens: 128000
+    context_window_tokens: 272000
+    thinking: "toggle"
+    adaptive_by_default: false
+    effort_levels:
+      - "low"
+      - "medium"
+      - "high"
+      - "xhigh"
+      - "max"
+    input_modalities:
+      - "text"
+      - "image"
+  - id: "gpt-5.6-terra-responses"
+    service_model_id: "gpt-5.6-terra"
+    display_name: "GPT-5.6 Terra"
+    adapter: "codex_responses"
+    max_output_tokens: 128000
+    context_window_tokens: 272000
+    thinking: "toggle"
+    adaptive_by_default: false
+    effort_levels:
+      - "low"
+      - "medium"
+      - "high"
+      - "xhigh"
+      - "max"
+    input_modalities:
+      - "text"
+      - "image"
+  - id: "gpt-5.6-luna-responses"
+    service_model_id: "gpt-5.6-luna"
+    display_name: "GPT-5.6 Luna"
+    adapter: "codex_responses"
+    max_output_tokens: 128000
+    context_window_tokens: 272000
+    thinking: "toggle"
+    adaptive_by_default: false
+    effort_levels:
+      - "low"
+      - "medium"
+      - "high"
+      - "xhigh"
+      - "max"
+    input_modalities:
+      - "text"
+      - "image"

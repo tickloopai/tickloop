@@ -1,0 +1,15 @@
+[workspace]
+members = ["crates/agent", "crates/ui", "crates/ticks", "crates/tick-connect"]
+resolver = "3"
+exclude = ["vendor/crossterm", "vendor/longbridge-oauth"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[patch.crates-io]
+crossterm = { path = "vendor/crossterm" }
+
+[patch."https://github.com/longbridge/openapi"]
+longbridge-oauth = { path = "vendor/longbridge-oauth" }
