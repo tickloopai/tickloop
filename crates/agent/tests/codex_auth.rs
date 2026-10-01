@@ -506,7 +506,7 @@ async fn browser_login_checks_state_and_exchanges_pkce_code_after_callback() {
     let wrong_response = String::from_utf8(wrong_response).unwrap();
     assert!(wrong_response.starts_with("HTTP/1.1 400"));
     assert!(wrong_response.contains("belongs to a different sign-in flow"));
-    assert!(wrong_response.contains("/model → Provider"));
+    assert!(wrong_response.contains("/provider"));
     assert!(!wrong_response.contains("state=wrong"));
 
     let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", callback.port().unwrap()))
@@ -523,7 +523,7 @@ async fn browser_login_checks_state_and_exchanges_pkce_code_after_callback() {
     let missing_code_response = String::from_utf8(missing_code_response).unwrap();
     assert!(missing_code_response.starts_with("HTTP/1.1 400"));
     assert!(missing_code_response.contains("missing an authorization code"));
-    assert!(missing_code_response.contains("/model → Provider"));
+    assert!(missing_code_response.contains("/provider"));
     assert!(!missing_code_response.contains(&state));
 
     let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", callback.port().unwrap()))

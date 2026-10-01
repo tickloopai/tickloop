@@ -845,7 +845,7 @@ impl LiveView for ReaderView {
                 .as_deref()
                 .unwrap_or("No readable original is currently available for this fiscal period.");
             let text = format!(
-                "{context}\n\n{state}\n\nR retry matched materials · o open another original\na ask Chat about this event · q quit"
+                "{context}\n\n{state}\n\nR retry matched materials · o open another original\na ask Chat about this event"
             );
             frame.render_widget(
                 Paragraph::new(text).wrap(ratatui::widgets::Wrap { trim: false }),
@@ -1103,7 +1103,7 @@ impl LiveView for ReaderView {
             notice.clone()
         } else if !self.search.is_empty() {
             format!(
-                "/{} · {} matches · n/N next/previous · Esc clear",
+                "/{} · {} matches · n/N next/previous",
                 self.search,
                 self.search_matches.get()
             )

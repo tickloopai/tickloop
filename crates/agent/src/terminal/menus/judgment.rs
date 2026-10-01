@@ -111,7 +111,7 @@ impl Menus {
         return_to: JudgmentReturn,
     ) -> Result<(), String> {
         match return_to {
-            JudgmentReturn::ModelProviders { chat } => self.back_to_providers(console, chat),
+            JudgmentReturn::Providers { chat } => self.back_to_providers(console, chat),
             JudgmentReturn::AutoSettings { chat, .. } => {
                 let view = agent
                     .permissions_view(chat)

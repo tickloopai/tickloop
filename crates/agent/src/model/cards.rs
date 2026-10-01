@@ -78,6 +78,35 @@ pub struct ModelCard {
     /// Omitted for models whose image input is not verified; like opencode, they stay text only.
     #[serde(default = "text_only")]
     pub input_modalities: Vec<InputModality>,
+    /// Messages models without adaptive thinking take a token budget per effort level instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_budgets: Option<ThinkingBudgets>,
+}
+
+/// Anthropic's minimum `budget_tokens`.
+pub const MIN_THINKING_BUDGET_TOKENS: u32 = 1024;
+/// Output kept for the answer when a thinking budget shares `max_tokens`, as pi does.
+pub const MIN_ANSWER_TOKENS: u32 = 1024;
+
+/// Manual thinking budgets for the effort levels a budget-only Messages model offers; pi uses
+/// low 2048, medium 8192 and high 16384. Higher levels are not offered for such models.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThinkingBudgets {
+    pub low: u32,
+    pub medium: u32,
+    pub high: u32,
+}
+
+impl ThinkingBudgets {
+    pub fn for_effort(self, effort: ReasoningEffort) -> Option<u32> {
+        match effort {
+            ReasoningEffort::Low => Some(self.low),
+            ReasoningEffort::Medium => Some(self.medium),
+            ReasoningEffort::High => Some(self.high),
+            _ => None,
+        }
+    }
 }
 
 const fn default_max_output_tokens() -> u32 {
@@ -148,6 +177,8 @@ pub struct ModelPatch {
     pub effort_levels: Option<Vec<ReasoningEffort>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_modalities: Option<Vec<InputModality>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_budgets: Option<ThinkingBudgets>,
 }
 
 impl ProviderPatch {
@@ -253,6 +284,9 @@ impl ModelPatch {
         }
         if next.input_modalities.is_some() {
             self.input_modalities = next.input_modalities;
+        }
+        if next.thinking_budgets.is_some() {
+            self.thinking_budgets = next.thinking_budgets;
         }
     }
 }
@@ -538,6 +572,24 @@ impl ModelCatalog {
                 {
                     return Err(format!(
                         "{location}.adaptive_by_default: only Messages supports adaptive thinking"
+                    ));
+                }
+                if let Some(budgets) = model.thinking_budgets
+                    && (model.adapter != Adapter::Messages
+                        || model.thinking == ThinkingControl::Unsupported
+                        || model.adaptive_by_default
+                        || model.effort_levels.is_empty()
+                        || model
+                            .effort_levels
+                            .iter()
+                            .any(|effort| budgets.for_effort(*effort).is_none())
+                        || [budgets.low, budgets.medium, budgets.high]
+                            .into_iter()
+                            .any(|budget| budget < MIN_THINKING_BUDGET_TOKENS)
+                        || model.max_output_tokens < MIN_THINKING_BUDGET_TOKENS + MIN_ANSWER_TOKENS)
+                {
+                    return Err(format!(
+                        "{location}.thinking_budgets: needs a Messages model with controllable, non-adaptive thinking whose effort levels are low/medium/high, budgets of at least {MIN_THINKING_BUDGET_TOKENS} tokens and room for an answer"
                     ));
                 }
                 if model
@@ -832,6 +884,9 @@ impl ModelPatch {
         if let Some(value) = self.input_modalities {
             model.input_modalities = value;
         }
+        if let Some(value) = self.thinking_budgets {
+            model.thinking_budgets = Some(value);
+        }
     }
 
     fn into_new(self, provider_location: &str) -> Result<ModelCard, String> {
@@ -855,6 +910,7 @@ impl ModelPatch {
             adaptive_by_default: self.adaptive_by_default.unwrap_or(false),
             effort_levels: self.effort_levels.unwrap_or_default(),
             input_modalities: self.input_modalities.unwrap_or_else(text_only),
+            thinking_budgets: self.thinking_budgets,
         })
     }
 }
@@ -1058,6 +1114,7 @@ pub fn migrate_legacy_model(mut config: ModelConfig) -> ModelConfig {
                 adaptive_by_default: false,
                 effort_levels: Vec::new(),
                 input_modalities: config.input_modalities.clone(),
+                thinking_budgets: None,
             });
         card.id = config.model_id.clone();
         card.display_name = config.name.clone();
@@ -1113,6 +1170,7 @@ pub fn model_for_persistent_selection(config: ModelConfig) -> ModelConfig {
         adaptive_by_default: false,
         effort_levels: Vec::new(),
         input_modalities: config.input_modalities.clone(),
+        thinking_budgets: None,
     });
     config
 }

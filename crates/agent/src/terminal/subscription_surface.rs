@@ -265,22 +265,18 @@ impl SubscriptionSurface {
         };
         SubscriptionFrame {
             lines,
-            footer: self.footer(display),
+            footer: self.footer(),
         }
     }
 
-    fn footer(&self, display: DisplayProfile) -> String {
+    fn footer(&self) -> String {
         if let Some(error) = &self.error {
-            return format!("{error} · Esc back");
+            return error.clone();
         }
         match self.focus {
-            SubscriptionFocus::List => format!(
-                "{}{}/j/k/Ctrl+N/P choose · Enter cadence · d cancel · Esc close",
-                display.glyph(Glyph::ScrollUp),
-                display.glyph(Glyph::ScrollDown)
-            ),
+            SubscriptionFocus::List => "d cancel".into(),
             SubscriptionFocus::Cadence => format!(
-                "Every {}s · digits edit · Enter save · Esc back",
+                "Every {}s",
                 if self.cadence_draft.is_empty() {
                     "_"
                 } else {
@@ -288,11 +284,8 @@ impl SubscriptionSurface {
                 }
             ),
             SubscriptionFocus::CancelConfirmation => match self.selected_row() {
-                Some(row) => format!(
-                    "Cancel the subscription to Tick Instance {}? Enter/y confirm · Esc keep it",
-                    row.instance
-                ),
-                None => "Nothing to cancel · Esc back".into(),
+                Some(row) => format!("Cancel the subscription to Tick Instance {}?", row.instance),
+                None => "Nothing to cancel".into(),
             },
         }
     }

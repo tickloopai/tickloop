@@ -30,14 +30,14 @@ pub(super) fn model_choices_with_profiles(
     {
         return profiles;
     }
-    let mut choices = vec![current.clone()];
-    let mut effective_current = current.clone();
-    effective_current.connection = current.connection().cloned();
-    choices.extend(profiles.into_iter().filter(|profile| {
-        let mut effective_profile = profile.clone();
-        effective_profile.connection = profile.connection().cloned();
-        effective_profile != effective_current
-    }));
+    let mut choices = profiles;
+    if let Some(index) = choices.iter().position(|profile| {
+        profile.provider_id == current.provider_id && profile.model_id == current.model_id
+    }) {
+        choices[index] = current.clone();
+    } else {
+        choices.push(current.clone());
+    }
     choices
 }
 
@@ -107,7 +107,7 @@ mod tests {
             let choices = model_choices(&current);
             assert_eq!(choices.len(), built_in_model_profiles().len());
             if tickloop_agent::model::cards::is_default_visible(&current) {
-                assert_eq!(choices[0], current);
+                assert!(choices.contains(&current));
                 assert_eq!(choices.iter().filter(|value| **value == current).count(), 1);
             } else {
                 assert_eq!(choices, built_in_model_profiles());
@@ -138,6 +138,17 @@ mod tests {
     }
 
     #[test]
+    fn current_model_keeps_its_position_and_runtime_overrides() {
+        let profiles = built_in_model_profiles();
+        let mut current = profiles.last().unwrap().clone();
+        current.max_output_tokens += 1;
+        let choices = model_choices_with_profiles(&current, profiles.clone());
+        assert_eq!(choices.len(), profiles.len());
+        assert_eq!(choices[..choices.len() - 1], profiles[..profiles.len() - 1]);
+        assert_eq!(choices.last(), Some(&current));
+    }
+
+    #[test]
     fn custom_profile_preserves_endpoint_credentials_and_limits_without_relabeling() {
         let mut current = built_in_model_profiles().remove(0);
         current.base_url = "https://user:secret@gateway.example/anthropic?token=secret".into();
@@ -148,8 +159,8 @@ mod tests {
         current.card = None;
         let choices = model_choices(&current);
         assert_eq!(choices.len(), built_in_model_profiles().len() + 1);
-        assert_eq!(choices[0], current);
-        assert_eq!(choices[1..], built_in_model_profiles());
+        assert!(choices.contains(&current));
+        assert_eq!(choices[..choices.len() - 1], built_in_model_profiles());
         let label = model_label(&current);
         assert!(label.contains("custom profile"));
         assert!(label.contains("deepseek-flash"));

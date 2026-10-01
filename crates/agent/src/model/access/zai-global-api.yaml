@@ -4,11 +4,14 @@ series:
     name: "GLM"
     version: "5.3"
     model: "glm-5.3"
+    capability_order: 0
   - id: "glm-flash"
     name: "GLM Flash"
     version: "5.3"
     model: "glm-5.3-flash"
+    capability_order: 1
   - id: "glm-flashx"
     name: "GLM FlashX"
     version: "5.3"
     model: "glm-5.3-flashx"
+    capability_order: 2

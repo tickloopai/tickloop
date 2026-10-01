@@ -15,7 +15,7 @@ pub(super) fn auth_error(error: &AuthError) -> ModelError {
             ModelError::Configuration(format!("Codex credential storage failed: {operation}"))
         }
         AuthError::InvalidCredentialFile => ModelError::Configuration(
-            "Codex credential file is invalid or unsafe; use /model → Provider after checking its permissions"
+            "Codex credential file is invalid or unsafe; use /provider after checking its permissions"
                 .into(),
         ),
         AuthError::Network { .. } => ModelError::ConnectionAt {

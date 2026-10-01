@@ -930,15 +930,10 @@ impl EventChart {
         text(
             frame,
             inner.height - 2,
-            "h/l Time · v View · r / [ ] Range · e Event · Enter Detail",
+            "v View · r / [ ] Range · e Event",
             styles.status_base(),
         );
-        text(
-            frame,
-            inner.height - 1,
-            "Esc Back · ? Help · q Quit",
-            styles.status_base(),
-        );
+        text(frame, inner.height - 1, "? Help", styles.status_base());
         if let Some((picker, selected)) = self.picker {
             let labels = match picker {
                 Picker::View => EventChartMode::ALL.map(EventChartMode::label),
@@ -955,10 +950,10 @@ impl EventChart {
                 .collect::<Vec<_>>()
                 .join("\n");
             frame.render_widget(
-                Paragraph::new(format!("{lines}\nEnter Select · Esc Back"))
+                Paragraph::new(lines)
                     .block(
                         Block::default()
-                            .title("j/k · Ctrl+N/P")
+                            .title("Events")
                             .borders(Borders::ALL)
                             .border_style(styles.border),
                     )
@@ -970,7 +965,7 @@ impl EventChart {
         {
             let popup = centered(area, 70, 10);
             frame.render_widget(Clear, popup);
-            frame.render_widget(Paragraph::new(format!("{}\nOpen {}   High {}\nLow {}   Close {}\nVolume {}  Turnover {}\nConference: {}\n{}\nEsc Back", format_instant(candle.timestamp), candle.open,candle.high,candle.low,candle.close,candle.volume,candle.turnover,self.config.conference_at.as_deref().unwrap_or("unknown"),data.map_or("",|data|data.window.session_boundary_note))).block(Block::default().title("Candle / event detail").borders(Borders::ALL).border_style(styles.border)).style(styles.overlay_base()), popup);
+            frame.render_widget(Paragraph::new(format!("{}\nOpen {}   High {}\nLow {}   Close {}\nVolume {}  Turnover {}\nConference: {}\n{}", format_instant(candle.timestamp), candle.open,candle.high,candle.low,candle.close,candle.volume,candle.turnover,self.config.conference_at.as_deref().unwrap_or("unknown"),data.map_or("",|data|data.window.session_boundary_note))).block(Block::default().title("Candle / event detail").borders(Borders::ALL).border_style(styles.border)).style(styles.overlay_base()), popup);
         }
     }
 
@@ -1483,7 +1478,7 @@ impl EventEditor {
                 ));
             }
         }
-        let help = "Date: exchange-local YYYY-MM-DD\nSession: pre_market / after_hours / during_market / closed / unknown\nActual times: RFC3339 with offset, or blank if unknown\nTab Next field · Enter Apply · Esc Normal / Back";
+        let help = "Date: exchange-local YYYY-MM-DD\nSession: pre_market / after_hours / during_market / closed / unknown\nActual times: RFC3339 with offset, or blank if unknown";
         frame.render_widget(
             Paragraph::new(help).style(styles.muted_text),
             ratatui::layout::Rect::new(

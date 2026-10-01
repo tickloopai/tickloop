@@ -5,7 +5,9 @@ series:
     name: "MiniMax"
     version: "M3"
     model: "MiniMax-M3"
+    capability_order: 0
   - id: "minimax-flash-preview"
     name: "MiniMax Flash Preview"
     version: "M3.1"
     model: "MiniMax-M3.1-Flash-Preview"
+    capability_order: 1

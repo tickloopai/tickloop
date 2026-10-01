@@ -8,13 +8,17 @@ use serde_json::{Value, json};
 use tickloop_agent::{
     auth::copilot::CopilotAuth,
     image::ImageMediaType,
+    model::copilot::CLIENT_HEADERS,
     model::{
         Content, ImageSource, InputModality, Message, ModelAuthSource, ModelConfig, ModelError,
         ModelFailureKind, ModelOutput, ModelRequest, ModelResponseRejection, Protocol,
         ReasoningEffort, Role, ToolDefinition,
         access::AccessCatalog,
         availability::{AccountModelDiscovery, ModelAvailability},
-        cards::{Adapter, ModelCatalog, ProviderPatch, ThinkingControl, built_in_model_profiles},
+        cards::{
+            Adapter, ModelCatalog, ProviderPatch, ThinkingBudgets, ThinkingControl,
+            built_in_model_profiles,
+        },
         connection::{ModelDiscovery, ProductKind},
         model_client, validate_reasoning_effort,
     },
@@ -29,7 +33,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 const PROVIDER: &str = "github-copilot";
-const ENDPOINT: &str = "https://api.githubcopilot.com";
+const ENDPOINT: &str = "https://api.individual.githubcopilot.com";
 
 #[test]
 fn copilot_connection_binds_one_recommended_card_per_series() {
@@ -126,14 +130,38 @@ fn copilot_connection_binds_one_recommended_card_per_series() {
             Adapter::Messages | Adapter::Responses
         ));
         let card = profile.card.as_ref().unwrap();
-        assert_eq!(card.context_window_tokens, None);
+        let gpt = profile.adapter() == Adapter::Responses;
+        assert_eq!(
+            card.context_window_tokens,
+            gpt.then_some(272_000),
+            "{}",
+            profile.model
+        );
+        assert_eq!(card.max_output_tokens, if gpt { 128_000 } else { 32_000 });
         assert!(!profile.accepts_images());
         let thinking = match (profile.adapter(), profile.model.as_str()) {
             (Adapter::Responses, _) | (_, "claude-fable-5.1") => ThinkingControl::AlwaysOn,
-            (_, "claude-haiku-4.5") => ThinkingControl::Unsupported,
             _ => ThinkingControl::Toggle,
         };
         assert_eq!(card.thinking, thinking, "{}", profile.model);
+        let haiku = profile.model == "claude-haiku-4.5";
+        assert_eq!(
+            card.thinking_budgets,
+            haiku.then_some(ThinkingBudgets {
+                low: 2048,
+                medium: 8192,
+                high: 16384
+            })
+        );
+        let mut levels = vec![
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+        ];
+        if !haiku {
+            levels.extend([ReasoningEffort::Xhigh, ReasoningEffort::Max]);
+        }
+        assert_eq!(card.effort_levels, levels, "{}", profile.model);
         if card.thinking == ThinkingControl::AlwaysOn {
             assert!(validate_reasoning_effort(profile, Some(ReasoningEffort::Off)).is_err());
         }
@@ -144,7 +172,7 @@ fn copilot_connection_binds_one_recommended_card_per_series() {
     assert_eq!(connection.discovery, ModelDiscovery::GithubCopilot);
     assert_eq!(
         connection.label(ENDPOINT),
-        "Copilot subscription (api.githubcopilot.com)"
+        "Copilot subscription (api.individual.githubcopilot.com)"
     );
     assert!(access.notice.as_deref().unwrap().contains("Fable"));
 }
@@ -185,20 +213,26 @@ api_key_env: "GITHUB_TOKEN"
     assert!(patched(api_key_on_copilot).is_err());
 }
 
+const COPILOT_SESSION_TOKEN: &str = "tid=test;exp=4102444800;sku=copilot_pro";
+
 fn issuer_reply(index: usize) -> serde_json::Value {
-    if index == 0 {
-        json!({"device_code":"device","user_code":"ABCD-1234","verification_uri":"https://github.com/login/device","expires_in":900,"interval":0})
-    } else {
-        json!({"access_token":"test-copilot-user-token","token_type":"bearer","expires_in":28800,"refresh_token":"test-copilot-refresh","refresh_token_expires_in":15897600})
+    match index {
+        0 => {
+            json!({"device_code":"device","user_code":"ABCD-1234","verification_uri":"https://github.com/login/device","expires_in":900,"interval":0})
+        }
+        1 => json!({"access_token":"test-github-user-token","token_type":"bearer"}),
+        // No `proxy-ep`, so requests keep the configured (loopback) base URL.
+        _ => json!({"token":COPILOT_SESSION_TOKEN,"expires_at":4102444800u64}),
     }
 }
 
-/// Signs in through a loopback GitHub issuer so the real client reads saved credentials.
+/// Signs in and exchanges the Copilot token through a loopback GitHub issuer, so the real
+/// client reads the saved session without further sign-in traffic.
 async fn sign_in(root: &Path) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
     let issuer = tokio::spawn(async move {
-        for index in 0..2 {
+        for index in 0..3 {
             let (socket, _) = listener.accept().await.unwrap();
             let mut reader = BufReader::new(socket);
             let mut headers = String::new();
@@ -212,7 +246,7 @@ async fn sign_in(root: &Path) {
                     key.eq_ignore_ascii_case("content-length")
                         .then(|| value.trim().parse::<usize>().unwrap())
                 })
-                .unwrap();
+                .unwrap_or(0);
             let mut bytes = vec![0; length];
             reader.read_exact(&mut bytes).await.unwrap();
             let body = issuer_reply(index).to_string();
@@ -223,6 +257,7 @@ async fn sign_in(root: &Path) {
     let cancel = CancellationToken::new();
     let login = auth.start_device_login(&cancel).await.unwrap();
     auth.finish_device_login(login, &cancel).await.unwrap();
+    auth.resolve_access(&cancel).await.unwrap();
     issuer.await.unwrap();
 }
 
@@ -281,6 +316,67 @@ fn messages_reply(text: &str) -> String {
     .concat()
 }
 
+/// Copilot gives the response and each item a new opaque id on every event, as observed on
+/// 2026-10-01.
+fn rotating_responses_reply(output: Vec<Value>) -> String {
+    let mut frames = Vec::new();
+    let mut sequence = 0;
+    let mut event = |kind: &str, mut body: Value| {
+        body["type"] = json!(kind);
+        body["sequence_number"] = json!(sequence);
+        sequence += 1;
+        frames.push(format!("event: {kind}\ndata: {body}\n\n"));
+    };
+    let rotated = |item: &Value, turn: &str| {
+        let mut item = item.clone();
+        item["id"] = json!(format!("opaque-{turn}"));
+        if item["type"] == "reasoning" {
+            item["encrypted_content"] = json!(format!("sealed-{turn}"));
+        }
+        item
+    };
+    event(
+        "response.created",
+        json!({"response":{"id":"resp-opaque-created","status":"in_progress"}}),
+    );
+    let mut completed = Vec::new();
+    for (index, item) in output.iter().enumerate() {
+        let mut initial = rotated(item, &format!("{index}-added"));
+        if item["type"] == "message" {
+            initial["content"] = json!([]);
+        }
+        if item["type"] == "function_call" {
+            initial["arguments"] = json!("");
+        }
+        event(
+            "response.output_item.added",
+            json!({"output_index":index,"item":initial}),
+        );
+        if item["type"] == "message" {
+            event(
+                "response.output_text.delta",
+                json!({"output_index":index,"item_id":format!("opaque-{index}-delta"),"content_index":0,"delta":item["content"][0]["text"]}),
+            );
+        }
+        if item["type"] == "function_call" {
+            event(
+                "response.function_call_arguments.delta",
+                json!({"output_index":index,"item_id":format!("opaque-{index}-arguments"),"delta":item["arguments"]}),
+            );
+        }
+        event(
+            "response.output_item.done",
+            json!({"output_index":index,"item":rotated(item, &format!("{index}-done"))}),
+        );
+        completed.push(rotated(item, &format!("{index}-completed")));
+    }
+    event(
+        "response.completed",
+        json!({"response":{"id":"resp-opaque-completed","status":"completed","output":completed,"usage":{"input_tokens":900,"output_tokens":12,"input_tokens_details":{"cached_tokens":600}}}}),
+    );
+    frames.concat()
+}
+
 fn responses_reply(output: Vec<Value>) -> String {
     let mut frames = Vec::new();
     let mut sequence = 0;
@@ -328,7 +424,7 @@ async fn complete(
 }
 
 #[tokio::test]
-async fn claude_requests_use_the_github_bearer_and_honest_copilot_identity() {
+async fn claude_requests_use_the_copilot_token_and_client_identity() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().canonicalize().unwrap();
     sign_in(&root).await;
@@ -349,15 +445,18 @@ async fn claude_requests_use_the_github_bearer_and_honest_copilot_identity() {
     let (raw, body) = captured.recv().await.unwrap();
     assert_eq!(request_line(&raw), "POST /v1/messages HTTP/1.1");
     let headers = header_map(&raw);
-    assert_eq!(headers["authorization"], "Bearer test-copilot-user-token");
+    assert_eq!(
+        headers["authorization"],
+        format!("Bearer {COPILOT_SESSION_TOKEN}")
+    );
     assert!(!headers.contains_key("x-api-key"));
-    assert!(headers["user-agent"].starts_with("tickloop-agent/"));
+    for (name, value) in CLIENT_HEADERS {
+        assert_eq!(headers[name], value, "{name}");
+    }
     assert_eq!(headers["openai-intent"], "conversation-edits");
-    assert_eq!(headers["x-github-api-version"], "2026-06-01");
+    assert!(!headers.contains_key("x-github-api-version"));
     assert_eq!(headers["x-initiator"], "user");
     assert!(!headers.contains_key("copilot-vision-request"));
-    assert!(!headers.contains_key("editor-version"));
-    assert!(!headers.contains_key("copilot-integration-id"));
     assert_eq!(body["model"], "claude-sonnet-5.5");
     assert_eq!(body["thinking"], json!({"type":"adaptive"}));
     assert_eq!(body["output_config"]["effort"], "medium");
@@ -418,7 +517,10 @@ async fn gpt_requests_use_responses_without_replaying_connection_bound_reasoning
     let (raw, body) = captured.recv().await.unwrap();
     assert_eq!(request_line(&raw), "POST /responses HTTP/1.1");
     let headers = header_map(&raw);
-    assert_eq!(headers["authorization"], "Bearer test-copilot-user-token");
+    assert_eq!(
+        headers["authorization"],
+        format!("Bearer {COPILOT_SESSION_TOKEN}")
+    );
     assert_eq!(headers["x-initiator"], "user");
     assert_eq!(body["store"], false);
     assert_eq!(body["reasoning"]["effort"], "high");
@@ -556,8 +658,12 @@ async fn account_directory_reports_listed_disabled_unconfigured_and_absent_model
     let raw = captured.await.unwrap();
     assert_eq!(request_line(&raw), "GET /models HTTP/1.1");
     let headers = header_map(&raw);
-    assert_eq!(headers["authorization"], "Bearer test-copilot-user-token");
+    assert_eq!(
+        headers["authorization"],
+        format!("Bearer {COPILOT_SESSION_TOKEN}")
+    );
     assert_eq!(headers["x-github-api-version"], "2026-06-01");
+    assert_eq!(headers["copilot-integration-id"], "vscode-chat");
     assert_eq!(
         found.availability("claude-sonnet-5.5"),
         ModelAvailability::DirectoryListed
@@ -745,6 +851,10 @@ async fn revoked_sign_in_and_entitlement_refusals_are_not_retried_as_service_err
             403,
             json!({"error":{"message":"model not enabled for this plan"}}).to_string(),
         ),
+        (
+            400,
+            json!({"error":{"message":"The requested model is not supported.","code":"model_not_supported"}}).to_string(),
+        ),
     ])
     .await;
     let config = configured("claude-opus-5.5", &endpoint);
@@ -756,10 +866,205 @@ async fn revoked_sign_in_and_entitlement_refusals_are_not_retried_as_service_err
         "{revoked:?}"
     );
     assert_eq!(revoked.kind(), ModelFailureKind::AuthenticationFailed);
-    let refused = complete(config, &root, request(vec![user("Hi")], None))
+    let refused = complete(config.clone(), &root, request(vec![user("Hi")], None))
         .await
         .unwrap_err();
     assert_eq!(refused.kind(), ModelFailureKind::EntitlementDenied);
     assert!(!refused.retry_hint().0);
     assert!(!refused.to_string().contains("model not enabled"));
+    let not_enabled = complete(config, &root, request(vec![user("Hi")], None))
+        .await
+        .unwrap_err();
+    assert_eq!(not_enabled.kind(), ModelFailureKind::EntitlementDenied);
+    assert!(!not_enabled.retry_hint().0);
+    assert!(
+        not_enabled
+            .to_string()
+            .contains("plan, organization policy or client")
+    );
+}
+
+#[tokio::test]
+async fn copilot_responses_streams_with_rotating_item_ids_are_matched_by_position() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    sign_in(&root).await;
+    let (endpoint, _) = serve_responses(vec![(
+        200,
+        rotating_responses_reply(vec![
+            json!({"type":"reasoning","summary":[]}),
+            json!({"type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Calling Echo"}]}),
+            json!({"type":"function_call","call_id":"call_echo","name":"Echo","arguments":"{\"text\":\"hi\"}","status":"completed"}),
+        ]),
+    )])
+    .await;
+    let output = complete(
+        configured("gpt-6-luna", &endpoint),
+        &root,
+        request(vec![user("Use Echo")], None),
+    )
+    .await
+    .unwrap();
+    assert!(
+        output
+            .content
+            .iter()
+            .any(|block| matches!(block, Content::Text { text } if text == "Calling Echo"))
+    );
+    assert!(output.content.iter().any(|block| matches!(
+        block,
+        Content::ToolUse { id, name, input } if id == "call_echo" && name == "Echo" && input["text"] == "hi"
+    )));
+}
+
+/// Shaped like Herdr's ModifyTick: each action is a top-level `oneOf` variant.
+fn variant_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "ModifyTick".into(),
+        description: "Open, move, send input or close.".into(),
+        input_schema: json!({"type":"object","oneOf":[
+            {"type":"object","properties":{"action":{"const":"open"},"command":{"type":"array","items":{"type":"string"}},"placement":{"type":"object","oneOf":[{"type":"object","properties":{"type":{"const":"new_tab"}}}]}},"required":["action","command"],"additionalProperties":false},
+            {"type":"object","properties":{"action":{"const":"move"},"tick_instance_id":{"type":"string"}},"required":["action","tick_instance_id"],"additionalProperties":false},
+            {"type":"object","properties":{"tick_instance_id":{"type":"string"},"action":{"type":"string","enum":["send_input","close"]},"text":{"type":"string"}},"required":["tick_instance_id","action"],"additionalProperties":false}
+        ]}),
+    }
+}
+
+#[tokio::test]
+async fn messages_flattens_top_level_schema_variants_that_anthropic_rejects() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    sign_in(&root).await;
+    let (claude_url, mut claude_requests) =
+        serve_responses(vec![(200, messages_reply("ok"))]).await;
+    let (gpt_url, mut gpt_requests) = serve_responses(vec![(
+        200,
+        responses_reply(vec![json!({"type":"message","id":"msg","role":"assistant","status":"completed","content":[{"type":"output_text","text":"ok"}]})]),
+    )])
+    .await;
+    let mut with_variants = request(vec![user("Hi")], None);
+    with_variants.tools = vec![variant_tool()];
+    complete(
+        configured("claude-haiku-4.5", &claude_url),
+        &root,
+        with_variants.clone(),
+    )
+    .await
+    .unwrap();
+    complete(configured("gpt-6-luna", &gpt_url), &root, with_variants)
+        .await
+        .unwrap();
+    let (_, claude) = claude_requests.recv().await.unwrap();
+    assert_eq!(
+        claude["tools"][0]["input_schema"],
+        json!({
+            "type":"object",
+            "properties":{
+                "action":{"type":"string","enum":["open","move","send_input","close"]},
+                "command":{"type":"array","items":{"type":"string"}},
+                "placement":{"type":"object","oneOf":[{"type":"object","properties":{"type":{"const":"new_tab"}}}]},
+                "tick_instance_id":{"type":"string"},
+                "text":{"type":"string"}
+            },
+            "required":["action"],
+            "additionalProperties":false
+        })
+    );
+    let (_, gpt) = gpt_requests.recv().await.unwrap();
+    assert_eq!(gpt["tools"][0]["parameters"], variant_tool().input_schema);
+}
+
+#[tokio::test]
+async fn budget_thinking_sends_budget_tokens_and_drops_temperature_while_thinking() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    sign_in(&root).await;
+    let (endpoint, mut captured) = serve_responses(vec![
+        (200, messages_reply("high")),
+        (200, messages_reply("off")),
+        (200, messages_reply("review")),
+    ])
+    .await;
+    let mut high = request(vec![user("Hi")], Some(ReasoningEffort::High));
+    high.temperature = Some(0.0);
+    complete(configured("claude-haiku-4.5", &endpoint), &root, high)
+        .await
+        .unwrap();
+    let (_, body) = captured.recv().await.unwrap();
+    assert_eq!(
+        body["thinking"],
+        json!({"type":"enabled","budget_tokens":16384})
+    );
+    assert!(body.get("output_config").is_none());
+    assert!(body.get("temperature").is_none());
+    assert_eq!(body["max_tokens"], 32000);
+
+    let mut off = request(vec![user("Hi")], Some(ReasoningEffort::Off));
+    off.temperature = Some(0.0);
+    complete(configured("claude-haiku-4.5", &endpoint), &root, off)
+        .await
+        .unwrap();
+    let (_, body) = captured.recv().await.unwrap();
+    assert_eq!(body["thinking"], json!({"type":"disabled"}));
+    assert_eq!(body["temperature"], 0.0);
+
+    // An auto-approval review asks for temperature 0 with the model's default thinking.
+    let mut review = request(vec![user("Review")], None);
+    review.temperature = Some(0.0);
+    complete(configured("claude-sonnet-5.5", &endpoint), &root, review)
+        .await
+        .unwrap();
+    let (_, body) = captured.recv().await.unwrap();
+    assert_eq!(body["thinking"], json!({"type":"adaptive"}));
+    assert!(body.get("temperature").is_none());
+}
+
+#[tokio::test]
+async fn budget_is_capped_to_leave_room_for_the_answer() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    sign_in(&root).await;
+    let (endpoint, mut captured) = serve_responses(vec![(200, messages_reply("ok"))]).await;
+    let mut config = configured("claude-haiku-4.5", &endpoint);
+    config.max_output_tokens = 8192;
+    config.card.as_mut().unwrap().max_output_tokens = 8192;
+    complete(
+        config,
+        &root,
+        request(vec![user("Hi")], Some(ReasoningEffort::High)),
+    )
+    .await
+    .unwrap();
+    let (_, body) = captured.recv().await.unwrap();
+    assert_eq!(body["thinking"]["budget_tokens"], 8192 - 1024);
+}
+
+#[test]
+fn thinking_budgets_are_validated_and_survive_provider_patches() {
+    let override_budgets = r#"
+id: "github-copilot"
+models:
+  - id: "claude-haiku-4.5"
+    thinking_budgets: { low: 1024, medium: 4096, high: 12000 }
+"#;
+    let catalog = patched(override_budgets).unwrap();
+    let haiku = catalog.get(PROVIDER, "claude-haiku-4.5").unwrap();
+    assert_eq!(
+        haiku.card.unwrap().thinking_budgets,
+        Some(ThinkingBudgets {
+            low: 1024,
+            medium: 4096,
+            high: 12000
+        })
+    );
+    for invalid in [
+        r#"{ id: "claude-haiku-4.5", thinking_budgets: { low: 512, medium: 4096, high: 12000 } }"#,
+        r#"{ id: "claude-haiku-4.5", effort_levels: ["low", "medium", "high", "max"] }"#,
+        r#"{ id: "claude-sonnet-5.5", thinking_budgets: { low: 2048, medium: 8192, high: 16384 } }"#,
+        r#"{ id: "gpt-6-luna", thinking_budgets: { low: 2048, medium: 8192, high: 16384 } }"#,
+        r#"{ id: "claude-haiku-4.5", thinking: "unsupported", effort_levels: [] }"#,
+    ] {
+        let yaml = format!("id: \"github-copilot\"\nmodels:\n  - {invalid}\n");
+        assert!(patched(&yaml).is_err(), "{invalid}");
+    }
 }

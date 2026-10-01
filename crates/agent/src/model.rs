@@ -546,7 +546,7 @@ pub enum ModelError {
     Authentication,
     #[error("model authentication failed during {stage:?}")]
     AuthenticationAt { stage: ModelRequestStage },
-    #[error("Codex subscription is not logged in; use /model → Provider")]
+    #[error("Codex subscription is not logged in; use /provider")]
     CodexNotLoggedIn,
     #[error("MiniMax is not signed in; select its OAuth Provider in /model")]
     MiniMaxNotLoggedIn,
@@ -1202,6 +1202,7 @@ impl HttpModelClient {
     ) -> Result<ModelOutput, ModelError> {
         let region = crate::auth::minimax::MiniMaxRegion::from_auth(self.config.auth_source);
         let copilot_auth = self.config.auth_source == ModelAuthSource::GithubCopilot;
+        let mut copilot_api_base = None;
         let identity_from_sign_in = region.is_some() || copilot_auth;
         let (key, credential_identity) = if let Some(region) = region {
             let root = self.state_root.as_deref().ok_or_else(|| {
@@ -1245,18 +1246,18 @@ impl HttpModelClient {
                     "GitHub Copilot sign-in requires an Agent state directory".into(),
                 )
             })?;
-            let credentials = crate::auth::copilot::CopilotAuth::new(root)
-                .resolve_credentials_with_refresh_gate(&cancel, || {
+            let access = crate::auth::copilot::CopilotAuth::new(root)
+                .resolve_access_with_refresh_gate(&cancel, || {
                     context.is_none_or(ModelRequestContext::try_begin_attempt)
                 })
                 .await
                 .map_err(copilot::credential_error)?;
-            let mut key = reqwest::header::HeaderValue::from_str(&credentials.access_token)
-                .map_err(|_| {
-                    ModelError::Configuration("invalid GitHub Copilot credential header".into())
-                })?;
+            let mut key = reqwest::header::HeaderValue::from_str(&access.token).map_err(|_| {
+                ModelError::Configuration("invalid GitHub Copilot credential header".into())
+            })?;
             key.set_sensitive(true);
-            (Some(key), Some(credentials.identity.to_string()))
+            copilot_api_base = access.api_base;
+            (Some(key), Some(access.identity.to_string()))
         } else {
             let key = api_key(&self.config, self.state_root.as_deref())?;
             let identity = key
@@ -1305,11 +1306,9 @@ impl HttpModelClient {
                 ));
             }
         };
-        let target = reqwest::Url::parse(&format!(
-            "{}/{endpoint}",
-            self.config.base_url.trim_end_matches('/')
-        ))
-        .map_err(|_| ModelError::Configuration("invalid model endpoint".into()))?;
+        let base_url = copilot_api_base.as_deref().unwrap_or(&self.config.base_url);
+        let target = reqwest::Url::parse(&format!("{}/{endpoint}", base_url.trim_end_matches('/')))
+            .map_err(|_| ModelError::Configuration("invalid model endpoint".into()))?;
         let mut outgoing = self
             .client
             .post(target.clone())
@@ -1386,7 +1385,7 @@ impl HttpModelClient {
             }
             if status == 403 {
                 return Err(if copilot_auth {
-                    copilot::entitlement_denied()
+                    copilot::entitlement_denied(status)
                 } else {
                     ModelError::Http { status }
                 }
@@ -1418,6 +1417,14 @@ impl HttpModelClient {
                 );
             }
             let body = serde_json::from_slice::<Value>(&error_bytes).ok();
+            if copilot_auth
+                && body
+                    .as_ref()
+                    .is_some_and(|body| copilot::is_model_not_enabled(status, body))
+            {
+                return Err(copilot::entitlement_denied(status)
+                    .at_stage(ModelRequestStage::ResponseHeaders));
+            }
             if self.config.adapter() == cards::Adapter::GlmChatCompletions
                 && let Some(error) = glm::http_error(status, body.as_ref())
             {
@@ -1457,6 +1464,7 @@ impl HttpModelClient {
             cancel,
             structured_tool.as_deref(),
             self.config.adapter(),
+            copilot_auth,
         )
         .await?;
         output.private_source = source;
@@ -1519,6 +1527,7 @@ async fn consume_sse_response(
     cancel: CancellationToken,
     structured_tool: Option<&str>,
     adapter: cards::Adapter,
+    rotating_response_item_ids: bool,
 ) -> Result<ModelOutput, ModelError> {
     let codex = adapter == cards::Adapter::CodexResponses;
     let has_event_stream_content_type = response
@@ -1551,6 +1560,8 @@ async fn consume_sse_response(
         }),
         Protocol::Responses => ProtocolStream::Responses(if codex {
             responses::ResponsesStream::for_codex()
+        } else if rotating_response_item_ids {
+            responses::ResponsesStream::with_rotating_item_ids()
         } else {
             responses::ResponsesStream::default()
         }),
@@ -1894,9 +1905,21 @@ fn messages_request(config: &ModelConfig, request: ModelRequest) -> Result<Value
             None => {}
         }
     } else if let Some(effort) = request.reasoning_effort {
-        match effort {
-            ReasoningEffort::Off => body["thinking"] = json!({"type":"disabled"}),
-            _ => {
+        let budget = cards::model_card(config)
+            .and_then(|card| card.thinking_budgets)
+            .and_then(|budgets| budgets.for_effort(effort));
+        match (effort, budget) {
+            (ReasoningEffort::Off, _) => body["thinking"] = json!({"type":"disabled"}),
+            // pi keeps room for the answer inside the shared `max_tokens`.
+            (_, Some(budget)) => {
+                let budget = budget.min(
+                    config
+                        .max_output_tokens
+                        .saturating_sub(cards::MIN_ANSWER_TOKENS),
+                );
+                body["thinking"] = json!({"type":"enabled","budget_tokens":budget});
+            }
+            (_, None) => {
                 body["thinking"] = json!({"type":"adaptive"});
                 body["output_config"] = json!({"effort":effort.label()});
             }
@@ -1904,7 +1927,14 @@ fn messages_request(config: &ModelConfig, request: ModelRequest) -> Result<Value
     } else if cards::model_card(config).is_some_and(|card| card.adaptive_by_default) {
         body["thinking"] = json!({"type":"adaptive"});
     }
-    if let Some(temperature) = request.temperature {
+    // Anthropic rejects a sampling temperature while thinking is on.
+    let thinking_on = matches!(
+        body["thinking"]["type"].as_str(),
+        Some("enabled" | "adaptive")
+    );
+    if let Some(temperature) = request.temperature
+        && !(config.adapter() == cards::Adapter::Messages && thinking_on)
+    {
         body["temperature"] = json!(temperature);
     }
     if !system.is_empty() {
@@ -1954,11 +1984,11 @@ fn messages_request(config: &ModelConfig, request: ModelRequest) -> Result<Value
                 "schema": format.schema
             });
             if !request.tools.is_empty() {
-                body["tools"] = json!(request.tools);
+                body["tools"] = messages_tools(&request.tools);
             }
         }
     } else if !request.tools.is_empty() {
-        body["tools"] = json!(request.tools);
+        body["tools"] = messages_tools(&request.tools);
     }
     Ok(body)
 }
@@ -2005,6 +2035,122 @@ fn normalize_structured_tool_output(
     }];
     output.stop_reason = "end_turn".into();
     Ok(output)
+}
+
+const SCHEMA_COMBINATORS: [&str; 3] = ["oneOf", "anyOf", "allOf"];
+
+fn messages_tools(tools: &[ToolDefinition]) -> Value {
+    json!(
+        tools
+            .iter()
+            .map(|tool| json!({
+                "name": tool.name,
+                "description": tool.description,
+                "input_schema": messages_input_schema(&tool.input_schema),
+            }))
+            .collect::<Vec<_>>()
+    )
+}
+
+/// Anthropic Messages accepts only a plain object at the top of a tool's `input_schema`, so a
+/// top-level `oneOf`/`anyOf`/`allOf` (Herdr's ModifyTick has one variant per action) becomes
+/// one object: properties are merged in order, fixed values of a shared property form one
+/// `enum`, and only properties every alternative requires stay required. The tool still
+/// validates its own arguments, and other protocols receive the original schema.
+fn messages_input_schema(schema: &Value) -> Value {
+    let Some(object) = schema.as_object() else {
+        return schema.clone();
+    };
+    if !SCHEMA_COMBINATORS
+        .iter()
+        .any(|keyword| object.contains_key(*keyword))
+    {
+        return schema.clone();
+    }
+    let mut merged = object.clone();
+    let mut properties = match merged.remove("properties") {
+        Some(Value::Object(properties)) => properties,
+        _ => serde_json::Map::new(),
+    };
+    let mut required = merged
+        .remove("required")
+        .and_then(|required| required.as_array().cloned())
+        .unwrap_or_default();
+    let mut required_by_every_alternative: Option<Vec<Value>> = None;
+    let mut every_variant_closed = true;
+    for keyword in SCHEMA_COMBINATORS {
+        let Some(Value::Array(variants)) = merged.remove(keyword) else {
+            continue;
+        };
+        for variant in variants {
+            for (name, property) in variant["properties"].as_object().into_iter().flatten() {
+                merge_schema_property(&mut properties, name, property);
+            }
+            let variant_required = variant["required"].as_array().cloned().unwrap_or_default();
+            if keyword == "allOf" {
+                required.extend(variant_required);
+            } else {
+                required_by_every_alternative = Some(match required_by_every_alternative {
+                    None => variant_required,
+                    Some(previous) => previous
+                        .into_iter()
+                        .filter(|name| variant_required.contains(name))
+                        .collect(),
+                });
+            }
+            every_variant_closed &= variant["additionalProperties"] == false;
+        }
+    }
+    required.extend(required_by_every_alternative.unwrap_or_default());
+    let mut unique_required = Vec::new();
+    for name in required {
+        if !unique_required.contains(&name) {
+            unique_required.push(name);
+        }
+    }
+    merged.insert("type".into(), json!("object"));
+    merged.insert("properties".into(), Value::Object(properties));
+    if unique_required.is_empty() {
+        merged.remove("required");
+    } else {
+        merged.insert("required".into(), Value::Array(unique_required));
+    }
+    if every_variant_closed && !merged.contains_key("additionalProperties") {
+        merged.insert("additionalProperties".into(), json!(false));
+    }
+    Value::Object(merged)
+}
+
+fn merge_schema_property(
+    properties: &mut serde_json::Map<String, Value>,
+    name: &str,
+    incoming: &Value,
+) {
+    let fixed_values = |property: &Value| {
+        property
+            .get("const")
+            .map(|value| vec![value.clone()])
+            .or_else(|| property["enum"].as_array().cloned())
+    };
+    let Some(existing) = properties.get_mut(name) else {
+        properties.insert(name.into(), incoming.clone());
+        return;
+    };
+    let (Some(mut values), Some(added)) = (fixed_values(existing), fixed_values(incoming)) else {
+        return;
+    };
+    for value in added {
+        if !values.contains(&value) {
+            values.push(value);
+        }
+    }
+    if let Some(property) = existing.as_object_mut() {
+        property.remove("const");
+        property.insert("enum".into(), Value::Array(values));
+        if let Some(kind) = incoming.get("type") {
+            property.entry("type").or_insert_with(|| kind.clone());
+        }
+    }
 }
 
 fn messages_content(content: &Content) -> Value {

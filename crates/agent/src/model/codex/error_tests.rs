@@ -20,7 +20,7 @@ use tokio_tungstenite::{
 use super::*;
 use crate::model::ModelFailureKind;
 use crate::{
-    model::cards::built_in_model_profiles,
+    model::cards::ModelCatalog,
     permissions::{Decision, ExecutionMode},
     runtime::{Agent, EventKind},
 };
@@ -213,7 +213,8 @@ async fn serve(replies: Vec<Reply>) -> (String, Arc<AtomicUsize>, tokio::task::J
 }
 
 fn client(state_dir: &Path, endpoint: &str) -> CodexModelClient {
-    let config = built_in_model_profiles()
+    let config = ModelCatalog::defaults()
+        .profiles()
         .into_iter()
         .find(|profile| {
             profile.model == "gpt-5.5" && profile.provider == ModelProvider::OpenAiCodex
@@ -584,7 +585,7 @@ async fn auto_review_refreshes_login_and_denies_after_websocket_output_breaks() 
             .is_ok()
     });
 
-    let profiles = built_in_model_profiles();
+    let profiles = ModelCatalog::defaults().profiles();
     let main_config = profiles
         .iter()
         .find(|profile| {

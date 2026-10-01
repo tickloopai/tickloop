@@ -17,7 +17,7 @@ use super::{
     },
 };
 use crate::{
-    model::{Content, HttpModelClient, ModelClient, ModelConfig, cards::built_in_model_profiles},
+    model::{Content, HttpModelClient, ModelClient, ModelConfig, cards::ModelCatalog},
     permissions::ExecutionMode,
     runtime::{
         Agent, BranchRequest, Event, EventKind, LoopState, RequestKind, RewindMode, Trigger,
@@ -26,9 +26,8 @@ use crate::{
 };
 
 fn config() -> ModelConfig {
-    built_in_model_profiles()
-        .into_iter()
-        .find(|config| config.model == "gpt-5.5")
+    ModelCatalog::defaults()
+        .get("openai-codex", "gpt-5.5")
         .unwrap()
 }
 
@@ -117,7 +116,7 @@ async fn triggered_request_after_logout(interval_seconds: Option<u64>) {
                 .unwrap()
                 .kind
         {
-            assert!(error.contains("/model → Provider"), "{error}");
+            assert!(error.contains("/provider"), "{error}");
             break;
         }
     }

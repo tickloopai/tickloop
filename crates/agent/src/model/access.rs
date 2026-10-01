@@ -35,6 +35,12 @@ pub struct SeriesBinding {
     pub version: String,
     /// Model Card `id` in the same Provider.
     pub model: String,
+    /// Keeps model families adjacent before ordering their capability tiers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub family_order: Option<u16>,
+    /// Maintained capability order for selection; lower values appear first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_order: Option<u16>,
 }
 
 impl SeriesBinding {
@@ -200,6 +206,10 @@ impl AccessCatalog {
                     .get(&profile.provider_id, &profile.model_id)
                     .is_none(),
         )
+    }
+
+    pub fn capability_order(&self, profile: &ModelConfig) -> Option<u16> {
+        self.series_for(profile)?.capability_order
     }
 
     pub fn series_position(&self, profile: &ModelConfig) -> Option<usize> {

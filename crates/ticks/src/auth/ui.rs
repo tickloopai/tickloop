@@ -211,11 +211,11 @@ fn render(frame: &mut Frame<'_>, settings: &Settings, screen: Screen<'_>) {
     if area.width < MINIMUM_COLUMNS || area.height < MINIMUM_ROWS {
         let message = match settings.language {
             Language::ZhCn => format!(
-                "连接 Longbridge\n\n需要 {}×{}\n当前 {}×{}\n\n请扩大 Panel · q 退出",
+                "连接 Longbridge\n\n需要 {}×{}\n当前 {}×{}\n\n请扩大 Panel",
                 MINIMUM_COLUMNS, MINIMUM_ROWS, area.width, area.height
             ),
             Language::En => format!(
-                "Connect Longbridge\n\nNeed {}x{}\nCurrent {}x{}\n\nResize panel · q quit",
+                "Connect Longbridge\n\nNeed {}x{}\nCurrent {}x{}\n\nResize panel",
                 MINIMUM_COLUMNS, MINIMUM_ROWS, area.width, area.height
             ),
         };
@@ -269,12 +269,12 @@ fn render_signed_in(
         Language::ZhCn => (
             "已登录 Longbridge".to_owned(),
             format!("接入区域 {} · 有效期至 {expires}", region.as_str()),
-            "Enter 继续    r 重新授权    q 退出",
+            "r 重新授权",
         ),
         Language::En => (
             "Signed in to Longbridge".to_owned(),
             format!("Region {} · valid until {expires}", region.as_str()),
-            "Enter continue    r sign in again    q quit",
+            "r sign in again",
         ),
     };
     let text = Text::from(vec![
@@ -294,16 +294,10 @@ fn render_signed_in(
 
 fn render_region(frame: &mut Frame<'_>, area: Rect, settings: &Settings, selected: Region) {
     let styles = settings.styles();
-    let (heading, hint, cn_description, global_description) = match settings.language {
-        Language::ZhCn => (
-            "选择接入区域",
-            "↑↓ / j k 选择    Enter 确认    q 退出",
-            "中国大陆网络",
-            "全球网络",
-        ),
+    let (heading, cn_description, global_description) = match settings.language {
+        Language::ZhCn => ("选择接入区域", "中国大陆网络", "全球网络"),
         Language::En => (
             "Choose access region",
-            "↑↓ / j k select    Enter confirm    q quit",
             "Mainland China network",
             "Global network",
         ),
@@ -341,7 +335,6 @@ fn render_region(frame: &mut Frame<'_>, area: Rect, settings: &Settings, selecte
         Paragraph::new(text).style(styles.overlay_base()),
         body_area(area),
     );
-    render_footer(frame, area, settings, hint);
 }
 
 fn render_starting(frame: &mut Frame<'_>, area: Rect, settings: &Settings, region: Region) {
@@ -358,15 +351,6 @@ fn render_starting(frame: &mut Frame<'_>, area: Rect, settings: &Settings, regio
         Paragraph::new(message).style(styles.overlay_base().patch(styles.muted_text)),
         body_area(area),
     );
-    render_footer(
-        frame,
-        area,
-        settings,
-        match settings.language {
-            Language::ZhCn => "q 取消",
-            Language::En => "q cancel",
-        },
-    );
 }
 
 fn render_waiting(
@@ -377,12 +361,11 @@ fn render_waiting(
     status: &str,
 ) {
     let styles = settings.styles();
-    let (open, confirm, footer) = match settings.language {
-        Language::ZhCn => ("1  在浏览器中打开", "2  核对设备码并批准", "q 取消"),
+    let (open, confirm) = match settings.language {
+        Language::ZhCn => ("1  在浏览器中打开", "2  核对设备码并批准"),
         Language::En => (
             "1  Open in your browser",
             "2  Confirm and approve this code",
-            "q cancel",
         ),
     };
     let remaining = login.remaining().as_secs();
@@ -406,7 +389,6 @@ fn render_waiting(
             .wrap(Wrap { trim: false }),
         body_area(area),
     );
-    render_footer(frame, area, settings, footer);
 }
 
 fn render_authorized(frame: &mut Frame<'_>, area: Rect, settings: &Settings) {
@@ -429,20 +411,12 @@ fn render_authorized(frame: &mut Frame<'_>, area: Rect, settings: &Settings) {
     );
 }
 
-fn render_footer(frame: &mut Frame<'_>, area: Rect, settings: &Settings, text: &str) {
-    let styles = settings.styles();
-    frame.render_widget(
-        Paragraph::new(text).style(styles.status_base().patch(styles.muted_text)),
-        Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1),
-    );
-}
-
 fn body_area(area: Rect) -> Rect {
     Rect::new(
         area.x,
         area.y + 1,
         area.width,
-        area.height.saturating_sub(3),
+        area.height.saturating_sub(2),
     )
 }
 

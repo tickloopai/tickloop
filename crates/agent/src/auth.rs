@@ -48,9 +48,9 @@ const CALLBACK_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CALLBACK_REQUEST_BYTES: usize = 8 * 1024;
 const CALLBACK_PATH: &str = "/auth/callback";
 const BROWSER_SCOPE: &str = "openid profile email offline_access";
-const INVALID_CALLBACK_REQUEST: &str = "Could not read the browser callback. Return to the current sign-in flow or start again from /model → Provider.";
-const INVALID_CALLBACK_URL: &str = "Callback URL is invalid or missing an authorization code. If this browser tab is old, start again from /model → Provider.";
-const CALLBACK_STATE_MISMATCH: &str = "This callback belongs to a different sign-in flow. Return to the current browser tab or start again from /model → Provider.";
+const INVALID_CALLBACK_REQUEST: &str = "Could not read the browser callback. Return to the current sign-in flow or start again from /provider.";
+const INVALID_CALLBACK_URL: &str = "Callback URL is invalid or missing an authorization code. If this browser tab is old, start again from /provider.";
+const CALLBACK_STATE_MISMATCH: &str = "This callback belongs to a different sign-in flow. Return to the current browser tab or start again from /provider.";
 
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {
@@ -60,17 +60,17 @@ pub enum AuthError {
     Copilot(String),
     #[error("OpenAI Codex login was cancelled")]
     Cancelled,
-    #[error("OpenAI Codex authorization timed out; retry from /model → Provider")]
+    #[error("OpenAI Codex authorization timed out; retry from /provider")]
     TimedOut,
-    #[error("OpenAI Codex is not logged in; use /model → Provider")]
+    #[error("OpenAI Codex is not logged in; use /provider")]
     NotLoggedIn,
     #[error(
-        "OpenAI Codex device login is unavailable on this server; choose browser sign-in from /model → Provider"
+        "OpenAI Codex device login is unavailable on this server; choose browser sign-in from /provider"
     )]
     DeviceUnavailable,
     #[error("OpenAI Codex authorization was denied")]
     AuthorizationDenied,
-    #[error("OpenAI Codex authorization expired; retry from /model → Provider")]
+    #[error("OpenAI Codex authorization expired; retry from /provider")]
     AuthorizationExpired,
     #[error("OpenAI Codex OAuth {operation} failed with HTTP {status}")]
     HttpStatus {
@@ -107,12 +107,12 @@ pub enum AuthError {
     )]
     InvalidCallback,
     #[error(
-        "OpenAI Codex browser callback belongs to a different sign-in flow; use the current Provider browser tab or restart from /model → Provider"
+        "OpenAI Codex browser callback belongs to a different sign-in flow; use the current Provider browser tab or restart from /provider"
     )]
     StateMismatch,
     #[error("OpenAI Codex browser login has ended")]
     BrowserLoginEnded,
-    #[error("OpenAI Codex browser authorization failed; retry from /model → Provider")]
+    #[error("OpenAI Codex browser authorization failed; retry from /provider")]
     BrowserAuthorizationFailed,
 }
 

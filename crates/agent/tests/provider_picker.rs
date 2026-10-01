@@ -58,6 +58,16 @@ impl Terminal {
         command.env_remove("DEEPSEEK_API_KEY");
         command.env_remove("TYPESAFE_API_KEY");
         command.env_remove("TMUX");
+        for name in ["HERDR_ENV", "HERDR_PANE_ID", "HERDR_SOCKET_PATH"] {
+            command.env_remove(name);
+        }
+        for model in tickloop_agent::model::cards::built_in_model_profiles() {
+            if !model.api_key_env.is_empty() {
+                command.env_remove(model.api_key_env);
+            }
+        }
+        command.env("NO_PROXY", "127.0.0.1,localhost");
+        command.env("no_proxy", "127.0.0.1,localhost");
         let child = pty.slave.spawn_command(command).unwrap();
         drop(pty.slave);
         let mut reader = pty.master.try_clone_reader().unwrap();
@@ -120,12 +130,20 @@ impl Terminal {
             thread::sleep(Duration::from_millis(10));
         }
         let output = self.output.lock().unwrap();
-        let last_frame = latest_frame(&output).map(strip_ansi).unwrap_or_default();
+        let last_frame = screen::visible_screen(&output, 120, 38);
         panic!("terminal did not show expected {label} frame; latest:\n{last_frame}");
     }
 
     fn visible_output(&self) -> String {
         strip_ansi(&self.output.lock().unwrap())
+    }
+
+    fn close_model_picker(&mut self) {
+        let mark = self.mark();
+        self.send(b"\x1b\x1b");
+        self.wait_for_frame_after(mark, "model picker closed", |frame| {
+            !frame.contains("Choose model")
+        });
     }
 
     fn exit(&mut self) {
@@ -251,7 +269,7 @@ fn bundled_model_names_match_the_current_model_names_without_transport_suffixes(
 }
 
 #[test]
-fn models_keep_their_bound_protocols_and_thinking_choices_are_drafts_until_enter() {
+fn models_keep_order_provider_labels_and_thinking_drafts_until_enter() {
     let directory = tempfile::tempdir().unwrap();
     let workdir = directory.path().canonicalize().unwrap();
     let provider = write_provider(&workdir, "127.0.0.1:1".parse().unwrap());
@@ -259,86 +277,72 @@ fn models_keep_their_bound_protocols_and_thinking_choices_are_drafts_until_enter
     let mut terminal = Terminal::start(&workdir, Some(&provider));
     terminal.wait_for("picker-messages-service");
 
+    let mark = terminal.mark();
     terminal.send(b"/model\r");
-    terminal.wait_for("Choose Provider");
-    assert!(!terminal.visible_output().contains("a Adapter"));
-    let mark = terminal.mark();
-    terminal.send(b"a\r");
-    terminal.wait_for_frame_after(mark, "all models without an API style shortcut", |frame| {
+    terminal.wait_for_frame_after(mark, "current Provider models open directly", |frame| {
         frame.contains("Choose model · Picker Fixture")
-            && frame.contains("Fixture OpenAI Chat Completions")
-            && frame.contains("Fixture Messages")
             && frame.contains("Fixture Messages Two")
-            && !frame.contains("Set API key")
-            && !frame.contains("Back to Providers")
-    });
-    let mark = terminal.mark();
-    terminal.send(b"jj");
-    terminal.wait_for_frame_after(mark, "model with another bound protocol", |frame| {
-        frame.contains("❯ 3. Fixture OpenAI Chat Completions")
-    });
-
-    let mark = terminal.mark();
-    terminal.send(b"l");
-    terminal.wait_for_frame_after(mark, "Thinking draft changed", |frame| {
-        frame.contains("Choose model · Picker Fixture") && frame.contains("Thinking ‹ off ›")
-    });
-    let mark = terminal.mark();
-    terminal.send(b"h");
-    terminal.wait_for_frame_after(mark, "Thinking draft moved back", |frame| {
-        frame.contains("Choose model · Picker Fixture") && frame.contains("Thinking ‹ auto ›")
-    });
-    let mark = terminal.mark();
-    terminal.send(b"\x1b[C");
-    terminal.wait_for_frame_after(mark, "right arrow changes Thinking draft", |frame| {
-        frame.contains("Choose model · Picker Fixture") && frame.contains("Thinking ‹ off ›")
-    });
-    let mark = terminal.mark();
-    terminal.send(b"\x1b[D");
-    terminal.wait_for_frame_after(mark, "left arrow restores Thinking draft", |frame| {
-        frame.contains("Choose model · Picker Fixture") && frame.contains("Thinking ‹ auto ›")
+            && frame.contains("● Fixture Messages")
+            && !frame.contains("1. ")
+            && !frame.contains("DeepSeek")
     });
     let mark = terminal.mark();
     terminal.send(b"\x1b");
-    terminal.wait_for_frame_after(mark, "Provider after draft cancellation", |frame| {
-        frame.contains("Choose Provider") && !frame.contains("Choose model ·")
+    terminal.wait_for_frame_after(mark, "Provider level after going back", |frame| {
+        frame.contains("Choose model Provider")
+            && frame.contains("Picker Fixture")
+            && !frame.contains("Fixture Messages Two")
+            && !frame.contains("1. ")
     });
-    assert!(!workdir.join("state/settings.json").exists());
-
     let mark = terminal.mark();
     terminal.send(b"\r");
-    terminal.wait_for_frame_after(mark, "all bound models after cancellation", |frame| {
+    terminal.wait_for_frame_after(mark, "models for chosen Provider", |frame| {
         frame.contains("Choose model · Picker Fixture")
-            && frame.contains("Fixture Messages")
             && frame.contains("Fixture Messages Two")
-            && frame.contains("Fixture OpenAI Chat Completions")
+            && frame.contains("● Fixture Messages")
     });
     let mark = terminal.mark();
-    terminal.send(b"j");
-    terminal.wait_for_frame_after(mark, "next model row", |frame| {
-        frame.contains("❯ 2. Fixture Messages Two")
-            && frame.contains("Choose model · Picker Fixture")
+    terminal.send(b"jjl");
+    terminal.wait_for_frame_after(mark, "Thinking draft on another protocol", |frame| {
+        frame.contains("❯   Fixture OpenAI Chat Completions") && frame.contains("Thinking ‹ off ›")
     });
     let mark = terminal.mark();
-    terminal.send(b"k");
-    terminal.wait_for_frame_after(mark, "previous model row", |frame| {
-        frame.contains("❯ 1. Fixture Messages") && frame.contains("Choose model · Picker Fixture")
+    terminal.send(b"p");
+    terminal.wait_for_frame_after(mark, "Provider from highlighted model", |frame| {
+        frame.contains("Choose Provider")
+            && frame.contains("❯ Picker Fixture")
+            && !frame.contains("1. ")
     });
     let mark = terminal.mark();
-    terminal.send(b"jj");
-    terminal.wait_for_frame_after(mark, "OpenAI Chat Completions model selected", |frame| {
-        frame.contains("❯ 3. Fixture OpenAI Chat Completions")
-    });
+    terminal.send(b"\x1b");
+    terminal.wait_for_frame_after(
+        mark,
+        "Provider cancellation restores draft and focus",
+        |frame| {
+            frame.contains("Choose model")
+                && frame.contains("❯   Fixture OpenAI Chat Completions")
+                && frame.contains("Thinking ‹ off ›")
+        },
+    );
+    assert!(!workdir.join("state/settings.json").exists());
     let mark = terminal.mark();
-    terminal.send(b"l");
-    terminal.wait_for_frame_after(mark, "Thinking next draft", |frame| {
-        frame.contains("Choose model · Picker Fixture") && frame.contains("Thinking ‹ off ›")
+    terminal.send(b"h\x1b[C\x1b[D");
+    terminal.wait_for_frame_after(mark, "arrows restore Thinking draft", |frame| {
+        frame.contains("❯   Fixture OpenAI Chat Completions") && !frame.contains("Thinking ‹ off ›")
     });
-    terminal.send(b"\r");
+    terminal.send(b"l\r");
     terminal.wait_for("Model selection:");
-    terminal.wait_for("OpenAI Chat Completions");
+    let mark = terminal.mark();
+    terminal.send(b"/model\r");
+    terminal.wait_for_frame_after(mark, "selected model stays last and is focused", |frame| {
+        frame.contains("❯ ● Fixture OpenAI Chat Completions")
+            && frame.rfind("Fixture Messages    ").unwrap()
+                < frame.rfind("Fixture Messages Two").unwrap()
+            && frame.rfind("Fixture Messages Two").unwrap()
+                < frame.rfind("Fixture OpenAI Chat Completions").unwrap()
+    });
+    terminal.close_model_picker();
     terminal.exit();
-
     let saved: Value =
         serde_json::from_slice(&fs::read(workdir.join("state/settings.json")).unwrap()).unwrap();
     assert_eq!(saved["defaultModel"]["provider"], "picker-fixture");
@@ -347,52 +351,275 @@ fn models_keep_their_bound_protocols_and_thinking_choices_are_drafts_until_enter
 }
 
 #[test]
-fn failed_model_save_keeps_the_model_menu_and_allows_return_to_providers() {
+fn startup_checks_current_provider_once_and_other_provider_only_on_entry() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let calls = Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
+    let stop = Arc::new(AtomicBool::new(false));
+    let received = calls.clone();
+    let stopped = stop.clone();
+    let server = thread::spawn(move || {
+        while !stopped.load(Ordering::SeqCst) {
+            let mut stream = match listener.accept() {
+                Ok((stream, _)) => stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(error) => panic!("{error}"),
+            };
+            stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+            let mut headers = String::new();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            loop {
+                let mut line = String::new();
+                std::io::BufRead::read_line(&mut reader, &mut line).unwrap();
+                let end = line == "\r\n" || line.is_empty();
+                headers.push_str(&line);
+                if end {
+                    break;
+                }
+            }
+            let index = if headers.starts_with("GET /primary/models ") {
+                0
+            } else {
+                assert!(headers.starts_with("GET /secondary/models "));
+                1
+            };
+            received[index].fetch_add(1, Ordering::SeqCst);
+            let body = r#"{"data":[{"id":"picker-messages-service"},{"id":"picker-messages-second-service"},{"id":"picker-chat-service"}]}"#;
+            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).unwrap();
+        }
+    });
+    let directory = tempfile::tempdir().unwrap();
+    let workdir = directory.path().canonicalize().unwrap();
+    let provider = write_provider(&workdir, address);
+    let original = fs::read_to_string(&provider).unwrap();
+    let connection = |product: &str, order| {
+        format!(
+            "connection:\n  vendor: Fixture Vendor\n  product: {product}\n  kind: pay_as_you_go\n  order: {order}\n  discovery: openai_api\n"
+        )
+    };
+    fs::write(
+        &provider,
+        format!(
+            "{}{}",
+            connection("Primary", 0),
+            original.replace(
+                &format!("http://{address}"),
+                &format!("http://{address}/primary")
+            )
+        ),
+    )
+    .unwrap();
+    write_saved_test_key(&workdir);
+    fs::create_dir_all(workdir.join("state/providers")).unwrap();
+    fs::write(
+        workdir.join("state/providers/other-fixture.yaml"),
+        format!(
+            "{}{}",
+            connection("Secondary", 1),
+            original
+                .replace("id: picker-fixture", "id: other-fixture")
+                .replace(
+                    "display_name: Picker Fixture",
+                    "display_name: Other Fixture"
+                )
+                .replace(
+                    &format!("http://{address}"),
+                    &format!("http://{address}/secondary")
+                )
+        ),
+    )
+    .unwrap();
+    let mut terminal = Terminal::start(&workdir, Some(&provider));
+    terminal.wait_for("picker-messages-service");
+    let deadline = Instant::now() + TIMEOUT;
+    while calls[0].load(Ordering::SeqCst) == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "startup did not check current Provider"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(calls[1].load(Ordering::SeqCst), 0);
+    for _ in 0..2 {
+        let mark = terminal.mark();
+        terminal.send(b"/model\r");
+        terminal.wait_for_frame_after(mark, "cached current Provider", |frame| {
+            frame.contains("Choose model · Fixture Vendor · Primary")
+                && frame.contains("Account directory checked")
+        });
+        terminal.close_model_picker();
+    }
+    assert_eq!(calls[0].load(Ordering::SeqCst), 1);
+    assert_eq!(calls[1].load(Ordering::SeqCst), 0);
+    terminal.send(b"/model\r");
+    terminal.wait_for("Choose model · Fixture Vendor · Primary");
+    let mark = terminal.mark();
+    terminal.send(b"\x1b");
+    terminal.wait_for_frame_after(
+        mark,
+        "Provider level without other account check",
+        |frame| frame.contains("Choose model Provider") && frame.contains("Secondary"),
+    );
+    assert_eq!(calls[1].load(Ordering::SeqCst), 0);
+    let mark = terminal.mark();
+    terminal.send(b"j\r");
+    terminal.wait_for_frame_after(mark, "secondary Provider on first entry", |frame| {
+        frame.contains("Choose model · Fixture Vendor · Secondary")
+            && frame.contains("Account directory checked")
+    });
+    assert_eq!(calls[1].load(Ordering::SeqCst), 1);
+    let mark = terminal.mark();
+    terminal.send(b"r");
+    terminal.wait_for_frame_after(mark, "only secondary Provider is refreshed", |frame| {
+        frame.contains("Choose model · Fixture Vendor · Secondary")
+            && calls[1].load(Ordering::SeqCst) == 2
+    });
+    assert_eq!(calls[0].load(Ordering::SeqCst), 1);
+    terminal.close_model_picker();
+    terminal.exit();
+    stop.store(true, Ordering::SeqCst);
+    server.join().unwrap();
+}
+
+#[test]
+fn long_model_list_follows_selection_and_retains_provider_title() {
+    let directory = tempfile::tempdir().unwrap();
+    let workdir = directory.path().canonicalize().unwrap();
+    let provider = write_provider(&workdir, "127.0.0.1:1".parse().unwrap());
+    let mut contents = fs::read_to_string(&provider).unwrap();
+    for index in 0..45 {
+        contents.push_str(&format!("  - id: extra-model-{index}\n    service_model_id: extra-model-{index}\n    display_name: Extra Model {index:02}\n    adapter: messages\n    max_output_tokens: 256\n    thinking: toggle\n"));
+    }
+    fs::write(&provider, contents).unwrap();
+    write_saved_test_key(&workdir);
+    let mut terminal = Terminal::start(&workdir, Some(&provider));
+    terminal.wait_for("picker-messages-service");
+    terminal.send(b"/model\r");
+    terminal.wait_for("Choose model · Picker Fixture");
+    let mark = terminal.mark();
+    terminal.send(&[b'j'; 40]);
+    terminal.wait_for_frame_after(mark, "selection near bottom of long model list", |frame| {
+        frame.contains("Choose model · Picker Fixture")
+            && frame.contains("❯   Extra Model 37")
+            && frame.contains("Extra Model 38")
+            && frame.contains("More above")
+    });
+    let mark = terminal.mark();
+    terminal.send(&[b'k'; 40]);
+    terminal.wait_for_frame_after(mark, "selection returns to current model", |frame| {
+        frame.contains("Choose model · Picker Fixture")
+            && frame.contains("❯ ● Fixture Messages")
+            && frame.contains("More below")
+    });
+    terminal.close_model_picker();
+    terminal.exit();
+    assert!(!workdir.join("state/settings.json").exists());
+}
+
+#[test]
+fn failed_model_save_keeps_the_model_menu_and_allows_provider_configuration() {
     let directory = tempfile::tempdir().unwrap();
     let workdir = directory.path().canonicalize().unwrap();
     let provider = write_provider(&workdir, "127.0.0.1:1".parse().unwrap());
     write_saved_test_key(&workdir);
-    let state = workdir.join("state");
-
     let mut terminal = Terminal::start(&workdir, Some(&provider));
     terminal.wait_for("picker-messages-service");
     terminal.send(b"/model\r");
-    terminal.wait_for("Choose Provider");
-    let mark = terminal.mark();
-    terminal.send(b"\r");
-    terminal.wait_for_frame_after(mark, "model before save failure", |frame| {
-        frame.contains("Choose model · Picker Fixture")
-            && frame.contains("Fixture Messages")
-            && !frame.contains("Set API key")
-    });
-
-    let blocked_directory = state.join("providers");
+    terminal.wait_for("Choose model");
+    let blocked_directory = workdir.join("state/providers");
     fs::write(&blocked_directory, "not a directory").unwrap();
     let mark = terminal.mark();
     terminal.send(b"\r");
     terminal.wait_for("Cannot apply selection:");
-    terminal.wait_for_frame_after(mark, "model after failed save", |frame| {
-        frame.contains("Choose model · Picker Fixture")
+    terminal.wait_for_frame_after(mark, "model remains after failed save", |frame| {
+        frame.contains("Choose model")
             && frame.contains("Fixture Messages")
             && frame.contains("Thinking")
     });
-    let settings_path = state.join("settings.json");
-    if settings_path.exists() {
-        let settings: Value = serde_json::from_slice(&fs::read(&settings_path).unwrap()).unwrap();
-        assert!(settings.get("defaultModel").is_none());
-    }
-
     let mark = terminal.mark();
-    terminal.send(b"\x1b");
-    terminal.wait_for_frame_after(mark, "provider parent after failed save", |frame| {
-        frame.contains("Choose Provider") && !frame.contains("Choose model ·")
+    terminal.send(b"p");
+    terminal.wait_for_frame_after(mark, "can configure Provider after failure", |frame| {
+        frame.contains("Choose Provider")
     });
     fs::remove_file(&blocked_directory).unwrap();
     let mark = terminal.mark();
     terminal.send(b"\x1b");
-    terminal.wait_for_frame_after(mark, "prompt after failed save", |frame| {
-        !frame.contains("Choose Provider") && frame.contains("picker-messages-service")
+    terminal.wait_for_frame_after(mark, "back to model after failure", |frame| {
+        frame.contains("Choose model")
     });
+    terminal.close_model_picker();
+    terminal.exit();
+    assert!(!terminal.output.lock().unwrap().contains(TEST_KEY));
+}
+
+#[test]
+fn empty_model_picker_can_configure_a_provider_and_preserves_drafts_on_key_update() {
+    let directory = tempfile::tempdir().unwrap();
+    let workdir = directory.path().canonicalize().unwrap();
+    let provider = write_provider(&workdir, "127.0.0.1:1".parse().unwrap());
+    let mut terminal = Terminal::start(&workdir, Some(&provider));
+    terminal.wait_for("picker-messages-service");
+    let mark = terminal.mark();
+    terminal.send(b"/model\r");
+    terminal.wait_for_frame_after(mark, "empty configured model list", |frame| {
+        frame.contains("No Providers configured")
+            && frame.contains("Configure Providers")
+            && !frame.contains("Fixture Messages")
+            && !frame.contains("1. ")
+    });
+    terminal.send(b"p");
+    terminal.wait_for("Choose Provider");
+    // Custom connections follow the bundled vendor groups.
+    terminal.send(b"jjjjj\r");
+    terminal.wait_for("API key · Picker Fixture");
+    terminal.send(TEST_KEY.as_bytes());
+    let mark = terminal.mark();
+    terminal.send(b"\r");
+    terminal.wait_for("API key saved to Agent .env.");
+    terminal.wait_for_frame_after(mark, "newly configured models", |frame| {
+        frame.contains("Choose model Provider")
+            && frame.contains("Picker Fixture")
+            && !frame.contains("Fixture Messages Two")
+    });
+    let mark = terminal.mark();
+    terminal.send(b"\r");
+    terminal.wait_for_frame_after(mark, "new connection models", |frame| {
+        frame.contains("Choose model · Picker Fixture") && frame.contains("Fixture Messages Two")
+    });
+    assert!(!workdir.join("state/settings.json").exists());
+    let mark = terminal.mark();
+    terminal.send(b"jl");
+    terminal.wait_for_frame_after(mark, "draft before key update", |frame| {
+        frame.contains("❯   Fixture Messages Two") && frame.contains("Thinking ‹ off ›")
+    });
+    let mark = terminal.mark();
+    terminal.send(b"p");
+    terminal.wait_for_frame_after(mark, "Provider before key update", |frame| {
+        frame.contains("Choose Provider")
+    });
+    let mark = terminal.mark();
+    terminal.send(b"\r");
+    terminal.wait_for_frame_after(mark, "key update from model draft", |frame| {
+        frame.contains("API key · Picker Fixture")
+    });
+    terminal.send(TEST_KEY.as_bytes());
+    let mark = terminal.mark();
+    terminal.send(b"\r");
+    terminal.wait_for_frame_after(mark, "key save restores model draft", |frame| {
+        frame.contains("Choose model")
+            && frame.contains("❯   Fixture Messages Two")
+            && frame.contains("Thinking ‹ off ›")
+    });
+    assert!(!workdir.join("state/settings.json").exists());
+    terminal.close_model_picker();
     terminal.exit();
     assert!(!terminal.output.lock().unwrap().contains(TEST_KEY));
 }
@@ -413,7 +640,7 @@ fn provider_reauthentication_removes_only_its_saved_key_and_requires_entry_again
 
     let mut terminal = Terminal::start(&workdir, Some(&provider));
     terminal.wait_for("picker-messages-service");
-    terminal.send(b"/model\r");
+    terminal.send(b"/provider\r");
     terminal.wait_for("Choose Provider");
     let mark = terminal.mark();
     terminal.send(b"r");
@@ -432,7 +659,9 @@ fn provider_reauthentication_removes_only_its_saved_key_and_requires_entry_again
     let mark = terminal.mark();
     terminal.send(b"\x1b");
     terminal.wait_for_frame_after(mark, "secret field closed", |frame| {
-        frame.contains("API key · Picker Fixture") && frame.contains("Tab API key")
+        frame.contains("API key · Picker Fixture")
+            && frame.contains("❯ 1. Save API key")
+            && !frame.contains("API key:")
     });
     let mark = terminal.mark();
     terminal.send(b"\x1b");
@@ -448,17 +677,13 @@ fn provider_reauthentication_removes_only_its_saved_key_and_requires_entry_again
     terminal.wait_for("API key: ********");
     terminal.send(b"\r");
     terminal.wait_for("API key saved to Agent .env.");
-    terminal.wait_for("Choose model · Picker Fixture");
+    terminal.wait_for("Choose Provider");
     assert!(
         fs::read_to_string(&env_file)
             .unwrap()
             .contains(TEST_KEY_NAME)
     );
-    let mark = terminal.mark();
-    terminal.send(b"\x1b");
-    terminal.wait_for_frame_after(mark, "Provider after saved key", |frame| {
-        frame.contains("Choose Provider") && frame.contains("API key saved")
-    });
+    terminal.wait_for("API key saved");
     let mark = terminal.mark();
     terminal.send(b"\x1b");
     terminal.wait_for_frame_after(mark, "prompt after reauthentication", |frame| {
@@ -627,7 +852,7 @@ fn api_key_menu_saves_private_env_and_restarted_model_uses_it_on_loopback() {
 
     let mut terminal = Terminal::start(&workdir, Some(&provider));
     terminal.wait_for("picker-messages-service");
-    terminal.send(b"/model\r");
+    terminal.send(b"/provider\r");
     terminal.wait_for("Choose Provider");
     let mark = terminal.mark();
     terminal.send(b"\r");
@@ -637,9 +862,20 @@ fn api_key_menu_saves_private_env_and_restarted_model_uses_it_on_loopback() {
     terminal.send(TEST_KEY.as_bytes());
     terminal.wait_for("API key: ********");
     assert!(!terminal.output.lock().unwrap().contains(TEST_KEY));
+    let mark = terminal.mark();
     terminal.send(b"\r");
-    terminal.wait_for("API key saved to Agent .env.");
-    terminal.wait_for("Choose model · Picker Fixture");
+    terminal.wait_for_frame_after(mark, "saved key returns to Provider", |frame| {
+        frame.contains("Choose Provider")
+            && frame.contains("API key saved")
+            && !frame.contains("API key ·")
+    });
+    let mark = terminal.mark();
+    terminal.send(b"\x1b");
+    terminal.wait_for_frame_after(mark, "Provider closed before model choice", |frame| {
+        !frame.contains("Choose Provider")
+    });
+    terminal.send(b"/model\r");
+    terminal.wait_for("Choose model");
     terminal.send(b"\r");
     terminal.wait_for("Model selection:");
     terminal.send(b"Provider key first turn\r");
@@ -694,10 +930,10 @@ fn model_judgment_settings_save_key_without_changing_model_mode_or_reviewer() {
     let mut terminal = Terminal::start(&workdir, Some(&provider));
     terminal.wait_for("picker-messages-service");
 
-    terminal.send(b"/model\r");
+    terminal.send(b"/provider\r");
     terminal.wait_for("Choose Provider");
     let mark = terminal.mark();
-    terminal.send(b"jjjjjjjjk\r");
+    terminal.send(b"jjjjjjjjjjjjjjjjjjjjk\r");
     terminal.wait_for_frame_after(mark, "Judgment settings from model picker", |frame| {
         frame.contains("Judgment settings · Jev (TypeSafe)")
             && frame.contains("Jev (TypeSafe) key: Missing")

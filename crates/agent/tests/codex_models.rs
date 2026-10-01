@@ -56,7 +56,7 @@ fn codex_profiles_are_source_aware_and_use_only_the_official_endpoint() {
     let profiles = built_in_model_profiles();
     let codex = profiles
         .iter()
-        .find(|profile| profile.model == "gpt-5.6-sol")
+        .find(|profile| profile.provider_id == "openai-codex" && profile.model == "gpt-6.1-sol")
         .unwrap();
     assert_eq!(codex.provider, ModelProvider::OpenAiCodex);
     assert_eq!(codex.auth_source, ModelAuthSource::CodexSubscription);

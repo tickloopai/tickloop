@@ -22,18 +22,26 @@ use super::{
     credential_fingerprint,
 };
 use crate::{
-    auth::copilot::{CopilotAuth, CopilotAuthError, CopilotCredentials},
+    auth::copilot::{CopilotAccess, CopilotAuth, CopilotAuthError},
     network::{HttpPolicy, build_http_client, is_loopback},
 };
 
-pub const COPILOT_API_URL: &str = "https://api.githubcopilot.com";
+/// pi's default plan host; a Copilot token's `proxy-ep` names the account's own host.
+pub const COPILOT_API_URL: &str = "https://api.individual.githubcopilot.com";
 pub(crate) const COPILOT_PROVIDER_ID: &str = "github-copilot";
-/// The API version OpenCode, GitHub's partner client, sends on Copilot inference requests.
+/// Sent only on `/models`, as pi does.
 pub const GITHUB_API_VERSION: &str = "2026-06-01";
-pub const USER_AGENT: &str = concat!("tickloop-agent/", env!("CARGO_PKG_VERSION"));
+pub const CLIENT_USER_AGENT: &str = "GitHubCopilotChat/0.35.0";
+/// The VS Code Copilot Chat identity pi sends on the token exchange and every Copilot request.
+pub const CLIENT_HEADERS: [(&str, &str); 4] = [
+    ("user-agent", CLIENT_USER_AGENT),
+    ("editor-version", "vscode/1.107.0"),
+    ("editor-plugin-version", "copilot-chat/0.35.0"),
+    ("copilot-integration-id", "vscode-chat"),
+];
 const API_VERSION_HEADER: HeaderName = HeaderName::from_static("x-github-api-version");
 
-/// The official service address, or a loopback HTTP test server in debug builds.
+/// The configured service address, or a loopback HTTP test server in debug builds.
 pub(crate) fn is_allowed_endpoint(endpoint: &str) -> bool {
     if endpoint.trim_end_matches('/') == COPILOT_API_URL {
         return true;
@@ -48,6 +56,9 @@ pub(crate) fn credential_error(error: CopilotAuthError) -> ModelError {
         CopilotAuthError::Cancelled => ModelError::Cancelled,
         CopilotAuthError::NotLoggedIn => ModelError::CopilotNotLoggedIn,
         CopilotAuthError::RefreshFailed => ModelError::CopilotAuthentication,
+        CopilotAuthError::NoCopilotAccess => {
+            entitlement_denied(403).at_stage(ModelRequestStage::Credentials)
+        }
         CopilotAuthError::BudgetExhausted => ModelError::RequestBudgetExhausted {
             stage: ModelRequestStage::Credentials,
         },
@@ -89,22 +100,15 @@ pub(crate) fn without_connection_bound_reasoning(mut request: ModelRequest) -> M
     request
 }
 
-/// Headers that identify Tick Loop honestly and describe the request to Copilot. The initiator
-/// follows GitHub's billing rule that only prompts the user sends count as premium requests:
-/// a request ending in the user's own message is `user`; tool continuations are `agent`.
+/// pi's client identity plus headers describing the request. The initiator follows GitHub's
+/// billing rule that only prompts the user sends count as premium requests: a request ending in
+/// the user's own message is `user`; tool continuations are `agent`.
 pub(crate) fn request_headers(body: &Value) -> Vec<(HeaderName, HeaderValue)> {
-    let mut headers = vec![
-        (
-            reqwest::header::USER_AGENT,
-            HeaderValue::from_static(USER_AGENT),
-        ),
+    let mut headers = client_headers();
+    headers.extend([
         (
             HeaderName::from_static("openai-intent"),
             HeaderValue::from_static("conversation-edits"),
-        ),
-        (
-            API_VERSION_HEADER,
-            HeaderValue::from_static(GITHUB_API_VERSION),
         ),
         (
             HeaderName::from_static("x-initiator"),
@@ -114,7 +118,7 @@ pub(crate) fn request_headers(body: &Value) -> Vec<(HeaderName, HeaderValue)> {
                 "agent"
             }),
         ),
-    ];
+    ]);
     if contains_image(&body["messages"]) || contains_image(&body["input"]) {
         headers.push((
             HeaderName::from_static("copilot-vision-request"),
@@ -122,6 +126,18 @@ pub(crate) fn request_headers(body: &Value) -> Vec<(HeaderName, HeaderValue)> {
         ));
     }
     headers
+}
+
+fn client_headers() -> Vec<(HeaderName, HeaderValue)> {
+    CLIENT_HEADERS
+        .iter()
+        .map(|(name, value)| {
+            (
+                HeaderName::from_static(name),
+                HeaderValue::from_static(value),
+            )
+        })
+        .collect()
 }
 
 fn ends_with_user_prompt(body: &Value) -> bool {
@@ -156,11 +172,17 @@ fn contains_image(value: &Value) -> bool {
 
 /// GitHub refuses a Copilot request when the plan, organization policy or client may not use
 /// the model; the remote body is not shown.
-pub(crate) fn entitlement_denied() -> ModelError {
+pub(crate) fn entitlement_denied(status: u16) -> ModelError {
     ModelError::EntitlementDenied {
-        status: 403,
+        status,
         description: ": GitHub Copilot does not allow this model for your plan, organization policy or client".into(),
     }
+}
+
+/// Copilot answers a model the account's plan or policy does not enable with HTTP 400
+/// `model_not_supported`; the account directory marks such models `disabled`.
+pub(crate) fn is_model_not_enabled(status: u16, body: &Value) -> bool {
+    status == 400 && body["error"]["code"] == "model_not_supported"
 }
 
 /// Copilot reports prompt overflow as `prompt token count of N exceeds the limit of M`.
@@ -184,23 +206,23 @@ pub(crate) struct CopilotDirectoryAdapter<'a> {
 }
 
 impl CopilotDirectoryAdapter<'_> {
-    async fn credentials(&self, cancel: &CancellationToken) -> Result<CopilotCredentials, String> {
-        let root = self.root.ok_or("Agent state directory is required")?;
-        CopilotAuth::new(root)
-            .resolve_credentials(cancel)
-            .await
-            .map_err(|error| match error {
-                CopilotAuthError::NotLoggedIn => "Sign in to GitHub Copilot first".to_owned(),
-                _ => "GitHub Copilot credentials could not be resolved".to_owned(),
-            })
-    }
-
-    fn endpoint(&self) -> Result<Url, String> {
+    async fn access(&self, cancel: &CancellationToken) -> Result<CopilotAccess, String> {
         if !is_allowed_endpoint(&self.config.base_url) {
             return Err("GitHub Copilot discovery requires the Copilot API origin".into());
         }
-        let mut endpoint =
-            Url::parse(&self.config.base_url).map_err(|_| "Invalid model discovery endpoint")?;
+        let root = self.root.ok_or("Agent state directory is required")?;
+        CopilotAuth::new(root)
+            .resolve_access(cancel)
+            .await
+            .map_err(|error| match error {
+                CopilotAuthError::NotLoggedIn => "Sign in to GitHub Copilot first".to_owned(),
+                error => error.to_string(),
+            })
+    }
+
+    fn endpoint(&self, access: &CopilotAccess) -> Result<Url, String> {
+        let base = access.api_base.as_deref().unwrap_or(&self.config.base_url);
+        let mut endpoint = Url::parse(base).map_err(|_| "Invalid model discovery endpoint")?;
         endpoint.set_path(&format!("{}/models", endpoint.path().trim_end_matches('/')));
         Ok(endpoint)
     }
@@ -209,20 +231,20 @@ impl CopilotDirectoryAdapter<'_> {
 #[async_trait::async_trait]
 impl AccountDirectoryAdapter for CopilotDirectoryAdapter<'_> {
     async fn identity(&self, cancel: &CancellationToken) -> Result<DiscoveryIdentity, String> {
-        let origin = self.endpoint()?.origin().ascii_serialization();
-        let credentials = self.credentials(cancel).await?;
+        let access = self.access(cancel).await?;
+        let endpoint = self.endpoint(&access)?;
         Ok(DiscoveryIdentity {
             provider: self.config.provider_id.clone(),
-            origin,
-            resource: credential_fingerprint(self.config.base_url.as_bytes()),
-            account: credentials.identity.to_string(),
+            origin: endpoint.origin().ascii_serialization(),
+            resource: credential_fingerprint(endpoint.as_str().as_bytes()),
+            account: access.identity.to_string(),
         })
     }
 
     async fn fetch(&self, cancel: &CancellationToken) -> Result<AccountModelDirectory, String> {
-        let endpoint = self.endpoint()?;
-        let credentials = self.credentials(cancel).await?;
-        let mut bearer = HeaderValue::from_str(&format!("Bearer {}", credentials.access_token))
+        let access = self.access(cancel).await?;
+        let endpoint = self.endpoint(&access)?;
+        let mut bearer = HeaderValue::from_str(&format!("Bearer {}", access.token))
             .map_err(|_| "Invalid discovery credentials")?;
         bearer.set_sensitive(true);
         // `AccountModelDiscovery` bounds the whole discovery, this request included.
@@ -230,8 +252,8 @@ impl AccountDirectoryAdapter for CopilotDirectoryAdapter<'_> {
             .map_err(|_| "Could not create discovery HTTP client")?;
         let mut response = client
             .get(endpoint)
+            .headers(client_headers().into_iter().collect())
             .header(AUTHORIZATION, bearer)
-            .header(reqwest::header::USER_AGENT, USER_AGENT)
             .header(API_VERSION_HEADER, GITHUB_API_VERSION)
             .send()
             .await

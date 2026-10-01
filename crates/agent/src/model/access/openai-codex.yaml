@@ -1,18 +1,22 @@
 provider: "openai-codex"
 series:
-  - id: "gpt"
-    name: "GPT"
-    version: "5.5"
-    model: "gpt-5.5"
   - id: "sol"
     name: "GPT Sol"
-    version: "5.6"
-    model: "gpt-5.6-sol"
+    version: "6.1"
+    model: "gpt-6.1-sol"
+    capability_order: 1
+  - id: "astra"
+    name: "GPT Astra"
+    version: "6"
+    model: "gpt-6-astra"
+    capability_order: 0
   - id: "terra"
     name: "GPT Terra"
     version: "5.6"
     model: "gpt-5.6-terra"
+    capability_order: 2
   - id: "luna"
     name: "GPT Luna"
-    version: "5.6"
-    model: "gpt-5.6-luna"
+    version: "6"
+    model: "gpt-6-luna"
+    capability_order: 3

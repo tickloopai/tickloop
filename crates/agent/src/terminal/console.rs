@@ -144,9 +144,9 @@ const EXIT_CONFIRMATION_WINDOW: Duration = Duration::from_millis(800);
 const ESCAPE_CONFIRMATION_WINDOW: Duration = Duration::from_millis(800);
 const SHELL_BACKGROUND_CHORD_WINDOW: Duration = Duration::from_millis(800);
 const SECRET_PASTE_ERROR: &str = "API key paste must contain one line of text";
-const PROVIDER_PICKER_HINT: &str =
-    "↑↓ Provider · r Sign in again · s Sign out · d Device code · Enter select · Esc back";
-const MODEL_PICKER_HINT: &str = "↑↓ Model · ←→ Thinking · Enter apply · Esc back";
+pub(super) const REFRESH_ACCOUNT_MODELS_LABEL: &str = "Refresh account models";
+const PICKER_CONTEXT_MAX_ROWS: usize = 5;
+const PICKER_CHROME_ROWS: usize = 3;
 // 照 Claude Code `shellHistoryCompletion.ts`：输入期间历史不会变化，缓存 60 秒。
 const SHELL_HISTORY_CACHE_TTL: Duration = Duration::from_secs(60);
 const NO_CLIPBOARD_IMAGE: &str = "No image found in clipboard";
@@ -314,11 +314,14 @@ pub(super) enum PickerAction {
     Reauthenticate,
     SignOut,
     DeviceLogin,
+    ConfigureProvider,
+    RefreshAccountModels,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum PickerKind {
     Provider,
+    ModelProvider,
     Model,
 }
 
@@ -1817,8 +1820,7 @@ impl Console {
         }
         let cursor = command.len();
         state.replace_draft(command, cursor);
-        state.status =
-            "Edit timer command · Enter save · Ctrl+G external editor · Ctrl+C cancel".into();
+        state.status = "Edit timer command · Ctrl+G external editor".into();
         state
             .draw(&mut io::stdout().lock())
             .map_err(|error| error.to_string())
@@ -1904,7 +1906,7 @@ impl Console {
                             MenuFocus::Menu
                             | MenuFocus::MenuWithLink(_)
                             | MenuFocus::Secret
-                            | MenuFocus::Picker(_) => true,
+                            | MenuFocus::Picker(..) => true,
                         })
             },
             |(_, focused)| focused,
@@ -1952,7 +1954,7 @@ impl Console {
             MenuFocus::WhenInputEmpty
             | MenuFocus::Menu
             | MenuFocus::Secret
-            | MenuFocus::Picker(_)
+            | MenuFocus::Picker(..)
             | MenuFocus::Question(_) => None,
         };
         state.menu = Some(menu);
@@ -3089,7 +3091,7 @@ impl State {
                 vec![RoleLine::default()]
             };
             let notice = RoleLine::role(
-                format!("Resize to at least {MIN_MENU_TERMINAL_ROWS} rows to review · Esc cancels"),
+                format!("Resize to at least {MIN_MENU_TERMINAL_ROWS} rows to review"),
                 Role::MutedText,
             );
             let (mut lines, row, column) = match (self.menu.is_some(), self.height) {
@@ -3200,8 +3202,32 @@ impl State {
                 .height
                 .saturating_sub(reserved_rows + MIN_SCROLL_ROWS)
                 .max(1);
-            let option_count = menu.options.len().min((menu_height / 3).max(1));
-            let option_start = menu.selected.saturating_sub(option_count - 1);
+            let option_count = if self.picker_kind.is_some() {
+                let title_rows = wrap_text(&display_text(&menu.title), self.width).len();
+                let context_rows = menu
+                    .context
+                    .iter()
+                    .map(|line| {
+                        wrap_text(&display_text(line), self.width.saturating_sub(2).max(2)).len()
+                    })
+                    .sum::<usize>()
+                    .min(PICKER_CONTEXT_MAX_ROWS)
+                    .min((menu_height / 3).max(1));
+                menu.options.len().min(
+                    menu_height
+                        .saturating_sub(title_rows + context_rows + PICKER_CHROME_ROWS)
+                        .max(1),
+                )
+            } else {
+                menu.options.len().min((menu_height / 3).max(1))
+            };
+            let option_start = if self.picker_kind.is_some() {
+                menu.selected
+                    .saturating_sub(option_count / 2)
+                    .min(menu.options.len().saturating_sub(option_count))
+            } else {
+                menu.selected.saturating_sub(option_count - 1)
+            };
             let options: Vec<(usize, Vec<RoleLine>)> = menu
                 .options
                 .iter()
@@ -3215,20 +3241,34 @@ impl State {
                     } else {
                         " "
                     };
-                    let role = focused.then_some(Role::Suggestion);
+                    let text = if self.picker_kind.is_some() {
+                        format!("{marker} {}", display_text(option))
+                    } else {
+                        format!("{marker} {}. {}", index + 1, display_text(option))
+                    };
+                    let option_lines = if self.picker_kind.is_some() {
+                        vec![truncate_width(&text, self.width)]
+                    } else {
+                        wrap_text(&text, self.width)
+                    };
+                    let role = focused.then_some(if self.picker_kind.is_some() {
+                        Role::Text
+                    } else {
+                        Role::Suggestion
+                    });
                     (
                         index,
-                        wrap_text(
-                            &format!("{marker} {}. {}", index + 1, display_text(option)),
-                            self.width,
-                        )
-                        .into_iter()
-                        .map(|line| {
-                            let mut styled = RoleLine::default();
-                            styled.push(line, role);
-                            styled
-                        })
-                        .collect(),
+                        option_lines
+                            .into_iter()
+                            .map(|line| {
+                                let mut styled = RoleLine::default();
+                                styled.push(line, role);
+                                if focused && self.picker_kind.is_some() {
+                                    styled = styled.filled(Role::Selection);
+                                }
+                                styled
+                            })
+                            .collect(),
                     )
                 })
                 .collect();
@@ -3261,7 +3301,15 @@ impl State {
                 })
                 .collect();
             let context_capacity = menu_height
-                .saturating_sub(lines.len() + option_rows + 2)
+                .saturating_sub(
+                    lines.len()
+                        + option_rows
+                        + if self.picker_kind.is_some() {
+                            PICKER_CHROME_ROWS
+                        } else {
+                            2
+                        },
+                )
                 .max(1);
             if let Some(review_state) = &mut self.menu_review {
                 self.context_offset = 0;
@@ -3330,7 +3378,7 @@ impl State {
                 if context.len() > context_capacity {
                     lines.push(RoleLine::role(
                         format!(
-                            "PgUp/PgDn · {}–{}/{}",
+                            "Context {}–{}/{}",
                             self.context_offset + 1,
                             (self.context_offset + context_capacity).min(context.len()),
                             context.len()
@@ -3370,84 +3418,60 @@ impl State {
                     }
                 }
             }
-            let hint: String = if self.review_focused {
-                "Diff focus · j/k/↑↓ · PgUp/PgDn · Home/End · Tab decision · Esc deny".into()
-            } else if self.menu_focused {
-                if self.picker_kind == Some(PickerKind::Provider) {
-                    PROVIDER_PICKER_HINT.into()
-                } else if self.picker_kind == Some(PickerKind::Model) {
-                    MODEL_PICKER_HINT.into()
-                } else if self.menu_comment_is_editing() {
-                    if self
-                        .menu_comment
-                        .as_ref()
-                        .is_some_and(|comment| comment.secret)
-                    {
-                        "Enter save API key · Esc close field · Tab close field".into()
-                    } else if self
-                        .menu_comment
-                        .as_ref()
-                        .is_some_and(|comment| comment.label == "Guidance")
-                    {
-                        "add context (optional) · Enter submit · Tab close · Esc close".into()
-                    } else if self.question_menu.is_some() {
-                        "Type your answer · Enter submit · Esc close field".into()
-                    } else {
-                        "Type a comment · Enter submit · Tab close · Esc close".into()
-                    }
-                } else if let Some(question) = &self.question_menu {
-                    question_menu_hint(question)
-                } else if menu.confirmation {
-                    if self.selected_menu_can_expand() {
-                        if self.menu_review.is_some() {
-                            "↑↓ choose · Enter/y exact · Tab prefixes · n/Esc · Shift+Tab diff"
-                                .into()
-                        } else {
-                            "↑↓ choose · Enter/y exact · Tab prefixes · n/Esc".into()
-                        }
-                    } else if self.selected_menu_accepts_comment() {
-                        if self.menu_review.is_some() {
-                            "↑↓ choose · Enter/y · n/Esc · Tab comment · Shift+Tab diff".into()
-                        } else {
-                            "↑↓ choose · Enter/y · n/Esc · Tab comment".into()
-                        }
-                    } else if self.menu_review.is_some() {
-                        "↑↓ choose · Enter/y · n/Esc · Tab input · Shift+Tab diff".into()
-                    } else {
-                        "↑↓ choose · Enter/y · n/Esc · Tab input".into()
-                    }
-                } else if self.selected_menu_accepts_comment() {
-                    if self
-                        .menu_comment
-                        .as_ref()
-                        .is_some_and(|comment| comment.secret)
-                    {
-                        "↑↓/j/k choose · Enter · Esc cancel · Tab API key".into()
-                    } else {
-                        "↑↓/j/k choose · number/Enter · Esc · Tab guidance".into()
-                    }
-                } else {
-                    "↑↓/j/k choose · number/Enter · Esc · Tab".into()
-                }
-            } else if self.menu_review.is_some() {
-                "Tab: decision · input preserved".into()
-            } else {
-                "Tab: menu · input preserved".into()
-            };
-            lines.push(RoleLine::role(
-                self.display.navigation_hint(&hint),
-                Role::MutedText,
-            ));
+            if self.picker_kind.is_some() && option_count < menu.options.len() {
+                let above = option_start > 0;
+                let below = option_start + option_count < menu.options.len();
+                let indicator = match (above, below) {
+                    (true, true) => "↑ More above · ↓ More below",
+                    (true, false) => "↑ More above",
+                    _ => "↓ More below",
+                };
+                lines.push(RoleLine::role(indicator, Role::MutedText));
+            }
+            let picker_hint = self
+                .picker_hint()
+                .map(|hint| RoleLine::role(hint, Role::MutedText));
+            let scroll_hint = (self.picker_kind.is_some() && option_count < menu.options.len())
+                .then(|| lines.last().unwrap().clone());
+            if let Some(hint) = &picker_hint {
+                lines.push(hint.clone());
+            }
             let menu_capacity = self
                 .height
                 .saturating_sub(reserved_rows + MIN_SCROLL_ROWS)
                 .max(1);
             if lines.len() > menu_capacity {
-                let start = selected_row.saturating_sub(menu_capacity.saturating_sub(1));
-                lines = lines.into_iter().skip(start).take(menu_capacity).collect();
-                selected_row -= start;
-                menu_comment_cursor = menu_comment_cursor
-                    .and_then(|(row, column)| row.checked_sub(start).map(|row| (row, column)));
+                if self.picker_kind.is_some() {
+                    let selected = lines[selected_row].clone();
+                    lines = vec![
+                        RoleLine::role(
+                            truncate_width(&display_text(&menu.title), self.width),
+                            Role::DialogTitle,
+                        ),
+                        selected,
+                    ];
+                    selected_row = 1;
+                    if menu_capacity > 2
+                        && let Some(scroll) = scroll_hint
+                    {
+                        lines.push(scroll);
+                    }
+                    if lines.len() < menu_capacity
+                        && let Some(hint) = picker_hint
+                    {
+                        lines.push(hint);
+                    }
+                    if menu_capacity == 1 {
+                        lines.remove(0);
+                        selected_row = 0;
+                    }
+                } else {
+                    let start = selected_row.saturating_sub(menu_capacity.saturating_sub(1));
+                    lines = lines.into_iter().skip(start).take(menu_capacity).collect();
+                    selected_row -= start;
+                    menu_comment_cursor = menu_comment_cursor
+                        .and_then(|(row, column)| row.checked_sub(start).map(|row| (row, column)));
+                }
             }
         }
         if self.menu.is_none() && self.shell_input.active_completion().is_some() {
@@ -3560,34 +3584,38 @@ impl State {
             "Shell running · Ctrl+B / Ctrl+X Ctrl+B background · Ctrl+C stop".into()
         } else if self.secret_menu_active() {
             if self.menu_comment_is_editing() {
-                "API key · Enter save · Esc close field".into()
+                "API key".into()
             } else {
-                "API key · Tab edit · Esc cancel".into()
+                "API key · Tab edit".into()
             }
         } else if self.menu_focused && self.menu_is_visible() {
-            match self.picker_kind {
-                Some(PickerKind::Provider) => PROVIDER_PICKER_HINT.into(),
-                Some(PickerKind::Model) => MODEL_PICKER_HINT.into(),
-                None => "Ctrl+O details · Tab focus".into(),
-            }
+            self.picker_hint()
+                .unwrap_or("Ctrl+O details · Tab focus")
+                .into()
         } else if self.menu.is_some() {
             "Ctrl+O details · Tab focus".into()
         } else if self.footer.selected().is_some() {
-            "Footer · ←→/h/l · ↑↓/j/k/Ctrl+N/P choose · Enter open · Esc input".into()
+            "Ctrl+O details".into()
         } else if self.shell_input.kind() == InputKind::Shell {
             "Shell · Tab complete · Ctrl+C stop".into()
         } else if self.file_mentions.is_open() || self.completion.is_open() {
-            "Tab complete · ↑↓/Ctrl+N/P choose · Enter send/select · Esc close".into()
-        } else if self.clipboard_hint.is_visible() {
+            "Tab complete".into()
+        } else if self.clipboard_hint.is_visible()
+            && self.menu.is_none()
+            && self.shell_input.kind() != InputKind::Shell
+            && self.footer.selected().is_none()
+        {
             // The hint only stands in for the idle key hints: the status and every
             // prompt, menu or confirmation above keep their place.
             CLIPBOARD_IMAGE_HINT.into()
         } else {
-            "↑↓ history · Ctrl+O details · Ctrl+C interrupt".into()
+            "Ctrl+O details · Ctrl+C interrupt".into()
         };
         let hints = self.display.navigation_hint(&hints);
         let mut footer = if self.status.is_empty() {
             hints
+        } else if hints.is_empty() {
+            self.status.clone()
         } else {
             format!("{} · {hints}", self.status)
         };
@@ -3694,9 +3722,7 @@ impl State {
         query.truncate(self.width);
         lines.push(query);
         let mut hint = RoleLine::role(
-            self.display.navigation_hint(
-                "↑↓/Ctrl+N/P choose · Ctrl+S scope · Enter/Tab insert · Esc cancel",
-            ),
+            self.display.navigation_hint("Ctrl+S scope"),
             Role::MutedText,
         );
         hint.truncate(self.width);
@@ -4572,13 +4598,22 @@ impl State {
         }
     }
 
-    fn selected_menu_accepts_comment(&self) -> bool {
-        let Some(selected) = self.menu.as_ref().map(|menu| menu.selected) else {
-            return false;
-        };
-        self.menu_comment
-            .as_ref()
-            .is_some_and(|comment| comment.options.contains(&selected))
+    fn picker_hint(&self) -> Option<&'static str> {
+        match self.picker_kind {
+            Some(PickerKind::Provider) => Some("r Sign in again · s Sign out · d Device code"),
+            Some(PickerKind::ModelProvider) => Some("p Configure Providers"),
+            Some(PickerKind::Model)
+                if self.menu.as_ref().is_some_and(|menu| {
+                    menu.options
+                        .iter()
+                        .any(|option| option == REFRESH_ACCOUNT_MODELS_LABEL)
+                }) =>
+            {
+                Some("p Provider · r Refresh account models")
+            }
+            Some(PickerKind::Model) => Some("p Provider"),
+            None => None,
+        }
     }
 
     fn selected_menu_can_expand(&self) -> bool {
@@ -5109,10 +5144,7 @@ impl State {
             .footer_open_pending
             .filter(|pending| !pending.cancelled)
         {
-            return Some(format!(
-                "Opening {}… · Esc return to input",
-                pending.item.label()
-            ));
+            return Some(format!("Opening {}…", pending.item.label()));
         }
         if let Some(control) = self.pending_exit_control() {
             return Some(if control == 'C' {
@@ -5449,8 +5481,21 @@ impl State {
             && let Some(menu) = &mut self.menu
         {
             let picker_action = match (self.picker_kind, key.code, key.modifiers) {
+                (
+                    Some(PickerKind::Model | PickerKind::ModelProvider),
+                    KeyCode::Char('p'),
+                    KeyModifiers::NONE,
+                ) => Some(PickerAction::ConfigureProvider),
                 (Some(PickerKind::Provider), KeyCode::Char('r'), KeyModifiers::NONE) => {
                     Some(PickerAction::Reauthenticate)
+                }
+                (Some(PickerKind::Model), KeyCode::Char('r'), KeyModifiers::NONE)
+                    if menu
+                        .options
+                        .iter()
+                        .any(|option| option == REFRESH_ACCOUNT_MODELS_LABEL) =>
+                {
+                    Some(PickerAction::RefreshAccountModels)
                 }
                 (Some(PickerKind::Provider), KeyCode::Char('s'), KeyModifiers::NONE) => {
                     Some(PickerAction::SignOut)
@@ -5708,7 +5753,8 @@ impl State {
             return None;
         }
         let selected_comment = self.selected_menu_comment();
-        let direct_number_choices = self.menu.as_ref().is_some_and(|menu| !menu.confirmation);
+        let direct_number_choices =
+            self.picker_kind.is_none() && self.menu.as_ref().is_some_and(|menu| !menu.confirmation);
         let approval_review_available = self
             .menu_review
             .as_ref()
@@ -6318,23 +6364,18 @@ fn task_surface_lines(
     }));
     if height > 1 {
         let footer = if let Some(error) = action_error {
-            format!("Error: {} · Esc close", display_single_line(&error))
+            format!("Error: {}", display_single_line(&error))
         } else {
             match frame.focus {
                 TaskSurfaceFocus::List => {
-                    let mut footer = format!(
-                        "{}{}/j/k/Ctrl+N/P choose · Enter open",
-                        display.glyph(Glyph::ScrollUp),
-                        display.glyph(Glyph::ScrollDown)
-                    );
+                    let mut footer = String::new();
                     if selected_capabilities.can_background {
                         footer.push_str(" · b background");
                     }
                     if selected_capabilities.can_stop {
                         footer.push_str(" · x stop");
                     }
-                    footer.push_str(" · Esc/← close");
-                    footer
+                    footer.trim_start_matches(" · ").to_owned()
                 }
                 TaskSurfaceFocus::Detail { .. } => {
                     let unread = if frame.unread_bytes == 0 {
@@ -6342,20 +6383,15 @@ fn task_surface_lines(
                     } else {
                         format!(" · {} unread bytes", frame.unread_bytes)
                     };
-                    let mut footer = "← list · Esc/Enter/Space close".to_owned();
+                    let mut footer = String::new();
                     if selected_capabilities.can_stop {
                         footer.push_str(" · x stop");
                     }
                     if selected_capabilities.can_background {
                         footer.push_str(" · b background");
                     }
-                    footer.push_str(&format!(
-                        " · j/k/{}{} scroll · PgUp/PgDn · Home/End",
-                        display.glyph(Glyph::ScrollUp),
-                        display.glyph(Glyph::ScrollDown)
-                    ));
                     footer.push_str(&unread);
-                    footer
+                    footer.trim_start_matches(" · ").to_owned()
                 }
             }
         };
@@ -6454,26 +6490,13 @@ fn diff_screen_lines(
         }
     }
 
-    let footer = if frame.mode == DiffDialogMode::Detail {
-        format!(
-            "j/k/{}{} · PgUp/PgDn · Home/End · ←/Esc back",
-            display.glyph(Glyph::ScrollUp),
-            display.glyph(Glyph::ScrollDown)
-        )
-    } else {
-        format!(
-            "←/→ source · j/k/{}{} file · Enter details · Esc close",
-            display.glyph(Glyph::ScrollUp),
-            display.glyph(Glyph::ScrollDown)
-        )
-    };
     let content_rows = height.saturating_sub(1);
     lines.truncate(content_rows);
     while lines.len() < content_rows {
         lines.push(String::new());
     }
     if height > 0 {
-        lines.push(footer);
+        lines.push(String::new());
     }
     lines
 }
@@ -6521,19 +6544,6 @@ fn display_single_line(text: &str) -> String {
             character => character,
         })
         .collect()
-}
-
-fn question_menu_hint(question: &QuestionMenu) -> String {
-    let mut hint = String::from(if question.multi_select {
-        "↑↓/j/k choose · Space/Enter toggle"
-    } else {
-        "↑↓/j/k choose · Enter select"
-    });
-    if question.navigable {
-        hint.push_str(" · ←/→ question");
-    }
-    hint.push_str(" · Esc answer later");
-    hint
 }
 
 fn display_text(text: &str) -> String {
@@ -8569,13 +8579,7 @@ mod tests {
 
         let mut state = console.state.lock().unwrap();
         assert!(state.menu_focused);
-        assert!(
-            state
-                .frame()
-                .0
-                .join("\n")
-                .contains("Enter select · Esc answer later")
-        );
+        assert!(!state.frame().0.join("\n").contains("Enter select"));
         assert!(state.key(key(KeyCode::Right)).is_none());
         assert!(state.key(key(KeyCode::Char('l'))).is_none());
         assert!(state.key(key(KeyCode::Char(' '))).is_none());
@@ -8588,7 +8592,7 @@ mod tests {
         state.key(key(KeyCode::Char('k')));
         let frame = state.frame().0.join("\n");
         assert!(frame.contains("Answer: jk"), "{frame}");
-        assert!(frame.contains("Type your answer · Enter submit · Esc close field"));
+        assert!(!frame.contains("Enter submit"));
         assert!(state.key(key(KeyCode::Esc)).is_none());
         assert!(!state.menu_comment_is_editing());
         assert!(state.key(key(KeyCode::Enter)).is_none());
@@ -8625,13 +8629,7 @@ mod tests {
         let menu_id = show();
         {
             let mut state = console.state.lock().unwrap();
-            assert!(
-                state
-                    .frame()
-                    .0
-                    .join("\n")
-                    .contains("Space/Enter toggle · ←/→ question · Esc answer later")
-            );
+            assert!(!state.frame().0.join("\n").contains("Space/Enter toggle"));
             assert!(matches!(
                 state.key(key(KeyCode::Char(' '))),
                 Some(InputEvent::Choice { menu_id: chosen, index: 0, comment: None })
@@ -9214,7 +9212,7 @@ mod tests {
         }
         let frame = state.frame().0.join("\n");
         assert!(frame.contains("Guidance: focus on API boundaries"));
-        assert!(frame.contains("add context (optional)"));
+        assert!(!frame.contains("Enter submit"));
         assert!(state.key(key(KeyCode::Tab)).is_none());
         assert!(matches!(
             state.key(key(KeyCode::Char('2'))),
@@ -11649,7 +11647,7 @@ mod tests {
         let (lines, input_row, _) = state.frame();
         assert_eq!(lines[lines.len() - 2], "  Tasks    Todo");
         assert_eq!(input_row, lines.len() - 3);
-        assert!(lines.last().unwrap().contains("history"));
+        assert!(!lines.last().unwrap().contains("history"));
 
         state.key(key(KeyCode::Down));
         assert_eq!(state.footer.selected(), Some(FooterItemId::Tasks));
@@ -12041,7 +12039,7 @@ mod tests {
         assert!(detail_row > conversation_row);
         assert!(detail_row >= 12);
         assert!(
-            state.rendered_screen[23].contains("Esc/Enter/Space close"),
+            !state.rendered_screen[23].contains("Esc/Enter/Space close"),
             "{:?}",
             state.rendered_screen[23]
         );
@@ -12278,7 +12276,7 @@ mod tests {
     }
 
     #[test]
-    fn paused_scrolling_keeps_footer_and_opening_hints_visible() {
+    fn paused_scrolling_keeps_footer_without_basic_navigation_hints() {
         let mut state = State::new(true, 120, 24);
         state.prompt_enabled = true;
         state
@@ -12303,8 +12301,8 @@ mod tests {
         state.draw(&mut output).unwrap();
         let output = String::from_utf8(output).unwrap();
         let screen = state.rendered_screen.join("\n");
-        assert!(screen.contains("Footer · ←→/h/l"));
-        assert!(screen.contains("Enter open"));
+        assert!(!screen.contains("Footer · ←→/h/l"));
+        assert!(!screen.contains("Enter open"));
         assert!(!screen.contains("Scrolled up"));
         assert!(output.contains("\x1b[?25l"));
 
@@ -12316,7 +12314,7 @@ mod tests {
         state.draw(&mut output).unwrap();
         let output = String::from_utf8(output).unwrap();
         let screen = state.rendered_screen.join("\n");
-        assert!(screen.contains("Opening Tasks… · Esc return to input"));
+        assert!(screen.contains("Opening Tasks…"));
         assert!(!screen.contains("Scrolled up"));
         assert!(output.contains("\x1b[?25l"));
     }
@@ -13014,7 +13012,7 @@ mod tests {
         );
         surface.clear_action_error();
         let lines = task_surface_lines(&mut surface, 80, 24, None, DisplayProfile::default());
-        assert!(lines.last().unwrap().contains("j/k/↑↓ scroll"));
+        assert!(!lines.last().unwrap().contains("j/k/↑↓ scroll"));
         assert!(!lines.last().unwrap().contains("owner mismatch"));
     }
 
@@ -13291,7 +13289,8 @@ mod tests {
         let mut state = State::new(true, 160, 24);
         state.prompt_enabled = true;
         let console = console_with_state(state);
-        let selection = menu();
+        let mut selection = menu();
+        selection.options.push(REFRESH_ACCOUNT_MODELS_LABEL.into());
         let menu_id = selection.id;
         console
             .show_picker_menu(selection, PickerKind::Model)
@@ -13302,6 +13301,8 @@ mod tests {
             (KeyCode::Char('h'), PickerAction::ThinkingPrevious),
             (KeyCode::Right, PickerAction::ThinkingNext),
             (KeyCode::Char('l'), PickerAction::ThinkingNext),
+            (KeyCode::Char('p'), PickerAction::ConfigureProvider),
+            (KeyCode::Char('r'), PickerAction::RefreshAccountModels),
         ] {
             assert!(matches!(
                 state.key(key(code)),
@@ -13312,13 +13313,10 @@ mod tests {
                 }) if id == menu_id && actual == action
             ));
         }
-        assert!(
-            state
-                .frame()
-                .0
-                .join("\n")
-                .contains("←→ Thinking · Enter apply")
-        );
+        let rendered = state.frame().0.join("\n");
+        assert!(rendered.contains("p Provider · r Refresh account models"));
+        assert!(!rendered.contains("←→ Thinking"));
+        assert!(!rendered.contains("↑↓/j/k"));
         state.menu_focused = false;
         assert!(!matches!(
             state.key(key(KeyCode::Right)),
@@ -13387,6 +13385,87 @@ mod tests {
         let state = console.state.lock().unwrap();
         assert_eq!(state.menu.as_ref().unwrap().selected, 1);
         assert!(!state.menu_focused);
+    }
+
+    #[test]
+    fn long_picker_keeps_title_selected_row_and_scroll_hint_visible() {
+        let mut state = State::new(true, 80, 20);
+        state.prompt_enabled = true;
+        state.menu_focused = true;
+        state.picker_kind = Some(PickerKind::Model);
+        let mut choices = menu();
+        choices.title = "Choose model · Test Provider".into();
+        choices.context = vec!["Account directory checked".into()];
+        choices.options = (0..30)
+            .map(|index| format!("Model {index:02} Thinking auto"))
+            .collect();
+        choices.selected = 29;
+        state.menu = Some(choices);
+        for expected in (0..30).rev() {
+            let (lines, _, _) = state.styled_frame();
+            let visible = lines
+                .iter()
+                .map(RoleLine::text)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(visible.contains("Choose model · Test Provider"));
+            assert!(visible.contains(&format!("Model {expected:02}")));
+            assert!(visible.contains("More above") || visible.contains("More below"));
+            assert!(lines.iter().any(|line| line.fill == Some(Role::Selection)
+                && line.text().contains(&format!("Model {expected:02}"))));
+            state.key(key(KeyCode::Char('k')));
+        }
+    }
+
+    #[test]
+    fn model_context_stays_visible_on_model_and_action_rows() {
+        let mut state = State::new(true, 160, 24);
+        state.prompt_enabled = true;
+        let console = console_with_state(state);
+        let mut selection = menu();
+        selection.context = vec![
+            "Provider account check failed".into(),
+            "Provider notice".into(),
+        ];
+        selection.options.push("Refresh account models".into());
+        console
+            .show_picker_menu(selection, PickerKind::Model)
+            .unwrap();
+        let mut state = console.state.lock().unwrap();
+        for _ in 0..3 {
+            let frame = state.frame().0.join("\n");
+            assert!(frame.contains("Provider account check failed"));
+            assert!(frame.contains("Provider notice"));
+            state.key(key(KeyCode::Char('j')));
+        }
+        assert_eq!(state.editor.draft(), "");
+    }
+
+    #[test]
+    fn provider_and_model_pickers_omit_numbers_and_ignore_numeric_submission() {
+        for kind in [
+            PickerKind::Provider,
+            PickerKind::ModelProvider,
+            PickerKind::Model,
+        ] {
+            let mut state = State::new(true, 160, 24);
+            state.prompt_enabled = true;
+            let console = console_with_state(state);
+            console.show_picker_menu(menu(), kind).unwrap();
+            let mut state = console.state.lock().unwrap();
+            let rendered = state.frame().0.join("\n");
+            assert!(!rendered.contains("1. "), "{rendered}");
+            assert!(!rendered.contains("2. "), "{rendered}");
+            for digit in ['1', '2', '3'] {
+                assert!(state.key(key(KeyCode::Char(digit))).is_none());
+                assert_eq!(state.menu.as_ref().unwrap().selected, 0);
+                assert_eq!(state.editor.draft(), "");
+            }
+            assert!(matches!(
+                state.key(key(KeyCode::Enter)),
+                Some(InputEvent::Choice { index: 0, .. })
+            ));
+        }
     }
 
     #[test]

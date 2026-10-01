@@ -495,7 +495,7 @@ async fn piped_provider_model_and_settings_menus_apply_numbered_choices() {
         .take()
         .unwrap()
         .write_all(
-            b"/model\n1\n1\n1\n/model\n1\ncancel\ncancel\n/settings\n4\n2\n/settings\ncancel\n/exit\n",
+            b"/model\n2\n/model\ncancel\ncancel\n/settings\n4\n2\n/settings\ncancel\n/exit\n",
         )
         .await
         .unwrap();
@@ -510,7 +510,7 @@ async fn piped_provider_model_and_settings_menus_apply_numbered_choices() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        transcript.contains("DeepSeek Flash (V4.1)    Thinking"),
+        transcript.contains("DeepSeek-V4.1-Flash    Thinking"),
         "{transcript}"
     );
     assert!(
@@ -2067,7 +2067,7 @@ async fn explicit_multimodel_yaml_shows_mixed_protocol_siblings_without_saving_o
         .stdin
         .take()
         .unwrap()
-        .write_all(b"/model\n1\ncancel\ncancel\n/exit\n")
+        .write_all(b"/model\ncancel\ncancel\n/exit\n")
         .await
         .unwrap();
     let output = tokio::time::timeout(INTERACTION_TIMEOUT, child.wait_with_output())

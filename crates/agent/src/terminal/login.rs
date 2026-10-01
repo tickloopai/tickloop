@@ -228,12 +228,12 @@ impl LoginFlow {
         if let LoginMethod::MiniMax(_) = self.method {
             context.push("Approve access on the MiniMax Portal. The consent page identifies the registered Portal client.".into());
         } else if let LoginMethod::Copilot = self.method {
-            context.push(format!("Authorize the {} GitHub App by {}. Requests use your Copilot subscription; your plan and organization policy decide which models work.", copilot::APP_NAME, copilot::APP_OWNER));
+            context.push(copilot::CONSENT_NOTICE.into());
         } else {
             context.push("If OpenAI asks you to enable device code authorization, enable it in ChatGPT Settings > Security and retry Device code sign-in from this Provider, or use Browser sign-in.".into());
         }
         context.push(format!(
-            "Waiting for {} authorization. Esc cancels.",
+            "Waiting for {} authorization.",
             self.method.label()
         ));
         Self::show(
@@ -273,7 +273,7 @@ impl LoginFlow {
             Some(Err(error)) => self.show_callback(console, Some(&error.to_string())),
             None => self.show_callback(
                 console,
-                Some("Press Tab to enter the full callback URL, including state, then Enter."),
+                Some("Enter the full callback URL, including state."),
             ),
         }
     }
@@ -291,7 +291,7 @@ impl LoginFlow {
             safe_text(address),
             "Use your terminal's link shortcut (often Ctrl/Cmd+click), or copy the URL.".into(),
             "Complete authorization in your browser. For a remote terminal, paste the full redirect URL here, or cancel and choose Device code sign-in from this Provider.".into(),
-            "Tab edits the callback field; Esc leaves editing, then cancels login.".into(),
+            "Tab edits the callback URL.".into(),
         ];
         if let Some(notice) = notice {
             context.push(safe_text(notice));
@@ -366,10 +366,7 @@ impl LogoutFlow {
         console: &Console,
         target: SignInTarget,
     ) -> Result<Self, String> {
-        console.set_status(&format!(
-            "Removing {} login… Esc cancels; input will run afterward",
-            target.label()
-        ))?;
+        console.set_status(&format!("Removing {} login…", target.label()))?;
         let cancel = CancellationToken::new();
         let task_cancel = cancel.clone();
         let task = tokio::spawn(async move {
@@ -462,6 +459,13 @@ pub(super) fn terminal_auth(root: PathBuf) -> CodexAuth {
 
 #[cfg(test)]
 mod tests {
+    mod screen {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/screen.rs"
+        ));
+    }
+
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
     use serde_json::json;
     use std::{
@@ -502,6 +506,16 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pty_login_then_conversation_uses_current_codex_sol() {
+        pty_login_conversation(true, Some("gpt-6.1-sol")).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pty_login_then_conversation_uses_current_codex_luna() {
+        pty_login_conversation(true, Some("gpt-6-luna")).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancelled_and_failed_login_return_to_provider_before_exit() {
         let directory = tempfile::tempdir().unwrap();
         let pty = native_pty_system()
@@ -522,6 +536,16 @@ mod tests {
         command.env("TICKLOOP_CONFIG_DIR", directory.path().join("state"));
         command.env("TICKLOOP_TEST_CODEX_OAUTH", "http://127.0.0.1:37981");
         command.env("TICKLOOP_AGENT_TUI", "inline");
+        for name in ["HERDR_ENV", "HERDR_PANE_ID", "HERDR_SOCKET_PATH"] {
+            command.env_remove(name);
+        }
+        for model in crate::model::cards::built_in_model_profiles() {
+            if !model.api_key_env.is_empty() {
+                command.env_remove(model.api_key_env);
+            }
+        }
+        command.env("NO_PROXY", "127.0.0.1,localhost");
+        command.env("no_proxy", "127.0.0.1,localhost");
         let mut reader = pty.master.try_clone_reader().unwrap();
         let mut writer = pty.master.take_writer().unwrap();
         struct ChildGuard(Box<dyn portable_pty::Child + Send + Sync>);
@@ -554,7 +578,7 @@ mod tests {
             }
         };
         wait("Ask");
-        writer.write_all(b"/model\r").unwrap();
+        writer.write_all(b"/provider\r").unwrap();
         writer.flush().unwrap();
         wait("Choose Provider");
         writer.write_all(b"j\r").unwrap();
@@ -625,9 +649,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
         if let Some(model) = selected_model {
-            let config = crate::model::cards::built_in_model_profiles()
-                .into_iter()
-                .find(|config| config.model == model)
+            let config = crate::model::cards::ModelCatalog::defaults()
+                .get("openai-codex", model)
                 .unwrap();
             crate::settings::UserSettings::in_root(&root.join("state"))
                 .save_model(&config, false)
@@ -702,7 +725,7 @@ mod tests {
                 } else if headers.starts_with("GET /codex/models?") {
                     assert!(headers.contains("chatgpt-account-id: acct-test"));
                     assert!(headers.contains("originator: tickloop"));
-                    (json!({"models":[{"slug":"gpt-5.5"},{"slug":"gpt-5.6-sol"},{"slug":"gpt-5.6-terra"},{"slug":"gpt-5.6-luna"}]}).to_string(), "application/json")
+                    (json!({"models":[{"slug":"gpt-6-astra"},{"slug":"gpt-6.1-sol"},{"slug":"gpt-5.6-terra"},{"slug":"gpt-6-luna"}]}).to_string(), "application/json")
                 } else {
                     assert!(headers.starts_with("POST /codex/responses "), "{headers}");
                     assert!(headers.contains("chatgpt-account-id: acct-test"));
@@ -710,7 +733,7 @@ mod tests {
                         serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap();
                     assert!(body["input"].to_string().contains("hello from terminal"));
                     assert_eq!(body["store"], false);
-                    assert_eq!(body["model"], selected_model.unwrap_or("gpt-5.5"));
+                    assert_eq!(body["model"], selected_model.unwrap_or("gpt-6-astra"));
                     model_seen = true;
                     let text = json!({"type":"message","id":"msg_pty","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Subscription terminal connected","annotations":[]}]});
                     let events = [
@@ -755,6 +778,16 @@ mod tests {
             format!("{origin}/codex/responses"),
         );
         command.env("TICKLOOP_AGENT_TUI", "inline");
+        for name in ["HERDR_ENV", "HERDR_PANE_ID", "HERDR_SOCKET_PATH"] {
+            command.env_remove(name);
+        }
+        for model in crate::model::cards::built_in_model_profiles() {
+            if !model.api_key_env.is_empty() {
+                command.env_remove(model.api_key_env);
+            }
+        }
+        command.env("NO_PROXY", "127.0.0.1,localhost");
+        command.env("no_proxy", "127.0.0.1,localhost");
         command.env("TICKLOOP_TEST_BROWSER_AUTH", "1");
         let mut reader = pty.master.try_clone_reader().unwrap();
         let mut writer = pty.master.take_writer().unwrap();
@@ -807,24 +840,31 @@ mod tests {
             let deadline = Instant::now() + Duration::from_secs(20);
             loop {
                 let text = output.lock().unwrap().clone();
-                if ansi
-                    .replace_all(text.get(offset..).unwrap_or(""), "")
-                    .contains(needle)
+                let updates = text.get(offset..).unwrap_or("");
+                let visible = screen::visible_screen(&text, 150, 40);
+                if ansi.replace_all(updates, "").contains(needle)
+                    || (updates.contains("\x1b[?2026l") && visible.contains(needle))
                 {
                     break;
                 }
                 assert!(
                     Instant::now() < deadline,
-                    "PTY missing {needle} after action"
+                    "PTY missing {needle} after action:\n{visible}"
                 );
                 std::thread::sleep(Duration::from_millis(20));
             }
         };
         wait("Ask");
-        writer.write_all(b"/model\r").unwrap();
+        writer.write_all(b"/provider\r").unwrap();
         writer.flush().unwrap();
         wait("Choose Provider");
-        writer.write_all(b"j\r").unwrap();
+        writer
+            .write_all(if selected_model.is_some() {
+                b"\r"
+            } else {
+                b"j\r"
+            })
+            .unwrap();
         writer.flush().unwrap();
         wait("Choose connection · OpenAI");
         writer
@@ -840,11 +880,14 @@ mod tests {
                 let plain = ansi.replace_all(&text, "");
                 // A frame carries only the rows that changed, so the picker is
                 // back once its title was drawn after the login dialog last was.
-                let picker_returned = plain.rfind("Choose model").is_some_and(|picker| {
+                let picker_returned =
                     plain
-                        .rfind("Codex browser login")
-                        .is_none_or(|login| login < picker)
-                });
+                        .rfind("Choose connection · OpenAI")
+                        .is_some_and(|picker| {
+                            plain
+                                .rfind("Codex browser login")
+                                .is_none_or(|login| login < picker)
+                        });
                 if picker_returned {
                     assert!(
                         !text.contains("Model selection:"),
@@ -859,20 +902,35 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(20));
             }
             if browser && selected_model.is_none() {
-                let before_back = output.lock().unwrap().len();
-                writer.write_all(b"\x1b").unwrap();
-                writer.flush().unwrap();
-                wait_after("Choose connection · OpenAI", before_back);
                 let before_reauthentication = output.lock().unwrap().len();
                 writer.write_all(b"r").unwrap();
                 writer.flush().unwrap();
                 wait_after("Codex browser login", before_reauthentication);
                 wait_after("login saved", before_reauthentication);
-                wait_after("Choose model", before_reauthentication);
+                wait_after("Choose connection · OpenAI", before_reauthentication);
             }
-            writer.write_all(b"\r").unwrap();
+            writer.write_all(b"\x1b\x1b").unwrap();
             writer.flush().unwrap();
-            wait("Model selection:");
+            wait("Selection cancelled");
+            if selected_model == Some("gpt-5.6-sol") {
+                let saved = crate::settings::UserSettings::in_root(&root.join("state"))
+                    .model()
+                    .unwrap();
+                assert_eq!(saved.model, "gpt-5.6-sol");
+            } else {
+                let before_models = output.lock().unwrap().len();
+                writer.write_all(b"/model\r").unwrap();
+                writer.flush().unwrap();
+                wait_after("Choose model", before_models);
+                if selected_model.is_none() {
+                    writer.write_all(b"\r").unwrap();
+                    writer.flush().unwrap();
+                }
+                wait_after("Choose model · OpenAI", before_models);
+                writer.write_all(b"\r").unwrap();
+                writer.flush().unwrap();
+                wait("Model selection:");
+            }
         }
         writer.write_all(b"hello from terminal\r").unwrap();
         writer.flush().unwrap();

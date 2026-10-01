@@ -694,7 +694,8 @@ async fn the_minimum_panel_draws_fiscal_comparisons_and_source_time() {
     }
     assert!(screen.contains("Longbridge"), "{screen}");
     assert!(screen.contains("Compare periods"), "{screen}");
-    assert!(screen.contains("? Help  q Quit"), "{screen}");
+    assert!(screen.contains("? Help"), "{screen}");
+    assert!(!screen.contains("q Quit"), "{screen}");
 }
 
 #[tokio::test]

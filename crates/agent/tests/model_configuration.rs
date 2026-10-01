@@ -32,6 +32,7 @@ fn custom_provider(id: &str) -> ProviderDefinition {
             adaptive_by_default: false,
             effort_levels: vec![tickloop_agent::model::ReasoningEffort::High],
             input_modalities: vec![tickloop_agent::model::InputModality::Text],
+            thinking_budgets: None,
         }],
     }
 }

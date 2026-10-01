@@ -3,7 +3,7 @@ mod providers;
 use providers::{ModelChoice, ProviderModels, ProviderRow};
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     path::PathBuf,
 };
 
@@ -56,9 +56,11 @@ enum Selection {
         choices: Vec<ProviderModels>,
         rows: Vec<ProviderRow>,
     },
+    ModelProviders {
+        chat: Uuid,
+    },
     Model {
         chat: Uuid,
-        provider: ProviderModels,
         choices: Vec<ModelChoice>,
     },
     Discovery {
@@ -134,7 +136,7 @@ enum Selection {
 
 #[derive(Clone)]
 enum JudgmentReturn {
-    ModelProviders {
+    Providers {
         chat: Uuid,
     },
     AutoSettings {
@@ -147,7 +149,7 @@ enum JudgmentReturn {
 impl JudgmentReturn {
     fn chat(&self) -> Uuid {
         match self {
-            Self::ModelProviders { chat } | Self::AutoSettings { chat, .. } => *chat,
+            Self::Providers { chat } | Self::AutoSettings { chat, .. } => *chat,
         }
     }
 }
@@ -256,6 +258,7 @@ impl Selection {
             Self::Permission { chat, .. }
             | Self::PermissionRule { chat, .. }
             | Self::Provider { chat, .. }
+            | Self::ModelProviders { chat }
             | Self::Discovery { chat }
             | Self::ApiKey { chat, .. }
             | Self::Model { chat, .. }
@@ -293,10 +296,16 @@ pub(super) struct Menus {
     provider_choices: Vec<ProviderModels>,
     provider_selected: usize,
     provider_group: Option<(String, usize)>,
+    model_return: Option<providers::ModelPickerDraft>,
+    model_choices: Vec<ModelChoice>,
+    model_providers: Vec<ProviderModels>,
+    model_provider: Option<String>,
+    current_model: Option<(String, String)>,
     config_root: Option<PathBuf>,
     model_discovery: tickloop_agent::model::availability::AccountModelDiscovery,
+    model_warmup: Option<providers::ModelWarmup>,
     discovery_flow: Option<providers::DiscoveryFlow>,
-    account_directory_status: String,
+    model_directory_status: BTreeMap<String, String>,
     font_manager: Option<NerdFontManager<SystemFontAdapter>>,
 }
 
@@ -318,10 +327,16 @@ impl Menus {
             provider_choices: Vec::new(),
             provider_selected: 0,
             provider_group: None,
+            model_return: None,
+            model_choices: Vec::new(),
+            model_providers: Vec::new(),
+            model_provider: None,
+            current_model: None,
             config_root: config_root.clone(),
             model_discovery: Default::default(),
+            model_warmup: None,
             discovery_flow: None,
-            account_directory_status: String::new(),
+            model_directory_status: BTreeMap::new(),
             font_manager: config_root.map(NerdFontManager::production),
         }
     }
@@ -587,6 +602,8 @@ impl Menus {
         if console.is_interactive() {
             if matches!(&selection, Selection::Provider { .. }) {
                 console.show_picker_menu(menu, PickerKind::Provider)?;
+            } else if matches!(&selection, Selection::ModelProviders { .. }) {
+                console.show_picker_menu(menu, PickerKind::ModelProvider)?;
             } else if matches!(&selection, Selection::Model { .. }) {
                 console.show_picker_menu(menu, PickerKind::Model)?;
             } else if matches!(
@@ -756,12 +773,7 @@ impl Menus {
         Ok(())
     }
 
-    pub(super) async fn models(
-        &mut self,
-        agent: &Agent,
-        console: &Console,
-        chat: Uuid,
-    ) -> Result<(), String> {
+    async fn load_providers(&mut self, agent: &Agent, chat: Uuid) -> Result<(), String> {
         let snapshot = agent
             .snapshot(chat)
             .await
@@ -808,16 +820,49 @@ impl Menus {
         {
             choices.push(pending.clone());
         }
+        self.current_model = Some((snapshot.model.provider_id, snapshot.model.model_id));
         self.provider_choices = ProviderModels::group(choices);
-        self.provider_selected = 0;
         self.provider_group = None;
-        self.show_providers(
-            console,
-            chat,
-            self.provider_choices.clone(),
-            0,
-            Uuid::new_v4(),
-        )
+        let rows = providers::provider_rows(&self.provider_choices, None);
+        self.provider_selected = rows
+            .iter()
+            .position(|row| match row {
+                ProviderRow::Provider(index) => {
+                    self.current_model.as_ref().is_some_and(|(provider, _)| {
+                        self.provider_choices[*index].models[0].provider_id == *provider
+                    })
+                }
+                ProviderRow::Group(group) => self.provider_choices.iter().any(|provider| {
+                    self.current_model
+                        .as_ref()
+                        .is_some_and(|(id, _)| provider.models[0].provider_id == *id)
+                        && providers::provider_group(provider) == Some(group.as_str())
+                }),
+            })
+            .unwrap_or(0);
+        Ok(())
+    }
+
+    pub(super) async fn models(
+        &mut self,
+        agent: &Agent,
+        console: &Console,
+        chat: Uuid,
+    ) -> Result<(), String> {
+        self.model_return = None;
+        self.load_providers(agent, chat).await?;
+        self.configured_models(agent, console, chat).await
+    }
+
+    pub(super) async fn providers(
+        &mut self,
+        agent: &Agent,
+        console: &Console,
+        chat: Uuid,
+    ) -> Result<(), String> {
+        self.model_return = None;
+        self.load_providers(agent, chat).await?;
+        self.back_to_providers(console, chat)
     }
 
     pub(super) async fn efforts(
@@ -1838,7 +1883,7 @@ impl Menus {
                             if let Err(error) = self.judgment_settings(
                                 agent,
                                 console,
-                                JudgmentReturn::ModelProviders { chat },
+                                JudgmentReturn::Providers { chat },
                             )
                             .await {
                                 self.back_to_providers(console, chat)?;
@@ -1860,8 +1905,7 @@ impl Menus {
                         let provider = choices.get(provider_index).ok_or("provider option does not exist")?.clone();
                         self.provider_choices = choices;
                         match self.provider_authenticated(&provider) {
-                            Ok(true) => self.provider_models(agent, console, chat, provider).await?,
-                            Ok(false) => return self.provider_auth(console, chat, provider),
+                            Ok(true) | Ok(false) => return self.provider_auth(console, chat, provider),
                             Err(error) => {
                                 self.back_to_providers(console, chat)?;
                                 return Err(error);
@@ -1869,6 +1913,8 @@ impl Menus {
                         }
                     } else if self.provider_group.take().is_some() {
                         self.back_to_providers(console, chat)?;
+                    } else if self.model_return.is_some() {
+                        self.configured_models(agent, console, chat).await?;
                     } else {
                         console.write("Selection cancelled; configuration unchanged.\n")?;
                     }
@@ -1883,9 +1929,9 @@ impl Menus {
                         }
                         self.model_discovery.invalidate(&provider.models[0].provider_id);
                         console.write("API key saved to Agent .env.\n")?;
-                        self.provider_models(agent, console, chat, provider).await?;
+                        self.finish_provider_configuration(agent, console, chat).await?;
                     } else {
-                        self.back_to_providers(console, chat)?;
+                        self.finish_provider_configuration(agent, console, chat).await?;
                     }
                 }
                 Selection::JudgmentSettings { return_to, has_key } => {
@@ -1917,7 +1963,7 @@ impl Menus {
                                 console.clear_menu(menu_id)?;
                                 self.finish_judgment_selection(agent, console, return_to, true).await?;
                             }
-                            JudgmentReturn::ModelProviders { .. } => {
+                            JudgmentReturn::Providers { .. } => {
                                 self.judgment_settings(agent, console, return_to).await?;
                                 console.write("Jev (TypeSafe) key saved; authentication has not been verified.\n")?;
                             }
@@ -1931,23 +1977,48 @@ impl Menus {
                     }
                 }
                 Selection::Discovery { chat } => {
-                    self.discovery_flow.take();
-                    self.back_to_providers(console, chat)?;
+                    if let Some(flow) = self.discovery_flow.take() {
+                        let providers = flow.providers.clone();
+                        drop(flow);
+                        let directories = providers.into_iter().map(|provider| (provider, Err("Account model check cancelled".into()))).collect();
+                        self.configured_model_choices(agent, console, chat, directories).await?;
+                    }
                 }
-                Selection::Model { chat, provider, choices } => {
+                Selection::ModelProviders { chat } => {
+                    if let Some(index) = index {
+                        if index == self.model_providers.len() {
+                            self.open_model_provider_configuration(console, chat, None)?;
+                        } else {
+                            let provider = self.model_providers.get(index).ok_or("provider option does not exist")?.models[0].provider_id.clone();
+                            self.model_return = Some(providers::ModelPickerDraft {
+                                selected: None,
+                                choices: self.model_choices.clone(),
+                                provider: Some(provider),
+                            });
+                            self.configured_models(agent, console, chat).await?;
+                        }
+                    }
+                }
+                Selection::Model { chat, choices } => {
                     let Some(index) = index else {
-                        self.back_to_providers(console, chat)?;
+                        self.remember_model_drafts(&choices);
+                        let provider = self.model_provider.clone();
+                        self.show_model_providers(console, chat, provider.as_deref())?;
                         return Ok(MenuOutcome::default());
                     };
                     if index == choices.len() {
-                        self.model_discovery.invalidate(&provider.models[0].provider_id);
-                        self.provider_models(agent, console, chat, provider).await?;
+                        self.open_model_providers(console, chat, choices, index)?;
+                        return Ok(MenuOutcome::default());
+                    }
+                    if index == choices.len() + 1 {
+                        self.remember_model_drafts(&choices);
+                        self.refresh_model_choices(agent, console, chat).await?;
                         return Ok(MenuOutcome::default());
                     }
                     let choice = choices.get(index).ok_or("model option does not exist")?;
                     if !choice.availability.selectable() {
                         let error = choice.availability.label().to_owned();
-                        self.show_model_choices(console, chat, provider, choices, index, Uuid::new_v4())?;
+                        self.show_model_choices(console, chat, choices, index, Uuid::new_v4())?;
                         return Err(error);
                     }
                     let result: Result<_, String> = async {
@@ -1959,7 +2030,7 @@ impl Menus {
                     match result {
                         Ok(change) => console.write(&safe_text(&format!("Model selection: {change:?} · {} · Thinking {}\n", choice.config.name, choice.thinking.map_or("auto", ReasoningEffort::label))))?,
                         Err(error) => {
-                            self.show_model_choices(console, chat, provider, choices, index, Uuid::new_v4())?;
+                            self.show_model_choices(console, chat, choices, index, Uuid::new_v4())?;
                             return Err(error);
                         }
                     }
@@ -2476,6 +2547,164 @@ mod tests {
     };
 
     use super::*;
+
+    #[tokio::test]
+    async fn model_levels_hide_account_denials_and_keep_unknown_models_selectable() {
+        use crate::terminal::test_support as support;
+        use tickloop_agent::model::availability::{AccountModelDirectory, DirectorySemantics};
+        let directory = tempfile::tempdir().unwrap();
+        let agent = Agent::new_embedded(
+            support::config(),
+            std::sync::Arc::new(support::ScriptedModel::new(Vec::new())),
+        );
+        let chat = agent.create_chat(directory.path().into()).await.unwrap();
+        let before = agent.snapshot(chat).await.unwrap().model;
+        let (console, _) = Console::start(false).unwrap();
+        let catalog = tickloop_agent::model::cards::ModelCatalog::defaults();
+        let providers = ProviderModels::group(vec![
+            catalog.get("deepseek-api", "deepseek-flash").unwrap(),
+            catalog.get("openai-api", "gpt-6-astra").unwrap(),
+        ]);
+        let mut menus = Menus::default();
+        menus
+            .configured_model_choices(
+                &agent,
+                &console,
+                chat,
+                vec![
+                    (
+                        providers[0].clone(),
+                        Err("Model discovery is not provided".into()),
+                    ),
+                    (
+                        providers[1].clone(),
+                        Ok(AccountModelDirectory {
+                            models: BTreeMap::new(),
+                            semantics: DirectorySemantics::ExclusiveAuthorization,
+                            complete: true,
+                        }),
+                    ),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(menus.model_choices.len(), 1);
+        assert!(menus.model_choices[0].availability.selectable());
+        assert_eq!(menus.model_choices[0].config.provider_id, "deepseek-api");
+        menus.show_model_providers(&console, chat, None).unwrap();
+        menus
+            .show_provider_models(&console, chat, "openai-api", None)
+            .unwrap();
+        let (id, Selection::Model { choices, .. }) = menus.active.as_ref().unwrap() else {
+            panic!("expected empty model selection for denied Provider");
+        };
+        assert!(choices.is_empty());
+        assert_eq!(menus.model_provider.as_deref(), Some("openai-api"));
+        let id = *id;
+        menus
+            .choose(&agent, &console, id, None, None)
+            .await
+            .unwrap();
+        assert!(matches!(
+            menus.active.as_ref(),
+            Some((_, Selection::ModelProviders { .. }))
+        ));
+        assert_eq!(agent.snapshot(chat).await.unwrap().model, before);
+        agent.shutdown().await;
+    }
+
+    struct CountingDirectory(std::sync::atomic::AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl tickloop_agent::model::availability::AccountDirectoryAdapter for CountingDirectory {
+        async fn identity(
+            &self,
+            _: &tokio_util::sync::CancellationToken,
+        ) -> Result<tickloop_agent::model::availability::DiscoveryIdentity, String> {
+            Ok(tickloop_agent::model::availability::DiscoveryIdentity {
+                provider: "test-provider".into(),
+                origin: "https://api.example.com".into(),
+                resource: "models".into(),
+                account: "account".into(),
+            })
+        }
+        async fn fetch(
+            &self,
+            _: &tokio_util::sync::CancellationToken,
+        ) -> Result<tickloop_agent::model::availability::AccountModelDirectory, String> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(tickloop_agent::model::availability::AccountModelDirectory {
+                models: BTreeMap::new(),
+                semantics: tickloop_agent::model::availability::DirectorySemantics::Directory,
+                complete: true,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn access_failures_invalidate_directory_but_transient_failures_reuse_it() {
+        use crate::terminal::test_support as support;
+        use tickloop_agent::runtime::{
+            RequestFailure, RequestKind, RequestOutcome, RequestOwner, RequestUsageLedger,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let agent = Agent::new_embedded(
+            support::config(),
+            std::sync::Arc::new(support::ScriptedModel::new(Vec::new())),
+        );
+        let chat = agent.create_chat(directory.path().into()).await.unwrap();
+        let mut snapshot = agent.snapshot(chat).await.unwrap();
+        snapshot.model.provider_id = "test-provider".into();
+        for (failure, expected_calls) in [
+            (RequestFailure::Authentication, 2),
+            (RequestFailure::Http { status: 402 }, 2),
+            (RequestFailure::Http { status: 403 }, 2),
+            (RequestFailure::Http { status: 404 }, 2),
+            (RequestFailure::Http { status: 429 }, 2),
+            (RequestFailure::RateLimited, 1),
+            (RequestFailure::Connection, 1),
+            (RequestFailure::Http { status: 503 }, 1),
+        ] {
+            let menus = Menus::default();
+            let adapter = CountingDirectory(std::sync::atomic::AtomicUsize::new(0));
+            let cancel = tokio_util::sync::CancellationToken::new();
+            menus
+                .model_discovery
+                .discover_with(&adapter, false, &cancel)
+                .await
+                .unwrap();
+            let run = Uuid::new_v4();
+            snapshot.request_usage = RequestUsageLedger::new();
+            let request = snapshot
+                .request_usage
+                .start(
+                    RequestOwner {
+                        chat_id: chat,
+                        loop_id: Some(Uuid::new_v4()),
+                        run_id: Some(run),
+                    },
+                    RequestKind::Conversation,
+                    snapshot.model.identity(),
+                )
+                .unwrap();
+            snapshot
+                .request_usage
+                .finish(request, RequestOutcome::Failed(failure))
+                .unwrap();
+            menus.invalidate_failed_directory(&snapshot, run);
+            menus
+                .model_discovery
+                .discover_with(&adapter, false, &cancel)
+                .await
+                .unwrap();
+            assert_eq!(
+                adapter.0.load(std::sync::atomic::Ordering::SeqCst),
+                expected_calls,
+                "{failure:?}"
+            );
+        }
+        agent.shutdown().await;
+    }
 
     fn unreported(request_count: usize) -> CounterSummary {
         CounterSummary {

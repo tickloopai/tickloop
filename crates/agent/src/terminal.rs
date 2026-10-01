@@ -180,6 +180,7 @@ fn command_timing(command: &str) -> CommandTiming {
                 | "/permissions"
                 | "/mode"
                 | "/model"
+                | "/provider"
                 | "/thinking"
                 | "/loops"
                 | "/tasks"
@@ -428,8 +429,8 @@ Starting without -c or -r opens a new Chat.
 Chats are saved under ~/.tickloop, or TICKLOOP_CONFIG_DIR when it is set.
 --no-session-persistence runs without saving Chats; so does cleanupPeriodDays 0 in settings.json.
 Transcripts, large tool results, plans, file backups and paste cache older than cleanupPeriodDays (default 30) are removed in the background 10 minutes after the first prompt (at start when input is not a terminal), later while you are typing.
-/model → Provider opens Codex subscription authorization; choose browser or device code there. Judgment settings manages the separate Jev (TypeSafe) key.
-/model → Provider: press s to sign out of Codex locally; requests already sent are not revoked.
+/provider opens Codex subscription authorization; choose browser or device code there. Judgment settings manages the separate Jev (TypeSafe) key.
+/provider: press s to sign out of Codex locally; requests already sent are not revoked.
 /model choices and persistent rules are saved in settings.json there; --config takes precedence over the saved model.
 
 Enter a task; follow-up inputs are accepted while the current run continues.
@@ -446,7 +447,8 @@ Shift+Up/Down opens background Tasks directly when any are running.
 /resume opens the Chat picker; /resume CHAT switches to that Chat without running it.
 Chats you switch away from keep running their goals in this process; /tasks lists Shell tasks from every Chat.
 /tickloop [REQUEST] loads the system Workspace Skill; other discovered Skills also use /NAME [ARGUMENTS].
-/model opens the Provider and model picker for this Chat, with separate Judgment settings for the Jev (TypeSafe) key; /model FILE loads an advanced Chat configuration. Model choices also apply to new Chats.
+/provider configures connections, sign-in and the separate Jev (TypeSafe) key without changing the Chat model.
+/model selects models from configured Providers; p opens Provider configuration. /model FILE loads an advanced Chat configuration. Model choices also apply to new Chats.
 /thinking opens the Thinking picker; /thinking LEVEL sets a supported level. Auto uses the model default; /settings toggles Thinking.
 /settings opens settings for this Chat; /permissions shows Auto, Ask and Full Access and a separate recent-activity entry.
 /permissions → Auto opens Auto settings, where you can select LLM or Judgment, manage review rules and Environment, and open the shared Jev (TypeSafe) key settings.
@@ -1012,6 +1014,13 @@ async fn interact(
             )?;
         }
     }
+    if let Some(chat) = selected_chat {
+        let snapshot = agent
+            .snapshot(chat)
+            .await
+            .map_err(|error| error.to_string())?;
+        menus.warm_model_directory(snapshot.model);
+    }
     let mut registration = config_root.as_deref().and_then(|root| {
         let registration =
             ProcessRegistration::register(root, selected_chat, &workdir, interactive);
@@ -1369,7 +1378,7 @@ async fn interact(
                     }
                     None => {
                         login.take().unwrap().close(console)?;
-                        outln!(console, "Sign-in ended before completion; use /model → Provider to retry.");
+                        outln!(console, "Sign-in ended before completion; use /provider to retry.");
                     }
                 }
                 status_dirty = true;
@@ -1543,7 +1552,7 @@ async fn interact(
                 },
                 Some(InputEvent::PickerAction { menu_id, index, action }) => {
                     if login.is_none() && logout.is_none() {
-                        match menus.picker_action(console, menu_id, index, action) {
+                        match menus.picker_action(agent, console, menu_id, index, action).await {
                             Ok(outcome) => menu_outcome = Some(outcome),
                             Err(error) => outln!(console, "Cannot apply selection: {}", safe_text(&error)),
                         }
@@ -1945,6 +1954,10 @@ async fn interact(
                                     Err(error) => outln!(console, "Cannot set execution mode: {}.",safe_text(&error)),
                                 }
                             } else { outln!(console, "Execution mode: {}",agent.snapshot(chat).await.map_err(|error|error.to_string())?.policy.mode); }
+                        },
+                        _ if line=="/provider" => {
+                            let chat = ensure_chat(console, agent, &mut selected_chat, &workdir).await?;
+                            menus.providers(agent, console, chat).await?;
                         },
                         _ if line=="/model" || line.starts_with("/model ") => {
                             let chat = ensure_chat(console, agent,&mut selected_chat,&workdir).await?;
@@ -2365,7 +2378,12 @@ async fn interact(
                     }
                     status_dirty |= !matches!(&event.kind, EventKind::Text(_)) || was_thinking != thinking_runs.contains(&event.run_id);
                     track_run_requests(&event,&mut pending,&mut permissions,&mut questions);
-                    if matches!(&event.kind,EventKind::Failed(_)) {failed=true;}
+                    if matches!(&event.kind,EventKind::Failed(_)) {
+                        failed=true;
+                        if let Ok(snapshot) = agent.snapshot(event.chat_id).await {
+                            menus.invalidate_failed_directory(&snapshot, event.run_id);
+                        }
+                    }
                     if matches!(&event.kind,EventKind::Started) {
                         pending.entry(event.run_id).or_insert(Receipt {chat_id:event.chat_id,loop_id:event.loop_id,run_id:event.run_id});
                         working_shimmer.reset();

@@ -3,7 +3,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     path::Path,
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use reqwest::{
@@ -20,8 +20,8 @@ use crate::{
     network::{HttpPolicy, build_http_client, is_loopback},
 };
 
-const CACHE_TTL: Duration = Duration::from_secs(300);
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(8);
+const DISCOVERY_TIMED_OUT: &str = "Model discovery timed out";
 const MAX_DIRECTORY_BYTES: usize = 1024 * 1024;
 const MAX_DIRECTORY_MODELS: usize = 10000;
 
@@ -87,8 +87,7 @@ pub struct DiscoveryIdentity {
 #[derive(Clone)]
 struct CachedDirectory {
     identity: DiscoveryIdentity,
-    fetched_at: Instant,
-    directory: AccountModelDirectory,
+    directory: Result<AccountModelDirectory, String>,
 }
 
 #[derive(Default)]
@@ -140,7 +139,7 @@ impl AccountModelDiscovery {
         tokio::select! {
             biased;
             () = cancel.cancelled() => Err("Model discovery cancelled".into()),
-            result = tokio::time::timeout(DISCOVERY_TIMEOUT, self.discover_inner(adapter, force, cancel)) => result.map_err(|_| "Model discovery timed out".to_owned())?,
+            result = self.discover_inner(adapter, force, cancel) => result,
         }
     }
 
@@ -150,8 +149,11 @@ impl AccountModelDiscovery {
         force: bool,
         cancel: &CancellationToken,
     ) -> Result<AccountModelDirectory, String> {
+        let deadline = tokio::time::Instant::now() + DISCOVERY_TIMEOUT;
         let initial_generations = self.state.lock().unwrap().generations.clone();
-        let identity = adapter.identity(cancel).await?;
+        let identity = tokio::time::timeout_at(deadline, adapter.identity(cancel))
+            .await
+            .map_err(|_| DISCOVERY_TIMED_OUT.to_owned())??;
         if identity.provider.is_empty()
             || identity.account.is_empty()
             || identity.resource.is_empty()
@@ -189,17 +191,26 @@ impl AccountModelDiscovery {
                 .insert(identity.provider.clone(), identity.clone());
             if let Some(cached) = state.entries.get(&identity.provider)
                 && cached.identity == identity
-                && cached.fetched_at.elapsed() < CACHE_TTL
             {
-                return Ok(cached.directory.clone());
+                return cached.directory.clone();
             }
             *state
                 .generations
                 .entry(identity.provider.clone())
                 .or_default()
         };
-        let directory = adapter.fetch(cancel).await?;
-        let current = adapter.identity(cancel).await?;
+        let (directory, timed_out) =
+            match tokio::time::timeout_at(deadline, adapter.fetch(cancel)).await {
+                Ok(directory) => (directory, false),
+                Err(_) => (Err(DISCOVERY_TIMED_OUT.to_owned()), true),
+            };
+        let current = if timed_out {
+            identity.clone()
+        } else {
+            tokio::time::timeout_at(deadline, adapter.identity(cancel))
+                .await
+                .map_err(|_| DISCOVERY_TIMED_OUT.to_owned())??
+        };
         let mut state = self.state.lock().unwrap();
         if cancel.is_cancelled()
             || current != identity
@@ -216,11 +227,10 @@ impl AccountModelDiscovery {
             identity.provider.clone(),
             CachedDirectory {
                 identity,
-                fetched_at: Instant::now(),
                 directory: directory.clone(),
             },
         );
-        Ok(directory)
+        directory
     }
 }
 
@@ -498,6 +508,7 @@ mod tests {
         started: Notify,
         release: Semaphore,
         directory: AccountModelDirectory,
+        failure: Option<String>,
     }
 
     impl ControlledAdapter {
@@ -509,6 +520,7 @@ mod tests {
                     resource: "test-resource".into(),
                     account: account.into(),
                 }),
+                failure: None,
                 calls: AtomicUsize::new(0),
                 started: Notify::new(),
                 release: Semaphore::new(if blocked { 0 } else { 10 }),
@@ -530,12 +542,15 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.started.notify_one();
             self.release.acquire().await.unwrap().forget();
-            Ok(self.directory.clone())
+            self.failure.as_ref().map_or_else(
+                || Ok(self.directory.clone()),
+                |failure| Err(failure.clone()),
+            )
         }
     }
 
     #[tokio::test(start_paused = true)]
-    async fn cache_reuses_identity_expires_and_explicitly_refreshes() {
+    async fn session_cache_reuses_identity_until_invalidation_or_explicit_refresh() {
         let cache = AccountModelDiscovery::default();
         let adapter = ControlledAdapter::new("account-a", false);
         let cancel = CancellationToken::new();
@@ -543,15 +558,10 @@ mod tests {
             cache.discover_with(&adapter, false, &cancel).await.unwrap();
         }
         assert_eq!(adapter.calls.load(Ordering::SeqCst), 1);
-        // The cache uses monotonic wall time; force expiration without sleeping the suite.
-        cache
-            .state
-            .lock()
-            .unwrap()
-            .entries
-            .get_mut("test-provider")
-            .unwrap()
-            .fetched_at = Instant::now() - CACHE_TTL;
+        tokio::time::advance(Duration::from_secs(86400)).await;
+        cache.discover_with(&adapter, false, &cancel).await.unwrap();
+        assert_eq!(adapter.calls.load(Ordering::SeqCst), 1);
+        cache.invalidate("test-provider");
         cache.discover_with(&adapter, false, &cancel).await.unwrap();
         cache.discover_with(&adapter, true, &cancel).await.unwrap();
         assert_eq!(adapter.calls.load(Ordering::SeqCst), 3);
@@ -561,6 +571,56 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(renewed_token_same_account.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn failed_directory_check_is_reused_until_invalidation() {
+        let cache = AccountModelDiscovery::default();
+        let mut adapter = ControlledAdapter::new("account-a", false);
+        adapter.failure = Some("Model discovery failed (HTTP 503)".into());
+        for _ in 0..3 {
+            assert!(
+                cache
+                    .discover_with(&adapter, false, &CancellationToken::new())
+                    .await
+                    .is_err()
+            );
+        }
+        assert_eq!(adapter.calls.load(Ordering::SeqCst), 1);
+        cache.invalidate("test-provider");
+        assert!(
+            cache
+                .discover_with(&adapter, false, &CancellationToken::new())
+                .await
+                .is_err()
+        );
+        assert_eq!(adapter.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn directory_timeout_is_cached_without_repeating_network_requests() {
+        let cache = AccountModelDiscovery::default();
+        let adapter = ControlledAdapter::new("account-a", true);
+        let cancel = CancellationToken::new();
+        assert_eq!(
+            cache
+                .discover_with(&adapter, false, &cancel)
+                .await
+                .unwrap_err(),
+            DISCOVERY_TIMED_OUT
+        );
+        assert_eq!(
+            cache
+                .discover_with(&adapter, false, &cancel)
+                .await
+                .unwrap_err(),
+            DISCOVERY_TIMED_OUT
+        );
+        assert_eq!(adapter.calls.load(Ordering::SeqCst), 1);
+        adapter.release.add_permits(1);
+        cache.invalidate("test-provider");
+        cache.discover_with(&adapter, false, &cancel).await.unwrap();
+        assert_eq!(adapter.calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -679,6 +739,8 @@ mod tests {
         assert_eq!(
             cache.state.lock().unwrap().entries["test-provider"]
                 .directory
+                .as_ref()
+                .unwrap()
                 .models,
             relogged.directory.models
         );

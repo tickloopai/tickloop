@@ -128,21 +128,21 @@ fn model_menu_cancellation_restores_prompt_and_allows_reopening() {
     let mut terminal = TerminalFixture::start(&root);
     terminal.wait_for("deepseek-flash");
     terminal.send(b"/model\r");
-    terminal.wait_for("Choose Provider");
+    terminal.wait_for("Choose model");
     let cancelled_menu = terminal.output_mark();
-    terminal.send(b"j\x10\x1b");
+    terminal.send(b"j\x10\x1b\x1b");
     terminal.wait_for_frame_after(cancelled_menu, "model menu closed", |frame| {
-        frame.contains("deepseek-flash") && !frame.contains("Choose Provider")
+        frame.contains("deepseek-flash") && !frame.contains("Choose model")
     });
     let reopened_menu = terminal.output_mark();
     terminal.send(b"/model\r");
     terminal.wait_for_frame_after(reopened_menu, "model menu reopened", |frame| {
-        frame.contains("Choose Provider")
+        frame.contains("Choose model")
     });
     let cancelled_model = terminal.output_mark();
-    terminal.send(b"\x1b");
+    terminal.send(b"\x1b\x1b");
     terminal.wait_for_frame_after(cancelled_model, "model menu closed", |frame| {
-        frame.contains("deepseek-flash") && !frame.contains("Choose Provider")
+        frame.contains("deepseek-flash") && !frame.contains("Choose model")
     });
     terminal.exit();
     assert!(!root.join("state/auth").exists());
@@ -170,7 +170,7 @@ fn logout_can_be_cancelled_while_another_process_holds_the_auth_lock() {
     lock.lock().unwrap();
     let mut terminal = TerminalFixture::start(&root);
     terminal.wait_for("deepseek-flash");
-    terminal.send(b"/model\r");
+    terminal.send(b"/provider\r");
     terminal.wait_for("Choose Provider");
     terminal.send(b"j\r");
     terminal.wait_for("Choose connection · OpenAI");
@@ -240,7 +240,10 @@ async fn piped_commands_wait_for_logout_before_model_menu_and_exit() {
         .spawn()
         .unwrap();
     let mut stdin = child.stdin.take().unwrap();
-    stdin.write_all(b"/help\n/login\n/model\n").await.unwrap();
+    stdin
+        .write_all(b"/help\n/login\n/provider\n")
+        .await
+        .unwrap();
     stdin.flush().await.unwrap();
     let mut stdout_reader = BufReader::new(child.stdout.take().unwrap());
     let mut captured = String::new();
@@ -286,7 +289,7 @@ async fn piped_commands_wait_for_logout_before_model_menu_and_exit() {
         "{stdout}\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(stdout.contains("/model → Provider"));
+    assert!(stdout.contains("/provider"));
     assert!(!stdout.contains("/login"));
     assert!(stdout.contains("Unknown command; use /help."));
     assert!(!stdout.contains("/logout"));

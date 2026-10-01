@@ -328,6 +328,7 @@ impl CodexModelClient {
             cancel,
             None,
             super::cards::Adapter::CodexResponses,
+            false,
         )
         .await
     }
@@ -698,14 +699,15 @@ mod tests {
 
     use super::*;
     use crate::{
-        model::cards::built_in_model_profiles,
+        model::cards::ModelCatalog,
         permissions::{Decision, ExecutionMode},
         runtime::{Agent, EventKind, RequestKind},
     };
 
     #[test]
     fn auto_review_request_requires_one_strict_schema_tool() {
-        let config = built_in_model_profiles()
+        let config = ModelCatalog::defaults()
+            .profiles()
             .into_iter()
             .find(|profile| {
                 profile.model == "gpt-5.5" && profile.provider == ModelProvider::OpenAiCodex
@@ -744,7 +746,8 @@ mod tests {
 
     #[test]
     fn normalized_tool_call_ids_stay_paired_with_results() {
-        let config = built_in_model_profiles()
+        let config = ModelCatalog::defaults()
+            .profiles()
             .into_iter()
             .find(|profile| {
                 profile.model == "gpt-5.5" && profile.provider == ModelProvider::OpenAiCodex
@@ -790,7 +793,8 @@ mod tests {
 
     #[test]
     fn assistant_phase_replays_only_for_the_same_codex_origin() {
-        let config = built_in_model_profiles()
+        let config = ModelCatalog::defaults()
+            .profiles()
             .into_iter()
             .find(|profile| profile.provider == ModelProvider::OpenAiCodex)
             .unwrap();
@@ -842,7 +846,8 @@ mod tests {
 
     #[test]
     fn codex_origin_filters_private_history_without_rewriting_transcript() {
-        let config = built_in_model_profiles()
+        let config = ModelCatalog::defaults()
+            .profiles()
             .into_iter()
             .find(|profile| {
                 profile.model == "gpt-5.5" && profile.provider == ModelProvider::OpenAiCodex
@@ -993,7 +998,8 @@ mod tests {
     #[test]
     fn test_endpoint_accepts_only_numeric_loopback_codex_responses() {
         let directory = tempfile::tempdir().unwrap();
-        let config = built_in_model_profiles()
+        let config = ModelCatalog::defaults()
+            .profiles()
             .into_iter()
             .find(|profile| {
                 profile.model == "gpt-5.5" && profile.provider == ModelProvider::OpenAiCodex
@@ -1288,7 +1294,8 @@ mod tests {
             }
             captured_tx.send(frames).unwrap();
         });
-        let config = built_in_model_profiles()
+        let config = ModelCatalog::defaults()
+            .profiles()
             .into_iter()
             .find(|profile| {
                 profile.model == "gpt-5.5" && profile.provider == ModelProvider::OpenAiCodex
@@ -1345,7 +1352,8 @@ mod tests {
         fs::write(state_dir.join("parallel-b.txt"), "PARALLEL_B_MARKER").unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}/codex/responses", listener.local_addr().unwrap());
-        let config = built_in_model_profiles()
+        let config = ModelCatalog::defaults()
+            .profiles()
             .into_iter()
             .find(|profile| {
                 profile.model == "gpt-5.5" && profile.provider == ModelProvider::OpenAiCodex
@@ -1501,7 +1509,8 @@ mod tests {
             }
             captured_tx.send(frames).unwrap();
         });
-        let config = built_in_model_profiles()
+        let config = ModelCatalog::defaults()
+            .profiles()
             .into_iter()
             .find(|profile| {
                 profile.model == "gpt-5.5" && profile.provider == ModelProvider::OpenAiCodex
@@ -1604,7 +1613,8 @@ mod tests {
                 ))
                 .unwrap();
         });
-        let config = built_in_model_profiles()
+        let config = ModelCatalog::defaults()
+            .profiles()
             .into_iter()
             .find(|profile| {
                 profile.model == "gpt-5.5" && profile.provider == ModelProvider::OpenAiCodex
@@ -1649,7 +1659,8 @@ mod tests {
                 .is_ok();
             requests_tx.send(retried).unwrap();
         });
-        let config = built_in_model_profiles()
+        let config = ModelCatalog::defaults()
+            .profiles()
             .into_iter()
             .find(|profile| {
                 profile.model == "gpt-5.5" && profile.provider == ModelProvider::OpenAiCodex
@@ -1739,7 +1750,8 @@ mod tests {
             }
             captured_tx.send((first, delta, full)).unwrap();
         });
-        let config = built_in_model_profiles()
+        let config = ModelCatalog::defaults()
+            .profiles()
             .into_iter()
             .find(|profile| {
                 profile.model == "gpt-5.5" && profile.provider == ModelProvider::OpenAiCodex
@@ -1850,7 +1862,8 @@ mod tests {
             captured_tx.send((frames, authorizations)).unwrap();
             let _ = connections;
         });
-        let config = built_in_model_profiles()
+        let config = ModelCatalog::defaults()
+            .profiles()
             .into_iter()
             .find(|profile| {
                 profile.model == "gpt-5.5" && profile.provider == ModelProvider::OpenAiCodex
@@ -1930,7 +1943,8 @@ mod tests {
     #[tokio::test]
     async fn codex_incomplete_and_malformed_tool_streams_never_complete() {
         let (_directory, state_dir) = state_with_credentials();
-        let config = built_in_model_profiles()
+        let config = ModelCatalog::defaults()
+            .profiles()
             .into_iter()
             .find(|profile| {
                 profile.model == "gpt-5.5" && profile.provider == ModelProvider::OpenAiCodex
@@ -1972,7 +1986,8 @@ mod tests {
     #[tokio::test]
     async fn codex_sse_interruption_after_reasoning_is_terminal() {
         let (_directory, state_dir) = state_with_credentials();
-        let config = built_in_model_profiles()
+        let config = ModelCatalog::defaults()
+            .profiles()
             .into_iter()
             .find(|profile| {
                 profile.model == "gpt-5.5" && profile.provider == ModelProvider::OpenAiCodex
@@ -2003,7 +2018,8 @@ mod tests {
     #[tokio::test]
     async fn cancelling_codex_stream_stops_the_request_without_a_terminal_event() {
         let (_directory, state_dir) = state_with_credentials();
-        let config = built_in_model_profiles()
+        let config = ModelCatalog::defaults()
+            .profiles()
             .into_iter()
             .find(|profile| {
                 profile.model == "gpt-5.5" && profile.provider == ModelProvider::OpenAiCodex
@@ -2059,7 +2075,8 @@ mod tests {
     async fn agent_conversation_uses_codex_credentials_and_streams_text_and_reasoning() {
         let (_directory, state_dir) = state_with_credentials();
 
-        let config = built_in_model_profiles()
+        let config = ModelCatalog::defaults()
+            .profiles()
             .into_iter()
             .find(|profile| {
                 profile.model == "gpt-5.5" && profile.provider == ModelProvider::OpenAiCodex
@@ -2135,7 +2152,8 @@ mod tests {
     #[tokio::test]
     async fn agent_uses_replaced_account_on_its_next_real_model_request() {
         let (_directory, state_dir) = state_with_credentials();
-        let config = built_in_model_profiles()
+        let config = ModelCatalog::defaults()
+            .profiles()
             .into_iter()
             .find(|profile| {
                 profile.model == "gpt-5.5" && profile.provider == ModelProvider::OpenAiCodex
@@ -2259,7 +2277,8 @@ mod tests {
             9,
         )])
         .await;
-        let config = built_in_model_profiles()
+        let config = ModelCatalog::defaults()
+            .profiles()
             .into_iter()
             .find(|profile| {
                 profile.model == "gpt-5.5" && profile.provider == ModelProvider::OpenAiCodex
@@ -2308,7 +2327,8 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
         let endpoint = format!("{origin}/codex/responses");
-        let config = built_in_model_profiles()
+        let config = ModelCatalog::defaults()
+            .profiles()
             .into_iter()
             .find(|profile| {
                 profile.model == "gpt-5.5" && profile.provider == ModelProvider::OpenAiCodex
@@ -2352,7 +2372,8 @@ mod tests {
         let (_directory, state_dir) = state_with_credentials();
         fs::write(state_dir.join("first.txt"), "FRIDAY_MARKER_123").unwrap();
         fs::write(state_dir.join("second.txt"), "MONDAY_MARKER_456").unwrap();
-        let config = built_in_model_profiles()
+        let config = ModelCatalog::defaults()
+            .profiles()
             .into_iter()
             .find(|profile| {
                 profile.model == "gpt-5.5" && profile.provider == ModelProvider::OpenAiCodex
@@ -2481,7 +2502,8 @@ mod tests {
     async fn codex_auto_review_allows_or_blocks_a_real_protected_operation() {
         for should_block in [false, true] {
             let (_directory, state_dir) = state_with_credentials();
-            let config = built_in_model_profiles()
+            let config = ModelCatalog::defaults()
+                .profiles()
                 .into_iter()
                 .find(|profile| {
                     profile.model == "gpt-5.5" && profile.provider == ModelProvider::OpenAiCodex
@@ -2584,7 +2606,7 @@ mod tests {
     #[tokio::test]
     async fn explicit_codex_reviewer_uses_its_own_model_and_usage_identity() {
         let (_directory, state_dir) = state_with_credentials();
-        let profiles = built_in_model_profiles();
+        let profiles = ModelCatalog::defaults().profiles();
         let main_config = profiles
             .iter()
             .find(|profile| {
@@ -2674,7 +2696,8 @@ mod tests {
         review_responses: Vec<(u16, String)>,
     ) -> (Vec<Value>, Vec<RequestKind>, String) {
         let (_directory, state_dir) = state_with_credentials();
-        let config = built_in_model_profiles()
+        let config = ModelCatalog::defaults()
+            .profiles()
             .into_iter()
             .find(|profile| {
                 profile.model == "gpt-5.5" && profile.provider == ModelProvider::OpenAiCodex

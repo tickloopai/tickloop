@@ -98,7 +98,7 @@ pub enum MiniMaxAuthError {
     BudgetExhausted,
     #[error("MiniMax sign-in cancelled")]
     Cancelled,
-    #[error("MiniMax device authorization expired; retry from /model → Provider")]
+    #[error("MiniMax device authorization expired; retry from /provider")]
     Expired,
     #[error("MiniMax authorization was denied")]
     Denied,
@@ -211,6 +211,11 @@ impl MiniMaxAuth {
     }
 
     pub fn has_saved_login(&self) -> Result<bool, MiniMaxAuthError> {
+        match std::fs::symlink_metadata(self.path()) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(_) => return Err(MiniMaxAuthError::Storage),
+        }
         Ok(self
             .read()?
             .is_some_and(|state| state.credentials.is_some()))

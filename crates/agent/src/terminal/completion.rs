@@ -85,7 +85,13 @@ const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         command: "/model",
         arguments: "[CONFIG_FILE]",
-        description: "Choose a Provider and model, manage sign-in, or load a Chat configuration file.",
+        description: "Choose a model from configured Providers, or load a Chat configuration file.",
+        menu_group: Some(CommandGroup::ModelAndSettings),
+    },
+    CommandSpec {
+        command: "/provider",
+        arguments: "",
+        description: "Configure Provider connections, API keys and sign-in.",
         menu_group: Some(CommandGroup::ModelAndSettings),
     },
     CommandSpec {
@@ -480,8 +486,8 @@ mod tests {
     fn discovery_separates_public_commands_advanced_controls_and_skills() {
         let mut completion = Completion::default();
         completion.update("/");
-        assert_eq!(completion.candidates().len(), 20);
-        assert_eq!(builtin_commands().len(), 39);
+        assert_eq!(completion.candidates().len(), 21);
+        assert_eq!(builtin_commands().len(), 40);
         assert_eq!(
             builtin_commands()
                 .iter()

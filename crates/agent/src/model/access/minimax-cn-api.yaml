@@ -5,3 +5,4 @@ series:
     name: "MiniMax"
     version: "M3"
     model: "MiniMax-M3"
+    capability_order: 0

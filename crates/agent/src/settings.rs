@@ -1038,6 +1038,7 @@ impl UserSettings {
                     adaptive_by_default: Some(card.adaptive_by_default),
                     effort_levels: Some(card.effort_levels.clone()),
                     input_modalities: Some(card.input_modalities.clone()),
+                    thinking_budgets: card.thinking_budgets,
                 }]),
             };
             let path = self.provider_path(&model.provider_id)?;

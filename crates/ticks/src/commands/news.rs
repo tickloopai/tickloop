@@ -130,7 +130,7 @@ impl<'a> NewsView<'a> {
             settings.ambiguous_width,
             &styles,
         );
-        let visible = inner.height.saturating_sub(1) as usize;
+        let visible = inner.height as usize;
         self.page_size.set(visible.max(1));
         let offset = self
             .detail_scroll
@@ -151,17 +151,6 @@ impl<'a> NewsView<'a> {
                 );
                 x = x.saturating_add(width(&span.content, settings.ambiguous_width) as u16);
             }
-        }
-        if inner.height > 0 {
-            write_text(
-                frame.buffer_mut(),
-                inner.x,
-                inner.bottom() - 1,
-                "Esc Back  ·  j/k Scroll  ·  q Quit",
-                inner.width as usize,
-                settings.ambiguous_width,
-                styles.muted_text,
-            );
         }
     }
 }
@@ -370,7 +359,7 @@ impl LiveView for NewsView<'_> {
             frame.buffer_mut(),
             inner.x,
             inner.bottom() - 1,
-            "Enter Read  ·  ? Help  ·  q Quit",
+            "? Help",
             inner.width as usize,
             settings.ambiguous_width,
             styles.muted_text,

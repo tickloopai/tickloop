@@ -1,8 +1,8 @@
 //! Opt-in real-account probe for GitHub Copilot. Sign-in uses your own device authorization of
-//! the TickLoop Agent GitHub App; requests call only an inert Echo fixture and a structured
-//! fixture. Tokens stay in STATE_DIRECTORY/auth and are never printed.
+//! GitHub's Copilot app (the client VS Code uses, as pi does); requests call only an inert Echo
+//! fixture and a structured fixture. Tokens stay in STATE_DIRECTORY/auth and are never printed.
 //!
-//! usage: copilot_probe login|models|echo|logout STATE_DIRECTORY [MODEL_CARD_ID]
+//! usage: copilot_probe login|models|events|replay|echo|logout STATE_DIRECTORY [MODEL_CARD_ID|BODY_JSON] [EFFORT]
 
 use std::{error::Error, os::unix::fs::PermissionsExt, path::PathBuf};
 
@@ -13,7 +13,7 @@ use tickloop_agent::{
         Content, Message, ModelRequest, Role, StructuredOutput, ToolDefinition,
         access::AccessCatalog,
         cards::ModelCatalog,
-        copilot::{COPILOT_API_URL, GITHUB_API_VERSION, USER_AGENT},
+        copilot::{CLIENT_HEADERS, COPILOT_API_URL, GITHUB_API_VERSION},
         model_client,
     },
 };
@@ -25,9 +25,10 @@ const PROVIDER: &str = "github-copilot";
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
-    if !(2..=3).contains(&arguments.len()) {
+    if !(2..=4).contains(&arguments.len()) {
         return Err(
-            "usage: copilot_probe login|models|echo|logout STATE_DIRECTORY [MODEL_CARD_ID]".into(),
+            "usage: copilot_probe login|models|events|replay|echo|logout STATE_DIRECTORY [MODEL_CARD_ID|BODY_JSON] [EFFORT]"
+                .into(),
         );
     }
     let root = PathBuf::from(&arguments[1]);
@@ -48,8 +49,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "login" => {
             let login = auth.start_device_login(&cancel).await?;
             println!(
-                "Open {} on your own device and enter {}. GitHub shows the TickLoop Agent app by TickLoopAI.",
-                login.verification_uri, login.user_code
+                "Open {} on your own device and enter {}. {}",
+                login.verification_uri,
+                login.user_code,
+                tickloop_agent::auth::copilot::CONSENT_NOTICE
             );
             auth.finish_device_login(login, &cancel).await?;
             println!(
@@ -64,6 +67,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
             );
         }
         "models" => summarize_models(&auth, &cancel).await?,
+        "replay" => {
+            let body =
+                std::fs::read_to_string(arguments.get(2).ok_or("replay needs a JSON body file")?)?;
+            replay_messages(&auth, serde_json::from_str(&body)?, &cancel).await?;
+        }
+        "events" => {
+            let model = arguments.get(2).map_or("gpt-6-luna", String::as_str);
+            summarize_response_events(&auth, model, &cancel).await?;
+        }
         "echo" => {
             let model = arguments.get(2).map_or_else(
                 || {
@@ -74,11 +86,159 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 },
                 Clone::clone,
             );
-            echo(&root, &model, &cancel).await?;
+            let effort = arguments
+                .get(3)
+                .map(|effort| serde_json::from_value(json!(effort)))
+                .transpose()?;
+            echo(&root, &model, effort, &cancel).await?;
         }
         _ => return Err("command must be login, models, echo or logout".into()),
     }
     Ok(())
+}
+
+/// Sends a recorded Messages body once and prints only the status and the service's error
+/// description; no token.
+async fn replay_messages(
+    auth: &CopilotAuth,
+    body: Value,
+    cancel: &CancellationToken,
+) -> Result<(), Box<dyn Error>> {
+    let access = auth.resolve_access(cancel).await?;
+    let base = access.api_base.as_deref().unwrap_or(COPILOT_API_URL);
+    let mut request = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?
+        .post(format!("{base}/v1/messages"))
+        .bearer_auth(&access.token)
+        .header("anthropic-version", "2023-06-01")
+        .header("openai-intent", "conversation-edits")
+        .header("x-initiator", "user")
+        .json(&body);
+    for (name, value) in CLIENT_HEADERS {
+        request = request.header(name, value);
+    }
+    let response = request.send().await?;
+    let status = response.status().as_u16();
+    let text = response.text().await?;
+    println!("POST {base}/v1/messages → HTTP {status}");
+    if status >= 400 {
+        let error: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+        println!("error: {}", error["error"]);
+    }
+    Ok(())
+}
+
+/// Streams one minimal Responses request and prints each event's type, output index and whether
+/// its item id matches the id announced by `response.output_item.added`; no text or token.
+async fn summarize_response_events(
+    auth: &CopilotAuth,
+    model: &str,
+    cancel: &CancellationToken,
+) -> Result<(), Box<dyn Error>> {
+    let access = auth.resolve_access(cancel).await?;
+    let base = access.api_base.as_deref().unwrap_or(COPILOT_API_URL);
+    let mut request = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?
+        .post(format!("{base}/responses"))
+        .bearer_auth(&access.token)
+        .header("openai-intent", "conversation-edits")
+        .header("x-initiator", "user")
+        .json(&json!({"model":model,"input":"Call the Echo tool once with text hello.","stream":true,"store":false,"max_output_tokens":2048,"tools":[{"type":"function","name":"Echo","description":"Returns the text unchanged.","parameters":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}}]}));
+    for (name, value) in CLIENT_HEADERS {
+        request = request.header(name, value);
+    }
+    let mut response = request.send().await?;
+    println!(
+        "POST {base}/responses → HTTP {}",
+        response.status().as_u16()
+    );
+    let mut announced = std::collections::BTreeMap::new();
+    let mut done_items = std::collections::BTreeMap::new();
+    let mut buffer = String::new();
+    while let Some(chunk) = response.chunk().await? {
+        buffer.push_str(&String::from_utf8_lossy(&chunk));
+        while let Some(end) = buffer.find("\n\n") {
+            let frame = buffer[..end].to_owned();
+            buffer.drain(..end + 2);
+            let Some(data) = frame.lines().find_map(|line| line.strip_prefix("data: ")) else {
+                continue;
+            };
+            let Ok(event) = serde_json::from_str::<Value>(data) else {
+                continue;
+            };
+            let index = event["output_index"].as_u64();
+            let id = event["item_id"]
+                .as_str()
+                .or_else(|| event["item"]["id"].as_str());
+            if event["type"] == "response.output_item.added" {
+                announced.insert(index, id.map(str::to_owned));
+            }
+            if event["type"] == "response.output_item.done" {
+                done_items.insert(index, event["item"].clone());
+            }
+            let same_id = id.map(|id| announced.get(&index).and_then(Option::as_deref) == Some(id));
+            println!(
+                "{} index={index:?} item_type={} id_len={:?} same_as_added={same_id:?}",
+                event["type"].as_str().unwrap_or("?"),
+                event["item"]["type"].as_str().unwrap_or("-"),
+                id.map(str::len),
+            );
+            if event["type"] == "response.completed" {
+                for (position, item) in event["response"]["output"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .enumerate()
+                {
+                    let id = item["id"].as_str();
+                    println!(
+                        "  completed output[{position}] type={} same_as_added={:?} differing_from_done={:?}",
+                        item["type"].as_str().unwrap_or("?"),
+                        id.map(|id| announced
+                            .get(&Some(position as u64))
+                            .and_then(Option::as_deref)
+                            == Some(id)),
+                        done_items
+                            .get(&Some(position as u64))
+                            .map(|done| differing_fields(done, item, ""))
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Paths of fields whose values differ between two JSON values; values themselves stay hidden.
+fn differing_fields(left: &Value, right: &Value, path: &str) -> Vec<String> {
+    match (left, right) {
+        (Value::Object(left), Value::Object(right)) => {
+            let mut keys = left.keys().chain(right.keys()).collect::<Vec<_>>();
+            keys.sort();
+            keys.dedup();
+            keys.into_iter()
+                .flat_map(|key| {
+                    differing_fields(
+                        left.get(key).unwrap_or(&Value::Null),
+                        right.get(key).unwrap_or(&Value::Null),
+                        &format!("{path}.{key}"),
+                    )
+                })
+                .collect()
+        }
+        (Value::Array(left), Value::Array(right)) if left.len() == right.len() => left
+            .iter()
+            .zip(right)
+            .enumerate()
+            .flat_map(|(index, (left, right))| {
+                differing_fields(left, right, &format!("{path}[{index}]"))
+            })
+            .collect(),
+        _ if left == right => Vec::new(),
+        _ => vec![path.to_owned()],
+    }
 }
 
 /// Prints only model metadata needed to check cards and bindings; no token or account data.
@@ -86,17 +246,19 @@ async fn summarize_models(
     auth: &CopilotAuth,
     cancel: &CancellationToken,
 ) -> Result<(), Box<dyn Error>> {
-    let credentials = auth.resolve_credentials(cancel).await?;
-    let response = reqwest::Client::builder()
+    let access = auth.resolve_access(cancel).await?;
+    let base = access.api_base.as_deref().unwrap_or(COPILOT_API_URL);
+    let mut request = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()?
-        .get(format!("{COPILOT_API_URL}/models"))
-        .bearer_auth(&credentials.access_token)
-        .header(reqwest::header::USER_AGENT, USER_AGENT)
-        .header("x-github-api-version", GITHUB_API_VERSION)
-        .send()
-        .await?;
-    println!("GET /models → HTTP {}", response.status().as_u16());
+        .get(format!("{base}/models"))
+        .bearer_auth(&access.token)
+        .header("x-github-api-version", GITHUB_API_VERSION);
+    for (name, value) in CLIENT_HEADERS {
+        request = request.header(name, value);
+    }
+    let response = request.send().await?;
+    println!("GET {base}/models → HTTP {}", response.status().as_u16());
     let listing: Value = response.json().await?;
     let bound = AccessCatalog::defaults()
         .provider(PROVIDER)
@@ -138,6 +300,7 @@ async fn summarize_models(
 async fn echo(
     root: &std::path::Path,
     model: &str,
+    effort: Option<tickloop_agent::model::ReasoningEffort>,
     cancel: &CancellationToken,
 ) -> Result<(), Box<dyn Error>> {
     let config = ModelCatalog::defaults()
@@ -164,7 +327,7 @@ async fn echo(
         }],
         structured_output: None,
         temperature: None,
-        reasoning_effort: None,
+        reasoning_effort: effort,
     };
     let first = client
         .complete(request.clone(), events.clone(), cancel.clone())

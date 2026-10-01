@@ -145,6 +145,7 @@ pub(super) struct ResponsesStream {
     items: BTreeMap<u64, ResponseItem>,
     usage: Usage,
     is_codex: bool,
+    rotating_item_ids: bool,
 }
 
 struct ResponseItem {
@@ -162,6 +163,31 @@ impl ResponsesStream {
         }
     }
 
+    /// GitHub Copilot gives the response and each item a new opaque id, and reasoning a new
+    /// `encrypted_content`, on every event, so items are matched by their output index; order,
+    /// type, tool identity and content are still checked. Copilot reasoning is never replayed.
+    pub(super) fn with_rotating_item_ids() -> Self {
+        Self {
+            rotating_item_ids: true,
+            ..Self::default()
+        }
+    }
+
+    fn same_item(&self, left: &Value, right: &Value) -> bool {
+        if !self.rotating_item_ids {
+            return left == right;
+        }
+        let stable_fields = |item: &Value| {
+            let mut item = item.clone();
+            if let Some(object) = item.as_object_mut() {
+                object.remove("id");
+                object.remove("encrypted_content");
+            }
+            item
+        };
+        stable_fields(left) == stable_fields(right)
+    }
+
     pub(super) fn response_id(&self) -> Option<&str> {
         self.response_id.as_deref()
     }
@@ -177,7 +203,9 @@ impl ResponsesStream {
             "response.completed" | "response.failed" | "response.incomplete" | "response.cancelled"
         ) {
             let response_id = required_string(&data["response"], "id")?;
-            if self.response_id.as_deref() != Some(response_id) {
+            if self.response_id.is_none()
+                || !self.rotating_item_ids && self.response_id.as_deref() != Some(response_id)
+            {
                 return Err(invalid_response(
                     "terminal response does not match its start",
                 ));
@@ -214,7 +242,8 @@ impl ResponsesStream {
                 let id = required_string(item, "id")?;
                 if self.response_id.is_none()
                     || index != self.items.len() as u64
-                    || self.items.values().any(|old| old.initial["id"] == id)
+                    || !self.rotating_item_ids
+                        && self.items.values().any(|old| old.initial["id"] == id)
                 {
                     return Err(invalid_response("duplicate or out-of-order response item"));
                 }
@@ -289,7 +318,7 @@ impl ResponsesStream {
                     .ok_or_else(|| invalid_response("completed item has no start"))?;
                 let completed = &data["item"];
                 if item.final_item.is_some()
-                    || completed["id"] != item.initial["id"]
+                    || !self.rotating_item_ids && completed["id"] != item.initial["id"]
                     || completed["type"] != item.initial["type"]
                 {
                     return Err(invalid_response("duplicate or mismatched completed item"));
@@ -352,11 +381,11 @@ impl ResponsesStream {
                 }
                 let mut call_ids = HashSet::new();
                 for (index, item) in output.iter().enumerate() {
-                    if self
+                    if !self
                         .items
                         .get(&(index as u64))
                         .and_then(|tracked| tracked.final_item.as_ref())
-                        != Some(item)
+                        .is_some_and(|tracked| self.same_item(tracked, item))
                     {
                         return Err(invalid_response(
                             "response contains an incomplete or altered item",
@@ -488,7 +517,9 @@ impl ResponsesStream {
             .items
             .get_mut(&index)
             .ok_or_else(|| invalid_response("delta has no output item"))?;
-        if item.final_item.is_some() || data["item_id"] != item.initial["id"] {
+        if item.final_item.is_some()
+            || !self.rotating_item_ids && data["item_id"] != item.initial["id"]
+        {
             return Err(invalid_response(
                 "delta targets a completed or different item",
             ));

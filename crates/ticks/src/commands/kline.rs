@@ -761,7 +761,7 @@ impl crate::runtime::LiveView for KlineView {
         settings: &Settings,
     ) {
         if self.research.is_some() && self.event.is_none() {
-            frame.render_widget(ratatui::widgets::Paragraph::new(format!("{}\nRelease date is unknown. No event window can be chosen.\na Ask Chat · e Edit event · Esc Back", self.title())).style(settings.styles().text), frame.area());
+            frame.render_widget(ratatui::widgets::Paragraph::new(format!("{}\nRelease date is unknown. No event window can be chosen.\na Ask Chat · e Edit event", self.title())).style(settings.styles().text), frame.area());
             if let Some(editor) = &self.event_editor {
                 editor.draw(frame, settings);
             }
@@ -793,7 +793,7 @@ impl crate::runtime::LiveView for KlineView {
                     frame.buffer_mut(),
                     area.x + 1,
                     area.bottom() - 2,
-                    "a Ask Chat · Esc Back · ? Help · q Quit",
+                    "a Ask Chat · ? Help",
                     usize::from(area.width.saturating_sub(2)),
                     settings.ambiguous_width,
                     settings.styles().status_base(),
@@ -1162,7 +1162,7 @@ impl crate::runtime::LiveView for KlineView {
             styles.chart_cursor,
         );
         let footer = format!(
-            "← → Select · 1–8 Period · m {} · {} · q Quit",
+            "1–8 Period · m {} · {}",
             if self.show_averages {
                 "MA5/10/20"
             } else {
