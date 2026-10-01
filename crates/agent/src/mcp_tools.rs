@@ -8,11 +8,12 @@ use std::{
 
 use async_trait::async_trait;
 use rmcp::{
-    ClientLifecycleMode, ClientServiceExt,
+    ClientLifecycleMode, ClientServiceExt, RoleClient,
     model::{
         CallToolRequestParams, ClientConfig, ProtocolVersion, ReadResourceRequestParams,
         ReadResourceResponse, ResourceContents, Tool,
     },
+    service::RunningService,
     transport::{
         StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig,
     },
@@ -361,7 +362,17 @@ impl McpHostToolProvider {
             .then(|| connection.clone())
     }
 
-    async fn load_directory(&self, credential: &CredentialSnapshot) -> Result<Directory, String> {
+    async fn connect_directory(
+        &self,
+        credential: &CredentialSnapshot,
+    ) -> Result<
+        (
+            Directory,
+            RunningService<RoleClient, ClientConfig>,
+            McpHttpClient,
+        ),
+        String,
+    > {
         let endpoint = reqwest::Url::parse(&format!("{}/mcp", credential.origin))
             .map_err(|_| "invalid MCP endpoint")?;
         let http = McpHttpClient::new(endpoint.clone(), credential.access_token.clone())?;
@@ -429,7 +440,13 @@ impl McpHostToolProvider {
             };
             directory.bridge = Some(Self::parse_bridge(&text, &directory)?);
         }
-        Ok(directory)
+        Ok((directory, service, http))
+    }
+
+    async fn load_directory(&self, credential: &CredentialSnapshot) -> Result<Directory, String> {
+        self.connect_directory(credential)
+            .await
+            .map(|(directory, _, _)| directory)
     }
 
     async fn read_descriptor(peer: &rmcp::Peer<rmcp::RoleClient>, uri: &str) -> DescriptorRead {
@@ -818,8 +835,8 @@ impl McpHostToolProvider {
                 ));
             }
         };
-        let directory = self
-            .load_directory(&credential)
+        let (directory, service, http) = self
+            .connect_directory(&credential)
             .await
             .map_err(EventRoleError::NotDispatched)?;
         let bridge = directory
@@ -851,29 +868,6 @@ impl McpHostToolProvider {
                 "MCP event role input rejected by schema".into(),
             ));
         }
-        let endpoint = reqwest::Url::parse(&format!("{}/mcp", credential.origin))
-            .map_err(|_| EventRoleError::NotDispatched("invalid MCP endpoint".into()))?;
-        let http = McpHttpClient::new(endpoint.clone(), credential.access_token.clone())
-            .map_err(EventRoleError::NotDispatched)?;
-        let config = StreamableHttpClientTransportConfig::with_uri(endpoint.as_str().to_owned())
-            .auth_header(credential.access_token.clone())
-            .reinit_on_expired_session(false);
-        let transport = StreamableHttpClientTransport::with_client(http.clone(), config);
-        let service = tokio::time::timeout(
-            DIRECTORY_TIMEOUT,
-            ClientConfig::default().serve_with_lifecycle(
-                transport,
-                ClientLifecycleMode::Discover {
-                    preferred_versions: vec![
-                        ProtocolVersion::V_2026_07_28,
-                        ProtocolVersion::V_2025_11_25,
-                    ],
-                },
-            ),
-        )
-        .await
-        .map_err(|_| EventRoleError::NotDispatched("MCP event connection timed out".into()))?
-        .map_err(|_| EventRoleError::NotDispatched("MCP event connection unavailable".into()))?;
         if cancel.is_cancelled() {
             return Err(EventRoleError::NotDispatched(
                 "event request cancelled".into(),

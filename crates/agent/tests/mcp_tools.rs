@@ -1027,11 +1027,11 @@ async fn idle_feedback_watcher_bounds_mcp_requests_and_recovers_a_later_comment(
         (3..=4).contains(&pending_polls),
         "60 seconds of idle feedback listening sent {pending_polls} pending polls"
     );
-    assert_eq!(count_method("server/discover"), pending_polls * 2);
+    assert_eq!(count_method("server/discover"), pending_polls);
     assert_eq!(count_method("tools/list"), pending_polls);
     assert_eq!(count_method("resources/read"), pending_polls);
     assert_eq!(count_method("tools/call"), pending_polls);
-    assert_eq!(idle_requests.len(), pending_polls * 5);
+    assert_eq!(idle_requests.len(), pending_polls * 4);
     control.feedback_pending.store(true, Ordering::SeqCst);
     for _ in 0..20 {
         if model.requests.lock().unwrap().len() >= 3 {
