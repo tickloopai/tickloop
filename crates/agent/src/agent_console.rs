@@ -147,7 +147,7 @@ impl AgentConsole {
                         .as_ref()
                         .is_none_or(|workspace| row.workspace.as_ref() == Some(workspace))
             })
-            .cloned()
+            .map(|row| self.presentation_row(row))
             .collect::<Vec<_>>();
         sort_overview_families(&mut rows);
         Projection {
@@ -162,6 +162,19 @@ impl AgentConsole {
             unconfirmed_dispatch: self.unconfirmed_dispatch.map(|(_, id)| id),
             created: self.created,
         }
+    }
+
+    fn presentation_row(&self, row: &AgentSummary) -> AgentSummary {
+        let mut presentation = row.clone();
+        if row.parent.is_none()
+            && self
+                .rows
+                .iter()
+                .any(|member| member.parent == Some(row.execution))
+        {
+            presentation.title = format!("Main · {}", row.title);
+        }
+        presentation
     }
 
     pub fn interpret(&mut self, intent: Intent) -> Result<Option<NavigationEffect>, AccessError> {
@@ -396,7 +409,7 @@ impl AgentConsole {
         self.rows
             .iter()
             .filter(|row| row.execution == root || self.is_descendant(row.execution, Some(root)))
-            .cloned()
+            .map(|row| self.presentation_row(row))
             .collect()
     }
 

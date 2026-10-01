@@ -51,6 +51,12 @@ impl LateReceiptOwner {
             .unwrap();
         writeln!(counter).unwrap();
     }
+
+    fn record(&self, name: &str, value: serde_json::Value) {
+        let pending = self.directory.join(format!("{name}.pending"));
+        std::fs::write(&pending, value.to_string()).unwrap();
+        std::fs::rename(pending, self.directory.join(name)).unwrap();
+    }
 }
 
 #[async_trait]
@@ -69,6 +75,14 @@ impl AgentAccess for LateReceiptOwner {
     }
 
     async fn execute(&self, command: CommandEnvelope) -> Result<CommandReceipt, AccessError> {
+        let (record_name, configured_choice) = match &command.command {
+            AgentCommand::Create { .. } => (Some("created-receipt.json"), None),
+            AgentCommand::Configure { execution, change } => (
+                Some("configured-receipt.json"),
+                Some((*execution, change.clone())),
+            ),
+            _ => (None, None),
+        };
         let loses_reply = match command.command {
             AgentCommand::Submit { .. } => self.flag("lose-replies"),
             AgentCommand::Create { .. } => self.flag("lose-create"),
@@ -76,6 +90,8 @@ impl AgentAccess for LateReceiptOwner {
             _ => false,
         };
         match &command.command {
+            AgentCommand::Create { .. } => self.count("creates"),
+            AgentCommand::Configure { .. } => self.count("configures"),
             AgentCommand::Submit { .. } => self.count("submits"),
             AgentCommand::ManageTask {
                 action: TaskAction::SubmitShell { .. },
@@ -85,6 +101,36 @@ impl AgentAccess for LateReceiptOwner {
             _ => {}
         }
         let receipt = self.owner.execute(command).await?;
+        if self.flag("lose-configure")
+            && let Some(name) = record_name
+        {
+            self.record(name, serde_json::to_value(&receipt).unwrap());
+        }
+        if self.flag("lose-configure")
+            && let Some((execution, change)) = configured_choice
+        {
+            let observation = self
+                .owner
+                .observe(ObservationRequest::Agent {
+                    execution,
+                    detail: AgentDetailQuery::Snapshot,
+                    after: None,
+                })
+                .await?;
+            let ObservationValue::Agent(snapshot) = observation.initial else {
+                panic!("the owner's configured Agent snapshot");
+            };
+            self.record("configured-state.json", serde_json::json!({
+                "execution": snapshot.execution,
+                "command_id": receipt.command_id,
+                "change": change,
+                "mode": snapshot.policy.mode,
+                "messages": snapshot.conversation.messages.len(),
+                "running": snapshot.conversation.loops.iter().any(|goal| goal.state == runtime::LoopState::Running),
+                "pending_inputs": snapshot.pending_inputs.len(),
+                "pending_commands": snapshot.pending_commands.len(),
+            }));
+        }
         if loses_reply {
             return Err(AccessError::new(
                 AccessErrorCode::OutcomeUnknown,
@@ -95,7 +141,21 @@ impl AgentAccess for LateReceiptOwner {
     }
 
     async fn show_view(&self, update: DisplayUpdate) -> Result<DisplayReceipt, AccessError> {
-        self.owner.show_view(update).await
+        let execution = match &update {
+            DisplayUpdate::Displayed { execution, .. } => Some(*execution),
+            _ => None,
+        };
+        let receipt = self.owner.show_view(update).await?;
+        if self.flag("lose-configure")
+            && let Some(execution) = execution
+        {
+            assert!(receipt.displayed);
+            self.record(
+                "displayed-execution.json",
+                serde_json::to_value(execution).unwrap(),
+            );
+        }
+        Ok(receipt)
     }
 }
 
@@ -587,8 +647,57 @@ fn an_unknown_staged_choice_keeps_its_input_out_of_the_body_until_it_is_sent_onc
                 .lines()
                 .rfind(|line| line.trim_start().starts_with('❯'))
                 .unwrap_or_default();
-            composer.contains(SECOND) && !frame.contains("Execution mode: Auto")
+            composer.contains(SECOND)
+                && flag("displayed-execution.json").exists()
+                && flag("configured-state.json").exists()
         },
+    );
+    let created: CommandReceipt =
+        serde_json::from_slice(&std::fs::read(flag("created-receipt.json")).unwrap()).unwrap();
+    let configured: CommandReceipt =
+        serde_json::from_slice(&std::fs::read(flag("configured-receipt.json")).unwrap()).unwrap();
+    let displayed: ExecutionRef =
+        serde_json::from_slice(&std::fs::read(flag("displayed-execution.json")).unwrap()).unwrap();
+    let state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(flag("configured-state.json")).unwrap()).unwrap();
+    assert!(matches!(created.state, ReceiptState::Completed));
+    assert!(matches!(configured.state, ReceiptState::Completed));
+    assert!(created.error.is_none());
+    assert!(configured.error.is_none());
+    let Some(CommandResult::Created { execution, .. }) = created.result else {
+        panic!("the actual Create result");
+    };
+    assert_eq!(displayed, execution);
+    assert_eq!(configured.target, Some(execution));
+    assert_eq!(state["execution"], serde_json::to_value(execution).unwrap());
+    assert_eq!(
+        state["command_id"],
+        serde_json::to_value(configured.command_id).unwrap()
+    );
+    let change: ConfigurationChange = serde_json::from_value(state["change"].clone()).unwrap();
+    assert!(matches!(
+        change,
+        ConfigurationChange::ExecutionMode {
+            mode: ExecutionMode::Auto
+        }
+    ));
+    assert_eq!(
+        state["mode"],
+        serde_json::to_value(ExecutionMode::Auto).unwrap()
+    );
+    assert_eq!(state["messages"], 0);
+    assert_eq!(state["running"], false);
+    assert_eq!(state["pending_inputs"], 0);
+    assert_eq!(state["pending_commands"], 0);
+    assert_eq!(counted(directory.path(), "creates"), 1);
+    assert_eq!(counted(directory.path(), "configures"), 1);
+    assert_eq!(submits(directory.path()), 0);
+    assert_eq!(conversation_body(&frame).matches("❯ /mode auto").count(), 1);
+    assert_eq!(
+        conversation_body(&frame)
+            .matches("Execution mode: Auto")
+            .count(),
+        1
     );
     assert_eq!(
         conversation_body(&frame).matches(SECOND).count(),
@@ -608,6 +717,16 @@ fn an_unknown_staged_choice_keeps_its_input_out_of_the_body_until_it_is_sent_onc
         "the created Agent shows the input once: {frame}"
     );
     assert_eq!(submits(directory.path()), 1);
+    assert_eq!(
+        counted(directory.path(), "creates"),
+        1,
+        "settling creates no second Agent"
+    );
+    assert_eq!(
+        counted(directory.path(), "configures"),
+        1,
+        "the unknown choice is not resent"
+    );
     view.send(b"/clear\r");
     view.wait_for("another New Agent draft", |frame| {
         !frame.contains("late reply")
@@ -789,13 +908,32 @@ fn a_busy_command_held_behind_an_unknown_input_is_queued_and_shown_once() {
     std::fs::remove_file(flag("hide-receipts")).unwrap();
     view.send(b"\r");
     let frame = view.wait_for_rows("the command queued behind the active turn", |frame| {
-        frame.contains("Queued 1")
+        frame
+            .split_once("Messages to be submitted (1)")
+            .is_some_and(|(_, preview)| {
+                preview
+                    .lines()
+                    .take_while(|line| !line.starts_with('─'))
+                    .any(|line| line.contains(COMMAND))
+            })
     });
+    let (body, preview) = frame.split_once("Messages to be submitted (1)").unwrap();
+    let preview = preview
+        .lines()
+        .take_while(|line| !line.starts_with('─'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!body.contains(COMMAND), "{frame}");
+    assert_eq!(
+        preview.matches(COMMAND).count(),
+        1,
+        "the queued command appears once in the pending preview: {frame}"
+    );
     assert_eq!(echoed(&frame, FIRST), 1, "{frame}");
     assert_eq!(
         echoed(&frame, COMMAND),
-        1,
-        "the queued command is shown once: {frame}"
+        0,
+        "the queued command is not shown as consumed: {frame}"
     );
     assert_eq!(
         submits(directory.path()),
@@ -823,9 +961,21 @@ fn a_busy_command_held_behind_an_unknown_input_is_queued_and_shown_once() {
     );
 
     std::fs::remove_file(flag("hold-model")).unwrap();
-    view.wait_for("the queued command ran after the turn", |frame| {
-        frame.contains("edited reply")
+    let frame = view.wait_for_rows("the queued command ran after the turn", |frame| {
+        frame.contains("edited reply") && !frame.contains("Messages to be submitted")
     });
+    assert_eq!(echoed(&frame, FIRST), 1, "{frame}");
+    assert_eq!(
+        echoed(&frame, COMMAND),
+        1,
+        "the consumed command is shown once: {frame}"
+    );
+    assert_eq!(submits(directory.path()), 1, "nothing was resent");
+    assert_eq!(
+        counted(directory.path(), "after-turn-queues"),
+        1,
+        "queued once"
+    );
     close(&mut view);
     assert_eq!(
         std::fs::read_to_string(flag("model-requests")).unwrap(),

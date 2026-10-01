@@ -134,7 +134,6 @@ pub(super) struct Scrollback {
     /// A live row drawn below the conversation while a run works; it is not
     /// part of the logical lines, so it disappears once cleared.
     activity: Option<RoleLine>,
-    activity_docked: bool,
     /// Header lines of tool calls still executing, by call id.
     running_tool_calls: HashMap<String, usize>,
     running_shimmer: RunningShimmer,
@@ -161,7 +160,6 @@ impl Default for Scrollback {
             seen_messages: HashSet::new(),
             unread: 0,
             activity: None,
-            activity_docked: false,
             running_tool_calls: HashMap::new(),
             running_shimmer: RunningShimmer::default(),
             completion_notice: None,
@@ -180,8 +178,9 @@ impl Scrollback {
         self.top_row() == self.row_count().saturating_sub(self.height)
     }
 
-    pub(super) fn set_activity_docked(&mut self, docked: bool) {
-        self.activity_docked = docked;
+    pub(super) fn has_hidden_tail(&mut self, width: usize, height: usize) -> bool {
+        self.prepare_frame(width, height);
+        !self.is_at_bottom()
     }
 
     pub(super) fn activity_line(&self) -> Option<RoleLine> {
@@ -574,12 +573,7 @@ impl Scrollback {
                 unread: self.unread,
             };
         }
-        if self.width != width {
-            self.width = width;
-            self.dirty_from = Some(0);
-        }
-        self.height = height;
-        self.refresh_rows();
+        self.prepare_frame(width, height);
         let top = self.top_row();
         if top.saturating_add(height) >= self.row_count() {
             self.unread = 0;
@@ -620,9 +614,6 @@ impl Scrollback {
     }
 
     fn activity_rows(&self) -> Vec<RoleLine> {
-        if self.activity_docked {
-            return Vec::new();
-        }
         let Some(activity) = &self.activity else {
             return Vec::new();
         };
@@ -633,6 +624,15 @@ impl Scrollback {
         }
         rows.push(activity.clone());
         rows
+    }
+
+    fn prepare_frame(&mut self, width: usize, height: usize) {
+        if self.width != width {
+            self.width = width;
+            self.dirty_from = Some(0);
+        }
+        self.height = height;
+        self.refresh_rows();
     }
 
     fn row_count(&self) -> usize {

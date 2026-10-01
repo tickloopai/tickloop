@@ -24,7 +24,10 @@ pub(super) fn before_resume(
     validate_model_for_resume_in_root(&snapshot.model, state_root)
         .map_err(|error| AgentError::Invalid(error.to_string()))?;
     for pending in &mut snapshot.pending_inputs {
-        if pending.receipt.loop_id == loop_id && pending.trigger_source.is_none() {
+        if pending.receipt.loop_id == loop_id
+            && pending.trigger_source.is_none()
+            && pending.agent_message.is_none()
+        {
             pending.armed = true;
         }
     }

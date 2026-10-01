@@ -971,7 +971,26 @@ pub(super) fn write_public_history(console: &Console, chat: &ChatSnapshot) -> Re
         }
     }
     let pieces = public_history_pieces(chat, console.display_profile()?, console.image_links()?);
-    console.write_pieces(&pieces)
+    console.write_pieces(&pieces)?;
+    console.mark_input_echoes(
+        chat.id,
+        chat.message_runs
+            .values()
+            .copied()
+            .filter(|input| super::consumed_input_text(chat, *input).is_some())
+            .chain(chat.agent_message_origins.keys().copied()),
+    )?;
+    if console.is_interactive()
+        && let Some(event) = chat.conversation_events().into_iter().rev().find(|event| {
+            event.chat_id == chat.id
+                && matches!(event.kind, EventKind::Started | EventKind::Completed { .. })
+        })
+        && let EventKind::Completed { usage } = event.kind
+    {
+        super::write_completion_notice(console, &usage)?;
+    }
+    console.replay_execution_losses(chat.id)?;
+    Ok(())
 }
 
 /// A Tick Update delivery: the Chat shows its `◉` lines, never the payload the model reads.
@@ -1015,7 +1034,8 @@ fn append_public_message(
                 if conversation::is_interruption_placeholder(message.role, text) => {}
             Content::Text { text }
                 if message.role == Role::User
-                    && let Some(local_message) = LocalMessage::parse(text) =>
+                    && let Some(local_message) =
+                        presentation::typed_local_message(text, source.is_agent_message) =>
             {
                 history.push_role(
                     presentation::local_message_text(
@@ -1135,6 +1155,55 @@ mod tests {
                 _ => {}
             }
         }
+    }
+
+    #[tokio::test]
+    async fn retained_history_keeps_completion_notices_out_of_permanent_content() {
+        let directory = tempfile::tempdir().unwrap();
+        let model = Arc::new(support::ScriptedModel::with_usages(
+            vec![
+                support::text("First report."),
+                support::text("Second report."),
+            ],
+            vec![
+                tickloop_agent::model::Usage {
+                    input_tokens: Some(31),
+                    output_tokens: Some(7),
+                    ..Default::default()
+                },
+                tickloop_agent::model::Usage {
+                    input_tokens: Some(117),
+                    output_tokens: Some(29),
+                    ..Default::default()
+                },
+            ],
+        ));
+        let agent = tickloop_agent::runtime::Agent::new_embedded(support::config(), model);
+        let chat = agent.create_chat(directory.path().into()).await.unwrap();
+        let mut events = agent.subscribe();
+        let first = agent
+            .submit(chat, None, "Read the first report.".into())
+            .await
+            .unwrap();
+        completed(&mut events).await;
+        agent
+            .submit(chat, Some(first.loop_id), "Read another report.".into())
+            .await
+            .unwrap();
+        completed(&mut events).await;
+        let history = public_history(
+            &agent.snapshot(chat).await.unwrap(),
+            DisplayProfile::default(),
+        );
+        assert!(!history.contains("Done"), "{history}");
+        assert!(!history.contains("input tokens:"), "{history}");
+        let positions = ["First report.", "Read another report.", "Second report."]
+            .map(|text| history.find(text).unwrap());
+        assert!(
+            positions.windows(2).all(|pair| pair[0] < pair[1]),
+            "{history}"
+        );
+        agent.shutdown().await;
     }
 
     async fn user_shell_reaches(

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -28,6 +28,9 @@ use unicode_width::UnicodeWidthChar;
 use uuid::Uuid;
 
 mod agent_layout;
+#[cfg(test)]
+#[path = "console/connection_tests.rs"]
+mod connection_tests;
 #[cfg(test)]
 #[path = "console/layout_tests.rs"]
 mod layout_tests;
@@ -81,7 +84,7 @@ use super::{
         InputKind, ShellCompletionKey, ShellCompletionKind, ShellEmptyControl, ShellExecution,
         ShellInputAction, ShellInputState, UserShellSubmission,
     },
-    status_area::{StatusArea, StatusItem},
+    status_area::{BackgroundStatusNotice, StatusArea, StatusItem},
     style::{ColourDepth, Role, RoleLine, Span, StyledLine, ThemeName},
     subscription_surface::{
         SubscriptionAction, SubscriptionEffect, SubscriptionFocus, SubscriptionSurface,
@@ -99,6 +102,7 @@ const RESET_SCROLL_REGION: &str = "\x1b[r";
 /// What a queued input names as its target when it starts a Loop of its own; one bound to an
 /// existing Loop of the shown Agent names nothing further.
 const NEW_LOOP_TARGET: &str = "new Loop";
+const MAX_PENDING_INPUT_ROWS: usize = 4;
 const CREATION_ATTACH_UNAVAILABLE_PREFIX: &str = "New Agent created; local connection unavailable";
 
 /// Pairs the escape sequences that move between screen buffers with the record
@@ -221,6 +225,7 @@ pub(super) enum InputEvent {
     OpenRewind,
     Suspend,
     Interrupt,
+    InterruptActivity,
     TakeBackQueued {
         draft_empty: bool,
     },
@@ -232,6 +237,7 @@ pub(super) enum InputEvent {
 impl fmt::Debug for InputEvent {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InterruptActivity => formatter.write_str("InterruptActivity"),
             Self::Line(value) => formatter.debug_tuple("Line").field(value).finish(),
             Self::Prompt {
                 text,
@@ -429,7 +435,14 @@ struct State {
     width: usize,
     height: usize,
     scrollback: Scrollback,
+    /// Startup and local feedback from before this View's draft created its Chat.
+    creation_prefixes: HashMap<Option<Uuid>, Vec<CreationPrefixEntry>>,
+    echoed_inputs: HashSet<Uuid>,
+    awaiting_input_echoes: HashSet<Uuid>,
     chat: Option<Uuid>,
+    activity_interruptible: bool,
+    back_to_bottom_target: Option<BackToBottomTarget>,
+    back_to_bottom_pressed: bool,
     completion: Completion,
     file_mentions: FileMentionState,
     input_owner: Uuid,
@@ -505,7 +518,12 @@ struct State {
     footer_open_pending: Option<FooterOpenPending>,
     status: String,
     configured_status_lines: Option<Vec<String>>,
+    background_status_notice: Option<BackgroundStatusNotice>,
     connection_notice: Option<String>,
+    execution_connection_notice: Option<ExecutionConnectionNotice>,
+    execution_losses: HashMap<Uuid, Vec<ExecutionLossNotice>>,
+    last_connection_diagnostics: HashMap<Uuid, String>,
+    rendered_execution_losses: HashSet<Uuid>,
     creation_notice: Option<String>,
     /// The visible Agent's owner-reported delegation; reset whenever the visible Agent changes.
     visible_delegated: bool,
@@ -607,6 +625,8 @@ impl Default for ChatInput {
 #[derive(Default)]
 struct ViewPresentation {
     scrollback: Scrollback,
+    echoed_inputs: HashSet<Uuid>,
+    awaiting_input_echoes: HashSet<Uuid>,
     footer: FooterState,
     status_area: StatusArea,
     queued_inputs: Vec<QueuedInput>,
@@ -620,6 +640,43 @@ struct ViewPresentation {
     footer_list_focused: bool,
     conversation_focused: bool,
     status: String,
+    execution_connection_notice: Option<ExecutionConnectionNotice>,
+    rendered_execution_losses: HashSet<Uuid>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ExecutionConnectionNotice {
+    Lost,
+    LostHistory,
+    CachedExecution,
+    CachedView,
+}
+
+impl ExecutionConnectionNotice {
+    fn text(self) -> &'static str {
+        match self {
+            Self::Lost => "Lost · outcome unknown",
+            Self::LostHistory => "Lost · cached history",
+            Self::CachedExecution => "Disconnected · cached execution",
+            Self::CachedView => "Disconnected · cached view",
+        }
+    }
+
+    fn compact(self) -> &'static str {
+        match self {
+            Self::Lost => "Lost · outcome unknown",
+            Self::LostHistory => "Lost · cached history",
+            Self::CachedExecution => "Offline · cached",
+            Self::CachedView => "Offline · cached view",
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct ExecutionLossNotice {
+    pub(super) run_id: Uuid,
+    pub(super) summary: String,
+    pub(super) technical: String,
 }
 
 /// Shell 补全用的历史命令，由新到旧；按键过滤只读这里，不读历史文件。
@@ -656,6 +713,72 @@ struct FooterOpenPending {
     cancelled: bool,
 }
 
+struct BackToBottomTarget {
+    row: usize,
+    columns: std::ops::Range<usize>,
+}
+
+fn status_notice_line(
+    notice: &str,
+    background: Option<&BackgroundStatusNotice>,
+    pending: Option<&str>,
+    width: usize,
+) -> RoleLine {
+    let mut line = RoleLine::role(notice, Role::StatusBar);
+    if pending.is_none() {
+        if let Some(background) = background {
+            let available = width.saturating_sub(display_width(notice) + 3);
+            if !notice.is_empty() {
+                line.push(" · ", Some(Role::MutedText));
+            }
+            line.spans.extend(background.line(available).spans);
+        }
+        return line.filled(Role::StatusBar);
+    }
+    let urgent_background = background.filter(|background| background.necessary);
+    if let Some(background) = urgent_background {
+        let separator_columns = if notice.is_empty() { 0 } else { 3 };
+        let available = width.saturating_sub(display_width(notice) + separator_columns);
+        let pending_columns = pending.map_or(0, |pending| display_width(pending) + 3);
+        let available_with_pending = available.saturating_sub(pending_columns);
+        let message = if display_width(&background.message) <= available_with_pending {
+            background.message.as_str()
+        } else {
+            background
+                .compact_message
+                .as_deref()
+                .unwrap_or(&background.message)
+        };
+        let available = if display_width(message) <= available_with_pending {
+            available_with_pending
+        } else {
+            available
+        };
+        if !notice.is_empty() {
+            line.push(" · ", Some(Role::MutedText));
+        }
+        line.spans.extend(background.line(available).spans);
+    }
+    if let Some(pending) = pending {
+        let separator = if line.text().is_empty() { "" } else { " · " };
+        if display_width(&line.text()) + display_width(separator) + display_width(pending) <= width
+        {
+            line.push(separator, Some(Role::MutedText));
+            line.push(pending, Some(Role::MutedText));
+        }
+    }
+    if let Some(background) = background.filter(|background| !background.necessary) {
+        let separator = if line.text().is_empty() { "" } else { " · " };
+        let available =
+            width.saturating_sub(display_width(&line.text()) + display_width(separator));
+        if available > 0 {
+            line.push(separator, Some(Role::MutedText));
+            line.spans.extend(background.line(available).spans);
+        }
+    }
+    line.filled(Role::StatusBar)
+}
+
 /// Keeps frames off the terminal until dropped. Writes made meanwhile reach
 /// the terminal as one frame, so a burst of them cannot repaint the screen
 /// once per write.
@@ -676,6 +799,47 @@ impl Drop for FrameHold {
 }
 
 impl Console {
+    pub(super) fn set_background_status_notice(
+        &self,
+        notice: Option<BackgroundStatusNotice>,
+    ) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        state.background_status_notice = notice.map(|mut notice| {
+            notice.title = notice.title.map(|title| display_single_line(&title));
+            notice.message = display_single_line(&notice.message);
+            notice.compact_message = notice
+                .compact_message
+                .map(|message| display_single_line(&message));
+            notice
+        });
+        Ok(())
+    }
+
+    pub(super) fn background_status_notice(
+        &self,
+        agent: Option<(Uuid, String)>,
+        message: String,
+        compact_message: Option<String>,
+        necessary: bool,
+        message_role: Role,
+    ) -> Result<BackgroundStatusNotice, String> {
+        let state = self.state.lock().map_err(|error| error.to_string())?;
+        let ordinal = agent.as_ref().and_then(|(agent_id, _)| {
+            state
+                .status_area
+                .ordinal(*agent_id)
+                .or_else(|| state.overview.numbers.shared(*agent_id))
+        });
+        Ok(BackgroundStatusNotice {
+            title: agent.map(|(_, title)| title),
+            ordinal,
+            message,
+            message_role,
+            compact_message,
+            necessary,
+        })
+    }
+
     pub(super) fn set_status_lines(&self, lines: Option<Vec<String>>) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         state.configured_status_lines = lines;
@@ -687,13 +851,90 @@ impl Console {
     pub(super) fn set_connection_notice(&self, notice: Option<String>) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         let notice = notice.map(|notice| display_single_line(&notice));
-        if state.connection_notice == notice {
+        if state.connection_notice == notice && state.execution_connection_notice.is_none() {
             return Ok(());
         }
         state.connection_notice = notice;
+        state.execution_connection_notice = None;
         state
             .draw(&mut io::stdout().lock())
             .map_err(|error| error.to_string())
+    }
+
+    pub(super) fn set_execution_connection_notice(
+        &self,
+        notice: Option<ExecutionConnectionNotice>,
+        cause: Option<String>,
+    ) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        if notice.is_some()
+            && let Some(chat) = state.chat
+            && let Some(cause) = cause
+        {
+            state
+                .last_connection_diagnostics
+                .insert(chat, display_text(&cause));
+        }
+        if state.execution_connection_notice == notice && state.connection_notice.is_none() {
+            return Ok(());
+        }
+        state.execution_connection_notice = notice;
+        state.connection_notice = None;
+        state
+            .draw(&mut io::stdout().lock())
+            .map_err(|error| error.to_string())
+    }
+
+    pub(super) fn record_execution_loss(
+        &self,
+        chat: Uuid,
+        notice: ExecutionLossNotice,
+    ) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        let losses = state.execution_losses.entry(chat).or_default();
+        if losses.iter().all(|loss| loss.run_id != notice.run_id) {
+            losses.push(notice.clone());
+        }
+        if state.chat == Some(chat) && state.overview.projection.is_some() {
+            if let Some(source) = state.overview_source_view.as_mut()
+                && source.rendered_execution_losses.insert(notice.run_id)
+            {
+                source
+                    .scrollback
+                    .append_as(&notice.summary, Some(Role::Warning), None);
+            }
+        } else if state.chat == Some(chat) {
+            if state.rendered_execution_losses.insert(notice.run_id) {
+                state
+                    .scrollback
+                    .append_as(&notice.summary, Some(Role::Warning), None);
+            }
+            state
+                .draw(&mut io::stdout().lock())
+                .map_err(|error| error.to_string())?;
+        } else if let Some(cached) = state.view_cache.get_mut(&Some(chat))
+            && cached.rendered_execution_losses.insert(notice.run_id)
+        {
+            cached
+                .scrollback
+                .append_as(&notice.summary, Some(Role::Warning), None);
+        }
+        Ok(())
+    }
+
+    pub(super) fn replay_execution_losses(&self, chat: Uuid) -> Result<(), String> {
+        let notices = self
+            .state
+            .lock()
+            .map_err(|error| error.to_string())?
+            .execution_losses
+            .get(&chat)
+            .cloned()
+            .unwrap_or_default();
+        for notice in notices {
+            self.record_execution_loss(chat, notice)?;
+        }
+        Ok(())
     }
     pub(super) fn set_creation_notice(&self, notice: Option<String>) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
@@ -714,6 +955,7 @@ impl Console {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         let was_open = state.overview.projection.is_some();
         if !was_open && projection.is_some() {
+            state.overview.current_draft = state.chat.is_none();
             let dispatch = std::mem::take(&mut state.overview_input);
             let source = state.replace_input(dispatch);
             state.overview_source_input = Some(source);
@@ -745,6 +987,9 @@ impl Console {
                 .saturating_sub(agent_layout::bottom_capacity(state.height) + heading_rows);
         }
         state.overview.update(projection);
+        if state.overview.projection.is_none() {
+            state.overview.current_draft = false;
+        }
         let index_directory = state
             .overview
             .projection
@@ -785,6 +1030,20 @@ impl Console {
     /// reading number when another Agent the View has listed reads alike.
     pub(super) fn agent_name(&self, agent_id: Uuid, title: &str) -> Result<String, String> {
         let state = self.state.lock().map_err(|error| error.to_string())?;
+        let title = state
+            .status_area
+            .agent_title(agent_id)
+            .or_else(|| {
+                state
+                    .overview
+                    .projection
+                    .as_ref()?
+                    .rows
+                    .iter()
+                    .find(|row| row.agent_id == agent_id)
+                    .map(|row| row.title.as_str())
+            })
+            .unwrap_or(title);
         let number = state
             .status_area
             .ordinal(agent_id)
@@ -1117,10 +1376,59 @@ impl Console {
         Ok(())
     }
 
+    pub(super) fn select_created_chat(
+        &self,
+        chat: Uuid,
+        startup_banner: &[(String, Option<Role>)],
+    ) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        let is_new_view = state.chat != Some(chat) && !state.view_cache.contains_key(&Some(chat));
+        let draft_history = (is_new_view && state.captures_creation_prefix())
+            .then(|| std::mem::take(&mut state.scrollback));
+        if let Some(history) = &draft_history {
+            let prefix = state.creation_prefixes.remove(&None).unwrap_or_default();
+            state.creation_prefixes.insert(Some(chat), prefix);
+            state.scrollback.set_auto_scroll(history.auto_scroll());
+            for (text, role) in startup_banner {
+                state.scrollback.append_as(text, *role, None);
+            }
+            state.creation_prefixes.insert(
+                None,
+                startup_banner
+                    .iter()
+                    .map(|(text, role)| {
+                        CreationPrefixEntry::Output(ConversationPiece::Styled(text.clone(), *role))
+                    })
+                    .collect(),
+            );
+        }
+        state.switch_view_chat(Some(chat));
+        if let Some(history) = draft_history {
+            state.scrollback = history;
+        } else if is_new_view && state.interactive {
+            for (text, role) in startup_banner {
+                state.scrollback.append_as(text, *role, None);
+            }
+            state.creation_prefixes.insert(
+                Some(chat),
+                startup_banner
+                    .iter()
+                    .map(|(text, role)| {
+                        CreationPrefixEntry::Output(ConversationPiece::Styled(text.clone(), *role))
+                    })
+                    .collect(),
+            );
+        }
+        Ok(())
+    }
+
     pub(super) fn activate_agent(&self, chat: Uuid) -> Result<bool, String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         let restored = state.chat == Some(chat) || state.view_cache.contains_key(&Some(chat));
         state.switch_view_chat(Some(chat));
+        state.clear_footer_selection();
+        state.status_area.collapse();
+        state.conversation_focused = false;
         Ok(restored)
     }
 
@@ -1250,8 +1558,35 @@ impl Console {
         Ok(closed)
     }
 
-    pub fn update_transcript(&self, id: Uuid, document: TranscriptDocument) -> Result<(), String> {
+    pub fn update_transcript(
+        &self,
+        id: Uuid,
+        mut document: TranscriptDocument,
+    ) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        if let Some(chat) = state.chat
+            && let Some(losses) = state.execution_losses.get(&chat)
+        {
+            for loss in losses {
+                document.lines.push(String::new());
+                document.lines.push("Execution connection details".into());
+                document
+                    .lines
+                    .extend(loss.technical.lines().map(display_text));
+            }
+        }
+        if let Some(chat) = state.chat
+            && let Some(cause) = state.last_connection_diagnostics.get(&chat)
+        {
+            document.lines.push(String::new());
+            document
+                .lines
+                .push("Last connection diagnostic (this View)".into());
+            document.lines.push(format!("Technical cause: {cause}"));
+            document.lines.push(format!(
+                "/resume {chat} loads saved history; continuing requires an explicit new input."
+            ));
+        }
         if let Some((current, transcript)) = &mut state.transcript
             && id == *current
         {
@@ -1827,6 +2162,9 @@ impl Console {
             return Ok(());
         }
         state.scrollback.append(text);
+        if self.message_id.is_none() {
+            state.capture_creation_output(&[ConversationPiece::Styled(text.into(), None)]);
+        }
         if let Some(id) = &self.message_id {
             state.scrollback.note_message(id.clone());
         }
@@ -1932,6 +2270,9 @@ impl Console {
         spans: Option<&[(String, Option<Role>)]>,
     ) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        if spans.is_none() {
+            state.activity_interruptible = false;
+        }
         if !state.interactive {
             return Ok(());
         }
@@ -1956,6 +2297,9 @@ impl Console {
         status: &str,
     ) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        if spans.is_none() {
+            state.activity_interruptible = false;
+        }
         let activity = spans.map(|spans| {
             let mut line = RoleLine::default();
             for (text, role) in spans {
@@ -1968,6 +2312,14 @@ impl Console {
         state
             .draw(&mut io::stdout().lock())
             .map_err(|error| error.to_string())
+    }
+
+    pub(super) fn set_activity_interruptible(&self, interruptible: bool) -> Result<(), String> {
+        self.state
+            .lock()
+            .map_err(|error| error.to_string())?
+            .activity_interruptible = interruptible;
+        Ok(())
     }
 
     /// Shows why an action did nothing, kept across periodic status refreshes until the next key.
@@ -2000,22 +2352,12 @@ impl Console {
             }
             return output.flush().map_err(|error| error.to_string());
         }
-        let lead = format!("{} ", state.display.glyph(Glyph::Assistant));
+        if self.message_id.is_none() {
+            state.capture_creation_output(pieces);
+        }
+        let display = state.display;
         for piece in pieces {
-            match piece {
-                ConversationPiece::Styled(text, role) => {
-                    state.scrollback.append_as(text, *role, None)
-                }
-                ConversationPiece::Linked { text, link } => {
-                    state.scrollback.append_span(text, None, None, Some(link))
-                }
-                ConversationPiece::Markdown {
-                    text,
-                    starts_message,
-                } => state
-                    .scrollback
-                    .append_markdown(text, &lead, *starts_message),
-            }
+            piece.append_to(&mut state.scrollback, display);
         }
         if let Some(id) = &self.message_id {
             state.scrollback.note_message(id.clone());
@@ -2037,6 +2379,116 @@ impl Console {
             .draw(&mut io::stdout().lock())
             .map_err(|error| error.to_string())?;
         Ok(echo)
+    }
+
+    pub(super) fn input_is_echoed(&self, chat: Uuid, input: Uuid) -> Result<bool, String> {
+        let state = self.state.lock().map_err(|error| error.to_string())?;
+        Ok(if state.chat == Some(chat) {
+            state.echoed_inputs.contains(&input)
+        } else {
+            state
+                .view_cache
+                .get(&Some(chat))
+                .is_none_or(|cached| cached.echoed_inputs.contains(&input))
+        })
+    }
+
+    pub(super) fn mark_input_echoes(
+        &self,
+        chat: Uuid,
+        inputs: impl IntoIterator<Item = Uuid>,
+    ) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        if state.chat == Some(chat) {
+            for input in inputs {
+                state.awaiting_input_echoes.remove(&input);
+                state.echoed_inputs.insert(input);
+            }
+        } else if let Some(cached) = state.view_cache.get_mut(&Some(chat)) {
+            for input in inputs {
+                cached.awaiting_input_echoes.remove(&input);
+                cached.echoed_inputs.insert(input);
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn defer_input_echo(&self, chat: Uuid, input: Uuid) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        if state.chat == Some(chat) {
+            if !state.echoed_inputs.contains(&input) {
+                state.awaiting_input_echoes.insert(input);
+            }
+        } else if let Some(cached) = state.view_cache.get_mut(&Some(chat))
+            && !cached.echoed_inputs.contains(&input)
+        {
+            cached.awaiting_input_echoes.insert(input);
+        }
+        Ok(())
+    }
+
+    pub(super) fn awaiting_input_echoes(&self, chat: Uuid) -> Result<Vec<Uuid>, String> {
+        let state = self.state.lock().map_err(|error| error.to_string())?;
+        Ok(if state.chat == Some(chat) {
+            state.awaiting_input_echoes.iter().copied().collect()
+        } else {
+            state
+                .view_cache
+                .get(&Some(chat))
+                .map(|cached| cached.awaiting_input_echoes.iter().copied().collect())
+                .unwrap_or_default()
+        })
+    }
+
+    pub(super) fn finish_deferred_input_echo(&self, chat: Uuid, input: Uuid) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        if state.chat == Some(chat) {
+            state.awaiting_input_echoes.remove(&input);
+        } else if let Some(cached) = state.view_cache.get_mut(&Some(chat)) {
+            cached.awaiting_input_echoes.remove(&input);
+        }
+        Ok(())
+    }
+
+    pub(super) fn record_consumed_input(
+        &self,
+        chat: Uuid,
+        input: Uuid,
+        line: &str,
+    ) -> Result<Option<InputEcho>, String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        if !state.interactive {
+            return Ok(None);
+        }
+        if state.chat == Some(chat) {
+            state.awaiting_input_echoes.remove(&input);
+            if state.echoed_inputs.contains(&input) {
+                return Ok(None);
+            }
+            let echo = state.record_input(line);
+            if echo.is_some() {
+                state.echoed_inputs.insert(input);
+            }
+            state
+                .draw(&mut io::stdout().lock())
+                .map_err(|error| error.to_string())?;
+            Ok(echo)
+        } else {
+            let display = state.display;
+            let links = state.image_links().in_text(chat, line);
+            let Some(cached) = state.view_cache.get_mut(&Some(chat)) else {
+                return Ok(None);
+            };
+            cached.awaiting_input_echoes.remove(&input);
+            if cached.echoed_inputs.contains(&input) {
+                return Ok(None);
+            }
+            let echo = append_input_echo(&mut cached.scrollback, line, display, &links);
+            if echo.is_some() {
+                cached.echoed_inputs.insert(input);
+            }
+            Ok(echo)
+        }
     }
 
     /// Shows `current` as the continuation of `previous` in `chat`'s body when the two echoes are
@@ -2069,6 +2521,11 @@ impl Console {
     /// sent, or is shown in the created Agent's view instead.
     pub(super) fn withdraw_echo(&self, view: Option<Uuid>, echo: InputEcho) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        if let Some(prefix) = state.creation_prefixes.get_mut(&view) {
+            prefix.retain(|entry| {
+                !matches!(entry, CreationPrefixEntry::Input { echo: recorded, .. } if *recorded == echo)
+            });
+        }
         if state.chat == view {
             state.scrollback.hide_echo(echo);
             state
@@ -2856,7 +3313,27 @@ pub(super) enum ConversationPiece {
     },
 }
 
+#[derive(Clone)]
+enum CreationPrefixEntry {
+    Input { echo: InputEcho, text: String },
+    Output(ConversationPiece),
+}
+
 impl ConversationPiece {
+    fn append_to(&self, scrollback: &mut Scrollback, display: DisplayProfile) {
+        match self {
+            Self::Styled(text, role) => scrollback.append_as(text, *role, None),
+            Self::Linked { text, link } => scrollback.append_span(text, None, None, Some(link)),
+            Self::Markdown {
+                text,
+                starts_message,
+            } => {
+                let lead = format!("{} ", display.glyph(Glyph::Assistant));
+                scrollback.append_markdown(text, &lead, *starts_message);
+            }
+        }
+    }
+
     pub(super) fn text(&self) -> &str {
         match self {
             Self::Styled(text, _) | Self::Linked { text, .. } | Self::Markdown { text, .. } => text,
@@ -2888,6 +3365,89 @@ fn body_scroll(previous: &[String], current: &[String]) -> Option<usize> {
         .map(|(shift, _)| shift)
 }
 
+fn append_input_echo(
+    scrollback: &mut Scrollback,
+    line: &str,
+    display: DisplayProfile,
+    links: &[(std::ops::Range<usize>, hyperlink::Hyperlink)],
+) -> Option<InputEcho> {
+    let input = line.trim();
+    if input.is_empty() {
+        return None;
+    }
+    scrollback.append("\n");
+    let first_line = scrollback.line_count() - 1;
+    scrollback.append_as(
+        &format!("{} ", display.glyph(Glyph::Prompt)),
+        Some(Role::Subtle),
+        Some(Role::UserMessageBg),
+    );
+    for (run, link) in hyperlink::runs(line, links) {
+        scrollback.append_span(run, None, Some(Role::UserMessageBg), link);
+    }
+    scrollback.append("\n");
+    let echo = scrollback.mark_input(first_line..scrollback.line_count() - 1);
+    if !input.starts_with('/') {
+        scrollback.note_message(Uuid::new_v4().to_string());
+        if scrollback.auto_scroll() {
+            scrollback.scroll(ScrollAction::Last);
+        }
+    }
+    Some(echo)
+}
+
+fn pending_input_lines(entries: &[QueuedInput], width: usize, rows: usize) -> Vec<RoleLine> {
+    if entries.is_empty() || rows == 0 {
+        return Vec::new();
+    }
+    let title = format!("Messages to be submitted ({}) · ↑ edit", entries.len());
+    let title = if display_width(&title) <= width {
+        title
+    } else {
+        format!("Pending {} · ↑ edit", entries.len())
+    };
+    let mut lines = vec![RoleLine::role(title, Role::MutedText)];
+    let available = rows.saturating_sub(1);
+    let preview_count = if entries.len() > available && available > 1 {
+        available - 1
+    } else {
+        available
+    };
+    for entry in entries.iter().take(preview_count) {
+        let kind = match entry.kind {
+            QueuedInputKind::Message => "message",
+            QueuedInputKind::Shell => "shell",
+            QueuedInputKind::Command => "command",
+        };
+        let target = if entry.loop_id.is_some() {
+            String::new()
+        } else {
+            format!(" {NEW_LOOP_TARGET}")
+        };
+        let text = format!(
+            "{kind}{target} · {}",
+            display_text(&entry.text).replace('\n', " ↵ ")
+        );
+        let text = if available == 1 && entries.len() > 1 {
+            let more = format!(" · … {} more", entries.len() - 1);
+            format!(
+                "{}{more}",
+                truncate_width(&text, width.saturating_sub(display_width(&more)))
+            )
+        } else {
+            text
+        };
+        lines.push(RoleLine::role(text, Role::MutedText));
+    }
+    if entries.len() > preview_count && available > 1 {
+        lines.push(RoleLine::role(
+            format!("… {} more", entries.len() - preview_count),
+            Role::MutedText,
+        ));
+    }
+    lines
+}
+
 impl State {
     fn set_foreground_shell(&mut self, active: bool) {
         self.foreground_shell = active;
@@ -2901,6 +3461,7 @@ impl State {
     }
 
     fn focus_lost(&mut self) {
+        self.back_to_bottom_pressed = false;
         self.shell_background_chord_started_at = None;
         self.clear_footer_selection();
         self.clipboard_hint.focus_lost();
@@ -2926,38 +3487,36 @@ impl State {
     }
 
     fn record_input(&mut self, line: &str) -> Option<InputEcho> {
-        let input = line.trim();
-        if input.is_empty() {
-            return None;
-        }
-        // Claude Code sets the prompt on a full-width background block with a
-        // subtle pointer, which is what separates it from the reply below.
-        self.scrollback.append("\n");
-        let first_line = self.scrollback.line_count() - 1;
-        self.scrollback.append_as(
-            &format!("{} ", self.display.glyph(Glyph::Prompt)),
-            Some(Role::Subtle),
-            Some(Role::UserMessageBg),
-        );
         let links = self
             .chat
             .map(|chat| self.image_links().in_text(chat, line))
             .unwrap_or_default();
-        for (run, link) in hyperlink::runs(line, &links) {
-            self.scrollback
-                .append_span(run, None, Some(Role::UserMessageBg), link);
+        let echo = append_input_echo(&mut self.scrollback, line, self.display, &links);
+        if self.captures_creation_prefix()
+            && let Some(echo) = echo
+        {
+            self.creation_prefixes
+                .entry(None)
+                .or_default()
+                .push(CreationPrefixEntry::Input {
+                    echo,
+                    text: line.into(),
+                });
         }
-        self.scrollback.append("\n");
-        let echo = self
-            .scrollback
-            .mark_input(first_line..self.scrollback.line_count() - 1);
-        if !input.starts_with('/') {
-            self.scrollback.note_message(Uuid::new_v4().to_string());
-            if self.scrollback.auto_scroll() {
-                self.scrollback.scroll(ScrollAction::Last);
-            }
+        echo
+    }
+
+    fn captures_creation_prefix(&self) -> bool {
+        self.interactive && self.chat.is_none() && self.overview.projection.is_none()
+    }
+
+    fn capture_creation_output(&mut self, pieces: &[ConversationPiece]) {
+        if self.captures_creation_prefix() {
+            self.creation_prefixes
+                .entry(None)
+                .or_default()
+                .extend(pieces.iter().cloned().map(CreationPrefixEntry::Output));
         }
-        Some(echo)
     }
 
     fn image_links(&self) -> ImageLinks {
@@ -2967,6 +3526,9 @@ impl State {
     fn clear_history(&mut self) {
         let auto_scroll = self.scrollback.auto_scroll();
         self.scrollback = Scrollback::new();
+        self.echoed_inputs.clear();
+        self.awaiting_input_echoes.clear();
+        self.rendered_execution_losses.clear();
         self.scrollback.set_auto_scroll(auto_scroll);
         self.rendered_region = None;
     }
@@ -2975,6 +3537,19 @@ impl State {
         let preserve_editor_context = self.branch_submission_protects_editor();
         self.switch_view_chat(Some(chat));
         self.clear_history();
+        if let Some(prefix) = self.creation_prefixes.get(&Some(chat)) {
+            for entry in prefix {
+                match entry {
+                    CreationPrefixEntry::Input { text, .. } => {
+                        let links = self.image_links().in_text(chat, text);
+                        append_input_echo(&mut self.scrollback, text, self.display, &links);
+                    }
+                    CreationPrefixEntry::Output(piece) => {
+                        piece.append_to(&mut self.scrollback, self.display);
+                    }
+                }
+            }
+        }
         self.reset_chat_surfaces(chat, preserve_editor_context);
     }
 
@@ -2983,6 +3558,9 @@ impl State {
             return;
         }
         self.visible_delegated = false;
+        self.activity_interruptible = false;
+        self.back_to_bottom_target = None;
+        self.back_to_bottom_pressed = false;
         let previous_chat = self.chat;
         let next = self.view_cache.remove(&chat).unwrap_or_else(|| {
             let mut next = ViewPresentation::default();
@@ -3018,6 +3596,11 @@ impl State {
     fn replace_view(&mut self, next: ViewPresentation) -> ViewPresentation {
         ViewPresentation {
             scrollback: std::mem::replace(&mut self.scrollback, next.scrollback),
+            echoed_inputs: std::mem::replace(&mut self.echoed_inputs, next.echoed_inputs),
+            awaiting_input_echoes: std::mem::replace(
+                &mut self.awaiting_input_echoes,
+                next.awaiting_input_echoes,
+            ),
             footer: std::mem::replace(&mut self.footer, next.footer),
             status_area: std::mem::replace(&mut self.status_area, next.status_area),
             queued_inputs: std::mem::replace(&mut self.queued_inputs, next.queued_inputs),
@@ -3037,6 +3620,14 @@ impl State {
                 next.conversation_focused,
             ),
             status: std::mem::replace(&mut self.status, next.status),
+            execution_connection_notice: std::mem::replace(
+                &mut self.execution_connection_notice,
+                next.execution_connection_notice,
+            ),
+            rendered_execution_losses: std::mem::replace(
+                &mut self.rendered_execution_losses,
+                next.rendered_execution_losses,
+            ),
         }
     }
 
@@ -3151,7 +3742,13 @@ impl State {
             width: usize::from(width).saturating_sub(1).max(2),
             height: usize::from(height).max(1),
             scrollback: Scrollback::new(),
+            creation_prefixes: HashMap::new(),
+            echoed_inputs: HashSet::new(),
+            awaiting_input_echoes: HashSet::new(),
             chat: None,
+            activity_interruptible: false,
+            back_to_bottom_target: None,
+            back_to_bottom_pressed: false,
             completion: Completion::default(),
             file_mentions: FileMentionState::default(),
             input_owner: Uuid::new_v4(),
@@ -3217,7 +3814,12 @@ impl State {
             footer_open_pending: None,
             status: String::new(),
             configured_status_lines: None,
+            background_status_notice: None,
             connection_notice: None,
+            execution_connection_notice: None,
+            execution_losses: HashMap::new(),
+            last_connection_diagnostics: HashMap::new(),
+            rendered_execution_losses: HashSet::new(),
             creation_notice: None,
             visible_delegated: false,
             status_held: false,
@@ -3226,17 +3828,30 @@ impl State {
         }
     }
 
-    /// The wheel scrolls the conversation and nothing else. Clicks, drags and
-    /// hover are captured only so the terminal stops translating the wheel into
-    /// arrow keys, and are deliberately ignored.
-    /// Pointer input: the wheel scrolls the conversation and the left button
-    /// selects text. Everything else is captured only so the terminal stops
-    /// translating the wheel into arrow keys, and is ignored.
+    /// Pointer input scrolls the conversation, selects text and activates the return control.
+    /// Other events are captured so the terminal does not translate the wheel into arrow keys.
     fn pointer(&mut self, event: MouseEvent, output: &mut impl Write) -> bool {
         let at = Cell {
             row: usize::from(event.row),
             column: usize::from(event.column),
         };
+        let at_return_control = self
+            .back_to_bottom_target
+            .as_ref()
+            .is_some_and(|target| target.row == at.row && target.columns.contains(&at.column));
+        if self.back_to_bottom_pressed {
+            match event.kind {
+                MouseEventKind::Drag(MouseButton::Left) => return true,
+                MouseEventKind::Up(MouseButton::Left) => {
+                    self.back_to_bottom_pressed = false;
+                    if at_return_control {
+                        self.scroll_conversation(ScrollAction::Last);
+                    }
+                    return true;
+                }
+                _ => {}
+            }
+        }
         match event.kind {
             MouseEventKind::ScrollUp => {
                 self.scroll_conversation(ScrollAction::LinesUp(renderer::WHEEL_SCROLL_LINES))
@@ -3245,6 +3860,11 @@ impl State {
                 self.scroll_conversation(ScrollAction::LinesDown(renderer::WHEEL_SCROLL_LINES))
             }
             MouseEventKind::Down(MouseButton::Left) => {
+                if at_return_control {
+                    self.clear_selection();
+                    self.back_to_bottom_pressed = true;
+                    return true;
+                }
                 if self.status_area.is_configured() && self.footer_items_are_visible() {
                     let panel_rows = self.status_area.row_count(self.height);
                     if panel_rows > 0
@@ -3259,6 +3879,7 @@ impl State {
                         return true;
                     }
                 }
+                self.back_to_bottom_pressed = false;
                 let had_selection = self.selection.is_some();
                 self.selection = Some(Selection::started_at(at));
                 had_selection
@@ -3292,6 +3913,9 @@ impl State {
         }
         self.clear_selection();
         self.scrollback.scroll(action);
+        if action == ScrollAction::Last {
+            self.conversation_focused = false;
+        }
         true
     }
 
@@ -3317,6 +3941,7 @@ impl State {
     }
 
     fn clear_selection(&mut self) -> bool {
+        self.back_to_bottom_pressed = false;
         self.selection.take().is_some()
     }
 
@@ -3448,8 +4073,7 @@ impl State {
     }
 
     fn draw_frame(&mut self, output: &mut impl Write) -> io::Result<()> {
-        self.scrollback
-            .set_activity_docked(self.menu.is_none() || self.request_layout.is_some());
+        self.back_to_bottom_target = None;
         if self.overview.projection.is_some() && self.menu.is_none() {
             let (bottom, row, column) = self.styled_frame();
             let top_height = self.height.saturating_sub(bottom.len());
@@ -4416,12 +5040,12 @@ impl State {
             footer
         };
         if self.status_area.is_configured() {
-            let notice = match self.confirmation_hint() {
-                Some(hint) if self.status.is_empty() => hint,
-                Some(hint) => format!("{} · {hint}", self.status),
-                None => self.status.clone(),
-            };
-            lines.push(self.status_area.status_line(self.width, &notice));
+            let notice = self.status_notice(&self.status);
+            lines.push(self.status_area.status_line_with_background(
+                self.width,
+                &notice,
+                self.background_status_notice.as_ref(),
+            ));
         } else {
             lines.push(RoleLine::role(status_line, Role::StatusBar));
         }
@@ -4571,13 +5195,18 @@ impl State {
         (lines, cursor.0, cursor.1)
     }
 
-    fn leading_status_notice(&self) -> String {
+    fn leading_status_notice(&self, width: usize) -> String {
         let creation_cue = (!self.help_open)
-            .then(|| self.overview.orientation_cue(self.width))
+            .then(|| self.overview.orientation_cue(width))
             .flatten();
         let attach_unavailable = self.status.starts_with(CREATION_ATTACH_UNAVAILABLE_PREFIX);
+        let execution_connection = self
+            .execution_connection_notice
+            .filter(|_| self.overview.projection.is_none());
         let full = [
-            self.connection_notice.as_deref(),
+            self.connection_notice
+                .as_deref()
+                .or(execution_connection.map(ExecutionConnectionNotice::text)),
             self.creation_notice.as_deref(),
             creation_cue.as_deref(),
             attach_unavailable.then_some(self.status.as_str()),
@@ -4586,10 +5215,13 @@ impl State {
         .flatten()
         .collect::<Vec<_>>()
         .join(" · ");
-        if display_width(&full) <= self.width {
+        if display_width(&full) <= width {
             return full;
         }
         let mut notices = Vec::new();
+        if let Some(connection) = execution_connection {
+            notices.push(connection.compact().to_owned());
+        }
         if let Some(connection) = &self.connection_notice {
             notices.push(if connection.starts_with("Disconnected") {
                 "Disconnected/cached".to_owned()
@@ -4627,18 +5259,18 @@ impl State {
                 .into(),
             );
         }
-        if display_width(&notices.join(" · ")) > self.width
+        if display_width(&notices.join(" · ")) > width
             && self
                 .connection_notice
                 .as_deref()
                 .is_some_and(|notice| notice.starts_with("Disconnected"))
         {
             notices[0] = "Offline/cached".into();
-            if display_width(&notices.join(" · ")) > self.width {
+            if display_width(&notices.join(" · ")) > width {
                 notices[0] = "Offline".into();
             }
         }
-        let separator = if display_width(&notices.join(" · ")) > self.width {
+        let separator = if display_width(&notices.join(" · ")) > width {
             " "
         } else {
             " · "
@@ -4646,7 +5278,7 @@ impl State {
         if let Some(index) = creation_index {
             let creation = self.creation_notice.as_deref().unwrap();
             let factual_prefix = creation.split(';').next().unwrap_or(creation);
-            let available = self.width.saturating_sub(
+            let available = width.saturating_sub(
                 display_width(&notices.join(separator))
                     .saturating_sub(display_width(&notices[index])),
             );
@@ -4655,7 +5287,7 @@ impl State {
             }
         }
         if let Some(index) = cue_index {
-            let available = self.width.saturating_sub(
+            let available = width.saturating_sub(
                 display_width(&notices.join(separator))
                     .saturating_sub(display_width(&notices[index])),
             );
@@ -4668,7 +5300,7 @@ impl State {
             } else {
                 "Created · local connection unavailable"
             };
-            let available = self.width.saturating_sub(
+            let available = width.saturating_sub(
                 display_width(&notices.join(separator))
                     .saturating_sub(display_width(&notices[index])),
             );
@@ -4677,6 +5309,28 @@ impl State {
             }
         }
         notices.join(separator)
+    }
+
+    fn connection_status_line(
+        &self,
+        notice: &str,
+        background: Option<&BackgroundStatusNotice>,
+        pending: Option<&str>,
+    ) -> RoleLine {
+        let mut line = status_notice_line(notice, background, pending, self.width);
+        if self.execution_connection_notice.is_some()
+            && self.connection_notice.is_none()
+            && self.overview.projection.is_none()
+        {
+            for span in line
+                .spans
+                .iter_mut()
+                .filter(|span| span.role == Some(Role::StatusBar))
+            {
+                span.role = Some(Role::Warning);
+            }
+        }
+        line
     }
 
     fn normal_styled_frame(&mut self) -> (Vec<RoleLine>, usize, usize) {
@@ -4698,39 +5352,11 @@ impl State {
         );
         input_rows = input.lines.len().max(1);
         let mut candidates = self.candidate_rows(agent_layout::MAX_CANDIDATE_ROWS);
-        let mut queue = if !overview && !self.queued_inputs.is_empty() {
-            let entry = &self.queued_inputs[0];
-            let kind = match entry.kind {
-                QueuedInputKind::Message => "message",
-                QueuedInputKind::Shell => "shell",
-                QueuedInputKind::Command => "command",
-            };
-            let target = if entry.loop_id.is_some() {
-                String::new()
-            } else {
-                format!(" {NEW_LOOP_TARGET}")
-            };
-            vec![
-                RoleLine::role(
-                    format!("Queued {} · Up take back", self.queued_inputs.len()),
-                    Role::MutedText,
-                ),
-                RoleLine::role(
-                    format!(
-                        "{kind}{target} · {}",
-                        display_text(&entry.text).replace('\n', " ↵ ")
-                    ),
-                    Role::MutedText,
-                ),
-            ]
+        let mut queue = if !overview {
+            pending_input_lines(&self.queued_inputs, self.width, MAX_PENDING_INPUT_ROWS)
         } else {
             Vec::new()
         };
-        let mut activity = (!overview)
-            .then(|| self.scrollback.activity_line())
-            .flatten();
-        let activity_notice = activity.as_ref().map(RoleLine::text);
-        let mut activity_merged = false;
         let mut queue_merged = false;
         let mut footer = self.footer.frame();
         footer.list_focused = self.footer_list_focused;
@@ -4752,32 +5378,73 @@ impl State {
             Vec::new()
         };
         help.truncate((self.height / 3).clamp(3, 12));
-        let configured_status = self.configured_status_lines.as_ref().map(|lines| {
-            let mut rows = lines
-                .iter()
-                .flat_map(|line| wrap_text(&display_text(line), self.width))
-                .take(4)
-                .collect::<Vec<_>>();
-            if rows.len() > 3 {
-                rows.truncate(3);
-                rows[2] = format!(
-                    "{} …",
-                    truncate_width(&rows[2], self.width.saturating_sub(2))
-                );
+        let configured_status = self
+            .configured_status_lines
+            .as_ref()
+            .filter(|_| !self.help_open)
+            .map(|lines| {
+                let mut rows = lines
+                    .iter()
+                    .flat_map(|line| wrap_text(&display_text(line), self.width))
+                    .take(4)
+                    .collect::<Vec<_>>();
+                if rows.len() > 3 {
+                    rows.truncate(3);
+                    rows[2] = format!(
+                        "{} …",
+                        truncate_width(&rows[2], self.width.saturating_sub(2))
+                    );
+                }
+                rows
+            });
+        let mut leading_notice = self.leading_status_notice(self.width);
+        if short && !overview && !self.queued_inputs.is_empty() {
+            let pending_columns =
+                display_width(&format!("Pending {}", self.queued_inputs.len())) + 3;
+            let available = self.width.saturating_sub(pending_columns);
+            let compact = self.leading_status_notice(available);
+            if display_width(&compact) <= available {
+                leading_notice = compact;
             }
-            rows
-        });
-        let leading_notice = self.leading_status_notice();
+        }
+        let separate_background_notice = self
+            .background_status_notice
+            .as_ref()
+            .filter(|notice| notice.necessary && !overview && !short)
+            .filter(|notice| {
+                !leading_notice.is_empty()
+                    && display_width(&leading_notice)
+                        + 3
+                        + display_width(
+                            notice.compact_message.as_deref().unwrap_or(&notice.message),
+                        )
+                        > self.width
+            });
+        let required_status = !self.status.is_empty()
+            || self.confirmation_hint().is_some()
+            || short && !overview && !self.queued_inputs.is_empty()
+            || !overview
+                && self
+                    .background_status_notice
+                    .as_ref()
+                    .is_some_and(|notice| notice.necessary);
         let mut status_rows = if self.help_open {
-            usize::from(!leading_notice.is_empty())
+            usize::from(!leading_notice.is_empty() || required_status)
         } else {
             configured_status
                 .as_ref()
                 .map_or(1, Vec::len)
-                .max(usize::from(!leading_notice.is_empty()))
+                .max(usize::from(!leading_notice.is_empty() || required_status))
         };
+        if separate_background_notice.is_some() {
+            status_rows = status_rows.max(2);
+        }
         if self.height < agent_layout::TALL_LAYOUT_MIN_ROWS {
-            status_rows = status_rows.min(1);
+            status_rows = status_rows.min(if separate_background_notice.is_some() {
+                2
+            } else {
+                1
+            });
         }
         let mut borders = if short { 1 } else { 2 };
         let directory_rows = usize::from(overview && !short);
@@ -4785,7 +5452,6 @@ impl State {
             status_rows = status_rows.min(1);
             input_rows = 1;
             queue.clear();
-            activity = None;
             panel_rows = usize::from(panel_rows > 0);
             candidates.truncate(1);
             help.truncate(1);
@@ -4796,7 +5462,6 @@ impl State {
         }
         let total = |input_rows: usize,
                      panel_rows: usize,
-                     activity: bool,
                      queue: usize,
                      candidates: usize,
                      help: usize,
@@ -4804,7 +5469,6 @@ impl State {
                      borders: usize| {
             input_rows
                 + panel_rows
-                + usize::from(activity)
                 + queue
                 + candidates
                 + help
@@ -4815,7 +5479,6 @@ impl State {
         while total(
             input_rows,
             panel_rows,
-            activity.is_some(),
             queue.len(),
             candidates.len(),
             help.len(),
@@ -4823,13 +5486,10 @@ impl State {
             borders,
         ) > cap
         {
-            if status_rows > 1 {
+            if status_rows > 1 && (status_rows > 2 || separate_background_notice.is_none()) {
                 status_rows -= 1;
             } else if queue.len() > 1 {
                 queue.pop();
-            } else if activity.is_some() {
-                activity = None;
-                activity_merged = true;
             } else if !self.footer_list_focused && panel_rows > 2 {
                 panel_rows -= 1;
             } else if input_rows > 1 {
@@ -4841,6 +5501,7 @@ impl State {
             } else if !queue.is_empty() {
                 queue.clear();
                 queue_merged = true;
+                status_rows = status_rows.max(1);
             } else if help.len() > 2 {
                 help.pop();
             } else if short && borders > 0 {
@@ -4855,12 +5516,14 @@ impl State {
                 break;
             }
         }
-        let input = InputView::frame_with_prompt(
+        queue = pending_input_lines(&self.queued_inputs, self.width, queue.len());
+        let input = InputView::frame_with_prompt_and_marks(
             &draft,
             cursor,
             self.width,
             input_rows,
             self.display.glyph(Glyph::Prompt),
+            &self.input_image_marks(),
         );
         if !candidates.is_empty() {
             candidates = self.candidate_rows(candidates.len());
@@ -4868,6 +5531,15 @@ impl State {
         if overview {
             self.overview.transient_rows = input.lines.len().saturating_sub(1) + candidates.len();
         }
+        let body_rows = self.height.saturating_sub(total(
+            input_rows,
+            panel_rows,
+            queue.len(),
+            candidates.len(),
+            help.len(),
+            status_rows,
+            borders,
+        ));
         let mut lines = Vec::new();
         if directory_rows > 0
             && let Some(projection) = &self.overview.projection
@@ -4877,9 +5549,6 @@ impl State {
                 Role::MutedText,
             ));
         }
-        if let Some(activity) = activity {
-            lines.push(activity);
-        }
         lines.extend(queue);
         lines.extend(candidates);
         let border = if self.shell_input.kind() == InputKind::Shell {
@@ -4887,16 +5556,37 @@ impl State {
         } else {
             Role::PromptBorder
         };
+        let mut return_control = None;
         if borders > 0 {
-            lines.push(RoleLine::role("─".repeat(self.width), border));
+            let can_return = self.ordinary_input_is_visible() && !self.scrollback.is_following();
+            let mut reading = can_return && self.scrollback.has_hidden_tail(self.width, body_rows);
+            if can_return
+                && self
+                    .scrollback
+                    .reading_prompt(self.width, body_rows)
+                    .is_some()
+            {
+                reading = self
+                    .scrollback
+                    .has_hidden_tail(self.width, body_rows.saturating_sub(1));
+            }
+            let label = reading.then(|| self.back_to_bottom_label()).flatten();
+            if let Some(label) = label {
+                let label_width = display_width(&label);
+                let space = self.width.saturating_sub(label_width);
+                let column = space / 2;
+                let mut line = RoleLine::role("─".repeat(column), border);
+                line.push(label, Some(Role::Permission));
+                line.push("─".repeat(space - column), Some(border));
+                return_control = Some((lines.len(), column..column + label_width));
+                lines.push(line);
+            } else {
+                lines.push(RoleLine::role("─".repeat(self.width), border));
+            }
         }
         let cursor_row = lines.len() + input.cursor_row;
         lines.extend(if self.prompt_enabled {
-            input
-                .lines
-                .into_iter()
-                .map(RoleLine::plain)
-                .collect::<Vec<_>>()
+            input.styled_lines
         } else {
             vec![RoleLine::default()]
         });
@@ -4904,16 +5594,13 @@ impl State {
             lines.push(RoleLine::role("─".repeat(self.width), border));
         }
         if status_rows > 0 {
+            let status_start = lines.len();
             let status = if self.status.starts_with(CREATION_ATTACH_UNAVAILABLE_PREFIX) {
                 ""
             } else {
                 self.status.as_str()
             };
-            let mut notice = match self.confirmation_hint() {
-                Some(hint) if status.is_empty() => hint,
-                Some(hint) => format!("{status} · {hint}"),
-                None => status.to_owned(),
-            };
+            let mut notice = self.status_notice(status);
             if !leading_notice.is_empty() {
                 notice = if notice.is_empty() {
                     leading_notice.clone()
@@ -4921,45 +5608,84 @@ impl State {
                     format!("{leading_notice} · {notice}")
                 };
             }
-            if (activity_merged || short)
-                && let Some(activity) = activity_notice
-            {
-                if !notice.is_empty() {
-                    notice.push_str(" · ");
-                }
-                notice.push_str(&activity);
-            }
-            if (queue_merged || short) && !self.queued_inputs.is_empty() && !overview {
-                if !notice.is_empty() {
-                    notice.push_str(" · ");
-                }
-                notice.push_str(&format!("Queued {}", self.queued_inputs.len()));
-            }
+            let compact_pending =
+                ((queue_merged || short) && !self.queued_inputs.is_empty() && !overview)
+                    .then(|| format!("Pending {}", self.queued_inputs.len()));
+            let background = self.background_status_notice.as_ref().filter(|background| {
+                separate_background_notice.is_none()
+                    && !overview
+                    && (background.necessary || !self.help_open)
+            });
             if let Some(configured_status) = &configured_status {
+                let notice_line =
+                    self.connection_status_line(&notice, background, compact_pending.as_deref());
+                notice = notice_line.text();
                 if configured_status.is_empty() {
-                    lines.push(RoleLine::role(notice.clone(), Role::StatusBar));
+                    lines.push(notice_line.clone());
                 }
-                for (index, configured) in configured_status.iter().take(status_rows).enumerate() {
-                    let mut text = if index == 0 && !notice.is_empty() {
-                        if !leading_notice.is_empty() {
-                            format!("{notice} · {configured}")
+                for (index, configured) in configured_status
+                    .iter()
+                    .take(status_rows - usize::from(separate_background_notice.is_some()))
+                    .enumerate()
+                {
+                    let mut line = if index == 0 && !notice.is_empty() {
+                        if !leading_notice.is_empty()
+                            || required_status
+                            || compact_pending.is_some()
+                        {
+                            let mut line = notice_line.clone();
+                            line.push(" · ", Some(Role::MutedText));
+                            line.push(configured.clone(), Some(Role::StatusBar));
+                            line
                         } else {
-                            format!("{configured} · {notice}")
+                            let mut line = RoleLine::role(configured.clone(), Role::StatusBar);
+                            line.push(" · ", Some(Role::MutedText));
+                            line.spans.extend(notice_line.clone().spans);
+                            line
                         }
                     } else {
-                        configured.clone()
+                        RoleLine::role(configured.clone(), Role::StatusBar)
                     };
-                    if index + 1 == status_rows && configured_status.len() > status_rows {
-                        text = format!("{} …", truncate_width(&text, self.width.saturating_sub(2)));
+                    if index + 1 == status_rows
+                        && configured_status.len() > status_rows
+                        && (index != 0 || display_width(&notice) <= self.width.saturating_sub(2))
+                    {
+                        line.truncate(self.width.saturating_sub(2));
+                        line.push(" …", Some(Role::MutedText));
                     }
-                    lines.push(RoleLine::role(text, Role::StatusBar));
+                    lines.push(line.filled(Role::StatusBar));
                 }
             } else {
                 lines.push(
-                    if self.status_area.is_configured() && !overview && leading_notice.is_empty() {
-                        self.status_area.status_line(self.width, &notice)
+                    if self.status_area.is_configured()
+                        && !overview
+                        && !self.help_open
+                        && (leading_notice.is_empty()
+                            || self.execution_connection_notice.is_some()
+                                && self.connection_notice.is_none()
+                                && self.creation_notice.is_none())
+                        && compact_pending.is_none()
+                    {
+                        let mut line = self
+                            .status_area
+                            .status_line_with_background(self.width, &notice, background);
+                        if self.execution_connection_notice.is_some() {
+                            let hint = "Ctrl+O details";
+                            if display_width(&line.text()) + 3 + display_width(hint) <= self.width {
+                                line.push(" · ", Some(Role::MutedText));
+                                line.push(hint, Some(Role::MutedText));
+                            }
+                        }
+                        line
                     } else {
+                        let mut notice_line = self.connection_status_line(
+                            &notice,
+                            background,
+                            compact_pending.as_deref(),
+                        );
+                        notice = notice_line.text();
                         let overview_list_hint;
+                        let return_hint;
                         let hints = if self.confirmation_hint().is_some() || self.help_open {
                             // Help is focused and draws its own close hint; only facts remain.
                             ""
@@ -4994,26 +5720,42 @@ impl State {
                             } else {
                                 "Enter dispatch · Tab list"
                             }
+                        } else if borders == 0
+                            && self.ordinary_input_is_visible()
+                            && !self.scrollback.is_at_bottom()
+                        {
+                            return_hint = self.back_to_bottom_label().unwrap_or_default();
+                            return_hint.as_str()
                         } else if self.editor.draft().is_empty() {
                             "← Agents · ? help · Ctrl+O details · Ctrl+G editor · Ctrl+C interrupt"
                         } else {
                             "Enter send · Ctrl+G editor · Ctrl+C clear"
                         };
-                        let text = if notice.is_empty() {
-                            hints.to_owned()
+                        if notice.is_empty() {
+                            RoleLine::role(hints, Role::StatusBar)
                         } else if hints.is_empty() {
-                            notice
+                            notice_line
                         } else if overview && leading_notice.is_empty() && !self.status_held {
-                            format!("{hints} · {notice}")
+                            RoleLine::role(format!("{hints} · {notice}"), Role::StatusBar)
                         } else if overview {
-                            Some(format!("{notice} · {hints}"))
-                                .filter(|text| display_width(text) <= self.width)
-                                .unwrap_or(notice)
+                            RoleLine::role(
+                                Some(format!("{notice} · {hints}"))
+                                    .filter(|text| display_width(text) <= self.width)
+                                    .unwrap_or(notice),
+                                Role::StatusBar,
+                            )
                         } else {
-                            format!("{notice} · {hints}")
-                        };
-                        RoleLine::role(text, Role::StatusBar)
+                            notice_line.push(" · ", Some(Role::MutedText));
+                            notice_line.push(hints, Some(Role::StatusBar));
+                            notice_line
+                        }
                     },
+                );
+            }
+            if let Some(background) = separate_background_notice {
+                lines.insert(
+                    status_start + 1,
+                    background.line(self.width).filled(Role::StatusBar),
                 );
             }
         }
@@ -5068,6 +5810,10 @@ impl State {
         for line in &mut lines {
             line.truncate(self.width);
         }
+        self.back_to_bottom_target = return_control.map(|(row, columns)| BackToBottomTarget {
+            row: self.height.saturating_sub(lines.len()) + row,
+            columns,
+        });
         (
             lines,
             cursor_row.min(cap.saturating_sub(1)),
@@ -5118,6 +5864,26 @@ impl State {
             .take(capacity)
             .map(|(index, (text, description))| {
                 candidate_line(selected == Some(index), &text, &description, self.display)
+            })
+            .collect()
+    }
+
+    fn input_image_marks(&self) -> Vec<(std::ops::Range<usize>, Role)> {
+        let offset = usize::from(self.shell_input.kind() == InputKind::Shell);
+        self.paste_blocks
+            .projection(
+                self.editor.draft(),
+                self.editor.cursor(),
+                self.width.saturating_sub(2),
+            )
+            .blocks
+            .into_iter()
+            .filter(|block| block.is_image)
+            .map(|block| {
+                (
+                    block.display_range.start + offset..block.display_range.end + offset,
+                    Role::Accent,
+                )
             })
             .collect()
     }
@@ -6197,7 +6963,7 @@ impl State {
     fn picker_hint(&self) -> Option<&'static str> {
         match self.picker_kind {
             Some(PickerKind::Provider) => {
-                Some("r Sign in again · s Sign out · d Device code · Enter configure · Esc back")
+                Some("r Sign in again · s Sign out · d Device code · Enter continue · Esc back")
             }
             Some(PickerKind::ModelProvider) => {
                 Some("p Configure Providers · Enter models · Esc cancel")
@@ -6827,6 +7593,60 @@ impl State {
         })
     }
 
+    fn status_notice(&self, status: &str) -> String {
+        let Some(hint) = self.confirmation_hint() else {
+            return status.to_owned();
+        };
+        let full = if status.is_empty() {
+            hint.clone()
+        } else {
+            format!("{status} · {hint}")
+        };
+        let available = if self.status_area.is_configured() {
+            self.status_area.notice_columns(self.width)
+        } else {
+            self.width
+        };
+        if display_width(&full) <= available {
+            return full;
+        }
+        let compact_hint = if let Some(control) = self.pending_exit_control() {
+            format!("Ctrl+{control} again exit")
+        } else if let Some(action) = self.pending_escape_action() {
+            match action {
+                EscapeAction::ClearDraft => "Esc again clear".into(),
+                EscapeAction::OpenRewind => "Esc again rewind".into(),
+            }
+        } else {
+            "Opening panel · Esc input".into()
+        };
+        if status.is_empty() {
+            return compact_hint;
+        }
+        let status = if status.starts_with("Not saved:") {
+            "Not saved"
+        } else {
+            status
+        };
+        let (available, compact_hint) = if display_width(status) + 3 + display_width(&compact_hint)
+            > available
+            && let Some(control) = self.pending_exit_control()
+        {
+            (self.width, format!("Ctrl+{control} exit"))
+        } else {
+            (available, compact_hint)
+        };
+        let status = truncate_width(
+            status,
+            available.saturating_sub(display_width(&compact_hint) + 3),
+        );
+        if status.is_empty() {
+            compact_hint
+        } else {
+            format!("{status} · {compact_hint}")
+        }
+    }
+
     /// Drops key confirmations whose window has passed. Returns whether one
     /// did, so its hint leaves the screen.
     fn expire_key_confirmations(&mut self) -> bool {
@@ -6882,6 +7702,17 @@ impl State {
     }
 
     fn main_escape(&mut self) -> Option<InputEvent> {
+        if self.ordinary_input_is_visible() {
+            if !self.scrollback.is_at_bottom() {
+                self.scroll_conversation(ScrollAction::Last);
+                self.escape_confirmation = None;
+                return None;
+            }
+            if self.activity_interruptible && self.scrollback.activity_line().is_some() {
+                self.escape_confirmation = None;
+                return Some(InputEvent::InterruptActivity);
+            }
+        }
         let action = if self.editor.draft().is_empty() {
             EscapeAction::OpenRewind
         } else {
@@ -6897,6 +7728,42 @@ impl State {
             }
             EscapeAction::OpenRewind => Some(InputEvent::OpenRewind),
         }
+    }
+
+    fn ordinary_input_is_visible(&self) -> bool {
+        self.prompt_enabled
+            && self.overview.projection.is_none()
+            && self.menu.is_none()
+            && self.transcript.is_none()
+            && self.task_surface.is_none()
+            && self.diff_screen.is_none()
+            && self.subscription_surface.is_none()
+            && self.permissions_surface.is_none()
+            && self.history_search.is_none()
+            && !self.help_open
+            && !self.foreground_shell
+            && !self.review_focused
+            && self.footer.selected().is_none()
+            && !self.status_area.is_open()
+            && self
+                .footer_open_pending
+                .is_none_or(|pending| pending.cancelled)
+            && self.shell_input.kind() == InputKind::Prompt
+            && self.shell_input.active_completion().is_none()
+            && !self.file_mentions.is_open()
+            && !self.completion.is_open()
+    }
+
+    fn back_to_bottom_label(&self) -> Option<String> {
+        let arrow = self.display.glyph(Glyph::ScrollDown);
+        [
+            format!("{arrow} Back to bottom · Esc"),
+            format!("{arrow} Bottom · Esc"),
+            format!("{arrow} Esc"),
+            "Esc".into(),
+        ]
+        .into_iter()
+        .find(|label| display_width(label) <= self.width)
     }
 
     fn overview_key(&mut self, key: KeyEvent) -> Option<Option<InputEvent>> {
@@ -6929,6 +7796,7 @@ impl State {
             (KeyCode::PageUp, _) => self.overview.move_selection(-page),
             (KeyCode::Enter | KeyCode::Right, _) => match self.overview.selected {
                 Some(OverviewTarget::Agent(id)) => return Some(Some(InputEvent::OpenAgent(id))),
+                Some(OverviewTarget::CurrentDraft) => return Some(Some(InputEvent::CloseOverview)),
                 Some(OverviewTarget::Heading(_) | OverviewTarget::Disclosure(_)) => {
                     self.overview.toggle_selected()
                 }
@@ -7002,10 +7870,7 @@ impl State {
             }
             if self.conversation_focused {
                 match (key.code, key.modifiers) {
-                    (KeyCode::Esc, _) => {
-                        self.conversation_focused = false;
-                        return None;
-                    }
+                    (KeyCode::Esc, _) => {}
                     (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE)
                     | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
                         self.scrollback.scroll(ScrollAction::LinesDown(1));
@@ -13233,21 +14098,26 @@ mod tests {
         state.prompt_enabled = true;
         state.scrollback.append("first line\n");
         state.insert("draft line");
-
-        let arrived = output_after_input_area_change(&mut state, |state| {
-            state
-                .scrollback
-                .set_activity(Some(RoleLine::role("activity fixture", Role::MutedText)));
-        });
+        frame_output(&mut state);
+        let bottom_rows = state.styled_frame().0.len();
+        state
+            .scrollback
+            .set_activity(Some(RoleLine::role("activity fixture", Role::MutedText)));
+        let arrived = frame_output(&mut state);
+        assert_eq!(state.styled_frame().0.len(), bottom_rows);
         assert!(arrived.contains("activity fixture"), "{arrived:?}");
         assert!(
             !arrived.contains("draft line") && !arrived.contains("Enter send"),
             "{arrived:?}"
         );
 
-        let left = output_after_input_area_change(&mut state, |state| {
-            state.scrollback.set_activity(None);
-        });
+        state.scrollback.set_activity(None);
+        let left = frame_output(&mut state);
+        assert_eq!(state.styled_frame().0.len(), bottom_rows);
+        for output in [&arrived, &left] {
+            assert!(!output.contains("\x1b[2J"), "{output:?}");
+            assert!(!output.contains("\x1b[1;1H"), "{output:?}");
+        }
         assert!(
             !left.contains("draft line") && !left.contains("Enter send"),
             "{left:?}"
@@ -13324,6 +14194,19 @@ mod tests {
         state.insert("see ");
         state.key(control(KeyCode::Char('v')));
         let end = state.editor.draft().len();
+
+        for width in [24, 40, 80] {
+            state.width = width;
+            let (lines, _, _) = state.normal_styled_frame();
+            let image_tag = lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .filter(|span| span.role == Some(Role::Accent))
+                .map(|span| span.text.as_str())
+                .collect::<String>();
+            assert_eq!(image_tag, "[Image #1]");
+            assert_eq!(state.editor.cursor(), end);
+        }
 
         state.key(key(KeyCode::Left));
         assert_eq!(state.editor.cursor(), "see ".len());
@@ -15479,7 +16362,7 @@ mod tests {
     }
 
     #[test]
-    fn queue_summary_and_first_preview_keep_the_captured_type_without_owner_hashes() {
+    fn queue_summary_and_previews_keep_the_captured_types_without_owner_hashes() {
         let mut state = State::new(true, 80, 24);
         state.prompt_enabled = true;
         let message = queued_input(QueuedInputKind::Message, "check deadbeef exactly", 1);
@@ -15495,8 +16378,12 @@ mod tests {
             .iter()
             .position(|line| line.contains("message") && line.contains("check deadbeef exactly"))
             .unwrap();
-        assert!(lines.iter().any(|line| line.contains("Queued 2")));
-        assert!(!lines.iter().any(|line| line.contains("printf exact-shell")));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("Messages to be submitted (2)"))
+        );
+        assert!(lines.iter().any(|line| line.contains("printf exact-shell")));
         assert!(message_row < divider);
         assert_eq!(state.queued_inputs.len(), 2);
         assert!(
@@ -15570,7 +16457,186 @@ mod tests {
             .collect();
         let lines = state.frame().0;
         assert!(lines.len() <= agent_layout::bottom_capacity(state.height));
-        assert!(lines.iter().any(|line| line.contains("Queued 20")));
+        assert!(lines.iter().any(|line| line.contains("Pending 20")));
+    }
+
+    #[test]
+    fn pending_previews_recalculate_visible_messages_and_omissions_with_the_row_budget() {
+        for width in [20, 40, 80] {
+            for count in [1, 2, 3, 7] {
+                let entries = (0..count)
+                    .map(|sequence| {
+                        queued_input(
+                            QueuedInputKind::Message,
+                            &format!("message {sequence}"),
+                            sequence as u64,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                for rows in 1..=MAX_PENDING_INPUT_ROWS {
+                    let lines = pending_input_lines(&entries, width, rows);
+                    assert!(lines.len() <= rows, "{width}/{count}/{rows}: {lines:?}");
+                    assert!(lines[0].text().contains(&count.to_string()), "{lines:?}");
+                    if count > rows.saturating_sub(1) && rows > 1 {
+                        assert!(
+                            lines.iter().any(|line| line.text().contains("more")),
+                            "{lines:?}"
+                        );
+                    }
+                    if rows == 4 && count <= 3 {
+                        for sequence in 0..count {
+                            assert!(
+                                lines.iter().any(|line| line
+                                    .text()
+                                    .contains(&format!("message {sequence}"))),
+                                "{lines:?}"
+                            );
+                        }
+                    }
+                    assert!(
+                        lines
+                            .iter()
+                            .flat_map(|line| &line.spans)
+                            .all(|span| span.role == Some(Role::MutedText)),
+                        "{lines:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn compact_pending_count_survives_zero_and_custom_status_rows_and_help() {
+        for height in [4, 8, 12, 15] {
+            for configured in [
+                Some(Vec::new()),
+                None,
+                Some(vec!["ordinary custom status".into()]),
+                Some(vec![
+                    "ordinary first status".into(),
+                    "second".into(),
+                    "third".into(),
+                ]),
+            ] {
+                for help_open in [false, true] {
+                    let mut state = State::new(true, 24, height);
+                    state.prompt_enabled = true;
+                    state.status_area.update(
+                        "Ask".into(),
+                        "fixture".into(),
+                        None,
+                        Vec::new(),
+                        Vec::new(),
+                    );
+                    state.configured_status_lines = configured.clone();
+                    state.help_open = help_open;
+                    state.queued_inputs = vec![
+                        queued_input(QueuedInputKind::Message, "Hello", 1),
+                        queued_input(QueuedInputKind::Message, "Hello", 2),
+                    ];
+                    let (lines, _, _) = state.normal_styled_frame();
+                    let pending=lines.iter().find(|line|line.text().contains("Pending 2")).unwrap_or_else(||panic!("height {height}, status {configured:?}, help {help_open}: {lines:?}"));
+                    assert!(
+                        pending
+                            .spans
+                            .iter()
+                            .filter(|span| span.text.contains("Pending 2"))
+                            .all(|span| span.role == Some(Role::MutedText)),
+                        "{pending:?}"
+                    );
+                    assert!(
+                        lines.len() <= agent_layout::bottom_capacity(usize::from(height)),
+                        "{lines:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn compact_pending_count_preserves_urgent_facts_and_discards_optional_labels() {
+        for width in [24, 40] {
+            for fact in ["offline", "approval", "creation"] {
+                let mut state = State::new(true, width, 4);
+                state.prompt_enabled = true;
+                state.configured_status_lines = Some(vec![
+                    "ordinary custom status".into(),
+                    "second".into(),
+                    "third".into(),
+                ]);
+                state.queued_inputs = vec![
+                    queued_input(QueuedInputKind::Message, "Hello", 1),
+                    queued_input(QueuedInputKind::Message, "Hello", 2),
+                ];
+                match fact {
+                    "offline" => {
+                        state.connection_notice =
+                            Some("Disconnected · cached execution · owned fixture".into())
+                    }
+                    "creation" => {
+                        state.creation_notice =
+                            Some("Creation attempt is unknown; reconcile before retrying".into())
+                    }
+                    _ => {
+                        state.background_status_notice = Some(BackgroundStatusNotice {
+                            title: Some("very long optional task label".into()),
+                            ordinal: None,
+                            message: "Waiting for approval".into(),
+                            message_role: Role::Permission,
+                            compact_message: Some("Approval".into()),
+                            necessary: true,
+                        })
+                    }
+                }
+                let (lines, _, _) = state.normal_styled_frame();
+                let text = lines
+                    .iter()
+                    .map(RoleLine::text)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let expected = match fact {
+                    "offline" => {
+                        if width == 24 {
+                            "Offline"
+                        } else {
+                            "Disconnected"
+                        }
+                    }
+                    "creation" => "Creation",
+                    _ => "Approval",
+                };
+                assert!(
+                    text.to_lowercase().contains(&expected.to_lowercase()),
+                    "{fact}/{width}: {lines:?}"
+                );
+                if fact != "creation" || width == 40 {
+                    assert!(text.contains("Pending 2"), "{fact}/{width}: {lines:?}");
+                }
+                if fact == "approval" {
+                    assert!(
+                        lines.iter().flat_map(|line| &line.spans).any(|span| span
+                            .text
+                            .to_lowercase()
+                            .contains("approval")
+                            && span.role == Some(Role::Permission)),
+                        "{lines:?}"
+                    );
+                }
+            }
+        }
+        for height in [1, 2] {
+            let mut state = State::new(true, 24, height);
+            state.prompt_enabled = true;
+            state.insert("preserved input");
+            state.queued_inputs = vec![queued_input(QueuedInputKind::Message, "Hello", 1)];
+            let (lines, _, _) = state.normal_styled_frame();
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.text().contains("preserved input")),
+                "{lines:?}"
+            );
+        }
     }
 
     #[test]
@@ -16086,7 +17152,7 @@ mod tests {
         let rendered = state.frame().0.join("\n");
         assert!(
             rendered.contains(
-                "r Sign in again · s Sign out · d Device code · Enter configure · Esc back"
+                "r Sign in again · s Sign out · d Device code · Enter continue · Esc back"
             )
         );
         assert!(!rendered.contains("a Adapter"));

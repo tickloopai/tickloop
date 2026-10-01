@@ -105,6 +105,7 @@ pub(crate) fn load_original_user_inputs(
             && entry.execution_mode.is_some()
             && !entry.is_compact_summary
             && !entry.is_inherited_prompt
+            && entry.agent_message_origin.is_none()
         {
             let (Some(loop_id), Some(run_id)) = (entry.loop_id, entry.run_id) else {
                 return Ok(None);
@@ -587,6 +588,7 @@ mod tests {
             execution_mode: None,
             is_inherited_prompt: false,
             original_user_message_id: None,
+            agent_message_origin: None,
             run_id: None,
             contexts: None,
             continues_message,

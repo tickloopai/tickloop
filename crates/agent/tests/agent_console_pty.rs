@@ -3,6 +3,12 @@
 mod model_http_support;
 mod support;
 
+#[path = "agent_console_pty/command_feedback.rs"]
+mod command_feedback;
+
+#[path = "agent_console_pty/family_navigation.rs"]
+mod family_navigation;
+
 use std::{
     io::{Read, Write},
     panic::AssertUnwindSafe,
@@ -277,6 +283,12 @@ async fn catalog(client: &LocalAgentClient) -> Vec<AgentSummary> {
     rows
 }
 
+fn new_input_is_visible(frame: &str) -> bool {
+    frame.contains("Tick Loop Agent")
+        && frame.contains("Context —")
+        && frame.lines().any(|line| line.starts_with('❯'))
+}
+
 async fn snapshot(client: &LocalAgentClient, execution: ExecutionRef) -> Box<LiveChatSnapshot> {
     let observation = client
         .observe(ObservationRequest::Agent {
@@ -294,9 +306,7 @@ async fn snapshot(client: &LocalAgentClient, execution: ExecutionRef) -> Box<Liv
 
 async fn run_lifecycle(fixture: &PrivateFixture) {
     let mut first = PtyView::start(fixture);
-    first
-        .wait_for("new View ready", |frame| frame.contains("Ready"))
-        .await;
+    first.wait_for("new View ready", new_input_is_visible).await;
     let client = fixture.client().await;
     assert!(
         catalog(&client).await.is_empty(),
@@ -312,6 +322,28 @@ async fn run_lifecycle(fixture: &PrivateFixture) {
         catalog(&client).await.is_empty(),
         "opening overview must create no execution"
     );
+    let overview = first.frame();
+    assert!(overview.contains("Needs input"), "{overview}");
+    assert!(
+        overview.contains("› ● New Agent · current session · send a prompt to start"),
+        "{overview}"
+    );
+    assert!(overview.contains("approvals 0 · questions 0"), "{overview}");
+    for return_key in [b"\r".as_slice(), b"\x1b[C".as_slice()] {
+        first.send(return_key);
+        first
+            .wait_for("current draft returns without creating an Agent", |frame| {
+                frame.contains("Tick Loop Agent v0.1.0") && !frame.contains("Agents · local")
+            })
+            .await;
+        assert!(catalog(&client).await.is_empty());
+        first.send(b"\x1b[D");
+        first
+            .wait_for("Left selects current draft again", |frame| {
+                frame.contains("› ● New Agent · current session")
+            })
+            .await;
+    }
     first.send(b"\t!printf 'shell began'; while [ ! -f finish ]; do sleep 0.05; done; printf 'shell ended'\r");
     let execution = tokio::time::timeout(UI_TIMEOUT, async {
         loop {
@@ -364,7 +396,7 @@ async fn run_lifecycle(fixture: &PrivateFixture) {
     assert!(catalog(&client).await[0].views.is_empty());
     let mut reopened = PtyView::start(fixture);
     reopened
-        .wait_for("replacement View ready", |frame| frame.contains("Ready"))
+        .wait_for("replacement View ready", new_input_is_visible)
         .await;
     assert_eq!(
         catalog(&client).await.len(),
@@ -377,7 +409,7 @@ async fn run_lifecycle(fixture: &PrivateFixture) {
             frame.contains("Agents · local")
         })
         .await;
-    reopened.send(b"\r");
+    reopened.send(b"\x1b[B\x1b[B\r");
     reopened
         .wait_for(
             "open live Agent exposes its real background Task",
@@ -492,7 +524,7 @@ async fn run_shell_external_editor(fixture: &PrivateFixture) {
     .unwrap();
     std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o700)).unwrap();
     let mut view = PtyView::start_with_environment(fixture, &[], &[("VISUAL", &editor)]);
-    view.wait_for("editor View ready", |frame| frame.contains("Ready"))
+    view.wait_for("editor View ready", new_input_is_visible)
         .await;
     let client = fixture.client().await;
     view.send(b"!printf original");
@@ -582,7 +614,7 @@ async fn run_working_agent_detach(fixture: &PrivateFixture) {
     fixture.set_model(&model);
     let mut first = PtyView::start_with_flags(fixture, &["--dangerously-skip-permissions"]);
     first
-        .wait_for("working View ready", |frame| frame.contains("Ready"))
+        .wait_for("working View ready", new_input_is_visible)
         .await;
     let client = fixture.client().await;
     first.send(b"Run the bounded work and report completion.\r");
@@ -623,7 +655,7 @@ async fn run_working_agent_detach(fixture: &PrivateFixture) {
     assert!(rows[0].views.is_empty());
     let mut reopened = PtyView::start_with_flags(fixture, &["--dangerously-skip-permissions"]);
     reopened
-        .wait_for("reattach new View ready", |frame| frame.contains("Ready"))
+        .wait_for("reattach new View ready", new_input_is_visible)
         .await;
     reopened.send(b"\x1b[D");
     reopened
@@ -631,6 +663,15 @@ async fn run_working_agent_detach(fixture: &PrivateFixture) {
             frame.contains("Agents · local")
         })
         .await;
+    select_overview_row(&mut reopened, &rows[0].title).await;
+    assert!(
+        reopened
+            .frame()
+            .lines()
+            .any(|line| { line.starts_with('›') && row_title(line).starts_with(&rows[0].title) }),
+        "the running Agent row is selected: {}",
+        reopened.frame()
+    );
     reopened.send(b"\r");
     reopened
         .wait_for("reattach shows the same running work", |frame| {
@@ -696,7 +737,7 @@ async fn actual_cli_empty_control_d_detaches_working_agent_and_reattaches_the_sa
 
 async fn run_resize_matrix(fixture: &PrivateFixture) {
     let mut view = PtyView::start(fixture);
-    view.wait_for("resize View ready", |frame| frame.contains("Ready"))
+    view.wait_for("resize View ready", new_input_is_visible)
         .await;
     let client = fixture.client().await;
     for (height, editor_limit, bottom_limit) in [(24, 6, 12), (32, 8, 16), (48, 10, 24)] {
@@ -813,7 +854,7 @@ async fn run_sustained_owner_loss(
     owner_stopped: &std::sync::atomic::AtomicBool,
 ) {
     let mut view = PtyView::start(fixture);
-    view.wait_for("owner-loss View ready", |frame| frame.contains("Ready"))
+    view.wait_for("owner-loss View ready", new_input_is_visible)
         .await;
     let client = fixture.client().await;
     view.send(b"!printf 'cached shell output\\n'\r");
@@ -1040,7 +1081,7 @@ async fn run_child_views(fixture: &PrivateFixture) {
     fixture.set_model(&model);
     let mut first = PtyView::start_with_flags(fixture, &["--dangerously-skip-permissions"]);
     first
-        .wait_for("delegation View ready", |frame| frame.contains("Ready"))
+        .wait_for("delegation View ready", new_input_is_visible)
         .await;
     let client = fixture.client().await;
     let other_project = fixture.path("other-project");
@@ -1213,7 +1254,7 @@ async fn run_child_views(fixture: &PrivateFixture) {
     );
     let mut second = PtyView::start_with_flags(fixture, &["--dangerously-skip-permissions"]);
     second
-        .wait_for("independent View ready", |frame| frame.contains("Ready"))
+        .wait_for("independent View ready", new_input_is_visible)
         .await;
     second.send(b"\x1b[D");
     second
@@ -1221,6 +1262,15 @@ async fn run_child_views(fixture: &PrivateFixture) {
             frame.contains("Agents · local") && frame.contains("child needs input")
         })
         .await;
+    select_overview_row(&mut second, "Delegate bounded cadence.").await;
+    assert!(
+        second
+            .frame()
+            .lines()
+            .any(|line| line.starts_with('›') && line.contains("Delegate bounded cadence.")),
+        "the parent row is selected in the second View: {}",
+        second.frame()
+    );
     second.send(b" ");
     second
         .wait_for("second overview expands the requesting child", |frame| {
@@ -1376,44 +1426,14 @@ async fn run_child_views(fixture: &PrivateFixture) {
             .len()
             == 2
     );
-    assert!(
-        first.frame().contains("2 items"),
-        "cached child initially retains its expanded Agent footer"
-    );
     let captured_output = Arc::clone(&first.output);
-    let escape_mark = captured_output.lock().unwrap().len();
-    first.send(b"\x1b[27u");
     first
         .wait_for(
-            "fresh collapsed child Agent footer keeps the cached draft",
+            "opening the cached child folds its family and focuses its editor",
             |frame| {
                 let captured = captured_output.lock().unwrap();
-                let fresh = String::from_utf8_lossy(&captured[escape_mark..]);
-                fresh.contains("\x1b[?2026l")
-                    && frame.contains("CHILD-DRAFT-ONE")
-                    && !frame.contains("2 items")
-            },
-        )
-        .await;
-    let mut editor_mark = escape_mark;
-    let editor_is_focused = {
-        let captured = captured_output.lock().unwrap();
-        let terminal = String::from_utf8_lossy(&captured);
-        terminal.rfind("\x1b[?25h") > terminal.rfind("\x1b[?25l")
-    };
-    if !editor_is_focused {
-        editor_mark = captured_output.lock().unwrap().len();
-        first.send(b"\x1b[27u");
-    }
-    first
-        .wait_for(
-            "fresh child editor focus after closing the cached Agent footer",
-            |frame| {
-                let captured = captured_output.lock().unwrap();
-                let fresh = String::from_utf8_lossy(&captured[editor_mark..]);
                 let terminal = String::from_utf8_lossy(&captured);
-                fresh.contains("\x1b[?2026l")
-                    && frame.contains("CHILD-DRAFT-ONE")
+                frame.contains("CHILD-DRAFT-ONE")
                     && !frame.contains("2 items")
                     && terminal.rfind("\x1b[?25h") > terminal.rfind("\x1b[?25l")
             },
@@ -1561,6 +1581,8 @@ async fn actual_cli_real_child_dual_tree_requests_drafts_and_follow_up_keep_the_
 async fn run_reading_and_draft_return(fixture: &PrivateFixture) {
     const DRAFT: &str = "KEEP-READING-DRAFT-jk";
     const CURSOR_DISTANCE_FROM_END: usize = 4;
+    const HISTORY_WHEEL_EVENTS: usize = 8;
+    const SCROLL_UP_WHEEL: &[u8] = b"\x1b[<64;1;1M";
     let history = (0..80)
         .map(|index| format!("stable history {index:02}\n"))
         .collect::<String>();
@@ -1576,7 +1598,7 @@ async fn run_reading_and_draft_return(fixture: &PrivateFixture) {
     model.api_key_env = "TICKLOOP_FIXTURE_API_KEY".into();
     fixture.set_model(&model);
     let mut view = PtyView::start_with_flags(fixture, &["--dangerously-skip-permissions"]);
-    view.wait_for("reading View ready", |frame| frame.contains("Ready"))
+    view.wait_for("reading View ready", new_input_is_visible)
         .await;
     let client = fixture.client().await;
     view.send(b"Produce bounded history and wait for the file gate.\r");
@@ -1636,7 +1658,10 @@ async fn run_reading_and_draft_return(fixture: &PrivateFixture) {
     .await;
     view.send(DRAFT.as_bytes());
     view.send(b"\x1b[D\x1b[D\x1b[D\x1b[D");
-    view.send(b"\x1b[5~\x1b[5~");
+    // Wheel scrolling keeps the editor focused; reading Esc returns to bottom.
+    for _ in 0..HISTORY_WHEEL_EVENTS {
+        view.send(SCROLL_UP_WHEEL);
+    }
     let reading = view
         .wait_for("manual history with unsent draft", |frame| {
             frame.contains(DRAFT)
@@ -1651,9 +1676,8 @@ async fn run_reading_and_draft_return(fixture: &PrivateFixture) {
         .trim()
         .to_owned();
     let captured_output = Arc::clone(&view.output);
-    view.send(b"\x1b");
     view.wait_for(
-        "reading focus returns to the editor without changing the anchor",
+        "wheel reading keeps editor focus without changing the anchor",
         |frame| {
             let captured = captured_output.lock().unwrap();
             let terminal = String::from_utf8_lossy(&captured);
@@ -1822,7 +1846,7 @@ async fn run_stashed_image_payload(fixture: &PrivateFixture, switch_roots: bool)
     .await;
     let model = fixture.set_chat_model(&base_url);
     let mut view = PtyView::start(fixture);
-    view.wait_for("image View ready", |frame| frame.contains("Ready"))
+    view.wait_for("image View ready", new_input_is_visible)
         .await;
 
     view.send(format!("\x1b[200~BEFORE-STASH {}\x1b[201~", image_path.display()).as_bytes());
@@ -1924,7 +1948,12 @@ async fn run_stashed_image_payload(fixture: &PrivateFixture, switch_roots: bool)
     })
     .await;
     let history_anchor = if switch_roots {
-        view.send(b"\x1b[D\x1b[D\x1b[D\x1b[D\x1b[5~\x1b[5~");
+        const HISTORY_WHEEL_EVENTS: usize = 8;
+        const SCROLL_UP_WHEEL: &[u8] = b"\x1b[<64;1;1M";
+        view.send(b"\x1b[D\x1b[D\x1b[D\x1b[D");
+        for _ in 0..HISTORY_WHEEL_EVENTS {
+            view.send(SCROLL_UP_WHEEL);
+        }
         let reading = view
             .wait_for(
                 "old image history with a pending image and middle cursor",
@@ -1943,9 +1972,8 @@ async fn run_stashed_image_payload(fixture: &PrivateFixture, switch_roots: bool)
             .trim()
             .to_owned();
         let captured_output = Arc::clone(&view.output);
-        view.send(b"\x1b");
         view.wait_for(
-            "reading focus returns to the image editor at the same anchor",
+            "wheel reading keeps the image editor focused at the same anchor",
             |frame| {
                 let captured = captured_output.lock().unwrap();
                 let terminal = String::from_utf8_lossy(&captured);
@@ -2123,7 +2151,7 @@ async fn run_stashed_folded_paste(fixture: &PrivateFixture) {
     .await;
     fixture.set_chat_model(&base_url);
     let mut view = PtyView::start(fixture);
-    view.wait_for("folded paste View ready", |frame| frame.contains("Ready"))
+    view.wait_for("folded paste View ready", new_input_is_visible)
         .await;
     view.send(b"SUMMARIZE ");
     view.send(format!("\x1b[200~{FIRST_PASTE}\x1b[201~ END").as_bytes());
@@ -2202,7 +2230,7 @@ async fn run_stashed_accepted_mention(fixture: &PrivateFixture) {
     .await;
     fixture.set_chat_model(&base_url);
     let mut view = PtyView::start(fixture);
-    view.wait_for("mention View ready", |frame| frame.contains("Ready"))
+    view.wait_for("mention View ready", new_input_is_visible)
         .await;
     view.send(b"Read @notes");
     view.wait_for("real file mention candidate is available", |frame| {
@@ -2357,7 +2385,7 @@ async fn run_stashed_shell_mode(fixture: &PrivateFixture) {
     const COMMAND: &str = "printf 'SHELL-MODE-RESTORED\\n'; pwd";
     let expected_directory = fixture.path("work").canonicalize().unwrap();
     let mut view = PtyView::start(fixture);
-    view.wait_for("Shell stash View ready", |frame| frame.contains("Ready"))
+    view.wait_for("Shell stash View ready", new_input_is_visible)
         .await;
     let client = fixture.client().await;
     view.send(format!("!{COMMAND}").as_bytes());
@@ -2561,8 +2589,7 @@ async fn run_filter_hidden_dispatch(fixture: &PrivateFixture) {
     std::fs::create_dir(fixture.path("bravo")).unwrap();
     let bravo_directory = fixture.path("bravo").canonicalize().unwrap();
     let mut view = PtyView::start(fixture);
-    view.wait_for("new View ready", |frame| frame.contains("Ready"))
-        .await;
+    view.wait_for("new View ready", new_input_is_visible).await;
     view.resize(80, 24).await;
     let client = fixture.client().await;
     view.send(b"\x1b[D");
@@ -2594,6 +2621,16 @@ async fn run_filter_hidden_dispatch(fixture: &PrivateFixture) {
     assert_eq!(bravo_output, "bravo");
     view.send(b"\t");
     view.send(b"p");
+    view.wait_for("bravo filter keeps its Shell listed", |frame| {
+        frame
+            .lines()
+            .any(|line| line.starts_with("Project: ") && line.contains("bravo"))
+            && frame
+                .lines()
+                .any(|line| row_title(line).starts_with("!printf bravo"))
+    })
+    .await;
+    view.send(b"jj");
     view.wait_for("monitor bravo", |frame| {
         frame
             .lines()
@@ -2847,7 +2884,7 @@ async fn actual_cli_filter_hidden_dispatch_names_the_created_agent_until_it_is_f
 
 async fn run_dense_overview(fixture: &PrivateFixture) {
     let mut view = PtyView::start(fixture);
-    view.wait_for("dense View ready", |frame| frame.contains("Ready"))
+    view.wait_for("dense View ready", new_input_is_visible)
         .await;
     let client = fixture.client().await;
     let mut model = support::config();
@@ -3086,14 +3123,18 @@ fn legacy_owner_endpoint(
 fn unreported_rows(frame: &str) -> usize {
     frame
         .lines()
-        .filter(|line| line.contains("New Agent") && !line.contains("New Agent · cwd"))
+        .filter(|line| {
+            line.contains("New Agent")
+                && !line.contains("New Agent · cwd")
+                && !line.contains("current session")
+        })
         .count()
 }
 
 async fn run_legacy_dense_overview(fixture: &PrivateFixture) {
     let mut owner_view = PtyView::start(fixture);
     owner_view
-        .wait_for("owner View ready", |frame| frame.contains("Ready"))
+        .wait_for("owner View ready", new_input_is_visible)
         .await;
     let client = fixture.client().await;
     let mut model = support::config();
@@ -3160,7 +3201,7 @@ async fn run_legacy_dense_overview(fixture: &PrivateFixture) {
     let (legacy, relay) = legacy_owner_endpoint(fixture, unreported.clone());
     let mut view =
         PtyView::start_with_environment(fixture, &[], &[("TICKLOOP_AGENT_RUNTIME_DIR", &legacy)]);
-    view.wait_for("legacy View ready", |frame| frame.contains("Ready"))
+    view.wait_for("legacy View ready", new_input_is_visible)
         .await;
     view.send(b"\x1b[D");
     for (width, height) in [(40, 16), (80, 24), (120, 48)] {
@@ -3285,10 +3326,17 @@ async fn run_sent_message_echo(fixture: &PrivateFixture, prompts: [&str; 2], gat
             gated_turn,
         )
         .await;
-    fixture.set_chat_model(&base_url);
+    let model = fixture.set_chat_model(&base_url);
     let mut view = PtyView::start(fixture);
-    view.wait_for("echo View ready", |frame| frame.contains("Ready"))
-        .await;
+    view.wait_for("echo View ready", new_input_is_visible).await;
+    let banner_model = format!("{} · {:?}", model.model, model.protocol);
+    let banner_directory = fixture.path("work").to_string_lossy().into_owned();
+    let assert_startup_banner = |frame: &str| {
+        assert!(frame.contains("Tick Loop Agent v0.1.0"), "{frame}");
+        assert!(frame.contains(&banner_model), "{frame}");
+        assert!(frame.contains(&banner_directory), "{frame}");
+    };
+    assert_startup_banner(&view.frame());
     let client = fixture.client().await;
     let mut release = Some(release);
     let mut conversation = Vec::new();
@@ -3327,6 +3375,7 @@ async fn run_sent_message_echo(fixture: &PrivateFixture, prompts: [&str; 2], gat
             frame = view.frame();
         }
         eprintln!("[echo-frame turn {turn} before reply]\n{frame}\n[/echo-frame]");
+        assert_startup_banner(&frame);
         assert!(
             body_shows_once_in_order(&frame, &conversation),
             "turn {turn}: each sent message is in the body once, in order, before the reply: {frame}"
@@ -3339,6 +3388,7 @@ async fn run_sent_message_echo(fixture: &PrivateFixture, prompts: [&str; 2], gat
             })
             .await;
         eprintln!("[echo-frame turn {turn} after reply]\n{frame}\n[/echo-frame]");
+        assert_startup_banner(&frame);
         assert!(
             body_shows_once_in_order(&frame, &conversation),
             "turn {turn}: each sent message stays once, in order, above its reply: {frame}"
@@ -3351,6 +3401,7 @@ async fn run_sent_message_echo(fixture: &PrivateFixture, prompts: [&str; 2], gat
         })
         .await;
     eprintln!("[echo-frame new draft after /clear]\n{frame}\n[/echo-frame]");
+    assert_startup_banner(&frame);
     assert!(
         prompts
             .iter()
@@ -3403,7 +3454,7 @@ const BUSY_INPUTS: [&str; 3] = ["busy alpha", "busy bravo", "busy charlie"];
 enum BusyShape {
     /// The active run is in a tool when the inputs arrive, so they join it at the tool boundary.
     ToolBoundary { status_between: bool },
-    /// The active run is waiting on a text-only reply; each input then runs on its own.
+    /// The active run is waiting on a text-only reply; waiting inputs share the next run.
     TextOnly,
 }
 
@@ -3437,17 +3488,39 @@ async fn run_busy_inputs(fixture: &PrivateFixture, shape: BusyShape) {
             (200, chat_reply(None, "answered all three")),
         ]
     } else {
-        ["first reply", "alpha reply", "bravo reply", "charlie reply"]
+        ["first reply", "batched reply"]
             .map(|reply| (200, chat_reply(None, reply)))
             .to_vec()
+    };
+    let queued_image = if tool_boundary {
+        None
+    } else {
+        use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+
+        let mut png = Vec::new();
+        ::image::DynamicImage::ImageRgba8(::image::RgbaImage::from_pixel(
+            4,
+            3,
+            ::image::Rgba([180, 40, 90, 255]),
+        ))
+        .write_to(
+            &mut std::io::Cursor::new(&mut png),
+            ::image::ImageFormat::Png,
+        )
+        .unwrap();
+        let path = fixture.path("work/busy-chart.png");
+        std::fs::write(&path, &png).unwrap();
+        Some((
+            path,
+            format!("data:image/png;base64,{}", BASE64.encode(&png)),
+        ))
     };
     let (base_url, mut requests, release) =
         model_http_support::serve_responses_with_gated_response(replies, 0).await;
     let mut release = Some(release);
     fixture.set_chat_model(&base_url);
     let mut view = PtyView::start_with_flags(fixture, &["--dangerously-skip-permissions"]);
-    view.wait_for("busy View ready", |frame| frame.contains("Ready"))
-        .await;
+    view.wait_for("busy View ready", new_input_is_visible).await;
     let client = fixture.client().await;
     view.send(b"start the busy work\r");
     tokio::time::timeout(UI_TIMEOUT, requests.recv())
@@ -3462,6 +3535,7 @@ async fn run_busy_inputs(fixture: &PrivateFixture, shape: BusyShape) {
         })
         .await;
     }
+    let mut queued_receipts = Vec::new();
     for (index, input) in BUSY_INPUTS.iter().enumerate() {
         if index == 1
             && matches!(
@@ -3477,24 +3551,85 @@ async fn run_busy_inputs(fixture: &PrivateFixture, shape: BusyShape) {
             })
             .await;
         }
-        view.send(format!("{input}\r").as_bytes());
-        wait_snapshot(
+        if index == 0
+            && let Some((path, _)) = &queued_image
+        {
+            view.send(format!("\x1b[200~{input} {}\x1b[201~", path.display()).as_bytes());
+            view.wait_for("the waiting message has its pasted image", |frame| {
+                frame.contains(input) && frame.contains("[Image #1]")
+            })
+            .await;
+            view.send(b"\r");
+        } else {
+            view.send(format!("{input}\r").as_bytes());
+        }
+        let queued = wait_snapshot(
             &client,
             execution,
             "the busy input is accepted",
             |snapshot| snapshot.pending_inputs.len() == index + 1,
         )
         .await;
+        if !tool_boundary {
+            queued_receipts = queued
+                .pending_inputs
+                .iter()
+                .map(|pending| pending.receipt.clone())
+                .collect();
+        }
     }
     if tool_boundary {
         std::fs::write(fixture.path("work/finish"), "finish").unwrap();
     } else {
+        assert_eq!(queued_receipts.len(), BUSY_INPUTS.len());
+        assert!(
+            queued_receipts
+                .iter()
+                .all(|receipt| receipt.loop_id == queued_receipts[0].loop_id)
+        );
+        assert_eq!(
+            queued_receipts
+                .iter()
+                .map(|receipt| receipt.run_id)
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            BUSY_INPUTS.len()
+        );
+        let queued_frame = view
+            .wait_for("all waiting inputs are only in the queue", |frame| {
+                frame.contains("Messages to be submitted (3)")
+                    && BUSY_INPUTS.iter().all(|input| frame.contains(input))
+            })
+            .await;
+        let (body, preview) = queued_frame
+            .split_once("Messages to be submitted (3)")
+            .unwrap();
+        for input in BUSY_INPUTS {
+            assert!(
+                !body.contains(input),
+                "waiting input is not echoed before consumption: {queued_frame}"
+            );
+            assert_eq!(
+                preview.matches(input).count(),
+                1,
+                "each waiting input has one preview: {queued_frame}"
+            );
+        }
+        assert_eq!(
+            preview.matches("[Image #1]").count(),
+            1,
+            "the image stays with its waiting input: {queued_frame}"
+        );
+        assert!(
+            requests.try_recv().is_err(),
+            "waiting inputs must not cause another model request before the current reply ends"
+        );
         release.take().unwrap().send(()).unwrap();
     }
     let last_reply = if tool_boundary {
         "answered all three"
     } else {
-        "charlie reply"
+        "batched reply"
     };
     let frame = view
         .wait_for("the busy work is answered", |frame| {
@@ -3503,11 +3638,105 @@ async fn run_busy_inputs(fixture: &PrivateFixture, shape: BusyShape) {
         .await;
     eprintln!("[busy-frame]\n{frame}\n[/busy-frame]");
     let mut sends = 1;
-    while let Ok(Some(_)) = tokio::time::timeout(Duration::from_millis(300), requests.recv()).await
+    let mut follow_up_requests = Vec::new();
+    while let Ok(Some((_, request))) =
+        tokio::time::timeout(Duration::from_millis(300), requests.recv()).await
     {
         sends += 1;
+        follow_up_requests.push(request);
     }
-    assert_eq!(sends, if tool_boundary { 2 } else { 4 }, "provider sends");
+    assert_eq!(sends, 2, "provider sends");
+    if let Some((_, expected_data_url)) = queued_image {
+        let request = &follow_up_requests[0];
+        let user_parts = request["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["role"] == "user")
+            .flat_map(|message| message["content"].as_array().into_iter().flatten())
+            .collect::<Vec<_>>();
+        let texts = request["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["role"] == "user")
+            .flat_map(|message| {
+                message["content"].as_str().into_iter().chain(
+                    message["content"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|part| part["text"].as_str()),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut previous = 0;
+        for input in BUSY_INPUTS {
+            assert_eq!(
+                texts.matches(input).count(),
+                1,
+                "the one follow-up request keeps every accepted message: {request}"
+            );
+            let position = texts.find(input).unwrap();
+            assert!(
+                position >= previous,
+                "accepted message order is preserved: {texts}"
+            );
+            previous = position;
+        }
+        let image_urls = user_parts
+            .iter()
+            .filter(|part| part["type"] == "image_url")
+            .map(|part| part["image_url"]["url"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            image_urls,
+            [expected_data_url.as_str()],
+            "the original pasted PNG reaches the same follow-up request once"
+        );
+        let completed = wait_snapshot(
+            &client,
+            execution,
+            "the waiting batch completes as one run",
+            |snapshot| {
+                snapshot.pending_inputs.is_empty()
+                    && snapshot.events.iter().any(|event| {
+                        event.run_id == queued_receipts[0].run_id
+                            && matches!(
+                                event.kind,
+                                tickloop_agent::runtime::EventKind::Completed { .. }
+                            )
+                    })
+            },
+        )
+        .await;
+        let started = completed
+            .events
+            .iter()
+            .filter(|event| matches!(event.kind, tickloop_agent::runtime::EventKind::Started))
+            .map(|event| event.run_id)
+            .collect::<Vec<_>>();
+        assert_eq!(started.len(), 2, "initial run plus one waiting batch");
+        assert_eq!(started[1], queued_receipts[0].run_id);
+        let merged = completed
+            .events
+            .iter()
+            .filter_map(|event| match event.kind {
+                tickloop_agent::runtime::EventKind::InputMerged { into_run_id } => {
+                    Some((event.run_id, into_run_id))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            merged,
+            queued_receipts[1..]
+                .iter()
+                .map(|receipt| (receipt.run_id, queued_receipts[0].run_id))
+                .collect::<Vec<_>>()
+        );
+    }
     let body = conversation_body(&frame);
     let body = body.lines().collect::<Vec<_>>();
     let rows = BUSY_INPUTS.map(|input| body_row(&body, input));
@@ -3532,8 +3761,8 @@ async fn run_busy_inputs(fixture: &PrivateFixture, shape: BusyShape) {
             "a local command echo between merged inputs keeps them apart: {body:#?}"
         ),
         BusyShape::TextOnly => assert!(
-            rows.iter().all(|row| opens_block(*row)),
-            "inputs answered one by one stay separate blocks: {body:#?}"
+            rows[0] < rows[1] && rows[1] < rows[2],
+            "waiting inputs are shown once in accepted order: {body:#?}"
         ),
     }
     view.close().await;
@@ -3574,7 +3803,7 @@ async fn actual_cli_a_local_command_between_merged_inputs_keeps_them_apart() {
 }
 
 #[tokio::test]
-async fn actual_cli_inputs_answered_one_by_one_stay_separate_blocks() {
+async fn actual_cli_waiting_messages_after_a_text_reply_enter_one_follow_up_request() {
     let fixture = PrivateFixture::new();
     let result = AssertUnwindSafe(run_busy_inputs(&fixture, BusyShape::TextOnly))
         .catch_unwind()
@@ -3586,22 +3815,22 @@ async fn actual_cli_inputs_answered_one_by_one_stay_separate_blocks() {
 }
 
 async fn run_busy_skill_barrier(fixture: &PrivateFixture) {
-    let (base_url, mut requests) = model_http_support::serve_responses(vec![(
-        200,
-        chat_reply(
+    let (base_url, mut requests,release) = model_http_support::serve_responses_with_gated_response(vec![
+        (200,chat_reply(
             Some((
                 "Bash",
                 "hold-busy",
                 json!({"command":"printf 'work started\\n'; while [ ! -f finish ]; do sleep 0.02; done"}),
             )),
             "",
-        ),
-    )])
+        )),
+        (200,chat_reply(None,"queued message finished")),
+        (200,chat_reply(None,"queued skill finished")),
+    ],2)
     .await;
     fixture.set_chat_model(&base_url);
     let mut view = PtyView::start_with_flags(fixture, &["--dangerously-skip-permissions"]);
-    view.wait_for("busy View ready", |frame| frame.contains("Ready"))
-        .await;
+    view.wait_for("busy View ready", new_input_is_visible).await;
     let client = fixture.client().await;
     view.send(b"start the busy work\r");
     tokio::time::timeout(UI_TIMEOUT, requests.recv())
@@ -3622,10 +3851,22 @@ async fn run_busy_skill_barrier(fixture: &PrivateFixture) {
     )
     .await;
     view.send(b"/tickloop busy skill\r");
-    view.wait_for("the Skill waits behind the turn", |frame| {
-        frame.contains("Queued 2")
-    })
-    .await;
+    let pending_frame = view
+        .wait_for("the Skill waits behind the turn", |frame| {
+            frame.contains("Messages to be submitted (2)")
+        })
+        .await;
+    let (pending_body, pending_preview) = pending_frame
+        .split_once("Messages to be submitted (2)")
+        .unwrap();
+    assert!(
+        !pending_body.contains("busy alpha") && !pending_body.contains("/tickloop busy skill"),
+        "{pending_frame}"
+    );
+    assert!(
+        pending_preview.contains("busy alpha") && pending_preview.contains("/tickloop busy skill"),
+        "{pending_frame}"
+    );
     let queued = wait_snapshot(
         &client,
         execution,
@@ -3642,6 +3883,34 @@ async fn run_busy_skill_barrier(fixture: &PrivateFixture) {
         requests.try_recv().is_err(),
         "nothing else reached the model"
     );
+    std::fs::write(fixture.path("work/finish"), "finish").unwrap();
+    for _ in 0..2 {
+        tokio::time::timeout(UI_TIMEOUT, requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    wait_snapshot(&client,execution,"the Skill is actually consumed",|snapshot| {
+        snapshot.pending_commands.is_empty() && snapshot.conversation.messages.iter().any(|message| message.content.iter().any(|content| matches!(content,tickloop_agent::model::Content::Text {text} if text=="/tickloop busy skill")))
+    }).await;
+    let consumed = view
+        .wait_for("the consumed Skill is echoed before its reply", |frame| {
+            conversation_body(frame).contains("/tickloop busy skill")
+                && !frame.contains("Messages to be submitted")
+        })
+        .await;
+    let body = conversation_body(&consumed);
+    assert_eq!(
+        body.matches("/tickloop busy skill").count(),
+        1,
+        "{consumed}"
+    );
+    assert_eq!(body.matches("busy alpha").count(), 1, "{consumed}");
+    release.send(()).unwrap();
+    view.wait_for("the consumed Skill replies", |frame| {
+        frame.contains("queued skill finished")
+    })
+    .await;
     view.close().await;
 }
 

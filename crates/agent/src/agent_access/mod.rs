@@ -150,43 +150,59 @@ const PREVIEW_MAX_CHARACTERS: usize = 160;
 /// local notices are skipped; text that only repeats `title` adds nothing.
 pub(crate) fn preview(conversation: &crate::runtime::ChatSnapshot, title: &str) -> Option<String> {
     use crate::model::{Content, Role};
-    let text = conversation.messages.iter().rev().find_map(|message| {
-        let texts = message
-            .content
-            .iter()
-            .filter_map(|content| match content {
-                Content::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        let text = match message.role {
-            Role::Assistant => texts.last().copied()?.to_owned(),
-            Role::User
-                if message
-                    .content
-                    .iter()
-                    .any(|content| matches!(content, Content::ToolResult { .. })) =>
+    let text = conversation
+        .messages
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, message)| {
+            if conversation
+                .message_ids
+                .get(&index)
+                .is_some_and(|id| conversation.agent_message_origins.contains_key(id))
             {
                 return None;
             }
-            Role::User if texts.iter().all(|text| text.trim().is_empty()) => {
-                let images = message
-                    .content
-                    .iter()
-                    .filter(|content| matches!(content, Content::Image { .. }))
-                    .count();
-                match images {
-                    0 => return None,
-                    1 => "[image]".to_owned(),
-                    images => format!("[{images} images]"),
+            let texts = message
+                .content
+                .iter()
+                .filter_map(|content| match content {
+                    Content::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let text = match message.role {
+                Role::Assistant => texts.last().copied()?.to_owned(),
+                Role::User
+                    if message
+                        .content
+                        .iter()
+                        .any(|content| matches!(content, Content::ToolResult { .. })) =>
+                {
+                    return None;
                 }
-            }
-            Role::User => texts.join("\n"),
-            _ => return None,
-        };
-        (!text.trim().is_empty() && crate::runtime::LocalMessage::parse(&text).is_none())
+                Role::User if texts.iter().all(|text| text.trim().is_empty()) => {
+                    let images = message
+                        .content
+                        .iter()
+                        .filter(|content| matches!(content, Content::Image { .. }))
+                        .count();
+                    match images {
+                        0 => return None,
+                        1 => "[image]".to_owned(),
+                        images => format!("[{images} images]"),
+                    }
+                }
+                Role::User => texts.join("\n"),
+                _ => return None,
+            };
+            (!text.trim().is_empty()
+                && matches!(
+                    crate::runtime::LocalMessage::parse(&text),
+                    None | Some(crate::runtime::LocalMessage::AgentCommunication { .. })
+                ))
             .then_some(text)
-    })?;
+        })?;
     let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if line == title.split_whitespace().collect::<Vec<_>>().join(" ") {
         return None;

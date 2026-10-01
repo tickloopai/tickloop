@@ -4,7 +4,7 @@ use unicode_width::UnicodeWidthStr;
 use uuid::Uuid;
 
 use super::{
-    console::{AgentTreeRow, MIN_REQUEST_AGENT_TITLE_COLUMNS, RowExtras},
+    console::{AgentTreeRow, MIN_REQUEST_AGENT_TITLE_COLUMNS, RowExtras, truncate_width},
     display::DisplayProfile,
     footer::{FooterFrame, FooterItemId},
     running_shimmer::RunningShimmer,
@@ -12,6 +12,75 @@ use super::{
 };
 
 const MAX_PANEL_ITEMS: usize = 8;
+const MAX_BACKGROUND_TITLE_COLUMNS: usize = 24;
+const BACKGROUND_AGENT_NAME_PREFIX: &str = "Agent ";
+const STATUS_SEGMENT_SEPARATOR: &str = " · ";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct BackgroundStatusNotice {
+    pub(super) title: Option<String>,
+    pub(super) ordinal: Option<usize>,
+    pub(super) message: String,
+    pub(super) message_role: Role,
+    pub(super) compact_message: Option<String>,
+    pub(super) necessary: bool,
+}
+
+impl BackgroundStatusNotice {
+    pub(super) fn line(&self, width: usize) -> RoleLine {
+        let message = if UnicodeWidthStr::width(self.message.as_str()) > width {
+            self.compact_message.as_deref().unwrap_or(&self.message)
+        } else {
+            &self.message
+        };
+        let message_width = UnicodeWidthStr::width(message);
+        let number = self
+            .ordinal
+            .map(|number| format!(" ({number})"))
+            .unwrap_or_default();
+        let Some(title) = &self.title else {
+            let mut full = RoleLine::role("Background Agent", Role::Text);
+            full.push(" · label unavailable · ", Some(Role::MutedText));
+            full.push(message, Some(self.message_role));
+            return if UnicodeWidthStr::width(full.text().as_str()) <= width {
+                full
+            } else {
+                RoleLine::role(message, self.message_role)
+            };
+        };
+        let title_columns = width
+            .saturating_sub(
+                message_width
+                    + UnicodeWidthStr::width(BACKGROUND_AGENT_NAME_PREFIX)
+                    + UnicodeWidthStr::width(STATUS_SEGMENT_SEPARATOR)
+                    + UnicodeWidthStr::width(number.as_str()),
+            )
+            .min(MAX_BACKGROUND_TITLE_COLUMNS);
+        if title_columns == 0 {
+            return RoleLine::role(message, self.message_role);
+        }
+        let title = if UnicodeWidthStr::width(title.as_str()) > title_columns {
+            format!(
+                "{}…",
+                truncate_width(title, title_columns.saturating_sub(1))
+            )
+        } else {
+            title.clone()
+        };
+        let name = format!("{BACKGROUND_AGENT_NAME_PREFIX}{title}{number}");
+        let mut line = RoleLine::default();
+        if self.necessary {
+            line.push(message, Some(self.message_role));
+            line.push(STATUS_SEGMENT_SEPARATOR, Some(Role::MutedText));
+            line.push(name, Some(Role::Text));
+        } else {
+            line.push(name, Some(Role::Text));
+            line.push(STATUS_SEGMENT_SEPARATOR, Some(Role::MutedText));
+            line.push(message, Some(self.message_role));
+        }
+        line
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct StatusItem {
@@ -46,6 +115,12 @@ pub(super) struct StatusArea {
 }
 
 impl StatusArea {
+    pub(super) fn notice_columns(&self, width: usize) -> usize {
+        width.saturating_sub(UnicodeWidthStr::width(
+            format!("⏵⏵ {} · ", self.mode).as_str(),
+        ))
+    }
+
     pub(super) fn is_configured(&self) -> bool {
         !self.mode.is_empty()
     }
@@ -110,6 +185,13 @@ impl StatusArea {
     /// alike, so a request header and the row it names always agree.
     pub(super) fn ordinal(&self, agent_id: Uuid) -> Option<usize> {
         self.agent_ordinals.get(&agent_id).copied()
+    }
+
+    pub(super) fn agent_title(&self, agent_id: Uuid) -> Option<&str> {
+        self.agents
+            .iter()
+            .find(|row| row.agent_id == agent_id)
+            .map(|row| row.title.as_str())
     }
 
     /// Replaces the family rows; `ordinals` are the View's reading numbers for repeated titles.
@@ -293,7 +375,17 @@ impl StatusArea {
             .min(height.saturating_sub(6))
     }
 
+    #[cfg(test)]
     pub(super) fn status_line(&self, width: usize, notice: &str) -> RoleLine {
+        self.status_line_with_background(width, notice, None)
+    }
+
+    pub(super) fn status_line_with_background(
+        &self,
+        width: usize,
+        notice: &str,
+        background: Option<&BackgroundStatusNotice>,
+    ) -> RoleLine {
         let mut line = RoleLine::default();
         let mode = format!("⏵⏵ {}", self.mode);
         let mode_role = match self.mode.as_str() {
@@ -309,18 +401,39 @@ impl StatusArea {
             |(used, limit)| {
                 let percent =
                     used.saturating_mul(100).saturating_add(limit as u64 / 2) / limit as u64;
-                (format!("Context {percent}% used"), Role::Text)
+                (format!("Context {percent}% used"), Role::Success)
             },
         );
+        let necessary_background = background.filter(|notice| notice.necessary);
+        let ordinary_background = background.filter(|notice| !notice.necessary);
+        let mut notice_line = RoleLine::role(notice, Role::Warning);
+        if let Some(background) = necessary_background {
+            let available = width.saturating_sub(UnicodeWidthStr::width(mode.as_str()) + 3);
+            if !notice.is_empty() {
+                notice_line.push(STATUS_SEGMENT_SEPARATOR, Some(Role::MutedText));
+            }
+            notice_line.spans.extend(background.line(available).spans);
+        }
+        let notice = notice_line.text();
+        if !notice.is_empty()
+            && UnicodeWidthStr::width(notice.as_str()) > self.notice_columns(width)
+        {
+            let mut urgent = notice_line;
+            urgent.truncate(width);
+            return urgent.filled(Role::StatusBar);
+        }
         let notice_width = if notice.is_empty() {
             0
         } else {
-            3 + UnicodeWidthStr::width(notice)
+            3 + UnicodeWidthStr::width(notice.as_str())
         };
+        let outcome_width = ordinary_background.map_or(0, |background| {
+            3 + UnicodeWidthStr::width(background.message.as_str())
+        });
         let mut used_width = UnicodeWidthStr::width(mode.as_str());
         for (text, role) in [(&self.model, Role::Text), (&context, context_role)] {
             let segment_width = 3 + UnicodeWidthStr::width(text.as_str());
-            if used_width + segment_width + notice_width > width {
+            if used_width + segment_width + notice_width + outcome_width > width {
                 break;
             }
             line.push(" · ", Some(Role::MutedText));
@@ -329,7 +442,15 @@ impl StatusArea {
         }
         if !notice.is_empty() {
             line.push(" · ", Some(Role::MutedText));
-            line.push(notice.to_owned(), Some(Role::Warning));
+            line.spans.extend(notice_line.spans);
+            used_width += notice_width;
+        }
+        if let Some(background) = ordinary_background {
+            let available = width.saturating_sub(used_width + 3);
+            if available > 0 {
+                line.push(" · ", Some(Role::MutedText));
+                line.spans.extend(background.line(available).spans);
+            }
         }
         line.truncate(width);
         line.filled(Role::StatusBar)
@@ -607,7 +728,7 @@ mod tests {
     }
 
     #[test]
-    fn context_is_neutral_and_auto_is_a_mode_notice_rather_than_a_fault() {
+    fn known_context_uses_success_while_unknown_context_and_modes_keep_their_roles() {
         let context_role = |area: &StatusArea| {
             area.status_line(80, "")
                 .spans
@@ -626,15 +747,51 @@ mod tests {
             vec![],
             vec![],
         );
-        assert_eq!(context_role(&area), Some(Role::Text));
+        assert_eq!(context_role(&area), Some(Role::Success));
         assert!(
             area.status_line(80, "")
                 .spans
                 .iter()
-                .all(|span| span.role != Some(Role::Success) && span.role != Some(Role::Error))
+                .all(|span| span.role != Some(Role::Error))
         );
         area.update("Plan".into(), "model".into(), None, vec![], vec![]);
         assert_eq!(area.status_line(80, "").spans[0].role, Some(Role::PlanMode));
+    }
+
+    #[test]
+    fn background_waiting_facts_and_agent_labels_use_separate_semantic_roles() {
+        let mut area = StatusArea::default();
+        area.update("Auto".into(), "model".into(), None, vec![], vec![]);
+        for message in ["waiting for approval", "waiting for your answer"] {
+            let notice = BackgroundStatusNotice {
+                title: Some("Review the implementation".into()),
+                ordinal: Some(2),
+                message: message.into(),
+                message_role: Role::Permission,
+                compact_message: None,
+                necessary: true,
+            };
+            for width in [20, 40, 120] {
+                let line = area.status_line_with_background(width, "", Some(&notice));
+                let waiting = line
+                    .spans
+                    .iter()
+                    .find(|span| span.text.starts_with("waiting"));
+                assert_eq!(
+                    waiting.and_then(|span| span.role),
+                    Some(Role::Permission),
+                    "{line:?}"
+                );
+                for span in &line.spans {
+                    if span.text.contains("Agent ") {
+                        assert_eq!(span.role, Some(Role::Text), "{line:?}");
+                    }
+                    if span.text == " · " {
+                        assert_eq!(span.role, Some(Role::MutedText), "{line:?}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]

@@ -18,7 +18,7 @@ use crate::{
     tools::{CommandSnapshot, SearchConfig},
 };
 
-pub const PROTOCOL_MAJOR: u16 = 1;
+pub const PROTOCOL_MAJOR: u16 = 2;
 pub const PROTOCOL_MINOR: u16 = 1;
 pub const MIN_CHUNKED_RESPONSE_MINOR: u16 = 1;
 pub const MAX_FRAME_BYTES: usize = 128 * 1024 * 1024;

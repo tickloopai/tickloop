@@ -2182,11 +2182,15 @@ impl Menus {
                         };
                         let provider = choices.get(provider_index).ok_or("provider option does not exist")?.clone();
                         self.provider_choices = choices;
-                        if provider.models[0].auth_source == tickloop_agent::model::ModelAuthSource::GoogleCloud {
-                            return self.provider_auth(console, target, provider);
-                        }
                         match self.provider_authenticated(&provider) {
+                            Ok(true) if self.model_return.is_none() => {
+                                self.choose_provider_models(agent, console, target, &provider.models[0].provider_id).await?;
+                                return Ok(MenuOutcome::default());
+                            }
                             Ok(true) | Ok(false) => return self.provider_auth(console, target, provider),
+                            Err(_) if provider.models[0].auth_source == tickloop_agent::model::ModelAuthSource::GoogleCloud => {
+                                return self.provider_auth(console, target, provider);
+                            }
                             Err(error) => {
                                 self.back_to_providers(console, target)?;
                                 return Err(error);
@@ -2210,8 +2214,10 @@ impl Menus {
                         }
                         self.model_discovery.invalidate(&provider.models[0].provider_id);
                         console.write("Service-account file configured.\n")?;
+                        self.choose_provider_models(agent, console, target, &provider.models[0].provider_id).await?;
+                    } else {
+                        self.finish_provider_configuration(agent, console, target).await?;
                     }
-                    self.finish_provider_configuration(agent, console, target).await?;
                 }
                 Selection::ApiKey { target, provider } => {
                     if index == Some(0) {
@@ -2223,7 +2229,7 @@ impl Menus {
                         }
                         self.model_discovery.invalidate(&provider.models[0].provider_id);
                         console.write("API key saved to Agent .env.\n")?;
-                        self.finish_provider_configuration(agent, console, target).await?;
+                        self.choose_provider_models(agent, console, target, &provider.models[0].provider_id).await?;
                     } else {
                         self.finish_provider_configuration(agent, console, target).await?;
                     }

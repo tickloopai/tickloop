@@ -16,6 +16,331 @@ const REQUEST_ID: Uuid = Uuid::from_u128(102);
 const PTY_TIMEOUT: Duration = Duration::from_secs(8);
 
 #[test]
+fn agent_layout_background_waiting_roles_survive_status_configuration_help_and_connection() {
+    for width in [40, 120] {
+        for configured in [None, Some(Vec::new()), Some(vec!["custom status".into()])] {
+            for help_open in [false, true] {
+                for connected in [false, true] {
+                    let mut state = State::new(true, width, 24);
+                    state.prompt_enabled = true;
+                    state.help_open = help_open;
+                    state.configured_status_lines = configured.clone();
+                    state
+                        .status_area
+                        .update("Auto".into(), "fixture".into(), None, vec![], vec![]);
+                    state.connection_notice =
+                        (!connected).then(|| "Disconnected · cached view · fixture".into());
+                    state.background_status_notice = Some(BackgroundStatusNotice {
+                        title: Some("Review the implementation".into()),
+                        ordinal: None,
+                        message: "waiting for approval".into(),
+                        message_role: Role::Permission,
+                        compact_message: None,
+                        necessary: true,
+                    });
+                    let (lines, _, _) = state.normal_styled_frame();
+                    let waiting = lines.iter().find(|line| line.text().contains("waiting for approval"))
+                        .unwrap_or_else(|| panic!("{width}, {configured:?}, help {help_open}, connected {connected}: {lines:?}"));
+                    assert_eq!(
+                        role_of(waiting, "waiting for approval"),
+                        Some(Role::Permission),
+                        "{waiting:?}"
+                    );
+                    if waiting.text().contains("Agent ") {
+                        assert_eq!(role_of(waiting, "Agent "), Some(Role::Text), "{waiting:?}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn agent_layout_background_notice_preserves_the_regular_status_and_result() {
+    let mut state = State::new(true, 120, 24);
+    state.prompt_enabled = true;
+    let console = super::tests::console_with_state(state);
+    console
+        .update_status_area(
+            "Auto".into(),
+            "deepseek-flash".into(),
+            Some((40_000, 1_000_000)),
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+    console
+        .set_agent_family(
+            vec![
+                agent_row(ROOT_AGENT, None, "visible"),
+                agent_row(CHILD_AGENT, Some(ROOT_AGENT), "background"),
+            ],
+            Some(ROOT_AGENT),
+        )
+        .unwrap();
+    console
+        .set_background_status_notice(Some(BackgroundStatusNotice {
+            title: Some("Review the implementation in /fixture/project/very/long/worktree/path and report every remaining issue\\nPreserve the original user message".into()),
+            ordinal: Some(2),
+            message: "reply completed".into(),
+            message_role: Role::MutedText,
+            compact_message: None,
+            necessary: false,
+        }))
+        .unwrap();
+    console.set_activity_and_status(None, "").unwrap();
+    let frame = frame_lines(&console);
+    let status = line_with(&frame, "⏵⏵ Auto").unwrap();
+    assert!(status.contains("deepseek-flash"), "{frame:#?}");
+    assert!(status.contains("Context 4% used"), "{frame:#?}");
+    assert!(status.contains("Agent Review"), "{frame:#?}");
+    assert!(status.contains("(2)"), "{frame:#?}");
+    assert!(status.contains("reply completed"), "{frame:#?}");
+    assert!(line_with(&frame, "Agents 2").is_some(), "{frame:#?}");
+}
+
+#[test]
+fn agent_layout_unsaved_status_and_exit_confirmation_keep_both_required_facts() {
+    for configured in [
+        None,
+        Some(Vec::new()),
+        Some(vec!["configured status with a long label".into()]),
+        Some(vec!["first".into(), "second".into(), "third".into()]),
+    ] {
+        for help_open in [false, true] {
+            let mut state = State::new(true, 40, 24);
+            state.prompt_enabled = true;
+            let console = super::tests::console_with_state(state);
+            console
+                .update_status_area(
+                    "Auto".into(),
+                    "deepseek-flash".into(),
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .unwrap();
+            console.set_status_lines(configured.clone()).unwrap();
+            console
+                .set_status("Not saved: /fixture/project/very/long/transcript/path: disk full")
+                .unwrap();
+            assert!(!console.confirm_control_c_exit().unwrap());
+            console.state.lock().unwrap().help_open = help_open;
+            let frame = frame_lines(&console);
+            let status = line_with(&frame, "Not saved")
+                .unwrap_or_else(|| panic!("{configured:?}, help {help_open}: {frame:#?}"));
+            assert!(
+                status.contains("Ctrl+C"),
+                "{configured:?}, help {help_open}: {frame:#?}"
+            );
+            assert!(
+                status.contains("exit"),
+                "{configured:?}, help {help_open}: {frame:#?}"
+            );
+            assert!(display_width(status) < 40, "{frame:#?}");
+            assert_eq!(
+                console.state.lock().unwrap().configured_status_lines,
+                configured
+            );
+        }
+    }
+}
+
+#[test]
+fn agent_layout_background_titles_use_display_columns_and_the_family_reading_number() {
+    for width in [80, 120] {
+        for title in [
+            "Review the entire implementation in /fixture/project/very/long/worktree/path",
+            "研究财报与投资目标，同时核对全部相关代码和执行状态",
+        ] {
+            let mut state = State::new(true, width, 24);
+            state.prompt_enabled = true;
+            let console = super::tests::console_with_state(state);
+            console
+                .update_status_area(
+                    "Auto".into(),
+                    "deepseek-flash".into(),
+                    Some((40_000, 1_000_000)),
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .unwrap();
+            console
+                .set_agent_family(
+                    vec![
+                        agent_row(ROOT_AGENT, None, "visible"),
+                        agent_row(CHILD_AGENT, Some(ROOT_AGENT), title),
+                        agent_row(REQUEST_ID, Some(ROOT_AGENT), title),
+                    ],
+                    Some(ROOT_AGENT),
+                )
+                .unwrap();
+            let notice = console
+                .background_status_notice(
+                    Some((REQUEST_ID, title.into())),
+                    "reply completed".into(),
+                    None,
+                    false,
+                    Role::MutedText,
+                )
+                .unwrap();
+            console.set_background_status_notice(Some(notice)).unwrap();
+            let frame = frame_lines(&console);
+            let status = line_with(&frame, "⏵⏵ Auto").unwrap();
+            assert!(
+                status.contains("deepseek-flash") && status.contains("Context 4% used"),
+                "{width} columns: {frame:#?}"
+            );
+            assert!(
+                status.contains("(2)") && status.contains("reply completed"),
+                "{width} columns: {frame:#?}"
+            );
+            assert!(
+                status.contains(if title.starts_with('研') {
+                    "研究"
+                } else {
+                    "Rev"
+                }),
+                "{width} columns: {frame:#?}"
+            );
+            assert!(display_width(status) < usize::from(width), "{frame:#?}");
+            assert!(line_with(&frame, "Agents 3").is_some(), "{frame:#?}");
+        }
+    }
+}
+
+#[test]
+fn agent_layout_necessary_background_facts_survive_narrow_status_configuration_and_help() {
+    for (message, compact, expected) in [
+        ("failed: fixture", None, "failed: fixture"),
+        ("waiting for approval", None, "waiting for approval"),
+        ("waiting for your answer", None, "waiting for your answer"),
+        (
+            "Outcome unknown · execution lost · nothing resent",
+            Some("Unknown/lost/no resend"),
+            "Unknown/lost/no resend",
+        ),
+    ] {
+        for configured in [
+            None,
+            Some(Vec::new()),
+            Some(vec!["configured status".into()]),
+            Some(vec!["one".into(), "two".into(), "three".into()]),
+        ] {
+            for help_open in [false, true] {
+                let mut state = State::new(true, 24, 24);
+                state.prompt_enabled = true;
+                let console = super::tests::console_with_state(state);
+                console
+                    .update_status_area(
+                        "Auto".into(),
+                        "deepseek-flash".into(),
+                        None,
+                        Vec::new(),
+                        Vec::new(),
+                    )
+                    .unwrap();
+                console.set_status_lines(configured.clone()).unwrap();
+                let notice = console
+                    .background_status_notice(
+                        Some((CHILD_AGENT, "研究财报与完整实现及其所有执行状态".into())),
+                        message.into(),
+                        compact.map(str::to_owned),
+                        true,
+                        if message.starts_with("waiting") {
+                            Role::Permission
+                        } else {
+                            Role::Warning
+                        },
+                    )
+                    .unwrap();
+                console.set_background_status_notice(Some(notice)).unwrap();
+                console.state.lock().unwrap().help_open = help_open;
+                let frame = frame_lines(&console);
+                assert!(
+                    line_with(&frame, expected).is_some(),
+                    "{message}, {configured:?}, help {help_open}: {frame:#?}"
+                );
+                assert!(
+                    frame.iter().all(|line| display_width(line) < 24),
+                    "{frame:#?}"
+                );
+                assert_eq!(
+                    console.state.lock().unwrap().configured_status_lines,
+                    configured
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn agent_layout_connection_and_necessary_background_facts_both_survive_narrow_status() {
+    for width in [24, 40] {
+        for message in [
+            "waiting for approval",
+            "Outcome unknown · execution lost · nothing resent",
+        ] {
+            let mut state = State::new(true, width, 24);
+            state.prompt_enabled = true;
+            let console = super::tests::console_with_state(state);
+            console
+                .update_status_area(
+                    "Auto".into(),
+                    "deepseek-flash".into(),
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .unwrap();
+            console.set_status_lines(Some(Vec::new())).unwrap();
+            console
+                .set_connection_notice(Some("Disconnected · cached view · fixture".into()))
+                .unwrap();
+            let notice = console
+                .background_status_notice(
+                    Some((CHILD_AGENT, "研究财报与完整实现".into())),
+                    message.into(),
+                    (message.starts_with("Outcome")).then(|| "Unknown/lost/no resend".into()),
+                    true,
+                    if message.starts_with("waiting") {
+                        Role::Permission
+                    } else {
+                        Role::Warning
+                    },
+                )
+                .unwrap();
+            console.set_background_status_notice(Some(notice)).unwrap();
+            let frame = frame_lines(&console);
+            assert!(
+                line_with(&frame, "Disconnected").is_some()
+                    || line_with(&frame, "Offline").is_some(),
+                "{frame:#?}"
+            );
+            let expected = if message.starts_with("Outcome") {
+                "Unknown/lost/no resend"
+            } else {
+                message
+            };
+            assert!(
+                line_with(&frame, expected).is_some(),
+                "{width} columns: {frame:#?}"
+            );
+            assert!(
+                frame
+                    .iter()
+                    .all(|line| display_width(line) < usize::from(width)),
+                "{frame:#?}"
+            );
+            assert_eq!(
+                console.state.lock().unwrap().configured_status_lines,
+                Some(Vec::new())
+            );
+        }
+    }
+}
+
+#[test]
 fn agent_layout_held_overview_refusal_precedes_hints_at_narrow_widths() {
     for width in [24, 40] {
         let mut state = State::new(true, width, 16);
@@ -308,7 +633,7 @@ fn agent_layout_first_down_expands_and_list_keys_preserve_the_draft() {
 }
 
 #[test]
-fn agent_layout_return_restores_reading_draft_and_footer_focus() {
+fn agent_layout_return_restores_reading_draft_and_focuses_the_editor() {
     let mut state = State::new(true, 80, 24);
     state.prompt_enabled = true;
     let console = super::tests::console_with_state(state);
@@ -351,7 +676,10 @@ fn agent_layout_return_restores_reading_draft_and_footer_focus() {
     assert!(!state.scrollback.is_following());
     assert_eq!(state.scrollback.frame(width, 16).lines, reading);
     assert_eq!(state.status_area.selected_task(), selected);
-    assert!(state.footer_list_focused);
+    assert!(!state.footer_list_focused);
+    assert!(state.footer.selected().is_none());
+    assert!(!state.status_area.is_open());
+    assert!(!state.conversation_focused);
     drop(state);
     assert!(console.activate_agent(CHILD_AGENT).unwrap());
     let state = console.state.lock().unwrap();
@@ -403,6 +731,586 @@ fn agent_layout_request_identity_and_idle_gate_preserve_the_editor() {
 }
 
 #[test]
+fn agent_layout_float_control_is_visible_only_for_its_reading_view() {
+    let mut state = State::new(true, 80, 24);
+    state.prompt_enabled = true;
+    let console = super::tests::console_with_state(state);
+    console.activate_agent(ROOT_AGENT).unwrap();
+    console
+        .write(
+            &(0..100)
+                .map(|row| format!("root history {row:03}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+    console
+        .set_activity(Some(&[("root Working".into(), Some(Role::Accent))]))
+        .unwrap();
+    console.set_activity_interruptible(true).unwrap();
+    frame_lines(&console);
+    console
+        .state
+        .lock()
+        .unwrap()
+        .key(KeyEvent::new(KeyCode::Home, KeyModifiers::CONTROL));
+    let reading = frame_lines(&console);
+    let row = reading
+        .iter()
+        .position(|line| line.contains("Back to bottom"))
+        .unwrap();
+    let column = reading[row]
+        .chars()
+        .position(|character| character == '↓')
+        .unwrap();
+    {
+        let mut state = console.state.lock().unwrap();
+        let press = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            row: row as u16,
+            column: column as u16,
+            modifiers: KeyModifiers::NONE,
+        };
+        state.pointer(press, &mut std::io::sink());
+        state.focus_lost();
+        state.pointer(
+            MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                ..press
+            },
+            &mut std::io::sink(),
+        );
+        assert!(!state.scrollback.is_following());
+        state.insert("root draft");
+    }
+    console.activate_agent(CHILD_AGENT).unwrap();
+    let child = frame_lines(&console);
+    assert!(line_with(&child, "Back to bottom").is_none());
+    assert!(
+        console
+            .state
+            .lock()
+            .unwrap()
+            .back_to_bottom_target
+            .is_none()
+    );
+    console.activate_agent(ROOT_AGENT).unwrap();
+    let root = frame_lines(&console);
+    assert!(line_with(&root, "Back to bottom").is_some());
+    let mut state = console.state.lock().unwrap();
+    assert!(!state.activity_interruptible);
+    assert_eq!(state.editor.draft(), "root draft");
+    assert!(state.key(key(KeyCode::Esc)).is_none());
+    assert!(state.scrollback.is_following());
+    assert!(matches!(
+        state.key(key(KeyCode::Esc)),
+        Some(InputEvent::Escape)
+    ));
+    assert_eq!(state.editor.draft(), "root draft");
+}
+
+#[test]
+fn agent_layout_float_return_keeps_input_geometry_and_escape_priorities() {
+    for (width, height) in [(5, 16), (12, 16), (25, 16), (41, 24), (81, 32), (121, 48)] {
+        let mut state = State::new(true, width, height);
+        state.prompt_enabled = true;
+        state.insert("keep draft and caret");
+        let console = super::tests::console_with_state(state);
+        console
+            .write(
+                &(0..200)
+                    .map(|row| format!("history {row:03}\n"))
+                    .collect::<String>(),
+            )
+            .unwrap();
+        console
+            .set_activity(Some(&[("Working live".into(), Some(Role::Accent))]))
+            .unwrap();
+        console.set_activity_interruptible(true).unwrap();
+        frame_lines(&console);
+        let (bottom_rows, cursor, draft_cursor) = {
+            let mut state = console.state.lock().unwrap();
+            let (lines, row, column) = state.frame();
+            (
+                lines.len(),
+                (state.height - lines.len() + row, column),
+                state.editor.cursor(),
+            )
+        };
+        console
+            .state
+            .lock()
+            .unwrap()
+            .key(KeyEvent::new(KeyCode::Home, KeyModifiers::CONTROL));
+        let frame = frame_lines(&console);
+        let mut state = console.state.lock().unwrap();
+        let (lines, row, column) = state.frame();
+        let target = state.back_to_bottom_target.as_ref().unwrap();
+        let label = state.back_to_bottom_label().unwrap();
+        let control = &frame[target.row];
+        let left = target.columns.start;
+        let right = state.width - target.columns.end;
+        assert!(left.abs_diff(right) <= 1, "{width}: {control:?}");
+        assert_eq!(target.columns.len(), display_width(&label));
+        assert_eq!(
+            control.trim_end().trim_matches('─'),
+            label,
+            "{width}: {control:?}"
+        );
+        assert_eq!(lines.len(), bottom_rows);
+        assert_eq!((state.height - lines.len() + row, column), cursor);
+        state.help_open = true;
+        assert!(state.key(key(KeyCode::Esc)).is_none());
+        assert!(!state.help_open);
+        assert!(!state.scrollback.is_following());
+        state.menu = Some(Menu {
+            id: REQUEST_ID,
+            title: "Approval".into(),
+            context: Vec::new(),
+            options: vec!["Allow".into(), "Deny".into()],
+            selected: 0,
+            confirmation: true,
+        });
+        state.menu_focused = true;
+        assert!(matches!(
+            state.key(key(KeyCode::Esc)),
+            Some(InputEvent::Cancel { .. })
+        ));
+        assert!(!state.scrollback.is_following());
+        state.clear_menu(REQUEST_ID);
+        state.mark_menu_submission_finished(REQUEST_ID);
+        state.release_finished_submissions();
+        state.status_area.update(
+            "Ask".into(),
+            "fixture".into(),
+            None,
+            status_items(),
+            Vec::new(),
+        );
+        let panels = state.status_area.available_panels().collect::<Vec<_>>();
+        state.footer.update(panels);
+        state.footer.select(FooterItemId::Tasks);
+        assert!(state.key(key(KeyCode::Esc)).is_none());
+        assert!(state.footer.selected().is_none());
+        assert!(!state.scrollback.is_following());
+        assert!(state.key(key(KeyCode::Esc)).is_none());
+        assert!(state.scrollback.is_following());
+        assert_eq!(state.editor.cursor(), draft_cursor);
+        assert_eq!(state.editor.draft(), "keep draft and caret");
+        assert!(matches!(
+            state.key(key(KeyCode::Esc)),
+            Some(InputEvent::InterruptActivity)
+        ));
+        assert!(state.escape_confirmation.is_none());
+        state.activity_interruptible = false;
+        assert!(matches!(
+            state.key(key(KeyCode::Esc)),
+            Some(InputEvent::Escape)
+        ));
+        assert!(state.escape_confirmation.is_some());
+        assert_eq!(state.editor.draft(), "keep draft and caret");
+    }
+}
+
+#[test]
+fn agent_layout_working_activity_scrolls_with_body_and_returns_to_bottom() {
+    let mut state = State::new(true, 80, 24);
+    state.prompt_enabled = true;
+    state.insert("preserved draft");
+    let console = super::tests::console_with_state(state);
+    console
+        .write(
+            &(0..200)
+                .map(|row| format!("history row {row:03}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+    console
+        .set_activity(Some(&[(
+            "Working live activity".into(),
+            Some(Role::Accent),
+        )]))
+        .unwrap();
+    let latest = frame_lines(&console);
+    assert!(line_with(&latest, "Working live activity").is_some());
+    console
+        .state
+        .lock()
+        .unwrap()
+        .key(KeyEvent::new(KeyCode::Home, KeyModifiers::CONTROL));
+    let reading = frame_lines(&console);
+    assert!(
+        line_with(&reading, "history row 000").is_some(),
+        "{reading:#?}"
+    );
+    assert!(
+        line_with(&reading, "Working live activity").is_none(),
+        "{reading:#?}"
+    );
+    let control = line_with(&reading, "Back to bottom").unwrap();
+    assert!(control.trim_end().trim_matches('─').ends_with("Esc"), "{reading:#?}");
+    assert!(
+        control.starts_with('─'),
+        "the return control floats over the input border: {reading:#?}"
+    );
+    console
+        .set_activity(Some(&[(
+            "Thinking later activity".into(),
+            Some(Role::Accent),
+        )]))
+        .unwrap();
+    console.write("new output while reading\n").unwrap();
+    let updated = frame_lines(&console);
+    assert_eq!(reading[0], updated[0]);
+    assert!(line_with(&updated, "Thinking later activity").is_none());
+    {
+        let mut state = console.state.lock().unwrap();
+        state.resize(100, 32);
+        state.key(key(KeyCode::Esc));
+        assert!(state.scrollback.is_following());
+        assert_eq!(state.editor.draft(), "preserved draft");
+    }
+    let bottom = frame_lines(&console);
+    assert!(
+        line_with(&bottom, "Thinking later activity").is_some(),
+        "{bottom:#?}"
+    );
+    assert!(
+        line_with(&bottom, "Back to bottom").is_none(),
+        "{bottom:#?}"
+    );
+    console
+        .state
+        .lock()
+        .unwrap()
+        .key(KeyEvent::new(KeyCode::Home, KeyModifiers::CONTROL));
+    let reading = frame_lines(&console);
+    let row = reading
+        .iter()
+        .position(|line| line.contains("Back to bottom"))
+        .unwrap();
+    let column = reading[row]
+        .chars()
+        .position(|character| character == '↓')
+        .unwrap();
+    let mut state = console.state.lock().unwrap();
+    let cursor = state.editor.cursor();
+    assert!(state.pointer(
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            row: row as u16,
+            column: column as u16,
+            modifiers: KeyModifiers::NONE
+        },
+        &mut std::io::sink()
+    ));
+    assert!(state.pointer(
+        MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            row: row as u16,
+            column: column as u16,
+            modifiers: KeyModifiers::NONE
+        },
+        &mut std::io::sink()
+    ));
+    assert!(state.scrollback.is_following());
+    assert_eq!(state.editor.cursor(), cursor);
+    assert_eq!(state.editor.draft(), "preserved draft");
+    assert!(state.selection.is_none());
+}
+
+#[test]
+fn agent_layout_created_chat_keeps_its_draft_history_and_keeps_other_views_isolated() {
+    let mut state = State::new(true, 100, 32);
+    state.prompt_enabled = true;
+    let console = super::tests::console_with_state(state);
+    console
+        .write_roles(&[("original draft banner\n".into(), Some(Role::Title))])
+        .unwrap();
+    console
+        .write_roles(&[("draft warning\n".into(), Some(Role::Error))])
+        .unwrap();
+    console.record_input("draft echo").unwrap();
+    console.select_chat(Some(ROOT_AGENT)).unwrap();
+    assert!(line_with(&frame_lines(&console), "original draft banner").is_none());
+    console
+        .write_roles(&[("existing Agent body\n".into(), Some(Role::Text))])
+        .unwrap();
+    console.clear_visible_agent().unwrap();
+    let created_banner = vec![
+        ("Tick Loop Agent v0.1.0\n".into(), Some(Role::Title)),
+        (
+            "current-model · current-protocol\n".into(),
+            Some(Role::MutedText),
+        ),
+        ("/fixture/current-directory\n".into(), Some(Role::MutedText)),
+    ];
+    console
+        .select_created_chat(CHILD_AGENT, &created_banner)
+        .unwrap();
+    console
+        .select_created_chat(CHILD_AGENT, &created_banner)
+        .unwrap();
+    let frame = frame_lines(&console);
+    for line in ["original draft banner", "draft warning", "draft echo"] {
+        assert_eq!(
+            frame.iter().filter(|text| text.contains(line)).count(),
+            1,
+            "{frame:#?}"
+        );
+    }
+    for absent in [
+        "Tick Loop Agent v0.1.0",
+        "current-model · current-protocol",
+        "/fixture/current-directory",
+        "existing Agent body",
+    ] {
+        assert!(line_with(&frame, absent).is_none(), "{frame:#?}");
+    }
+    for _ in 0..2 {
+        console.reset_chat(CHILD_AGENT).unwrap();
+        console.write("rebuilt public conversation\n").unwrap();
+        let frame = frame_lines(&console);
+        for line in [
+            "original draft banner",
+            "draft warning",
+            "draft echo",
+            "rebuilt public conversation",
+        ] {
+            assert_eq!(
+                frame.iter().filter(|text| text.contains(line)).count(),
+                1,
+                "{frame:#?}"
+            );
+        }
+    }
+    console
+        .select_created_chat(ROOT_AGENT, &created_banner)
+        .unwrap();
+    let frame = frame_lines(&console);
+    assert!(line_with(&frame, "existing Agent body").is_some());
+    assert!(line_with(&frame, "Tick Loop Agent v0.1.0").is_none());
+    console.clear_visible_agent().unwrap();
+    let frame = frame_lines(&console);
+    assert!(line_with(&frame, "Tick Loop Agent v0.1.0").is_some());
+    assert!(line_with(&frame, "current-model").is_some());
+    for absent in [
+        "original draft banner",
+        "draft warning",
+        "draft echo",
+        "existing Agent body",
+    ] {
+        assert!(line_with(&frame, absent).is_none(), "{frame:#?}");
+    }
+    console.reset_chat(Uuid::from_u128(103)).unwrap();
+    let frame = frame_lines(&console);
+    for absent in [
+        "original draft banner",
+        "draft warning",
+        "draft echo",
+        "rebuilt public conversation",
+    ] {
+        assert!(line_with(&frame, absent).is_none(), "{frame:#?}");
+    }
+}
+
+#[test]
+fn agent_layout_creation_prefix_excludes_overview_and_model_tagged_output() {
+    let mut state = State::new(true, 100, 32);
+    state.prompt_enabled = true;
+    let console = super::tests::console_with_state(state);
+    let startup = vec![("draft startup\n".into(), Some(Role::Title))];
+    console.write_roles(&startup).unwrap();
+    console.record_input("/model").unwrap();
+    console.write("Model selection: Applied\n").unwrap();
+    console
+        .for_message(Some("hidden-model-output".into()))
+        .write("hidden Agent content\n")
+        .unwrap();
+    console
+        .set_global_overview(Some(dispatch_overview(Vec::new(), None)))
+        .unwrap();
+    console.record_input("overview dispatch draft").unwrap();
+    console.write("overview feedback\n").unwrap();
+    console.set_global_overview(None).unwrap();
+    console.select_created_chat(CHILD_AGENT, &startup).unwrap();
+    console.reset_chat(CHILD_AGENT).unwrap();
+    let frame = frame_lines(&console);
+    for line in ["draft startup", "/model", "Model selection: Applied"] {
+        assert_eq!(
+            frame.iter().filter(|text| text.contains(line)).count(),
+            1,
+            "{frame:#?}"
+        );
+    }
+    for absent in [
+        "hidden Agent content",
+        "overview dispatch draft",
+        "overview feedback",
+    ] {
+        assert!(line_with(&frame, absent).is_none(), "{frame:#?}");
+    }
+}
+
+#[test]
+fn agent_layout_draft_overview_refresh_filters_and_heading_folds_preserve_navigation() {
+    let mut state = State::new(true, 100, 32);
+    state.prompt_enabled = true;
+    let console = super::tests::console_with_state(state);
+    let projection = AgentOverview {
+        rows: vec![agent_row(ROOT_AGENT, None, "another Agent")],
+        dispatch_directory: PathBuf::from("/fixture/dispatch"),
+        created: None,
+        visible: None,
+    };
+    console
+        .set_global_overview(Some(projection.clone()))
+        .unwrap();
+    {
+        let mut state = console.state.lock().unwrap();
+        assert_eq!(state.overview.selected, Some(OverviewTarget::CurrentDraft));
+        state.key(key(KeyCode::Char('p')));
+        state.key(key(KeyCode::Char('w')));
+        assert_eq!(state.overview.selected, Some(OverviewTarget::CurrentDraft));
+        state.key(key(KeyCode::Down));
+        assert_eq!(state.overview.selected_agent(), Some(ROOT_AGENT));
+    }
+    console
+        .set_global_overview(Some(projection.clone()))
+        .unwrap();
+    {
+        let mut state = console.state.lock().unwrap();
+        assert_eq!(state.overview.selected_agent(), Some(ROOT_AGENT));
+        state.key(key(KeyCode::Up));
+        state.key(key(KeyCode::Up));
+        assert_eq!(
+            state.overview.selected,
+            Some(OverviewTarget::Heading(AttentionGroup::NeedsInput))
+        );
+        state.key(key(KeyCode::Char(' ')));
+        assert!(state.key(key(KeyCode::Enter)).is_none());
+        assert_eq!(
+            state.overview.selected,
+            Some(OverviewTarget::Heading(AttentionGroup::NeedsInput))
+        );
+        state.key(key(KeyCode::Down));
+        assert_eq!(state.overview.selected, Some(OverviewTarget::CurrentDraft));
+        assert!(matches!(
+            state.key(key(KeyCode::Esc)),
+            Some(InputEvent::CloseOverview)
+        ));
+    }
+    console.set_global_overview(None).unwrap();
+    console.select_chat(Some(ROOT_AGENT)).unwrap();
+    console.set_global_overview(Some(projection)).unwrap();
+    assert!(!console.state.lock().unwrap().overview.current_draft);
+    assert!(line_with(&frame_lines(&console), "current session").is_none());
+}
+
+#[test]
+fn agent_layout_current_draft_keeps_its_name_and_return_cue_at_supported_sizes() {
+    for (width, height) in [(25, 16), (41, 24), (81, 24), (121, 48)] {
+        let mut state = State::new(true, width, height);
+        state.prompt_enabled = true;
+        let console = super::tests::console_with_state(state);
+        console
+            .set_global_overview(Some(AgentOverview {
+                rows: Vec::new(),
+                dispatch_directory: PathBuf::from("/fixture/draft"),
+                created: None,
+                visible: None,
+            }))
+            .unwrap();
+        let frame = frame_lines(&console);
+        let draft = line_with(&frame, "› ● New Agent").unwrap();
+        assert!(draft.contains("current"), "{frame:#?}");
+        if width >= 41 {
+            assert!(draft.contains("current session"), "{frame:#?}");
+        }
+        if width >= 81 {
+            assert!(draft.contains("send a prompt to start"), "{frame:#?}");
+        }
+        assert!(
+            frame
+                .iter()
+                .all(|line| display_width(line) < usize::from(width)),
+            "{frame:#?}"
+        );
+        assert!(frame.len() <= usize::from(height));
+        assert!(matches!(
+            console.state.lock().unwrap().key(key(KeyCode::Right)),
+            Some(InputEvent::CloseOverview)
+        ));
+    }
+}
+
+#[test]
+fn agent_layout_new_draft_is_the_overview_return_target() {
+    for return_key in [KeyCode::Enter, KeyCode::Right] {
+        let mut state = State::new(true, 100, 32);
+        state.prompt_enabled = true;
+        state.history_project = PathBuf::from("/fixture/current-draft");
+        state.status_area.update(
+            "Auto".into(),
+            "draft-model".into(),
+            None,
+            Vec::new(),
+            Vec::new(),
+        );
+        assert!(matches!(
+            state.key(key(KeyCode::Left)),
+            Some(InputEvent::OpenOverview)
+        ));
+        let console = super::tests::console_with_state(state);
+        let projection = AgentOverview {
+            rows: vec![agent_row(ROOT_AGENT, None, "another Agent")],
+            dispatch_directory: PathBuf::from("/fixture/dispatch"),
+            created: None,
+            visible: None,
+        };
+        console
+            .set_global_overview(Some(projection.clone()))
+            .unwrap();
+        let frame = frame_lines(&console);
+        assert!(line_with(&frame, "Needs input").is_some(), "{frame:#?}");
+        let draft = line_with(&frame, "New Agent").unwrap();
+        assert!(draft.contains("current session"), "{frame:#?}");
+        assert!(draft.contains("send a prompt to start"), "{frame:#?}");
+        assert!(draft.starts_with('›'), "{frame:#?}");
+        assert_eq!(
+            console
+                .state
+                .lock()
+                .unwrap()
+                .overview
+                .projection
+                .as_ref()
+                .unwrap()
+                .rows
+                .len(),
+            1
+        );
+        console.set_global_overview(Some(projection)).unwrap();
+        let mut state = console.state.lock().unwrap();
+        assert!(matches!(
+            state.key(key(return_key)),
+            Some(InputEvent::CloseOverview)
+        ));
+        state.insert("separate dispatch draft");
+        drop(state);
+        console.set_global_overview(None).unwrap();
+        let state = console.state.lock().unwrap();
+        assert!(state.chat.is_none());
+        assert!(state.editor.draft().is_empty());
+        assert_eq!(
+            state.history_project,
+            PathBuf::from("/fixture/current-draft")
+        );
+        drop(state);
+        assert!(line_with(&frame_lines(&console), "draft-model").is_some());
+    }
+}
+
+#[test]
 fn agent_layout_overview_context_updates_keep_the_dispatch_draft_and_source_focus() {
     let mut state = State::new(true, 80, 24);
     state.prompt_enabled = true;
@@ -440,6 +1348,7 @@ fn agent_layout_overview_context_updates_keep_the_dispatch_draft_and_source_focu
 #[test]
 fn agent_layout_overview_family_reordering_preserves_child_selection_and_dispatch_focus() {
     let mut state = State::new(true, 100, 32);
+    state.chat = Some(CHILD_AGENT);
     state.prompt_enabled = true;
     let console = super::tests::console_with_state(state);
     let mut independent = agent_row(Uuid::from_u128(103), None, "independent work");
@@ -1064,6 +1973,19 @@ impl PtyConsole {
         self.writer.flush().unwrap();
     }
 
+    fn resize(&mut self, width: u16, height: u16) {
+        self._master
+            .resize(PtySize {
+                rows: height,
+                cols: width,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        self.width = usize::from(width);
+        self.height = usize::from(height);
+    }
+
     fn send_and_wait(&mut self, bytes: &[u8]) {
         let mark = self.output.lock().unwrap().len();
         self.send(bytes);
@@ -1104,6 +2026,93 @@ impl Drop for PtyConsole {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+#[test]
+fn agent_layout_real_pty_float_return_click_and_escape_preserve_the_draft() {
+    let directory = tempfile::tempdir_in("/tmp").unwrap();
+    let mut terminal = PtyConsole::start_in_directory(80, 24, directory.path());
+    terminal.wait_for("initial working", |frame| frame.contains("Working fixture"));
+    terminal.send_and_wait(b"keep this draft");
+    terminal.send_and_wait(b"\x1b[1;5H");
+    let reading = terminal.wait_for("reading hides working", |frame| {
+        frame.contains("history 00")
+            && frame.contains("Back to bottom")
+            && !frame.contains("Working fixture")
+    });
+    let border_before = reading
+        .lines()
+        .position(|line| line.starts_with("──") && line.contains("Back to bottom"))
+        .unwrap();
+    terminal.resize(40, 32);
+    let reading = terminal.wait_for("resize retains the reading anchor", |frame| {
+        frame.contains("history 00")
+            && frame.contains("Back to bottom")
+            && frame.contains("keep this draft")
+    });
+    assert!(!reading.contains("Working fixture"), "{reading}");
+    let row = reading
+        .lines()
+        .position(|line| line.contains("Back to bottom"))
+        .unwrap();
+    let column = reading
+        .lines()
+        .nth(row)
+        .unwrap()
+        .chars()
+        .position(|character| character == '↓')
+        .unwrap();
+    let control = reading.lines().nth(row).unwrap();
+    let label_width = display_width(control.trim_end().trim_matches('─'));
+    let content_width = display_width(control.trim_end());
+    assert!(column.abs_diff(content_width - column - label_width) <= 1);
+    let divider_column = column + label_width + 1;
+    terminal.send_and_wait(
+        format!(
+            "\x1b[<0;{divider_column};{}M\x1b[<0;{divider_column};{}m",
+            row + 1,
+            row + 1
+        )
+        .as_bytes(),
+    );
+    terminal.wait_for("trailing divider does not activate the return control", |frame| {
+        frame.contains("history 00")
+            && frame.contains("Back to bottom")
+            && frame.contains("keep this draft")
+            && !frame.contains("Working fixture")
+    });
+    terminal.send_and_wait(
+        format!(
+            "\x1b[<0;{};{}M\x1b[<0;{};{}m",
+            column + 1,
+            row + 1,
+            column + 1,
+            row + 1
+        )
+        .as_bytes(),
+    );
+    terminal.wait_for("click follows working without changing input", |frame| {
+        frame.contains("Working fixture")
+            && frame.contains("keep this draft")
+            && !frame.contains("Back to bottom")
+    });
+    terminal.send_and_wait(b"\x1b[1;5H");
+    terminal.wait_for("return control appears again", |frame| {
+        frame.contains("Back to bottom")
+    });
+    terminal.send_and_wait(b"\x1b");
+    let bottom = terminal.wait_for("Esc follows latest and preserves draft", |frame| {
+        frame.contains("Working fixture")
+            && frame.contains("keep this draft")
+            && !frame.contains("Back to bottom")
+    });
+    assert!(
+        bottom
+            .lines()
+            .position(|line| line.starts_with("──"))
+            .unwrap()
+            > border_before
+    );
 }
 
 #[test]
@@ -1891,6 +2900,8 @@ fn monitor_bravo_with_dispatch_draft(width: u16, height: u16) -> Console {
         state.key(key(KeyCode::Char('p')));
         state.key(key(KeyCode::Char('p')));
         assert_eq!(state.overview.project.as_deref(), Some("project-b"));
+        state.key(key(KeyCode::Down));
+        state.key(key(KeyCode::Down));
         assert_eq!(state.overview.selected_agent(), Some(BRAVO_AGENT));
         state.key(key(KeyCode::Tab));
         state.insert("next draft");
@@ -2790,6 +3801,7 @@ fn heading_order(frame: &[String]) -> Vec<String> {
 #[test]
 fn agent_layout_dense_overview_folds_children_done_and_empty_without_hiding_attention() {
     let mut state = State::new(true, 100, 32);
+    state.chat = Some(VISIBLE_EMPTY);
     state.prompt_enabled = true;
     let console = super::tests::console_with_state(state);
     console.set_global_overview(Some(fleet_overview())).unwrap();
@@ -2911,6 +3923,7 @@ fn agent_layout_dense_overview_folds_children_done_and_empty_without_hiding_atte
 #[test]
 fn agent_layout_narrow_dense_overview_keeps_family_facts_on_one_line() {
     let mut state = State::new(true, 40, 24);
+    state.chat = Some(VISIBLE_EMPTY);
     state.prompt_enabled = true;
     let console = super::tests::console_with_state(state);
     console.set_global_overview(Some(fleet_overview())).unwrap();
@@ -3162,7 +4175,8 @@ fn agent_layout_folded_counts_stay_visible_when_priority_groups_fill_the_list() 
 
 #[test]
 fn agent_layout_a_fully_pinned_empty_group_reserves_no_counter_row_for_done() {
-    let state = State::new(true, 100, 24);
+    let mut state = State::new(true, 100, 24);
+    state.chat = Some(VISIBLE_EMPTY);
     let console = super::tests::console_with_state(state);
     let mut rows = vec![fleet_row(
         Uuid::from_u128(0x8000),
@@ -3867,6 +4881,7 @@ fn has_hex_token(line: &str) -> bool {
 #[test]
 fn agent_layout_low_priority_groups_fold_behind_selectable_headings() {
     let mut state = State::new(true, 80, 24);
+    state.chat = Some(SCREENSHOT_SOURCE);
     state.prompt_enabled = true;
     let console = super::tests::console_with_state(state);
     console
@@ -3909,6 +4924,7 @@ fn agent_layout_low_priority_groups_fold_behind_selectable_headings() {
 #[test]
 fn agent_layout_overview_marks_the_agent_it_returns_to_apart_from_the_selection() {
     let mut state = State::new(true, 80, 24);
+    state.chat = Some(SCREENSHOT_SOURCE);
     state.prompt_enabled = true;
     let console = super::tests::console_with_state(state);
     console
@@ -4012,6 +5028,7 @@ fn agent_layout_reading_numbers_stay_bound_through_arrivals_and_removals() {
         visible: Some(current),
     };
     let mut state = State::new(true, 100, 32);
+    state.chat = Some(current);
     state.prompt_enabled = true;
     let console = super::tests::console_with_state(state);
     console
@@ -4088,6 +5105,7 @@ fn agent_layout_collapsing_a_group_hides_its_current_created_and_selected_rows()
         }
     };
     let mut state = State::new(true, 100, 32);
+    state.chat = Some(child);
     state.prompt_enabled = true;
     let console = super::tests::console_with_state(state);
     console.set_global_overview(Some(overview(false))).unwrap();
@@ -4281,6 +5299,7 @@ fn agent_layout_receipt_and_hidden_current_cues_survive_together() {
         for width in [24, 40, 80] {
             let label = format!("{width} columns, filter {hide_by_filter}");
             let mut state = State::new(true, width, 24);
+            state.chat = Some(child);
             state.prompt_enabled = true;
             let console = super::tests::console_with_state(state);
             console.set_global_overview(Some(overview())).unwrap();

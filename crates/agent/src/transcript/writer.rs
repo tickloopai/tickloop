@@ -307,6 +307,7 @@ mod tests {
                 execution_mode: None,
                 is_inherited_prompt: false,
                 original_user_message_id: None,
+                agent_message_origin: None,
                 run_id: None,
                 contexts: None,
                 continues_message: false,

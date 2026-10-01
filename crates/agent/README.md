@@ -12,6 +12,15 @@
 cargo run -p tickloop-agent
 ```
 
+To replace an incompatible local Agent service, run this build's stop command, then launch again:
+
+```sh
+./target/debug/tickloop service stop
+./target/debug/tickloop
+```
+
+This stops the service and its running Agents. Saved history is kept. `TICKLOOP_AGENT_RUNTIME_DIR` selects the service; keep it unchanged between these commands. Closing a View still leaves its work running. The next launch starts this build's service without automatically continuing saved work.
+
 从仓库根目录执行 `make package`，将 Agent 与 example Tick 编译为 Release 并打包到 `dist/tickloop-<target>.tar.gz`，默认使用当前主机的 Rust target。压缩包包含 `tickloop` 和 `tick`，不包含 `.env`、配置或会话数据；解压后在匹配的系统与架构上运行，无需安装 Rust。模型凭据通过下述配置入口提供，默认状态目录为 `~/.tickloop`，可用 `TICKLOOP_CONFIG_DIR` 指定。
 
 省略 `--cwd` 时使用当前目录。需要指定工作目录时，传入一个已经存在的实际目录，例如 `--cwd "$PWD"`；程序不会创建工作目录。
@@ -20,6 +29,8 @@ cargo run -p tickloop-agent
 
 
 总览与输入下方 Agents 树都来自真实执行目录。进入当前 Agent 的后代始终原位；其他 Agent 若在同一 Herdr 实例有活 View，优先经核实的 Pane 导航，多位置无法确定首选时选择。否则缓存当前界面后原位连接。进入 child 后，家族仍显示 root／parent 关系，后续文字作用于可见 child；审批／问题附近面板标实际 requester。`DelegateAgent` 创建真实独立 Chat／Loop，后续输入保持冻结授权上限；嵌套委派、团队调度、child 历史改写及 Agent／家族 stop 暂不提供，拒绝不会转发给 parent。
+
+父子后续通信使用 `SendMessage`：父可补充已委派 child 的任务方向，child 可向 `parent` 请求澄清。等待收件与等待 child 实际结果分别用 `ReceiveAgentMessage`、`WaitForAgent`；父在同步委派等待中有新输入时让出等待，child 继续。消息来源与真人输入分别记录，不能批准人工请求或改变委派权限。明确中断和只装载历史不因消息自动恢复；独立 root 与 siblings 通信本期不提供。合同与当前验收状态见[父子消息设计](../../.scratch/agent-layout-redesign/parent-child-messaging.md)和[工单37](../../.scratch/agent-layout-redesign/issues/37-parent-child-agent-messages.md)。
 
 owner 自动启动使用当前登录用户私有 Unix socket，启动锁协调并发 CLI，不安装 launchd 服务。关闭终端／Pane、`/exit` 或 View EOF 只撤界面；owner／worker 退出后旧 execution 失效。`/resume` 打开历史不执行，明确向原 Loop Continue 才恢复其原有效 Trigger；没有自动崩溃续跑或跨崩溃 exactly-once 承诺。确认丢失先查询原 CommandId，创建仍未知时保留输入并阻止盲目重复创建；检查总览与历史后，可按提示 `/acknowledge-create COMMAND_ID` 显式承认未知，以允许另一条新提交，此动作不重放旧命令。New Agent 的暂存选择逐条以回执证明后才提交首个输入，未知或被拒的选择不会重发，也不会让输入落到配置不全的 Agent；同一命令可取消其余选择。普通输入结果未知时原样恢复到输入区，在不改动的情况下再次 Enter 只读取原收据：已被接受就采纳原结果、不再发送；改动后的输入等原结果确定后作为新输入发送；`/acknowledge-input COMMAND_ID` 只停止跟踪、不重发。
 
@@ -33,13 +44,13 @@ owner 自动启动使用当前登录用户私有 Unix socket，启动锁协调�
 
 如果设备码页面提示启用设备代码授权，需要本人在 ChatGPT 的 Settings → Security 中开启后，在 Provider 列表按 `d` 重试设备码方式，或回车使用浏览器方式。这个账号设置由 OpenAI 管理。官方说明见 [Codex 身份验证](https://developers.openai.com/codex/auth#login-on-headless-devices)。
 
-`/provider` 负责连接配置与认证，回车登录或更新 API Key；登录成功后仍留在 Provider 页面，不自动切换模型。按 `r` 清除该 Provider 的本地凭据并重新认证；API Key 来自外部 shell 时只删除本地保存值，不修改 shell 环境。`/model` 在已配置 Provider → Model 两级中选择模型，已有选择时直接进入当前 Provider，并查询或复用同连接账号模型目录。明确无权限的模型隐藏，查询失败或无发现接口时保留未验证候选。Herdr 内外使用同一套 Agent 命令。
+`/provider` 选择连接：已有可用凭据时回车进入模型页，缺少凭据时先认证，成功后继续模型选择；保存凭据不自动应用模型，明确选择才生效。按 `r` 清除该 Provider 的本地凭据并重新认证；API Key 来自外部 shell 时只删除本地保存值，不修改 shell 环境。`/model` 在已配置 Provider → Model 两级中选择模型，已有选择时直接进入当前 Provider，并查询或复用同连接账号模型目录。明确无权限的模型隐藏，查询失败或无发现接口时保留未验证候选。Herdr 内外使用同一套 Agent 命令。
 
 同一 `TICKLOOP_CONFIG_DIR` 的 Chat 共用登录，后续模型请求读取最新账户并在到期前刷新。Provider 列表的 `Sign out · Codex subscription`（或选中 Codex 后按 `s`）仅删除本地登录，不撤销已发出的请求或远端授权。凭证单独保存在状态根目录的 `auth/openai-codex-credentials.json`，使用私有文件权限；不读取 Codex CLI 或 pi 的登录文件。不要分享这份文件；同一系统用户下已经获准执行的任意 Shell 仍可能访问本地文件。
 
 Kimi 中国区使用 `MOONSHOT_CN_API_KEY`，国际区使用 `MOONSHOT_API_KEY`；两个服务分别验证 key，不自动切换地区。百炼使用 `DASHSCOPE_API_KEY` 和 `https://dashscope.aliyuncs.com/compatible-mode/v1/`；Anthropic 使用 `ANTHROPIC_API_KEY`，Gemini Developer API 使用 `GEMINI_API_KEY`，xAI API 使用 `XAI_API_KEY`。Kimi Code 和 Grok 的 OAuth 连接在 `/provider` 中使用设备授权，并在 consent 说明实际注册客户端名称。Grok OAuth 使用官方订阅代理 `cli-chat-proxy.grok.com`，独立于按量 API。
 
-Vertex service account 在 `/provider` → Google → Vertex service account 按 Enter，输入本机私有 `service_account` JSON 文件的绝对路径。已有路径会预填，支持普通文本编辑与 `Ctrl+G` 外部编辑器；Esc 先退出输入、再取消。程序验证文件权限（`0600`，不含符号链接）、格式和签名密钥后保存路径，失败则留在输入框且不修改已有配置。保存后返回 Provider，再通过 `/model` 选择模型；JSON 文件留在原处，不复制其内容。
+Vertex service account 在 `/provider` → Google → Vertex service account 按 Enter，输入本机私有 `service_account` JSON 文件的绝对路径。已有路径会预填，支持普通文本编辑与 `Ctrl+G` 外部编辑器；Esc 先退出输入、再取消。程序验证文件权限（`0600`，不含符号链接）、格式和签名密钥后保存路径，失败则留在输入框且不修改已有配置。保存后立即进入该连接的模型页，明确选择后才应用；JSON 文件留在原处，不复制其内容。
 
 脚本和非交互启动仍可通过 `GOOGLE_APPLICATION_CREDENTIALS` 设置文件路径，或写入 Agent 状态根的私有 `.env`。`GOOGLE_CLOUD_PROJECT` 可覆盖文件中的资源项目，`GOOGLE_CLOUD_LOCATION` 默认 `global`，选择其他位置前核对模型在该位置的支持。程序自行签名 JWT、交换及刷新短期 token。该文件路径及 key 不写入模型 YAML。
 
@@ -152,7 +163,7 @@ Provider 内的 `id` 是配置身份，`service_model_id` 是服务实际接收�
 
 输入自然语言开始工作，再输入补充要求继续同一目标。输入区固定在终端底部，上方显示流式回复和工具摘要。单行状态栏依次显示当前 Execution Mode、模型及 `Context x% used`，重要提示优先显示；已知窗口大小且当前模型尚无请求时从 `Context 0% used` 开始；请求进行中沿用 0% 或最近一次已确认用量，窗口大小未知或请求结束后仍无已确认用量时显示 `Context —`。仍在活动状态的后台 Shell Tasks 和当前 Loop 的 Todo 共用状态栏下方的单列面板，默认只显示计数标签，点击或按 Down、Enter 展开；Tasks 可用 `j`／`k` 选中单个任务，Enter 打开详情，`x` 停止，Todo 可用相同按键滚动；Subagents 尚未接入。PgUp／PgDn 回看半页，Ctrl+Home／End 到会话首尾；上滚后新输出不会抢走阅读位置，底栏显示新消息数。`Shift+Tab` 在普通输入界面按 Auto → Ask → Full Access → Auto 循环；权限 Diff、菜单和候选打开时由当前界面优先处理。`/settings` 中的 Auto-scroll 开关只作用于当前终端客户端，关闭后手动到底也不会被之后的输出重新带走。
 
-输入 `/model` 在已配置 Provider → Model 两级中选择，已有选择时直接进入当前 Provider，`/provider` 独立配置连接与登录。模型页标题显示厂商及实际产品、地区、服务域名；模型行使用完整 Model Card 名称；按固定厂商顺序、产品/地区连接顺序，再按模型系列（OpenAI 在 Claude 前）和接入目录维护的能力顺序排列。能力顺序不改变默认推荐。光标所在行用整行背景高亮，长列表跟随光标并提示上下方还有内容；当前模型用 `●` 标记，打开时定位到它，但不移到第一项。交互式 Provider 与 Model 选择器不显示序号，也不接受数字直接确认；管道模式保留编号文本选择作为非交互回退。上下键、`j`／`k`、`Ctrl+N`／`Ctrl+P` 导航，左右键或 `h`／`l` 调整 Thinking，回车应用模型与 Thinking，`Esc` 返回 Provider 层，再按 `Esc` 关闭。模型页按 `p` 打开高亮模型所属连接的配置，完成或取消返回发起层并保留草稿；也可通过 Configure Providers 配置其他连接。新配置连接立即出现在 Provider 层，但不自动应用。`/thinking` 可单独调整当前模型的 Thinking 档位。每个模型绑定首选协议，普通菜单不提供独立 API 风格切换；DeepSeek 只列 OpenAI Chat Completions 的首选模型。两个模型共用 `DEEPSEEK_API_KEY`；当前内置 Model Card 的上下文窗口为 1M，输出限制为 64,000 tokens，可通过公开配置调整。`/settings` 集中显示模型、Execution Mode、当前会话状态、本进程用量和 Auto-scroll。照 Claude Code，`/model` 的选择、持久权限规则和 `defaultMode` 位于状态根目录的 `settings.json`；启动时 `--config` 与 `--mode` 分别优先于保存的模型和默认模式。内置默认是 Auto。Chat 内切换、会话级规则和 `/add-dir` 附加目录只在本进程内有效；新建、恢复与 Branch 使用当时的默认模式，不恢复来源 Chat 的临时模式。Auto-scroll 作用于当前终端会话；在途工作结束后模型切换才生效，历史按目标模型投影，协议变化不要求先压缩。已知模型的上下文窗口自动取该模型的最大值。
+输入 `/model` 在已配置 Provider → Model 两级中选择，已有选择时直接进入当前 Provider，`/provider` 也可选择连接并继续模型选择，显式重认证与配置入口保留。模型页标题显示厂商及实际产品、地区、服务域名；模型行使用完整 Model Card 名称；按固定厂商顺序、产品/地区连接顺序，再按模型系列（OpenAI 在 Claude 前）和接入目录维护的能力顺序排列。能力顺序不改变默认推荐。光标所在行用整行背景高亮，长列表跟随光标并提示上下方还有内容；当前模型用 `●` 标记，打开时定位到它，但不移到第一项。交互式 Provider 与 Model 选择器不显示序号，也不接受数字直接确认；管道模式保留编号文本选择作为非交互回退。上下键、`j`／`k`、`Ctrl+N`／`Ctrl+P` 导航，左右键或 `h`／`l` 调整 Thinking，回车应用模型与 Thinking，`Esc` 返回 Provider 层，再按 `Esc` 关闭。模型页按 `p` 打开高亮模型所属连接的配置，成功后继续该连接模型页，取消返回发起层并保留草稿；也可通过 Configure Providers 配置其他连接。新配置连接立即出现在 Provider 层，但不自动应用。`/thinking` 可单独调整当前模型的 Thinking 档位。每个模型绑定首选协议，普通菜单不提供独立 API 风格切换；DeepSeek 只列 OpenAI Chat Completions 的首选模型。两个模型共用 `DEEPSEEK_API_KEY`；当前内置 Model Card 的上下文窗口为 1M，输出限制为 64,000 tokens，可通过公开配置调整。`/settings` 集中显示模型、Execution Mode、当前会话状态、本进程用量和 Auto-scroll。照 Claude Code，`/model` 的选择、持久权限规则和 `defaultMode` 位于状态根目录的 `settings.json`；启动时 `--config` 与 `--mode` 分别优先于保存的模型和默认模式。内置默认是 Auto。Chat 内切换、会话级规则和 `/add-dir` 附加目录只在本进程内有效；新建、恢复与 Branch 使用当时的默认模式，不恢复来源 Chat 的临时模式。Auto-scroll 作用于当前终端会话；在途工作结束后模型切换才生效，历史按目标模型投影，协议变化不要求先压缩。已知模型的上下文窗口自动取该模型的最大值。
 
 内置 DeepSeek 配置的单次输出上限为 64,000 tokens；保存的旧内置 4096 配置在读取时升级，自定义配置与显式 `--config` 的上限保持原值。模型报告输出截断时，Agent 只用已收到的文字续接，最多再请求三次；没有完整文字可续接或次数耗尽时报告失败。上下文自动压缩独立按输入历史与上下文窗口判断。
 
@@ -217,7 +228,7 @@ Model Card 与单模型配置的 `input_modalities` 声明模型接受的输入�
 | 高级 | `/answer QUESTION ANSWER` | 回答澄清问题；只有一个可见问题时也可直接输入答案 |
 | 高级 | `/allow REQUEST [once\|session\|persistent]`、`/deny REQUEST` | 回答绑定具体操作的权限请求；默认为单次 |
 | 高级 | `/mode [auto\|ask\|fullAccess\|plan]` | 查看或修改当前 Chat 的模式；旧 `acceptEdits` 兼容 Ask，`manual` 与 `default` 是废弃别名；Plan 推荐使用 `/plan` |
-| 公开 | `/provider` | 配置 Provider 连接、API Key、登录、退出登录与独立 Jev Key；不切换 Chat 模型 |
+| 公开 | `/provider` | 选择连接，按需认证后选择模型；另可重认证、注销与配置独立 Jev Key，保存凭据不自动切换模型 |
 | 公开 | `/model` | 选择已配置连接的模型，显示 Provider 与 Thinking；按 p 配置连接；选择保存到 `settings.json` |
 | 公开 | `/thinking [LEVEL]` | 选择当前模型支持的力度；无参数打开选择器，`auto` 使用模型默认值 |
 | 公开 | `/permissions` | 先选择 Auto／Ask／Full Access，或直接查看近期记录；Auto 下可配置 LLM／Jev 与 Key；Settings 中的 Permissions 打开同一入口 |

@@ -333,7 +333,7 @@ async fn repeated_legal_images_cross_the_frame_limit_without_losing_history_or_r
     let mut legacy = UnixStream::connect(&socket).await.unwrap();
     write_json(
         &mut legacy,
-        &serde_json::json!({"Hello": {"major": 1, "minor": 0}}),
+        &serde_json::json!({"Hello": {"major": PROTOCOL_MAJOR, "minor": 0}}),
     )
     .await;
     let hello = read_json(&mut legacy).await;

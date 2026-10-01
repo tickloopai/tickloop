@@ -157,6 +157,7 @@ async fn restart_discards_a_stale_trigger_input_and_a_resumed_schedule_ticks_aga
             },
             input: trigger.prompt.clone(),
             contexts: Vec::new(),
+            agent_message: None,
             denial_reference: None,
             trigger_source: Some(TriggerSource {
                 source: "timer".into(),
@@ -165,6 +166,7 @@ async fn restart_discards_a_stale_trigger_input_and_a_resumed_schedule_ticks_aga
             armed: true,
             queued_sequence: 1,
             task_continuation: false,
+            is_skill_invocation: false,
             attached_file_reads: Vec::new(),
         });
         source.save(&chat.snapshot);

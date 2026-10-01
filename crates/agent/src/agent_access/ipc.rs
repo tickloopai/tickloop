@@ -120,6 +120,15 @@ impl LocalAgentClient {
         .await?;
         let hello = match read_frame::<_, ServerMessage>(&mut stream).await? {
             Some(ServerMessage::Hello(hello)) if hello.major == PROTOCOL_MAJOR => hello,
+            Some(ServerMessage::Hello(hello)) => {
+                return Err(AccessError::new(
+                    AccessErrorCode::VersionMismatch,
+                    format!(
+                        "AgentAccess peer protocol {}.{} is incompatible with client {}.{}; use the same Tick Loop version",
+                        hello.major, hello.minor, PROTOCOL_MAJOR, PROTOCOL_MINOR,
+                    ),
+                ));
+            }
             Some(ServerMessage::Error { error, .. }) => return Err(error),
             _ => {
                 return Err(AccessError::new(
@@ -552,6 +561,22 @@ async fn serve_connection_mode(
             major: PROTOCOL_MAJOR,
             minor,
         }) => minor.min(PROTOCOL_MINOR),
+        Some(ClientMessage::Hello { major, minor }) => {
+            write_frame(
+                &mut stream,
+                &ServerMessage::Error {
+                    request_id: None,
+                    error: AccessError::new(
+                        AccessErrorCode::VersionMismatch,
+                        format!(
+                            "AgentAccess client protocol {major}.{minor} is incompatible with server {PROTOCOL_MAJOR}.{PROTOCOL_MINOR}; use the same Tick Loop version",
+                        ),
+                    ),
+                },
+            )
+            .await?;
+            return Ok(());
+        }
         _ => {
             write_frame(
                 &mut stream,
@@ -559,7 +584,7 @@ async fn serve_connection_mode(
                     request_id: None,
                     error: AccessError::new(
                         AccessErrorCode::VersionMismatch,
-                        "incompatible AgentAccess protocol major",
+                        "AgentAccess connection must begin with protocol negotiation",
                     ),
                 },
             )

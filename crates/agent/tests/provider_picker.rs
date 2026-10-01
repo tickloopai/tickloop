@@ -35,6 +35,15 @@ impl Terminal {
     }
 
     fn start_with_arguments(workdir: &Path, provider: Option<&Path>, arguments: &[&str]) -> Self {
+        Self::start_with_environment(workdir, provider, arguments, &[])
+    }
+
+    fn start_with_environment(
+        workdir: &Path,
+        provider: Option<&Path>,
+        arguments: &[&str],
+        environment: &[(&str, &str)],
+    ) -> Self {
         let pty = native_pty_system()
             .openpty(PtySize {
                 rows: 38,
@@ -79,6 +88,9 @@ impl Terminal {
         }
         command.env("NO_PROXY", "127.0.0.1,localhost");
         command.env("no_proxy", "127.0.0.1,localhost");
+        for (name, value) in environment {
+            command.env(name, value);
+        }
         let child = pty.slave.spawn_command(command).unwrap();
         drop(pty.slave);
         let mut reader = pty.master.try_clone_reader().unwrap();
@@ -292,6 +304,269 @@ fn write_saved_test_key(workdir: &Path) {
 }
 
 #[test]
+fn provider_with_a_saved_key_opens_models_without_authentication_or_configuration_changes() {
+    let directory = tempfile::tempdir().unwrap();
+    let workdir = directory.path().canonicalize().unwrap();
+    let provider = write_provider(&workdir, "127.0.0.1:1".parse().unwrap());
+    write_saved_test_key(&workdir);
+    let original = fs::read(workdir.join("state/.env")).unwrap();
+    let mut terminal = Terminal::start(&workdir, Some(&provider));
+    terminal.wait_for("picker-messages-service");
+    terminal.send(b"/provider\r");
+    terminal.wait_for("Choose Provider");
+    let mark = terminal.mark();
+    terminal.send(b"\r");
+    terminal.wait_for_frame_after(mark, "saved connection models without key entry", |frame| {
+        frame.contains("Choose model · Picker Fixture")
+            && frame.contains("Fixture Messages Two")
+            && !frame.contains("Save API key")
+    });
+    assert_eq!(fs::read(workdir.join("state/.env")).unwrap(), original);
+    assert!(!workdir.join("state/settings.json").exists());
+    terminal.close_model_picker();
+    terminal.exit();
+    assert!(!terminal.output.lock().unwrap().contains(TEST_KEY));
+}
+
+#[test]
+fn provider_key_save_continues_to_its_models_and_cancel_does_not_apply_a_model() {
+    let directory = tempfile::tempdir().unwrap();
+    let workdir = directory.path().canonicalize().unwrap();
+    let provider = write_provider(&workdir, "127.0.0.1:1".parse().unwrap());
+    let mut terminal = Terminal::start(&workdir, Some(&provider));
+    terminal.wait_for("picker-messages-service");
+    terminal.send(b"/provider\r");
+    terminal.wait_for("Choose Provider");
+    terminal.send(b"\r");
+    terminal.wait_for("API key · Picker Fixture");
+    terminal.send(TEST_KEY.as_bytes());
+    let mark = terminal.mark();
+    terminal.send(b"\r");
+    terminal.wait_for_frame_after(mark, "saved key continues to connection models", |frame| {
+        frame.contains("Choose model · Picker Fixture")
+            && frame.contains("Fixture Messages Two")
+            && !frame.contains("Save API key")
+    });
+    assert!(!workdir.join("state/settings.json").exists());
+    terminal.close_model_picker();
+    terminal.exit();
+    assert_eq!(
+        tickloop_agent::model::credentials::load_api_key(&workdir.join("state"), TEST_KEY_NAME)
+            .unwrap()
+            .as_deref(),
+        Some(TEST_KEY)
+    );
+    assert!(!workdir.join("state/settings.json").exists());
+    assert!(!terminal.output.lock().unwrap().contains(TEST_KEY));
+}
+
+#[test]
+fn provider_with_an_environment_key_opens_models_without_saving_credentials() {
+    let directory = tempfile::tempdir().unwrap();
+    let workdir = directory.path().canonicalize().unwrap();
+    let provider = write_provider(&workdir, "127.0.0.1:1".parse().unwrap());
+    let mut terminal = Terminal::start_with_environment(
+        &workdir,
+        Some(&provider),
+        &[],
+        &[(TEST_KEY_NAME, TEST_KEY)],
+    );
+    terminal.wait_for("picker-messages-service");
+    terminal.send(b"/provider\r");
+    terminal.wait_for("Choose Provider");
+    let mark = terminal.mark();
+    terminal.send(b"\r");
+    terminal.wait_for_frame_after(mark, "environment connection models", |frame| {
+        frame.contains("Choose model · Picker Fixture") && !frame.contains("Save API key")
+    });
+    terminal.close_model_picker();
+    terminal.exit();
+    assert!(!workdir.join("state/.env").exists());
+    assert!(!workdir.join("state/settings.json").exists());
+    assert!(!terminal.output.lock().unwrap().contains(TEST_KEY));
+}
+
+#[test]
+fn provider_key_save_failure_and_cancel_keep_authentication_and_model_unchanged() {
+    let directory = tempfile::tempdir().unwrap();
+    let workdir = directory.path().canonicalize().unwrap();
+    let provider = write_provider(&workdir, "127.0.0.1:1".parse().unwrap());
+    let mut terminal = Terminal::start(&workdir, Some(&provider));
+    terminal.wait_for("picker-messages-service");
+    terminal.send(b"/provider\r");
+    terminal.wait_for("Choose Provider");
+    terminal.send(b"\r");
+    terminal.wait_for("API key · Picker Fixture");
+    let mark = terminal.mark();
+    terminal.send(b"\r");
+    terminal.wait_for_frame_after(mark, "failed key save remains in authentication", |frame| {
+        frame.contains("API key · Picker Fixture")
+            && frame.contains("API key must be nonempty")
+            && !frame.contains("Choose model")
+    });
+    assert!(!workdir.join("state/.env").exists());
+    let mark = terminal.mark();
+    terminal.send(b"\x1b\x1b");
+    terminal.wait_for_frame_after(mark, "cancelled key entry", |frame| {
+        frame.contains("Choose Provider") && frame.contains("API key required")
+    });
+    terminal.close_provider_picker();
+    terminal.exit();
+    assert!(!workdir.join("state/.env").exists());
+    assert!(!workdir.join("state/settings.json").exists());
+    assert!(!terminal.output.lock().unwrap().contains("Choose model ·"));
+}
+
+#[test]
+fn provider_models_keep_regional_identity_and_queue_a_busy_agents_explicit_selection() {
+    let directory = tempfile::tempdir().unwrap();
+    let workdir = directory.path().canonicalize().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let provider = write_provider(&workdir, listener.local_addr().unwrap());
+    let definition = fs::read_to_string(&provider).unwrap();
+    let connection = |region: &str, order| {
+        format!(
+            "connection:\n  vendor: Regional Fixture\n  product: API\n  kind: pay_as_you_go\n  region:\n    name: {region}\n    order: {order}\n"
+        )
+    };
+    fs::write(
+        &provider,
+        format!("{}{}", connection("China", 0), definition),
+    )
+    .unwrap();
+    write_saved_test_key(&workdir);
+    let env_file = workdir.join("state/.env");
+    let global_key_name = "TICKLOOP_PROVIDER_PICKER_GLOBAL_KEY";
+    let credentials = format!(
+        "{}{}=\"{TEST_KEY}\"\n",
+        fs::read_to_string(&env_file).unwrap(),
+        global_key_name
+    );
+    fs::write(&env_file, &credentials).unwrap();
+    fs::create_dir_all(workdir.join("state/providers")).unwrap();
+    fs::write(
+        workdir.join("state/providers/global-fixture.yaml"),
+        format!(
+            "{}{}",
+            connection("Global", 1),
+            definition
+                .replace("id: picker-fixture", "id: global-fixture")
+                .replace(TEST_KEY_NAME, global_key_name)
+        ),
+    )
+    .unwrap();
+    let (started_sender, started) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let server = thread::spawn(move || {
+        let deadline = Instant::now() + TIMEOUT;
+        let mut socket = loop {
+            match listener.accept() {
+                Ok((socket, _)) => break socket,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "no first regional request");
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("{error}"),
+            }
+        };
+        socket.set_read_timeout(Some(TIMEOUT)).unwrap();
+        let first = read_http_request(&mut socket);
+        started_sender.send(()).unwrap();
+        released.recv_timeout(TIMEOUT * 2).unwrap();
+        let answer = messages_text_stream("First regional reply");
+        socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{answer}", answer.len()).as_bytes()).unwrap();
+        let second =
+            receive_request_with_stream(&listener, &messages_text_stream("Second regional reply"));
+        (first, second)
+    });
+    let mut terminal = Terminal::start(&workdir, Some(&provider));
+    terminal.wait_for("picker-messages-service");
+    terminal.send(b"Keep this regional request running\r");
+    started.recv_timeout(TIMEOUT).unwrap();
+    let original_settings = fs::read(workdir.join("state/settings.json")).ok();
+    let mark = terminal.mark();
+    terminal.send(b"/provider\r");
+    terminal.wait_for_frame_after(mark, "regional Provider", |frame| {
+        frame.contains("Choose Provider")
+    });
+    terminal.select_row("Regional Fixture");
+    terminal.wait_for("Choose connection · Regional Fixture");
+    let mark = terminal.mark();
+    terminal.select_row("Global");
+    terminal.wait_for_frame_after(mark, "configured Global models while China runs", |frame| {
+        frame.contains("Choose model · Regional Fixture · API · Global")
+            && !frame.contains("Save API key")
+    });
+    assert_eq!(
+        fs::read(workdir.join("state/settings.json")).ok(),
+        original_settings
+    );
+    assert_eq!(fs::read_to_string(&env_file).unwrap(), credentials);
+    let mark = terminal.mark();
+    terminal.send(b"p");
+    terminal.wait_for_frame_after(mark, "explicit Global key configuration", |frame| {
+        frame.contains("Choose connection · Regional Fixture")
+    });
+    let mark = terminal.mark();
+    terminal.send(b"\r");
+    terminal.wait_for_frame_after(mark, "Global key entry for existing Agent", |frame| {
+        frame.contains("API key · API · Global") && frame.contains("Save API key")
+    });
+    terminal.send(TEST_KEY.as_bytes());
+    let mark = terminal.mark();
+    terminal.send(b"\r");
+    terminal.wait_for_frame_after(
+        mark,
+        "Global key save leaves running Agent unchanged",
+        |frame| frame.contains("Choose model · Regional Fixture · API · Global"),
+    );
+    assert_eq!(
+        fs::read(workdir.join("state/settings.json")).ok(),
+        original_settings
+    );
+    assert_eq!(fs::read_to_string(&env_file).unwrap(), credentials);
+    assert!(!terminal.visible_output().contains("Model selection:"));
+    terminal.close_model_picker();
+    let mark = terminal.mark();
+    terminal.send(b"/provider\r");
+    terminal.wait_for_frame_after(
+        mark,
+        "regional Provider after cancelled browsing",
+        |frame| frame.contains("Choose Provider"),
+    );
+    let mark = terminal.mark();
+    terminal.select_row("Regional Fixture");
+    terminal.wait_for_frame_after(mark, "regional connections again", |frame| {
+        frame.contains("Choose connection · Regional Fixture")
+    });
+    let mark = terminal.mark();
+    terminal.select_row("Global");
+    terminal.wait_for_frame_after(mark, "Global models before explicit selection", |frame| {
+        frame.contains("Choose model · Regional Fixture · API · Global")
+    });
+    terminal.select_row("Fixture Messages Two");
+    terminal.wait_for("Model selection: Pending");
+    release.send(()).unwrap();
+    terminal.wait_for("First regional reply");
+    let mark = terminal.mark();
+    terminal.send(b"Use the explicitly chosen Global model\r");
+    terminal.wait_for_frame_after(mark, "next request uses selected model", |frame| {
+        frame.contains("Second regional reply") && frame.contains("picker-messages-second-service")
+    });
+    terminal.exit();
+    let ((_, first), second) = server.join().unwrap();
+    assert_eq!(first["model"], "picker-messages-service");
+    assert_eq!(second["model"], "picker-messages-second-service");
+    let saved: Value =
+        serde_json::from_slice(&fs::read(workdir.join("state/settings.json")).unwrap()).unwrap();
+    assert_eq!(saved["defaultModel"]["provider"], "global-fixture");
+    assert_eq!(saved["defaultModel"]["model"], "picker-messages-second");
+    assert_eq!(fs::read_to_string(&env_file).unwrap(), credentials);
+    assert!(!terminal.output.lock().unwrap().contains(TEST_KEY));
+}
+
+#[test]
 fn vertex_service_account_opens_user_configuration_and_cancel_preserves_credentials() {
     let directory = tempfile::tempdir().unwrap();
     let workdir = directory.path().canonicalize().unwrap();
@@ -344,8 +619,8 @@ fn vertex_service_account_save_retry_and_reconfigure_preserve_model_and_other_ke
     terminal.send(source.to_str().unwrap().as_bytes());
     let mark = terminal.mark();
     terminal.send(b"\r");
-    terminal.wait_for_frame_after(mark, "configured Vertex", |frame| {
-        frame.contains("Choose connection · Google") && frame.contains("Service account configured")
+    terminal.wait_for_frame_after(mark, "configured Vertex models", |frame| {
+        frame.contains("Choose model · Google") && frame.contains("Vertex")
     });
     let saved = fs::read(workdir.join("state/.env")).unwrap();
     assert_eq!(
@@ -363,6 +638,11 @@ fn vertex_service_account_save_retry_and_reconfigure_preserve_model_and_other_ke
     assert!(!workdir.join("state/auth").exists());
 
     let mark = terminal.mark();
+    terminal.send(b"p");
+    terminal.wait_for_frame_after(mark, "explicit Vertex configuration", |frame| {
+        frame.contains("Choose connection · Google")
+    });
+    let mark = terminal.mark();
     terminal.send(b"\r");
     terminal.wait_for_frame_after(mark, "prefilled service-account path", |frame| {
         frame.contains("Service account · Google") && frame.contains("service account.json")
@@ -377,12 +657,17 @@ fn vertex_service_account_save_retry_and_reconfigure_preserve_model_and_other_ke
     assert_eq!(fs::read(workdir.join("state/.env")).unwrap(), saved);
     let mark = terminal.mark();
     terminal.send(b"\x1b\x1b");
-    terminal.wait_for_frame_after(mark, "cancel returns to connections", |frame| {
-        frame.contains("Choose connection · Google") && !frame.contains("Service account · Google")
+    terminal.wait_for_frame_after(mark, "cancel returns to models", |frame| {
+        frame.contains("Choose model · Google") && !frame.contains("Service account · Google")
     });
+    terminal.close_model_picker();
     fs::remove_file(&source).unwrap();
+    terminal.send(b"/provider\r");
+    terminal.wait_for("Choose Provider");
+    terminal.select_row("Google");
+    terminal.wait_for("Choose connection · Google");
     let mark = terminal.mark();
-    terminal.send(b"\r");
+    terminal.select_row("Vertex service account");
     terminal.wait_for_frame_after(mark, "broken path remains configurable", |frame| {
         frame.contains("Service account · Google") && frame.contains("JSON file path:")
     });
@@ -750,14 +1035,7 @@ fn empty_model_picker_can_configure_a_provider_and_preserves_drafts_on_key_updat
     let mark = terminal.mark();
     terminal.send(b"\r");
     terminal.wait_for("API key saved to Agent .env.");
-    terminal.wait_for_frame_after(mark, "newly configured models", |frame| {
-        frame.contains("Choose model Provider")
-            && frame.contains("Picker Fixture")
-            && !frame.contains("Fixture Messages Two")
-    });
-    let mark = terminal.mark();
-    terminal.send(b"\r");
-    terminal.wait_for_frame_after(mark, "new connection models", |frame| {
+    terminal.wait_for_frame_after(mark, "newly configured connection models", |frame| {
         frame.contains("Choose model · Picker Fixture") && frame.contains("Fixture Messages Two")
     });
     assert!(!workdir.join("state/settings.json").exists());
@@ -843,18 +1121,14 @@ fn provider_reauthentication_removes_only_its_saved_key_and_requires_entry_again
     terminal.wait_for("API key: ********");
     terminal.send(b"\r");
     terminal.wait_for("API key saved to Agent .env.");
-    terminal.wait_for("Choose Provider");
+    terminal.wait_for("Choose model · Picker Fixture");
     assert!(
         fs::read_to_string(&env_file)
             .unwrap()
             .contains(TEST_KEY_NAME)
     );
     terminal.wait_for("API key saved");
-    let mark = terminal.mark();
-    terminal.send(b"\x1b");
-    terminal.wait_for_frame_after(mark, "prompt after reauthentication", |frame| {
-        !frame.contains("Choose Provider") && frame.contains("picker-messages-service")
-    });
+    terminal.close_model_picker();
     terminal.exit();
     assert!(!terminal.output.lock().unwrap().contains(TEST_KEY));
 }
@@ -1030,16 +1304,13 @@ fn api_key_menu_saves_private_env_and_restarted_model_uses_it_on_loopback() {
     assert!(!terminal.output.lock().unwrap().contains(TEST_KEY));
     let mark = terminal.mark();
     terminal.send(b"\r");
-    terminal.wait_for_frame_after(mark, "saved key returns to Provider", |frame| {
-        frame.contains("Choose Provider")
+    terminal.wait_for_frame_after(mark, "saved key opens its models", |frame| {
+        frame.contains("Choose model · Picker Fixture")
             && frame.contains("API key saved")
             && !frame.contains("API key ·")
     });
-    let mark = terminal.mark();
-    terminal.send(b"\x1b");
-    terminal.wait_for_frame_after(mark, "Provider closed before model choice", |frame| {
-        !frame.contains("Choose Provider")
-    });
+    assert!(!state.join("settings.json").exists());
+    terminal.close_model_picker();
     terminal.send(b"/model\r");
     terminal.wait_for("Choose model");
     terminal.send(b"\r");

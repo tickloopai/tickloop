@@ -108,7 +108,9 @@ use style::Role;
 const DISCONNECTED_CACHED_VIEW_NOTICE: &str = "Disconnected · cached view";
 const VIEW_REGISTRATION_UNAVAILABLE_NOTICE: &str = "View registration unavailable";
 use subscription_surface::SubscriptionEffect;
-use tickloop_agent::agent_access::ConfigurationChange;
+use tickloop_agent::agent_access::{
+    AgentDetailQuery, ConfigurationChange, ObservationRequest, ObservationValue,
+};
 
 use task_access::{ShellTaskCenter, ShellTaskSubscription};
 /// How often an open subscription view re-reads the Agent's snapshot; an unchanged one repaints
@@ -131,6 +133,59 @@ const COMMAND_OUTPUT_BYTES: usize = 16 * 1024;
 const ANIMATION_FRAME_DURATION: std::time::Duration = std::time::Duration::from_millis(32);
 /// The activity shown while a run works without an in-progress todo.
 const WORKING_ACTIVITY: &str = "Working";
+
+struct RunningActivity {
+    chat_id: uuid::Uuid,
+    label: String,
+    started_at: Option<std::time::Instant>,
+    interruptible: bool,
+}
+
+impl RunningActivity {
+    fn spans(
+        &self,
+        console: &Console,
+        preview: Option<&ThinkingPreview>,
+        shimmer: &RunningShimmer,
+    ) -> Result<Vec<(String, Option<Role>)>, String> {
+        let reduced_motion = console.display_preferences()?.prefers_reduced_motion;
+        if let Some(preview) = preview {
+            return Ok(preview.spans(console.conversation_width()?, reduced_motion));
+        }
+        let mut row = style::RoleLine::default();
+        row.push("• ", Some(Role::MutedText));
+        shimmer.append(&mut row, &self.label, reduced_motion);
+        let mut details = self
+            .started_at
+            .map(|started| format_activity_elapsed(started.elapsed()))
+            .into_iter()
+            .collect::<Vec<_>>();
+        if self.interruptible {
+            details.push("Esc to interrupt".into());
+        }
+        if !details.is_empty() {
+            row.push(format!(" ({})", details.join(" · ")), Some(Role::MutedText));
+        }
+        Ok(row
+            .spans
+            .into_iter()
+            .map(|span| (span.text, span.role))
+            .collect())
+    }
+}
+
+fn format_activity_elapsed(elapsed: std::time::Duration) -> String {
+    let seconds = elapsed.as_secs() % 60;
+    let minutes = elapsed.as_secs() / 60 % 60;
+    let hours = elapsed.as_secs() / 3600;
+    if hours > 0 {
+        format!("{hours}h {minutes}m {seconds}s")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
 
 fn write_pending_reply_lines(console: &Console, reply: &mut ReplyLines) -> Result<(), String> {
     let _frame_hold = console.hold_frames()?;
@@ -176,6 +231,38 @@ fn write_next_reply_line(console: &Console, reply: &mut ReplyLines) -> Result<()
     }
     console.write_markdown(&line, starts_message)?;
     Ok(())
+}
+
+fn write_completion_notice(console: &Console, usage: &Usage) -> Result<(), String> {
+    let display = console.display_profile()?;
+    let interactive = console.is_interactive();
+    console.write_completion_notice(&[
+        ((if interactive { "\n\n" } else { "\n" }).into(), None),
+        (
+            if interactive {
+                format!("{} Done", display.glyph(Glyph::Success))
+            } else {
+                "Reply completed".into()
+            },
+            Some(Role::Success),
+        ),
+        (usage_text(usage), Some(Role::MutedText)),
+        ("\n".into(), None),
+    ])
+}
+
+fn ends_thinking(kind: &EventKind) -> bool {
+    matches!(
+        kind,
+        EventKind::Text(_)
+            | EventKind::ToolStarted { .. }
+            | EventKind::PermissionRequested { .. }
+            | EventKind::QuestionAsked { .. }
+            | EventKind::ModelRetry { .. }
+            | EventKind::Completed { .. }
+            | EventKind::Failed(_)
+            | EventKind::Interrupted
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -439,6 +526,10 @@ Usage: tickloop [--config FILE] [--cwd DIRECTORY]
        [--working-directory-is-trusted]
        [-c | --continue | -r [CHAT] | --resume [CHAT] | --chat-id CHAT] [--fork-session]
        [--no-session-persistence]
+       tickloop service stop
+
+service stop ends the local Agent service and its running Agents; saved history is kept.
+Run tickloop again to start this build. TICKLOOP_AGENT_RUNTIME_DIR selects the service.
 
 The working directory must exist; omitting --cwd uses the current directory.
 Unknown directories require interactive trust. --working-directory-is-trusted is an explicit host assertion for externally controlled automation and does not save trust.
@@ -844,27 +935,19 @@ async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Result<(
         .map(|root| root.canonicalize().unwrap_or_else(|_| root.clone()));
     console.configure_image_cache(image_cache_root.as_deref())?;
     console.set_input_context(None, &workdir, &[])?;
-    console.update_status_area(
+    initialize_startup_console(
+        console,
+        &config,
+        &workdir,
         execution_mode_override
             .or_else(|| {
                 user_settings
                     .as_ref()
                     .and_then(UserSettings::default_execution_mode)
             })
-            .unwrap_or_default()
-            .to_string(),
-        safe_text(&config.model),
-        None,
-        Vec::new(),
-        Vec::new(),
+            .unwrap_or_default(),
+        startup_settings_warnings,
     )?;
-    write_banner(console, &config, &workdir)?;
-    show_settings_warnings(console, startup_settings_warnings)?;
-    console.set_status(&safe_text(&format!(
-        "{} · {:?} · Ready",
-        config.model, config.protocol
-    )))?;
-    console.set_prompt_enabled(true)?;
     let result = interact(
         &agent,
         workdir,
@@ -900,6 +983,25 @@ struct StartupState {
     chat: StartupChat,
     explicit_provider: Option<ProviderPatch>,
     user_settings: Option<UserSettings>,
+}
+
+fn initialize_startup_console(
+    console: &Console,
+    config: &ModelConfig,
+    workdir: &std::path::Path,
+    execution_mode: ExecutionMode,
+    warnings: Vec<String>,
+) -> Result<(), String> {
+    console.update_status_area(
+        execution_mode.to_string(),
+        safe_text(&config.model),
+        None,
+        Vec::new(),
+        Vec::new(),
+    )?;
+    write_banner(console, config, workdir)?;
+    show_settings_warnings(console, warnings)?;
+    console.set_prompt_enabled(true)
 }
 
 /// 按 `--fork-session` 恢复或复制已保存的 Chat，错误文案照 Claude Code。
@@ -946,6 +1048,13 @@ fn write_banner(
         );
         return Ok(());
     }
+    console.write_roles(&startup_banner_spans(config, workdir))
+}
+
+fn startup_banner_spans(
+    config: &ModelConfig,
+    workdir: &std::path::Path,
+) -> Vec<(String, Option<Role>)> {
     let directory = workdir.to_string_lossy().into_owned();
     let directory = match std::env::var("HOME") {
         Ok(home) if !home.is_empty() && directory.starts_with(&home) => {
@@ -953,7 +1062,7 @@ fn write_banner(
         }
         _ => directory,
     };
-    console.write_roles(&[
+    vec![
         ("Tick Loop Agent".into(), Some(Role::Title)),
         (
             format!(" v{}\n", env!("CARGO_PKG_VERSION")),
@@ -967,7 +1076,7 @@ fn write_banner(
             format!("{}\n", safe_text(&directory)),
             Some(Role::MutedText),
         ),
-    ])
+    ]
 }
 
 async fn interact(
@@ -1005,6 +1114,8 @@ async fn interact(
     transcript_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut animation_refresh = tokio::time::interval(ANIMATION_FRAME_DURATION);
     animation_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut elapsed_refresh = tokio::time::interval(std::time::Duration::from_secs(1));
+    elapsed_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut working_shimmer = RunningShimmer::default();
     let task_center = ShellTaskCenter::new(agent.clone());
     let mut task_subscription = None;
@@ -1043,7 +1154,7 @@ async fn interact(
     let mut global_refresh = tokio::time::interval(std::time::Duration::from_secs(1));
     global_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut ui_selected = selected_chat;
-    let mut background_notice: Option<(uuid::Uuid, String)> = None;
+    let mut background_notice: Option<(uuid::Uuid, BackgroundRunNotice)> = None;
     let mut transcript_write_error = None;
     let mut loop_trigger_notices: Vec<(uuid::Uuid, String)> = Vec::new();
     let mut displayed_sequences: HashMap<uuid::Uuid, u64> = HashMap::new();
@@ -1051,6 +1162,11 @@ async fn interact(
     let mut eof = false;
     let mut failed = false;
     let mut status_dirty = true;
+    let mut activity_dirty = false;
+    let mut running_activity: Option<RunningActivity> = None;
+    // A replayed or restored run has no known start; only a live Started event begins this clock.
+    let mut observed_run_starts = HashMap::new();
+    let mut cached_activity_status: Option<(uuid::Uuid, String)> = None;
     let mut menu_outcome: Option<MenuOutcome> = None;
     let mut draft_question = None;
     let mut menu_commands = VecDeque::new();
@@ -1096,6 +1212,7 @@ async fn interact(
         registration
     });
     loop {
+        observed_run_starts.retain(|run, _| pending.contains_key(run));
         if let Some(chat) = selected_chat {
             selected_loops.insert(chat, goal);
         }
@@ -1280,6 +1397,9 @@ async fn interact(
             }
         }
         if interactive && status_dirty {
+            running_activity = None;
+            cached_activity_status = None;
+            console.set_activity_interruptible(false)?;
             if overview_active {
                 // The overview heading and dispatch line carry counts and directory; the status
                 // row keeps the latest action feedback until another action replaces it.
@@ -1308,6 +1428,7 @@ async fn interact(
                     snapshot.accepts_images(),
                     snapshot.highest_pasted_image_id(),
                 )?;
+                reconcile_consumed_input_echoes(console, &snapshot)?;
                 let task_snapshot = task_center
                     .snapshot(chat)
                     .await
@@ -1319,19 +1440,52 @@ async fn interact(
                     task_status_items(&task_snapshot),
                     todo_status_items(&snapshot, goal),
                 )?;
-                let running_loop = pending
+                let running_receipt = pending
                     .values()
-                    .find(|receipt| receipt.chat_id == chat)
-                    .map(|receipt| receipt.loop_id);
+                    .find(|receipt| {
+                        receipt.chat_id == chat
+                            && snapshot.loops.iter().any(|goal| {
+                                goal.run_id == Some(receipt.run_id)
+                                    && goal.state == tickloop_agent::runtime::LoopState::Running
+                            })
+                    })
+                    .or_else(|| pending.values().find(|receipt| receipt.chat_id == chat));
+                let running_loop = running_receipt.map(|receipt| receipt.loop_id);
                 let run_is_working = running_loop.is_some();
                 let mut activity: Option<Vec<(String, Option<Role>)>> = None;
-                console.set_connection_notice(
-                    agent.disconnected().or_else(|| owner_unreachable.clone()),
-                )?;
-                let state = if let Some(error) = agent.disconnected() {
-                    format!(
-                        "Disconnected · cached execution · {error} · use /resume to load history"
-                    )
+                let connection = execution_connection_notice(
+                    &global.projection().rows,
+                    chat,
+                    agent.disconnected().is_some(),
+                    !snapshot.loops.is_empty()
+                        && snapshot.loops.iter().all(|goal| {
+                            goal.state == tickloop_agent::runtime::LoopState::Completed
+                        })
+                        && !pending.values().any(|receipt| receipt.chat_id == chat)
+                        && agent.unknown_input(chat).is_none()
+                        && snapshot.queued_inputs().is_empty()
+                        && snapshot.user_shells.iter().all(|record| {
+                            matches!(
+                                record.state,
+                                UserShellState::Completed | UserShellState::Failed
+                            )
+                        }),
+                    owner_unreachable.is_some(),
+                );
+                if connection.is_some() {
+                    console.set_execution_connection_notice(
+                        connection,
+                        agent.disconnected().or_else(|| owner_unreachable.clone()),
+                    )?;
+                } else if let Some(notice) = owner_unreachable.clone() {
+                    console.set_connection_notice(Some(notice))?;
+                } else {
+                    console.set_execution_connection_notice(connection, agent.disconnected())?;
+                }
+                let state = if connection
+                    .is_some_and(|notice| notice != console::ExecutionConnectionNotice::CachedView)
+                {
+                    String::new()
                 } else if logout.is_some() {
                     "Removing Codex login · Esc cancels".to_owned()
                 } else if !snapshot.permissions.is_empty() {
@@ -1346,39 +1500,31 @@ async fn interact(
                 } else if summary_recovery_required.contains(&chat) {
                     "Restart required".to_owned()
                 } else if directed_summaries.contains(chat) || run_is_working {
+                    let working = RunningActivity {
+                        chat_id: chat,
+                        label: working_activity(&snapshot, running_loop),
+                        started_at: running_receipt
+                            .and_then(|receipt| observed_run_starts.get(&receipt.run_id).copied()),
+                        interruptible: owner_unreachable.is_none()
+                            && agent.disconnected().is_none()
+                            && global.projection().rows.iter().any(|row| {
+                                row.chat_id == chat
+                                    && row.availability
+                                        == crate::agent_access::ExecutionAvailability::Live
+                                    && row
+                                        .capabilities
+                                        .iter()
+                                        .any(|capability| capability == "loop")
+                            }),
+                    };
                     let preview = pending.iter().find_map(|(run_id, receipt)| {
                         (receipt.chat_id == chat && thinking_runs.contains(run_id))
                             .then(|| thinking_previews.get(run_id))
                             .flatten()
                     });
-                    if let Some(preview) = preview {
-                        activity = Some(preview.spans(
-                            console.conversation_width()?,
-                            console.display_preferences()?.prefers_reduced_motion,
-                        ));
-                    } else {
-                        let mut row = style::RoleLine::default();
-                        row.push("• ", Some(Role::MutedText));
-                        working_shimmer.append(
-                            &mut row,
-                            &working_activity(&snapshot, running_loop),
-                            console.display_preferences()?.prefers_reduced_motion,
-                        );
-                        row.push(
-                            format!(
-                                " · {} · {:?}",
-                                safe_text(&snapshot.model.model),
-                                snapshot.model.protocol
-                            ),
-                            Some(Role::MutedText),
-                        );
-                        activity = Some(
-                            row.spans
-                                .into_iter()
-                                .map(|span| (span.text, span.role))
-                                .collect(),
-                        );
-                    }
+                    activity = Some(working.spans(console, preview, &working_shimmer)?);
+                    console.set_activity_interruptible(working.interruptible)?;
+                    running_activity = Some(working);
                     "Working".to_owned()
                 } else if foreground_shells.contains_key(&chat) {
                     "Shell running".to_owned()
@@ -1386,7 +1532,7 @@ async fn interact(
                     "Ready".to_owned()
                 };
                 let status = format!(
-                    "{}{}{}{}{}{}",
+                    "{}{}{}{}{}",
                     if state == "Ready" || state.contains("Working") || state == "Shell running" {
                         ""
                     } else {
@@ -1402,13 +1548,6 @@ async fn interact(
                     } else {
                         ""
                     },
-                    background_wait(selected_chat, &pending, &permissions, &questions)
-                        .map(|wait| background_wait_status(
-                            &wait,
-                            &background_label(agent, console, wait.chat_id)
-                        ))
-                        .or_else(|| background_notice.as_ref().map(|(_, notice)| notice.clone()))
-                        .map_or_else(String::new, |notice| format!(" · {notice}")),
                     transcript_write_error
                         .as_ref()
                         .map_or_else(String::new, |error| format!(" · Not saved: {error}")),
@@ -1418,12 +1557,54 @@ async fn interact(
                         .map(|(_, message)| format!(" · Trigger: {message}"))
                         .collect::<String>(),
                 );
+                let displayed_background =
+                    background_wait(selected_chat, &pending, &permissions, &questions)
+                        .map(|wait| {
+                            let message = match wait.kind {
+                                BackgroundWaitKind::Approval => "waiting for approval",
+                                BackgroundWaitKind::Answer => "waiting for your answer",
+                            };
+                            (
+                                wait.chat_id,
+                                BackgroundRunNotice {
+                                    message: message.into(),
+                                    compact_message: None,
+                                    necessary: true,
+                                },
+                                Role::Permission,
+                            )
+                        })
+                        .or_else(|| {
+                            background_notice.clone().map(|(chat, notice)| {
+                                let role = if notice.necessary {
+                                    Role::Warning
+                                } else {
+                                    Role::MutedText
+                                };
+                                (chat, notice, role)
+                            })
+                        });
+                console.set_background_status_notice(
+                    displayed_background
+                        .map(|(chat, notice, role)| {
+                            console.background_status_notice(
+                                agent.cached_title(chat),
+                                notice.message,
+                                notice.compact_message,
+                                notice.necessary,
+                                role,
+                            )
+                        })
+                        .transpose()?,
+                )?;
+                cached_activity_status = Some((chat, safe_text(status.trim_start_matches(" · "))));
                 console.set_activity_and_status(
                     activity.as_deref(),
                     &safe_text(status.trim_start_matches(" · ")),
                 )?;
             } else {
                 console.set_activity(None)?;
+                console.set_background_status_notice(None)?;
                 console.set_footer_items(Vec::new())?;
                 if let Ok(draft) = agent.configuration(ConfigTarget::NewDraft).await {
                     console.update_status_area(
@@ -1436,6 +1617,29 @@ async fn interact(
                 }
             }
             status_dirty = false;
+            activity_dirty = false;
+        }
+        if interactive && activity_dirty {
+            if !overview_active
+                && let Some(chat) = selected_chat
+                && let Some((cached_chat, status)) = &cached_activity_status
+                && *cached_chat == chat
+            {
+                let activity = running_activity
+                    .as_ref()
+                    .filter(|activity| activity.chat_id == chat)
+                    .map(|activity| {
+                        let preview = pending.iter().find_map(|(run_id, receipt)| {
+                            (receipt.chat_id == chat)
+                                .then(|| thinking_previews.get(run_id))
+                                .flatten()
+                        });
+                        activity.spans(console, preview, &working_shimmer)
+                    })
+                    .transpose()?;
+                console.set_activity_and_status(activity.as_deref(), status)?;
+            }
+            activity_dirty = false;
         }
         if login.is_none() && !overview_active {
             menus
@@ -1458,7 +1662,6 @@ async fn interact(
             && compactions.is_empty()
             && directed_summaries.is_empty()
             && deferred_events.is_empty()
-            && !thinking_previews.values().any(ThinkingPreview::has_pending)
             && !reply_lines.values().any(ReplyLines::has_complete_line)
             && login.is_none()
             && logout.is_none()
@@ -1475,8 +1678,10 @@ async fn interact(
         let summary_input_locked =
             !directed_summaries.is_empty() || !summary_recovery_required.is_empty();
         let visual_pacing_pending = interactive
-            && (thinking_previews.values().any(ThinkingPreview::has_pending)
-                || reply_lines.values().any(ReplyLines::has_complete_line));
+            && !overview_active
+            && reply_lines
+                .values()
+                .any(|reply| Some(reply.chat_id) == selected_chat && reply.has_complete_line());
         let has_visible_running_task = interactive && console.has_visible_running_task()?;
         let prefers_reduced_motion =
             interactive && console.display_preferences()?.prefers_reduced_motion;
@@ -1541,6 +1746,9 @@ async fn interact(
                 // Opening the overview, navigating, restoring or any other View action may show
                 // the conversation again, so a merged-input block only spans uninterrupted events.
                 merged_echoes.close_all();
+                if !matches!(&line,Some(InputEvent::Line(input)|InputEvent::Prompt {text:input,..}) if !input.trim_start().starts_with('/')) {
+                    merged_echoes.next_submission_block();
+                }
                 match line {
                 None | Some(InputEvent::Eof) => {
                     if interactive { return Ok(()); }
@@ -1640,13 +1848,6 @@ async fn interact(
                         continue;
                     }
                     if console.close_transcript()? { continue; }
-                    if let Some(chat) = selected_chat
-                        && pending.values().any(|receipt| receipt.chat_id == chat)
-                    {
-                        agent.interrupt(chat).await.map_err(|error|error.to_string())?;
-                        stop_visual_pacing(console,chat,&pending,&mut thinking_previews,&mut reply_lines,&mut unpaced_runs)?;
-                        status_dirty=true;
-                    }
                 },
                 Some(InputEvent::Interrupt) if logout_active => {
                     logout.as_ref().unwrap().cancel();
@@ -1702,6 +1903,10 @@ async fn interact(
                         continue;
                     }
                     if console.close_transcript()? { continue; }
+                    if overview_active {
+                        if console.confirm_control_c_exit()? {return Ok(());}
+                        continue;
+                    }
                     if let Some(chat)=selected_chat
                         && let Some(command_id)=foreground_shells.get(&chat).copied()
                     {
@@ -1728,6 +1933,19 @@ async fn interact(
                     {
                         agent.interrupt(chat).await.map_err(|error|error.to_string())?;
                         stop_visual_pacing(console,chat,&pending,&mut thinking_previews,&mut reply_lines,&mut unpaced_runs)?;
+                        status_dirty=true;
+                    }
+                },
+                Some(InputEvent::InterruptActivity) => {
+                    let Some(chat) = selected_chat.filter(|chat| running_activity.as_ref().is_some_and(|activity| activity.chat_id == *chat && activity.interruptible)) else { continue; };
+                    if pending.values().any(|receipt| receipt.chat_id == chat) || directed_summaries.contains(chat) {
+                        match agent.interrupt(chat).await {
+                            Ok(_) => {
+                                stop_visual_pacing(console,chat,&pending,&mut thinking_previews,&mut reply_lines,&mut unpaced_runs)?;
+                                if directed_summaries.contains(chat) { outln!(console,"\nCancelling conversation summary…"); }
+                            },
+                            Err(error) => console.set_status(&format!("Cannot interrupt: {}",safe_text(&error.to_string())))?,
+                        }
                         status_dirty=true;
                     }
                 },
@@ -2113,16 +2331,13 @@ async fn interact(
                         status_dirty=true;continue;
                     }
                     if selected_chat.is_some() && agent.disconnected().is_some()
-                        && !matches!(line.trim(),"/exit"|"/clear"|"/status"|"/help"|"/help advanced"|"/resume"|"/tui")
+                        && !matches!(line.trim(),"/exit"|"/clear"|"/status"|"/help"|"/help advanced"|"/resume"|"/tui"|"/details")
                         && !line.trim().starts_with("/resume ") {
                         console.restore_rejected_prompt(restored_contexts,"This execution is unavailable; inspect cached history or use /resume explicitly")?;
                         continue;
                     }
-                    // An unchanged restored draft retries an input whose echo is already shown.
-                    let mut echo=match retry_of {
-                        None=>console.record_input(&line)?,
-                        Some(id)=>merged_echoes.take_unknown(id),
-                    };
+                    // Retrying an unchanged draft checks its receipt without another optimistic echo.
+                    let mut echo=if retry_of.is_none() {console.record_input(&line)?} else {None};
                     let record_after_chat = is_user_prompt
                         && selected_chat.is_none()
                         && !line.trim_start().starts_with('/');
@@ -2148,10 +2363,12 @@ async fn interact(
                                 crate::agent_access::CommandResult::Queued { command_id }=>Some(command_id),
                                 _=>None,
                             }).await {
-                                InputSend::Accepted { adopted: Some(id), .. }=>console.set_status(&input_adopted(id))?,
-                                InputSend::Accepted { adopted: None, .. }=>console.set_status("Command queued until the current turn ends")?,
+                                InputSend::Accepted { adopted, .. }=>{
+                                    if let Some(echo)=echo {console.withdraw_echo(Some(chat),echo)?;}
+                                    console.set_status(&adopted.map(input_adopted).unwrap_or_else(||"Command queued until the current turn ends".into()))?;
+                                },
                                 InputSend::Unknown(id, error)=>{
-                                    merged_echoes.unknown(id,echo);
+                                    if let Some(echo)=echo {console.withdraw_echo(Some(chat),echo)?;}
                                     console.restore_unknown_prompt(restored_contexts,&safe_line(&error.to_string()),Some(id))?;
                                 },
                                 InputSend::Held(error)=>{
@@ -2721,13 +2938,14 @@ async fn interact(
                             let sent=send_input(agent,chat_id,retry_of,agent.invoke_skill(chat_id, goal, name, arguments),submitted_receipt).await;
                             match sent {
                                 InputSend::Accepted { value: receipt, adopted } => {
+                                    echo=track_accepted_echo(console,agent,&receipt,echo).await?;
                                     merged_echoes.accepted(receipt.run_id,echo);
                                     goal = Some(receipt.loop_id);
                                     if !interactive {outln!(console, "Accepted: Goal {} · Run {}", receipt.loop_id, receipt.run_id);}
                                     track_accepted_input(console,agent,receipt,adopted,&mut pending,&mut permissions,&mut questions).await?;
                                 },
                                 InputSend::Unknown(id, error) => {
-                                    merged_echoes.unknown(id,echo);
+                                    if let Some(echo)=echo {console.withdraw_echo(Some(chat_id),echo)?;}
                                     outln!(console, "Failed: {}", safe_text(&error.to_string()));
                                     console.restore_unknown_prompt(restored_contexts,&safe_line(&error.to_string()),Some(id))?;
                                 },
@@ -2776,6 +2994,7 @@ async fn interact(
                             );
                             match send_input(agent,chat_id,retry_of,submission,submitted_receipt).await {
                                 InputSend::Accepted { value: receipt, adopted } => {
+                                    echo=track_accepted_echo(console,agent,&receipt,echo).await?;
                                     merged_echoes.accepted(receipt.run_id,echo);
                                     goal = Some(receipt.loop_id);
                                     if !interactive {outln!(console, "Accepted: Goal {} · Run {}", receipt.loop_id, receipt.run_id);}
@@ -2788,7 +3007,7 @@ async fn interact(
                                     failed=true;
                                 },
                                 InputSend::Unknown(id, error) => {
-                                    merged_echoes.unknown(id,echo);
+                                    if let Some(echo)=echo {console.withdraw_echo(Some(chat_id),echo)?;}
                                     outln!(console, "Failed: {}", safe_text(&error.to_string()));
                                     console.restore_unknown_prompt(submitted_contexts,&safe_line(&error.to_string()),Some(id))?;
                                     failed=true;
@@ -2846,6 +3065,16 @@ async fn interact(
                 }
                 match &event {
                     Ok(event) => {
+                        if matches!(event.kind,EventKind::Started) && event.sequence>*displayed_sequences.get(&event.chat_id).unwrap_or(&0) {
+                            pending.entry(event.run_id).or_insert(Receipt {chat_id:event.chat_id,loop_id:event.loop_id,run_id:event.run_id});
+                            observed_run_starts.entry(event.run_id).or_insert_with(std::time::Instant::now);
+                            #[cfg(test)]
+                            agent.record_recovery_fact(recovery_tests::RecoveryFact::LiveRunStarted {chat:event.chat_id,run:event.run_id,overview:overview_active});
+                        }
+                        if matches!(event.kind,EventKind::Started|EventKind::InputMerged {..}) {
+                            let echo=show_consumed_input(console,agent,event).await?;
+                            merged_echoes.consumed_echo(event.run_id,echo);
+                        }
                         if let Some((previous,current))=merged_echoes.observe(event,displayed_sequences.get(&event.chat_id).copied().unwrap_or(0)) {console.join_inputs(event.chat_id,previous,current)?;}
                         #[cfg(test)]
                         if let EventKind::InputMerged { into_run_id } = &event.kind {
@@ -2856,6 +3085,10 @@ async fn interact(
                 }
                 match event {
                 Ok(event) if !overview_active && (pending.contains_key(&event.run_id) || Some(event.chat_id)==selected_chat) => {
+                    if Some(event.chat_id)==selected_chat && matches!(event.kind,EventKind::Started|EventKind::InputMerged {..})
+                        && let Ok(snapshot)=agent.snapshot(event.chat_id).await {
+                        show_consumed_agent_message(console,&snapshot,event.run_id)?;
+                    }
                     transcript_dirty |= Some(event.chat_id)==selected_chat;
                     if event.sequence<=*displayed_sequences.get(&event.chat_id).unwrap_or(&0) {
                         #[cfg(test)]
@@ -2873,8 +3106,8 @@ async fn interact(
                             thinking_runs.insert(event.run_id);
                             if interactive && Some(event.chat_id) == selected_chat && !unpaced_runs.contains(&event.run_id) {
                                 let preview = thinking_previews.entry(event.run_id).or_default();
-                                preview.enqueue(thinking);
-                                preview.advance();
+                                preview.append(thinking);
+                                activity_dirty = true;
                             }
                         },
                         EventKind::Text(_)
@@ -2891,7 +3124,7 @@ async fn interact(
                     if stopped_thinking {
                         thinking_previews.remove(&event.run_id);
                     }
-                    status_dirty |= !matches!(&event.kind, EventKind::Text(_)) || was_thinking != thinking_runs.contains(&event.run_id);
+                    status_dirty |= !matches!(&event.kind, EventKind::Text(_) | EventKind::Thinking(_)) || stopped_thinking;
                     track_run_requests(&event,&mut pending,&mut permissions,&mut questions);
                     if matches!(&event.kind,EventKind::Failed(_)) {
                         failed=true;
@@ -2900,7 +3133,6 @@ async fn interact(
                         }
                     }
                     if matches!(&event.kind,EventKind::Started) {
-                        pending.entry(event.run_id).or_insert(Receipt {chat_id:event.chat_id,loop_id:event.loop_id,run_id:event.run_id});
                         working_shimmer.reset();
                     }
                     if matches!(&event.kind, EventKind::ConversationRewound { .. }) {
@@ -3020,12 +3252,7 @@ async fn interact(
                         EventKind::Completed {usage} => {
                             #[cfg(test)]
                             agent.record_recovery_fact(recovery_tests::RecoveryFact::Completed {chat:event.chat_id,run:event.run_id,sequence:event.sequence});
-                            console.write_completion_notice(&[
-                                ((if interactive {"\n\n"} else {"\n"}).into(), None),
-                                ((if interactive {format!("{} Done", console.display_profile()?.glyph(Glyph::Success))} else {"Reply completed".into()}), Some(Role::Success)),
-                                (usage_text(&usage), Some(Role::MutedText)),
-                                ("\n".into(), None),
-                            ])?;
+                            write_completion_notice(console, &usage)?;
                         },
                         EventKind::Failed(error) => {
                             let message = if interactive {
@@ -3117,7 +3344,7 @@ async fn interact(
                             outln!(console, "\nContext compaction: {status:?}");
                             if let Some(error)=error {outln!(console, "{}",safe_text(&error));}
                         },
-                        EventKind::ToolStarted {..} | EventKind::ToolCompleted {..} => {},
+                        EventKind::ToolStarted {..} | EventKind::ToolCompleted {..} | EventKind::AgentMessageQueued {..} => {},
                     }
 
                 },
@@ -3132,7 +3359,7 @@ async fn interact(
                     deferred_events.clear();
                     transcript_dirty = true;
                     status_dirty = true;
-                    if let Some(chat)=selected_chat {
+                    if !overview_active && let Some(chat)=selected_chat {
                         let frame_hold=console.hold_frames()?;
                         outln!(console, "The view fell behind; restoring it from saved execution events.");
                         let observation=restore_view(console, agent,&mut tools,chat,*displayed_sequences.get(&chat).unwrap_or(&0),&mut reply_lines).await?;
@@ -3141,9 +3368,9 @@ async fn interact(
                         displayed_sequences.insert(chat,observation.snapshot.last_sequence);
                         sync_snapshot(&observation.snapshot,&mut pending,&mut permissions,&mut questions);
                     }
-                    let mut background_snapshots=agent.list_chats().await.into_iter().filter(|snapshot|Some(snapshot.id)!=selected_chat).collect::<Vec<_>>();
+                    let mut background_snapshots=agent.list_chats().await.into_iter().filter(|snapshot|overview_active || Some(snapshot.id)!=selected_chat).collect::<Vec<_>>();
                     let unlisted_chats=pending.values().map(|receipt|receipt.chat_id)
-                        .filter(|chat|Some(*chat)!=selected_chat&&!background_snapshots.iter().any(|snapshot|snapshot.id==*chat))
+                        .filter(|chat|(overview_active || Some(*chat)!=selected_chat)&&!background_snapshots.iter().any(|snapshot|snapshot.id==*chat))
                         .collect::<HashSet<_>>();
                     for chat in unlisted_chats {
                         match agent.snapshot(chat).await {
@@ -3160,7 +3387,8 @@ async fn interact(
                         let recovery=recover_background_chat(snapshot,&background_label(agent,console,snapshot.id),&mut pending,&mut permissions,&mut questions);
                         failed |= recovery.failed;
                         if !interactive {
-                            for notice in recovery.run_notices.iter().chain(&recovery.request_notices) {outln!(console,"Background {notice}");}
+                            for notice in &recovery.run_notices {outln!(console,"Background {}",notice.text(&background_label(agent,console,snapshot.id)));}
+                            for notice in &recovery.request_notices {outln!(console,"Background {notice}");}
                         }
                         if let Some(notice)=recovery.run_notices.last() {background_notice=Some((snapshot.id,notice.clone()));}
                     }
@@ -3273,8 +3501,16 @@ async fn interact(
                         // A run whose execution the owner has lost can no longer report its end.
                         for notice in end_runs_of_lost_executions(&projection.rows,&mut pending,&mut permissions,&mut questions) {
                             failed=true;
-                            if Some(notice.chat)==selected_chat || !interactive {outln!(console,"{}",notice.text);}
-                            else {background_notice=Some((notice.chat,notice.text));}
+                            if interactive {
+                                let label=readable_background_label(agent,console,notice.chat);
+                                console.record_execution_loss(notice.chat,console::ExecutionLossNotice {
+                                    run_id:notice.run,
+                                    summary:format!("\n{label} · Execution connection was lost · outcome unknown for that attempt; nothing was resent. Use /resume to open saved history; continuing requires an explicit new input.\n"),
+                                    technical:notice.text,
+                                })?;
+                                transcript_dirty |= Some(notice.chat)==selected_chat;
+                            } else {outln!(console,"{}",notice.text);}
+                            if Some(notice.chat)!=selected_chat {background_notice=Some((notice.chat,BackgroundRunNotice { message: "Outcome unknown · execution lost · nothing resent".into(), compact_message: Some("Unknown/lost/no resend".into()), necessary: true }));}
                         }
                         console.set_creation_notice(creation_notice(&projection))?;
                         if overview_active {console.set_global_overview(Some(agent_overview(&projection)))?;}
@@ -3304,9 +3540,12 @@ async fn interact(
                                             } else {
                                                 let recovery=recover_background_chat(&snapshot,&background_label(agent,console,snapshot.id),&mut pending,&mut permissions,&mut questions);
                                                 failed |= recovery.failed;
-                                                for notice in recovery.run_notices.into_iter().chain(recovery.request_notices) {
-                                                    if !interactive {outln!(console,"Background {notice}");}
+                                                for notice in recovery.run_notices {
+                                                    if !interactive {outln!(console,"Background {}",notice.text(&background_label(agent,console,snapshot.id)));}
                                                     background_notice=Some((snapshot.id,notice));
+                                                }
+                                                for notice in recovery.request_notices {
+                                                    if !interactive {outln!(console,"Background {notice}");}
                                                 }
                                             }
                                             continue;
@@ -3321,30 +3560,50 @@ async fn interact(
                             }
                             else {visible_family.clear();console.set_agent_family(Vec::new(),None)?;}
                         } else {visible_family.clear();console.set_agent_family(Vec::new(),None)?;}
+                        let background_request_chats=permissions.values()
+                            .filter_map(|run|pending.get(run).map(|receipt|receipt.chat_id))
+                            .chain(questions.values().map(|request|request.chat_id))
+                            .filter(|chat|!visible_family.contains(chat))
+                            .collect::<HashSet<_>>();
+                        for chat in background_request_chats {
+                            // A cached snapshot cannot prove that another View resolved a request.
+                            if let Ok(execution)=agent.reference(chat).await
+                                && let Ok(observation)=agent.access().observe(ObservationRequest::Agent {
+                                    execution,detail:AgentDetailQuery::Snapshot,after:None,
+                                }).await
+                                && let ObservationValue::Agent(snapshot)=observation.initial
+                            {
+                                sync_snapshot_requests(&snapshot.conversation,&pending,&mut permissions,&mut questions);
+                            }
+                        }
                         let live_visible=selected_chat.filter(|chat|visible_rows.iter().any(|row|row.chat_id==*chat && row.availability==crate::agent_access::ExecutionAvailability::Live));
                         owner_unreachable=None;
                         let notice=if let Err(error)=agent.display_chat(if overview_active {None}else{live_visible}).await {
                             Some(format!("{VIEW_REGISTRATION_UNAVAILABLE_NOTICE} · {}",safe_line(&error.to_string())))
                         } else if let Err(error)=agent.renew_display().await {
                             Some(format!("View connection unavailable · {}",safe_line(&error.to_string())))
-                        } else {agent.disconnected()};
-                        console.set_connection_notice(notice)?;
+                        } else {None};
+                        if notice.is_some() || selected_chat.is_none() || overview_active {
+                            console.set_connection_notice(notice.or_else(||agent.disconnected()))?;
+                        }
                         status_dirty=true;
                     }
                     Err(error)=>{
                         owner_unreachable=Some(format!("{DISCONNECTED_CACHED_VIEW_NOTICE} · {}",safe_text(&error.to_string())));
-                        console.set_connection_notice(owner_unreachable.clone())?;
+                        if !overview_active && selected_chat.is_some() {
+                            status_dirty=true;
+                        } else {console.set_connection_notice(owner_unreachable.clone())?;}
                     }
                 }
             },
             _ = animation_refresh.tick(), if interactive && !prefers_reduced_motion && !visual_pacing_pending && (!pending.is_empty() || !directed_summaries.is_empty() || has_visible_running_task) => {
-                status_dirty = true;
+                activity_dirty = true;
+            },
+            _ = elapsed_refresh.tick(), if interactive && prefers_reduced_motion && !visual_pacing_pending && running_activity.as_ref().is_some_and(|activity| activity.started_at.is_some()) => {
+                activity_dirty = true;
             },
             _ = tokio::task::yield_now(), if visual_pacing_pending => {
-                if let Some(preview) = thinking_previews.values_mut().find(|preview| preview.has_pending()) {
-                    preview.advance();
-                    status_dirty = true;
-                } else if let Some(reply) = reply_lines.values_mut().find(|reply| reply.has_complete_line()) {
+                if let Some(reply) = reply_lines.values_mut().find(|reply| Some(reply.chat_id) == selected_chat && reply.has_complete_line()) {
                     write_next_reply_line(console, reply)?;
                 }
             },
@@ -3425,7 +3684,12 @@ async fn interact(
                 Ok(notification) => {
                     let notice=format!("{} · {}",background_label(agent,console,notification.chat_id),safe_line(&notification.summary));
                     if !interactive {outln!(console,"Background {notice}");}
-                    background_notice=Some((notification.chat_id,notice));
+                    let (message, necessary) = match notification.status {
+                        TaskNotificationStatus::Completed => ("Shell task completed", false),
+                        TaskNotificationStatus::Failed => ("Shell task failed", true),
+                        TaskNotificationStatus::Killed => ("Shell task killed", false),
+                    };
+                    background_notice=Some((notification.chat_id,BackgroundRunNotice { message: message.into(), compact_message: None, necessary }));
                     status_dirty=true;
                 },
                 Err(broadcast::error::RecvError::Lagged(_)) => {},
@@ -3828,11 +4092,7 @@ fn sync_snapshot(
     questions: &mut HashMap<uuid::Uuid, QuestionRequest>,
 ) {
     use tickloop_agent::runtime::LoopState;
-    permissions.retain(|_, run| {
-        pending
-            .get(run)
-            .is_some_and(|receipt| receipt.chat_id != snapshot.id)
-    });
+    sync_snapshot_requests(snapshot, pending, permissions, questions);
     pending.retain(|_, receipt| receipt.chat_id != snapshot.id);
     for input in snapshot.pending_inputs.iter().filter(|input| input.armed) {
         pending.insert(input.receipt.run_id, input.receipt.clone());
@@ -3853,6 +4113,19 @@ fn sync_snapshot(
             );
         }
     }
+}
+
+fn sync_snapshot_requests(
+    snapshot: &tickloop_agent::runtime::ChatSnapshot,
+    pending: &HashMap<uuid::Uuid, Receipt>,
+    permissions: &mut HashMap<uuid::Uuid, uuid::Uuid>,
+    questions: &mut HashMap<uuid::Uuid, QuestionRequest>,
+) {
+    permissions.retain(|_, run| {
+        pending
+            .get(run)
+            .is_some_and(|receipt| receipt.chat_id != snapshot.id)
+    });
     for request in &snapshot.permissions {
         permissions.insert(request.id, request.run_id);
     }
@@ -3933,7 +4206,33 @@ async fn restore_view(
             outln!(console, "Failed: {}", safe_text(error));
         }
     } else {
+        let mut thinking_runs = HashSet::new();
+        let mut message_groups = MessageGroups::default();
+        for event in conversation_events
+            .iter()
+            .filter(|event| event.sequence <= after)
+        {
+            message_groups.message_id(event);
+            if matches!(event.kind, EventKind::Thinking(_)) {
+                thinking_runs.insert(event.run_id);
+            } else if ends_thinking(&event.kind) {
+                thinking_runs.remove(&event.run_id);
+            }
+        }
         for event in &observation.events {
+            if matches!(
+                event.kind,
+                EventKind::Started | EventKind::InputMerged { .. }
+            ) {
+                show_consumed_agent_message(console, &observation.snapshot, event.run_id)?;
+            }
+            if matches!(
+                event.kind,
+                EventKind::Started | EventKind::InputMerged { .. }
+            ) && let Some(input) = consumed_input_text(&observation.snapshot, event.run_id)
+            {
+                console.record_consumed_input(chat, event.run_id, &safe_text(input))?;
+            }
             if matches!(
                 event.kind,
                 EventKind::Thinking(_)
@@ -3951,20 +4250,51 @@ async fn restore_view(
             if matches!(event.kind, EventKind::Failed(_)) {
                 buffered_replies.remove(&event.run_id);
             }
+            let message_id = message_groups.message_id(event);
+            let console = &console.for_message(message_id.clone());
+            if matches!(event.kind, EventKind::Thinking(_)) {
+                thinking_runs.insert(event.run_id);
+            } else if ends_thinking(&event.kind)
+                && thinking_runs.remove(&event.run_id)
+                && console.is_interactive()
+            {
+                console.write_roles(&[(
+                    "\n∴ Thinking (ctrl+o to expand)\n".into(),
+                    Some(Role::MutedText),
+                )])?;
+            }
+            match &event.kind {
+                EventKind::ToolCompleted { call_id, .. } => {
+                    console.finish_tool_call(Some(call_id))?
+                }
+                EventKind::Completed { .. } | EventKind::Failed(_) | EventKind::Interrupted => {
+                    console.finish_tool_call(None)?
+                }
+                _ => {}
+            }
             tools.record(event);
-            if let Some(rendered) = tools.render_event(event) {
-                out!(console, "{}", rendered);
+            if let Some(rendered) = tools.render_event_roles(event, console.display_profile()?) {
+                match &event.kind {
+                    EventKind::ToolStarted { call_id, .. }
+                        if console.is_interactive() && !tools.is_detailed() =>
+                    {
+                        console.write_tool_call(call_id, &rendered)?
+                    }
+                    _ => console.write_roles(&rendered)?,
+                }
                 continue;
             }
             match &event.kind {
                 EventKind::Thinking(thinking) => {
-                    console.write(&safe_text(thinking))?;
+                    if !console.is_interactive() {
+                        console.write(&safe_text(thinking))?;
+                    }
                 }
                 EventKind::Text(text) if !failed_runs.contains(&event.run_id) => {
                     if console.is_interactive() {
                         let reply = buffered_replies
                             .entry(event.run_id)
-                            .or_insert_with(|| ReplyLines::new(event.chat_id, None));
+                            .or_insert_with(|| ReplyLines::new(event.chat_id, message_id));
                         reply.push(&safe_text(text));
                         write_pending_reply_lines(console, reply)?;
                     } else {
@@ -3972,7 +4302,10 @@ async fn restore_view(
                     }
                 }
                 EventKind::Completed { usage } => {
-                    outln!(console, "\nReply completed{}", usage_text(usage))
+                    write_completion_notice(console, usage)?;
+                }
+                EventKind::Started if console.is_interactive() => {
+                    console.hide_completion_notice()?;
                 }
                 EventKind::Failed(error) => outln!(console, "\nFailed: {}", safe_text(error)),
                 EventKind::ModelRetry {
@@ -4037,6 +4370,7 @@ async fn restore_view(
             }
         }
     }
+    reconcile_consumed_input_echoes(console, &observation.snapshot)?;
     if !console.is_interactive() {
         outln!(console,);
         for goal in &observation.snapshot.loops {
@@ -4677,6 +5011,11 @@ async fn ensure_chat(
     {
         return Ok(*id);
     }
+    let draft = agent
+        .configuration(ConfigTarget::NewDraft)
+        .await
+        .map_err(|error| error.to_string())?;
+    let startup_banner = startup_banner_spans(&draft.model, workdir);
     let (id, unapplied) = match agent.create_from_draft(workdir.to_path_buf()).await {
         Ok(id) => (id, None),
         Err(DraftCreationError::NotCreated(error)) => {
@@ -4733,7 +5072,7 @@ async fn ensure_chat(
         }
     };
     *selected = Some(id);
-    console.select_chat(Some(id))?;
+    console.select_created_chat(id, &startup_banner)?;
     console.set_input_context(Some(id), workdir, &[])?;
     agent
         .display_chat(Some(id))
@@ -4757,10 +5096,10 @@ async fn ensure_chat(
 struct MergedEchoes {
     /// Accepted message runs not yet merged, started or taken back, with the echo shown for each.
     accepted: HashMap<uuid::Uuid, InputEcho>,
+    input_blocks: HashMap<uuid::Uuid, u64>,
+    submission_block: u64,
     /// Per chat, the latest live merge a following merge may continue.
     open: HashMap<uuid::Uuid, MergeCursor>,
-    /// Echoes of inputs whose acceptance is unknown, by command id, until a retry adopts one.
-    unknown: HashMap<uuid::Uuid, InputEcho>,
 }
 
 /// A chat's latest live InputMerged: the run it joined, its event sequence and the input's echo.
@@ -4768,23 +5107,21 @@ struct MergeCursor {
     into_run: uuid::Uuid,
     sequence: u64,
     echo: InputEcho,
+    submission_block: Option<u64>,
 }
 
 impl MergedEchoes {
     fn accepted(&mut self, run: uuid::Uuid, echo: Option<InputEcho>) {
+        self.input_blocks
+            .entry(run)
+            .or_insert(self.submission_block);
+        self.consumed_echo(run, echo);
+    }
+
+    fn consumed_echo(&mut self, run: uuid::Uuid, echo: Option<InputEcho>) {
         if let Some(echo) = echo {
             self.accepted.insert(run, echo);
         }
-    }
-
-    fn unknown(&mut self, command: uuid::Uuid, echo: Option<InputEcho>) {
-        if let Some(echo) = echo {
-            self.unknown.insert(command, echo);
-        }
-    }
-
-    fn take_unknown(&mut self, command: uuid::Uuid) -> Option<InputEcho> {
-        self.unknown.remove(&command)
     }
 
     /// Follows one event of a chat shown through `displayed_through`; returns the two echoes to
@@ -4809,6 +5146,9 @@ impl MergedEchoes {
         let current = consumed
             .then(|| self.accepted.remove(&event.run_id))
             .flatten();
+        let submission_block = consumed
+            .then(|| self.input_blocks.remove(&event.run_id))
+            .flatten();
         if event.sequence <= displayed_through {
             return None;
         }
@@ -4822,16 +5162,24 @@ impl MergedEchoes {
                 into_run: *into_run_id,
                 sequence: event.sequence,
                 echo: current,
+                submission_block,
             },
         );
         let previous = previous?;
-        (previous.into_run == *into_run_id && previous.sequence + 1 == event.sequence)
+        (previous.into_run == *into_run_id
+            && previous.sequence + 1 == event.sequence
+            && submission_block.is_some()
+            && previous.submission_block == submission_block)
             .then_some((previous.echo, current))
     }
 
     /// Ends every open block, as after missed events or when the View shows something else.
     fn close_all(&mut self) {
         self.open.clear();
+    }
+
+    fn next_submission_block(&mut self) {
+        self.submission_block = self.submission_block.wrapping_add(1);
     }
 }
 
@@ -4857,6 +5205,9 @@ async fn ensure_chat_for_input(
         Err(error) => {
             if creates_agent && let Some(echo) = echo.take() {
                 console.withdraw_echo(echoed_in, echo)?;
+                if *selected != echoed_in {
+                    console.withdraw_echo(*selected, echo)?;
+                }
             }
             return Ok(Err(error));
         }
@@ -4864,6 +5215,7 @@ async fn ensure_chat_for_input(
     if creates_agent && echoed_in != Some(chat) {
         if let Some(echo) = echo.take() {
             console.withdraw_echo(echoed_in, echo)?;
+            console.withdraw_echo(Some(chat), echo)?;
         }
         *echo = console.record_input(input)?;
     }
@@ -4941,6 +5293,160 @@ fn submitted_receipt(result: crate::agent_access::CommandResult) -> Option<Recei
 
 fn input_adopted(id: uuid::Uuid) -> String {
     format!("Input {id} was already accepted; nothing was resent")
+}
+
+fn consumed_input_text(snapshot: &ChatSnapshot, input: uuid::Uuid) -> Option<&str> {
+    snapshot
+        .messages
+        .iter()
+        .enumerate()
+        .find_map(|(index, message)| {
+            if snapshot.message_runs.get(&index) != Some(&input)
+                || message.role != tickloop_agent::model::Role::User
+            {
+                return None;
+            }
+            if snapshot
+                .message_ids
+                .get(&index)
+                .is_some_and(|id| snapshot.agent_message_origins.contains_key(id))
+            {
+                return None;
+            }
+            message.content.iter().find_map(|content| match content {
+                tickloop_agent::model::Content::Text { text }
+                    if presentation::typed_local_message(text, false).is_none()
+                        && !conversation::is_interruption_placeholder(message.role, text) =>
+                {
+                    Some(text.as_str())
+                }
+                _ => None,
+            })
+        })
+}
+
+fn show_consumed_agent_message(
+    console: &Console,
+    snapshot: &ChatSnapshot,
+    run: uuid::Uuid,
+) -> Result<(), String> {
+    for (index, message) in snapshot.messages.iter().enumerate() {
+        let Some(id) = snapshot
+            .message_ids
+            .get(&index)
+            .filter(|id| snapshot.agent_message_origins.contains_key(id))
+        else {
+            continue;
+        };
+        if snapshot.message_runs.get(&index) != Some(&run)
+            || console.input_is_echoed(snapshot.id, *id)?
+        {
+            continue;
+        }
+        for content in &message.content {
+            if let tickloop_agent::model::Content::Text { text } = content
+                && let Some(
+                    local @ tickloop_agent::runtime::LocalMessage::AgentCommunication { .. },
+                ) = tickloop_agent::runtime::LocalMessage::parse(text)
+            {
+                console.write_roles(&[(
+                    presentation::local_message_text(
+                        &local,
+                        presentation::OutputDetail::Preview,
+                        console.display_profile()?,
+                    ),
+                    Some(Role::MutedText),
+                )])?;
+            }
+        }
+        console.mark_input_echoes(snapshot.id, [*id])?;
+    }
+    Ok(())
+}
+
+async fn track_accepted_echo(
+    console: &Console,
+    agent: &Agent,
+    receipt: &Receipt,
+    echo: Option<InputEcho>,
+) -> Result<Option<InputEcho>, String> {
+    if !console.is_interactive() {
+        return Ok(echo);
+    }
+    if let Ok(snapshot) = agent.snapshot(receipt.chat_id).await
+        && let Some(input) = consumed_input_text(&snapshot, receipt.run_id)
+    {
+        if echo.is_some() {
+            console.mark_input_echoes(receipt.chat_id, [receipt.run_id])?;
+            return Ok(echo);
+        }
+        return console.record_consumed_input(receipt.chat_id, receipt.run_id, &safe_text(input));
+    }
+    if let Some(echo) = echo {
+        console.withdraw_echo(Some(receipt.chat_id), echo)?;
+    }
+    Ok(None)
+}
+
+async fn show_consumed_input(
+    console: &Console,
+    agent: &Agent,
+    event: &tickloop_agent::runtime::Event,
+) -> Result<Option<InputEcho>, String> {
+    if !console.is_interactive() || console.input_is_echoed(event.chat_id, event.run_id)? {
+        return Ok(None);
+    }
+    console.defer_input_echo(event.chat_id, event.run_id)?;
+    let Ok(snapshot) = agent.snapshot(event.chat_id).await else {
+        return Ok(None);
+    };
+    consume_input_echo_from_snapshot(console, &snapshot, event.run_id)
+}
+
+fn consume_input_echo_from_snapshot(
+    console: &Console,
+    snapshot: &ChatSnapshot,
+    input: uuid::Uuid,
+) -> Result<Option<InputEcho>, String> {
+    match consumed_input_text(snapshot, input) {
+        Some(text) => console.record_consumed_input(snapshot.id, input, &safe_text(text)),
+        None => {
+            let mut has_unshown_agent_message = false;
+            for (index, id) in &snapshot.message_ids {
+                if snapshot.message_runs.get(index) == Some(&input)
+                    && snapshot.agent_message_origins.contains_key(id)
+                    && !console.input_is_echoed(snapshot.id, *id)?
+                {
+                    has_unshown_agent_message = true;
+                    break;
+                }
+            }
+            if !has_unshown_agent_message && snapshot.message_runs.values().any(|run| *run == input)
+            {
+                console.finish_deferred_input_echo(snapshot.id, input)?;
+            }
+            Ok(None)
+        }
+    }
+}
+
+fn reconcile_consumed_input_echoes(
+    console: &Console,
+    snapshot: &ChatSnapshot,
+) -> Result<(), String> {
+    let mut inputs = console.awaiting_input_echoes(snapshot.id)?;
+    inputs.sort_by_key(|input| {
+        snapshot
+            .message_runs
+            .iter()
+            .find_map(|(index, run)| (*run == *input).then_some(*index))
+            .unwrap_or(usize::MAX)
+    });
+    for input in inputs {
+        show_consumed_agent_message(console, snapshot, input)?;
+        consume_input_echo_from_snapshot(console, snapshot, input)?;
+    }
+    Ok(())
 }
 
 /// Follows an accepted run. An adopted run may have ended while its acceptance was unknown, so
@@ -5279,14 +5785,31 @@ fn readable_background_label(agent: &Agent, console: &Console, chat: uuid::Uuid)
 }
 
 /// 后台 Chat 的运行结束时显示在状态栏的提示；不写入前台对话。
-fn background_run_notice(event: &tickloop_agent::runtime::Event, label: &str) -> Option<String> {
-    let outcome = match &event.kind {
-        EventKind::Completed { .. } => "reply completed".to_owned(),
-        EventKind::Failed(error) => format!("failed: {}", safe_line(error)),
-        EventKind::Interrupted => "interrupted".to_owned(),
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BackgroundRunNotice {
+    message: String,
+    compact_message: Option<String>,
+    necessary: bool,
+}
+
+impl BackgroundRunNotice {
+    fn text(&self, label: &str) -> String {
+        format!("{label} · {}", self.message)
+    }
+}
+
+fn background_run_notice(event: &tickloop_agent::runtime::Event) -> Option<BackgroundRunNotice> {
+    let (message, necessary) = match &event.kind {
+        EventKind::Completed { .. } => ("reply completed".to_owned(), false),
+        EventKind::Failed(error) => (format!("failed: {}", safe_line(error)), true),
+        EventKind::Interrupted => ("interrupted".to_owned(), false),
         _ => return None,
     };
-    Some(format!("{label} · {outcome}"))
+    Some(BackgroundRunNotice {
+        message,
+        compact_message: None,
+        necessary,
+    })
 }
 
 /// 后台 Chat 发出权限请求或提问时，管道模式输出的单行提示。
@@ -5307,7 +5830,7 @@ fn announce_background_event(
     console: &Console,
     event: &tickloop_agent::runtime::Event,
     label: &str,
-    background_notice: &mut Option<(uuid::Uuid, String)>,
+    background_notice: &mut Option<(uuid::Uuid, BackgroundRunNotice)>,
 ) -> Result<bool, String> {
     let interactive = console.is_interactive();
     if let Some(notice) = background_request_notice(event, label) {
@@ -5316,11 +5839,11 @@ fn announce_background_event(
         }
         return Ok(true);
     }
-    let Some(notice) = background_run_notice(event, label) else {
+    let Some(notice) = background_run_notice(event) else {
         return Ok(false);
     };
     if !interactive {
-        outln!(console, "Background {notice}");
+        outln!(console, "Background {}", notice.text(label));
     }
     *background_notice = Some((event.chat_id, notice));
     Ok(true)
@@ -5416,18 +5939,35 @@ fn background_wait(
     })
 }
 
-fn background_wait_status(wait: &BackgroundWait, label: &str) -> String {
-    let state = match wait.kind {
-        BackgroundWaitKind::Approval => "waiting for approval",
-        BackgroundWaitKind::Answer => "waiting for your answer",
-    };
-    format!("{label} · {state} · /resume {}", wait.chat_id)
-}
-
 /// A run that stopped being waited for because the owner reports its execution Lost.
 struct LostRunNotice {
     chat: uuid::Uuid,
+    run: uuid::Uuid,
     text: String,
+}
+
+fn execution_connection_notice(
+    rows: &[crate::agent_access::AgentSummary],
+    chat: uuid::Uuid,
+    disconnected: bool,
+    cached_completed: bool,
+    owner_unreachable: bool,
+) -> Option<console::ExecutionConnectionNotice> {
+    if rows.iter().any(|row| {
+        row.chat_id == chat && row.availability == crate::agent_access::ExecutionAvailability::Lost
+    }) {
+        Some(if cached_completed {
+            console::ExecutionConnectionNotice::LostHistory
+        } else {
+            console::ExecutionConnectionNotice::Lost
+        })
+    } else if disconnected {
+        Some(console::ExecutionConnectionNotice::CachedExecution)
+    } else if owner_unreachable {
+        Some(console::ExecutionConnectionNotice::CachedView)
+    } else {
+        None
+    }
 }
 
 /// Stops waiting for runs whose execution the owner reports Lost; their outcome is unknown and
@@ -5456,6 +5996,7 @@ fn end_runs_of_lost_executions(
             questions.retain(|_, question| question.run_id != receipt.run_id);
             LostRunNotice {
                 chat: receipt.chat_id,
+                run: receipt.run_id,
                 text: format!(
                     "Run {} has an unknown outcome: its Agent execution was lost; nothing was resent. /resume {} loads its history",
                     receipt.run_id, receipt.chat_id
@@ -5506,7 +6047,7 @@ fn input_closed_while_waiting(
 
 #[derive(Debug, Default, Eq, PartialEq)]
 struct BackgroundRecovery {
-    run_notices: Vec<String>,
+    run_notices: Vec<BackgroundRunNotice>,
     request_notices: Vec<String>,
     failed: bool,
 }
@@ -5553,7 +6094,11 @@ fn recover_background_chat(
             ) => continue,
             _ => "reply completed",
         };
-        recovery.run_notices.push(format!("{label} · {outcome}"));
+        recovery.run_notices.push(BackgroundRunNotice {
+            message: outcome.into(),
+            compact_message: None,
+            necessary: outcome == "failed",
+        });
     }
     for request in &snapshot.permissions {
         if !known_permissions.contains(&request.id) {
@@ -6092,6 +6637,46 @@ async fn navigate_agent(
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+
+    #[test]
+    fn consumed_agent_message_stays_deferred_until_the_selected_view_can_render_it() {
+        use super::{
+            ChatSnapshot, Console, consume_input_echo_from_snapshot,
+            reconcile_consumed_input_echoes,
+        };
+        let chat = uuid::Uuid::new_v4();
+        let run = uuid::Uuid::new_v4();
+        let source = uuid::Uuid::new_v4();
+        let text = format!(
+            "<agent-message>{}</agent-message>",
+            serde_json::json!({"source":{"sender_relationship":"child","sender_label":"Report check","is_result":false},"message":"Which year should I use?"})
+        );
+        let mut snapshot:ChatSnapshot=serde_json::from_value(serde_json::json!({"id":chat,"workdir":"/work","messages":[{"role":"user","content":[{"type":"text","text":text}]}],"loops":[]})).unwrap();
+        snapshot.message_ids.insert(0, source);
+        snapshot.message_runs.insert(0, run);
+        snapshot
+            .agent_message_origins
+            .insert(source, serde_json::json!({"sender_relationship":"child"}));
+        let (console, _) = Console::start(false).unwrap();
+        console.select_chat(Some(chat)).unwrap();
+        console.defer_input_echo(chat, run).unwrap();
+        assert!(
+            consume_input_echo_from_snapshot(&console, &snapshot, run)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            console.awaiting_input_echoes(chat).unwrap(),
+            vec![run],
+            "a successful human-source lookup must not discard the Agent echo before its separate snapshot read succeeds"
+        );
+        console.select_chat(None).unwrap();
+        assert_eq!(console.awaiting_input_echoes(chat).unwrap(), vec![run]);
+        console.select_chat(Some(chat)).unwrap();
+        reconcile_consumed_input_echoes(&console, &snapshot).unwrap();
+        assert!(console.awaiting_input_echoes(chat).unwrap().is_empty());
+        assert!(console.input_is_echoed(chat, source).unwrap());
+    }
     #[test]
     fn explicit_provider_yaml_selects_declared_default_model() {
         let directory = tempfile::tempdir().unwrap();
@@ -6133,8 +6718,8 @@ mod tests {
         test_support as support, tui_renderer_request,
     };
     use super::{
-        BackgroundRecovery, Receipt, UNLABELED_BACKGROUND_AGENT, background_wait,
-        background_wait_status, context_usage, input_closed_while_waiting,
+        BackgroundRecovery, BackgroundRunNotice, BackgroundWaitKind, Receipt,
+        UNLABELED_BACKGROUND_AGENT, background_wait, context_usage, input_closed_while_waiting,
         observe_user_shell_record, readable_background_label, recover_background_chat,
         todo_status_items, track_run_requests, working_activity,
     };
@@ -6961,10 +7546,9 @@ mod tests {
         assert!(pending.contains_key(&receipt.run_id));
         assert_eq!(permissions.get(&request.id), Some(&receipt.run_id));
         let wait = background_wait(foreground_chat, &pending, &permissions, &questions).unwrap();
-        assert_eq!(
-            background_wait_status(&wait, &label),
-            format!("{label} · waiting for approval · /resume {background_chat}")
-        );
+        assert_eq!(wait.kind, BackgroundWaitKind::Approval);
+        assert_eq!(wait.chat_id, background_chat);
+        assert_eq!(wait.request_id, request.id);
         let closed =
             input_closed_while_waiting(foreground_chat, &pending, &permissions, &questions)
                 .unwrap();
@@ -7000,7 +7584,11 @@ mod tests {
         assert_eq!(
             recovery,
             BackgroundRecovery {
-                run_notices: vec![format!("{label} · reply completed")],
+                run_notices: vec![BackgroundRunNotice {
+                    message: "reply completed".into(),
+                    compact_message: None,
+                    necessary: false
+                }],
                 request_notices: Vec::new(),
                 failed: false,
             }
@@ -7083,16 +7671,6 @@ mod tests {
         echoes.observe(&merged(5, 10, into), 0);
         echoes.close_all();
         assert_eq!(echoes.observe(&merged(6, 11, into), 0), None);
-
-        let mut echoes = MergedEchoes::default();
-        let command = Uuid::from_u128(20);
-        echoes.unknown(command, Some(alpha));
-        assert_eq!(echoes.take_unknown(command), Some(alpha));
-        assert_eq!(
-            echoes.take_unknown(command),
-            None,
-            "an unknown input's echo is adopted once"
-        );
     }
 
     #[test]

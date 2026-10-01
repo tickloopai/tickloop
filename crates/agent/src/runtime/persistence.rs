@@ -736,15 +736,17 @@ impl ChatRecorder {
             let message = snapshot.messages[index].clone();
             let role = message.role;
             let is_meta = log.meta_messages.contains(&index);
-            let prompt = (role == Role::User && !is_meta)
-                .then(|| typed_prompt(&message))
-                .flatten();
-            let blocks = message.content.len();
             let uuid = snapshot
                 .message_ids
                 .get(&index)
                 .copied()
                 .unwrap_or_else(Uuid::new_v4);
+            let prompt = (role == Role::User
+                && !is_meta
+                && !snapshot.agent_message_origins.contains_key(&uuid))
+            .then(|| typed_prompt(&message))
+            .flatten();
+            let blocks = message.content.len();
             let mut entry = chain_entry(snapshot, index, uuid, message, parent, &timestamp);
             if entry.is_compact_boundary() && entry.parent_uuid.is_none() {
                 entry.logical_parent_uuid = parent;
@@ -919,6 +921,11 @@ fn chain_entry(
             .and_then(|mode| serde_json::to_value(mode).ok()),
         is_inherited_prompt: snapshot.inherited_prompts.contains(&index),
         original_user_message_id: snapshot.original_user_message_ids.get(&index).copied(),
+        agent_message_origin: snapshot
+            .message_ids
+            .get(&index)
+            .and_then(|id| snapshot.agent_message_origins.get(id))
+            .cloned(),
         run_id: snapshot.message_runs.get(&index).copied(),
         contexts: snapshot
             .message_contexts
@@ -1039,6 +1046,7 @@ fn record_loop(
         execution_mode: None,
         is_inherited_prompt: false,
         original_user_message_id: None,
+        agent_message_origin: None,
         run_id,
         contexts: None,
         continues_message: false,
@@ -1123,7 +1131,12 @@ fn typed_prompt(message: &Message) -> Option<String> {
         })
         .collect::<Option<Vec<_>>>()?
         .join("\n");
-    (!text.trim().is_empty() && LocalMessage::parse(&text).is_none()).then_some(text)
+    (!text.trim().is_empty()
+        && matches!(
+            LocalMessage::parse(&text),
+            None | Some(LocalMessage::AgentCommunication { .. })
+        ))
+    .then_some(text)
 }
 
 /// 从工作目录向上查找 `.git/HEAD`；工作树中的 `.git` 文件按 `gitdir:` 跳转。不启动 git 进程。
@@ -1155,6 +1168,7 @@ struct RestoredChain {
     message_runs: BTreeMap<usize, RunId>,
     message_contexts: BTreeMap<usize, Vec<InputContext>>,
     message_ids: BTreeMap<usize, Uuid>,
+    agent_message_origins: BTreeMap<Uuid, serde_json::Value>,
     original_user_message_ids: BTreeMap<usize, Uuid>,
     prompt_execution_modes: BTreeMap<usize, ExecutionMode>,
     inherited_prompts: HashSet<usize>,
@@ -1184,6 +1198,7 @@ fn restore_chain(chain: &[ChainEntry]) -> (RestoredChain, Vec<String>) {
         message_runs: BTreeMap::new(),
         message_contexts: BTreeMap::new(),
         message_ids: BTreeMap::new(),
+        agent_message_origins: BTreeMap::new(),
         original_user_message_ids: BTreeMap::new(),
         prompt_execution_modes: BTreeMap::new(),
         inherited_prompts: HashSet::new(),
@@ -1272,6 +1287,12 @@ fn restore_chain(chain: &[ChainEntry]) -> (RestoredChain, Vec<String>) {
         if entry.is_inherited_prompt {
             restored.inherited_prompts.insert(index);
         }
+        if let Some(origin) = &entry.agent_message_origin {
+            restored.message_ids.insert(index, entry.uuid);
+            restored
+                .agent_message_origins
+                .insert(entry.uuid, origin.clone());
+        }
         if let Some(source_id) = entry.original_user_message_id {
             restored.original_user_message_ids.insert(index, source_id);
         }
@@ -1301,6 +1322,7 @@ fn restore_chain(chain: &[ChainEntry]) -> (RestoredChain, Vec<String>) {
         if let Some(execution_mode) = execution_mode
             && entry.message.role == Role::User
             && !entry.is_meta
+            && entry.agent_message_origin.is_none()
             && typed_prompt(&entry.message).is_some()
         {
             restored
@@ -1360,6 +1382,7 @@ impl RestoredChain {
             message_runs: BTreeMap::new(),
             message_contexts: BTreeMap::new(),
             message_ids: BTreeMap::new(),
+            agent_message_origins: self.agent_message_origins.clone(),
             original_user_message_ids: BTreeMap::new(),
             prompt_execution_modes: BTreeMap::new(),
             inherited_prompts: HashSet::new(),
@@ -1495,6 +1518,7 @@ impl RestoredChain {
         snapshot.message_runs = self.message_runs.clone();
         snapshot.message_contexts = self.message_contexts.clone();
         snapshot.message_ids = self.message_ids.clone();
+        snapshot.agent_message_origins = self.agent_message_origins.clone();
         snapshot.original_user_message_ids = self.original_user_message_ids.clone();
         snapshot.prompt_execution_modes = self.prompt_execution_modes.clone();
         snapshot.inherited_prompts = self.inherited_prompts.clone();

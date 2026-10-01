@@ -79,6 +79,8 @@ pub(crate) struct ChainEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub original_user_message_id: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_message_origin: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contexts: Option<serde_json::Value>,

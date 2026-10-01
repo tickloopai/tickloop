@@ -436,11 +436,13 @@ impl Agent {
                 receipt: new_receipt.clone(),
                 input: parsed.goal,
                 contexts: Vec::new(),
+                agent_message: None,
                 denial_reference: None,
                 trigger_source: None,
                 armed: true,
                 queued_sequence,
                 task_continuation: false,
+                is_skill_invocation: false,
                 attached_file_reads: Vec::new(),
             },
         );

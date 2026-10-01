@@ -41,6 +41,8 @@ pub struct BranchSessionPermissionRegistration {
 pub struct BranchPublicSource {
     pub chat_id: ChatId,
     pub run_id: Option<RunId>,
+    #[serde(default)]
+    pub is_agent_message: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -284,6 +286,7 @@ impl Agent {
             message_contexts: BTreeMap::new(),
             denial_references: BTreeMap::new(),
             message_ids: BTreeMap::new(),
+            agent_message_origins: source.snapshot.agent_message_origins.clone(),
             original_user_message_ids: BTreeMap::new(),
             prompt_execution_modes: BTreeMap::new(),
             inherited_prompts: HashSet::new(),
@@ -516,6 +519,10 @@ fn materialize_active_items(
                         source: BranchPublicSource {
                             chat_id: snapshot.id,
                             run_id,
+                            is_agent_message: snapshot
+                                .message_ids
+                                .get(&message_index)
+                                .is_some_and(|id| snapshot.agent_message_origins.contains_key(id)),
                         },
                         message: Message {
                             role: message.role,
@@ -532,6 +539,7 @@ fn materialize_active_items(
                 source: BranchPublicSource {
                     chat_id: snapshot.id,
                     run_id: None,
+                    is_agent_message: false,
                 },
                 direction,
                 summary,
@@ -1092,11 +1100,13 @@ mod tests {
                             },
                             input: "queued work".into(),
                             contexts: Vec::new(),
+                            agent_message: None,
                             denial_reference: None,
                             trigger_source: None,
                             armed: true,
                             queued_sequence: 1,
                             task_continuation: false,
+                            is_skill_invocation: false,
                             attached_file_reads: Vec::new(),
                         });
                 }
@@ -1233,6 +1243,7 @@ mod tests {
             source: BranchPublicSource {
                 chat_id: Uuid::from_u128(1),
                 run_id: Some(Uuid::from_u128(2)),
+                is_agent_message: false,
             },
             message: Message {
                 role: Role::User,

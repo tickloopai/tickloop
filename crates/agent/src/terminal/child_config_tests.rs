@@ -1006,7 +1006,10 @@ fn a_child_request_names_the_child_with_its_family_number_and_no_persistent_gran
     );
     view.send(b"\r");
     let finished = view.wait_for("the parent finishing after the approved child", |frame| {
-        frame.contains("Permission accepted") && frame.contains("parent done")
+        frame.contains("Permission accepted")
+            && frame.contains("parent done")
+            && !frame.contains("Permission required")
+            && frame.contains("reply completed")
     });
     let notices = finished
         .lines()

@@ -39,6 +39,8 @@ use crate::{
     settings::UserSettings,
 };
 
+mod service_control;
+
 const STARTUP_DEADLINE: Duration = Duration::from_secs(5);
 const CONNECT_INTERVAL: Duration = Duration::from_millis(25);
 const SOCKET_NAME: &str = "owner.sock";
@@ -179,6 +181,11 @@ impl WorkerFactory for ProcessWorkerFactory {
                         });
                         return Ok(access);
                     }
+                    Ok(Err(error))
+                        if error.code == crate::agent_access::AccessErrorCode::VersionMismatch =>
+                    {
+                        return Err(error);
+                    }
                     Ok(Err(error)) if Instant::now() >= deadline => return Err(error),
                     Err(_) => {
                         return Err(AccessError::unavailable("Agent worker handshake timed out"));
@@ -233,7 +240,7 @@ pub async fn connect_or_start_at(
     validate_directory(&directory)?;
     let endpoint = directory.join(SOCKET_NAME);
     check_socket_length(&endpoint)?;
-    if let Some(client) = connect_existing(&endpoint).await? {
+    if let Some(client) = connect_existing(&endpoint, &executable).await? {
         return Ok(client);
     }
     let lock = OpenOptions::new()
@@ -248,12 +255,12 @@ pub async fn connect_or_start_at(
     validate_file(&lock, "Agent owner lock")?;
     let deadline = Instant::now() + STARTUP_DEADLINE;
     if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-        if let Some(client) = connect_existing(&endpoint).await? {
+        if let Some(client) = connect_existing(&endpoint, &executable).await? {
             return Ok(client);
         }
         remove_stale_socket(&endpoint)?;
         let lock_fd = lock.as_raw_fd();
-        let mut command = std::process::Command::new(executable);
+        let mut command = std::process::Command::new(&executable);
         command
             .arg("--agent-owner")
             .arg(&directory)
@@ -284,7 +291,7 @@ pub async fn connect_or_start_at(
     }
     drop(lock);
     loop {
-        if let Some(client) = connect_existing(&endpoint).await? {
+        if let Some(client) = connect_existing(&endpoint, &executable).await? {
             return Ok(client);
         }
         if Instant::now() >= deadline {
@@ -294,13 +301,19 @@ pub async fn connect_or_start_at(
     }
 }
 
-async fn connect_existing(endpoint: &Path) -> Result<Option<LocalAgentClient>, String> {
+async fn connect_existing(
+    endpoint: &Path,
+    executable: &Path,
+) -> Result<Option<LocalAgentClient>, String> {
     if !endpoint.exists() {
         return Ok(None);
     }
     validate_socket(endpoint)?;
     match tokio::time::timeout(STARTUP_DEADLINE, LocalAgentClient::connect(endpoint)).await {
         Ok(Ok(client)) => Ok(Some(client)),
+        Ok(Err(error)) if error.code == crate::agent_access::AccessErrorCode::VersionMismatch => {
+            Err(incompatible_owner_guidance(executable))
+        }
         Ok(Err(error)) => {
             if matches!(
                 error.code,
@@ -320,10 +333,46 @@ async fn connect_existing(endpoint: &Path) -> Result<Option<LocalAgentClient>, S
     }
 }
 
+fn incompatible_owner_guidance(executable: &Path) -> String {
+    let executable = std::env::current_dir()
+        .ok()
+        .and_then(|directory| executable.strip_prefix(directory).ok())
+        .map(|relative| PathBuf::from(".").join(relative))
+        .unwrap_or_else(|| executable.to_path_buf());
+    let Some(executable) = executable.to_str() else {
+        return "Agent service version mismatch\n\nRun this build with service stop, then relaunch.\nThis stops running Agents. Saved history is kept.".into();
+    };
+    let mut stop = String::new();
+    if let Some(directory) = std::env::var_os("TICKLOOP_AGENT_RUNTIME_DIR") {
+        let Some(directory) = directory.to_str() else {
+            return "Agent service version mismatch\n\nKeep TICKLOOP_AGENT_RUNTIME_DIR unchanged. Run this build with service stop, then relaunch.\nThis stops running Agents. Saved history is kept.".into();
+        };
+        stop.push_str(&format!(
+            "TICKLOOP_AGENT_RUNTIME_DIR={} ",
+            shell_words::quote(directory),
+        ));
+    }
+    let mut launch = stop.clone();
+    if let Some(config) = std::env::var_os("TICKLOOP_CONFIG_DIR")
+        && let Some(config) = config.to_str()
+    {
+        launch.push_str(&format!(
+            "TICKLOOP_CONFIG_DIR={} ",
+            shell_words::quote(config),
+        ));
+    }
+    stop.push_str(&shell_words::quote(executable));
+    launch.push_str(&shell_words::quote(executable));
+    format!(
+        "Agent service version mismatch\n\nStop the service and relaunch:\n  {stop} service stop\n  {launch}\n\nThis stops running Agents. Saved history is kept."
+    )
+}
+
 pub async fn run_internal(arguments: &[OsString]) -> Option<Result<(), String>> {
     match arguments.first().and_then(|value| value.to_str()) {
         Some("--agent-owner") => Some(run_owner(arguments).await),
         Some("--agent-worker") => Some(run_worker(arguments).await),
+        Some("service") => Some(service_control::run(&arguments[1..]).await),
         _ => None,
     }
 }

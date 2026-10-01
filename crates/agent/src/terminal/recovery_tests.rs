@@ -11,6 +11,14 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+mod background_request_tests;
+mod hidden_view_recovery_tests;
+mod lost_presentation_tests;
+mod pending_input_tests;
+mod startup_status_tests;
+mod thinking_stream_tests;
+mod working_activity_tests;
+
 mod screen {
     include!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -44,6 +52,11 @@ pub(super) enum RecoveryFact {
         sequence: u64,
     },
     OverviewOpened,
+    LiveRunStarted {
+        chat: Uuid,
+        run: Uuid,
+        overview: bool,
+    },
     AgentOpened {
         chat: Uuid,
     },
@@ -1024,7 +1037,14 @@ fn routine_restore_pty_fixture() {
                 }
                 replies.push(test_support::text(ROUTINE_REPLY));
                 let expected_requests = replies.len();
-                let model = Arc::new(test_support::ScriptedModel::new(replies));
+                let model = Arc::new(test_support::ScriptedModel::with_usages(
+                    replies,
+                    vec![Usage {
+                        input_tokens: Some(31),
+                        output_tokens: Some(7),
+                        ..Usage::default()
+                    }; expected_requests],
+                ));
                 let core = runtime::Agent::new_embedded(test_support::config(), model.clone());
                 let workdir = std::env::current_dir().unwrap();
                 let access = EmbeddedAgentAccess::new(core.clone());
@@ -1179,6 +1199,319 @@ fn routine_restore_preserves_raw_user_model_and_read_tool_identifiers() {
 #[test]
 fn interactive_reset_keeps_the_retained_history_notice_and_raw_text() {
     run_routine_restore_pty(RESET_ROUTE);
+}
+
+struct RetainedCompletionModel {
+    turns: std::sync::atomic::AtomicUsize,
+}
+
+const RETAINED_COMPLETION_FIXTURE: &str = "TICKLOOP_RETAINED_COMPLETION_FIXTURE";
+const RETAINED_COMPLETION_STAGE: &str = "retained-completion-stage";
+
+#[async_trait]
+impl ModelClient for RetainedCompletionModel {
+    fn identity(&self) -> ModelIdentity {
+        ModelIdentity {
+            provider: ModelProvider::Api,
+            profile: "fixture".into(),
+            protocol: Protocol::Messages,
+            requested_model: "fixture".into(),
+        }
+    }
+
+    async fn complete(
+        &self,
+        _: ModelRequest,
+        events: mpsc::UnboundedSender<ModelDelta>,
+        cancel: CancellationToken,
+    ) -> Result<ModelOutput, ModelError> {
+        let turn = self.turns.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let (reply, input_tokens, output_tokens) = if turn == 0 {
+            ("First retained report.", 31, 7)
+        } else if turn == 1 {
+            for _ in 0..REPLAY_CAPACITY + 1 {
+                events
+                    .send(ModelDelta::Thinking("thinking ".into()))
+                    .unwrap();
+            }
+            ("Second retained report.", 117, 29)
+        } else {
+            let finish = format!("finish-{}", turn + 1);
+            while !std::fs::read_to_string(RETAINED_COMPLETION_STAGE)
+                .is_ok_and(|stage| stage == finish)
+            {
+                tokio::select! {
+                    _=cancel.cancelled()=>return Err(ModelError::Cancelled),
+                    _=tokio::time::sleep(Duration::from_millis(5))=>{},
+                }
+            }
+            if turn == 2 {
+                ("Third retained report.", 211, 53)
+            } else {
+                ("Fourth retained report.", 331, 67)
+            }
+        };
+        events.send(ModelDelta::Text(reply.into())).unwrap();
+        Ok(ModelOutput {
+            private_source: None,
+            content: test_support::text(reply),
+            usage: Usage {
+                input_tokens: Some(input_tokens),
+                output_tokens: Some(output_tokens),
+                ..Usage::default()
+            },
+            stop_reason: "end_turn".into(),
+        })
+    }
+}
+
+#[test]
+#[ignore = "owned PTY producer for the retained completion lifecycle regression"]
+fn retained_completion_lifecycle_pty_fixture() {
+    if std::env::var(RETAINED_COMPLETION_FIXTURE).as_deref() != Ok("1") {
+        return;
+    }
+    std::thread::Builder::new()
+        .name("retained-completion-fixture".into())
+        .stack_size(FIXTURE_STACK_BYTES)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            tokio::task::LocalSet::new()
+                .block_on(&runtime, run_retained_completion_lifecycle_fixture());
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+async fn run_retained_completion_lifecycle_fixture() {
+    let workdir = std::env::current_dir().unwrap();
+    let model = Arc::new(RetainedCompletionModel {
+        turns: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let core = runtime::Agent::new_embedded(test_support::config(), model.clone());
+    let access = EmbeddedAgentAccess::new(core.clone());
+    let mut launch = LaunchSpec::embedded(workdir.clone());
+    launch.model = Some(test_support::config());
+    launch.session_persistence = false;
+    let agent = Agent::from_access_for_test(
+        Arc::new(access.clone()),
+        access.owner_epoch(),
+        ViewRef {
+            session_id: Uuid::new_v4(),
+            view_id: Uuid::new_v4(),
+        },
+        launch,
+        None,
+    );
+    let chat = agent.create_chat(workdir.clone()).await.unwrap();
+    let mut receipts = Vec::new();
+    let mut snapshots = Vec::new();
+    for prompt in ["Read the first report.", "Read another report."] {
+        let loop_id = receipts.first().map(|receipt: &Receipt| receipt.loop_id);
+        let receipt = core.submit(chat, loop_id, prompt.into()).await.unwrap();
+        let snapshot = tokio::time::timeout(LAGGED_DRAIN_TIMEOUT, async {
+            loop {
+                let snapshot = core.snapshot(chat).await.unwrap();
+                if snapshot.loops.iter().any(|goal| {
+                    goal.run_id == Some(receipt.run_id)
+                        && goal.state == runtime::LoopState::Completed
+                }) {
+                    break snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        receipts.push(receipt);
+        snapshots.push(snapshot);
+    }
+    assert!(
+        snapshots[1]
+            .events
+            .iter()
+            .all(|event| event.run_id != receipts[0].run_id
+                || !matches!(event.kind, EventKind::Completed { .. }))
+    );
+    let (probe, mut facts) = mpsc::unbounded_channel();
+    agent.set_recovery_probe(probe);
+    let (console, input) = Console::start(true).unwrap();
+    console.set_prompt_enabled(true).unwrap();
+    let interaction_agent = agent.clone();
+    let interaction_console = console.clone();
+    let startup_snapshot = agent.snapshot(chat).await.unwrap();
+    let interaction = tokio::task::spawn_local(async move {
+        interact(
+            &interaction_agent,
+            workdir,
+            &interaction_console,
+            input,
+            StartupState {
+                chat: StartupChat::Resumed(Box::new(startup_snapshot), true),
+                explicit_provider: None,
+                user_settings: None,
+            },
+            None,
+        )
+        .await
+    });
+    tokio::task::yield_now().await;
+    let observation = restore_view(
+        &console,
+        &agent,
+        &mut ToolPresentation::new(false),
+        chat,
+        snapshots[0].last_sequence,
+        &mut HashMap::new(),
+    )
+    .await
+    .unwrap();
+    assert!(observation.reset_required);
+    assert_eq!(model.turns.load(std::sync::atomic::Ordering::SeqCst), 2);
+    write_phase(
+        serde_json::json!({"phase":"reset-completed","reset_required":observation.reset_required,"first_completion_evicted":true}),
+    );
+    for turn in [3, 4] {
+        next_fact(
+            &mut facts,
+            |fact| matches!(fact,RecoveryFact::LiveRunStarted {chat:started,..} if *started==chat),
+        )
+        .await;
+        write_phase(serde_json::json!({"phase":format!("started-{turn}")}));
+        let completed = next_fact(
+            &mut facts,
+            |fact| matches!(fact,RecoveryFact::Completed {chat:completed,..} if *completed==chat),
+        )
+        .await;
+        write_phase(serde_json::json!({"phase":format!("completed-{turn}"),"completed":completed}));
+    }
+    interaction.await.unwrap().unwrap();
+    assert_eq!(model.turns.load(std::sync::atomic::Ordering::SeqCst), 4);
+    core.shutdown().await;
+}
+
+#[test]
+fn real_event_overflow_restores_known_completion_once_without_inventing_evicted_usage() {
+    let directory = tempfile::tempdir_in("/tmp").unwrap();
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+    let phase_path = directory.path().join("retained-completion-phase.json");
+    let mut command = CommandBuilder::new(std::env::current_exe().unwrap());
+    command.args([
+        "--ignored",
+        "--exact",
+        "terminal::recovery_tests::retained_completion_lifecycle_pty_fixture",
+        "--nocapture",
+    ]);
+    command.env(RETAINED_COMPLETION_FIXTURE, "1");
+    command.env(PHASE_VARIABLE, &phase_path);
+    command.env("TICKLOOP_AGENT_TUI", "fullscreen");
+    command.env("TERM", "xterm-256color");
+    command.env("HOME", directory.path());
+    command.env("TICKLOOP_TMPDIR", directory.path());
+    command.cwd(directory.path());
+    let child = pair.slave.spawn_command(command).unwrap();
+    drop(pair.slave);
+    let mut reader = pair.master.try_clone_reader().unwrap();
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let captured = output.clone();
+    std::thread::spawn(move || {
+        let mut bytes = [0; 8192];
+        while let Ok(count) = reader.read(&mut bytes) {
+            if count == 0 {
+                break;
+            }
+            captured.lock().unwrap().extend_from_slice(&bytes[..count]);
+        }
+    });
+    let mut fixture = RecoveryPty {
+        child,
+        writer: pair.master.take_writer().unwrap(),
+        output,
+        _master: pair.master,
+        timeout: LAGGED_DRAIN_TIMEOUT,
+    };
+    let proof = fixture.wait_for_phase(&phase_path, "reset-completed");
+    assert_eq!(proof["reset_required"], true);
+    assert_eq!(proof["first_completion_evicted"], true);
+    let restored = fixture
+        .repaint_after_recovery("retained completion after real event overflow", |frame| {
+            frame.contains("Second retained report.") && frame.contains("✓ Done")
+        });
+    assert!(restored.contains("First retained report."), "{restored}");
+    assert!(
+        restored.contains("The saved event range changed"),
+        "{restored}"
+    );
+    assert_eq!(restored.matches("✓ Done").count(), 1, "{restored}");
+    assert!(
+        restored.contains("input tokens: 117, output tokens: 29"),
+        "{restored}"
+    );
+    assert!(!restored.contains("input tokens: 31"), "{restored}");
+    assert!(
+        restored.find("Second retained report.").unwrap() < restored.find("✓ Done").unwrap(),
+        "{restored}"
+    );
+    for (turn, reply, input_tokens, output_tokens) in [
+        (3, "Third retained report.", 211, 53),
+        (4, "Fourth retained report.", 331, 67),
+    ] {
+        fixture.send(format!("Read retained report {turn}.\r").as_bytes());
+        fixture.wait_for_phase(&phase_path, &format!("started-{turn}"));
+        let running = fixture
+            .repaint_after_recovery("a new Started hides the restored completion", |frame| {
+                frame.contains("Working (") && !frame.contains("✓ Done")
+            });
+        assert!(!running.contains("input tokens:"), "{running}");
+        std::fs::write(
+            directory.path().join(RETAINED_COMPLETION_STAGE),
+            format!("finish-{turn}"),
+        )
+        .unwrap();
+        fixture.wait_for_phase(&phase_path, &format!("completed-{turn}"));
+        let completed =
+            fixture.repaint_after_recovery("only the latest completion is visible", |frame| {
+                frame.contains(reply) && frame.contains("✓ Done") && !frame.contains("Working (")
+            });
+        assert_eq!(completed.matches("✓ Done").count(), 1, "{completed}");
+        assert!(
+            completed.contains(&format!(
+                "input tokens: {input_tokens}, output tokens: {output_tokens}"
+            )),
+            "{completed}"
+        );
+        assert!(
+            !completed.contains("input tokens: 117") && !completed.contains("input tokens: 31"),
+            "{completed}"
+        );
+        if turn == 4 {
+            assert!(!completed.contains("input tokens: 211"), "{completed}");
+        }
+    }
+    fixture.send(b"\x04\x04");
+    let deadline = Instant::now() + RECOVERY_TIMEOUT;
+    loop {
+        if let Some(status) = fixture.child.try_wait().unwrap() {
+            assert!(status.success(), "{}", fixture.raw_output());
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "retained completion producer did not exit"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[test]
@@ -1348,6 +1681,9 @@ fn run_routine_restore_pty(route: &str) {
                 ),
                 "{frame}"
             );
+            assert_eq!(frame.matches("✓ Done").count(), 1, "{frame}");
+            assert!(frame.contains("input tokens: 31"), "{frame}");
+            assert!(frame.contains("output tokens: 7"), "{frame}");
         } else {
             assert_eq!(
                 body(&frame),
@@ -1720,7 +2056,7 @@ fn run_merge_boundary_pty(route: &str) {
         fixture.send(format!("{input}\r").as_bytes());
         fixture.wait_for(input);
     }
-    fixture.wait_for("Queued 3");
+    fixture.wait_for("Messages to be submitted (3)");
     std::fs::write(directory.path().join("release-model"), "").unwrap();
     fixture.wait_for_phase(&phase_path, "merged-one");
     let restored_frame = if route == OVERVIEW_ROUTE {
@@ -1781,8 +2117,15 @@ fn run_merge_boundary_pty(route: &str) {
             "a restored input keeps its own prefix and separator: {frame}"
         );
         assert_eq!(
-            restored, frame,
-            "late replayed merges must leave the restored frame unchanged"
+            restored
+                .lines()
+                .filter(|line| !line.starts_with("• Working"))
+                .collect::<Vec<_>>(),
+            frame
+                .lines()
+                .filter(|line| !line.starts_with("• Working"))
+                .collect::<Vec<_>>(),
+            "late replayed merges must leave retained content unchanged as elapsed time advances"
         );
     } else {
         assert!(

@@ -21,6 +21,7 @@ enum ToolRoute {
     Skill,
     TickSubscription,
     Delegation,
+    AgentMessage,
     Host(Arc<dyn crate::host_tools::HostToolProvider>),
 }
 
@@ -86,6 +87,14 @@ impl ToolRegistry {
                     }),
             );
         }
+        tools.extend(
+            agent_messages::definitions(chat.snapshot.delegation.is_some())
+                .into_iter()
+                .map(|definition| RegisteredTool {
+                    definition,
+                    route: ToolRoute::AgentMessage,
+                }),
+        );
         if tick_stream_installed {
             tools.extend(
                 tick_subscriptions::definitions()
@@ -400,6 +409,16 @@ impl Agent {
         cancel: CancellationToken,
     ) -> Result<ToolResult, String> {
         match &registered.route {
+            ToolRoute::AgentMessage => {
+                self.agent_message_tool(
+                    receipt,
+                    &operation.call_id,
+                    &operation.name,
+                    &operation.input,
+                    cancel,
+                )
+                .await
+            }
             ToolRoute::Delegation => {
                 self.delegation_tool(receipt, &operation.call_id, &operation.input, cancel)
                     .await

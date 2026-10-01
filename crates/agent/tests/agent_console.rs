@@ -432,6 +432,24 @@ async fn overview_prioritizes_a_waiting_child_family_before_an_independent_runni
     assert_eq!(projection.waiting_permissions, 0);
     assert_eq!(projection.waiting_questions, 1);
     assert_eq!(projection.visible, Some(independent));
+    assert_eq!(
+        projection
+            .rows
+            .iter()
+            .find(|row| row.execution == parent)
+            .unwrap()
+            .title,
+        "Main · Run the bounded task."
+    );
+    assert_eq!(
+        projection
+            .rows
+            .iter()
+            .find(|row| row.execution == independent)
+            .unwrap()
+            .title,
+        "Run the bounded task."
+    );
     let family = console.family(parent);
     assert_eq!(family.len(), 2);
     assert_eq!(
@@ -464,6 +482,36 @@ async fn overview_prioritizes_a_waiting_child_family_before_an_independent_runni
     assert_eq!(visible_family.len(), 2);
     assert!(visible_family.iter().any(|row| row.execution == parent));
     assert!(visible_family.iter().any(|row| row.execution == child));
+    assert_eq!(
+        visible_family
+            .iter()
+            .find(|row| row.execution == parent)
+            .unwrap()
+            .title,
+        "Main · Run the bounded task."
+    );
+    let observed = access
+        .observe(ObservationRequest::Overview {
+            filter: AgentFilter::default(),
+            page: Page {
+                offset: 0,
+                limit: 20,
+            },
+            after: None,
+        })
+        .await
+        .unwrap();
+    let ObservationValue::Overview(canonical) = observed.initial else {
+        panic!("actual owner catalog")
+    };
+    assert_eq!(
+        canonical
+            .iter()
+            .find(|row| row.execution == parent)
+            .unwrap()
+            .title,
+        "Run the bounded task."
+    );
 }
 
 #[tokio::test]

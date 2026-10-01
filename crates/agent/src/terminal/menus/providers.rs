@@ -469,11 +469,13 @@ impl Menus {
                     || "Choose Provider".into(),
                     |name| format!("Choose connection · {name}"),
                 ),
-                context: vec![if group.is_some() {
+                context: vec![if self.model_return.is_some() {
+                    "Configure this connection; authentication success opens its models.".into()
+                } else if group.is_some() {
                     "Choose the product and service connection. Authentication is shown separately."
                         .into()
                 } else {
-                    "Configure connections and credentials. This does not change the Chat model."
+                    "Choose a connection, then a model. Unconfigured connections require authentication."
                         .into()
                 }],
                 options,
@@ -1004,6 +1006,28 @@ impl Menus {
         }
     }
 
+    pub(super) async fn choose_provider_models(
+        &mut self,
+        agent: &Agent,
+        console: &Console,
+        target: ConfigTarget,
+        provider: &str,
+    ) -> Result<(), String> {
+        let draft = self.model_return.take();
+        self.model_return = Some(ModelPickerDraft {
+            selected: draft.as_ref().and_then(|draft| {
+                draft
+                    .selected
+                    .as_ref()
+                    .filter(|(selected_provider, _)| selected_provider == provider)
+                    .cloned()
+            }),
+            choices: draft.map_or_else(|| self.model_choices.clone(), |draft| draft.choices),
+            provider: Some(provider.into()),
+        });
+        self.configured_models(agent, console, target).await
+    }
+
     pub(super) fn open_model_providers(
         &mut self,
         console: &Console,
@@ -1439,9 +1463,17 @@ impl Menus {
             if succeeded {
                 self.model_discovery
                     .invalidate(&provider.models[0].provider_id);
-            }
-            self.finish_provider_configuration(agent, console, target)
+                self.choose_provider_models(
+                    agent,
+                    console,
+                    target,
+                    &provider.models[0].provider_id,
+                )
                 .await?;
+            } else {
+                self.finish_provider_configuration(agent, console, target)
+                    .await?;
+            }
         }
         Ok(())
     }

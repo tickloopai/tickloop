@@ -1,3 +1,7 @@
+use std::io::{self, IsTerminal, Write};
+
+use crossterm::style::Stylize;
+
 const TERMINAL_WORKER_THREADS: usize = 2;
 
 fn main() {
@@ -14,7 +18,21 @@ fn main() {
         }
     });
     if let Err(error) = result {
-        eprintln!("Error: {}", tickloop_agent::terminal::safe_text(&error));
+        let stderr = io::stderr();
+        let use_color = stderr.is_terminal()
+            && std::env::var_os("NO_COLOR").is_none()
+            && std::env::var("TERM").is_ok_and(|term| term != "dumb");
+        let error = tickloop_agent::terminal::safe_text(&error);
+        let (title, body) = error.split_once('\n').unwrap_or((&error, ""));
+        let mut output = stderr.lock();
+        if use_color {
+            let _ = writeln!(output, "{}", format!("Error: {title}").red().bold());
+        } else {
+            let _ = writeln!(output, "Error: {title}");
+        }
+        if !body.is_empty() {
+            let _ = writeln!(output, "{body}");
+        }
         std::process::exit(1);
     }
 }

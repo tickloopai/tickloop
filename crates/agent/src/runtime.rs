@@ -32,6 +32,7 @@ pub use usage::{
     RequestUsageLedger, RequestUsageRecord, ResponseRejection, UsageCounter, UsageCoverage,
     UsageSummary,
 };
+mod agent_messages;
 mod compaction;
 mod context;
 mod delegation;
@@ -157,6 +158,10 @@ const SHELL_STATE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_m
 pub type ChatId = Uuid;
 pub type LoopId = Uuid;
 pub type RunId = Uuid;
+pub use agent_messages::{
+    AgentMessageSource, RECEIVE_AGENT_MESSAGE_TOOL_NAME, SEND_AGENT_MESSAGE_TOOL_NAME,
+    WAIT_FOR_AGENT_TOOL_NAME,
+};
 pub use delegation::{DELEGATE_AGENT_TOOL_NAME, DelegationCeiling, DelegationMetadata};
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -239,6 +244,8 @@ pub struct ChatSnapshot {
     /// 确定，恢复时只重建用户提示的；其余消息的 uuid 在写入 Transcript 时生成。
     #[serde(default)]
     pub message_ids: BTreeMap<usize, Uuid>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub agent_message_origins: BTreeMap<Uuid, serde_json::Value>,
     /// Stable source IDs for genuine prompts rewritten across directed summaries.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub original_user_message_ids: BTreeMap<usize, Uuid>,
@@ -474,6 +481,9 @@ pub enum EventKind {
         into_run_id: RunId,
     },
     InputTakenBack,
+    AgentMessageQueued {
+        source: AgentMessageSource,
+    },
     ConversationRewound {
         message_id: Uuid,
     },
@@ -534,6 +544,8 @@ pub struct PendingInput {
     pub input: String,
     #[serde(default)]
     pub contexts: Vec<InputContext>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_message: Option<AgentMessageSource>,
     #[serde(default)]
     denial_reference: Option<denials::DenialReference>,
     #[serde(default)]
@@ -545,6 +557,8 @@ pub struct PendingInput {
     /// A queued continuation for a completed background task; its notification is already in the conversation.
     #[serde(default)]
     pub task_continuation: bool,
+    #[serde(skip)]
+    is_skill_invocation: bool,
     /// Files attached whole with the prompt; they count as read once the prompt enters the
     /// conversation. Not persisted, so a restored prompt grants no reads.
     #[serde(skip)]
@@ -641,7 +655,11 @@ impl ChatSnapshot {
         let mut entries = self
             .pending_inputs
             .iter()
-            .filter(|pending| pending.trigger_source.is_none() && !pending.task_continuation)
+            .filter(|pending| {
+                pending.trigger_source.is_none()
+                    && !pending.task_continuation
+                    && pending.agent_message.is_none()
+            })
             .map(|pending| QueuedInput {
                 id: pending.receipt.run_id,
                 chat_id: pending.receipt.chat_id,
@@ -778,6 +796,9 @@ struct Inner {
     trusted_working_directories: std::sync::Mutex<HashSet<PathBuf>>,
     host_contexts: std::sync::Mutex<host_context::HostContexts>,
     delegations: Mutex<HashMap<(RunId, String), Receipt>>,
+    agent_messages: Mutex<HashMap<(RunId, String), agent_messages::SentMessage>>,
+    input_wakeup: tokio::sync::watch::Sender<()>,
+    delegation_notifications: Mutex<HashSet<RunId>>,
     chats: Mutex<HashMap<ChatId, Chat>>,
     events: broadcast::Sender<Event>,
     user_shell_events: broadcast::Sender<UserShellRecord>,
@@ -859,6 +880,8 @@ struct SubmissionOptions {
     trigger_cancel: Option<CancellationToken>,
     invoked_skill: Option<crate::skills::InvokedSkill>,
     host_context: Option<crate::host_tools::HostCallContext>,
+    agent_message: Option<AgentMessageSource>,
+    goal_title: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -1059,6 +1082,7 @@ fn empty_snapshot(id: ChatId, workdir: PathBuf, model: ModelConfig) -> ChatSnaps
         message_contexts: BTreeMap::new(),
         denial_references: BTreeMap::new(),
         message_ids: BTreeMap::new(),
+        agent_message_origins: BTreeMap::new(),
         original_user_message_ids: BTreeMap::new(),
         prompt_execution_modes: BTreeMap::new(),
         inherited_prompts: HashSet::new(),
@@ -1123,6 +1147,7 @@ impl Agent {
             .chain(interaction::definitions())
             .chain(tick_subscriptions::definitions())
             .chain(delegation::definitions())
+            .chain(agent_messages::definitions(false))
             .map(|definition| definition.name)
             .chain(std::iter::once(crate::skills::SKILL_TOOL_NAME.into()))
             .collect::<HashSet<_>>();
@@ -1457,14 +1482,23 @@ impl Agent {
     pub async fn interrupt(&self, chat_id: ChatId) -> Result<Vec<OperationRecord>, AgentError> {
         let mut chats = self.inner.chats.lock().await;
         let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
+        let mut interrupted_loop = None;
         if let Some(cancel) = &chat.active {
             cancel.cancel();
             if let Some(run_id) = chat.active_run {
                 chat.user_cancelled_runs.insert(run_id);
+                interrupted_loop = chat.snapshot.run_loops.get(&run_id).copied();
             }
         } else if let Some(waiting) = chat.parked.values().max_by_key(|run| run.sequence) {
             waiting.cancel.cancel();
             chat.user_cancelled_runs.insert(waiting.receipt.run_id);
+            interrupted_loop = Some(waiting.receipt.loop_id);
+        }
+        for pending in &mut chat.snapshot.pending_inputs {
+            if pending.agent_message.is_some() && Some(pending.receipt.loop_id) == interrupted_loop
+            {
+                pending.armed = false;
+            }
         }
         Ok(chat
             .snapshot
@@ -1652,6 +1686,9 @@ impl Agent {
                 trusted_working_directories: std::sync::Mutex::new(HashSet::new()),
                 host_contexts: std::sync::Mutex::new(host_context::HostContexts::default()),
                 delegations: Mutex::new(HashMap::new()),
+                agent_messages: Mutex::new(HashMap::new()),
+                input_wakeup: tokio::sync::watch::channel(()).0,
+                delegation_notifications: Mutex::new(HashSet::new()),
                 chats: Mutex::new(HashMap::new()),
                 events: broadcast::channel(256).0,
                 user_shell_events: broadcast::channel(256).0,
@@ -2098,6 +2135,8 @@ impl Agent {
             trigger_cancel,
             invoked_skill,
             host_context,
+            agent_message,
+            goal_title,
         } = options;
         if self.inner.closed.load(Ordering::SeqCst) {
             return Err(AgentError::Invalid("agent host has shut down".into()));
@@ -2114,6 +2153,7 @@ impl Agent {
             goal.is_none() && trigger_source.is_none() && original.snapshot.branch_origin.is_some();
         let mut candidate = original.clone();
         let chat = &mut candidate;
+        let is_skill_invocation = invoked_skill.is_some();
         if let Some(invoked_skill) = invoked_skill {
             record_invoked_skill(&mut chat.snapshot, invoked_skill);
         }
@@ -2127,7 +2167,7 @@ impl Agent {
             let id = Uuid::new_v4();
             chat.snapshot.add_loop(LoopSnapshot {
                 id,
-                goal: input.clone(),
+                goal: goal_title.unwrap_or_else(|| input.clone()),
                 state: LoopState::Idle,
                 run_id: None,
                 trigger: None,
@@ -2249,11 +2289,13 @@ impl Agent {
                 receipt: receipt.clone(),
                 input,
                 contexts,
+                agent_message,
                 denial_reference,
                 trigger_source,
                 armed: true,
                 queued_sequence,
                 task_continuation: false,
+                is_skill_invocation,
                 attached_file_reads,
             },
         );
@@ -2297,6 +2339,7 @@ impl Agent {
             self.inner.tasks.lock().await.push(self.run_task(next));
         }
 
+        self.inner.input_wakeup.send_replace(());
         Ok(requested_receipt)
     }
 
@@ -2550,7 +2593,9 @@ impl Agent {
                     pending.armed
                         && pending.trigger_source.is_none()
                         && pending.receipt.loop_id == active.loop_id
-                        && queue_barrier.is_none_or(|sequence| pending.queued_sequence < sequence)
+                        && (pending.agent_message.is_some()
+                            || queue_barrier
+                                .is_none_or(|sequence| pending.queued_sequence < sequence))
                 })
                 .map(|(index, _)| index)
                 .collect::<Vec<_>>();
@@ -2568,7 +2613,9 @@ impl Agent {
             let mut events = Vec::with_capacity(merged.len());
             for pending in merged {
                 let receipt = pending.receipt.clone();
-                self.merge_host_context(active, &receipt);
+                if pending.agent_message.is_none() {
+                    self.merge_host_context(active, &receipt);
+                }
                 self.append_input_message(&mut candidate, pending);
                 candidate.snapshot.last_sequence += 1;
                 let event = Event {
@@ -3029,6 +3076,16 @@ impl Agent {
         if pending.trigger_source.is_some() {
             return;
         }
+        if let Some(source) = pending.agent_message {
+            chat.snapshot
+                .message_ids
+                .insert(message_index, source.message_id);
+            chat.snapshot.agent_message_origins.insert(
+                source.message_id,
+                serde_json::to_value(source).expect("Agent message source is serializable"),
+            );
+            return;
+        }
         let message_id = Uuid::new_v4();
         chat.snapshot.message_ids.insert(message_index, message_id);
         chat.snapshot
@@ -3129,6 +3186,48 @@ impl Agent {
                     .and_then(crate::settings::UserSettings::root_directory),
             )?;
             candidate.snapshot.pending_inputs.remove(index);
+            let mut merged_inputs = Vec::new();
+            let mut agent_message_receipts = Vec::new();
+            if pending.agent_message.is_none()
+                && pending.trigger_source.is_none()
+                && !pending.task_continuation
+            {
+                while !pending.is_skill_invocation
+                    && candidate
+                        .snapshot
+                        .pending_inputs
+                        .get(index)
+                        .is_some_and(|queued| {
+                            queued.armed
+                                && queued.agent_message.is_none()
+                                && queued.trigger_source.is_none()
+                                && !queued.task_continuation
+                                && !queued.is_skill_invocation
+                                && queued.receipt.loop_id == pending.receipt.loop_id
+                                && command_barrier
+                                    .is_none_or(|sequence| queued.queued_sequence < sequence)
+                                && preceding_model_runs
+                                    .as_ref()
+                                    .is_none_or(|runs| runs.contains(&queued.receipt.run_id))
+                        })
+                {
+                    merged_inputs.push(candidate.snapshot.pending_inputs.remove(index));
+                }
+                let mut retained = Vec::new();
+                for queued in std::mem::take(&mut candidate.snapshot.pending_inputs) {
+                    if queued.agent_message.is_some()
+                        && !queued.armed
+                        && queued.receipt.loop_id == pending.receipt.loop_id
+                    {
+                        let receipt = queued.receipt.clone();
+                        self.append_input_message(&mut candidate, queued);
+                        agent_message_receipts.push(receipt);
+                    } else {
+                        retained.push(queued);
+                    }
+                }
+                candidate.snapshot.pending_inputs = retained;
+            }
             let goal = candidate
                 .snapshot
                 .loops
@@ -3142,8 +3241,33 @@ impl Agent {
             candidate.active_run = Some(pending.receipt.run_id);
             let receipt = pending.receipt.clone();
             self.append_input_message(&mut candidate, pending);
+            let mut merged_receipts = Vec::with_capacity(merged_inputs.len());
+            for queued in merged_inputs {
+                let consumed = queued.receipt.clone();
+                self.merge_host_context(&receipt, &consumed);
+                self.append_input_message(&mut candidate, queued);
+                merged_receipts.push(consumed);
+            }
             self.save(&candidate.snapshot);
+            for consumed in agent_message_receipts {
+                self.emit(
+                    &mut candidate,
+                    &consumed,
+                    EventKind::InputMerged {
+                        into_run_id: receipt.run_id,
+                    },
+                );
+            }
             self.emit(&mut candidate, &receipt, EventKind::Started);
+            for consumed in merged_receipts {
+                self.emit(
+                    &mut candidate,
+                    &consumed,
+                    EventKind::InputMerged {
+                        into_run_id: receipt.run_id,
+                    },
+                );
+            }
             let (messages, history_sources) = context::model_history(&candidate)?;
             let request = ModelRequest {
                 history_sources,
@@ -3628,10 +3752,9 @@ impl Agent {
             }
             let mut candidate = original.clone();
             let ids = taken.iter().map(|entry| entry.id).collect::<HashSet<_>>();
-            candidate
-                .snapshot
-                .pending_inputs
-                .retain(|pending| !ids.contains(&pending.receipt.run_id));
+            candidate.snapshot.pending_inputs.retain(|pending| {
+                pending.agent_message.is_some() || !ids.contains(&pending.receipt.run_id)
+            });
             candidate
                 .snapshot
                 .pending_commands
@@ -3860,11 +3983,13 @@ impl Agent {
             },
             input: String::new(),
             contexts: Vec::new(),
+            agent_message: None,
             denial_reference: None,
             trigger_source: None,
             armed: true,
             queued_sequence,
             task_continuation: true,
+            is_skill_invocation: false,
             attached_file_reads: Vec::new(),
         });
         true

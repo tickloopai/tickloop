@@ -635,6 +635,7 @@ impl AgentOverview {
 pub(super) enum OverviewTarget {
     Heading(AttentionGroup),
     Agent(Uuid),
+    CurrentDraft,
     Disclosure(AttentionGroup),
 }
 
@@ -652,6 +653,7 @@ enum OverviewEntry<'a> {
         row: &'a AgentTreeRow,
         fold: Option<FamilyFold>,
     },
+    CurrentDraft,
     Disclosure {
         group: AttentionGroup,
         hidden: usize,
@@ -664,6 +666,7 @@ impl OverviewEntry<'_> {
         match self {
             Self::Heading { group, .. } => OverviewTarget::Heading(*group),
             Self::Agent { row, .. } => OverviewTarget::Agent(row.agent_id),
+            Self::CurrentDraft => OverviewTarget::CurrentDraft,
             Self::Disclosure { group, .. } => OverviewTarget::Disclosure(*group),
         }
     }
@@ -745,6 +748,7 @@ fn folds_by_default(group: AttentionGroup) -> bool {
 pub(super) struct OverviewState {
     pub(super) projection: Option<AgentOverview>,
     pub(super) selected: Option<OverviewTarget>,
+    pub(super) current_draft: bool,
     /// Explicit fold choices. Rows with children default to folded unless they lead to this
     /// View's Agent.
     pub(super) expanded: HashMap<Uuid, bool>,
@@ -787,6 +791,13 @@ impl OverviewState {
             return;
         };
         self.numbers.register(&projection.rows);
+        if entering && self.current_draft {
+            self.folded_groups.insert(AttentionGroup::NeedsInput, false);
+            self.selected = Some(OverviewTarget::CurrentDraft);
+            self.settle_selection(&[], Some(AttentionGroup::NeedsInput));
+            self.offset = self.scroll_offset(&self.entries());
+            return;
+        }
         if entering && let Some(source) = projection.visible {
             self.locate(source);
             return;
@@ -844,6 +855,9 @@ impl OverviewState {
     /// Where the selection can retreat if its row stops being listed: its ancestors, nearest
     /// first, and its family's group.
     fn selection_context(&self) -> (Vec<Uuid>, Option<AttentionGroup>) {
+        if self.selected == Some(OverviewTarget::CurrentDraft) {
+            return (Vec::new(), Some(AttentionGroup::NeedsInput));
+        }
         let (Some(projection), Some(id)) = (&self.projection, self.selected_agent()) else {
             return (Vec::new(), None);
         };
@@ -1016,6 +1030,19 @@ impl OverviewState {
             .iter()
             .map(|group| (*group, Vec::<Member<'_>>::new()))
             .collect::<Vec<_>>();
+        if self.current_draft
+            && let Some((_, members)) = grouped
+                .iter_mut()
+                .find(|(group, _)| *group == AttentionGroup::NeedsInput)
+        {
+            members.push(Member {
+                pinned: true,
+                current: true,
+                approvals: 0,
+                questions: 0,
+                lines: vec![OverviewEntry::CurrentDraft],
+            });
+        }
         for family in projection.families() {
             let Some(group) = family.iter().map(|row| row.group).min() else {
                 continue;
@@ -1478,7 +1505,7 @@ impl OverviewState {
                 let (ancestors, group) = (Vec::new(), Some(group));
                 self.settle_selection(&ancestors, group);
             }
-            None => {}
+            Some(OverviewTarget::CurrentDraft) | None => {}
         }
         self.offset = self.scroll_offset(&self.entries());
     }
@@ -1551,6 +1578,7 @@ impl OverviewState {
     /// What Enter and Space do on the selected line.
     pub(super) fn row_hints(&self) -> Vec<String> {
         match self.selected {
+            Some(OverviewTarget::CurrentDraft) => vec!["Enter/→ return".into()],
             Some(OverviewTarget::Heading(group)) => vec![if self.is_group_folded(group) {
                 "Enter/→ expand".to_owned()
             } else {
@@ -1835,6 +1863,7 @@ impl OverviewState {
                         &self.row_status(row, *fold, terminal_columns),
                         MIN_AGENT_TITLE_COLUMNS,
                     ),
+                    OverviewEntry::CurrentDraft => current_draft_line(width, selected, display),
                     OverviewEntry::Disclosure {
                         group,
                         hidden,
@@ -1869,6 +1898,33 @@ impl OverviewState {
 }
 
 /// The word that marks the Agent this View returns to with Esc.
+fn current_draft_line(width: usize, selected: bool, display: DisplayProfile) -> RoleLine {
+    let marker = if selected { "› " } else { "  " };
+    let glyph = display.glyph(Glyph::AgentNeedsInput);
+    let prefix = format!("{marker}{glyph} New Agent");
+    let mut line = RoleLine::role(marker, Role::Text);
+    line.push(glyph, Some(Role::Permission));
+    line.push(" New Agent", Some(Role::Text));
+    let details = [
+        "current session · send a prompt to start",
+        "current session",
+        "current",
+    ]
+    .into_iter()
+    .find(|details| display_width(&format!("{prefix} · {details}")) <= width);
+    if let Some(details) = details {
+        line.push(" · ", Some(Role::MutedText));
+        if let Some((current, hint)) = details.split_once(" · ") {
+            line.push(current, Some(Role::Accent));
+            line.push(format!(" · {hint}"), Some(Role::MutedText));
+        } else {
+            line.push(details, Some(Role::Accent));
+        }
+    }
+    line.truncate(width);
+    line
+}
+
 const CURRENT_LABEL: &str = "current";
 /// The shortest status cue for an Agent Esc returns to that is not listed.
 const MINIMUM_CURRENT_CUE: &str = "Current hidden";

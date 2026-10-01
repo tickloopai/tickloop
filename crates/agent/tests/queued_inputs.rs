@@ -2,7 +2,7 @@ mod support;
 
 use async_trait::async_trait;
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
 use support::{ScriptedModel, config, next_event, text};
@@ -18,6 +18,7 @@ struct PendingModel;
 
 struct GatedModel {
     calls: AtomicUsize,
+    requests: Mutex<Vec<ModelRequest>>,
     started: tokio::sync::Notify,
     release: tokio::sync::Notify,
 }
@@ -57,10 +58,11 @@ impl ModelClient for GatedModel {
 
     async fn complete(
         &self,
-        _: ModelRequest,
+        request: ModelRequest,
         _: UnboundedSender<ModelDelta>,
         cancel: CancellationToken,
     ) -> Result<ModelOutput, ModelError> {
+        self.requests.lock().unwrap().push(request);
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.started.notify_one();
         tokio::select! {
@@ -268,6 +270,7 @@ async fn queued_commands_form_a_persistent_barrier_between_model_inputs() {
     let directory = tempfile::tempdir().unwrap();
     let model = Arc::new(GatedModel {
         calls: AtomicUsize::new(0),
+        requests: Mutex::new(Vec::new()),
         started: tokio::sync::Notify::new(),
         release: tokio::sync::Notify::new(),
     });
@@ -309,10 +312,11 @@ async fn queued_commands_form_a_persistent_barrier_between_model_inputs() {
 }
 
 #[tokio::test]
-async fn interrupt_preserves_the_queue_and_starts_only_its_oldest_message() {
+async fn interrupt_preserves_waiting_messages_in_one_follow_up_request() {
     let directory = tempfile::tempdir().unwrap();
     let model = Arc::new(GatedModel {
         calls: AtomicUsize::new(0),
+        requests: Mutex::new(Vec::new()),
         started: tokio::sync::Notify::new(),
         release: tokio::sync::Notify::new(),
     });
@@ -329,18 +333,95 @@ async fn interrupt_preserves_the_queue_and_starts_only_its_oldest_message() {
         .await
         .unwrap();
 
+    assert_ne!(first.run_id, second.run_id);
+    assert_eq!(first.loop_id, second.loop_id);
+    assert_eq!(
+        agent
+            .snapshot(chat)
+            .await
+            .unwrap()
+            .queued_inputs()
+            .iter()
+            .map(|queued| queued.id)
+            .collect::<Vec<_>>(),
+        vec![first.run_id, second.run_id],
+    );
+    let mut events = agent.subscribe();
     agent.interrupt(chat).await.unwrap();
     model.started.notified().await;
     assert_eq!(model.calls.load(Ordering::SeqCst), 2);
-    let queued = agent.snapshot(chat).await.unwrap().queued_inputs();
-    assert_eq!(queued.len(), 1);
-    assert_eq!(queued[0].id, second.run_id);
-    assert_ne!(queued[0].id, first.run_id);
+    let consumed = agent.snapshot(chat).await.unwrap();
+    assert!(consumed.queued_inputs().is_empty());
+    let request = model.requests.lock().unwrap()[1].clone();
+    let queued_texts = request
+        .messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .filter_map(|content| match content {
+            Content::Text { text } if text == "first queued" || text == "second queued" => {
+                Some(text.as_str())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        queued_texts,
+        ["first queued", "second queued"],
+        "both accepted inputs appear once in the same model request"
+    );
+    for (expected, receipt) in [("first queued", &first), ("second queued", &second)] {
+        let index = consumed
+            .messages
+            .iter()
+            .position(|message| {
+                message
+                    .content
+                    .iter()
+                    .any(|content| matches!(content, Content::Text { text } if text == expected))
+            })
+            .unwrap();
+        assert_eq!(consumed.message_runs.get(&index), Some(&receipt.run_id));
+    }
+    assert!(
+        consumed
+            .events
+            .iter()
+            .any(|event| event.run_id == active.run_id
+                && matches!(event.kind, EventKind::Interrupted))
+    );
+    let started = consumed
+        .events
+        .iter()
+        .filter(|event| matches!(event.kind, EventKind::Started))
+        .map(|event| event.run_id)
+        .collect::<Vec<_>>();
+    assert_eq!(started, [active.run_id, first.run_id]);
+    let merged = consumed
+        .events
+        .iter()
+        .filter_map(|event| match event.kind {
+            EventKind::InputMerged { into_run_id } => Some((event.run_id, into_run_id)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(merged, [(second.run_id, first.run_id)]);
 
     model.release.notify_one();
-    model.started.notified().await;
-    assert_eq!(model.calls.load(Ordering::SeqCst), 3);
-    model.release.notify_one();
+    loop {
+        let event = next_event(&mut events).await;
+        if event.run_id == first.run_id && matches!(event.kind, EventKind::Completed { .. }) {
+            break;
+        }
+    }
+    assert_eq!(model.calls.load(Ordering::SeqCst), 2);
+    assert!(
+        agent
+            .snapshot(chat)
+            .await
+            .unwrap()
+            .queued_inputs()
+            .is_empty()
+    );
     agent.shutdown().await;
 }
 

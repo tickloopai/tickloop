@@ -34,12 +34,14 @@ pub struct DelegationMetadata {
     pub parent_call_id: String,
     pub task: String,
     pub ceiling: DelegationCeiling,
+    #[serde(default)]
+    pub(crate) trusted_user_inputs: Option<Value>,
 }
 
 pub(super) fn definitions() -> Vec<ToolDefinition> {
     vec![ToolDefinition {
         name: DELEGATE_AGENT_TOOL_NAME.into(),
-        description: "Delegate one bounded task to an independent child Agent and wait for its actual result. The child inherits this task's working directories, host context and permission ceiling; follow-up input cannot expand them. The child has its own identity, Loop and approval/question requests. Interrupting this wait does not stop the child. Nested delegation, history rewrites and unrestricted Shell commands are unsupported. This creates a new task, not a Branch or a copy of your conversation.".into(),
+        description: "Delegate one bounded task to an independent child Agent and wait for its actual result. Incoming user context or child messages yield this wait while the child keeps working; use SendMessage to reply or steer it and WaitForAgent to observe its result. A yielded wait also delivers the eventual child result to your inbox. If required_action=finish_current_turn is returned, finish this turn to advance a pending after-turn human command instead of waiting again. The child inherits this task's working directories, host context and permission ceiling; follow-up input cannot expand them. The child has its own identity, Loop and approval/question requests. Interrupting this wait does not stop the child. Nested delegation, history rewrites and unrestricted Shell commands are unsupported. This creates a new task, not a Branch or a copy of your conversation.".into(),
         input_schema: json!({"type":"object","properties":{"task":{"type":"string","minLength":1}},"required":["task"],"additionalProperties":false}),
     }]
 }
@@ -280,6 +282,7 @@ impl Agent {
                 .ok_or("delegation task cannot be empty")?
                 .to_owned();
             let mut events = self.subscribe();
+            let mut input_wakeup = self.inner.input_wakeup.subscribe();
             let child = {
                 let mut delegations = self.inner.delegations.lock().await;
                 let key = (parent.run_id, call_id.to_owned());
@@ -339,6 +342,20 @@ impl Agent {
                         parent_run_id: parent.run_id,
                         parent_call_id: call_id.to_owned(),
                         task: task.clone(),
+                        trusted_user_inputs: approval_context::originals_for_active_chain(
+                            &snapshot,
+                        )
+                        .ok()
+                        .map(|inputs| {
+                            inputs
+                                .into_iter()
+                                .filter(|input| {
+                                    input.chat_id == parent.chat_id
+                                        && input.loop_id == parent.loop_id
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .and_then(|inputs| serde_json::to_value(inputs).ok()),
                         ceiling: DelegationCeiling {
                             workdir: snapshot.workdir.clone(),
                             additional_directories: snapshot.additional_directories.clone(),
@@ -359,6 +376,7 @@ impl Agent {
                                 .collect(),
                         },
                     };
+                    let sender_label = agent_messages::family_label(&snapshot, parent.loop_id);
                     let child_id = self
                         .create_chat_with_delegation(
                             Uuid::new_v4(),
@@ -372,8 +390,26 @@ impl Agent {
                             .await
                             .map_err(|error| error.to_string())?;
                     }
+                    let source = AgentMessageSource {
+                        message_id: Uuid::new_v4(),
+                        sender_chat_id: parent.chat_id,
+                        sender_loop_id: parent.loop_id,
+                        sender_run_id: parent.run_id,
+                        sender_relationship: "parent".into(),
+                        is_result: false,
+                        sender_label,
+                    };
                     let receipt = self
-                        .submit(child_id, None, task)
+                        .submit_internal(
+                            child_id,
+                            None,
+                            local_messages::agent_message(&source, &task),
+                            SubmissionOptions {
+                                agent_message: Some(source),
+                                goal_title: Some(task),
+                                ..Default::default()
+                            },
+                        )
                         .await
                         .map_err(|error| error.to_string())?;
                     delegations.insert(key, receipt.clone());
@@ -385,70 +421,25 @@ impl Agent {
                     .snapshot(child.chat_id)
                     .await
                     .map_err(|error| error.to_string())?;
-                let goal = snapshot
-                    .loops
-                    .iter()
-                    .find(|goal| goal.id == child.loop_id)
-                    .ok_or("child Loop is unavailable")?;
-                let outcome = snapshot.events.iter().rev().find_map(|event| {
-                    if event.run_id != child.run_id {
-                        return None;
-                    }
-                    match &event.kind {
-                        EventKind::Completed { .. } => Some(("completed", None)),
-                        EventKind::Failed(error) => Some(("failed", Some(error.as_str()))),
-                        EventKind::Interrupted => Some(("interrupted", None)),
-                        _ => None,
-                    }
-                });
-                if let Some((status, error)) = outcome {
-                    let result = snapshot
-                        .messages
-                        .iter()
-                        .enumerate()
-                        .rev()
-                        .find(|(index, message)| {
-                            message.role == Role::Assistant
-                                && snapshot.message_runs.get(index) == Some(&child.run_id)
-                        })
-                        .map(|(_, message)| {
-                            message
-                                .content
-                                .iter()
-                                .filter_map(|block| {
-                                    if let Content::Text { text } = block {
-                                        Some(text.as_str())
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .collect::<Vec<_>>()
-                                .join("\n")
-                        })
-                        .unwrap_or_default();
-                    let metadata = snapshot
-                        .delegation
-                        .as_ref()
-                        .ok_or("child delegation identity is unavailable")?;
+                if let Some(result) = agent_messages::child_run_result(&snapshot, &child, parent) {
+                    return Ok(result);
+                }
+                if let Some(reason) = self.agent_wait_input(parent).await {
+                    self.observe_delegated_result(parent.clone(), child.clone())
+                        .await;
                     return Ok(ToolResult {
-                        content: json!({
-                            "delegation_id": metadata.delegation_id,
-                            "child_chat_id": child.chat_id,
-                            "child_loop_id": child.loop_id,
-                            "child_run_id": child.run_id,
-                            "parent_chat_id": parent.chat_id,
-                            "status": status,
-                            "child_state": format!("{:?}", goal.state).to_lowercase(),
-                            "result": result,
-                            "error": error,
-                        })
-                        .to_string(),
-                        is_error: status != "completed",
-                        output_ref: None,
+                        content: json!({"status":"running","child_chat_id":child.chat_id,
+                            "child_loop_id":child.loop_id,"child_run_id":child.run_id,
+                            "wait_reason":reason,"required_action":(reason=="after_turn_queue").then_some("finish_current_turn")}).to_string(),
+                        is_error:false, output_ref:None,
                     });
                 }
                 tokio::select! {
-                    _ = cancel.cancelled() => return Err(format!("delegation wait interrupted; child {} Loop {} remains independently active",child.chat_id,child.loop_id)),
+                    _ = cancel.cancelled() => return Ok(ToolResult {
+                        content:json!({"status":"wait_interrupted","child_chat_id":child.chat_id,"child_loop_id":child.loop_id,"child_run_id":child.run_id,"error":"Delegation wait interrupted; the child Agent remains independently active."}).to_string(),
+                        is_error:true,output_ref:None,
+                    }),
+                    _ = input_wakeup.changed()=>{},
                     event = events.recv() => match event {
                         Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {},
                         Err(broadcast::error::RecvError::Closed) => return Err("Agent event stream closed while observing child".into()),

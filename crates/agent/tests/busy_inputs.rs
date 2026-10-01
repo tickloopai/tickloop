@@ -1,13 +1,12 @@
-//! Three inputs accepted while an Agent is busy, through the public `AgentAccess`: which model
-//! request first carries each one, and whether the runtime merged it into the active run. These
-//! pin the current execution semantics; they change nothing about them.
+//! Busy inputs through public `AgentAccess`: which model request consumes each input and
+//! which queue boundaries keep accepted work in separate runs.
 mod support;
 
 use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -39,6 +38,9 @@ struct GatedFirstRequest {
     entered: Notify,
     release: Notify,
     calls: AtomicUsize,
+    hold_next: AtomicBool,
+    next_entered: Notify,
+    next_release: Notify,
 }
 
 #[async_trait]
@@ -53,11 +55,18 @@ impl ModelClient for GatedFirstRequest {
         events: UnboundedSender<ModelDelta>,
         cancel: CancellationToken,
     ) -> Result<ModelOutput, ModelError> {
-        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
-            self.entered.notify_one();
+        let gate = match self.calls.fetch_add(1, Ordering::SeqCst) {
+            0 => Some((&self.entered, &self.release)),
+            1 if self.hold_next.load(Ordering::SeqCst) => {
+                Some((&self.next_entered, &self.next_release))
+            }
+            _ => None,
+        };
+        if let Some((entered, release)) = gate {
+            entered.notify_one();
             tokio::select! {
                 _ = cancel.cancelled() => return Err(ModelError::Cancelled),
-                _ = self.release.notified() => {}
+                _ = release.notified() => {}
             }
         }
         self.model.complete(request, events, cancel).await
@@ -77,6 +86,14 @@ struct Busy {
 impl Busy {
     /// An Agent whose first run is waiting on its first model request.
     async fn start(directory: &Path, replies: Vec<Vec<tickloop_agent::model::Content>>) -> Self {
+        Self::start_with_archive(directory, replies, None).await
+    }
+
+    async fn start_with_archive(
+        directory: &Path,
+        replies: Vec<Vec<tickloop_agent::model::Content>>,
+        archive: Option<PathBuf>,
+    ) -> Self {
         let source = directory.canonicalize().unwrap().join("source.txt");
         std::fs::write(&source, SOURCE_CONTENT).unwrap();
         let model = Arc::new(ScriptedModel::new(replies));
@@ -85,14 +102,22 @@ impl Busy {
             entered: Notify::new(),
             release: Notify::new(),
             calls: AtomicUsize::new(0),
+            hold_next: AtomicBool::new(false),
+            next_entered: Notify::new(),
+            next_release: Notify::new(),
         });
-        let runtime = Agent::new_embedded(config(), gate.clone());
+        let runtime = match &archive {
+            Some(archive) => Agent::open_embedded(archive.clone(), config(), gate.clone()).unwrap(),
+            None => Agent::new_embedded(config(), gate.clone()),
+        };
         let access = EmbeddedAgentAccess::new(runtime.clone());
+        let mut launch = LaunchSpec::embedded(directory.to_path_buf());
+        launch.config_root = archive;
         let created = access
             .execute(envelope(
                 &access,
                 AgentCommand::Create {
-                    launch: LaunchSpec::embedded(directory.to_path_buf()),
+                    launch,
                     initial: Some(text_input("start the busy work", &[])),
                     origin: None,
                 },
@@ -173,6 +198,10 @@ impl Busy {
     /// Releases the first request and waits until no Loop is still working.
     async fn release_and_settle(&self) -> LiveChatSnapshot {
         self.gate.release.notify_one();
+        self.settle().await
+    }
+
+    async fn settle(&self) -> LiveChatSnapshot {
         tokio::time::timeout(TEST_DEADLINE, async {
             loop {
                 let snapshot = self.snapshot().await;
@@ -198,9 +227,14 @@ impl Busy {
         INPUTS
             .iter()
             .map(|input| {
-                requests
-                    .iter()
-                    .position(|request| format!("{:?}", request.messages).contains(input))
+                requests.iter().position(|request| {
+                    request.messages.iter().any(|message| {
+                        message.role == tickloop_agent::model::Role::User
+                            && message.content.iter().any(|content| {
+                                matches!(content, tickloop_agent::model::Content::Text { text } if text == input)
+                            })
+                    })
+                })
             })
             .collect()
     }
@@ -320,45 +354,496 @@ async fn busy_inputs_accepted_before_a_tool_boundary_join_the_active_run_in_one_
     busy.runtime.shutdown().await;
 }
 
-#[tokio::test]
-async fn busy_inputs_after_a_text_only_reply_are_answered_one_request_each() {
+async fn assert_text_only_batch(count: usize) {
     let directory = tempfile::tempdir().unwrap();
     let busy = Busy::start(
         directory.path(),
         vec![
             text("first reply"),
-            text("alpha reply"),
-            text("bravo reply"),
-            text("charlie reply"),
+            text("one reply for the queued batch"),
+            text("unexpected separate reply"),
+            text("unexpected separate reply"),
         ],
     )
     .await;
-    let mut runs = Vec::new();
-    for input in INPUTS {
-        let command = busy.submit_command(input, Some(busy.active.loop_id));
-        runs.push(busy.submit(&command).await.1.run_id);
+    let commands = INPUTS[..count]
+        .iter()
+        .map(|input| busy.submit_command(input, Some(busy.active.loop_id)))
+        .collect::<Vec<_>>();
+    let mut accepted = Vec::new();
+    for command in &commands {
+        accepted.push(busy.submit(command).await.1);
     }
+    assert_eq!(
+        accepted
+            .iter()
+            .map(|receipt| receipt.run_id)
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        count,
+    );
+    assert!(
+        accepted
+            .iter()
+            .all(|receipt| receipt.loop_id == busy.active.loop_id)
+    );
+    let replayed = busy.submit(&commands[0]).await.1;
+    assert_eq!(replayed.run_id, accepted[0].run_id);
+    assert_eq!(busy.snapshot().await.pending_inputs.len(), count);
+
     let settled = busy.release_and_settle().await;
     assert_eq!(
         busy.sends(),
-        4,
-        "a text-only reply admits one pending input at a time"
+        2,
+        "all {count} queued inputs share the next model request"
     );
-    assert_eq!(busy.first_requests(), vec![Some(1), Some(2), Some(3)]);
+    assert_eq!(&busy.first_requests()[..count], &vec![Some(1); count]);
+    let second = format!("{:?}", busy.model.requests.lock().unwrap()[1].messages);
+    let positions = INPUTS[..count]
+        .iter()
+        .map(|input| second.find(input).unwrap())
+        .collect::<Vec<_>>();
+    assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
     assert!(
-        !settled
-            .events
+        INPUTS[..count]
             .iter()
-            .any(|event| matches!(event.kind, EventKind::InputMerged { .. })),
-        "nothing was merged"
+            .all(|input| second.matches(input).count() == 1)
+    );
+    assert!(
+        second.contains(SOURCE_CONTENT),
+        "the first queued input keeps its attachment"
+    );
+    for (input, receipt) in INPUTS[..count].iter().zip(&accepted) {
+        let index = settled.conversation.messages.iter().position(|message| {
+            message.content.iter().any(|content| matches!(content, tickloop_agent::model::Content::Text { text } if text == input))
+        }).unwrap();
+        assert_eq!(
+            settled.conversation.message_runs.get(&index),
+            Some(&receipt.run_id)
+        );
+        assert_eq!(
+            settled
+                .events
+                .iter()
+                .find(|event| event.run_id == receipt.run_id)
+                .map(|event| event.loop_id),
+            Some(receipt.loop_id)
+        );
+        assert!(
+            settled
+                .conversation
+                .prompt_execution_modes
+                .contains_key(&index)
+        );
+    }
+    let merged = settled
+        .events
+        .iter()
+        .filter_map(|event| match event.kind {
+            EventKind::InputMerged { into_run_id } => Some((event.run_id, into_run_id)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        merged,
+        accepted[1..]
+            .iter()
+            .map(|receipt| (receipt.run_id, accepted[0].run_id))
+            .collect::<Vec<_>>()
     );
     let started = runs_with(&settled, |kind| matches!(kind, EventKind::Started));
     let completed = runs_with(&settled, |kind| matches!(kind, EventKind::Completed { .. }));
-    assert!(
-        runs.iter()
-            .all(|run| started.contains(run) && completed.contains(run)),
-        "each input ran as its own run: started {started:?}, completed {completed:?}"
+    assert_eq!(started, vec![busy.active.run_id, accepted[0].run_id]);
+    assert_eq!(completed, started);
+    assert_eq!(busy.submit(&commands[0]).await.1.run_id, accepted[0].run_id);
+    assert_eq!(
+        busy.sends(),
+        2,
+        "an accepted CommandId is never resent after the batch completes"
     );
+    assert!(busy.snapshot().await.pending_inputs.is_empty());
+    busy.runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn two_busy_inputs_after_a_text_only_reply_share_the_next_run() {
+    assert_text_only_batch(2).await;
+}
+
+#[tokio::test]
+async fn three_busy_inputs_after_a_text_only_reply_share_the_next_run() {
+    assert_text_only_batch(3).await;
+}
+
+#[tokio::test]
+async fn a_started_input_batch_is_recoverable_before_its_model_reply() {
+    let directory = tempfile::tempdir().unwrap();
+    let archive = directory.path().join("archive");
+    let busy = Busy::start_with_archive(
+        directory.path(),
+        vec![text("first reply"), text("queued batch reply")],
+        Some(archive.clone()),
+    )
+    .await;
+    busy.gate.hold_next.store(true, Ordering::SeqCst);
+    let mut accepted = Vec::new();
+    for input in INPUTS {
+        accepted.push(
+            busy.submit(&busy.submit_command(input, Some(busy.active.loop_id)))
+                .await
+                .1,
+        );
+    }
+    let mut events = busy.runtime.subscribe();
+    busy.gate.release.notify_one();
+    tokio::time::timeout(TEST_DEADLINE, async {
+        loop {
+            let event = events.recv().await.unwrap();
+            if event.run_id == accepted[0].run_id && matches!(event.kind, EventKind::Started) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the queued batch starts");
+    tokio::time::timeout(TEST_DEADLINE, busy.gate.next_entered.notified())
+        .await
+        .expect("the next model request is held before replying");
+    let started = busy.snapshot().await;
+    assert!(started.pending_inputs.is_empty());
+    assert_eq!(busy.gate.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(busy.sends(), 1, "the queued reply has not completed");
+    assert!(!started.events.iter().any(|event| {
+        event.run_id == accepted[0].run_id && matches!(event.kind, EventKind::Completed { .. })
+    }));
+    for (input, receipt) in INPUTS.iter().zip(&accepted) {
+        let index = started.conversation.messages.iter().position(|message| {
+            message.content.iter().any(|content| matches!(content, tickloop_agent::model::Content::Text { text } if text == input))
+        }).expect("each accepted input is already in the started batch");
+        assert_eq!(
+            started.conversation.message_runs.get(&index),
+            Some(&receipt.run_id)
+        );
+    }
+    busy.runtime.flush_transcripts().await;
+    let recovery_model = Arc::new(ScriptedModel::new(Vec::new()));
+    let recovered = Agent::open_embedded(archive, config(), recovery_model.clone()).unwrap();
+    let history = recovered.resume_chat(busy.active.chat_id).await.unwrap();
+    for (input, receipt) in INPUTS.iter().zip(&accepted) {
+        let indexes = history.messages.iter().enumerate().filter_map(|(index, message)| {
+            message.content.iter().any(|content| matches!(content, tickloop_agent::model::Content::Text { text } if text == input)).then_some(index)
+        }).collect::<Vec<_>>();
+        assert_eq!(
+            indexes.len(),
+            1,
+            "each accepted input is recoverable exactly once"
+        );
+        assert_eq!(history.message_runs.get(&indexes[0]), Some(&receipt.run_id));
+        assert!(history.prompt_execution_modes.contains_key(&indexes[0]));
+    }
+    assert!(format!("{:?}", history.message_contexts).contains(SOURCE_CONTENT));
+    assert!(
+        recovery_model.requests.lock().unwrap().is_empty(),
+        "opening saved history does not execute the batch"
+    );
+    recovered.shutdown().await;
+    busy.gate.next_release.notify_one();
+    busy.settle().await;
+    assert_eq!(busy.sends(), 2);
+    busy.runtime.shutdown().await;
+}
+
+async fn assert_direct_skill_boundary(tool_boundary: bool) {
+    let directory = tempfile::tempdir().unwrap();
+    let skill_directory = directory.path().join(".tickloop/skills/queued-boundary");
+    std::fs::create_dir_all(&skill_directory).unwrap();
+    std::fs::write(
+        skill_directory.join("SKILL.md"),
+        "---\nname: queued-boundary\ndescription: Owned queued Skill fixture\n---\nRead the supplied context and answer.\n",
+    )
+    .unwrap();
+    let replies = if tool_boundary {
+        vec![
+            call("read", "Read", json!({"file_path": "source.txt"})),
+            text("answered the active tool turn"),
+        ]
+    } else {
+        vec![
+            text("first reply"),
+            text("before the Skill"),
+            text("Skill reply"),
+            text("after the Skill"),
+        ]
+    };
+    let busy = Busy::start(directory.path(), replies).await;
+    let first = busy
+        .submit(&busy.submit_command(INPUTS[0], Some(busy.active.loop_id)))
+        .await
+        .1;
+    let skill_command = envelope(
+        &busy.access,
+        AgentCommand::Submit {
+            execution: busy.execution,
+            target_loop: Some(busy.active.loop_id),
+            input: UserInput::Skill {
+                name: "queued-boundary".into(),
+                arguments: "typed Skill input".into(),
+            },
+            origin: None,
+        },
+    );
+    let skill = busy.submit(&skill_command).await.1;
+    assert_eq!(busy.submit(&skill_command).await.1.run_id, skill.run_id);
+    let second = busy
+        .submit(&busy.submit_command(INPUTS[1], Some(busy.active.loop_id)))
+        .await
+        .1;
+    let last = busy
+        .submit(&busy.submit_command(INPUTS[2], Some(busy.active.loop_id)))
+        .await
+        .1;
+    assert_eq!(busy.snapshot().await.pending_inputs.len(), 4);
+    let settled = busy.release_and_settle().await;
+    let skill_request = busy
+        .model
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .position(|request| {
+            request.messages.iter().any(|message| {
+                message.role == tickloop_agent::model::Role::User
+                    && message.content.iter().any(|content| {
+                        matches!(content, tickloop_agent::model::Content::Text { text } if text == "/queued-boundary typed Skill input")
+                    })
+            })
+        });
+    let merged = settled
+        .events
+        .iter()
+        .filter_map(|event| match event.kind {
+            EventKind::InputMerged { into_run_id } => Some((event.run_id, into_run_id)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if tool_boundary {
+        assert_eq!(busy.sends(), 2);
+        assert_eq!(busy.first_requests(), vec![Some(1); 3]);
+        assert_eq!(skill_request, Some(1));
+        assert_eq!(
+            merged,
+            [&first, &skill, &second, &last]
+                .iter()
+                .map(|receipt| (receipt.run_id, busy.active.run_id))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            runs_with(&settled, |kind| matches!(kind, EventKind::Started)),
+            vec![busy.active.run_id]
+        );
+    } else {
+        assert_eq!(busy.sends(), 4);
+        assert_eq!(busy.first_requests(), vec![Some(1), Some(3), Some(3)]);
+        assert_eq!(skill_request, Some(2));
+        assert_eq!(merged, vec![(last.run_id, second.run_id)]);
+        assert_eq!(
+            runs_with(&settled, |kind| matches!(kind, EventKind::Started)),
+            vec![
+                busy.active.run_id,
+                first.run_id,
+                skill.run_id,
+                second.run_id
+            ]
+        );
+    }
+    busy.runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_direct_skill_keeps_text_only_input_batches_separate() {
+    assert_direct_skill_boundary(false).await;
+}
+
+#[tokio::test]
+async fn a_direct_skill_still_joins_the_active_tool_turn() {
+    assert_direct_skill_boundary(true).await;
+}
+
+#[tokio::test]
+async fn a_command_barrier_splits_text_only_input_batches() {
+    let directory = tempfile::tempdir().unwrap();
+    let busy = Busy::start(
+        directory.path(),
+        vec![text("first"), text("before command"), text("after command")],
+    )
+    .await;
+    let first = busy
+        .submit(&busy.submit_command(INPUTS[0], Some(busy.active.loop_id)))
+        .await
+        .1;
+    let second = busy
+        .submit(&busy.submit_command(INPUTS[1], Some(busy.active.loop_id)))
+        .await
+        .1;
+    let barrier = busy
+        .access
+        .execute(envelope(
+            &busy.access,
+            AgentCommand::EnqueueAfterTurn {
+                execution: busy.execution,
+                target_loop: Some(busy.active.loop_id),
+                action: AfterTurnAction::Configure {
+                    change: ConfigurationChange::ThinkingEnabled { enabled: true },
+                },
+            },
+        ))
+        .await
+        .unwrap();
+    assert!(
+        matches!(barrier.state, ReceiptState::Completed),
+        "{barrier:?}"
+    );
+    let last = busy
+        .submit(&busy.submit_command(INPUTS[2], Some(busy.active.loop_id)))
+        .await
+        .1;
+    let settled = busy.release_and_settle().await;
+    assert_eq!(busy.first_requests(), vec![Some(1), Some(1), Some(2)]);
+    assert_eq!(busy.sends(), 3);
+    assert!(settled.pending_commands.is_empty());
+    assert!(
+        settled.queue_failures.is_empty(),
+        "{:?}",
+        settled.queue_failures
+    );
+    assert!(settled.thinking_enabled);
+    assert_eq!(
+        runs_with(&settled, |kind| matches!(
+            kind,
+            EventKind::InputMerged { .. }
+        )),
+        vec![second.run_id]
+    );
+    assert_eq!(
+        runs_with(&settled, |kind| matches!(kind, EventKind::Started)),
+        vec![busy.active.run_id, first.run_id, last.run_id]
+    );
+    busy.runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_foreground_shell_barrier_splits_text_only_input_batches() {
+    let directory = tempfile::tempdir().unwrap();
+    let busy = Busy::start(
+        directory.path(),
+        vec![text("first"), text("before shell"), text("after shell")],
+    )
+    .await;
+    let first = busy
+        .submit(&busy.submit_command(INPUTS[0], Some(busy.active.loop_id)))
+        .await
+        .1;
+    let shell = busy
+        .access
+        .execute(envelope(
+            &busy.access,
+            AgentCommand::Submit {
+                execution: busy.execution,
+                target_loop: Some(busy.active.loop_id),
+                input: UserInput::Shell {
+                    command: "printf 'NEXT_BATCH_SHELL_MARKER'".into(),
+                    background: false,
+                },
+                origin: None,
+            },
+        ))
+        .await
+        .unwrap();
+    let Some(CommandResult::ShellSubmitted(shell)) = shell.result else {
+        panic!("Shell was accepted")
+    };
+    let second = busy
+        .submit(&busy.submit_command(INPUTS[1], Some(busy.active.loop_id)))
+        .await
+        .1;
+    let last = busy
+        .submit(&busy.submit_command(INPUTS[2], Some(busy.active.loop_id)))
+        .await
+        .1;
+    let settled = busy.release_and_settle().await;
+    assert_eq!(busy.first_requests(), vec![Some(1), Some(2), Some(2)]);
+    assert_eq!(busy.sends(), 3);
+    let record = settled
+        .user_shells
+        .iter()
+        .find(|record| record.id == shell.command_id)
+        .unwrap();
+    assert_eq!(
+        record.state,
+        tickloop_agent::runtime::UserShellState::Completed
+    );
+    let third = {
+        let requests = busy.model.requests.lock().unwrap();
+        assert!(!format!("{:?}", requests[1].messages).contains("NEXT_BATCH_SHELL_MARKER"));
+        format!("{:?}", requests[2].messages)
+    };
+    assert!(third.find("NEXT_BATCH_SHELL_MARKER").unwrap() < third.find(INPUTS[1]).unwrap());
+    assert_eq!(
+        runs_with(&settled, |kind| matches!(
+            kind,
+            EventKind::InputMerged { .. }
+        )),
+        vec![last.run_id]
+    );
+    assert_eq!(
+        runs_with(&settled, |kind| matches!(kind, EventKind::Started)),
+        vec![busy.active.run_id, first.run_id, second.run_id]
+    );
+    busy.runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn another_loop_splits_text_only_input_batches_without_changing_targets() {
+    let directory = tempfile::tempdir().unwrap();
+    let busy = Busy::start(
+        directory.path(),
+        vec![text("first"), text("alpha"), text("bravo"), text("charlie")],
+    )
+    .await;
+    let first = busy
+        .submit(&busy.submit_command(INPUTS[0], Some(busy.active.loop_id)))
+        .await
+        .1;
+    let other = busy.submit(&busy.submit_command(INPUTS[1], None)).await.1;
+    let last = busy
+        .submit(&busy.submit_command(INPUTS[2], Some(busy.active.loop_id)))
+        .await
+        .1;
+    assert_ne!(other.loop_id, busy.active.loop_id);
+    let settled = busy.release_and_settle().await;
+    assert_eq!(busy.first_requests(), vec![Some(1), Some(2), Some(3)]);
+    assert_eq!(busy.sends(), 4);
+    assert_eq!(
+        runs_with(&settled, |kind| matches!(kind, EventKind::Started)),
+        vec![busy.active.run_id, first.run_id, other.run_id, last.run_id]
+    );
+    assert!(
+        runs_with(&settled, |kind| matches!(
+            kind,
+            EventKind::InputMerged { .. }
+        ))
+        .is_empty()
+    );
+    for receipt in [&first, &other, &last] {
+        assert_eq!(
+            settled
+                .events
+                .iter()
+                .find(|event| event.run_id == receipt.run_id)
+                .map(|event| event.loop_id),
+            Some(receipt.loop_id)
+        );
+    }
     busy.runtime.shutdown().await;
 }
 

@@ -29,10 +29,12 @@ pub struct Observation {
 type Observer = Arc<dyn Fn(Observation) + Send + Sync>;
 
 impl Stub {
+    #[allow(dead_code)]
     pub async fn start(respond: impl Fn(&str) -> (u16, Value) + Send + Sync + 'static) -> Self {
         Self::start_with_disconnect(move |request| Some(respond(request))).await
     }
 
+    #[allow(dead_code)]
     pub async fn start_with_disconnect(
         respond: impl Fn(&str) -> Option<(u16, Value)> + Send + Sync + 'static,
     ) -> Self {
