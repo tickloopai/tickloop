@@ -11,6 +11,7 @@ prototypes/
 !/vendor/longbridge-oauth/**
 target/
 /dist/
+/.wrangler/
 *.profraw
 *.profdata
 

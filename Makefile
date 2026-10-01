@@ -12,7 +12,7 @@ CARGO_PACKAGE := -p tickloop-agent
 PACKAGE_TARGET ?= $(shell rustc -vV | sed -n 's/^host: //p')
 PACKAGE_ARCHIVE = dist/tickloop-$(PACKAGE_TARGET).tar.gz
 
-.PHONY: dev dev-here dev-reset build install package test check prototype-glyph-set prototype-glyph-set-terminal prototype-earnings-review
+.PHONY: dev dev-here dev-reset build install package test check docs-release docs-release-check prototype-glyph-set prototype-glyph-set-terminal prototype-earnings-review
 
 ## 用隔离目录启动 Agent；传参示例：make dev ARGS="-c"
 dev:
@@ -56,6 +56,14 @@ check:
 	cargo fmt --all --check
 	cargo clippy --locked --workspace --all-targets -- -D warnings
 	$(MAKE) test
+
+## 发布已提交的 Docs 快照；默认递增 patch，可用 VERSION=0.1.0 指定版本
+docs-release:
+	@node services/artifacts/scripts/release.mjs
+
+## 仅检查版本、工作树、origin 和 tag，不写入 Git
+docs-release-check:
+	@node services/artifacts/scripts/release.mjs --check
 
 ## 启动一次性 Glyph Set 设置页原型；访问 http://127.0.0.1:8765/?variant=A
 prototype-glyph-set:
