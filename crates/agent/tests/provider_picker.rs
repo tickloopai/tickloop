@@ -577,8 +577,15 @@ fn empty_model_picker_can_configure_a_provider_and_preserves_drafts_on_key_updat
     });
     terminal.send(b"p");
     terminal.wait_for("Choose Provider");
-    // Custom connections follow the bundled vendor groups.
-    terminal.send(b"jjjjj\r");
+    let vendors = tickloop_agent::model::cards::built_in_model_profiles()
+        .into_iter()
+        .filter_map(|model| {
+            model
+                .connection()
+                .map(|connection| connection.vendor.clone())
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    terminal.send(format!("{}\r", "j".repeat(vendors.len())).as_bytes());
     terminal.wait_for("API key · Picker Fixture");
     terminal.send(TEST_KEY.as_bytes());
     let mark = terminal.mark();
@@ -1470,7 +1477,9 @@ fn recently_denied_restores_details_and_retry_obeys_the_current_ask_rule() {
     let mark = terminal.mark();
     terminal.send(b"\x1b");
     terminal.wait_for_frame_after(mark, "history list", |frame| {
-        frame.contains("Enter details")
+        frame.contains("Permissions ·")
+            && frame.contains("[Recent activity]")
+            && frame.contains("Deny ·")
     });
     let mark = terminal.mark();
     terminal.send(b"\x1b");
@@ -1884,7 +1893,9 @@ fn auto_jev_failure_shows_llm_fallback_and_preserves_a_custom_hard_denial_in_det
     let mark = terminal.mark();
     terminal.send(b"\x1b");
     terminal.wait_for_frame_after(mark, "back to denied list", |frame| {
-        frame.contains("Enter details")
+        frame.contains("Permissions ·")
+            && frame.contains("[Recent activity]")
+            && frame.contains("Deny ·")
     });
     let mark = terminal.mark();
     terminal.send(b"\x1b");
@@ -2069,7 +2080,9 @@ fn auto_jev_recovery_notice_appears_after_real_cooldown_in_agent_pty() {
     let mark = terminal.mark();
     terminal.send(b"\x1b");
     terminal.wait_for_frame_after(mark, "back to recent denials", |frame| {
-        frame.contains("Enter details")
+        frame.contains("Permissions ·")
+            && frame.contains("[Recent activity]")
+            && frame.contains("Deny ·")
     });
     let mark = terminal.mark();
     terminal.send(b"\x1b");

@@ -24,6 +24,7 @@ pub enum ModelDiscovery {
     OpenAiApi,
     Codex,
     GithubCopilot,
+    ProviderApi,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

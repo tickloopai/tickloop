@@ -31,18 +31,24 @@ pub enum Adapter {
     DeepseekChatCompletions,
     GlmChatCompletions,
     CodexResponses,
+    Google,
+    KimiChatCompletions,
+    QwenChatCompletions,
     SystemOne,
 }
 
 impl Adapter {
     pub const fn protocol(self) -> Protocol {
         match self {
+            Self::Google => Protocol::Google,
             Self::SystemOne => Protocol::SystemOne,
             Self::Messages | Self::DeepseekMessages | Self::MinimaxMessages => Protocol::Messages,
             Self::Responses | Self::CodexResponses => Protocol::Responses,
-            Self::ChatCompletions | Self::DeepseekChatCompletions | Self::GlmChatCompletions => {
-                Protocol::ChatCompletions
-            }
+            Self::ChatCompletions
+            | Self::DeepseekChatCompletions
+            | Self::GlmChatCompletions
+            | Self::KimiChatCompletions
+            | Self::QwenChatCompletions => Protocol::ChatCompletions,
         }
     }
 }
@@ -50,6 +56,7 @@ impl Adapter {
 impl From<Protocol> for Adapter {
     fn from(protocol: Protocol) -> Self {
         match protocol {
+            Protocol::Google => Self::Google,
             Protocol::SystemOne => Self::SystemOne,
             Protocol::Messages => Self::Messages,
             Protocol::Responses => Self::Responses,
@@ -403,6 +410,16 @@ impl ModelCatalog {
             include_str!("providers/zai-global-api.yaml"),
             include_str!("providers/zai-global-coding.yaml"),
             include_str!("providers/github-copilot.yaml"),
+            include_str!("providers/kimi-cn-api.yaml"),
+            include_str!("providers/kimi-global-api.yaml"),
+            include_str!("providers/kimi-code-oauth.yaml"),
+            include_str!("providers/alibaba-cn-api.yaml"),
+            include_str!("providers/google-gemini-api.yaml"),
+            include_str!("providers/google-gemini-oauth.yaml"),
+            include_str!("providers/google-vertex-service-account.yaml"),
+            include_str!("providers/google-vertex-oauth.yaml"),
+            include_str!("providers/xai-api.yaml"),
+            include_str!("providers/xai-oauth.yaml"),
         ]
         .into_iter()
         .map(|yaml| serde_yaml_ng::from_str(yaml).expect("bundled Provider YAML is valid"))
@@ -993,6 +1010,7 @@ fn legacy_builtin_name(profile: &ModelConfig) -> Option<String> {
             Protocol::Messages => "",
             Protocol::Responses => " Responses",
             Protocol::ChatCompletions => " Chat Completions",
+            Protocol::Google => " Google API",
             Protocol::SystemOne => " System One",
         }
     } else {

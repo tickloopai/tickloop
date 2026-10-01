@@ -28,8 +28,10 @@ pub mod connection;
 pub mod copilot;
 pub mod credentials;
 mod glm;
+mod google;
 pub(crate) mod history;
 mod image_limits;
+mod provider_directory;
 mod responses;
 
 pub(crate) use image_limits::strip_images;
@@ -45,6 +47,7 @@ pub enum Protocol {
     Messages,
     Responses,
     ChatCompletions,
+    Google,
     SystemOne,
 }
 
@@ -68,6 +71,13 @@ pub enum ModelAuthSource {
     #[serde(rename = "minimax_oauth_global")]
     MiniMaxOAuthGlobal,
     GithubCopilot,
+    GoogleCloud,
+    #[serde(rename = "google_oauth")]
+    GoogleOAuth,
+    #[serde(rename = "kimi_oauth")]
+    KimiOAuth,
+    #[serde(rename = "xai_oauth")]
+    XaiOAuth,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -443,9 +453,11 @@ pub fn validate_reasoning_effort(
 ) -> Result<(), ModelError> {
     let is_supported = effort.is_none_or(|effort| match effort {
         ReasoningEffort::On => {
-            config.adapter() == cards::Adapter::MinimaxMessages
-                && cards::model_card(config)
-                    .is_some_and(|card| card.thinking == cards::ThinkingControl::Toggle)
+            matches!(
+                config.adapter(),
+                cards::Adapter::MinimaxMessages | cards::Adapter::QwenChatCompletions
+            ) && cards::model_card(config)
+                .is_some_and(|card| card.thinking == cards::ThinkingControl::Toggle)
         }
         ReasoningEffort::Off => cards::model_card(config)
             .is_some_and(|card| card.thinking == cards::ThinkingControl::Toggle),
@@ -872,7 +884,11 @@ pub fn validate_model_config(config: &ModelConfig) -> Result<(), ModelError> {
             ModelAuthSource::ApiKeyEnv
             | ModelAuthSource::MiniMaxOAuthCn
             | ModelAuthSource::MiniMaxOAuthGlobal
-            | ModelAuthSource::GithubCopilot,
+            | ModelAuthSource::GithubCopilot
+            | ModelAuthSource::GoogleCloud
+            | ModelAuthSource::GoogleOAuth
+            | ModelAuthSource::KimiOAuth
+            | ModelAuthSource::XaiOAuth,
         ) => HttpModelClient::deferred(config.clone()).map(|_| ()),
         (ModelProvider::OpenAiCodex, ModelAuthSource::CodexSubscription) => {
             codex::validate_config(config)
@@ -895,7 +911,7 @@ pub(crate) fn validate_model_for_resume_in_root(
     match config.provider {
         ModelProvider::Api
             if crate::auth::minimax::MiniMaxRegion::from_auth(config.auth_source).is_some()
-                || config.auth_source == ModelAuthSource::GithubCopilot =>
+                || config.auth_source != ModelAuthSource::ApiKeyEnv =>
         {
             Ok(())
         }
@@ -918,9 +934,9 @@ pub fn model_client(
                     "MiniMax OAuth requires an Agent state directory".into(),
                 ));
             }
-            if config.auth_source == ModelAuthSource::GithubCopilot && state_dir.is_none() {
+            if config.auth_source != ModelAuthSource::ApiKeyEnv && state_dir.is_none() {
                 return Err(ModelError::Configuration(
-                    "GitHub Copilot sign-in requires an Agent state directory".into(),
+                    "Provider sign-in requires an Agent state directory".into(),
                 ));
             }
             Ok(Arc::new(HttpModelClient::deferred_with_root(
@@ -955,6 +971,7 @@ pub struct HttpModelClient {
     client: reqwest::Client,
     route: NetworkRoute,
     state_root: Option<PathBuf>,
+    cache_id: uuid::Uuid,
 }
 
 type PrivateBlockKey = (crate::runtime::ChatId, [u8; 32], [u8; 32]);
@@ -1102,6 +1119,75 @@ impl HttpModelClient {
             ));
         }
 
+        let registered_auth = match config.provider_id.as_str() {
+            "google-gemini-oauth" | "google-vertex-oauth" => Some(ModelAuthSource::GoogleOAuth),
+            "google-vertex-service-account" => Some(ModelAuthSource::GoogleCloud),
+            "kimi-code-oauth" => Some(ModelAuthSource::KimiOAuth),
+            "xai-oauth" => Some(ModelAuthSource::XaiOAuth),
+            _ => None,
+        };
+        if registered_auth.is_some_and(|source| source != config.auth_source) {
+            return Err(ModelError::Configuration(
+                "This Provider requires its registered authentication route".into(),
+            ));
+        }
+        if matches!(
+            config.auth_source,
+            ModelAuthSource::GoogleCloud | ModelAuthSource::GoogleOAuth
+        ) {
+            let loopback = cfg!(debug_assertions)
+                && reqwest::Url::parse(&config.base_url)
+                    .is_ok_and(|url| url.scheme() == "http" && is_loopback(&url));
+            let valid = config.api_key_env.is_empty()
+                && config.adapter() == cards::Adapter::Google
+                && match (config.provider_id.as_str(), config.auth_source) {
+                    ("google-gemini-oauth", ModelAuthSource::GoogleOAuth) => {
+                        loopback
+                            || config.base_url == "https://generativelanguage.googleapis.com/v1beta"
+                    }
+                    ("google-vertex-service-account", ModelAuthSource::GoogleCloud)
+                    | ("google-vertex-oauth", ModelAuthSource::GoogleOAuth) => {
+                        loopback || config.base_url == "https://aiplatform.googleapis.com/v1"
+                    }
+                    _ => false,
+                };
+            if !valid {
+                return Err(ModelError::Configuration(
+                    "Google OAuth requires its registered Provider and official native endpoint"
+                        .into(),
+                ));
+            }
+        }
+        if let Some(provider) =
+            crate::auth::device_subscriptions::DeviceSubscription::from_auth(config.auth_source)
+            && (!config.api_key_env.is_empty()
+                || config.base_url != provider.endpoint()
+                    && !(cfg!(debug_assertions)
+                        && reqwest::Url::parse(&config.base_url)
+                            .is_ok_and(|url| url.scheme() == "http" && is_loopback(&url)))
+                || match provider {
+                    crate::auth::device_subscriptions::DeviceSubscription::Kimi => {
+                        config.provider_id != "kimi-code-oauth"
+                            || config.adapter() != cards::Adapter::KimiChatCompletions
+                    }
+                    crate::auth::device_subscriptions::DeviceSubscription::Xai => {
+                        config.provider_id != "xai-oauth"
+                            || config.adapter() != cards::Adapter::Responses
+                    }
+                })
+        {
+            return Err(ModelError::Configuration("Subscription OAuth requires its registered Provider, adapter and official endpoint".into()));
+        }
+        if config.protocol == Protocol::Google
+            && (!config
+                .model
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte)))
+        {
+            return Err(ModelError::Configuration(
+                "invalid Google service model ID".into(),
+            ));
+        }
         if config.provider != ModelProvider::Api
             || config.auth_source == ModelAuthSource::CodexSubscription
         {
@@ -1147,6 +1233,7 @@ impl HttpModelClient {
             client,
             route,
             state_root: state_root.map(Path::to_path_buf),
+            cache_id: uuid::Uuid::new_v4(),
         })
     }
 }
@@ -1203,7 +1290,16 @@ impl HttpModelClient {
         let region = crate::auth::minimax::MiniMaxRegion::from_auth(self.config.auth_source);
         let copilot_auth = self.config.auth_source == ModelAuthSource::GithubCopilot;
         let mut copilot_api_base = None;
-        let identity_from_sign_in = region.is_some() || copilot_auth;
+        let google_auth = matches!(
+            self.config.auth_source,
+            ModelAuthSource::GoogleCloud | ModelAuthSource::GoogleOAuth
+        );
+        let subscription = crate::auth::device_subscriptions::DeviceSubscription::from_auth(
+            self.config.auth_source,
+        );
+        let identity_from_sign_in = self.config.auth_source != ModelAuthSource::ApiKeyEnv;
+        let mut google_project = None;
+        let mut resolved_base = None;
         let (key, credential_identity) = if let Some(region) = region {
             let root = self.state_root.as_deref().ok_or_else(|| {
                 ModelError::Configuration("MiniMax OAuth requires an Agent state directory".into())
@@ -1258,6 +1354,46 @@ impl HttpModelClient {
             key.set_sensitive(true);
             copilot_api_base = access.api_base;
             (Some(key), Some(access.identity.to_string()))
+        } else if google_auth {
+            let root = self.state_root.as_deref().ok_or_else(|| {
+                ModelError::Configuration(
+                    "Google authentication requires an Agent state directory".into(),
+                )
+            })?;
+            let access = crate::auth::google::GoogleAuth::new(root)
+                .resolve(&self.config, &cancel, context)
+                .await?;
+            let mut key = reqwest::header::HeaderValue::from_str(&access.token).map_err(|_| {
+                ModelError::Configuration("invalid Google credential header".into())
+            })?;
+            key.set_sensitive(true);
+            google_project = Some(access.project);
+            resolved_base = Some(access.base_url);
+            (
+                Some(key),
+                Some(credential_fingerprint(
+                    format!(
+                        "{}:{}",
+                        access.identity,
+                        resolved_base.as_deref().unwrap_or("")
+                    )
+                    .as_bytes(),
+                )),
+            )
+        } else if let Some(provider) = subscription {
+            let root = self.state_root.as_deref().ok_or_else(|| {
+                ModelError::Configuration(
+                    "Subscription authentication requires an Agent state directory".into(),
+                )
+            })?;
+            let access = crate::auth::device_subscriptions::SubscriptionAuth::new(root, provider)
+                .resolve(&cancel, context)
+                .await?;
+            let mut key = reqwest::header::HeaderValue::from_str(&access.token).map_err(|_| {
+                ModelError::Configuration("invalid subscription credential header".into())
+            })?;
+            key.set_sensitive(true);
+            (Some(key), Some(access.identity.to_string()))
         } else {
             let key = api_key(&self.config, self.state_root.as_deref())?;
             let identity = key
@@ -1280,8 +1416,8 @@ impl HttpModelClient {
         if !identity_from_sign_in {
             self.ensure_credential_history_compatible(chat_id, &request, key.as_ref())?;
         }
-        let structured_tool = messages_structured_tool(&self.config, &request);
-        let (endpoint, body) = match self.config.adapter() {
+        let structured_tool = structured_tool_name(&self.config, &request);
+        let (endpoint, mut body) = match self.config.adapter() {
             cards::Adapter::Messages
             | cards::Adapter::DeepseekMessages
             | cards::Adapter::MinimaxMessages => {
@@ -1293,10 +1429,13 @@ impl HttpModelClient {
             ),
             cards::Adapter::ChatCompletions
             | cards::Adapter::DeepseekChatCompletions
-            | cards::Adapter::GlmChatCompletions => (
+            | cards::Adapter::GlmChatCompletions
+            | cards::Adapter::KimiChatCompletions
+            | cards::Adapter::QwenChatCompletions => (
                 "chat/completions",
                 chat_completions::encode_request(&self.config, request)?,
             ),
+            cards::Adapter::Google => ("", google::encode_request(&self.config, request)?),
             cards::Adapter::SystemOne => {
                 return Err(ModelError::UnsupportedProtocol(Protocol::SystemOne));
             }
@@ -1306,9 +1445,32 @@ impl HttpModelClient {
                 ));
             }
         };
-        let base_url = copilot_api_base.as_deref().unwrap_or(&self.config.base_url);
-        let target = reqwest::Url::parse(&format!("{}/{endpoint}", base_url.trim_end_matches('/')))
-            .map_err(|_| ModelError::Configuration("invalid model endpoint".into()))?;
+        if matches!(self.config.adapter(), cards::Adapter::KimiChatCompletions)
+            || self.config.provider_id.starts_with("xai-")
+        {
+            body["prompt_cache_key"] = json!(credential_fingerprint(
+                format!(
+                    "{}:{}",
+                    self.config.provider_id,
+                    chat_id.unwrap_or(self.cache_id)
+                )
+                .as_bytes()
+            ));
+        }
+        let base_url = resolved_base
+            .as_deref()
+            .or(copilot_api_base.as_deref())
+            .unwrap_or(&self.config.base_url);
+        let target = reqwest::Url::parse(&if self.config.protocol == Protocol::Google {
+            format!(
+                "{}/models/{}:streamGenerateContent?alt=sse",
+                base_url.trim_end_matches('/'),
+                self.config.model
+            )
+        } else {
+            format!("{}/{endpoint}", base_url.trim_end_matches('/'))
+        })
+        .map_err(|_| ModelError::Configuration("invalid model endpoint".into()))?;
         let mut outgoing = self
             .client
             .post(target.clone())
@@ -1316,9 +1478,12 @@ impl HttpModelClient {
             .json(&body);
         if let Some(key) = key.as_ref() {
             outgoing = match self.config.protocol {
+                Protocol::Google if self.config.auth_source == ModelAuthSource::ApiKeyEnv => {
+                    outgoing.header("x-goog-api-key", key.clone())
+                }
                 Protocol::Messages
                     if self.config.adapter() != cards::Adapter::MinimaxMessages
-                        && self.config.auth_source != ModelAuthSource::GithubCopilot =>
+                        && self.config.auth_source == ModelAuthSource::ApiKeyEnv =>
                 {
                     outgoing.header("x-api-key", key.clone())
                 }
@@ -1334,6 +1499,14 @@ impl HttpModelClient {
                     outgoing.header(reqwest::header::AUTHORIZATION, value)
                 }
             };
+        }
+        if let Some(project) = google_project {
+            outgoing = outgoing.header("x-goog-user-project", project);
+        }
+        if self.config.auth_source == ModelAuthSource::XaiOAuth {
+            outgoing = outgoing
+                .header("X-XAI-Token-Auth", "xai-grok-cli")
+                .header("x-grok-model-override", &self.config.model);
         }
         if copilot_auth {
             for (name, value) in copilot::request_headers(&body) {
@@ -1553,6 +1726,7 @@ async fn consume_sse_response(
     let mut received_sse_data = false;
     let mut output_started = false;
     let mut stream = match protocol {
+        Protocol::Google => ProtocolStream::Google(google::GoogleStream::default()),
         Protocol::SystemOne => return Err(ModelError::UnsupportedProtocol(protocol)),
         Protocol::Messages => ProtocolStream::Messages(MessagesStream {
             provisional_input_usage: adapter == cards::Adapter::MinimaxMessages,
@@ -1677,6 +1851,9 @@ async fn consume_sse_response(
             response.status().as_u16()
         )));
     }
+    if protocol == Protocol::Google && pending.is_empty() && event_data.is_empty() {
+        return stream.finish();
+    }
     Err(if output_started {
         ModelError::StreamInterruptedAfterOutput
     } else {
@@ -1689,6 +1866,13 @@ fn sse_event_starts_output(protocol: Protocol, data: &Value) -> bool {
         return true;
     }
     match protocol {
+        Protocol::Google => data["candidates"].as_array().is_some_and(|candidates| {
+            candidates.iter().any(|candidate| {
+                candidate["content"]["parts"]
+                    .as_array()
+                    .is_some_and(|parts| !parts.is_empty())
+            })
+        }),
         Protocol::SystemOne => false,
         Protocol::Messages => data["type"] == "content_block_delta",
         Protocol::Responses => data["type"].as_str().is_some_and(|kind| {
@@ -1709,6 +1893,13 @@ fn sse_event_starts_output(protocol: Protocol, data: &Value) -> bool {
 
 fn sse_event_needs_output_marker(protocol: Protocol, data: &Value) -> bool {
     match protocol {
+        Protocol::Google => data["candidates"].as_array().is_some_and(|candidates| {
+            candidates.iter().any(|candidate| {
+                candidate["content"]["parts"]
+                    .as_array()
+                    .is_some_and(|parts| !parts.is_empty())
+            })
+        }),
         Protocol::SystemOne => false,
         Protocol::Messages => {
             data["type"] == "content_block_start" && data["content_block"]["type"] == "tool_use"
@@ -1993,18 +2184,32 @@ fn messages_request(config: &ModelConfig, request: ModelRequest) -> Result<Value
     Ok(body)
 }
 
-fn messages_structured_tool(config: &ModelConfig, request: &ModelRequest) -> Option<String> {
+pub(super) fn uses_structured_response_tool(config: &ModelConfig, request: &ModelRequest) -> bool {
     matches!(
         config.adapter(),
         cards::Adapter::DeepseekMessages | cards::Adapter::MinimaxMessages
-    )
-    .then(|| {
-        request
-            .structured_output
-            .as_ref()
-            .map(|format| format.name.clone())
-    })
-    .flatten()
+    ) || config.provider_id == "kimi-code-oauth"
+        || config.adapter() == cards::Adapter::QwenChatCompletions
+            && request
+                .messages
+                .iter()
+                .flat_map(|message| &message.content)
+                .any(|block| match block {
+                    Content::Image { .. } => true,
+                    Content::ToolResult { content, .. } => content.has_images(),
+                    _ => false,
+                })
+}
+
+fn structured_tool_name(config: &ModelConfig, request: &ModelRequest) -> Option<String> {
+    uses_structured_response_tool(config, request)
+        .then(|| {
+            request
+                .structured_output
+                .as_ref()
+                .map(|format| format.name.clone())
+        })
+        .flatten()
 }
 
 fn normalize_structured_tool_output(
@@ -2180,6 +2385,7 @@ enum ProtocolStream {
     Messages(MessagesStream),
     Responses(responses::ResponsesStream),
     Chat(chat_completions::ChatStream),
+    Google(google::GoogleStream),
 }
 
 impl ProtocolStream {
@@ -2192,6 +2398,7 @@ impl ProtocolStream {
             Self::Messages(stream) => stream.accept(data, events),
             Self::Responses(stream) => stream.accept(data, events),
             Self::Chat(stream) => stream.accept(data, events),
+            Self::Google(stream) => stream.accept(data, events),
         }
     }
 
@@ -2200,6 +2407,7 @@ impl ProtocolStream {
             Self::Messages(stream) => stream.finish(),
             Self::Responses(stream) => stream.finish(),
             Self::Chat(stream) => stream.finish(),
+            Self::Google(stream) => stream.finish(),
         }
     }
 }
@@ -2496,7 +2704,7 @@ fn observe_usage(
     let mut observation = Usage::default();
     let mut failure = None;
     let (input_name, output_name) = match protocol {
-        Protocol::Messages | Protocol::Responses | Protocol::SystemOne => {
+        Protocol::Messages | Protocol::Responses | Protocol::Google | Protocol::SystemOne => {
             ("input_tokens", "output_tokens")
         }
         Protocol::ChatCompletions => ("prompt_tokens", "completion_tokens"),
@@ -2525,7 +2733,7 @@ fn observe_usage(
         );
     }
     let details_name = match protocol {
-        Protocol::Messages | Protocol::SystemOne => None,
+        Protocol::Messages | Protocol::Google | Protocol::SystemOne => None,
         Protocol::Responses => Some("input_tokens_details"),
         Protocol::ChatCompletions => Some("prompt_tokens_details"),
     };
@@ -3072,6 +3280,7 @@ mod tests {
                 let _ = released.await;
             });
             let client = HttpModelClient {
+                cache_id: uuid::Uuid::new_v4(),
                 config: ModelConfig {
                     provider: crate::model::ModelProvider::Api,
                     auth_source: crate::model::ModelAuthSource::ApiKeyEnv,

@@ -1,0 +1,10 @@
+---
+provider: kimi-code-oauth
+series:
+- id: kimi
+  name: Kimi
+  version: K3
+  model: k3
+  capability_order: 0
+notice: Kimi Code OAuth uses the registered Kimi Code client. K3 context is conservatively
+  capped at 256K; 1M requires Pro entitlement. OAuth account access has not been tested.

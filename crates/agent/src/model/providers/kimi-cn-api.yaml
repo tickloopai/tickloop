@@ -1,0 +1,31 @@
+---
+id: kimi-cn-api
+display_name: Kimi Pay-as-you-go API
+connection:
+  vendor: Kimi
+  product: Pay-as-you-go API
+  kind: pay_as_you_go
+  order: 0
+  discovery: provider_api
+  region:
+    name: China
+    order: 0
+auth: api_key_env
+api_key_env: MOONSHOT_CN_API_KEY
+endpoints:
+  kimi_chat_completions: https://api.moonshot.cn/v1
+models:
+- id: kimi-k3
+  service_model_id: kimi-k3
+  display_name: Kimi K3
+  adapter: kimi_chat_completions
+  max_output_tokens: 131072
+  context_window_tokens: 1048576
+  thinking: always_on
+  effort_levels:
+  - low
+  - high
+  - max
+  input_modalities:
+  - text
+  - image

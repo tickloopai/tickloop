@@ -1,0 +1,29 @@
+---
+id: xai-oauth
+display_name: xAI Grok subscription
+connection:
+  vendor: xAI
+  product: Grok subscription
+  kind: plan
+  order: 0
+  discovery: unsupported
+auth: xai_oauth
+api_key_env: ''
+endpoints:
+  responses: https://cli-chat-proxy.grok.com/v1
+models:
+- id: grok-4.6
+  service_model_id: grok-4.6
+  display_name: Grok 4.6
+  adapter: responses
+  max_output_tokens: 32768
+  context_window_tokens: 500000
+  thinking: always_on
+  effort_levels:
+  - low
+  - medium
+  - high
+  - xhigh
+  input_modalities:
+  - text
+  - image

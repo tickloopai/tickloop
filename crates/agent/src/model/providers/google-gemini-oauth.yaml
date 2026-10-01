@@ -1,0 +1,42 @@
+---
+id: google-gemini-oauth
+display_name: Google Developer API OAuth
+connection:
+  vendor: Google
+  product: Developer API OAuth
+  kind: pay_as_you_go
+  order: 1
+  discovery: provider_api
+auth: google_oauth
+api_key_env: ''
+endpoints:
+  google: https://generativelanguage.googleapis.com/v1beta
+models:
+- id: gemini-3.8-flash
+  service_model_id: gemini-3.8-flash
+  display_name: Gemini 3.8 Flash
+  adapter: google
+  max_output_tokens: 65536
+  context_window_tokens: 1048576
+  thinking: always_on
+  effort_levels:
+  - low
+  - medium
+  - high
+  input_modalities:
+  - text
+  - image
+- id: gemini-3.5-flash-lite
+  service_model_id: gemini-3.5-flash-lite
+  display_name: Gemini 3.5 Flash-Lite
+  adapter: google
+  max_output_tokens: 65536
+  context_window_tokens: 1048576
+  thinking: always_on
+  effort_levels:
+  - low
+  - medium
+  - high
+  input_modalities:
+  - text
+  - image

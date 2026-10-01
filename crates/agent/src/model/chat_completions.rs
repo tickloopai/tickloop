@@ -17,6 +17,7 @@ pub(super) fn encode_request(
 ) -> Result<Value, ModelError> {
     validate_reasoning_effort(config, request.reasoning_effort)?;
     let reasoning_effort = request.reasoning_effort;
+    let structured_tool = super::uses_structured_response_tool(config, &request);
     let mut messages = Vec::new();
     for message in request.messages {
         let has_image = message
@@ -87,6 +88,58 @@ pub(super) fn encode_request(
     }
     if !request.tools.is_empty() {
         body["tools"] = json!(request.tools.into_iter().map(|tool|json!({"type":"function","function":{"name":tool.name,"description":tool.description,"parameters":tool.input_schema}})).collect::<Vec<_>>());
+    }
+    if matches!(
+        config.adapter(),
+        Adapter::KimiChatCompletions | Adapter::QwenChatCompletions
+    ) {
+        body.as_object_mut()
+            .expect("request object")
+            .remove("max_tokens");
+        body["max_completion_tokens"] = json!(config.max_output_tokens);
+        if config.adapter() == Adapter::KimiChatCompletions {
+            body.as_object_mut()
+                .expect("request object")
+                .remove("temperature");
+            if let Some(effort) = reasoning_effort {
+                body["reasoning_effort"] = json!(effort.label());
+            }
+        } else {
+            body["enable_thinking"] = json!(reasoning_effort != Some(ReasoningEffort::Off));
+            if let Some(effort) = reasoning_effort
+                .filter(|effort| !matches!(effort, ReasoningEffort::Off | ReasoningEffort::On))
+            {
+                body["reasoning_effort"] = json!(effort.label());
+            }
+            let preserved = config.model.starts_with("qwen3.8-max")
+                || config.model.starts_with("qwen3.7-plus")
+                || config.model.starts_with("qwen3.8-flash");
+            if preserved {
+                body["preserve_thinking"] = json!(true);
+            } else {
+                for message in body["messages"].as_array_mut().expect("messages array") {
+                    message
+                        .as_object_mut()
+                        .expect("message object")
+                        .remove("reasoning_content");
+                }
+            }
+        }
+        if let Some(format) = request.structured_output {
+            if body.get("tools").is_some() {
+                return Err(ModelError::Configuration(
+                    "Structured output cannot be combined with executable tools".into(),
+                ));
+            }
+            if structured_tool {
+                body["tools"] = json!([{"type":"function","function":{"name":format.name,"description":"Return exactly one structured result using this tool; no other content or tools.","parameters":format.schema}}]);
+                body["tool_choice"] = json!("auto");
+                body["messages"].as_array_mut().expect("messages array").insert(0, json!({"role":"system","content":format!("Call {} exactly once to return the structured result. Emit no ordinary text and no other tool calls.", format.name)}));
+            } else {
+                body["response_format"] = json!({"type":"json_schema","json_schema":{"name":format.name,"schema":format.schema,"strict":true}});
+            }
+        }
+        return Ok(body);
     }
     if config.adapter() == Adapter::GlmChatCompletions {
         super::glm::shape_request(&mut body, reasoning_effort, request.structured_output)?;

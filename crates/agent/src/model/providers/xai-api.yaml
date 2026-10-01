@@ -1,0 +1,29 @@
+---
+id: xai-api
+display_name: xAI Pay-as-you-go API
+connection:
+  vendor: xAI
+  product: Pay-as-you-go API
+  kind: pay_as_you_go
+  order: 0
+  discovery: provider_api
+auth: api_key_env
+api_key_env: XAI_API_KEY
+endpoints:
+  responses: https://api.x.ai/v1
+models:
+- id: grok-4.7
+  service_model_id: grok-4.7
+  display_name: Grok 4.7
+  adapter: responses
+  max_output_tokens: 32768
+  context_window_tokens: 500000
+  thinking: always_on
+  effort_levels:
+  - low
+  - medium
+  - high
+  - xhigh
+  input_modalities:
+  - text
+  - image

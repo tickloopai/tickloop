@@ -1,3 +1,9 @@
+connection:
+  vendor: "Anthropic"
+  product: "Pay-as-you-go API"
+  kind: "pay_as_you_go"
+  order: 0
+  discovery: "provider_api"
 model_aliases:
   "claude-opus-5-messages": "claude-opus-5"
   "claude-opus-4-8-messages": "claude-opus-4-8"
@@ -118,8 +124,8 @@ models:
     service_model_id: "claude-fable-5-1"
     display_name: "Claude Fable 5.1"
     adapter: "messages"
-    max_output_tokens: 64000
-    context_window_tokens: null
+    max_output_tokens: 128000
+    context_window_tokens: 1000000
     thinking: "always_on"
     adaptive_by_default: true
     effort_levels:
@@ -148,3 +154,33 @@ models:
     input_modalities:
       - "text"
       - "image"
+  - id: "claude-opus-5-5"
+    service_model_id: "claude-opus-5-5"
+    display_name: "Claude Opus 5.5"
+    adapter: "messages"
+    max_output_tokens: 128000
+    context_window_tokens: 1000000
+    thinking: "always_on"
+    effort_levels: ["low", "medium", "high", "xhigh", "max"]
+    input_modalities: ["text", "image"]
+    adaptive_by_default: true
+  - id: "claude-sonnet-5-5"
+    service_model_id: "claude-sonnet-5-5"
+    display_name: "Claude Sonnet 5.5"
+    adapter: "messages"
+    max_output_tokens: 128000
+    context_window_tokens: 1000000
+    thinking: "toggle"
+    effort_levels: ["low", "medium", "high", "xhigh", "max"]
+    input_modalities: ["text", "image"]
+    adaptive_by_default: true
+  - id: "claude-haiku-4-5-20251001"
+    service_model_id: "claude-haiku-4-5-20251001"
+    display_name: "Claude Haiku 4.5"
+    adapter: "messages"
+    max_output_tokens: 64000
+    context_window_tokens: 200000
+    thinking: "toggle"
+    effort_levels: ["low", "medium", "high"]
+    input_modalities: ["text", "image"]
+    thinking_budgets: {low: 2048, medium: 8192, high: 16384}

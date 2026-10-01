@@ -197,6 +197,7 @@ async fn every_adapter_preserves_independently_valid_counters_in_malformed_usage
         Protocol::ChatCompletions,
     ] {
         let (input_name, output_name, read_name, write_name) = match protocol {
+            Protocol::Google => unreachable!("native usage is covered by google_models tests"),
             Protocol::SystemOne => unreachable!("judgments do not stream conversation usage"),
             Protocol::Messages | Protocol::Responses => (
                 "input_tokens",
@@ -230,6 +231,9 @@ async fn every_adapter_preserves_independently_valid_counters_in_malformed_usage
                     usage[write_name] = counters[3].clone();
                 }
                 let body = match protocol {
+                    Protocol::Google => {
+                        unreachable!("native usage is covered by google_models tests")
+                    }
                     Protocol::SystemOne => {
                         unreachable!("judgments do not stream conversation usage")
                     }

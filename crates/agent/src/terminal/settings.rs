@@ -46,6 +46,7 @@ pub(super) fn model_label(config: &ModelConfig) -> String {
         Protocol::Messages => "Messages",
         Protocol::Responses => "Responses",
         Protocol::ChatCompletions => "OpenAI Chat Completions",
+        Protocol::Google => "Google API",
         Protocol::SystemOne => "System One",
     };
     if !config.provider_id.is_empty() {

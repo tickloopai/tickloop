@@ -1,7 +1,12 @@
 //! Local subscription credentials.
 
 pub mod copilot;
+pub mod device_subscriptions;
+pub mod google;
 pub mod minimax;
+mod provider_store;
+#[cfg(test)]
+pub(crate) mod provider_test_support;
 
 use std::fmt;
 use std::fs::{File, OpenOptions};
@@ -54,6 +59,8 @@ const CALLBACK_STATE_MISMATCH: &str = "This callback belongs to a different sign
 
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {
+    #[error("{0}")]
+    Provider(String),
     #[error("{0}")]
     MiniMax(String),
     #[error("{0}")]

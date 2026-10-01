@@ -116,6 +116,8 @@ fn chat_chunk(delta: Value, finish_reason: Value) -> String {
 
 fn incomplete_response(protocol: Protocol, output: IncompleteOutput) -> String {
     match (protocol, output) {
+        (Protocol::Google, IncompleteOutput::Thinking) => format!("data: {}\n\n", json!({"responseId":"google-1","candidates":[{"index":0,"content":{"role":"model","parts":[{"thought":true,"text":"Consider a file write"}]}}]})),
+        (Protocol::Google, IncompleteOutput::ToolArguments) => format!("data: {}\n\n", json!({"responseId":"google-1","candidates":[{"index":0,"content":{"role":"model","parts":[{"functionCall":{"name":"Write","args":{"file_path":"side-effect.txt"}}}]}}]})),
         (Protocol::SystemOne, _) => unreachable!("Jev is not a conversation protocol"),
         (Protocol::Messages, IncompleteOutput::Thinking) => [
             frame("message_start", json!({"message":{"role":"assistant","content":[]}})),
@@ -146,6 +148,10 @@ fn incomplete_response(protocol: Protocol, output: IncompleteOutput) -> String {
 
 fn complete_response(protocol: Protocol) -> String {
     match protocol {
+        Protocol::Google => format!(
+            "data: {}\n\n",
+            json!({"responseId":"google-2","candidates":[{"index":0,"content":{"role":"model","parts":[{"text":"Quick completion"}]},"finishReason":"STOP"}]})
+        ),
         Protocol::SystemOne => unreachable!("Jev is not a conversation protocol"),
         Protocol::Messages => [
             frame(
@@ -240,8 +246,11 @@ async fn run_agent_until_terminal(
 }
 
 fn assert_real_request_encoding(protocol: Protocol, request: &Value) {
-    assert_eq!(request["stream"], true, "{protocol:?}");
+    if protocol != Protocol::Google {
+        assert_eq!(request["stream"], true, "{protocol:?}");
+    }
     match protocol {
+        Protocol::Google => assert!(request["contents"].is_array(), "{request}"),
         Protocol::SystemOne => unreachable!("Jev is not a conversation protocol"),
         Protocol::Responses => assert!(request["input"].is_array(), "{request}"),
         Protocol::Messages | Protocol::ChatCompletions => {
@@ -256,6 +265,7 @@ async fn reasoning_only_disconnect_is_not_replayed_by_any_http_adapter() {
         Protocol::Messages,
         Protocol::Responses,
         Protocol::ChatCompletions,
+        Protocol::Google,
     ] {
         let workdir = tempfile::tempdir().unwrap();
         let server = ReplayServer::start(
@@ -284,6 +294,7 @@ async fn partial_tool_arguments_disconnect_without_replay_or_tool_execution() {
         Protocol::Messages,
         Protocol::Responses,
         Protocol::ChatCompletions,
+        Protocol::Google,
     ] {
         let workdir = tempfile::tempdir().unwrap();
         let server = ReplayServer::start(

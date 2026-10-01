@@ -203,6 +203,7 @@ async fn api_key_branch_uses_public_history_while_source_keeps_proven_private_hi
 
 fn response(protocol: Protocol, tool: Option<&Value>, text: &str) -> String {
     match protocol {
+        Protocol::Google => unreachable!("Google switching is covered by google_models tests"),
         Protocol::SystemOne => unreachable!("Jev is not a conversation protocol"),
         Protocol::Messages => {
             let block = tool.map_or_else(
@@ -354,6 +355,7 @@ fn assert_tool_history_with_output(protocol: Protocol, body: &Value, expected_ou
     .as_array()
     .unwrap();
     let (call, result, content) = match protocol {
+        Protocol::Google => unreachable!("Google switching is covered by google_models tests"),
         Protocol::SystemOne => unreachable!("Jev is not a conversation protocol"),
         Protocol::Messages => {
             let index = messages
@@ -515,6 +517,7 @@ async fn three_http_protocols_switch_only_after_the_running_shell_and_old_tool_r
             .unwrap();
         assert_tool_history(new, &body);
         let path = match new {
+            Protocol::Google => unreachable!("Google switching is covered by google_models tests"),
             Protocol::SystemOne => unreachable!("Jev is not a conversation protocol"),
             Protocol::Messages => "/v1/messages",
             Protocol::Responses => "/responses",

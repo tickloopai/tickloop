@@ -112,6 +112,10 @@ fn text_stream(protocol: Protocol) -> String {
             ]
             .concat()
         }
+        Protocol::Google => format!(
+            "data: {}\n\n",
+            json!({"responseId":"google-1","candidates":[{"index":0,"content":{"role":"model","parts":[{"text":"I cannot see images."}]},"finishReason":"STOP"}]})
+        ),
         Protocol::SystemOne => unreachable!("System One never receives image prompts"),
     }
 }

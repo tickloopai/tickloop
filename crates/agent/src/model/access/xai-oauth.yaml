@@ -1,0 +1,9 @@
+---
+provider: xai-oauth
+notice: Uses the registered Grok client and cli-chat-proxy.grok.com OAuth inference
+  route, separately from api.x.ai pay-as-you-go. Login and model entitlement are untested.
+series:
+- id: grok
+  name: Grok
+  version: '4.6'
+  model: grok-4.6

@@ -1,0 +1,8 @@
+---
+provider: kimi-cn-api
+series:
+- id: kimi
+  name: Kimi
+  version: K3
+  model: kimi-k3
+  capability_order: 0

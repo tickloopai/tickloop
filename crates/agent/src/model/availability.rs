@@ -122,6 +122,15 @@ impl AccountModelDiscovery {
             .map_or(ModelDiscovery::Unsupported, |connection| {
                 connection.discovery
             });
+        if strategy == ModelDiscovery::ProviderApi {
+            return self
+                .discover_with(
+                    &super::provider_directory::ProviderDirectoryAdapter { config, root },
+                    force,
+                    cancel,
+                )
+                .await;
+        }
         if strategy == ModelDiscovery::GithubCopilot {
             let adapter = super::copilot::CopilotDirectoryAdapter { config, root };
             return self.discover_with(&adapter, force, cancel).await;
@@ -320,7 +329,9 @@ async fn resolve_auth(
             let identity = credential_fingerprint(key.as_bytes());
             (key, None, identity)
         }
-        ModelDiscovery::Unsupported | ModelDiscovery::GithubCopilot => {
+        ModelDiscovery::Unsupported
+        | ModelDiscovery::GithubCopilot
+        | ModelDiscovery::ProviderApi => {
             return Err("Model discovery is not provided".into());
         }
     };
@@ -376,7 +387,9 @@ fn discovery_endpoint(config: &ModelConfig, strategy: ModelDiscovery) -> Result<
                 .query_pairs_mut()
                 .append_pair("client_version", env!("CARGO_PKG_VERSION"));
         }
-        ModelDiscovery::Unsupported | ModelDiscovery::GithubCopilot => {
+        ModelDiscovery::Unsupported
+        | ModelDiscovery::GithubCopilot
+        | ModelDiscovery::ProviderApi => {
             return Err("Model discovery is not provided".into());
         }
     }
@@ -471,7 +484,9 @@ fn parse_directory(strategy: ModelDiscovery, body: &[u8]) -> Result<AccountModel
                 !response.has_more,
             )
         }
-        ModelDiscovery::Unsupported | ModelDiscovery::GithubCopilot => {
+        ModelDiscovery::Unsupported
+        | ModelDiscovery::GithubCopilot
+        | ModelDiscovery::ProviderApi => {
             return Err("Model discovery is not provided".into());
         }
     };

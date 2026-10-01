@@ -24,6 +24,8 @@ pub(super) enum LoginMethod {
     Browser,
     MiniMax(MiniMaxRegion),
     Copilot,
+    Google,
+    Subscription(crate::auth::device_subscriptions::DeviceSubscription),
 }
 
 impl LoginMethod {
@@ -31,6 +33,8 @@ impl LoginMethod {
         match self {
             Self::MiniMax(region) => region.label(),
             Self::Copilot => "GitHub Copilot",
+            Self::Google => "Google OAuth",
+            Self::Subscription(provider) => provider.label(),
             Self::Device | Self::Browser => "Codex subscription",
         }
     }
@@ -43,11 +47,20 @@ pub(super) enum SignInTarget {
     Codex,
     MiniMax(MiniMaxRegion),
     Copilot,
+    Google,
+    Subscription(crate::auth::device_subscriptions::DeviceSubscription),
 }
 
 impl SignInTarget {
-    /// Connections that sign in only through a device authorization.
-    pub(super) fn device_only(source: ModelAuthSource) -> Option<Self> {
+    pub(super) fn from_auth(source: ModelAuthSource) -> Option<Self> {
+        if source == ModelAuthSource::GoogleOAuth {
+            return Some(Self::Google);
+        }
+        if let Some(provider) =
+            crate::auth::device_subscriptions::DeviceSubscription::from_auth(source)
+        {
+            return Some(Self::Subscription(provider));
+        }
         if source == ModelAuthSource::GithubCopilot {
             return Some(Self::Copilot);
         }
@@ -59,6 +72,8 @@ impl SignInTarget {
             Self::Codex => "Codex",
             Self::MiniMax(region) => region.label(),
             Self::Copilot => "GitHub Copilot",
+            Self::Google => "Google OAuth",
+            Self::Subscription(provider) => provider.label(),
         }
     }
 
@@ -67,6 +82,8 @@ impl SignInTarget {
             Self::Codex => LoginMethod::Browser,
             Self::MiniMax(region) => LoginMethod::MiniMax(region),
             Self::Copilot => LoginMethod::Copilot,
+            Self::Google => LoginMethod::Google,
+            Self::Subscription(provider) => LoginMethod::Subscription(provider),
         }
     }
 }
@@ -110,6 +127,40 @@ impl LoginFlow {
         let task_cancel = cancel.clone();
         let (updates, receiver) = mpsc::unbounded_channel();
         let task = tokio::spawn(async move {
+            if let LoginMethod::Google = method {
+                let auth = crate::auth::google::GoogleAuth::new(root);
+                let result = async {
+                    let login = auth.start_browser_login(&task_cancel).await?;
+                    let address = login.browser.authorization_url.clone();
+                    let _ = updates.send(LoginUpdate::Browser { address: address.clone(), callback: login.browser.manual_callback() });
+                    let launch = launch_browser(&address);
+                    let finish = auth.finish_browser_login(login, &task_cancel);
+                    tokio::pin!(launch, finish);
+                    tokio::select! { result = &mut finish => result, () = &mut launch => finish.await }
+                }.await;
+                let _ = updates.send(LoginUpdate::Finished(
+                    result.map_err(|error: crate::model::ModelError| error.to_string()),
+                ));
+                return;
+            }
+            if let LoginMethod::Subscription(provider) = method {
+                let auth = crate::auth::device_subscriptions::SubscriptionAuth::new(root, provider);
+                let result = async {
+                    let login = auth.start_device_login(&task_cancel).await?;
+                    let address = login.verification_uri.clone();
+                    let _ = updates.send(LoginUpdate::Device { address: address.clone(), code: login.user_code.clone() });
+                    let launch = launch_browser(&address);
+                    let finish = auth.finish_device_login(login, &task_cancel);
+                    tokio::pin!(launch, finish);
+                    tokio::select! { result = &mut finish => result, () = &mut launch => finish.await }
+                }.await;
+                let _ = updates.send(LoginUpdate::Finished(
+                    result
+                        .map(|access| access.identity.to_string())
+                        .map_err(|error: crate::model::ModelError| error.to_string()),
+                ));
+                return;
+            }
             if let LoginMethod::MiniMax(region) = method {
                 let auth = MiniMaxAuth::new(root, region);
                 let result = async {
@@ -149,7 +200,10 @@ impl LoginFlow {
             let auth = terminal_auth(root);
             let result = async {
                 match method {
-                    LoginMethod::MiniMax(_) | LoginMethod::Copilot => {
+                    LoginMethod::MiniMax(_)
+                    | LoginMethod::Copilot
+                    | LoginMethod::Google
+                    | LoginMethod::Subscription(_) => {
                         unreachable!("device-only sign-ins return before Codex login")
                     }
                     LoginMethod::Device => {
@@ -227,6 +281,8 @@ impl LoginFlow {
         ];
         if let LoginMethod::MiniMax(_) = self.method {
             context.push("Approve access on the MiniMax Portal. The consent page identifies the registered Portal client.".into());
+        } else if let LoginMethod::Subscription(provider) = self.method {
+            context.push(provider.consent_notice().into());
         } else if let LoginMethod::Copilot = self.method {
             context.push(copilot::CONSENT_NOTICE.into());
         } else {
@@ -290,7 +346,11 @@ impl LoginFlow {
             "Opening your browser. If no page appears, open this link:".into(),
             safe_text(address),
             "Use your terminal's link shortcut (often Ctrl/Cmd+click), or copy the URL.".into(),
-            "Complete authorization in your browser. For a remote terminal, paste the full redirect URL here, or cancel and choose Device code sign-in from this Provider.".into(),
+            if matches!(self.method, LoginMethod::Google) {
+                "Authorize your own Google Cloud client and project. For a remote terminal, paste the complete redirect URL here.".into()
+            } else {
+                "Complete authorization in your browser. For a remote terminal, paste the full redirect URL here, or cancel and choose Device code sign-in from this Provider.".into()
+            },
             "Tab edits the callback field; Esc leaves editing, then cancels login.".into(),
         ];
         if let Some(notice) = notice {
@@ -300,7 +360,11 @@ impl LoginFlow {
             console.show_login_menu(
                 Menu {
                     id: self.id,
-                    title: "Codex browser login".into(),
+                    title: if matches!(self.method, LoginMethod::Google) {
+                        "Google OAuth browser login".into()
+                    } else {
+                        "Codex browser login".into()
+                    },
                     context,
                     options: vec!["Submit callback URL…".into(), "Cancel login".into()],
                     selected: 0,
@@ -389,6 +453,16 @@ impl LogoutFlow {
                             copilot::CopilotAuthError::Cancelled => AuthError::Cancelled,
                             _ => AuthError::Copilot(error.to_string()),
                         })
+                }
+                SignInTarget::Google => crate::auth::google::GoogleAuth::new(root)
+                    .logout(&task_cancel)
+                    .await
+                    .map_err(|error| AuthError::Provider(error.to_string())),
+                SignInTarget::Subscription(provider) => {
+                    crate::auth::device_subscriptions::SubscriptionAuth::new(root, provider)
+                        .logout(&task_cancel)
+                        .await
+                        .map_err(|error| AuthError::Provider(error.to_string()))
                 }
                 SignInTarget::Codex => terminal_auth(root).logout(&task_cancel).await,
             }

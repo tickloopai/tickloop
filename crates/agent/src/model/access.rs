@@ -82,6 +82,17 @@ impl AccessCatalog {
                 include_str!("access/zai-global-api.yaml"),
                 include_str!("access/zai-global-coding.yaml"),
                 include_str!("access/github-copilot.yaml"),
+                include_str!("access/anthropic-api.yaml"),
+                include_str!("access/kimi-cn-api.yaml"),
+                include_str!("access/kimi-global-api.yaml"),
+                include_str!("access/kimi-code-oauth.yaml"),
+                include_str!("access/alibaba-cn-api.yaml"),
+                include_str!("access/google-gemini-api.yaml"),
+                include_str!("access/google-gemini-oauth.yaml"),
+                include_str!("access/google-vertex-service-account.yaml"),
+                include_str!("access/google-vertex-oauth.yaml"),
+                include_str!("access/xai-api.yaml"),
+                include_str!("access/xai-oauth.yaml"),
             ])
             .expect("bundled access catalog YAML is valid");
             catalog

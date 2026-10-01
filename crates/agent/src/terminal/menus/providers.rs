@@ -160,7 +160,7 @@ mod tests {
         );
         assert_eq!(choices[*index].models.len(), 8);
         assert_eq!(
-            SignInTarget::device_only(choices[*index].models[0].auth_source),
+            SignInTarget::from_auth(choices[*index].models[0].auth_source),
             Some(SignInTarget::Copilot)
         );
     }
@@ -355,6 +355,11 @@ impl ProviderModels {
             "MiniMax",
             "Zhipu GLM",
             "GitHub Copilot",
+            "Anthropic",
+            "Kimi",
+            "Alibaba Bailian",
+            "Google",
+            "xAI",
         ];
         let mut vendors: Vec<String> = VENDOR_ORDER
             .iter()
@@ -501,6 +506,13 @@ impl Menus {
 
     fn provider_auth_label(&self, provider: &ProviderModels) -> &'static str {
         let config = &provider.models[0];
+        if config.auth_source == ModelAuthSource::GoogleCloud {
+            return match self.provider_authenticated(provider) {
+                Ok(true) => "Service account configured",
+                Ok(false) => "Service account required",
+                Err(_) => "Service account needs attention",
+            };
+        }
         if config.auth_source != ModelAuthSource::ApiKeyEnv {
             return match self.provider_authenticated(provider) {
                 Ok(true) => "Signed in",
@@ -539,6 +551,31 @@ impl Menus {
                         .map_err(|error| error.to_string())
                 })
                 .unwrap_or(Ok(false));
+        }
+        if matches!(
+            config.auth_source,
+            ModelAuthSource::GoogleOAuth | ModelAuthSource::GoogleCloud
+        ) {
+            let Some(root) = self.config_root.as_deref() else {
+                return Ok(false);
+            };
+            let auth = crate::auth::google::GoogleAuth::new(root);
+            return if config.auth_source == ModelAuthSource::GoogleCloud {
+                auth.service_account_configured()
+            } else {
+                auth.has_saved_login()
+            }
+            .map_err(|error| error.to_string());
+        }
+        if let Some(kind) =
+            crate::auth::device_subscriptions::DeviceSubscription::from_auth(config.auth_source)
+        {
+            let Some(root) = self.config_root.as_deref() else {
+                return Ok(false);
+            };
+            return crate::auth::device_subscriptions::SubscriptionAuth::new(root, kind)
+                .has_saved_login()
+                .map_err(|error| error.to_string());
         }
         if config.auth_source == ModelAuthSource::GithubCopilot {
             return self
@@ -1151,7 +1188,7 @@ impl Menus {
                         // Keep the selection recoverable if clearing a credential fails.
                         self.show_providers(console, chat, choices, index, menu_id)?;
                         if let Some(target) =
-                            SignInTarget::device_only(provider.models[0].auth_source)
+                            SignInTarget::from_auth(provider.models[0].auth_source)
                         {
                             if matches!(
                                 action,
@@ -1270,7 +1307,19 @@ impl Menus {
         chat: Uuid,
         provider: ProviderModels,
     ) -> Result<MenuOutcome, String> {
-        if let Some(target) = SignInTarget::device_only(provider.models[0].auth_source) {
+        if provider.models[0].auth_source == ModelAuthSource::GoogleCloud {
+            let status = if self.provider_authenticated(&provider)? {
+                "Service-account file is configured. Select its model from /model."
+            } else {
+                "Set GOOGLE_APPLICATION_CREDENTIALS in the Agent environment or private .env to an absolute private service-account JSON path. Optional GOOGLE_CLOUD_PROJECT and GOOGLE_CLOUD_LOCATION select the billed project and resource."
+            };
+            self.back_to_providers(console, chat)?;
+            return Ok(MenuOutcome {
+                status: Some(status.into()),
+                ..Default::default()
+            });
+        }
+        if let Some(target) = SignInTarget::from_auth(provider.models[0].auth_source) {
             return self.begin_provider_login(console, chat, provider, target.login_method());
         }
         if provider.models[0].auth_source == ModelAuthSource::CodexSubscription {

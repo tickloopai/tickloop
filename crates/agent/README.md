@@ -30,6 +30,14 @@ cargo run -p tickloop-agent
 
 同一 `TICKLOOP_CONFIG_DIR` 的 Chat 共用登录，后续模型请求读取最新账户并在到期前刷新。Provider 列表的 `Sign out · Codex subscription`（或选中 Codex 后按 `s`）仅删除本地登录，不撤销已发出的请求或远端授权。凭证单独保存在状态根目录的 `auth/openai-codex-credentials.json`，使用私有文件权限；不读取 Codex CLI 或 pi 的登录文件。不要分享这份文件；同一系统用户下已经获准执行的任意 Shell 仍可能访问本地文件。
 
+Kimi 中国区使用 `MOONSHOT_CN_API_KEY`，国际区使用 `MOONSHOT_API_KEY`；两个服务分别验证 key，不自动切换地区。百炼使用 `DASHSCOPE_API_KEY` 和 `https://dashscope.aliyuncs.com/compatible-mode/v1/`；Anthropic 使用 `ANTHROPIC_API_KEY`，Gemini Developer API 使用 `GEMINI_API_KEY`，xAI API 使用 `XAI_API_KEY`。Kimi Code 和 Grok 的 OAuth 连接在 `/provider` 中使用设备授权，并在 consent 说明实际注册客户端名称。Grok OAuth 使用官方订阅代理 `cli-chat-proxy.grok.com`，独立于按量 API。
+
+Vertex service account 使用 `GOOGLE_APPLICATION_CREDENTIALS` 指向绝对路径的私有 `service_account` JSON 文件（`0600`，路径不含符号链接）；可写进 Agent 状态根的私有 `.env`。`GOOGLE_CLOUD_PROJECT` 可覆盖资源项目，`GOOGLE_CLOUD_LOCATION` 默认 `global`，选择其他位置前核对模型在该位置的支持。程序自行签名 JWT、交换及刷新短期 token。该文件路径及 key 不写入模型 YAML。
+
+Google 用户 OAuth 使用自己的 installed-app client：在环境或私有 `.env` 设置 `GOOGLE_OAUTH_CLIENT_ID`、`GOOGLE_OAUTH_CLIENT_SECRET` 和 `GOOGLE_CLOUD_PROJECT`，再进入 Google 的 OAuth 连接授权。它使用 PKCE/state 和官方 Google token 服务；远程终端可粘贴完整 callback URL。Gemini Developer API 和 Vertex 使用独立 Provider 身份及资源路径，共享本程序的 Google 用户登录。也提供 `GoogleAuth::import_authorized_user` 显式导入私有 ADC 用户文件的 library 接口；不会自动读取其他程序的凭据。退出登录仅清除本地 token；服务账号文件由用户管理。
+
+百炼当前 Qwen OAuth 免费登录已退役；Claude 订阅 OAuth 和 Gemini CLI Code Assist OAuth 没有开放给第三方客户端的使用授权，因此不提供这些登录入口。实际支持的认证路线、官方来源与未测账户见 [接入验证记录](../../.scratch/provider-expansion/verification.md)。
+
 `/settings` → Usage 显示服务端实际返回的 token 用量，包括审查和压缩请求；这些数字不是套餐剩余额度或实际账单。账号失效时在 `/provider` 选中连接并按 `r` 重新授权；模型没有权限时在 `/model` 中自行选择可用模型；套餐额度耗尽会结束本次任务，并在服务端提供时显示重置时间。不会自动换号、切换到付费 API 或等额度重置后自行继续。
 
 本地协议、终端和恢复验证与真实套餐验收分别记录在[验证记录](../../.scratch/codex-subscription/verification.md)。真实服务未验证的能力仍以该记录中的未验收项为准。
@@ -95,7 +103,7 @@ providers/
   openai-codex.yaml
 ```
 
-内置目录中的定义不代表已经配置账户或已开通服务。DeepSeek API、OpenAI 按量 API/Codex 套餐、MiniMax 两区 API/OAuth 与智谱 GLM 两区按量 API/Coding Plan 是当前接入；`anthropic-api.yaml` 保留此前已有的 Claude Model Card，供旧配置兼容使用，不会因此自动调用 Anthropic。
+内置目录中的定义不代表已经配置账户或已开通服务。当前目录还包括 Anthropic API、Kimi 中国/国际 API 和 Code OAuth、阿里云百炼中国区 API、Google Gemini Developer API/Vertex，以及 xAI API/Grok OAuth；每条连接独立配置认证、服务地址和模型。旧 Claude 卡继续可供固定配置与历史恢复使用，普通菜单使用当前系列绑定。
 
 完整示例见 [DeepSeek API](examples/providers/deepseek-api.yaml)、[OpenAI API](examples/providers/openai-api.yaml) 和 [Codex 套餐](examples/providers/openai-codex.yaml)。单个文件可用于 `--config` 或 `/model CONFIG_FILE`。显式加载多模型文件时，用 `default_model` 指定该 Provider 内的模型 ID；只有一个模型时可省略。 显式文件中的自定义模型会出现在本次菜单中；已退休内置卡继续支持固定配置/历史恢复，普通菜单仍读取每系列推荐绑定；加载本身不写配置，确认选择后保存该 Provider 的已填写字段和模型列表。省略的字段继续继承有效用户配置与内置默认值，保存时不会被展开成固定值。
 
@@ -115,7 +123,7 @@ models:
 
 文件名必须与 Provider ID 一致；新增 Provider 时提供完整的身份、连接与模型定义。模型选择及权限、外观等设置继续保存在 `settings.json`，Provider 定义的新保存写入相应 YAML 文件。旧的单模型 JSON、完整目录 JSON 和 `settings.json.providers` 保留兼容读取，相同 ID 的 YAML 显式字段优先；加载不会自动改写旧文件。
 
-Provider 内的 `id` 是配置身份，`service_model_id` 是服务实际接收的模型名称；同一个服务模型可以有不同适配器条目。普通 `adapter` 为 `messages`、`responses`、`chat_completions`；DeepSeek 的协议差异由 `deepseek_messages`、`deepseek_chat_completions` 表达，MiniMax 使用 `minimax_messages`，智谱 GLM 使用 `glm_chat_completions`，Codex 使用 `codex_responses`。地址取自 Provider 的 `endpoints` 同名项。可选 `connection` 声明 vendor/product/kind/order/region/discovery，厂商组织及产品优先、地区其次排序共用该配置，服务 host 取实际 endpoint；旧/自定义配置没有该字段时保留兼容行为。字段与校验见 [Model Card 配置参考](../../docs/agents/model-integration/model-card.md)。Codex 套餐结合 `codex_subscription` 认证使用专用请求处理，并限制为官方端点；普通 API 使用 `api_key_env`；MiniMax OAuth 分别使用 `minimax_oauth_cn`、`minimax_oauth_global`，只允许对应区域的 MiniMax Messages 端点。不要把套餐 token 填进 API Key 配置。
+Provider 内的 `id` 是配置身份，`service_model_id` 是服务实际接收的模型名称；同一个服务模型可以有不同适配器条目。普通 `adapter` 为 `messages`、`responses`、`chat_completions`；DeepSeek 的协议差异由 `deepseek_messages`、`deepseek_chat_completions` 表达，MiniMax 使用 `minimax_messages`，智谱 GLM 使用 `glm_chat_completions`，Kimi 使用 `kimi_chat_completions`，百炼使用 `qwen_chat_completions`，Google 使用原生 `google`（GenerateContent），Codex 使用 `codex_responses`。地址取自 Provider 的 `endpoints` 同名项。可选 `connection` 声明 vendor/product/kind/order/region/discovery，厂商组织及产品优先、地区其次排序共用该配置，服务 host 取实际 endpoint；旧/自定义配置没有该字段时保留兼容行为。字段与校验见 [Model Card 配置参考](../../docs/agents/model-integration/model-card.md)。Codex 套餐结合 `codex_subscription` 认证使用专用请求处理，并限制为官方端点；普通 API 使用 `api_key_env`；MiniMax OAuth 分别使用 `minimax_oauth_cn`、`minimax_oauth_global`，只允许对应区域的 MiniMax Messages 端点。不要把套餐 token 填进 API Key 配置。
 
 | 位置 | 公开配置项 |
 | --- | --- |

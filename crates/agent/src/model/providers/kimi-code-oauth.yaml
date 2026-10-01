@@ -1,0 +1,28 @@
+---
+id: kimi-code-oauth
+display_name: Kimi Code subscription
+connection:
+  vendor: Kimi
+  product: Code subscription
+  kind: plan
+  order: 0
+  discovery: provider_api
+auth: kimi_oauth
+api_key_env: ''
+endpoints:
+  kimi_chat_completions: https://api.kimi.com/coding/v1
+models:
+- id: k3
+  service_model_id: k3
+  display_name: Kimi K3
+  adapter: kimi_chat_completions
+  max_output_tokens: 131072
+  context_window_tokens: 262144
+  thinking: always_on
+  effort_levels:
+  - low
+  - high
+  - max
+  input_modalities:
+  - text
+  - image

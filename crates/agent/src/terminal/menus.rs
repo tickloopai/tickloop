@@ -2301,6 +2301,7 @@ fn recorded_usage_context(summary: &UsageSummary) -> Vec<String> {
             Protocol::Messages => "Messages",
             Protocol::Responses => "Responses",
             Protocol::ChatCompletions => "Chat Completions",
+            Protocol::Google => "Google API",
             Protocol::SystemOne => "System One",
         };
         for (label, value) in [
