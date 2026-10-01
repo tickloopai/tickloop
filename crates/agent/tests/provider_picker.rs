@@ -195,7 +195,7 @@ models:
     effort_levels: [low, high, max]
   - id: picker-chat
     service_model_id: picker-chat-service
-    display_name: Fixture Chat
+    display_name: Fixture OpenAI Chat Completions
     adapter: chat_completions
     max_output_tokens: 256
     thinking: toggle
@@ -251,7 +251,7 @@ fn bundled_model_names_match_the_current_model_names_without_transport_suffixes(
 }
 
 #[test]
-fn provider_adapter_and_model_thinking_choices_are_drafts_until_enter() {
+fn models_keep_their_bound_protocols_and_thinking_choices_are_drafts_until_enter() {
     let directory = tempfile::tempdir().unwrap();
     let workdir = directory.path().canonicalize().unwrap();
     let provider = write_provider(&workdir, "127.0.0.1:1".parse().unwrap());
@@ -261,21 +261,21 @@ fn provider_adapter_and_model_thinking_choices_are_drafts_until_enter() {
 
     terminal.send(b"/model\r");
     terminal.wait_for("Choose Provider");
+    assert!(!terminal.visible_output().contains("a Adapter"));
     let mark = terminal.mark();
-    terminal.send(b"a");
-    terminal.wait_for_frame_after(mark, "adapter cycled within Provider list", |frame| {
-        frame.contains("Choose Provider")
-            && frame.contains("Picker Fixture · Chat Completions")
-            && !frame.contains("Choose adapter ·")
-    });
-    let mark = terminal.mark();
-    terminal.send(b"\r");
-    terminal.wait_for_frame_after(mark, "model filtered by Provider adapter", |frame| {
+    terminal.send(b"a\r");
+    terminal.wait_for_frame_after(mark, "all models without an API style shortcut", |frame| {
         frame.contains("Choose model · Picker Fixture")
-            && frame.contains("Fixture Chat")
-            && !frame.contains("Fixture Messages")
+            && frame.contains("Fixture OpenAI Chat Completions")
+            && frame.contains("Fixture Messages")
+            && frame.contains("Fixture Messages Two")
             && !frame.contains("Set API key")
             && !frame.contains("Back to Providers")
+    });
+    let mark = terminal.mark();
+    terminal.send(b"jj");
+    terminal.wait_for_frame_after(mark, "model with another bound protocol", |frame| {
+        frame.contains("❯ 3. Fixture OpenAI Chat Completions")
     });
 
     let mark = terminal.mark();
@@ -306,17 +306,12 @@ fn provider_adapter_and_model_thinking_choices_are_drafts_until_enter() {
     assert!(!workdir.join("state/settings.json").exists());
 
     let mark = terminal.mark();
-    terminal.send(b"a");
-    terminal.wait_for_frame_after(mark, "original adapter restored", |frame| {
-        frame.contains("Choose Provider") && frame.contains("Picker Fixture · Messages")
-    });
-    let mark = terminal.mark();
     terminal.send(b"\r");
-    terminal.wait_for_frame_after(mark, "Messages model", |frame| {
+    terminal.wait_for_frame_after(mark, "all bound models after cancellation", |frame| {
         frame.contains("Choose model · Picker Fixture")
             && frame.contains("Fixture Messages")
             && frame.contains("Fixture Messages Two")
-            && !frame.contains("Fixture Chat")
+            && frame.contains("Fixture OpenAI Chat Completions")
     });
     let mark = terminal.mark();
     terminal.send(b"j");
@@ -330,18 +325,24 @@ fn provider_adapter_and_model_thinking_choices_are_drafts_until_enter() {
         frame.contains("❯ 1. Fixture Messages") && frame.contains("Choose model · Picker Fixture")
     });
     let mark = terminal.mark();
+    terminal.send(b"jj");
+    terminal.wait_for_frame_after(mark, "OpenAI Chat Completions model selected", |frame| {
+        frame.contains("❯ 3. Fixture OpenAI Chat Completions")
+    });
+    let mark = terminal.mark();
     terminal.send(b"l");
     terminal.wait_for_frame_after(mark, "Thinking next draft", |frame| {
         frame.contains("Choose model · Picker Fixture") && frame.contains("Thinking ‹ off ›")
     });
     terminal.send(b"\r");
     terminal.wait_for("Model selection:");
+    terminal.wait_for("OpenAI Chat Completions");
     terminal.exit();
 
     let saved: Value =
         serde_json::from_slice(&fs::read(workdir.join("state/settings.json")).unwrap()).unwrap();
     assert_eq!(saved["defaultModel"]["provider"], "picker-fixture");
-    assert_eq!(saved["defaultModel"]["model"], "picker-messages");
+    assert_eq!(saved["defaultModel"]["model"], "picker-chat");
     assert_eq!(saved["effortLevel"], "off");
 }
 
@@ -436,8 +437,7 @@ fn provider_reauthentication_removes_only_its_saved_key_and_requires_entry_again
     let mark = terminal.mark();
     terminal.send(b"\x1b");
     terminal.wait_for_frame_after(mark, "Provider asks for key again", |frame| {
-        frame.contains("Choose Provider")
-            && frame.contains("Picker Fixture · Messages · API key required")
+        frame.contains("Choose Provider") && frame.contains("Picker Fixture · API key required")
     });
     let mark = terminal.mark();
     terminal.send(b"\r");

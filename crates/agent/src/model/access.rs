@@ -1,0 +1,213 @@
+//! Current access catalog: for each Provider it declares the stable model series offered in
+//! ordinary selection and the concrete Model Card each series currently recommends. Cards stay
+//! in the definition catalog after a series moves on, so saved selections and history keep
+//! resolving to the exact model they used.
+
+use std::{collections::HashSet, sync::OnceLock};
+
+use serde::{Deserialize, Serialize};
+
+use super::{
+    ModelConfig,
+    cards::{ModelCatalog, valid_provider_id},
+};
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderAccess {
+    pub provider: String,
+    /// Menu entry shared by this vendor's regional or authentication Providers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    /// Plan or billing condition shown before choosing a model of this Provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notice: Option<String>,
+    pub series: Vec<SeriesBinding>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeriesBinding {
+    /// Stable series identity, kept when the recommended card changes.
+    pub id: String,
+    pub name: String,
+    /// Version of the recommended card as shown next to the series name.
+    pub version: String,
+    /// Model Card `id` in the same Provider.
+    pub model: String,
+}
+
+impl SeriesBinding {
+    pub fn label(&self) -> String {
+        format!("{} ({})", self.name, self.version)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AccessCatalog {
+    providers: Vec<ProviderAccess>,
+}
+
+impl AccessCatalog {
+    pub fn from_yaml(files: &[&str]) -> Result<Self, String> {
+        let providers = files
+            .iter()
+            .map(|file| {
+                serde_yaml_ng::from_str(file)
+                    .map_err(|error| format!("invalid access catalog YAML: {error}"))
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(Self { providers })
+    }
+
+    pub fn defaults() -> &'static Self {
+        static DEFAULTS: OnceLock<AccessCatalog> = OnceLock::new();
+        DEFAULTS.get_or_init(|| {
+            let catalog = Self::from_yaml(&[
+                include_str!("access/zhipu-cn-api.yaml"),
+                include_str!("access/zhipu-cn-coding.yaml"),
+                include_str!("access/zai-global-api.yaml"),
+                include_str!("access/zai-global-coding.yaml"),
+            ])
+            .expect("bundled access catalog YAML is valid");
+            catalog
+                .validate(&ModelCatalog::defaults())
+                .expect("bundled access catalog references valid Model Cards");
+            catalog
+        })
+    }
+
+    /// Every binding must resolve to a valid Model Card of the same Provider, so a series can
+    /// never point at a missing card, another connection or an endpoint-less adapter.
+    pub fn validate(&self, models: &ModelCatalog) -> Result<(), String> {
+        let mut providers = HashSet::new();
+        for access in &self.providers {
+            let location = format!("access[{}]", access.provider);
+            if !valid_provider_id(&access.provider) || !providers.insert(&access.provider) {
+                return Err(format!("{location}: invalid or duplicate provider"));
+            }
+            if [&access.group, &access.notice]
+                .into_iter()
+                .any(|text| text.as_ref().is_some_and(|text| text.trim().is_empty()))
+            {
+                return Err(format!("{location}: group and notice must not be empty"));
+            }
+            if access.series.is_empty() {
+                return Err(format!(
+                    "{location}.series: at least one series is required"
+                ));
+            }
+            let mut series_ids = HashSet::new();
+            let mut series_names = HashSet::new();
+            let mut bound_models = HashSet::new();
+            for series in &access.series {
+                let location = format!("{location}.series[{}]", series.id);
+                if !valid_provider_id(&series.id)
+                    || series.name.trim().is_empty()
+                    || series.version.trim().is_empty()
+                {
+                    return Err(format!(
+                        "{location}: id must be a safe lowercase slug; name and version are required"
+                    ));
+                }
+                if !series_ids.insert(&series.id) || !series_names.insert(&series.name) {
+                    return Err(format!("{location}: duplicate series"));
+                }
+                if !bound_models.insert(&series.model) {
+                    return Err(format!(
+                        "{location}.model: `{}` is already bound to another series",
+                        series.model
+                    ));
+                }
+                if models.get(&access.provider, &series.model).is_none() {
+                    return Err(format!(
+                        "{location}.model: no valid Model Card `{}` in this Provider",
+                        series.model
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn provider(&self, provider_id: &str) -> Option<&ProviderAccess> {
+        self.providers
+            .iter()
+            .find(|access| access.provider == provider_id)
+    }
+
+    pub fn series_for(&self, profile: &ModelConfig) -> Option<&SeriesBinding> {
+        self.provider(&profile.provider_id)?
+            .series
+            .iter()
+            .find(|series| series.model == profile.model_id)
+    }
+
+    /// The first series is the Provider's default recommendation.
+    pub fn recommended_model(&self, provider_id: &str) -> Option<&str> {
+        self.provider(provider_id)?
+            .series
+            .first()
+            .map(|series| series.model.as_str())
+    }
+
+    /// For Providers governed by this catalog, ordinary selection offers bound cards and cards
+    /// the user added under new ids; retired built-in cards stay loadable but are not offered,
+    /// even after a user override. `None` leaves other Providers to their existing rule.
+    pub fn ordinary_candidate(
+        &self,
+        profile: &ModelConfig,
+        defaults: &ModelCatalog,
+    ) -> Option<bool> {
+        self.provider(&profile.provider_id)?;
+        Some(
+            self.series_for(profile).is_some()
+                || defaults
+                    .get(&profile.provider_id, &profile.model_id)
+                    .is_none(),
+        )
+    }
+
+    pub fn series_position(&self, profile: &ModelConfig) -> Option<usize> {
+        self.provider(&profile.provider_id)?
+            .series
+            .iter()
+            .position(|series| series.model == profile.model_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bundled_bindings_resolve_to_concrete_cards() {
+        let catalog = AccessCatalog::defaults();
+        let models = ModelCatalog::defaults();
+        for provider in ["zhipu-cn-api", "zai-global-api"] {
+            let access = catalog.provider(provider).unwrap();
+            assert_eq!(access.group.as_deref(), Some("Zhipu GLM"));
+            let resolved = access
+                .series
+                .iter()
+                .map(|series| {
+                    let card = models.get(provider, &series.model).unwrap();
+                    (series.label(), card.name)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                resolved,
+                [
+                    ("GLM (5.3)".to_string(), "GLM-5.3".to_string()),
+                    ("GLM Flash (5.3)".to_string(), "GLM-5.3-Flash".to_string()),
+                    ("GLM FlashX (5.3)".to_string(), "GLM-5.3-FlashX".to_string()),
+                ]
+            );
+            assert_eq!(
+                catalog.recommended_model(provider),
+                Some("glm-5.3-chat-completions")
+            );
+        }
+        assert!(catalog.provider("deepseek-api").is_none());
+    }
+}

@@ -1,0 +1,12 @@
+provider: "zhipu-cn-coding"
+group: "Zhipu GLM"
+notice: "GLM Coding Plan terms limit plan quota to officially listed tools; Tick Loop is not listed, so use may be rate limited or suspended. FlashX is not part of the plan."
+series:
+  - id: "glm"
+    name: "GLM"
+    version: "5.3"
+    model: "glm-5.3-chat-completions"
+  - id: "glm-flash"
+    name: "GLM Flash"
+    version: "5.3"
+    model: "glm-5.3-flash-chat-completions"

@@ -678,7 +678,7 @@ async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Result<(
         model
     } else {
         crate::model::cards::ModelCatalog::defaults()
-            .get("deepseek-api", "deepseek-flash-messages")
+            .get("deepseek-api", "deepseek-flash-chat-completions")
             .expect("bundled default model exists")
     };
     if let (Some(settings), Some(provider)) = (&user_settings, &explicit_provider) {
@@ -4448,7 +4448,7 @@ mod tests {
         .unwrap();
         let selected = super::read_config(&path).unwrap();
         assert_eq!(selected.provider_id, "deepseek-api");
-        assert_eq!(selected.model_id, "deepseek-flash-messages");
+        assert_eq!(selected.model_id, "deepseek-flash-chat-completions");
         std::fs::write(&path, "id: deepseek-api\nmodels:\n  - id: deepseek-flash-messages\n  - id: deepseek-flash-responses\n").unwrap();
         assert!(
             super::read_config(&path)

@@ -19,10 +19,12 @@ use tokio_util::sync::CancellationToken;
 use crate::image::{Image, ImageMediaType};
 use crate::network::{HttpPolicy, NetworkDiagnostic, NetworkRoute, build_http_client, is_loopback};
 
+pub mod access;
 pub mod cards;
 mod chat_completions;
 mod codex;
 pub mod credentials;
+mod glm;
 pub(crate) mod history;
 mod image_limits;
 mod responses;
@@ -1200,7 +1202,9 @@ impl HttpModelClient {
                 "responses",
                 responses::encode_request(&self.config, request)?,
             ),
-            cards::Adapter::ChatCompletions | cards::Adapter::DeepseekChatCompletions => (
+            cards::Adapter::ChatCompletions
+            | cards::Adapter::DeepseekChatCompletions
+            | cards::Adapter::GlmChatCompletions => (
                 "chat/completions",
                 chat_completions::encode_request(&self.config, request)?,
             ),
@@ -1311,6 +1315,11 @@ impl HttpModelClient {
                 );
             }
             let body = serde_json::from_slice::<Value>(&error_bytes).ok();
+            if self.config.adapter() == cards::Adapter::GlmChatCompletions
+                && let Some(error) = glm::http_error(status, body.as_ref())
+            {
+                return Err(error.at_stage(ModelRequestStage::ResponseHeaders));
+            }
             if body.as_ref().is_some_and(is_context_limit_error) {
                 return Err(
                     ModelError::ResponseRejected(ModelResponseRejection::ContextLimit)
@@ -1440,7 +1449,9 @@ async fn consume_sse_response(
         } else {
             responses::ResponsesStream::default()
         }),
-        Protocol::ChatCompletions => ProtocolStream::Chat(chat_completions::ChatStream::default()),
+        Protocol::ChatCompletions => {
+            ProtocolStream::Chat(chat_completions::ChatStream::for_adapter(adapter))
+        }
     };
     loop {
         let chunk = tokio::select! {
@@ -1570,10 +1581,11 @@ fn sse_event_starts_output(protocol: Protocol, data: &Value) -> bool {
         Protocol::ChatCompletions => data["choices"].as_array().is_some_and(|choices| {
             choices.iter().any(|choice| {
                 let delta = &choice["delta"];
-                delta.get("content").is_some_and(|value| !value.is_null())
-                    || delta
-                        .get("reasoning_content")
-                        .is_some_and(|value| !value.is_null())
+                ["content", "reasoning_content"].into_iter().any(|field| {
+                    delta
+                        .get(field)
+                        .is_some_and(|value| !value.is_null() && value.as_str() != Some(""))
+                })
             })
         }),
     }
@@ -2619,7 +2631,7 @@ mod tests {
     }
 
     #[test]
-    fn model_card_lists_deepseek_adapters_and_claude_thinking_control() {
+    fn model_card_lists_preferred_deepseek_protocol_and_keeps_legacy_adapters() {
         let profiles = cards::built_in_model_profiles();
         for model in ["deepseek-flash", "deepseek-v4-pro"] {
             let protocols = profiles
@@ -2627,8 +2639,15 @@ mod tests {
                 .filter(|profile| profile.model == model)
                 .map(|profile| profile.protocol)
                 .collect::<Vec<_>>();
+            assert_eq!(protocols, [Protocol::ChatCompletions]);
+            let legacy_protocols = cards::ModelCatalog::defaults()
+                .profiles()
+                .into_iter()
+                .filter(|profile| profile.model == model)
+                .map(|profile| profile.protocol)
+                .collect::<Vec<_>>();
             assert_eq!(
-                protocols,
+                legacy_protocols,
                 [
                     Protocol::Messages,
                     Protocol::Responses,

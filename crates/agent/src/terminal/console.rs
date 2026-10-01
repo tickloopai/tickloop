@@ -144,7 +144,8 @@ const EXIT_CONFIRMATION_WINDOW: Duration = Duration::from_millis(800);
 const ESCAPE_CONFIRMATION_WINDOW: Duration = Duration::from_millis(800);
 const SHELL_BACKGROUND_CHORD_WINDOW: Duration = Duration::from_millis(800);
 const SECRET_PASTE_ERROR: &str = "API key paste must contain one line of text";
-const PROVIDER_PICKER_HINT: &str = "↑↓ Provider · a Adapter · r Sign in again · s Sign out · d Device code · Enter select · Esc back";
+const PROVIDER_PICKER_HINT: &str =
+    "↑↓ Provider · r Sign in again · s Sign out · d Device code · Enter select · Esc back";
 const MODEL_PICKER_HINT: &str = "↑↓ Model · ←→ Thinking · Enter apply · Esc back";
 // 照 Claude Code `shellHistoryCompletion.ts`：输入期间历史不会变化，缓存 60 秒。
 const SHELL_HISTORY_CACHE_TTL: Duration = Duration::from_secs(60);
@@ -310,7 +311,6 @@ impl fmt::Debug for InputEvent {
 pub(super) enum PickerAction {
     ThinkingPrevious,
     ThinkingNext,
-    CycleAdapter,
     Reauthenticate,
     SignOut,
     DeviceLogin,
@@ -5449,9 +5449,6 @@ impl State {
             && let Some(menu) = &mut self.menu
         {
             let picker_action = match (self.picker_kind, key.code, key.modifiers) {
-                (Some(PickerKind::Provider), KeyCode::Char('a'), KeyModifiers::NONE) => {
-                    Some(PickerAction::CycleAdapter)
-                }
                 (Some(PickerKind::Provider), KeyCode::Char('r'), KeyModifiers::NONE) => {
                     Some(PickerAction::Reauthenticate)
                 }
@@ -13185,7 +13182,7 @@ mod tests {
                 assert_eq!(
                     labels,
                     [
-                        "Model & adapter",
+                        "Model",
                         "Thinking",
                         "Thinking",
                         "Execution mode",
@@ -13267,7 +13264,6 @@ mod tests {
         );
         assert_eq!(state.menu.as_ref().unwrap().selected, 1);
         for (code, action) in [
-            (KeyCode::Char('a'), PickerAction::CycleAdapter),
             (KeyCode::Char('r'), PickerAction::Reauthenticate),
             (KeyCode::Char('s'), PickerAction::SignOut),
             (KeyCode::Char('d'), PickerAction::DeviceLogin),
@@ -13282,7 +13278,9 @@ mod tests {
             ));
         }
         let rendered = state.frame().0.join("\n");
-        assert!(rendered.contains("a Adapter · r Sign in again · s Sign out · d Device code"));
+        assert!(rendered.contains("r Sign in again · s Sign out · d Device code"));
+        assert!(!rendered.contains("a Adapter"));
+        assert!(state.key(key(KeyCode::Char('a'))).is_none());
         assert_eq!(state.editor.draft(), "");
     }
 

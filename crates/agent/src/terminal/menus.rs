@@ -762,14 +762,29 @@ impl Menus {
             .transpose()?
             .unwrap_or_else(tickloop_agent::model::cards::ModelCatalog::defaults)
             .with_providers(self.transient_providers.clone())?;
+        let defaults = tickloop_agent::model::cards::ModelCatalog::defaults();
+        let access = tickloop_agent::model::access::AccessCatalog::defaults();
+        access.validate(&catalog)?;
         let profiles = catalog
             .profiles()
             .into_iter()
             .filter(|profile| {
-                tickloop_agent::model::cards::ModelCatalog::defaults()
-                    .get(&profile.provider_id, &profile.model_id)
-                    .is_none()
-                    || tickloop_agent::model::cards::is_default_visible(profile)
+                let explicitly_loaded = self.transient_providers.iter().any(|provider| {
+                    provider.id == profile.provider_id
+                        && provider.models.as_ref().is_some_and(|models| {
+                            models.iter().any(|model| model.id == profile.model_id)
+                        })
+                });
+                explicitly_loaded
+                    || access
+                        .ordinary_candidate(profile, &defaults)
+                        .unwrap_or_else(|| {
+                            defaults
+                                .get(&profile.provider_id, &profile.model_id)
+                                .as_ref()
+                                != Some(profile)
+                                || tickloop_agent::model::cards::is_default_visible(profile)
+                        })
             })
             .collect();
         let mut choices = settings::model_choices_with_profiles(&snapshot.model, profiles);
@@ -890,7 +905,7 @@ impl Menus {
                 title: "Settings".into(),
                 context,
                 options: vec![
-                    "Model & adapter".into(),
+                    "Model".into(),
                     format!(
                         "Thinking: {}",
                         match tickloop_agent::model::cards::model_card(&snapshot.model)

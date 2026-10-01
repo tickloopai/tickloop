@@ -29,6 +29,7 @@ pub enum Adapter {
     Responses,
     ChatCompletions,
     DeepseekChatCompletions,
+    GlmChatCompletions,
     CodexResponses,
     SystemOne,
 }
@@ -39,7 +40,9 @@ impl Adapter {
             Self::SystemOne => Protocol::SystemOne,
             Self::Messages | Self::DeepseekMessages | Self::MinimaxMessages => Protocol::Messages,
             Self::Responses | Self::CodexResponses => Protocol::Responses,
-            Self::ChatCompletions | Self::DeepseekChatCompletions => Protocol::ChatCompletions,
+            Self::ChatCompletions | Self::DeepseekChatCompletions | Self::GlmChatCompletions => {
+                Protocol::ChatCompletions
+            }
         }
     }
 }
@@ -284,6 +287,11 @@ impl ModelCatalog {
                     .filter(|models| models.len() == 1)
                     .map(|models| models[0].id.clone())
             })
+            .or_else(|| {
+                super::access::AccessCatalog::defaults()
+                    .recommended_model(&provider.id)
+                    .map(str::to_owned)
+            })
             .ok_or_else(|| {
                 "provider YAML with multiple models requires `default_model`".to_string()
             })?;
@@ -304,6 +312,10 @@ impl ModelCatalog {
             include_str!("providers/minimax-global-api.yaml"),
             include_str!("providers/minimax-cn-oauth.yaml"),
             include_str!("providers/minimax-global-oauth.yaml"),
+            include_str!("providers/zhipu-cn-api.yaml"),
+            include_str!("providers/zhipu-cn-coding.yaml"),
+            include_str!("providers/zai-global-api.yaml"),
+            include_str!("providers/zai-global-coding.yaml"),
         ]
         .into_iter()
         .map(|yaml| serde_yaml_ng::from_str(yaml).expect("bundled Provider YAML is valid"))
@@ -728,13 +740,19 @@ pub(crate) fn is_minimax_provider(provider_id: &str) -> bool {
     )
 }
 
+/// Display group for vendors whose regional or authentication Providers share one menu entry.
+pub fn provider_group(provider_id: &str) -> Option<&'static str> {
+    if is_minimax_provider(provider_id) {
+        return Some("MiniMax");
+    }
+    super::access::AccessCatalog::defaults()
+        .provider(provider_id)
+        .and_then(|access| access.group.as_deref())
+}
+
 pub fn is_default_visible(profile: &ModelConfig) -> bool {
     const VISIBLE: &[(&str, &str)] = &[
-        ("deepseek-api", "deepseek-flash-messages"),
-        ("deepseek-api", "deepseek-flash-responses"),
         ("deepseek-api", "deepseek-flash-chat-completions"),
-        ("deepseek-api", "deepseek-v4-pro-messages"),
-        ("deepseek-api", "deepseek-v4-pro-responses"),
         ("deepseek-api", "deepseek-v4-pro-chat-completions"),
         ("openai-codex", "gpt-5.5-responses"),
         ("openai-codex", "gpt-5.6-sol-responses"),
@@ -742,6 +760,9 @@ pub fn is_default_visible(profile: &ModelConfig) -> bool {
         ("openai-codex", "gpt-5.6-luna-responses"),
     ];
     VISIBLE.contains(&(profile.provider_id.as_str(), profile.model_id.as_str()))
+        || super::access::AccessCatalog::defaults()
+            .series_for(profile)
+            .is_some()
         || is_minimax_provider(&profile.provider_id)
             && matches!(
                 profile.model_id.as_str(),

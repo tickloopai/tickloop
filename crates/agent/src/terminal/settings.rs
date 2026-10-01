@@ -23,6 +23,22 @@ pub(super) fn model_choices_with_profiles(
     current: &ModelConfig,
     profiles: Vec<ModelConfig>,
 ) -> Vec<ModelConfig> {
+    let defaults = tickloop_agent::model::cards::ModelCatalog::defaults();
+    if tickloop_agent::model::access::AccessCatalog::defaults()
+        .ordinary_candidate(current, &defaults)
+        == Some(false)
+    {
+        return profiles;
+    }
+    if current.provider_id == "deepseek-api"
+        && !tickloop_agent::model::cards::is_default_visible(current)
+        && tickloop_agent::model::cards::ModelCatalog::defaults()
+            .get(&current.provider_id, &current.model_id)
+            .as_ref()
+            == Some(current)
+    {
+        return profiles;
+    }
     let mut choices = vec![current.clone()];
     choices.extend(profiles.into_iter().filter(|profile| profile != current));
     choices
@@ -32,7 +48,7 @@ pub(super) fn model_label(config: &ModelConfig) -> String {
     let protocol = match config.protocol {
         Protocol::Messages => "Messages",
         Protocol::Responses => "Responses",
-        Protocol::ChatCompletions => "Chat Completions",
+        Protocol::ChatCompletions => "OpenAI Chat Completions",
         Protocol::SystemOne => "System One",
     };
     if !config.provider_id.is_empty() {
@@ -81,7 +97,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn built_in_profiles_match_existing_config_files_without_duplicate_current() {
+    fn preferred_profiles_keep_visible_current_and_hide_legacy_adapter_duplicates() {
         for source in [
             include_str!("../../examples/deepseek-config.json"),
             include_str!("../../examples/deepseek-responses-config.json"),
@@ -93,18 +109,30 @@ mod tests {
             );
             let choices = model_choices(&current);
             assert_eq!(choices.len(), built_in_model_profiles().len());
-            assert_eq!(choices[0], current);
-            assert_eq!(choices.iter().filter(|value| **value == current).count(), 1);
+            if tickloop_agent::model::cards::is_default_visible(&current) {
+                assert_eq!(choices[0], current);
+                assert_eq!(choices.iter().filter(|value| **value == current).count(), 1);
+            } else {
+                assert_eq!(choices, built_in_model_profiles());
+                assert!(!choices.contains(&current));
+            }
+            assert!(
+                choices
+                    .iter()
+                    .filter(|model| model.provider_id == "deepseek-api")
+                    .all(|model| model.adapter()
+                        == tickloop_agent::model::cards::Adapter::DeepseekChatCompletions)
+            );
         }
     }
 
     #[test]
-    fn default_deepseek_messages_profile_matches_the_example_and_accepts_images() {
+    fn default_deepseek_chat_completions_profile_matches_the_example_and_accepts_images() {
         let example = tickloop_agent::model::cards::migrate_legacy_model(
-            serde_json::from_str(include_str!("../../examples/deepseek-config.json")).unwrap(),
+            serde_json::from_str(include_str!("../../examples/deepseek-chat-config.json")).unwrap(),
         );
         let default = tickloop_agent::model::cards::ModelCatalog::defaults()
-            .get("deepseek-api", "deepseek-flash-messages")
+            .get("deepseek-api", "deepseek-flash-chat-completions")
             .unwrap();
         assert_eq!(default, example);
         assert!(default.accepts_images());
@@ -126,7 +154,7 @@ mod tests {
         let label = model_label(&current);
         assert!(label.contains("custom profile"));
         assert!(label.contains("deepseek-flash"));
-        assert!(label.contains("Messages"));
+        assert!(label.contains("OpenAI Chat Completions"));
         assert!(!label.contains("secret"));
         assert!(!label.contains("PRIVATE_GATEWAY_TOKEN"));
         assert_ne!(label, model_label(&choices[1]));

@@ -1,8 +1,8 @@
 use super::{
     Content, ModelConfig, ModelDelta, ModelError, ModelOutput, ModelRequest,
     ModelResponseRejection, Protocol, ReasoningEffort, Role, ToolResultBlock, ToolResultContent,
-    Usage, image_outside_user_message, invalid_response, observe_usage, required_string,
-    stream_provider_error, validate_reasoning_effort,
+    Usage, cards::Adapter, image_outside_user_message, invalid_response, observe_usage,
+    required_string, stream_provider_error, validate_reasoning_effort,
 };
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashSet};
@@ -82,6 +82,16 @@ pub(super) fn encode_request(
         }
     }
     let mut body = json!({"model":config.model,"messages":messages,"max_tokens":config.max_output_tokens,"stream":true,"stream_options":{"include_usage":true}});
+    if let Some(temperature) = request.temperature {
+        body["temperature"] = json!(temperature);
+    }
+    if !request.tools.is_empty() {
+        body["tools"] = json!(request.tools.into_iter().map(|tool|json!({"type":"function","function":{"name":tool.name,"description":tool.description,"parameters":tool.input_schema}})).collect::<Vec<_>>());
+    }
+    if config.adapter() == Adapter::GlmChatCompletions {
+        super::glm::shape_request(&mut body, reasoning_effort, request.structured_output)?;
+        return Ok(body);
+    }
     if let Some(effort) = reasoning_effort {
         match effort {
             ReasoningEffort::Off => body["thinking"] = json!({"type":"disabled"}),
@@ -91,26 +101,19 @@ pub(super) fn encode_request(
             }
         }
     }
-    if let Some(temperature) = request.temperature {
-        body["temperature"] = json!(temperature);
-    }
-    if !request.tools.is_empty() {
-        body["tools"] = json!(request.tools.into_iter().map(|tool|json!({"type":"function","function":{"name":tool.name,"description":tool.description,"parameters":tool.input_schema}})).collect::<Vec<_>>());
-    }
     if let Some(format) = request.structured_output {
-        body["response_format"] =
-            if config.adapter() == super::cards::Adapter::DeepseekChatCompletions {
-                json!({"type":"json_object"})
-            } else {
-                json!({
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": format.name,
-                        "schema": format.schema,
-                        "strict": true
-                    }
-                })
-            };
+        body["response_format"] = if config.adapter() == Adapter::DeepseekChatCompletions {
+            json!({"type":"json_object"})
+        } else {
+            json!({
+                "type": "json_schema",
+                "json_schema": {
+                    "name": format.name,
+                    "schema": format.schema,
+                    "strict": true
+                }
+            })
+        };
     }
     Ok(body)
 }
@@ -124,6 +127,9 @@ pub(super) struct ChatStream {
     finish_reason: Option<String>,
     usage: Usage,
     refused: bool,
+    /// GLM streamed tool calls follow the official client: a call is keyed by its index, and
+    /// later chunks for that index may repeat the identity from the first chunk.
+    tool_identity_by_index: bool,
 }
 
 struct ToolCall {
@@ -133,6 +139,13 @@ struct ToolCall {
 }
 
 impl ChatStream {
+    pub(super) fn for_adapter(adapter: Adapter) -> Self {
+        Self {
+            tool_identity_by_index: adapter == Adapter::GlmChatCompletions,
+            ..Self::default()
+        }
+    }
+
     pub(super) fn accept(
         &mut self,
         data: Value,
@@ -183,11 +196,16 @@ impl ChatStream {
         {
             self.refused = true;
         }
-        if let Some(text) = delta["reasoning_content"].as_str() {
+        // Final chunks commonly carry `content: ""`; empty strings are not output and must
+        // not block a retry of a failure reported by the same chunk.
+        if let Some(text) = delta["reasoning_content"]
+            .as_str()
+            .filter(|text| !text.is_empty())
+        {
             self.thinking.push_str(text);
             let _ = events.send(ModelDelta::Thinking(text.into()));
         }
-        if let Some(text) = delta["content"].as_str() {
+        if let Some(text) = delta["content"].as_str().filter(|text| !text.is_empty()) {
             self.text.push_str(text);
             let _ = events.send(ModelDelta::Text(text.into()));
         }
@@ -199,7 +217,16 @@ impl ChatStream {
                 let index = call["index"]
                     .as_u64()
                     .ok_or_else(|| invalid_response("missing tool call index"))?;
-                if let Some(id) = call["id"].as_str().filter(|id| !id.is_empty()) {
+                let repeated_identity = self.tool_identity_by_index
+                    && self.tools.get(&index).is_some_and(|tool| {
+                        call["id"]
+                            .as_str()
+                            .is_none_or(|id| id.is_empty() || id == tool.id)
+                    });
+                if let Some(id) = call["id"]
+                    .as_str()
+                    .filter(|id| !id.is_empty() && !repeated_identity)
+                {
                     if self.tools.contains_key(&index)
                         || self.tools.values().any(|tool| tool.id == id)
                         || index != self.tools.len() as u64
@@ -221,7 +248,9 @@ impl ChatStream {
                 let tool = self.tools.get_mut(&index).ok_or_else(|| {
                     invalid_response("tool arguments arrived without an identity")
                 })?;
-                if let Some(name) = call["function"]["name"].as_str() {
+                if let Some(name) = call["function"]["name"].as_str()
+                    && (!repeated_identity || tool.name.is_empty())
+                {
                     tool.name.push_str(name);
                 }
                 if let Some(arguments) = call["function"]["arguments"].as_str() {
@@ -247,10 +276,18 @@ impl ChatStream {
                     ModelResponseRejection::OutputLimit,
                 ));
             }
-            "content_filter" => {
+            "content_filter" | "sensitive" => {
                 return Err(ModelError::ResponseRejected(
                     ModelResponseRejection::ContentFilter,
                 ));
+            }
+            "model_context_window_exceeded" => {
+                return Err(ModelError::ResponseRejected(
+                    ModelResponseRejection::ContextLimit,
+                ));
+            }
+            "network_error" => {
+                return Err(ModelError::Http { status: 500 });
             }
             "insufficient_system_resource" => {
                 return Err(ModelError::Http { status: 503 });

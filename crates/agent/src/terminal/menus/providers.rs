@@ -8,7 +8,6 @@ use tickloop_agent::model::{
 #[derive(Clone)]
 pub(super) struct ProviderModels {
     pub(super) models: Vec<ModelConfig>,
-    pub(super) adapter: Adapter,
 }
 
 #[cfg(test)]
@@ -41,6 +40,63 @@ mod tests {
             .collect::<std::collections::HashSet<_>>();
         assert_eq!(ids.len(), 4);
     }
+
+    #[test]
+    fn glm_regions_share_one_entry_with_separate_providers() {
+        let choices =
+            ProviderModels::group(tickloop_agent::model::cards::built_in_model_profiles());
+        let rows = provider_rows(&choices, None);
+        assert_eq!(
+            rows.iter()
+                .filter(|row| matches!(row, ProviderRow::Group("Zhipu GLM")))
+                .count(),
+            1
+        );
+        let connections = provider_rows(&choices, Some("Zhipu GLM"))
+            .into_iter()
+            .map(|row| match row {
+                ProviderRow::Provider(index) => choices[index].models[0].api_key_env.clone(),
+                ProviderRow::Group(_) => panic!("connections must reference actual Providers"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            connections,
+            [
+                "ZHIPU_API_KEY",
+                "ZHIPU_CODING_API_KEY",
+                "ZAI_API_KEY",
+                "ZAI_CODING_API_KEY"
+            ]
+        );
+    }
+
+    #[test]
+    fn retired_glm_card_is_not_offered_even_as_the_current_model() {
+        let defaults = tickloop_agent::model::cards::ModelCatalog::defaults();
+        let retired = defaults
+            .get("zhipu-cn-api", "glm-5.2-chat-completions")
+            .unwrap();
+        let profiles = tickloop_agent::model::cards::built_in_model_profiles();
+        let choices =
+            super::super::super::settings::model_choices_with_profiles(&retired, profiles);
+        assert!(!choices.contains(&retired));
+        let current = defaults
+            .get("zhipu-cn-api", "glm-5.3-flash-chat-completions")
+            .unwrap();
+        let choices = super::super::super::settings::model_choices_with_profiles(
+            &current,
+            tickloop_agent::model::cards::built_in_model_profiles(),
+        );
+        assert_eq!(choices[0], current);
+        assert_eq!(current.name, "GLM-5.3-Flash");
+        assert_eq!(
+            tickloop_agent::model::access::AccessCatalog::defaults()
+                .series_for(&current)
+                .unwrap()
+                .label(),
+            "GLM Flash (5.3)"
+        );
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -50,7 +106,7 @@ pub(super) enum ProviderRow {
 }
 
 fn provider_group(provider: &ProviderModels) -> Option<&'static str> {
-    crate::model::cards::is_minimax_provider(&provider.models[0].provider_id).then_some("MiniMax")
+    crate::model::cards::provider_group(&provider.models[0].provider_id)
 }
 
 pub(super) fn provider_rows(choices: &[ProviderModels], group: Option<&str>) -> Vec<ProviderRow> {
@@ -85,7 +141,6 @@ impl ProviderModels {
                 provider.models.push(model);
             } else {
                 choices.push(Self {
-                    adapter: model.adapter(),
                     models: vec![model],
                 });
             }
@@ -100,29 +155,6 @@ impl ProviderModels {
         } else {
             &model.provider_name
         }
-    }
-
-    pub(super) fn adapters(&self) -> Vec<Adapter> {
-        let mut adapters = Vec::new();
-        for model in &self.models {
-            if !adapters.contains(&model.adapter()) {
-                adapters.push(model.adapter());
-            }
-        }
-        adapters
-    }
-}
-
-fn adapter_label(adapter: Adapter) -> &'static str {
-    match adapter {
-        Adapter::SystemOne => "System One",
-        Adapter::Messages => "Messages",
-        Adapter::DeepseekMessages => "DeepSeek Messages",
-        Adapter::MinimaxMessages => "MiniMax Messages",
-        Adapter::Responses => "Responses",
-        Adapter::CodexResponses => "Codex Responses",
-        Adapter::ChatCompletions => "Chat Completions",
-        Adapter::DeepseekChatCompletions => "DeepSeek Chat Completions",
     }
 }
 
@@ -164,9 +196,8 @@ impl Menus {
                 ProviderRow::Provider(index) => {
                     let provider = &choices[*index];
                     safe_text(&format!(
-                        "{} · {} · {}",
+                        "{} · {}",
                         provider.name(),
-                        adapter_label(provider.adapter),
                         self.provider_auth_label(provider)
                     ))
                 }
@@ -283,10 +314,11 @@ impl Menus {
             .snapshot(chat)
             .await
             .map_err(|error| error.to_string())?;
-        let choices: Vec<_> = provider
-            .models
+        let access = tickloop_agent::model::access::AccessCatalog::defaults();
+        let mut models = provider.models.clone();
+        models.sort_by_key(|model| access.series_position(model).unwrap_or(usize::MAX));
+        let choices: Vec<_> = models
             .iter()
-            .filter(|model| model.adapter() == provider.adapter)
             .map(|model| {
                 let preferred = if snapshot.thinking_enabled {
                     snapshot.reasoning_effort
@@ -345,16 +377,19 @@ impl Menus {
                         ReasoningEffort::label,
                     )
                 };
-                safe_text(&format!(
-                    "{}    Thinking ‹ {thinking} ›",
-                    choice.config.name
-                ))
+                let name = tickloop_agent::model::access::AccessCatalog::defaults()
+                    .series_for(&choice.config)
+                    .map_or_else(|| choice.config.name.clone(), |series| series.label());
+                safe_text(&format!("{name}    Thinking ‹ {thinking} ›"))
             })
             .collect();
-        let mut context = vec![
-            format!("Adapter: {}", adapter_label(provider.adapter)),
-            "Enter saves the model and Thinking. Esc discards changes.".into(),
-        ];
+        let mut context = vec!["Enter saves the model and Thinking. Esc discards changes.".into()];
+        if let Some(notice) = tickloop_agent::model::access::AccessCatalog::defaults()
+            .provider(&provider.models[0].provider_id)
+            .and_then(|access| access.notice.as_deref())
+        {
+            context.push(safe_text(notice));
+        }
         if provider.models[0].adapter() == Adapter::MinimaxMessages
             && provider.models[0].auth_source != ModelAuthSource::ApiKeyEnv
         {
@@ -392,7 +427,7 @@ impl Menus {
         match selection {
             Selection::Provider {
                 chat,
-                mut choices,
+                choices,
                 rows,
             } => {
                 if let Some((_, selected)) = &mut self.provider_group {
@@ -413,17 +448,9 @@ impl Menus {
                     ProviderRow::Provider(provider_index) => provider_index,
                 };
                 let provider = choices
-                    .get_mut(provider_index)
+                    .get(provider_index)
                     .ok_or("provider option does not exist")?;
                 match action {
-                    PickerAction::CycleAdapter => {
-                        let adapters = provider.adapters();
-                        let position = adapters
-                            .iter()
-                            .position(|adapter| *adapter == provider.adapter)
-                            .unwrap_or(0);
-                        provider.adapter = adapters[(position + 1) % adapters.len()];
-                    }
                     PickerAction::Reauthenticate
                     | PickerAction::DeviceLogin
                     | PickerAction::SignOut => {

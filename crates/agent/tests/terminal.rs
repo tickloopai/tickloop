@@ -515,7 +515,7 @@ async fn piped_provider_model_and_settings_menus_apply_numbered_choices() {
     );
     assert!(
         transcript.contains(
-            "Current model: DeepSeek API · DeepSeek-V4.1-Flash (deepseek-flash) · Messages"
+            "Current model: DeepSeek API · DeepSeek-V4.1-Flash (deepseek-flash) · OpenAI Chat Completions"
         ),
         "{transcript}"
     );
@@ -2040,13 +2040,13 @@ async fn selected_external_provider_yaml_is_saved_as_a_provider_and_reloaded() {
 }
 
 #[tokio::test]
-async fn explicit_multimodel_yaml_shows_siblings_without_saving_on_load() {
+async fn explicit_multimodel_yaml_shows_mixed_protocol_siblings_without_saving_on_load() {
     let directory = tempfile::tempdir().unwrap();
     let config_root = directory.path().join("config-root");
     let config = directory.path().join("multimodel.yaml");
     std::fs::write(
         &config,
-        "id: external-provider\ndefault_model: first\ndisplay_name: External provider\nauth: api_key_env\napi_key_env: EXTERNAL_TEST_KEY\nendpoints:\n  messages: https://gateway.example/messages\nmodels:\n  - id: first\n    service_model_id: first-service\n    display_name: First choice\n    adapter: messages\n  - id: second\n    service_model_id: second-service\n    display_name: Second choice\n    adapter: messages\n",
+        "id: external-provider\ndefault_model: first\ndisplay_name: External provider\nauth: api_key_env\napi_key_env: EXTERNAL_TEST_KEY\nendpoints:\n  messages: https://gateway.example/messages\n  responses: https://gateway.example\nmodels:\n  - id: first\n    service_model_id: first-service\n    display_name: First choice\n    adapter: messages\n  - id: second\n    service_model_id: second-service\n    display_name: Second choice\n    adapter: responses\n",
     )
     .unwrap();
     let mut child = trusted_async_agent_command()
@@ -3485,12 +3485,14 @@ async fn process_registration_follows_the_foreground_chat_and_is_removed_at_exit
     };
     let first_chat = next_chat_line(&mut output).await;
     tokio::time::timeout(INTERACTION_TIMEOUT, async {
-        while registered_chat(&registration).as_deref() != Some(first_chat.as_str()) {
+        while registered_chat(&registration).as_deref() != Some(first_chat.as_str())
+            || stale.exists()
+        {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
-    .expect("startup did not register the process with its Chat");
+    .expect("startup did not register its Chat and remove the stale process registration");
     let record: Value = serde_json::from_slice(&std::fs::read(&registration).unwrap()).unwrap();
     assert_eq!(record["pid"], child.id().unwrap());
     assert_eq!(record["kind"], "interactive");
