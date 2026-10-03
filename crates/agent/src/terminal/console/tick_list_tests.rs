@@ -843,11 +843,10 @@ fn passive_todos_allow_tick_list_focus_on_right_and_shift_arrows() {
                 "Auto".into(),
                 "fixture".into(),
                 None,
-                vec![StatusItem {
-                    id: "1".into(),
-                    title: "own passive todo".into(),
-                    state: "pending",
-                    role: Role::MutedText,
+                vec![TodoItem {
+                    content: "own passive todo".into(),
+                    status: tickloop_agent::runtime::TodoStatus::Pending,
+                    active_form: "Working".into(),
                 }],
             )
             .unwrap();

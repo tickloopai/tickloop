@@ -4,7 +4,8 @@ use serde_json::{Value, json};
 use tickloop_agent::{
     image::ImageMediaType,
     model::{
-        Content, ImageSource, Message, ModelRequest, ReasoningEffort, Role, StructuredOutput,
+        Content, ImageSource, Message, ModelFailureKind, ModelRequest, ReasoningEffort, Role,
+        StructuredOutput,
         cards::{ModelCatalog, built_in_model_profiles},
         credentials::save_api_key,
         model_client,
@@ -287,6 +288,45 @@ async fn kimi_code_oauth_schema_is_a_single_inert_auto_tool_on_its_own_route() {
     assert_eq!(body["tool_choice"], "auto");
     assert!(body.get("response_format").is_none());
     assert_eq!(body["tools"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn kimi_code_403_reports_plan_quota_or_denial_without_remote_text() {
+    let quota_body = json!({"error":{"type":"access_terminated_error","message":"You've reached your monthly usage limit for this billing cycle. Your quota will be refreshed in the next cycle. To continue now, purchase extra usage or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota"}});
+    let denied_body =
+        json!({"error":{"type":"access_terminated_error","message":"remote-secret-diagnostic"}});
+    for (body, expected_kind, expected_text) in [
+        (
+            quota_body,
+            ModelFailureKind::QuotaExhausted,
+            "model allowance is exhausted (HTTP 403): Kimi Code plan usage limit reached",
+        ),
+        (
+            denied_body,
+            ModelFailureKind::EntitlementDenied,
+            "model service denied access (HTTP 403): access_terminated_error",
+        ),
+    ] {
+        let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        saved_subscription(root.path(), "kimi-code-oauth", "kimi");
+        let (endpoint, _) = model_http_support::serve_response(403, body.to_string()).await;
+        let mut config = ModelCatalog::defaults()
+            .get("kimi-code-oauth", "k3")
+            .unwrap();
+        config.base_url = endpoint;
+        let (events, _) = mpsc::unbounded_channel();
+        let error = model_client(config, Some(root.path()))
+            .unwrap()
+            .complete(request(None), events, CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), expected_kind);
+        assert!(!error.retry_hint().0);
+        let message = error.to_string();
+        assert!(message.starts_with(expected_text), "{message}");
+        assert!(!message.contains("purchase extra usage"), "{message}");
+        assert!(!message.contains("remote-secret-diagnostic"), "{message}");
+    }
 }
 
 #[tokio::test]

@@ -113,7 +113,7 @@ OAuth 使用 Portal 设备授权，终端显示地址和用户码；在自己的
 
 模型选择和 Thinking 保存在状态目录 `settings.json` 的 `defaultModel`、`effortLevel` 和 `alwaysThinkingEnabled`。旧的内置选择与兼容别名继续使用当前版本内置定义；引用未知外部身份的旧选择给出一条明确提示并回退到内置默认。旧定义/调优文件被忽略，用户文件不会被删除。
 
-API Key 仍读取状态目录 `.env`，OAuth 登录使用私有认证存储，Google service account 等凭据文件继续支持。凭据不参与 Provider/model 定义，不在厂商、地区、产品或计费连接之间自动复制或别名匹配。开发入口 `make dev` 使用唯一固定副本启动 CLI／owner／worker，沿用调用方 cwd，默认读取 `/tmp/tickloop-dev/config/settings.json` 与同目录 `.env`；可用 `DEV_CONFIG_DIR` 调整。独立启动由 `TICKLOOP_CONFIG_DIR` 或默认状态目录决定。
+API Key 仍读取状态目录 `.env`，OAuth 登录使用私有认证存储，Google service account 等凭据文件继续支持。凭据不参与 Provider/model 定义，不在厂商、地区、产品或计费连接之间自动复制或别名匹配。开发入口 `make dev` 在共享 target 中增量构建，再用每次保留的唯一固定副本启动 CLI／owner／worker，沿用调用方 cwd 与全局配置（`TICKLOOP_CONFIG_DIR` 或默认状态目录），不另建开发配置。
 
 内置目录与 AccessCatalog 控制普通菜单的模型系列和推荐卡；既有已退休内置选择保持兼容，不因目录更新静默升级。新增支持通过源码/SOP、验证和程序发布提供，外部 Provider 示例不构成产品加载入口。
 
@@ -167,7 +167,7 @@ Rewind 同时提供 `Summarize from here` 和 `Summarize up to here`，照 Claud
 
 `/tasks` 打开同一个 Shell 任务界面，模型响应期间也可立即进入；Shift+↑／Shift+↓ 聚焦右侧 Tick List 的 Shells 组，Enter 打开所选 Shell。列表和详情贴在屏幕底部，最多占半屏，保留上方的 Chat 内容。单任务直接打开详情，多任务先显示列表；`j/k`、方向键或 Ctrl+N/P 选择，Enter 查看，`b` 转后台，`x` 停止可控任务。详情支持逐行、翻页与 Home/End；向上浏览时保持位置并累计未读输出，End 恢复尾随。Left 返回列表，Esc／Enter／Space 关闭详情，Ctrl+O 查看完整记录。后台输出留在任务详情中；后台 Shell（User 或 Agent）结束后，所属 Chat 收到一条 `<task-notification>` user 消息，包含任务 id、Agent 任务的 tool-use id、输出文件、状态（completed／failed／killed）和摘要，对话中显示为 `● 摘要`，下一次模型请求会带上它。Shell 任务状态与输出读取依赖所属执行 worker，View 退出不丢失；worker 退出后历史不重建活任务。
 
-底部只提供有子 Agent 时的 Subagents N 入口，N 只统计子 Agent，不计 Main（当前查看的子 Agent 仍计入），列表默认展开。输入光标在最后视觉行且历史已到底时，Down 聚焦入口；点击或在入口按 Enter／Space 隐藏或显示列表，带修饰键的 Enter 忽略。展开入口再 Down 进入列表，j/k 或 Ctrl+N/P 选择，Enter 打开 Agent，Space 折叠后代，Esc 先回入口，再回输入。隐藏列表不获得焦点或消费导航。Todo 不属于 footer，始终在 Working 下方按当前 Agent 的消息流宽度显示；空闲也保留，全部完成保留 5 秒后清空，没有展开、详情或开关。差异视图通过独立 /diff 打开；候选、弹层和阅读界面独占各自按键。
+底部只提供有子 Agent 时的 Subagents N 入口，N 只统计子 Agent，不计 Main（当前查看的子 Agent 仍计入），列表默认展开。输入光标在最后视觉行且历史已到底时，Down 聚焦入口；点击或在入口按 Enter／Space 隐藏或显示列表，带修饰键的 Enter 忽略。展开入口再 Down 进入列表，j/k 或 Ctrl+N/P 选择，Enter 打开 Agent，Space 折叠后代，Esc 先回入口，再回输入。隐藏列表不获得焦点或消费导航。Todo 不属于 footer，始终在 Working 下方按当前 Agent 的消息流宽度显示；空闲也保留，全部完成保留 5 秒后清空，没有展开、详情或开关。首项带树形连接，后续图标对齐；Unicode 与 Nerd Font 均提供单列的待办／进行中／完成图标。待办普通、进行中 accent 加粗、完成变暗并划除，颜色跟随当前 Theme；Working 使用当前 Loop 第一项进行中的 activeForm，保留计时与中断提示。差异视图通过独立 /diff 打开；候选、弹层和阅读界面独占各自按键。
 
 超过 800 字符或超过 3 行的 bracketed paste 在输入区折叠为一个块，左右移动和删除把它视为一个单元，提交仍使用完整原文。输入框可编辑时 Ctrl+G 随时使用 VISUAL／EDITOR 打开外部编辑器（可以是 Vim）；返回后用编辑结果更新草稿，并恢复底部输入、raw mode 和 bracketed paste。从输入历史取回（包括重启后）的粘贴恢复为完整原文，超过 1024 字符的原文保存在状态根目录的 `paste-cache/`；取回时不恢复折叠块。Ctrl+V 把剪贴板图片附加为 `[Image #N]`，与折叠粘贴共用编号并同样整块移动和删除，删除占位符即移除图片；发送时图片按占位符顺序随消息提交，输入历史只保留占位符文字。当前模型未在 `input_modalities` 中声明 `image` 时不附加并提示；通过 SSH 运行时读取的是远程主机的剪贴板，可改用 `@路径`。把 png、jpg、jpeg、gif 或 webp 文件拖入终端或粘贴其路径（支持引号、shell 转义、`file://`、`~/`，相对路径按 Chat 工作目录解析）时同样附加为 `[Image #N]`，混合粘贴中的其余文字保持原样；路径不存在或不是图片时按文字粘贴。macOS 上剪贴板是图片时 Cmd+V 产生的空粘贴会读取剪贴板图片。
 

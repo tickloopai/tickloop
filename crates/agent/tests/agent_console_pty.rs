@@ -43,6 +43,10 @@ mod screen {
 const TERMINAL_WIDTH: usize = 100;
 const TERMINAL_HEIGHT: usize = 32;
 const UI_TIMEOUT: Duration = Duration::from_secs(10);
+const COMPLETED_FRAME_START: &str = "\x1b[?2026h";
+const COMPLETED_FRAME_END: &str = "\x1b[?2026l";
+const CURSOR_VISIBLE: &str = "\x1b[?25h";
+const CURSOR_HIDDEN: &str = "\x1b[?25l";
 
 struct PrivateFixture {
     directory: tempfile::TempDir,
@@ -278,8 +282,40 @@ impl PtyView {
         panic!("CLI PTY {label}: {}", self.frame());
     }
 
+    async fn wait_for_editor(&mut self, label: &str, expected_draft: Option<&str>) {
+        let output = Arc::clone(&self.output);
+        self.wait_for(label, |frame| {
+            let bytes = output.lock().unwrap();
+            let ansi = String::from_utf8_lossy(&bytes);
+            let Some(end) = ansi.rfind(COMPLETED_FRAME_END) else {
+                return false;
+            };
+            let Some(start) = ansi[..end].rfind(COMPLETED_FRAME_START) else {
+                return false;
+            };
+            let completed = &ansi[start..end];
+            let cursor_is_visible = completed.rfind(CURSOR_VISIBLE).is_some_and(|shown| {
+                completed
+                    .rfind(CURSOR_HIDDEN)
+                    .is_none_or(|hidden| shown > hidden)
+            });
+            cursor_is_visible
+                && !frame.contains("Shell running")
+                && frame.lines().any(|line| {
+                    line.strip_prefix('❯')
+                        .is_some_and(|text| expected_draft.is_none_or(|draft| text.trim() == draft))
+                })
+        })
+        .await;
+    }
+
     async fn close(&mut self) {
-        self.send(b"\x15\x7f\x04\x04");
+        self.wait_for_editor("editor owns the close input", None)
+            .await;
+        self.send(b"\x15\x7f");
+        self.wait_for_editor("cleared editor is ready to close", Some(""))
+            .await;
+        self.send(b"\x04\x04");
         tokio::time::timeout(UI_TIMEOUT, async {
             loop {
                 if let Some(status) = self.child.try_wait().unwrap() {
@@ -294,7 +330,12 @@ impl PtyView {
             }
         })
         .await
-        .expect("Ctrl+D twice must close the View without stopping its Agent");
+        .unwrap_or_else(|_| {
+            panic!(
+                "Ctrl+D twice must close the View without stopping its Agent: {}",
+                self.frame()
+            )
+        });
     }
 }
 

@@ -1,9 +1,13 @@
 mod support;
 
+mod screen {
+    include!("support/screen.rs");
+}
+
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use serde_json::json;
 use std::{
-    io::{Read, Write},
+    io::{BufRead, BufReader, Write},
     os::unix::fs::PermissionsExt,
     sync::{Arc, Mutex},
     thread,
@@ -11,11 +15,16 @@ use std::{
 };
 
 const TIMEOUT: Duration = Duration::from_secs(15);
+const TERMINAL_WIDTH: usize = 140;
+const TERMINAL_HEIGHT: usize = 30;
+const COMPLETED_FRAME_END: &str = "\x1b[?2026l";
+const CURSOR_VISIBLE: &str = "\x1b[?25h";
+const CURSOR_HIDDEN: &str = "\x1b[?25l";
 
 struct Session {
     child: Box<dyn portable_pty::Child + Send + Sync>,
     writer: Box<dyn Write + Send>,
-    master: Box<dyn portable_pty::MasterPty + Send>,
+    _master: Box<dyn portable_pty::MasterPty + Send>,
     output: Arc<Mutex<String>>,
     reader: Option<thread::JoinHandle<()>>,
 }
@@ -27,8 +36,8 @@ impl Session {
     ) -> Self {
         let pty = native_pty_system()
             .openpty(PtySize {
-                rows: 30,
-                cols: 140,
+                rows: TERMINAL_HEIGHT as u16,
+                cols: TERMINAL_WIDTH as u16,
                 pixel_width: 0,
                 pixel_height: 0,
             })
@@ -59,26 +68,15 @@ impl Session {
         }
         let child = pty.slave.spawn_command(command).unwrap();
         let writer = pty.master.take_writer().unwrap();
-        let mut input = pty.master.try_clone_reader().unwrap();
+        let input = pty.master.try_clone_reader().unwrap();
         let output = Arc::new(Mutex::new(String::new()));
         let capture = output.clone();
-        let reader = thread::spawn(move || {
-            let mut bytes = [0_u8; 8192];
-            while let Ok(length) = input.read(&mut bytes) {
-                if length == 0 {
-                    break;
-                }
-                capture
-                    .lock()
-                    .unwrap()
-                    .push_str(&String::from_utf8_lossy(&bytes[..length]));
-            }
-        });
+        let reader = thread::spawn(move || screen::capture_output(input, capture));
         drop(pty.slave);
         Self {
             child,
             writer,
-            master: pty.master,
+            _master: pty.master,
             output,
             reader: Some(reader),
         }
@@ -89,29 +87,60 @@ impl Session {
     }
     fn wait(&self, needle: &str) {
         let deadline = Instant::now() + TIMEOUT;
-        let ansi = regex::Regex::new(r"\x1b\[[0-9;?]*[ -/]*[@-~]").unwrap();
         loop {
-            if ansi
-                .replace_all(&self.output.lock().unwrap(), "")
-                .contains(needle)
-            {
+            let frame = screen::visible_screen(
+                &self.output.lock().unwrap(),
+                TERMINAL_WIDTH,
+                TERMINAL_HEIGHT,
+            );
+            if frame.contains(needle) {
                 return;
             }
             assert!(
                 Instant::now() < deadline,
                 "PTY did not display {needle:?}: {}",
-                self.output.lock().unwrap()
+                frame
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+    fn wait_for_editor(&self) {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            let captured = self.output.lock().unwrap().clone();
+            let completed = captured
+                .rfind(COMPLETED_FRAME_END)
+                .map(|end| &captured[..end + COMPLETED_FRAME_END.len()]);
+            let frame = screen::visible_screen(&captured, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+            let editor_has_focus = completed
+                .is_some_and(|output| output.rfind(CURSOR_VISIBLE) > output.rfind(CURSOR_HIDDEN));
+            if editor_has_focus
+                && frame.contains("⏵⏵ ")
+                && frame.lines().any(|line| line.trim() == "❯")
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "PTY editor did not become ready: {frame}"
             );
             thread::sleep(Duration::from_millis(20));
         }
     }
     fn exit(&mut self) {
-        self.send(b"\x1b");
-        thread::sleep(Duration::from_millis(100));
+        self.wait_for_editor();
         self.send(b"/exit\r\r");
         let deadline = Instant::now() + TIMEOUT;
         while self.child.try_wait().unwrap().is_none() {
-            assert!(Instant::now() < deadline, "PTY did not exit");
+            assert!(
+                Instant::now() < deadline,
+                "PTY did not exit: {}",
+                screen::visible_screen(
+                    &self.output.lock().unwrap(),
+                    TERMINAL_WIDTH,
+                    TERMINAL_HEIGHT
+                )
+            );
             thread::sleep(Duration::from_millis(20));
         }
     }
@@ -119,13 +148,10 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         let _ = self.child.kill();
-        let _ = self.master.resize(PtySize {
-            rows: 30,
-            cols: 140,
-            pixel_width: 0,
-            pixel_height: 0,
-        });
-        self.reader.take();
+        let _ = self.child.wait();
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
     }
 }
 
@@ -133,15 +159,14 @@ impl Drop for Session {
 fn shell_tick_appears_can_be_focused_and_removed_in_an_isolated_pty() {
     let directory = tempfile::tempdir().unwrap();
     let mut session = Session::start(directory.path(), None, None);
-    session.wait("Auto");
+    session.wait_for_editor();
     assert!(!session.output.lock().unwrap().contains("No Ticks"));
     session.send(b"!printf shell-tick-pty; while [ ! -f finish ]; do sleep 0.02; done\r");
-    session.wait("shell-tick-pty");
+    session.wait("Shell running");
     session.send(b"\x02");
     session.wait("Shells (1)");
     std::fs::write(directory.path().join("finish"), "").unwrap();
     session.wait("exit 0");
-    thread::sleep(Duration::from_millis(300));
     session.send(b"\x1b[Cx");
     session.send(b"/ticks\r\r");
     let settings_path = directory.path().join("state/settings.json");
@@ -177,12 +202,12 @@ fn artifact_login_opens_picker_adds_tick_and_uses_a_substitute_browser() {
                 thread::sleep(Duration::from_millis(5));
                 continue;
             };
+            socket.set_nonblocking(false).unwrap();
             socket
                 .set_read_timeout(Some(Duration::from_secs(3)))
                 .unwrap();
-            let mut bytes = [0_u8; 8192];
-            let count = socket.read(&mut bytes).unwrap();
-            let request = String::from_utf8_lossy(&bytes[..count]);
+            let mut request = String::new();
+            BufReader::new(&mut socket).read_line(&mut request).unwrap();
             let user = json!({"id":"owner","name":"Owner","email":"owner@example.test"});
             let artifact = json!({"id":id,"title":"PTY Research","format":"markdown","access_role":"owner","url":"https://docs.example/a/test","updated_at":"2026-10-06T00:00:00Z","metadata_revision":1});
             let body = if request.starts_with("POST /api/v1/auth/device ") {
@@ -202,42 +227,47 @@ fn artifact_login_opens_picker_adds_tick_and_uses_a_substitute_browser() {
             socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).unwrap();
         }
     });
-    let directory = tempfile::tempdir().unwrap();
-    let bin = directory.path().join("bin");
-    std::fs::create_dir(&bin).unwrap();
-    let browser = bin.join(if cfg!(target_os = "macos") {
-        "open"
-    } else {
-        "xdg-open"
+    let result = std::panic::catch_unwind(|| {
+        let directory = tempfile::tempdir().unwrap();
+        let bin = directory.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let browser = bin.join(if cfg!(target_os = "macos") {
+            "open"
+        } else {
+            "xdg-open"
+        });
+        std::fs::write(
+            &browser,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$TICK_TEST_BROWSER_LOG\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&browser, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut session = Session::start(directory.path(), Some(&origin), Some(&bin));
+        session.wait_for_editor();
+        session.send(b"/artifacts\r");
+        session.wait("ABCD");
+        session.wait("[All]");
+        session.wait("PTY Research");
+        session.send(b"\r");
+        session.wait("Artifacts (1)");
+        session.wait("Ticks 1");
+        session.send(b"\r");
+        let deadline = Instant::now() + TIMEOUT;
+        let log = directory.path().join("browser.log");
+        while !log.exists() {
+            assert!(Instant::now() < deadline, "substitute browser not invoked");
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            std::fs::read_to_string(log).unwrap().trim(),
+            "https://docs.example/a/test"
+        );
+        session.send(b"x");
+        session.exit();
     });
-    std::fs::write(
-        &browser,
-        "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$TICK_TEST_BROWSER_LOG\"\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&browser, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let mut session = Session::start(directory.path(), Some(&origin), Some(&bin));
-    session.wait("Auto");
-    session.send(b"/artifacts\r");
-    session.wait("ABCD");
-    session.wait("[All]");
-    session.wait("PTY Research");
-    session.send(b"\r");
-    session.wait("Artifacts (1)");
-    session.wait("Ticks 1");
-    session.send(b"\r");
-    let deadline = Instant::now() + TIMEOUT;
-    let log = directory.path().join("browser.log");
-    while !log.exists() {
-        assert!(Instant::now() < deadline, "substitute browser not invoked");
-        thread::sleep(Duration::from_millis(20));
-    }
-    assert_eq!(
-        std::fs::read_to_string(log).unwrap().trim(),
-        "https://docs.example/a/test"
-    );
-    session.send(b"x\x1b");
-    session.exit();
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     server.join().unwrap();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
 }

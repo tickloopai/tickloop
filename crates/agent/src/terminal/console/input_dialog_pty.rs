@@ -288,13 +288,17 @@ fn input_dialog_pty_preserves_search_and_draft_through_permission_preemption() {
                 .nth(top)
                 .is_some_and(|line| line.starts_with("Permission fixture"))
         });
-        assert!(
-            frame
-                .lines()
-                .next()
-                .unwrap()
-                .contains("Pinned fixture prompt")
-        );
+        assert_eq!(frame.matches("Pinned fixture prompt").count(), 1, "{frame}");
+        if top >= 12 {
+            assert!(
+                !frame
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .contains("Pinned fixture prompt"),
+                "{frame}"
+            );
+        }
         assert!(
             frame
                 .lines()

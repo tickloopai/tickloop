@@ -3,21 +3,19 @@ set -eu
 
 launch_directory=$(pwd -P)
 repository_root=$(CDPATH= cd "$(dirname "$0")/.." && pwd -P)
+target_directory=${CARGO_TARGET_DIR:-$repository_root/target}
 cd "$repository_root"
 mkdir -p "$repository_root/target/dev-runs"
 run_directory=$(mktemp -d "$repository_root/target/dev-runs/run.XXXXXX")
-build_directory="$run_directory/build"
 bin_directory="$run_directory/bin"
 trap 'rm -rf "$run_directory"' 0
 trap 'exit 1' 1 2 15
 
-cargo build --locked --target-dir "$build_directory" \
-    -p tickloop-agent --bin tickloop -p tickloop-ticks --bin tick
+cargo build --locked -p tickloop-agent --bin tickloop -p tickloop-ticks --bin tick
 mkdir "$bin_directory"
-cp "$build_directory/debug/tickloop" "$bin_directory/tickloop"
-cp "$build_directory/debug/tick" "$bin_directory/tick"
+cp "$target_directory/debug/tickloop" "$bin_directory/tickloop"
+cp "$target_directory/debug/tick" "$bin_directory/tick"
 chmod 0500 "$bin_directory/tickloop" "$bin_directory/tick"
-rm -rf "$build_directory"
 chmod 0500 "$bin_directory" "$run_directory"
 
 # Detached owners and workers can still exec this bundle after the View exits.

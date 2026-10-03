@@ -25,6 +25,7 @@ use super::{
     hyperlink,
     image_cache::ImageLinks,
     presentation, safe_text,
+    style::RoleSpan,
 };
 
 const COMMAND_OUTPUT_PAGE_BYTES: usize = 16 * 1024;
@@ -859,17 +860,36 @@ impl PublicHistoryBuilder {
     }
 
     /// Prompt text of `chat`, with each cached `[Image #N]` linked to its image.
-    fn push_prompt(&mut self, chat: Uuid, text: &str) {
+    fn push_prompt(
+        &mut self,
+        chat: Uuid,
+        text: &str,
+        display: DisplayProfile,
+        is_user_message: bool,
+    ) {
         let links = self.image_links.in_text(chat, text);
+        let mut spans = vec![RoleSpan {
+            text: format!("\n{} ", display.glyph(super::display::Glyph::Prompt)),
+            role: Some(super::style::Role::Subtle),
+            link: None,
+        }];
         for (run, link) in hyperlink::runs(text, &links) {
-            match link {
-                Some(link) => self.pieces.push(ConversationPiece::Linked {
-                    text: run.to_owned(),
-                    link: link.clone(),
-                }),
-                None => self.push_str(run),
-            }
+            spans.push(RoleSpan {
+                text: run.to_owned(),
+                role: None,
+                link: link.cloned(),
+            });
         }
+        spans.push(RoleSpan {
+            text: "\n".into(),
+            role: None,
+            link: None,
+        });
+        self.pieces.push(ConversationPiece::Input {
+            text: spans.iter().map(|span| span.text.as_str()).collect(),
+            spans,
+            is_user_message,
+        });
     }
 
     fn push(&mut self, text: String, role: Option<super::style::Role>) {
@@ -962,7 +982,7 @@ pub(super) fn public_history(chat: &ChatSnapshot, display: DisplayProfile) -> St
         .iter()
         .map(|piece| match piece {
             ConversationPiece::Styled(text, _)
-            | ConversationPiece::Linked { text, .. }
+            | ConversationPiece::Input { text, .. }
             | ConversationPiece::ToolCall { text, .. } => text.clone(),
             ConversationPiece::Markdown { text, .. } => format!("{assistant_lead}{text}"),
         })
@@ -981,34 +1001,6 @@ pub(super) fn write_public_history(console: &Console, chat: &ChatSnapshot) -> Re
             ))?;
         }
     }
-    let latest_user_message = chat
-        .public_conversation_items()
-        .ok()
-        .into_iter()
-        .flatten()
-        .rev()
-        .find_map(|item| {
-            let BranchPublicItem::Message {
-                source, message, ..
-            } = item
-            else {
-                return None;
-            };
-            if message.role != Role::User || source.is_agent_message || is_tick_delivery(&message) {
-                return None;
-            }
-            message.content.iter().find_map(|content| match content {
-                Content::Text { text }
-                    if !text.trim().is_empty()
-                        && presentation::typed_local_message(text, false).is_none()
-                        && !conversation::is_interruption_placeholder(Role::User, text) =>
-                {
-                    Some(safe_text(text))
-                }
-                _ => None,
-            })
-        });
-    console.set_latest_user_message(chat.id, latest_user_message)?;
     let pieces = public_history_pieces(chat, console.display_profile()?, console.image_links()?);
     console.write_pieces(&pieces)?;
     console.mark_input_echoes(
@@ -1087,13 +1079,12 @@ fn append_public_message(
             }
             Content::Text { text } => match message.role {
                 Role::User => {
-                    history.push_str("\n");
-                    history.push_role(
-                        format!("{} ", display.glyph(super::display::Glyph::Prompt)),
-                        super::style::Role::Subtle,
+                    history.push_prompt(
+                        source_chat_id,
+                        &safe_text(text),
+                        display,
+                        !source.is_agent_message,
                     );
-                    history.push_prompt(source_chat_id, &safe_text(text));
-                    history.push_str("\n");
                 }
                 Role::Assistant if folded => {
                     history.push_role(
@@ -1563,9 +1554,12 @@ mod tests {
                 ImageLinks::new(Some(cache.clone()), true),
             )
             .into_iter()
-            .filter_map(|piece| match piece {
-                ConversationPiece::Linked { text, link } => Some((text, link)),
-                _ => None,
+            .flat_map(|piece| match piece {
+                ConversationPiece::Input { spans, .. } => spans
+                    .into_iter()
+                    .filter_map(|span| span.link.map(|link| (span.text, link)))
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
             })
             .collect::<Vec<_>>()
         };

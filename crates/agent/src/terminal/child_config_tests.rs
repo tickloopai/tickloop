@@ -32,10 +32,12 @@ const CURSOR_HIDDEN: &str = "\x1b[?25l";
 const COMPLETED_FRAME_END: &str = "\x1b[?2026l";
 const CHILD_VIEW_HEADING: &str = "Delegated Agent ·";
 const TIMEOUT: Duration = Duration::from_secs(15);
+const VIEW_REGISTRATION_DELAY: Duration = Duration::from_millis(50);
 
 /// Records every command the View sends, one JSON line each in `commands.jsonl`. On the
 /// requester route, the catalog also lists a Lost sibling whose id shares the child's first ten
-/// digits, so only a longer token tells the two apart.
+/// digits, so only a longer token tells the two apart. Slow View registration separates the
+/// initial transcript frame from the initialized editor.
 struct RecordingOwner {
     owner: EmbeddedAgentAccess,
     directory: PathBuf,
@@ -90,6 +92,7 @@ impl AgentAccess for RecordingOwner {
     }
 
     async fn show_view(&self, update: DisplayUpdate) -> Result<DisplayReceipt, AccessError> {
+        tokio::time::sleep(VIEW_REGISTRATION_DELAY).await;
         self.owner.show_view(update).await
     }
 }
@@ -353,6 +356,12 @@ impl ChildPty {
         panic!("child View never showed {label}: {}", self.frame());
     }
 
+    fn wait_for_root_editor(&mut self) -> String {
+        self.wait_for("the initialized root editor", |frame| {
+            frame.contains("❯") && status_mode(frame).is_some()
+        })
+    }
+
     fn wait_for_child_editor(&mut self) {
         let captured = self.output.clone();
         self.wait_for("the child editor owns input", |frame| {
@@ -398,7 +407,7 @@ impl ChildPty {
 
     /// Opens the delegated child in place from the overview.
     fn open_child(&mut self) {
-        self.wait_for("the root View", |frame| frame.contains("❯"));
+        self.wait_for_root_editor();
         self.send(b"\x1b[D");
         self.wait_for("the overview", |frame| frame.contains("Agents · local"));
         self.send(b" ");
@@ -488,7 +497,7 @@ fn child_permission_candidates_and_help_describe_the_read_only_view() {
     let directory = tempfile::tempdir_in("/tmp").unwrap();
     let mut view = ChildPty::start(directory.path(), "child-config");
     child_fixture(directory.path(), &view);
-    view.wait_for("the root View", |frame| frame.contains("parent done"));
+    view.wait_for_root_editor();
     view.send(b"/per");
     let root = view.wait_for("the root permission candidate", |frame| {
         frame.contains("/permissions") && frame.contains("Choose Auto")
@@ -844,7 +853,7 @@ fn shift_tab_on_the_root_still_changes_its_mode() {
     let directory = tempfile::tempdir_in("/tmp").unwrap();
     let mut view = ChildPty::start(directory.path(), "child-config");
     child_fixture(directory.path(), &view);
-    let before = view.wait_for("the root View", |frame| frame.contains("parent done"));
+    let before = view.wait_for_root_editor();
     let initial = status_mode(&before);
     let baseline = commands(directory.path()).len();
     view.send(b"\x1b[Z");
@@ -874,9 +883,8 @@ fn shift_tab_in_the_overview_changes_no_hidden_agent_and_the_root_keeps_its_key(
     let directory = tempfile::tempdir_in("/tmp").unwrap();
     let mut view = ChildPty::start(directory.path(), "child-config");
     let fixture = child_fixture(directory.path(), &view);
-    let root = view.wait_for("the root View", |frame| frame.contains("parent done"));
+    let root = view.wait_for_root_editor();
     let root_mode = status_mode(&root);
-    assert!(root_mode.is_some(), "the root shows its mode: {root}");
     let baseline = commands(directory.path()).len();
 
     view.send(b"\x1b[D");

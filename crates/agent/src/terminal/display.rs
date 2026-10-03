@@ -26,10 +26,12 @@ pub(super) enum Glyph {
     ProtocolTick,
     Prompt,
     Assistant,
+    Subagents,
     ToolCall,
     ToolResult,
     TickDelivery,
     Success,
+    TodoBranch,
     TodoPending,
     TodoInProgress,
     TodoCompleted,
@@ -91,12 +93,17 @@ impl DisplayProfile {
             (GlyphSet::NerdFont, Glyph::TerminalTick) => "\u{f120}",
             (GlyphSet::NerdFont, Glyph::ProtocolTick) => "\u{f0318}",
             (GlyphSet::Unicode, Glyph::Prompt) => "❯",
-            (GlyphSet::Unicode, Glyph::Assistant | Glyph::ToolCall) => "⏺",
+            (GlyphSet::Unicode, Glyph::Assistant | Glyph::Subagents | Glyph::ToolCall) => "⏺",
             (GlyphSet::Unicode, Glyph::ToolResult) => "⎿",
             (GlyphSet::Unicode, Glyph::TickDelivery) => "◉",
-            (_, Glyph::TodoPending) => "◻",
-            (_, Glyph::TodoInProgress) => "◼",
-            (_, Glyph::TodoCompleted) => "✔",
+            (GlyphSet::Unicode, Glyph::TodoBranch) => "⎿",
+            (GlyphSet::Unicode, Glyph::TodoPending) => "◻",
+            (GlyphSet::Unicode, Glyph::TodoInProgress) => "◼",
+            (GlyphSet::Unicode, Glyph::TodoCompleted) => "✔",
+            (GlyphSet::NerdFont, Glyph::TodoBranch) => "\u{f060d}",
+            (GlyphSet::NerdFont, Glyph::TodoPending) => "\u{f0131}",
+            (GlyphSet::NerdFont, Glyph::TodoInProgress) => "\u{f012e}",
+            (GlyphSet::NerdFont, Glyph::TodoCompleted) => "\u{f00c}",
             (GlyphSet::Unicode, Glyph::Success) => "✓",
             (GlyphSet::Unicode, Glyph::Failure) => "✗",
             (GlyphSet::Unicode, Glyph::Warning) => "!",
@@ -112,7 +119,7 @@ impl DisplayProfile {
             (GlyphSet::Unicode, Glyph::Collapsed) => "▸",
             (GlyphSet::Unicode, Glyph::Expanded) => "▾",
             (GlyphSet::NerdFont, Glyph::Prompt) => "\u{f0142}",
-            (GlyphSet::NerdFont, Glyph::Assistant) => "\u{f06a9}",
+            (GlyphSet::NerdFont, Glyph::Assistant | Glyph::Subagents) => "\u{f06a9}",
             (GlyphSet::NerdFont, Glyph::ToolCall) => "\u{f1064}",
             (GlyphSet::NerdFont, Glyph::ToolResult) => "\u{f060c}",
             (GlyphSet::NerdFont, Glyph::TickDelivery) => "\u{f0318}",
@@ -164,6 +171,10 @@ impl DisplayProfile {
             self.glyph(Glyph::ToolResult),
             self.glyph(Glyph::TickDelivery),
             self.glyph(Glyph::Success),
+            self.glyph(Glyph::TodoBranch),
+            self.glyph(Glyph::TodoPending),
+            self.glyph(Glyph::TodoInProgress),
+            self.glyph(Glyph::TodoCompleted),
             self.glyph(Glyph::Failure),
             self.glyph(Glyph::Warning),
             self.glyph(Glyph::ScrollUp),
@@ -198,6 +209,22 @@ mod tests {
     }
 
     #[test]
+    fn subagents_glyph_uses_the_robot_with_a_single_column_unicode_fallback() {
+        for (glyph_set, expected, expanded) in [
+            (GlyphSet::Unicode, "⏺", "▾"),
+            (GlyphSet::NerdFont, "\u{f06a9}", "\u{f0140}"),
+        ] {
+            let profile = DisplayProfile::new(DisplayPreferences {
+                glyph_set,
+                prefers_reduced_motion: false,
+            });
+            assert_eq!(profile.glyph(Glyph::Subagents), expected);
+            assert_eq!(unicode_width::UnicodeWidthStr::width(expected), 1);
+            assert_eq!(profile.glyph(Glyph::Expanded), expanded);
+        }
+    }
+
+    #[test]
     fn agent_state_glyphs_differ_per_state_in_both_glyph_sets() {
         let states = [
             Glyph::AgentNeedsInput,
@@ -227,6 +254,10 @@ mod tests {
                 Glyph::ArtifactTick,
                 Glyph::TerminalTick,
                 Glyph::ProtocolTick,
+                Glyph::TodoBranch,
+                Glyph::TodoPending,
+                Glyph::TodoInProgress,
+                Glyph::TodoCompleted,
             ]) {
                 assert_eq!(
                     unicode_width::UnicodeWidthStr::width(profile.glyph(glyph)),

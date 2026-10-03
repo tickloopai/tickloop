@@ -5,6 +5,52 @@ const BATCH_PROMPT: &str = "Visibility batch probe";
 const QUESTION: &str = "QUEUED-QUESTION-PREVIEW";
 const PARKED_CALL: &str = "PARKED-CALL-AWAITING-PERMISSION";
 
+async fn short_exchange_has_no_sticky_prompt(fixture: &PrivateFixture, renderer: &str) {
+    const PROMPT: &str = "SHORT-EXCHANGE-USER-MESSAGE";
+    const REPLY: &str = "SHORT-EXCHANGE-ASSISTANT-REPLY";
+    let (url, mut requests) =
+        model_http_support::serve_responses(vec![(200, chat_reply(None, REPLY))]).await;
+    fixture.set_chat_model(&url);
+    let mut view = PtyView::start_with_environment(
+        fixture,
+        &[],
+        &[("TICKLOOP_AGENT_TUI", std::path::Path::new(renderer))],
+    );
+    view.wait_for("short exchange View ready", new_input_is_visible)
+        .await;
+    view.send(format!("{PROMPT}\r").as_bytes());
+    let (_, request) = tokio::time::timeout(UI_TIMEOUT, requests.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(request["messages"].to_string().contains(PROMPT));
+    let frame = view
+        .wait_for("short exchange reply", |frame| frame.contains(REPLY))
+        .await;
+    eprintln!("[short-exchange-frame {renderer}]\n{frame}\n[/short-exchange-frame]");
+    assert!(!frame.lines().next().unwrap().contains(PROMPT), "{frame}");
+    assert_eq!(frame.matches(PROMPT).count(), 1, "{frame}");
+    assert!(
+        frame.find(PROMPT).unwrap() < frame.find(REPLY).unwrap(),
+        "{frame}"
+    );
+    view.close().await;
+}
+
+#[tokio::test]
+async fn actual_cli_short_exchange_keeps_the_user_message_in_the_flow_only() {
+    for renderer in ["fullscreen", "inline"] {
+        let fixture = PrivateFixture::new();
+        let result = AssertUnwindSafe(short_exchange_has_no_sticky_prompt(&fixture, renderer))
+            .catch_unwind()
+            .await;
+        fixture.shutdown().await;
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
+}
+
 fn tool_header_count(frame: &str, name: &str) -> usize {
     conversation_body(frame)
         .lines()

@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+use tickloop_agent::runtime::TodoItem;
 
 use super::workspace_trust::{TRUST_ACCEPT_CHOICE_INDEX, TrustDecision, WorkspaceTrust};
 use crossterm::cursor::{Hide, MoveTo, Show};
@@ -106,8 +107,8 @@ use super::{
         InputKind, ShellCompletionKey, ShellCompletionKind, ShellEmptyControl, ShellExecution,
         ShellInputAction, ShellInputState, UserShellSubmission,
     },
-    status_area::{BackgroundStatusNotice, StatusArea, StatusItem},
-    style::{ColourDepth, Role, RoleLine, Span, StyledLine, ThemeName},
+    status_area::{BackgroundStatusNotice, StatusArea},
+    style::{ColourDepth, Role, RoleLine, RoleSpan, Span, StyledLine, ThemeName},
     subscription_surface::{
         SubscriptionAction, SubscriptionEffect, SubscriptionFocus, SubscriptionSurface,
         SubscriptionViewport,
@@ -541,7 +542,6 @@ pub(super) struct State {
     width: usize,
     height: usize,
     scrollback: Scrollback,
-    latest_user_message: Option<String>,
     /// Startup and local feedback from before this View's draft created its Chat.
     creation_prefixes: HashMap<Option<Uuid>, Vec<CreationPrefixEntry>>,
     echoed_inputs: HashSet<Uuid>,
@@ -749,7 +749,6 @@ impl Default for ChatInput {
 struct ViewPresentation {
     pub(super) tick_list: TickList,
     scrollback: Scrollback,
-    latest_user_message: Option<String>,
     echoed_inputs: HashSet<Uuid>,
     awaiting_input_echoes: HashSet<Uuid>,
     footer: FooterState,
@@ -1726,7 +1725,7 @@ impl Console {
         mode: String,
         model: String,
         context: Option<(u64, usize)>,
-        todos: Vec<StatusItem>,
+        todos: Vec<TodoItem>,
     ) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         state.status_area.update(mode, model, context, todos);
@@ -3004,24 +3003,6 @@ impl Console {
     }
 
     /// Echoes a submitted line in the body; the returned echo names it in this presentation only.
-    pub(super) fn set_latest_user_message(
-        &self,
-        chat: Uuid,
-        text: Option<String>,
-    ) -> Result<(), String> {
-        let mut state = self.state.lock().map_err(|error| error.to_string())?;
-        if state.chat == Some(chat) {
-            state.latest_user_message = text;
-        } else {
-            state
-                .view_cache
-                .entry(Some(chat))
-                .or_default()
-                .latest_user_message = text;
-        }
-        Ok(())
-    }
-
     pub fn record_input(&self, line: &str) -> Result<Option<InputEcho>, String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         if !state.interactive {
@@ -4044,9 +4025,10 @@ impl Drop for Lifetime {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum ConversationPiece {
     Styled(String, Option<Role>),
-    Linked {
+    Input {
         text: String,
-        link: hyperlink::Hyperlink,
+        spans: Vec<RoleSpan>,
+        is_user_message: bool,
     },
     Markdown {
         text: String,
@@ -4078,7 +4060,19 @@ impl ConversationPiece {
                 ..
             } => scrollback.set_tool_call(*run_id, call_key, spans, *state),
             Self::Styled(text, role) => scrollback.append_as(text, *role, None),
-            Self::Linked { text, link } => scrollback.append_span(text, None, None, Some(link)),
+            Self::Input {
+                spans,
+                is_user_message,
+                ..
+            } => {
+                let first_line = scrollback.line_count();
+                for span in spans {
+                    scrollback.append_span(&span.text, span.role, None, span.link.as_ref());
+                }
+                if *is_user_message {
+                    scrollback.mark_input(first_line..scrollback.line_count() - 1);
+                }
+            }
             Self::Markdown {
                 text,
                 starts_message,
@@ -4092,7 +4086,7 @@ impl ConversationPiece {
     pub(super) fn text(&self) -> &str {
         match self {
             Self::Styled(text, _)
-            | Self::Linked { text, .. }
+            | Self::Input { text, .. }
             | Self::Markdown { text, .. }
             | Self::ToolCall { text, .. } => text,
         }
@@ -4287,7 +4281,6 @@ impl State {
     fn clear_history(&mut self) {
         let auto_scroll = self.scrollback.auto_scroll();
         self.scrollback = Scrollback::new();
-        self.latest_user_message = None;
         self.echoed_inputs.clear();
         self.awaiting_input_echoes.clear();
         self.rendered_execution_losses.clear();
@@ -4360,10 +4353,6 @@ impl State {
         ViewPresentation {
             tick_list: std::mem::replace(&mut self.tick_list, next.tick_list),
             scrollback: std::mem::replace(&mut self.scrollback, next.scrollback),
-            latest_user_message: std::mem::replace(
-                &mut self.latest_user_message,
-                next.latest_user_message,
-            ),
             echoed_inputs: std::mem::replace(&mut self.echoed_inputs, next.echoed_inputs),
             awaiting_input_echoes: std::mem::replace(
                 &mut self.awaiting_input_echoes,
@@ -4509,7 +4498,6 @@ impl State {
             width: usize::from(width).saturating_sub(1).max(2),
             height: usize::from(height).max(1),
             scrollback: Scrollback::new(),
-            latest_user_message: None,
             creation_prefixes: HashMap::new(),
             echoed_inputs: HashSet::new(),
             awaiting_input_echoes: HashSet::new(),
@@ -5128,10 +5116,11 @@ impl State {
         let content_columns = self.content_columns();
         let sticky_prompt = (start >= 2 && self.workspace_trust.is_none())
             .then(|| {
-                let text = self
-                    .scrollback
-                    .latest_input_text(self.display.glyph(Glyph::Prompt))
-                    .or_else(|| self.latest_user_message.clone())?;
+                let text = self.scrollback.sticky_input_text(
+                    self.display.glyph(Glyph::Prompt),
+                    content_columns,
+                    start,
+                )?;
                 let text = format!(
                     "{} {}",
                     self.display.glyph(Glyph::Prompt),
@@ -5145,30 +5134,11 @@ impl State {
             .flatten();
         let sticky_rows = usize::from(sticky_prompt.is_some());
         let body_height = start.saturating_sub(sticky_rows);
-        let mut body = self.scrollback.frame_with_motion(
+        let body = self.scrollback.frame_with_motion(
             content_columns,
             body_height,
             self.display.preferences().prefers_reduced_motion,
         );
-        let reading_prompt = if sticky_prompt.is_none()
-            && !self.input_dialog_visible()
-            && self.footer.selected().is_none()
-            && self.candidate_rows(1).is_empty()
-        {
-            self.scrollback.reading_prompt(content_columns, start)
-        } else {
-            None
-        };
-        if let Some(prompt) = &reading_prompt {
-            body = self.scrollback.frame_with_motion(
-                content_columns,
-                start.saturating_sub(1),
-                self.display.preferences().prefers_reduced_motion,
-            );
-            body.lines.insert(0, prompt.clone());
-            body.styled
-                .insert(0, RoleLine::role(prompt.clone(), Role::MutedText));
-        }
         self.initialize_screen(output)?;
         write!(output, "{RESET_SCROLL_REGION}")?;
         let padding = body_height.saturating_sub(body.lines.len());
@@ -5263,10 +5233,7 @@ impl State {
                 .render(self.colour_depth)
             }))
             .collect();
-        let scroll_rows = if sticky_prompt.is_none()
-            && !self.tick_list_visible()
-            && self.scrollback.reading_prompt(self.width, start).is_none()
-        {
+        let scroll_rows = if sticky_prompt.is_none() && !self.tick_list_visible() {
             start
         } else {
             0
@@ -6033,11 +6000,7 @@ impl State {
         .then(|| {
             format!(
                 "{} {}",
-                self.display.glyph(if self.status_area.agents_collapsed {
-                    Glyph::Collapsed
-                } else {
-                    Glyph::Expanded
-                }),
+                self.display.glyph(Glyph::Subagents),
                 self.status_area.header_label(FooterItemId::Agents)
             )
         })
@@ -6298,17 +6261,23 @@ impl State {
         let mut tick_control = None;
         if borders > 0 {
             let can_return = self.ordinary_input_is_visible() && !self.scrollback.is_following();
-            let mut reading = can_return && self.scrollback.has_hidden_tail(self.width, body_rows);
-            if can_return
+            let content_columns = self.content_columns();
+            let sticky_rows = usize::from(
+                can_return
+                    && body_rows >= 2
+                    && self
+                        .scrollback
+                        .sticky_input_text(
+                            self.display.glyph(Glyph::Prompt),
+                            content_columns,
+                            body_rows,
+                        )
+                        .is_some(),
+            );
+            let reading = can_return
                 && self
                     .scrollback
-                    .reading_prompt(self.width, body_rows)
-                    .is_some()
-            {
-                reading = self
-                    .scrollback
-                    .has_hidden_tail(self.width, body_rows.saturating_sub(1));
-            }
+                    .has_hidden_tail(content_columns, body_rows.saturating_sub(sticky_rows));
             let label = reading.then(|| self.back_to_bottom_label()).flatten();
             if let Some(label) = label {
                 let label_width = display_width(&label);
@@ -14778,7 +14747,7 @@ mod tests {
             core.starts_with('─')
                 && core.contains("⏵⏵ Auto")
                 && core.contains("claude-fable-5-1")
-                && !core.contains("Context"),
+                && core.contains("Context unknown"),
             "{core:?}"
         );
         assert_eq!(
@@ -15146,11 +15115,10 @@ mod tests {
                     "Auto".into(),
                     "loss-model".into(),
                     None,
-                    vec![StatusItem {
-                        id: "todo".into(),
-                        title: "review".into(),
-                        state: "pending",
-                        role: Role::MutedText,
+                    vec![TodoItem {
+                        content: "review".into(),
+                        status: tickloop_agent::runtime::TodoStatus::Pending,
+                        active_form: "Working".into(),
                     }],
                 );
                 super::layout_tests::set_status_family(&mut state.status_area);
@@ -15218,7 +15186,7 @@ mod tests {
                 assert!(
                     returned.contains("Auto")
                         && returned.contains("loss-model")
-                        && !returned.contains("Context"),
+                        && returned.contains("Context unknown"),
                     "{focus}: {returned}"
                 );
                 assert!(
@@ -16444,34 +16412,6 @@ mod tests {
         state.key(key(KeyCode::Down));
         assert_eq!(state.footer.selected(), Some(FooterItemId::Agents));
         assert_eq!(state.editor.cursor(), 0);
-    }
-
-    #[test]
-    fn status_area_variant_a_keeps_the_draft_and_switches_exclusive_panels() {
-        let mut state = State::new(true, 80, 24);
-        state.prompt_enabled = true;
-        state.insert("inspect current work");
-        let draft = state.editor.draft().to_owned();
-        state.status_area.update(
-            "Auto".into(),
-            "model".into(),
-            Some((42000, 200000)),
-            vec![StatusItem {
-                id: "1".into(),
-                title: "review results".into(),
-                state: "pending",
-                role: Role::MutedText,
-            }],
-        );
-        super::layout_tests::set_status_family(&mut state.status_area);
-        state.footer.update(state.status_area.available_panels());
-        state.key(key(KeyCode::Down));
-        state.key(key(KeyCode::Right));
-        let frame = state.frame().0;
-        assert!(frame.iter().any(|row| row.contains("task 00")));
-        assert!(!frame.iter().any(|row| row.contains("cargo test")));
-        assert!(state.key(key(KeyCode::Esc)).is_none());
-        assert_eq!(state.editor.draft(), draft);
     }
 
     #[test]

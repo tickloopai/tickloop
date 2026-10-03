@@ -1036,11 +1036,82 @@ fn workspace_trust_and_subscriptions_use_the_fixed_dialog_height() {
 }
 
 #[test]
+fn sticky_prompt_short_conversation_keeps_the_full_content_height() {
+    let console = tests::console_with_state(State::new(true, 160, 24));
+    console.select_chat(Some(Uuid::new_v4())).unwrap();
+    console.show_focused_menu(menu(Uuid::new_v4())).unwrap();
+    let mut state = console.state.lock().unwrap();
+    state
+        .tick_list
+        .replace(TickGroup::Artifacts, fixture_ticks());
+    state.scrollback.append("Leading boundary");
+    state.record_input("Short user request");
+    for index in 0..9 {
+        state.scrollback.append(&format!("Short reply {index}\n"));
+    }
+    state.draw(&mut Vec::new()).unwrap();
+    assert!(state.rendered_screen[0].starts_with("Leading boundary"));
+    assert!(state.rendered_screen[0].contains('│'));
+    assert!(
+        state.rendered_screen[..12]
+            .iter()
+            .any(|row| row.contains("Fixture Tick 0"))
+    );
+    assert!(state.rendered_screen[1].starts_with("❯ Short user request"));
+    assert_eq!(
+        state
+            .rendered_screen
+            .iter()
+            .filter(|row| row.contains("Short user request"))
+            .count(),
+        1
+    );
+    assert!(state.rendered_screen[12].starts_with("Settings"));
+}
+
+#[test]
+fn sticky_prompt_loaded_history_tracks_the_original_message_row() {
+    let console = tests::console_with_state(State::new(true, 80, 24));
+    let chat = Uuid::new_v4();
+    let agent_message = Uuid::new_v4();
+    console.select_chat(Some(chat)).unwrap();
+    let snapshot: crate::runtime::ChatSnapshot = serde_json::from_value(serde_json::json!({
+        "id": chat,
+        "workdir": "/fixture",
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "Loaded user request"}]},
+            {"role": "user", "content": [{"type": "text", "text": "Legacy Agent message"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": (0..40).map(|index| format!("Loaded reply {index}\n\n")).collect::<String>()}]}
+        ],
+        "message_ids": {"1": agent_message},
+        "agent_message_origins": {(agent_message.to_string()): {}},
+        "loops": []
+    })).unwrap();
+    super::super::workflows::write_public_history(&console, &snapshot).unwrap();
+    let mut state = console.state.lock().unwrap();
+    state.draw(&mut Vec::new()).unwrap();
+    assert!(state.rendered_screen[0].starts_with("❯ Loaded user request"));
+    state.scroll_conversation(ScrollAction::First);
+    state.draw(&mut Vec::new()).unwrap();
+    assert!(!state.rendered_screen[0].contains("Loaded user request"));
+    assert_eq!(
+        state
+            .rendered_screen
+            .iter()
+            .filter(|row| row.contains("Loaded user request"))
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn latest_user_message_stays_at_the_top_left_with_ticks_and_an_input_dialog() {
     let mut state = State::new(true, 160, 24);
     state.chat = Some(Uuid::new_v4());
     state.record_input("Most recent user request\nwith more detail");
-    state.scrollback.append("Agent reply\n");
+    for index in 0..30 {
+        state.scrollback.append(&format!("Agent reply {index}\n"));
+    }
     state.tick_list.replace(
         TickGroup::Shells,
         vec![TickListEntry {
@@ -1076,13 +1147,19 @@ fn latest_user_message_is_scoped_to_its_agent_and_falls_back_on_short_screens() 
         .record_input(&format!("First user {}\nnext line", "界".repeat(40)))
         .unwrap();
     console.select_chat(Some(second)).unwrap();
-    console
-        .set_latest_user_message(second, Some("Loaded second user message".into()))
-        .unwrap();
+    console.record_input("Second user").unwrap();
     {
         let mut state = console.state.lock().unwrap();
         state.draw(&mut Vec::new()).unwrap();
-        assert!(state.rendered_screen[0].contains("Loaded second"));
+        assert!(!state.rendered_screen[0].contains("Second user"));
+        assert_eq!(
+            state
+                .rendered_screen
+                .iter()
+                .filter(|row| row.contains("Second user"))
+                .count(),
+            1
+        );
     }
     console.select_chat(Some(first)).unwrap();
     let mut state = console.state.lock().unwrap();
@@ -1103,6 +1180,127 @@ fn latest_user_message_is_scoped_to_its_agent_and_falls_back_on_short_screens() 
             );
         }
     }
+}
+
+#[test]
+fn sticky_prompt_first_line_boundary_is_stable_on_scroll_and_resize() {
+    let console = tests::console_with_state(State::new(true, 80, 24));
+    console.select_chat(Some(Uuid::new_v4())).unwrap();
+    console.show_focused_menu(menu(Uuid::new_v4())).unwrap();
+    let mut state = console.state.lock().unwrap();
+    state.record_input("Boundary request\ncontinuation visible");
+    for index in 0..9 {
+        state.scrollback.append(&format!("Reply {index}\n"));
+    }
+    for _ in 0..3 {
+        state.draw(&mut Vec::new()).unwrap();
+        assert!(state.rendered_screen[0].starts_with("❯ Boundary request"));
+        assert_eq!(
+            state
+                .rendered_screen
+                .iter()
+                .filter(|row| row.contains("Boundary request"))
+                .count(),
+            1
+        );
+        assert!(state.rendered_screen[1].contains("continuation visible"));
+    }
+    state.scrollback.append("Reply 9\n");
+    state.draw(&mut Vec::new()).unwrap();
+    assert!(state.rendered_screen[0].starts_with("❯ Boundary request continuation visible"));
+    state.resize(80, 25);
+    for _ in 0..3 {
+        state.draw(&mut Vec::new()).unwrap();
+        assert!(state.rendered_screen[0].starts_with("❯ Boundary request"));
+        assert!(!state.rendered_screen[0].contains("continuation visible"));
+        assert!(state.rendered_screen[1].contains("continuation visible"));
+    }
+    state.resize(80, 24);
+    state.draw(&mut Vec::new()).unwrap();
+    state.scroll_conversation(ScrollAction::First);
+    state.scroll_conversation(ScrollAction::LinesDown(2));
+    state.draw(&mut Vec::new()).unwrap();
+    assert!(state.rendered_screen[0].starts_with("❯ Boundary request continuation visible"));
+    assert!(state.rendered_screen[1].contains("continuation visible"));
+    state.scroll_conversation(ScrollAction::LinesUp(1));
+    state.draw(&mut Vec::new()).unwrap();
+    assert!(state.rendered_screen[0].starts_with("❯ Boundary request"));
+    assert!(!state.rendered_screen[0].contains("continuation visible"));
+    assert!(state.rendered_screen[1].contains("continuation visible"));
+}
+
+#[test]
+fn sticky_prompt_latest_message_below_the_viewport_has_no_header() {
+    let mut state = State::new(true, 80, 24);
+    state.chat = Some(Uuid::new_v4());
+    state.record_input("Earlier request");
+    for index in 0..40 {
+        state.scrollback.append(&format!("Earlier reply {index}\n"));
+    }
+    state.record_input("Latest request");
+    for index in 0..40 {
+        state.scrollback.append(&format!("Latest reply {index}\n"));
+    }
+    state.draw(&mut Vec::new()).unwrap();
+    assert!(state.rendered_screen[0].starts_with("❯ Latest request"));
+    state.scroll_conversation(ScrollAction::First);
+    state.scroll_conversation(ScrollAction::LinesDown(10));
+    state.draw(&mut Vec::new()).unwrap();
+    assert!(state.rendered_screen[0].starts_with("Earlier reply"));
+    assert!(
+        !state
+            .rendered_screen
+            .iter()
+            .any(|row| row.contains("Latest request"))
+    );
+}
+
+#[test]
+fn sticky_prompt_reflows_with_width_and_respects_auto_scroll_switches() {
+    let console = tests::console_with_state(State::new(true, 80, 24));
+    console.select_chat(Some(Uuid::new_v4())).unwrap();
+    console.show_focused_menu(menu(Uuid::new_v4())).unwrap();
+    let mut state = console.state.lock().unwrap();
+    state.record_input("Reflow request");
+    state
+        .scrollback
+        .append(&format!("{}\n", "width ".repeat(80)));
+    state.draw(&mut Vec::new()).unwrap();
+    assert!(!state.rendered_screen[0].contains("Reflow request"));
+    assert_eq!(
+        state
+            .rendered_screen
+            .iter()
+            .filter(|row| row.contains("Reflow request"))
+            .count(),
+        1
+    );
+    state.resize(40, 24);
+    state.draw(&mut Vec::new()).unwrap();
+    assert!(state.rendered_screen[0].starts_with("❯ Reflow request"));
+    state.scrollback.set_auto_scroll(false);
+    state.draw(&mut Vec::new()).unwrap();
+    assert!(state.rendered_screen[0].starts_with("❯ Reflow request"));
+    state.scroll_conversation(ScrollAction::First);
+    state.draw(&mut Vec::new()).unwrap();
+    assert!(!state.rendered_screen[0].contains("Reflow request"));
+    state.scrollback.set_auto_scroll(true);
+    state.draw(&mut Vec::new()).unwrap();
+    assert!(!state.rendered_screen[0].contains("Reflow request"));
+    state.scroll_conversation(ScrollAction::Last);
+    state.draw(&mut Vec::new()).unwrap();
+    assert!(state.rendered_screen[0].starts_with("❯ Reflow request"));
+    state.resize(80, 24);
+    state.draw(&mut Vec::new()).unwrap();
+    assert!(!state.rendered_screen[0].contains("Reflow request"));
+    assert_eq!(
+        state
+            .rendered_screen
+            .iter()
+            .filter(|row| row.contains("Reflow request"))
+            .count(),
+        1
+    );
 }
 
 #[test]

@@ -31,6 +31,7 @@ mod glm;
 mod google;
 pub(crate) mod history;
 mod image_limits;
+mod kimi;
 mod provider_directory;
 mod responses;
 mod structured_response;
@@ -1564,13 +1565,9 @@ impl HttpModelClient {
                     }
                 });
             }
-            if status == 403 {
-                return Err(if copilot_auth {
-                    copilot::entitlement_denied(status)
-                } else {
-                    ModelError::Http { status }
-                }
-                .at_stage(ModelRequestStage::ResponseHeaders));
+            if status == 403 && copilot_auth {
+                return Err(copilot::entitlement_denied(status)
+                    .at_stage(ModelRequestStage::ResponseHeaders));
             }
             if status == 402 {
                 return Err(
@@ -1611,6 +1608,11 @@ impl HttpModelClient {
             {
                 return Err(error.at_stage(ModelRequestStage::ResponseHeaders));
             }
+            if self.config.adapter() == cards::Adapter::KimiChatCompletions
+                && let Some(error) = kimi::http_error(status, body.as_ref())
+            {
+                return Err(error.at_stage(ModelRequestStage::ResponseHeaders));
+            }
             if body.as_ref().is_some_and(is_context_limit_error)
                 || copilot_auth && body.as_ref().is_some_and(copilot::is_context_limit)
             {
@@ -1625,6 +1627,13 @@ impl HttpModelClient {
             });
             if is_spend_limit {
                 return Err(ModelError::QuotaExhausted {
+                    status,
+                    description: provider_error_description(status, body.as_ref()),
+                }
+                .at_stage(ModelRequestStage::ResponseHeaders));
+            }
+            if status == 403 {
+                return Err(ModelError::EntitlementDenied {
                     status,
                     description: provider_error_description(status, body.as_ref()),
                 }

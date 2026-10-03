@@ -6,38 +6,6 @@ const TODO_SECOND: &str = "Explain the verified layout result";
 const TODO_REPLY: &str = "FOOTER-TODO-READY";
 const TODO_DRAFT: &str = "jk-FOOTER-EDITOR-DRAFT";
 const SHELL_POLL_INTERVAL: Duration = Duration::from_millis(20);
-const COMPLETED_FRAME_START: &str = "\x1b[?2026h";
-const COMPLETED_FRAME_END: &str = "\x1b[?2026l";
-const CURSOR_VISIBLE: &str = "\x1b[?25h";
-const CURSOR_HIDDEN: &str = "\x1b[?25l";
-
-async fn wait_editor_ready(pty: &mut PtyView, label: &str, draft: &str) {
-    let output = Arc::clone(&pty.output);
-    pty.wait_for(label, |frame| {
-        let bytes = output.lock().unwrap();
-        let ansi = String::from_utf8_lossy(&bytes);
-        let Some(end) = ansi.rfind(COMPLETED_FRAME_END) else {
-            return false;
-        };
-        let Some(start) = ansi[..end].rfind(COMPLETED_FRAME_START) else {
-            return false;
-        };
-        let completed = &ansi[start..end];
-        let cursor_is_visible = completed.rfind(CURSOR_VISIBLE).is_some_and(|shown| {
-            completed
-                .rfind(CURSOR_HIDDEN)
-                .is_none_or(|hidden| shown > hidden)
-        });
-        cursor_is_visible
-            && !frame.contains("Shell running")
-            && frame.lines().any(|line| {
-                line.strip_prefix('❯')
-                    .is_some_and(|text| text.trim() == draft)
-            })
-    })
-    .await;
-}
-
 async fn run_working_todo_list(fixture: &PrivateFixture) {
     let todos = json!({"todos":[
         {"content":TODO_FIRST,"status":"in_progress","activeForm":"Inspecting the source-owned footer behavior"},
@@ -72,8 +40,10 @@ async fn run_working_todo_list(fixture: &PrivateFixture) {
         .await;
     fixture.set_chat_model(&base_url);
     let mut pty = PtyView::launch(fixture, &["--dangerously-skip-permissions"], &[], true);
-    pty.wait_for("new Todo View ready", new_input_is_visible)
-        .await;
+    pty.wait_for("new Todo View ready with known empty context", |frame| {
+        new_input_is_visible(frame) && frame.contains("Context 0% used")
+    })
+    .await;
     pty.resize(80, 24).await;
     let client = fixture.client().await;
     pty.send(b"Todo grace probe.\r");
@@ -129,13 +99,17 @@ async fn run_working_todo_list(fixture: &PrivateFixture) {
     assert!(
         working
             .lines()
-            .any(|line| line.contains("◼") && line.contains(TODO_FIRST))
+            .any(|line| line.starts_with("  ⎿  ◼ ") && line.contains(TODO_FIRST))
     );
     assert!(
         working
             .lines()
-            .any(|line| line.contains("◻") && line.contains(TODO_SECOND))
+            .any(|line| line.starts_with("     ◻ ") && line.contains(TODO_SECOND))
     );
+    assert!(working.lines().any(
+        |line| line.contains("Inspecting the source-owned footer behavior")
+            && line.contains("s · Esc to interrupt)")
+    ));
     releases.remove(0).send(()).unwrap();
     pty.wait_for("idle keeps the same owned Todo list", |frame| {
         frame.contains(TODO_REPLY)
@@ -144,7 +118,8 @@ async fn run_working_todo_list(fixture: &PrivateFixture) {
             && frame.contains("2 tasks (0 done, 1 in progress, 1 open)")
     })
     .await;
-    wait_editor_ready(&mut pty, "idle input accepts the next turn", "").await;
+    pty.wait_for_editor("idle input accepts the next turn", Some(""))
+        .await;
     pty.send(b"Complete the checklist.\r");
     let done = pty
         .wait_for("all-done list remains during idle grace", |frame| {
@@ -237,7 +212,8 @@ async fn run_working_todo_list(fixture: &PrivateFixture) {
             && !archive.contains("Todos have been modified successfully")
     );
     pty.send(b"\x0f");
-    wait_editor_ready(&mut pty, "completed checklist returns editor focus", "").await;
+    pty.wait_for_editor("completed checklist returns editor focus", Some(""))
+        .await;
     pty.send(b"Finish a checklist and stay idle.\r");
     pty.wait_for("idle completed rows retain their grace", |frame| {
         frame.contains("TODO-IDLE-DONE") && frame.contains("IDLE-GRACE-TASK")
@@ -406,12 +382,8 @@ async fn run_shell_panel(fixture: &PrivateFixture) {
         frame.contains("prior-completed") && frame.lines().any(|line| line.starts_with('❯'))
     })
     .await;
-    wait_editor_ready(
-        &mut pty,
-        "completed Shell releases the foreground editor",
-        "",
-    )
-    .await;
+    pty.wait_for_editor("completed Shell releases the foreground editor", Some(""))
+        .await;
     pty.send(b"!printf 'shell-first-0123456789abcdef\\n'; while [ ! -f first-finish ]; do sleep 0.02; done\r");
     wait_snapshot(
         &client,
@@ -452,7 +424,8 @@ async fn run_shell_panel(fixture: &PrivateFixture) {
         frame.contains("Ticks 1")
     })
     .await;
-    wait_editor_ready(&mut pty, "background Shell releases the editor", "").await;
+    pty.wait_for_editor("background Shell releases the editor", Some(""))
+        .await;
     pty.send(b"jk-SHELL-DRAFT");
     pty.wait_for("Shell draft remains editable", |frame| {
         frame.contains("jk-SHELL-DRAFT")
@@ -486,14 +459,13 @@ async fn run_shell_panel(fixture: &PrivateFixture) {
     })
     .await;
     pty.send(b"\x1b");
-    wait_editor_ready(
-        &mut pty,
+    pty.wait_for_editor(
         "Esc returns to the full-width draft",
-        "jk-SHELL-DRAFT",
+        Some("jk-SHELL-DRAFT"),
     )
     .await;
     pty.send(b"\x15");
-    wait_editor_ready(&mut pty, "draft cleared", "").await;
+    pty.wait_for_editor("draft cleared", Some("")).await;
     pty.send(b"!printf 'shell-second\\n'; while [ ! -f second-finish ]; do sleep 0.02; done\r");
     pty.wait_for("second Shell output", |frame| {
         frame.lines().any(|line| line.trim() == "shell-second")
@@ -523,7 +495,8 @@ async fn run_shell_panel(fixture: &PrivateFixture) {
         frame.contains("Ticks 2")
     })
     .await;
-    wait_editor_ready(&mut pty, "second Shell releases input", "").await;
+    pty.wait_for_editor("second Shell releases input", Some(""))
+        .await;
     click_category(&mut pty, "Ticks 2");
     pty.wait_for("all three Shell Ticks appear", |frame| {
         frame.contains("Shells (2)")
@@ -582,7 +555,8 @@ async fn run_shell_panel(fixture: &PrivateFixture) {
     })
     .await;
     pty.send(b"\x1b");
-    wait_editor_ready(&mut pty, "stopped detail closes to input", "").await;
+    pty.wait_for_editor("stopped detail closes to input", Some(""))
+        .await;
     click_category(&mut pty, "Ticks 2");
     pty.wait_for("Tick List opens after saved preference", |frame| {
         frame.contains("Shells (2)")
@@ -609,7 +583,8 @@ async fn run_shell_panel(fixture: &PrivateFixture) {
     )
     .await;
     pty.send(b"\x1b");
-    wait_editor_ready(&mut pty, "Tick List closes to input", "").await;
+    pty.wait_for_editor("Tick List closes to input", Some(""))
+        .await;
     pty.send(b"/tasks\r");
     pty.wait_for("Task Center retains the removed Tick's task", |frame| {
         frame.contains("Shell task") && frame.contains("shell-second")
@@ -624,7 +599,8 @@ async fn run_shell_panel(fixture: &PrivateFixture) {
     })
     .await;
     pty.send(b"\x1b");
-    wait_editor_ready(&mut pty, "task list closes before exit", "").await;
+    pty.wait_for_editor("task list closes before exit", Some(""))
+        .await;
     std::fs::write(fixture.path("work/first-finish"), "done").unwrap();
     std::fs::write(fixture.path("work/second-finish"), "done").unwrap();
     pty.close().await;

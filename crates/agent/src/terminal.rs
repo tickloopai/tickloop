@@ -15,7 +15,7 @@ use tickloop_agent::{
         DirectoryTrustPolicy, ENTER_PLAN_MODE_TOOL_NAME, EventKind, InputContext, LoopId,
         PermissionChange, PromptPolicy, QuestionRequest, Receipt, RequestKind, RequestOutcome,
         ShellTaskNotice, ShellTaskPromptWatchdog, ShellTaskState, ShellTaskSubscriptionEvent,
-        TaskNotification, TaskNotificationStatus, TodoStatus, Trigger, TriggerSource,
+        TaskNotification, TaskNotificationStatus, TodoItem, Trigger, TriggerSource,
         UserShellRecord, UserShellState,
     },
     settings::{LoadedSettings, UserSettings},
@@ -109,7 +109,6 @@ use renderer::Renderer;
 use reply_lines::ReplyLines;
 use running_shimmer::RunningShimmer;
 use scrollback::InputEcho;
-use status_area::StatusItem;
 use style::Role;
 
 const DISCONNECTED_CACHED_VIEW_NOTICE: &str = "Disconnected · cached view";
@@ -1032,7 +1031,7 @@ fn initialize_startup_console(
     console.update_status_area(
         execution_mode.to_string(),
         safe_text(&config.model),
-        None,
+        initial_context_usage(config),
         Vec::new(),
     )?;
     write_banner(console, config, workdir)?;
@@ -1488,7 +1487,7 @@ async fn interact(
                     snapshot.policy.mode.to_string(),
                     safe_text(&snapshot.model.model),
                     context_usage(&snapshot),
-                    todo_status_items(&snapshot, goal),
+                    current_loop_todos(&snapshot, goal),
                 )?;
                 let running_receipt = pending
                     .values()
@@ -1666,7 +1665,7 @@ async fn interact(
                     console.update_status_area(
                         draft.execution_mode.to_string(),
                         safe_text(&draft.model.model),
-                        None,
+                        initial_context_usage(&draft.model),
                         Vec::new(),
                     )?;
                 }
@@ -6114,31 +6113,12 @@ fn recover_background_chat(
     recovery
 }
 
-fn todo_status_items(snapshot: &ChatSnapshot, current_loop: Option<uuid::Uuid>) -> Vec<StatusItem> {
+fn current_loop_todos(snapshot: &ChatSnapshot, current_loop: Option<uuid::Uuid>) -> Vec<TodoItem> {
     snapshot
         .progress
         .iter()
         .find(|progress| Some(progress.loop_id) == current_loop)
-        .map(|progress| {
-            progress
-                .todos
-                .iter()
-                .enumerate()
-                .map(|(index, todo)| {
-                    let (state, role) = match todo.status {
-                        TodoStatus::Pending => ("pending", Role::MutedText),
-                        TodoStatus::InProgress => ("in progress", Role::Warning),
-                        TodoStatus::Completed => ("completed", Role::Success),
-                    };
-                    StatusItem {
-                        id: format!("{}.", index + 1),
-                        title: safe_text(&todo.content),
-                        state,
-                        role,
-                    }
-                })
-                .collect()
-        })
+        .map(|progress| progress.todos.clone())
         .unwrap_or_default()
 }
 
@@ -6155,8 +6135,15 @@ fn working_activity(snapshot: &ChatSnapshot, running_loop: Option<LoopId>) -> St
         .and_then(|progress| progress.active_form())
         .map_or_else(
             || WORKING_ACTIVITY.to_owned(),
-            |active_form| safe_text(active_form).replace('\n', " "),
+            |active_form| safe_text(active_form).replace(['\n', '\t'], " "),
         )
+}
+
+fn initial_context_usage(model: &ModelConfig) -> Option<(u64, usize)> {
+    model
+        .maximum_context_window_tokens()
+        .filter(|limit| *limit > 0)
+        .map(|limit| (0, limit))
 }
 
 fn context_usage(snapshot: &ChatSnapshot) -> Option<(u64, usize)> {
@@ -6654,9 +6641,9 @@ mod tests {
     };
     use super::{
         BackgroundRecovery, BackgroundRunNotice, BackgroundWaitKind, Receipt,
-        UNLABELED_BACKGROUND_AGENT, background_wait, context_usage, input_closed_while_waiting,
-        observe_user_shell_record, readable_background_label, recover_background_chat,
-        todo_status_items, track_run_requests, working_activity,
+        UNLABELED_BACKGROUND_AGENT, background_wait, context_usage, current_loop_todos,
+        input_closed_while_waiting, observe_user_shell_record, readable_background_label,
+        recover_background_chat, track_run_requests, working_activity,
     };
     use std::{
         collections::{HashMap, HashSet},
@@ -6668,6 +6655,9 @@ mod tests {
 
     #[tokio::test]
     async fn todos_show_their_content_and_the_running_goal_shows_its_active_form() {
+        use super::{RunningShimmer, style};
+        use tickloop_agent::settings;
+
         let directory = tempfile::tempdir().unwrap();
         let model = Arc::new(support::ScriptedModel::new(vec![
             support::call(
@@ -6675,7 +6665,7 @@ mod tests {
                 tickloop_agent::runtime::TODO_WRITE_TOOL_NAME,
                 serde_json::json!({"todos": [
                     {"content": "Read the notes", "status": "completed", "activeForm": "Reading the notes"},
-                    {"content": "Draft the\nreport", "status": "in_progress", "activeForm": "Drafting the\nreport"},
+                    {"content": "Draft the\nreport", "status": "in_progress", "activeForm": "Drafting\tthe\nreport"},
                     {"content": "Check the figures", "status": "pending", "activeForm": "Checking the figures"},
                 ]}),
             ),
@@ -6697,25 +6687,83 @@ mod tests {
         }
         let mut snapshot = agent.snapshot(chat).await.unwrap();
 
-        let todos = todo_status_items(&snapshot, Some(receipt.loop_id));
+        let todos = current_loop_todos(&snapshot, Some(receipt.loop_id));
+        assert_eq!(todos[1].active_form, "Drafting\tthe\nreport");
         assert_eq!(
             todos
                 .iter()
-                .map(|item| (item.title.as_str(), item.state))
+                .map(|todo| (todo.content.as_str(), todo.status.clone()))
                 .collect::<Vec<_>>(),
             [
-                ("Read the notes", "completed"),
-                ("Draft the\nreport", "in progress"),
-                ("Check the figures", "pending"),
+                (
+                    "Read the notes",
+                    tickloop_agent::runtime::TodoStatus::Completed
+                ),
+                (
+                    "Draft the\nreport",
+                    tickloop_agent::runtime::TodoStatus::InProgress
+                ),
+                (
+                    "Check the figures",
+                    tickloop_agent::runtime::TodoStatus::Pending
+                ),
             ]
         );
         assert_eq!(
             working_activity(&snapshot, Some(receipt.loop_id)),
             "Drafting the report"
         );
+        for glyph_set in [settings::GlyphSet::Unicode, settings::GlyphSet::NerdFont] {
+            let (console, _) = Console::start_with_display(
+                false,
+                settings::DisplayPreferences {
+                    glyph_set,
+                    prefers_reduced_motion: true,
+                },
+            )
+            .unwrap();
+            let activity = super::RunningActivity {
+                chat_id: chat,
+                label: working_activity(&snapshot, Some(receipt.loop_id)),
+                started_at: Some(std::time::Instant::now()),
+                interruptible: true,
+            };
+            let spans = activity
+                .spans(&console, None, &RunningShimmer::default())
+                .unwrap();
+            let mut row = style::RoleLine::default();
+            for (text, role) in spans {
+                row.push(text, role);
+            }
+            assert!(row.text().starts_with("• Drafting the report ("));
+            assert!(row.text().ends_with("s · Esc to interrupt)"));
+            assert_eq!(row.spans[0].role, Some(style::Role::MutedText));
+            assert_eq!(row.spans[1].role, Some(style::Role::RunningShade0));
+            assert_eq!(row.spans[2].role, Some(style::Role::MutedText));
+            let themed = style::ThemeName::ALL.map(|name| {
+                row.resolve(style::Theme::new(name), 80)
+                    .render(style::ColourDepth::TrueColour)
+            });
+            assert_ne!(themed[0], themed[1]);
+            for width in [0, 1, 12, 40, 80] {
+                let mut narrow = row.clone();
+                narrow.truncate(width);
+                assert!(unicode_width::UnicodeWidthStr::width(narrow.text().as_str()) <= width);
+            }
+        }
         assert_eq!(working_activity(&snapshot, None), "Working");
         assert_eq!(working_activity(&snapshot, Some(Uuid::new_v4())), "Working");
+        snapshot.progress[0].todos[2].status = tickloop_agent::runtime::TodoStatus::InProgress;
+        assert_eq!(
+            working_activity(&snapshot, Some(receipt.loop_id)),
+            "Drafting the report"
+        );
         snapshot.progress[0].todos[1].status = tickloop_agent::runtime::TodoStatus::Completed;
+        assert_eq!(
+            working_activity(&snapshot, Some(receipt.loop_id)),
+            "Checking the figures"
+        );
+        snapshot.progress[0].todos[2].status = tickloop_agent::runtime::TodoStatus::Completed;
         assert_eq!(
             working_activity(&snapshot, Some(receipt.loop_id)),
             "Working"
@@ -6772,33 +6820,45 @@ mod tests {
             (
                 goals[0],
                 vec![
-                    ("Draft the first report", "in progress"),
-                    ("Review the first report", "pending"),
+                    (
+                        "Draft the first report",
+                        tickloop_agent::runtime::TodoStatus::InProgress,
+                    ),
+                    (
+                        "Review the first report",
+                        tickloop_agent::runtime::TodoStatus::Pending,
+                    ),
                 ],
                 "Drafting the first report",
             ),
             (
                 goals[1],
                 vec![
-                    ("Check the second dataset", "completed"),
-                    ("Summarize the second dataset", "in progress"),
+                    (
+                        "Check the second dataset",
+                        tickloop_agent::runtime::TodoStatus::Completed,
+                    ),
+                    (
+                        "Summarize the second dataset",
+                        tickloop_agent::runtime::TodoStatus::InProgress,
+                    ),
                 ],
                 "Summarizing the second dataset",
             ),
         ] {
-            let todos = todo_status_items(&snapshot, Some(goal));
+            let todos = current_loop_todos(&snapshot, Some(goal));
             assert_eq!(
                 todos
                     .iter()
-                    .map(|item| (item.title.as_str(), item.state))
+                    .map(|todo| (todo.content.as_str(), todo.status.clone()))
                     .collect::<Vec<_>>(),
                 expected
             );
             assert_eq!(working_activity(&snapshot, Some(goal)), activity);
         }
-        assert!(todo_status_items(&snapshot, None).is_empty());
+        assert!(current_loop_todos(&snapshot, None).is_empty());
         assert!(
-            todo_status_items(&snapshot, Some(Uuid::new_v4())).is_empty(),
+            current_loop_todos(&snapshot, Some(Uuid::new_v4())).is_empty(),
             "a Todo-free selected Loop must not borrow another Loop's list"
         );
         assert_eq!(working_activity(&snapshot, None), "Working");
@@ -6813,6 +6873,7 @@ mod tests {
         );
         let chat_id = agent.create_chat(PathBuf::from("/tmp")).await.unwrap();
         let mut snapshot = agent.snapshot(chat_id).await.unwrap();
+        assert_eq!(context_usage(&snapshot), None);
         snapshot.model = tickloop_agent::model::cards::ModelCatalog::defaults()
             .get("deepseek-api", "deepseek-flash-messages")
             .unwrap();
