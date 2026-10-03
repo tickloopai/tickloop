@@ -284,6 +284,44 @@ fn family_updates_preserve_editor_focus_and_never_expose_todo_or_shell_categorie
 }
 
 #[test]
+fn runtime_empty_progress_clears_completed_activity_details_while_working_and_idle() {
+    let console = fixture();
+    let mut done = item("1.", "retired runtime task", None);
+    done.state = "completed";
+    done.role = Role::Success;
+    update(&console, vec![], vec![done]);
+    console
+        .set_activity(Some(&[(
+            "Working runtime update".into(),
+            Some(Role::MutedText),
+        )]))
+        .unwrap();
+    assert!(
+        frame(&console)
+            .iter()
+            .any(|row| row.contains("retired runtime task"))
+    );
+    update(&console, vec![], vec![]);
+    let working = frame(&console);
+    assert!(
+        working
+            .iter()
+            .any(|row| row.contains("Working runtime update"))
+    );
+    assert!(
+        !working
+            .iter()
+            .any(|row| row.contains("retired runtime task"))
+    );
+    console.set_activity(None).unwrap();
+    assert!(
+        !frame(&console)
+            .iter()
+            .any(|row| row.contains("retired runtime task"))
+    );
+}
+
+#[test]
 fn todos_follow_working_and_remain_when_idle_only_for_the_visible_agent() {
     let console = fixture();
     let mut pending = item("1.", "pending unique", None);

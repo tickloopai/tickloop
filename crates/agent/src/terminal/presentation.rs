@@ -5,7 +5,7 @@ use serde_json::Value;
 use tickloop_agent::{
     runtime::{
         ASK_USER_QUESTION_TOOL_NAME, ChatSnapshot, Event, EventKind, LocalMessage,
-        PermissionApprovalSource, PermissionRequest, TickDeliveryLine,
+        PermissionApprovalSource, PermissionRequest, TODO_WRITE_TOOL_NAME, TickDeliveryLine,
     },
     tools::{
         BASH_TOOL_NAME, CommandState, EDIT_TOOL_NAME, TASK_STOP_TOOL_NAME, ToolResult,
@@ -34,6 +34,10 @@ const PREVIEW_LINES: usize = 5;
 const PREVIEW_LINE_CHARACTERS: usize = 200;
 const TOOL_SUMMARY_CHARACTERS: usize = 160;
 const BACKGROUND_RUNNING_STATUS: &str = "Running in background";
+
+pub(super) fn is_model_only_tool(name: &str) -> bool {
+    name == TODO_WRITE_TOOL_NAME
+}
 const BACKGROUND_LAUNCH_PREFIXES: [&str; 2] = [
     "Command running in background with ID: ",
     "Command was manually backgrounded by user with ID: ",
@@ -176,6 +180,9 @@ pub(super) fn transcript_document(
                 input,
             } => {
                 tool_names.insert(exchange.clone(), name.clone());
+                if is_model_only_tool(&name) {
+                    continue;
+                }
                 text.push_str(&format!(
                     "\nTool {} · {}\n",
                     safe_text(&exchange.call_id),
@@ -190,6 +197,13 @@ pub(super) fn transcript_document(
                 output_ref,
             } => {
                 let _output_ref = output_ref;
+                if !is_error
+                    && tool_names
+                        .get(&exchange)
+                        .is_some_and(|name| is_model_only_tool(name))
+                {
+                    continue;
+                }
                 let result = ToolResult {
                     content: content.clone(),
                     is_error,
@@ -322,6 +336,9 @@ impl ToolPresentation {
             EventKind::AssistantMessageCommitted { tool_calls, .. } if console.is_interactive() => {
                 let _frame_hold = console.hold_frames()?;
                 for call in tool_calls {
+                    if is_model_only_tool(&call.name) {
+                        continue;
+                    }
                     let key = tool_call_key(event.run_id, &call.call_id);
                     console.for_message(Some(key.clone())).write_tool_call(
                         event.run_id,
@@ -341,7 +358,7 @@ impl ToolPresentation {
                 call_id,
                 name,
                 input,
-            } if console.is_interactive() => {
+            } if console.is_interactive() && !is_model_only_tool(name) => {
                 console.write_tool_call(
                     event.run_id,
                     &tool_call_key(event.run_id, call_id),
@@ -397,6 +414,17 @@ impl ToolPresentation {
     }
 
     pub(super) fn render_event(&self, event: &Event) -> Option<String> {
+        match &event.kind {
+            EventKind::ToolStarted { name, .. } if is_model_only_tool(name) => {
+                return Some(String::new());
+            }
+            EventKind::ToolCompleted { call_id, result }
+                if !result.is_error && is_model_only_tool(self.started_call(event, call_id).0) =>
+            {
+                return Some(String::new());
+            }
+            _ => {}
+        }
         if self.detailed {
             let name = match &event.kind {
                 EventKind::ToolCompleted { call_id, .. } => self.started_call(event, call_id).0,
@@ -453,6 +481,11 @@ impl ToolPresentation {
         event: &Event,
         display: DisplayProfile,
     ) -> Option<Vec<(String, Option<Role>)>> {
+        if matches!(&event.kind, EventKind::ToolStarted { name, .. } if is_model_only_tool(name))
+            || matches!(&event.kind, EventKind::ToolCompleted { call_id, result } if !result.is_error && is_model_only_tool(self.started_call(event, call_id).0))
+        {
+            return Some(Vec::new());
+        }
         if self.detailed {
             return self
                 .render_event(event)
@@ -1282,6 +1315,75 @@ mod tests {
             run_id,
             kind,
         }
+    }
+
+    #[test]
+    fn successful_todo_tools_are_model_only_and_failed_results_remain_visible() {
+        let run = Uuid::new_v4();
+        let started = event(
+            run,
+            EventKind::ToolStarted {
+                call_id: "todo-call".into(),
+                name: "TodoWrite".into(),
+                input: json!({"todos":[]}),
+            },
+        );
+        let completed = event(
+            run,
+            EventKind::ToolCompleted {
+                call_id: "todo-call".into(),
+                result: ToolResult {
+                    content: "Todos have been modified successfully".into(),
+                    is_error: false,
+                    output_ref: None,
+                },
+            },
+        );
+        for detailed in [false, true] {
+            let mut tools = ToolPresentation::new(detailed);
+            tools.record(&started);
+            assert_eq!(tools.render_event(&started).unwrap(), "");
+            assert_eq!(tools.render_event(&completed).unwrap(), "");
+            let failed = event(
+                run,
+                EventKind::ToolCompleted {
+                    call_id: "todo-call".into(),
+                    result: ToolResult {
+                        content: "invalid Todo input".into(),
+                        is_error: true,
+                        output_ref: None,
+                    },
+                },
+            );
+            assert!(
+                tools
+                    .render_event(&failed)
+                    .unwrap()
+                    .contains("invalid Todo input")
+            );
+        }
+        let snapshot: ChatSnapshot = serde_json::from_value(json!({
+            "id":Uuid::new_v4(), "workdir":"/work", "messages":[
+                {"role":"assistant", "content":[{"type":"tool_use","id":"todo-ok","name":"TodoWrite","input":{"todos":[]}}]},
+                {"role":"user", "content":[{"type":"tool_result","tool_use_id":"todo-ok","content":"Todos have been modified successfully","is_error":false}]},
+                {"role":"assistant", "content":[{"type":"tool_use","id":"todo-bad","name":"TodoWrite","input":{"todos":"invalid"}}]},
+                {"role":"user", "content":[{"type":"tool_result","tool_use_id":"todo-bad","content":"invalid Todo input","is_error":true}]}
+            ],"loops":[]
+        })).unwrap();
+        let compact = super::super::workflows::public_history(&snapshot, DisplayProfile::default());
+        let full =
+            transcript_document(&snapshot, DisplayProfile::default(), &ImageLinks::default())
+                .lines
+                .join("\n");
+        for visible in [compact, full] {
+            assert!(
+                !visible.contains("Todos have been modified successfully"),
+                "{visible}"
+            );
+            assert!(!visible.contains("tool_use"), "{visible}");
+            assert!(visible.contains("invalid Todo input"), "{visible}");
+        }
+        assert_eq!(snapshot.messages.len(), 4);
     }
 
     #[test]

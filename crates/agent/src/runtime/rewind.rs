@@ -269,6 +269,7 @@ impl Agent {
                 recorder.truncate(&mut chat.snapshot, point.message_index);
             }
             chat.snapshot = candidate;
+            self.reset_restored_todo_graces(chat);
             self.emit_conversation_rewound(chat, loop_id, point.message_id);
             Some(RewindDraft {
                 loop_id,

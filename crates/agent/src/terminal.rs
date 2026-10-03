@@ -599,7 +599,7 @@ Down on the last visual input row, after history ends, focuses the Subagents N e
 Click Subagents N or press Enter/Space on its focused entry to hide/show the list; modified Enter is ignored.
 Down from the expanded entry focuses the list; Enter opens an Agent, Space folds descendants, Esc returns to the entry, then Esc returns to the editor.
 Shift+Up/Down focuses the Tick List's Shells group; Enter opens the selected Shell.
-Each Agent's own Todos stay below Working, including while idle, until all items are completed and the list clears.
+Each Agent's own Todos stay below Working, including while idle, with a five-second grace after all items complete; rewrites do not extend it.
 Mode and model stay right-aligned on the lower divider; Context appears only with confirmed nonzero rounded usage.
 Divider edge titles have a short rule beyond the text; the expanded Subagents list has no items summary row.
 /loops opens Loop management; /loops new starts another goal in this Chat; /loops UUID selects one.
@@ -8107,7 +8107,7 @@ mod status_agents_help_tests {
         assert!(help.contains("Subagents N") && help.contains("expanded by default"));
         assert!(help.contains("Enter/Space") && help.contains("Esc returns to the entry"));
         assert!(help.contains("Tick List's Shells group"));
-        assert!(help.contains("including while idle") && help.contains("list clears"));
+        assert!(help.contains("including while idle") && help.contains("five-second grace"));
         assert!(!help.contains("Footer Tasks/Todo") && !help.contains("starts folded"));
     }
 }

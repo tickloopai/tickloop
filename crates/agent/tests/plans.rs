@@ -507,10 +507,11 @@ async fn ordinary_progress_retires_completed_todos_and_restores_empty_state() {
         [Some(TodoStatus::InProgress), Some(TodoStatus::Completed)]
     );
     loop {
-        if let EventKind::ProgressUpdated { progress } = next_event(&mut events).await.kind {
-            if progress.loop_id == receipt.loop_id && progress.todos.is_empty() {
-                break;
-            }
+        if let EventKind::ProgressUpdated { progress } = next_event(&mut events).await.kind
+            && progress.loop_id == receipt.loop_id
+            && progress.todos.is_empty()
+        {
+            break;
         }
     }
     assert_eq!(
@@ -573,10 +574,11 @@ async fn all_done_rewrites_do_not_extend_the_completion_deadline() {
     let mut events = agent.subscribe();
     tokio::time::advance(std::time::Duration::from_secs(1)).await;
     loop {
-        if let EventKind::ProgressUpdated { progress } = next_event(&mut events).await.kind {
-            if progress.loop_id == first.loop_id && progress.todos.is_empty() {
-                break;
-            }
+        if let EventKind::ProgressUpdated { progress } = next_event(&mut events).await.kind
+            && progress.loop_id == first.loop_id
+            && progress.todos.is_empty()
+        {
+            break;
         }
     }
     agent.shutdown().await;
@@ -646,10 +648,11 @@ async fn retirement_is_isolated_by_agent_and_loop_and_partial_lists_persist() {
     let mut events = agent.subscribe();
     tokio::time::advance(std::time::Duration::from_secs(6)).await;
     loop {
-        if let EventKind::ProgressUpdated { progress } = next_event(&mut events).await.kind {
-            if progress.loop_id == first.loop_id && progress.todos.is_empty() {
-                break;
-            }
+        if let EventKind::ProgressUpdated { progress } = next_event(&mut events).await.kind
+            && progress.loop_id == first.loop_id
+            && progress.todos.is_empty()
+        {
+            break;
         }
     }
     let first_state = agent.snapshot(first_chat).await.unwrap();
@@ -724,10 +727,11 @@ async fn restoring_unretired_completed_progress_starts_a_fresh_grace() {
     let mut events = restored.subscribe();
     tokio::time::advance(std::time::Duration::from_secs(1)).await;
     loop {
-        if let EventKind::ProgressUpdated { progress } = next_event(&mut events).await.kind {
-            if progress.loop_id == receipt.loop_id && progress.todos.is_empty() {
-                break;
-            }
+        if let EventKind::ProgressUpdated { progress } = next_event(&mut events).await.kind
+            && progress.loop_id == receipt.loop_id
+            && progress.todos.is_empty()
+        {
+            break;
         }
     }
     restored.shutdown().await;
@@ -783,10 +787,11 @@ async fn completed_todos_keep_five_seconds_across_turns_then_restore_an_empty_ch
     );
     tokio::time::advance(std::time::Duration::from_secs(1)).await;
     loop {
-        if let EventKind::ProgressUpdated { progress } = next_event(&mut events).await.kind {
-            if progress.loop_id == first.loop_id && progress.todos.is_empty() {
-                break;
-            }
+        if let EventKind::ProgressUpdated { progress } = next_event(&mut events).await.kind
+            && progress.loop_id == first.loop_id
+            && progress.todos.is_empty()
+        {
+            break;
         }
     }
     assert!(

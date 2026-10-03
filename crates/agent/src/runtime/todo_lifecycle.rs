@@ -54,6 +54,11 @@ impl Agent {
         let Some(chat) = chats.get_mut(&chat_id) else {
             return;
         };
+        self.reset_restored_todo_graces(chat);
+    }
+
+    pub(super) fn reset_restored_todo_graces(&self, chat: &mut Chat) {
+        chat.todo_completion_graces.clear();
         for progress in chat.snapshot.progress.clone() {
             self.track_todo_progress(chat, &progress);
         }
@@ -76,9 +81,11 @@ impl Agent {
             .iter_mut()
             .find(|p| p.loop_id == loop_id)
         else {
+            chat.todo_completion_graces.remove(&loop_id);
             return;
         };
         if progress.todos != grace.todos {
+            chat.todo_completion_graces.remove(&loop_id);
             return;
         }
         progress.todos.clear();

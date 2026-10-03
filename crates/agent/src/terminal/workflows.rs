@@ -1085,6 +1085,9 @@ fn append_public_message(
                     (source_chat_id, run_id, id.clone()),
                     (name.clone(), input.clone()),
                 );
+                if presentation::is_model_only_tool(name) {
+                    continue;
+                }
                 if let Some(run) = run_id {
                     let state = history
                         .tool_states
@@ -1122,6 +1125,9 @@ fn append_public_message(
                 let (name, input) = call
                     .as_ref()
                     .map_or(("tool", None), |(name, input)| (name.as_str(), Some(input)));
+                if !*is_error && presentation::is_model_only_tool(name) {
+                    continue;
+                }
                 history.push_role(
                     presentation::archived_tool_result(
                         name,
