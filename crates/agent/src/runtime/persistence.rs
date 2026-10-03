@@ -656,6 +656,34 @@ impl ChatRecorder {
         }
     }
 
+    pub(super) fn record_todo_retirement(&self, snapshot: &ChatSnapshot, loop_id: LoopId) {
+        let Some((path, mut lines)) = self.sync_chat(snapshot) else {
+            return;
+        };
+        let Some(goal) = snapshot.loops.iter().find(|goal| goal.id == loop_id) else {
+            return;
+        };
+        let Some(content) = plan_entry_content(snapshot, goal) else {
+            return;
+        };
+        let mut logs = self.logs.lock().unwrap();
+        let Some(log) = logs.get_mut(&snapshot.id) else {
+            return;
+        };
+        let milliseconds = unix_time_milliseconds().max(log.last_entry_milliseconds + 1);
+        let mut parent = log.parent_cursor;
+        lines.push(record_loop(
+            log,
+            snapshot,
+            content,
+            &mut parent,
+            &format_timestamp(milliseconds),
+        ));
+        log.parent_cursor = parent;
+        log.last_entry_milliseconds = milliseconds;
+        self.writer.enqueue(&path, lines);
+    }
+
     /// 差分依据：运行时对消息只有三种修改：追加新消息；向最后一条消息追加内容块（并行工具
     /// 结果），写成标记接续该消息的新条目；rewind 截断对话，由 `truncate` 事先同步到已写出的条目。
     fn sync_chat(&self, snapshot: &ChatSnapshot) -> Option<(PathBuf, Vec<Line>)> {
@@ -2277,6 +2305,7 @@ impl Agent {
             chat_id,
             Chat {
                 snapshot: snapshot.clone(),
+                todo_completion_graces: HashMap::new(),
                 retention,
                 active: None,
                 active_run: None,
@@ -2311,6 +2340,7 @@ impl Agent {
             self.set_host_work_context(chat_id, context).await?;
         }
         self.save(&snapshot);
+        self.start_restored_todo_graces(chat_id).await;
         Ok(snapshot)
     }
 

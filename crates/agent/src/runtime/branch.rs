@@ -382,6 +382,7 @@ impl Agent {
             child_chat_id,
             Chat {
                 snapshot: snapshot.clone(),
+                todo_completion_graces: Default::default(),
                 retention,
                 // 备份在锁外复制完成之前占住子 Chat，不能开始 Run 或 rewind。
                 active: Some(tokio_util::sync::CancellationToken::new()),
@@ -436,6 +437,7 @@ impl Agent {
         if let Some(next) = next {
             self.inner.tasks.lock().await.push(self.run_task(next));
         }
+        self.start_restored_todo_graces(child_chat_id).await;
         self.flush_transcripts().await;
         Ok(BranchOutcome {
             source_chat_id: request.source_chat_id,

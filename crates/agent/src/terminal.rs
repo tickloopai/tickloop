@@ -6491,6 +6491,7 @@ fn todo_status_items(snapshot: &ChatSnapshot, current_loop: Option<uuid::Uuid>) 
         .progress
         .iter()
         .find(|progress| Some(progress.loop_id) == current_loop)
+        .or_else(|| current_loop.and(snapshot.progress.last()))
         .map(|progress| {
             progress
                 .todos

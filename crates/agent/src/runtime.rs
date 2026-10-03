@@ -90,6 +90,7 @@ mod triggers;
 pub use triggers::{Trigger, TriggerSource};
 mod permission_management;
 mod plan;
+mod todo_lifecycle;
 pub use crate::settings::{AutoReviewerPreference, AutoSettingsRevision};
 pub(crate) use auto_settings::jev_key_status_in;
 pub use branch::{
@@ -949,6 +950,7 @@ struct Inner {
 #[derive(Clone)]
 struct Chat {
     snapshot: ChatSnapshot,
+    todo_completion_graces: HashMap<LoopId, todo_lifecycle::CompletionGrace>,
     retention: Option<Arc<crate::transcript::retention::RetentionGuard>>,
     active: Option<CancellationToken>,
     active_run: Option<RunId>,
@@ -1256,6 +1258,7 @@ fn empty_snapshot(id: ChatId, workdir: PathBuf, model: ModelConfig) -> ChatSnaps
 impl Drop for Inner {
     /// 最后一个 Agent 句柄释放时，同步写出尚未冲刷的 Transcript 条目。
     fn drop(&mut self) {
+        self.shutdown.cancel();
         if let Some(recorder) = &self.recorder {
             recorder.flush_on_drop(self.chats.get_mut());
         }
@@ -1978,6 +1981,7 @@ impl Agent {
             id,
             Chat {
                 snapshot,
+                todo_completion_graces: HashMap::new(),
                 retention,
                 active: None,
                 active_run: None,
