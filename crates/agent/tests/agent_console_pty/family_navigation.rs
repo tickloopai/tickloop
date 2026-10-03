@@ -1,5 +1,17 @@
 use super::*;
 
+fn family_rows_are_visible(frame: &str) -> bool {
+    frame
+        .lines()
+        .skip_while(|line| !line.contains("Subagents 2"))
+        .skip(1)
+        .any(|line| {
+            [MAIN_TASK, FIRST_CHILD_TASK, SECOND_CHILD_TASK]
+                .iter()
+                .any(|title| line.contains(title))
+        })
+}
+
 const MAIN_TASK: &str = "FAMILY-MAIN";
 const FIRST_CHILD_TASK: &str = "FAMILY-CHILD-ONE";
 const SECOND_CHILD_TASK: &str = "FAMILY-CHILD-TWO";
@@ -60,8 +72,10 @@ async fn open_family_member(
         row.execution == target && row.views.iter().any(|location| location.view == view)
     });
     pty.send(b"\x1b[B");
-    pty.wait_for("family list expands", |frame| frame.contains("3 items"))
-        .await;
+    pty.wait_for("family list expands", |frame| {
+        family_rows_are_visible(frame)
+    })
+    .await;
     pty.send(b"\x1b[B");
     pty.wait_for("family list receives focus", |frame| {
         frame.lines().any(|line| line.starts_with('›'))
@@ -98,19 +112,19 @@ async fn open_family_member(
                         .iter()
                         .filter(|(agent, _)| *agent != title)
                         .all(|(_, draft)| !frame.contains(draft))
-                        && frame.contains("3 items")
+                        && family_rows_are_visible(frame)
                         && editor_has_focus(&captured)
                 })
                 .await;
             assert!(
-                opened.contains("3 items") && editor_has_focus(&pty.output),
+                family_rows_are_visible(&opened) && editor_has_focus(&pty.output),
                 "opening {title} must retain the family panel and focus its editor: {opened}"
             );
             return version;
         }
         let rows = frame
             .lines()
-            .skip_while(|line| !line.contains("3 items"))
+            .skip_while(|line| !line.contains("Subagents 2"))
             .skip(1)
             .collect::<Vec<_>>();
         let selected = rows.iter().position(|line| line.starts_with('›')).unwrap();
@@ -293,29 +307,29 @@ async fn run_family_navigation(fixture: &PrivateFixture) {
     pty.wait_for("Main completed editor and family summary", |frame| {
         frame.contains(MAIN_REPLY)
             && frame.contains("✓ Done")
-            && frame.contains("Agents 3")
+            && frame.contains("Subagents 2")
             && editor_has_focus(&captured)
     })
     .await;
-    super::unified_footer::click_category(&mut pty, "Agents 3");
+    super::unified_footer::click_category(&mut pty, "Subagents 2");
     pty.wait_for("mouse collapses the completed family", |frame| {
-        frame.contains("Enter/Space expand") && !frame.contains("3 items")
+        frame.contains("Enter/Space expand") && !family_rows_are_visible(frame)
     })
     .await;
     assert!(!pty.frame().contains("reply completed"));
     pty.send(b"\r");
     pty.wait_for("focused Enter expands the family", |frame| {
-        frame.contains("3 items") && frame.contains("Enter/Space hide")
+        family_rows_are_visible(frame) && frame.contains("Enter/Space hide")
     })
     .await;
     pty.send(b" ");
     pty.wait_for("focused Space collapses the family", |frame| {
-        frame.contains("Enter/Space expand") && !frame.contains("3 items")
+        frame.contains("Enter/Space expand") && !family_rows_are_visible(frame)
     })
     .await;
-    super::unified_footer::click_category(&mut pty, "Agents 3");
+    super::unified_footer::click_category(&mut pty, "Subagents 2");
     pty.wait_for("mouse reopens the same family", |frame| {
-        frame.contains("3 items") && frame.contains("Enter/Space hide")
+        family_rows_are_visible(frame) && frame.contains("Enter/Space hide")
     })
     .await;
     pty.send(b"\x1b");

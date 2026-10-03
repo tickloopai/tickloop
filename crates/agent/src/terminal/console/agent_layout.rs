@@ -1974,7 +1974,7 @@ pub(super) fn help_lines(
             "Ctrl+J newline",
             "Ctrl+G editor",
             "A/Q approval/question",
-            "↓ Agents entry (input end)",
+            "↓ Subagents entry (input end)",
             "Enter/Space toggle Agents (entry)",
             "↓ Agent list (entry expanded)",
             "Ctrl+N/P list/completion",

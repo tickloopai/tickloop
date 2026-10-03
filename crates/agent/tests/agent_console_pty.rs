@@ -315,9 +315,17 @@ async fn catalog(client: &LocalAgentClient) -> Vec<AgentSummary> {
     rows
 }
 
+fn family_panel_has_viewing_row(frame: &str) -> bool {
+    frame
+        .lines()
+        .skip_while(|line| !line.contains("Subagents "))
+        .skip(1)
+        .any(|line| line.contains("viewing"))
+}
+
 fn new_input_is_visible(frame: &str) -> bool {
     frame.contains("Tick Loop Agent")
-        && frame.contains("Context —")
+        && frame.contains("⏵⏵ ")
         && frame.lines().any(|line| line.starts_with('❯'))
 }
 
@@ -1447,7 +1455,7 @@ async fn run_child_views(fixture: &PrivateFixture) {
     first.send(b"\x1b[B");
     first
         .wait_for("real family expands below input", |frame| {
-            frame.contains("Agents 2") && frame.contains("2 items")
+            frame.contains("Subagents 1") && family_panel_has_viewing_row(frame)
         })
         .await;
     first.send(b"\x1b[B\r");
@@ -1466,7 +1474,7 @@ async fn run_child_views(fixture: &PrivateFixture) {
     first
         .wait_for(
             "parent family expands without consuming its draft",
-            |frame| frame.contains("2 items") && frame.contains("PARENT-DRAFT-ONE"),
+            |frame| family_panel_has_viewing_row(frame) && frame.contains("PARENT-DRAFT-ONE"),
         )
         .await;
     first.send(b"\x1b[Bj\r");
@@ -1494,8 +1502,8 @@ async fn run_child_views(fixture: &PrivateFixture) {
                 let captured = captured_output.lock().unwrap();
                 let terminal = String::from_utf8_lossy(&captured);
                 frame.contains("CHILD-DRAFT-ONE")
-                    && frame.contains("Agents 2")
-                    && frame.contains("2 items")
+                    && frame.contains("Subagents 1")
+                    && family_panel_has_viewing_row(frame)
                     && terminal.rfind("\x1b[?25h") > terminal.rfind("\x1b[?25l")
             },
         )

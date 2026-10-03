@@ -8,7 +8,7 @@ impl FooterItemId {
     pub(super) fn label(self) -> &'static str {
         match self {
             Self::Tasks => "Shell",
-            Self::Agents => "Agents",
+            Self::Agents => "Subagents",
         }
     }
 }
@@ -276,6 +276,6 @@ mod tests {
         assert_eq!(footer.selected(), None);
         assert_eq!(footer.frame().items.len(), 2);
         assert_eq!(FooterItemId::Tasks.label(), "Shell");
-        assert_eq!(FooterItemId::Agents.label(), "Agents");
+        assert_eq!(FooterItemId::Agents.label(), "Subagents");
     }
 }

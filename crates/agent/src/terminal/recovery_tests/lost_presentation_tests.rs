@@ -388,7 +388,7 @@ fn lost_execution_has_one_readable_notice_and_keeps_the_core_status() {
         .find(|line| line.starts_with('─') && line.contains("⏵⏵ Auto"))
         .unwrap();
     assert!(
-        core.contains(LOST_MODEL) && core.contains("Context —"),
+        core.contains(LOST_MODEL) && !core.contains("Context"),
         "loss feedback must preserve readable core status on the lower divider: {core}"
     );
     assert_eq!(frame.matches("⏵⏵ Auto").count(), 1, "{frame}");
@@ -451,7 +451,7 @@ fn completed_cached_execution_keeps_its_known_outcome_and_exposes_connection_det
     let frame =
         wait_for_lost_presentation(&mut view, |frame| frame.contains("Lost · cached history"));
     assert!(
-        frame.contains("⏵⏵ Auto") && frame.contains(LOST_MODEL) && frame.contains("Context —"),
+        frame.contains("⏵⏵ Auto") && frame.contains(LOST_MODEL) && !frame.contains("Context"),
         "{frame}"
     );
     assert!(frame.contains("Ctrl+O details"), "{frame}");
@@ -497,7 +497,7 @@ fn an_unknown_input_after_a_completed_run_still_has_an_unknown_outcome_on_loss()
         wait_for_lost_presentation(&mut view, |frame| frame.contains("Lost · outcome unknown"));
     assert!(!frame.contains("Lost · cached history"), "{frame}");
     assert!(
-        frame.contains("⏵⏵ Auto") && frame.contains(LOST_MODEL) && frame.contains("Context —"),
+        frame.contains("⏵⏵ Auto") && frame.contains(LOST_MODEL) && !frame.contains("Context"),
         "{frame}"
     );
     let after = lost_presentation_proof(directory.path());
@@ -536,7 +536,7 @@ fn an_unavailable_owner_catalog_preserves_the_live_worker_core_and_connection_de
         "raw connection diagnosis belongs in details: {frame}"
     );
     assert!(
-        frame.contains("⏵⏵ Auto") && frame.contains(LOST_MODEL) && frame.contains("Context —"),
+        frame.contains("⏵⏵ Auto") && frame.contains(LOST_MODEL) && !frame.contains("Context"),
         "{frame}"
     );
     assert!(
@@ -567,7 +567,7 @@ fn an_unavailable_owner_catalog_preserves_the_live_worker_core_and_connection_de
             && frame.contains(LOST_MODEL)
     });
     assert!(
-        recovered.contains("⏵⏵ Auto") && recovered.contains("Context —"),
+        recovered.contains("⏵⏵ Auto") && !recovered.contains("Context"),
         "{recovered}"
     );
     let restored = lost_presentation_proof(directory.path());

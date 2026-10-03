@@ -594,13 +594,14 @@ Transcripts, large tool results, plans, file backups and paste cache older than 
 
 Enter a task; follow-up inputs are accepted while the current run continues.
 Queued messages, commands and Shell input appear above the editor; Up on the first visual row restores editable queued input.
-The footer contains only Agents N when there are subagents, expanded by default.
-Down on the last visual input row, after history ends, focuses the Agents N entry without submitting the draft.
-Click Agents N or press Enter/Space on its focused entry to hide/show the list; modified Enter is ignored.
+The footer contains only Subagents N when there are subagents, expanded by default.
+Down on the last visual input row, after history ends, focuses the Subagents N entry without submitting the draft.
+Click Subagents N or press Enter/Space on its focused entry to hide/show the list; modified Enter is ignored.
 Down from the expanded entry focuses the list; Enter opens an Agent, Space folds descendants, Esc returns to the entry, then Esc returns to the editor.
 Shift+Up/Down focuses the Tick List's Shells group; Enter opens the selected Shell.
 Each Agent's own Todos stay below Working, including while idle, until all items are completed and the list clears.
-Mode, model and Context stay right-aligned on the lower editor divider when they fit.
+Mode and model stay right-aligned on the lower divider; Context appears only with confirmed nonzero rounded usage.
+Divider edge titles have a short rule beyond the text; the expanded Subagents list has no items summary row.
 /loops opens Loop management; /loops new starts another goal in this Chat; /loops UUID selects one.
 /loops trigger [GOAL_ID] reads its trigger.
 /loops schedule GOAL_ID SECONDS [--for DURATION_SECONDS] PROMPT sets a local timer and optional deadline.
@@ -8102,7 +8103,7 @@ mod status_agents_help_tests {
     #[test]
     fn help_describes_agents_only_footer_and_persistent_own_todos() {
         let help = super::help_text();
-        assert!(help.contains("Agents N") && help.contains("expanded by default"));
+        assert!(help.contains("Subagents N") && help.contains("expanded by default"));
         assert!(help.contains("Enter/Space") && help.contains("Esc returns to the entry"));
         assert!(help.contains("Tick List's Shells group"));
         assert!(help.contains("including while idle") && help.contains("list clears"));

@@ -72,6 +72,155 @@ fn agent(id: u128, parent: Option<Uuid>, title: &str) -> AgentTreeRow {
 }
 
 #[test]
+fn subagent_count_excludes_main_and_includes_the_child_currently_viewed() {
+    let console = fixture();
+    update(&console, vec![], vec![]);
+    console
+        .set_agent_family(
+            vec![
+                agent(1, None, "Main count probe"),
+                agent(2, Some(Uuid::from_u128(1)), "viewed child count probe"),
+                agent(3, Some(Uuid::from_u128(2)), "nested child count probe"),
+            ],
+            Some(Uuid::from_u128(2)),
+        )
+        .unwrap();
+    let rendered = frame(&console);
+    assert!(
+        rendered.iter().any(|row| row.contains("Subagents 2")),
+        "{rendered:?}"
+    );
+    for title in [
+        "Main count probe",
+        "viewed child count probe",
+        "nested child count probe",
+    ] {
+        assert!(
+            rendered.iter().any(|row| row.contains(title)),
+            "{rendered:?}"
+        );
+    }
+    console
+        .set_agent_family(
+            vec![agent(1, None, "Main count probe")],
+            Some(Uuid::from_u128(1)),
+        )
+        .unwrap();
+    assert!(!frame(&console).iter().any(|row| row.contains("Subagents")));
+}
+
+#[test]
+fn expanded_subagents_start_at_the_entry_without_an_items_or_blank_summary_row() {
+    let console = fixture();
+    update(&console, vec![], vec![]);
+    console
+        .set_agent_family(
+            vec![
+                agent(1, None, "Main summary probe"),
+                agent(2, Some(Uuid::from_u128(1)), "child summary probe"),
+            ],
+            Some(Uuid::from_u128(1)),
+        )
+        .unwrap();
+    for width in [80, 48] {
+        console.state.lock().unwrap().resize(width, 24);
+        let rendered = frame(&console);
+        let entry = rendered
+            .iter()
+            .position(|row| row.contains("Subagents 1"))
+            .unwrap();
+        assert!(
+            rendered[entry + 1].contains("Main summary probe"),
+            "{rendered:?}"
+        );
+        assert!(
+            rendered[entry + 2].contains("child summary probe"),
+            "{rendered:?}"
+        );
+        assert!(
+            !rendered.iter().any(|row| row.contains("items")
+                || row.contains("↓ open")
+                || row.contains("Enter list")),
+            "{rendered:?}"
+        );
+    }
+}
+
+#[test]
+fn divider_edges_use_short_rules_and_exact_label_targets_with_narrow_fallbacks() {
+    let console = fixture();
+    update(&console, vec![], vec![]);
+    console
+        .set_agent_family(
+            vec![
+                agent(1, None, "Main edge"),
+                agent(2, Some(Uuid::from_u128(1)), "child edge"),
+            ],
+            Some(Uuid::from_u128(1)),
+        )
+        .unwrap();
+    console.state.lock().unwrap().tick_list.replace(
+        TickGroup::Shells,
+        vec![TickListEntry {
+            id: TASK.to_string(),
+            group: TickGroup::Shells,
+            glyph: Glyph::ShellTick,
+            title: "edge Shell".into(),
+            kind: "Shell".into(),
+            status: "running".into(),
+            updated_at_ms: None,
+            running: true,
+        }],
+    );
+    for (width, prefix, suffix) in [
+        (80, "─ ▾ Subagents 1 ", "Context 21% used ─"),
+        (55, "▾ Subagents 1 ", "Context 21% used ─"),
+        (53, "▾ Subagents 1 ", "Context 21% used"),
+    ] {
+        console.state.lock().unwrap().resize(width, 24);
+        let rendered = frame(&console);
+        let state = console.state.lock().unwrap();
+        let footer = state.footer_bar_target.as_ref().unwrap();
+        let lower = &rendered[footer.row];
+        assert!(
+            lower.starts_with(prefix) && lower.ends_with(suffix),
+            "{lower:?}"
+        );
+        assert_eq!(display_width(lower), usize::from(width) - 1);
+        let label = footer.categories[0].0.clone();
+        assert_eq!(
+            lower
+                .chars()
+                .skip(label.start)
+                .take(label.len())
+                .collect::<String>(),
+            "▾ Subagents 1"
+        );
+        let ticks = state.tick_toggle_target.as_ref().unwrap();
+        let upper = &rendered[ticks.row];
+        assert!(upper.ends_with(" ◉ Ticks 1 ─"), "{upper:?}");
+        assert_eq!(ticks.columns.end, state.width - 2);
+        assert_eq!(
+            upper
+                .chars()
+                .skip(ticks.columns.start)
+                .take(ticks.columns.len())
+                .collect::<String>(),
+            "◉ Ticks 1"
+        );
+    }
+    console.set_agent_family(vec![], None).unwrap();
+    for (width, suffix) in [(14, " ◉ Ticks 1 ─"), (13, " ◉ Ticks 1")] {
+        console.state.lock().unwrap().resize(width, 24);
+        let rendered = frame(&console);
+        let state = console.state.lock().unwrap();
+        let ticks = state.tick_toggle_target.as_ref().unwrap();
+        assert!(rendered[ticks.row].ends_with(suffix), "{rendered:?}");
+        assert_eq!(ticks.columns.len(), 9);
+    }
+}
+
+#[test]
 fn family_updates_preserve_editor_focus_and_never_expose_todo_or_shell_categories() {
     let console = fixture();
     let shell = item("1.", "shell unique", Some(TASK));
@@ -445,7 +594,7 @@ fn core_status_floats_on_the_lower_divider_with_roles_and_preserved_fallback_not
         .position(|row| row.contains("keep literal jk draft"))
         .unwrap();
     assert!(
-        lines[editor + 1].starts_with('─') && lines[editor + 1].ends_with("Context 21% used"),
+        lines[editor + 1].starts_with('─') && lines[editor + 1].ends_with("Context 21% used ─"),
         "{lines:?}"
     );
     assert_eq!(
@@ -514,7 +663,7 @@ fn core_status_is_always_right_aligned_with_styled_content_and_fallback() {
             .unwrap();
         let divider = &rendered[editor + 1];
         assert!(
-            divider.starts_with('─') && divider.ends_with("Context —"),
+            divider.starts_with('─') && divider.ends_with("模型 fixture ─"),
             "{rendered:?}"
         );
         assert_eq!(display_width(divider), 79);
@@ -523,7 +672,7 @@ fn core_status_is_always_right_aligned_with_styled_content_and_fallback() {
         let (styled, _, _) = state.normal_styled_frame();
         let core = styled
             .iter()
-            .find(|row| row.text().contains("Context —"))
+            .find(|row| row.text().contains("模型 fixture"))
             .unwrap();
         assert!(
             core.spans
@@ -559,7 +708,7 @@ fn agents_entry_is_on_lower_divider_and_family_is_expanded_by_default() {
     assert!(
         !frame(&console)
             .iter()
-            .any(|row| row.contains("Agents 1") || row.contains("Main unique"))
+            .any(|row| row.contains("Subagents 0") || row.contains("Main unique"))
     );
     console
         .set_agent_family(
@@ -576,14 +725,14 @@ fn agents_entry_is_on_lower_divider_and_family_is_expanded_by_default() {
         .position(|row| row.contains("keep literal jk draft"))
         .unwrap();
     assert!(
-        rendered[editor + 1].contains("Agents 2")
-            && rendered[editor + 1].ends_with("Context 21% used"),
+        rendered[editor + 1].contains("Subagents 1")
+            && rendered[editor + 1].ends_with("Context 21% used ─"),
         "{rendered:?}"
     );
     assert_eq!(
         rendered
             .iter()
-            .filter(|row| row.contains("Agents 2"))
+            .filter(|row| row.contains("Subagents 1"))
             .count(),
         1
     );
@@ -592,7 +741,7 @@ fn agents_entry_is_on_lower_divider_and_family_is_expanded_by_default() {
         console.state.lock().unwrap().resize(width, height);
         let fallback = frame(&console);
         assert!(
-            fallback.iter().any(|row| row.contains("Agents 2")),
+            fallback.iter().any(|row| row.contains("Subagents 1")),
             "{fallback:?}"
         );
         assert!(
@@ -816,7 +965,7 @@ fn question_mark_help_matches_agents_focus_layers_and_tick_list_shells() {
     key(&console, KeyCode::Char('?'));
     let help = frame(&console).join("\n");
     for hint in [
-        "↓ Agents entry",
+        "↓ Subagents entry",
         "Enter/Space toggle",
         "↓ Agent list",
         "Enter open Agent",

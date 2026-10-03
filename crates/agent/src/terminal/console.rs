@@ -123,6 +123,8 @@ const RESET_SCROLL_REGION: &str = "\x1b[r";
 /// existing Loop of the shown Agent names nothing further.
 const NEW_LOOP_TARGET: &str = "new Loop";
 const MAX_PENDING_INPUT_ROWS: usize = 4;
+const DIVIDER_EDGE_RULE_COLUMNS: usize = 1;
+const DIVIDER_ENTRY_GAP_COLUMNS: usize = 1;
 const CREATION_ATTACH_UNAVAILABLE_PREFIX: &str = "New Agent created; local connection unavailable";
 const EXECUTION_CONNECTION_DETAILS_HINT: &str = "Ctrl+O details";
 
@@ -6615,7 +6617,7 @@ impl State {
                 .any(|item| item.id == FooterItemId::Agents))
         .then(|| {
             format!(
-                " {} {} ",
+                "{} {}",
                 self.display.glyph(if self.status_area.agents_collapsed {
                     Glyph::Collapsed
                 } else {
@@ -6624,13 +6626,13 @@ impl State {
                 self.status_area.header_label(FooterItemId::Agents)
             )
         })
-        .filter(|label| display_width(label) + 2 <= self.width);
+        .filter(|label| display_width(label) + DIVIDER_ENTRY_GAP_COLUMNS + 2 <= self.width);
         let mut agents_entry_width = agents_entry
             .as_ref()
-            .map_or(0, |label| display_width(label));
+            .map_or(0, |label| display_width(label) + DIVIDER_ENTRY_GAP_COLUMNS);
         let mut panel_rows = if !overview && !self.help_open && self.footer_items_are_visible() {
-            if agents_entry.is_some() && !self.status_area.is_open() {
-                0
+            if agents_entry.is_some() {
+                self.status_area.row_count(self.height).saturating_sub(1)
             } else {
                 self.status_area.row_count(self.height).max(1)
             }
@@ -6706,6 +6708,20 @@ impl State {
             && configured_status.is_none()
             && self.status_area.is_configured()
             && display_width(&core_status.text()) + 2 <= self.width;
+        let edge_width = DIVIDER_EDGE_RULE_COLUMNS + DIVIDER_ENTRY_GAP_COLUMNS;
+        let mut core_edge_width = if float_core_status
+            && display_width(&core_status.text()) + edge_width + 2 <= self.width
+        {
+            edge_width
+        } else {
+            0
+        };
+        if float_core_status
+            && display_width(&core_status.text()) + core_edge_width + agents_entry_width + 2
+                > self.width
+        {
+            core_edge_width = 0;
+        }
         if float_core_status
             && display_width(&core_status.text()) + agents_entry_width + 2 > self.width
         {
@@ -6715,6 +6731,20 @@ impl State {
                 panel_rows = self.status_area.row_count(self.height).max(1);
             }
         }
+        let agents_edge_width = if agents_entry.is_some()
+            && agents_entry_width
+                + edge_width
+                + if float_core_status {
+                    display_width(&core_status.text()) + core_edge_width + 2
+                } else {
+                    1
+                }
+                <= self.width
+        {
+            edge_width
+        } else {
+            0
+        };
         let mut status_rows = if self.help_open {
             usize::from(!leading_notice.is_empty() || required_status)
         } else {
@@ -6884,15 +6914,28 @@ impl State {
                 && !self.tick_list.entries().is_empty()
             {
                 let label = format!(
-                    " {} Ticks {} ",
+                    "{} Ticks {}",
                     self.display.glyph(Glyph::ProtocolTick),
                     self.tick_list.entries().len()
                 );
                 let label_width = display_width(&label);
-                if label_width + 2 <= self.width {
-                    let column = self.width - label_width;
+                if label_width + DIVIDER_ENTRY_GAP_COLUMNS + DIVIDER_EDGE_RULE_COLUMNS <= self.width
+                {
+                    let tick_edge_width = if label_width
+                        + DIVIDER_ENTRY_GAP_COLUMNS
+                        + edge_width
+                        + DIVIDER_EDGE_RULE_COLUMNS
+                        <= self.width
+                    {
+                        edge_width
+                    } else {
+                        0
+                    };
+                    let column =
+                        self.width - label_width - tick_edge_width - DIVIDER_ENTRY_GAP_COLUMNS;
                     let line = lines.last_mut().unwrap();
                     line.truncate(column);
+                    line.push(" ".repeat(DIVIDER_ENTRY_GAP_COLUMNS), None);
                     line.push(
                         label,
                         Some(if self.tick_list_visible() {
@@ -6901,7 +6944,14 @@ impl State {
                             Role::MutedText
                         }),
                     );
-                    tick_control = Some((lines.len() - 1, column..self.width));
+                    if tick_edge_width > 0 {
+                        line.push(" ".repeat(DIVIDER_ENTRY_GAP_COLUMNS), None);
+                        line.push("─".repeat(DIVIDER_EDGE_RULE_COLUMNS), Some(border));
+                    }
+                    tick_control = Some((
+                        lines.len() - 1,
+                        column + DIVIDER_ENTRY_GAP_COLUMNS..self.width - tick_edge_width,
+                    ));
                     if return_control
                         .as_ref()
                         .is_some_and(|(_, columns)| columns.end > column)
@@ -6922,6 +6972,10 @@ impl State {
             let mut divider = RoleLine::default();
             if let Some(label) = &agents_entry {
                 agents_divider_row = Some(lines.len());
+                if agents_edge_width > 0 {
+                    divider.push("─".repeat(DIVIDER_EDGE_RULE_COLUMNS), Some(border));
+                    divider.push(" ".repeat(DIVIDER_ENTRY_GAP_COLUMNS), None);
+                }
                 divider.push(
                     label,
                     Some(if self.footer.selected() == Some(FooterItemId::Agents) {
@@ -6932,10 +6986,13 @@ impl State {
                         Role::Permission
                     }),
                 );
+                divider.push(" ".repeat(DIVIDER_ENTRY_GAP_COLUMNS), None);
             }
             divider.push(
                 "─".repeat(self.width.saturating_sub(
                     agents_entry_width
+                        + agents_edge_width
+                        + core_edge_width
                         + if float_core_status {
                             display_width(&core_status.text()) + 1
                         } else {
@@ -6947,6 +7004,10 @@ impl State {
             if float_core_status {
                 divider.push(" ", None);
                 divider.spans.extend(core_status.spans);
+                if core_edge_width > 0 {
+                    divider.push(" ".repeat(DIVIDER_ENTRY_GAP_COLUMNS), None);
+                    divider.push("─".repeat(DIVIDER_EDGE_RULE_COLUMNS), Some(border));
+                }
             }
             lines.push(divider);
         }
@@ -7212,7 +7273,11 @@ impl State {
                 row: self.height.saturating_sub(lines.len()) + row,
                 inset: 0,
                 categories: if agents_divider_row.is_some() {
-                    vec![(0..agents_entry_width, FooterItemId::Agents)]
+                    vec![(
+                        agents_edge_width
+                            ..agents_edge_width + agents_entry_width - DIVIDER_ENTRY_GAP_COLUMNS,
+                        FooterItemId::Agents,
+                    )]
                 } else {
                     self.status_area.panel_targets(&footer, self.width)
                 },
@@ -15385,7 +15450,7 @@ mod tests {
             core.starts_with('─')
                 && core.contains("⏵⏵ Auto")
                 && core.contains("claude-fable-5-1")
-                && core.contains("Context —"),
+                && !core.contains("Context"),
             "{core:?}"
         );
         assert_eq!(
@@ -15842,7 +15907,7 @@ mod tests {
                 assert!(
                     returned.contains("Auto")
                         && returned.contains("loss-model")
-                        && returned.contains("Context —"),
+                        && !returned.contains("Context"),
                     "{focus}: {returned}"
                 );
                 assert!(

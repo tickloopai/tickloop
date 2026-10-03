@@ -1001,7 +1001,7 @@ mod tests {
                 let visible = screen::visible_screen(completed.unwrap_or(&text), 150, 40);
                 let input_restored = completed.is_some()
                     && visible.contains("Tick Loop Agent v")
-                    && visible.contains("Context —")
+                    && !visible.contains("Context")
                     && visible.lines().any(|line| line.trim() == "❯")
                     && [
                         "Choose model",

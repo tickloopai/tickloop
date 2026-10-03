@@ -155,7 +155,7 @@ fn assert_clean_startup_status(frame: &str, rows: &str, model: &str) {
             .find(|line| line.contains("⏵⏵ Auto"))
             .unwrap_or_else(|| panic!("missing core status: {frame}"));
         assert_eq!(status.matches(model).count(), 1, "{status}");
-        assert!(status.contains("Context —"), "{status}");
+        assert!(!status.contains("Context"), "{status}");
         assert!(!status.contains("ChatCompletions"), "{status}");
     }
     if matches!(rows, "1" | "3") {
@@ -172,7 +172,7 @@ fn new_agent_startup_has_one_model_and_no_ordinary_ready_status() {
     let (mut fixture, _directory) = start_startup_fixture("default");
     fixture.wait_for("Tick Loop Agent");
     let frame =
-        fixture.repaint_after_recovery("New Agent startup", |frame| frame.contains("Context —"));
+        fixture.repaint_after_recovery("New Agent startup", |frame| !frame.contains("Context"));
     assert_clean_startup_status(&frame, "default", STARTUP_MODEL);
 }
 

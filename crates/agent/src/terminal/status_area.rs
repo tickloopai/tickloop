@@ -464,14 +464,10 @@ impl StatusArea {
             _ => Role::Text,
         };
         line.push(mode.clone(), Some(mode_role));
-        let (context, context_role) = self.context.map_or_else(
-            || ("Context —".to_owned(), Role::MutedText),
-            |(used, limit)| {
-                let percent =
-                    used.saturating_mul(100).saturating_add(limit as u64 / 2) / limit as u64;
-                (format!("Context {percent}% used"), Role::Success)
-            },
-        );
+        let context = self.context.and_then(|(used, limit)| {
+            let percent = used.saturating_mul(100).saturating_add(limit as u64 / 2) / limit as u64;
+            (percent > 0).then(|| format!("Context {percent}% used"))
+        });
         let necessary_background = background.filter(|notice| notice.necessary);
         let ordinary_background = background.filter(|notice| !notice.necessary);
         let mut notice_line = RoleLine::role(notice, Role::Warning);
@@ -499,13 +495,19 @@ impl StatusArea {
             3 + UnicodeWidthStr::width(background.message.as_str())
         });
         let mut used_width = UnicodeWidthStr::width(mode.as_str());
-        for (text, role) in [(&self.model, Role::Text), (&context, context_role)] {
-            let segment_width = 3 + UnicodeWidthStr::width(text.as_str());
+        for (text, role) in [
+            (Some(self.model.as_str()), Role::Text),
+            (context.as_deref(), Role::Success),
+        ] {
+            let Some(text) = text else {
+                continue;
+            };
+            let segment_width = 3 + UnicodeWidthStr::width(text);
             if used_width + segment_width + notice_width + outcome_width > width {
                 break;
             }
             line.push(" · ", Some(Role::MutedText));
-            line.push(text.clone(), Some(role));
+            line.push(text.to_owned(), Some(role));
             used_width += segment_width;
         }
         if !notice.is_empty() {
@@ -676,7 +678,15 @@ impl StatusArea {
         }
         let summary_focused =
             footer.selected.is_some() || footer.items.iter().any(|item| item.selected);
-        let summary = if self.is_open()
+        let family_panel = self.visible == Some(FooterItemId::Agents)
+            || footer
+                .items
+                .iter()
+                .any(|item| item.id == FooterItemId::Agents);
+        let render_header = !family_panel || !footer.items.is_empty();
+        let summary = if family_panel {
+            String::new()
+        } else if self.is_open()
             && let Some(panel) = self.visible
         {
             let count = self.item_count(panel);
@@ -704,12 +714,16 @@ impl StatusArea {
         let space = width
             .saturating_sub(UnicodeWidthStr::width(header.text().as_str()))
             .saturating_sub(UnicodeWidthStr::width(summary.as_str()));
-        if space > 1 {
+        if space > 1 && !summary.is_empty() {
             header.push(" ".repeat(space), None);
             header.push(summary, Some(Role::MutedText));
         }
         header.truncate(width);
-        let mut lines = vec![header.filled(Role::StatusPanel)];
+        let mut lines = if render_header {
+            vec![header.filled(Role::StatusPanel)]
+        } else {
+            Vec::new()
+        };
         let Some(panel) = self.visible else {
             return lines;
         };
@@ -718,7 +732,7 @@ impl StatusArea {
                 return lines;
             }
             let agents = self.visible_agents();
-            let capacity = row_count.saturating_sub(1);
+            let capacity = row_count.saturating_sub(usize::from(render_header));
             let selected_index = agents
                 .iter()
                 .position(|row| Some(row.agent_id) == self.selected_agent)
@@ -835,7 +849,14 @@ impl StatusArea {
     pub(super) fn header_label(&self, panel: FooterItemId) -> String {
         match panel {
             FooterItemId::Tasks => format!("Shell {}", self.tasks.len()),
-            FooterItemId::Agents => format!("Agents {}", self.agents.len()),
+            FooterItemId::Agents => {
+                let subagent_count = self
+                    .agents
+                    .iter()
+                    .filter(|row| row.parent_id.is_some())
+                    .count();
+                format!("Subagents {subagent_count}")
+            }
         }
     }
 
@@ -1001,13 +1022,41 @@ mod tests {
     }
 
     #[test]
+    fn context_segment_is_absent_until_rounded_confirmed_usage_is_nonzero() {
+        let mut area = StatusArea::default();
+        for context in [
+            None,
+            Some((0, 200_000)),
+            Some((999, 200_000)),
+            Some((42, 0)),
+        ] {
+            area.update("Auto".into(), "model".into(), context, vec![], vec![]);
+            assert_eq!(area.status_line(80, "").text(), "⏵⏵ Auto · model");
+        }
+        area.update(
+            "Auto".into(),
+            "model".into(),
+            Some((1000, 200_000)),
+            vec![],
+            vec![],
+        );
+        assert_eq!(
+            area.status_line(80, "").text(),
+            "⏵⏵ Auto · model · Context 1% used"
+        );
+        assert_eq!(area.status_line(16, "").text(), "⏵⏵ Auto · model");
+        area.update("Auto".into(), "model".into(), None, vec![], vec![]);
+        assert_eq!(
+            area.status_line(80, "Not saved").text(),
+            "⏵⏵ Auto · model · Not saved"
+        );
+    }
+
+    #[test]
     fn status_keeps_mode_and_notice_when_narrow_and_never_invents_usage() {
         let mut area = StatusArea::default();
         area.update("Auto".into(), "gpt-5.6".into(), None, vec![], vec![]);
-        assert_eq!(
-            area.status_line(80, "").text(),
-            "⏵⏵ Auto · gpt-5.6 · Context —"
-        );
+        assert_eq!(area.status_line(80, "").text(), "⏵⏵ Auto · gpt-5.6");
         let narrow = area.status_line(24, "Not saved").text();
         assert!(narrow.starts_with("⏵⏵ Auto · Not saved"));
         assert!(!narrow.contains("gpt-5.6"));
@@ -1018,10 +1067,7 @@ mod tests {
             vec![],
             vec![],
         );
-        assert_eq!(
-            area.status_line(80, "").text(),
-            "⏵⏵ Auto · gpt-5.6 · Context 0% used"
-        );
+        assert_eq!(area.status_line(80, "").text(), "⏵⏵ Auto · gpt-5.6");
         area.update(
             "Auto".into(),
             "gpt-5.6".into(),
@@ -1046,7 +1092,7 @@ mod tests {
         };
         let mut area = StatusArea::default();
         area.update("Auto".into(), "model".into(), None, vec![], vec![]);
-        assert_eq!(context_role(&area), Some(Role::MutedText));
+        assert_eq!(context_role(&area), None);
         assert_eq!(area.status_line(80, "").spans[0].role, Some(Role::Warning));
         area.update(
             "Auto".into(),
