@@ -197,8 +197,32 @@ async fn run_family_navigation(fixture: &PrivateFixture) {
         ),
         chat_reply(None, SECOND_CHILD_REPLY),
         chat_reply(None, MAIN_REPLY),
+        chat_reply(
+            Some((
+                "TodoWrite",
+                "main-todo",
+                json!({"todos":[{"content":"MAIN-OWN-TODO","status":"in_progress","activeForm":"Main own work"}]}),
+            )),
+            "",
+        ),
         waiting_reply("main-context-wait", "Main remains busy"),
+        chat_reply(
+            Some((
+                "TodoWrite",
+                "first-todo",
+                json!({"todos":[{"content":"FIRST-OWN-TODO","status":"in_progress","activeForm":"First own work"}]}),
+            )),
+            "",
+        ),
         waiting_reply("first-context-wait", "First child remains busy"),
+        chat_reply(
+            Some((
+                "TodoWrite",
+                "second-todo",
+                json!({"todos":[{"content":"SECOND-OWN-TODO","status":"in_progress","activeForm":"Second own work"}]}),
+            )),
+            "",
+        ),
         waiting_reply("second-context-wait", "Second child remains busy"),
         waiting_reply(
             "second-follow-up-wait",
@@ -271,6 +295,32 @@ async fn run_family_navigation(fixture: &PrivateFixture) {
             && frame.contains("✓ Done")
             && frame.contains("Agents 3")
             && editor_has_focus(&captured)
+    })
+    .await;
+    super::unified_footer::click_category(&mut pty, "Agents 3");
+    pty.wait_for("mouse collapses the completed family", |frame| {
+        frame.contains("Enter/Space expand") && !frame.contains("3 items")
+    })
+    .await;
+    assert!(!pty.frame().contains("reply completed"));
+    pty.send(b"\r");
+    pty.wait_for("focused Enter expands the family", |frame| {
+        frame.contains("3 items") && frame.contains("Enter/Space hide")
+    })
+    .await;
+    pty.send(b" ");
+    pty.wait_for("focused Space collapses the family", |frame| {
+        frame.contains("Enter/Space expand") && !frame.contains("3 items")
+    })
+    .await;
+    super::unified_footer::click_category(&mut pty, "Agents 3");
+    pty.wait_for("mouse reopens the same family", |frame| {
+        frame.contains("3 items") && frame.contains("Enter/Space hide")
+    })
+    .await;
+    pty.send(b"\x1b");
+    pty.wait_for("toggle returns editor focus", |_| {
+        editor_has_focus(&captured)
     })
     .await;
     pty.send(MAIN_DRAFT.as_bytes());
@@ -353,7 +403,7 @@ async fn run_family_navigation(fixture: &PrivateFixture) {
     let main_wait = continue_waiting(&client, main_execution, "Main").await;
     let first_wait = continue_waiting(&client, first_execution, "first child").await;
     let second_wait = continue_waiting(&client, second_execution, "second child").await;
-    for _ in 0..3 {
+    for _ in 0..6 {
         requests.try_recv().unwrap();
     }
     let runs = [
@@ -378,6 +428,21 @@ async fn run_family_navigation(fixture: &PrivateFixture) {
         (main_execution, MAIN_TASK, MAIN_REPLY, MAIN_DRAFT),
     ] {
         version = open_family_member(&mut pty, &client, target, title, reply, view, version).await;
+        let own_todo = if target == main_execution {
+            "MAIN-OWN-TODO"
+        } else if target == first_execution {
+            "FIRST-OWN-TODO"
+        } else {
+            "SECOND-OWN-TODO"
+        };
+        let working = pty
+            .wait_for("the visible Agent owns the live Todo list", |frame| {
+                frame.contains(own_todo)
+            })
+            .await;
+        for other in ["MAIN-OWN-TODO", "FIRST-OWN-TODO", "SECOND-OWN-TODO"] {
+            assert_eq!(working.contains(other), other == own_todo, "{working}");
+        }
         assert!(pty.frame().contains(draft));
         assert_eq!(catalog(&client).await.len(), 3);
     }

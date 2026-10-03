@@ -38,146 +38,131 @@ async fn wait_editor_ready(pty: &mut PtyView, label: &str, draft: &str) {
     .await;
 }
 
-async fn run_default_todo_panel(fixture: &PrivateFixture) {
+async fn run_working_todo_list(fixture: &PrivateFixture) {
     let todos = json!({"todos":[
         {"content":TODO_FIRST,"status":"in_progress","activeForm":"Inspecting the source-owned footer behavior"},
         {"content":TODO_SECOND,"status":"pending","activeForm":"Explaining the verified layout result"}
     ]});
-    let replies = [
-        chat_reply(Some(("TodoWrite", "footer-todos", todos)), ""),
-        chat_reply(None, TODO_REPLY),
-    ];
-    let (base_url, mut requests) = model_http_support::serve_responses(
-        replies.into_iter().map(|reply| (200, reply)).collect(),
-    )
-    .await;
+    let completed = json!({"todos":[
+        {"content":TODO_FIRST,"status":"completed","activeForm":"Inspecting the source-owned footer behavior"},
+        {"content":TODO_SECOND,"status":"completed","activeForm":"Explaining the verified layout result"}
+    ]});
+    let (base_url, mut requests, release) =
+        model_http_support::serve_responses_with_gated_response(
+            vec![
+                (
+                    200,
+                    chat_reply(Some(("TodoWrite", "active-todos", todos)), ""),
+                ),
+                (200, chat_reply(None, TODO_REPLY)),
+                (
+                    200,
+                    chat_reply(Some(("TodoWrite", "completed-todos", completed)), ""),
+                ),
+                (200, chat_reply(None, "TODO-ALL-DONE")),
+            ],
+            1,
+        )
+        .await;
     fixture.set_chat_model(&base_url);
     let mut pty = PtyView::start_with_flags(fixture, &["--dangerously-skip-permissions"]);
-    pty.wait_for("new footer View ready", new_input_is_visible)
+    pty.wait_for("new Todo View ready", new_input_is_visible)
         .await;
     pty.resize(80, 24).await;
     let client = fixture.client().await;
-    pty.send(b"Create the two-item checklist and report readiness.\r");
+    pty.send(b"Create the two-item checklist.\r");
     let execution = tokio::time::timeout(UI_TIMEOUT, async {
         loop {
-            let rows = catalog(&client).await;
-            if let [row] = rows.as_slice() {
+            if let [row] = catalog(&client).await.as_slice() {
                 break row.execution;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
-    .expect("one actual execution is created");
-    let actual = wait_snapshot(&client, execution, "TodoWrite completes", |current| {
-        current
-            .conversation
-            .loops
-            .first()
-            .is_some_and(|goal| goal.state == tickloop_agent::runtime::LoopState::Completed)
-            && current.conversation.progress.len() == 1
-            && current.conversation.progress[0].todos.len() == 2
-    })
-    .await;
-    assert_eq!(actual.conversation.progress[0].todos[0].content, TODO_FIRST);
-    assert_eq!(
-        actual.conversation.progress[0].todos[1].content,
-        TODO_SECOND
-    );
-    assert!(actual.events.iter().any(|event| matches!(&event.kind,
-        tickloop_agent::runtime::EventKind::ToolStarted { name, .. } if name == "TodoWrite"
-    )));
-    pty.wait_for("the controlled-model reply is rendered", |frame| {
-        frame.contains(TODO_REPLY)
-    })
-    .await;
-    pty.send(TODO_DRAFT.as_bytes());
-    pty.wait_for("the editor keeps its original draft", |frame| {
-        frame
-            .lines()
-            .any(|line| line.starts_with('❯') && line.contains(TODO_DRAFT))
-    })
-    .await;
-    let before_open = pty.frame();
-    assert!(!before_open.contains("Choose a model"));
-    assert!(!before_open.contains("Permission"));
-    assert!(!before_open.contains("Artifacts"));
-    let opened = pty
-        .wait_for(
-            "Todo is expanded by default without a footer activation",
-            |frame| {
-                let rows = frame.lines().collect::<Vec<_>>();
-                let Some(bar) = rows.iter().position(|line| line.contains("Todo 2")) else {
-                    return false;
-                };
-                let panel = &rows[bar + 1..];
-                panel.iter().any(|line| line.contains(TODO_FIRST))
-                    && panel.iter().any(|line| line.contains(TODO_SECOND))
-                    && rows
-                        .iter()
-                        .any(|line| line.starts_with('❯') && line.contains(TODO_DRAFT))
-            },
-        )
-        .await;
-    assert_eq!(
-        opened
-            .lines()
-            .filter(|line| line.contains("Todo 2"))
-            .count(),
-        1
-    );
-    let rows = opened.lines().collect::<Vec<_>>();
-    let editor = rows
-        .iter()
-        .position(|line| line.starts_with('❯') && line.contains(TODO_DRAFT))
-        .unwrap();
-    assert!(
-        rows[editor + 1].starts_with('─') && rows[editor + 1].contains("Context"),
-        "{opened}"
-    );
-    assert_eq!(
-        rows.iter().filter(|line| line.contains("⏵⏵ Auto")).count(),
-        1
-    );
-    pty.send(b"\x1b[B\r\r");
-    pty.wait_for("Todo item opens read-only in the shared panel", |frame| {
-        frame.contains("Todo item 1") && frame.contains(TODO_FIRST) && frame.contains("Read-only")
-    })
-    .await;
-    pty.resize(40, 24).await;
-    pty.wait_for("narrow Todo details retain the captured item", |frame| {
-        frame.contains("Todo item 1") && frame.contains("Read-only")
-    })
-    .await;
-    pty.send(b"\x1b");
-    pty.wait_for("Esc returns from Todo detail to its list", |frame| {
-        frame.contains("Todo 2") && !frame.contains("Read-only")
-    })
-    .await;
-    pty.send(b"\x1b");
-    wait_editor_ready(
-        &mut pty,
-        "Esc restores the ordinary editor caret",
-        TODO_DRAFT,
-    )
-    .await;
-    pty.send(b"jk");
-    pty.wait_for(
-        "Esc returns to the editor without consuming literal j/k",
-        |frame| {
-            frame
-                .lines()
-                .any(|line| line.starts_with('❯') && line.contains(&format!("{TODO_DRAFT}jk")))
+    .unwrap();
+    let actual = wait_snapshot(
+        &client,
+        execution,
+        "TodoWrite updates own progress",
+        |current| {
+            current
+                .conversation
+                .progress
+                .first()
+                .is_some_and(|progress| progress.todos.len() == 2)
         },
     )
     .await;
-    assert_eq!(
-        snapshot(&client, execution).await.conversation.progress[0]
-            .todos
-            .len(),
-        2
+    assert_eq!(actual.conversation.progress[0].todos[0].content, TODO_FIRST);
+    let working = pty
+        .wait_for(
+            "live Todos immediately follow the activity above input",
+            |frame| {
+                let rows = frame.lines().collect::<Vec<_>>();
+                rows.iter()
+                    .position(|line| {
+                        line.contains("Inspecting the source-owned footer behavior")
+                            && line.contains("Esc")
+                    })
+                    .is_some_and(|activity| {
+                        rows.get(activity + 1)
+                            .is_some_and(|line| line.contains(TODO_FIRST))
+                            && rows
+                                .get(activity + 2)
+                                .is_some_and(|line| line.contains(TODO_SECOND))
+                    })
+            },
+        )
+        .await;
+    assert!(!working.contains("Todo 2"));
+    assert!(
+        working
+            .lines()
+            .any(|line| line.contains("◼") && line.contains(TODO_FIRST))
     );
-    for _ in 0..2 {
+    assert!(
+        working
+            .lines()
+            .any(|line| line.contains("◻") && line.contains(TODO_SECOND))
+    );
+    release.send(()).unwrap();
+    pty.wait_for("idle keeps the same owned Todo list", |frame| {
+        frame.contains(TODO_REPLY)
+            && frame.contains(TODO_FIRST)
+            && frame.contains(TODO_SECOND)
+            && frame.contains("2 tasks (0 done, 1 in progress, 1 open)")
+    })
+    .await;
+    wait_editor_ready(&mut pty, "idle input accepts the next turn", "").await;
+    pty.send(b"Complete the checklist.\r");
+    pty.wait_for("all-completed checklist disappears", |frame| {
+        frame.contains("TODO-ALL-DONE")
+            && !frame.contains(TODO_FIRST)
+            && !frame.contains(TODO_SECOND)
+    })
+    .await;
+    let completed = wait_snapshot(
+        &client,
+        execution,
+        "all-completed state is empty",
+        |current| {
+            current
+                .conversation
+                .progress
+                .first()
+                .is_some_and(|progress| progress.todos.is_empty())
+        },
+    )
+    .await;
+    assert!(completed.events.iter().any(|event| matches!(&event.kind, tickloop_agent::runtime::EventKind::ProgressUpdated { progress } if progress.todos.is_empty())));
+    wait_editor_ready(&mut pty, "completed checklist returns editor focus", "").await;
+    pty.send(TODO_DRAFT.as_bytes());
+    pty.wait_for("literal editor keys survive layout", |frame| {
+        frame.contains(TODO_DRAFT)
+    })
+    .await;
+    for _ in 0..4 {
         tokio::time::timeout(UI_TIMEOUT, requests.recv())
             .await
             .unwrap()
@@ -187,7 +172,7 @@ async fn run_default_todo_panel(fixture: &PrivateFixture) {
     pty.close().await;
 }
 
-fn click_category(pty: &mut PtyView, label: &str) {
+pub(super) fn click_category(pty: &mut PtyView, label: &str) {
     let frame = pty.frame();
     let (row, column) = frame
         .lines()
@@ -527,9 +512,9 @@ async fn actual_cli_shell_category_uses_its_exact_eligible_count_and_task() {
 }
 
 #[tokio::test]
-async fn actual_cli_todo_panel_is_visible_by_default_without_taking_the_editor() {
+async fn actual_cli_todos_follow_working_remain_idle_and_clear_when_completed() {
     let fixture = PrivateFixture::new();
-    let result = AssertUnwindSafe(run_default_todo_panel(&fixture))
+    let result = AssertUnwindSafe(run_working_todo_list(&fixture))
         .catch_unwind()
         .await;
     fixture.shutdown().await;

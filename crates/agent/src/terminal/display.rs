@@ -30,6 +30,9 @@ pub(super) enum Glyph {
     ToolResult,
     TickDelivery,
     Success,
+    TodoPending,
+    TodoInProgress,
+    TodoCompleted,
     Failure,
     Warning,
     ScrollUp,
@@ -91,6 +94,9 @@ impl DisplayProfile {
             (GlyphSet::Unicode, Glyph::Assistant | Glyph::ToolCall) => "⏺",
             (GlyphSet::Unicode, Glyph::ToolResult) => "⎿",
             (GlyphSet::Unicode, Glyph::TickDelivery) => "◉",
+            (_, Glyph::TodoPending) => "◻",
+            (_, Glyph::TodoInProgress) => "◼",
+            (_, Glyph::TodoCompleted) => "✔",
             (GlyphSet::Unicode, Glyph::Success) => "✓",
             (GlyphSet::Unicode, Glyph::Failure) => "✗",
             (GlyphSet::Unicode, Glyph::Warning) => "!",
@@ -184,7 +190,6 @@ mod tests {
         let nerd_font = DisplayProfile::new(DisplayPreferences {
             glyph_set: GlyphSet::NerdFont,
             prefers_reduced_motion: true,
-            ..Default::default()
         });
         assert_eq!(nerd_font.glyph(Glyph::Prompt), "\u{f0142}");
         assert_eq!(nerd_font.glyph(Glyph::Assistant), "\u{f06a9}");
@@ -209,7 +214,6 @@ mod tests {
             let profile = DisplayProfile::new(DisplayPreferences {
                 glyph_set,
                 prefers_reduced_motion: false,
-                ..Default::default()
             });
             let shapes = states
                 .iter()

@@ -1704,7 +1704,6 @@ mod tests {
         let display = DisplayProfile::new(tickloop_agent::settings::DisplayPreferences {
             glyph_set: tickloop_agent::settings::GlyphSet::NerdFont,
             prefers_reduced_motion: false,
-            ..Default::default()
         });
 
         let history = public_history(

@@ -167,6 +167,7 @@ pub(super) struct Scrollback {
     /// A live row drawn below the conversation while a run works; it is not
     /// part of the logical lines, so it disappears once cleared.
     activity: Option<RoleLine>,
+    activity_details: Vec<RoleLine>,
     /// Header lines of tool calls still executing, by call id.
     running_tool_calls: HashMap<String, usize>,
     tool_call_headers: HashMap<String, ToolCallHeader>,
@@ -194,6 +195,7 @@ impl Default for Scrollback {
             seen_messages: HashSet::new(),
             unread: 0,
             activity: None,
+            activity_details: Vec::new(),
             running_tool_calls: HashMap::new(),
             tool_call_headers: HashMap::new(),
             running_shimmer: RunningShimmer::default(),
@@ -516,6 +518,10 @@ impl Scrollback {
         true
     }
 
+    pub(super) fn set_activity_details(&mut self, details: Vec<RoleLine>) {
+        self.activity_details = details;
+    }
+
     pub(super) fn remap_display(&mut self, previous: DisplayProfile, next: DisplayProfile) {
         if previous.preferences().glyph_set == next.preferences().glyph_set {
             return;
@@ -710,15 +716,20 @@ impl Scrollback {
     }
 
     fn activity_rows(&self) -> Vec<RoleLine> {
-        let Some(activity) = &self.activity else {
+        if self.activity.is_none() && self.activity_details.is_empty() {
             return Vec::new();
-        };
+        }
         let separated = self.rows.last().is_none_or(|row| row.text.is_empty());
         let mut rows = Vec::with_capacity(2);
         if !separated {
             rows.push(RoleLine::default());
         }
-        rows.push(activity.clone());
+        if let Some(activity) = &self.activity {
+            let mut activity = activity.clone();
+            activity.truncate(self.width);
+            rows.push(activity);
+        }
+        rows.extend(self.activity_details.clone());
         rows
     }
 
@@ -1138,7 +1149,6 @@ mod tests {
         let nerd_font = DisplayProfile::new(tickloop_agent::settings::DisplayPreferences {
             glyph_set: tickloop_agent::settings::GlyphSet::NerdFont,
             prefers_reduced_motion: false,
-            ..Default::default()
         });
 
         scrollback.remap_display(unicode, nerd_font);
@@ -1157,7 +1167,6 @@ mod tests {
         let reduced_motion = DisplayProfile::new(tickloop_agent::settings::DisplayPreferences {
             glyph_set: tickloop_agent::settings::GlyphSet::NerdFont,
             prefers_reduced_motion: true,
-            ..Default::default()
         });
         scrollback.remap_display(nerd_font, reduced_motion);
         assert_eq!(scrollback.frame(80, 8).lines, before_reduced_motion);
@@ -1189,7 +1198,6 @@ mod tests {
         let nerd_font = DisplayProfile::new(tickloop_agent::settings::DisplayPreferences {
             glyph_set: tickloop_agent::settings::GlyphSet::NerdFont,
             prefers_reduced_motion: false,
-            ..Default::default()
         });
         scrollback.remap_display(DisplayProfile::default(), nerd_font);
         assert_eq!(linked_text(&mut scrollback, 40), ["[Image #1]"]);
@@ -1292,7 +1300,6 @@ mod tests {
         let nerd_font = DisplayProfile::new(tickloop_agent::settings::DisplayPreferences {
             glyph_set: tickloop_agent::settings::GlyphSet::NerdFont,
             prefers_reduced_motion: false,
-            ..Default::default()
         });
         scrollback.remap_display(DisplayProfile::default(), nerd_font);
         assert_eq!(scrollback.frame(20, 4).lines, ["\u{f06a9} reply"]);

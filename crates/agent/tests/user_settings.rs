@@ -10,7 +10,7 @@ use tickloop_agent::{
     output_style::OutputStyle,
     permissions::{Decision, PermissionRule, PermissionScope, permission_rule_candidates},
     runtime::{Agent, ChatId, EventKind, ModelChange},
-    settings::{DisplayPreferences, GlyphSet, StatusLinePosition, UserSettings},
+    settings::{DisplayPreferences, GlyphSet, UserSettings},
 };
 use tokio::sync::Barrier;
 use uuid::Uuid;
@@ -39,7 +39,6 @@ fn display_preferences_round_trip_without_replacing_unrelated_settings() {
         .save_display_preferences(DisplayPreferences {
             glyph_set: GlyphSet::NerdFont,
             prefers_reduced_motion: true,
-            ..Default::default()
         })
         .unwrap();
 
@@ -48,63 +47,44 @@ fn display_preferences_round_trip_without_replacing_unrelated_settings() {
         DisplayPreferences {
             glyph_set: GlyphSet::NerdFont,
             prefers_reduced_motion: true,
-            ..Default::default()
         }
     );
     assert_eq!(settings_json(directory.path())["cleanupPeriodDays"], 7);
     assert_eq!(settings_json(directory.path())["futureSetting"], true);
+    assert!(
+        settings_json(directory.path())
+            .get("statusLinePosition")
+            .is_none()
+    );
 }
 
 #[test]
-fn display_preferences_status_line_position_round_trips_and_validates_without_rewriting() {
+fn legacy_status_position_is_silently_ignored_and_preserved_on_display_save() {
     let directory = tempfile::tempdir().unwrap();
     let settings = UserSettings::in_root(directory.path());
-    assert_eq!(
-        settings.display_preferences().status_line_position,
-        StatusLinePosition::Right
-    );
-    for (position, serialized) in [
-        (StatusLinePosition::Left, "left"),
-        (StatusLinePosition::Right, "right"),
-    ] {
-        settings
-            .save_display_preferences(DisplayPreferences {
-                status_line_position: position,
-                ..Default::default()
-            })
-            .unwrap();
-        assert_eq!(
-            UserSettings::in_root(directory.path())
-                .display_preferences()
-                .status_line_position,
-            position
-        );
-        assert_eq!(
-            settings_json(directory.path())["statusLinePosition"],
-            serialized
-        );
-    }
-    for invalid in [
+    for legacy in [
+        json!("left"),
         json!("center"),
         json!(12),
         json!(false),
         json!(null),
         json!({}),
     ] {
-        let original = json!({"statusLinePosition": invalid, "futureSetting": true});
+        let original = json!({"statusLinePosition": legacy, "futureSetting": {"keep": true}});
         std::fs::write(directory.path().join("settings.json"), original.to_string()).unwrap();
         let mut loaded = settings.load();
-        assert_eq!(
-            loaded.display_preferences().status_line_position,
-            StatusLinePosition::Right
-        );
-        assert!(
-            loaded
-                .warnings()
-                .iter()
-                .any(|warning| warning.contains("statusLinePosition"))
-        );
+        assert_eq!(loaded.display_preferences(), DisplayPreferences::default());
+        assert!(loaded.warnings().is_empty(), "{:?}", loaded.warnings());
         assert_eq!(settings_json(directory.path()), original);
+        settings
+            .save_display_preferences(DisplayPreferences {
+                glyph_set: GlyphSet::NerdFont,
+                prefers_reduced_motion: true,
+            })
+            .unwrap();
+        let saved = settings_json(directory.path());
+        assert_eq!(saved["statusLinePosition"], legacy);
+        assert_eq!(saved["futureSetting"], original["futureSetting"]);
     }
 }
 

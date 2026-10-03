@@ -23,7 +23,7 @@ use tickloop_agent::{
         RequestFailure, RequestKind, RequestOutcome, ResponseRejection, RewindMode, RewindOutcome,
         SummaryDirection, UsageCounter, UsageCoverage, UsageSummary,
     },
-    settings::{DisplayPreferences, GlyphSet, StatusLinePosition, UserSettings},
+    settings::{DisplayPreferences, GlyphSet, UserSettings},
 };
 use uuid::Uuid;
 
@@ -43,9 +43,9 @@ use super::{
     workflows::{self, Workflow},
 };
 
-pub(super) const STATUS_LINE_POSITION_SETTING_INDEX: usize = 10;
-pub(super) const OUTPUT_STYLE_SETTING_INDEX: usize = 11;
-pub(super) const PERMISSIONS_SETTING_INDEX: usize = 12;
+pub(super) const REDUCE_MOTION_SETTING_INDEX: usize = 9;
+pub(super) const OUTPUT_STYLE_SETTING_INDEX: usize = 10;
+pub(super) const PERMISSIONS_SETTING_INDEX: usize = 11;
 
 enum Selection {
     ArtifactSignOut {
@@ -1211,10 +1211,6 @@ impl Menus {
                             "Off"
                         }
                     ),
-                    format!(
-                        "Status line position: {}",
-                        console.display_preferences()?.status_line_position.label()
-                    ),
                     format!("Output style: {}", self.saved_output_style().label()),
                     "Permissions".into(),
                     format!("Artifact Service: {artifact_account}"),
@@ -1275,7 +1271,6 @@ impl Menus {
         let nerd_font = DisplayProfile::new(DisplayPreferences {
             glyph_set: GlyphSet::NerdFont,
             prefers_reduced_motion: false,
-            ..Default::default()
         })
         .preview();
         let mut options = GlyphSet::ALL
@@ -2457,22 +2452,13 @@ impl Menus {
                     }
                     Some(7) => self.themes(console, Some(target))?,
                     Some(8) => self.glyph_sets(console, target).await?,
-                    Some(9) => {
+                    Some(REDUCE_MOTION_SETTING_INDEX) => {
                         let mut preferences = console.display_preferences()?;
                         preferences.prefers_reduced_motion = !preferences.prefers_reduced_motion;
                         self.save_display_preferences(console, preferences)?;
                         self.settings(agent, console, target).await?;
                     }
-                    Some(STATUS_LINE_POSITION_SETTING_INDEX) => {
-                        let mut preferences = console.display_preferences()?;
-                        preferences.status_line_position = match preferences.status_line_position {
-                            StatusLinePosition::Left => StatusLinePosition::Right,
-                            StatusLinePosition::Right => StatusLinePosition::Left,
-                        };
-                        self.save_display_preferences(console, preferences)?;
-                        self.settings(agent, console, target).await?;
-                    }
-                    Some(13) => {
+                    Some(12) => {
                         self.show(console, Menu { id: Uuid::new_v4(), title: "Sign out of Artifact Service?".into(), context: vec!["Stops feedback listening before revoking the credential.".into()], options: vec!["Cancel".into(), "Sign out".into()], selected: 0, confirmation: true }, Selection::ArtifactSignOut { target })?;
                     }
                     Some(OUTPUT_STYLE_SETTING_INDEX) => self.output_styles(console, target)?,

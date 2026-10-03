@@ -511,6 +511,15 @@ impl ConsoleExecution {
         ))
     }
 
+    pub(super) fn cached_is_delegated(&self, chat: Uuid) -> bool {
+        self.inner
+            .snapshots
+            .read()
+            .unwrap()
+            .get(&chat)
+            .is_some_and(|snapshot| snapshot.conversation.delegation.is_some())
+    }
+
     pub(super) async fn reference(&self, chat: Uuid) -> Result<ExecutionRef, AgentError> {
         if let Some(reference) = self.inner.references.read().unwrap().get(&chat).copied() {
             return Ok(reference);

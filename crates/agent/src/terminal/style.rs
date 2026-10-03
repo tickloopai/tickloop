@@ -143,6 +143,7 @@ pub(super) enum Role {
     Heading,
     /// The dim bar in front of each quoted Markdown line.
     QuoteBar,
+    CompletedTodo,
 }
 
 impl Role {
@@ -188,10 +189,11 @@ impl Role {
         Self::StrongEmphasis,
         Self::Heading,
         Self::QuoteBar,
+        Self::CompletedTodo,
     ];
 }
 
-const ROLE_COUNT: usize = 41;
+const ROLE_COUNT: usize = 42;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) enum ThemeName {
@@ -308,6 +310,10 @@ const DARK_PALETTE: [Style; ROLE_COUNT] = [
     strong_italic(255, 255, 255), // StrongEmphasis <- chalk.bold.italic
     heading(255, 255, 255), // Heading        <- chalk.bold.italic.underline
     dim(255, 255, 255), // QuoteBar       <- chalk.dim
+    Style {
+        crossed_out: true,
+        ..fg(153, 153, 153)
+    },
 ];
 
 /// Values reproduced from `lightTheme` in the Claude Code source.
@@ -356,6 +362,10 @@ const LIGHT_PALETTE: [Style; ROLE_COUNT] = [
     strong_italic(0, 0, 0), // StrongEmphasis
     heading(0, 0, 0),  // Heading
     dim(0, 0, 0),      // QuoteBar
+    Style {
+        crossed_out: true,
+        ..fg(102, 102, 102)
+    },
 ];
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

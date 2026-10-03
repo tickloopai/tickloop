@@ -594,10 +594,13 @@ Transcripts, large tool results, plans, file backups and paste cache older than 
 
 Enter a task; follow-up inputs are accepted while the current run continues.
 Queued messages, commands and Shell input appear above the editor; Up on the first visual row restores editable queued input.
-Down on the last visual input row, after history ends, selects Footer Tasks/Todo without submitting the draft.
-Footer Tasks/Todo starts folded: click a label or press Enter/Space to expand; Space folds, Esc returns to the editor.
-Footer: h/l or arrows choose; Enter on an expanded Task opens details; other typed keys return to the editor.
-Shift+Up/Down opens background Tasks directly when any are running.
+The footer contains only Agents N when there are subagents, expanded by default.
+Down on the last visual input row, after history ends, focuses the Agents N entry without submitting the draft.
+Click Agents N or press Enter/Space on its focused entry to hide/show the list; modified Enter is ignored.
+Down from the expanded entry focuses the list; Enter opens an Agent, Space folds descendants, Esc returns to the entry, then Esc returns to the editor.
+Shift+Up/Down focuses the Tick List's Shells group; Enter opens the selected Shell.
+Each Agent's own Todos stay below Working, including while idle, until all items are completed and the list clears.
+Mode, model and Context stay right-aligned on the lower editor divider when they fit.
 /loops opens Loop management; /loops new starts another goal in this Chat; /loops UUID selects one.
 /loops trigger [GOAL_ID] reads its trigger.
 /loops schedule GOAL_ID SECONDS [--for DURATION_SECONDS] PROMPT sets a local timer and optional deadline.
@@ -1657,14 +1660,20 @@ async fn interact(
                             )
                         })
                         .or_else(|| {
-                            background_notice.clone().map(|(chat, notice)| {
-                                let role = if notice.necessary {
-                                    Role::Warning
-                                } else {
-                                    Role::MutedText
-                                };
-                                (chat, notice, role)
-                            })
+                            background_notice
+                                .clone()
+                                .filter(|(chat, notice)| {
+                                    notice.message != REPLY_COMPLETED_NOTICE
+                                        || !agent.cached_is_delegated(*chat)
+                                })
+                                .map(|(chat, notice)| {
+                                    let role = if notice.necessary {
+                                        Role::Warning
+                                    } else {
+                                        Role::MutedText
+                                    };
+                                    (chat, notice, role)
+                                })
                         });
                 console.set_background_status_notice(
                     displayed_background
@@ -1765,6 +1774,7 @@ async fn interact(
                 .values()
                 .any(|reply| Some(reply.chat_id) == selected_chat && reply.has_complete_line());
         let has_visible_running_task = interactive && console.has_visible_running_task()?;
+        let todo_refresh_pending = interactive && console.todo_refresh_pending()?;
         let prefers_reduced_motion =
             interactive && console.display_preferences()?.prefers_reduced_motion;
         if interactive
@@ -2038,7 +2048,6 @@ async fn interact(
                     let result = if let Some(chat) = selected_chat {
                         match item {
                             FooterItemId::Tasks => open_tasks(&task_center,console,chat,&mut task_subscription,None,true).await,
-                            FooterItemId::Todo => Ok(()),
                             FooterItemId::Agents => Ok(()),
                         }
                     } else { Ok(()) };
@@ -3516,8 +3525,10 @@ async fn interact(
                             }
                         },
                         EventKind::ProgressUpdated {progress} => {
-                            outln!(console, "\nProgress for goal {}:",progress.loop_id);
-                            for todo in progress.todos {outln!(console, "  {:?}: {}",todo.status,safe_text(&todo.content));}
+                            if !interactive {
+                                outln!(console, "\nProgress for goal {}:",progress.loop_id);
+                                for todo in progress.todos {outln!(console, "  {:?}: {}",todo.status,safe_text(&todo.content));}
+                            }
                         },
                         EventKind::CommandUpdated {..} => {},
                         EventKind::ContextCompaction {status,error} => {
@@ -3779,7 +3790,7 @@ async fn interact(
             _ = animation_refresh.tick(), if interactive && !prefers_reduced_motion && !visual_pacing_pending && (!pending.is_empty() || !directed_summaries.is_empty() || has_visible_running_task) => {
                 activity_dirty = true;
             },
-            _ = elapsed_refresh.tick(), if interactive && prefers_reduced_motion && !visual_pacing_pending && running_activity.as_ref().is_some_and(|activity| activity.started_at.is_some()) => {
+            _ = elapsed_refresh.tick(), if interactive && !visual_pacing_pending && (todo_refresh_pending || prefers_reduced_motion && running_activity.as_ref().is_some_and(|activity| activity.started_at.is_some())) => {
                 activity_dirty = true;
             },
             _ = tokio::task::yield_now(), if visual_pacing_pending => {
@@ -6110,6 +6121,8 @@ fn readable_background_label(agent: &Agent, console: &Console, chat: uuid::Uuid)
         .unwrap_or_else(|| UNLABELED_BACKGROUND_AGENT.into())
 }
 
+const REPLY_COMPLETED_NOTICE: &str = "reply completed";
+
 /// 后台 Chat 的运行结束时显示在状态栏的提示；不写入前台对话。
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct BackgroundRunNotice {
@@ -6126,7 +6139,7 @@ impl BackgroundRunNotice {
 
 fn background_run_notice(event: &tickloop_agent::runtime::Event) -> Option<BackgroundRunNotice> {
     let (message, necessary) = match &event.kind {
-        EventKind::Completed { .. } => ("reply completed".to_owned(), false),
+        EventKind::Completed { .. } => (REPLY_COMPLETED_NOTICE.to_owned(), false),
         EventKind::Failed(error) => (format!("failed: {}", safe_line(error)), true),
         EventKind::Interrupted => ("interrupted".to_owned(), false),
         _ => return None,
@@ -6418,7 +6431,7 @@ fn recover_background_chat(
                 | LoopState::WaitingPermission
                 | LoopState::WaitingQuestion,
             ) => continue,
-            _ => "reply completed",
+            _ => REPLY_COMPLETED_NOTICE,
         };
         recovery.run_notices.push(BackgroundRunNotice {
             message: outcome.into(),
@@ -8081,5 +8094,18 @@ mod tests {
             track_run_requests(&event, &mut pending, &mut permissions, &mut questions);
         }
         assert!(pending.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod status_agents_help_tests {
+    #[test]
+    fn help_describes_agents_only_footer_and_persistent_own_todos() {
+        let help = super::help_text();
+        assert!(help.contains("Agents N") && help.contains("expanded by default"));
+        assert!(help.contains("Enter/Space") && help.contains("Esc returns to the entry"));
+        assert!(help.contains("Tick List's Shells group"));
+        assert!(help.contains("including while idle") && help.contains("list clears"));
+        assert!(!help.contains("Footer Tasks/Todo") && !help.contains("starts folded"));
     }
 }

@@ -431,7 +431,7 @@ async fn a_plan_file_that_was_never_submitted_is_not_restored_as_a_plan() {
 }
 
 #[tokio::test]
-async fn ordinary_progress_keeps_the_execution_mode_and_survives_file_work_and_restart() {
+async fn ordinary_progress_clears_all_completed_todos_and_restores_empty_state() {
     let directory = tempfile::tempdir().unwrap();
     let store = directory.path().join("archive");
     let model = Arc::new(ScriptedModel::new(vec![
@@ -489,7 +489,7 @@ async fn ordinary_progress_keeps_the_execution_mode_and_survives_file_work_and_r
         match next_event(&mut events).await.kind {
             EventKind::ProgressUpdated { progress } => {
                 assert_eq!(progress.loop_id, receipt.loop_id);
-                observed.push(progress.todos[0].status.clone());
+                observed.push(progress.todos.first().map(|todo| todo.status.clone()));
                 let snapshot = agent.snapshot(chat).await.unwrap();
                 assert_eq!(snapshot.policy.mode, ExecutionMode::AcceptEdits);
                 assert!(snapshot.plans.is_empty());
@@ -502,7 +502,7 @@ async fn ordinary_progress_keeps_the_execution_mode_and_survives_file_work_and_r
             _ => {}
         }
     }
-    assert_eq!(observed, [TodoStatus::InProgress, TodoStatus::Completed]);
+    assert_eq!(observed, [Some(TodoStatus::InProgress), None]);
     assert_eq!(
         std::fs::read_to_string(directory.path().join("report.txt")).unwrap(),
         "ordinary progress result"
@@ -516,14 +516,10 @@ async fn ordinary_progress_keeps_the_execution_mode_and_survives_file_work_and_r
     assert!(snapshot.plans.is_empty());
     assert_eq!(snapshot.progress.len(), 1);
     assert_eq!(snapshot.progress[0].loop_id, receipt.loop_id);
-    assert_eq!(
-        snapshot.progress[0].todos,
-        [TodoItem {
-            content: "Write the report".into(),
-            status: TodoStatus::Completed,
-            active_form: "Writing the report".into(),
-        }]
-    );
+    assert!(snapshot.progress[0].todos.is_empty());
+    assert!(snapshot.messages.iter().any(|message| message.content.iter().any(|content| matches!(content,
+        Content::ToolUse { name, input, .. } if name == TODO_WRITE_TOOL_NAME && input["todos"][0]["status"] == "completed"
+    ))));
     restored.shutdown().await;
 }
 

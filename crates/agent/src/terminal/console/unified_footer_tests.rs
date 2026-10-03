@@ -72,134 +72,99 @@ fn agent(id: u128, parent: Option<Uuid>, title: &str) -> AgentTreeRow {
 }
 
 #[test]
-fn automatic_priority_and_manual_selection_survive_updates_without_editor_focus_theft() {
+fn family_updates_preserve_editor_focus_and_never_expose_todo_or_shell_categories() {
     let console = fixture();
-    let shell = item("1.", "printf selected-shell", Some(TASK));
-    update(&console, vec![shell.clone()], vec![]);
-    assert!(
-        !frame(&console)
-            .iter()
-            .any(|row| row.contains("selected-shell"))
-    );
-    console
-        .set_agent_family(
-            vec![
-                agent(1, None, "Main · root"),
-                agent(2, Some(Uuid::from_u128(1)), "child unique"),
-            ],
-            Some(Uuid::from_u128(1)),
-        )
-        .unwrap();
-    let agents = frame(&console);
-    assert!(
-        agents.iter().any(|row| row.contains("child unique")),
-        "{agents:?}"
-    );
-    assert!(!agents.iter().any(|row| row.contains("selected-shell")));
+    let shell = item("1.", "shell unique", Some(TASK));
     update(
         &console,
         vec![shell.clone()],
         vec![item("1.", "todo unique", None)],
     );
-    let todo = frame(&console);
-    assert!(todo.iter().any(|row| row.contains("todo unique")));
-    assert!(!todo.iter().any(|row| row.contains("child unique")));
+    console
+        .set_agent_family(
+            vec![
+                agent(1, None, "Main unique"),
+                agent(2, Some(Uuid::from_u128(1)), "child unique"),
+            ],
+            Some(Uuid::from_u128(1)),
+        )
+        .unwrap();
     for character in "jk".chars() {
         key(&console, KeyCode::Char(character));
     }
-    key(&console, KeyCode::Down);
-    key(&console, KeyCode::Right);
-    key(&console, KeyCode::Right);
-    key(&console, KeyCode::Esc);
-    update(
-        &console,
-        vec![shell],
-        vec![item("1.", "newer todo must not take focus", None)],
-    );
-    let manual = frame(&console);
+    update(&console, vec![shell], vec![item("1.", "new todo", None)]);
+    let rendered = frame(&console);
+    assert!(rendered.iter().any(|row| row.contains("child unique")));
     assert!(
-        manual.iter().any(|row| row.contains("child unique")),
-        "{manual:?}"
-    );
-    assert!(
-        !manual
-            .iter()
-            .any(|row| row.contains("newer todo must not take focus"))
-    );
-    assert!(
-        manual
+        rendered
             .iter()
             .any(|row| row.contains("keep literal jk draftjk"))
     );
-    console.set_agent_family(vec![], None).unwrap();
-    update(&console, vec![], vec![item("1.", "fallback todo", None)]);
-    let fallback = frame(&console);
     assert!(
-        fallback.iter().any(|row| row.contains("fallback todo")),
-        "{fallback:?}"
-    );
-    assert!(
-        !fallback
+        !rendered
             .iter()
-            .any(|row| row.contains("Shell 0") || row.contains("Artifacts"))
+            .any(|row| row.contains("Todo ") || row.contains("Shell "))
     );
     assert!(console.state.lock().unwrap().footer.selected().is_none());
 }
 
 #[test]
-fn todo_detail_is_captured_read_only_and_returns_to_the_preserved_list_and_draft() {
+fn todos_follow_working_and_remain_when_idle_only_for_the_visible_agent() {
     let console = fixture();
-    let content = "Full Todo content contains user hash 0123456789abcdef and a second line\nSecond line stays available in details";
-    update(
-        &console,
-        vec![],
-        vec![item("1.", content, None), item("2.", "other item", None)],
-    );
-    key(&console, KeyCode::Down);
-    key(&console, KeyCode::Enter);
-    key(&console, KeyCode::Enter);
-    let detail = frame(&console);
-    assert!(
-        detail.iter().any(|row| row.contains("Todo item 1")),
-        "{detail:?}"
-    );
-    assert!(detail.iter().any(|row| row.contains("0123456789abcdef")));
-    assert!(
-        detail
-            .iter()
-            .any(|row| row.contains("Second line stays available"))
-    );
-    assert!(detail.iter().any(|row| row.contains("Read-only")));
-    update(
-        &console,
-        vec![],
-        vec![item("1.", "replacement must not reinterpret detail", None)],
-    );
-    let replaced = frame(&console);
-    assert!(
-        replaced
-            .iter()
-            .any(|row| row.contains("Second line stays available"))
-    );
-    assert!(
-        !replaced
-            .iter()
-            .any(|row| row.contains("replacement must not reinterpret"))
-    );
-    assert!(key(&console, KeyCode::Enter).is_none());
-    assert!(key(&console, KeyCode::Char('x')).is_none());
-    key(&console, KeyCode::Esc);
+    let mut pending = item("1.", "pending unique", None);
+    pending.state = "pending";
+    pending.role = Role::MutedText;
+    let active = item("2.", "active unique", None);
+    let mut done = item("3.", "completed unique", None);
+    done.state = "completed";
+    done.role = Role::Success;
+    update(&console, vec![], vec![pending, active, done]);
     assert!(
         frame(&console)
             .iter()
-            .any(|row| row.contains("replacement must not reinterpret"))
+            .any(|row| row.contains("pending unique"))
     );
-    key(&console, KeyCode::Esc);
-    key(&console, KeyCode::Char('j'));
+    console
+        .set_activity(Some(&[(
+            "Working (Esc to interrupt)".into(),
+            Some(Role::MutedText),
+        )]))
+        .unwrap();
+    let working = frame(&console);
+    let activity = working
+        .iter()
+        .position(|row| row.contains("Working (Esc"))
+        .unwrap();
+    assert!(
+        working[activity + 1].contains("pending unique"),
+        "{working:?}"
+    );
+    assert!(working[activity + 2].contains("active unique"));
+    assert!(working[activity + 3].contains("completed unique"));
+    assert!(!working.iter().any(|row| row.contains("Todo 3")));
+    console.activate_agent(Uuid::from_u128(99)).unwrap();
+    update(
+        &console,
+        vec![],
+        vec![item("1.", "child todo unique", None)],
+    );
+    console
+        .set_activity(Some(&[("Working child".into(), Some(Role::MutedText))]))
+        .unwrap();
+    let child = frame(&console);
+    assert!(child.iter().any(|row| row.contains("child todo unique")));
+    assert!(!child.iter().any(|row| row.contains("pending unique")));
+    console.activate_agent(CHAT).unwrap();
     assert!(
         frame(&console)
             .iter()
-            .any(|row| row.contains("keep literal jk draftj"))
+            .any(|row| row.contains("pending unique"))
+    );
+    console.set_activity(None).unwrap();
+    assert!(
+        frame(&console)
+            .iter()
+            .any(|row| row.contains("pending unique"))
     );
 }
 
@@ -536,82 +501,337 @@ fn core_status_floats_on_the_lower_divider_with_roles_and_preserved_fallback_not
 }
 
 #[test]
-fn core_status_position_moves_the_complete_styled_segment_and_preserves_fallback() {
-    use tickloop_agent::settings::StatusLinePosition;
+fn core_status_is_always_right_aligned_with_styled_content_and_fallback() {
     for mode in ["Auto", "Plan", "Ask", "Full Access"] {
         let console = fixture();
         console
             .update_status_area(mode.into(), "模型 fixture".into(), None, vec![], vec![])
             .unwrap();
-        let right = frame(&console);
-        let editor = right
+        let rendered = frame(&console);
+        let editor = rendered
             .iter()
             .position(|row| row.contains("keep literal jk draft"))
             .unwrap();
-        let core = right[editor + 1]
-            .trim_start_matches('─')
-            .trim_start()
-            .to_owned();
-        console
-            .set_display_preferences(DisplayPreferences {
-                status_line_position: StatusLinePosition::Left,
-                ..Default::default()
-            })
-            .unwrap();
-        let left = frame(&console);
-        assert_eq!(left.len(), right.len());
-        assert!(left[editor + 1].starts_with(&core), "{left:?}");
-        assert!(left[editor + 1].ends_with('─'));
-        assert_eq!(display_width(&left[editor + 1]), 79);
+        let divider = &rendered[editor + 1];
+        assert!(
+            divider.starts_with('─') && divider.ends_with("Context —"),
+            "{rendered:?}"
+        );
+        assert_eq!(display_width(divider), 79);
         let mut state = console.state.lock().unwrap();
         assert_eq!(state.editor.draft(), "keep literal jk draft");
         let (styled, _, _) = state.normal_styled_frame();
-        let styled_editor = styled
+        let core = styled
             .iter()
-            .position(|line| line.text().contains("keep literal jk draft"))
+            .find(|row| row.text().contains("Context —"))
             .unwrap();
-        assert_eq!(styled[styled_editor + 1].fill, None);
         assert!(
-            styled[styled_editor + 1]
-                .spans
+            core.spans
                 .iter()
                 .any(|span| span.text == "模型 fixture" && span.role == Some(Role::Text))
         );
-        for width in [24, display_width(&core) + 1, display_width(&core) + 2] {
-            state.resize((width + 1).try_into().unwrap(), 24);
-            let left_frame = state.frame().0;
-            state.display.set_preferences(DisplayPreferences::default());
-            let right_frame = state.frame().0;
-            if width == display_width(&core) + 2 {
-                assert!(
-                    left_frame
-                        .iter()
-                        .any(|line| line.starts_with(&core) && line.ends_with('─'))
-                );
-                assert!(
-                    right_frame
-                        .iter()
-                        .any(|line| line.starts_with('─') && line.ends_with(&core))
-                );
-            } else {
-                assert_eq!(left_frame, right_frame);
-            }
-            state.display.set_preferences(DisplayPreferences {
-                status_line_position: StatusLinePosition::Left,
-                ..Default::default()
-            });
-        }
+        state.resize(24, 24);
+        assert!(state.frame().0.iter().any(|row| row.starts_with("⏵⏵")));
         state.resize(80, 15);
-        let short_left = state.frame().0;
-        state.display.set_preferences(DisplayPreferences::default());
-        assert_eq!(short_left, state.frame().0);
+        assert!(state.frame().0.iter().any(|row| row.starts_with("⏵⏵")));
         state.resize(80, 24);
         state.configured_status_lines = Some(vec!["custom user status".into()]);
-        let custom_right = state.frame().0;
-        state.display.set_preferences(DisplayPreferences {
-            status_line_position: StatusLinePosition::Left,
-            ..Default::default()
-        });
-        assert_eq!(custom_right, state.frame().0);
+        let custom = state.frame().0;
+        assert!(custom.iter().any(|row| row.contains("custom user status")));
+        assert!(
+            !custom
+                .iter()
+                .any(|row| row.starts_with('─') && row.contains("⏵⏵"))
+        );
     }
+}
+
+#[test]
+fn agents_entry_is_on_lower_divider_and_family_is_expanded_by_default() {
+    let console = fixture();
+    update(&console, vec![], vec![]);
+    console
+        .set_agent_family(
+            vec![agent(1, None, "Main unique")],
+            Some(Uuid::from_u128(1)),
+        )
+        .unwrap();
+    assert!(
+        !frame(&console)
+            .iter()
+            .any(|row| row.contains("Agents 1") || row.contains("Main unique"))
+    );
+    console
+        .set_agent_family(
+            vec![
+                agent(1, None, "Main unique"),
+                agent(2, Some(Uuid::from_u128(1)), "child unique"),
+            ],
+            Some(Uuid::from_u128(1)),
+        )
+        .unwrap();
+    let rendered = frame(&console);
+    let editor = rendered
+        .iter()
+        .position(|row| row.contains("keep literal jk draft"))
+        .unwrap();
+    assert!(
+        rendered[editor + 1].contains("Agents 2")
+            && rendered[editor + 1].ends_with("Context 21% used"),
+        "{rendered:?}"
+    );
+    assert_eq!(
+        rendered
+            .iter()
+            .filter(|row| row.contains("Agents 2"))
+            .count(),
+        1
+    );
+    assert!(rendered.iter().any(|row| row.contains("child unique")));
+    for (width, height) in [(24, 24), (48, 24), (80, 15)] {
+        console.state.lock().unwrap().resize(width, height);
+        let fallback = frame(&console);
+        assert!(
+            fallback.iter().any(|row| row.contains("Agents 2")),
+            "{fallback:?}"
+        );
+        assert!(
+            fallback
+                .iter()
+                .all(|row| display_width(row) < usize::from(width))
+        );
+        key(&console, KeyCode::Down);
+        if height == 15 {
+            let focused = frame(&console);
+            assert!(
+                focused.iter().any(|row| row.contains("Enter/Space hide")),
+                "{focused:?}"
+            );
+            assert!(
+                !focused.iter().any(|row| row.contains("Enter list")),
+                "{focused:?}"
+            );
+        }
+        key(&console, KeyCode::Enter);
+        assert!(
+            !frame(&console)
+                .iter()
+                .any(|row| row.contains("child unique"))
+        );
+        key(&console, KeyCode::Char(' '));
+        key(&console, KeyCode::Esc);
+    }
+}
+
+#[test]
+fn agents_divider_toggle_uses_mouse_hitbox_and_focused_enter_space_without_reopening_on_update() {
+    let console = fixture();
+    update(&console, vec![], vec![]);
+    let family = vec![
+        agent(1, None, "Main unique"),
+        agent(2, Some(Uuid::from_u128(1)), "child unique"),
+    ];
+    console
+        .set_agent_family(family.clone(), Some(Uuid::from_u128(1)))
+        .unwrap();
+    frame(&console);
+    let click = |column| {
+        let mut state = console.state.lock().unwrap();
+        let row = state.footer_bar_target.as_ref().unwrap().row;
+        state.pointer(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row: row as u16,
+                modifiers: KeyModifiers::NONE,
+            },
+            &mut io::sink(),
+        );
+    };
+    click(5);
+    assert!(
+        !frame(&console)
+            .iter()
+            .any(|row| row.contains("child unique"))
+    );
+    console
+        .set_agent_family(family, Some(Uuid::from_u128(1)))
+        .unwrap();
+    update(&console, vec![], vec![]);
+    assert!(
+        !frame(&console)
+            .iter()
+            .any(|row| row.contains("child unique"))
+    );
+    console.activate_agent(Uuid::from_u128(98)).unwrap();
+    console.activate_agent(CHAT).unwrap();
+    assert!(
+        !frame(&console)
+            .iter()
+            .any(|row| row.contains("child unique")),
+        "switching Agent keeps this View collapsed"
+    );
+    click(12);
+    assert!(
+        !frame(&console)
+            .iter()
+            .any(|row| row.contains("child unique")),
+        "outside the entry must not toggle"
+    );
+    key(&console, KeyCode::Esc);
+    key(&console, KeyCode::Down);
+    assert!(
+        frame(&console)
+            .iter()
+            .any(|row| row.contains("Enter/Space expand"))
+    );
+    key(&console, KeyCode::Enter);
+    assert!(
+        frame(&console)
+            .iter()
+            .any(|row| row.contains("child unique"))
+    );
+    key(&console, KeyCode::Char(' '));
+    assert!(
+        !frame(&console)
+            .iter()
+            .any(|row| row.contains("child unique"))
+    );
+    key(&console, KeyCode::Char(' '));
+    key(&console, KeyCode::Down);
+    assert!(matches!(
+        key(&console, KeyCode::Enter),
+        Some(InputEvent::OpenAgent(_))
+    ));
+    key(&console, KeyCode::Esc);
+    assert!(!console.state.lock().unwrap().footer_list_focused);
+    key(&console, KeyCode::Esc);
+    key(&console, KeyCode::Char('j'));
+    assert!(
+        frame(&console)
+            .iter()
+            .any(|row| row.contains("keep literal jk draftj"))
+    );
+}
+
+#[test]
+fn modified_enter_cannot_focus_or_activate_a_collapsed_agents_list() {
+    for modifiers in [
+        KeyModifiers::SHIFT,
+        KeyModifiers::ALT,
+        KeyModifiers::CONTROL,
+    ] {
+        let console = fixture();
+        update(&console, vec![], vec![]);
+        console
+            .set_agent_family(
+                vec![
+                    agent(1, None, "Main unique"),
+                    agent(2, Some(Uuid::from_u128(1)), "child unique"),
+                ],
+                Some(Uuid::from_u128(1)),
+            )
+            .unwrap();
+        key(&console, KeyCode::Down);
+        key(&console, KeyCode::Enter);
+        assert!(
+            !frame(&console)
+                .iter()
+                .any(|row| row.contains("child unique"))
+        );
+        let event = console
+            .state
+            .lock()
+            .unwrap()
+            .key(KeyEvent::new(KeyCode::Enter, modifiers));
+        assert!(event.is_none());
+        assert!(
+            !console.state.lock().unwrap().footer_list_focused,
+            "{modifiers:?}"
+        );
+        for code in [KeyCode::Down, KeyCode::Char('j'), KeyCode::PageDown] {
+            assert!(key(&console, code).is_none());
+            assert!(!console.state.lock().unwrap().footer_list_focused);
+        }
+        let hidden = frame(&console);
+        assert!(
+            !hidden
+                .iter()
+                .any(|row| row.contains("Enter open") || row.contains("child unique"))
+        );
+        assert!(key(&console, KeyCode::Enter).is_none());
+        assert!(
+            frame(&console)
+                .iter()
+                .any(|row| row.contains("child unique"))
+        );
+        key(&console, KeyCode::Down);
+        assert!(matches!(
+            key(&console, KeyCode::Enter),
+            Some(InputEvent::OpenAgent(_))
+        ));
+    }
+}
+
+#[test]
+fn todos_use_claude_status_marks_styles_and_width_ellipsis() {
+    let console = fixture();
+    let mut pending = item("1.", "pending mark", None);
+    pending.state = "pending";
+    let mut done = item("3.", "completed mark", None);
+    done.state = "completed";
+    update(
+        &console,
+        vec![],
+        vec![pending, item("2.", &"active mark ".repeat(20), None), done],
+    );
+    let rows = frame(&console);
+    assert!(
+        rows.iter().any(|row| row.contains("◻ pending mark")),
+        "{rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("◼ active mark") && row.ends_with('…')),
+        "{rows:?}"
+    );
+    assert!(rows.iter().any(|row| row.contains("✔ completed mark")));
+    let mut bytes = Vec::new();
+    let mut state = console.state.lock().unwrap();
+    state.rendered_region = None;
+    state.draw(&mut bytes).unwrap();
+    let ansi = String::from_utf8(bytes).unwrap();
+    assert!(
+        ansi.contains("\x1b[9m"),
+        "completed text must keep its strike decoration: {ansi:?}"
+    );
+}
+
+#[test]
+fn question_mark_help_matches_agents_focus_layers_and_tick_list_shells() {
+    let mut state = State::new(true, 160, 40);
+    state.prompt_enabled = true;
+    state.chat = Some(CHAT);
+    let console = tests::console_with_state(state);
+    key(&console, KeyCode::Char('?'));
+    let help = frame(&console).join("\n");
+    for hint in [
+        "↓ Agents entry",
+        "Enter/Space toggle",
+        "↓ Agent list",
+        "Enter open Agent",
+        "Space fold descendants",
+        "Esc list → entry → input",
+        "Shift+↑/↓ Tick List Shells",
+    ] {
+        assert!(help.contains(hint), "missing {hint}: {help}");
+    }
+    assert!(!help.contains("tasks / children"));
+    key(&console, KeyCode::Esc);
+    key(&console, KeyCode::Char('j'));
+    assert!(
+        frame(&console)
+            .iter()
+            .any(|row| row.starts_with('❯') && row.contains('j'))
+    );
 }

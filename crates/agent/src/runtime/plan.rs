@@ -233,8 +233,18 @@ impl TodoWriteInput {
                 }
             }
         }
-        Ok(parsed.todos)
+        Ok(clear_finished_todo_list(parsed.todos))
     }
+}
+
+fn clear_finished_todo_list(mut todos: Vec<TodoItem>) -> Vec<TodoItem> {
+    if todos
+        .iter()
+        .all(|todo| todo.status == TodoStatus::Completed)
+    {
+        todos.clear();
+    }
+    todos
 }
 
 /// 计划文件中的计划内容，以及宿主提交计划时写出的版本行。
@@ -591,7 +601,7 @@ pub(super) fn rebuild_plans_and_progress(
                 *versions.entry(loop_id).or_default() += 1;
             }
             Change::Progress(todos) => {
-                progress.insert(loop_id, todos);
+                progress.insert(loop_id, clear_finished_todo_list(todos));
             }
         }
     }

@@ -44,9 +44,15 @@ struct PrivateFixture {
 
 impl PrivateFixture {
     fn new() -> Self {
+        use std::os::unix::fs::PermissionsExt;
         let directory = tempfile::tempdir_in("/tmp").unwrap();
-        for name in ["config", "home", "work", "scratch"] {
+        for name in ["config", "home", "runtime", "work", "scratch"] {
             std::fs::create_dir(directory.path().join(name)).unwrap();
+            std::fs::set_permissions(
+                directory.path().join(name),
+                std::fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
         }
         let mut model = support::config();
         model.api_key_env = "TICKLOOP_FIXTURE_API_KEY".into();

@@ -48,7 +48,6 @@ const CONTEXT_WINDOW_KEY: &str = "contextWindowTokens";
 const GLYPH_SET_KEY: &str = "glyphSet";
 const PREFERS_REDUCED_MOTION_KEY: &str = "prefersReducedMotion";
 const TICK_LIST_KEY: &str = "tickList";
-const STATUS_LINE_POSITION_KEY: &str = "statusLinePosition";
 /// Claude Code's `outputStyle` setting.
 const OUTPUT_STYLE_KEY: &str = "outputStyle";
 /// 照 Claude Code `cleanupPeriodDays`：保留对话记录等文件的天数；0 表示不写 Transcript。
@@ -204,28 +203,10 @@ impl GlyphSet {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum StatusLinePosition {
-    Left,
-    #[default]
-    Right,
-}
-
-impl StatusLinePosition {
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Left => "Left",
-            Self::Right => "Right",
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct DisplayPreferences {
     pub glyph_set: GlyphSet,
     pub prefers_reduced_motion: bool,
-    pub status_line_position: StatusLinePosition,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -440,23 +421,9 @@ impl LoadedSettings {
                 })
             })
             .unwrap_or(false);
-        let status_line_position = self
-            .settings
-            .get(STATUS_LINE_POSITION_KEY)
-            .cloned()
-            .map(|value| {
-                serde_json::from_value(value).unwrap_or_else(|error| {
-                    self.warn(format!(
-                        "`{STATUS_LINE_POSITION_KEY}` is not `left` or `right` and is ignored ({error})"
-                    ));
-                    StatusLinePosition::default()
-                })
-            })
-            .unwrap_or_default();
         DisplayPreferences {
             glyph_set,
             prefers_reduced_motion,
-            status_line_position,
         }
     }
 
@@ -1620,11 +1587,6 @@ impl UserSettings {
             settings.insert(
                 PREFERS_REDUCED_MOTION_KEY.into(),
                 preferences.prefers_reduced_motion.into(),
-            );
-            settings.insert(
-                STATUS_LINE_POSITION_KEY.into(),
-                serde_json::to_value(preferences.status_line_position)
-                    .expect("status line position serializes to JSON"),
             );
             Ok(())
         })

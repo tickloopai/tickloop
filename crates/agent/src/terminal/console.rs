@@ -22,7 +22,7 @@ use tickloop_agent::{
         ImageContext, ImageOrigin, InputContext, QueuedInput, QueuedInputKind,
         TickSubscriptionStatus,
     },
-    settings::{DisplayPreferences, StatusLinePosition},
+    settings::DisplayPreferences,
 };
 use tokio::sync::mpsc;
 use unicode_width::UnicodeWidthChar;
@@ -635,7 +635,6 @@ struct State {
     tick_list_preference: tickloop_agent::settings::TickListPreference,
     task_surface: Option<TaskSurface<Uuid>>,
     task_surface_cache: HashMap<Uuid, TaskSurface<Uuid>>,
-    todo_detail: Option<TodoDetail>,
     subscription_surface: Option<SubscriptionSurface>,
     permissions_surface: Option<PermissionsSurface>,
     footer: FooterState,
@@ -854,12 +853,6 @@ struct FooterOpenPending {
 struct BackToBottomTarget {
     row: usize,
     columns: std::ops::Range<usize>,
-}
-
-struct TodoDetail {
-    ordinal: usize,
-    item: StatusItem,
-    offset: usize,
 }
 
 struct FooterBarTarget {
@@ -1786,7 +1779,6 @@ impl Console {
             && state.menu.is_none()
             && state.transcript.is_none()
             && state.task_surface.is_none()
-            && state.todo_detail.is_none()
             && state.diff_screen.is_none()
             && state.subscription_surface.is_none()
             && state.permissions_surface.is_none()
@@ -1891,6 +1883,15 @@ impl Console {
 
     pub(super) fn conversation_width(&self) -> Result<usize, String> {
         Ok(self.state.lock().map_err(|error| error.to_string())?.width)
+    }
+
+    pub(super) fn todo_refresh_pending(&self) -> Result<bool, String> {
+        Ok(self
+            .state
+            .lock()
+            .map_err(|error| error.to_string())?
+            .status_area
+            .todo_refresh_pending())
     }
 
     pub(super) fn has_visible_running_task(&self) -> Result<bool, String> {
@@ -2388,7 +2389,7 @@ impl Console {
             effect = surface.apply(TaskSurfaceAction::Back, viewport);
         }
         state.task_surface = Some(surface);
-        state.todo_detail = None;
+
         state.hide_subscription_view();
         state.permissions_surface = None;
         state.clear_footer_selection();
@@ -3569,7 +3570,6 @@ impl Console {
                         state.menu_focused
                             && state.menu_is_visible()
                             && state.task_surface.is_none()
-                            && state.todo_detail.is_none()
                             && state.subscription_surface.is_none()
                             && state.transcript.is_none()
                             && state.diff_screen.is_none()
@@ -4430,7 +4430,7 @@ impl State {
         self.activity_interruptible = false;
         self.back_to_bottom_target = None;
         self.back_to_bottom_pressed = false;
-        self.todo_detail = None;
+
         self.hide_task_surface();
         self.status_area.release_panel();
         let previous_chat = self.chat;
@@ -4466,7 +4466,8 @@ impl State {
         self.rendered_region = None;
     }
 
-    fn replace_view(&mut self, next: ViewPresentation) -> ViewPresentation {
+    fn replace_view(&mut self, mut next: ViewPresentation) -> ViewPresentation {
+        next.status_area.agents_collapsed = self.status_area.agents_collapsed;
         ViewPresentation {
             tick_list: std::mem::replace(&mut self.tick_list, next.tick_list),
             scrollback: std::mem::replace(&mut self.scrollback, next.scrollback),
@@ -4680,7 +4681,6 @@ impl State {
             tick_list_preference: tickloop_agent::settings::TickListPreference::Auto,
             task_surface: None,
             task_surface_cache: HashMap::new(),
-            todo_detail: None,
             subscription_surface: None,
             permissions_surface: None,
             footer: FooterState::default(),
@@ -4804,16 +4804,20 @@ impl State {
                 });
                 if let Some(panel) = category {
                     self.clear_selection();
-                    if self.todo_detail.is_some() || self.task_surface.is_some() {
+                    if self.task_surface.is_some() {
                         if self.status_area.selected_panel() == Some(panel) {
                             return true;
                         }
-                        self.todo_detail = None;
+
                         self.hide_task_surface();
                         self.status_area.release_panel();
                     }
                     self.footer.select(panel);
-                    self.status_area.select(panel);
+                    if panel == FooterItemId::Agents {
+                        self.status_area.toggle_agents();
+                    } else {
+                        self.status_area.select(panel);
+                    }
                     self.footer_list_focused = panel == FooterItemId::Tasks;
                     if panel == FooterItemId::Tasks
                         && let Some(task_id) = self.status_area.single_task()
@@ -4849,7 +4853,6 @@ impl State {
     fn scroll_conversation(&mut self, action: ScrollAction) -> bool {
         if self.transcript.is_some()
             || self.task_surface.is_some()
-            || self.todo_detail.is_some()
             || self.subscription_surface.is_some()
             || self.diff_screen.is_some()
         {
@@ -5190,34 +5193,6 @@ impl State {
         if let Some(surface) = &mut self.subscription_surface {
             let lines = subscription_surface_lines(surface, panel_content_rows, self.display);
             return self.draw_bottom_panel(output, lines);
-        }
-        if let Some(detail) = &mut self.todo_detail {
-            let width = task_surface_content_width(self.width);
-            let capacity = panel_content_rows.saturating_sub(3).max(1);
-            let content = wrap_text(&detail.item.title, width);
-            detail.offset = detail.offset.min(content.len().saturating_sub(capacity));
-            let mut lines = self.status_area.panel_lines_with_rows(
-                &self.footer.frame(),
-                width,
-                1,
-                self.display,
-            );
-            let mut title = RoleLine::role(format!("Todo item {} · ", detail.ordinal), Role::Text);
-            title.push(detail.item.state, Some(detail.item.role));
-            lines.push(title);
-            lines.extend(
-                content
-                    .into_iter()
-                    .skip(detail.offset)
-                    .take(capacity)
-                    .map(|line| RoleLine::role(line, Role::Text)),
-            );
-            lines.push(RoleLine::role(
-                "Read-only · j/k scroll · Esc list",
-                Role::MutedText,
-            ));
-            lines.truncate(panel_content_rows.max(1));
-            return self.draw_panel_lines(output, lines, true, true);
         }
         if let Some(surface) = &mut self.task_surface {
             let from_footer = self.task_footer_return;
@@ -5567,6 +5542,15 @@ impl State {
     /// Builds the fixed rows below the conversation, each row carrying the
     /// roles its parts play so the writer can apply the active theme.
     fn styled_frame(&mut self) -> (Vec<RoleLine>, usize, usize) {
+        let todo_columns = self.content_columns();
+        let todo_lines = self.status_area.todo_lines(
+            todo_columns,
+            self.height,
+            self.display,
+            self.scrollback.activity_line().is_some(),
+            Instant::now(),
+        );
+        self.scrollback.set_activity_details(todo_lines);
         if let Some(dialog) = &self.workspace_trust {
             let frame = dialog.frame(self.width, self.height, self.display);
             let (row, column) = frame.cursor.unwrap_or_default();
@@ -6624,8 +6608,33 @@ impl State {
         if !self.footer_list_focused && !short {
             footer.selected = None;
         }
+        let mut agents_entry = (!short
+            && self.footer_items_are_visible()
+            && footer
+                .items
+                .iter()
+                .any(|item| item.id == FooterItemId::Agents))
+        .then(|| {
+            format!(
+                " {} {} ",
+                self.display.glyph(if self.status_area.agents_collapsed {
+                    Glyph::Collapsed
+                } else {
+                    Glyph::Expanded
+                }),
+                self.status_area.header_label(FooterItemId::Agents)
+            )
+        })
+        .filter(|label| display_width(label) + 2 <= self.width);
+        let mut agents_entry_width = agents_entry
+            .as_ref()
+            .map_or(0, |label| display_width(label));
         let mut panel_rows = if !overview && !self.help_open && self.footer_items_are_visible() {
-            self.status_area.row_count(self.height).max(1)
+            if agents_entry.is_some() && !self.status_area.is_open() {
+                0
+            } else {
+                self.status_area.row_count(self.height).max(1)
+            }
         } else {
             0
         };
@@ -6698,6 +6707,15 @@ impl State {
             && configured_status.is_none()
             && self.status_area.is_configured()
             && display_width(&core_status.text()) + 2 <= self.width;
+        if float_core_status
+            && display_width(&core_status.text()) + agents_entry_width + 2 > self.width
+        {
+            agents_entry = None;
+            agents_entry_width = 0;
+            if !overview && !self.help_open && self.footer_items_are_visible() {
+                panel_rows = self.status_area.row_count(self.height).max(1);
+            }
+        }
         let mut status_rows = if self.help_open {
             usize::from(!leading_notice.is_empty() || required_status)
         } else {
@@ -6900,29 +6918,36 @@ impl State {
         } else {
             vec![RoleLine::default()]
         });
+        let mut agents_divider_row = None;
         if borders > 1 {
-            let mut divider = RoleLine::role(
-                "─".repeat(if float_core_status {
-                    self.width
-                        .saturating_sub(display_width(&core_status.text()) + 1)
-                } else {
-                    self.width
-                }),
-                border,
+            let mut divider = RoleLine::default();
+            if let Some(label) = &agents_entry {
+                agents_divider_row = Some(lines.len());
+                divider.push(
+                    label,
+                    Some(if self.footer.selected() == Some(FooterItemId::Agents) {
+                        Role::Suggestion
+                    } else if self.status_area.agents_collapsed {
+                        Role::MutedText
+                    } else {
+                        Role::Permission
+                    }),
+                );
+            }
+            divider.push(
+                "─".repeat(self.width.saturating_sub(
+                    agents_entry_width
+                        + if float_core_status {
+                            display_width(&core_status.text()) + 1
+                        } else {
+                            0
+                        },
+                )),
+                Some(border),
             );
             if float_core_status {
-                match self.display.preferences().status_line_position {
-                    StatusLinePosition::Right => {
-                        divider.push(" ", None);
-                        divider.spans.extend(core_status.spans);
-                    }
-                    StatusLinePosition::Left => {
-                        let rule_spans = divider.spans;
-                        divider.spans = core_status.spans;
-                        divider.push(" ", None);
-                        divider.spans.extend(rule_spans);
-                    }
-                }
+                divider.push(" ", None);
+                divider.spans.extend(core_status.spans);
             }
             lines.push(divider);
         }
@@ -7037,10 +7062,12 @@ impl State {
                             "Shell running · Ctrl+B background · Ctrl+C stop"
                         } else if let Some(selected) = self.footer.selected() {
                             match (self.footer_list_focused, selected) {
+                                (false, FooterItemId::Agents) if self.status_area.agents_collapsed => "Enter/Space expand · Esc input",
+                                (false, FooterItemId::Agents) => "Enter/Space hide · ↓ list · Esc input",
                                 (false, _) => "Enter list · Esc input",
                                 (true, FooterItemId::Tasks) => "Enter details · Esc input",
-                                (true, FooterItemId::Agents) => "Enter open · Esc input",
-                                (true, FooterItemId::Todo) => "Enter details · Esc input",
+                                (true, FooterItemId::Agents) => "Enter open · Space fold · Esc entry",
+
                             }
                         } else if float_core_status {
                             ""
@@ -7118,6 +7145,7 @@ impl State {
                 if short
                     && panel_rows == 1
                     && footer.selected.is_some()
+                    && self.footer_list_focused
                     && self.status_area.is_open()
                 {
                     lines.extend(
@@ -7129,8 +7157,14 @@ impl State {
                     );
                 } else {
                     footer_bar_row = Some(lines.len());
+                    let mut panel_footer = footer.clone();
+                    if agents_entry.is_some() {
+                        panel_footer
+                            .items
+                            .retain(|item| item.id != FooterItemId::Agents);
+                    }
                     lines.extend(self.status_area.panel_lines_with_rows(
-                        &footer,
+                        &panel_footer,
                         self.width,
                         panel_rows,
                         self.display,
@@ -7173,11 +7207,17 @@ impl State {
             row: self.height.saturating_sub(lines.len()) + row,
             columns,
         });
-        self.footer_bar_target = footer_bar_row.map(|row| FooterBarTarget {
-            row: self.height.saturating_sub(lines.len()) + row,
-            inset: 0,
-            categories: self.status_area.panel_targets(&footer, self.width),
-        });
+        self.footer_bar_target = agents_divider_row
+            .or(footer_bar_row)
+            .map(|row| FooterBarTarget {
+                row: self.height.saturating_sub(lines.len()) + row,
+                inset: 0,
+                categories: if agents_divider_row.is_some() {
+                    vec![(0..agents_entry_width, FooterItemId::Agents)]
+                } else {
+                    self.status_area.panel_targets(&footer, self.width)
+                },
+            });
         (
             lines,
             cursor_row.min(cap.saturating_sub(1)),
@@ -7863,7 +7903,6 @@ impl State {
             && self.transcript.is_none()
             && self.diff_screen.is_none()
             && self.task_surface.is_none()
-            && self.todo_detail.is_none()
             && self.subscription_surface.is_none()
             && !self.foreground_shell
             && self.shell_input.kind() == InputKind::Prompt
@@ -7938,7 +7977,7 @@ impl State {
         match effect {
             FooterEffect::None
             | FooterEffect::ReturnToEditor
-            | FooterEffect::Open(FooterItemId::Todo | FooterItemId::Agents) => None,
+            | FooterEffect::Open(FooterItemId::Agents) => None,
             FooterEffect::Open(item) => {
                 self.footer_open_pending = Some(FooterOpenPending {
                     item,
@@ -7973,7 +8012,27 @@ impl State {
     }
 
     fn footer_key(&mut self, key: KeyEvent) -> Option<Option<InputEvent>> {
+        if !self.status_area.is_open() {
+            self.footer_list_focused = false;
+        }
+        if self.footer.selected() == Some(FooterItemId::Agents) {
+            if key.code == KeyCode::Enter && key.modifiers != KeyModifiers::NONE {
+                return Some(None);
+            }
+            if !self.footer_list_focused
+                && key.modifiers == KeyModifiers::NONE
+                && matches!(key.code, KeyCode::Enter | KeyCode::Char(' '))
+            {
+                self.status_area.toggle_agents();
+                return Some(None);
+            }
+            if self.footer_list_focused && key.code == KeyCode::Esc {
+                self.footer_list_focused = false;
+                return Some(None);
+            }
+        }
         if self.status_area.is_configured()
+            && self.status_area.is_open()
             && let Some(selected) = self.footer.selected()
         {
             let amount = match (key.code, key.modifiers) {
@@ -7986,7 +8045,7 @@ impl State {
             if let Some(amount) = amount {
                 if !self.footer_list_focused {
                     if amount > 0 {
-                        self.footer_list_focused = true;
+                        self.footer_list_focused = self.status_area.is_open();
                     } else {
                         self.apply_footer_action(FooterAction::Clear);
                     }
@@ -7997,9 +8056,6 @@ impl State {
                     match selected {
                         FooterItemId::Tasks => {
                             self.status_area.move_task_selection(amount, capacity)
-                        }
-                        FooterItemId::Todo => {
-                            self.status_area.move_todo_selection(amount, capacity)
                         }
                         FooterItemId::Agents => {
                             self.status_area.move_agent_selection(amount, capacity)
@@ -8019,18 +8075,6 @@ impl State {
             }
             if key.code == KeyCode::Enter && selected == FooterItemId::Agents {
                 return Some(self.status_area.selected_agent().map(InputEvent::OpenAgent));
-            }
-            if key.code == KeyCode::Enter && selected == FooterItemId::Todo {
-                if let Some((index, item)) = self.status_area.selected_todo() {
-                    self.todo_detail = Some(TodoDetail {
-                        ordinal: index + 1,
-                        item: item.clone(),
-                        offset: 0,
-                    });
-                    self.status_area.pin_panel();
-                    self.rendered_region = None;
-                }
-                return Some(None);
             }
             if key.code == KeyCode::Char(' ')
                 && selected == FooterItemId::Agents
@@ -8064,6 +8108,8 @@ impl State {
             _ => None,
         };
         if self.status_area.is_configured()
+            && self.status_area.is_open()
+            && self.footer_list_focused
             && let Some(amount) = scroll
         {
             let capacity = self.status_area.row_count(self.height).saturating_sub(1);
@@ -8333,43 +8379,6 @@ impl State {
         InputEvent::OpenStatusTask(task_id)
     }
 
-    fn todo_detail_key(&mut self, key: KeyEvent) {
-        if matches!(key.code, KeyCode::Esc | KeyCode::Left) {
-            self.todo_detail = None;
-            self.status_area.release_panel();
-            let panels = self.status_area.available_panels().collect::<Vec<_>>();
-            self.footer.update(panels);
-            self.footer.select(FooterItemId::Todo);
-            self.footer_list_focused = self.footer.selected() == Some(FooterItemId::Todo);
-            return;
-        }
-        let Some(detail) = &mut self.todo_detail else {
-            return;
-        };
-        let amount = match (key.code, key.modifiers) {
-            (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE)
-            | (KeyCode::Char('n'), KeyModifiers::CONTROL) => 1,
-            (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE)
-            | (KeyCode::Char('p'), KeyModifiers::CONTROL) => -1,
-            (KeyCode::PageDown, _) => task_surface_panel_height(self.height) as isize,
-            (KeyCode::PageUp, _) => -(task_surface_panel_height(self.height) as isize),
-            (KeyCode::Home, _) => {
-                detail.offset = 0;
-                return;
-            }
-            (KeyCode::End, _) => {
-                detail.offset = usize::MAX;
-                return;
-            }
-            _ => return,
-        };
-        let rows = wrap_text(&detail.item.title, task_surface_content_width(self.width));
-        detail.offset = detail
-            .offset
-            .saturating_add_signed(amount)
-            .min(rows.len().saturating_sub(1));
-    }
-
     /// Handles the keys a question menu adds; `Some` carries the event for a handled key.
     fn question_menu_key(&mut self, key: KeyEvent) -> Option<Option<InputEvent>> {
         let (entry_option, multi_select, navigable) =
@@ -8622,10 +8631,7 @@ impl State {
             surface.paste(text);
             return;
         }
-        if self.task_surface.is_some()
-            || self.todo_detail.is_some()
-            || self.subscription_surface.is_some()
-        {
+        if self.task_surface.is_some() || self.subscription_surface.is_some() {
             return;
         }
         if let Some((_, transcript)) = &mut self.transcript {
@@ -9288,7 +9294,6 @@ impl State {
             && self.conversation_picker.is_none()
             && self.transcript.is_none()
             && self.task_surface.is_none()
-            && self.todo_detail.is_none()
             && self.diff_screen.is_none()
             && self.subscription_surface.is_none()
             && self.permissions_surface.is_none()
@@ -9561,7 +9566,6 @@ impl State {
         if self.menu.is_none()
             && self.transcript.is_none()
             && self.task_surface.is_none()
-            && self.todo_detail.is_none()
             && self.diff_screen.is_none()
             && self.subscription_surface.is_none()
             && self.permissions_surface.is_none()
@@ -9649,7 +9653,6 @@ impl State {
                 || self.menu.is_some()
                 || self.diff_screen.is_some()
                 || self.task_surface.is_some()
-                || self.todo_detail.is_some()
                 || self.subscription_surface.is_some()
                 || self.permissions_surface.is_some()
                 || self.transcript.is_some()
@@ -9701,11 +9704,6 @@ impl State {
                 }
                 effect => Some(InputEvent::Permissions(effect)),
             };
-        }
-        if self.todo_detail.is_some() {
-            self.escape_confirmation = None;
-            self.todo_detail_key(key);
-            return None;
         }
         if self.task_surface.is_some() {
             self.escape_confirmation = None;
@@ -15771,6 +15769,7 @@ mod tests {
                         role: Role::MutedText,
                     }],
                 );
+                super::layout_tests::set_status_family(&mut state.status_area);
                 state.insert("preserved draft");
                 let cursor = state.editor.cursor();
                 state.scrollback.append(
@@ -15790,7 +15789,7 @@ mod tests {
                     }
                     "footer" => {
                         assert!(state.key(key(KeyCode::Down)).is_none());
-                        assert_eq!(state.footer.selected(), Some(FooterItemId::Todo));
+                        assert_eq!(state.footer.selected(), Some(FooterItemId::Agents));
                     }
                     "conversation" => {
                         assert!(state.key(key(KeyCode::PageUp)).is_none());
@@ -16999,25 +16998,23 @@ mod tests {
         let mut state = State::new(true, 80, 24);
         state.prompt_enabled = true;
         state
-            .footer
-            .update([FooterItemId::Tasks, FooterItemId::Todo]);
-
+            .status_area
+            .update("Auto".into(), "fixture".into(), None, vec![], vec![]);
+        super::layout_tests::set_status_family(&mut state.status_area);
+        state.footer.update(state.status_area.available_panels());
         let (lines, input_row, _) = state.frame();
-        assert_eq!(lines.last().unwrap(), "  Shell    Todo");
-        assert_eq!(input_row, lines.len() - 4);
-        assert!(lines[lines.len() - 2].contains("Ctrl+O details"));
-
+        assert!(lines[input_row].starts_with('❯'));
+        assert!(lines[input_row + 1].contains("Agents 20"));
         state.key(key(KeyCode::Down));
-        assert_eq!(state.footer.selected(), Some(FooterItemId::Tasks));
+        assert_eq!(state.footer.selected(), Some(FooterItemId::Agents));
         state.height = MIN_FOOTER_ITEMS_TERMINAL_ROWS - 1;
         let lines = state.frame().0;
-        assert!(lines.iter().all(|line| !line.contains("Shell")));
+        assert!(lines.iter().all(|line| !line.contains("Agents 20")));
         assert_eq!(state.footer.selected(), None);
-
         state.height = 24;
-        state.width = display_width("  Shell    Todo") - 1;
+        state.width = 23;
         let lines = state.frame().0;
-        assert!(lines.iter().any(|line| line.contains("Shell")));
+        assert!(lines.iter().any(|line| line.contains("Agents 20")));
         assert!(lines.iter().all(|line| display_width(line) <= state.width));
         assert_eq!(state.footer.selected(), None);
     }
@@ -17028,7 +17025,7 @@ mod tests {
         state.prompt_enabled = true;
         state
             .footer
-            .update([FooterItemId::Tasks, FooterItemId::Todo]);
+            .update([FooterItemId::Tasks, FooterItemId::Agents]);
         state.insert("first line\nlast line");
         set_cursor(&mut state, 0);
 
@@ -17064,7 +17061,7 @@ mod tests {
         state.prompt_enabled = true;
         state
             .footer
-            .update([FooterItemId::Tasks, FooterItemId::Todo]);
+            .update([FooterItemId::Tasks, FooterItemId::Agents]);
         state.paste("first\nsecond\nthird\nfourth");
         set_cursor(&mut state, 0);
 
@@ -17084,7 +17081,7 @@ mod tests {
         state.prompt_enabled = true;
         state
             .footer
-            .update([FooterItemId::Tasks, FooterItemId::Todo]);
+            .update([FooterItemId::Tasks, FooterItemId::Agents]);
         state.insert("Unicode 草稿");
         let draft = state.editor.draft().to_owned();
         let cursor = state.editor.cursor();
@@ -17092,11 +17089,11 @@ mod tests {
         state.key(key(KeyCode::Down));
         assert_eq!(state.footer.selected(), Some(FooterItemId::Tasks));
         state.key(key(KeyCode::Right));
-        assert_eq!(state.footer.selected(), Some(FooterItemId::Todo));
+        assert_eq!(state.footer.selected(), Some(FooterItemId::Agents));
         state.key(key(KeyCode::Char('h')));
         assert_eq!(state.footer.selected(), Some(FooterItemId::Tasks));
         state.key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
-        assert_eq!(state.footer.selected(), Some(FooterItemId::Todo));
+        assert_eq!(state.footer.selected(), Some(FooterItemId::Agents));
         state.key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
         assert_eq!(state.footer.selected(), Some(FooterItemId::Tasks));
 
@@ -17136,11 +17133,12 @@ mod tests {
                 role: Role::MutedText,
             }],
         );
+        super::layout_tests::set_status_family(&mut state.status_area);
         state.footer.update(state.status_area.available_panels());
         state.key(key(KeyCode::Down));
         state.key(key(KeyCode::Right));
         let frame = state.frame().0;
-        assert!(frame.iter().any(|row| row.contains("review results")));
+        assert!(frame.iter().any(|row| row.contains("task 00")));
         assert!(!frame.iter().any(|row| row.contains("cargo test")));
         assert!(state.key(key(KeyCode::Esc)).is_none());
         assert_eq!(state.editor.draft(), draft);
@@ -17241,83 +17239,37 @@ mod tests {
     }
 
     #[test]
-    fn status_panels_stay_visible_when_focus_returns_to_the_editor() {
+    fn agents_panel_keeps_its_visibility_when_focus_returns_to_the_editor() {
         let mut state = State::new(true, 80, 24);
         state.prompt_enabled = true;
         state.insert("preserved draft");
-        let draft = state.editor.draft().to_owned();
         let cursor = state.editor.cursor();
-        let task = StatusItem {
-            id: "sh-1".into(),
-            task_id: Some(Uuid::from_u128(1)),
-            can_stop: true,
-            title: "sleep 60".into(),
-            state: "running",
-            role: Role::Success,
-        };
-        let todo = StatusItem {
-            id: "1.".into(),
-            task_id: None,
-            can_stop: false,
-            title: "review".into(),
-            state: "pending",
-            role: Role::MutedText,
-        };
         state
             .status_area
-            .update("Auto".into(), "model".into(), None, vec![task], vec![todo]);
-        state
-            .footer
-            .update([FooterItemId::Tasks, FooterItemId::Todo]);
-
-        assert!(state.status_area.is_open());
-        assert_eq!(state.status_area.row_count(state.height), 2);
-        assert_eq!(state.status_area.selected_panel(), Some(FooterItemId::Todo));
+            .update("Auto".into(), "model".into(), None, vec![], vec![]);
+        super::layout_tests::set_status_family(&mut state.status_area);
+        state.footer.update(state.status_area.available_panels());
         state.key(key(KeyCode::Down));
         state.key(key(KeyCode::Char(' ')));
-        assert!(state.status_area.is_open());
-        assert!(state.footer.selected().is_none());
-        state.key(key(KeyCode::Down));
-        assert!(state.key(key(KeyCode::Esc)).is_none());
+        assert!(!state.status_area.is_open());
+        state.key(key(KeyCode::Char(' ')));
+        state.key(key(KeyCode::Esc));
         assert!(state.status_area.is_open());
         assert!(state.footer.selected().is_none());
         state.frame();
         let target = state.footer_bar_target.as_ref().unwrap();
-        let bar = target.row;
-        let todo_column = target
-            .categories
-            .iter()
-            .find(|(_, item)| *item == FooterItemId::Todo)
-            .map(|(columns, _)| target.inset + columns.start)
-            .unwrap();
-        assert!(state.pointer(
-            MouseEvent {
-                kind: MouseEventKind::Down(MouseButton::Left),
-                column: todo_column as u16,
-                row: bar as u16,
-                modifiers: KeyModifiers::NONE
-            },
-            &mut Vec::new()
-        ));
-        assert_eq!(state.status_area.selected_panel(), Some(FooterItemId::Todo));
-        assert_eq!(state.footer.selected(), Some(FooterItemId::Todo));
-        assert!(state.status_area.is_open());
-        assert!(state.pointer_input.is_none());
-        assert!(state.key(key(KeyCode::Esc)).is_none());
-        assert!(state.status_area.is_open());
+        let event = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: target.categories[0].0.start as u16,
+            row: target.row as u16,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(state.pointer(event, &mut Vec::new()));
+        assert!(!state.status_area.is_open());
+        state.key(key(KeyCode::Esc));
+        assert!(!state.status_area.is_open());
         assert!(state.footer.selected().is_none());
-        assert_eq!(state.editor.draft(), draft);
-        assert_eq!(state.editor.cursor(), cursor);
-
-        state.frame();
-        let target = state.footer_bar_target.as_ref().unwrap();
-        assert!(
-            target
-                .categories
-                .iter()
-                .all(|(_, item)| *item != FooterItemId::Tasks)
-        );
-        assert_eq!(state.editor.draft(), draft);
+        assert_eq!(state.editor.draft(), "preserved draft");
         assert_eq!(state.editor.cursor(), cursor);
     }
 
@@ -17575,7 +17527,7 @@ mod tests {
         state.chat = Some(chat_id);
         state
             .footer
-            .update([FooterItemId::Tasks, FooterItemId::Todo]);
+            .update([FooterItemId::Tasks, FooterItemId::Agents]);
         state.insert("preserved draft");
         state.key(key(KeyCode::Down));
         assert!(state.footer.selected().is_some());
@@ -17619,7 +17571,7 @@ mod tests {
         state.chat = Some(first_chat);
         state
             .footer
-            .update([FooterItemId::Tasks, FooterItemId::Todo]);
+            .update([FooterItemId::Tasks, FooterItemId::Agents]);
         state.footer.apply(FooterAction::Down);
         let console = console_with_state(state);
 
@@ -17669,7 +17621,7 @@ mod tests {
         state.prompt_enabled = true;
         state
             .footer
-            .update([FooterItemId::Tasks, FooterItemId::Todo]);
+            .update([FooterItemId::Tasks, FooterItemId::Agents]);
         state.scrollback.append(
             &(0..100)
                 .map(|index| format!("ordinary-{index}\n"))
@@ -18881,7 +18833,6 @@ mod tests {
                         "Theme",
                         "Glyph Set",
                         "Reduce motion",
-                        "Status line position",
                         "Output style",
                         "Permissions",
                         "Artifact Service",
@@ -18916,11 +18867,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn settings_menu_status_line_position_saves_before_applying_and_keeps_later_actions() {
-        use crate::settings::{StatusLinePosition, UserSettings};
+    async fn settings_menu_reduce_motion_saves_before_applying_and_keeps_later_actions() {
+        use crate::settings::UserSettings;
         use crate::terminal::menus::{
             Menus, OUTPUT_STYLE_SETTING_INDEX, PERMISSIONS_SETTING_INDEX,
-            STATUS_LINE_POSITION_SETTING_INDEX,
+            REDUCE_MOTION_SETTING_INDEX,
         };
         let directory = tempfile::tempdir().unwrap();
         let settings = UserSettings::in_root(directory.path());
@@ -18942,19 +18893,18 @@ mod tests {
                 &agent,
                 &console,
                 id,
-                Some(STATUS_LINE_POSITION_SETTING_INDEX),
+                Some(REDUCE_MOTION_SETTING_INDEX),
                 None,
             )
             .await
             .unwrap();
-        assert_eq!(
-            console.display_preferences().unwrap().status_line_position,
-            StatusLinePosition::Left
+        assert!(
+            console
+                .display_preferences()
+                .unwrap()
+                .prefers_reduced_motion
         );
-        assert_eq!(
-            settings.display_preferences().status_line_position,
-            StatusLinePosition::Left
-        );
+        assert!(settings.display_preferences().prefers_reduced_motion);
         assert_eq!(
             console.state.lock().unwrap().editor.draft(),
             "keep jk draft"
@@ -18968,15 +18918,17 @@ mod tests {
                     &agent,
                     &console,
                     id,
-                    Some(STATUS_LINE_POSITION_SETTING_INDEX),
+                    Some(REDUCE_MOTION_SETTING_INDEX),
                     None
                 )
                 .await
                 .is_err()
         );
-        assert_eq!(
-            console.display_preferences().unwrap().status_line_position,
-            StatusLinePosition::Left
+        assert!(
+            console
+                .display_preferences()
+                .unwrap()
+                .prefers_reduced_motion
         );
         assert_eq!(
             std::fs::read_to_string(directory.path().join("settings.json")).unwrap(),

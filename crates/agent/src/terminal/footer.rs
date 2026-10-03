@@ -1,7 +1,6 @@
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) enum FooterItemId {
     Tasks,
-    Todo,
     Agents,
 }
 
@@ -9,7 +8,6 @@ impl FooterItemId {
     pub(super) fn label(self) -> &'static str {
         match self {
             Self::Tasks => "Shell",
-            Self::Todo => "Todo",
             Self::Agents => "Agents",
         }
     }
@@ -178,7 +176,7 @@ mod tests {
         assert_eq!(footer.apply(FooterAction::Down), FooterEffect::None);
         assert_eq!(footer.selected(), None);
 
-        footer.update([FooterItemId::Tasks, FooterItemId::Todo]);
+        footer.update([FooterItemId::Tasks, FooterItemId::Agents]);
         assert_eq!(footer.apply(FooterAction::Down), FooterEffect::None);
         assert_eq!(footer.selected(), Some(FooterItemId::Tasks));
         assert_eq!(
@@ -190,7 +188,7 @@ mod tests {
                         selected: true,
                     },
                     FooterFrameItem {
-                        id: FooterItemId::Todo,
+                        id: FooterItemId::Agents,
                         selected: false,
                     },
                 ],
@@ -203,17 +201,17 @@ mod tests {
     #[test]
     fn update_preserves_identity_but_does_not_revive_a_removed_selection() {
         let mut footer = FooterState::default();
-        footer.update([FooterItemId::Tasks, FooterItemId::Todo]);
+        footer.update([FooterItemId::Tasks, FooterItemId::Agents]);
         footer.apply(FooterAction::Down);
         footer.apply(FooterAction::Next);
 
-        footer.update([FooterItemId::Todo, FooterItemId::Tasks]);
-        assert_eq!(footer.selected(), Some(FooterItemId::Todo));
+        footer.update([FooterItemId::Agents, FooterItemId::Tasks]);
+        assert_eq!(footer.selected(), Some(FooterItemId::Agents));
 
         footer.update([FooterItemId::Tasks]);
         assert_eq!(footer.selected(), None);
 
-        footer.update([FooterItemId::Todo, FooterItemId::Tasks]);
+        footer.update([FooterItemId::Agents, FooterItemId::Tasks]);
         assert_eq!(footer.selected(), None);
         assert!(footer.frame().items.iter().all(|item| !item.selected));
     }
@@ -221,12 +219,12 @@ mod tests {
     #[test]
     fn navigation_clamps_and_up_returns_to_the_editor_at_the_top() {
         let mut footer = FooterState::default();
-        footer.update([FooterItemId::Tasks, FooterItemId::Todo]);
+        footer.update([FooterItemId::Tasks, FooterItemId::Agents]);
         footer.apply(FooterAction::Down);
 
         footer.apply(FooterAction::Next);
         footer.apply(FooterAction::Next);
-        assert_eq!(footer.selected(), Some(FooterItemId::Todo));
+        assert_eq!(footer.selected(), Some(FooterItemId::Agents));
 
         footer.apply(FooterAction::Previous);
         footer.apply(FooterAction::Previous);
@@ -239,18 +237,18 @@ mod tests {
     #[test]
     fn down_advances_after_footer_is_focused() {
         let mut footer = FooterState::default();
-        footer.update([FooterItemId::Tasks, FooterItemId::Todo]);
+        footer.update([FooterItemId::Tasks, FooterItemId::Agents]);
 
         footer.apply(FooterAction::Down);
         footer.apply(FooterAction::Down);
 
-        assert_eq!(footer.selected(), Some(FooterItemId::Todo));
+        assert_eq!(footer.selected(), Some(FooterItemId::Agents));
     }
 
     #[test]
     fn open_returns_the_typed_identity_and_clears_focus() {
         let mut footer = FooterState::default();
-        footer.update([FooterItemId::Tasks, FooterItemId::Todo]);
+        footer.update([FooterItemId::Tasks, FooterItemId::Agents]);
         footer.apply(FooterAction::Down);
 
         assert_eq!(
@@ -264,7 +262,11 @@ mod tests {
     #[test]
     fn clear_returns_to_the_editor_and_duplicate_items_are_removed() {
         let mut footer = FooterState::default();
-        footer.update([FooterItemId::Tasks, FooterItemId::Tasks, FooterItemId::Todo]);
+        footer.update([
+            FooterItemId::Tasks,
+            FooterItemId::Tasks,
+            FooterItemId::Agents,
+        ]);
         footer.apply(FooterAction::Down);
 
         assert_eq!(
@@ -274,6 +276,6 @@ mod tests {
         assert_eq!(footer.selected(), None);
         assert_eq!(footer.frame().items.len(), 2);
         assert_eq!(FooterItemId::Tasks.label(), "Shell");
-        assert_eq!(FooterItemId::Todo.label(), "Todo");
+        assert_eq!(FooterItemId::Agents.label(), "Agents");
     }
 }

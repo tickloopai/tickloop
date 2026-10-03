@@ -424,10 +424,7 @@ fn child_fixture(directory: &Path, view: &ChildPty) -> Value {
 fn status_mode(frame: &str) -> Option<String> {
     frame
         .lines()
-        .find_map(|line| {
-            line.trim_start_matches(|character: char| character.is_whitespace() || character == '─')
-                .strip_prefix("⏵⏵ ")
-        })
+        .find_map(|line| line.split_once("⏵⏵ ").map(|(_, core)| core))
         .and_then(|line| line.split(" · ").next())
         .map(str::to_owned)
 }
@@ -1008,27 +1005,38 @@ fn a_child_request_names_the_child_with_its_family_number_and_no_persistent_gran
         "a child cannot save a grant as a rule: {dialog}"
     );
     view.send(b"\r");
-    let finished = view.wait_for("the parent finishing after the approved child", |frame| {
-        frame.contains("Permission accepted")
-            && frame.contains("parent done")
-            && !frame.contains("Permission required")
-            && frame.contains("reply completed")
-    });
-    let notices = finished
-        .lines()
-        .filter(|line| line.contains("reply completed"))
-        .collect::<Vec<_>>();
-    assert!(
-        !notices.is_empty()
-            && notices.iter().all(|line| {
-                line.contains(&format!("Agent {TASK}"))
-                    && !line.split_whitespace().any(|word| {
-                        word.len() >= 8
-                            && word.chars().all(|character| character.is_ascii_hexdigit())
-                    })
-            }),
-        "background notices name the child by its title, never by a hash: {finished}"
+    let finished = view.wait_for(
+        "the parent finishing with the child's list state",
+        |frame| {
+            frame.contains("Permission accepted")
+                && frame.contains("parent done")
+                && !frame.contains("Permission required")
+                && frame
+                    .lines()
+                    .any(|line| line.contains(TASK) && line.contains("Completed"))
+        },
     );
+    assert!(
+        !finished.contains("reply completed"),
+        "completion is already in the family list: {finished}"
+    );
+    view.send(b"\x1b[B");
+    let focused = view.wait_for("the completed family entry remains usable", |frame| {
+        frame.contains("Enter/Space hide")
+    });
+    assert!(!focused.contains("reply completed"), "{focused}");
+    view.send(b" ");
+    let hidden = view.wait_for(
+        "the collapsed family keeps completion out of the status area",
+        |frame| frame.contains("Enter/Space expand"),
+    );
+    assert!(!hidden.contains("reply completed"), "{hidden}");
+    view.send(b" ");
+    view.wait_for("family reopens", |frame| frame.contains("Enter/Space hide"));
+    view.send(b"\x1b");
+    view.wait_for("focus returns to input", |frame| {
+        !frame.contains("Enter/Space hide") && !frame.contains("Enter/Space expand")
+    });
 
     view.close();
     let decisions = commands(directory.path())

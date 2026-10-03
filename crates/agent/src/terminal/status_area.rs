@@ -1,17 +1,26 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    time::{Duration, Instant},
+};
 
 use unicode_width::UnicodeWidthStr;
 use uuid::Uuid;
 
 use super::{
     console::{AgentTreeRow, MIN_REQUEST_AGENT_TITLE_COLUMNS, RowExtras, truncate_width},
-    display::DisplayProfile,
+    display::{DisplayProfile, Glyph},
     footer::{FooterFrame, FooterItemId},
     running_shimmer::RunningShimmer,
     style::{Role, RoleLine},
 };
 
 const MAX_PANEL_ITEMS: usize = 8;
+const TODO_SUBJECT_MARGIN_COLUMNS: usize = 15;
+const TODO_LAYOUT_RESERVED_ROWS: usize = 14;
+const TODO_COMPACT_TERMINAL_ROWS: usize = 10;
+const MIN_TODO_DISPLAY_ITEMS: usize = 3;
+const MAX_TODO_DISPLAY_ITEMS: usize = 10;
+const RECENT_TODO_COMPLETION_TTL: Duration = Duration::from_secs(30);
 const MAX_BACKGROUND_TITLE_COLUMNS: usize = 24;
 const BACKGROUND_AGENT_NAME_PREFIX: &str = "Agent ";
 const STATUS_SEGMENT_SEPARATOR: &str = " · ";
@@ -99,6 +108,8 @@ pub(super) struct StatusArea {
     context: Option<(u64, usize)>,
     tasks: Vec<StatusItem>,
     todos: Vec<StatusItem>,
+    todos_initialized: bool,
+    todo_completed_at: HashMap<(String, String), Instant>,
     agents: Vec<AgentTreeRow>,
     /// Reading numbers shown after repeated family titles.
     agent_ordinals: HashMap<Uuid, usize>,
@@ -106,13 +117,13 @@ pub(super) struct StatusArea {
     visible_agent: Option<Uuid>,
     selected_agent: Option<Uuid>,
     collapsed_agents: HashSet<Uuid>,
+    pub(super) agents_collapsed: bool,
     panel_offsets: HashMap<FooterItemId, usize>,
     visible: Option<FooterItemId>,
     manually_selected: bool,
     pinned: bool,
     offset: usize,
     selected_task: Option<Uuid>,
-    selected_todo: usize,
     running_shimmer: RunningShimmer,
     prefers_reduced_motion: bool,
 }
@@ -130,6 +141,10 @@ impl StatusArea {
 
     pub(super) fn set_reduced_motion(&mut self, prefers_reduced_motion: bool) {
         self.prefers_reduced_motion = prefers_reduced_motion;
+    }
+
+    pub(super) fn todo_refresh_pending(&self) -> bool {
+        !self.todo_completed_at.is_empty()
     }
 
     pub(super) fn has_visible_running_task(&self) -> bool {
@@ -154,8 +169,27 @@ impl StatusArea {
         self.model = model;
         self.context = context.filter(|(_, limit)| *limit > 0);
         self.tasks = tasks;
+        let now = Instant::now();
+        if self.todos_initialized {
+            for todo in todos.iter().filter(|todo| todo.state == "completed") {
+                if !self.todos.iter().any(|previous| {
+                    previous.id == todo.id
+                        && previous.title == todo.title
+                        && previous.state == "completed"
+                }) {
+                    self.todo_completed_at
+                        .insert((todo.id.clone(), todo.title.clone()), now);
+                }
+            }
+        }
+        self.todo_completed_at.retain(|(id, title), _| {
+            todos
+                .iter()
+                .any(|todo| &todo.id == id && &todo.title == title && todo.state == "completed")
+        });
+        self.todos_initialized = !todos.is_empty();
         self.todos = todos;
-        self.selected_todo = self.selected_todo.min(self.todos.len().saturating_sub(1));
+
         if !self
             .selected_task
             .is_some_and(|selected| self.tasks.iter().any(|task| task.task_id == Some(selected)))
@@ -170,11 +204,9 @@ impl StatusArea {
     }
 
     pub(super) fn available_panels(&self) -> impl Iterator<Item = FooterItemId> + '_ {
-        [FooterItemId::Todo, FooterItemId::Agents]
-            .into_iter()
-            .filter(|panel| {
-                self.item_count(*panel) > 0 || self.pinned && self.visible == Some(*panel)
-            })
+        [FooterItemId::Agents].into_iter().filter(|panel| {
+            self.item_count(*panel) > 0 || self.pinned && self.visible == Some(*panel)
+        })
     }
 
     /// The reading number this family panel shows for `agent_id` when another family row reads
@@ -261,7 +293,6 @@ impl StatusArea {
             FooterItemId::Agents => {
                 self.selected_agent == self.visible_agents().first().map(|row| row.agent_id)
             }
-            FooterItemId::Todo => self.selected_todo == 0,
         }
     }
 
@@ -328,6 +359,12 @@ impl StatusArea {
 
     pub(super) fn is_open(&self) -> bool {
         self.visible.is_some()
+            && !(self.visible == Some(FooterItemId::Agents) && self.agents_collapsed)
+    }
+
+    pub(super) fn toggle_agents(&mut self) {
+        self.select(FooterItemId::Agents);
+        self.agents_collapsed = !self.agents_collapsed;
     }
 
     pub(super) fn selected_panel(&self) -> Option<FooterItemId> {
@@ -354,31 +391,6 @@ impl StatusArea {
         (self.tasks.len() == 1)
             .then(|| self.tasks[0].task_id)
             .flatten()
-    }
-
-    pub(super) fn selected_todo(&self) -> Option<(usize, &StatusItem)> {
-        (self.visible == Some(FooterItemId::Todo))
-            .then(|| {
-                self.todos
-                    .get(self.selected_todo)
-                    .map(|item| (self.selected_todo, item))
-            })
-            .flatten()
-    }
-
-    pub(super) fn move_todo_selection(&mut self, amount: isize, capacity: usize) {
-        if self.visible != Some(FooterItemId::Todo) || self.todos.is_empty() {
-            return;
-        }
-        self.selected_todo = self
-            .selected_todo
-            .saturating_add_signed(amount)
-            .min(self.todos.len() - 1);
-        if self.selected_todo < self.offset {
-            self.offset = self.selected_todo;
-        } else if self.selected_todo >= self.offset + capacity.max(1) {
-            self.offset = self.selected_todo + 1 - capacity.max(1);
-        }
     }
 
     pub(super) fn stoppable_task(&self) -> Option<Uuid> {
@@ -422,6 +434,9 @@ impl StatusArea {
         let Some(panel) = self.visible else {
             return 1;
         };
+        if panel == FooterItemId::Agents && self.agents_collapsed {
+            return 1;
+        }
         1 + self
             .item_count(panel)
             .min((height / 6).clamp(3, MAX_PANEL_ITEMS))
@@ -509,6 +524,122 @@ impl StatusArea {
         line.filled(Role::StatusBar)
     }
 
+    pub(super) fn todo_lines(
+        &mut self,
+        width: usize,
+        height: usize,
+        display: DisplayProfile,
+        has_activity: bool,
+        now: Instant,
+    ) -> Vec<RoleLine> {
+        self.todo_completed_at.retain(|_, completed| {
+            now.saturating_duration_since(*completed) < RECENT_TODO_COMPLETION_TTL
+        });
+        if self.todos.is_empty() {
+            return Vec::new();
+        }
+        let capacity = if height <= TODO_COMPACT_TERMINAL_ROWS {
+            1
+        } else {
+            height
+                .saturating_sub(TODO_LAYOUT_RESERVED_ROWS)
+                .clamp(MIN_TODO_DISPLAY_ITEMS, MAX_TODO_DISPLAY_ITEMS)
+        };
+        let mut todos = self.todos.iter().collect::<Vec<_>>();
+        let numeric_id = |todo: &StatusItem| {
+            todo.id
+                .trim_end_matches('.')
+                .parse::<usize>()
+                .unwrap_or(usize::MAX)
+        };
+        if todos.len() > capacity {
+            todos.sort_by_key(|todo| {
+                let rank = if self
+                    .todo_completed_at
+                    .contains_key(&(todo.id.clone(), todo.title.clone()))
+                {
+                    0
+                } else if todo.state == "in progress" {
+                    1
+                } else if todo.state == "pending" {
+                    2
+                } else {
+                    3
+                };
+                (rank, numeric_id(todo))
+            });
+        } else {
+            todos.sort_by_key(|todo| numeric_id(todo));
+        }
+        let completed = self
+            .todos
+            .iter()
+            .filter(|todo| todo.state == "completed")
+            .count();
+        let pending = self
+            .todos
+            .iter()
+            .filter(|todo| todo.state == "pending")
+            .count();
+        let in_progress = self.todos.len() - completed - pending;
+        let mut lines = Vec::new();
+        if !has_activity {
+            let mut header = RoleLine::role("  ", Role::MutedText);
+            header.push(self.todos.len().to_string(), Some(Role::Strong));
+            header.push(" tasks (", Some(Role::MutedText));
+            header.push(completed.to_string(), Some(Role::Strong));
+            header.push(" done, ", Some(Role::MutedText));
+            if in_progress > 0 {
+                header.push(in_progress.to_string(), Some(Role::Strong));
+                header.push(" in progress, ", Some(Role::MutedText));
+            }
+            header.push(pending.to_string(), Some(Role::Strong));
+            header.push(" open)", Some(Role::MutedText));
+            header.truncate(width);
+            lines.push(header);
+        }
+        let subject_columns = width
+            .saturating_sub(TODO_SUBJECT_MARGIN_COLUMNS)
+            .max(TODO_SUBJECT_MARGIN_COLUMNS)
+            .min(width.saturating_sub(4));
+        for todo in todos.iter().take(capacity) {
+            let (glyph, icon_role, text_role) = match todo.state {
+                "completed" => (Glyph::TodoCompleted, Role::Success, Role::CompletedTodo),
+                "in progress" => (Glyph::TodoInProgress, Role::Accent, Role::Strong),
+                _ => (Glyph::TodoPending, Role::Text, Role::Text),
+            };
+            let mut title = todo.title.replace('\n', " ");
+            if UnicodeWidthStr::width(title.as_str()) > subject_columns {
+                title = format!(
+                    "{}…",
+                    truncate_width(&title, subject_columns.saturating_sub(1))
+                );
+            }
+            let mut line = RoleLine::role(format!("  {} ", display.glyph(glyph)), icon_role);
+            line.push(title, Some(text_role));
+            line.truncate(width);
+            lines.push(line);
+        }
+        let hidden = &todos[capacity.min(todos.len())..];
+        if !hidden.is_empty() {
+            let parts = [
+                ("in progress", "in progress"),
+                ("pending", "pending"),
+                ("completed", "completed"),
+            ]
+            .into_iter()
+            .filter_map(|(state, label)| {
+                let count = hidden.iter().filter(|todo| todo.state == state).count();
+                (count > 0).then(|| format!("{count} {label}"))
+            })
+            .collect::<Vec<_>>();
+            let mut summary = RoleLine::role(format!("  … +{}", parts.join(", ")), Role::MutedText);
+            summary.truncate(width);
+            lines.push(summary);
+        }
+        lines
+    }
+
     pub(super) fn panel_lines(
         &self,
         footer: &FooterFrame,
@@ -543,8 +674,11 @@ impl StatusArea {
             };
             header.push(label, Some(role));
         }
-        let summary_focused = footer.items.iter().any(|item| item.selected);
-        let summary = if let Some(panel) = self.visible {
+        let summary_focused =
+            footer.selected.is_some() || footer.items.iter().any(|item| item.selected);
+        let summary = if self.is_open()
+            && let Some(panel) = self.visible
+        {
             let count = self.item_count(panel);
             if footer.list_focused && panel == FooterItemId::Tasks {
                 let action = if self.stoppable_task().is_some() {
@@ -553,8 +687,8 @@ impl StatusArea {
                     ""
                 };
                 format!("{count} items · Enter details{action}")
-            } else if footer.list_focused && panel == FooterItemId::Todo {
-                format!("{count} items · Enter details")
+            } else if summary_focused && !footer.list_focused && panel == FooterItemId::Agents {
+                format!("{count} items · Enter/Space hide")
             } else if summary_focused && !footer.list_focused {
                 format!("{count} items · Enter list")
             } else if count > row_count.saturating_sub(1) {
@@ -580,6 +714,9 @@ impl StatusArea {
             return lines;
         };
         if panel == FooterItemId::Agents {
+            if self.agents_collapsed {
+                return lines;
+            }
             let agents = self.visible_agents();
             let capacity = row_count.saturating_sub(1);
             let selected_index = agents
@@ -602,7 +739,8 @@ impl StatusArea {
                 row.own_status_variants(status, width + 1)
             };
             for row in agents.iter().skip(offset).take(capacity) {
-                let selected = footer.selected == Some(FooterItemId::Agents)
+                let selected = footer.list_focused
+                    && footer.selected == Some(FooterItemId::Agents)
                     && Some(row.agent_id) == self.selected_agent;
                 let line = row.summary_line(
                     width,
@@ -640,7 +778,7 @@ impl StatusArea {
         } else {
             self.offset
         };
-        for (index, item) in items.iter().enumerate().skip(offset).take(capacity) {
+        for item in items.iter().skip(offset).take(capacity) {
             let mut row = RoleLine::default();
             let selected = footer.list_focused
                 && footer.selected == Some(panel)
@@ -648,7 +786,6 @@ impl StatusArea {
                     FooterItemId::Tasks => {
                         item.task_id.is_some() && item.task_id == self.selected_task
                     }
-                    FooterItemId::Todo => index == self.selected_todo,
                     FooterItemId::Agents => false,
                 };
             row.push(if selected { "› " } else { "  " }, Some(Role::Suggestion));
@@ -679,23 +816,25 @@ impl StatusArea {
     fn items(&self, panel: FooterItemId) -> &[StatusItem] {
         match panel {
             FooterItemId::Tasks => &self.tasks,
-            FooterItemId::Todo => &self.todos,
             FooterItemId::Agents => &[],
         }
     }
 
     fn item_count(&self, panel: FooterItemId) -> usize {
         if panel == FooterItemId::Agents {
-            self.agents.len()
+            if self.agents.iter().any(|row| row.parent_id.is_some()) {
+                self.agents.len()
+            } else {
+                0
+            }
         } else {
             self.items(panel).len()
         }
     }
 
-    fn header_label(&self, panel: FooterItemId) -> String {
+    pub(super) fn header_label(&self, panel: FooterItemId) -> String {
         match panel {
             FooterItemId::Tasks => format!("Shell {}", self.tasks.len()),
-            FooterItemId::Todo => format!("Todo {}", self.todos.len()),
             FooterItemId::Agents => format!("Agents {}", self.agents.len()),
         }
     }
@@ -751,6 +890,114 @@ mod tests {
             selected,
             list_focused: selected.is_some(),
         }
+    }
+
+    #[test]
+    fn todo_truncation_prioritizes_live_work_and_accounts_for_hidden_statuses() {
+        let mut area = StatusArea::default();
+        let todos = (1..=13)
+            .map(|index| {
+                let mut todo = item(&format!("{index}."), &format!("todo {index}"));
+                todo.state = if index == 1 {
+                    "completed"
+                } else if index == 13 {
+                    "in progress"
+                } else {
+                    "pending"
+                };
+                todo
+            })
+            .collect();
+        area.update("Auto".into(), "fixture".into(), None, vec![], todos);
+        let rows = area.todo_lines(80, 24, DisplayProfile::default(), true, Instant::now());
+        assert!(
+            rows.iter().any(|row| row.text().contains("todo 13")),
+            "{rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|row| row.text().ends_with("todo 1")),
+            "{rows:?}"
+        );
+        assert_eq!(
+            rows.last().unwrap().text().trim(),
+            "… +2 pending, 1 completed"
+        );
+    }
+
+    #[test]
+    fn todo_order_and_recent_completion_expiry_match_the_reference() {
+        let mut area = StatusArea::default();
+        let initial = (1..=13)
+            .map(|index| {
+                let mut todo = item(&format!("{index}."), &format!("todo {index}"));
+                todo.state = if index == 13 {
+                    "in progress"
+                } else {
+                    "pending"
+                };
+                todo
+            })
+            .collect::<Vec<_>>();
+        area.update(
+            "Auto".into(),
+            "fixture".into(),
+            None,
+            vec![],
+            initial.clone(),
+        );
+        let mut completed = initial;
+        completed[0].state = "completed";
+        area.update("Auto".into(), "fixture".into(), None, vec![], completed);
+        let now = Instant::now();
+        assert!(area.todo_refresh_pending());
+        let recent = area.todo_lines(80, 24, DisplayProfile::default(), true, now);
+        assert_eq!(recent[0].text(), "  ✔ todo 1");
+        assert_eq!(recent[1].text(), "  ◼ todo 13");
+        assert_eq!(recent.last().unwrap().text().trim(), "… +3 pending");
+        let expired = area.todo_lines(
+            80,
+            24,
+            DisplayProfile::default(),
+            true,
+            now + Duration::from_secs(31),
+        );
+        assert_eq!(expired[0].text(), "  ◼ todo 13");
+        assert_eq!(
+            expired.last().unwrap().text().trim(),
+            "… +2 pending, 1 completed"
+        );
+        assert!(!area.todo_refresh_pending());
+        let idle = area.todo_lines(
+            32,
+            24,
+            DisplayProfile::default(),
+            false,
+            now + Duration::from_secs(31),
+        );
+        assert!(
+            idle.iter()
+                .all(|row| UnicodeWidthStr::width(row.text().as_str()) <= 32)
+        );
+        area.update(
+            "Auto".into(),
+            "fixture".into(),
+            None,
+            vec![],
+            vec![
+                item("3.", "third"),
+                item("1.", "first"),
+                item("2.", "second"),
+            ],
+        );
+        let ordered = area.todo_lines(80, 24, DisplayProfile::default(), true, now);
+        assert!(ordered[0].text().ends_with("first"));
+        assert!(ordered[1].text().ends_with("second"));
+        assert!(ordered[2].text().ends_with("third"));
+        area.update("Auto".into(), "fixture".into(), None, vec![], vec![]);
+        assert!(
+            area.todo_lines(80, 24, DisplayProfile::default(), false, now)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -880,16 +1127,13 @@ mod tests {
                 .collect(),
             vec![item("1.", "review plan")],
         );
-        let focused_list = footer(
-            &[FooterItemId::Tasks, FooterItemId::Todo],
-            Some(FooterItemId::Tasks),
-        );
-        let footer = footer(&[FooterItemId::Tasks, FooterItemId::Todo], None);
+        let focused_list = footer(&[FooterItemId::Tasks], Some(FooterItemId::Tasks));
+        let footer = footer(&[FooterItemId::Tasks], None);
         let collapsed = area.panel_lines(&footer, 80, 24, DisplayProfile::default());
-        assert_eq!(collapsed.len(), 2);
-        assert!(collapsed[0].text().contains("Shell 6  Todo 1"));
+        assert_eq!(collapsed.len(), 1);
+        assert!(collapsed[0].text().contains("Shell 6"));
         assert!(
-            collapsed[0].text().contains("1 items"),
+            collapsed[0].text().contains("↓ open"),
             "automatic selection leaves editor ownership unchanged"
         );
         area.select(FooterItemId::Tasks);
@@ -901,7 +1145,7 @@ mod tests {
         );
         let first = area.panel_lines(&footer, 80, 24, DisplayProfile::default());
         assert_eq!(first.len(), 5);
-        assert!(first[0].text().contains("Shell 6  Todo 1"));
+        assert!(first[0].text().contains("Shell 6"));
         assert!(first[0].text().contains("6 items · scroll"));
         assert!(first[1].text().contains("task 1"));
         assert!(first[4].text().contains("task 4"));
@@ -911,10 +1155,6 @@ mod tests {
                 .text()
                 .contains("task 3")
         );
-        area.select(FooterItemId::Todo);
-        let todo = area.panel_lines(&footer, 80, 24, DisplayProfile::default());
-        assert_eq!(todo.len(), 2);
-        assert!(todo[1].text().contains("review plan"));
         area.release_panel();
         area.update(
             "Auto".into(),
