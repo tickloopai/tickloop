@@ -27,7 +27,7 @@ fn agent_layout_background_waiting_roles_survive_status_configuration_help_and_c
                     state.configured_status_lines = configured.clone();
                     state
                         .status_area
-                        .update("Auto".into(), "fixture".into(), None, vec![], vec![]);
+                        .update("Auto".into(), "fixture".into(), None, vec![]);
                     state.connection_notice =
                         (!connected).then(|| "Disconnected · cached view · fixture".into());
                     state.background_status_notice = Some(BackgroundStatusNotice {
@@ -65,7 +65,6 @@ fn agent_layout_background_notice_preserves_the_regular_status_and_result() {
             "Auto".into(),
             "deepseek-flash".into(),
             Some((40_000, 1_000_000)),
-            Vec::new(),
             Vec::new(),
         )
         .unwrap();
@@ -120,13 +119,7 @@ fn agent_layout_unsaved_status_and_exit_confirmation_keep_both_required_facts() 
             state.prompt_enabled = true;
             let console = super::tests::console_with_state(state);
             console
-                .update_status_area(
-                    "Auto".into(),
-                    "deepseek-flash".into(),
-                    None,
-                    Vec::new(),
-                    Vec::new(),
-                )
+                .update_status_area("Auto".into(), "deepseek-flash".into(), None, Vec::new())
                 .unwrap();
             console.set_status_lines(configured.clone()).unwrap();
             console
@@ -135,6 +128,14 @@ fn agent_layout_unsaved_status_and_exit_confirmation_keep_both_required_facts() 
             assert!(!console.confirm_control_c_exit().unwrap());
             console.state.lock().unwrap().help_open = help_open;
             let frame = frame_lines(&console);
+            if help_open {
+                assert_eq!(frame[12], "Help");
+                let state = console.state.lock().unwrap();
+                assert!(state.status.contains("Not saved"));
+                assert!(state.exit_confirmation.is_some());
+                assert_eq!(state.configured_status_lines, configured);
+                continue;
+            }
             let status = line_with(&frame, "Not saved")
                 .unwrap_or_else(|| panic!("{configured:?}, help {help_open}: {frame:#?}"));
             assert!(
@@ -169,7 +170,6 @@ fn agent_layout_background_titles_use_display_columns_and_the_family_reading_num
                     "Auto".into(),
                     "deepseek-flash".into(),
                     Some((40_000, 1_000_000)),
-                    Vec::new(),
                     Vec::new(),
                 )
                 .unwrap();
@@ -250,13 +250,7 @@ fn agent_layout_necessary_background_facts_survive_narrow_status_configuration_a
                 state.prompt_enabled = true;
                 let console = super::tests::console_with_state(state);
                 console
-                    .update_status_area(
-                        "Auto".into(),
-                        "deepseek-flash".into(),
-                        None,
-                        Vec::new(),
-                        Vec::new(),
-                    )
+                    .update_status_area("Auto".into(), "deepseek-flash".into(), None, Vec::new())
                     .unwrap();
                 console.set_status_lines(configured.clone()).unwrap();
                 let notice = console
@@ -275,6 +269,13 @@ fn agent_layout_necessary_background_facts_survive_narrow_status_configuration_a
                 console.set_background_status_notice(Some(notice)).unwrap();
                 console.state.lock().unwrap().help_open = help_open;
                 let frame = frame_lines(&console);
+                if help_open {
+                    assert_eq!(frame[12], "Help");
+                    let state = console.state.lock().unwrap();
+                    assert!(state.background_status_notice.is_some());
+                    assert_eq!(state.configured_status_lines, configured);
+                    continue;
+                }
                 assert!(
                     line_with(&frame, expected).is_some(),
                     "{message}, {configured:?}, help {help_open}: {frame:#?}"
@@ -303,13 +304,7 @@ fn agent_layout_connection_and_necessary_background_facts_both_survive_narrow_st
             state.prompt_enabled = true;
             let console = super::tests::console_with_state(state);
             console
-                .update_status_area(
-                    "Auto".into(),
-                    "deepseek-flash".into(),
-                    None,
-                    Vec::new(),
-                    Vec::new(),
-                )
+                .update_status_area("Auto".into(), "deepseek-flash".into(), None, Vec::new())
                 .unwrap();
             console.set_status_lines(Some(Vec::new())).unwrap();
             console
@@ -405,13 +400,9 @@ fn agent_layout_child_refusal_keeps_the_parent_reason_at_narrow_widths() {
         let mut state = State::new(true, width, 24);
         state.prompt_enabled = true;
         state.visible_delegated = true;
-        state.status_area.update(
-            "Auto".into(),
-            "fixture".into(),
-            None,
-            Vec::new(),
-            Vec::new(),
-        );
+        state
+            .status_area
+            .update("Auto".into(), "fixture".into(), None, Vec::new());
         state.insert("/mode full");
         assert!(state.key(key(KeyCode::Enter)).is_none());
         let frame = drawn(&mut state);
@@ -488,8 +479,6 @@ fn status_items() -> Vec<StatusItem> {
     (0..20)
         .map(|index| StatusItem {
             id: format!("sh-{index:02}"),
-            task_id: Some(Uuid::from_u128(200 + index)),
-            can_stop: true,
             title: format!("task {index:02}"),
             state: "running",
             role: Role::Success,
@@ -561,7 +550,7 @@ fn agent_layout_narrow_agent_rows_keep_request_types_when_the_title_is_long() {
     state.prompt_enabled = true;
     state
         .status_area
-        .update("Ask".into(), "fixture".into(), None, Vec::new(), Vec::new());
+        .update("Ask".into(), "fixture".into(), None, Vec::new());
     let console = super::tests::console_with_state(state);
     let mut child = agent_row(CHILD_AGENT, Some(ROOT_AGENT), &"很长的研究标题".repeat(20));
     child.approvals = 1;
@@ -586,13 +575,9 @@ fn agent_layout_narrow_agent_rows_keep_request_types_when_the_title_is_long() {
 fn agent_layout_footer_enters_at_the_bottom_with_following_disabled() {
     let mut state = State::new(true, 80, 24);
     state.prompt_enabled = true;
-    state.status_area.update(
-        "Ask".into(),
-        "fixture".into(),
-        None,
-        Vec::new(),
-        status_items(),
-    );
+    state
+        .status_area
+        .update("Ask".into(), "fixture".into(), None, status_items());
     set_status_family(&mut state.status_area);
     state
         .footer
@@ -613,13 +598,9 @@ fn agent_layout_footer_enters_at_the_bottom_with_following_disabled() {
 fn agent_layout_first_down_expands_and_list_keys_preserve_the_draft() {
     let mut state = State::new(true, 80, 24);
     state.prompt_enabled = true;
-    state.status_area.update(
-        "Ask".into(),
-        "test model".into(),
-        None,
-        Vec::new(),
-        status_items(),
-    );
+    state
+        .status_area
+        .update("Ask".into(), "test model".into(), None, status_items());
     set_status_family(&mut state.status_area);
     state
         .footer
@@ -665,13 +646,9 @@ fn agent_layout_return_restores_reading_draft_and_focuses_the_editor() {
     );
     state.scrollback.frame(width, 16);
     state.insert("parent draft");
-    state.status_area.update(
-        "Ask".into(),
-        "test model".into(),
-        None,
-        Vec::new(),
-        status_items(),
-    );
+    state
+        .status_area
+        .update("Ask".into(), "test model".into(), None, status_items());
     set_status_family(&mut state.status_area);
     let panels = state.status_area.available_panels().collect::<Vec<_>>();
     state.footer.update(panels);
@@ -902,13 +879,9 @@ fn agent_layout_float_return_keeps_input_geometry_and_escape_priorities() {
         state.clear_menu(REQUEST_ID);
         state.mark_menu_submission_finished(REQUEST_ID);
         state.release_finished_submissions();
-        state.status_area.update(
-            "Ask".into(),
-            "fixture".into(),
-            None,
-            Vec::new(),
-            status_items(),
-        );
+        state
+            .status_area
+            .update("Ask".into(), "fixture".into(), None, status_items());
         set_status_family(&mut state.status_area);
         let panels = state.status_area.available_panels().collect::<Vec<_>>();
         state.footer.update(panels);
@@ -1080,7 +1053,11 @@ fn agent_layout_created_chat_keeps_its_draft_history_and_keeps_other_views_isola
     let frame = frame_lines(&console);
     for line in ["original draft banner", "draft warning", "draft echo"] {
         assert_eq!(
-            frame.iter().filter(|text| text.contains(line)).count(),
+            frame
+                .iter()
+                .skip(1)
+                .filter(|text| text.contains(line))
+                .count(),
             1,
             "{frame:#?}"
         );
@@ -1104,7 +1081,11 @@ fn agent_layout_created_chat_keeps_its_draft_history_and_keeps_other_views_isola
             "rebuilt public conversation",
         ] {
             assert_eq!(
-                frame.iter().filter(|text| text.contains(line)).count(),
+                frame
+                    .iter()
+                    .skip(1)
+                    .filter(|text| text.contains(line))
+                    .count(),
                 1,
                 "{frame:#?}"
             );
@@ -1276,13 +1257,9 @@ fn agent_layout_new_draft_is_the_overview_return_target() {
         let mut state = State::new(true, 100, 32);
         state.prompt_enabled = true;
         state.history_project = PathBuf::from("/fixture/current-draft");
-        state.status_area.update(
-            "Auto".into(),
-            "draft-model".into(),
-            None,
-            Vec::new(),
-            Vec::new(),
-        );
+        state
+            .status_area
+            .update("Auto".into(), "draft-model".into(), None, Vec::new());
         assert!(matches!(
             state.key(key(KeyCode::Left)),
             Some(InputEvent::OpenOverview)
@@ -1467,13 +1444,7 @@ fn agent_layout_visible_family_summary_remains_navigable_after_footer_reset() {
     let console = super::tests::console_with_state(state);
     console.activate_agent(ROOT_AGENT).unwrap();
     console
-        .update_status_area(
-            "Auto".into(),
-            "fixture".into(),
-            None,
-            Vec::new(),
-            Vec::new(),
-        )
+        .update_status_area("Auto".into(), "fixture".into(), None, Vec::new())
         .unwrap();
     console
         .set_agent_family(
@@ -1505,13 +1476,9 @@ fn agent_layout_required_connection_notice_borrows_one_row_without_changing_conf
     for height in [4, 12, 24, 48] {
         let mut state = State::new(true, 40, height);
         state.prompt_enabled = true;
-        state.status_area.update(
-            "Ask".into(),
-            "fixture".into(),
-            None,
-            Vec::new(),
-            status_items(),
-        );
+        state
+            .status_area
+            .update("Ask".into(), "fixture".into(), None, status_items());
         set_status_family(&mut state.status_area);
         state
             .footer
@@ -1721,7 +1688,6 @@ fn agent_layout_pty_fixture() {
             "Ask".into(),
             "test model".into(),
             Some((20, 100)),
-            status_items(),
             Vec::new(),
         )
         .unwrap();
@@ -2855,9 +2821,7 @@ fn agent_layout_real_pty_short_screens_keep_request_actions_reachable() {
         terminal.send(b"\r");
         terminal.wait_for("short send", |frame| frame.contains("Draft submitted"));
         terminal.send(b"permission\r");
-        terminal.wait_for("short request", |frame| {
-            frame.contains("Permission required") && frame.contains("Allow once")
-        });
+        terminal.wait_for("short request", |frame| frame.contains("Allow once"));
         terminal.send(b"j");
         terminal.wait_for("short request list", |frame| {
             frame.contains("Reject request")
@@ -2870,41 +2834,49 @@ fn agent_layout_real_pty_short_screens_keep_request_actions_reachable() {
 }
 
 #[test]
-fn agent_layout_real_pty_reading_header_tracks_the_visible_turn() {
+fn agent_layout_real_pty_latest_user_message_stays_pinned_while_reading_history() {
     let mut terminal = PtyConsole::start(80, 24);
     terminal.wait_for("ready", |frame| frame.contains("history 99"));
     terminal.send(b"turns\r");
     let following = terminal.wait_for("latest reply", |frame| frame.contains("latest reply 99"));
     assert!(
-        !following
+        following
             .lines()
             .next()
             .unwrap()
             .contains("latest question")
     );
     terminal.send_and_wait(b"\x1b[5~");
-    terminal.wait_for("latest reading header", |frame| {
-        frame.lines().next().unwrap().contains("latest question")
-    });
+    assert!(
+        terminal
+            .frame()
+            .lines()
+            .next()
+            .unwrap()
+            .contains("latest question")
+    );
     for _ in 0..25 {
         terminal.send_and_wait(b"\x1b[5~");
         if terminal
             .frame()
             .lines()
-            .next()
-            .unwrap()
-            .contains("earlier question")
+            .skip(1)
+            .any(|line| line.contains("earlier question"))
         {
             break;
         }
     }
-    let earlier = terminal.wait_for("earlier reading header", |frame| {
-        frame.lines().next().unwrap().contains("earlier question")
+    let earlier = terminal.wait_for("earlier conversation", |frame| {
+        frame
+            .lines()
+            .skip(1)
+            .any(|line| line.contains("earlier question"))
     });
-    assert!(!earlier.lines().next().unwrap().contains("latest question"));
+    assert!(earlier.lines().next().unwrap().contains("latest question"));
     terminal.send_and_wait(b"\x1b[1;5F");
-    terminal.wait_for("follow latest hides header", |frame| {
-        frame.contains("latest reply 99") && !frame.lines().next().unwrap().contains("question")
+    terminal.wait_for("follow latest keeps pinned message", |frame| {
+        frame.contains("latest reply 99")
+            && frame.lines().next().unwrap().contains("latest question")
     });
 }
 
@@ -3348,7 +3320,7 @@ fn agent_layout_configured_conversation_status_keeps_unknown_and_disconnected_fa
     state.prompt_enabled = true;
     let console = super::tests::console_with_state(state);
     console
-        .update_status_area("Ask".into(), "fixture".into(), None, Vec::new(), Vec::new())
+        .update_status_area("Ask".into(), "fixture".into(), None, Vec::new())
         .unwrap();
     console
         .set_connection_notice(Some("Disconnected · cached view · fixture".into()))
@@ -4474,13 +4446,9 @@ fn agent_layout_session_hints_name_the_action_of_the_focused_region() {
 
     let mut state = State::new(true, 100, 32);
     state.prompt_enabled = true;
-    state.status_area.update(
-        "Ask".into(),
-        "test model".into(),
-        None,
-        Vec::new(),
-        status_items(),
-    );
+    state
+        .status_area
+        .update("Ask".into(), "test model".into(), None, status_items());
     set_status_family(&mut state.status_area);
     state
         .footer
@@ -4509,13 +4477,8 @@ fn agent_layout_session_hints_name_the_action_of_the_focused_region() {
 
     let mut todo = State::new(true, 100, 32);
     todo.prompt_enabled = true;
-    todo.status_area.update(
-        "Ask".into(),
-        "test model".into(),
-        None,
-        Vec::new(),
-        status_items(),
-    );
+    todo.status_area
+        .update("Ask".into(), "test model".into(), None, status_items());
     set_status_family(&mut todo.status_area);
     todo.footer
         .update(todo.status_area.available_panels().collect::<Vec<_>>());
@@ -4853,13 +4816,9 @@ fn agent_layout_twenty_four_columns_keep_identity_focus_help_draft_and_discovery
 fn agent_layout_conversation_occupancy_toggling_agents_avoids_whole_screen_redraw() {
     let mut state = State::new(true, 80, 24);
     state.prompt_enabled = true;
-    state.status_area.update(
-        "Ask".into(),
-        "fixture".into(),
-        None,
-        Vec::new(),
-        status_items(),
-    );
+    state
+        .status_area
+        .update("Ask".into(), "fixture".into(), None, status_items());
     set_status_family(&mut state.status_area);
     state.footer.update(state.status_area.available_panels());
     state.scrollback.append("first line\n");

@@ -2222,6 +2222,43 @@ impl PermissionsSurface {
         frame
     }
 
+    pub(super) fn click(&mut self, row: usize, width: usize, height: usize) -> PermissionsEffect {
+        let frame = self.styled_lines(width, height);
+        let selectable = frame
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| {
+                line.spans.first().is_some_and(|span| {
+                    (span.role == Some(Role::Permission)
+                        || self.page == Page::RecentlyDenied && !self.denials.is_detail())
+                        && matches!(span.text.as_str(), "  " | "❯ ")
+                })
+            })
+            .map(|(row, _)| row)
+            .collect::<Vec<_>>();
+        let Some(clicked) = selectable.iter().position(|candidate| *candidate == row) else {
+            return PermissionsEffect::None;
+        };
+        let Some(selected) = selectable.iter().position(|candidate| {
+            frame[*candidate]
+                .spans
+                .first()
+                .is_some_and(|span| span.text == "❯ ")
+        }) else {
+            return PermissionsEffect::None;
+        };
+        let delta = clicked as isize - selected as isize;
+        let direction = if delta < 0 {
+            KeyCode::Up
+        } else {
+            KeyCode::Down
+        };
+        for _ in 0..delta.unsigned_abs() {
+            self.key(KeyEvent::new(direction, KeyModifiers::NONE));
+        }
+        self.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+    }
+
     pub(super) fn styled_lines(&mut self, width: usize, height: usize) -> Vec<RoleLine> {
         if height == 0 {
             return Vec::new();

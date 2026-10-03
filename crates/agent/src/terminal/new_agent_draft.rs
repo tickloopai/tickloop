@@ -13,10 +13,7 @@ use uuid::Uuid;
 
 use crate::{
     agent_access::{ConfigurationChange, LaunchSpec},
-    model::{
-        ModelConfig, ReasoningEffort, cards::ProviderPatch, validate_model_config,
-        validate_reasoning_effort,
-    },
+    model::{ModelConfig, ReasoningEffort, validate_model_config, validate_reasoning_effort},
     permissions::{ExecutionMode, PermissionRule},
     runtime::{AgentError, ChatSnapshot, PermissionChange},
 };
@@ -148,7 +145,6 @@ pub(super) struct NewAgentDraft {
     changes: Vec<ConfigurationChange>,
     additional_directories: Option<Vec<PathBuf>>,
     rules: Vec<PermissionRule>,
-    transient_provider: Option<ProviderPatch>,
 }
 
 impl NewAgentDraft {
@@ -233,19 +229,11 @@ impl NewAgentDraft {
     }
 
     pub(super) fn is_empty(&self) -> bool {
-        self.changes.is_empty()
-            && self.additional_directories.is_none()
-            && self.rules.is_empty()
-            && self.transient_provider.is_none()
+        self.changes.is_empty() && self.additional_directories.is_none() && self.rules.is_empty()
     }
 
     pub(super) fn staged_rules(&self) -> &[PermissionRule] {
         &self.rules
-    }
-
-    /// The provider a staged `/model PATH` selection needs in the first worker.
-    pub(super) fn stage_transient_provider(&mut self, provider: ProviderPatch) {
-        self.transient_provider = Some(provider);
     }
 
     /// Splits the draft into what the first Create sends, starting from the View's launch.
@@ -261,9 +249,6 @@ impl NewAgentDraft {
                 ConfigurationChange::ExecutionMode { mode } => execution_mode = Some(mode),
                 change => changes.push(change),
             }
-        }
-        if let Some(provider) = self.transient_provider {
-            launch.transient_provider = Some(provider);
         }
         FirstCreate {
             launch,

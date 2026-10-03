@@ -229,10 +229,13 @@ async fn images_read_by_tools_count_by_pixels_so_they_do_not_force_compaction() 
         text("Looked at it."),
         text("Still fine."),
     ]));
-    let agent =
-        Agent::open_embedded(directory.path().join("state"), config(), model.clone()).unwrap();
+    let agent = Agent::open_embedded(
+        directory.path().join("state"),
+        support::config_with_window(100_000),
+        model.clone(),
+    )
+    .unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    agent.set_context_window(chat, 100_000).await.unwrap();
 
     run_to_completion(&agent, chat, "Check screenshot.png").await;
     run_to_completion(&agent, chat, "Anything else?").await;

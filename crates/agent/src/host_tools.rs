@@ -44,6 +44,16 @@ pub enum HostToolPermission {
     Confirmation,
 }
 
+pub struct BuiltinToolCall {
+    pub name: String,
+    pub input: Value,
+}
+
+struct HostPolicyIdentity {
+    name: String,
+    input: Value,
+}
+
 /// One invocation's resolved operation. Ownership is transferred to dispatch exactly once.
 pub struct PreparedHostCall {
     name: String,
@@ -54,6 +64,7 @@ pub struct PreparedHostCall {
     approval_summary: String,
     payload: Option<Box<dyn Any + Send + Sync>>,
     event_context: Option<EventToolContext>,
+    policy_identity: Option<HostPolicyIdentity>,
 }
 
 impl std::fmt::Debug for PreparedHostCall {
@@ -84,6 +95,7 @@ impl PreparedHostCall {
             approval_summary,
             payload: None,
             event_context: None,
+            policy_identity: None,
         }
     }
 
@@ -121,6 +133,21 @@ impl PreparedHostCall {
     pub fn name(&self) -> &str {
         &self.name
     }
+    pub fn policy_name(&self) -> &str {
+        self.policy_identity
+            .as_ref()
+            .map_or(&self.name, |identity| &identity.name)
+    }
+    pub fn policy_input(&self) -> &Value {
+        self.policy_identity
+            .as_ref()
+            .map_or(&self.input, |identity| &identity.input)
+    }
+    /// Aliases inherit the resolved operation's identity for approval, delegation and admission.
+    pub fn with_policy_identity(mut self, name: String, input: Value) -> Self {
+        self.policy_identity = Some(HostPolicyIdentity { name, input });
+        self
+    }
     pub fn source_input(&self) -> &Value {
         &self.source_input
     }
@@ -152,6 +179,7 @@ pub enum HostCallResult {
 #[derive(Clone, Debug)]
 pub enum HostEffect {
     PublishedSource(PublishedSourceEffect),
+    CreatedArtifact(crate::artifacts::ArtifactTick),
     /// A strictly validated connection read. It carries the private service envelope, so it is
     /// never serialized; Runtime turns it into the model-visible result.
     ConnectSource(ConnectSourceEffect),
@@ -167,6 +195,8 @@ pub struct PublishedSourceEffect {
     pub credential_generation: [u8; 32],
     pub directory_fingerprint: [u8; 32],
     pub bridge_fingerprint: [u8; 32],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_tick: Option<crate::artifacts::ArtifactTick>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -404,6 +434,15 @@ impl HostCallResult {
 #[async_trait]
 pub trait HostToolProvider: Send + Sync {
     fn definitions(&self) -> Vec<ToolDefinition>;
+
+    async fn builtin_alias(
+        &self,
+        _chat: ChatId,
+        _name: &str,
+        _input: &Value,
+    ) -> Result<Option<BuiltinToolCall>, String> {
+        Ok(None)
+    }
 
     async fn associate_event_source(
         &self,

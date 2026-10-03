@@ -135,6 +135,7 @@ async fn explicit_host_operations_continue_after_the_agent_view_closes() {
             owner_epoch: access.owner_epoch(),
             command_id: uuid::Uuid::new_v4(),
             command: AgentCommand::Configure {
+                provider: None,
                 execution,
                 change: ConfigurationChange::ExecutionMode {
                     mode: ExecutionMode::FullAccess,
@@ -1515,6 +1516,7 @@ async fn isolated_herdr_keeps_background_host_access_and_places_beside_the_input
             owner_epoch: access.owner_epoch(),
             command_id: uuid::Uuid::new_v4(),
             command: AgentCommand::Configure {
+                provider: None,
                 execution,
                 change: ConfigurationChange::ExecutionMode {
                     mode: ExecutionMode::FullAccess,

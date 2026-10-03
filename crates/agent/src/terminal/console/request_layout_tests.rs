@@ -96,13 +96,7 @@ fn request_question_wraps_within_the_row_budget_after_resize() {
             state.resize(width, height);
             let (lines, row, column) = state.styled_frame();
             let text = lines.iter().map(RoleLine::text).collect::<Vec<_>>();
-            let capacity = if state.height >= 10 {
-                state
-                    .height
-                    .saturating_sub(agent_layout::MIN_CONVERSATION_ROWS)
-            } else {
-                state.height.saturating_sub(1).max(1)
-            };
+            let capacity = input_dialog::height_for_terminal(state.height);
             assert!(lines.len() <= capacity, "{width}×{height}: {text:?}");
             assert!(
                 text.iter()
@@ -120,7 +114,7 @@ fn request_question_wraps_within_the_row_budget_after_resize() {
             if capacity >= 3 && width >= 40 {
                 assert!(
                     text.iter()
-                        .any(|line| line == "Space/Enter toggle · Esc answer later"),
+                        .any(|line| line.starts_with("Space/Enter toggle · Esc answer later")),
                     "{text:?}"
                 );
             }

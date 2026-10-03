@@ -176,14 +176,14 @@ const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         command: "/model",
-        arguments: "[CONFIG_FILE]",
-        description: "Choose a model from configured Providers, or load a Chat configuration file.",
+        arguments: "",
+        description: "Choose built-in models; p opens connection details, f switches connection filters.",
         menu_group: Some(CommandGroup::ModelAndSettings),
     },
     CommandSpec {
         command: "/provider",
         arguments: "",
-        description: "Configure Provider connections, API keys and sign-in.",
+        description: "Browse connections and models; p manages credentials in connection details.",
         menu_group: Some(CommandGroup::ModelAndSettings),
     },
     CommandSpec {
@@ -780,8 +780,8 @@ mod tests {
         assert_eq!(
             completion.handle_key(CompletionKey::Choose),
             CompletionAction::ReplaceDraft {
-                draft: "/model ".into(),
-                cursor: "/model ".len(),
+                draft: "/model".into(),
+                cursor: "/model".len(),
             }
         );
         assert!(!completion.is_open());
@@ -864,7 +864,7 @@ mod tests {
             completion.handle_key(CompletionKey::Choose),
             CompletionAction::ReplaceDraft {
                 draft: "研究一下\u{3000}/model 保留后缀".into(),
-                cursor: "研究一下\u{3000}/model ".len(),
+                cursor: "研究一下\u{3000}/model".len(),
             }
         );
     }
@@ -882,7 +882,7 @@ mod tests {
             completion.handle_key(CompletionKey::Complete),
             CompletionAction::ReplaceDraft {
                 draft: "before /model after".into(),
-                cursor: "before /model ".len(),
+                cursor: "before /model".len(),
             }
         );
     }
@@ -899,8 +899,8 @@ mod tests {
         assert_eq!(
             completion.handle_key(CompletionKey::Choose),
             CompletionAction::ReplaceDraft {
-                draft: "第一行\n/model \n第二行".into(),
-                cursor: "第一行\n/model ".len(),
+                draft: "第一行\n/model\n第二行".into(),
+                cursor: "第一行\n/model".len(),
             }
         );
     }

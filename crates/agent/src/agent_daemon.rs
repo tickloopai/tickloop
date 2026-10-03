@@ -34,7 +34,7 @@ use crate::{
         AccessError, AgentAccess, EmbeddedAgentAccess, LaunchSpec, LocalAgentClient, OwnerServer,
         WorkerFactory, serve_worker_listener, worker_link,
     },
-    model::{ModelConfig, cards::ModelCatalog, model_client},
+    model::{ModelClient, ModelConfig, cards::ModelCatalog, model_client},
     runtime::Agent,
     settings::UserSettings,
 };
@@ -516,24 +516,37 @@ async fn run_worker(arguments: &[OsString]) -> Result<(), String> {
 
 /// The model a worker for `launch` starts with.
 pub(crate) fn launch_model(launch: &LaunchSpec) -> ModelConfig {
-    launch.model.clone().unwrap_or_else(|| {
-        ModelCatalog::defaults()
-            .get("deepseek-api", "deepseek-flash-chat-completions")
-            .expect("bundled default model")
-    })
+    let catalog = ModelCatalog::defaults();
+    launch
+        .model
+        .as_ref()
+        .and_then(|model| catalog.get(&model.provider_id, &model.model_id))
+        .unwrap_or_else(|| {
+            catalog
+                .get("deepseek-api", "deepseek-flash")
+                .expect("bundled default model")
+        })
 }
 
 pub(crate) async fn build_runtime(launch: &LaunchSpec) -> Result<Agent, String> {
+    let model = launch_model(launch);
+    let client =
+        model_client(model, launch.config_root.as_deref()).map_err(|error| error.to_string())?;
+    build_runtime_with_client(launch, client).await
+}
+
+/// Build the same version-owned runtime with a caller-supplied model transport.
+/// Integration fixtures use this seam without adding definition-file loading to the CLI.
+#[doc(hidden)]
+pub async fn build_runtime_with_client(
+    launch: &LaunchSpec,
+    client: Arc<dyn ModelClient>,
+) -> Result<Agent, String> {
     let model = launch_model(launch);
     let settings = launch
         .config_root
         .as_ref()
         .map(|root| UserSettings::in_root(root));
-    if let (Some(settings), Some(provider)) = (&settings, &launch.transient_provider) {
-        settings.set_transient_provider(provider.clone());
-    }
-    let client = model_client(model.clone(), launch.config_root.as_deref())
-        .map_err(|error| error.to_string())?;
     let agent = if launch.session_persistence {
         let root = launch
             .config_root
@@ -557,43 +570,41 @@ pub(crate) async fn build_runtime(launch: &LaunchSpec) -> Result<Agent, String> 
         Ok(Agent::new_with_options(model, client, launch.host_options))
     }
     .map_err(|error| error.to_string())?;
-    let mut native_stream: Option<Arc<dyn crate::tick_stream::TickStreamPort>> = None;
-    let mut native_host: Option<Arc<dyn crate::host_tools::HostToolProvider>> = None;
-    if let Some(work) = &launch.host_work_context {
-        let access = Arc::new(tick_connect::access::TickAccess::new(
+    use crate::tick_adapter::TickAdapters;
+    let access = launch.host_work_context.as_ref().map(|work| {
+        Arc::new(tick_connect::access::TickAccess::new(
             tick_connect::herdr::HerdrContext {
                 socket: work.socket.clone(),
                 caller_pane: String::new(),
             },
-        ));
-        native_host = Some(Arc::new(crate::native_host::NativeHostToolProvider::new(
+        ))
+    });
+    let native_host = access.as_ref().map(|access| {
+        Arc::new(crate::native_host::NativeHostToolProvider::new(
             access.clone(),
-        )));
-        native_stream = Some(Arc::new(crate::tick_stream::NativeTickStream::new(access)));
-    }
+        )) as Arc<dyn crate::host_tools::HostToolProvider>
+    });
+    let adapters = Arc::new(TickAdapters::builtin(
+        Some(agent.clone()),
+        launch.config_root.clone(),
+        access,
+    ));
+    agent.install_tick_stream(adapters.clone()).await;
+    let tools = adapters.host_tools(native_host);
     if let Some(root) = launch.config_root.as_ref()
         && let Ok(artifact) = crate::artifacts::ArtifactClient::new(root)
     {
         agent
-            .install_tick_stream(Arc::new(crate::tick_stream::ArtifactTickStream::new(
-                root.clone(),
-                native_stream.clone(),
-            )))
-            .await;
-        agent
             .install_host_tools(Arc::new(
-                crate::mcp_tools::McpHostToolProvider::new(artifact, native_host)
+                crate::mcp_tools::McpHostToolProvider::new(artifact, Some(tools))
                     .with_event_bridge(ARTIFACT_EVENT_BRIDGE_URI)
                     .with_event_bridge_fallback(ARTIFACT_EVENT_BRIDGE_FALLBACK_URI),
             ))
             .map_err(|error| format!("cannot install MCP tools: {error}"))?;
-    } else if let Some(native) = native_host {
-        if let Some(stream) = native_stream {
-            agent.install_tick_stream(stream).await;
-        }
+    } else {
         agent
-            .install_host_tools(native)
-            .map_err(|error| format!("cannot install Herdr tools: {error}"))?;
+            .install_host_tools(tools)
+            .map_err(|error| format!("cannot install Tick tools: {error}"))?;
     }
     Ok(agent)
 }

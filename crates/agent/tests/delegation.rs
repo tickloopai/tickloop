@@ -134,6 +134,7 @@ async fn loaded_delegated_host_authority_stays_with_its_original_socket_and_work
     access_command(
         &access,
         AgentCommand::Configure {
+            provider: None,
             execution: parent,
             change: ConfigurationChange::ExecutionMode {
                 mode: ExecutionMode::FullAccess,
@@ -1064,6 +1065,7 @@ async fn console_opens_the_real_child_in_place_and_routes_follow_up_with_its_cei
     };
     for command in [
         AgentCommand::Configure {
+            provider: None,
             execution: parent,
             change: ConfigurationChange::ExecutionMode {
                 mode: ExecutionMode::FullAccess,
@@ -1333,6 +1335,7 @@ async fn console_opens_the_real_child_in_place_and_routes_follow_up_with_its_cei
             owner_epoch: access.owner_epoch(),
             command_id: uuid::Uuid::new_v4(),
             command: AgentCommand::Configure {
+                provider: None,
                 execution: console.projection().visible.unwrap(),
                 change: ConfigurationChange::ReplaceRules { rules: vec![] },
             },

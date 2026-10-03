@@ -101,7 +101,6 @@ async fn run_owner_loss_fixture() {
     console.set_prompt_enabled(true).unwrap();
     let startup = StartupState {
         chat: StartupChat::Resumed(Box::new(agent.snapshot(chat).await.unwrap()), false),
-        explicit_provider: None,
         user_settings: None,
     };
     let result = interact(&agent, workdir, &console, input, startup, None).await;

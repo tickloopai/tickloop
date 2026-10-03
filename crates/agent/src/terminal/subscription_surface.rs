@@ -246,6 +246,21 @@ impl SubscriptionSurface {
         self.selected_index().map(|index| &self.rows[index])
     }
 
+    pub fn select_at_row(&mut self, row: usize, height: usize, display: DisplayProfile) -> bool {
+        let frame = self.frame(SubscriptionViewport { height }, display);
+        if frame.lines.get(row).is_none() {
+            return false;
+        }
+        let Some(id) = self.rows.get(self.top + row).map(|row| row.id) else {
+            return false;
+        };
+        if self.focus != SubscriptionFocus::List {
+            return self.selected == Some(id);
+        }
+        self.select(id);
+        true
+    }
+
     pub fn frame(
         &mut self,
         viewport: SubscriptionViewport,

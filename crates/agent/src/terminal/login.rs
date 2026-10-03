@@ -104,6 +104,7 @@ pub(super) enum LoginUpdate {
 
 pub(super) struct LoginFlow {
     id: Uuid,
+    chat: Option<Uuid>,
     method: LoginMethod,
     cancel: CancellationToken,
     task: tokio::task::JoinHandle<()>,
@@ -118,6 +119,7 @@ impl LoginFlow {
         method: LoginMethod,
     ) -> Result<Self, String> {
         let id = Uuid::new_v4();
+        let chat = console.dialog_chat()?;
         let cancel = CancellationToken::new();
         Self::show(
             console,
@@ -272,6 +274,7 @@ impl LoginFlow {
         });
         Ok(Self {
             id,
+            chat,
             method,
             cancel,
             task,
@@ -286,6 +289,10 @@ impl LoginFlow {
 
     pub(super) fn id(&self) -> Uuid {
         self.id
+    }
+
+    pub(super) fn chat(&self) -> Option<Uuid> {
+        self.chat
     }
 
     pub(super) async fn next(&mut self) -> Option<LoginUpdate> {
@@ -429,7 +436,7 @@ impl LoginFlow {
             };
             match link {
                 Some(address) => console.show_login_menu(menu, address, false),
-                None => console.show_focused_menu(menu),
+                None => console.show_picker_menu(menu, super::console::PickerKind::Actions),
             }
         } else {
             console.write(&format!("{}\n", context.join("\n")))
@@ -597,8 +604,9 @@ mod tests {
 
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
     use serde_json::json;
+    use std::os::unix::fs::PermissionsExt;
     use std::{
-        io::{Read, Write},
+        io::Write,
         sync::{Arc, Mutex},
         time::{Duration, Instant},
     };
@@ -606,6 +614,7 @@ mod tests {
 
     const TERMINAL_CHILD_STACK_BYTES: usize = 8 * 1024 * 1024;
     const TERMINAL_ESCAPE_KEY: &[u8] = b"\x1b[27u";
+    const SYNCHRONIZED_FRAME_END: &str = "\x1b[?2026l";
 
     #[test]
     fn terminal_child() {
@@ -650,6 +659,16 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancelled_and_failed_login_return_to_provider_before_exit() {
         let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let auth_directory = root.join("state/auth");
+        std::fs::create_dir_all(&auth_directory).unwrap();
+        for path in [root.join("state"), auth_directory.clone()] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let credentials = auth_directory.join("openai-codex-credentials.json");
+        let original = serde_json::json!({"access_token":"old-fixture-access", "refresh_token":"old-fixture-refresh", "account_id":"old-fixture-account", "expires_at_ms":u64::MAX}).to_string();
+        std::fs::write(&credentials, &original).unwrap();
+        std::fs::set_permissions(&credentials, std::fs::Permissions::from_mode(0o600)).unwrap();
         let pty = native_pty_system()
             .openpty(PtySize {
                 rows: 40,
@@ -664,10 +683,47 @@ mod tests {
             "terminal::login::tests::terminal_child",
             "--nocapture",
         ]);
-        command.cwd(directory.path());
-        command.env("TICKLOOP_CONFIG_DIR", directory.path().join("state"));
-        command.env("TICKLOOP_TEST_CODEX_OAUTH", "http://127.0.0.1:37981");
+        command.cwd(&root);
+        command.env("TICKLOOP_CONFIG_DIR", root.join("state"));
+        let rejected_login = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        command.env(
+            "TICKLOOP_TEST_CODEX_OAUTH",
+            format!("http://{}", rejected_login.local_addr().unwrap()),
+        );
+        let rejected_login = std::thread::spawn(move || {
+            use std::io::Read;
+            let (mut stream, _) = rejected_login.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(20)))
+                .unwrap();
+            let mut headers = Vec::new();
+            while !headers.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                headers.push(byte[0]);
+            }
+            let headers = String::from_utf8(headers).unwrap();
+            assert!(headers.starts_with("POST "));
+            let length = headers
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(|length| length.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            let mut body = vec![0; length];
+            stream.read_exact(&mut body).unwrap();
+            let response = "{\"error\":\"controlled login refusal\"}";
+            stream.write_all(format!("HTTP/1.1 400 Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).as_bytes()).unwrap();
+        });
         command.env("TICKLOOP_AGENT_TUI", "inline");
+        let home = root.join("home");
+        let temporary = root.join("tmp");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&temporary).unwrap();
+        command.env("HOME", home);
+        command.env("TICKLOOP_TMPDIR", temporary);
         // The Console runs on a libtest thread instead of the CLI main thread.
         command.env("RUST_MIN_STACK", TERMINAL_CHILD_STACK_BYTES.to_string());
         for name in ["HERDR_ENV", "HERDR_PANE_ID", "HERDR_SOCKET_PATH"] {
@@ -680,7 +736,7 @@ mod tests {
         }
         command.env("NO_PROXY", "127.0.0.1,localhost");
         command.env("no_proxy", "127.0.0.1,localhost");
-        let mut reader = pty.master.try_clone_reader().unwrap();
+        let reader = pty.master.try_clone_reader().unwrap();
         let mut writer = pty.master.take_writer().unwrap();
         struct ChildGuard(Box<dyn portable_pty::Child + Send + Sync>);
         impl Drop for ChildGuard {
@@ -693,21 +749,16 @@ mod tests {
         let output = Arc::new(Mutex::new(String::new()));
         let captured = output.clone();
         let reading = std::thread::spawn(move || {
-            let mut buffer = [0; 4096];
-            while let Ok(count) = reader.read(&mut buffer) {
-                if count == 0 {
-                    break;
-                }
-                captured
-                    .lock()
-                    .unwrap()
-                    .push_str(&String::from_utf8_lossy(&buffer[..count]));
-            }
+            screen::capture_output(reader, captured);
         });
         let wait = |needle: &str| {
             let deadline = Instant::now() + Duration::from_secs(20);
             while !output.lock().unwrap().contains(needle) {
-                assert!(Instant::now() < deadline, "PTY missing {needle}");
+                assert!(
+                    Instant::now() < deadline,
+                    "PTY missing {needle}; latest frame:\n{}",
+                    screen::visible_screen(&output.lock().unwrap(), 150, 40)
+                );
                 std::thread::sleep(Duration::from_millis(20));
             }
         };
@@ -715,9 +766,12 @@ mod tests {
         writer.write_all(b"/provider\r").unwrap();
         writer.flush().unwrap();
         wait("Choose Provider");
+        writer.write_all(b"jjp").unwrap();
+        writer.flush().unwrap();
+        wait("Connection · OpenAI");
         writer.write_all(b"j\r").unwrap();
         writer.flush().unwrap();
-        wait("Choose connection · OpenAI");
+        wait("Sign in · OpenAI");
         writer.write_all(b"j\r").unwrap();
         writer.flush().unwrap();
         wait("Codex browser login");
@@ -728,7 +782,9 @@ mod tests {
         loop {
             let text = output.lock().unwrap();
             if let Some(cancelled) = text.rfind("Login cancelled")
-                && text[cancelled..].contains("Choose connection · OpenAI")
+                && text[cancelled..].contains("Sign in · OpenAI")
+                && text[cancelled..].contains("\x1b[?2026l")
+                && screen::visible_screen(&text, 150, 40).contains("Sign in · OpenAI")
             {
                 break;
             }
@@ -739,14 +795,17 @@ mod tests {
             drop(text);
             std::thread::sleep(Duration::from_millis(20));
         }
-        writer.write_all(b"d").unwrap();
+        writer.write_all(b"k\r").unwrap();
         writer.flush().unwrap();
         wait("Cannot log in:");
+        rejected_login.join().unwrap();
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             let text = output.lock().unwrap();
             if let Some(failed) = text.rfind("Cannot log in:")
-                && text[failed..].contains("Choose connection · OpenAI")
+                && text[failed..].contains("Sign in · OpenAI")
+                && text[failed..].contains("\x1b[?2026l")
+                && screen::visible_screen(&text, 150, 40).contains("Sign in · OpenAI")
             {
                 break;
             }
@@ -757,12 +816,21 @@ mod tests {
             drop(text);
             std::thread::sleep(Duration::from_millis(20));
         }
-        writer.write_all(b"\x1b").unwrap();
-        writer.flush().unwrap();
-        wait("Choose Provider");
-        writer.write_all(b"\x1b").unwrap();
-        writer.flush().unwrap();
-        wait("Selection cancelled");
+        assert_eq!(std::fs::read_to_string(&credentials).unwrap(), original);
+        for title in [
+            "Connection · OpenAI",
+            "Choose Provider",
+            "Selection cancelled",
+        ] {
+            let mark = output.lock().unwrap().len();
+            writer.write_all(TERMINAL_ESCAPE_KEY).unwrap();
+            writer.flush().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !output.lock().unwrap()[mark..].contains(title) {
+                assert!(Instant::now() < deadline, "PTY missing fresh {title}");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
         writer.write_all(b"/exit\r").unwrap();
         writer.flush().unwrap();
         let deadline = Instant::now() + Duration::from_secs(20);
@@ -912,6 +980,12 @@ mod tests {
             format!("{origin}/codex/responses"),
         );
         command.env("TICKLOOP_AGENT_TUI", "inline");
+        let home = root.join("home");
+        let temporary = root.join("tmp");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&temporary).unwrap();
+        command.env("HOME", home);
+        command.env("TICKLOOP_TMPDIR", temporary);
         command.env("RUST_MIN_STACK", TERMINAL_CHILD_STACK_BYTES.to_string());
         for name in ["HERDR_ENV", "HERDR_PANE_ID", "HERDR_SOCKET_PATH"] {
             command.env_remove(name);
@@ -924,7 +998,7 @@ mod tests {
         command.env("NO_PROXY", "127.0.0.1,localhost");
         command.env("no_proxy", "127.0.0.1,localhost");
         command.env("TICKLOOP_TEST_BROWSER_AUTH", "1");
-        let mut reader = pty.master.try_clone_reader().unwrap();
+        let reader = pty.master.try_clone_reader().unwrap();
         let mut writer = pty.master.take_writer().unwrap();
         struct ChildGuard(Box<dyn portable_pty::Child + Send + Sync>);
         impl Drop for ChildGuard {
@@ -937,16 +1011,7 @@ mod tests {
         let output = Arc::new(Mutex::new(String::new()));
         let captured = output.clone();
         let reading = std::thread::spawn(move || {
-            let mut buf = [0; 4096];
-            while let Ok(n) = reader.read(&mut buf) {
-                if n == 0 {
-                    break;
-                }
-                captured
-                    .lock()
-                    .unwrap()
-                    .push_str(&String::from_utf8_lossy(&buf[..n]));
-            }
+            screen::capture_output(reader, captured);
         });
         let ansi = regex::Regex::new(r"\x1b\[[0-9;?]*[ -/]*[@-~]").unwrap();
         let wait = |needle: &str| {
@@ -976,12 +1041,17 @@ mod tests {
             loop {
                 let text = output.lock().unwrap().clone();
                 let updates = text.get(offset..).unwrap_or("");
-                let visible = screen::visible_screen(&text, 150, 40);
-                if ansi.replace_all(updates, "").contains(needle)
-                    || (updates.contains("\x1b[?2026l") && visible.contains(needle))
-                {
-                    break;
+                if let Some(end) = updates.rfind(SYNCHRONIZED_FRAME_END) {
+                    let completed = &text[..offset + end + SYNCHRONIZED_FRAME_END.len()];
+                    let visible = screen::visible_screen(completed, 150, 40);
+                    let completed_updates = &updates[..end + SYNCHRONIZED_FRAME_END.len()];
+                    if ansi.replace_all(completed_updates, "").contains(needle)
+                        || visible.contains(needle)
+                    {
+                        break;
+                    }
                 }
+                let visible = screen::visible_screen(&text, 150, 40);
                 assert!(
                     Instant::now() < deadline,
                     "PTY missing {needle} after action:\n{visible}"
@@ -991,7 +1061,7 @@ mod tests {
         };
         let wait_for_input_after = |offset: usize| {
             let deadline = Instant::now() + Duration::from_secs(20);
-            let frame_end = "\x1b[?2026l";
+            let frame_end = SYNCHRONIZED_FRAME_END;
             loop {
                 let text = output.lock().unwrap().clone();
                 let completed = text
@@ -1030,14 +1100,14 @@ mod tests {
             .write_all(if selected_model.is_some() {
                 b"\r"
             } else {
-                b"j\r"
+                b"jj\r"
             })
             .unwrap();
         writer.flush().unwrap();
-        wait("Choose connection · OpenAI");
+        wait("Sign in · OpenAI");
         let before_login = output.lock().unwrap().len();
         writer
-            .write_all(if browser { b"j\r" } else { b"jd" })
+            .write_all(if browser { b"j\r" } else { b"\r" })
             .unwrap();
         writer.flush().unwrap();
         wait_after("login saved", before_login);
@@ -1048,7 +1118,7 @@ mod tests {
                 let text = output.lock().unwrap().clone();
                 let updates = text.get(before_login..).unwrap_or("");
                 let visible = screen::visible_screen(&text, 150, 40);
-                let picker_returned = updates.contains("\x1b[?2026l")
+                let picker_returned = updates.contains(SYNCHRONIZED_FRAME_END)
                     && visible.contains("Choose model · OpenAI")
                     && visible.contains("Codex subscription")
                     && !visible.contains("Codex browser login");
@@ -1069,13 +1139,20 @@ mod tests {
                 let before_configuration = output.lock().unwrap().len();
                 writer.write_all(b"p").unwrap();
                 writer.flush().unwrap();
-                wait_after("Choose connection · OpenAI", before_configuration);
+                wait_after("Connection · OpenAI", before_configuration);
                 let before_reauthentication = output.lock().unwrap().len();
-                writer.write_all(b"r").unwrap();
+                writer.write_all(b"j\r").unwrap();
+                writer.flush().unwrap();
+                wait_after("Sign in · OpenAI", before_reauthentication);
+                writer.write_all(b"j\r").unwrap();
                 writer.flush().unwrap();
                 wait_after("Codex browser login", before_reauthentication);
                 wait_after("login saved", before_reauthentication);
-                wait_after("Choose model · OpenAI", before_reauthentication);
+                wait_after("Connection · OpenAI", before_reauthentication);
+                let before_model_return = output.lock().unwrap().len();
+                writer.write_all(TERMINAL_ESCAPE_KEY).unwrap();
+                writer.flush().unwrap();
+                wait_after("Choose model · OpenAI", before_model_return);
             }
             if selected_model.is_none() {
                 assert!(!root.join("state/settings.json").exists());
@@ -1083,7 +1160,7 @@ mod tests {
             let before_back = output.lock().unwrap().len();
             writer.write_all(TERMINAL_ESCAPE_KEY).unwrap();
             writer.flush().unwrap();
-            wait_after("Choose model Provider", before_back);
+            wait_after("Choose Provider", before_back);
             let before_cancel = output.lock().unwrap().len();
             writer.write_all(TERMINAL_ESCAPE_KEY).unwrap();
             writer.flush().unwrap();
@@ -1092,17 +1169,14 @@ mod tests {
             writer.write_all(b"/provider\r").unwrap();
             writer.flush().unwrap();
             wait_after("Choose Provider", before_saved_login);
+            let before_saved_connection = output.lock().unwrap().len();
             writer
                 .write_all(if selected_model.is_some() {
                     b"\r"
                 } else {
-                    b"j\r"
+                    b"jj\r"
                 })
                 .unwrap();
-            writer.flush().unwrap();
-            wait_after("Choose connection · OpenAI", before_saved_login);
-            let before_saved_connection = output.lock().unwrap().len();
-            writer.write_all(b"j\r").unwrap();
             writer.flush().unwrap();
             wait_after("Choose model · OpenAI", before_saved_connection);
             assert!(
@@ -1123,7 +1197,7 @@ mod tests {
                 let before_model_back = output.lock().unwrap().len();
                 writer.write_all(TERMINAL_ESCAPE_KEY).unwrap();
                 writer.flush().unwrap();
-                wait_after("Choose model Provider", before_model_back);
+                wait_after("Choose Provider", before_model_back);
                 let before_model_cancel = output.lock().unwrap().len();
                 writer.write_all(TERMINAL_ESCAPE_KEY).unwrap();
                 writer.flush().unwrap();

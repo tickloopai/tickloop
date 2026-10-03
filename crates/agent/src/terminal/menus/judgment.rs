@@ -180,7 +180,7 @@ impl Menus {
                     console.permissions_key_saved_choice_failed(view, safe_text(&error.to_string()))
                 } else {
                     console.permissions_refreshed(view)?;
-                    console.permissions_error(safe_text(&error.to_string()))
+                    console.permissions_error(Some(chat), safe_text(&error.to_string()))
                 }
             }
         }
@@ -223,7 +223,7 @@ impl Menus {
                     console.permissions_key_saved_choice_failed(page, safe_text(&error.to_string()))
                 } else {
                     console.permissions_refreshed(page)?;
-                    console.permissions_error(safe_text(&error.to_string()))
+                    console.permissions_error(None, safe_text(&error.to_string()))
                 }
             }
         }

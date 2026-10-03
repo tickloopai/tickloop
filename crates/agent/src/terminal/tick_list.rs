@@ -8,22 +8,10 @@ use super::{
 pub(super) const TICK_LIST_COLUMNS: usize = 42;
 pub(super) const TICK_LIST_AUTO_MIN_COLUMNS: usize = 121;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum TickGroup {
-    Artifacts,
-    Shells,
-    Subscribed,
-}
-
-impl TickGroup {
-    pub(super) fn title(self) -> &'static str {
-        match self {
-            Self::Artifacts => "Artifacts",
-            Self::Shells => "Shells",
-            Self::Subscribed => "Subscribed",
-        }
-    }
-}
+pub(super) use crate::tick_adapter::TickGroup;
+use crate::tick_adapter::{
+    TickAdapters, TickDescriptor, TickGlyph, TickListAction, TickListContext,
+};
 
 #[derive(Clone, Debug)]
 pub(super) struct TickListEntry {
@@ -34,19 +22,28 @@ pub(super) struct TickListEntry {
     pub(super) kind: String,
     pub(super) status: String,
     pub(super) updated_at_ms: Option<u64>,
-    pub(super) running: bool,
+    pub(super) actions: Vec<TickListAction>,
 }
 
+#[derive(Clone)]
+pub(super) struct TickConfirmation {
+    pub(super) instance: String,
+    pub(super) action: std::sync::Arc<dyn crate::tick_adapter::TickActionExecutor>,
+    pub(super) prompt: String,
+}
 #[derive(Default)]
 pub(super) struct TickList {
-    pub(super) shell_detail: Option<super::tick_shell::TickShell>,
+    pub(super) detail: Option<Box<dyn super::tick_actions::TickDetailView>>,
     pub(super) subscriptions: Vec<crate::runtime::TickSubscriptionStatus>,
     pub(super) metadata: HashMap<String, Option<crate::artifacts::ArtifactMetadata>>,
     pub(super) metadata_failures: HashMap<String, String>,
-    pub(super) confirmation: Option<String>,
+    pub(super) confirmation: Option<TickConfirmation>,
     entries: Vec<TickListEntry>,
     selected: Option<String>,
-    removed_shells: HashSet<String>,
+    removed_instances: HashSet<String>,
+    adapters: Option<TickAdapters>,
+    pub(super) chat_snapshot: Option<crate::runtime::ChatSnapshot>,
+    pub(super) shell_snapshot: Option<crate::runtime::ShellTaskSnapshot>,
     pub(super) focused: bool,
     pub(super) overlay: bool,
 }
@@ -57,6 +54,15 @@ pub(super) struct TickListFrame {
 }
 
 impl TickList {
+    pub(super) fn refresh_action(
+        &mut self,
+    ) -> std::sync::Arc<dyn crate::tick_adapter::TickActionExecutor> {
+        let actions = self
+            .adapters
+            .get_or_insert_with(TickAdapters::presentation)
+            .refresh_actions();
+        super::tick_actions::builtin::refresh(actions)
+    }
     pub(super) fn entries(&self) -> &[TickListEntry] {
         &self.entries
     }
@@ -65,39 +71,43 @@ impl TickList {
             .as_ref()
             .and_then(|id| self.entries.iter().find(|entry| &entry.id == id))
     }
+    pub(super) fn rebuild(&mut self) {
+        let context = TickListContext {
+            chat: self.chat_snapshot.clone(),
+            shells: self.shell_snapshot.clone(),
+            subscriptions: self.subscriptions.clone(),
+            metadata: self.metadata.clone(),
+            metadata_failures: self.metadata_failures.clone(),
+        };
+        self.entries = self
+            .adapters
+            .get_or_insert_with(TickAdapters::presentation)
+            .list(&context)
+            .into_iter()
+            .map(TickListEntry::from)
+            .filter(|entry| !self.removed_instances.contains(&entry.id))
+            .collect();
+        self.reconcile_selection();
+    }
+    #[cfg(test)]
     pub(super) fn replace(&mut self, group: TickGroup, rows: Vec<TickListEntry>) {
         self.entries.retain(|entry| entry.group != group);
-        self.entries.extend(rows.into_iter().filter(|entry| {
-            group != TickGroup::Shells || !self.removed_shells.contains(&entry.id)
-        }));
-        let joined: HashSet<_> = self
-            .entries
-            .iter()
-            .filter(|entry| entry.group == TickGroup::Artifacts)
-            .map(|entry| entry.id.clone())
-            .collect();
-        self.entries.retain(|entry| {
-            if entry.group != TickGroup::Subscribed {
-                return true;
-            }
-            let subscription_id = uuid::Uuid::parse_str(&entry.id).ok();
-            !self.subscriptions.iter().any(|row| {
-                Some(row.id) == subscription_id && joined.contains(row.instance.as_str())
-            })
-        });
+        self.entries.extend(
+            rows.into_iter()
+                .filter(|entry| !self.removed_instances.contains(&entry.id)),
+        );
         self.entries.sort_by(|a, b| {
-            let order = |group| match group {
-                TickGroup::Artifacts => 0,
-                TickGroup::Shells => 1,
-                TickGroup::Subscribed => 2,
-            };
-            order(a.group)
-                .cmp(&order(b.group))
+            a.group
+                .cmp(&b.group)
                 .then_with(|| b.updated_at_ms.cmp(&a.updated_at_ms))
                 .then_with(|| a.id.cmp(&b.id))
         });
+        self.entries.dedup_by(|a, b| a.id == b.id);
+        self.reconcile_selection();
+    }
+    fn reconcile_selection(&mut self) {
         if self.entries.is_empty() {
-            self.shell_detail = None;
+            self.detail = None;
             self.focused = false;
             self.overlay = false;
         }
@@ -136,14 +146,10 @@ impl TickList {
             self.selected = Some(entry.id.clone());
         }
     }
-    pub(super) fn remove_shell(&mut self, id: &str) {
-        self.removed_shells.insert(id.into());
+    pub(super) fn remove_local(&mut self, id: &str) {
+        self.removed_instances.insert(id.into());
         self.entries.retain(|entry| entry.id != id);
-        self.selected = self.entries.first().map(|entry| entry.id.clone());
-        if self.entries.is_empty() {
-            self.focused = false;
-            self.overlay = false;
-        }
+        self.reconcile_selection();
     }
     #[cfg(test)]
     pub(super) fn lines(
@@ -175,11 +181,12 @@ impl TickList {
         let mut rows = Vec::new();
         let mut row_ids = Vec::new();
         let mut selected_row = 0;
-        for group in [
-            TickGroup::Artifacts,
-            TickGroup::Shells,
-            TickGroup::Subscribed,
-        ] {
+        let groups = self
+            .entries
+            .iter()
+            .map(|entry| entry.group)
+            .collect::<std::collections::BTreeSet<_>>();
+        for group in groups {
             let entries: Vec<_> = self
                 .entries
                 .iter()
@@ -239,17 +246,28 @@ impl TickList {
             .collect();
         lines.extend(rows.into_iter().skip(offset).take(capacity));
         if self.focused && height > 2 {
-            let artifact = self
+            let mut hints = self
                 .selected()
-                .is_some_and(|entry| entry.glyph == Glyph::ArtifactTick);
-            lines.push(RoleLine::role(
-                if artifact {
-                    "Enter open · x remove · c copy · f feedback · Esc"
-                } else {
-                    "Enter open · x remove · Esc"
-                },
-                Role::MutedText,
-            ));
+                .map(|entry| {
+                    entry
+                        .actions
+                        .iter()
+                        .map(|action| {
+                            format!(
+                                "{} {}",
+                                if action.key == 'o' {
+                                    "Enter".into()
+                                } else {
+                                    action.key.to_string()
+                                },
+                                action.label
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            hints.push("Esc".into());
+            lines.push(RoleLine::role(hints.join(" · "), Role::MutedText));
         }
         lines.truncate(height);
         for line in &mut lines {
@@ -288,5 +306,94 @@ mod tests {
         ] {
             assert_eq!(relative_time(updated, 90000000), expected);
         }
+    }
+}
+
+impl From<TickDescriptor> for TickListEntry {
+    fn from(row: TickDescriptor) -> Self {
+        Self {
+            id: row.instance.to_string(),
+            group: row.group,
+            glyph: match row.glyph {
+                TickGlyph::Artifact => Glyph::ArtifactTick,
+                TickGlyph::Shell => Glyph::ShellTick,
+                TickGlyph::Protocol => Glyph::ProtocolTick,
+                TickGlyph::Terminal => Glyph::TerminalTick,
+            },
+            title: row.title,
+            kind: row.kind,
+            status: row.status,
+            updated_at_ms: row.updated_at_ms,
+            actions: row.actions,
+        }
+    }
+}
+
+#[cfg(test)]
+mod adapter_tests {
+    use super::*;
+    use crate::tick_adapter::{TickAdapter, TickListOperation};
+    use std::sync::Arc;
+
+    struct Calendar;
+    impl TickAdapter for Calendar {
+        fn tick_type(&self) -> &'static str {
+            "calendar"
+        }
+        fn list(&self, _: &TickListContext) -> Vec<TickDescriptor> {
+            vec![TickDescriptor {
+                instance: crate::tick_stream::InstanceRef::new("calendar", "earnings").unwrap(),
+                group: TickGroup {
+                    order: 4,
+                    name: "Calendars",
+                },
+                glyph: TickGlyph::Protocol,
+                title: "Earnings calendar".into(),
+                kind: "Calendar".into(),
+                status: "waiting".into(),
+                updated_at_ms: None,
+                running: true,
+                actions: [('o', "inspect"), ('z', "expand")]
+                    .into_iter()
+                    .map(|(key, label)| TickListAction {
+                        key,
+                        label,
+                        operation: TickListOperation::Notify("opened".into()),
+                    })
+                    .collect(),
+            }]
+        }
+        fn stream(&self) -> Option<Arc<dyn crate::tick_stream::TickStreamPort>> {
+            None
+        }
+        fn tools(&self) -> Option<Arc<dyn crate::host_tools::HostToolProvider>> {
+            None
+        }
+    }
+    #[test]
+    fn registered_adapter_groups_rows_and_hints_render_without_list_type_changes() {
+        let mut list = TickList {
+            adapters: Some(
+                TickAdapters::new([Arc::new(Calendar) as Arc<dyn TickAdapter>]).unwrap(),
+            ),
+            ..Default::default()
+        };
+        list.rebuild();
+        list.focus(false, None);
+        let text = list
+            .lines(80, 20, DisplayProfile::default(), 0)
+            .iter()
+            .map(RoleLine::text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        for expected in [
+            "Calendars (1)",
+            "Earnings calendar",
+            "Calendar · waiting · —",
+            "Enter inspect · z expand · Esc",
+        ] {
+            assert!(text.contains(expected), "{text}");
+        }
+        assert!(!text.contains("Subscribed"));
     }
 }

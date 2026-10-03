@@ -38,6 +38,7 @@ const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const PRODUCTION_ORIGIN: &str = "https://auth.openai.com";
 const CREDENTIAL_FILE: &str = "openai-codex-credentials.json";
 const LOCK_FILE: &str = "openai-codex.lock";
+const LOGIN_GENERATION_STORE: &str = "openai-codex-generation";
 const DEVICE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 const REFRESH_WINDOW_MS: u64 = 5 * 60 * 1000;
@@ -67,6 +68,8 @@ pub enum AuthError {
     Copilot(String),
     #[error("OpenAI Codex login was cancelled")]
     Cancelled,
+    #[error("This Codex sign-in was superseded or signed out; start again from Connection Details")]
+    SupersededLogin,
     #[error("OpenAI Codex authorization timed out; retry from /provider")]
     TimedOut,
     #[error("OpenAI Codex is not logged in; use /provider")]
@@ -147,10 +150,12 @@ pub struct DeviceLogin {
     pub interval_seconds: u64,
     pub expires_in_seconds: u64,
     device_auth_id: String,
+    generation: Uuid,
     started_at: Instant,
 }
 
 pub struct BrowserLogin {
+    generation: Uuid,
     pub authorization_url: String,
     pub callback_uri: String,
     session: BrowserSession,
@@ -337,6 +342,7 @@ impl CodexAuth {
         &self,
         cancellation: &CancellationToken,
     ) -> Result<DeviceLogin, AuthError> {
+        let generation = self.begin_login(cancellation).await?;
         let response = self
             .post_json(
                 "/api/accounts/deviceauth/usercode",
@@ -369,6 +375,7 @@ impl CodexAuth {
             interval_seconds,
             expires_in_seconds: DEVICE_TIMEOUT.as_secs(),
             device_auth_id,
+            generation,
             started_at: Instant::now(),
         })
     }
@@ -380,6 +387,7 @@ impl CodexAuth {
         if cancellation.is_cancelled() {
             return Err(AuthError::Cancelled);
         }
+        let generation = self.begin_login(cancellation).await?;
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, self.callback_port))
             .await
             .map_err(|_| AuthError::CallbackPortUnavailable)?;
@@ -422,6 +430,7 @@ impl CodexAuth {
             stop.clone(),
         ));
         Ok(BrowserLogin {
+            generation,
             authorization_url: authorize_url.into(),
             callback_uri,
             session: BrowserSession {
@@ -463,6 +472,11 @@ impl CodexAuth {
         if cancellation.is_cancelled() {
             return Err(AuthError::Cancelled);
         }
+        let _generation_lock = self.lock_login_generation(cancellation).await?;
+        if cancellation.is_cancelled() {
+            return Err(AuthError::Cancelled);
+        }
+        self.ensure_current_login(login.generation)?;
         self.save(&credential)?;
         Ok(credential.public())
     }
@@ -508,6 +522,11 @@ impl CodexAuth {
                 if cancellation.is_cancelled() {
                     return Err(AuthError::Cancelled);
                 }
+                let _generation_lock = self.lock_login_generation(cancellation).await?;
+                if cancellation.is_cancelled() {
+                    return Err(AuthError::Cancelled);
+                }
+                self.ensure_current_login(device.generation)?;
                 self.save(&credential)?;
                 return Ok(credential.public());
             }
@@ -596,11 +615,62 @@ impl CodexAuth {
         if cancellation.is_cancelled() {
             return Err(AuthError::Cancelled);
         }
+        let _generation_lock = self.lock_login_generation(cancellation).await?;
+        if cancellation.is_cancelled() {
+            return Err(AuthError::Cancelled);
+        }
+        self.login_generation_store()
+            .save(&Uuid::new_v4())
+            .map_err(|_| AuthError::Storage("invalidate login generation"))?;
         let path = self.credential_path();
         match self.open_credential_file()? {
             Some(_) => std::fs::remove_file(path).map_err(|_| AuthError::Storage("logout")),
             None => Ok(()),
         }
+    }
+
+    fn login_generation_store(&self) -> provider_store::ProviderStore {
+        provider_store::ProviderStore::new(&self.state_dir, LOGIN_GENERATION_STORE)
+    }
+
+    async fn begin_login(&self, cancellation: &CancellationToken) -> Result<Uuid, AuthError> {
+        if cancellation.is_cancelled() {
+            return Err(AuthError::Cancelled);
+        }
+        let _lock = self.lock_login_generation(cancellation).await?;
+        if cancellation.is_cancelled() {
+            return Err(AuthError::Cancelled);
+        }
+        let generation = Uuid::new_v4();
+        self.login_generation_store()
+            .save(&generation)
+            .map_err(|_| AuthError::Storage("start login generation"))?;
+        Ok(generation)
+    }
+
+    async fn lock_login_generation(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Result<File, AuthError> {
+        self.directory()?;
+        self.login_generation_store()
+            .lock(cancellation)
+            .await
+            .map_err(|error| match error {
+                crate::model::ModelError::Cancelled => AuthError::Cancelled,
+                _ => AuthError::Storage("lock login generation"),
+            })
+    }
+
+    fn ensure_current_login(&self, generation: Uuid) -> Result<(), AuthError> {
+        let current = self
+            .login_generation_store()
+            .read::<Uuid>()
+            .map_err(|_| AuthError::Storage("read login generation"))?;
+        if current != Some(generation) {
+            return Err(AuthError::SupersededLogin);
+        }
+        Ok(())
     }
 
     async fn exchange_code(
@@ -1181,7 +1251,7 @@ mod network_tests {
                 .unwrap();
             runtime.block_on(async {
                 let directory = tempfile::tempdir().unwrap();
-                let auth = CodexAuth::new(directory.path());
+                let auth = CodexAuth::new(directory.path().canonicalize().unwrap());
                 assert_eq!(
                     auth.network_route.proxy_source,
                     crate::network::ProxySource::Environment

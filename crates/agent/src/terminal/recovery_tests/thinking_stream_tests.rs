@@ -214,8 +214,7 @@ fn thinking_stream_pty_fixture() {
                         Box::new(agent.snapshot(chat).await.unwrap()),
                         false,
                     ),
-                    explicit_provider: None,
-                    user_settings: None,
+                                user_settings: None,
                 };
                 interact(&agent, workdir, &console, input, startup, None)
                     .await
@@ -396,7 +395,9 @@ fn run_thinking_restore(fixture: &mut RecoveryPty, directory: &std::path::Path) 
         "restored Thinking leaked into the conversation: {frame}"
     );
     assert_eq!(
-        frame.matches("Continue the same Thinking stream.").count(),
+        screen::message_flow(&frame)
+            .matches("Continue the same Thinking stream.")
+            .count(),
         1,
         "{frame}"
     );

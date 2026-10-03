@@ -25,6 +25,7 @@ mod service_management;
 pub mod settings;
 pub mod skills;
 pub mod terminal;
+pub mod tick_adapter;
 pub mod tick_stream;
 pub mod tools;
 mod transcript;

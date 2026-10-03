@@ -18,12 +18,15 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 const BRIDGE_URI: &str = "tickloop://event-bridge/v1";
+const FIXTURE_ARTIFACT_TITLE: &str = "Fixture published artifact";
 const FIXTURE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Default)]
 struct ObservedRequests {
     missing_v2_read: AtomicBool,
     descriptor_read: AtomicBool,
+    artifact_metadata_read: AtomicBool,
+    attached_to_model: AtomicBool,
     associated: AtomicBool,
     model_calls: AtomicUsize,
     model_tools: Mutex<Vec<String>>,
@@ -96,6 +99,11 @@ async fn console_publication_enables_feedback_and_keeps_lifecycle_tools_host_onl
                         "application/json",
                         json!({"user":user,"expires_at":"2099-01-01T00:00:00Z"}).to_string(),
                     )
+                } else if path.starts_with("GET /api/v1/artifacts/fixture-artifact ") {
+                    observed
+                        .artifact_metadata_read
+                        .store(true, Ordering::SeqCst);
+                    ("application/json", json!({"id":"fixture-artifact","title":FIXTURE_ARTIFACT_TITLE,"format":"markdown","access_role":"owner","url":format!("{origin}/a/fixture-artifact")}).to_string())
                 } else if path.starts_with("POST /mcp ") {
                     let response = if request["method"] == "resources/read"
                         && request["params"]["uri"] == "tickloop://event-bridge/v2"
@@ -116,6 +124,9 @@ async fn console_publication_enables_feedback_and_keeps_lifecycle_tools_host_onl
                                 ];
                                 tools.extend(["associate","pending","claim","renew","release","operation"].map(|role| json!({"name":format!("event_{role}"),"inputSchema":{"type":"object"}})));
                                 json!({"tools":tools})
+                            }
+                            "resources/list" => {
+                                json!({"resources":[{"uri":BRIDGE_URI,"name":"legacy-event-bridge"}]})
                             }
                             "resources/read" => {
                                 assert_eq!(request["params"]["uri"], BRIDGE_URI);
@@ -152,6 +163,9 @@ async fn console_publication_enables_feedback_and_keeps_lifecycle_tools_host_onl
                         .iter()
                         .map(|tool| tool["name"].as_str().unwrap().to_owned())
                         .collect();
+                    if request.to_string().contains(FIXTURE_ARTIFACT_TITLE) {
+                        observed.attached_to_model.store(true, Ordering::SeqCst);
+                    }
                     let call = observed.model_calls.fetch_add(1, Ordering::SeqCst);
                     ("text/event-stream", model_stream(call == 0))
                 };
@@ -171,13 +185,23 @@ async fn console_publication_enables_feedback_and_keeps_lifecycle_tools_host_onl
     let config_path = root.join("model.json");
     std::fs::write(&config_path, serde_json::to_vec(&json!({"name":"fixture","protocol":"messages","base_url":origin,"model":"fixture","api_key_env":"","max_output_tokens":256})).unwrap()).unwrap();
     let runtime_directory = support::cli_runtime::directory();
-    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_tickloop"))
+    let home = root.join("home");
+    std::fs::create_dir(&home).unwrap();
+    std::fs::set_permissions(
+        &home,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+    )
+    .unwrap();
+    let mut child = tokio::process::Command::new(support::fixture_cli::executable())
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", &home)
         .env("TICKLOOP_AGENT_RUNTIME_DIR", &runtime_directory)
         .args([
             "--working-directory-is-trusted",
             "--mode",
             "fullAccess",
-            "--config",
+            "--transport-fixture",
         ])
         .arg(&config_path)
         .arg("--cwd")
@@ -214,6 +238,8 @@ async fn console_publication_enables_feedback_and_keeps_lifecycle_tools_host_onl
         .await
         .unwrap();
     server.abort();
+    assert!(observed.artifact_metadata_read.load(Ordering::SeqCst));
+    assert!(observed.attached_to_model.load(Ordering::SeqCst));
     assert!(
         completed.is_ok(),
         "fixture publication did not reach the model's second request: {}",

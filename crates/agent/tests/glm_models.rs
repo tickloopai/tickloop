@@ -279,20 +279,18 @@ fn series_upgrade_rebinds_one_entry_and_keeps_old_cards_resolvable() {
 }
 
 #[test]
-fn pinned_version_example_selects_the_retained_card_with_overrides() {
-    let (pinned, _) = ModelCatalog::resolved_provider_yaml(include_str!(
-        "../examples/providers/zhipu-cn-api.yaml"
-    ))
-    .unwrap();
+fn retained_builtin_version_uses_compiled_definition_without_external_example() {
+    let pinned = ModelCatalog::defaults()
+        .get("zhipu-cn-api", "glm-5.2")
+        .unwrap();
     assert_eq!(pinned.model_id, "glm-5.2");
     assert_eq!(pinned.name, "GLM-5.2");
     assert_eq!(pinned.model, "glm-5.2");
-    assert_eq!(pinned.max_output_tokens, 32768);
     assert_eq!(AccessCatalog::defaults().series_for(&pinned), None);
 }
 
 #[test]
-fn user_overrides_keep_retired_cards_out_while_custom_deployments_stay_selectable() {
+fn internal_catalog_fixtures_keep_retired_cards_out_and_custom_models_separate() {
     let patch: ProviderPatch = serde_yaml_ng::from_str(
         "id: zhipu-cn-api\nmodels:\n  - {id: glm-5.2-chat-completions, max_output_tokens: 65536}\n  - {id: glm-5.3-chat-completions, max_output_tokens: 65536}\n  - {id: private-glm, service_model_id: glm-5.3, display_name: Private GLM, adapter: glm_chat_completions, max_output_tokens: 8192}\n",
     )
@@ -350,22 +348,6 @@ fn access_bindings_reject_missing_foreign_duplicate_and_unknown_entries() {
         ])
         .is_err()
     );
-}
-
-#[test]
-fn provider_yaml_without_default_model_resolves_to_the_recommended_card() {
-    let (selected, _) = ModelCatalog::resolved_provider_yaml(
-        "id: zhipu-cn-api\nendpoints:\n  glm_chat_completions: https://gateway.example/api/paas/v4\n",
-    )
-    .unwrap();
-    assert_eq!(selected.model_id, "glm-5.3");
-    assert_eq!(selected.name, "GLM-5.3");
-    assert_eq!(selected.base_url, "https://gateway.example/api/paas/v4");
-    let (pinned, _) = ModelCatalog::resolved_provider_yaml(
-        "id: zhipu-cn-api\ndefault_model: glm-5.2-chat-completions\n",
-    )
-    .unwrap();
-    assert_eq!(pinned.name, "GLM-5.2");
 }
 
 #[tokio::test]
@@ -484,12 +466,11 @@ async fn streamed_tool_call_identity_stays_bound_to_one_index() {
     }
 }
 
-/// A user Provider YAML can pin the retained GLM-5.2 card outside the ordinary menu.
+/// The compiled catalog retains GLM-5.2 for explicit identity selection.
 fn pinned_glm_5_2(root: &std::path::Path, url: String) -> ModelConfig {
-    let (mut config, _) = ModelCatalog::resolved_provider_yaml(
-        "id: zai-global-api\ndefault_model: glm-5.2-chat-completions\n",
-    )
-    .unwrap();
+    let mut config = ModelCatalog::defaults()
+        .get("zai-global-api", "glm-5.2")
+        .unwrap();
     save_api_key(root, &config.api_key_env, "test-glm-api-key").unwrap();
     config.base_url = url;
     config
@@ -791,7 +772,9 @@ async fn glm_messages_restart_glm_keeps_original_history_and_same_source_prefix(
     let (messages_url, mut messages_requests) =
         model_http_support::serve_responses(vec![(200, signed_messages_reply())]).await;
     let glm = configured("zhipu-cn-api", "glm-5.3-chat-completions", &root, glm_url);
-    let mut claude = support::config();
+    let mut claude = ModelCatalog::defaults()
+        .get("anthropic-api", "claude-sonnet-4-6")
+        .unwrap();
     claude.base_url = messages_url;
     claude.api_key_env = glm.api_key_env.clone();
     let agent = Agent::open_embedded(

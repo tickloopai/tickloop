@@ -1,6 +1,6 @@
 use super::*;
 
-const MODEL_FEEDBACK: &str = "Model selection: Applied · Feedback Model · Thinking auto";
+const MODEL_FEEDBACK: &str = "Model selection: Applied · DeepSeek-V4.1-Flash · Thinking auto";
 const FIRST_PROMPT: &str = "Keep the prior model selection visible";
 const FIRST_REPLY: &str = "First message completed";
 
@@ -32,8 +32,8 @@ impl LocalCommand {
         match self {
             Self::Model => {
                 view.wait_for("real model picker opens", |frame| {
-                    frame.contains("Choose model · Feedback Fixture")
-                        && frame.contains("Feedback Model")
+                    frame.contains("Choose model · DeepSeek")
+                        && frame.contains("DeepSeek-V4.1-Flash")
                 })
                 .await;
                 view.send(b"\r");
@@ -55,16 +55,14 @@ impl LocalCommand {
 }
 
 async fn start_feedback_view(fixture: &PrivateFixture, base_url: &str) -> PtyView {
-    let provider = fixture.path("feedback-provider.yaml");
-    std::fs::write(
-        &provider,
-        format!(
-            "id: feedback-fixture\ndisplay_name: Feedback Fixture\nauth: api_key_env\napi_key_env: TICKLOOP_FIXTURE_API_KEY\ndefault_model: feedback-chat\nendpoints:\n  chat_completions: {}\nmodels:\n  - id: feedback-chat\n    service_model_id: feedback-chat-service\n    display_name: Feedback Model\n    adapter: chat_completions\n    max_output_tokens: 256\n",
-            base_url.trim_end_matches("/anthropic")
-        ),
+    fixture.set_chat_model(base_url);
+    tickloop_agent::model::credentials::save_api_key(
+        &fixture.path("config").canonicalize().unwrap(),
+        "DEEPSEEK_API_KEY",
+        "fixture-deepseek-key",
     )
     .unwrap();
-    let mut view = PtyView::start_with_flags(fixture, &["--config", provider.to_str().unwrap()]);
+    let mut view = PtyView::start(fixture);
     view.wait_for("new model feedback View ready", new_input_is_visible)
         .await;
     view
@@ -141,10 +139,7 @@ async fn run_new_agent_command_feedback(fixture: &PrivateFixture, command: Local
         .await;
     assert!(body_shows_once_in_order(
         &draft,
-        &[
-            "Tick Loop Agent v0.1.0",
-            "feedback-chat-service · ChatCompletions"
-        ]
+        &["Tick Loop Agent v0.1.0", "deepseek-flash · ChatCompletions"]
     ));
     assert!(!conversation_body(&draft).contains(command.input()));
     assert!(!conversation_body(&draft).contains(command.result_prefix()));

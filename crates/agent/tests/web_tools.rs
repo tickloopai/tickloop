@@ -415,7 +415,7 @@ async fn a_failed_page_request_is_reported_as_a_clear_tool_error() {
     assert!(run.results[0].is_error);
     assert_eq!(
         run.results[0].content,
-        "the model request that applies the prompt to the fetched content failed: model authentication failed; check the configured API key environment variable"
+        "the model request that applies the prompt to the fetched content failed: model authentication failed; review this connection in /provider → Connection Details"
     );
     assert!(request_kinds(&run.snapshot).contains(&(
         RequestKind::WebFetch,

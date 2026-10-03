@@ -10,6 +10,11 @@ autobins = false
 name = "tickloop"
 path = "src/main.rs"
 
+[[test]]
+name = "cli_fixture"
+path = "tests/support/cli_fixture_main.rs"
+harness = false
+
 [dependencies]
 arboard = { version = "3", features = ["wayland-data-control"] }
 async-trait = "0.1"

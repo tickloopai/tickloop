@@ -14,6 +14,42 @@ pub fn artifact_instance_id(origin: &str, id: &str) -> String {
 pub struct InstanceRef(String);
 
 impl InstanceRef {
+    pub fn new(tick_type: &str, id: &str) -> Result<Self, &'static str> {
+        Self::validate_type(tick_type)?;
+        if id.is_empty() || id.chars().any(char::is_control) {
+            return Err("a Tick Instance requires a type and nonempty identity");
+        }
+        if tick_type == "artifact" {
+            let (origin, artifact_id) = id
+                .rsplit_once('/')
+                .ok_or("invalid Artifact Tick identity")?;
+            return Self::artifact(origin, artifact_id);
+        }
+        Ok(Self(format!("{tick_type}:{id}")))
+    }
+
+    pub fn validate_type(tick_type: &str) -> Result<(), &'static str> {
+        if tick_type.is_empty()
+            || !tick_type
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+        {
+            return Err("a Tick type requires a nonempty identifier");
+        }
+        Ok(())
+    }
+
+    pub fn tick_type(&self) -> &str {
+        self.0.split_once(':').expect("validated Tick identity").0
+    }
+
+    pub fn id(&self) -> &str {
+        self.0.split_once(':').expect("validated Tick identity").1
+    }
+
+    pub fn shell(task_id: impl fmt::Display) -> Self {
+        Self::new("shell", &task_id.to_string()).expect("valid Shell task identity")
+    }
     pub fn native(run: impl AsRef<str>) -> Result<Self, &'static str> {
         let run = run.as_ref();
         if run.is_empty() || run.chars().any(char::is_control) {
@@ -72,18 +108,29 @@ impl<'de> Deserialize<'de> for InstanceRef {
                 .ok_or_else(|| serde::de::Error::custom("invalid Artifact Tick identity"))?;
             return Self::artifact(origin, id).map_err(serde::de::Error::custom);
         }
-        if !identity.starts_with(HERDR_SOURCE) {
-            return Err(serde::de::Error::custom(
-                "Tick Instance reference must start with herdr:",
-            ));
-        }
-        Self::native(identity).map_err(serde::de::Error::custom)
+        let (tick_type, id) = identity.split_once(':').ok_or_else(|| {
+            serde::de::Error::custom("Tick Instance reference requires a type prefix")
+        })?;
+        Self::new(tick_type, id).map_err(serde::de::Error::custom)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::InstanceRef;
+
+    #[test]
+    fn adapter_identities_round_trip_without_becoming_herdr_instances() {
+        for identity in ["shell:task-17", "calendar:meeting-42"] {
+            let reference: InstanceRef =
+                serde_json::from_value(serde_json::json!(identity)).unwrap();
+            assert_eq!(reference.as_str(), identity);
+            assert_eq!(serde_json::to_value(reference).unwrap(), identity);
+        }
+        for identity in ["shell:", ":task", "bad type:task", "shell:task\n"] {
+            assert!(serde_json::from_value::<InstanceRef>(serde_json::json!(identity)).is_err());
+        }
+    }
 
     #[test]
     fn run_identity_round_trips_without_losing_source_or_bytes() {

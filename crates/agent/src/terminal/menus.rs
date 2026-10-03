@@ -4,21 +4,21 @@ mod providers;
 use providers::{ModelChoice, ProviderModels, ProviderRow};
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     path::PathBuf,
 };
 
 use tickloop_agent::{
     agent_access::ConfigurationChange,
     file_change::load_file_change_review,
-    model::{ModelConfig, Protocol, ReasoningEffort, cards::ProviderPatch},
+    model::{ModelConfig, Protocol, ReasoningEffort},
     output_style::OutputStyle,
     permissions::{
         ExecutionMode, PermissionRuleCandidate, PermissionScope, permission_rule_candidates,
     },
     runtime::{
         AutoReviewerPreference, ChatSnapshot, CounterSummary, CounterTotal, DirectedSummaryRequest,
-        ENTER_PLAN_MODE_TOOL_NAME, PermissionApprovalSource, PermissionChange,
+        ENTER_PLAN_MODE_TOOL_NAME, EventKind, PermissionApprovalSource, PermissionChange,
         PermissionChangeError, PermissionRequest, ProtocolFailure, QuestionRequest, Receipt,
         RequestFailure, RequestKind, RequestOutcome, ResponseRejection, RewindMode, RewindOutcome,
         SummaryDirection, UsageCounter, UsageCoverage, UsageSummary,
@@ -29,7 +29,7 @@ use uuid::Uuid;
 
 use super::{
     completion::{CommandGroup, CommandSpec, builtin_commands},
-    console::{Console, Menu, PickerAction, PickerKind},
+    console::{Console, Menu, PickerAction, PickerKind, RequestPresentation},
     conversation_picker::ConversationPicker,
     diff_view::{DiffNavigation, DiffViewport, render_diff, render_error},
     display::{DisplayProfile, Glyph},
@@ -74,16 +74,28 @@ enum Selection {
         choices: Vec<ProviderModels>,
         rows: Vec<ProviderRow>,
     },
-    ModelProviders {
+    ConnectionDetails {
         target: ConfigTarget,
+        provider: ProviderModels,
+        actions: Vec<providers::ConnectionAction>,
+    },
+    ConnectionConfirm {
+        target: ConfigTarget,
+        provider: ProviderModels,
+        action: providers::ConnectionAction,
+    },
+    CredentialDetails {
+        target: ConfigTarget,
+    },
+    LoginMethods {
+        target: ConfigTarget,
+        provider: ProviderModels,
     },
     Model {
         target: ConfigTarget,
         choices: Vec<ModelChoice>,
     },
-    Discovery {
-        target: ConfigTarget,
-    },
+
     ApiKey {
         target: ConfigTarget,
         provider: ProviderModels,
@@ -283,6 +295,7 @@ impl Selection {
                 Some(request.id)
             }
             Self::Question(flow) => Some(flow.request().id),
+            Self::Workflow(Workflow::Plan { goal, .. }) => Some(*goal),
             _ => None,
         }
     }
@@ -306,8 +319,10 @@ impl Selection {
     fn config_target(&self) -> Option<ConfigTarget> {
         match self {
             Self::Provider { target, .. }
-            | Self::ModelProviders { target }
-            | Self::Discovery { target }
+            | Self::ConnectionDetails { target, .. }
+            | Self::ConnectionConfirm { target, .. }
+            | Self::CredentialDetails { target }
+            | Self::LoginMethods { target, .. }
             | Self::ApiKey { target, .. }
             | Self::ServiceAccount { target, .. }
             | Self::Model { target, .. }
@@ -332,26 +347,22 @@ impl Selection {
 
 pub(super) struct Menus {
     active: Option<(Uuid, Selection)>,
+    dialog_chat: Option<Uuid>,
+    active_cache: HashMap<Option<Uuid>, Option<(Uuid, Selection)>>,
+    provider_chat: Option<Option<Uuid>>,
+    provider_sessions: HashMap<Option<Uuid>, providers::ProviderSession>,
+    provider_login_results: HashMap<Option<Uuid>, bool>,
+    suspended_active: HashMap<Option<Uuid>, (Uuid, Selection)>,
+    request_order: VecDeque<(Uuid, Uuid)>,
     /// Questions whose dialog was closed; they wait for typed answers instead.
     deferred_questions: HashSet<Uuid>,
     /// Answers typed so far, one line per question.
     typed_questions: HashMap<Uuid, QuestionFlow>,
     user_settings: Option<UserSettings>,
-    transient_providers: Vec<ProviderPatch>,
-    login_return: Option<(ConfigTarget, ProviderModels)>,
-    provider_choices: Vec<ProviderModels>,
-    provider_selected: usize,
-    provider_group: Option<(String, usize)>,
-    model_return: Option<providers::ModelPickerDraft>,
-    model_choices: Vec<ModelChoice>,
-    model_providers: Vec<ProviderModels>,
-    model_provider: Option<String>,
-    current_model: Option<(String, String)>,
+    provider: providers::ProviderSession,
     config_root: Option<PathBuf>,
+    refresh_connections: HashSet<(Option<Uuid>, String)>,
     model_discovery: tickloop_agent::model::availability::AccountModelDiscovery,
-    model_warmup: Option<providers::ModelWarmup>,
-    discovery_flow: Option<providers::DiscoveryFlow>,
-    model_directory_status: BTreeMap<String, String>,
     font_manager: Option<NerdFontManager<SystemFontAdapter>>,
     /// Where the next New Agent will be created; its saved project rules are shown before the
     /// first input.
@@ -368,24 +379,20 @@ impl Menus {
     pub(super) fn new(user_settings: Option<UserSettings>, config_root: Option<PathBuf>) -> Self {
         Self {
             active: None,
+            dialog_chat: None,
+            active_cache: HashMap::new(),
+            provider_chat: None,
+            provider_sessions: HashMap::new(),
+            provider_login_results: HashMap::new(),
+            suspended_active: HashMap::new(),
+            request_order: VecDeque::new(),
             deferred_questions: HashSet::new(),
             typed_questions: HashMap::new(),
             user_settings,
-            transient_providers: Vec::new(),
-            login_return: None,
-            provider_choices: Vec::new(),
-            provider_selected: 0,
-            provider_group: None,
-            model_return: None,
-            model_choices: Vec::new(),
-            model_providers: Vec::new(),
-            model_provider: None,
-            current_model: None,
+            provider: Default::default(),
             config_root: config_root.clone(),
+            refresh_connections: HashSet::new(),
             model_discovery: Default::default(),
-            model_warmup: None,
-            discovery_flow: None,
-            model_directory_status: BTreeMap::new(),
             font_manager: config_root.map(NerdFontManager::production),
             new_agent_directory: None,
         }
@@ -426,12 +433,6 @@ impl Menus {
             load_warning: None,
         };
         console.show_permissions(page, Ok(history), return_to_settings, auto_page)
-    }
-
-    pub(super) fn add_transient_provider(&mut self, provider: ProviderPatch) {
-        self.transient_providers
-            .retain(|existing| existing.id != provider.id);
-        self.transient_providers.push(provider);
     }
 }
 
@@ -683,6 +684,7 @@ impl Menus {
         console: &Console,
         (picker, workflow): (ConversationPicker, Workflow),
     ) -> Result<(), String> {
+        self.sync_dialog_chat(console)?;
         self.dismiss(console)?;
         console.set_request_layout(None)?;
         let id = picker.id();
@@ -748,17 +750,88 @@ impl Menus {
         )
     }
 
+    pub(super) fn note_request(&mut self, chat: Uuid, request: Uuid) {
+        if !self.request_order.iter().any(|(_, id)| *id == request) {
+            self.request_order.push_back((chat, request));
+        }
+    }
+
+    pub(super) fn sync_dialog_chat(&mut self, console: &Console) -> Result<(), String> {
+        let chat = console.dialog_chat()?;
+        self.sync_provider_chat(chat);
+        if self.dialog_chat != chat {
+            self.active_cache
+                .insert(self.dialog_chat, self.active.take());
+            self.active = self.active_cache.remove(&chat).flatten();
+            self.dialog_chat = chat;
+        }
+        if self.active.is_none()
+            && self
+                .suspended_active
+                .get(&chat)
+                .is_some_and(|(id, _)| console.dialog_menu_id().ok().flatten() == Some(*id))
+        {
+            self.active = self.suspended_active.remove(&chat);
+        }
+        Ok(())
+    }
+
+    fn prepare_dialog(
+        &mut self,
+        console: &Console,
+        request: Option<Uuid>,
+    ) -> Result<RequestPresentation, String> {
+        self.sync_dialog_chat(console)?;
+        if request.is_some()
+            && self
+                .active
+                .as_ref()
+                .is_some_and(|(_, selection)| selection.request_id().is_none())
+        {
+            let presentation = console.set_request_layout(request)?;
+            if presentation == RequestPresentation::Deferred {
+                return Ok(presentation);
+            }
+            if let Some(active) = self.active.take() {
+                self.suspended_active.insert(self.dialog_chat, active);
+            }
+            Ok(RequestPresentation::Presented)
+        } else {
+            self.dismiss(console)?;
+            console.set_request_layout(request)
+        }
+    }
+
     pub(super) fn dismiss(&mut self, console: &Console) -> Result<(), String> {
-        self.discovery_flow.take();
         if let Some((id, _)) = self.active.take() {
+            self.cancel_model_discovery(id);
             console.clear_menu(id)?;
         }
         Ok(())
     }
 
+    fn cancel_model_discovery(&mut self, menu_id: Uuid) {
+        if self
+            .provider
+            .discovery_flow
+            .as_ref()
+            .is_some_and(|flow| flow.id == menu_id)
+        {
+            self.provider.discovery_flow.take();
+        }
+    }
+
     fn show(&mut self, console: &Console, menu: Menu, selection: Selection) -> Result<(), String> {
-        self.dismiss(console)?;
-        console.set_request_layout(selection.request_id())?;
+        let discovery = (self.id() == Some(menu.id))
+            .then(|| self.provider.discovery_flow.take())
+            .flatten();
+        let presentation = self.prepare_dialog(console, selection.request_id())?;
+        if let Some(discovery) = discovery {
+            self.provider.discovery_flow = Some(discovery);
+        }
+        if presentation == RequestPresentation::Deferred {
+            return Ok(());
+        }
         if !console.is_interactive() {
             console.write(&format!("{}\n{}\n", menu.title, menu.context.join("\n")))?;
             for (index, option) in menu.options.iter().enumerate() {
@@ -770,10 +843,53 @@ impl Menus {
         if console.is_interactive() {
             if matches!(&selection, Selection::Provider { .. }) {
                 console.show_picker_menu(menu, PickerKind::Provider)?;
-            } else if matches!(&selection, Selection::ModelProviders { .. }) {
-                console.show_picker_menu(menu, PickerKind::ModelProvider)?;
+            } else if matches!(
+                &selection,
+                Selection::ConnectionDetails { .. }
+                    | Selection::ConnectionConfirm { .. }
+                    | Selection::CredentialDetails { .. }
+                    | Selection::LoginMethods { .. }
+                    | Selection::JudgmentSettings {
+                        return_to: JudgmentReturn::Providers { .. },
+                        ..
+                    }
+            ) {
+                let hint = match &selection {
+                    Selection::ConnectionConfirm { .. } => "Enter confirm · Esc Connection",
+                    Selection::LoginMethods { .. } => "Enter start · Esc Connection",
+                    Selection::CredentialDetails { .. } => "Enter back · Esc Connection",
+                    _ => "Enter open · Esc back",
+                };
+                console.show_presented_picker_menu(
+                    menu,
+                    PickerKind::Actions,
+                    super::console::PickerPresentation {
+                        hint: hint.into(),
+                        ..Default::default()
+                    },
+                )?;
             } else if matches!(&selection, Selection::Model { .. }) {
-                console.show_picker_menu(menu, PickerKind::Model)?;
+                let refresh = self
+                    .provider
+                    .model_provider
+                    .as_ref()
+                    .and_then(|key| self.connection(key).ok())
+                    .is_some_and(|provider| provider.supports_discovery());
+                console.show_presented_picker_menu(
+                    menu,
+                    PickerKind::Model,
+                    super::console::PickerPresentation {
+                        headers: Vec::new(),
+                        refresh,
+                        hint: if refresh {
+                            "p Connection · r Refresh · Enter apply · Esc back"
+                        } else {
+                            "p Connection · Enter apply · Esc back"
+                        }
+                        .into(),
+                        ..Default::default()
+                    },
+                )?;
             } else if matches!(
                 &selection,
                 Selection::Rewind { .. }
@@ -790,8 +906,9 @@ impl Menus {
     }
 
     fn show_question(&mut self, console: &Console, flow: QuestionFlow) -> Result<(), String> {
-        self.dismiss(console)?;
-        console.set_request_layout(Some(flow.request().id))?;
+        if self.prepare_dialog(console, Some(flow.request().id))? == RequestPresentation::Deferred {
+            return Ok(());
+        }
         let (menu, keys) = flow.menu(console.display_profile()?);
         let id = menu.id;
         console.show_question_menu(menu, keys)?;
@@ -864,8 +981,9 @@ impl Menus {
         selection: Selection,
         comment_options: Vec<usize>,
     ) -> Result<(), String> {
-        self.dismiss(console)?;
-        console.set_request_layout(selection.request_id())?;
+        if self.prepare_dialog(console, selection.request_id())? == RequestPresentation::Deferred {
+            return Ok(());
+        }
         if !console.is_interactive() {
             return self.show(console, menu, selection);
         }
@@ -883,8 +1001,9 @@ impl Menus {
         comment_options: Vec<usize>,
         expand_options: Vec<usize>,
     ) -> Result<(), String> {
-        self.dismiss(console)?;
-        console.set_request_layout(selection.request_id())?;
+        if self.prepare_dialog(console, selection.request_id())? == RequestPresentation::Deferred {
+            return Ok(());
+        }
         if !console.is_interactive() {
             return self.show(console, menu, selection);
         }
@@ -901,8 +1020,9 @@ impl Menus {
         selection: Selection,
         comment_options: Vec<usize>,
     ) -> Result<(), String> {
-        self.dismiss(console)?;
-        console.set_request_layout(selection.request_id())?;
+        if self.prepare_dialog(console, selection.request_id())? == RequestPresentation::Deferred {
+            return Ok(());
+        }
         if !console.is_interactive() {
             return self.show(console, menu, selection);
         }
@@ -920,8 +1040,9 @@ impl Menus {
         comment_options: Vec<usize>,
         review: Result<tickloop_agent::file_change::FileChangeReview, String>,
     ) -> Result<(), String> {
-        self.dismiss(console)?;
-        console.set_request_layout(selection.request_id())?;
+        if self.prepare_dialog(console, selection.request_id())? == RequestPresentation::Deferred {
+            return Ok(());
+        }
         if !console.is_interactive() {
             let viewport = DiffViewport {
                 width: 120,
@@ -951,13 +1072,8 @@ impl Menus {
             .configuration(target)
             .await
             .map_err(|error| error.to_string())?;
-        let catalog = self
-            .user_settings
-            .as_ref()
-            .map(UserSettings::model_catalog)
-            .transpose()?
-            .unwrap_or_else(tickloop_agent::model::cards::ModelCatalog::defaults)
-            .with_providers(self.transient_providers.clone())?;
+        self.refresh_provider_scope(agent, target).await?;
+        let catalog = tickloop_agent::model::cards::ModelCatalog::defaults();
         let defaults = tickloop_agent::model::cards::ModelCatalog::defaults();
         let access = tickloop_agent::model::access::AccessCatalog::defaults();
         access.validate(&catalog)?;
@@ -965,22 +1081,9 @@ impl Menus {
             .profiles()
             .into_iter()
             .filter(|profile| {
-                let explicitly_loaded = self.transient_providers.iter().any(|provider| {
-                    provider.id == profile.provider_id
-                        && provider.models.as_ref().is_some_and(|models| {
-                            models.iter().any(|model| model.id == profile.model_id)
-                        })
-                });
                 access
                     .ordinary_candidate(profile, &defaults)
-                    .unwrap_or_else(|| {
-                        explicitly_loaded
-                            || defaults
-                                .get(&profile.provider_id, &profile.model_id)
-                                .as_ref()
-                                != Some(profile)
-                            || tickloop_agent::model::cards::is_default_visible(profile)
-                    })
+                    .unwrap_or_else(|| tickloop_agent::model::cards::is_default_visible(profile))
             })
             .collect();
         let mut choices = settings::model_choices_with_profiles(&snapshot.model, profiles);
@@ -993,26 +1096,16 @@ impl Menus {
         {
             choices.push(pending.clone());
         }
-        self.current_model = Some((snapshot.model.provider_id, snapshot.model.model_id));
-        self.provider_choices = ProviderModels::group(choices);
-        self.provider_group = None;
-        let rows = providers::provider_rows(&self.provider_choices, None);
-        self.provider_selected = rows
+        self.provider.provider_choices = ProviderModels::group_with_catalog(choices, &catalog);
+        self.provider.current_connection = self.key_for_model(&snapshot.model);
+        self.provider.current_model = Some((snapshot.model.provider_id, snapshot.model.model_id));
+        self.provider.provider_selected = self
+            .provider
+            .provider_choices
             .iter()
-            .position(|row| match row {
-                ProviderRow::Provider(index) => {
-                    self.current_model.as_ref().is_some_and(|(provider, _)| {
-                        self.provider_choices[*index].models[0].provider_id == *provider
-                    })
-                }
-                ProviderRow::Group(group) => self.provider_choices.iter().any(|provider| {
-                    self.current_model
-                        .as_ref()
-                        .is_some_and(|(id, _)| provider.models[0].provider_id == *id)
-                        && providers::provider_group(provider) == Some(group.as_str())
-                }),
-            })
+            .position(|provider| Some(&provider.key()) == self.provider.current_connection.as_ref())
             .unwrap_or(0);
+        self.provider.provider_nav.focused = self.provider.current_connection.clone();
         Ok(())
     }
 
@@ -1022,8 +1115,22 @@ impl Menus {
         console: &Console,
         target: ConfigTarget,
     ) -> Result<(), String> {
-        self.model_return = None;
+        self.sync_dialog_chat(console)?;
+        self.provider.model_return = None;
+        self.provider.provider_nav = providers::ProviderNavigator {
+            filter: providers::ConnectionFilter::Configured,
+            ..Default::default()
+        };
         self.load_providers(agent, target).await?;
+        if self.provider.provider_choices.iter().any(|provider| {
+            Some(&provider.key()) == self.provider.current_connection.as_ref()
+                && self.provider_authenticated(provider) == Ok(true)
+        }) {
+            self.provider
+                .provider_nav
+                .back_stack
+                .push(self.directory_parent());
+        }
         self.configured_models(agent, console, target).await
     }
 
@@ -1033,7 +1140,9 @@ impl Menus {
         console: &Console,
         target: ConfigTarget,
     ) -> Result<(), String> {
-        self.model_return = None;
+        self.sync_dialog_chat(console)?;
+        self.provider.model_return = None;
+        self.provider.provider_nav = Default::default();
         self.load_providers(agent, target).await?;
         self.back_to_providers(console, target)
     }
@@ -1117,7 +1226,7 @@ impl Menus {
             .await
             .map_err(|error| error.to_string())?;
         let mut context = vec![
-            "Model, Thinking, effort, persistent rules, context window, output style, Glyph Set, reduced motion and status line position are saved in user settings; execution mode applies to this process.".into(),
+            "Model, Thinking, effort, persistent rules, output style, Glyph Set, reduced motion and status line position are saved in user settings; execution mode applies to this process.".into(),
             "Auto-scroll and Theme apply to this terminal session.".into(),
             safe_text(&format!(
                 "Current model: {}",
@@ -1626,10 +1735,24 @@ impl Menus {
         pending: &HashMap<Uuid, Uuid>,
         questions: &HashMap<Uuid, QuestionRequest>,
     ) -> Result<(), String> {
-        if let Some((_, selection)) = &self.active {
-            if selection.request_id().is_none() {
-                return Ok(());
-            }
+        self.sync_dialog_chat(console)?;
+        self.request_order
+            .retain(|(_, id)| pending.contains_key(id) || questions.contains_key(id));
+        let queued = self
+            .request_order
+            .iter()
+            .filter(|(chat, id)| family.contains(chat) && !self.deferred_questions.contains(id))
+            .count();
+        let active_unqueued = usize::from(
+            self.active
+                .as_ref()
+                .and_then(|(_, selection)| selection.request_id())
+                .is_some_and(|id| !self.request_order.iter().any(|(_, queued)| *queued == id)),
+        );
+        console.set_request_queue_count(queued + active_unqueued)?;
+        if let Some((_, selection)) = &self.active
+            && selection.request_id().is_some()
+        {
             if let Some(requester) = selection
                 .chat()
                 .filter(|requester| family.contains(requester))
@@ -1653,19 +1776,31 @@ impl Menus {
                 .snapshot(*requester)
                 .await
                 .map_err(|error| error.to_string())?;
-            if snapshot
-                .permissions
-                .iter()
-                .any(|request| pending.contains_key(&request.id))
-                || snapshot.questions.iter().any(|request| {
-                    questions.contains_key(&request.id)
-                        && !self.deferred_questions.contains(&request.id)
-                })
-            {
-                return self
-                    .refresh_permissions(agent, console, Some(*requester), pending, questions)
-                    .await;
+            for event in &snapshot.events {
+                match &event.kind {
+                    EventKind::PermissionRequested { request }
+                        if pending.contains_key(&request.id) =>
+                    {
+                        self.note_request(*requester, request.id)
+                    }
+                    EventKind::QuestionAsked { request } if questions.contains_key(&request.id) => {
+                        self.note_request(*requester, request.id)
+                    }
+                    _ => {}
+                }
             }
+        }
+        let queued = self
+            .request_order
+            .iter()
+            .filter(|(chat, id)| family.contains(chat) && !self.deferred_questions.contains(id))
+            .copied()
+            .collect::<Vec<_>>();
+        console.set_request_queue_count(queued.len())?;
+        if let Some((requester, _)) = queued.first() {
+            return self
+                .refresh_permissions(agent, console, Some(*requester), pending, questions)
+                .await;
         }
         Ok(())
     }
@@ -1683,7 +1818,9 @@ impl Menus {
         self.typed_questions
             .retain(|id, _| questions.contains_key(id));
         if let Some((_, selection)) = &self.active {
-            let stale = selection.chat().is_some() && selection.chat() != chat
+            let stale = selection.request_id().is_some()
+                && selection.chat().is_some()
+                && selection.chat() != chat
                 || matches!(selection, Selection::Permission { request, .. } | Selection::PermissionRule { request, .. } if !pending.contains_key(&request.id))
                 || matches!(selection, Selection::Question(flow) if !questions.contains_key(&flow.request().id));
             if stale {
@@ -1691,7 +1828,10 @@ impl Menus {
             }
         }
         if !console.is_interactive()
-            || self.active.is_some()
+            || self
+                .active
+                .as_ref()
+                .is_some_and(|(_, selection)| selection.request_id().is_some())
             || pending.is_empty() && questions.is_empty()
         {
             return Ok(());
@@ -1701,12 +1841,15 @@ impl Menus {
                 .snapshot(chat)
                 .await
                 .map_err(|error| error.to_string())?;
-            let requester = requester_label(agent, console, &snapshot).await;
-            if let Some(request) = snapshot
-                .permissions
+            let next_request = self
+                .request_order
                 .iter()
-                .find(|request| pending.contains_key(&request.id))
-            {
+                .find(|(requester, id)| *requester == chat && !self.deferred_questions.contains(id))
+                .map(|(_, id)| *id);
+            let requester = requester_label(agent, console, &snapshot).await;
+            if let Some(request) = snapshot.permissions.iter().find(|request| {
+                pending.contains_key(&request.id) && next_request.is_none_or(|id| id == request.id)
+            }) {
                 let goal = snapshot
                     .loops
                     .iter()
@@ -1725,6 +1868,7 @@ impl Menus {
             } else if let Some(request) = snapshot.questions.iter().find(|request| {
                 !self.deferred_questions.contains(&request.id)
                     && questions.contains_key(&request.id)
+                    && next_request.is_none_or(|id| id == request.id)
             }) {
                 let goal = snapshot
                     .loops
@@ -1901,10 +2045,21 @@ impl Menus {
         index: Option<usize>,
         comment: Option<String>,
     ) -> Result<MenuOutcome, String> {
+        self.sync_dialog_chat(console)?;
+        let menu_id = match self.provider.refreshed_model_cancel {
+            Some((previous, current))
+                if index.is_none() && menu_id == previous && self.id() == Some(current) =>
+            {
+                self.provider.refreshed_model_cancel = None;
+                current
+            }
+            _ => menu_id,
+        };
         if self.id() != Some(menu_id) {
             console.finish_menu_submission(menu_id)?;
             return Ok(MenuOutcome::default());
         }
+        self.cancel_model_discovery(menu_id);
         let (_, selection) = self.active.take().unwrap();
         let outcome: Result<MenuOutcome, String> = async {
             match selection {
@@ -2200,67 +2355,95 @@ impl Menus {
                     }
                 }
                 Selection::Provider { target, choices, rows } => {
+                    self.refresh_provider_scope(agent, target).await?;
                     if let Some(index) = index {
-                        if self.provider_group.is_none() && index == rows.len() + 1 {
-                            let provider = choices.iter().find(|provider| provider.models[0].auth_source == tickloop_agent::model::ModelAuthSource::CodexSubscription).cloned().ok_or("Codex subscription Provider is not configured.")?;
-                            self.provider_choices = choices;
-                            self.provider_selected = index;
-                            self.dismiss(console)?;
-                            self.login_return = Some((target, provider));
-                            return Ok(MenuOutcome { provider_logout: true, logout_target: super::login::SignInTarget::Codex, ..Default::default() });
+                        self.provider.provider_selected = index;
+                        if let Some(ProviderRow::Provider(provider_index)) = rows.get(index) {
+                            let provider = choices[*provider_index].clone();
+                            self.provider.provider_choices = choices;
+                            self.provider.provider_nav.focused = Some(provider.key());
+                            self.provider.provider_nav.back_stack.push(self.directory_parent());
+                            return self.enter_connection(agent, console, target, provider).await;
                         }
-                        if self.provider_group.is_none() && index == rows.len() {
-                            self.provider_choices = choices;
-                            self.provider_selected = index;
-                            if let Err(error) = self.judgment_settings(
-                                agent,
-                                console,
-                                JudgmentReturn::Providers { target },
-                            )
-                            .await {
-                                self.back_to_providers(console, target)?;
-                                return Err(error);
-                            }
-                            return Ok(MenuOutcome::default());
+                        if rows.is_empty() && index == 0 {
+                            self.provider.provider_nav.filter = providers::ConnectionFilter::All;
+                            self.back_to_providers(console, target)?;
+                        } else {
+                            self.provider.provider_nav.focused = None;
+                            self.judgment_settings(agent, console, JudgmentReturn::Providers { target }).await?;
                         }
-                        let row = rows.get(index).ok_or("provider option does not exist")?;
-                        if let Some((_, selected)) = &mut self.provider_group { *selected = index; } else { self.provider_selected = index; }
-                        let provider_index = match row {
-                            ProviderRow::Group(name) => {
-                                self.provider_group = Some((name.clone(), 0));
-                                self.provider_choices = choices.clone();
-                                self.show_providers(console, target, choices, 0, Uuid::new_v4())?;
-                                return Ok(MenuOutcome::default());
-                            }
-                            ProviderRow::Provider(provider_index) => *provider_index,
-                        };
-                        let provider = choices.get(provider_index).ok_or("provider option does not exist")?.clone();
-                        self.provider_choices = choices;
-                        match self.provider_authenticated(&provider) {
-                            Ok(true) if self.model_return.is_none() => {
-                                self.choose_provider_models(agent, console, target, &provider.models[0].provider_id).await?;
-                                return Ok(MenuOutcome::default());
-                            }
-                            Ok(true) | Ok(false) => return self.provider_auth(console, target, provider),
-                            Err(_) if provider.models[0].auth_source == tickloop_agent::model::ModelAuthSource::GoogleCloud => {
-                                return self.provider_auth(console, target, provider);
-                            }
-                            Err(error) => {
-                                self.back_to_providers(console, target)?;
-                                return Err(error);
-                            }
-                        }
-                    } else if self.provider_group.take().is_some() {
-                        self.back_to_providers(console, target)?;
-                    } else if self.model_return.is_some() {
-                        self.configured_models(agent, console, target).await?;
                     } else {
-                        console.write("Selection cancelled; configuration unchanged.\n")?;
+                        self.provider_back(agent, console, target).await?;
                     }
+                }
+                Selection::ConnectionDetails { target, provider, actions } => {
+                    let Some(index) = index else {
+                        self.provider_back(agent, console, target).await?;
+                        return Ok(MenuOutcome::default());
+                    };
+                    let action = *actions.get(index).ok_or("Connection action no longer exists")?;
+                    let parent = providers::ProviderPage::Details { connection: provider.key(), selected: index };
+                    match action {
+                        providers::ConnectionAction::Browse => {
+                            if matches!(self.provider.provider_nav.back_stack.last(), Some(providers::ProviderPage::Models { connection, .. }) if *connection == provider.key()) {
+                                self.provider_back(agent, console, target).await?;
+                            } else {
+                                self.provider.provider_nav.back_stack.push(parent);
+                                return self.enter_connection(agent, console, target, provider).await;
+                            }
+                        }
+                        providers::ConnectionAction::Configure => {
+                            self.provider.provider_nav.back_stack.push(parent);
+                            self.provider.provider_nav.credential_intent = Some(if self.provider_authenticated(&provider) == Ok(false) { providers::CredentialIntent::Setup } else { providers::CredentialIntent::Replace });
+                            return self.provider_auth(console, target, provider);
+                        }
+                        providers::ConnectionAction::RemoveKey | providers::ConnectionAction::SignOut => {
+                            self.provider.provider_nav.back_stack.push(parent);
+                            let label = if matches!(action, providers::ConnectionAction::RemoveKey) { "Remove saved key" } else { "Sign out" };
+                            let fallback = self.provider_environment_key(&provider.models[0].api_key_env);
+                            let context = if matches!(action, providers::ConnectionAction::RemoveKey) {
+                                vec!["This removes the saved value of this connection's credential reference. Other connections using that reference are also affected.".into(), if fallback { "An environment key will still be used.".into() } else { "No environment key is configured.".into() }]
+                            } else { vec!["This signs out this provider's saved login. Connections and Chats using the same login also need sign-in.".into()] };
+                            self.show(console, Menu { id: Uuid::new_v4(), title: format!("{label} · {}", provider.model_page_name()), context, options: vec!["Cancel".into(), label.into()], selected: 0, confirmation: false }, Selection::ConnectionConfirm { target, provider, action })?;
+                        }
+                        providers::ConnectionAction::CredentialDetails => {
+                            self.provider.provider_nav.back_stack.push(parent);
+                            let root = self.provider_root().map(|root| root.join(if provider.models[0].auth_source == tickloop_agent::model::ModelAuthSource::ApiKeyEnv || provider.models[0].auth_source == tickloop_agent::model::ModelAuthSource::GoogleCloud { ".env" } else { "auth" }).display().to_string()).unwrap_or_else(|| "No private store".into());
+                            let reference = &provider.models[0].api_key_env;
+                            let context = vec![self.provider_auth_label(&provider).into(), safe_text(&format!("Credential reference: {reference}")), safe_text(&format!("Private store: {root}")), "Saved values take precedence over the Agent's inherited environment. Removing saved values does not unset the environment.".into()];
+                            self.show(console, Menu { id: Uuid::new_v4(), title: format!("Credential details · {}", provider.model_page_name()), context, options: vec!["Back to connection".into()], selected: 0, confirmation: false }, Selection::CredentialDetails { target })?;
+                        }
+                    }
+                }
+                Selection::ConnectionConfirm { target, provider, action } => {
+                    if index != Some(1) {
+                        self.provider_back(agent, console, target).await?;
+                    } else if matches!(action, providers::ConnectionAction::RemoveKey) {
+                        let root = self.provider_root().ok_or("Cannot locate the Agent credential directory")?;
+                        if let Err(error) = tickloop_agent::model::credentials::remove_api_key(root, &provider.models[0].api_key_env) {
+                            self.provider_back(agent, console, target).await?;
+                            return Err(error.to_string());
+                        }
+                        self.model_discovery.invalidate(&provider.models[0].provider_id);
+                        self.refresh_connections.insert((target.agent(), provider.key()));
+                        self.provider_back(agent, console, target).await?;
+                    } else {
+                        let sign_in = super::login::SignInTarget::from_auth(provider.models[0].auth_source).unwrap_or(super::login::SignInTarget::Codex);
+                        self.provider.login_return = Some((target, provider));
+                        return Ok(MenuOutcome { provider_logout: true, logout_target: sign_in, ..Default::default() });
+                    }
+                }
+                Selection::CredentialDetails { target } => self.provider_back(agent, console, target).await?,
+                Selection::LoginMethods { target, provider } => {
+                    if let Some(index) = index {
+                        self.provider.provider_nav.back_stack.push(providers::ProviderPage::LoginMethods { connection: provider.key() });
+                        return self.begin_provider_login(console, target, provider, if index == 0 { super::login::LoginMethod::Device } else { super::login::LoginMethod::Browser });
+                    }
+                    self.provider_back(agent, console, target).await?;
                 }
                 Selection::ServiceAccount { target, provider } => {
                     if index == Some(0) {
-                        let root = self.config_root.as_deref().ok_or("Cannot locate the Agent state directory; set TICKLOOP_CONFIG_DIR.")?;
+                        let root = self.provider_root().ok_or("Cannot locate the Agent state directory; set TICKLOOP_CONFIG_DIR.")?;
                         let path = comment.as_deref().unwrap_or("").trim();
                         if let Err(error) = crate::auth::google::GoogleAuth::new(root).save_service_account_path(path) {
                             self.provider_service_account(console, target, provider, Some(path))?;
@@ -2268,24 +2451,24 @@ impl Menus {
                         }
                         self.model_discovery.invalidate(&provider.models[0].provider_id);
                         console.write("Service-account file configured.\n")?;
-                        self.choose_provider_models(agent, console, target, &provider.models[0].provider_id).await?;
+                        self.credential_saved(agent, console, target, &provider).await?;
                     } else {
-                        self.finish_provider_configuration(agent, console, target).await?;
+                        self.provider_back(agent, console, target).await?;
                     }
                 }
                 Selection::ApiKey { target, provider } => {
                     if index == Some(0) {
-                        let root = self.config_root.as_deref().ok_or("Cannot locate the Agent state directory; set TICKLOOP_CONFIG_DIR.")?;
+                        let root = self.provider_root().ok_or("Cannot locate the Agent state directory; set TICKLOOP_CONFIG_DIR.")?;
                         let result = tickloop_agent::model::credentials::save_api_key(root, &provider.models[0].api_key_env, comment.as_deref().unwrap_or(""));
                         if let Err(error) = result {
-                            self.provider_api_key(console, target, provider)?;
+                            self.provider_api_key(console, target, provider, comment.as_deref())?;
                             return Err(error.to_string());
                         }
                         self.model_discovery.invalidate(&provider.models[0].provider_id);
                         console.write("API key saved to Agent .env.\n")?;
-                        self.choose_provider_models(agent, console, target, &provider.models[0].provider_id).await?;
+                        self.credential_saved(agent, console, target, &provider).await?;
                     } else {
-                        self.finish_provider_configuration(agent, console, target).await?;
+                        self.provider_back(agent, console, target).await?;
                     }
                 }
                 Selection::JudgmentSettings { return_to, has_key } => {
@@ -2330,34 +2513,10 @@ impl Menus {
                         self.judgment_settings(agent, console, return_to).await?;
                     }
                 }
-                Selection::Discovery { target } => {
-                    if let Some(flow) = self.discovery_flow.take() {
-                        let providers = flow.providers.clone();
-                        drop(flow);
-                        let directories = providers.into_iter().map(|provider| (provider, Err("Account model check cancelled".into()))).collect();
-                        self.configured_model_choices(agent, console, target, directories).await?;
-                    }
-                }
-                Selection::ModelProviders { target } => {
-                    if let Some(index) = index {
-                        if index == self.model_providers.len() {
-                            self.open_model_provider_configuration(console, target, None)?;
-                        } else {
-                            let provider = self.model_providers.get(index).ok_or("provider option does not exist")?.models[0].provider_id.clone();
-                            self.model_return = Some(providers::ModelPickerDraft {
-                                selected: None,
-                                choices: self.model_choices.clone(),
-                                provider: Some(provider),
-                            });
-                            self.configured_models(agent, console, target).await?;
-                        }
-                    }
-                }
                 Selection::Model { target, choices } => {
                     let Some(index) = index else {
                         self.remember_model_drafts(&choices);
-                        let provider = self.model_provider.clone();
-                        self.show_model_providers(console, target, provider.as_deref())?;
+                        self.provider_back(agent, console, target).await?;
                         return Ok(MenuOutcome::default());
                     };
                     if index == choices.len() {
@@ -2989,6 +3148,375 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn connection_management_uses_the_captured_agents_store_from_a_different_view_root() {
+        use crate::agent_access::{
+            AgentAccess, AgentCommand, CommandEnvelope, CommandResult, EmbeddedAgentAccess,
+            LaunchSpec, ViewRef,
+        };
+        use crate::terminal::test_support as support;
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().canonicalize().unwrap();
+        let root_a = project.join("a");
+        let root_b = project.join("b");
+        let reference = "PICKER_SCOPE_TEST_KEY";
+        crate::model::credentials::save_api_key(&root_a, reference, "root-a-fixture-key").unwrap();
+        crate::model::credentials::save_api_key(&root_b, reference, "root-b-fixture-key").unwrap();
+        let mut model = support::config();
+        model.api_key_env = reference.into();
+        let core = crate::runtime::Agent::new_embedded(
+            model.clone(),
+            std::sync::Arc::new(support::ScriptedModel::new(Vec::new())),
+        );
+        let access = std::sync::Arc::new(EmbeddedAgentAccess::new(core.clone()));
+        let mut launch = LaunchSpec::embedded(project);
+        launch.model = Some(model.clone());
+        launch.config_root = Some(root_a.clone());
+        let receipt = access
+            .execute(CommandEnvelope {
+                owner_epoch: access.owner_epoch(),
+                command_id: Uuid::new_v4(),
+                command: AgentCommand::Create {
+                    launch: launch.clone(),
+                    initial: None,
+                    origin: None,
+                },
+            })
+            .await
+            .unwrap();
+        let CommandResult::Created { snapshot, .. } = receipt.into_result().unwrap() else {
+            panic!("Agent not created")
+        };
+        let target = ConfigTarget::Agent(snapshot.conversation.id);
+        let before_model = snapshot.model.clone();
+        launch.config_root = Some(root_b.clone());
+        let view = Agent::from_access_for_test(
+            access.clone(),
+            access.owner_epoch(),
+            ViewRef {
+                session_id: Uuid::new_v4(),
+                view_id: Uuid::new_v4(),
+            },
+            launch,
+            None,
+        );
+        let (console, _) = Console::start(false).unwrap();
+        let mut menus = Menus::new(Some(UserSettings::in_root(&root_b)), Some(root_b.clone()));
+        menus.models(&view, &console, target).await.unwrap();
+        assert_eq!(menus.provider_root(), Some(root_a.as_path()));
+        let (id, Selection::Model { choices, .. }) = menus.active.as_ref().unwrap() else {
+            panic!("Expected configured Agent models")
+        };
+        let choice = choices[0].config.clone();
+        let id = *id;
+        menus
+            .picker_action(&view, &console, id, 0, PickerAction::ConfigureProvider)
+            .await
+            .unwrap();
+        let (_, Selection::ConnectionDetails { provider, .. }) = menus.active.as_ref().unwrap()
+        else {
+            panic!("Expected connection details")
+        };
+        assert_eq!(provider.models[0], choice);
+        crate::model::credentials::save_api_key(
+            menus.provider_root().unwrap(),
+            reference,
+            "replacement-for-a",
+        )
+        .unwrap();
+        menus.provider_back(&view, &console, target).await.unwrap();
+        assert_eq!(
+            crate::model::credentials::load_api_key(&root_a, reference)
+                .unwrap()
+                .as_deref(),
+            Some("replacement-for-a")
+        );
+        assert_eq!(
+            crate::model::credentials::load_api_key(&root_b, reference)
+                .unwrap()
+                .as_deref(),
+            Some("root-b-fixture-key")
+        );
+        assert_eq!(
+            view.snapshot(target.agent().unwrap()).await.unwrap().model,
+            before_model
+        );
+        core.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn dropping_an_account_directory_observation_cancels_the_pending_http_request() {
+        use crate::agent_access::{
+            AgentAccess, AgentCommand, CommandEnvelope, CommandResult, EmbeddedAgentAccess,
+            LaunchSpec,
+        };
+        use crate::terminal::test_support as support;
+        use tokio::io::AsyncReadExt;
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().canonicalize().unwrap();
+        let root = project.join("state");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = crate::model::cards::ModelCatalog::defaults()
+            .get("openai-api", "gpt-6.1-sol")
+            .unwrap();
+        config.base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        config.api_key_env = "PICKER_OBSERVATION_KEY".into();
+        crate::model::credentials::save_api_key(
+            &root,
+            &config.api_key_env,
+            "synthetic-observation-key",
+        )
+        .unwrap();
+        let core = crate::runtime::Agent::new_embedded(
+            config.clone(),
+            std::sync::Arc::new(support::ScriptedModel::new(Vec::new())),
+        );
+        let access = EmbeddedAgentAccess::new(core.clone());
+        let mut launch = LaunchSpec::embedded(project);
+        launch.config_root = Some(root);
+        launch.model = Some(config.clone());
+        let receipt = access
+            .execute(CommandEnvelope {
+                owner_epoch: access.owner_epoch(),
+                command_id: Uuid::new_v4(),
+                command: AgentCommand::Create {
+                    launch,
+                    initial: None,
+                    origin: None,
+                },
+            })
+            .await
+            .unwrap();
+        let CommandResult::Created { execution, .. } = receipt.into_result().unwrap() else {
+            panic!("Agent not created")
+        };
+        let observation = access
+            .observe(crate::agent_access::ObservationRequest::Agent {
+                execution,
+                detail: crate::agent_access::AgentDetailQuery::AccountModels {
+                    config: Box::new(config),
+                    refresh: false,
+                },
+                after: None,
+            })
+            .await
+            .unwrap();
+        let (mut socket, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            let mut byte = [0];
+            socket.read_exact(&mut byte).await.unwrap();
+            request.push(byte[0]);
+        }
+        assert!(
+            String::from_utf8(request)
+                .unwrap()
+                .starts_with("GET /v1/models ")
+        );
+        drop(observation);
+        let mut byte = [0];
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), socket.read(&mut byte))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        core.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn execution_directory_over_ipc_preserves_more_than_eight_kib_of_models() {
+        use crate::agent_access::{
+            AgentAccess, AgentCommand, CommandEnvelope, CommandResult, EmbeddedAgentAccess,
+            LaunchSpec, LocalAgentClient, ViewRef,
+        };
+        use crate::terminal::test_support as support;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let directory = tempfile::Builder::new()
+            .prefix("pmdir-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let project = directory.path().canonicalize().unwrap();
+        let root = project.join("state");
+        let http = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = crate::model::cards::ModelCatalog::defaults()
+            .get("openai-api", "gpt-6.1-sol")
+            .unwrap();
+        config.base_url = format!("http://{}/v1", http.local_addr().unwrap());
+        config.api_key_env = "REVIEW_LARGE_DIRECTORY_KEY".into();
+        crate::model::credentials::save_api_key(
+            &root,
+            &config.api_key_env,
+            "synthetic-large-directory-key",
+        )
+        .unwrap();
+        let response = serde_json::json!({"data": (0..400).map(|index| serde_json::json!({"id":format!("model-{index:04}")})).collect::<Vec<_>>()}).to_string();
+        let server_http = tokio::spawn(async move {
+            let (mut stream, _) = http.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).await.unwrap();
+                request.push(byte[0]);
+            }
+            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",response.len()).as_bytes()).await.unwrap();
+        });
+        let core = crate::runtime::Agent::new_embedded(
+            config.clone(),
+            std::sync::Arc::new(support::ScriptedModel::new(Vec::new())),
+        );
+        let access = std::sync::Arc::new(EmbeddedAgentAccess::new(core.clone()));
+        let mut launch = LaunchSpec::embedded(project.clone());
+        launch.config_root = Some(root);
+        launch.model = Some(config.clone());
+        let created = access
+            .execute(CommandEnvelope {
+                owner_epoch: access.owner_epoch(),
+                command_id: Uuid::new_v4(),
+                command: AgentCommand::Create {
+                    launch: launch.clone(),
+                    initial: None,
+                    origin: None,
+                },
+            })
+            .await
+            .unwrap()
+            .into_result()
+            .unwrap();
+        let CommandResult::Created { snapshot, .. } = created else {
+            panic!("Agent not created")
+        };
+        let target = ConfigTarget::Agent(snapshot.conversation.id);
+        let endpoint = project.join("owner.sock");
+        let listener = tokio::net::UnixListener::bind(&endpoint).unwrap();
+        let epoch = access.owner_epoch();
+        let ipc = tokio::spawn(crate::agent_access::serve_listener(listener, access, epoch));
+        let client = std::sync::Arc::new(LocalAgentClient::connect(&endpoint).await.unwrap());
+        let view = Agent::from_access_for_test(
+            client,
+            epoch,
+            ViewRef {
+                session_id: Uuid::new_v4(),
+                view_id: Uuid::new_v4(),
+            },
+            launch,
+            None,
+        );
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(12),
+            view.account_models(target, config, false),
+        )
+        .await
+        .unwrap();
+        server_http.await.unwrap();
+        let models = result.expect("A valid model directory must survive the IPC delta limit");
+        assert_eq!(models.models.len(), 400);
+        assert!(serde_json::to_vec(&models).unwrap().len() > 8192);
+        assert_eq!(
+            models.availability("model-0399"),
+            crate::model::availability::ModelAvailability::DirectoryListed
+        );
+        ipc.abort();
+        core.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn resumed_agent_warmup_and_first_model_page_share_one_execution_directory() {
+        use crate::agent_access::{
+            AgentAccess, AgentCommand, CommandEnvelope, CommandResult, EmbeddedAgentAccess,
+            LaunchSpec, ViewRef,
+        };
+        use crate::terminal::test_support as support;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().canonicalize().unwrap();
+        let root = project.join("state");
+        let http = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = crate::model::cards::ModelCatalog::defaults()
+            .get("openai-api", "gpt-6.1-sol")
+            .unwrap();
+        config.base_url = format!("http://{}/v1", http.local_addr().unwrap());
+        config.api_key_env = "REVIEW_WARMUP_KEY".into();
+        crate::model::credentials::save_api_key(&root, &config.api_key_env, "synthetic-warmup-key")
+            .unwrap();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = calls.clone();
+        let http_task = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = http.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    stream.read_exact(&mut byte).await.unwrap();
+                    request.push(byte[0]);
+                }
+                observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let body = "{\"data\":[{\"id\":\"gpt-6.1-sol\"}]}";
+                stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+            }
+        });
+        let core = crate::runtime::Agent::new_embedded(
+            config.clone(),
+            std::sync::Arc::new(support::ScriptedModel::new(Vec::new())),
+        );
+        let access = std::sync::Arc::new(EmbeddedAgentAccess::new(core.clone()));
+        let mut launch = LaunchSpec::embedded(project);
+        launch.config_root = Some(root.clone());
+        launch.model = Some(config.clone());
+        let result = access
+            .execute(CommandEnvelope {
+                owner_epoch: access.owner_epoch(),
+                command_id: Uuid::new_v4(),
+                command: AgentCommand::Create {
+                    launch: launch.clone(),
+                    initial: None,
+                    origin: None,
+                },
+            })
+            .await
+            .unwrap()
+            .into_result()
+            .unwrap();
+        let CommandResult::Created { snapshot, .. } = result else {
+            panic!("Agent not created")
+        };
+        let target = ConfigTarget::Agent(snapshot.conversation.id);
+        let view = Agent::from_access_for_test(
+            access.clone(),
+            access.owner_epoch(),
+            ViewRef {
+                session_id: Uuid::new_v4(),
+                view_id: Uuid::new_v4(),
+            },
+            launch,
+            None,
+        );
+        let (console, _) = Console::start(false).unwrap();
+        let mut menus = Menus::new(Some(UserSettings::in_root(&root)), Some(root));
+        menus.warm_model_directory(&view, target, config);
+        menus.models(&view, &console, target).await.unwrap();
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(12), menus.next_discovery())
+                .await
+                .unwrap();
+        menus
+            .finish_discovery(&view, &console, result)
+            .await
+            .unwrap();
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "Resumed-Agent warmup and the model page must use the same cache"
+        );
+        http_task.abort();
+        core.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn model_levels_hide_account_denials_and_keep_unknown_models_selectable() {
         use crate::terminal::test_support as support;
         use tickloop_agent::model::availability::{AccountModelDirectory, DirectorySemantics};
@@ -3028,20 +3556,39 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(menus.model_choices.len(), 1);
-        assert!(menus.model_choices[0].availability.selectable());
-        assert_eq!(menus.model_choices[0].config.provider_id, "deepseek-api");
+        assert_eq!(menus.provider.model_choices.len(), 1);
+        assert!(menus.provider.model_choices[0].availability.selectable());
+        assert_eq!(
+            menus.provider.model_choices[0].config.provider_id,
+            "deepseek-api"
+        );
         menus
             .show_model_providers(&console, ConfigTarget::Agent(chat), None)
             .unwrap();
+        menus.provider.provider_choices = menus.provider.model_providers.clone();
         menus
-            .show_provider_models(&console, ConfigTarget::Agent(chat), "openai-api", None)
+            .provider
+            .provider_nav
+            .back_stack
+            .push(menus.directory_parent());
+        let openai = menus
+            .provider
+            .model_providers
+            .iter()
+            .find(|provider| provider.models[0].provider_id == "openai-api")
+            .unwrap()
+            .key();
+        menus
+            .show_provider_models(&console, ConfigTarget::Agent(chat), &openai, None)
             .unwrap();
         let (id, Selection::Model { choices, .. }) = menus.active.as_ref().unwrap() else {
             panic!("expected empty model selection for denied Provider");
         };
         assert!(choices.is_empty());
-        assert_eq!(menus.model_provider.as_deref(), Some("openai-api"));
+        assert_eq!(
+            menus.provider.model_provider.as_deref(),
+            Some(openai.as_str())
+        );
         let id = *id;
         menus
             .choose(&agent, &console, id, None, None)
@@ -3049,7 +3596,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             menus.active.as_ref(),
-            Some((_, Selection::ModelProviders { .. }))
+            Some((_, Selection::Provider { .. }))
         ));
         assert_eq!(agent.snapshot(chat).await.unwrap().model, before);
         agent.shutdown().await;
@@ -3107,7 +3654,7 @@ mod tests {
             (RequestFailure::Connection, 1),
             (RequestFailure::Http { status: 503 }, 1),
         ] {
-            let menus = Menus::default();
+            let mut menus = Menus::default();
             let adapter = CountingDirectory(std::sync::atomic::AtomicUsize::new(0));
             let cancel = tokio_util::sync::CancellationToken::new();
             menus

@@ -224,7 +224,8 @@ impl CodexModelClient {
         output.private_source = source;
         tag_private_output(&mut output, &origin);
         match structured_tool {
-            Some(name) => normalize_structured_output(output, &name),
+            Some(name) => normalize_structured_output(output, &name)
+                .map_err(super::structured_response::verified_format_error),
             None => Ok(output),
         }
     }
@@ -326,7 +327,7 @@ impl CodexModelClient {
             Protocol::Responses,
             events,
             cancel,
-            None,
+            super::structured_response::StructuredResponsePolicy::for_codex_body(body),
             super::cards::Adapter::CodexResponses,
             false,
         )
@@ -639,6 +640,25 @@ fn normalize_structured_output(
     mut output: ModelOutput,
     tool_name: &str,
 ) -> Result<ModelOutput, ModelError> {
+    let tool_calls = output
+        .content
+        .iter()
+        .filter_map(|content| match content {
+            Content::ToolUse { name, .. } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if tool_calls.iter().any(|name| *name != tool_name)
+        || tool_calls.len() > 1
+        || output
+            .content
+            .iter()
+            .any(|content| matches!(content, Content::ToolResult { .. }))
+    {
+        return Err(ModelError::ResponseRejected(
+            ModelResponseRejection::UnexpectedToolOperation,
+        ));
+    }
     if output.stop_reason != "tool_use" {
         return Err(ModelError::InvalidResponse(
             "structured output did not finish with the required tool".into(),
@@ -655,6 +675,11 @@ fn normalize_structured_output(
                 value,
             } if value["type"] == "reasoning" => {}
             Content::Thinking { .. } => {}
+            Content::ToolUse { .. } | Content::ToolResult { .. } => {
+                return Err(ModelError::ResponseRejected(
+                    ModelResponseRejection::UnexpectedToolOperation,
+                ));
+            }
             _ => {
                 return Err(ModelError::InvalidResponse(
                     "structured output contained extra content or tool operations".into(),
@@ -2817,7 +2842,319 @@ mod tests {
                 .count(),
             1
         );
-        assert!(reason.contains("temporarily unavailable") || reason.contains("model failure"));
+        assert!(reason.contains("unexpected tool operations"), "{reason}");
+    }
+
+    #[test]
+    fn mixed_structured_output_always_rejects_unexpected_tools_before_format_errors() {
+        let text = Content::Text {
+            text: "valid JSON or commentary".into(),
+        };
+        let result = Content::ToolUse {
+            id: "result".into(),
+            name: "classify_result".into(),
+            input: json!({}),
+        };
+        let operation = Content::ToolUse {
+            id: "operation".into(),
+            name: "Read".into(),
+            input: json!({"file_path":"notes.txt"}),
+        };
+        for content in [
+            vec![text.clone(), operation.clone()],
+            vec![result.clone(), text.clone(), operation.clone()],
+            vec![operation.clone(), text.clone(), result.clone()],
+            vec![text.clone(), result.clone(), result.clone()],
+        ] {
+            for stop_reason in ["tool_use", "end_turn"] {
+                let output = ModelOutput {
+                    private_source: None,
+                    content: content.clone(),
+                    usage: Default::default(),
+                    stop_reason: stop_reason.into(),
+                };
+                assert!(matches!(
+                    normalize_structured_output(output, "classify_result"),
+                    Err(ModelError::ResponseRejected(
+                        ModelResponseRejection::UnexpectedToolOperation
+                    ))
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn structured_sse_and_websocket_reject_mixed_malformed_business_calls() {
+        for websocket in [false, true] {
+            let (_directory, state_dir) = state_with_credentials();
+            let text = json!({"type":"message","id":"text","role":"assistant","status":"completed","content":[{"type":"output_text","text":"{\"task_scope\":\"within_task\",\"rules\":[]}"}]});
+            let operation = json!({"type":"function_call","id":"operation","call_id":"unexpected","name":"Bash","arguments":"{truncated","status":"completed"});
+            let response = [
+                event("response.created", 0, json!({"response":{"id":"mixed","status":"in_progress"}})),
+                event("response.output_item.added", 1, json!({"output_index":0,"item":text})),
+                event("response.output_item.done", 2, json!({"output_index":0,"item":text})),
+                event("response.output_item.added", 3, json!({"output_index":1,"item":operation})),
+                event("response.output_item.done", 4, json!({"output_index":1,"item":operation})),
+                event("response.done", 5, json!({"response":{"id":"mixed","status":"completed","output":[text,operation]}})),
+            ].concat();
+            let (endpoint, captured) = if websocket {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let endpoint = format!("http://{}/codex/responses", listener.local_addr().unwrap());
+                let (sender, captured) = oneshot::channel();
+                tokio::spawn(async move {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let mut socket = accept_async(stream).await.unwrap();
+                    let request = socket.next().await.unwrap().unwrap().into_text().unwrap();
+                    for line in response
+                        .lines()
+                        .filter_map(|line| line.strip_prefix("data: "))
+                    {
+                        if socket
+                            .send(WsMessage::Text(line.to_owned().into()))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    sender
+                        .send(vec![serde_json::from_str::<Value>(&request).unwrap()])
+                        .unwrap();
+                });
+                (endpoint, captured)
+            } else {
+                let (endpoint, captured) = serve_scripted_responses(vec![(200, response)]).await;
+                (endpoint.to_string(), captured)
+            };
+            let config = ModelCatalog::defaults()
+                .profiles()
+                .into_iter()
+                .find(|profile| {
+                    profile.model == "gpt-5.5" && profile.provider == ModelProvider::OpenAiCodex
+                })
+                .unwrap();
+            let mut client = CodexModelClient::new(config, &state_dir)
+                .unwrap()
+                .with_loopback_test_endpoint(&endpoint)
+                .unwrap();
+            if websocket {
+                client = client.with_loopback_test_websocket();
+            }
+            let mut request = simple_request();
+            request.structured_output = Some(crate::model::StructuredOutput {
+                name: "classify_result".into(),
+                schema: json!({"type":"object","properties":{},"required":[],"additionalProperties":false}),
+            });
+            let (events, _) = tokio::sync::mpsc::unbounded_channel();
+            assert!(
+                matches!(
+                    client
+                        .complete(request, events, CancellationToken::new())
+                        .await,
+                    Err(ModelError::ResponseRejected(
+                        ModelResponseRejection::UnexpectedToolOperation
+                    ))
+                ),
+                "websocket={websocket}"
+            );
+            assert_eq!(captured.await.unwrap().len(), 1);
+        }
+    }
+
+    async fn orphan_tool_event_requires_manual_review(malformed_result: bool) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for websocket in [false, true] {
+            for event_type in [
+                "response.custom_tool_call_input.delta",
+                "response.custom_tool_call_input.done",
+                "response.function_call_output.delta",
+                "response.mcp_call_arguments.delta",
+                "response.file_search_call.searching",
+                "response.code_interpreter_call_code.delta",
+            ] {
+                let (_directory, state_dir) = state_with_credentials();
+                let config = ModelCatalog::defaults()
+                    .profiles()
+                    .into_iter()
+                    .find(|profile| {
+                        profile.model == "gpt-5.5" && profile.provider == ModelProvider::OpenAiCodex
+                    })
+                    .unwrap();
+                let main_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let main_endpoint = format!(
+                    "http://{}/codex/responses",
+                    main_listener.local_addr().unwrap()
+                );
+                let main_server = tokio::spawn(async move {
+                    for reply in [
+                        function_call_stream(
+                            "proposal",
+                            "Bash",
+                            json!({"command":"ln -s missing-target blocked"}),
+                            12,
+                        ),
+                        reply_stream("done", "Done without the operation", 12),
+                    ] {
+                        let (mut socket, _) = main_listener.accept().await.unwrap();
+                        read_request(&mut socket).await;
+                        send_stream(&mut socket, 200, &reply).await;
+                    }
+                });
+                let input = if malformed_result {
+                    json!(true)
+                } else {
+                    approval_findings(false)
+                };
+                let original = function_call_stream("review", "classify_result", input, 7);
+                let mut response = String::new();
+                for (index, chunk) in original
+                    .split("\n\n")
+                    .filter(|chunk| !chunk.is_empty())
+                    .enumerate()
+                {
+                    let mut data: Value = serde_json::from_str(
+                        chunk
+                            .lines()
+                            .find_map(|line| line.strip_prefix("data: "))
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    data["sequence_number"] = json!(if index > 1 { index + 1 } else { index });
+                    response += &format!(
+                        "event: {}\ndata: {data}\n\n",
+                        data["type"].as_str().unwrap()
+                    );
+                    if index == 1 {
+                        response += &event(
+                            event_type,
+                            2,
+                            json!({"output_index":42,"item_id":"orphan","delta":"unexpected command","input":"unexpected command"}),
+                        );
+                    }
+                }
+                let repair =
+                    function_call_stream("repair", "classify_result", approval_findings(false), 7);
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let endpoint = format!("http://{}/codex/responses", listener.local_addr().unwrap());
+                let calls = Arc::new(AtomicUsize::new(0));
+                let captured = calls.clone();
+                let server = tokio::spawn(async move {
+                    if websocket {
+                        let (stream, _) = listener.accept().await.unwrap();
+                        let mut socket = accept_async(stream).await.unwrap();
+                        for reply in [response, repair] {
+                            let Some(Ok(WsMessage::Text(_))) = socket.next().await else {
+                                break;
+                            };
+                            captured.fetch_add(1, Ordering::SeqCst);
+                            for line in reply.lines().filter_map(|line| line.strip_prefix("data: "))
+                            {
+                                if socket
+                                    .send(WsMessage::Text(line.to_owned().into()))
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                        }
+                    } else {
+                        for reply in [response, repair] {
+                            let (mut socket, _) = listener.accept().await.unwrap();
+                            read_request(&mut socket).await;
+                            captured.fetch_add(1, Ordering::SeqCst);
+                            send_stream(&mut socket, 200, &reply).await;
+                        }
+                    }
+                });
+                let main = CodexModelClient::new(config.clone(), &state_dir)
+                    .unwrap()
+                    .with_loopback_test_endpoint(main_endpoint.as_str())
+                    .unwrap();
+                let mut reviewer = CodexModelClient::new(config.clone(), &state_dir)
+                    .unwrap()
+                    .with_loopback_test_endpoint(&endpoint)
+                    .unwrap();
+                if websocket {
+                    reviewer = reviewer.with_loopback_test_websocket();
+                }
+                let agent = Agent::new_embedded(config, Arc::new(main));
+                agent.set_auto_reviewer(Arc::new(reviewer)).await;
+                let chat = agent.create_chat(state_dir.clone()).await.unwrap();
+                agent
+                    .set_execution_mode(chat, ExecutionMode::Auto)
+                    .await
+                    .unwrap();
+                let mut events = agent.subscribe();
+                agent
+                    .submit(chat, None, "Create the blocked link".into())
+                    .await
+                    .unwrap();
+                let mut manual = false;
+                loop {
+                    match tokio::time::timeout(Duration::from_secs(5), events.recv())
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .kind
+                    {
+                        EventKind::PermissionChecked { decision, reason } => {
+                            assert_eq!(
+                                decision,
+                                Decision::Ask,
+                                "{event_type}, websocket={websocket}, malformed={malformed_result}: {reason}"
+                            );
+                            assert!(reason.contains("unexpected tool operations"), "{reason}");
+                        }
+                        EventKind::PermissionRequested { request } => {
+                            manual = true;
+                            agent
+                                .answer_permission(chat, request.id, false)
+                                .await
+                                .unwrap();
+                        }
+                        EventKind::ToolStarted { .. } => {
+                            panic!("orphan tool event admitted the original operation")
+                        }
+                        EventKind::Completed { .. } | EventKind::Interrupted => break,
+                        EventKind::Failed(error) => panic!("{error}"),
+                        _ => {}
+                    }
+                }
+                assert!(manual);
+                assert_eq!(
+                    calls.load(Ordering::SeqCst),
+                    1,
+                    "the queued valid Allow must not be requested"
+                );
+                assert!(state_dir.join("blocked").symlink_metadata().is_err());
+                assert_eq!(
+                    agent
+                        .snapshot(chat)
+                        .await
+                        .unwrap()
+                        .request_usage
+                        .entries()
+                        .iter()
+                        .filter(|entry| entry.kind == RequestKind::PermissionCheck)
+                        .count(),
+                    1
+                );
+                agent.shutdown().await;
+                main_server.abort();
+                server.abort();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn allowing_result_with_orphan_custom_tool_event_requires_manual_review() {
+        orphan_tool_event_requires_manual_review(false).await;
+    }
+
+    #[tokio::test]
+    async fn malformed_result_with_orphan_custom_tool_event_never_gets_a_correction_retry() {
+        orphan_tool_event_requires_manual_review(true).await;
     }
 
     #[tokio::test]

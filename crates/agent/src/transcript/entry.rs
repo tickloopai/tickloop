@@ -436,4 +436,6 @@ pub(crate) struct ArtifactTicksEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<std::path::PathBuf>,
     pub artifact_ticks: Vec<crate::artifacts::ArtifactTick>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub removed_artifact_ticks: std::collections::BTreeSet<String>,
 }

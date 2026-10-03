@@ -24,17 +24,68 @@ use super::{
     protocol::*,
 };
 
+const OBSERVATION_CANCELLED_BEFORE_OPENING: &str = "observation cancelled before opening";
+
 #[derive(Clone)]
 pub struct LocalAgentClient {
     inner: Arc<ClientInner>,
 }
 
 struct ClientInner {
-    writer: Mutex<OwnedWriteHalf>,
+    writer: Arc<Mutex<OwnedWriteHalf>>,
     hello: ServerHello,
     pending: Mutex<HashMap<Uuid, oneshot::Sender<Result<Reply, AccessError>>>>,
     subscriptions: Mutex<HashMap<Uuid, Subscription>>,
     cancel: CancellationToken,
+}
+
+struct PendingObservationCancel {
+    writer: Weak<Mutex<OwnedWriteHalf>>,
+    connection: CancellationToken,
+    request_id: Uuid,
+    written: Option<oneshot::Receiver<()>>,
+}
+
+async fn write_observation_cancel(
+    writer: Arc<Mutex<OwnedWriteHalf>>,
+    connection: CancellationToken,
+    observation_id: Uuid,
+) {
+    let result = tokio::select! {
+        biased;
+        () = connection.cancelled() => return,
+        result = async {
+            write_frame(&mut *writer.lock().await, &ClientMessage::CancelObservation { observation_id }).await
+        } => result,
+    };
+    if result.is_err() {
+        connection.cancel();
+    }
+}
+
+impl Drop for PendingObservationCancel {
+    fn drop(&mut self) {
+        let Some(written) = self.written.take() else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let writer = self.writer.clone();
+        let connection = self.connection.clone();
+        let observation_id = self.request_id;
+        runtime.spawn(async move {
+            tokio::select! {
+                biased;
+                () = connection.cancelled() => return,
+                result = written => if result.is_err() { return; },
+            }
+            let Some(writer) = writer.upgrade() else {
+                return;
+            };
+            write_observation_cancel(writer, connection, observation_id).await;
+        });
+    }
 }
 
 struct Subscription {
@@ -139,7 +190,7 @@ impl LocalAgentClient {
         };
         let (reader, writer) = stream.into_split();
         let inner = Arc::new(ClientInner {
-            writer: Mutex::new(writer),
+            writer: Arc::new(Mutex::new(writer)),
             hello,
             pending: Mutex::new(HashMap::new()),
             subscriptions: Mutex::new(HashMap::new()),
@@ -194,19 +245,52 @@ impl LocalAgentClient {
         request_id: Uuid,
         message: ClientMessage,
     ) -> Result<Reply, AccessError> {
+        self.request_with_notification(request_id, message, None)
+            .await
+    }
+
+    async fn request_with_notification(
+        &self,
+        request_id: Uuid,
+        message: ClientMessage,
+        written: Option<oneshot::Sender<()>>,
+    ) -> Result<Reply, AccessError> {
         if self.inner.cancel.is_cancelled() {
             return Err(AccessError::unavailable("owner connection is closed"));
         }
         let (sender, receiver) = oneshot::channel();
         self.inner.pending.lock().await.insert(request_id, sender);
-        if let Err(error) = write_frame(&mut *self.inner.writer.lock().await, &message).await {
-            self.inner.pending.lock().await.remove(&request_id);
-            // A failed write can leave part of a frame behind and usually means the peer is gone,
-            // so close now instead of waiting for the reader to see end of stream.
-            if error.code == AccessErrorCode::Unavailable {
-                self.inner.cancel.cancel();
+        let detached = written.is_some();
+        let inner = Arc::downgrade(&self.inner);
+        let writer = self.inner.writer.clone();
+        let connection = self.inner.cancel.clone();
+        let send = async move {
+            let result = tokio::select! {
+                biased;
+                () = connection.cancelled() => Err(AccessError::unavailable("owner connection is closed")),
+                result = async { write_frame(&mut *writer.lock().await, &message).await } => result,
+            };
+            if let Err(error) = result {
+                if let Some(inner) = inner.upgrade() {
+                    inner.pending.lock().await.remove(&request_id);
+                }
+                if error.code == AccessErrorCode::Unavailable {
+                    connection.cancel();
+                }
+                return Err(error);
             }
-            return Err(error);
+            if let Some(written) = written {
+                let _ = written.send(());
+            }
+            Ok(())
+        };
+        if detached {
+            // Finish the request frame before cancellation is written on the shared stream.
+            tokio::spawn(send)
+                .await
+                .map_err(|_| AccessError::unavailable("observation request writer stopped"))??;
+        } else {
+            send.await?;
         }
         receiver
             .await
@@ -217,11 +301,29 @@ impl LocalAgentClient {
 #[async_trait]
 impl AgentAccess for LocalAgentClient {
     async fn observe(&self, query: ObservationRequest) -> Result<Observation, AccessError> {
+        query.check_peer_version(self.inner.hello.minor)?;
         let request_id = Uuid::new_v4();
-        match self
-            .request(request_id, ClientMessage::Observe { request_id, query })
-            .await?
-        {
+        let (written, waiting) = if self.inner.hello.minor >= MIN_PREOPEN_OBSERVATION_CANCEL_MINOR {
+            let (written, waiting) = oneshot::channel();
+            (Some(written), Some(waiting))
+        } else {
+            (None, None)
+        };
+        let mut cancel = PendingObservationCancel {
+            writer: Arc::downgrade(&self.inner.writer),
+            connection: self.inner.cancel.clone(),
+            request_id,
+            written: waiting,
+        };
+        let result = self
+            .request_with_notification(
+                request_id,
+                ClientMessage::Observe { request_id, query },
+                written,
+            )
+            .await;
+        cancel.written = None;
+        match result? {
             Reply::Opened {
                 initial,
                 cursor,
@@ -241,6 +343,7 @@ impl AgentAccess for LocalAgentClient {
         }
     }
     async fn execute(&self, command: CommandEnvelope) -> Result<CommandReceipt, AccessError> {
+        command.command.check_peer_version(self.inner.hello.minor)?;
         let request_id = Uuid::new_v4();
         match self
             .request(
@@ -371,16 +474,19 @@ async fn read_responses(
                         },
                     );
                     let client = Arc::downgrade(&inner);
+                    let writer = inner.writer.clone();
+                    let connection = cancel.clone();
                     tokio::spawn(async move {
-                        tokio::select! { _ = sender.closed() => {}, _ = subscription_cancel.cancelled() => return };
+                        tokio::select! {
+                            biased;
+                            () = connection.cancelled() => return,
+                            () = subscription_cancel.cancelled() => return,
+                            () = sender.closed() => {},
+                        }
                         if let Some(client) = client.upgrade() {
                             client.subscriptions.lock().await.remove(&observation_id);
-                            let _ = write_frame(
-                                &mut *client.writer.lock().await,
-                                &ClientMessage::CancelObservation { observation_id },
-                            )
-                            .await;
                         }
+                        write_observation_cancel(writer, connection, observation_id).await;
                     });
                     Some(receiver)
                 } else {
@@ -424,11 +530,11 @@ async fn read_responses(
                     {
                         subscription.cancel.cancel();
                     }
-                    let _ = write_frame(
-                        &mut *inner.writer.lock().await,
-                        &ClientMessage::CancelObservation { observation_id },
-                    )
-                    .await;
+                    tokio::spawn(write_observation_cancel(
+                        inner.writer.clone(),
+                        cancel.clone(),
+                        observation_id,
+                    ));
                 }
             }
             ServerMessage::Error {
@@ -652,6 +758,8 @@ async fn serve_connection_mode(
     let (mut reader, writer) = stream.into_split();
     let writer = Arc::new(Mutex::new(writer));
     let observations: Arc<Mutex<HashMap<Uuid, FeedTask>>> = Arc::new(Mutex::new(HashMap::new()));
+    let pending_observations: Arc<Mutex<HashMap<Uuid, CancellationToken>>> =
+        Arc::new(Mutex::new(HashMap::new()));
     let cancel = owner_shutdown
         .as_ref()
         .map_or_else(CancellationToken::new, CancellationToken::child_token);
@@ -710,6 +818,11 @@ async fn serve_connection_mode(
             continue;
         }
         if let ClientMessage::CancelObservation { observation_id } = message {
+            if minor >= MIN_PREOPEN_OBSERVATION_CANCEL_MINOR
+                && let Some(pending) = pending_observations.lock().await.remove(&observation_id)
+            {
+                pending.cancel();
+            }
             if let Some(feed) = observations.lock().await.remove(&observation_id) {
                 feed.stop.cancel();
             }
@@ -725,6 +838,17 @@ async fn serve_connection_mode(
             | ClientMessage::ShowView { request_id, .. } => *request_id,
             _ => continue,
         };
+        let observation_cancel = if matches!(&message, ClientMessage::Observe { .. }) {
+            let pending = cancel.child_token();
+            pending_observations
+                .lock()
+                .await
+                .insert(request_id, pending.clone());
+            Some(pending)
+        } else {
+            None
+        };
+        let pending_observations = pending_observations.clone();
         let access = access.clone();
         let writer = writer.clone();
         let observations = observations.clone();
@@ -734,131 +858,163 @@ async fn serve_connection_mode(
         tokio::spawn(async move {
             let command_response = matches!(&message, ClientMessage::Execute { .. });
             let response = match message {
-                ClientMessage::Observe { request_id, query } => match access.observe(query).await {
-                    Ok(observation) if !cancel.is_cancelled() => {
-                        let observation_id = Uuid::new_v4();
-                        let feed = observation.changes.is_some();
-                        let terminal_error = observation.terminal_error.clone();
-                        let response = ServerMessage::Opened {
-                            request_id,
-                            observation_id,
-                            initial: observation.initial,
-                            cursor: observation.cursor,
-                            reset: observation.reset,
-                            feed,
-                        };
-                        let start = if let Some(mut changes) = observation.changes {
-                            let (start, started) = oneshot::channel();
-                            let writer = writer.clone();
-                            let cancel = cancel.clone();
-                            let stop = CancellationToken::new();
-                            let task_stop = stop.clone();
-                            let active = observations.clone();
-                            let task = tokio::spawn(async move {
-                                let ready = tokio::select! {
-                                    _ = cancel.cancelled() => return,
-                                    _ = task_stop.cancelled() => return,
-                                    ready = started => ready,
-                                };
-                                if ready.is_err() {
-                                    return;
-                                }
-                                loop {
-                                    // Stopping is checked only here, never while a frame is being
-                                    // written.
-                                    let update = tokio::select! {
-                                        biased;
-                                        _ = cancel.cancelled() => break,
-                                        _ = task_stop.cancelled() => break,
-                                        update = changes.recv() => update,
+                ClientMessage::Observe { request_id, query } => {
+                    let observation_cancel =
+                        observation_cancel.expect("Observe has a cancellation scope");
+                    let result = async {
+                        query.check_peer_version(minor)?;
+                        tokio::select! {
+                            biased;
+                            () = observation_cancel.cancelled() => Err(AccessError::unavailable(OBSERVATION_CANCELLED_BEFORE_OPENING)),
+                            result = access.observe(query) => result,
+                        }
+                    }.await;
+                    let result = result.and_then(|observation| {
+                        if observation_cancel.is_cancelled() {
+                            Err(AccessError::unavailable(
+                                OBSERVATION_CANCELLED_BEFORE_OPENING,
+                            ))
+                        } else {
+                            Ok(observation)
+                        }
+                    });
+                    match result {
+                        Ok(observation) => {
+                            let observation_id = if minor >= MIN_PREOPEN_OBSERVATION_CANCEL_MINOR {
+                                request_id
+                            } else {
+                                Uuid::new_v4()
+                            };
+                            let feed = observation.changes.is_some();
+                            let terminal_error = observation.terminal_error.clone();
+                            let response = ServerMessage::Opened {
+                                request_id,
+                                observation_id,
+                                initial: observation.initial,
+                                cursor: observation.cursor,
+                                reset: observation.reset,
+                                feed,
+                            };
+                            let start = if let Some(mut changes) = observation.changes {
+                                let (start, started) = oneshot::channel();
+                                let writer = writer.clone();
+                                let cancel = cancel.clone();
+                                let stop = observation_cancel.clone();
+                                let task_stop = stop.clone();
+                                let active = observations.clone();
+                                let task = tokio::spawn(async move {
+                                    let ready = tokio::select! {
+                                        _ = cancel.cancelled() => return,
+                                        _ = task_stop.cancelled() => return,
+                                        ready = started => ready,
                                     };
-                                    let Some(update) = update else {
-                                        let error = terminal_error
-                                            .as_ref()
-                                            .and_then(|error| error.lock().unwrap().clone())
-                                            .unwrap_or_else(|| {
-                                                AccessError::unavailable(
-                                                    "execution observation ended",
-                                                )
-                                            });
+                                    if ready.is_err() {
+                                        return;
+                                    }
+                                    loop {
+                                        // Stopping is checked only here, never while a frame is being
+                                        // written.
+                                        let update = tokio::select! {
+                                            biased;
+                                            _ = cancel.cancelled() => break,
+                                            _ = task_stop.cancelled() => break,
+                                            update = changes.recv() => update,
+                                        };
+                                        let Some(update) = update else {
+                                            let error = terminal_error
+                                                .as_ref()
+                                                .and_then(|error| error.lock().unwrap().clone())
+                                                .unwrap_or_else(|| {
+                                                    AccessError::unavailable(
+                                                        "execution observation ended",
+                                                    )
+                                                });
+                                            if write_frame(
+                                                &mut *writer.lock().await,
+                                                &ServerMessage::ObservationClosed {
+                                                    observation_id,
+                                                    error,
+                                                },
+                                            )
+                                            .await
+                                            .is_err()
+                                            {
+                                                cancel.cancel();
+                                            }
+                                            break;
+                                        };
                                         if write_frame(
                                             &mut *writer.lock().await,
-                                            &ServerMessage::ObservationClosed {
+                                            &ServerMessage::Changed {
                                                 observation_id,
-                                                error,
+                                                update: super::bounded_update(update),
                                             },
                                         )
                                         .await
                                         .is_err()
                                         {
                                             cancel.cancel();
+                                            break;
                                         }
-                                        break;
-                                    };
-                                    if write_frame(
-                                        &mut *writer.lock().await,
-                                        &ServerMessage::Changed {
-                                            observation_id,
-                                            update: super::bounded_update(update),
-                                        },
-                                    )
-                                    .await
-                                    .is_err()
-                                    {
-                                        cancel.cancel();
-                                        break;
                                     }
+                                    active.lock().await.remove(&observation_id);
+                                });
+                                observations.lock().await.insert(
+                                    observation_id,
+                                    FeedTask {
+                                        stop,
+                                        task: task.abort_handle(),
+                                    },
+                                );
+                                Some(start)
+                            } else {
+                                None
+                            };
+                            pending_observations.lock().await.remove(&request_id);
+                            if !write_response(
+                                &mut *writer.lock().await,
+                                response,
+                                request_id,
+                                false,
+                                minor >= MIN_CHUNKED_RESPONSE_MINOR,
+                                &cancel,
+                            )
+                            .await
+                            {
+                                if let Some(feed) =
+                                    observations.lock().await.remove(&observation_id)
+                                {
+                                    feed.task.abort();
                                 }
-                                active.lock().await.remove(&observation_id);
-                            });
-                            observations.lock().await.insert(
-                                observation_id,
-                                FeedTask {
-                                    stop,
-                                    task: task.abort_handle(),
-                                },
-                            );
-                            Some(start)
-                        } else {
-                            None
-                        };
-                        if !write_response(
-                            &mut *writer.lock().await,
-                            response,
-                            request_id,
-                            false,
-                            minor >= MIN_CHUNKED_RESPONSE_MINOR,
-                            &cancel,
-                        )
-                        .await
-                        {
-                            if let Some(feed) = observations.lock().await.remove(&observation_id) {
-                                feed.task.abort();
+                                return;
+                            }
+                            #[cfg(test)]
+                            if let Some(hooks) = observation_hooks
+                                && hooks.next.swap(false, std::sync::atomic::Ordering::SeqCst)
+                            {
+                                hooks.opened.notify_one();
+                                hooks.resume.notified().await;
+                            }
+                            if let Some(start) = start {
+                                let _ = start.send(());
                             }
                             return;
                         }
-                        #[cfg(test)]
-                        if let Some(hooks) = observation_hooks
-                            && hooks.next.swap(false, std::sync::atomic::Ordering::SeqCst)
-                        {
-                            hooks.opened.notify_one();
-                            hooks.resume.notified().await;
+                        Err(error) => {
+                            pending_observations.lock().await.remove(&request_id);
+                            ServerMessage::Error {
+                                request_id: Some(request_id),
+                                error,
+                            }
                         }
-                        if let Some(start) = start {
-                            let _ = start.send(());
-                        }
-                        return;
                     }
-                    Ok(_) => return,
-                    Err(error) => ServerMessage::Error {
-                        request_id: Some(request_id),
-                        error,
-                    },
-                },
+                }
                 ClientMessage::Execute {
                     request_id,
                     command,
-                } => match if !forwarded_sessions
+                } => match if let Err(error) = command.command.check_peer_version(minor) {
+                    Err(error)
+                } else if !forwarded_sessions
                     && super::views::command_origin(&command.command)
                         .is_some_and(|source| source.view.session_id != session_id)
                 {
@@ -1189,6 +1345,166 @@ mod tests {
         }
     }
 
+    struct CompletingLookup {
+        epoch: Uuid,
+        started: tokio::sync::Notify,
+        release: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait]
+    impl AgentAccess for CompletingLookup {
+        async fn observe(&self, query: ObservationRequest) -> Result<Observation, AccessError> {
+            let initial = if matches!(
+                query,
+                ObservationRequest::Agent {
+                    detail: AgentDetailQuery::AccountModels { .. },
+                    ..
+                }
+            ) {
+                self.started.notify_one();
+                tokio::task::block_in_place(|| {
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                    while !self.release.load(std::sync::atomic::Ordering::SeqCst) {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "Controlled lookup was not released"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                });
+                ObservationValue::AccountModels(Err("Controlled completed lookup".into()))
+            } else {
+                ObservationValue::Receipt(None)
+            };
+            Ok(Observation {
+                initial,
+                cursor: Cursor {
+                    owner_epoch: self.epoch,
+                    execution: None,
+                    sequence: 0,
+                },
+                reset: None,
+                changes: None,
+                terminal_error: None,
+            })
+        }
+        async fn execute(&self, _: CommandEnvelope) -> Result<CommandReceipt, AccessError> {
+            Err(AccessError::invalid("Fixture has no commands"))
+        }
+        async fn show_view(&self, _: DisplayUpdate) -> Result<DisplayReceipt, AccessError> {
+            Err(AccessError::invalid("Fixture has no display"))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn completing_a_cancelled_lookup_returns_exactly_one_terminal_reply() {
+        use std::time::Duration;
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
+        let socket = directory.path().join("completion.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let epoch = Uuid::new_v4();
+        let source = Arc::new(CompletingLookup {
+            epoch,
+            started: tokio::sync::Notify::new(),
+            release: std::sync::atomic::AtomicBool::new(false),
+        });
+        let server = tokio::spawn(serve_listener(listener, source.clone(), epoch));
+        let mut client = UnixStream::connect(&socket).await.unwrap();
+        write_frame(
+            &mut client,
+            &ClientMessage::Hello {
+                major: PROTOCOL_MAJOR,
+                minor: PROTOCOL_MINOR,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_frame::<_, ServerMessage>(&mut client).await.unwrap(),
+            Some(ServerMessage::Hello(_))
+        ));
+        for _ in 0..3 {
+            source
+                .release
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            let cancelled_request = Uuid::new_v4();
+            write_frame(
+                &mut client,
+                &ClientMessage::Observe {
+                    request_id: cancelled_request,
+                    query: ObservationRequest::Agent {
+                        execution: ExecutionRef {
+                            owner_epoch: epoch,
+                            agent_id: Uuid::new_v4(),
+                            generation: 1,
+                        },
+                        detail: AgentDetailQuery::AccountModels {
+                            config: Box::new(
+                                crate::model::cards::ModelCatalog::defaults()
+                                    .get("openai-api", "gpt-6.1-sol")
+                                    .unwrap(),
+                            ),
+                            refresh: true,
+                        },
+                        after: None,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+            source.started.notified().await;
+            write_frame(
+                &mut client,
+                &ClientMessage::CancelObservation {
+                    observation_id: cancelled_request,
+                },
+            )
+            .await
+            .unwrap();
+            let compatible_request = Uuid::new_v4();
+            write_frame(
+                &mut client,
+                &ClientMessage::Observe {
+                    request_id: compatible_request,
+                    query: ObservationRequest::Receipt {
+                        epoch,
+                        command_id: Uuid::new_v4(),
+                    },
+                },
+            )
+            .await
+            .unwrap();
+            let compatible = tokio::time::timeout(
+                Duration::from_secs(2),
+                read_frame::<_, ServerMessage>(&mut client),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(
+                matches!(compatible,Some(ServerMessage::Opened { request_id,initial:ObservationValue::Receipt(None),.. }) if request_id==compatible_request)
+            );
+            source
+                .release
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let terminal = tokio::time::timeout(Duration::from_secs(2),read_frame::<_,ServerMessage>(&mut client)).await.expect("A completing cancelled lookup must retire its pending request with a terminal response").unwrap();
+            assert!(
+                matches!(terminal,Some(ServerMessage::Error { request_id:Some(request_id),error:AccessError { code:AccessErrorCode::Unavailable,.. } }) if request_id==cancelled_request)
+            );
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_millis(50),
+                    read_frame::<_, ServerMessage>(&mut client)
+                )
+                .await
+                .is_err(),
+                "Cancellation and completion must not send duplicate terminal replies"
+            );
+        }
+        drop(client);
+        server.abort();
+    }
+
     /// Shrinks a server socket's send buffer so one feed frame cannot fit in the kernel, and
     /// returns the size the kernel applied.
     fn shrink_send_buffer(stream: &UnixStream) -> usize {
@@ -1218,6 +1534,315 @@ mod tests {
         };
         assert_eq!(read, 0, "cannot read the server send buffer");
         applied as usize
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelling_a_backpressured_lookup_keeps_the_live_request_frame_whole() {
+        use std::time::Duration;
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
+        let socket = directory.path().join("ordering.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let epoch = Uuid::new_v4();
+        let (started, waiting) = oneshot::channel();
+        let (resume, draining) = oneshot::channel();
+        let (cancelled, cancellation) = oneshot::channel();
+        let peer = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            assert!(matches!(
+                read_frame::<_, ClientMessage>(&mut stream).await.unwrap(),
+                Some(ClientMessage::Hello { .. })
+            ));
+            write_frame(
+                &mut stream,
+                &ServerMessage::Hello(ServerHello {
+                    process_id: 0,
+                    major: PROTOCOL_MAJOR,
+                    minor: PROTOCOL_MINOR,
+                    owner_epoch: epoch,
+                    session_id: Uuid::new_v4(),
+                    capabilities: Vec::new(),
+                    limits: None,
+                }),
+            )
+            .await
+            .unwrap();
+            let length = stream.read_u32().await.unwrap() as usize;
+            assert!(length > 3 * 1024 * 1024);
+            started.send(()).unwrap();
+            draining.await.unwrap();
+            let mut body = vec![0; length];
+            stream.read_exact(&mut body).await.unwrap();
+            let ClientMessage::Observe { request_id, .. } =
+                serde_json::from_slice::<ClientMessage>(&body)
+                    .expect("Observation cancellation must not truncate a live request frame")
+            else {
+                panic!("Expected Observe")
+            };
+            assert!(
+                matches!(read_frame::<_,ClientMessage>(&mut stream).await.unwrap(),Some(ClientMessage::CancelObservation { observation_id }) if observation_id==request_id)
+            );
+            write_frame(
+                &mut stream,
+                &ServerMessage::Error {
+                    request_id: Some(request_id),
+                    error: AccessError::unavailable("Controlled observation cancelled"),
+                },
+            )
+            .await
+            .unwrap();
+            cancelled.send(()).unwrap();
+            let Some(ClientMessage::Observe { request_id, .. }) =
+                read_frame::<_, ClientMessage>(&mut stream).await.unwrap()
+            else {
+                panic!("Expected compatible next request")
+            };
+            write_frame(
+                &mut stream,
+                &ServerMessage::Opened {
+                    request_id,
+                    observation_id: request_id,
+                    initial: ObservationValue::Overview(Vec::new()),
+                    cursor: Cursor {
+                        owner_epoch: epoch,
+                        execution: None,
+                        sequence: 0,
+                    },
+                    reset: None,
+                    feed: false,
+                },
+            )
+            .await
+            .unwrap();
+        });
+        let client = LocalAgentClient::connect(&socket).await.unwrap();
+        let observing = client.clone();
+        let query = tokio::spawn(async move {
+            observing
+                .observe(ObservationRequest::Overview {
+                    filter: AgentFilter {
+                        workdir: None,
+                        workspace: Some("x".repeat(3 * 1024 * 1024)),
+                    },
+                    page: Page::default(),
+                    after: None,
+                })
+                .await
+        });
+        waiting.await.unwrap();
+        query.abort();
+        let _ = query.await;
+        resume.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), cancellation)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(client.is_connected());
+        let next = tokio::time::timeout(
+            Duration::from_secs(2),
+            client.observe(ObservationRequest::Overview {
+                filter: AgentFilter::default(),
+                page: Page::default(),
+                after: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(matches!(next.initial,ObservationValue::Overview(rows) if rows.is_empty()));
+        peer.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropped_opened_feed_cannot_keep_a_backpressured_client_alive() {
+        use std::time::Duration;
+        for opened_feed in [true, false] {
+            let directory = tempfile::tempdir_in("/tmp").unwrap();
+            let socket = directory.path().join("feed-pressure.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let epoch = Uuid::new_v4();
+            let (started, waiting) = oneshot::channel();
+            let (resume, draining) = oneshot::channel();
+            let peer = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                assert!(matches!(
+                    read_frame::<_, ClientMessage>(&mut stream).await.unwrap(),
+                    Some(ClientMessage::Hello { .. })
+                ));
+                write_frame(
+                    &mut stream,
+                    &ServerMessage::Hello(ServerHello {
+                        process_id: 0,
+                        major: PROTOCOL_MAJOR,
+                        minor: PROTOCOL_MINOR,
+                        owner_epoch: epoch,
+                        session_id: Uuid::new_v4(),
+                        capabilities: Vec::new(),
+                        limits: None,
+                    }),
+                )
+                .await
+                .unwrap();
+                if opened_feed {
+                    let Some(ClientMessage::Observe { request_id, .. }) =
+                        read_frame::<_, ClientMessage>(&mut stream).await.unwrap()
+                    else {
+                        panic!("Expected feed request")
+                    };
+                    write_frame(
+                        &mut stream,
+                        &ServerMessage::Opened {
+                            request_id,
+                            observation_id: request_id,
+                            initial: ObservationValue::Overview(Vec::new()),
+                            cursor: Cursor {
+                                owner_epoch: epoch,
+                                execution: None,
+                                sequence: 0,
+                            },
+                            reset: None,
+                            feed: true,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                }
+                let length = stream.read_u32().await.unwrap() as usize;
+                assert!(length > 8 * 1024 * 1024);
+                started.send(()).unwrap();
+                draining.await.unwrap();
+                let mut remaining = Vec::new();
+                tokio::time::timeout(Duration::from_secs(2),stream.read_to_end(&mut remaining)).await.expect("An opened-feed cancellation must release the last client without waiting for full peer drain").unwrap();
+                assert!(
+                    remaining.len() < length,
+                    "opened_feed={opened_feed}: feed cancellation retained the client and completed its abandoned frame ({} bytes)",
+                    remaining.len()
+                );
+            });
+            let client = LocalAgentClient::connect(&socket).await.unwrap();
+            let observation = if opened_feed {
+                Some(
+                    client
+                        .observe(ObservationRequest::Overview {
+                            filter: AgentFilter::default(),
+                            page: Page::default(),
+                            after: None,
+                        })
+                        .await
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
+            let observing = client.clone();
+            let query = tokio::spawn(async move {
+                observing
+                    .observe(ObservationRequest::Overview {
+                        filter: AgentFilter {
+                            workdir: None,
+                            workspace: Some("x".repeat(8 * 1024 * 1024)),
+                        },
+                        page: Page::default(),
+                        after: None,
+                    })
+                    .await
+            });
+            waiting.await.unwrap();
+            drop(observation);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            query.abort();
+            let _ = query.await;
+            drop(client);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            resume.send(()).unwrap();
+            peer.await.unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn backpressured_observation_write_stops_on_eof_or_last_client_drop() {
+        use std::time::Duration;
+        for peer_eof in [true, false] {
+            let directory = tempfile::tempdir_in("/tmp").unwrap();
+            let socket = directory.path().join("pressure.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let (started, waiting) = oneshot::channel();
+            let (resume, draining) = oneshot::channel();
+            let epoch = Uuid::new_v4();
+            let peer = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                assert!(matches!(
+                    read_frame::<_, ClientMessage>(&mut stream).await.unwrap(),
+                    Some(ClientMessage::Hello { .. })
+                ));
+                write_frame(
+                    &mut stream,
+                    &ServerMessage::Hello(ServerHello {
+                        process_id: 0,
+                        major: PROTOCOL_MAJOR,
+                        minor: PROTOCOL_MINOR,
+                        owner_epoch: epoch,
+                        session_id: Uuid::new_v4(),
+                        capabilities: Vec::new(),
+                        limits: None,
+                    }),
+                )
+                .await
+                .unwrap();
+                let length = stream.read_u32().await.unwrap() as usize;
+                assert!(length > 8 * 1024 * 1024);
+                let (mut reader, mut writer) = stream.into_split();
+                if peer_eof {
+                    writer.shutdown().await.unwrap();
+                }
+                started.send(length).unwrap();
+                draining.await.unwrap();
+                let mut remaining = Vec::new();
+                tokio::time::timeout(Duration::from_secs(2), reader.read_to_end(&mut remaining)).await.expect("Dropping the last client must close a backpressured writer without completing its abandoned frame").unwrap();
+                assert!(
+                    remaining.len() < length,
+                    "peer_eof={peer_eof}: an abandoned request was still written in full ({} bytes)",
+                    remaining.len()
+                );
+            });
+            let client = LocalAgentClient::connect(&socket).await.unwrap();
+            let observing = client.clone();
+            let query = tokio::spawn(async move {
+                observing
+                    .observe(ObservationRequest::Overview {
+                        filter: AgentFilter {
+                            workdir: None,
+                            workspace: Some("x".repeat(8 * 1024 * 1024)),
+                        },
+                        page: Page::default(),
+                        after: None,
+                    })
+                    .await
+            });
+            waiting.await.unwrap();
+            if peer_eof {
+                let result = tokio::time::timeout(Duration::from_secs(1), query)
+                    .await
+                    .expect(
+                        "Response EOF must stop the blocked request writer and unblock the caller",
+                    )
+                    .unwrap();
+                assert!(matches!(
+                    result,
+                    Err(AccessError {
+                        code: AccessErrorCode::Unavailable,
+                        ..
+                    })
+                ));
+                assert!(!client.is_connected());
+            } else {
+                query.abort();
+                let _ = query.await;
+            }
+            drop(client);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            resume.send(()).unwrap();
+            peer.await.unwrap();
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1550,6 +2175,93 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn provider_queries_are_rejected_before_sending_to_a_minor_one_peer() {
+        let directory = tempfile::Builder::new()
+            .prefix("pmipc-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let path = directory.path().join("owner.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let epoch = Uuid::new_v4();
+        let server = tokio::spawn(serve_legacy_overview(
+            listener,
+            epoch,
+            serde_json::json!([]),
+        ));
+        let client = LocalAgentClient::connect(&path).await.unwrap();
+        let execution = ExecutionRef {
+            owner_epoch: epoch,
+            agent_id: Uuid::new_v4(),
+            generation: 1,
+        };
+        let config = crate::model::cards::ModelCatalog::defaults()
+            .get("openai-api", "gpt-6.1-sol")
+            .unwrap();
+        for detail in [
+            AgentDetailQuery::ProviderCredentials,
+            AgentDetailQuery::AccountModels {
+                config: Box::new(config),
+                refresh: false,
+            },
+        ] {
+            let result = client
+                .observe(ObservationRequest::Agent {
+                    execution,
+                    detail,
+                    after: None,
+                })
+                .await;
+            assert!(
+                matches!(
+                    result,
+                    Err(AccessError {
+                        code: AccessErrorCode::VersionMismatch,
+                        ..
+                    })
+                ),
+                "New closed queries must be blocked before dispatch to a 2.1 reader"
+            );
+        }
+        let provider: crate::model::cards::ProviderPatch =
+            serde_json::from_value(serde_json::json!({"id":"openai-api"})).unwrap();
+        let config = crate::model::cards::ModelCatalog::defaults()
+            .get("openai-api", "gpt-6.1-sol")
+            .unwrap();
+        let result = client
+            .execute(CommandEnvelope {
+                owner_epoch: epoch,
+                command_id: Uuid::new_v4(),
+                command: AgentCommand::Configure {
+                    execution,
+                    change: ConfigurationChange::Model {
+                        config,
+                        thinking: None,
+                    },
+                    provider: Some(Box::new(provider)),
+                },
+            })
+            .await;
+        assert!(matches!(
+            result,
+            Err(AccessError {
+                code: AccessErrorCode::VersionMismatch,
+                ..
+            })
+        ));
+        assert!(client.is_connected());
+        let safe = client
+            .observe(ObservationRequest::Overview {
+                filter: AgentFilter::default(),
+                page: Page::default(),
+                after: None,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(safe.initial, ObservationValue::Overview(rows) if rows.is_empty()));
+        server.abort();
     }
 
     /// Answers every overview request with `rows` as raw JSON, the way an owner built before

@@ -15,11 +15,15 @@ struct TerminalFixture {
     writer: Box<dyn std::io::Write + Send>,
     output: std::sync::Arc<std::sync::Mutex<String>>,
     _master: Box<dyn portable_pty::MasterPty + Send>,
+    runtime: std::path::PathBuf,
+    root: std::path::PathBuf,
 }
 
 impl TerminalFixture {
     fn start(root: &std::path::Path) -> Self {
-        use std::io::Read;
+        std::fs::create_dir_all(root.join("home")).unwrap();
+        std::fs::create_dir_all(root.join("tmp")).unwrap();
+        let runtime = support::cli_runtime::directory();
         let pty = portable_pty::native_pty_system()
             .openpty(portable_pty::PtySize {
                 rows: 35,
@@ -29,45 +33,63 @@ impl TerminalFixture {
             })
             .unwrap();
         let mut command = portable_pty::CommandBuilder::new(env!("CARGO_BIN_EXE_tickloop"));
-        command.env(
-            "TICKLOOP_AGENT_RUNTIME_DIR",
-            support::cli_runtime::directory(),
-        );
+        command.env("TICKLOOP_AGENT_RUNTIME_DIR", &runtime);
         command.args(["--working-directory-is-trusted", "--mode", "acceptEdits"]);
         command.arg("--cwd");
         command.arg(root);
         command.env("TICKLOOP_CONFIG_DIR", root.join("state"));
+        command.env("HOME", root.join("home"));
+        command.env("TICKLOOP_TMPDIR", root.join("tmp"));
+        for model in tickloop_agent::model::cards::built_in_model_profiles() {
+            if !model.api_key_env.is_empty() {
+                command.env_remove(model.api_key_env);
+            }
+        }
+        command.env("DEEPSEEK_API_KEY", "unused-codex-terminal-fixture-key");
+        for name in ["HERDR_ENV", "HERDR_PANE_ID", "HERDR_SOCKET_PATH"] {
+            command.env_remove(name);
+        }
         command.env("TICKLOOP_AGENT_TUI", "inline");
         command.env_remove("TMUX");
         let child = pty.slave.spawn_command(command).unwrap();
         drop(pty.slave);
-        let mut reader = pty.master.try_clone_reader().unwrap();
+        let reader = pty.master.try_clone_reader().unwrap();
         let writer = pty.master.take_writer().unwrap();
         let output = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let captured = output.clone();
         std::thread::spawn(move || {
-            let mut buffer = [0; 8192];
-            while let Ok(count) = reader.read(&mut buffer) {
-                if count == 0 {
-                    break;
-                }
-                captured
-                    .lock()
-                    .unwrap()
-                    .push_str(&String::from_utf8_lossy(&buffer[..count]));
-            }
+            screen::capture_output(reader, captured);
         });
         Self {
             child,
             writer,
             output,
             _master: pty.master,
+            runtime,
+            root: root.into(),
         }
     }
 
     fn send(&mut self, bytes: &[u8]) {
         self.writer.write_all(bytes).unwrap();
         self.writer.flush().unwrap();
+    }
+
+    fn select_row(&mut self, label: &str) {
+        for _ in 0..64 {
+            let output = self.output.lock().unwrap().clone();
+            let frame = screen::visible_screen(&output, 120, 35);
+            if frame
+                .lines()
+                .any(|line| line.trim_start().starts_with(['❯', '›', '>']) && line.contains(label))
+            {
+                self.send(b"\r");
+                return;
+            }
+            self.send(b"j");
+            std::thread::sleep(Duration::from_millis(40));
+        }
+        panic!("missing selectable row {label}");
     }
 
     fn output_mark(&self) -> usize {
@@ -113,7 +135,8 @@ impl TerminalFixture {
         while self.child.try_wait().unwrap().is_none() {
             assert!(
                 std::time::Instant::now() < deadline,
-                "terminal did not exit"
+                "terminal did not exit: {}",
+                screen::visible_screen(&self.output.lock().unwrap(), 120, 35)
             );
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -124,6 +147,14 @@ impl Drop for TerminalFixture {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        let _ = std::process::Command::new(env!("CARGO_BIN_EXE_tickloop"))
+            .args(["service", "stop"])
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", self.root.join("home"))
+            .env("TICKLOOP_CONFIG_DIR", self.root.join("state"))
+            .env("TICKLOOP_AGENT_RUNTIME_DIR", &self.runtime)
+            .output();
     }
 }
 
@@ -141,7 +172,7 @@ fn model_menu_cancellation_restores_prompt_and_allows_reopening() {
     let returned_provider = terminal.output_mark();
     terminal.send(b"j\x10\x1b");
     terminal.wait_for_frame_after(returned_provider, "model Provider returned", |frame| {
-        frame.contains("Choose model Provider")
+        frame.contains("Choose Provider")
     });
     let cancelled_menu = terminal.output_mark();
     terminal.send(b"\x1b");
@@ -156,7 +187,7 @@ fn model_menu_cancellation_restores_prompt_and_allows_reopening() {
     let returned_provider = terminal.output_mark();
     terminal.send(b"\x1b");
     terminal.wait_for_frame_after(returned_provider, "model Provider returned", |frame| {
-        frame.contains("Choose model Provider")
+        frame.contains("Choose Provider")
     });
     let cancelled_model = terminal.output_mark();
     terminal.send(b"\x1b");
@@ -177,7 +208,7 @@ fn logout_can_be_cancelled_while_another_process_holds_the_auth_lock() {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
     let credentials = auth_dir.join("openai-codex-credentials.json");
-    std::fs::write(&credentials, "saved credentials must survive cancellation").unwrap();
+    std::fs::write(&credentials, serde_json::json!({"access_token":"fake-access", "refresh_token":"fake-refresh", "account_id":"acct-test", "expires_at_ms":u64::MAX}).to_string()).unwrap();
     std::fs::set_permissions(&credentials, std::fs::Permissions::from_mode(0o600)).unwrap();
     let lock = OpenOptions::new()
         .read(true)
@@ -191,9 +222,11 @@ fn logout_can_be_cancelled_while_another_process_holds_the_auth_lock() {
     terminal.wait_for("deepseek-flash");
     terminal.send(b"/provider\r");
     terminal.wait_for("Choose Provider");
+    terminal.send(b"jjp");
+    terminal.wait_for("Connection · OpenAI");
+    terminal.select_row("Sign out…");
+    terminal.wait_for("Sign out · OpenAI");
     terminal.send(b"j\r");
-    terminal.wait_for("Choose connection · OpenAI");
-    terminal.send(b"js");
     terminal.wait_for("Removing Codex login");
     let cancelled = terminal.output_mark();
     terminal.send(b"\x03");
@@ -201,7 +234,7 @@ fn logout_can_be_cancelled_while_another_process_holds_the_auth_lock() {
     assert!(credentials.exists());
     drop(lock);
     terminal.wait_for_frame_after(cancelled, "Provider after logout cancellation", |frame| {
-        frame.contains("Choose connection · OpenAI")
+        frame.contains("Connection · OpenAI")
     });
     terminal.send(b"\x1b");
     terminal.wait_for("Choose Provider");
@@ -235,6 +268,22 @@ async fn piped_commands_wait_for_logout_before_model_menu_and_exit() {
     )
     .unwrap();
     std::fs::set_permissions(&credential_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let mut connection = tickloop_agent::model::cards::ModelCatalog::defaults()
+        .get("openai-codex", "gpt-6.1-sol")
+        .unwrap()
+        .connection()
+        .unwrap()
+        .clone();
+    connection.discovery = tickloop_agent::model::connection::ModelDiscovery::Unsupported;
+    std::fs::create_dir_all(state_dir.join("providers")).unwrap();
+    std::fs::write(
+        state_dir.join("providers/openai-codex.yaml"),
+        serde_yaml_ng::to_string(
+            &serde_json::json!({"id":"openai-codex", "connection":connection}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
     let lock_path = auth_dir.join("openai-codex.lock");
     let lock = OpenOptions::new()
         .read(true)
@@ -270,26 +319,69 @@ async fn piped_commands_wait_for_logout_before_model_menu_and_exit() {
     stdin.flush().await.unwrap();
     let mut stdout_reader = BufReader::new(child.stdout.take().unwrap());
     let mut captured = String::new();
-    let logout_selection = tokio::time::timeout(Duration::from_secs(10), async {
+    let connection_selection = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let mut line = String::new();
             assert_ne!(stdout_reader.read_line(&mut line).await.unwrap(), 0);
             captured.push_str(&line);
-            if line.contains("Sign out · Codex subscription") {
-                break line
+            if line.contains("Codex subscription")
+                && let Some(number) = line
                     .trim()
                     .split_once('.')
-                    .unwrap()
-                    .0
-                    .parse::<usize>()
-                    .unwrap();
+                    .and_then(|(number, _)| number.parse::<usize>().ok())
+            {
+                break number;
             }
         }
     })
     .await
     .unwrap();
     stdin
-        .write_all(format!("{logout_selection}\ncancel\n/exit\n").as_bytes())
+        .write_all(format!("{connection_selection}\n").as_bytes())
+        .await
+        .unwrap();
+    stdin.flush().await.unwrap();
+    let details_selection = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let mut line = String::new();
+            assert_ne!(stdout_reader.read_line(&mut line).await.unwrap(), 0);
+            captured.push_str(&line);
+            if line.contains("Connection details")
+                && let Some(number) = line
+                    .trim()
+                    .split_once('.')
+                    .and_then(|(number, _)| number.parse::<usize>().ok())
+            {
+                break number;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    stdin
+        .write_all(format!("{details_selection}\n").as_bytes())
+        .await
+        .unwrap();
+    stdin.flush().await.unwrap();
+    let logout_selection = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let mut line = String::new();
+            assert_ne!(stdout_reader.read_line(&mut line).await.unwrap(), 0);
+            captured.push_str(&line);
+            if line.contains("Sign out…")
+                && let Some(number) = line
+                    .trim()
+                    .split_once('.')
+                    .and_then(|(number, _)| number.parse::<usize>().ok())
+            {
+                break number;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    stdin
+        .write_all(format!("{logout_selection}\n2\ncancel\ncancel\ncancel\n/exit\n").as_bytes())
         .await
         .unwrap();
     drop(stdin);
@@ -316,7 +408,7 @@ async fn piped_commands_wait_for_logout_before_model_menu_and_exit() {
     assert!(!stdout.contains("/login"));
     assert!(stdout.contains("Unknown command; use /help."));
     assert!(!stdout.contains("/logout"));
-    assert!(stdout.contains("Sign out · Codex subscription"));
+    assert!(stdout.contains("Sign out · OpenAI"));
     assert!(stdout.contains("Codex subscription"));
     assert!(!stdout.contains("fake-refresh"));
     assert!(!stdout.contains("Codex browser login"));

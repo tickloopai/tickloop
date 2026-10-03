@@ -6,7 +6,7 @@ use serde_json::json;
 use support::{ScriptedModel, call, config, next_event, text};
 use tickloop_agent::model::{Content, ReasoningEffort, cards::model_for_persistent_selection};
 use tickloop_agent::{
-    model::{InputModality, ModelConfig},
+    model::ModelConfig,
     output_style::OutputStyle,
     permissions::{Decision, PermissionRule, PermissionScope, permission_rule_candidates},
     runtime::{Agent, ChatId, EventKind, ModelChange},
@@ -16,13 +16,9 @@ use tokio::sync::Barrier;
 use uuid::Uuid;
 
 fn selected_model() -> ModelConfig {
-    model_for_persistent_selection(ModelConfig {
-        provider: tickloop_agent::model::ModelProvider::Api,
-        auth_source: tickloop_agent::model::ModelAuthSource::ApiKeyEnv,
-        name: "selected".into(),
-        model: "selected-model".into(),
-        ..config()
-    })
+    tickloop_agent::model::cards::ModelCatalog::defaults()
+        .get("deepseek-api", "deepseek-v4-pro")
+        .unwrap()
 }
 
 #[test]
@@ -333,7 +329,7 @@ async fn a_saved_output_style_applies_to_chats_opened_afterwards() {
 }
 
 #[test]
-fn saved_models_without_input_modalities_load_as_text_only() {
+fn unsupported_legacy_models_are_ignored_with_one_notice() {
     let directory = tempfile::tempdir().unwrap();
     std::fs::write(
         directory.path().join("settings.json"),
@@ -349,11 +345,9 @@ fn saved_models_without_input_modalities_load_as_text_only() {
     )
     .unwrap();
 
-    let model = UserSettings::in_root(directory.path()).model().unwrap();
-
-    assert_eq!(model.model, "old-model");
-    assert_eq!(model.input_modalities, [InputModality::Text]);
-    assert!(!model.accepts_images());
+    let mut loaded = UserSettings::in_root(directory.path()).load();
+    assert!(loaded.configured_model().unwrap().is_none());
+    assert_eq!(loaded.into_warnings().len(), 1);
 }
 
 fn rule(tool: &str, persistent: bool) -> PermissionRule {
@@ -406,10 +400,10 @@ fn settings_json(root: &Path) -> serde_json::Value {
     serde_json::from_slice(&std::fs::read(root.join("settings.json")).unwrap()).unwrap()
 }
 
-/// Model, persistent rules, and context window settings apply to new and resumed Chats
+/// Built-in model and persistent rules apply to new and resumed Chats
 /// across restarts; session rules stay local, and protected tools still require admission.
 #[tokio::test]
-async fn model_rules_and_context_window_apply_to_new_chats_after_restart() {
+async fn builtin_model_and_rules_apply_after_restart_without_context_tuning() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("root");
     let workdir = directory.path().join("work");
@@ -435,7 +429,7 @@ async fn model_rules_and_context_window_apply_to_new_chats_after_restart() {
             .unwrap(),
         ModelChange::Applied
     );
-    first.set_context_window(chat, 64_000).await.unwrap();
+    assert!(first.set_context_window(chat, 64_000).await.is_err());
     first
         .set_permission_rules(chat, vec![rule("Read", true), rule("Glob", false)])
         .await
@@ -445,13 +439,13 @@ async fn model_rules_and_context_window_apply_to_new_chats_after_restart() {
     let fresh = first.create_chat(workdir.clone()).await.unwrap();
     let fresh = first.snapshot(fresh).await.unwrap();
     assert_eq!(fresh.model, selected_model());
-    assert_eq!(fresh.context_window_tokens, Some(64_000));
+    assert_eq!(fresh.context_window_tokens, None);
     assert_eq!(tools_of(&fresh.policy.rules), ["Bash", "Read"]);
     first.shutdown().await;
 
     let settings = UserSettings::in_root(&root);
     assert_eq!(settings.model(), Some(selected_model()));
-    assert_eq!(settings.context_window_tokens(), Some(64_000));
+    assert_eq!(settings.context_window_tokens(), None);
     assert_eq!(
         tools_of(&settings.permission_rules(&workdir.canonicalize().unwrap())),
         ["Bash", "Read"]
@@ -469,7 +463,7 @@ async fn model_rules_and_context_window_apply_to_new_chats_after_restart() {
     let restarted = second.create_chat(workdir.clone()).await.unwrap();
     let snapshot = second.snapshot(restarted).await.unwrap();
     assert_eq!(snapshot.model, selected_model());
-    assert_eq!(snapshot.context_window_tokens, Some(64_000));
+    assert_eq!(snapshot.context_window_tokens, None);
     assert_eq!(tools_of(&snapshot.policy.rules), ["Bash", "Read"]);
     assert!(
         !run_turn(&second, restarted, "Run it again", PermissionScope::Once).await,
@@ -478,7 +472,7 @@ async fn model_rules_and_context_window_apply_to_new_chats_after_restart() {
 
     let resumed = second.resume_chat(chat).await.unwrap();
     assert_eq!(resumed.model, selected_model());
-    assert_eq!(resumed.context_window_tokens, Some(64_000));
+    assert_eq!(resumed.context_window_tokens, None);
     assert_eq!(tools_of(&resumed.policy.rules), ["Bash", "Read"]);
 
     let elsewhere = second.create_chat(other_project).await.unwrap();
@@ -763,10 +757,12 @@ async fn settings_writes_merge_unknown_keys_replace_atomically_and_refuse_invali
         inode,
         "settings must be replaced by renaming a complete temporary file"
     );
-    second
-        .set_context_window(second_chat, 32_000)
-        .await
-        .unwrap();
+    assert!(
+        second
+            .set_context_window(second_chat, 32_000)
+            .await
+            .is_err()
+    );
     second
         .set_permission_rules(second_chat, vec![rule("Read", true)])
         .await
@@ -775,20 +771,12 @@ async fn settings_writes_merge_unknown_keys_replace_atomically_and_refuse_invali
     let saved = settings_json(&root);
     assert_eq!(saved["cleanupPeriodDays"], 7);
     assert_eq!(saved["projects"]["/elsewhere"]["note"], "keep");
-    assert_eq!(saved["contextWindowTokens"], 32_000);
+    assert!(saved.get("contextWindowTokens").is_none());
     let selected = selected_model();
     assert_eq!(saved["defaultModel"]["provider"], selected.provider_id);
     assert_eq!(saved["defaultModel"]["model"], selected.model_id);
     assert!(saved.get("model").is_none());
-    let provider: serde_yaml_ng::Value = serde_yaml_ng::from_slice(
-        &std::fs::read(root.join(format!("providers/{}.yaml", selected.provider_id))).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(provider["id"].as_str(), Some(selected.provider_id.as_str()));
-    assert_eq!(
-        provider["models"][0]["service_model_id"].as_str(),
-        Some("selected-model")
-    );
+    assert!(!root.join("providers").exists());
     let settings = UserSettings::in_root(&root);
     assert_eq!(settings.model(), Some(selected_model()));
     assert_eq!(
@@ -1179,10 +1167,13 @@ async fn invalid_settings_are_reported_and_never_overwritten() {
             .is_err()
     );
     assert_eq!(std::fs::read_to_string(&path).unwrap(), wrong_nesting);
-    reopened.set_context_window(nested, 32_000).await.unwrap();
+    assert!(reopened.set_context_window(nested, 32_000).await.is_err());
+    UserSettings::in_root(&root)
+        .save_thinking_enabled(false)
+        .unwrap();
     let saved = settings_json(&root);
     assert_eq!(saved["projects"]["/elsewhere"]["note"], "keep");
-    assert_eq!(saved["contextWindowTokens"], 32_000);
+    assert!(saved.get("contextWindowTokens").is_none());
     reopened.shutdown().await;
 }
 
@@ -1211,14 +1202,17 @@ async fn settings_writes_follow_a_symlinked_settings_file() {
     )
     .unwrap();
     let chat = agent.create_chat(workdir).await.unwrap();
-    agent.set_context_window(chat, 32_000).await.unwrap();
+    assert!(agent.set_context_window(chat, 32_000).await.is_err());
+    UserSettings::in_root(&root)
+        .save_thinking_enabled(false)
+        .unwrap();
 
     let link = std::fs::symlink_metadata(root.join("settings.json")).unwrap();
     assert!(link.file_type().is_symlink(), "the symlink must be kept");
     let saved: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&target).unwrap()).unwrap();
     assert_eq!(saved["cleanupPeriodDays"], 7);
-    assert_eq!(saved["contextWindowTokens"], 32_000);
+    assert!(saved.get("contextWindowTokens").is_none());
     for folder in [&root, &dotfiles] {
         let leftovers = std::fs::read_dir(folder)
             .unwrap()

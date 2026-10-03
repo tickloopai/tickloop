@@ -64,7 +64,7 @@ impl ServiceFixture {
     }
 
     fn command(&self, arguments: &[&str]) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_tickloop"));
+        let mut command = Command::new(support::fixture_cli::executable());
         command
             .args(arguments)
             .current_dir(self.directory.path())
@@ -553,10 +553,14 @@ async fn launch_active_worker(
     model.api_key_env = "TICKLOOP_STOP_FIXTURE_KEY".into();
     let mut launch = LaunchSpec::embedded(fixture.directory.path().canonicalize().unwrap());
     launch.config_root = Some(fixture.config.clone());
+    let transport = fixture.directory.path().join("transport.json");
+    std::fs::write(&transport, serde_json::to_vec(&model).unwrap()).unwrap();
     launch.model = Some(model);
     launch.environment = [
         ("HOME", fixture.directory.path().to_str().unwrap()),
         ("TICKLOOP_STOP_FIXTURE_KEY", "fixture-only"),
+        ("TICKLOOP_TRANSPORT_FIXTURE", transport.to_str().unwrap()),
+        ("DEEPSEEK_API_KEY", "fixture-compiled-selection-key"),
     ]
     .into_iter()
     .map(|(name, value)| EnvironmentValue {
@@ -602,7 +606,7 @@ async fn verify_stopped_and_restart(
     assert_processes_exited(process_ids).await;
     let replacement = tickloop_agent::agent_daemon::connect_or_start_at(
         fixture.runtime.clone(),
-        env!("CARGO_BIN_EXE_tickloop").into(),
+        support::fixture_cli::executable(),
     )
     .await
     .unwrap();
@@ -665,7 +669,7 @@ async fn explicit_cli_stop_ends_current_owner_and_active_worker_preserving_saved
     fixture.launch_in_progress = true;
     let owner = tickloop_agent::agent_daemon::connect_or_start_at(
         fixture.runtime.clone(),
-        env!("CARGO_BIN_EXE_tickloop").into(),
+        support::fixture_cli::executable(),
     )
     .await
     .unwrap();
@@ -757,17 +761,8 @@ async fn rejected_startup_then_cli_stop_ends_legacy_owner_and_worker_before_curr
         .path();
     let (_, worker_hello) = legacy_connect(&worker_socket).await;
     assert_eq!(worker_hello["owner_epoch"], hello["owner_epoch"]);
-    let model_path = fixture.directory.path().join("model.json");
-    let mut model = support::config();
-    model.api_key_env = "TICKLOOP_STOP_FIXTURE_KEY".into();
-    std::fs::write(&model_path, serde_json::to_vec(&model).unwrap()).unwrap();
     let output = fixture
-        .command(&[
-            "--working-directory-is-trusted",
-            "--config",
-            model_path.to_str().unwrap(),
-        ])
-        .env("TICKLOOP_STOP_FIXTURE_KEY", "fixture-only")
+        .command(&["--working-directory-is-trusted"])
         .output()
         .await
         .unwrap();

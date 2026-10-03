@@ -3,7 +3,7 @@ use super::*;
 const STARTUP_FIXTURE: &str = "TICKLOOP_STARTUP_STATUS_FIXTURE";
 const STATUS_ROWS: &str = "TICKLOOP_STARTUP_STATUS_ROWS";
 const STARTUP_MODEL: &str = "deepseek-flash";
-const SELECTED_MODEL: &str = "selected-fixture";
+const EXTERNAL_MODEL: &str = "external-fixture";
 
 fn startup_config(model: &str) -> ModelConfig {
     let mut config = test_support::config();
@@ -75,7 +75,6 @@ fn startup_status_pty_fixture() {
                     input,
                     StartupState {
                         chat: StartupChat::New,
-                        explicit_provider: None,
                         user_settings: None,
                     },
                     None,
@@ -95,7 +94,7 @@ fn start_startup_fixture(rows: &str) -> (RecoveryPty, tempfile::TempDir) {
     let directory = tempfile::tempdir_in("/tmp").unwrap();
     std::fs::write(
         directory.path().join("model.json"),
-        serde_json::to_vec(&startup_config(SELECTED_MODEL)).unwrap(),
+        serde_json::to_vec(&startup_config(EXTERNAL_MODEL)).unwrap(),
     )
     .unwrap();
     let pair = native_pty_system()
@@ -177,7 +176,7 @@ fn new_agent_startup_has_one_model_and_no_ordinary_ready_status() {
 }
 
 #[test]
-fn startup_status_configuration_help_and_model_selection_feedback_survive_refresh() {
+fn startup_status_configuration_help_and_removed_model_file_notice_survive_refresh() {
     for rows in ["default", "0", "1", "3"] {
         let (mut fixture, _directory) = start_startup_fixture(rows);
         fixture.wait_for("Tick Loop Agent");
@@ -192,12 +191,17 @@ fn startup_status_configuration_help_and_model_selection_feedback_survive_refres
         assert!(!help.contains("Ready"), "{rows}: {help}");
         fixture.send(b"?");
         fixture.send(b"/model model.json\r");
-        fixture.wait_for("Model selection:");
+        fixture.wait_for("Model files are not supported");
         std::thread::sleep(Duration::from_millis(1100));
-        let selected = fixture.repaint_after_recovery("model selection refresh", |frame| {
-            frame.contains("Model selection:") && frame.contains(SELECTED_MODEL)
-        });
-        assert_clean_startup_status(&selected, rows, SELECTED_MODEL);
-        assert!(selected.contains("Model selection:"), "{rows}: {selected}");
+        let selected = fixture
+            .repaint_after_recovery("removed model file notice refresh", |frame| {
+                frame.contains("Model files are not supported")
+            });
+        assert_clean_startup_status(&selected, rows, STARTUP_MODEL);
+        assert!(
+            selected.contains("Model files are not supported"),
+            "{rows}: {selected}"
+        );
+        assert!(!selected.contains("Model selection: Applied"));
     }
 }

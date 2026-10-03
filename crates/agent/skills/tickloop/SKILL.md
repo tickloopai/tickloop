@@ -1,21 +1,25 @@
 ---
 name: tickloop
-description: Show stock prices, quotes or K-line charts in Ticks, operate a Tick, or subscribe to updates. Use for 看看特斯拉股价 and 打开K线, even without the word Tick. Check the host first; Herdr is supported, tmux and Zellij are not yet integrated.
+description: Show stock prices, quotes or K-line charts in Ticks, operate a Tick, or subscribe to updates. Use for 看看特斯拉股价 and 打开K线, even without the word Tick, and for Shell or Artifact Tick updates. Check the host for Pane operations; Herdr is supported, tmux and Zellij are not yet integrated.
 ---
 
 # Tick Loop Workspace
 
-## 1. Select the workspace host
+## 1. Select the Tick and workspace host
+
+Keep the complete `<type>:<id>` instance reference. A Shell task's reference is `shell:<task id>`, using the task ID returned by Bash or the user Shell execution. Read it with `ReadTick`, then use its declared `output` query or `stop` action through `CallTickTool`. The model stop action is evaluated and dispatched as TaskStop: it stops only the current Loop's Agent command, follows TaskStop Ask/Deny rules and Plan behavior, and leaves user Shells and other Loops' commands to the user. A joined artifact has reference `artifact:<origin>/<artifact_id>` from `artifact_ticks`; `ReadTick` and its declared queries use the existing Artifact Service MCP reads, while modifications use the discovered MCP tools. Shell and Artifact access do not require Herdr. Use section 3 for either type's subscriptions; Shell content at subscription time is a baseline, its final exit is an update, and it becomes quiet after that result.
+
+For a program in a Pane, select the workspace host below. Use instance references returned by task results, current host state or discovery, and follow each instance's declared catalog and existing permissions.
 
 Start with `workspace_host` in Current host state. The program supplies `name`, `integration`, and `tick_executable`; an installed multiplexer command or a repository name is not proof of the current environment.
 
 | Current host | Action |
 | --- | --- |
 | `herdr`, integration `available` | Continue to the Herdr instructions below. Confirm live access with `ReadWorkspace({})`. |
-| `herdr`, integration `unavailable`, or a failed host connection | Explain that this Agent is not connected to Herdr and cannot operate Ticks. Report the connection diagnostic. Stop this workflow. |
-| `tmux` | Say that tmux was detected but Tick Loop's tmux integration is not implemented yet. Cross-Tick operations are unavailable; stop this workflow. |
-| `zellij` | Say that Zellij was detected but Tick Loop's Zellij integration is not implemented yet. Cross-Tick operations are unavailable; stop this workflow. |
-| `standalone` | Say that no supported workspace host is connected, so cross-Tick operations are unavailable. Stop this workflow. |
+| `herdr`, integration `unavailable`, or a failed host connection | Explain that this Agent is not connected to Herdr and cannot operate Pane programs. Report the connection diagnostic. Stop this Pane workflow. |
+| `tmux` | Say that tmux was detected but Tick Loop's tmux integration is not implemented yet. Pane operations are unavailable; stop this Pane workflow. |
+| `zellij` | Say that Zellij was detected but Tick Loop's Zellij integration is not implemented yet. Pane operations are unavailable; stop this Pane workflow. |
+| `standalone` | Say that no supported workspace host is connected, so Pane operations are unavailable. Stop this Pane workflow. |
 
 For an unsupported branch, briefly name the detected host and explain that its Tick integration is unavailable, then end the turn. Wait for a new user request before troubleshooting installation or switching to another task. `tick_executable` is only evaluated for supported Herdr; its null value in other hosts does not mean the executable is missing. Explain the status in ordinary language, without dumping internal context fields.
 
@@ -70,7 +74,7 @@ For ordinary programs, use `ModifyTick` with `action: "send_input"`, the selecte
 
 ## 3. Keep a Loop informed
 
-For continued observation, call `SubscribeTick` with the selected instance and optional `every_seconds` (default 60, range 5–86400). The subscription belongs to the current Loop; retain its returned subscription ID for `UnsubscribeTick`. Report that observation has started only when the result says `ready: true`; `armed` alone means the Trigger is configured. If `ready: false`, use the returned link and diagnostic to inspect the existing subscription instead of creating it again.
+For continued observation, call `SubscribeTick` with the selected instance and optional `every_seconds` (default 60, range 5–86400). The subscription belongs to the current Loop; retain its returned subscription ID for `UnsubscribeTick`. Report that observation has started only when the result says `ready: true`; `armed` alone means the Trigger is configured. If `ready: false`, use the returned link and diagnostic to inspect the existing subscription instead of creating it again. The subscription passes the same read permission, credential and target checks as `ReadTick`, including rules on its underlying query. Shell reads and subscriptions require a task belonging to this Chat; another Chat's Shell is unavailable.
 
 Existing content supplies a baseline. Subsequent changes are delivered latest-only at the Loop's cadence, with observed overwrite counts. Quiet periods do not call the model; busy Loops wait under existing execution rules. Stopping or disabling a Loop keeps it stopped.
 
@@ -78,4 +82,4 @@ Protocol Tick Updates carry business content. Read the catalog's recovery query 
 
 Moving a live instance preserves its reference and subscriptions. New operations need its explicit current Workspace scope. A replaced or restarted program has a new identity: retain the old subscription's state and select the new target explicitly. Herdr detach preserves live processes. Closing an Agent Pane closes its View while the daemon-owned Agent continues; closing an ordinary Tick Pane exits that Tick. Stop a Loop explicitly when requested.
 
-Current host state `artifact_ticks` lists artifacts the user added to this Chat. Read and modify their content with the discovered Artifact Service MCP tools. Addition grants no extra permissions and creates neither feedback associations nor Tick Subscriptions.
+Current host state `artifact_ticks` lists artifacts joined to this Chat. Addition grants no extra permissions and creates neither feedback associations nor Tick Subscriptions.

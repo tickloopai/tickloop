@@ -1,13 +1,11 @@
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) enum FooterItemId {
-    Tasks,
     Agents,
 }
 
 impl FooterItemId {
     pub(super) fn label(self) -> &'static str {
         match self {
-            Self::Tasks => "Shell",
             Self::Agents => "Subagents",
         }
     }
@@ -168,114 +166,24 @@ impl FooterState {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
-    fn down_selects_only_a_visible_first_item() {
+    fn the_only_footer_entry_is_subagents_and_hidden_entries_do_not_take_focus() {
         let mut footer = FooterState::default();
-
         assert_eq!(footer.apply(FooterAction::Down), FooterEffect::None);
         assert_eq!(footer.selected(), None);
-
-        footer.update([FooterItemId::Tasks, FooterItemId::Agents]);
-        assert_eq!(footer.apply(FooterAction::Down), FooterEffect::None);
-        assert_eq!(footer.selected(), Some(FooterItemId::Tasks));
-        assert_eq!(
-            footer.frame(),
-            FooterFrame {
-                items: vec![
-                    FooterFrameItem {
-                        id: FooterItemId::Tasks,
-                        selected: true,
-                    },
-                    FooterFrameItem {
-                        id: FooterItemId::Agents,
-                        selected: false,
-                    },
-                ],
-                selected: Some(FooterItemId::Tasks),
-                list_focused: false,
-            }
-        );
-    }
-
-    #[test]
-    fn update_preserves_identity_but_does_not_revive_a_removed_selection() {
-        let mut footer = FooterState::default();
-        footer.update([FooterItemId::Tasks, FooterItemId::Agents]);
+        footer.update([FooterItemId::Agents, FooterItemId::Agents]);
         footer.apply(FooterAction::Down);
-        footer.apply(FooterAction::Next);
-
-        footer.update([FooterItemId::Agents, FooterItemId::Tasks]);
         assert_eq!(footer.selected(), Some(FooterItemId::Agents));
-
-        footer.update([FooterItemId::Tasks]);
-        assert_eq!(footer.selected(), None);
-
-        footer.update([FooterItemId::Agents, FooterItemId::Tasks]);
-        assert_eq!(footer.selected(), None);
-        assert!(footer.frame().items.iter().all(|item| !item.selected));
-    }
-
-    #[test]
-    fn navigation_clamps_and_up_returns_to_the_editor_at_the_top() {
-        let mut footer = FooterState::default();
-        footer.update([FooterItemId::Tasks, FooterItemId::Agents]);
         footer.apply(FooterAction::Down);
-
-        footer.apply(FooterAction::Next);
-        footer.apply(FooterAction::Next);
         assert_eq!(footer.selected(), Some(FooterItemId::Agents));
-
-        footer.apply(FooterAction::Previous);
-        footer.apply(FooterAction::Previous);
-        assert_eq!(footer.selected(), Some(FooterItemId::Tasks));
-
-        assert_eq!(footer.apply(FooterAction::Up), FooterEffect::ReturnToEditor);
-        assert_eq!(footer.selected(), None);
-    }
-
-    #[test]
-    fn down_advances_after_footer_is_focused() {
-        let mut footer = FooterState::default();
-        footer.update([FooterItemId::Tasks, FooterItemId::Agents]);
-
-        footer.apply(FooterAction::Down);
-        footer.apply(FooterAction::Down);
-
-        assert_eq!(footer.selected(), Some(FooterItemId::Agents));
-    }
-
-    #[test]
-    fn open_returns_the_typed_identity_and_clears_focus() {
-        let mut footer = FooterState::default();
-        footer.update([FooterItemId::Tasks, FooterItemId::Agents]);
-        footer.apply(FooterAction::Down);
-
+        assert_eq!(FooterItemId::Agents.label(), "Subagents");
         assert_eq!(
             footer.apply(FooterAction::Open),
-            FooterEffect::Open(FooterItemId::Tasks)
+            FooterEffect::Open(FooterItemId::Agents)
         );
-        assert_eq!(footer.selected(), None);
-        assert_eq!(footer.apply(FooterAction::Open), FooterEffect::None);
-    }
-
-    #[test]
-    fn clear_returns_to_the_editor_and_duplicate_items_are_removed() {
-        let mut footer = FooterState::default();
-        footer.update([
-            FooterItemId::Tasks,
-            FooterItemId::Tasks,
-            FooterItemId::Agents,
-        ]);
         footer.apply(FooterAction::Down);
-
-        assert_eq!(
-            footer.apply(FooterAction::Clear),
-            FooterEffect::ReturnToEditor
-        );
+        footer.update([]);
         assert_eq!(footer.selected(), None);
-        assert_eq!(footer.frame().items.len(), 2);
-        assert_eq!(FooterItemId::Tasks.label(), "Shell");
-        assert_eq!(FooterItemId::Agents.label(), "Subagents");
+        assert_eq!(footer.apply(FooterAction::Up), FooterEffect::ReturnToEditor);
     }
 }

@@ -19,6 +19,7 @@ const RULE_MIN_HEIGHT: usize = 16;
 pub(super) struct WorkspaceTrustFrame {
     pub(super) lines: Vec<RoleLine>,
     pub(super) cursor: Option<(usize, usize)>,
+    choice_rows: Vec<(std::ops::Range<usize>, usize)>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -84,6 +85,31 @@ impl WorkspaceTrust {
         decision
     }
 
+    pub(super) fn click(
+        &mut self,
+        row: usize,
+        width: usize,
+        height: usize,
+        display: DisplayProfile,
+    ) -> Option<TrustDecision> {
+        if self.decision.is_some() {
+            return None;
+        }
+        let frame = self.frame(width, height, display);
+        let selected = frame
+            .choice_rows
+            .iter()
+            .find(|(rows, _)| rows.contains(&row))
+            .map(|(_, index)| *index)?;
+        self.selected = selected;
+        self.key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            width,
+            height,
+            display,
+        )
+    }
+
     pub(super) fn failed(&mut self, error: String) {
         self.error = Some(safe_line(&error));
         self.selected = TRUST_CANCEL_CHOICE_INDEX;
@@ -108,7 +134,9 @@ impl WorkspaceTrust {
         );
         let mut actions = Vec::new();
         let mut selected_row = 0;
+        let mut choice_rows = Vec::new();
         for (index, choice) in CHOICES.iter().enumerate() {
+            let first_row = actions.len();
             if self.selected == index {
                 selected_row = actions.len();
             }
@@ -136,6 +164,7 @@ impl WorkspaceTrust {
                     )
                 }),
             );
+            choice_rows.push((first_row..actions.len(), index));
         }
         actions.extend(
             wrap_text(
@@ -174,6 +203,7 @@ impl WorkspaceTrust {
             return WorkspaceTrustFrame {
                 lines,
                 cursor: None,
+                choice_rows: Vec::new(),
             };
         }
         let mut body = Vec::new();
@@ -203,6 +233,11 @@ impl WorkspaceTrust {
             .decision
             .is_none()
             .then_some((body.len() + selected_row, 0));
+        let action_start = body.len();
+        for (rows, _) in &mut choice_rows {
+            rows.start += action_start;
+            rows.end += action_start;
+        }
         body.extend(actions);
         for line in &mut body {
             line.truncate(width);
@@ -210,6 +245,7 @@ impl WorkspaceTrust {
         WorkspaceTrustFrame {
             lines: body,
             cursor,
+            choice_rows,
         }
     }
 }

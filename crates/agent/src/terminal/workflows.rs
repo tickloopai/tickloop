@@ -981,6 +981,34 @@ pub(super) fn write_public_history(console: &Console, chat: &ChatSnapshot) -> Re
             ))?;
         }
     }
+    let latest_user_message = chat
+        .public_conversation_items()
+        .ok()
+        .into_iter()
+        .flatten()
+        .rev()
+        .find_map(|item| {
+            let BranchPublicItem::Message {
+                source, message, ..
+            } = item
+            else {
+                return None;
+            };
+            if message.role != Role::User || source.is_agent_message || is_tick_delivery(&message) {
+                return None;
+            }
+            message.content.iter().find_map(|content| match content {
+                Content::Text { text }
+                    if !text.trim().is_empty()
+                        && presentation::typed_local_message(text, false).is_none()
+                        && !conversation::is_interruption_placeholder(Role::User, text) =>
+                {
+                    Some(safe_text(text))
+                }
+                _ => None,
+            })
+        });
+    console.set_latest_user_message(chat.id, latest_user_message)?;
     let pieces = public_history_pieces(chat, console.display_profile()?, console.image_links()?);
     console.write_pieces(&pieces)?;
     console.mark_input_echoes(

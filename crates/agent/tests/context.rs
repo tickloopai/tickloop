@@ -1,7 +1,7 @@
 mod support;
 
 use std::sync::Arc;
-use support::{ScriptedModel, config, next_event, text};
+use support::{ScriptedModel, next_event, persisted_config as config, text};
 use tickloop_agent::{
     model::{Content, Protocol, ReasoningEffort, Usage, cards::ModelCatalog},
     permissions::{Decision, PermissionRule},

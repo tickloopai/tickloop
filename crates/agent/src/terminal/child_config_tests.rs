@@ -27,6 +27,10 @@ const ROUTE_VARIABLE: &str = "TICKLOOP_CHILD_CONFIG_ROUTE";
 const TASK: &str = "Review notes";
 const WIDTH: usize = 110;
 const HEIGHT: usize = 44;
+const CURSOR_VISIBLE: &str = "\x1b[?25h";
+const CURSOR_HIDDEN: &str = "\x1b[?25l";
+const COMPLETED_FRAME_END: &str = "\x1b[?2026l";
+const CHILD_VIEW_HEADING: &str = "Delegated Agent ·";
 const TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Records every command the View sends, one JSON line each in `commands.jsonl`. On the
@@ -241,7 +245,6 @@ async fn run_child_config_fixture() {
     console.set_prompt_enabled(true).unwrap();
     let startup = StartupState {
         chat: StartupChat::Resumed(Box::new(agent.snapshot(root).await.unwrap()), false),
-        explicit_provider: None,
         user_settings: config_root
             .as_deref()
             .map(crate::settings::UserSettings::in_root),
@@ -348,6 +351,24 @@ impl ChildPty {
             std::thread::sleep(Duration::from_millis(20));
         }
         panic!("child View never showed {label}: {}", self.frame());
+    }
+
+    fn wait_for_child_editor(&mut self) {
+        let captured = self.output.clone();
+        self.wait_for("the child editor owns input", |frame| {
+            let bytes = captured.lock().unwrap();
+            let output = String::from_utf8_lossy(&bytes);
+            let end = output
+                .rfind(COMPLETED_FRAME_END)
+                .map_or(output.len(), |end| end + COMPLETED_FRAME_END.len());
+            let completed = &output[..end];
+            frame.contains(CHILD_VIEW_HEADING)
+                && completed.rfind(CURSOR_VISIBLE).is_some_and(|shown| {
+                    completed
+                        .rfind(CURSOR_HIDDEN)
+                        .is_none_or(|hidden| shown > hidden)
+                })
+        });
     }
 
     fn assert_alive(&mut self, label: &str) {
@@ -484,6 +505,7 @@ fn child_permission_candidates_and_help_describe_the_read_only_view() {
     view.wait_for("the child in place", |frame| {
         frame.contains("child reviewed")
     });
+    view.wait_for_child_editor();
     let baseline = commands(directory.path()).len();
     view.send(b"/per");
     let candidate = view.wait_for("the child permission candidate", |frame| {
@@ -707,6 +729,7 @@ fn a_child_opened_in_place_refuses_root_only_changes_before_sending_and_keeps_it
     view.wait_for("the child in place", |frame| {
         frame.contains("child reviewed")
     });
+    view.wait_for_child_editor();
     let baseline = commands(directory.path()).len();
 
     view.send(b"/permissions\r");
@@ -913,7 +936,9 @@ fn shift_tab_in_the_overview_changes_no_hidden_agent_and_the_root_keeps_its_key(
     view.wait_for("the advanced reference over the overview", |frame| {
         frame.contains("Advanced commands") && frame.contains("PgUp/PgDn")
     });
-    view.send(b"\x1b[6~\x1b[6~\x1b[6~\x1b[6~\x1b[6~");
+    for _ in 0..30 {
+        view.send(b"\x1b[6~");
+    }
     view.wait_for("the overview meaning of /acknowledge-create", |frame| {
         frame.contains("unconfirmed New Agent dispatch")
     });

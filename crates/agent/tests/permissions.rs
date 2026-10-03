@@ -22,6 +22,11 @@ enum ReviewerFailure {
     ContextLimit,
     Authentication,
     InsufficientBalance,
+    MalformedResponse,
+    VerifiedMalformedResponse,
+    OutputLimit,
+    Refusal,
+    UnexpectedToolOperation,
 }
 
 struct FailingReviewer {
@@ -99,7 +104,99 @@ impl tickloop_agent::model::ModelClient for FailingReviewer {
             ReviewerFailure::InsufficientBalance => {
                 tickloop_agent::model::ModelError::InsufficientBalance
             }
+            ReviewerFailure::MalformedResponse => {
+                tickloop_agent::model::ModelError::InvalidResponse(
+                    "UNTRUSTED-PROVIDER-DESCRIPTION".into(),
+                )
+            }
+            ReviewerFailure::OutputLimit => tickloop_agent::model::ModelError::ResponseRejected(
+                ModelResponseRejection::OutputLimit,
+            ),
+            ReviewerFailure::VerifiedMalformedResponse => {
+                tickloop_agent::model::ModelError::ResponseRejected(
+                    ModelResponseRejection::MalformedStructuredOutput,
+                )
+            }
+            ReviewerFailure::Refusal => {
+                tickloop_agent::model::ModelError::ResponseRejected(ModelResponseRejection::Refusal)
+            }
+            ReviewerFailure::UnexpectedToolOperation => {
+                tickloop_agent::model::ModelError::ResponseRejected(
+                    ModelResponseRejection::UnexpectedToolOperation,
+                )
+            }
         })
+    }
+}
+
+#[tokio::test]
+async fn verified_malformed_or_truncated_reviews_retry_but_unverified_operations_do_not() {
+    for (failure, attempts, cause) in [
+        (
+            ReviewerFailure::MalformedResponse,
+            1,
+            "unverified tool operations",
+        ),
+        (
+            ReviewerFailure::VerifiedMalformedResponse,
+            2,
+            "malformed verified structured result",
+        ),
+        (ReviewerFailure::OutputLimit, 2, "truncated"),
+        (ReviewerFailure::Refusal, 1, "refused"),
+        (
+            ReviewerFailure::UnexpectedToolOperation,
+            1,
+            "unexpected tool operations",
+        ),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let agent = Agent::new_embedded(
+            config(),
+            Arc::new(ScriptedModel::new(vec![
+                call("link", "Bash", link_command("blocked")),
+                text("done"),
+            ])),
+        );
+        let reviewer = Arc::new(FailingReviewer::new(failure));
+        agent.set_auto_reviewer(reviewer.clone()).await;
+        let chat = agent.create_chat(directory.path().into()).await.unwrap();
+        agent
+            .set_execution_mode(chat, ExecutionMode::Auto)
+            .await
+            .unwrap();
+        let mut events = agent.subscribe();
+        agent
+            .submit(chat, None, "Create the blocked link".into())
+            .await
+            .unwrap();
+        let mut saw_manual = false;
+        loop {
+            match next_event(&mut events).await.kind {
+                EventKind::PermissionChecked { decision, reason } => {
+                    assert_eq!(decision, Decision::Ask);
+                    assert!(reason.contains(cause), "{reason}");
+                    assert!(!reason.contains("UNTRUSTED-PROVIDER-DESCRIPTION"));
+                }
+                EventKind::PermissionRequested { request } => {
+                    saw_manual = true;
+                    agent
+                        .answer_permission(chat, request.id, false)
+                        .await
+                        .unwrap();
+                }
+                EventKind::Completed { .. } | EventKind::Interrupted => break,
+                EventKind::ToolStarted { .. } => panic!("failed review admitted the operation"),
+                EventKind::Failed(error) => {
+                    panic!("failed review bypassed manual approval: {error}")
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_manual);
+        assert_eq!(reviewer.calls.load(Ordering::SeqCst), attempts);
+        assert!(!link_exists(directory.path(), "blocked"));
+        agent.shutdown().await;
     }
 }
 
@@ -521,6 +618,17 @@ async fn automatic_check_retries_invalid_structured_output_once() {
         }
     }
     assert_eq!(checker.requests.lock().unwrap().len(), 2);
+    {
+        let requests = checker.requests.lock().unwrap();
+        assert_ne!(
+            requests[0].messages, requests[1].messages,
+            "a malformed-output retry must explain the formatting failure"
+        );
+        assert_eq!(
+            requests[0].messages[1], requests[1].messages[1],
+            "the captured authorization and operation must remain unchanged"
+        );
+    }
     assert!(link_exists(directory.path(), "checked"));
     agent.shutdown().await;
 }

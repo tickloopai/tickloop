@@ -274,6 +274,7 @@ impl Agent {
         let mut snapshot = ChatSnapshot {
             tool_call_recoveries: Vec::new(),
             artifact_ticks: source.snapshot.artifact_ticks.clone(),
+            removed_artifact_ticks: source.snapshot.removed_artifact_ticks.clone(),
             request_usage: RequestUsageLedger::new(),
             id: child_chat_id,
             branch_origin: Some(origin),
@@ -383,6 +384,7 @@ impl Agent {
             Chat {
                 snapshot: snapshot.clone(),
                 todo_completion_graces: Default::default(),
+                start_new_tool_result_message: false,
                 retention,
                 // 备份在锁外复制完成之前占住子 Chat，不能开始 Run 或 rewind。
                 active: Some(tokio_util::sync::CancellationToken::new()),

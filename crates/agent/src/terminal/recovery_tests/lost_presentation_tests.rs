@@ -218,8 +218,7 @@ fn lost_presentation_pty_fixture() {
                     input,
                     StartupState {
                         chat: StartupChat::Resumed(Box::new(snapshot), true),
-                        explicit_provider: None,
-                        user_settings: None,
+                                        user_settings: None,
                     },
                     None,
                 )

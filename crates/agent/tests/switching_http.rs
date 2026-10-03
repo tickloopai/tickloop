@@ -8,7 +8,6 @@ use tickloop_agent::{
         Content, HttpModelClient, ModelConfig, Protocol, cards::model_for_persistent_selection,
     },
     runtime::{Agent, BranchRequest, EventKind, ModelChange},
-    settings::UserSettings,
     tools::CommandState,
 };
 use tokio::{
@@ -23,7 +22,7 @@ fn frame(kind: &str, mut data: Value) -> String {
 }
 
 #[tokio::test]
-async fn configured_compatible_provider_completes_tool_round_and_resumes_from_transcript() {
+async fn builtin_selection_with_a_mock_transport_completes_tools_and_resumes_history() {
     let directory = tempfile::tempdir().unwrap();
     let tool = json!({"command":"printf gateway-tool","timeout":10000});
     let (endpoint, requests) = old_endpoint(vec![
@@ -33,15 +32,8 @@ async fn configured_compatible_provider_completes_tool_round_and_resumes_from_tr
     ])
     .await;
     let root = directory.path().join("agent");
-    std::fs::create_dir_all(root.join("providers")).unwrap();
-    std::fs::write(root.join("providers/gateway.yaml"), format!(
-        "id: gateway\ndisplay_name: Local gateway\nauth: api_key_env\napi_key_env: PATH\nendpoints:\n  responses: {endpoint}\nmodels:\n  - id: assistant-responses\n    service_model_id: assistant\n    display_name: Gateway assistant\n    adapter: responses\n    max_output_tokens: 4096\n    thinking: unsupported\n"
-    )).unwrap();
-    let config = UserSettings::in_root(&root)
-        .model_catalog()
-        .unwrap()
-        .get("gateway", "assistant-responses")
-        .unwrap();
+    let config = profile(endpoint, Protocol::Responses, "assistant");
+    assert!(!root.join("providers").exists());
     let agent = Agent::open_embedded(
         root.clone(),
         config.clone(),
@@ -338,7 +330,7 @@ fn profile(base_url: String, protocol: Protocol, name: &str) -> ModelConfig {
         protocol,
         name: name.into(),
         model: name.into(),
-        ..support::config()
+        ..support::persisted_config()
     }
 }
 

@@ -11,11 +11,10 @@
 //! 失效是需要用户知道的）。
 
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::HashSet,
     fs::File,
     io,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
 };
 
 use serde::{Deserialize, Serialize};
@@ -26,8 +25,8 @@ use uuid::Uuid;
 use crate::model::{
     ModelConfig, ReasoningEffort,
     cards::{
-        ModelCatalog, ModelPatch, ModelSelection, ProviderPatch, migrate_legacy_provider_patch,
-        model_for_persistent_selection, upgrade_saved_legacy_builtin_model, valid_provider_id,
+        ModelCatalog, ModelSelection, model_for_persistent_selection,
+        upgrade_saved_legacy_builtin_model,
     },
 };
 use crate::output_style::OutputStyle;
@@ -89,8 +88,6 @@ pub enum SettingsError {
     Lock { path: PathBuf, source: io::Error },
     #[error("cannot write settings file {path}: {source}")]
     Write { path: PathBuf, source: io::Error },
-    #[error("invalid provider YAML {path}: {reason}")]
-    InvalidProviderYaml { path: PathBuf, reason: String },
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -164,7 +161,6 @@ pub(crate) struct ProjectRuleChanges {
 #[derive(Clone, Debug)]
 pub struct UserSettings {
     path: PathBuf,
-    transient_providers: Arc<Mutex<BTreeMap<String, ProviderPatch>>>,
 }
 
 /// 一次读取的设置内容，以及读取各项时发现的问题。
@@ -248,48 +244,38 @@ impl LoadedSettings {
         if let Some(error) = &self.read_error {
             return Err(error.clone());
         }
-        catalog_from_settings(&self.settings, parent_directory(&self.path))
+        Ok(ModelCatalog::defaults())
     }
 
     pub fn configured_model(&mut self) -> Result<Option<ModelConfig>, String> {
-        let catalog = self.model_catalog()?;
-        let default_model = self
-            .settings
-            .get(DEFAULT_MODEL_KEY)
-            .cloned()
-            .map(|value| {
-                let selection: ModelSelection = serde_json::from_value(value)
-                    .map_err(|error| format!("`{DEFAULT_MODEL_KEY}`: {error}"))?;
-                catalog
-                    .get(&selection.provider, &selection.model)
-                    .ok_or_else(|| {
-                        format!(
-                            "`{DEFAULT_MODEL_KEY}`: unknown provider/model {}/{}",
-                            selection.provider, selection.model
-                        )
-                    })
-            })
-            .transpose()?;
-        if let Some(value) = self.settings.get(MODEL_KEY).cloned() {
-            let saved: ModelConfig =
-                serde_json::from_value(value).map_err(|error| format!("`{MODEL_KEY}`: {error}"))?;
-            let was_legacy_profile = saved.card.is_none();
-            let migrated = upgrade_saved_legacy_builtin_model(saved);
-            if was_legacy_profile
-                && migrated.card.is_some()
-                && !migrated.provider_id.is_empty()
-                && let Some(current) = catalog.get(&migrated.provider_id, &migrated.model_id)
-            {
-                return Ok(Some(current));
-            }
-            crate::model::validate_model_config(&migrated)
-                .map_err(|error| format!("`{MODEL_KEY}`: {error}"))?;
-            return Ok(Some(migrated));
+        if let Some(error) = &self.read_error {
+            return Err(error.clone());
         }
-        Ok(default_model)
+        let catalog = ModelCatalog::defaults();
+        if has_retired_model_settings(&self.settings, parent_directory(&self.path)) {
+            self.warn(BUILTIN_ONLY_NOTICE.into());
+        }
+        if let Some(value) = self.settings.get(DEFAULT_MODEL_KEY) {
+            if let Ok(selection) = serde_json::from_value::<ModelSelection>(value.clone())
+                && let Some(model) = catalog.get(&selection.provider, &selection.model)
+            {
+                return Ok(Some(model));
+            }
+            self.warn(BUILTIN_ONLY_NOTICE.into());
+            return Ok(None);
+        }
+        if let Some(value) = self.settings.get(MODEL_KEY) {
+            if let Ok(saved) = serde_json::from_value::<ModelConfig>(value.clone()) {
+                let saved = upgrade_saved_legacy_builtin_model(saved);
+                if let Some(model) = catalog.get(&saved.provider_id, &saved.model_id) {
+                    return Ok(Some(model));
+                }
+            }
+            self.warn(BUILTIN_ONLY_NOTICE.into());
+        }
+        Ok(None)
     }
 
-    /// `/model` 保存的模型配置，格式与 `--config` 文件相同。
     pub fn model(&mut self) -> Option<ModelConfig> {
         match self.configured_model() {
             Ok(model) => model,
@@ -327,14 +313,7 @@ impl LoadedSettings {
     }
 
     pub fn context_window_tokens(&mut self) -> Option<usize> {
-        let value = self.settings.get(CONTEXT_WINDOW_KEY)?.clone();
-        serde_json::from_value(value)
-            .map_err(|error| {
-                self.warn(format!(
-                    "`{CONTEXT_WINDOW_KEY}` is not a token count and is ignored ({error})"
-                ))
-            })
-            .ok()
+        None
     }
 
     pub fn default_execution_mode(&mut self) -> Option<ExecutionMode> {
@@ -567,243 +546,36 @@ fn saved_project_rules(
         .collect()
 }
 
-fn legacy_provider_patches(settings: &Map<String, Value>) -> Result<Vec<ProviderPatch>, String> {
-    settings
-        .get(PROVIDERS_KEY)
-        .cloned()
-        .map(serde_json::from_value)
-        .transpose()
-        .map_err(|error| format!("`{PROVIDERS_KEY}`: {error}"))
-        .map(|patches: Option<Vec<ProviderPatch>>| {
-            let mut patches = patches.unwrap_or_default();
-            for patch in &mut patches {
-                migrate_legacy_provider_patch(patch);
-            }
-            patches
-        })
-}
+pub const BUILTIN_ONLY_NOTICE: &str = "External Provider/model definitions and model-parameter overrides are ignored; only the program's built-in catalog is supported. Unsupported selections use the built-in default. Your files and credentials are unchanged.";
 
-fn remove_legacy_model_override(
-    settings: &mut Map<String, Value>,
-    provider_id: &str,
-    model_id: &str,
-) -> Result<bool, String> {
-    if !settings.contains_key(PROVIDERS_KEY) {
-        return Ok(false);
-    }
-    let mut configured = legacy_provider_patches(settings)?;
-    let mut removed = false;
-    if let Some(provider) = configured
-        .iter_mut()
-        .find(|provider| provider.id == provider_id)
-        && let Some(models) = &mut provider.models
+fn has_retired_model_settings(settings: &Map<String, Value>, root: &Path) -> bool {
+    if settings.contains_key(PROVIDERS_KEY)
+        || settings.contains_key(MODEL_KEY)
+        || settings.contains_key(CONTEXT_WINDOW_KEY)
     {
-        let previous_count = models.len();
-        models.retain(|model| model.id != model_id);
-        removed = models.len() != previous_count;
+        return true;
     }
-    if removed {
-        settings.insert(
-            PROVIDERS_KEY.into(),
-            serde_json::to_value(configured).expect("providers serialize"),
-        );
-    }
-    Ok(removed)
-}
-
-fn remove_legacy_provider_override(
-    settings: &mut Map<String, Value>,
-    provider_id: &str,
-) -> Result<bool, String> {
-    if !settings.contains_key(PROVIDERS_KEY) {
-        return Ok(false);
-    }
-    let mut configured = legacy_provider_patches(settings)?;
-    let previous_count = configured.len();
-    configured.retain(|provider| provider.id != provider_id);
-    if configured.len() == previous_count {
-        return Ok(false);
-    }
-    settings.insert(
-        PROVIDERS_KEY.into(),
-        serde_json::to_value(configured).expect("providers serialize"),
-    );
-    Ok(true)
-}
-
-fn provider_directory(root: &Path) -> PathBuf {
-    root.join(PROVIDERS_DIRECTORY)
-}
-
-fn provider_path(root: &Path, provider_id: &str) -> Result<PathBuf, String> {
-    if !valid_provider_id(provider_id) {
-        return Err(format!(
-            "providers[{provider_id}]: id must be a safe lowercase slug"
-        ));
-    }
-    Ok(provider_directory(root).join(format!("{provider_id}.yaml")))
-}
-
-fn provider_patch_is_empty(patch: &ProviderPatch) -> bool {
-    if patch.connection.is_some()
-        || patch
-            .model_aliases
-            .as_ref()
-            .is_some_and(|aliases| !aliases.is_empty())
+    let directory = root.join(PROVIDERS_DIRECTORY);
+    if let Ok(metadata) = std::fs::symlink_metadata(&directory)
+        && !metadata.file_type().is_dir()
     {
-        return false;
+        return true;
     }
-    patch.default_model.is_none()
-        && patch.display_name.is_none()
-        && patch.auth.is_none()
-        && patch.api_key_env.is_none()
-        && patch
-            .endpoints
-            .as_ref()
-            .is_none_or(|value| value.is_empty())
-        && patch.models.as_ref().is_none_or(|value| value.is_empty())
-}
-
-fn read_provider_patch(path: &Path, expected_id: &str) -> Result<ProviderPatch, String> {
-    let metadata =
-        std::fs::symlink_metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
-    if !metadata.file_type().is_file() {
-        return Err(format!(
-            "{}: provider YAML must be a regular file",
-            path.display()
-        ));
+    match std::fs::read_dir(&directory) {
+        Ok(mut entries) => entries.any(|entry| {
+            entry.map_or(true, |entry| {
+                entry.path().extension().is_some_and(|extension| {
+                    matches!(extension.to_str(), Some("yaml" | "yml" | "json"))
+                })
+            })
+        }),
+        Err(error) => error.kind() != io::ErrorKind::NotFound,
     }
-    let contents =
-        std::fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
-    let patch: ProviderPatch = serde_yaml_ng::from_str(&contents)
-        .map_err(|error| format!("{}: {error}", path.display()))?;
-    if patch.id != expected_id {
-        return Err(format!(
-            "{}: file name must match provider id `{}`",
-            path.display(),
-            patch.id
-        ));
-    }
-    validate_patch_model_ids(&patch).map_err(|reason| format!("{}: {reason}", path.display()))?;
-    Ok(patch)
-}
-
-fn validate_patch_model_ids(patch: &ProviderPatch) -> Result<(), String> {
-    let mut ids = HashSet::new();
-    for model in patch.models.iter().flatten() {
-        if !ids.insert(&model.id) {
-            return Err(format!(
-                "providers[{}].models[{}]: duplicate model id",
-                patch.id, model.id
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn directory_provider_patches(root: &Path) -> Result<Vec<ProviderPatch>, String> {
-    let directory = provider_directory(root);
-    match std::fs::symlink_metadata(&directory) {
-        Ok(metadata) if !metadata.file_type().is_dir() => {
-            return Err(format!(
-                "{}: providers path must be a real directory",
-                directory.display()
-            ));
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(format!("{}: {error}", directory.display())),
-        Ok(_) => {}
-    }
-    let entries = match std::fs::read_dir(&directory) {
-        Ok(entries) => entries,
-        Err(error) => return Err(format!("{}: {error}", directory.display())),
-    };
-    let mut patches = Vec::new();
-    let mut ids = HashSet::new();
-    for entry in entries {
-        let entry = entry.map_err(|error| format!("{}: {error}", directory.display()))?;
-        let path = entry.path();
-        if path.extension().is_none_or(|extension| extension != "yaml") {
-            continue;
-        }
-        let id = path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .ok_or_else(|| format!("{}: invalid provider file name", path.display()))?;
-        if !valid_provider_id(id) {
-            return Err(format!("{}: invalid provider file name", path.display()));
-        }
-        let patch = read_provider_patch(&path, id)?;
-        if !ids.insert(patch.id.clone()) {
-            return Err(format!(
-                "{}: duplicate provider id `{}`",
-                path.display(),
-                patch.id
-            ));
-        }
-        patches.push(patch);
-    }
-    patches.sort_by(|left, right| left.id.cmp(&right.id));
-    Ok(patches)
-}
-
-fn combined_provider_patches(
-    settings: &Map<String, Value>,
-    directory_patches: Vec<ProviderPatch>,
-) -> Result<Vec<ProviderPatch>, String> {
-    let mut legacy = legacy_provider_patches(settings)?;
-    let mut legacy_ids = HashSet::new();
-    for patch in &legacy {
-        validate_patch_model_ids(patch)?;
-        if !legacy_ids.insert(&patch.id) {
-            return Err(format!(
-                "`{PROVIDERS_KEY}`: duplicate provider id `{}`",
-                patch.id
-            ));
-        }
-    }
-    for patch in directory_patches {
-        if let Some(existing) = legacy.iter_mut().find(|legacy| legacy.id == patch.id) {
-            existing.merge_from(patch)?;
-        } else {
-            legacy.push(patch);
-        }
-    }
-    Ok(legacy)
-}
-
-fn catalog_from_settings(
-    settings: &Map<String, Value>,
-    root: &Path,
-) -> Result<ModelCatalog, String> {
-    let patches = combined_provider_patches(settings, directory_provider_patches(root)?)?;
-    ModelCatalog::defaults().with_providers(patches)
-}
-
-fn validate_saved_selection(
-    settings: &Map<String, Value>,
-    catalog: &ModelCatalog,
-) -> Result<(), String> {
-    let Some(value) = settings.get(DEFAULT_MODEL_KEY) else {
-        return Ok(());
-    };
-    let selection: ModelSelection = serde_json::from_value(value.clone())
-        .map_err(|error| format!("`{DEFAULT_MODEL_KEY}`: {error}"))?;
-    if catalog.get(&selection.provider, &selection.model).is_none() {
-        return Err(format!(
-            "`{DEFAULT_MODEL_KEY}`: selected model {}/{} would be removed; select another model first",
-            selection.provider, selection.model
-        ));
-    }
-    Ok(())
 }
 
 impl UserSettings {
     pub fn new(path: PathBuf) -> Self {
-        Self {
-            path,
-            transient_providers: Arc::new(Mutex::new(BTreeMap::new())),
-        }
+        Self { path }
     }
 
     /// Tick Loop 状态根目录下的设置文件。
@@ -816,41 +588,8 @@ impl UserSettings {
     }
 
     pub fn model_catalog(&self) -> Result<ModelCatalog, String> {
-        self.persisted_model_catalog()?
-            .with_providers(self.transient_provider_patches())
-    }
-
-    pub fn persisted_model_catalog(&self) -> Result<ModelCatalog, String> {
-        let object = self.read_object().map_err(|error| error.to_string())?;
-        catalog_from_settings(&object, parent_directory(&self.path))
-    }
-
-    pub fn set_transient_provider(&self, provider: ProviderPatch) -> Option<ProviderPatch> {
-        self.transient_providers
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(provider.id.clone(), provider)
-    }
-
-    pub fn restore_transient_provider(&self, provider_id: &str, previous: Option<ProviderPatch>) {
-        let mut providers = self
-            .transient_providers
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(previous) = previous {
-            providers.insert(provider_id.into(), previous);
-        } else {
-            providers.remove(provider_id);
-        }
-    }
-
-    fn transient_provider_patches(&self) -> Vec<ProviderPatch> {
-        self.transient_providers
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .values()
-            .cloned()
-            .collect()
+        self.read_object().map_err(|error| error.to_string())?;
+        Ok(ModelCatalog::defaults())
     }
 
     pub(crate) fn root(&self) -> Option<&Path> {
@@ -880,6 +619,9 @@ impl UserSettings {
             read_error,
         };
         loaded.cleanup_period_days();
+        if has_retired_model_settings(&loaded.settings, parent_directory(&loaded.path)) {
+            loaded.warn(BUILTIN_ONLY_NOTICE.into());
+        }
         loaded
     }
 
@@ -1029,124 +771,31 @@ impl UserSettings {
         clear_context_window: bool,
         thinking_choice: Option<Option<ReasoningEffort>>,
     ) -> Result<(), SettingsError> {
-        let model = model_for_persistent_selection(model.clone());
-        crate::model::validate_model_config(&model).map_err(|_| SettingsError::InvalidEntry {
-            path: self.path.clone(),
-            key: MODEL_KEY.into(),
-            expected: "a valid model configuration".into(),
-        })?;
+        let selected = model_for_persistent_selection(model.clone());
+        let model = ModelCatalog::defaults()
+            .get(&selected.provider_id, &selected.model_id)
+            .ok_or_else(|| SettingsError::InvalidEntry {
+                path: self.path.clone(),
+                key: DEFAULT_MODEL_KEY.into(),
+                expected: "a built-in Provider/model selection".into(),
+            })?;
         if let Some(effort) = thinking_choice {
             crate::model::validate_reasoning_effort(&model, effort).map_err(|_| {
                 SettingsError::InvalidEntry {
                     path: self.path.clone(),
                     key: EFFORT_LEVEL_KEY.into(),
-                    expected: "an effort supported by the selected model".into(),
+                    expected: "an effort supported by the built-in model".into(),
                 }
             })?;
         }
-        if let Some(card) = &model.card {
-            let selected_model_patch = ProviderPatch {
-                model_aliases: None,
-                connection: model.connection.clone(),
-                id: model.provider_id.clone(),
-                default_model: None,
-                display_name: Some(model.provider_name.clone()),
-                auth: Some(model.auth_source),
-                api_key_env: Some(model.api_key_env.clone()),
-                endpoints: Some(std::collections::BTreeMap::from([(
-                    card.adapter,
-                    model.base_url.clone(),
-                )])),
-                models: Some(vec![ModelPatch {
-                    id: card.id.clone(),
-                    service_model_id: Some(card.service_model_id.clone()),
-                    display_name: Some(card.display_name.clone()),
-                    adapter: Some(card.adapter),
-                    max_output_tokens: Some(card.max_output_tokens),
-                    context_window_tokens: Some(card.context_window_tokens),
-                    thinking: Some(card.thinking),
-                    adaptive_by_default: Some(card.adaptive_by_default),
-                    effort_levels: Some(card.effort_levels.clone()),
-                    input_modalities: Some(card.input_modalities.clone()),
-                    thinking_budgets: card.thinking_budgets,
-                }]),
-            };
-            let path = self.provider_path(&model.provider_id)?;
-            let _lock = self.lock_provider(&path)?;
-            let settings = self.read_object()?;
-            let current_catalog = catalog_from_settings(&settings, parent_directory(&self.path))
-                .map_err(|reason| SettingsError::InvalidProviderYaml {
-                    path: path.clone(),
-                    reason,
-                })?;
-            let transient_provider =
-                self.transient_provider_patches()
-                    .into_iter()
-                    .find(|candidate| {
-                        candidate.id == model.provider_id
-                            && current_catalog
-                                .clone()
-                                .with_providers(vec![candidate.clone()])
-                                .ok()
-                                .and_then(|catalog| {
-                                    catalog.get(&model.provider_id, &model.model_id)
-                                })
-                                .as_ref()
-                                == Some(&model)
-                    });
-            let has_transient_provider = transient_provider.is_some();
-            let provider = transient_provider.unwrap_or(selected_model_patch);
-            if !has_transient_provider
-                && current_catalog
-                    .get(&model.provider_id, &model.model_id)
-                    .as_ref()
-                    == Some(&model)
-            {
-                return self.save_model_selection(&model, clear_context_window, thinking_choice);
-            }
-            let original_yaml = match std::fs::read(&path) {
-                Ok(contents) => Some(contents),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-                Err(source) => return Err(SettingsError::Read { path, source }),
-            };
-            let catalog = self.save_provider_locked(&path, provider)?;
-            if catalog.get(&model.provider_id, &model.model_id).as_ref() != Some(&model) {
-                self.restore_provider_bytes(&path, original_yaml)?;
-                return Err(SettingsError::InvalidProviderYaml {
-                    path,
-                    reason: "saved Provider definition does not match the selected model".into(),
-                });
-            }
-            if let Err(error) =
-                self.save_model_selection(&model, clear_context_window, thinking_choice)
-            {
-                self.restore_provider_bytes(&path, original_yaml)?;
-                return Err(error);
-            }
-            return Ok(());
-        }
-        Err(SettingsError::InvalidEntry {
-            path: self.path.clone(),
-            key: MODEL_KEY.into(),
-            expected: "a model with a supported Provider and Model Card".into(),
-        })
-    }
-
-    fn save_model_selection(
-        &self,
-        model: &ModelConfig,
-        clear_context_window: bool,
-        thinking_choice: Option<Option<ReasoningEffort>>,
-    ) -> Result<(), SettingsError> {
         self.update(|settings| {
-            settings.remove(MODEL_KEY);
             settings.insert(
                 DEFAULT_MODEL_KEY.into(),
                 serde_json::to_value(ModelSelection {
                     provider: model.provider_id.clone(),
                     model: model.model_id.clone(),
                 })
-                .expect("model selection serializes"),
+                .expect("selection serializes"),
             );
             if clear_context_window {
                 settings.remove(CONTEXT_WINDOW_KEY);
@@ -1156,7 +805,7 @@ impl UserSettings {
                     Some(effort) => {
                         settings.insert(
                             EFFORT_LEVEL_KEY.into(),
-                            serde_json::to_value(effort).expect("reasoning effort serializes"),
+                            serde_json::to_value(effort).expect("effort serializes"),
                         );
                     }
                     None => {
@@ -1170,341 +819,6 @@ impl UserSettings {
             }
             Ok(())
         })
-    }
-
-    pub fn save_provider(&self, provider: ProviderPatch) -> Result<(), SettingsError> {
-        let path = self.provider_path(&provider.id)?;
-        let _lock = self.lock_provider(&path)?;
-        self.save_provider_locked(&path, provider).map(|_| ())
-    }
-
-    fn save_provider_locked(
-        &self,
-        path: &Path,
-        provider: ProviderPatch,
-    ) -> Result<ModelCatalog, SettingsError> {
-        let mut saved = if std::fs::symlink_metadata(path).is_ok() {
-            read_provider_patch(path, &provider.id).map_err(|reason| {
-                SettingsError::InvalidProviderYaml {
-                    path: path.to_path_buf(),
-                    reason,
-                }
-            })?
-        } else {
-            let settings = self.read_object()?;
-            legacy_provider_patches(&settings)
-                .map_err(|reason| SettingsError::InvalidProviderYaml {
-                    path: self.path.clone(),
-                    reason,
-                })?
-                .into_iter()
-                .find(|legacy| legacy.id == provider.id)
-                .unwrap_or_else(|| ProviderPatch {
-                    model_aliases: None,
-                    connection: None,
-                    id: provider.id.clone(),
-                    default_model: None,
-                    display_name: None,
-                    auth: None,
-                    api_key_env: None,
-                    endpoints: None,
-                    models: None,
-                })
-        };
-        saved
-            .merge_from(provider)
-            .map_err(|reason| SettingsError::InvalidProviderYaml {
-                path: path.to_path_buf(),
-                reason,
-            })?;
-        let settings = self.read_object()?;
-        let mut directory =
-            directory_provider_patches(parent_directory(&self.path)).map_err(|reason| {
-                SettingsError::InvalidProviderYaml {
-                    path: path.to_path_buf(),
-                    reason,
-                }
-            })?;
-        if let Some(existing) = directory
-            .iter_mut()
-            .find(|existing| existing.id == saved.id)
-        {
-            *existing = saved.clone();
-        } else {
-            directory.push(saved.clone());
-        }
-        let catalog = combined_provider_patches(&settings, directory)
-            .and_then(|patches| ModelCatalog::defaults().with_providers(patches))
-            .map_err(|reason| SettingsError::InvalidProviderYaml {
-                path: path.to_path_buf(),
-                reason,
-            })?;
-        self.write_provider_patch(path, &saved)?;
-        Ok(catalog)
-    }
-
-    fn restore_provider_bytes(
-        &self,
-        path: &Path,
-        original_yaml: Option<Vec<u8>>,
-    ) -> Result<(), SettingsError> {
-        match original_yaml {
-            Some(contents) => {
-                replace_file_atomically(path, &contents, PRIVATE_FILE_MODE).map_err(|source| {
-                    SettingsError::Write {
-                        path: path.to_path_buf(),
-                        source,
-                    }
-                })
-            }
-            None => self.remove_provider_file(path),
-        }
-    }
-
-    pub fn restore_provider_default(&self, provider_id: &str) -> Result<(), SettingsError> {
-        let path = self.provider_path(provider_id)?;
-        let _lock = self.lock_provider(&path)?;
-        let original_yaml = match std::fs::read(&path) {
-            Ok(contents) => Some(contents),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-            Err(source) => return Err(SettingsError::Read { path, source }),
-        };
-        let mut preview_settings = self.read_object()?;
-        let remove_legacy = remove_legacy_provider_override(&mut preview_settings, provider_id)
-            .map_err(|reason| SettingsError::InvalidProviderYaml {
-                path: self.path.clone(),
-                reason,
-            })?;
-        let mut directory =
-            directory_provider_patches(parent_directory(&self.path)).map_err(|reason| {
-                SettingsError::InvalidProviderYaml {
-                    path: path.clone(),
-                    reason,
-                }
-            })?;
-        directory.retain(|existing| existing.id != provider_id);
-        let prospective = combined_provider_patches(&preview_settings, directory)
-            .and_then(|patches| ModelCatalog::defaults().with_providers(patches))
-            .map_err(|reason| SettingsError::InvalidProviderYaml {
-                path: path.clone(),
-                reason,
-            })?;
-        validate_saved_selection(&preview_settings, &prospective).map_err(|reason| {
-            SettingsError::InvalidProviderYaml {
-                path: path.clone(),
-                reason,
-            }
-        })?;
-        self.remove_provider_file(&path)?;
-        if remove_legacy
-            && let Err(error) = self.update(|settings| {
-                remove_legacy_provider_override(settings, provider_id).map_err(|reason| {
-                    InvalidEntry {
-                        key: PROVIDERS_KEY.into(),
-                        expected: reason,
-                    }
-                })?;
-                Ok(())
-            })
-        {
-            if let Some(contents) = original_yaml
-                && let Err(source) = replace_file_atomically(&path, &contents, PRIVATE_FILE_MODE)
-            {
-                return Err(SettingsError::Write { path, source });
-            }
-            return Err(error);
-        }
-        Ok(())
-    }
-
-    pub fn restore_model_default(
-        &self,
-        provider_id: &str,
-        model_id: &str,
-    ) -> Result<(), SettingsError> {
-        let path = self.provider_path(provider_id)?;
-        let _lock = self.lock_provider(&path)?;
-        let original_yaml = match std::fs::read(&path) {
-            Ok(contents) => Some(contents),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-            Err(source) => {
-                return Err(SettingsError::Read {
-                    path: path.clone(),
-                    source,
-                });
-            }
-        };
-        let current =
-            self.model_catalog()
-                .map_err(|reason| SettingsError::InvalidProviderYaml {
-                    path: path.clone(),
-                    reason,
-                })?;
-        let canonical = current
-            .canonical_model_id(provider_id, model_id)
-            .unwrap_or(model_id);
-        let mut equivalent_ids =
-            std::collections::BTreeSet::from([model_id.to_owned(), canonical.to_owned()]);
-        if let Some(provider) = current
-            .providers
-            .iter()
-            .find(|provider| provider.id == provider_id)
-        {
-            equivalent_ids.extend(
-                provider
-                    .model_aliases
-                    .iter()
-                    .filter(|(_, target)| target.as_str() == canonical)
-                    .map(|(alias, _)| alias.clone()),
-            );
-        }
-        let mut patch = if original_yaml.is_some() {
-            Some(read_provider_patch(&path, provider_id).map_err(|reason| {
-                SettingsError::InvalidProviderYaml {
-                    path: path.clone(),
-                    reason,
-                }
-            })?)
-        } else {
-            None
-        };
-        if let Some(models) = patch.as_mut().and_then(|patch| patch.models.as_mut()) {
-            models.retain(|model| !equivalent_ids.contains(&model.id));
-        }
-        let mut preview_settings = self.read_object()?;
-        let mut remove_legacy = false;
-        for id in &equivalent_ids {
-            remove_legacy |= remove_legacy_model_override(&mut preview_settings, provider_id, id)
-                .map_err(|reason| SettingsError::InvalidProviderYaml {
-                path: self.path.clone(),
-                reason,
-            })?;
-        }
-        let mut directory =
-            directory_provider_patches(parent_directory(&self.path)).map_err(|reason| {
-                SettingsError::InvalidProviderYaml {
-                    path: path.clone(),
-                    reason,
-                }
-            })?;
-        directory.retain(|existing| existing.id != provider_id);
-        if let Some(patch) = &patch
-            && !provider_patch_is_empty(patch)
-        {
-            directory.push(patch.clone());
-        }
-        let prospective = combined_provider_patches(&preview_settings, directory)
-            .and_then(|patches| ModelCatalog::defaults().with_providers(patches))
-            .map_err(|reason| SettingsError::InvalidProviderYaml {
-                path: path.clone(),
-                reason,
-            })?;
-        validate_saved_selection(&preview_settings, &prospective).map_err(|reason| {
-            SettingsError::InvalidProviderYaml {
-                path: path.clone(),
-                reason,
-            }
-        })?;
-        if let Some(patch) = &patch {
-            if provider_patch_is_empty(patch) {
-                self.remove_provider_file(&path)?;
-            } else {
-                self.write_provider_patch(&path, patch)?;
-            }
-        }
-        if remove_legacy
-            && let Err(error) = self.update(|settings| {
-                for id in &equivalent_ids {
-                    remove_legacy_model_override(settings, provider_id, id).map_err(|reason| {
-                        InvalidEntry {
-                            key: PROVIDERS_KEY.into(),
-                            expected: reason,
-                        }
-                    })?;
-                }
-                Ok(())
-            })
-        {
-            let rollback = match original_yaml {
-                Some(contents) => replace_file_atomically(&path, &contents, PRIVATE_FILE_MODE),
-                None => match std::fs::remove_file(&path) {
-                    Ok(()) => Ok(()),
-                    Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
-                    Err(source) => Err(source),
-                },
-            };
-            if let Err(source) = rollback {
-                return Err(SettingsError::Write { path, source });
-            }
-            return Err(error);
-        }
-        Ok(())
-    }
-
-    fn provider_path(&self, provider_id: &str) -> Result<PathBuf, SettingsError> {
-        provider_path(parent_directory(&self.path), provider_id).map_err(|reason| {
-            SettingsError::InvalidProviderYaml {
-                path: provider_directory(parent_directory(&self.path)),
-                reason,
-            }
-        })
-    }
-
-    fn lock_provider(&self, path: &Path) -> Result<File, SettingsError> {
-        create_private_directory(parent_directory(path)).map_err(|source| {
-            SettingsError::Write {
-                path: path.to_path_buf(),
-                source,
-            }
-        })?;
-        let metadata = std::fs::symlink_metadata(parent_directory(path)).map_err(|source| {
-            SettingsError::Read {
-                path: parent_directory(path).to_path_buf(),
-                source,
-            }
-        })?;
-        if !metadata.file_type().is_dir() {
-            return Err(SettingsError::InvalidProviderYaml {
-                path: parent_directory(path).to_path_buf(),
-                reason: "providers path must be a real directory".into(),
-            });
-        }
-        let mut lock_name = path.as_os_str().to_os_string();
-        lock_name.push(LOCK_FILE_SUFFIX);
-        let lock_path = PathBuf::from(lock_name);
-        lock_exclusively(&lock_path).map_err(|source| SettingsError::Lock {
-            path: lock_path,
-            source,
-        })
-    }
-
-    fn write_provider_patch(
-        &self,
-        path: &Path,
-        patch: &ProviderPatch,
-    ) -> Result<(), SettingsError> {
-        let mut contents =
-            serde_yaml_ng::to_string(patch).expect("provider patch serializes to YAML");
-        if !contents.ends_with('\n') {
-            contents.push('\n');
-        }
-        replace_file_atomically(path, contents.as_bytes(), PRIVATE_FILE_MODE).map_err(|source| {
-            SettingsError::Write {
-                path: path.to_path_buf(),
-                source,
-            }
-        })
-    }
-
-    fn remove_provider_file(&self, path: &Path) -> Result<(), SettingsError> {
-        match std::fs::remove_file(path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(source) => Err(SettingsError::Write {
-                path: path.to_path_buf(),
-                source,
-            }),
-        }
     }
 
     pub fn save_reasoning_effort(
@@ -1555,10 +869,11 @@ impl UserSettings {
         })
     }
 
-    pub(crate) fn save_context_window(&self, tokens: usize) -> Result<(), SettingsError> {
-        self.update(|settings| {
-            settings.insert(CONTEXT_WINDOW_KEY.into(), tokens.into());
-            Ok(())
+    pub(crate) fn save_context_window(&self, _tokens: usize) -> Result<(), SettingsError> {
+        Err(SettingsError::InvalidEntry {
+            path: self.path.clone(),
+            key: CONTEXT_WINDOW_KEY.into(),
+            expected: "the context window supplied by the built-in program catalog".into(),
         })
     }
 
@@ -2004,219 +1319,6 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn saving_an_old_alias_card_canonicalizes_identity_without_replacing_overrides() {
-        let root = tempfile::tempdir().unwrap();
-        let settings = UserSettings::in_root(root.path());
-        let mut saved = ModelCatalog::defaults()
-            .get("openai-api", "gpt-6.1-sol")
-            .unwrap();
-        saved.model_id = "gpt-6.1-sol-responses".into();
-        saved.card.as_mut().unwrap().id = saved.model_id.clone();
-        saved.base_url = "https://retained.example/legacy-messages".into();
-        saved.protocol = crate::model::Protocol::Messages;
-        saved.card.as_mut().unwrap().adapter = crate::model::cards::Adapter::Messages;
-        saved.model = "private-service-version".into();
-        saved.card.as_mut().unwrap().service_model_id = saved.model.clone();
-        saved.max_output_tokens = 2048;
-        saved.card.as_mut().unwrap().max_output_tokens = 2048;
-        saved.card.as_mut().unwrap().context_window_tokens = Some(8192);
-        let original_source = saved.private_history_source();
-        settings.save_model(&saved, false).unwrap();
-        saved.model_id = "gpt-6.1-sol".into();
-        saved.card.as_mut().unwrap().id = saved.model_id.clone();
-        let restored = settings.load().configured_model().unwrap().unwrap();
-        assert_eq!(restored, saved);
-        assert_eq!(restored.private_history_source(), original_source);
-        let json: Value =
-            serde_json::from_slice(&std::fs::read(root.path().join(SETTINGS_FILE_NAME)).unwrap())
-                .unwrap();
-        assert_eq!(json[DEFAULT_MODEL_KEY]["model"], "gpt-6.1-sol");
-    }
-
-    #[test]
-    fn explicit_same_id_model_definition_survives_restart_and_yaml_edits() {
-        let root = tempfile::tempdir().unwrap();
-        let settings = UserSettings::in_root(root.path());
-        let mut explicit = ModelCatalog::defaults()
-            .get("deepseek-api", "deepseek-flash-messages")
-            .unwrap();
-        explicit.base_url = "https://custom.example/messages".into();
-        explicit.max_output_tokens = 8192;
-        explicit.card.as_mut().unwrap().max_output_tokens = 8192;
-        settings.save_model(&explicit, false).unwrap();
-        let saved: Value =
-            serde_json::from_slice(&std::fs::read(root.path().join(SETTINGS_FILE_NAME)).unwrap())
-                .unwrap();
-        assert!(saved.get(MODEL_KEY).is_none());
-        assert_eq!(saved[DEFAULT_MODEL_KEY]["provider"], "deepseek-api");
-        assert_eq!(saved[DEFAULT_MODEL_KEY]["model"], "deepseek-flash-messages");
-        let provider_path = root.path().join("providers/deepseek-api.yaml");
-        assert!(provider_path.is_file());
-        let restarted = UserSettings::in_root(root.path())
-            .load()
-            .configured_model()
-            .unwrap()
-            .unwrap();
-        assert_eq!(restarted, explicit);
-
-        let mut provider: ProviderPatch =
-            serde_yaml_ng::from_slice(&std::fs::read(&provider_path).unwrap()).unwrap();
-        provider.models.as_mut().unwrap()[0].max_output_tokens = Some(16384);
-        std::fs::write(&provider_path, serde_yaml_ng::to_string(&provider).unwrap()).unwrap();
-        let edited = UserSettings::in_root(root.path())
-            .load()
-            .configured_model()
-            .unwrap()
-            .unwrap();
-        assert_eq!(edited.max_output_tokens, 16384);
-        assert_eq!(edited.base_url, explicit.base_url);
-    }
-
-    #[test]
-    fn selecting_an_unchanged_builtin_model_does_not_create_provider_yaml() {
-        let root = tempfile::tempdir().unwrap();
-        let settings = UserSettings::in_root(root.path());
-        let selected = ModelCatalog::defaults()
-            .get("deepseek-api", "deepseek-flash-messages")
-            .unwrap();
-        settings.save_model(&selected, false).unwrap();
-        assert!(!root.path().join("providers/deepseek-api.yaml").exists());
-        let saved: Value =
-            serde_json::from_slice(&std::fs::read(root.path().join(SETTINGS_FILE_NAME)).unwrap())
-                .unwrap();
-        assert!(saved.get(MODEL_KEY).is_none());
-        assert_eq!(saved[DEFAULT_MODEL_KEY]["provider"], "deepseek-api");
-    }
-
-    #[test]
-    fn failed_selection_write_rolls_back_the_new_provider_definition() {
-        let root = tempfile::tempdir().unwrap();
-        std::os::unix::fs::symlink("/dev/null", root.path().join(SETTINGS_FILE_NAME)).unwrap();
-        let settings = UserSettings::in_root(root.path());
-        let mut selected = ModelCatalog::defaults()
-            .get("deepseek-api", "deepseek-flash-messages")
-            .unwrap();
-        selected.base_url = "https://custom.example/messages".into();
-        assert!(matches!(
-            settings.save_model(&selected, false),
-            Err(SettingsError::Write { .. })
-        ));
-        assert!(!root.path().join("providers/deepseek-api.yaml").exists());
-    }
-
-    #[test]
-    fn transient_multimodel_provider_is_saved_in_full_when_a_sibling_is_selected() {
-        let root = tempfile::tempdir().unwrap();
-        let settings = UserSettings::in_root(root.path());
-        let yaml = "id: external-provider\ndefault_model: first\ndisplay_name: External provider\nauth: api_key_env\napi_key_env: EXTERNAL_KEY\nendpoints:\n  messages: https://gateway.example/messages\nmodels:\n  - id: first\n    service_model_id: first-service\n    display_name: First\n    adapter: messages\n  - id: second\n    service_model_id: second-service\n    display_name: Second\n    adapter: messages\n";
-        let (_, provider) = ModelCatalog::resolved_provider_yaml(yaml).unwrap();
-        settings.set_transient_provider(provider);
-        let shared = settings.clone();
-        let second = shared
-            .model_catalog()
-            .unwrap()
-            .get("external-provider", "second")
-            .unwrap();
-        assert!(
-            !root
-                .path()
-                .join("providers/external-provider.yaml")
-                .exists()
-        );
-        settings.save_model(&second, false).unwrap();
-
-        let saved: ProviderPatch = serde_yaml_ng::from_slice(
-            &std::fs::read(root.path().join("providers/external-provider.yaml")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(saved.default_model.as_deref(), Some("first"));
-        assert_eq!(saved.models.unwrap().len(), 2);
-        let selection: Value =
-            serde_json::from_slice(&std::fs::read(root.path().join(SETTINGS_FILE_NAME)).unwrap())
-                .unwrap();
-        assert!(selection.get(MODEL_KEY).is_none());
-        assert_eq!(selection[DEFAULT_MODEL_KEY]["model"], "second");
-        let restarted = UserSettings::in_root(root.path())
-            .load()
-            .configured_model()
-            .unwrap()
-            .unwrap();
-        assert_eq!(restarted.model, "second-service");
-    }
-
-    #[test]
-    fn matching_selected_card_still_saves_new_transient_siblings() {
-        let root = tempfile::tempdir().unwrap();
-        let settings = UserSettings::in_root(root.path());
-        let yaml = "id: external-provider\ndefault_model: first\ndisplay_name: External provider\nauth: api_key_env\napi_key_env: EXTERNAL_KEY\nendpoints:\n  messages: https://gateway.example/messages\nmodels:\n  - id: first\n    service_model_id: first-service\n    display_name: First\n    adapter: messages\n  - id: second\n    service_model_id: second-service\n    display_name: Second\n    adapter: messages\n";
-        let (first, complete) = ModelCatalog::resolved_provider_yaml(yaml).unwrap();
-        let mut first_only = complete.clone();
-        first_only
-            .models
-            .as_mut()
-            .unwrap()
-            .retain(|model| model.id == "first");
-        settings.save_provider(first_only).unwrap();
-        settings.set_transient_provider(complete);
-        settings.save_model(&first, false).unwrap();
-        let saved: ProviderPatch = serde_yaml_ng::from_slice(
-            &std::fs::read(root.path().join("providers/external-provider.yaml")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(saved.models.unwrap().len(), 2);
-    }
-
-    #[test]
-    fn partial_explicit_yaml_keeps_saved_endpoint_and_inherited_defaults_live() {
-        let root = tempfile::tempdir().unwrap();
-        let settings = UserSettings::in_root(root.path());
-        let existing: ProviderPatch = serde_yaml_ng::from_str(
-            "id: deepseek-api\nendpoints:\n  deepseek_messages: https://gateway.example/anthropic\n",
-        )
-        .unwrap();
-        settings.save_provider(existing).unwrap();
-        let partial = "id: deepseek-api\ndefault_model: deepseek-flash-messages\nmodels:\n  - id: deepseek-flash-messages\n    max_output_tokens: 8192\n";
-        let (selected, authored) = ModelCatalog::resolved_provider_yaml_with_catalog(
-            partial,
-            settings.persisted_model_catalog().unwrap(),
-        )
-        .unwrap();
-        assert_eq!(selected.base_url, "https://gateway.example/anthropic");
-        settings.set_transient_provider(authored);
-        settings.save_model(&selected, false).unwrap();
-
-        let saved: ProviderPatch = serde_yaml_ng::from_slice(
-            &std::fs::read(root.path().join("providers/deepseek-api.yaml")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(saved.display_name, None);
-        assert_eq!(saved.auth, None);
-        assert_eq!(saved.models.as_ref().unwrap().len(), 1);
-        let selected_patch = &saved.models.as_ref().unwrap()[0];
-        assert_eq!(selected_patch.max_output_tokens, Some(8192));
-        assert_eq!(selected_patch.service_model_id, None);
-        assert_eq!(selected_patch.context_window_tokens, None);
-        let mut next_defaults = ModelCatalog::defaults();
-        let sibling = next_defaults
-            .providers
-            .iter_mut()
-            .find(|provider| provider.id == "deepseek-api")
-            .unwrap()
-            .models
-            .iter_mut()
-            .find(|model| model.id == "deepseek-flash-responses")
-            .unwrap();
-        sibling.max_output_tokens = 12345;
-        let next = next_defaults.with_providers(vec![saved]).unwrap();
-        assert_eq!(
-            next.get("deepseek-api", "deepseek-flash-responses")
-                .unwrap()
-                .max_output_tokens,
-            12345
-        );
-    }
-
     fn allow(tool: &str) -> PermissionRule {
         PermissionRule {
             id: Uuid::new_v4(),
@@ -2234,6 +1336,22 @@ mod tests {
             removed: removed.iter().copied().collect(),
             added: added.to_vec(),
         }
+    }
+
+    #[test]
+    fn selecting_an_unchanged_builtin_model_does_not_create_provider_yaml() {
+        let root = tempfile::tempdir().unwrap();
+        let settings = UserSettings::in_root(root.path());
+        let selected = ModelCatalog::defaults()
+            .get("deepseek-api", "deepseek-flash-messages")
+            .unwrap();
+        settings.save_model(&selected, false).unwrap();
+        assert!(!root.path().join("providers/deepseek-api.yaml").exists());
+        let saved: Value =
+            serde_json::from_slice(&std::fs::read(root.path().join(SETTINGS_FILE_NAME)).unwrap())
+                .unwrap();
+        assert!(saved.get(MODEL_KEY).is_none());
+        assert_eq!(saved[DEFAULT_MODEL_KEY]["provider"], "deepseek-api");
     }
 
     #[test]

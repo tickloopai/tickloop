@@ -153,9 +153,14 @@ fn config(identity: &ModelIdentity) -> ModelConfig {
         base_url: "http://127.0.0.1".into(),
         api_key_env: String::new(),
         max_output_tokens: 1024,
-        provider_id: String::new(),
-        provider_name: String::new(),
-        model_id: String::new(),
+        provider_id: "deepseek-api".into(),
+        provider_name: "DeepSeek API".into(),
+        model_id: match identity.protocol {
+            Protocol::Responses => "deepseek-flash-responses",
+            Protocol::ChatCompletions => "deepseek-flash",
+            _ => "deepseek-flash-messages",
+        }
+        .into(),
         connection: None,
         card: None,
         input_modalities: vec![InputModality::Text],

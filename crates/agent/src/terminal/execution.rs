@@ -16,7 +16,7 @@ use super::permissions_surface::{
 };
 use crate::{
     agent_access::*,
-    model::{ModelClient, ModelConfig, ReasoningEffort, cards::ProviderPatch, model_client},
+    model::{ModelClient, ModelConfig, ReasoningEffort, model_client},
     permissions::{ExecutionMode, PermissionRule, PermissionScope},
     runtime::{self, AgentError, ChatSnapshot, InputContext, Receipt},
     tools::{CommandSnapshot, ToolResult},
@@ -1009,6 +1009,10 @@ impl ConsoleExecution {
                         }
                     }
                     Ok(ObservationUpdate {
+                        change: ObservationChange::AccountModels(_),
+                        ..
+                    }) => {}
+                    Ok(ObservationUpdate {
                         change: ObservationChange::Changed | ObservationChange::Resync { .. },
                         ..
                     }) => {
@@ -1435,7 +1439,11 @@ impl ConsoleExecution {
         self.send(
             epoch,
             command_id,
-            AgentCommand::Configure { execution, change },
+            AgentCommand::Configure {
+                execution,
+                change,
+                provider: None,
+            },
         )
         .await
     }
@@ -1532,6 +1540,73 @@ impl ConsoleExecution {
             }
         }
     }
+    pub(super) async fn provider_credentials(
+        &self,
+        target: ConfigTarget,
+    ) -> Result<ProviderCredentialScope, AgentError> {
+        let ConfigTarget::Agent(chat) = target else {
+            return Ok(ProviderCredentialScope::current(
+                self.inner.launch.config_root.clone(),
+                None,
+            ));
+        };
+        match self
+            .value(chat, AgentDetailQuery::ProviderCredentials)
+            .await?
+        {
+            ObservationValue::ProviderCredentials(scope) => Ok(*scope),
+            _ => Err(unexpected()),
+        }
+    }
+
+    pub(super) async fn account_models(
+        &self,
+        target: ConfigTarget,
+        config: ModelConfig,
+        refresh: bool,
+    ) -> Result<crate::model::availability::AccountModelDirectory, String> {
+        let ConfigTarget::Agent(chat) = target else {
+            return Err("New Agent has no execution".into());
+        };
+        let execution = self
+            .reference(chat)
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut refresh = refresh;
+        loop {
+            let mut observation = self
+                .inner
+                .access
+                .observe(ObservationRequest::Agent {
+                    execution,
+                    detail: AgentDetailQuery::AccountModels {
+                        config: Box::new(config.clone()),
+                        refresh,
+                    },
+                    after: None,
+                })
+                .await
+                .map_err(|error| error.to_string())?;
+            match observation.initial {
+                ObservationValue::AccountModels(result) => return result,
+                ObservationValue::AccountModelsPending => {}
+                _ => return Err("Agent returned an invalid account model snapshot".into()),
+            }
+            match observation
+                .recv()
+                .await
+                .map_err(|error| error.to_string())?
+                .change
+            {
+                ObservationChange::AccountModels(result) => return result,
+                ObservationChange::Changed | ObservationChange::Resync { .. } => {
+                    refresh = false;
+                }
+                _ => return Err("Agent returned an invalid account model update".into()),
+            }
+        }
+    }
+
     /// Applies `change` to the visible Agent. For the New Agent, model, effort and Thinking are user
     /// defaults saved at once, exactly as choosing them on an Agent saves them; process-local
     /// choices wait for the first input.
@@ -1953,13 +2028,6 @@ impl ConsoleExecution {
     pub(super) fn staged_rules(&self) -> Vec<PermissionRule> {
         self.inner.draft.lock().unwrap().staged_rules().to_vec()
     }
-    pub(super) fn stage_transient_provider(&self, provider: ProviderPatch) {
-        self.inner
-            .draft
-            .lock()
-            .unwrap()
-            .stage_transient_provider(provider);
-    }
     async fn apply_configuration(
         &self,
         chat: Uuid,
@@ -2177,8 +2245,15 @@ impl ConsoleExecution {
     ) -> Result<CommandResult, AgentError> {
         self.preflight(chat, &change).await?;
         let execution = self.reference(chat).await?;
-        self.command(AgentCommand::Configure { execution, change }, None)
-            .await
+        self.command(
+            AgentCommand::Configure {
+                execution,
+                change,
+                provider: None,
+            },
+            None,
+        )
+        .await
     }
     pub(super) async fn set_execution_mode(
         &self,
@@ -2289,7 +2364,11 @@ impl ConsoleExecution {
             .execute(CommandEnvelope {
                 owner_epoch: self.owner_epoch(),
                 command_id: Uuid::new_v4(),
-                command: AgentCommand::Configure { execution, change },
+                command: AgentCommand::Configure {
+                    execution,
+                    change,
+                    provider: None,
+                },
             })
             .await
             .map_err(agent_error)?;
@@ -3730,15 +3809,22 @@ mod tests {
     }
 
     fn recording_terminal(directory: &Path) -> (runtime::Agent, Arc<Recording>, ConsoleExecution) {
-        recording_terminal_with_model(directory, support::config())
+        recording_terminal_with_model(
+            directory,
+            crate::model::cards::ModelCatalog::defaults()
+                .get("deepseek-api", "deepseek-flash")
+                .unwrap(),
+        )
     }
 
     fn recording_terminal_with_model(
         directory: &Path,
         model: ModelConfig,
     ) -> (runtime::Agent, Arc<Recording>, ConsoleExecution) {
-        let runtime =
-            runtime::Agent::new_embedded(model, Arc::new(support::ScriptedModel::new(vec![])));
+        let runtime = runtime::Agent::new_embedded(
+            model.clone(),
+            Arc::new(support::ScriptedModel::new(vec![])),
+        );
         let actual = EmbeddedAgentAccess::new(runtime.clone());
         let epoch = actual.owner_epoch();
         let access = Arc::new(Recording {
@@ -3753,7 +3839,7 @@ mod tests {
             fail_after_register: false.into(),
         });
         let mut launch = LaunchSpec::embedded(directory.into());
-        launch.model = Some(support::config());
+        launch.model = Some(model);
         let terminal = ConsoleExecution::from_access_for_test(
             access.clone(),
             epoch,
@@ -4587,11 +4673,12 @@ mod tests {
         let (runtime, access, terminal) = recording_terminal(directory.path());
         let config_root = directory.path().canonicalize().unwrap().join("config");
         terminal.use_user_settings(Some(crate::settings::UserSettings::in_root(&config_root)));
+        let initial_model = terminal.launch_spec().model.unwrap().model;
         let chosen = ModelCatalog::defaults()
             .profiles()
             .into_iter()
-            .find(|model| model.model != support::config().model)
-            .expect("a bundled model other than the fixture");
+            .find(|model| model.model != initial_model)
+            .expect("another built-in model");
         stage_plan(&terminal).await;
         assert_ne!(
             terminal.launch_spec().model.map(|model| model.model),

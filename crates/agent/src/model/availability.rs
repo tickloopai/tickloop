@@ -25,7 +25,7 @@ const DISCOVERY_TIMED_OUT: &str = "Model discovery timed out";
 const MAX_DIRECTORY_BYTES: usize = 1024 * 1024;
 const MAX_DIRECTORY_MODELS: usize = 10000;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ModelAvailability {
     DirectoryListed,
     Unavailable { reason: String },
@@ -44,13 +44,13 @@ impl ModelAvailability {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum DirectorySemantics {
     Directory,
     ExclusiveAuthorization,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct AccountModelDirectory {
     pub models: BTreeMap<String, ModelAvailability>,
     pub semantics: DirectorySemantics,
@@ -86,15 +86,14 @@ pub struct DiscoveryIdentity {
 
 #[derive(Clone)]
 struct CachedDirectory {
-    identity: DiscoveryIdentity,
     directory: Result<AccountModelDirectory, String>,
 }
 
 #[derive(Default)]
 struct CacheState {
     generations: HashMap<String, u64>,
-    identities: HashMap<String, DiscoveryIdentity>,
-    entries: HashMap<String, CachedDirectory>,
+    identity_generations: HashMap<DiscoveryIdentity, u64>,
+    entries: HashMap<DiscoveryIdentity, CachedDirectory>,
 }
 
 #[derive(Clone, Default)]
@@ -106,8 +105,12 @@ impl AccountModelDiscovery {
     pub fn invalidate(&self, provider: &str) {
         let mut state = self.state.lock().unwrap();
         *state.generations.entry(provider.to_owned()).or_default() += 1;
-        state.entries.remove(provider);
-        state.identities.remove(provider);
+        state
+            .entries
+            .retain(|identity, _| identity.provider != provider);
+        state
+            .identity_generations
+            .retain(|identity, _| identity.provider != provider);
     }
 
     pub async fn discover(
@@ -117,26 +120,46 @@ impl AccountModelDiscovery {
         force: bool,
         cancel: &CancellationToken,
     ) -> Result<AccountModelDirectory, String> {
-        let strategy = config
-            .connection()
-            .map_or(ModelDiscovery::Unsupported, |connection| {
-                connection.discovery
-            });
-        if strategy == ModelDiscovery::ProviderApi {
-            return self
-                .discover_with(
-                    &super::provider_directory::ProviderDirectoryAdapter { config, root },
-                    force,
-                    cancel,
-                )
-                .await;
+        let adapter = directory_adapter(config, root);
+        self.discover_with(adapter.as_ref(), force, cancel).await
+    }
+
+    pub async fn cached_directory(
+        &self,
+        config: &ModelConfig,
+        root: Option<&Path>,
+        cancel: &CancellationToken,
+    ) -> Option<Result<AccountModelDirectory, String>> {
+        let adapter = directory_adapter(config, root);
+        let initial_generations = self.state.lock().unwrap().generations.clone();
+        let identity = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Some(Err("Model discovery cancelled".into())),
+            result = tokio::time::timeout(DISCOVERY_TIMEOUT, adapter.identity(cancel)) => match result {
+                Ok(Ok(identity)) => identity,
+                Ok(Err(error)) => return Some(Err(error)),
+                Err(_) => return Some(Err(DISCOVERY_TIMED_OUT.into())),
+            },
+        };
+        let state = self.state.lock().unwrap();
+        if state
+            .generations
+            .get(&identity.provider)
+            .copied()
+            .unwrap_or(0)
+            != initial_generations
+                .get(&identity.provider)
+                .copied()
+                .unwrap_or(0)
+        {
+            return Some(Err(
+                "Model discovery superseded by an authentication change".into(),
+            ));
         }
-        if strategy == ModelDiscovery::GithubCopilot {
-            let adapter = super::copilot::CopilotDirectoryAdapter { config, root };
-            return self.discover_with(&adapter, force, cancel).await;
-        }
-        self.discover_with(&OpenAiDirectoryAdapter { config, root }, force, cancel)
-            .await
+        state
+            .entries
+            .get(&identity)
+            .map(|cached| cached.directory.clone())
     }
 
     pub async fn discover_with(
@@ -184,28 +207,19 @@ impl AccountModelDiscovery {
             {
                 return Err("Model discovery superseded by an authentication change".into());
             }
-            let same_identity = state
-                .identities
-                .get(&identity.provider)
-                .is_none_or(|current| *current == identity);
-            if force || !same_identity {
-                state.entries.remove(&identity.provider);
+            if force {
+                state.entries.remove(&identity);
                 *state
-                    .generations
-                    .entry(identity.provider.clone())
+                    .identity_generations
+                    .entry(identity.clone())
                     .or_default() += 1;
             }
-            state
-                .identities
-                .insert(identity.provider.clone(), identity.clone());
-            if let Some(cached) = state.entries.get(&identity.provider)
-                && cached.identity == identity
-            {
+            if let Some(cached) = state.entries.get(&identity) {
                 return cached.directory.clone();
             }
             *state
-                .generations
-                .entry(identity.provider.clone())
+                .identity_generations
+                .entry(identity.clone())
                 .or_default()
         };
         let (directory, timed_out) =
@@ -228,14 +242,22 @@ impl AccountModelDiscovery {
                 .get(&identity.provider)
                 .copied()
                 .unwrap_or(0)
+                != initial_generations
+                    .get(&identity.provider)
+                    .copied()
+                    .unwrap_or(0)
+            || state
+                .identity_generations
+                .get(&identity)
+                .copied()
+                .unwrap_or(0)
                 != generation
         {
             return Err("Model discovery superseded by an authentication change".into());
         }
         state.entries.insert(
-            identity.provider.clone(),
+            identity,
             CachedDirectory {
-                identity,
                 directory: directory.clone(),
             },
         );
@@ -249,6 +271,25 @@ impl AccountModelDiscovery {
 pub trait AccountDirectoryAdapter: Send + Sync {
     async fn identity(&self, cancel: &CancellationToken) -> Result<DiscoveryIdentity, String>;
     async fn fetch(&self, cancel: &CancellationToken) -> Result<AccountModelDirectory, String>;
+}
+
+fn directory_adapter<'a>(
+    config: &'a ModelConfig,
+    root: Option<&'a Path>,
+) -> Box<dyn AccountDirectoryAdapter + 'a> {
+    match config
+        .connection()
+        .map_or(ModelDiscovery::Unsupported, |connection| {
+            connection.discovery
+        }) {
+        ModelDiscovery::ProviderApi => {
+            Box::new(super::provider_directory::ProviderDirectoryAdapter { config, root })
+        }
+        ModelDiscovery::GithubCopilot => {
+            Box::new(super::copilot::CopilotDirectoryAdapter { config, root })
+        }
+        _ => Box::new(OpenAiDirectoryAdapter { config, root }),
+    }
 }
 
 struct OpenAiDirectoryAdapter<'a> {
@@ -564,6 +605,38 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn session_cache_keeps_distinct_resources_under_the_same_provider_and_refreshes_only_one()
+    {
+        let cache = AccountModelDiscovery::default();
+        let a = ControlledAdapter::new("same-account", false);
+        let b = ControlledAdapter::new("same-account", false);
+        a.identity.lock().unwrap().resource = "endpoint-a/models".into();
+        b.identity.lock().unwrap().resource = "endpoint-b/models".into();
+        let cancel = CancellationToken::new();
+        for adapter in [&a, &b, &a, &b] {
+            cache.discover_with(adapter, false, &cancel).await.unwrap();
+        }
+        assert_eq!(
+            a.calls.load(Ordering::SeqCst),
+            1,
+            "Returning to A must reuse its session directory"
+        );
+        assert_eq!(
+            b.calls.load(Ordering::SeqCst),
+            1,
+            "Returning to B must reuse its session directory"
+        );
+        cache.discover_with(&a, true, &cancel).await.unwrap();
+        cache.discover_with(&b, false, &cancel).await.unwrap();
+        assert_eq!(a.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            b.calls.load(Ordering::SeqCst),
+            1,
+            "Refreshing A must retain B's evidence"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn session_cache_reuses_identity_until_invalidation_or_explicit_refresh() {
         let cache = AccountModelDiscovery::default();
@@ -669,12 +742,15 @@ mod tests {
                 .discover_with(&newer, false, &CancellationToken::new())
                 .await
                 .unwrap();
+            *older.identity.lock().unwrap() = newer.identity.lock().unwrap().clone();
             older.release.add_permits(1);
             assert!(pending.await.unwrap().is_err());
-            assert_eq!(
-                cache.state.lock().unwrap().entries["test-provider"].identity,
-                *newer.identity.lock().unwrap()
-            );
+            let directory = cache
+                .discover_with(&newer, false, &CancellationToken::new())
+                .await
+                .unwrap();
+            assert_eq!(directory.models, newer.directory.models);
+            assert_eq!(newer.calls.load(Ordering::SeqCst), 1);
         }
     }
 
@@ -752,9 +828,9 @@ mod tests {
         assert!(pending.await.unwrap().is_err());
         assert_eq!(old.adapter.calls.load(Ordering::SeqCst), 0);
         assert_eq!(
-            cache.state.lock().unwrap().entries["test-provider"]
-                .directory
-                .as_ref()
+            cache
+                .discover_with(&relogged, false, &CancellationToken::new())
+                .await
                 .unwrap()
                 .models,
             relogged.directory.models

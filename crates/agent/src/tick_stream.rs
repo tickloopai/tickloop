@@ -84,9 +84,69 @@ pub struct TickStreamHandle {
     pub events: mpsc::Receiver<TickStreamEvent>,
 }
 
+/// A subscription's prepared query binding; admission revalidates it without reading its body.
+pub struct PreparedTickWatch {
+    provider: Arc<dyn crate::host_tools::HostToolProvider>,
+    query: crate::host_tools::PreparedHostCall,
+}
+impl PreparedTickWatch {
+    pub fn new(
+        provider: Arc<dyn crate::host_tools::HostToolProvider>,
+        query: crate::host_tools::PreparedHostCall,
+    ) -> Self {
+        Self { provider, query }
+    }
+    pub(crate) fn provider(&self) -> &dyn crate::host_tools::HostToolProvider {
+        self.provider.as_ref()
+    }
+    pub(crate) fn into_admission(
+        self,
+        input: serde_json::Value,
+    ) -> crate::host_tools::PreparedHostCall {
+        crate::host_tools::PreparedHostCall::new(
+            "SubscribeTick".into(),
+            input.clone(),
+            input,
+            self.query.permission(),
+            self.query.approval_summary().into(),
+        )
+        .with_policy_identity(
+            self.query.policy_name().into(),
+            self.query.policy_input().clone(),
+        )
+        .with_permission_input(self.query.permission_input().clone())
+        .with_payload(self)
+    }
+    pub(crate) async fn revalidate(
+        chat: Uuid,
+        call: &crate::host_tools::PreparedHostCall,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<(), String> {
+        let watch = call
+            .payload::<Self>()
+            .ok_or("Tick watch lost its prepared query")?;
+        watch
+            .provider
+            .revalidate_call(chat, &watch.query, cancel)
+            .await
+    }
+}
+
+#[async_trait::async_trait]
 pub trait TickStreamPort: Send + Sync + 'static {
     fn open(&self) -> TickStreamHandle;
     fn set_cadences(&self, _cadences: BTreeMap<WatchId, u64>) {}
+    /// Caller identities for active watches, including restored subscriptions.
+    fn set_watch_chats(&self, _chats: BTreeMap<WatchId, Uuid>) {}
+    /// Adapters prepare their read operation so watching inherits its policy and ownership.
+    async fn prepare_watch(
+        &self,
+        _chat: Uuid,
+        _instance: &InstanceRef,
+        _cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<Option<PreparedTickWatch>, String> {
+        Ok(None)
+    }
 }
 
 /// A finite latest-only mailbox. Producers never wait for a slow Agent: each watch keeps one
@@ -108,6 +168,23 @@ struct EventMailbox {
 }
 
 impl EventPublisher {
+    pub fn publish(&self, event: TickStreamEvent) {
+        match event {
+            TickStreamEvent::Metadata {
+                instance,
+                audience,
+                metadata,
+            } => self.metadata(instance, audience, metadata),
+            TickStreamEvent::Ready { watch } => self.ready(watch),
+            TickStreamEvent::Observation { audience, value } => self.observation(&audience, value),
+            TickStreamEvent::State {
+                instance,
+                state,
+                audience,
+            } => self.state_to(instance, state, audience),
+            TickStreamEvent::Gap { instance, audience } => self.gap_to(instance, audience),
+        }
+    }
     pub fn channel() -> (Self, mpsc::Receiver<TickStreamEvent>) {
         let publisher = Self {
             state: Arc::new(Mutex::new(EventMailbox::default())),
@@ -193,7 +270,7 @@ impl EventPublisher {
         self.wake.notify_one();
     }
 
-    fn state_to(
+    pub fn state_to(
         &self,
         instance: InstanceRef,
         state: TickConnectionState,
@@ -213,7 +290,7 @@ impl EventPublisher {
         self.wake.notify_one();
     }
 
-    fn gap_to(&self, instance: InstanceRef, audience: impl IntoIterator<Item = WatchId>) {
+    pub fn gap_to(&self, instance: InstanceRef, audience: impl IntoIterator<Item = WatchId>) {
         let mut mailbox = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         for watch in audience {
             mailbox.gaps.insert(watch, instance.clone());

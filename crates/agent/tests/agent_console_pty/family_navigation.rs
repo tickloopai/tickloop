@@ -272,7 +272,12 @@ async fn run_family_navigation(fixture: &PrivateFixture) {
         }
     })
     .await
-    .expect("two real mapped delegations must finish in the same family");
+    .unwrap_or_else(|error| {
+        panic!(
+            "two real mapped delegations must finish: {error}; frame: {}",
+            pty.frame()
+        )
+    });
     let main = rows.iter().find(|row| row.title == MAIN_TASK).unwrap();
     let first = rows
         .iter()
@@ -311,6 +316,40 @@ async fn run_family_navigation(fixture: &PrivateFixture) {
             && editor_has_focus(&captured)
     })
     .await;
+    pty.resize(38, 24).await;
+    pty.send(b"\x1b[B");
+    let entry_focused = pty
+        .wait_for("fallback entry hint follows family members", |frame| {
+            frame
+                .lines()
+                .last()
+                .is_some_and(|line| line.contains("Enter/Space hide"))
+        })
+        .await;
+    let rows = entry_focused.lines().collect::<Vec<_>>();
+    let entry = rows
+        .iter()
+        .position(|line| line.contains("Subagents 2"))
+        .unwrap();
+    assert!(rows[entry + 1].contains("Main ·"), "{entry_focused}");
+    assert!(!entry_focused.contains("items"));
+    pty.send(b"\x1b[B");
+    let list_focused = pty
+        .wait_for("fallback list hint matches its focus", |frame| {
+            frame
+                .lines()
+                .last()
+                .is_some_and(|line| line.contains("Enter open · Space fold · Esc entry"))
+        })
+        .await;
+    assert!(!list_focused.contains("Enter/Space hide"));
+    eprintln!("[fallback-family-focused]\n{list_focused}\n[/fallback-family-focused]");
+    pty.send(b"\x1b\x1b");
+    pty.wait_for("fallback focus returns to input", |_| {
+        editor_has_focus(&captured)
+    })
+    .await;
+    pty.resize(TERMINAL_WIDTH, TERMINAL_HEIGHT).await;
     super::unified_footer::click_category(&mut pty, "Subagents 2");
     pty.wait_for("mouse collapses the completed family", |frame| {
         frame.contains("Enter/Space expand") && !family_rows_are_visible(frame)

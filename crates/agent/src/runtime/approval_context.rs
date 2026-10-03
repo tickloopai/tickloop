@@ -12,7 +12,7 @@ use super::{ChatSnapshot, OperationRecord};
 use crate::model::{Content, Role};
 
 pub(super) const APPROVAL_CONTEXT_VERSION: &str = "trusted-approval-v2";
-pub(super) const REVIEW_TEMPLATE_VERSION: &str = "auto-review-v2";
+pub(super) const REVIEW_TEMPLATE_VERSION: &str = "auto-review-v3";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct OriginalUserInput {

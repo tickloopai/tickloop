@@ -20,6 +20,7 @@ pub(super) struct TickShell {
     surface: Option<TaskSurface>,
     confirm_stop: bool,
     error: Option<String>,
+    last_refresh_ms: Option<u64>,
 }
 
 pub(super) enum TickShellKey {
@@ -39,7 +40,22 @@ impl TickShell {
             surface: None,
             confirm_stop: false,
             error: None,
+            last_refresh_ms: None,
         }
+    }
+    pub(super) fn is_loaded(&self) -> bool {
+        self.surface.is_some()
+    }
+    pub(super) fn should_refresh(&mut self, now: u64) -> bool {
+        const REFRESH_INTERVAL_MS: u64 = 250;
+        if self
+            .last_refresh_ms
+            .is_some_and(|last| now.saturating_sub(last) < REFRESH_INTERVAL_MS)
+        {
+            return false;
+        }
+        self.last_refresh_ms = Some(now);
+        true
     }
     pub(super) fn load(
         &mut self,
@@ -54,14 +70,7 @@ impl TickShell {
         self.error = None;
         self.started_at_ms = self.started_at_ms.or(started_at_ms);
         if self.surface.is_some() {
-            let effect = self.update(snapshot.clone())?;
-            return if effect == TaskSurfaceEffect::None {
-                self.surface
-                    .as_mut()
-                    .map(|surface| surface.reopen(snapshot))
-            } else {
-                Some(effect)
-            };
+            return self.update(snapshot);
         }
         let mut surface = TaskSurface::open(snapshot, ());
         let effect = surface.initial_effect();
@@ -82,7 +91,12 @@ impl TickShell {
             self.surface
                 .as_mut()
                 .map_or(TaskSurfaceEffect::None, |surface| {
-                    surface.update_snapshot(snapshot)
+                    let effect = surface.update_snapshot(snapshot.clone());
+                    if effect == TaskSurfaceEffect::None {
+                        surface.reopen(snapshot)
+                    } else {
+                        effect
+                    }
                 }),
         )
     }
@@ -118,6 +132,10 @@ impl TickShell {
             surface.clear_action_error();
         }
     }
+    pub(super) fn is_confirming_stop(&self) -> bool {
+        self.confirm_stop
+    }
+
     fn can_stop(&self) -> bool {
         self.task
             .as_ref()
@@ -211,7 +229,11 @@ impl TickShell {
         lines.truncate(height.saturating_sub(1));
         lines.resize_with(height.saturating_sub(1), RoleLine::default);
         if height > 0 {
-            let hint = self.hint();
+            let hint = if self.confirm_stop {
+                String::new()
+            } else {
+                self.hint()
+            };
             lines.push(RoleLine::role(hint, Role::MutedText));
         }
         for line in &mut lines {
@@ -237,21 +259,7 @@ impl TickShell {
     }
 }
 
-pub(super) fn shell_status(task: &ShellTask) -> String {
-    if task.state == crate::runtime::ShellTaskState::Unknown {
-        "unknown".into()
-    } else if !task.state.is_terminal() {
-        "running".into()
-    } else if let Some(signal) = task.signal {
-        format!("signal {signal}")
-    } else if let Some(exit) = task.exit_code {
-        format!("exit {exit}")
-    } else if task.reason.is_some() {
-        "stopped".into()
-    } else {
-        "unknown".into()
-    }
-}
+pub(super) use crate::tick_adapter::shell_status;
 
 #[cfg(test)]
 mod tests {

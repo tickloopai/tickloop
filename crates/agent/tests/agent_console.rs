@@ -360,6 +360,7 @@ async fn overview_prioritizes_a_waiting_child_family_before_an_independent_runni
     for execution in [independent, parent] {
         for command in [
             AgentCommand::Configure {
+                provider: None,
                 execution,
                 change: ConfigurationChange::ExecutionMode {
                     mode: tickloop_agent::permissions::ExecutionMode::FullAccess,
@@ -1045,6 +1046,7 @@ async fn overview_rows_tell_configured_empty_sessions_from_agents_that_worked() 
             owner_epoch: epoch,
             command_id: Uuid::new_v4(),
             command: AgentCommand::Configure {
+                provider: None,
                 execution: configured,
                 change: ConfigurationChange::ExecutionMode {
                     mode: tickloop_agent::permissions::ExecutionMode::FullAccess,

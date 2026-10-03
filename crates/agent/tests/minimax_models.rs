@@ -194,7 +194,12 @@ async fn structured_response_uses_auto_tool_selection_and_rejects_extra_operatio
             .complete(input, events, CancellationToken::new())
             .await;
         if extra {
-            assert!(matches!(output, Err(ModelError::InvalidResponse(_))));
+            assert!(matches!(
+                output,
+                Err(ModelError::ResponseRejected(
+                    tickloop_agent::model::ModelResponseRejection::UnexpectedToolOperation
+                ))
+            ));
         } else {
             let output = output.unwrap();
             assert_eq!(output.stop_reason, "end_turn");

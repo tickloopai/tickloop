@@ -500,6 +500,7 @@ async fn a_real_worker_keeps_shell_execution_after_ui_disconnect_and_exits_on_li
         .env("PATH", "/usr/bin:/bin")
         .env("HOME", temporary.path())
         .env("TICKLOOP_FIXTURE_API_KEY", "fixture-key")
+        .env("DEEPSEEK_API_KEY", "fixture-compiled-selection-key")
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -658,6 +659,7 @@ async fn concurrent_cold_start_uses_one_isolated_owner_and_owner_exit_closes_wor
         launch.environment = [
             ("PATH", "/usr/bin:/bin"),
             ("TICKLOOP_FIXTURE_API_KEY", "fixture-key"),
+            ("DEEPSEEK_API_KEY", "fixture-compiled-selection-key"),
             ("TICKLOOP_FIXTURE_WORKER", label),
         ]
         .into_iter()
@@ -721,7 +723,12 @@ async fn concurrent_cold_start_uses_one_isolated_owner_and_owner_exit_closes_wor
                     .await
                     .unwrap();
                 if let ObservationValue::Agent(snapshot) = observation.initial {
-                    assert_eq!(snapshot.model.name, *label);
+                    assert_eq!(
+                        snapshot.model,
+                        tickloop_agent::model::cards::ModelCatalog::defaults()
+                            .get("deepseek-api", "deepseek-flash")
+                            .unwrap()
+                    );
                     if snapshot.user_shells.iter().any(|record| {
                         record.id == *task_id
                             && record.state == tickloop_agent::runtime::UserShellState::Completed
@@ -1942,6 +1949,7 @@ async fn an_oversized_accepted_receipt_stays_queryable_without_replaying_the_com
     let command = envelope(
         client.owner_epoch(),
         AgentCommand::Configure {
+            provider: None,
             execution: target,
             change: ConfigurationChange::Directories {
                 workdir: temporary.path().to_path_buf(),

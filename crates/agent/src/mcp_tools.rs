@@ -40,6 +40,7 @@ use crate::{
 };
 
 const SERVER_NAMESPACE: &str = "artifacts";
+const ARTIFACT_ATTACHMENT_URI: &str = "tickloop://artifact-tick-attachments/v1";
 const MAX_TOOLS: usize = 128;
 const DIRECTORY_TIMEOUT: Duration = Duration::from_secs(30);
 const CALL_TIMEOUT: Duration = Duration::from_secs(45);
@@ -95,6 +96,29 @@ struct PublicationTool {
     operation_id_argument: String,
     source_key_result: String,
     version_key_result: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ArtifactAttachmentDescriptor {
+    version: u8,
+    creation_tools: Vec<CreationTool>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CreationTool {
+    tool: String,
+    operation_id_argument: String,
+    artifact_id_result: String,
+    title_argument: String,
+    format_argument: String,
+    url_result: String,
+}
+
+struct ArtifactAttachments {
+    creation_tools: Vec<CreationTool>,
+    fingerprint: [u8; 32],
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -160,12 +184,15 @@ struct Directory {
     protocol_version: ProtocolVersion,
     tools: Vec<DiscoveredTool>,
     bridge: Option<EventBridge>,
+    attachments: Option<ArtifactAttachments>,
 }
 
 struct PreparedMcpCall {
     credential: CredentialSnapshot,
     fingerprint: [u8; 32],
     bridge_fingerprint: Option<[u8; 32]>,
+    attachment_fingerprint: Option<[u8; 32]>,
+    creation: Option<CreationTool>,
     remote_name: String,
     arguments: Value,
     publication: Option<PublicationTool>,
@@ -440,6 +467,28 @@ impl McpHostToolProvider {
             };
             directory.bridge = Some(Self::parse_bridge(&text, &directory)?);
         }
+        if service
+            .peer()
+            .peer_info()
+            .is_some_and(|info| info.capabilities.resources.is_some())
+        {
+            let resources =
+                tokio::time::timeout(DIRECTORY_TIMEOUT, service.peer().list_all_resources())
+                    .await
+                    .map_err(|_| "MCP resource directory unavailable")?
+                    .map_err(|_| "MCP resource directory unavailable")?;
+            if resources
+                .iter()
+                .any(|resource| resource.uri == ARTIFACT_ATTACHMENT_URI)
+            {
+                let DescriptorRead::Text(text) =
+                    Self::read_descriptor(service.peer(), ARTIFACT_ATTACHMENT_URI).await
+                else {
+                    return Err("MCP artifact attachment descriptor unavailable".into());
+                };
+                directory.attachments = Some(Self::parse_attachments(&text, &directory)?);
+            }
+        }
         Ok((directory, service, http))
     }
 
@@ -621,6 +670,7 @@ impl McpHostToolProvider {
             protocol_version,
             tools: mapped,
             bridge: None,
+            attachments: None,
         })
     }
 
@@ -691,6 +741,105 @@ impl McpHostToolProvider {
         Ok(descriptor)
     }
 
+    fn parse_attachments(text: &str, directory: &Directory) -> Result<ArtifactAttachments, String> {
+        const INVALID: &str = "MCP artifact attachment descriptor is invalid";
+        let descriptor: ArtifactAttachmentDescriptor =
+            serde_json::from_str(text).map_err(|_| INVALID)?;
+        if descriptor.version != 1
+            || descriptor.creation_tools.is_empty()
+            || descriptor.creation_tools.len() > MAX_TOOLS
+        {
+            return Err(INVALID.into());
+        }
+        let mut names = HashSet::new();
+        for mapping in &descriptor.creation_tools {
+            let arguments = [
+                &mapping.operation_id_argument,
+                &mapping.title_argument,
+                &mapping.format_argument,
+            ];
+            let tool = directory
+                .tools
+                .iter()
+                .find(|tool| tool.remote_name == mapping.tool)
+                .ok_or(INVALID)?;
+            let properties = tool
+                .definition
+                .input_schema
+                .get("properties")
+                .and_then(Value::as_object)
+                .ok_or(INVALID)?;
+            if !names.insert(&mapping.tool)
+                || arguments.iter().collect::<HashSet<_>>().len() != arguments.len()
+                || !arguments
+                    .iter()
+                    .all(|key| is_argument_key(key) && properties.contains_key(key.as_str()))
+                || !is_argument_key(&mapping.artifact_id_result)
+                || !is_argument_key(&mapping.url_result)
+                || directory.bridge.as_ref().is_some_and(|bridge| {
+                    bridge.tools.names().contains(&mapping.tool.as_str())
+                        || bridge
+                            .publication_tools
+                            .iter()
+                            .any(|tool| tool.tool == mapping.tool)
+                        || bridge
+                            .connection
+                            .as_ref()
+                            .is_some_and(|tool| tool.tool == mapping.tool)
+                })
+            {
+                return Err(INVALID.into());
+            }
+        }
+        let fingerprint =
+            Sha256::digest(serde_json::to_vec(&descriptor).map_err(|_| INVALID)?).into();
+        Ok(ArtifactAttachments {
+            creation_tools: descriptor.creation_tools,
+            fingerprint,
+        })
+    }
+
+    fn creation_effect(
+        result: &rmcp::model::CallToolResult,
+        prepared: &PreparedMcpCall,
+    ) -> Option<crate::artifacts::ArtifactTick> {
+        if result.is_error == Some(true) {
+            return None;
+        }
+        let mapping = prepared.creation.as_ref()?;
+        let structured = result.structured_content.as_ref()?;
+        if structured.get("status")?.as_str()? != "committed"
+            || bounded_identifier(structured.get("operation_id"))?
+                != bounded_identifier(prepared.arguments.get(&mapping.operation_id_argument))?
+        {
+            return None;
+        }
+        let artifact_id = bounded_identifier(structured.get(&mapping.artifact_id_result))?;
+        if artifact_id.contains(['/', '?', '#']) {
+            return None;
+        }
+        let title = prepared.arguments.get(&mapping.title_argument)?.as_str()?;
+        let format = prepared.arguments.get(&mapping.format_argument)?.as_str()?;
+        if !["markdown", "html"].contains(&format) {
+            return None;
+        }
+        let url = structured.get(&mapping.url_result)?.as_str()?;
+        let parsed_url = reqwest::Url::parse(url).ok()?;
+        let origin = reqwest::Url::parse(&prepared.credential.origin).ok()?;
+        if parsed_url.origin() != origin.origin() {
+            return None;
+        }
+        Some(crate::artifacts::ArtifactTick {
+            artifact_id: artifact_id.into(),
+            origin: prepared.credential.origin.clone(),
+            title: title.into(),
+            format: format.into(),
+            url: url.into(),
+            access_role: "owner".into(),
+            added_at_ms: crate::private_fs::unix_time_milliseconds(),
+        })
+    }
+
     fn publication_effect(
         result: &rmcp::model::CallToolResult,
         publication: &PublicationTool,
@@ -736,6 +885,7 @@ impl McpHostToolProvider {
             credential_generation: Self::credential_key(&prepared.credential),
             directory_fingerprint: prepared.fingerprint,
             bridge_fingerprint: prepared.bridge_fingerprint?,
+            artifact_tick: None,
         })
     }
 
@@ -1392,6 +1542,19 @@ impl McpHostToolProvider {
 
 #[async_trait]
 impl HostToolProvider for McpHostToolProvider {
+    async fn builtin_alias(
+        &self,
+        chat: ChatId,
+        name: &str,
+        input: &Value,
+    ) -> Result<Option<crate::host_tools::BuiltinToolCall>, String> {
+        match &self.native {
+            Some(native) if !Self::is_mcp_name(name) => {
+                native.builtin_alias(chat, name, input).await
+            }
+            _ => Ok(None),
+        }
+    }
     fn definitions(&self) -> Vec<ToolDefinition> {
         let mut definitions = self
             .native
@@ -1917,7 +2080,16 @@ impl HostToolProvider for McpHostToolProvider {
         if cancel.is_cancelled() {
             return Err("MCP call cancelled".into());
         }
-        let (tool, fingerprint, expected_key, bridge_fingerprint, publication, connection) = {
+        let (
+            tool,
+            fingerprint,
+            expected_key,
+            bridge_fingerprint,
+            attachment_fingerprint,
+            creation,
+            publication,
+            connection,
+        ) = {
             let directory = self.directory.read().unwrap();
             let directory = directory
                 .as_ref()
@@ -1950,11 +2122,26 @@ impl HostToolProvider for McpHostToolProvider {
                 .and_then(|bridge| bridge.connection.as_ref())
                 .filter(|connection| connection.tool == tool.remote_name)
                 .cloned();
+            let creation = directory
+                .attachments
+                .as_ref()
+                .and_then(|attachments| {
+                    attachments
+                        .creation_tools
+                        .iter()
+                        .find(|mapping| mapping.tool == tool.remote_name)
+                })
+                .cloned();
             (
                 tool,
                 directory.fingerprint,
                 directory.credential_key,
                 bridge_fingerprint,
+                directory
+                    .attachments
+                    .as_ref()
+                    .map(|attachments| attachments.fingerprint),
+                creation,
                 publication,
                 connection,
             )
@@ -2017,6 +2204,8 @@ impl HostToolProvider for McpHostToolProvider {
                 credential,
                 fingerprint,
                 bridge_fingerprint,
+                attachment_fingerprint,
+                creation: None,
                 remote_name: tool.remote_name,
                 arguments: input.clone(),
                 publication: None,
@@ -2044,6 +2233,8 @@ impl HostToolProvider for McpHostToolProvider {
             credential,
             fingerprint,
             bridge_fingerprint,
+            attachment_fingerprint,
+            creation,
             remote_name: tool.remote_name,
             arguments: input.clone(),
             publication,
@@ -2080,6 +2271,11 @@ impl HostToolProvider for McpHostToolProvider {
         if directory.fingerprint != prepared.fingerprint
             || directory.bridge.as_ref().map(|bridge| bridge.fingerprint)
                 != prepared.bridge_fingerprint
+            || directory
+                .attachments
+                .as_ref()
+                .map(|attachments| attachments.fingerprint)
+                != prepared.attachment_fingerprint
             || !directory.tools.iter().any(|tool| {
                 tool.remote_name == prepared.remote_name && tool.definition.name == call.name()
             })
@@ -2222,9 +2418,28 @@ impl HostToolProvider for McpHostToolProvider {
         }
         match outcome {
             Ok(Ok(rmcp::model::CallToolResponse::Complete(result))) => {
-                let effect = prepared.publication.as_ref().and_then(|publication| {
+                let creation = Self::creation_effect(&result, &prepared);
+                let mut effect = prepared.publication.as_ref().and_then(|publication| {
                     Self::publication_effect(&result, publication, &prepared)
                 });
+                if let Some(effect) = &mut effect {
+                    let metadata = tokio::select! {
+                        _ = cancel.cancelled() => None,
+                        metadata = self.artifact.read(&effect.source_key) => metadata.ok(),
+                    };
+                    if let Some(metadata) = metadata {
+                        effect.artifact_tick = Some(metadata.tick(
+                            &prepared.credential.origin,
+                            crate::private_fs::unix_time_milliseconds(),
+                        ));
+                    }
+                    if !self.credential_is_current(&prepared.credential) {
+                        return HostCallResult::OutcomeUnknown(
+                            "Artifact account changed after publication; query its operation ID"
+                                .into(),
+                        );
+                    }
+                }
                 let mut tool_result =
                     Self::model_result(result, &prepared.credential.access_token, false);
                 if let Some(context) = &event_context {
@@ -2237,7 +2452,13 @@ impl HostToolProvider for McpHostToolProvider {
                         tool_result,
                         Box::new(HostEffect::PublishedSource(effect)),
                     ),
-                    None => HostCallResult::Completed(tool_result),
+                    None => match creation {
+                        Some(tick) => HostCallResult::CompletedWithEffect(
+                            tool_result,
+                            Box::new(HostEffect::CreatedArtifact(tick)),
+                        ),
+                        None => HostCallResult::Completed(tool_result),
+                    },
                 }
             }
             Ok(Ok(_)) => HostCallResult::OutcomeUnknown(

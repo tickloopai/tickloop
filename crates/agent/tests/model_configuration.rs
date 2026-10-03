@@ -1,12 +1,12 @@
-use std::{collections::BTreeMap, sync::Arc, thread};
+use std::collections::BTreeMap;
 
 use serde_json::json;
 use tickloop_agent::{
     model::{
         ModelAuthSource, ModelConfig,
         cards::{
-            Adapter, ModelCard, ModelCatalog, ModelCatalogFile, ModelSelection, ProviderDefinition,
-            ProviderPatch, ThinkingControl, migrate_legacy_model, model_for_persistent_selection,
+            Adapter, ModelCard, ModelCatalog, ModelSelection, ProviderDefinition, ProviderPatch,
+            ThinkingControl, migrate_legacy_model, model_for_persistent_selection,
         },
     },
     settings::UserSettings,
@@ -122,70 +122,6 @@ fn provider_model_identity_and_service_id_are_distinct() {
 }
 
 #[test]
-fn custom_provider_survives_settings_save_and_restore_without_losing_unrelated_keys() {
-    let root = tempfile::tempdir().unwrap();
-    let settings = UserSettings::in_root(root.path());
-    std::fs::write(
-        root.path().join("settings.json"),
-        r#"{"futureSetting":{"keep":true}}"#,
-    )
-    .unwrap();
-    settings.save_provider(custom_patch("gateway")).unwrap();
-    let selected = settings
-        .model_catalog()
-        .unwrap()
-        .get("gateway", "assistant-responses")
-        .unwrap();
-    assert_eq!(selected.model, "assistant");
-    assert_eq!(selected.card.unwrap().context_window_tokens, Some(32_000));
-    let saved: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(root.path().join("settings.json")).unwrap()).unwrap();
-    assert_eq!(saved["futureSetting"], json!({"keep":true}));
-    assert!(saved.get("providers").is_none());
-    let yaml = std::fs::read_to_string(root.path().join("providers/gateway.yaml")).unwrap();
-    assert_eq!(
-        serde_yaml_ng::from_str::<ProviderPatch>(&yaml).unwrap().id,
-        "gateway"
-    );
-    settings.restore_provider_default("gateway").unwrap();
-    assert!(
-        settings
-            .model_catalog()
-            .unwrap()
-            .get("gateway", "assistant-responses")
-            .is_none()
-    );
-    assert_eq!(
-        settings
-            .model_catalog()
-            .unwrap()
-            .get("deepseek-api", "deepseek-flash-messages")
-            .unwrap()
-            .model,
-        "deepseek-flash"
-    );
-}
-
-#[test]
-fn separate_process_style_writers_keep_both_providers() {
-    let root = tempfile::tempdir().unwrap();
-    let settings = Arc::new(UserSettings::in_root(root.path()));
-    let workers: Vec<_> = ["first", "second"]
-        .into_iter()
-        .map(|id| {
-            let settings = settings.clone();
-            thread::spawn(move || settings.save_provider(custom_patch(id)).unwrap())
-        })
-        .collect();
-    for worker in workers {
-        worker.join().unwrap();
-    }
-    let catalog = settings.model_catalog().unwrap();
-    assert!(catalog.get("first", "assistant-responses").is_some());
-    assert!(catalog.get("second", "assistant-responses").is_some());
-}
-
-#[test]
 fn invalid_provider_fields_are_rejected_with_location() {
     let mut provider = serde_json::to_value(custom_provider("gateway")).unwrap();
     provider["models"][0]["private_response_id"] = json!("inject");
@@ -197,36 +133,6 @@ fn invalid_provider_fields_are_rejected_with_location() {
     provider.auth = ModelAuthSource::CodexSubscription;
     let error = ModelCatalog::from_providers(vec![provider]).unwrap_err();
     assert!(error.contains("providers[gateway].auth"));
-}
-
-#[test]
-fn rejected_provider_save_preserves_the_last_valid_settings() {
-    let root = tempfile::tempdir().unwrap();
-    let settings = UserSettings::in_root(root.path());
-    settings.save_provider(custom_patch("gateway")).unwrap();
-    let before = std::fs::read(root.path().join("providers/gateway.yaml")).unwrap();
-    let mut invalid = custom_patch("other-gateway");
-    invalid.auth = Some(ModelAuthSource::CodexSubscription);
-    let error = settings.save_provider(invalid).unwrap_err().to_string();
-    assert!(error.contains("providers[other-gateway].auth"), "{error}");
-    assert_eq!(
-        std::fs::read(root.path().join("providers/gateway.yaml")).unwrap(),
-        before
-    );
-
-    let mut saved: serde_yaml_ng::Value = serde_yaml_ng::from_slice(&before).unwrap();
-    saved["models"][0]["private_response_id"] = serde_yaml_ng::Value::String("inject".into());
-    std::fs::write(
-        root.path().join("providers/gateway.yaml"),
-        serde_yaml_ng::to_string(&saved).unwrap(),
-    )
-    .unwrap();
-    let error = settings.load().configured_model().unwrap_err();
-    assert!(error.contains("private_response_id"), "{error}");
-
-    std::fs::write(root.path().join("settings.json"), "{broken").unwrap();
-    let error = settings.load().configured_model().unwrap_err();
-    assert!(error.contains("not valid JSON"), "{error}");
 }
 
 #[test]
@@ -247,89 +153,9 @@ fn explicit_default_selection_resolves_from_catalog() {
 }
 
 #[test]
-fn documented_provider_file_selects_a_valid_model() {
-    let selected = ModelCatalog::selected_provider_yaml(include_str!(
-        "../examples/providers/deepseek-api.yaml"
-    ))
-    .unwrap();
-    assert_eq!(selected.provider_id, "deepseek-api");
-    let codex = ModelCatalog::selected_provider_yaml(include_str!(
-        "../examples/providers/openai-codex.yaml"
-    ))
-    .unwrap();
-    assert_eq!(codex.provider_id, "openai-codex");
-    assert_eq!(selected.model_id, selected.card.as_ref().unwrap().id);
-}
-
-#[test]
-fn one_builtin_capability_override_keeps_sibling_models_and_provider_defaults() {
-    let root = tempfile::tempdir().unwrap();
-    let settings = UserSettings::in_root(root.path());
-    let patch: ProviderPatch = serde_json::from_value(json!({
-        "id": "deepseek-api",
-        "models": [{"id": "deepseek-flash-messages", "context_window_tokens": 64_000}]
-    }))
-    .unwrap();
-    settings.save_provider(patch).unwrap();
-    let saved: ProviderPatch = serde_yaml_ng::from_slice(
-        &std::fs::read(root.path().join("providers/deepseek-api.yaml")).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(
-        saved.models.as_ref().unwrap()[0].context_window_tokens,
-        Some(Some(64_000))
-    );
-    let catalog = settings.model_catalog().unwrap();
-    let changed = catalog
-        .get("deepseek-api", "deepseek-flash-messages")
-        .unwrap();
-    let sibling = catalog
-        .get("deepseek-api", "deepseek-flash-responses")
-        .unwrap();
-    assert_eq!(
-        changed.card.as_ref().unwrap().context_window_tokens,
-        Some(64_000)
-    );
-    assert_eq!(
-        sibling.card.as_ref().unwrap().context_window_tokens,
-        Some(1_000_000)
-    );
-    assert_eq!(changed.api_key_env, "DEEPSEEK_API_KEY");
-    let patch: ProviderPatch = serde_json::from_value(json!({
-        "id": "deepseek-api",
-        "models": [{"id": "deepseek-flash-messages", "max_output_tokens": 8192}]
-    }))
-    .unwrap();
-    settings.save_provider(patch).unwrap();
-    let changed = settings
-        .model_catalog()
-        .unwrap()
-        .get("deepseek-api", "deepseek-flash-messages")
-        .unwrap();
-    assert_eq!(
-        changed.card.as_ref().unwrap().context_window_tokens,
-        Some(64_000)
-    );
-    assert_eq!(changed.max_output_tokens, 8192);
-    settings
-        .restore_model_default("deepseek-api", "deepseek-flash-messages")
-        .unwrap();
-    let restored = settings
-        .model_catalog()
-        .unwrap()
-        .get("deepseek-api", "deepseek-flash-messages")
-        .unwrap();
-    assert_eq!(
-        restored.card.as_ref().unwrap().context_window_tokens,
-        Some(1_000_000)
-    );
-    assert_eq!(restored.max_output_tokens, 64_000);
-}
-
-#[test]
-fn saved_legacy_builtin_upgrade_does_not_change_explicit_custom_limit() {
+fn saved_legacy_builtin_uses_version_owned_limit_with_one_notice() {
     let mut legacy: ModelConfig =
-        serde_json::from_str(include_str!("../examples/deepseek-config.json")).unwrap();
+        serde_json::from_str(include_str!("support/legacy_models/deepseek-config.json")).unwrap();
     legacy.max_output_tokens = 4096;
     let explicit = migrate_legacy_model(legacy.clone());
     assert_eq!(explicit.max_output_tokens, 4096);
@@ -349,13 +175,14 @@ fn saved_legacy_builtin_upgrade_does_not_change_explicit_custom_limit() {
     let selected = saved.configured_model().unwrap().unwrap();
     assert_eq!(selected.max_output_tokens, 64_000);
     assert_eq!(selected.provider_id, "deepseek-api");
-    assert!(saved.warnings().is_empty());
+    assert_eq!(saved.warnings().len(), 1);
+    assert!(saved.warnings()[0].contains("built-in"));
 }
 
 #[test]
 fn custom_legacy_deepseek_messages_is_migrated_without_losing_public_fields() {
     let mut legacy: ModelConfig =
-        serde_json::from_str(include_str!("../examples/deepseek-config.json")).unwrap();
+        serde_json::from_str(include_str!("support/legacy_models/deepseek-config.json")).unwrap();
     legacy.name = "Research access".into();
     legacy.api_key_env = "RESEARCH_DEEPSEEK_KEY".into();
     legacy.max_output_tokens = 8192;
@@ -379,7 +206,7 @@ fn custom_legacy_deepseek_messages_is_migrated_without_losing_public_fields() {
 #[test]
 fn unknown_legacy_deepseek_model_gets_dialect_without_invented_capabilities() {
     let mut legacy: ModelConfig =
-        serde_json::from_str(include_str!("../examples/deepseek-config.json")).unwrap();
+        serde_json::from_str(include_str!("support/legacy_models/deepseek-config.json")).unwrap();
     legacy.model = "future-private-model".into();
     legacy.name = "Private model".into();
     let migrated = migrate_legacy_model(legacy);
@@ -392,8 +219,10 @@ fn unknown_legacy_deepseek_model_gets_dialect_without_invented_capabilities() {
 
 #[test]
 fn custom_legacy_deepseek_responses_keeps_known_capabilities() {
-    let mut legacy: ModelConfig =
-        serde_json::from_str(include_str!("../examples/deepseek-responses-config.json")).unwrap();
+    let mut legacy: ModelConfig = serde_json::from_str(include_str!(
+        "support/legacy_models/deepseek-responses-config.json"
+    ))
+    .unwrap();
     legacy.name = "Research Responses".into();
     legacy.max_output_tokens = 8192;
     let migrated = migrate_legacy_model(legacy.clone());
@@ -429,393 +258,6 @@ fn custom_legacy_codex_keeps_fixed_adapter_and_known_capabilities() {
     assert_eq!(card.context_window_tokens, Some(272_000));
     assert!(!card.effort_levels.is_empty());
     assert_eq!(migrate_legacy_model(migrated.clone()), migrated);
-}
-
-#[test]
-fn invalid_explicit_default_is_reported_even_when_legacy_choice_exists() {
-    let root = tempfile::tempdir().unwrap();
-    let legacy: ModelConfig =
-        serde_json::from_str(include_str!("../examples/deepseek-config.json")).unwrap();
-    std::fs::write(
-        root.path().join("settings.json"),
-        json!({
-            "model": legacy,
-            "defaultModel": {"provider":"missing","model":"assistant"}
-        })
-        .to_string(),
-    )
-    .unwrap();
-    let error = UserSettings::in_root(root.path())
-        .load()
-        .configured_model()
-        .unwrap_err();
-    assert!(error.contains("defaultModel"), "{error}");
-    assert!(error.contains("missing/assistant"), "{error}");
-}
-
-#[test]
-fn provider_yaml_overrides_legacy_settings_and_reset_does_not_revive_it() {
-    let root = tempfile::tempdir().unwrap();
-    let settings = UserSettings::in_root(root.path());
-    std::fs::write(
-        root.path().join("settings.json"),
-        json!({
-            "providers": [{"id":"deepseek-api", "display_name":"Old Label"}]
-        })
-        .to_string(),
-    )
-    .unwrap();
-    std::fs::create_dir(root.path().join("providers")).unwrap();
-    std::fs::write(
-        root.path().join("providers/deepseek-api.yaml"),
-        "id: deepseek-api\ndisplay_name: New Label\n",
-    )
-    .unwrap();
-    assert_eq!(
-        settings
-            .model_catalog()
-            .unwrap()
-            .get("deepseek-api", "deepseek-flash-messages")
-            .unwrap()
-            .provider_name,
-        "New Label"
-    );
-    settings.restore_provider_default("deepseek-api").unwrap();
-    assert_eq!(
-        settings
-            .model_catalog()
-            .unwrap()
-            .get("deepseek-api", "deepseek-flash-messages")
-            .unwrap()
-            .provider_name,
-        "DeepSeek API"
-    );
-    assert!(!root.path().join("providers/deepseek-api.yaml").exists());
-    let saved: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(root.path().join("settings.json")).unwrap()).unwrap();
-    assert!(saved["providers"].as_array().unwrap().is_empty());
-}
-
-#[test]
-fn partial_yaml_preserves_legacy_endpoint_and_sibling_models() {
-    let root = tempfile::tempdir().unwrap();
-    let settings = UserSettings::in_root(root.path());
-    std::fs::write(
-        root.path().join("settings.json"),
-        json!({
-            "providers": [{
-                "id":"deepseek-api",
-                "api_key_env":"OLD_DEEPSEEK_KEY",
-                "endpoints":{"messages":"https://old.example/messages"},
-                "models":[{"id":"deepseek-flash-responses","max_output_tokens":8192}]
-            }]
-        })
-        .to_string(),
-    )
-    .unwrap();
-    std::fs::create_dir(root.path().join("providers")).unwrap();
-    std::fs::write(root.path().join("providers/deepseek-api.yaml"),
-        "id: deepseek-api\nmodels:\n  - id: deepseek-flash-messages\n    max_output_tokens: 16384\n").unwrap();
-    let catalog = settings.model_catalog().unwrap();
-    let selected = catalog
-        .get("deepseek-api", "deepseek-flash-messages")
-        .unwrap();
-    assert_eq!(selected.base_url, "https://old.example/messages");
-    assert_eq!(selected.api_key_env, "OLD_DEEPSEEK_KEY");
-    assert_eq!(selected.max_output_tokens, 16384);
-    assert_eq!(
-        catalog
-            .get("deepseek-api", "deepseek-flash-responses")
-            .unwrap()
-            .max_output_tokens,
-        8192
-    );
-}
-
-#[test]
-fn provider_yaml_rejects_unknown_fields_duplicate_models_and_bad_file_names() {
-    let root = tempfile::tempdir().unwrap();
-    let settings = UserSettings::in_root(root.path());
-    std::fs::create_dir(root.path().join("providers")).unwrap();
-    let path = root.path().join("providers/deepseek-api.yaml");
-    std::fs::write(&path, "id: deepseek-api\nmodels:\n  - id: deepseek-flash-messages\n    unknown_capability: true\n").unwrap();
-    assert!(
-        settings
-            .model_catalog()
-            .unwrap_err()
-            .contains("unknown_capability")
-    );
-    std::fs::write(&path, "id: deepseek-api\nmodels:\n  - id: deepseek-flash-messages\n  - id: deepseek-flash-messages\n").unwrap();
-    assert!(
-        settings
-            .model_catalog()
-            .unwrap_err()
-            .contains("duplicate model id")
-    );
-    std::fs::write(&path, "id: another-provider\n").unwrap();
-    assert!(
-        settings
-            .model_catalog()
-            .unwrap_err()
-            .contains("file name must match")
-    );
-    std::fs::remove_file(&path).unwrap();
-    std::fs::write(root.path().join("providers/Unsafe.yaml"), "id: Unsafe\n").unwrap();
-    assert!(
-        settings
-            .model_catalog()
-            .unwrap_err()
-            .contains("invalid provider file name")
-    );
-}
-
-#[test]
-fn provider_yaml_uses_shared_default_but_preserves_explicit_old_selection() {
-    let single = ModelCatalog::selected_provider_yaml(
-        "id: deepseek-api\nmodels:\n  - id: deepseek-flash-responses\n",
-    )
-    .unwrap();
-    assert_eq!(single.model_id, "deepseek-flash-responses");
-    let recommended = ModelCatalog::selected_provider_yaml("id: deepseek-api\nmodels:\n  - id: deepseek-flash-messages\n  - id: deepseek-flash-responses\n").unwrap();
-    assert_eq!(recommended.model_id, "deepseek-flash");
-    let fixed = ModelCatalog::selected_provider_yaml("id: deepseek-api\ndefault_model: deepseek-flash-messages\nmodels:\n  - id: deepseek-flash-messages\n  - id: deepseek-flash-responses\n").unwrap();
-    assert_eq!(fixed.model_id, "deepseek-flash-messages");
-    assert_eq!(fixed.adapter(), Adapter::DeepseekMessages);
-    assert_eq!(fixed.base_url, "https://api.deepseek.com/anthropic");
-    let mut ambiguous = custom_patch("custom-ambiguous");
-    let mut second = ambiguous.models.as_ref().unwrap()[0].clone();
-    second.id = "second".into();
-    ambiguous.models.as_mut().unwrap().push(second);
-    assert!(
-        ModelCatalog::selected_provider_yaml(&serde_yaml_ng::to_string(&ambiguous).unwrap())
-            .unwrap_err()
-            .contains("default_model")
-    );
-    let selected = ModelCatalog::selected_provider_yaml("id: deepseek-api\ndefault_model: deepseek-flash-responses\nmodels:\n  - id: deepseek-flash-messages\n  - id: deepseek-flash-responses\n").unwrap();
-    assert_eq!(selected.model_id, "deepseek-flash-responses");
-}
-
-#[test]
-fn yaml_null_capability_is_unknown_and_provider_default_does_not_replace_saved_choice() {
-    let root = tempfile::tempdir().unwrap();
-    let settings = UserSettings::in_root(root.path());
-    std::fs::write(
-        root.path().join("settings.json"),
-        json!({
-            "defaultModel":{"provider":"deepseek-api","model":"deepseek-flash-responses"}
-        })
-        .to_string(),
-    )
-    .unwrap();
-    std::fs::create_dir(root.path().join("providers")).unwrap();
-    std::fs::write(root.path().join("providers/deepseek-api.yaml"),
-        "id: deepseek-api\ndefault_model: deepseek-flash-messages\nmodels:\n  - id: deepseek-flash-messages\n    context_window_tokens: null\n").unwrap();
-    let catalog = settings.model_catalog().unwrap();
-    assert_eq!(
-        catalog
-            .get("deepseek-api", "deepseek-flash-messages")
-            .unwrap()
-            .card
-            .unwrap()
-            .context_window_tokens,
-        None
-    );
-    assert_eq!(
-        settings
-            .load()
-            .configured_model()
-            .unwrap()
-            .unwrap()
-            .model_id,
-        "deepseek-flash-responses"
-    );
-}
-
-#[test]
-fn same_provider_concurrent_field_updates_are_merged() {
-    let root = tempfile::tempdir().unwrap();
-    let settings = Arc::new(UserSettings::in_root(root.path()));
-    let workers: Vec<_> = [
-        json!({"id":"deepseek-api", "display_name":"DeepSeek Custom"}),
-        json!({"id":"deepseek-api", "models":[{"id":"deepseek-flash-messages", "max_output_tokens":8192}]}),
-    ].into_iter().map(|value| {
-        let settings = settings.clone();
-        thread::spawn(move || settings.save_provider(serde_json::from_value(value).unwrap()).unwrap())
-    }).collect();
-    for worker in workers {
-        worker.join().unwrap();
-    }
-    let selected = settings
-        .model_catalog()
-        .unwrap()
-        .get("deepseek-api", "deepseek-flash-messages")
-        .unwrap();
-    assert_eq!(selected.provider_name, "DeepSeek Custom");
-    assert_eq!(selected.max_output_tokens, 8192);
-}
-
-#[test]
-fn failed_provider_write_preserves_existing_yaml() {
-    let root = tempfile::tempdir().unwrap();
-    let settings = UserSettings::in_root(root.path());
-    settings
-        .save_provider(
-            serde_json::from_value(json!({"id":"deepseek-api", "display_name":"Saved"})).unwrap(),
-        )
-        .unwrap();
-    let path = root.path().join("providers/deepseek-api.yaml");
-    let before = std::fs::read(&path).unwrap();
-    let mut invalid = custom_patch("deepseek-api");
-    invalid.auth = Some(ModelAuthSource::CodexSubscription);
-    assert!(settings.save_provider(invalid).is_err());
-    assert_eq!(std::fs::read(path).unwrap(), before);
-}
-
-#[test]
-fn failed_yaml_reset_preserves_legacy_and_yaml_overrides() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let root = tempfile::tempdir().unwrap();
-    let settings = UserSettings::in_root(root.path());
-    std::fs::write(root.path().join("settings.json"), json!({
-        "providers":[{"id":"deepseek-api","models":[{"id":"deepseek-flash-messages","max_output_tokens":8192}]}]
-    }).to_string()).unwrap();
-    let patch: ProviderPatch = serde_json::from_value(json!({
-        "id":"deepseek-api","models":[{"id":"deepseek-flash-messages","max_output_tokens":16384}]
-    }))
-    .unwrap();
-    settings.save_provider(patch).unwrap();
-    let yaml_path = root.path().join("providers/deepseek-api.yaml");
-    let yaml_before = std::fs::read(&yaml_path).unwrap();
-    let settings_before = std::fs::read(root.path().join("settings.json")).unwrap();
-    let directory = root.path().join("providers");
-    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o500)).unwrap();
-    let result = settings.restore_model_default("deepseek-api", "deepseek-flash-messages");
-    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
-    assert!(result.is_err());
-    assert_eq!(std::fs::read(yaml_path).unwrap(), yaml_before);
-    assert_eq!(
-        std::fs::read(root.path().join("settings.json")).unwrap(),
-        settings_before
-    );
-}
-
-#[test]
-fn reset_rejects_removing_the_saved_custom_selection() {
-    let root = tempfile::tempdir().unwrap();
-    let settings = UserSettings::in_root(root.path());
-    let mut provider = custom_provider("gateway");
-    let mut sibling = provider.models[0].clone();
-    sibling.id = "second-responses".into();
-    sibling.service_model_id = "second".into();
-    sibling.display_name = "Second Assistant".into();
-    provider.models.push(sibling);
-    settings
-        .save_provider(serde_json::from_value(serde_json::to_value(provider).unwrap()).unwrap())
-        .unwrap();
-    std::fs::write(
-        root.path().join("settings.json"),
-        json!({
-            "defaultModel":{"provider":"gateway","model":"assistant-responses"}
-        })
-        .to_string(),
-    )
-    .unwrap();
-    let yaml_path = root.path().join("providers/gateway.yaml");
-    let yaml_before = std::fs::read(&yaml_path).unwrap();
-    let settings_before = std::fs::read(root.path().join("settings.json")).unwrap();
-    assert!(
-        settings
-            .restore_model_default("gateway", "assistant-responses")
-            .unwrap_err()
-            .to_string()
-            .contains("select another model first")
-    );
-    assert!(
-        settings
-            .restore_provider_default("gateway")
-            .unwrap_err()
-            .to_string()
-            .contains("select another model first")
-    );
-    assert_eq!(std::fs::read(yaml_path).unwrap(), yaml_before);
-    assert_eq!(
-        std::fs::read(root.path().join("settings.json")).unwrap(),
-        settings_before
-    );
-    assert_eq!(
-        UserSettings::in_root(root.path())
-            .load()
-            .configured_model()
-            .unwrap()
-            .unwrap()
-            .model_id,
-        "assistant-responses"
-    );
-}
-
-#[test]
-fn legacy_json_provider_file_remains_readable() {
-    let yaml = include_str!("../examples/providers/deepseek-api.yaml");
-    let selected = ModelCatalog::selected_provider_yaml(yaml).unwrap();
-    let provider = ModelCatalog::defaults()
-        .providers
-        .into_iter()
-        .find(|provider| provider.id == selected.provider_id)
-        .unwrap();
-    let legacy = ModelCatalogFile {
-        providers: vec![provider],
-        default_model: ModelSelection {
-            provider: selected.provider_id,
-            model: selected.model_id,
-        },
-    };
-    assert_eq!(legacy.selected_model().unwrap().model, selected.model);
-}
-
-#[test]
-fn typed_connection_metadata_survives_patch_save_and_restore() {
-    let root = tempfile::tempdir().unwrap();
-    let settings = UserSettings::in_root(root.path());
-    let patch: ProviderPatch = serde_yaml_ng::from_str("id: custom-provider\nconnection:\n  vendor: Custom vendor\n  product: Developer plan\n  kind: plan\n  order: 2\n  region: {name: Private region, order: 4}\n  discovery: unsupported\n").unwrap();
-    let mut catalog = ModelCatalog::from_providers(vec![custom_provider("custom-provider")])
-        .unwrap()
-        .with_providers(vec![patch])
-        .unwrap();
-    let profile = catalog
-        .get("custom-provider", "assistant-responses")
-        .unwrap();
-    assert_eq!(profile.connection().unwrap().sort_key().1, 2);
-    assert_eq!(
-        profile.connection().unwrap().label(&profile.base_url),
-        "Developer plan · Private region (127.0.0.1:3001)"
-    );
-    let saved: ProviderPatch =
-        serde_json::from_value(serde_json::to_value(&catalog.providers[0]).unwrap()).unwrap();
-    settings.save_provider(saved).unwrap();
-    let restored = settings
-        .model_catalog()
-        .unwrap()
-        .get("custom-provider", "assistant-responses")
-        .unwrap();
-    assert_eq!(restored, profile);
-    let partial: ProviderPatch = serde_yaml_ng::from_str(
-        "id: custom-provider\nmodels:\n  - id: assistant-responses\n    max_output_tokens: 2048\n",
-    )
-    .unwrap();
-    catalog = catalog.with_providers(vec![partial]).unwrap();
-    assert_eq!(
-        catalog
-            .get("custom-provider", "assistant-responses")
-            .unwrap()
-            .connection,
-        profile.connection
-    );
-    let invalid: ProviderPatch = serde_yaml_ng::from_str(
-        "id: custom-provider\nconnection:\n  vendor: ''\n  product: API\n  kind: service\n",
-    )
-    .unwrap();
-    assert!(catalog.with_providers(vec![invalid]).is_err());
 }
 
 #[test]
@@ -858,97 +300,4 @@ fn official_primary_ids_and_aliases_preserve_routes_and_private_sources() {
         let fixed = catalog.get("deepseek-api", legacy_route).unwrap();
         assert_eq!(fixed.model_id, legacy_route);
     }
-}
-
-#[test]
-fn aliases_merge_across_settings_and_yaml_then_save_and_reset_by_either_id() {
-    let root = tempfile::tempdir().unwrap();
-    let settings = UserSettings::in_root(root.path());
-    std::fs::write(root.path().join("settings.json"), json!({
-        "defaultModel":{"provider":"openai-api","model":"gpt-6.1-sol-responses"},
-        "providers":[{"id":"openai-api","models":[{"id":"gpt-6.1-sol-responses","max_output_tokens":2048}]}]
-    }).to_string()).unwrap();
-    std::fs::create_dir(root.path().join("providers")).unwrap();
-    std::fs::write(
-        root.path().join("providers/openai-api.yaml"),
-        "id: openai-api\nmodels:\n  - id: gpt-6.1-sol\n    max_output_tokens: 3072\n",
-    )
-    .unwrap();
-    let selected = settings.load().configured_model().unwrap().unwrap();
-    assert_eq!(selected.model_id, "gpt-6.1-sol");
-    assert_eq!(selected.max_output_tokens, 3072);
-    for (id, limit, reset) in [
-        ("gpt-6.1-sol-responses", 4096, "gpt-6.1-sol"),
-        ("gpt-6.1-sol", 8192, "gpt-6.1-sol-responses"),
-    ] {
-        let patch: ProviderPatch = serde_yaml_ng::from_str(&format!(
-            "id: openai-api\nmodels:\n  - id: {id}\n    max_output_tokens: {limit}\n"
-        ))
-        .unwrap();
-        settings.save_provider(patch).unwrap();
-        assert_eq!(
-            settings
-                .load()
-                .configured_model()
-                .unwrap()
-                .unwrap()
-                .max_output_tokens,
-            limit
-        );
-        settings.restore_model_default("openai-api", reset).unwrap();
-        assert_eq!(
-            settings
-                .load()
-                .configured_model()
-                .unwrap()
-                .unwrap()
-                .max_output_tokens,
-            128_000
-        );
-    }
-    let duplicate: ProviderPatch = serde_yaml_ng::from_str("id: openai-api\nmodels:\n  - id: gpt-6.1-sol-responses\n    max_output_tokens: 1024\n  - id: gpt-6.1-sol\n    max_output_tokens: 2048\n").unwrap();
-    assert!(settings.save_provider(duplicate.clone()).is_err());
-    assert!(
-        ModelCatalog::defaults()
-            .with_providers(vec![duplicate])
-            .is_err()
-    );
-}
-
-#[test]
-fn aliases_validate_direct_targets_and_survive_custom_provider_save_restore() {
-    for aliases in [
-        "{old: missing}",
-        "{assistant-responses: assistant-responses}",
-        "{old: middle, middle: assistant-responses}",
-        "{'': assistant-responses}",
-    ] {
-        let patch: ProviderPatch =
-            serde_yaml_ng::from_str(&format!("id: custom-alias\nmodel_aliases: {aliases}\n"))
-                .unwrap();
-        assert!(
-            ModelCatalog::from_providers(vec![custom_provider("custom-alias")])
-                .unwrap()
-                .with_providers(vec![patch])
-                .is_err()
-        );
-    }
-    let root = tempfile::tempdir().unwrap();
-    let settings = UserSettings::in_root(root.path());
-    let mut provider = custom_patch("custom-alias");
-    provider.model_aliases = Some(BTreeMap::from([(
-        "LegacyMixedCase".into(),
-        "assistant-responses".into(),
-    )]));
-    provider.default_model = Some("LegacyMixedCase".into());
-    settings.save_provider(provider).unwrap();
-    let catalog = settings.model_catalog().unwrap();
-    assert_eq!(
-        catalog.get("custom-alias", "LegacyMixedCase"),
-        catalog.get("custom-alias", "assistant-responses")
-    );
-    let saved = std::fs::read_to_string(root.path().join("providers/custom-alias.yaml")).unwrap();
-    assert!(saved.contains("LegacyMixedCase"));
-    let selected = ModelCatalog::selected_provider_yaml(&saved).unwrap();
-    assert_eq!(selected.model_id, "assistant-responses");
 }

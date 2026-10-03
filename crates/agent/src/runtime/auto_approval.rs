@@ -1,3 +1,4 @@
+use crate::model::Content;
 use std::{sync::Arc, time::Duration};
 
 use tokio_util::sync::CancellationToken;
@@ -301,8 +302,9 @@ impl Agent {
             requested_model: client.identity().requested_model,
             reported_model: None,
         };
-        let request = auto_mode::classifier_request(context);
+        let mut request = auto_mode::classifier_request(context);
         let mut attempts = Vec::new();
+        let mut invalid_reason = "invalid classification";
         for _ in 0..auto_mode::MAX_CLASSIFIER_ATTEMPTS {
             let started = tokio::time::Instant::now();
             let response = self
@@ -321,7 +323,15 @@ impl Agent {
                     return Err(ModelError::Cancelled.into());
                 }
                 Err(AgentError::Model(error)) => {
-                    let failure = failure_kind(&error);
+                    if error.kind() == ModelFailureKind::Cancelled {
+                        return Err(error.into());
+                    }
+                    let response_failure = auto_mode::response_failure(&error);
+                    let failure = if response_failure.is_some_and(|(_, retryable)| retryable) {
+                        ApprovalFailureKind::InvalidResponse
+                    } else {
+                        failure_kind(&error)
+                    };
                     attempts.push(ApprovalAttemptDetails {
                         reviewer: reviewer.clone(),
                         elapsed_ms,
@@ -329,6 +339,23 @@ impl Agent {
                         failure: Some(failure),
                         usage: None,
                     });
+                    if let Some((reason, retryable)) = response_failure {
+                        if retryable {
+                            invalid_reason = reason;
+                            request = auto_mode::classifier_retry_request(&request, reason);
+                            continue;
+                        }
+                        return Ok(ReviewerRun::technical(
+                            AutoReview::Unavailable {
+                                message: format!(
+                                    "Auto reviewer {reason}; review this action manually"
+                                ),
+                            },
+                            reviewer,
+                            failure,
+                            attempts,
+                        ));
+                    }
                     let review = if matches!(
                         error,
                         ModelError::ResponseRejected(ModelResponseRejection::ContextLimit)
@@ -347,6 +374,30 @@ impl Agent {
                 }
                 Err(error) => return Err(error),
             };
+            if response.output.content.iter().any(|content| {
+                matches!(
+                    content,
+                    Content::ToolUse { .. } | Content::ToolResult { .. }
+                )
+            }) {
+                self.finish_model_request(
+                    receipt.chat_id,
+                    response.sequence,
+                    RequestOutcome::HostRejected(ResponseRejection::InvalidToolCall),
+                )
+                .await?;
+                attempts.push(ApprovalAttemptDetails {
+                    reviewer: reviewer.clone(),
+                    elapsed_ms,
+                    outcome: ApprovalAttemptOutcome::TechnicalFailure,
+                    failure: Some(ApprovalFailureKind::InvalidResponse),
+                    usage: Some(response.output.usage),
+                });
+                return Ok(ReviewerRun::technical(
+                    AutoReview::Unavailable { message:"Auto reviewer returned unexpected tool operations; review this action manually".into() },
+                    reviewer, ApprovalFailureKind::InvalidResponse, attempts,
+                ));
+            }
             match auto_mode::parse_verdict(&response.output, &context.auto_policy) {
                 Ok(verdict) => {
                     self.finish_model_request(
@@ -370,7 +421,9 @@ impl Agent {
                         failure: None,
                     });
                 }
-                Err(_) => {
+                Err(reason) => {
+                    invalid_reason = reason;
+                    request = auto_mode::classifier_retry_request(&request, reason);
                     self.finish_model_request(
                         receipt.chat_id,
                         response.sequence,
@@ -389,7 +442,10 @@ impl Agent {
         }
         Ok(ReviewerRun::technical(
             AutoReview::Unavailable {
-                message: "Invalid Auto reviewer response; review this action manually".into(),
+                message: format!(
+                    "Invalid Auto reviewer response after {} attempts ({invalid_reason}); review this action manually",
+                    attempts.len()
+                ),
             },
             reviewer,
             ApprovalFailureKind::InvalidResponse,

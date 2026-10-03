@@ -1,64 +1,31 @@
 use super::{
     EventPublisher, InstanceRef, ObservationKind, TickConnectionState, TickObservation,
-    TickStreamEvent, TickStreamHandle, TickStreamPort, WatchId,
+    TickStreamHandle, TickStreamPort, WatchId,
 };
 use crate::artifacts::{ArtifactClient, ArtifactError, ArtifactMetadata};
 use crate::runtime::{DEFAULT_CADENCE_SECONDS, MAX_CADENCE_SECONDS, MIN_CADENCE_SECONDS};
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 use tokio::{sync::watch, time::Instant};
 
 pub struct ArtifactTickStream {
     root: PathBuf,
-    native: Option<Arc<dyn TickStreamPort>>,
     cadences: watch::Sender<BTreeMap<WatchId, u64>>,
 }
 impl ArtifactTickStream {
-    pub fn new(root: PathBuf, native: Option<Arc<dyn TickStreamPort>>) -> Self {
+    pub fn new(root: PathBuf) -> Self {
         Self {
             root,
-            native,
             cadences: watch::channel(BTreeMap::new()).0,
         }
     }
 }
 impl TickStreamPort for ArtifactTickStream {
     fn set_cadences(&self, cadences: BTreeMap<WatchId, u64>) {
-        if let Some(native) = &self.native {
-            native.set_cadences(cadences.clone());
-        }
         self.cadences.send_replace(cadences);
     }
     fn open(&self) -> TickStreamHandle {
         let (desired, receiver) = watch::channel(BTreeMap::<WatchId, InstanceRef>::new());
         let (publisher, events) = EventPublisher::channel();
-        if let Some(native) = &self.native {
-            let native = native.open();
-            let mut desired_rx = receiver.clone();
-            let publisher = publisher.clone();
-            tokio::spawn(async move {
-                let mut native_events = native.events;
-                loop {
-                    let targets = desired_rx
-                        .borrow_and_update()
-                        .iter()
-                        .filter(|(_, instance)| !instance.as_str().starts_with("artifact:"))
-                        .map(|(watch, instance)| (*watch, instance.clone()))
-                        .collect();
-                    native.desired.send_replace(targets);
-                    tokio::select! {
-                        result = desired_rx.changed() => if result.is_err() { return; },
-                        event = native_events.recv() => match event {
-                            Some(TickStreamEvent::Metadata { instance, audience, metadata }) => publisher.metadata(instance, audience, metadata),
-                            Some(TickStreamEvent::Ready { watch }) => publisher.ready(watch),
-                            Some(TickStreamEvent::Observation { audience, value }) => publisher.observation(&audience, value),
-                            Some(TickStreamEvent::State { instance, state, audience }) => publisher.state_to(instance, state, audience),
-                            Some(TickStreamEvent::Gap { instance, audience }) => publisher.gap_to(instance, audience),
-                            None => return,
-                        }
-                    }
-                }
-            });
-        }
         tokio::spawn(observe(
             self.root.clone(),
             receiver,
@@ -89,7 +56,7 @@ async fn observe(
         cursors.retain(|watch, cursor| targets.get(watch) == Some(&cursor.instance));
         for (watch, instance) in targets
             .iter()
-            .filter(|(_, instance)| instance.as_str().starts_with("artifact:"))
+            .filter(|(_, instance)| instance.tick_type() == "artifact")
         {
             let cadence = frequencies
                 .get(watch)
@@ -180,12 +147,8 @@ async fn read(
     root: &std::path::Path,
     instance: &InstanceRef,
 ) -> Result<ArtifactMetadata, ArtifactError> {
-    let identity = instance
-        .as_str()
-        .strip_prefix("artifact:")
-        .ok_or(ArtifactError::InvalidResponse)?;
-    let (origin, id) = identity
-        .rsplit_once('/')
+    let (origin, id) = instance
+        .artifact_parts()
         .ok_or(ArtifactError::InvalidResponse)?;
     ArtifactClient::for_origin(root, origin)?.read(id).await
 }

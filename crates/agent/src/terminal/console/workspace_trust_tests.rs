@@ -100,7 +100,7 @@ fn workspace_trust_modal_owns_input_and_keeps_choices_visible_across_sizes() {
                 kind: "Shell".into(),
                 status: "running".into(),
                 updated_at_ms: None,
-                running: true,
+                actions: Vec::new(),
             }],
         );
         state.tick_list.overlay = true;

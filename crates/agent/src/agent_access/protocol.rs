@@ -19,8 +19,12 @@ use crate::{
 };
 
 pub const PROTOCOL_MAJOR: u16 = 3;
-pub const PROTOCOL_MINOR: u16 = 1;
+pub const PROTOCOL_MINOR: u16 = 2;
 pub const MIN_CHUNKED_RESPONSE_MINOR: u16 = 1;
+pub const MIN_PROVIDER_CREDENTIALS_MINOR: u16 = 2;
+pub const MIN_ACCOUNT_MODELS_MINOR: u16 = 2;
+pub const MIN_PREOPEN_OBSERVATION_CANCEL_MINOR: u16 = 2;
+pub const MIN_PROVIDER_MODEL_SELECTION_MINOR: u16 = 2;
 pub const MAX_FRAME_BYTES: usize = 128 * 1024 * 1024;
 pub const RESPONSE_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 pub const FEED_CAPACITY: usize = 128;
@@ -143,10 +147,53 @@ impl std::fmt::Debug for EnvironmentValue {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ProviderCredentialScope {
+    pub config_root: Option<PathBuf>,
+    pub environment_keys: Vec<String>,
+    /// Retained for older wire decoders; built-in-only processes never apply this definition.
+    pub transient_provider: Option<ProviderPatch>,
+    pub service_account_path: Result<Option<String>, String>,
+    pub service_account_configured: Result<bool, String>,
+}
+
+impl ProviderCredentialScope {
+    pub fn current(config_root: Option<PathBuf>, _legacy_provider: Option<ProviderPatch>) -> Self {
+        let environment_keys = std::env::vars_os()
+            .filter_map(|(name, value)| {
+                let name = name.into_string().ok()?;
+                let value = value.into_string().ok()?;
+                (!value.trim().is_empty() && reqwest::header::HeaderValue::from_str(&value).is_ok())
+                    .then_some(name)
+            })
+            .collect();
+        let (service_account_path, service_account_configured) = config_root
+            .as_ref()
+            .map(|root| {
+                let auth = crate::auth::google::GoogleAuth::new(root);
+                (
+                    auth.service_account_path()
+                        .map_err(|error| error.to_string()),
+                    auth.service_account_configured()
+                        .map_err(|error| error.to_string()),
+                )
+            })
+            .unwrap_or((Ok(None), Ok(false)));
+        Self {
+            config_root,
+            environment_keys,
+            transient_provider: None,
+            service_account_path,
+            service_account_configured,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct LaunchSpec {
     pub workdir: PathBuf,
     pub config_root: Option<PathBuf>,
     pub model: Option<ModelConfig>,
+    /// Retained for older wire decoders; built-in-only processes never apply this definition.
     pub transient_provider: Option<ProviderPatch>,
     pub host_options: AgentHostOptions,
     pub session_persistence: bool,
@@ -247,6 +294,9 @@ pub enum AgentCommand {
     Configure {
         execution: ExecutionRef,
         change: ConfigurationChange,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        /// Legacy wire field; built-in-only workers reject supplied definitions.
+        provider: Option<Box<ProviderPatch>>,
     },
     EditHistory {
         execution: ExecutionRef,
@@ -275,6 +325,19 @@ pub enum AgentCommand {
 }
 
 impl AgentCommand {
+    pub(crate) fn check_peer_version(&self, minor: u16) -> Result<(), AccessError> {
+        if matches!(
+            self,
+            Self::Configure {
+                provider: Some(_),
+                ..
+            }
+        ) {
+            check_provider_peer_version(minor, MIN_PROVIDER_MODEL_SELECTION_MINOR)?;
+        }
+        Ok(())
+    }
+
     pub fn execution(&self) -> Option<ExecutionRef> {
         match self {
             Self::Submit { execution, .. }
@@ -455,6 +518,11 @@ pub struct AgentFilter {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AgentDetailQuery {
     Snapshot,
+    ProviderCredentials,
+    AccountModels {
+        config: Box<ModelConfig>,
+        refresh: bool,
+    },
     Permissions,
     ApprovalHistory,
     Tasks,
@@ -560,6 +628,38 @@ pub struct QueuedCommandFailure {
     pub execution: ExecutionRef,
     pub label: String,
     pub error: AccessError,
+}
+
+impl ObservationRequest {
+    pub(crate) fn minimum_minor(&self) -> u16 {
+        match self {
+            Self::Agent {
+                detail: AgentDetailQuery::ProviderCredentials,
+                ..
+            } => MIN_PROVIDER_CREDENTIALS_MINOR,
+            Self::Agent {
+                detail: AgentDetailQuery::AccountModels { .. },
+                ..
+            } => MIN_ACCOUNT_MODELS_MINOR,
+            _ => 0,
+        }
+    }
+
+    pub(crate) fn check_peer_version(&self, minor: u16) -> Result<(), AccessError> {
+        check_provider_peer_version(minor, self.minimum_minor())
+    }
+}
+
+fn check_provider_peer_version(minor: u16, required: u16) -> Result<(), AccessError> {
+    if minor < required {
+        return Err(AccessError::new(
+            AccessErrorCode::VersionMismatch,
+            format!(
+                "Provider/model management requires AgentAccess {PROTOCOL_MAJOR}.{required} or newer; this connection negotiated {PROTOCOL_MAJOR}.{minor}. Existing Agent work and compatible operations remain available."
+            ),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -680,6 +780,9 @@ impl LiveChatSnapshot {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum ObservationValue {
+    AccountModelsPending,
+    ProviderCredentials(Box<ProviderCredentialScope>),
+    AccountModels(Result<crate::model::availability::AccountModelDirectory, String>),
     Overview(Vec<AgentSummary>),
     Agent(Box<LiveChatSnapshot>),
     Permissions(Box<PermissionsView>),
@@ -707,6 +810,7 @@ pub struct ObservationUpdate {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum ObservationChange {
+    AccountModels(Result<crate::model::availability::AccountModelDirectory, String>),
     Event(Event),
     UserShell(UserShellRecord),
     TaskNotification(TaskNotification),

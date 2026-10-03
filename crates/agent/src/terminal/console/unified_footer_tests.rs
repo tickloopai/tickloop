@@ -16,11 +16,9 @@ fn fixture() -> Console {
     tests::console_with_state(state)
 }
 
-fn item(id: &str, content: &str, task_id: Option<Uuid>) -> StatusItem {
+fn item(id: &str, content: &str) -> StatusItem {
     StatusItem {
         id: id.into(),
-        task_id,
-        can_stop: task_id.is_some(),
         title: content.into(),
         state: "in progress",
         role: Role::Warning,
@@ -41,13 +39,12 @@ fn key(console: &Console, code: KeyCode) -> Option<InputEvent> {
         .key(KeyEvent::new(code, KeyModifiers::NONE))
 }
 
-fn update(console: &Console, tasks: Vec<StatusItem>, todos: Vec<StatusItem>) {
+fn update(console: &Console, todos: Vec<StatusItem>) {
     console
         .update_status_area(
             "Auto".into(),
             "fixture".into(),
             Some((42_000, 200_000)),
-            tasks,
             todos,
         )
         .unwrap();
@@ -74,7 +71,7 @@ fn agent(id: u128, parent: Option<Uuid>, title: &str) -> AgentTreeRow {
 #[test]
 fn subagent_count_excludes_main_and_includes_the_child_currently_viewed() {
     let console = fixture();
-    update(&console, vec![], vec![]);
+    update(&console, vec![]);
     console
         .set_agent_family(
             vec![
@@ -114,7 +111,7 @@ fn subagent_count_excludes_main_and_includes_the_child_currently_viewed() {
 #[test]
 fn expanded_subagents_start_at_the_entry_without_an_items_or_blank_summary_row() {
     let console = fixture();
-    update(&console, vec![], vec![]);
+    update(&console, vec![]);
     console
         .set_agent_family(
             vec![
@@ -149,11 +146,21 @@ fn expanded_subagents_start_at_the_entry_without_an_items_or_blank_summary_row()
             focused[entry + 1].contains("Main summary probe"),
             "{focused:?}"
         );
-        if width == 80 {
+        {
             assert!(
                 focused.last().unwrap().contains("Enter/Space hide"),
                 "{focused:?}"
             );
+            key(&console, KeyCode::Down);
+            let list_focused = frame(&console);
+            assert!(
+                list_focused
+                    .last()
+                    .unwrap()
+                    .contains("Enter open · Space fold · Esc entry"),
+                "{list_focused:?}"
+            );
+            key(&console, KeyCode::Esc);
             key(&console, KeyCode::Enter);
             let collapsed = frame(&console);
             assert!(
@@ -175,7 +182,7 @@ fn expanded_subagents_start_at_the_entry_without_an_items_or_blank_summary_row()
 #[test]
 fn divider_edges_use_short_rules_and_exact_label_targets_with_narrow_fallbacks() {
     let console = fixture();
-    update(&console, vec![], vec![]);
+    update(&console, vec![]);
     console
         .set_agent_family(
             vec![
@@ -195,7 +202,7 @@ fn divider_edges_use_short_rules_and_exact_label_targets_with_narrow_fallbacks()
             kind: "Shell".into(),
             status: "running".into(),
             updated_at_ms: None,
-            running: true,
+            actions: Vec::new(),
         }],
     );
     for (width, prefix, suffix) in [
@@ -249,12 +256,7 @@ fn divider_edges_use_short_rules_and_exact_label_targets_with_narrow_fallbacks()
 #[test]
 fn family_updates_preserve_editor_focus_and_never_expose_todo_or_shell_categories() {
     let console = fixture();
-    let shell = item("1.", "shell unique", Some(TASK));
-    update(
-        &console,
-        vec![shell.clone()],
-        vec![item("1.", "todo unique", None)],
-    );
+    update(&console, vec![item("1.", "todo unique")]);
     console
         .set_agent_family(
             vec![
@@ -267,7 +269,7 @@ fn family_updates_preserve_editor_focus_and_never_expose_todo_or_shell_categorie
     for character in "jk".chars() {
         key(&console, KeyCode::Char(character));
     }
-    update(&console, vec![shell], vec![item("1.", "new todo", None)]);
+    update(&console, vec![item("1.", "new todo")]);
     let rendered = frame(&console);
     assert!(rendered.iter().any(|row| row.contains("child unique")));
     assert!(
@@ -286,10 +288,10 @@ fn family_updates_preserve_editor_focus_and_never_expose_todo_or_shell_categorie
 #[test]
 fn runtime_empty_progress_clears_completed_activity_details_while_working_and_idle() {
     let console = fixture();
-    let mut done = item("1.", "retired runtime task", None);
+    let mut done = item("1.", "retired runtime task");
     done.state = "completed";
     done.role = Role::Success;
-    update(&console, vec![], vec![done]);
+    update(&console, vec![done]);
     console
         .set_activity(Some(&[(
             "Working runtime update".into(),
@@ -301,7 +303,7 @@ fn runtime_empty_progress_clears_completed_activity_details_while_working_and_id
             .iter()
             .any(|row| row.contains("retired runtime task"))
     );
-    update(&console, vec![], vec![]);
+    update(&console, vec![]);
     let working = frame(&console);
     assert!(
         working
@@ -324,14 +326,14 @@ fn runtime_empty_progress_clears_completed_activity_details_while_working_and_id
 #[test]
 fn todos_follow_working_and_remain_when_idle_only_for_the_visible_agent() {
     let console = fixture();
-    let mut pending = item("1.", "pending unique", None);
+    let mut pending = item("1.", "pending unique");
     pending.state = "pending";
     pending.role = Role::MutedText;
-    let active = item("2.", "active unique", None);
-    let mut done = item("3.", "completed unique", None);
+    let active = item("2.", "active unique");
+    let mut done = item("3.", "completed unique");
     done.state = "completed";
     done.role = Role::Success;
-    update(&console, vec![], vec![pending, active, done]);
+    update(&console, vec![pending, active, done]);
     assert!(
         frame(&console)
             .iter()
@@ -356,11 +358,7 @@ fn todos_follow_working_and_remain_when_idle_only_for_the_visible_agent() {
     assert!(working[activity + 3].contains("completed unique"));
     assert!(!working.iter().any(|row| row.contains("Todo 3")));
     console.activate_agent(Uuid::from_u128(99)).unwrap();
-    update(
-        &console,
-        vec![],
-        vec![item("1.", "child todo unique", None)],
-    );
+    update(&console, vec![item("1.", "child todo unique")]);
     console
         .set_activity(Some(&[("Working child".into(), Some(Role::MutedText))]))
         .unwrap();
@@ -425,13 +423,26 @@ fn single_shell_activation_and_detail_updates_keep_the_exact_eligible_task() {
         .lock()
         .unwrap()
         .key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
-    let Some(InputEvent::OpenTickShell { task_id, panel, .. }) = key(&console, KeyCode::Enter)
-    else {
+    let Some(InputEvent::TickAction { action, .. }) = key(&console, KeyCode::Enter) else {
         panic!("Shell shortcut did not open the Tick panel");
     };
-    assert_eq!(task_id, TASK);
+    assert_eq!(
+        action.instance,
+        crate::tick_stream::InstanceRef::shell(TASK).to_string()
+    );
+    let panel = console
+        .state
+        .lock()
+        .unwrap()
+        .tick_list
+        .detail
+        .as_ref()
+        .unwrap()
+        .id();
     console
-        .load_tick_shell(CHAT, panel, snapshot, None)
+        .update_tick_detail::<crate::terminal::tick_shell::TickShell, _>(CHAT, panel, |detail| {
+            detail.load(snapshot, None)
+        })
         .unwrap();
     let mut completed =
         shell_snapshot(2, vec![(TASK, "selected shell", ShellTaskState::Completed)]);
@@ -478,7 +489,7 @@ fn multiple_shell_shortcut_opens_the_list_after_an_earlier_single_detail() {
     );
     key(&console, KeyCode::Char('j'));
     assert!(
-        matches!(key(&console, KeyCode::Enter), Some(InputEvent::OpenTickShell {task_id,..}) if task_id == second)
+        matches!(key(&console, KeyCode::Enter), Some(InputEvent::TickAction {action,..}) if action.instance == crate::tick_stream::InstanceRef::shell(second).to_string())
     );
     assert_eq!(
         console.state.lock().unwrap().editor.draft(),
@@ -514,15 +525,28 @@ fn assert_single_shell_shortcut(cached_detail: bool) {
         .key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
     assert!(matches!(
         event,
-        Some(InputEvent::TickListAction { action: 'r', .. })
+        Some(InputEvent::TickAction { action, .. }) if action.key == 'r'
     ));
-    let Some(InputEvent::OpenTickShell { task_id, panel, .. }) = key(&console, KeyCode::Enter)
-    else {
+    let Some(InputEvent::TickAction { action, .. }) = key(&console, KeyCode::Enter) else {
         panic!("Shell shortcut did not open Tick panel");
     };
-    assert_eq!(task_id, target);
+    assert_eq!(
+        action.instance,
+        crate::tick_stream::InstanceRef::shell(target).to_string()
+    );
+    let panel = console
+        .state
+        .lock()
+        .unwrap()
+        .tick_list
+        .detail
+        .as_ref()
+        .unwrap()
+        .id();
     console
-        .load_tick_shell(CHAT, panel, snapshot, None)
+        .update_tick_detail::<crate::terminal::tick_shell::TickShell, _>(CHAT, panel, |detail| {
+            detail.load(snapshot, None)
+        })
         .unwrap();
     let detail = frame(&console);
     assert!(
@@ -598,7 +622,7 @@ async fn global_shell_count_and_open_keep_the_peer_task_and_stop_its_actual_owne
         console.update_shell_ticks(&snapshot).unwrap();
         assert!(console.state.lock().unwrap().tick_list.entries().is_empty());
         let mut subscription = None;
-        crate::terminal::open_tasks(&center, &console, source, &mut subscription, Some(peer_task), false).await.unwrap();
+        crate::terminal::open_tasks(&center, &console, source, &mut subscription, Some(peer_task)).await.unwrap();
         key(&console, KeyCode::Home);
         let detail = frame(&console);
         assert!(detail.iter().any(|row| row.contains("Status:")), "{detail:?}");
@@ -606,13 +630,11 @@ async fn global_shell_count_and_open_keep_the_peer_task_and_stop_its_actual_owne
         assert_eq!(agent.origin(), Some(source_origin));
         key(&console, KeyCode::Left);
         let source_task = agent.submit_user_shell_for_goal(source, None, "printf 'source-shell-marker'; while [ ! -f source-finish ]; do sleep 0.02; done".into(), true).await.unwrap().command_id;
-        let multiple = center.snapshot(source).await.unwrap();
-        assert_eq!(crate::terminal::task_status_items(&multiple).len(), 2);
         let fresh = fixture();
         fresh.state.lock().unwrap().chat = Some(source);
-        update(&fresh, crate::terminal::task_status_items(&multiple), vec![]);
+        update(&fresh, vec![]);
         let mut subscription = None;
-        crate::terminal::open_tasks(&center, &fresh, source, &mut subscription, None, false).await.unwrap();
+        crate::terminal::open_tasks(&center, &fresh, source, &mut subscription, None).await.unwrap();
         let list = frame(&fresh);
         assert!(list.iter().any(|row| row.contains("Shell")), "{list:?}");
         assert!(list.iter().any(|row| row.contains("peer-shell-marker")), "{list:?}");
@@ -651,7 +673,7 @@ async fn global_shell_count_and_open_keep_the_peer_task_and_stop_its_actual_owne
 #[test]
 fn core_status_floats_on_the_lower_divider_with_roles_and_preserved_fallback_notices() {
     let console = fixture();
-    update(&console, vec![], vec![]);
+    update(&console, vec![]);
     let lines = frame(&console);
     let editor = lines
         .iter()
@@ -718,7 +740,7 @@ fn core_status_is_always_right_aligned_with_styled_content_and_fallback() {
     for mode in ["Auto", "Plan", "Ask", "Full Access"] {
         let console = fixture();
         console
-            .update_status_area(mode.into(), "模型 fixture".into(), None, vec![], vec![])
+            .update_status_area(mode.into(), "模型 fixture".into(), None, vec![])
             .unwrap();
         let rendered = frame(&console);
         let editor = rendered
@@ -762,7 +784,7 @@ fn core_status_is_always_right_aligned_with_styled_content_and_fallback() {
 #[test]
 fn agents_entry_is_on_lower_divider_and_family_is_expanded_by_default() {
     let console = fixture();
-    update(&console, vec![], vec![]);
+    update(&console, vec![]);
     console
         .set_agent_family(
             vec![agent(1, None, "Main unique")],
@@ -839,7 +861,7 @@ fn agents_entry_is_on_lower_divider_and_family_is_expanded_by_default() {
 #[test]
 fn agents_divider_toggle_uses_mouse_hitbox_and_focused_enter_space_without_reopening_on_update() {
     let console = fixture();
-    update(&console, vec![], vec![]);
+    update(&console, vec![]);
     let family = vec![
         agent(1, None, "Main unique"),
         agent(2, Some(Uuid::from_u128(1)), "child unique"),
@@ -870,7 +892,7 @@ fn agents_divider_toggle_uses_mouse_hitbox_and_focused_enter_space_without_reope
     console
         .set_agent_family(family, Some(Uuid::from_u128(1)))
         .unwrap();
-    update(&console, vec![], vec![]);
+    update(&console, vec![]);
     assert!(
         !frame(&console)
             .iter()
@@ -935,7 +957,7 @@ fn modified_enter_cannot_focus_or_activate_a_collapsed_agents_list() {
         KeyModifiers::CONTROL,
     ] {
         let console = fixture();
-        update(&console, vec![], vec![]);
+        update(&console, vec![]);
         console
             .set_agent_family(
                 vec![
@@ -989,14 +1011,13 @@ fn modified_enter_cannot_focus_or_activate_a_collapsed_agents_list() {
 #[test]
 fn todos_use_claude_status_marks_styles_and_width_ellipsis() {
     let console = fixture();
-    let mut pending = item("1.", "pending mark", None);
+    let mut pending = item("1.", "pending mark");
     pending.state = "pending";
-    let mut done = item("3.", "completed mark", None);
+    let mut done = item("3.", "completed mark");
     done.state = "completed";
     update(
         &console,
-        vec![],
-        vec![pending, item("2.", &"active mark ".repeat(20), None), done],
+        vec![pending, item("2.", &"active mark ".repeat(20)), done],
     );
     let rows = frame(&console);
     assert!(
@@ -1030,7 +1051,7 @@ fn question_mark_help_matches_agents_focus_layers_and_tick_list_shells() {
     let help = frame(&console).join("\n");
     for hint in [
         "↓ Subagents entry",
-        "Enter/Space toggle",
+        "Enter/Space toggle Subagents (entry)",
         "↓ Agent list",
         "Enter open Agent",
         "Space fold descendants",

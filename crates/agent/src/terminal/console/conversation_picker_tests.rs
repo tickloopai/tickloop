@@ -15,7 +15,11 @@ fn control(character: char) -> KeyEvent {
 
 fn screen(state: &mut State) -> Vec<String> {
     state.draw(&mut Vec::new()).unwrap();
-    state.rendered_screen.clone()
+    if state.conversation_picker.is_some() {
+        state.rendered_screen[state.height - state.input_dialog_height()..].to_vec()
+    } else {
+        state.rendered_screen.clone()
+    }
 }
 
 fn hint_row(lines: &[String]) -> &str {
@@ -57,11 +61,11 @@ fn the_open_picker_owns_every_key_and_cancelling_restores_the_same_screen_and_dr
     let menu_id = picker.id();
     state.conversation_picker = Some(picker);
     let opened = screen(&mut state);
-    assert_eq!(opened.len(), 12);
+    assert_eq!(opened.len(), 8);
     assert!(opened[0].starts_with("Resume Chat · 1 of 3"), "{opened:?}");
-    assert_eq!(opened[2], "⌕ Search…");
-    assert!(opened[3].starts_with("❯ 请分析腾讯控股") && opened[3].ends_with('…'));
-    assert_eq!(opened[4], "  2h ago · main");
+    assert_eq!(opened[1], "⌕ Search…");
+    assert!(opened[2].starts_with("❯ 请分析腾讯控股") && opened[2].ends_with('…'));
+    assert_eq!(opened[3], "  2h ago · main");
     assert!(
         !opened.iter().any(|line| line.contains(DRAFT)),
         "{opened:?}"
@@ -202,8 +206,8 @@ fn enter_reports_the_original_entry_index_after_filtering_duplicate_titles() {
     }
     let filtered = screen(&mut state);
     assert!(filtered[0].ends_with("1 of 1 matching"), "{filtered:?}");
-    assert_eq!(filtered[3], "❯ Duplicate");
-    assert_eq!(filtered[4], "  3d ago");
+    assert_eq!(filtered[2], "❯ Duplicate");
+    assert_eq!(filtered[3], "  3d ago");
     for input in [control('u'), control('y'), control('_'), control('7')] {
         assert!(state.key(input).is_none());
     }
@@ -278,8 +282,8 @@ fn dismissing_the_menu_clears_the_picker_and_returns_keys_to_the_editor() {
     let menu_id = picker.id();
     state.conversation_picker = Some(picker);
     let tiny = screen(&mut state);
-    assert_eq!(tiny.len(), 3);
-    assert_eq!(tiny[1], "❯ 请分析腾讯控股最近三个季度的财报，…");
+    assert_eq!(tiny.len(), 1);
+    assert_eq!(tiny[0], "❯ 请分析腾讯控股最近三个季度的财报，…");
     assert!(!state.clear_menu(Uuid::new_v4()));
     assert!(state.conversation_picker.is_some());
     assert!(state.clear_menu(menu_id));

@@ -1,3 +1,5 @@
+mod support;
+
 #[path = "support/screen.rs"]
 mod screen;
 
@@ -63,7 +65,7 @@ impl Fixture {
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        let _ = Command::new(env!("CARGO_BIN_EXE_tickloop"))
+        let _ = Command::new(support::fixture_cli::executable())
             .args(["service", "stop"])
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
@@ -101,7 +103,7 @@ impl Terminal {
             pixel_height: 0,
         };
         let pty = native_pty_system().openpty(size).unwrap();
-        let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_tickloop"));
+        let mut command = CommandBuilder::new(support::fixture_cli::executable());
         command.env_clear();
         command.env("PATH", "/usr/bin:/bin");
         command.env("TERM", "xterm-256color");
@@ -111,27 +113,16 @@ impl Terminal {
         }
         command.arg("--cwd");
         command.arg(fixture.path("work"));
-        command.arg("--config");
+        command.arg("--transport-fixture");
         command.arg(fixture.path("work/model.json"));
         command.args(flags);
         let child = pty.slave.spawn_command(command).unwrap();
         drop(pty.slave);
-        let mut reader = pty.master.try_clone_reader().unwrap();
+        let reader = pty.master.try_clone_reader().unwrap();
         let writer = pty.master.take_writer().unwrap();
         let output = Arc::new(Mutex::new(String::new()));
         let captured = output.clone();
-        thread::spawn(move || {
-            let mut buffer = [0; 8192];
-            while let Ok(length) = reader.read(&mut buffer) {
-                if length == 0 {
-                    break;
-                }
-                captured
-                    .lock()
-                    .unwrap()
-                    .push_str(&String::from_utf8_lossy(&buffer[..length]));
-            }
-        });
+        thread::spawn(move || screen::capture_output(reader, captured));
         Self {
             child,
             writer,
@@ -333,8 +324,8 @@ fn startup_trust_real_input_pty_eof_is_quiet_without_persisting_trust() {
     for renderer in ["inline", "fullscreen"] {
         let fixture = Fixture::new();
         let (input_master, input_slave) = pty_files();
-        let (mut output_master, output_slave) = pty_files();
-        let mut child = Command::new(env!("CARGO_BIN_EXE_tickloop"))
+        let (output_master, output_slave) = pty_files();
+        let mut child = Command::new(support::fixture_cli::executable())
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
             .env("TERM", "xterm-256color")
@@ -342,7 +333,7 @@ fn startup_trust_real_input_pty_eof_is_quiet_without_persisting_trust() {
             .envs(fixture.environment())
             .arg("--cwd")
             .arg(fixture.path("work"))
-            .arg("--config")
+            .arg("--transport-fixture")
             .arg(fixture.path("work/model.json"))
             .stdin(input_slave)
             .stdout(output_slave)
@@ -351,18 +342,7 @@ fn startup_trust_real_input_pty_eof_is_quiet_without_persisting_trust() {
             .unwrap();
         let output = Arc::new(Mutex::new(String::new()));
         let captured = output.clone();
-        let reader = thread::spawn(move || {
-            let mut buffer = [0; 8192];
-            while let Ok(length) = output_master.read(&mut buffer) {
-                if length == 0 {
-                    break;
-                }
-                captured
-                    .lock()
-                    .unwrap()
-                    .push_str(&String::from_utf8_lossy(&buffer[..length]));
-            }
-        });
+        let reader = thread::spawn(move || screen::capture_output(output_master, captured));
         let deadline = Instant::now() + TIMEOUT;
         while !output.lock().unwrap().contains("Enter confirm") && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
@@ -577,13 +557,15 @@ fn startup_trust_noninteractive_refusal_and_host_assertion_keep_their_contracts(
     for host_assertion in [false, true] {
         let fixture = Fixture::new();
         fixture.valid_model();
-        let mut command = Command::new(env!("CARGO_BIN_EXE_tickloop"));
+        let mut command = Command::new(support::fixture_cli::executable());
         command
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
             .envs(fixture.environment());
         command.arg("--cwd").arg(fixture.path("work"));
-        command.arg("--config").arg(fixture.path("work/model.json"));
+        command
+            .arg("--transport-fixture")
+            .arg(fixture.path("work/model.json"));
         if host_assertion {
             command.arg("--working-directory-is-trusted");
         }

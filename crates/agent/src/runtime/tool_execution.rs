@@ -501,6 +501,39 @@ impl Agent {
         self.refresh_project_rules(receipt.chat_id)
             .await
             .map_err(|error| error.to_string())?;
+        let alias = match registration
+            .as_ref()
+            .and_then(RegisteredTool::host_provider)
+        {
+            Some(provider) => match provider.builtin_alias(receipt.chat_id, &name, &input).await {
+                Ok(alias) => alias,
+                Err(error) => return Ok(ToolCallOutcome::not_admitted(error)),
+            },
+            None => None,
+        };
+        let (name, input, registration) = if let Some(alias) = alias {
+            let Some(definition) = crate::tools::Tools::definitions()
+                .into_iter()
+                .find(|definition| definition.name == alias.name)
+            else {
+                return Ok(ToolCallOutcome::not_admitted(
+                    "Host alias does not name a built-in tool".into(),
+                ));
+            };
+            if let Err(error) = validate_tool_input(&definition, &alias.input) {
+                return Ok(ToolCallOutcome::not_admitted(error));
+            }
+            (
+                alias.name,
+                alias.input,
+                Some(RegisteredTool {
+                    definition,
+                    route: ToolRoute::BuiltIn,
+                }),
+            )
+        } else {
+            (name, input, registration)
+        };
         let mut permission_comment = None;
         let mut continue_after_denial = false;
         let mut is_rejected_by_user = false;
@@ -590,16 +623,46 @@ impl Agent {
                     });
                 }
             }
+        } else if matches!(
+            registration.as_ref().map(|registered| &registered.route),
+            Some(ToolRoute::TickSubscription)
+        ) && name == "SubscribeTick"
+        {
+            let instance: crate::tick_stream::InstanceRef =
+                match serde_json::from_value(input["tick_instance_id"].clone()) {
+                    Ok(instance) => instance,
+                    Err(error) => return Ok(ToolCallOutcome::not_admitted(error.to_string())),
+                };
+            let port = self.tick_deliveries().port.clone();
+            match port {
+                Some(port) => match port
+                    .prepare_watch(receipt.chat_id, &instance, cancel.clone())
+                    .await
+                {
+                    Ok(Some(watch)) => {
+                        if let Err(error) = self
+                            .check_delegated_host_endpoint(receipt, watch.provider())
+                            .await
+                        {
+                            return Ok(ToolCallOutcome::not_admitted(error));
+                        }
+                        Some(watch.into_admission(input.clone()))
+                    }
+                    Ok(None) => None,
+                    Err(error) => return Ok(ToolCallOutcome::not_admitted(error)),
+                },
+                None => None,
+            }
         } else {
             None
         };
         let host_permission = prepared_host_call.as_ref().map(|call| call.permission());
         let normalized_name = prepared_host_call
             .as_ref()
-            .map_or(name.as_str(), |call| call.name());
+            .map_or(name.as_str(), |call| call.policy_name());
         let normalized_input = prepared_host_call
             .as_ref()
-            .map_or(&input, |call| call.input());
+            .map_or(&input, |call| call.policy_input());
         let permission_input = prepared_host_call
             .as_ref()
             .map_or(&input, |call| call.permission_input());
@@ -833,6 +896,27 @@ impl Agent {
                         }
                         Err(error) => Err(error),
                     }
+                } else if let Some((prepared, watch)) =
+                    prepared_host_call.as_ref().and_then(|prepared| {
+                        prepared
+                            .payload::<crate::tick_stream::PreparedTickWatch>()
+                            .map(|watch| (prepared, watch))
+                    })
+                {
+                    match self
+                        .check_delegated_host_endpoint(receipt, watch.provider())
+                        .await
+                    {
+                        Ok(()) => {
+                            crate::tick_stream::PreparedTickWatch::revalidate(
+                                receipt.chat_id,
+                                prepared,
+                                cancel.clone(),
+                            )
+                            .await
+                        }
+                        Err(error) => Err(error),
+                    }
                 } else {
                     Ok(())
                 };
@@ -949,9 +1033,14 @@ impl Agent {
                             host_effect = effect;
                             Ok(result)
                         } else {
+                            let dispatch_operation = OperationRecord {
+                                name: name.clone(),
+                                input: input.clone(),
+                                ..operation.clone()
+                            };
                             self.dispatch_registered_tool(
                                 receipt,
-                                &operation,
+                                &dispatch_operation,
                                 registration
                                     .as_ref()
                                     .expect("registered local or Host tool"),

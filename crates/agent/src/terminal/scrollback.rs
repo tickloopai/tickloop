@@ -224,6 +224,22 @@ impl Scrollback {
         self.activity.clone()
     }
 
+    pub(super) fn latest_input_text(&self, prompt: &str) -> Option<String> {
+        self.inputs.iter().rev().find_map(|(_, range)| {
+            let text = self
+                .lines
+                .get(range.clone())?
+                .iter()
+                .zip(&self.line_styles[range.clone()])
+                .filter(|(_, style)| !style.hidden)
+                .map(|(line, _)| line.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let text = text.strip_prefix(prompt).unwrap_or(&text).trim();
+            (!text.is_empty() && !text.starts_with('/')).then(|| text.to_owned())
+        })
+    }
+
     pub(super) fn reading_prompt(&self, width: usize, height: usize) -> Option<String> {
         if self.following || height < 7 || width < 24 {
             return None;

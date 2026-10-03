@@ -76,28 +76,58 @@ pub(super) async fn tick_action(
         let artifact = rows
             .iter()
             .find(|row| row.id == subscription_id)
-            .and_then(|row| row.instance.artifact_parts());
+            .and_then(|row| crate::tick_adapter::artifact_target(&row.instance));
         let Some((origin, artifact_id)) = artifact.filter(|_| matches!(action, 'o' | 'c' | 'f'))
         else {
             console.show_subscriptions_at(chat, rows, subscription_id, action == 'x')?;
             return Ok(None);
         };
         let root = root.ok_or("Artifact Service configuration is unavailable")?;
-        let client = ArtifactClient::for_origin(root, origin).map_err(|error| error.to_string())?;
+        let client =
+            ArtifactClient::for_origin(root, &origin).map_err(|error| error.to_string())?;
         let metadata = client
-            .read(artifact_id)
+            .read(&artifact_id)
             .await
             .map_err(|error| error.to_string())?;
-        subscribed_tick = Some(metadata.tick(origin, 0));
+        subscribed_tick = Some(metadata.tick(&origin, 0));
     }
     let ticks = agent
         .artifact_ticks(chat)
         .await
         .map_err(|error| error.to_string())?;
-    let Some(tick) =
-        subscribed_tick.or_else(|| ticks.into_iter().find(|tick| tick.instance_id() == id))
-    else {
-        return Ok(None);
+    let tick = subscribed_tick.or_else(|| ticks.into_iter().find(|tick| tick.instance_id() == id));
+    let tick = if let Some(tick) = tick {
+        tick
+    } else {
+        let rows = agent
+            .tick_subscriptions(chat)
+            .await
+            .map_err(|error| error.to_string())?;
+        let target = rows
+            .iter()
+            .find(|row| row.instance.as_str() == id)
+            .and_then(|row| crate::tick_adapter::artifact_target(&row.instance));
+        let Some((origin, artifact_id)) = target else {
+            return Ok(None);
+        };
+        if matches!(action, 'x' | 'X') {
+            if action == 'x' {
+                console.confirm_tick_removal(chat, id)?;
+            } else {
+                remove_local_artifact(agent, console, chat, &id).await?;
+            }
+            return Ok(None);
+        }
+        let client = ArtifactClient::for_origin(
+            root.ok_or("Artifact Service configuration is unavailable")?,
+            &origin,
+        )
+        .map_err(|error| error.to_string())?;
+        client
+            .read(&artifact_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .tick(&origin, 0)
     };
     match action {
         'o' => {
@@ -342,7 +372,7 @@ async fn apply_choice_with_client(
                     .map_err(|error| error.to_string())?,
             )?;
             console.update_artifact_metadata(chat, id.clone(), Some(artifact))?;
-            console.select_artifact_tick(chat, &id)?;
+            console.select_artifact_tick(choice.picker, chat, &id)?;
         }
         ArtifactPickerAction::Open => super::login::open_artifact(&artifact.url)
             .await

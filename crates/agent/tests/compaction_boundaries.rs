@@ -173,6 +173,15 @@ fn reopen(root: &Path, model: Arc<dyn ModelClient>) -> Agent {
     Agent::open_embedded(root.to_path_buf(), config(), model).unwrap()
 }
 
+fn reopen_with_window(root: &Path, model: Arc<dyn ModelClient>, tokens: usize) -> Agent {
+    Agent::open_embedded(
+        root.to_path_buf(),
+        support::config_with_window(tokens),
+        model,
+    )
+    .unwrap()
+}
+
 #[tokio::test]
 async fn full_compaction_restart_sends_the_same_request_as_the_compacted_process() {
     let directory = tempfile::tempdir().unwrap();
@@ -181,9 +190,9 @@ async fn full_compaction_restart_sends_the_same_request_as_the_compacted_process
         &["first answer", "second answer", "third answer"],
         &["compacted summary"],
     );
-    let agent = reopen(&root, model.clone());
+    let agent = reopen_with_window(&root, model.clone(), 5_000_000);
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    agent.set_context_window(chat, 5_000_000).await.unwrap();
+
     complete_turn(&agent, chat, "first prompt").await;
     complete_turn(&agent, chat, "second prompt").await;
     agent.compact(chat).await.unwrap();
@@ -196,14 +205,14 @@ async fn full_compaction_restart_sends_the_same_request_as_the_compacted_process
     drop(agent);
 
     let resumed_model = UsageModel::new(&["fourth answer"], &[]);
-    let resumed = reopen(&root, resumed_model.clone());
+    let resumed = reopen_with_window(&root, resumed_model.clone(), 5_000_000);
     let restored = resumed.resume_chat(chat).await.unwrap();
     // 边界之前的消息不再加载：对话链从边界开始，只有边界、摘要与之后的消息。
     assert_eq!(restored.messages.len(), 4);
     assert!(restored.is_compact_boundary(0));
     assert!(restored.is_compact_summary(1));
     assert_eq!(restored.conversation_messages().unwrap(), expected);
-    assert_eq!(restored.context_window_tokens, Some(5_000_000));
+    assert_eq!(restored.effective_context_window_tokens(), Some(5_000_000));
     assert_eq!(restored.rewind_points().len(), 1);
     complete_turn(&resumed, chat, "fourth prompt").await;
     let mut sent = conversation(&resumed_model.last_request());
@@ -307,7 +316,7 @@ async fn a_large_transcript_loads_only_after_the_last_boundary_and_keeps_session
         text("large answer three"),
         text("summary of the large turns"),
     ]));
-    let agent = reopen(&root, model);
+    let agent = reopen_with_window(&root, model, 50_000_000);
     let source = agent.create_chat(directory.path().into()).await.unwrap();
     complete_turn(&agent, source, "source prompt").await;
     let branch = agent
@@ -320,7 +329,7 @@ async fn a_large_transcript_loads_only_after_the_last_boundary_and_keeps_session
         .await
         .unwrap();
     let chat = branch.child_chat_id;
-    agent.set_context_window(chat, 50_000_000).await.unwrap();
+
     for turn in ["one", "two", "three"] {
         complete_turn(&agent, chat, &format!("large prompt {turn} {large}")).await;
     }
@@ -369,7 +378,7 @@ async fn a_large_transcript_loads_only_after_the_last_boundary_and_keeps_session
     assert!(std::fs::metadata(&path).unwrap().len() > 5 * 1024 * 1024);
 
     let resumed_model = Arc::new(ScriptedModel::new(vec![text("small answer")]));
-    let resumed = reopen(&root, resumed_model.clone());
+    let resumed = reopen_with_window(&root, resumed_model.clone(), 50_000_000);
     let restored = resumed.resume_chat(chat).await.unwrap();
     // 边界、摘要，以及照 Claude Code 恢复时在末尾 user 消息后追加的哨兵。
     assert_eq!(restored.messages.len(), 3);
@@ -378,7 +387,7 @@ async fn a_large_transcript_loads_only_after_the_last_boundary_and_keeps_session
         restored.latest_compact_summary().as_deref(),
         Some("summary of the large turns")
     );
-    assert_eq!(restored.context_window_tokens, Some(50_000_000));
+    assert_eq!(restored.effective_context_window_tokens(), Some(50_000_000));
     assert_eq!(
         restored
             .branch_origin
@@ -797,9 +806,9 @@ async fn rewind_across_a_full_compaction_after_a_directed_summary(prompt_padding
         ],
         &["directed summary", "full summary"],
     );
-    let agent = reopen(&root, model);
+    let agent = reopen_with_window(&root, model, 50_000_000);
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    agent.set_context_window(chat, 50_000_000).await.unwrap();
+
     for prompt in ["prompt one", "prompt two", "prompt three"] {
         complete_turn(&agent, chat, &format!("{prompt}{prompt_padding}")).await;
     }
@@ -827,7 +836,7 @@ async fn rewind_across_a_full_compaction_after_a_directed_summary(prompt_padding
         !prompt_padding.is_empty(),
         "Transcript size {size}"
     );
-    let resumed = reopen(&root, Arc::new(ScriptedModel::new(Vec::new())));
+    let resumed = reopen_with_window(&root, Arc::new(ScriptedModel::new(Vec::new())), 50_000_000);
     let restored = resumed.resume_chat(chat).await.unwrap();
     assert_restored_like(&restored, &in_process, "rewind across a full compaction");
     resumed.shutdown().await;

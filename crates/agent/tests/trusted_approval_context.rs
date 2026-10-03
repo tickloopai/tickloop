@@ -330,9 +330,14 @@ async fn clarified_answer_survives_compaction_and_restoration() {
         text("Clarified"),
         text("The user wants news in the current Agent Tab"),
     ]));
-    let first = Agent::open_embedded(root.clone(), config(), first_model).unwrap();
+    let first = Agent::open_embedded(
+        root.clone(),
+        support::config_with_window(10_000_000),
+        first_model,
+    )
+    .unwrap();
     let chat = first.create_chat(directory.path().into()).await.unwrap();
-    first.set_context_window(chat, 10_000_000).await.unwrap();
+
     let mut events = first.subscribe();
     let receipt = first
         .submit(chat, None, "Monitor Tesla news".into())
@@ -382,7 +387,7 @@ async fn clarified_answer_survives_compaction_and_restoration() {
     )]));
     let resumed = Agent::open_embedded(
         root,
-        config(),
+        support::config_with_window(10_000_000),
         Arc::new(ScriptedModel::new(vec![
             call("inspect-host", "Bash", json!({"command":"printf 'ok'"})),
             text("Done"),
@@ -432,9 +437,14 @@ async fn legacy_large_transcript_recovers_original_prompt_through_active_compact
         text("First step complete"),
         text("Brief public summary"),
     ]));
-    let first = Agent::open_embedded(root.clone(), config(), first_model).unwrap();
+    let first = Agent::open_embedded(
+        root.clone(),
+        support::config_with_window(10_000_000),
+        first_model,
+    )
+    .unwrap();
     let chat = first.create_chat(directory.path().into()).await.unwrap();
-    first.set_context_window(chat, 10_000_000).await.unwrap();
+
     let loop_id = finish_one(
         &first,
         chat,
@@ -470,7 +480,8 @@ async fn legacy_large_transcript_recovers_original_prompt_through_active_compact
         ),
         text("Done"),
     ]));
-    let resumed = Agent::open_embedded(root, config(), model).unwrap();
+    let resumed =
+        Agent::open_embedded(root, support::config_with_window(10_000_000), model).unwrap();
     resumed.resume_chat(chat).await.unwrap();
     resumed
         .set_execution_mode(chat, ExecutionMode::Auto)

@@ -215,7 +215,6 @@ async fn run_cached_navigation_fixture() {
             input,
             StartupState {
                 chat: StartupChat::Resumed(Box::new(initial), true),
-                explicit_provider: None,
                 user_settings: None,
             },
             None,

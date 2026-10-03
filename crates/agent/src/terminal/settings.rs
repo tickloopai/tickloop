@@ -97,10 +97,10 @@ mod tests {
     #[test]
     fn preferred_profiles_keep_visible_current_and_hide_legacy_adapter_duplicates() {
         for source in [
-            include_str!("../../examples/deepseek-config.json"),
-            include_str!("../../examples/deepseek-responses-config.json"),
-            include_str!("../../examples/deepseek-chat-config.json"),
-            include_str!("../../examples/deepseek-v4-pro-config.json"),
+            include_str!("../../tests/support/legacy_models/deepseek-config.json"),
+            include_str!("../../tests/support/legacy_models/deepseek-responses-config.json"),
+            include_str!("../../tests/support/legacy_models/deepseek-chat-config.json"),
+            include_str!("../../tests/support/legacy_models/deepseek-v4-pro-config.json"),
         ] {
             let current: ModelConfig = tickloop_agent::model::cards::migrate_legacy_model(
                 serde_json::from_str(source).unwrap(),
@@ -125,9 +125,12 @@ mod tests {
     }
 
     #[test]
-    fn default_deepseek_chat_completions_profile_matches_the_example_and_accepts_images() {
+    fn default_deepseek_chat_completions_profile_keeps_legacy_identity_and_accepts_images() {
         let mut example = tickloop_agent::model::cards::migrate_legacy_model(
-            serde_json::from_str(include_str!("../../examples/deepseek-chat-config.json")).unwrap(),
+            serde_json::from_str(include_str!(
+                "../../tests/support/legacy_models/deepseek-chat-config.json"
+            ))
+            .unwrap(),
         );
         let default = tickloop_agent::model::cards::ModelCatalog::defaults()
             .get("deepseek-api", "deepseek-flash-chat-completions")

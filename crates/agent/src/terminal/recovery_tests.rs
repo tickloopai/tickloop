@@ -287,7 +287,6 @@ async fn run_completed_reply_recovery_fixture() {
     console.set_prompt_enabled(true).unwrap();
     let startup = StartupState {
         chat: StartupChat::Resumed(Box::new(agent.snapshot(chat).await.unwrap()), false),
-        explicit_provider: None,
         user_settings: None,
     };
     let interaction_agent = agent.clone();
@@ -1125,8 +1124,7 @@ fn routine_restore_pty_fixture() {
                         input,
                         StartupState {
                             chat: StartupChat::New,
-                            explicit_provider: None,
-                            user_settings: None,
+                                                user_settings: None,
                         },
                         None,
                     )
@@ -1370,7 +1368,6 @@ async fn run_retained_completion_lifecycle_fixture() {
             input,
             StartupState {
                 chat: StartupChat::Resumed(Box::new(startup_snapshot), true),
-                explicit_provider: None,
                 user_settings: None,
             },
             None,
@@ -1626,7 +1623,7 @@ fn run_routine_restore_pty(route: &str) {
         _master: pair.master,
         timeout: RECOVERY_TIMEOUT,
     };
-    fixture.wait_for("fixture");
+    fixture.wait_for("deepseek-flash");
     fixture.send(format!("{ROUTINE_INPUT}\r").as_bytes());
     let completed = fixture.wait_for_phase(&phase_path, "completed");
     fixture.wait_for("✓ Done");
@@ -1899,7 +1896,6 @@ async fn run_merge_boundary_fixture() {
     console.set_prompt_enabled(true).unwrap();
     let startup = StartupState {
         chat: StartupChat::Resumed(Box::new(agent.snapshot(chat).await.unwrap()), false),
-        explicit_provider: None,
         user_settings: None,
     };
     let interaction_agent = agent.clone();
@@ -2002,7 +1998,7 @@ async fn run_merge_boundary_fixture() {
     assert!(
         MERGE_INPUTS
             .iter()
-            .all(|input| merged.matches(input).count() == 1),
+            .all(|input| screen::message_flow(&merged).matches(input).count() == 1),
         "{merged}"
     );
     console.write("\nMerge boundary verified\n").unwrap();
@@ -2111,7 +2107,7 @@ fn run_merge_boundary_pty(route: &str) {
     });
     let frame = screen::visible_screen(&fixture.raw_output(), 80, 24);
     println!("MERGE_BOUNDARY_FRAME_BEGIN\n{frame}\nMERGE_BOUNDARY_FRAME_END");
-    let lines = frame.lines().collect::<Vec<_>>();
+    let lines = screen::message_flow(&frame).lines().collect::<Vec<_>>();
     let row = |text: &str| {
         let rows = lines
             .iter()

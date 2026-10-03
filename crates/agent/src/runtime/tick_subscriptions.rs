@@ -112,7 +112,7 @@ pub(super) fn definitions() -> Vec<ToolDefinition> {
             description: format!(
                 "Subscribe the current goal to a Tick Instance. Every {DEFAULT_CADENCE_SECONDS} seconds by default the goal is woken with that instance's latest Tick Update and how many updates were dropped in between; a quiet cadence wakes nothing. Intermediate updates are not kept, so read older data with the Tick's own query tools."
             ),
-            input_schema: json!({"type":"object","properties":{"tick_instance_id":{"type":"string","minLength":7},"every_seconds":{"type":"integer","minimum":MIN_CADENCE_SECONDS,"maximum":MAX_CADENCE_SECONDS}},"required":["tick_instance_id"],"additionalProperties":false}),
+            input_schema: json!({"type":"object","properties":{"tick_instance_id":{"type":"string","minLength":3},"every_seconds":{"type":"integer","minimum":MIN_CADENCE_SECONDS,"maximum":MAX_CADENCE_SECONDS}},"required":["tick_instance_id"],"additionalProperties":false}),
         },
         ToolDefinition {
             name: UNSUBSCRIBE_TICK_TOOL.into(),
@@ -136,7 +136,7 @@ struct UnsubscribeTickInput {
 
 #[derive(Default)]
 pub(super) struct TickDeliveries {
-    port: Option<Arc<dyn TickStreamPort>>,
+    pub(super) port: Option<Arc<dyn TickStreamPort>>,
     desired: Option<tokio::sync::watch::Sender<BTreeMap<WatchId, InstanceRef>>>,
     subscriptions: BTreeMap<Uuid, SubscriptionRuntime>,
     pending: HashMap<(ChatId, LoopId), PendingDelivery>,
@@ -216,6 +216,13 @@ impl TickDeliveries {
 
     fn publish_desired(&self) {
         if let Some(port) = &self.port {
+            port.set_watch_chats(
+                self.subscriptions
+                    .values()
+                    .filter(|subscription| subscription.blocked.is_none())
+                    .map(|subscription| (subscription.watch, subscription.chat_id))
+                    .collect(),
+            );
             port.set_cadences(
                 self.subscriptions
                     .values()

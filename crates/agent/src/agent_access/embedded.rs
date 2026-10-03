@@ -32,12 +32,14 @@ struct Inner {
     executions: Mutex<HashMap<ExecutionRef, Uuid>>,
     references: Mutex<HashMap<Uuid, ExecutionRef>>,
     launches: Mutex<HashMap<ExecutionRef, LaunchSpec>>,
+    account_models: crate::model::availability::AccountModelDiscovery,
     receipts: ReceiptStore,
     answers: Mutex<HashMap<(ExecutionRef, Uuid, RequestKind), AnswerState>>,
     queue: Mutex<HashMap<Uuid, QueuedAction>>,
     queue_failures: Mutex<VecDeque<QueuedCommandFailure>>,
     views: ViewRegistry,
     verified_sources: AtomicBool,
+    builtin_catalog_only: AtomicBool,
     sequence: AtomicU64,
     changes: broadcast::Sender<ObservationUpdate>,
     publishing: Mutex<()>,
@@ -71,12 +73,14 @@ impl EmbeddedAgentAccess {
             executions: Mutex::new(HashMap::new()),
             references: Mutex::new(HashMap::new()),
             launches: Mutex::new(HashMap::new()),
+            account_models: Default::default(),
             receipts: ReceiptStore::new(epoch),
             answers: Mutex::new(HashMap::new()),
             queue: Mutex::new(HashMap::new()),
             queue_failures: Mutex::new(VecDeque::new()),
             views: ViewRegistry::default(),
             verified_sources: AtomicBool::new(false),
+            builtin_catalog_only: AtomicBool::new(false),
             sequence: AtomicU64::new(0),
             changes: broadcast::channel(REPLAY_CAPACITY).0,
             publishing: Mutex::new(()),
@@ -96,6 +100,10 @@ impl EmbeddedAgentAccess {
     pub fn for_worker(agent: Agent, epoch: Uuid) -> Self {
         let access = Self::with_epoch(agent, epoch);
         access.inner.verified_sources.store(true, Ordering::SeqCst);
+        access
+            .inner
+            .builtin_catalog_only
+            .store(true, Ordering::SeqCst);
         access
     }
 
@@ -503,7 +511,16 @@ impl EmbeddedAgentAccess {
                 }
                 Ok(CommandResult::Done)
             }
-            AgentCommand::Configure { execution, change } => {
+            AgentCommand::Configure {
+                execution,
+                change,
+                provider,
+            } => {
+                if provider.is_some() {
+                    return Err(AccessError::invalid(
+                        "External Provider definitions are not supported; choose a built-in model",
+                    ));
+                }
                 self.configure(execution, change).await
             }
             AgentCommand::EditHistory { execution, action } => {
@@ -635,6 +652,7 @@ impl EmbeddedAgentAccess {
         let agent = &self.inner.agent;
         match change {
             ConfigurationChange::Model { config, thinking } => {
+                let config = self.builtin_config(config)?;
                 let root = self
                     .inner
                     .launches
@@ -664,6 +682,11 @@ impl EmbeddedAgentAccess {
                 agent.set_execution_mode(chat, mode).await?
             }
             ConfigurationChange::ContextWindow { tokens } => {
+                if self.inner.builtin_catalog_only.load(Ordering::SeqCst) {
+                    return Err(AccessError::invalid(
+                        "Context window is version-owned by the built-in catalog and cannot be overridden",
+                    ));
+                }
                 agent.set_context_window(chat, tokens).await?
             }
             ConfigurationChange::Search { config } => agent.set_search(chat, config).await?,
@@ -904,18 +927,107 @@ impl EmbeddedAgentAccess {
         let _ = self.inner.changes.send(update);
     }
 
+    fn builtin_config(
+        &self,
+        config: crate::model::ModelConfig,
+    ) -> Result<crate::model::ModelConfig, AccessError> {
+        if !self.inner.builtin_catalog_only.load(Ordering::SeqCst) {
+            return Ok(config);
+        }
+        crate::model::cards::ModelCatalog::defaults()
+            .get(&config.provider_id, &config.model_id)
+            .ok_or_else(|| {
+                AccessError::invalid("Only built-in Provider/model selections are supported")
+            })
+    }
+
+    async fn observe_account_models(
+        &self,
+        execution: ExecutionRef,
+        config: crate::model::ModelConfig,
+        refresh: bool,
+    ) -> Result<Observation, AccessError> {
+        self.chat(execution).await?;
+        let config = self.builtin_config(config)?;
+        let root = self
+            .inner
+            .launches
+            .lock()
+            .await
+            .get(&execution)
+            .and_then(|launch| launch.config_root.clone());
+        let cursor = Cursor {
+            owner_epoch: self.inner.epoch,
+            execution: Some(execution),
+            sequence: self.inner.sequence.load(Ordering::SeqCst),
+        };
+        let cache = self.inner.account_models.clone();
+        let cancel = CancellationToken::new();
+        let _cancel_on_drop = cancel.clone().drop_guard();
+        if !refresh
+            && let Some(directory) = cache
+                .cached_directory(&config, root.as_deref(), &cancel)
+                .await
+        {
+            return Ok(Observation {
+                initial: ObservationValue::AccountModels(directory),
+                cursor,
+                reset: None,
+                changes: None,
+                terminal_error: None,
+            });
+        }
+        let (sender, receiver) = mpsc::channel(1);
+        tokio::spawn(async move {
+            let cancel = CancellationToken::new();
+            let result = tokio::select! {
+                biased;
+                () = sender.closed() => { cancel.cancel(); return; }
+                result = cache.discover(&config, root.as_deref(), refresh, &cancel) => result,
+            };
+            let change = match result {
+                Ok(_) => ObservationChange::Changed,
+                Err(error) => ObservationChange::AccountModels(Err(error)),
+            };
+            let _ = sender.send(ObservationUpdate { cursor, change }).await;
+        });
+        Ok(Observation {
+            initial: ObservationValue::AccountModelsPending,
+            cursor,
+            reset: None,
+            changes: Some(receiver),
+            terminal_error: None,
+        })
+    }
+
     async fn observe_agent(
         &self,
         execution: ExecutionRef,
         detail: AgentDetailQuery,
         after: Option<Cursor>,
     ) -> Result<Observation, AccessError> {
+        if let AgentDetailQuery::AccountModels { config, refresh } = &detail {
+            return self
+                .observe_account_models(execution, *config.clone(), *refresh)
+                .await;
+        }
         let mut receiver = self.inner.changes.subscribe();
         let sequence = self.inner.sequence.load(Ordering::SeqCst);
         let chat = self.chat(execution).await?;
         let snapshot = self.snapshot(execution).await?;
         let watermark = snapshot.last_sequence;
         let initial = match detail {
+            AgentDetailQuery::ProviderCredentials => {
+                let launches = self.inner.launches.lock().await;
+                let launch = launches.get(&execution);
+                ObservationValue::ProviderCredentials(Box::new(ProviderCredentialScope::current(
+                    launch.and_then(|launch| launch.config_root.clone()),
+                    None,
+                )))
+            }
+            AgentDetailQuery::AccountModels { .. } => {
+                unreachable!("account queries return their own observation")
+            }
             AgentDetailQuery::Snapshot => ObservationValue::Agent(Box::new(snapshot)),
             AgentDetailQuery::Permissions => ObservationValue::Permissions(Box::new(
                 self.inner.agent.permissions_view(chat).await?,

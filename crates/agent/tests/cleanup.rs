@@ -320,7 +320,9 @@ async fn a_zero_cleanup_period_writes_no_transcript() {
             _ => {}
         }
     }
-    agent.set_context_window(chat, 64_000).await.unwrap();
+    tickloop_agent::settings::UserSettings::in_root(&root)
+        .save_thinking_enabled(false)
+        .unwrap();
     agent.flush_transcripts().await;
     agent.shutdown().await;
 
@@ -331,7 +333,8 @@ async fn a_zero_cleanup_period_writes_no_transcript() {
     assert_eq!(project_entries, vec![std::ffi::OsString::from("-earlier")]);
     let settings: serde_json::Value =
         serde_json::from_slice(&std::fs::read(root.join("settings.json")).unwrap()).unwrap();
-    assert_eq!(settings["contextWindowTokens"], 64_000);
+    assert_eq!(settings["alwaysThinkingEnabled"], false);
+    assert!(settings.get("contextWindowTokens").is_none());
     assert_eq!(settings["cleanupPeriodDays"], 0);
     assert!(agent.saved_chats(&workdir).await.unwrap().is_empty());
     let reopened = Agent::open_embedded(

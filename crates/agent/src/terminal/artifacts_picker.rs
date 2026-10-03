@@ -65,6 +65,7 @@ pub(super) struct ArtifactsPicker {
     cursor: Option<String>,
     error: Option<String>,
     top: usize,
+    row_targets: Vec<(std::ops::Range<usize>, usize)>,
     rename: Option<(ArtifactMetadata, ConversationPicker)>,
     delete: Option<ArtifactMetadata>,
 }
@@ -86,6 +87,7 @@ impl ArtifactsPicker {
             cursor: None,
             error: None,
             top: 0,
+            row_targets: Vec::new(),
             rename: None,
             delete: None,
         }
@@ -333,6 +335,24 @@ impl ArtifactsPicker {
     pub(super) fn refresh(&mut self) {
         self.reload(false);
     }
+    pub(super) fn select_at_row(&mut self, row: usize) -> bool {
+        if self.rename.is_some() {
+            return false;
+        }
+        let index = self
+            .row_targets
+            .iter()
+            .find(|(rows, _)| rows.contains(&row))
+            .map(|(_, index)| *index);
+        index.is_some_and(|index| {
+            if self.delete.is_some() {
+                self.picker.selection() == Some(index)
+            } else {
+                self.picker.select_entry(index)
+            }
+        })
+    }
+
     pub(super) fn frame(
         &mut self,
         width: usize,
@@ -355,6 +375,7 @@ impl ArtifactsPicker {
             (self.picker.focus() == ConversationPickerFocus::Search).then_some((1, column));
         lines.push(search);
         let mut rows = Vec::new();
+        let mut targets = Vec::new();
         let mut selected_row = 0;
         let mut previous_group = None;
         let now = crate::private_fs::unix_time_milliseconds();
@@ -372,6 +393,7 @@ impl ArtifactsPicker {
                 ));
                 previous_group = Some(added);
             }
+            let first_row = rows.len();
             let selected = self.picker.selection() == Some(*index);
             if selected {
                 selected_row = rows.len();
@@ -412,6 +434,7 @@ impl ArtifactsPicker {
                 ),
                 Role::MutedText,
             ));
+            targets.push((first_row..rows.len(), *index));
         }
         let capacity = height.saturating_sub(3 + usize::from(self.rename.is_some()));
         if selected_row < self.top {
@@ -430,6 +453,17 @@ impl ArtifactsPicker {
                 Role::MutedText,
             ));
         }
+        self.row_targets = targets
+            .into_iter()
+            .filter_map(|(rows, index)| {
+                let start = rows.start.max(self.top);
+                let end = rows.end.min(self.top + capacity);
+                (start < end).then_some((
+                    start.saturating_sub(self.top) + 2..end.saturating_sub(self.top) + 2,
+                    index,
+                ))
+            })
+            .collect();
         lines.extend(rows.into_iter().skip(self.top).take(capacity));
         while lines.len() < height.saturating_sub(1 + usize::from(self.rename.is_some())) {
             lines.push(RoleLine::default());

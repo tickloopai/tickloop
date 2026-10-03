@@ -55,6 +55,13 @@ struct ServiceControl {
     fail_association_after_publish: AtomicBool,
     stale_next_directory: AtomicBool,
     bridge_enabled: AtomicBool,
+    creation_enabled: AtomicBool,
+    resource_directory_enabled: AtomicBool,
+    attachment_revision: AtomicUsize,
+    reject_creation: AtomicBool,
+    unconfirmed_creation: AtomicBool,
+    wrong_creation_operation: AtomicBool,
+    metadata_enabled: AtomicBool,
     feedback_pending: AtomicBool,
     feedback_claimed: AtomicBool,
     feedback_completed: AtomicBool,
@@ -150,11 +157,15 @@ async fn service() -> (String, Arc<Mutex<Vec<Value>>>, Arc<ServiceControl>) {
                 } else if path.starts_with("POST /api/v1/auth/logout ") {
                     control.active.store(false, Ordering::SeqCst);
                     json!({"revoked":true})
+                } else if path.starts_with("GET /api/v1/artifacts/")
+                    && control.metadata_enabled.load(Ordering::SeqCst)
+                {
+                    json!({"id":"source-one","title":"REST title","format":"markdown","access_role":"owner","url":format!("{origin}/a/source-one")})
                 } else if path.starts_with("POST /mcp ") {
                     let id = body["id"].clone();
                     let result = match body["method"].as_str().unwrap_or("") {
                         "server/discover" => {
-                            json!({"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{}},"ttlMs":0,"cacheScope":"private"})
+                            json!({"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":if control.creation_enabled.load(Ordering::SeqCst) || control.resource_directory_enabled.load(Ordering::SeqCst) {json!({"tools":{},"resources":{}})}else{json!({"tools":{}})},"ttlMs":0,"cacheScope":"private"})
                         }
                         "tools/list" => {
                             let mut tools = vec![
@@ -171,7 +182,21 @@ async fn service() -> (String, Arc<Mutex<Vec<Value>>>, Arc<ServiceControl>) {
                                     tools.push(json!({"name":"artifact_agent_connect","inputSchema":{"type":"object","properties":{"artifact_id":{"type":"string"},"operation_id":{"type":"string"},"action":{"type":"string","enum":["connect","check"]},"replace_existing":{"type":"boolean"}},"required":["artifact_id","operation_id"],"additionalProperties":false}}));
                                 }
                             }
+                            tools.push(json!({"name":"create_custom_document","inputSchema":{"type":"object","properties":{"operation_id":{"type":"string"},"title":{"type":"string"},"format":{"type":"string"}}}}));
                             json!({"tools":tools})
+                        }
+                        "resources/list" => {
+                            json!({"resources":if control.creation_enabled.load(Ordering::SeqCst){json!([{"uri":"tickloop://artifact-tick-attachments/v1","name":"attachments"}])}else{json!([])}})
+                        }
+                        "resources/read"
+                            if body["params"]["uri"]
+                                == "tickloop://artifact-tick-attachments/v1" =>
+                        {
+                            let mut descriptor = json!({"version":1,"creation_tools":[{"tool":"create_custom_document","operation_id_argument":"operation_id","artifact_id_result":"artifact_id","title_argument":"title","format_argument":"format","url_result":"url"}]});
+                            if control.attachment_revision.load(Ordering::SeqCst) != 0 {
+                                descriptor["creation_tools"][0]["url_result"] = json!("public_url");
+                            }
+                            json!({"contents":[{"uri":"tickloop://artifact-tick-attachments/v1","mimeType":"application/json","text":descriptor.to_string()}]})
                         }
                         "resources/read" => {
                             let mut descriptor = json!({"version":1,"publication_tools":[{"tool":"artifact_publish","operation_id_argument":"operation_id","source_key_result":"artifact_id","version_key_result":"version_id"}],"tools":{"associate":"event_associate","pending":"event_pending","claim":"event_claim","renew":"event_renew","release":"event_release","operation":"event_operation"}});
@@ -190,7 +215,9 @@ async fn service() -> (String, Arc<Mutex<Vec<Value>>>, Arc<ServiceControl>) {
                             json!({"contents":[{"uri":uri,"mimeType":"application/json","text":descriptor.to_string()}]})
                         }
                         "tools/call" => {
-                            if body["params"]["name"] == "artifact_agent_connect" {
+                            if body["params"]["name"] == "create_custom_document" {
+                                json!({"content":[],"isError":control.reject_creation.load(Ordering::SeqCst),"structuredContent":{"status":if control.unconfirmed_creation.load(Ordering::SeqCst){"unknown"}else{"committed"},"operation_id":if control.wrong_creation_operation.load(Ordering::SeqCst){json!("wrong-operation")}else{body["params"]["arguments"]["operation_id"].clone()},"artifact_id":"source-one","url":format!("{origin}/a/source-one")}})
+                            } else if body["params"]["name"] == "artifact_agent_connect" {
                                 let arguments = &body["params"]["arguments"];
                                 let action = arguments["action"].as_str().unwrap_or("connect");
                                 let operation = if control
@@ -519,6 +546,7 @@ async fn service() -> (String, Arc<Mutex<Vec<Value>>>, Arc<ServiceControl>) {
 async fn confirmed_publication_records_effect_on_current_loop_receipt() {
     let (origin, requests, control) = service().await;
     control.bridge_enabled.store(true, Ordering::SeqCst);
+    control.metadata_enabled.store(true, Ordering::SeqCst);
     let directory = tempfile::tempdir().unwrap();
     let account =
         ArtifactClient::for_origin(directory.path().canonicalize().unwrap(), &origin).unwrap();
@@ -586,6 +614,9 @@ async fn confirmed_publication_records_effect_on_current_loop_receipt() {
     .await
     .unwrap();
     let snapshot = agent.snapshot(chat).await.unwrap();
+    assert_eq!(snapshot.artifact_ticks.len(), 1);
+    assert_eq!(snapshot.artifact_ticks[0].title, "REST title");
+    assert_eq!(snapshot.artifact_ticks[0].origin, origin);
     let goal = snapshot.loops.last().unwrap();
     assert_eq!(goal.event_sources.len(), 1);
     let source = &goal.event_sources[0];
@@ -6071,4 +6102,128 @@ async fn connection36_delayed_initiating_check_does_not_rearm_explicitly_disable
         );
     }
     agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn optional_attachment_descriptor_creates_a_display_only_tick() {
+    for (advertised, failed, unconfirmed, wrong_operation, expected) in [
+        (true, false, false, false, 1),
+        (false, false, false, false, 0),
+        (true, true, false, false, 0),
+        (true, false, true, false, 0),
+        (true, false, false, true, 0),
+    ] {
+        let (origin, requests, control) = service().await;
+        control.creation_enabled.store(advertised, Ordering::SeqCst);
+        control
+            .resource_directory_enabled
+            .store(true, Ordering::SeqCst);
+        control.reject_creation.store(failed, Ordering::SeqCst);
+        control
+            .unconfirmed_creation
+            .store(unconfirmed, Ordering::SeqCst);
+        control
+            .wrong_creation_operation
+            .store(wrong_operation, Ordering::SeqCst);
+        let directory = tempfile::tempdir().unwrap();
+        let account =
+            ArtifactClient::for_origin(directory.path().canonicalize().unwrap(), &origin).unwrap();
+        login(&account).await;
+        let agent = Agent::new_embedded(
+            config(),
+            Arc::new(ScriptedModel::new(vec![
+                call(
+                    "create",
+                    "mcp__artifacts__create_custom_document",
+                    json!({"operation_id":"creation-one","title":"Created document","format":"markdown"}),
+                ),
+                text("done"),
+            ])),
+        );
+        agent
+            .install_host_tools(Arc::new(McpHostToolProvider::new(account, None)))
+            .unwrap();
+        let chat = agent.create_chat(directory.path().into()).await.unwrap();
+        let mut events = agent.subscribe();
+        agent.submit(chat, None, "Create".into()).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                match events.recv().await.unwrap().kind {
+                    EventKind::PermissionRequested { request } => agent
+                        .answer_permission(chat, request.id, true)
+                        .await
+                        .unwrap(),
+                    EventKind::Completed { .. } => break,
+                    EventKind::Failed(error) => panic!("{error}"),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let ticks = agent.artifact_ticks(chat).await.unwrap();
+        assert_eq!(
+            ticks.len(),
+            expected,
+            "advertised={advertised} failed={failed}"
+        );
+        if let Some(tick) = ticks.first() {
+            assert_eq!(tick.title, "Created document");
+            assert_eq!(tick.origin, origin);
+        }
+        assert!(agent.tick_subscriptions(chat).await.unwrap().is_empty());
+        assert!(
+            agent
+                .snapshot(chat)
+                .await
+                .unwrap()
+                .loops
+                .iter()
+                .all(|goal| goal.event_sources.is_empty())
+        );
+        assert!(
+            !requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r["body"]["params"]["name"] == "event_associate")
+        );
+        agent.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn changed_attachment_mapping_is_rejected_before_dispatch() {
+    let (origin, requests, control) = service().await;
+    control.creation_enabled.store(true, Ordering::SeqCst);
+    let directory = tempfile::tempdir().unwrap();
+    let account =
+        ArtifactClient::for_origin(directory.path().canonicalize().unwrap(), &origin).unwrap();
+    login(&account).await;
+    let provider = McpHostToolProvider::new(account, None);
+    provider.refresh(CancellationToken::new()).await.unwrap();
+    let chat = tickloop_agent::runtime::ChatId::new_v4();
+    let prepared = provider
+        .prepare_call(
+            chat,
+            "mcp__artifacts__create_custom_document",
+            &json!({"operation_id":"create-once","title":"Document","format":"markdown"}),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    control.attachment_revision.store(1, Ordering::SeqCst);
+    assert!(
+        provider
+            .revalidate_call(chat, &prepared, CancellationToken::new())
+            .await
+            .is_err()
+    );
+    assert!(
+        !requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| request["body"]["method"] == "tools/call")
+    );
 }

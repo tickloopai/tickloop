@@ -3,6 +3,9 @@
 mod model_http_support;
 mod support;
 
+#[path = "agent_console_pty/artifact_attachment.rs"]
+mod artifact_attachment;
+
 #[path = "agent_console_pty/command_feedback.rs"]
 mod command_feedback;
 
@@ -17,6 +20,9 @@ mod reply_visibility;
 
 #[path = "agent_console_pty/unified_footer.rs"]
 mod unified_footer;
+
+#[path = "agent_console_pty/auto_review.rs"]
+mod auto_review;
 
 use std::{
     io::{Read, Write},
@@ -78,7 +84,9 @@ impl PrivateFixture {
         model.base_url = base_url.trim_end_matches("/anthropic").into();
         model.api_key_env = "TICKLOOP_FIXTURE_API_KEY".into();
         self.set_model(&model);
-        model
+        tickloop_agent::model::cards::ModelCatalog::defaults()
+            .get("deepseek-api", "deepseek-flash")
+            .unwrap()
     }
 
     async fn client(&self) -> LocalAgentClient {
@@ -169,8 +177,8 @@ impl PtyView {
                 pixel_height: 0,
             })
             .unwrap();
-        let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_tickloop"));
-        command.args(["--working-directory-is-trusted", "--config"]);
+        let mut command = CommandBuilder::new(support::fixture_cli::executable());
+        command.args(["--working-directory-is-trusted", "--transport-fixture"]);
         command.arg(fixture.path("model.json"));
         if !saves_chats {
             command.arg("--no-session-persistence");
@@ -838,7 +846,7 @@ async fn run_resize_matrix(fixture: &PrivateFixture) {
             );
             assert!(borders[0] >= 6, "{height}×{width}: {frame}");
             assert!(
-                rows.last().unwrap().contains("fixture"),
+                rows.last().unwrap().contains("deepseek-flash"),
                 "{height}×{width}: {frame}"
             );
             view.send(b"\x03");
@@ -859,7 +867,7 @@ async fn run_resize_matrix(fixture: &PrivateFixture) {
             view.send(b"\x1b");
             view.wait_for("help restores actual status", |frame| {
                 !frame.contains("Ctrl+J newline")
-                    && frame.lines().last().unwrap().contains("fixture")
+                    && frame.lines().last().unwrap().contains("deepseek-flash")
             })
             .await;
             view.send(b"\x1b[D");
@@ -1587,6 +1595,7 @@ async fn run_child_views(fixture: &PrivateFixture) {
             owner_epoch: client.owner_epoch(),
             command_id: uuid::Uuid::new_v4(),
             command: AgentCommand::Configure {
+                provider: None,
                 execution: child,
                 change: ConfigurationChange::ReplaceRules { rules: Vec::new() },
             },
@@ -3364,6 +3373,7 @@ async fn actual_cli_legacy_dense_overview_preserves_unknown_work_facts() {
 /// Rows above the composer's upper rule; a sent prompt must be echoed there, not only left in the
 /// editor or the provider request.
 fn conversation_body(frame: &str) -> String {
+    let frame = screen::message_flow(frame);
     let lines: Vec<&str> = frame.lines().collect();
     let composer = lines
         .iter()

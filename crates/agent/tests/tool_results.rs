@@ -346,9 +346,14 @@ async fn budget_replacements_preserved_by_a_directed_summary_of_a_large_transcri
         text("Summary of the early turn."),
         text("Nothing changed."),
     ]));
-    let agent = Agent::open_embedded(root.clone(), config(), model.clone()).unwrap();
+    let agent = Agent::open_embedded(
+        root.clone(),
+        support::config_with_window(50_000_000),
+        model.clone(),
+    )
+    .unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    agent.set_context_window(chat, 50_000_000).await.unwrap();
+
     complete_turn(&agent, chat, None, "Early prompt").await;
     complete_turn(&agent, chat, None, "List the directories").await;
     complete_turn(&agent, chat, None, &large_prompt).await;
@@ -394,7 +399,7 @@ async fn budget_replacements_preserved_by_a_directed_summary_of_a_large_transcri
 
     let copying = Agent::open_embedded(
         root.clone(),
-        config(),
+        support::config_with_window(50_000_000),
         Arc::new(ScriptedModel::new(Vec::new())),
     )
     .unwrap();
@@ -411,7 +416,7 @@ async fn budget_replacements_preserved_by_a_directed_summary_of_a_large_transcri
 
     let branching = Agent::open_embedded(
         root.clone(),
-        config(),
+        support::config_with_window(50_000_000),
         Arc::new(ScriptedModel::new(Vec::new())),
     )
     .unwrap();

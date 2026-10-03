@@ -4,10 +4,10 @@
 use serde_json::json;
 
 use super::approval_context::ApprovalSnapshot;
-use super::auto_rules::{AutoPolicy, RuleVerdict, SemanticFindings, reduce};
+use super::auto_rules::{AutoPolicy, AutoRuleKind, RuleVerdict, SemanticFindings, reduce};
 use crate::model::{
-    Content, Message, ModelError, ModelFailureKind, ModelOutput, ModelRequest, Role,
-    StructuredOutput,
+    Content, Message, ModelError, ModelFailureKind, ModelOutput, ModelRequest,
+    ModelResponseRejection, Role, StructuredOutput,
 };
 
 pub(super) const CLASSIFIER_TOOL_NAME: &str = "classify_result";
@@ -22,6 +22,14 @@ Return a finding for task scope and exactly one finding for every Soft deny and 
 
 /// Serializes the complete trusted snapshot for the isolated LLM reviewer.
 pub(super) fn classifier_request(context: &ApprovalSnapshot) -> ModelRequest {
+    let schema = classifier_schema(&context.auto_policy);
+    let example = json!({
+        "task_scope": "uncertain",
+        "rules": context.auto_policy.rules.iter().filter(|rule| rule.kind != AutoRuleKind::SoftAllow).map(|rule| json!({
+            "id": rule.id, "applicability": "uncertain",
+            "clearance": if rule.kind == AutoRuleKind::HardDeny { serde_json::Value::Null } else { json!("uncertain") }
+        })).collect::<Vec<_>>()
+    });
     ModelRequest {
         history_sources: Vec::new(),
         messages: vec![
@@ -29,8 +37,8 @@ pub(super) fn classifier_request(context: &ApprovalSnapshot) -> ModelRequest {
                 role: Role::System,
                 content: vec![Content::Text {
                     text: format!(
-                        "{SYSTEM_PROMPT}\n\n{}",
-                        super::auto_rules::OPERATION_INTERPRETATION
+                        "{SYSTEM_PROMPT}\n\n{}\n\nReturn exactly one JSON object with the exact lowercase field names and enum values in the output schema, or call the supplied result tool exactly once. No prose, Markdown fences, or global verdict fields. This example shows the required shape only; assess every finding independently:\n{example}",
+                        super::auto_rules::OPERATION_INTERPRETATION,
                     ),
                 }],
             },
@@ -44,27 +52,56 @@ pub(super) fn classifier_request(context: &ApprovalSnapshot) -> ModelRequest {
         tools: Vec::new(),
         structured_output: Some(StructuredOutput {
             name: CLASSIFIER_TOOL_NAME.into(),
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "task_scope": {"type": "string", "enum": ["within_task", "outside_task", "uncertain"]},
-                    "rules": {"type": "array", "items": {"type": "object", "properties": {
-                        "id": {"type": "string"},
-                        "applicability": {"type": "string", "enum": ["present", "absent", "uncertain"]},
-                        "clearance": {"oneOf": [
-                            {"type": "string", "enum": ["explicit_consent", "missing", "uncertain"]},
-                            {"type": "object", "properties": {"soft_allow": {"type": "string"}}, "required": ["soft_allow"], "additionalProperties": false},
-                            {"type": "null"}
-                        ]}
-                    }, "required": ["id", "applicability", "clearance"], "additionalProperties": false}}
-                },
-                "required": ["task_scope", "rules"],
-                "additionalProperties": false
-            }),
+            schema,
         }),
         temperature: Some(0.0),
         reasoning_effort: None,
     }
+}
+
+fn classifier_schema(policy: &AutoPolicy) -> serde_json::Value {
+    let soft_allow_ids = policy
+        .rules
+        .iter()
+        .filter(|rule| rule.kind == AutoRuleKind::SoftAllow)
+        .map(|rule| rule.id.as_str())
+        .collect::<Vec<_>>();
+    let mut soft_clearances =
+        vec![json!({"type":"string", "enum":["explicit_consent", "missing", "uncertain"]})];
+    if !soft_allow_ids.is_empty() {
+        soft_clearances.push(json!({"type":"object", "properties":{"soft_allow":{"type":"string", "enum":soft_allow_ids}}, "required":["soft_allow"], "additionalProperties":false}));
+    }
+    let mut variants = Vec::new();
+    for kind in [AutoRuleKind::SoftDeny, AutoRuleKind::HardDeny] {
+        let ids = policy
+            .rules
+            .iter()
+            .filter(|rule| rule.kind == kind)
+            .map(|rule| rule.id.as_str())
+            .collect::<Vec<_>>();
+        if ids.is_empty() {
+            continue;
+        }
+        let clearance = if kind == AutoRuleKind::HardDeny {
+            json!({"type":"null"})
+        } else {
+            json!({"anyOf":soft_clearances})
+        };
+        variants.push(json!({"type":"object", "properties":{
+            "id":{"type":"string", "enum":ids},
+            "applicability":{"type":"string", "enum":["present", "absent", "uncertain"]},
+            "clearance":clearance
+        }, "required":["id", "applicability", "clearance"], "additionalProperties":false}));
+    }
+    let items = match variants.len() {
+        0 => json!({"type":"object", "properties":{}, "required":[], "additionalProperties":false}),
+        1 => variants.remove(0),
+        _ => json!({"anyOf":variants}),
+    };
+    json!({"type":"object", "properties":{
+        "task_scope":{"type":"string", "enum":["within_task", "outside_task", "uncertain"]},
+        "rules":{"type":"array", "items":items}
+    }, "required":["task_scope", "rules"], "additionalProperties":false})
 }
 
 pub(super) fn parse_verdict(
@@ -90,9 +127,80 @@ pub(super) fn parse_verdict(
             _ => None,
         })
         .collect::<String>();
-    let findings = serde_json::from_str::<SemanticFindings>(text.trim())
+    let findings = serde_json::from_str::<SemanticFindings>(classification_json(&text)?)
         .map_err(|_| "classifier returned an invalid classification")?;
     reduce(policy, &findings).map_err(|_| "classifier returned incomplete or invalid rule findings")
+}
+
+fn classification_json(text: &str) -> Result<&str, &'static str> {
+    let mut text = text.trim();
+    for (opening, closing) in [("<think>", "</think>"), ("<thinking>", "</thinking>")] {
+        if let Some(thinking) = text.strip_prefix(opening) {
+            let (thinking, remaining) = thinking
+                .split_once(closing)
+                .ok_or("classifier returned unfinished thinking")?;
+            if thinking.contains(opening) {
+                return Err("classifier returned ambiguous thinking");
+            }
+            text = remaining.trim();
+            break;
+        }
+    }
+    if let Some(fenced) = text.strip_prefix("```") {
+        let (language, body) = fenced
+            .split_once('\n')
+            .ok_or("classifier returned an unfinished JSON fence")?;
+        if !language.trim().is_empty() && !language.trim().eq_ignore_ascii_case("json") {
+            return Err("classifier returned an unsupported JSON fence");
+        }
+        text = body
+            .trim_end()
+            .strip_suffix("```")
+            .ok_or("classifier returned an unfinished JSON fence")?
+            .trim();
+    }
+    Ok(text)
+}
+
+pub(super) fn response_failure(error: &ModelError) -> Option<(&'static str, bool)> {
+    match error {
+        ModelError::AtStage { error, .. } => response_failure(error),
+        ModelError::InvalidResponse(_) => Some((
+            "returned malformed output with unverified tool operations",
+            false,
+        )),
+        ModelError::ResponseRejected(ModelResponseRejection::MalformedStructuredOutput) => {
+            Some(("malformed verified structured result", true))
+        }
+        ModelError::ResponseRejected(ModelResponseRejection::InvalidToolCall) => Some((
+            "returned an invalid tool call with unverified identity",
+            false,
+        )),
+        ModelError::ResponseRejected(ModelResponseRejection::OutputLimit) => {
+            Some(("model output was truncated", true))
+        }
+        ModelError::ResponseRejected(ModelResponseRejection::Refusal) => {
+            Some(("refused to classify the operation", false))
+        }
+        ModelError::ResponseRejected(ModelResponseRejection::UnexpectedToolOperation) => {
+            Some(("returned unexpected tool operations", false))
+        }
+        ModelError::ResponseRejected(ModelResponseRejection::ContentFilter) => {
+            Some(("response was blocked by the service content filter", false))
+        }
+        _ => None,
+    }
+}
+
+pub(super) fn classifier_retry_request(request: &ModelRequest, reason: &str) -> ModelRequest {
+    let mut retry = request.clone();
+    let Content::Text { text } = &mut retry.messages[0].content[0] else {
+        unreachable!("classifier system prompt is text")
+    };
+    text.push_str(&format!(
+        "\n\nThe previous response could not be validated: {reason}. Reassess the same operation against the same original user inputs and full policy. Return complete schema-compliant findings with every restriction ID exactly once, exact lowercase fields and enum values, non-null Soft deny clearance, and null Hard deny clearance. Emit no prose or extra tool calls. Do not change a safety finding merely to repair formatting; preserve uncertainty and restrictions."
+    ));
+    retry
 }
 
 const DENIAL_WORKAROUND_GUIDANCE: &str = "IMPORTANT: You *may* attempt to accomplish this action using other tools that might naturally be used to accomplish this goal, e.g. using head instead of cat. But you *should not* attempt to work around this denial in malicious ways, e.g. do not use your ability to run tests to execute non-test actions. You should only try to work around this restriction in reasonable ways that do not attempt to bypass the intent behind this denial. If you believe this capability is essential to complete the user's request, STOP and explain to the user what you were trying to do and why you need this permission. Let the user decide how to proceed.";
@@ -258,6 +366,29 @@ mod tests {
     }
 
     #[test]
+    fn complete_json_wrappers_preserve_the_classification() {
+        let policy = AutoPolicy::from_settings(&crate::settings::AutoSettings::default());
+        let findings = json!({
+            "task_scope": "within_task",
+            "rules": policy.rules.iter().map(|rule| json!({
+                "id": rule.id, "applicability": "absent", "clearance": "missing"
+            })).collect::<Vec<_>>()
+        });
+        for text in [
+            format!("```json\n{findings}\n```"),
+            format!("```JSON\r\n{findings}\r\n```"),
+            format!("<think>Consider {{\"task_scope\":\"outside_task\"}}</think>\n{findings}"),
+            format!("<thinking>Assess every rule</thinking>\n```json\n{findings}\n```"),
+        ] {
+            assert_eq!(
+                parse_verdict(&output(&text), &policy),
+                Ok(RuleVerdict::Allow),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
     fn prose_fences_and_unknown_fields_are_invalid() {
         let policy = AutoPolicy::from_settings(&crate::settings::AutoSettings::default());
         for text in [
@@ -268,6 +399,47 @@ mod tests {
         ] {
             assert!(parse_verdict(&output(text), &policy).is_err(), "{text}");
         }
+    }
+
+    #[test]
+    fn ambiguous_incomplete_or_refused_classifications_never_allow() {
+        let policy = AutoPolicy::from_settings(&crate::settings::AutoSettings::default());
+        let findings = json!({"task_scope":"within_task", "rules":policy.rules.iter().map(|rule| json!({
+            "id":rule.id, "applicability":"absent", "clearance":"missing"
+        })).collect::<Vec<_>>()});
+        let raw = findings.to_string();
+        for text in [
+            format!("Here is the assessment: {raw}"),
+            format!("{raw}\nThe operation must be denied."),
+            format!("{raw}\n{raw}"),
+            format!("```json\n{raw}\n```\nRefused."),
+            format!("<think>unfinished\n{raw}"),
+            format!("<think><think>ambiguous</think>\n{raw}"),
+            format!("```json\n{raw}"),
+            raw.replace("task_scope", "Task_Scope"),
+            raw.replace("within_task", "WITHIN_TASK"),
+            raw.replace("\"clearance\":\"missing\"", "\"clearance\":null"),
+            raw.replace("builtin.soft_deny.finance", "unknown-rule"),
+            raw[..raw.len() - 1].to_owned(),
+            r#"{"task_scope":"outside_task","task_scope":"within_task","rules":[]}"#.into(),
+            r#"{"task_scope":"within_task","rules":[]}"#.into(),
+            "I cannot review this operation.".into(),
+            String::new(),
+        ] {
+            assert!(parse_verdict(&output(&text), &policy).is_err(), "{text}");
+        }
+        for stop in ["max_tokens", "refusal", "content_filter", "tool_use", ""] {
+            let mut unfinished = output(&raw);
+            unfinished.stop_reason = stop.into();
+            assert!(parse_verdict(&unfinished, &policy).is_err(), "{stop}");
+        }
+        let mut unexpected = output(&raw);
+        unexpected.content.push(Content::ToolUse {
+            id: "extra".into(),
+            name: CLASSIFIER_TOOL_NAME.into(),
+            input: findings,
+        });
+        assert!(parse_verdict(&unexpected, &policy).is_err());
     }
 
     #[test]
@@ -304,6 +476,31 @@ mod tests {
         assert!(
             matches!(parse_verdict(&output(&findings.to_string()), &policy), Ok(RuleVerdict::Block { kind: AutoBlockKind::HardDeny, rule_id: Some(id), .. }) if id == "hard")
         );
+        assert!(matches!(
+            parse_verdict(&output(&format!("```json\n{findings}\n```")), &policy),
+            Ok(RuleVerdict::Block {
+                kind: AutoBlockKind::HardDeny,
+                ..
+            })
+        ));
+        assert!(jsonschema::is_valid(&classifier_schema(&policy), &findings));
+        let mut invalid_clearance = findings.clone();
+        invalid_clearance["rules"][0]["clearance"] = json!("explicit_consent");
+        assert!(!jsonschema::is_valid(
+            &classifier_schema(&policy),
+            &invalid_clearance
+        ));
+        let uncertainty = json!({"task_scope":"uncertain", "rules":[
+            {"id":"hard", "applicability":"absent", "clearance":null},
+            {"id":"soft", "applicability":"absent", "clearance":"uncertain"}
+        ]});
+        assert!(matches!(
+            parse_verdict(
+                &output(&format!("<think>Assess policy</think>\n{uncertainty}")),
+                &policy
+            ),
+            Ok(RuleVerdict::NeedsHuman { .. })
+        ));
         let missing = json!({"task_scope":"within_task","rules":[{"id":"hard","applicability":"absent","clearance":null}]});
         assert!(parse_verdict(&output(&missing.to_string()), &policy).is_err());
     }
@@ -396,6 +593,17 @@ mod tests {
             CLASSIFIER_TOOL_NAME
         );
         assert_eq!(request.temperature, Some(0.0));
+        let schema = classifier_request(&context)
+            .structured_output
+            .unwrap()
+            .schema;
+        let null_clearance = json!({"task_scope":"within_task", "rules": context.auto_policy.rules.iter().map(|rule| json!({
+            "id":rule.id, "applicability":"absent", "clearance":null
+        })).collect::<Vec<_>>()});
+        assert!(
+            !jsonschema::is_valid(&schema, &null_clearance),
+            "the schema must reject null clearance for Soft deny"
+        );
     }
 
     #[test]

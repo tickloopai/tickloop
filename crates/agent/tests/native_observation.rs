@@ -119,6 +119,7 @@ impl HerdrPort for TerminalHost {
             ));
         }
         match method {
+            "pane.current" => Ok(json!({"pane": self.pane("agent")})),
             "pane.list" => {
                 let gone = self.gone.lock().unwrap();
                 let mut panes: Vec<_> = ["one", "two"]
@@ -865,4 +866,139 @@ for line in sys.stdin:
     assert!(delivered.contains("\"dropped\":0"), "{delivered}");
     agent.shutdown().await;
     session.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn herdr_adapter_aliases_keep_native_query_permissions_and_target_admission() {
+    use support::tick_alias_contract::{AliasCase, verify_alias_policy};
+    use tickloop_agent::{
+        host_tools::HostToolProvider,
+        native_host::NativeHostToolProvider,
+        tick_adapter::{HerdrAdapter, TickAdapter, TickAdapters},
+    };
+    let directory = tempfile::Builder::new()
+        .prefix("ta-contract")
+        .tempdir_in("/private/tmp")
+        .unwrap();
+    let runtime_dir = directory.path().join("sessions");
+    let host_socket = directory.path().join("herdr.sock");
+    let script = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/ticks/counter.py");
+    let session = TickSession::spawn(SessionLaunch {
+        command: vec!["python3".into(), script.to_string_lossy().into_owned()],
+        cwd: directory.path().into(),
+        host_socket: host_socket.clone(),
+        terminal_id: "protocol".into(),
+        runtime_dir: Some(runtime_dir.clone()),
+    })
+    .await
+    .unwrap();
+    let instance = session.instance().clone();
+    let host = Arc::new(TerminalHost::new());
+    *host.protocol.lock().unwrap() = Some(instance.clone());
+    let access = Arc::new(
+        TickAccess::with_host(
+            HerdrContext {
+                socket: host_socket,
+                caller_pane: "agent".into(),
+            },
+            host.clone(),
+        )
+        .with_runtime_dir(runtime_dir),
+    );
+    let native = NativeHostToolProvider::new(access.clone());
+    let adapters = Arc::new(
+        TickAdapters::new([Arc::new(HerdrAdapter::new(Some(access))) as Arc<dyn TickAdapter>])
+            .unwrap(),
+    );
+    let model = Arc::new(ScriptedModel::new(vec![]));
+    let agent = Agent::new_embedded(config(), model.clone());
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let read_input = json!({"tick_instance_id":instance});
+    let query_input = json!({"tick_instance_id":instance,"tool":"history","args":{}});
+    let read = native
+        .prepare_call(chat, "ReadTick", &read_input, CancellationToken::new())
+        .await
+        .unwrap();
+    let query = native
+        .prepare_call(chat, "CallTickTool", &query_input, CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        read.permission(),
+        tickloop_agent::host_tools::HostToolPermission::ReadOnly
+    );
+    assert_eq!(query.permission(), read.permission());
+    let mutation_input =
+        json!({"tick_instance_id":instance,"tool":"increment","args":{"amount":1}});
+    let mutation = native
+        .prepare_call(
+            chat,
+            "CallTickTool",
+            &mutation_input,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        mutation.permission(),
+        tickloop_agent::host_tools::HostToolPermission::Reviewable
+    );
+    let cases = [
+        AliasCase {
+            plan_denied: true,
+            name: "CallTickTool",
+            input: mutation_input,
+            policy_name: "CallTickTool",
+            policy_input: mutation.input().clone(),
+        },
+        AliasCase {
+            plan_denied: false,
+            name: "ReadTick",
+            input: read_input.clone(),
+            policy_name: "ReadTick",
+            policy_input: read.input().clone(),
+        },
+        AliasCase {
+            plan_denied: false,
+            name: "CallTickTool",
+            input: query_input.clone(),
+            policy_name: "CallTickTool",
+            policy_input: query.input().clone(),
+        },
+        AliasCase {
+            plan_denied: false,
+            name: "SubscribeTick",
+            input: json!({"tick_instance_id":instance,"every_seconds":5}),
+            policy_name: "ReadTick",
+            policy_input: read.input().clone(),
+        },
+    ];
+    let tools = adapters.host_tools(None);
+    agent.install_host_tools(tools.clone()).unwrap();
+    agent.install_tick_stream(adapters.clone()).await;
+    verify_alias_policy(&agent, &model, chat, &cases).await;
+    session.shutdown().await.unwrap();
+    *host.protocol.lock().unwrap() = None;
+    assert!(
+        native
+            .prepare_call(chat, "ReadTick", &read_input, CancellationToken::new())
+            .await
+            .is_err()
+    );
+    for (name, input) in [("ReadTick", read_input), ("CallTickTool", query_input)] {
+        assert!(
+            tools
+                .prepare_call(chat, name, &input, CancellationToken::new())
+                .await
+                .is_err()
+        );
+    }
+    assert!(
+        adapters
+            .prepare_watch(chat, &instance, CancellationToken::new())
+            .await
+            .is_err()
+    );
+    agent.shutdown().await;
 }

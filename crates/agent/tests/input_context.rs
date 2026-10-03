@@ -420,10 +420,13 @@ async fn images_count_by_pixels_so_a_large_payload_does_not_force_compaction() {
     let bytes = write_png(&path, 400, 400);
     assert!(BASE64.encode(&bytes).len() > 400_000);
     let model = Arc::new(ScriptedModel::new(vec![text("Looked at it.")]));
-    let agent =
-        Agent::open_embedded(directory.path().join("state"), config(), model.clone()).unwrap();
+    let agent = Agent::open_embedded(
+        directory.path().join("state"),
+        support::config_with_window(100_000),
+        model.clone(),
+    )
+    .unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    agent.set_context_window(chat, 100_000).await.unwrap();
 
     submit_and_wait(&agent, chat, "Check @screenshot.png", vec![path]).await;
 

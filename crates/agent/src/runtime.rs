@@ -317,6 +317,8 @@ pub struct ChatSnapshot {
     pub tool_call_recoveries: Vec<ToolCallRecovery>,
     #[serde(default)]
     pub artifact_ticks: Vec<crate::artifacts::ArtifactTick>,
+    #[serde(skip)]
+    pub removed_artifact_ticks: std::collections::BTreeSet<String>,
     /// 本进程内的请求用量账本（不持久化，照 Claude Code 用量只记在 assistant 消息上）。
     #[serde(skip)]
     pub request_usage: RequestUsageLedger,
@@ -904,6 +906,29 @@ pub struct Agent {
     inner: Arc<Inner>,
 }
 
+#[derive(Clone)]
+pub(crate) struct WeakAgent {
+    inner: std::sync::Weak<Inner>,
+}
+
+impl WeakAgent {
+    pub(crate) fn upgrade(&self) -> Option<Agent> {
+        self.inner.upgrade().map(|inner| Agent { inner })
+    }
+}
+
+impl Agent {
+    pub(crate) fn downgrade(&self) -> WeakAgent {
+        WeakAgent {
+            inner: Arc::downgrade(&self.inner),
+        }
+    }
+
+    pub(crate) fn shutdown_token(&self) -> CancellationToken {
+        self.inner.shutdown.clone()
+    }
+}
+
 struct Inner {
     /// 本进程当前选择的模型；新建与恢复的 Chat 使用它，`set_model` 随选择更新。
     selected_model: std::sync::Mutex<chat_settings::SelectedModel>,
@@ -951,6 +976,7 @@ struct Inner {
 struct Chat {
     snapshot: ChatSnapshot,
     todo_completion_graces: HashMap<LoopId, todo_lifecycle::CompletionGrace>,
+    start_new_tool_result_message: bool,
     retention: Option<Arc<crate::transcript::retention::RetentionGuard>>,
     active: Option<CancellationToken>,
     active_run: Option<RunId>,
@@ -1205,6 +1231,7 @@ fn empty_snapshot(id: ChatId, workdir: PathBuf, model: ModelConfig) -> ChatSnaps
     ChatSnapshot {
         tool_call_recoveries: Vec::new(),
         artifact_ticks: Vec::new(),
+        removed_artifact_ticks: Default::default(),
         request_usage: RequestUsageLedger::new(),
         id,
         branch_origin: None,
@@ -1982,6 +2009,7 @@ impl Agent {
             Chat {
                 snapshot,
                 todo_completion_graces: HashMap::new(),
+                start_new_tool_result_message: false,
                 retention,
                 active: None,
                 active_run: None,
@@ -2998,8 +3026,9 @@ impl Agent {
                     };
                     let block=Content::ToolResult {tool_use_id:id.clone(),content,is_error:result.is_error};
                     let last_index=chat.snapshot.messages.len().checked_sub(1);
-                    let same_run=last_index.is_some_and(|index|chat.snapshot.message_runs.get(&index)==Some(&receipt.run_id));
+                    let same_run=!chat.start_new_tool_result_message && last_index.is_some_and(|index|chat.snapshot.message_runs.get(&index)==Some(&receipt.run_id));
                     if let Some(message)=chat.snapshot.messages.last_mut().filter(|message|same_run && message.role==Role::User && message.content.iter().all(|content|matches!(content,Content::ToolResult{..}))) {message.content.push(block);} else {chat.snapshot.message_runs.insert(chat.snapshot.messages.len(),receipt.run_id);chat.snapshot.messages.push(Message {role:Role::User,content:vec![block]});}
+                    chat.start_new_tool_result_message = false;
                     if let Some(operation) = chat.snapshot.operations.iter_mut().find(|operation|operation.run_id==receipt.run_id && operation.call_id==id) {
                         let state=match (host_call_status, command_state) {
                             (Some(crate::host_tools::HostCallStatus::OutcomeUnknown), _)=>OperationState::Unknown,
@@ -3013,6 +3042,14 @@ impl Agent {
                         };
                         if !matches!(operation.state,OperationState::Completed|OperationState::Failed) {operation.state=state;}
                         operation.result=Some(result.clone());
+                    }
+                    if !result.is_error && host_call_status == Some(crate::host_tools::HostCallStatus::Completed) {
+                        let tick = match &host_effect {
+                            Some(crate::host_tools::HostEffect::CreatedArtifact(tick)) => Some(tick),
+                            Some(crate::host_tools::HostEffect::PublishedSource(effect)) => effect.artifact_tick.as_ref(),
+                            _ => None,
+                        };
+                        if let Some(tick) = tick { self.auto_attach_artifact_tick(chat, tick.clone()); }
                     }
                     if let Some(crate::host_tools::HostEffect::PublishedSource(effect)) = host_effect
                         && !source_connection::has_recorded_publication(&chat.snapshot, &effect)

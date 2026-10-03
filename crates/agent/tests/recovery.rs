@@ -2,7 +2,7 @@ mod support;
 
 use serde::{Deserialize, Serialize};
 use std::{borrow::Cow, path::Path, sync::Arc};
-use support::{ScriptedModel, config, next_event, text};
+use support::{ScriptedModel, next_event, persisted_config as config, text};
 use tickloop_agent::{
     model::{
         Content, ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest,

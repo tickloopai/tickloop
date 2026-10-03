@@ -33,6 +33,7 @@ pub(crate) mod history;
 mod image_limits;
 mod provider_directory;
 mod responses;
+mod structured_response;
 
 pub(crate) use image_limits::strip_images;
 
@@ -120,7 +121,7 @@ pub struct ModelConfig {
     pub model_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub card: Option<cards::ModelCard>,
-    /// Omitted in older settings and `--config` files; like opencode for unknown models, such a
+    /// Omitted in older recorded snapshots; like opencode for unknown models, such a
     /// model is treated as text only.
     #[serde(default = "text_only")]
     pub input_modalities: Vec<InputModality>,
@@ -546,6 +547,10 @@ pub enum ModelResponseRejection {
     UnsupportedContinuation,
     #[error("model response contains an invalid tool call")]
     InvalidToolCall,
+    #[error("structured response contains unexpected tool operations")]
+    UnexpectedToolOperation,
+    #[error("verified structured response contains a malformed result")]
+    MalformedStructuredOutput,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -554,26 +559,28 @@ pub enum ModelError {
     Configuration(String),
     #[error("model protocol {0:?} is not implemented yet")]
     UnsupportedProtocol(Protocol),
-    #[error("model authentication failed; check the configured API key environment variable")]
+    #[error(
+        "model authentication failed; review this connection in /provider → Connection Details"
+    )]
     Authentication,
     #[error("model authentication failed during {stage:?}")]
     AuthenticationAt { stage: ModelRequestStage },
     #[error("Codex subscription is not logged in; use /provider")]
     CodexNotLoggedIn,
-    #[error("MiniMax is not signed in; select its OAuth Provider in /model")]
+    #[error("MiniMax is not signed in; open its OAuth connection in /provider")]
     MiniMaxNotLoggedIn,
     #[error(
-        "MiniMax credentials need renewed authorization; select its OAuth Provider and press r"
+        "MiniMax credentials need renewed authorization; open its Connection Details in /provider and choose Sign in again"
     )]
     MiniMaxAuthentication,
-    #[error("GitHub Copilot is not signed in; select its Provider in /model")]
+    #[error("GitHub Copilot is not signed in; open its connection in /provider")]
     CopilotNotLoggedIn,
     #[error(
-        "GitHub Copilot sign-in needs renewed authorization; select its Provider in /model and press r"
+        "GitHub Copilot sign-in needs renewed authorization; open Connection Details in /provider and choose Sign in again"
     )]
     CopilotAuthentication,
     #[error(
-        "Codex subscription authentication failed; select the Codex Provider in /model and press r to renew it"
+        "Codex subscription authentication failed; open Codex Connection Details in /provider and choose Sign in again"
     )]
     CodexAuthentication,
     #[error("model service rejected the request because the account balance is insufficient")]
@@ -1416,7 +1423,8 @@ impl HttpModelClient {
         if !identity_from_sign_in {
             self.ensure_credential_history_compatible(chat_id, &request, key.as_ref())?;
         }
-        let structured_tool = structured_tool_name(&self.config, &request);
+        let structured_response =
+            structured_response::StructuredResponsePolicy::for_request(&self.config, &request);
         let (endpoint, mut body) = match self.config.adapter() {
             cards::Adapter::Messages
             | cards::Adapter::DeepseekMessages
@@ -1635,7 +1643,7 @@ impl HttpModelClient {
             self.config.protocol,
             events,
             cancel,
-            structured_tool.as_deref(),
+            structured_response,
             self.config.adapter(),
             copilot_auth,
         )
@@ -1698,7 +1706,7 @@ async fn consume_sse_response(
     protocol: Protocol,
     events: UnboundedSender<ModelDelta>,
     cancel: CancellationToken,
-    structured_tool: Option<&str>,
+    mut structured_response: Option<structured_response::StructuredResponsePolicy>,
     adapter: cards::Adapter,
     rotating_response_item_ids: bool,
 ) -> Result<ModelOutput, ModelError> {
@@ -1791,11 +1799,14 @@ async fn consume_sse_response(
                 }
             } else if line.is_empty() && !event_data.is_empty() {
                 if protocol == Protocol::ChatCompletions && event_data == "[DONE]" {
-                    return normalize_structured_tool_output(stream.finish()?, structured_tool);
+                    return finish_structured_response(stream, structured_response.as_ref(), codex);
                 }
                 let mut data: Value = serde_json::from_str(&event_data)
                     .map_err(|_| ModelError::InvalidResponse("invalid event JSON".into()))?;
                 event_data.clear();
+                if let Some(policy) = &mut structured_response {
+                    policy.check_event(protocol, &data)?;
+                }
                 if !event_name.is_empty() && data["type"].as_str() != Some(&event_name) {
                     return Err(invalid_response(
                         "SSE event name does not match its data type",
@@ -1818,13 +1829,17 @@ async fn consume_sse_response(
                     let _ = events.send(ModelDelta::OutputStarted);
                 }
                 if stream.accept(data, &events).map_err(|error| {
+                    let error = match &structured_response {
+                        Some(policy) => policy.decode_error(error),
+                        None => error,
+                    };
                     if error.stage() == ModelRequestStage::Unknown {
                         error.at_stage(ModelRequestStage::ResponseStream)
                     } else {
                         error
                     }
                 })? {
-                    return normalize_structured_tool_output(stream.finish()?, structured_tool);
+                    return finish_structured_response(stream, structured_response.as_ref(), codex);
                 }
             } else if line.is_empty() {
                 event_name.clear();
@@ -1852,7 +1867,7 @@ async fn consume_sse_response(
         )));
     }
     if protocol == Protocol::Google && pending.is_empty() && event_data.is_empty() {
-        return stream.finish();
+        return finish_structured_response(stream, structured_response.as_ref(), codex);
     }
     Err(if output_started {
         ModelError::StreamInterruptedAfterOutput
@@ -2201,15 +2216,23 @@ pub(super) fn uses_structured_response_tool(config: &ModelConfig, request: &Mode
                 })
 }
 
-fn structured_tool_name(config: &ModelConfig, request: &ModelRequest) -> Option<String> {
-    uses_structured_response_tool(config, request)
-        .then(|| {
-            request
-                .structured_output
-                .as_ref()
-                .map(|format| format.name.clone())
-        })
-        .flatten()
+fn finish_structured_response(
+    stream: ProtocolStream,
+    policy: Option<&structured_response::StructuredResponsePolicy>,
+    codex: bool,
+) -> Result<ModelOutput, ModelError> {
+    let output = stream.finish(policy)?;
+    if let Some(policy) = policy {
+        policy.check_output(&output)?;
+    }
+    if codex {
+        return Ok(output);
+    }
+    normalize_structured_tool_output(
+        output,
+        policy.and_then(|policy| policy.expected_tool.as_deref()),
+    )
+    .map_err(structured_response::verified_format_error)
 }
 
 fn normalize_structured_tool_output(
@@ -2219,6 +2242,14 @@ fn normalize_structured_tool_output(
     let Some(structured_tool) = structured_tool else {
         return Ok(output);
     };
+    if output.content.iter().any(|content| {
+        matches!(content, Content::ToolUse { name, .. } if name != structured_tool)
+            || matches!(content, Content::ToolResult { .. })
+    }) {
+        return Err(ModelError::ResponseRejected(
+            ModelResponseRejection::UnexpectedToolOperation,
+        ));
+    }
     let mut structured_inputs = output.content.iter().filter_map(|content| match content {
         Content::ToolUse { name, input, .. } if name == structured_tool => Some(input),
         _ => None,
@@ -2227,10 +2258,11 @@ fn normalize_structured_tool_output(
         .next()
         .filter(|_| structured_inputs.next().is_none())
         .ok_or_else(|| invalid_response("structured output tool was not called exactly once"))?;
-    if output.content.iter().any(|content| {
-        matches!(content, Content::Text { text } if !text.trim().is_empty())
-            || matches!(content, Content::ToolUse { name, .. } if name != structured_tool)
-    }) {
+    if output
+        .content
+        .iter()
+        .any(|content| matches!(content, Content::Text { text } if !text.trim().is_empty()))
+    {
         return Err(invalid_response(
             "structured output contained unexpected content",
         ));
@@ -2402,13 +2434,20 @@ impl ProtocolStream {
         }
     }
 
-    fn finish(self) -> Result<ModelOutput, ModelError> {
-        match self {
+    fn finish(
+        self,
+        policy: Option<&structured_response::StructuredResponsePolicy>,
+    ) -> Result<ModelOutput, ModelError> {
+        let output = match self {
             Self::Messages(stream) => stream.finish(),
             Self::Responses(stream) => stream.finish(),
-            Self::Chat(stream) => stream.finish(),
+            Self::Chat(stream) => stream.finish_with_policy(policy),
             Self::Google(stream) => stream.finish(),
-        }
+        };
+        output.map_err(|error| match policy {
+            Some(policy) => policy.decode_error(error),
+            None => error,
+        })
     }
 }
 
@@ -3230,6 +3269,20 @@ mod tests {
         chat_config.base_url = "https://compatible.example".into();
         let chat = chat_completions::encode_request(&chat_config, structured_request()).unwrap();
         assert_eq!(chat["response_format"], json!({"type":"json_object"}));
+        let schema = structured_request()
+            .structured_output
+            .unwrap()
+            .schema
+            .to_string();
+        assert!(
+            chat["messages"].as_array().unwrap().iter().any(|message| {
+                message["role"] == "system"
+                    && message["content"]
+                        .as_str()
+                        .is_some_and(|text| text.contains(&schema))
+            }),
+            "JSON mode must communicate the result schema to DeepSeek"
+        );
 
         let generic = chat_completions::encode_request(
             &protocol_config(Protocol::ChatCompletions, "https://api.deepseek.com"),

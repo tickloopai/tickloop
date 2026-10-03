@@ -227,7 +227,6 @@ async fn run_hidden_view_fixture() {
     });
     let startup = StartupState {
         chat: StartupChat::Resumed(Box::new(agent.snapshot(chat).await.unwrap()), false),
-        explicit_provider: None,
         user_settings: None,
     };
     let interaction_agent = agent.clone();

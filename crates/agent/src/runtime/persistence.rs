@@ -325,6 +325,7 @@ impl ChatRecorder {
                         chat_id,
                         cwd: Some(workdir.to_path_buf()),
                         artifact_ticks: entry.artifact_ticks,
+                        removed_artifact_ticks: entry.removed_artifact_ticks,
                     })
                 }))
                 .collect(),
@@ -364,11 +365,12 @@ impl ChatRecorder {
                 custom_title: title.to_owned(),
             }),
         ];
-        if !source.artifact_ticks.is_empty() {
+        if !source.artifact_ticks.is_empty() || !source.removed_artifact_ticks.is_empty() {
             lines.push(Line::ArtifactTicks(ArtifactTicksEntry {
                 chat_id: child_chat_id,
                 cwd: Some(source.workdir.clone()),
                 artifact_ticks: source.artifact_ticks.clone(),
+                removed_artifact_ticks: source.removed_artifact_ticks.clone(),
             }));
         }
         self.writer.enqueue(&path, lines);
@@ -1571,6 +1573,12 @@ fn recover_transcript(
         .as_ref()
         .map(|entry| entry.artifact_ticks.clone())
         .unwrap_or_default();
+    snapshot.removed_artifact_ticks = loaded
+        .metadata
+        .artifact_ticks
+        .as_ref()
+        .map(|entry| entry.removed_artifact_ticks.clone())
+        .unwrap_or_default();
     kept.fill_conversation(&mut snapshot);
     recover_snapshot_for_resume(snapshot, kept.meta_messages.clone())
 }
@@ -1851,6 +1859,7 @@ impl Agent {
         chat_id: ChatId,
         workdir: &Path,
         artifact_ticks: Vec<crate::artifacts::ArtifactTick>,
+        removed_artifact_ticks: std::collections::BTreeSet<String>,
     ) {
         if let Some(recorder) = &self.inner.recorder
             && let Some(log) = recorder.logs.lock().unwrap().get(&chat_id)
@@ -1861,6 +1870,7 @@ impl Agent {
                     chat_id,
                     cwd: Some(workdir.to_path_buf()),
                     artifact_ticks,
+                    removed_artifact_ticks,
                 })],
             );
         }
@@ -2306,6 +2316,7 @@ impl Agent {
             Chat {
                 snapshot: snapshot.clone(),
                 todo_completion_graces: HashMap::new(),
+                start_new_tool_result_message: false,
                 retention,
                 active: None,
                 active_run: None,

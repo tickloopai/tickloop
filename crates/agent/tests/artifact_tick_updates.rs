@@ -12,6 +12,7 @@ use std::{
 use tickloop_agent::{
     artifacts::ArtifactClient,
     runtime::Agent,
+    tick_adapter::{ArtifactAdapter, TickAdapter, TickAdapters},
     tick_stream::{ArtifactTickStream, InstanceRef, TickStreamEvent, TickStreamPort},
 };
 use tokio::{
@@ -38,14 +39,62 @@ async fn service() -> (String, Arc<AtomicU64>, Arc<AtomicU64>, Arc<AtomicU64>) {
             let Ok((mut socket, _)) = listener.accept().await else {
                 return;
             };
-            let mut bytes = [0_u8; 8192];
-            let count = socket.read(&mut bytes).await.unwrap();
-            let request = String::from_utf8_lossy(&bytes[..count]);
+            let mut bytes = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            loop {
+                let count = socket.read(&mut chunk).await.unwrap();
+                if count == 0 {
+                    return;
+                }
+                bytes.extend_from_slice(&chunk[..count]);
+                if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&bytes[..end]).to_ascii_lowercase();
+                    let length = headers
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length: "))
+                        .and_then(|value| value.parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if bytes.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            let request = String::from_utf8_lossy(&bytes);
             let user = json!({"id":"owner","name":"Owner","email":"owner@example.test"});
             let body = if request.starts_with("POST /api/v1/auth/device ") {
                 json!({"device_code":"device","user_code":"CODE","verification_uri":format!("{endpoint}/device?code=CODE"),"expires_in":60,"interval":1})
             } else if request.starts_with("POST /api/v1/auth/device/token ") {
                 json!({"access_token":"test-token","token_type":"Bearer","expires_in":600,"user":user})
+            } else if request.starts_with("GET /api/v1/auth/session ") {
+                json!({"user":user,"expires_at":"2099-01-01T00:00:00Z"})
+            } else if request.starts_with("POST /api/v1/auth/logout ") {
+                json!({"revoked":true})
+            } else if request.starts_with("POST /mcp ") {
+                let rpc: serde_json::Value =
+                    serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+                if rpc.get("id").is_none() {
+                    socket.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                    continue;
+                }
+                let result = match rpc["method"].as_str().unwrap_or_default() {
+                    "server/discover" => {
+                        json!({"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{}},"ttlMs":0,"cacheScope":"private"})
+                    }
+                    "initialize" => {
+                        json!({"protocolVersion":"2026-07-28","capabilities":{"tools":{}},"serverInfo":{"name":"mock-artifacts","version":"1"}})
+                    }
+                    "tools/list" => json!({"tools":[
+                        {"name":"artifact_read","description":"Read artifact","inputSchema":{"type":"object","properties":{"artifact_id":{"type":"string"},"version_id":{"type":"string"}},"required":["artifact_id"],"additionalProperties":false},"annotations":{"readOnlyHint":true}},
+                        {"name":"artifact_publish","description":"Publish artifact","inputSchema":{"type":"object","properties":{"artifact_id":{"type":"string"}},"required":["artifact_id"]},"annotations":{"readOnlyHint":false}}
+                    ]}),
+                    "tools/call" => {
+                        assert_eq!(rpc["params"]["name"], "artifact_read");
+                        assert_eq!(rpc["params"]["arguments"]["artifact_id"], "doc");
+                        json!({"content":[{"type":"text","text":"# Recovered artifact body"}],"isError":false})
+                    }
+                    _ => json!({}),
+                };
+                json!({"jsonrpc":"2.0","id":rpc["id"],"result":result})
             } else {
                 read_count.fetch_add(1, Ordering::SeqCst);
                 let sequence = changes.load(Ordering::SeqCst);
@@ -88,7 +137,7 @@ async fn feedback_between_polls_does_not_swallow_the_latest_undelivered_body_cha
     let (origin, sequence, feedback, _) = service().await;
     let directory = tempfile::tempdir().unwrap();
     login(directory.path(), &origin).await;
-    let stream = ArtifactTickStream::new(directory.path().canonicalize().unwrap(), None);
+    let stream = ArtifactTickStream::new(directory.path().canonicalize().unwrap());
     let watch = Uuid::new_v4();
     stream.set_cadences(BTreeMap::from([(watch, 5)]));
     let mut handle = stream.open();
@@ -133,7 +182,7 @@ async fn subscribed_artifact_baselines_each_watch_polls_at_cadence_and_preserves
     let (origin, sequence, feedback, reads) = service().await;
     let directory = tempfile::tempdir().unwrap();
     login(directory.path(), &origin).await;
-    let stream = ArtifactTickStream::new(directory.path().canonicalize().unwrap(), None);
+    let stream = ArtifactTickStream::new(directory.path().canonicalize().unwrap());
     let watch = Uuid::new_v4();
     stream.set_cadences(BTreeMap::from([(watch, 5)]));
     let mut handle = stream.open();
@@ -203,10 +252,12 @@ async fn artifact_subscription_reaches_loop_and_quiet_polling_does_not_call_the_
     ]));
     let agent = Agent::new_embedded(support::config(), model.clone());
     agent
-        .install_tick_stream(Arc::new(ArtifactTickStream::new(
-            directory.path().canonicalize().unwrap(),
-            None,
-        )))
+        .install_tick_stream(Arc::new(
+            TickAdapters::new([Arc::new(ArtifactAdapter::new(Some(
+                directory.path().canonicalize().unwrap(),
+            ))) as Arc<dyn TickAdapter>])
+            .unwrap(),
+        ))
         .await;
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
@@ -250,5 +301,249 @@ async fn artifact_subscription_reaches_loop_and_quiet_polling_does_not_call_the_
     let subscription = agent.tick_subscriptions(chat).await.unwrap().remove(0);
     agent.stop(chat, subscription.loop_id).await.unwrap();
     assert!(agent.tick_subscriptions(chat).await.unwrap().is_empty());
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn artifact_adapter_catalog_uses_mcp_queries_and_keeps_identity_and_credentials_bound() {
+    let (origin, _, _, _) = service().await;
+    let directory = tempfile::tempdir().unwrap();
+    login(directory.path(), &origin).await;
+    let instance = InstanceRef::artifact(&origin, "doc").unwrap();
+    let adapters = TickAdapters::new([Arc::new(ArtifactAdapter::new(Some(
+        directory.path().canonicalize().unwrap(),
+    ))) as Arc<dyn TickAdapter>])
+    .unwrap();
+    let tools = adapters.host_tools(None);
+    let chat = Uuid::new_v4();
+    let prepared = tools
+        .prepare_call(
+            chat,
+            "ReadTick",
+            &json!({"tick_instance_id":instance}),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let read = tools
+        .execute_prepared(chat, prepared, CancellationToken::new())
+        .await
+        .into_tool_result();
+    assert!(!read.is_error, "{}", read.content);
+    let data: serde_json::Value = serde_json::from_str(&read.content).unwrap();
+    assert!(
+        data["content"]
+            .as_str()
+            .unwrap()
+            .contains("Recovered artifact body")
+    );
+    assert_eq!(data["tools"].as_array().unwrap().len(), 1);
+    assert_eq!(data["tools"][0]["name"], "artifact_read");
+    assert!(
+        data["tools"][0]["input_schema"]["properties"]
+            .get("artifact_id")
+            .is_none()
+    );
+    assert!(tools.prepare_call(chat,"CallTickTool",&json!({"tick_instance_id":instance,"tool":"artifact_read","args":{"artifact_id":"another"}}),CancellationToken::new()).await.is_err());
+    assert!(
+        tools
+            .prepare_call(
+                chat,
+                "CallTickTool",
+                &json!({"tick_instance_id":instance,"tool":"artifact_publish","args":{}}),
+                CancellationToken::new()
+            )
+            .await
+            .is_err()
+    );
+    let query = tools.prepare_call(chat,"CallTickTool",&json!({"tick_instance_id":instance,"tool":"artifact_read","args":{"version_id":"version-1"}}),CancellationToken::new()).await.unwrap();
+    assert_eq!(
+        query.permission(),
+        tickloop_agent::host_tools::HostToolPermission::ReadOnly
+    );
+    let result = tools
+        .execute_prepared(chat, query, CancellationToken::new())
+        .await
+        .into_tool_result();
+    assert!(!result.is_error, "{}", result.content);
+    let stale = tools
+        .prepare_call(
+            chat,
+            "CallTickTool",
+            &json!({"tick_instance_id":instance,"tool":"artifact_read","args":{}}),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    ArtifactClient::for_origin(directory.path().canonicalize().unwrap(), &origin)
+        .unwrap()
+        .logout()
+        .await
+        .unwrap();
+    assert!(matches!(
+        tools
+            .execute_prepared(chat, stale, CancellationToken::new())
+            .await,
+        tickloop_agent::host_tools::HostCallResult::NotDispatched(_)
+    ));
+}
+
+#[tokio::test]
+async fn artifact_aliases_preserve_underlying_read_policy_for_queries_and_subscription() {
+    use tickloop_agent::{
+        host_tools::HostToolProvider,
+        permissions::{Decision, ExecutionMode, PermissionRule},
+        runtime::EventKind,
+    };
+    for decision in [Decision::Deny, Decision::Ask] {
+        let (origin, _, _, _) = service().await;
+        let directory = tempfile::tempdir().unwrap();
+        login(directory.path(), &origin).await;
+        let root = directory.path().canonicalize().unwrap();
+        let instance = InstanceRef::artifact(&origin, "doc").unwrap();
+        let model = Arc::new(support::ScriptedModel::new(vec![
+            support::call(
+                "direct",
+                "mcp__artifacts__artifact_read",
+                json!({"artifact_id":"doc"}),
+            ),
+            support::call("read", "ReadTick", json!({"tick_instance_id":instance})),
+            support::call(
+                "query",
+                "CallTickTool",
+                json!({"tick_instance_id":instance,"tool":"artifact_read","args":{}}),
+            ),
+            support::call(
+                "subscribe",
+                "SubscribeTick",
+                json!({"tick_instance_id":instance,"every_seconds":5}),
+            ),
+            support::text("done"),
+        ]));
+        let agent = Agent::new_embedded(support::config(), model.clone());
+        let adapters = Arc::new(
+            TickAdapters::new([
+                Arc::new(ArtifactAdapter::new(Some(root.clone()))) as Arc<dyn TickAdapter>
+            ])
+            .unwrap(),
+        );
+        let provider = Arc::new(tickloop_agent::mcp_tools::McpHostToolProvider::new(
+            ArtifactClient::for_origin(&root, &origin).unwrap(),
+            Some(adapters.host_tools(None)),
+        ));
+        provider.refresh(CancellationToken::new()).await.unwrap();
+        agent.install_host_tools(provider).unwrap();
+        agent.install_tick_stream(adapters).await;
+        let chat = agent.create_chat(root).await.unwrap();
+        agent
+            .set_execution_mode(chat, ExecutionMode::FullAccess)
+            .await
+            .unwrap();
+        agent
+            .set_permission_rules(
+                chat,
+                vec![PermissionRule {
+                    id: Uuid::new_v4(),
+                    decision,
+                    tool: "mcp__artifacts__artifact_read".into(),
+                    specifier: None,
+                    input: None,
+                    loop_id: None,
+                    persistent: false,
+                }],
+            )
+            .await
+            .unwrap();
+        let mut events = agent.subscribe();
+        agent
+            .submit(chat, None, "read and watch this artifact".into())
+            .await
+            .unwrap();
+        let mut asked = 0;
+        let mut completed = Vec::new();
+        loop {
+            match support::next_event(&mut events).await.kind {
+                EventKind::PermissionRequested { request } => {
+                    assert_eq!(request.name, "mcp__artifacts__artifact_read");
+                    asked += 1;
+                    agent
+                        .answer_permission(chat, request.id, true)
+                        .await
+                        .unwrap();
+                }
+                EventKind::ToolCompleted { call_id, result } => completed.push((call_id, result)),
+                EventKind::Completed { .. } => break,
+                _ => {}
+            }
+        }
+        assert_eq!(completed.len(), 4);
+        assert_eq!(asked, if decision == Decision::Ask { 4 } else { 0 });
+        for (id, result) in completed {
+            assert_eq!(
+                result.is_error,
+                decision == Decision::Deny,
+                "{id}: {}",
+                result.content
+            );
+        }
+        assert_eq!(
+            agent.tick_subscriptions(chat).await.unwrap().len(),
+            usize::from(decision == Decision::Ask)
+        );
+        agent.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn artifact_aliases_preserve_plan_and_final_admission_as_the_direct_query() {
+    use support::tick_alias_contract::{AliasCase, verify_alias_policy};
+    use tickloop_agent::host_tools::HostToolProvider;
+    let (origin, _, _, _) = service().await;
+    let directory = tempfile::tempdir().unwrap();
+    login(directory.path(), &origin).await;
+    let root = directory.path().canonicalize().unwrap();
+    let instance = InstanceRef::artifact(&origin, "doc").unwrap();
+    let model = Arc::new(support::ScriptedModel::new(vec![]));
+    let agent = Agent::new_embedded(support::config(), model.clone());
+    let adapters = Arc::new(
+        TickAdapters::new([
+            Arc::new(ArtifactAdapter::new(Some(root.clone()))) as Arc<dyn TickAdapter>
+        ])
+        .unwrap(),
+    );
+    let provider = Arc::new(tickloop_agent::mcp_tools::McpHostToolProvider::new(
+        ArtifactClient::for_origin(&root, &origin).unwrap(),
+        Some(adapters.host_tools(None)),
+    ));
+    provider.refresh(CancellationToken::new()).await.unwrap();
+    agent.install_host_tools(provider).unwrap();
+    agent.install_tick_stream(adapters).await;
+    let chat = agent.create_chat(root).await.unwrap();
+    let queries = [
+        (
+            "mcp__artifacts__artifact_read",
+            json!({"artifact_id":"doc"}),
+        ),
+        ("ReadTick", json!({"tick_instance_id":instance})),
+        (
+            "CallTickTool",
+            json!({"tick_instance_id":instance,"tool":"artifact_read","args":{}}),
+        ),
+        (
+            "SubscribeTick",
+            json!({"tick_instance_id":instance,"every_seconds":5}),
+        ),
+    ];
+    let cases = queries
+        .into_iter()
+        .map(|(name, input)| AliasCase {
+            plan_denied: false,
+            name,
+            input,
+            policy_name: "mcp__artifacts__artifact_read",
+            policy_input: json!({"artifact_id":"doc"}),
+        })
+        .collect::<Vec<_>>();
+    verify_alias_policy(&agent, &model, chat, &cases).await;
     agent.shutdown().await;
 }

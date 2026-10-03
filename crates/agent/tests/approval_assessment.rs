@@ -127,7 +127,7 @@ async fn agent_reports_typed_assessment_for_each_actual_reviewer() {
         );
         assert_eq!(assessment.outcome, ApprovalOutcome::Allow);
         assert_eq!(assessment.context_version, "trusted-approval-v2");
-        assert_eq!(assessment.review_template_version, "auto-review-v2");
+        assert_eq!(assessment.review_template_version, "auto-review-v3");
         let reviewer = assessment.reviewer.as_ref().unwrap();
         assert_eq!(
             reviewer.kind,

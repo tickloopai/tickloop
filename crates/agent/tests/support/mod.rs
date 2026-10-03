@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 
 pub mod cli_runtime;
+pub mod fixture_cli;
+pub mod tick_alias_contract;
 
 use async_trait::async_trait;
 use std::{collections::VecDeque, sync::Mutex};
@@ -98,6 +100,23 @@ pub fn config() -> ModelConfig {
         input_modalities: vec![InputModality::Text, InputModality::Image],
     }
 }
+/// A transport fixture using a valid built-in selection identity; its parameters stay in memory.
+pub fn persisted_config() -> ModelConfig {
+    let mut model = config();
+    model.provider_id = "deepseek-api".into();
+    model.provider_name = "DeepSeek API".into();
+    model.model_id = "deepseek-flash-messages".into();
+    model
+}
+
+/// Declares the test program's context budget instead of saving a retired user override.
+pub fn config_with_window(tokens: usize) -> ModelConfig {
+    let mut model =
+        tickloop_agent::model::cards::model_for_persistent_selection(persisted_config());
+    model.card.as_mut().unwrap().context_window_tokens = Some(tokens);
+    model
+}
+
 pub fn text(value: &str) -> Vec<Content> {
     vec![Content::Text { text: value.into() }]
 }

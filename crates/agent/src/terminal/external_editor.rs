@@ -15,8 +15,6 @@ use std::{
 #[cfg(test)]
 use std::sync::{Arc, Mutex};
 
-use uuid::Uuid;
-
 const MAX_PROMPT_BYTES: usize = 8 * 1024 * 1024;
 const TEMPORARY_FILE_MODE: u32 = 0o600;
 const FALLBACK_EDITORS: [&str; 3] = ["code", "vi", "nano"];
@@ -263,11 +261,23 @@ fn edit_prompt_with_limit(
 
 struct TemporaryPrompt {
     path: PathBuf,
+    _directory: tempfile::TempDir,
 }
 
 impl TemporaryPrompt {
     fn create(draft: &str) -> Result<Self, ExternalEditorFailure> {
-        let path = env::temp_dir().join(format!("tickloop-prompt-{}.md", Uuid::new_v4()));
+        let directory = tempfile::Builder::new()
+            .prefix("tickloop-editor-")
+            .tempdir()
+            .map_err(|error| ExternalEditorFailure::TemporaryFile {
+                reason: error.to_string(),
+            })?;
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).map_err(
+            |error| ExternalEditorFailure::TemporaryFile {
+                reason: error.to_string(),
+            },
+        )?;
+        let path = directory.path().join("input.md");
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -286,7 +296,10 @@ impl TemporaryPrompt {
                 reason: error.to_string(),
             });
         }
-        Ok(Self { path })
+        Ok(Self {
+            path,
+            _directory: directory,
+        })
     }
 
     fn path(&self) -> &Path {
@@ -463,7 +476,7 @@ mod tests {
     fn fixture(directory: &TempDir, body: &str) -> PathBuf {
         let path = directory
             .path()
-            .join(format!("editor-{}.sh", Uuid::new_v4()));
+            .join(format!("editor-{}.sh", uuid::Uuid::new_v4()));
         fs::write(&path, format!("#!/bin/sh\nset -eu\n{body}\n")).unwrap();
         let mut permissions = fs::metadata(&path).unwrap().permissions();
         permissions.set_mode(0o700);

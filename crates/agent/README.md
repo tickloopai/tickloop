@@ -1,5 +1,8 @@
 # Tick Loop Agent
 
+Agent 的权限、问题、确认、设置、帮助，以及 /model、/provider 的内置选择器、连接详情、凭据编辑和登录使用底部固定 12 行的输入对话框，替换输入框与 Subagents 面板。终端过矮时容器缩小，上方内容仍保留；关闭后恢复原草稿与光标。Agent 请求优先于用户打开的菜单，完成后恢复被打断的界面；界面状态随 Chat 保存。最近一条用户消息显示在左栏首行，Tick List 从同一行开始；整页 Agents、Transcript、Diff 与右侧 Shell 详情保留各自的查看方式。
+
+
 主命令为 `tickloop`。Herdr 内自动接入 Tick，宿主外可独立使用；双向操作见[原生 Herdr 接入](../../docs/design/native-herdr.md)。
 
 运行环境和接入状态会提供给模型；Herdr 接入可用时，首个对话请求前自动加载内置 `tickloop` Skill。Tick 的内容和工具由实例动态声明，查看股价或 K 线默认优先通过 Tick 展示。tmux、Zellij 当前提示尚未接入，独立运行不提供跨 Tick 能力。
@@ -46,7 +49,7 @@ owner 自动启动使用当前登录用户私有 Unix socket，启动锁协调�
 
 `/provider` 选择连接：已有可用凭据时回车进入模型页，缺少凭据时先认证，成功后继续模型选择；保存凭据不自动应用模型，明确选择才生效。按 `r` 清除该 Provider 的本地凭据并重新认证；API Key 来自外部 shell 时只删除本地保存值，不修改 shell 环境。`/model` 在已配置 Provider → Model 两级中选择模型，已有选择时直接进入当前 Provider，并查询或复用同连接账号模型目录。明确无权限的模型隐藏，查询失败或无发现接口时保留未验证候选。Herdr 内外使用同一套 Agent 命令。
 
-同一 `TICKLOOP_CONFIG_DIR` 的 Chat 共用登录，后续模型请求读取最新账户并在到期前刷新。Provider 列表的 `Sign out · Codex subscription`（或选中 Codex 后按 `s`）仅删除本地登录，不撤销已发出的请求或远端授权。凭证单独保存在状态根目录的 `auth/openai-codex-credentials.json`，使用私有文件权限；不读取 Codex CLI 或 pi 的登录文件。不要分享这份文件；同一系统用户下已经获准执行的任意 Shell 仍可能访问本地文件。
+同一 `TICKLOOP_CONFIG_DIR` 的 Chat 共用登录，后续模型请求读取最新账户并在到期前刷新。Codex 连接 Details 中的 `Sign out…`（确认后）仅删除本地登录，不撤销已发出的请求或远端授权。凭证单独保存在状态根目录的 `auth/openai-codex-credentials.json`，使用私有文件权限；`auth/openai-codex-generation.json` 是私有的登录代次标记，阻止晚到登录覆盖后续登录／退出，不含 token。不读取 Codex CLI 或 pi 的登录文件。不要分享这份文件；同一系统用户下已经获准执行的任意 Shell 仍可能访问本地文件。
 
 Kimi 中国区使用 `MOONSHOT_CN_API_KEY`，国际区使用 `MOONSHOT_API_KEY`；两个服务分别验证 key，不自动切换地区。百炼使用 `DASHSCOPE_API_KEY` 和 `https://dashscope.aliyuncs.com/compatible-mode/v1/`；Anthropic 使用 `ANTHROPIC_API_KEY`，Gemini Developer API 使用 `GEMINI_API_KEY`，xAI API 使用 `XAI_API_KEY`。Kimi Code 和 Grok 的 OAuth 连接在 `/provider` 中使用设备授权，并在 consent 说明实际注册客户端名称。Grok OAuth 使用官方订阅代理 `cli-chat-proxy.grok.com`，独立于按量 API。
 
@@ -75,7 +78,7 @@ API 查询 `/v1/models`，Codex 订阅查询其自己的 `/backend-api/codex/mod
 
 `/provider` 一级列表显示单个 `MiniMax`，进入连接页后先选两区 `API` 或 `Portal` 产品连接，连接名显示 China / International 和实际服务 host，四个 Provider 分别认证。API Key 使用 `MINIMAX_CN_API_KEY` 或 `MINIMAX_GLOBAL_API_KEY`，也可以在菜单遮蔽输入并保存；账户和 Key 必须对应站点。
 
-OAuth 使用 Portal 设备授权，终端显示地址和用户码；在自己的浏览器完成授权，无需远程机器的回调。采用官方 OpenClaw 指南的 Portal 路线，同意页客户端显示为 OpenClaw，不是独立登记的 Tick Loop 客户端。登录文件分别为状态根 `auth/minimax-cn.json` 和 `auth/minimax-global.json`；访问 token 到期前刷新，刷新保持历史来源身份，重新登录产生新身份。Provider 列表选中后按 `s` 清除本地登录，按 `r` 清除后重新授权；不宣称撤销远端授权。
+OAuth 使用 Portal 设备授权，终端显示地址和用户码；在自己的浏览器完成授权，无需远程机器的回调。采用官方 OpenClaw 指南的 Portal 路线，同意页客户端显示为 OpenClaw，不是独立登记的 Tick Loop 客户端。登录文件分别为状态根 `auth/minimax-cn.json` 和 `auth/minimax-global.json`；访问 token 到期前刷新，刷新保持历史来源身份，重新登录产生新身份。连接 Details 中可明确选择 Sign out 清除对应地区登录，或 Sign in again 重新授权；重新授权取消／失败保留旧登录；不宣称撤销远端授权。
 
 内置范围为 M3 及以上。M3 支持文字和图片，1M 上下文，默认单次输出上限 131,072 tokens；默认关闭 Thinking，开启使用 adaptive，菜单提供 on/off。OAuth 目录另提供 M3.1 Flash Preview，强制 Thinking，支持 low/medium/high/xhigh/max、默认 max。预览模型暂限有相应权益的 M Plan / MiniMax Code；OAuth 登录成功不代表该账户具有模型权限。视频不在 Tick Loop 当前输入范围。
 
@@ -94,7 +97,7 @@ OAuth 使用 Portal 设备授权，终端显示地址和用户码；在自己的
 
 按量连接在账户没有余额或资源包时返回业务码 1113；只订阅了 GLM Coding Plan 的账户在按量连接上也会报这个码，需要改用 Coding Plan 连接。两种计费方式之间不自动探测、不回退。官方条款把 Coding Plan 额度限定在指定工具内，Tick Loop 不在名单，可能被限流或封禁；Coding Plan 模型页会显示这条提示，是否使用由用户自行决定。Coding Plan 只提供 GLM 与 GLM Flash 两个系列，FlashX 不在套餐内。智谱不提供第三方 OAuth，个人版和团队版套餐都用 API Key 认证，团队套餐 Key 与平台其他 Key 不通用。
 
-模型定义与当前接入分开维护。Provider YAML 中的 Model Card 描述具体版本 GLM-5.3、GLM-5.3-Flash、GLM-5.3-FlashX 与 GLM-5.2。当前接入目录 [src/model/access/](src/model/access/) 为每个 Provider 声明系列及推荐卡：`GLM → glm-5.3`、`GLM Flash → glm-5.3-flash`、`GLM FlashX → glm-5.3-flashx`。模型页由这份绑定生成 `GLM-5.3`、`GLM-5.3-Flash`、`GLM-5.3-FlashX` 三个入口；选中后保存、请求和历史记录都使用具体卡，状态栏显示实际版本。三个推荐版本均为 1M 上下文、默认单次输出上限 131,072 tokens、强制 Thinking，档位为 low/high/max（`auto` 即服务端默认 max）；Flash 与 FlashX 接收文字和图片，基础 GLM 只收文字，视频与文件不在当前输入范围。GLM-5.2 卡继续保留供已保存选择和历史使用，可开关 Thinking，档位 high/max，但不再出现在普通菜单。需要固定它时，在显式 Provider YAML 或状态目录 `providers/zhipu-cn-api.yaml` 写 `default_model: glm-5.2`（旧 `glm-5.2-chat-completions` 仍由兼容别名解析），例见 [examples/providers/zhipu-cn-api.yaml](examples/providers/zhipu-cn-api.yaml)。新版本发布后，先新增具体卡，再更新系列绑定；已有会话、固定选择与自定义卡不会被目录更新静默切换。
+模型定义与当前接入分开维护。Provider YAML 中的 Model Card 描述具体版本 GLM-5.3、GLM-5.3-Flash、GLM-5.3-FlashX 与 GLM-5.2。当前接入目录 [src/model/access/](src/model/access/) 为每个 Provider 声明系列及推荐卡：`GLM → glm-5.3`、`GLM Flash → glm-5.3-flash`、`GLM FlashX → glm-5.3-flashx`。模型页由这份绑定生成 `GLM-5.3`、`GLM-5.3-Flash`、`GLM-5.3-FlashX` 三个入口；选中后保存、请求和历史记录都使用具体卡，状态栏显示实际版本。三个推荐版本均为 1M 上下文、默认单次输出上限 131,072 tokens、强制 Thinking，档位为 low/high/max（`auto` 即服务端默认 max）；Flash 与 FlashX 接收文字和图片，基础 GLM 只收文字，视频与文件不在当前输入范围。GLM-5.2 卡继续保留供已保存选择和历史使用，可开关 Thinking，档位 high/max，但不再出现在普通菜单。旧保存选择中的 `glm-5.2` 和兼容别名 `glm-5.2-chat-completions` 仍按内置目录解析；不再通过用户 Provider YAML 固定或覆盖卡。新版本发布后，先新增具体卡，再更新系列绑定；已有已知内置选择不会被目录更新静默切换。
 
 四个连接都使用 GLM 专用 OpenAI Chat Completions Adapter。请求开启 Preserved Thinking（`clear_thinking: false`），同一来源的 `reasoning_content` 原样回放以保持缓存前缀；有工具时开启流式工具参数。结构化审查使用官方 JSON mode 并由宿主严格校验。余额不足、额度耗尽和套餐/模型权限错误不重试；限流与过载按现有预算重试。官方依据与参考实现见[接入规格](../../.scratch/glm-integration/spec.md)，证据与未验收项见[验证记录](../../.scratch/glm-integration/verification.md)；真实账户可用 `cargo run -p tickloop-agent --example glm_probe -- cn|global|cn-coding|global-coding STATE_DIRECTORY` 自行验证，只调用无副作用的 Echo 与结构化 fixture。
 
@@ -102,62 +105,17 @@ OAuth 使用 Portal 设备授权，终端显示地址和用户码；在自己的
 
 仓库内模型接入 SOP 位于 [.tickloop/skills/model-integration](../../.tickloop/skills/model-integration/SKILL.md)，在本项目通过 `/model-integration` 使用。
 
-自定义配置：
+### 内置 Provider 与模型
 
-```sh
-cargo run -p tickloop-agent --bin tickloop -- \
-  --config crates/agent/examples/providers/deepseek-api.yaml \
-  --cwd "$PWD"
-```
+目前只支持随程序编译的 Provider/model 目录，动态 Provider 接入延期。支持的厂商、连接、地区、模型和所有定义参数均随程序版本变化，目录源文件位于 [src/model/providers/](src/model/providers/)，通过 `include_str!` 编译到程序中。
 
-### Provider 与模型配置
+使用 `tickloop --cwd "$PWD"` 启动；`/provider` 和 `/model` 选择内置连接与模型。`/model FILE` 和启动 `--config FILE` 不再支持，也不读取状态目录 `providers/*.yaml`、旧 `settings.json.providers` 或其他外部 Provider/model 定义。单次输出上限、上下文窗口、端点、认证变量和 Model Card 能力参数均采用内置版本值；外部文件不能覆盖它们。
 
-模型定义采用 `providers → models`。Provider 保存认证方式、凭据环境变量名称与各协议的服务地址；每个模型条目就是 Model Card，同时定义服务模型 ID、显示名、`adapter`、能力与默认限制。同一厂商的 API 与套餐分别配置，例如 `openai-api` 和 `openai-codex`。
+模型选择和 Thinking 保存在状态目录 `settings.json` 的 `defaultModel`、`effortLevel` 和 `alwaysThinkingEnabled`。旧的内置选择与兼容别名继续使用当前版本内置定义；引用未知外部身份的旧选择给出一条明确提示并回退到内置默认。旧定义/调优文件被忽略，用户文件不会被删除。
 
-每个 Provider 一个 YAML 文件，文件根就是 Provider，内部 `models` 是它的模型列表。内置默认文件位于 [src/model/providers/](src/model/providers/)，随程序编译；用户定义位于状态根目录的 `providers/`：
+API Key 仍读取状态目录 `.env`，OAuth 登录使用私有认证存储，Google service account 等凭据文件继续支持。凭据不参与 Provider/model 定义，不在厂商、地区、产品或计费连接之间自动复制或别名匹配。开发入口 `make dev` 使用唯一固定副本启动 CLI／owner／worker，沿用调用方 cwd，默认读取 `/tmp/tickloop-dev/config/settings.json` 与同目录 `.env`；可用 `DEV_CONFIG_DIR` 调整。独立启动由 `TICKLOOP_CONFIG_DIR` 或默认状态目录决定。
 
-```text
-providers/
-  deepseek-api.yaml
-  openai-api.yaml
-  openai-codex.yaml
-```
-
-内置目录中的定义不代表已经配置账户或已开通服务。当前目录还包括 Anthropic API、Kimi 中国/国际 API 和 Code OAuth、阿里云百炼中国区 API、Google Gemini Developer API/Vertex，以及 xAI API/Grok OAuth；每条连接独立配置认证、服务地址和模型。旧 Claude 卡继续可供固定配置与历史恢复使用，普通菜单使用当前系列绑定。
-
-完整示例见 [DeepSeek API](examples/providers/deepseek-api.yaml)、[OpenAI API](examples/providers/openai-api.yaml) 和 [Codex 套餐](examples/providers/openai-codex.yaml)。单个文件可用于 `--config` 或 `/model CONFIG_FILE`。显式加载多模型文件时，用 `default_model` 指定该 Provider 内的模型 ID；只有一个模型时可省略。 显式文件中的自定义模型会出现在本次菜单中；已退休内置卡继续支持固定配置/历史恢复，普通菜单仍读取每系列推荐绑定；加载本身不写配置，确认选择后保存该 Provider 的已填写字段和模型列表。省略的字段继续继承有效用户配置与内置默认值，保存时不会被展开成固定值。
-
-```sh
-cargo run -p tickloop-agent --bin tickloop -- \
-  --config crates/agent/examples/providers/deepseek-api.yaml --cwd "$PWD"
-```
-
-用户文件可以仅覆盖内置条目的公开字段，省略字段继承默认值。例如，在状态目录创建 `providers/deepseek-api.yaml`：
-
-```yaml
-id: deepseek-api
-models:
-  - id: deepseek-flash-chat-completions
-    max_output_tokens: 8192
-```
-
-文件名必须与 Provider ID 一致；新增 Provider 时提供完整的身份、连接与模型定义。模型选择及权限、外观等设置继续保存在 `settings.json`，Provider 定义的新保存写入相应 YAML 文件。旧的单模型 JSON、完整目录 JSON 和 `settings.json.providers` 保留兼容读取，相同 ID 的 YAML 显式字段优先；加载不会自动改写旧文件。
-
-Provider 内的 `id` 是配置身份，`service_model_id` 是服务实际接收的模型名称；同一个服务模型可以有不同适配器条目。普通 `adapter` 为 `messages`、`responses`、`chat_completions`；DeepSeek 的协议差异由 `deepseek_messages`、`deepseek_chat_completions` 表达，MiniMax 使用 `minimax_messages`，智谱 GLM 使用 `glm_chat_completions`，Kimi 使用 `kimi_chat_completions`，百炼使用 `qwen_chat_completions`，Google 使用原生 `google`（GenerateContent），Codex 使用 `codex_responses`。地址取自 Provider 的 `endpoints` 同名项。可选 `connection` 声明 vendor/product/kind/order/region/discovery，厂商组织及产品优先、地区其次排序共用该配置，服务 host 取实际 endpoint；旧/自定义配置没有该字段时保留兼容行为。字段与校验见 [Model Card 配置参考](../../docs/agents/model-integration/model-card.md)。Codex 套餐结合 `codex_subscription` 认证使用专用请求处理，并限制为官方端点；普通 API 使用 `api_key_env`；MiniMax OAuth 分别使用 `minimax_oauth_cn`、`minimax_oauth_global`，只允许对应区域的 MiniMax Messages 端点。不要把套餐 token 填进 API Key 配置。
-
-| 位置 | 公开配置项 |
-| --- | --- |
-| Provider YAML | `id`、`display_name`、`auth`、`api_key_env`、`endpoints`、`models`、`default_model` |
-| Model Card | `id`、`service_model_id`、`display_name`、`adapter`、`max_output_tokens`、`context_window_tokens`、`thinking`、`adaptive_by_default`、`effort_levels`、`input_modalities` |
-| 设置中的默认选择 | `defaultModel.provider`、`defaultModel.model` |
-
-内置条目按 ID 修改指定字段，其他模型保持原值；新增 Provider 和模型需要提供必要的身份、服务地址、认证方式和适配器。自定义模型未声明 Thinking 时默认为 `unsupported`，不根据模型名字猜测能力；`thinking` 还可为 `toggle` 或 `always_on`。`effort_levels` 只填写服务实际支持且 Adapter 能处理的档位。未声明上下文窗口时保持未知；自定义模型省略输出限制时默认为 4096。能力配置不能赋予账户额外权益。
-
-只有上述公开字段以及已有 settings/config 选项可以修改。未知内部字段、错误类型和非法认证/适配器组合会被拒绝；不能通过配置注入 OAuth 端点、任意请求 JSON 或模型私有状态。登录凭证仍由独立私有存储管理。
-
-`/model` 确认时一次保存模型选择与 Thinking 档位。启动时显式 `--config` 优先于保存选择，保存选择优先于内置默认；升级保留用户的合法显式设置。手工编辑配置后重新启动读取，运行中的请求保持原配置快照。保存失败会显示错误，不会冒充保存成功。开发入口 `make dev` 默认读取 `/tmp/tickloop-dev/config/settings.json` 和 `/tmp/tickloop-dev/config/providers/*.yaml`，API Key 则读取同目录的 `.env`；可用 `DEV_CONFIG_DIR` 更改。独立启动仍由 `TICKLOOP_CONFIG_DIR` 或默认状态目录决定。
-
-旧配置、模型选择与 Transcript 在加载时转换为统一定义，保留原模型、地址、凭据引用及公开历史。已有有效 Codex 登录无需因本次配置升级重新授权。 Codex 普通菜单提供 GPT-6 Astra、GPT-6.1 Sol、GPT-5.6 Terra、GPT-6 Luna；Astra 排在 Sol 前。GPT-5.5、旧 Sol／Luna 卡只供固定配置和历史兼容，当前保存选择不会自动升级。模型显示名相同不会合并不同服务地址的自定义接入。
+内置目录与 AccessCatalog 控制普通菜单的模型系列和推荐卡；既有已退休内置选择保持兼容，不因目录更新静默升级。新增支持通过源码/SOP、验证和程序发布提供，外部 Provider 示例不构成产品加载入口。
 
 排查网络失败时，可为启动命令设置 `TICKLOOP_NETWORK_DIAGNOSTICS=1`，将标准错误重定向到本地日志。该模式记录失败阶段、目标的协议/主机/端口、代理来源、HTTP 状态和耗时，不记录 URL 路径、查询参数、认证头或请求正文；默认不输出这些诊断行。
 
@@ -165,9 +123,9 @@ Provider 内的 `id` 是配置身份，`service_model_id` 是服务实际接收�
 
 模式、模型与 Context 固定在输入框下分隔线右侧；窄屏、短屏与自定义 `statusLines` 保持独立状态行回退。旧 `statusLinePosition` 静默忽略并作为未知键保留。左侧 `Subagents N` 仅在有子 Agent 时出现，N 只统计子 Agent，不计 Main（当前查看的子 Agent 仍计入）；默认展开，点击或 ↓ 聚焦入口后的 Enter／Space 切换，隐藏状态仅属于本 View 会话。展开后 ↓ 进入列表，Enter 打开 Agent，Space 折叠后代，Esc 返回。Todo 始终显示在当前 Agent 消息流左栏的 Working 下方，空闲时也保留非空列表；没有展开或快捷键开关，全部完成后保留 5 秒再持久化清空列表；Shell 保持在右侧 Tick List。子 Agent 不再产生重复的 `reply completed` 状态行，完成状态与回复仍可在列表和该 Agent 对话查看。
 
-输入 `/model` 在已配置 Provider → Model 两级中选择，已有选择时直接进入当前 Provider，`/provider` 也可选择连接并继续模型选择，显式重认证与配置入口保留。模型页标题显示厂商及实际产品、地区、服务域名；模型行使用完整 Model Card 名称；按固定厂商顺序、产品/地区连接顺序，再按模型系列（OpenAI 在 Claude 前）和接入目录维护的能力顺序排列。能力顺序不改变默认推荐。光标所在行用整行背景高亮，长列表跟随光标并提示上下方还有内容；当前模型用 `●` 标记，打开时定位到它，但不移到第一项。交互式 Provider 与 Model 选择器不显示序号，也不接受数字直接确认；管道模式保留编号文本选择作为非交互回退。上下键、`j`／`k`、`Ctrl+N`／`Ctrl+P` 导航，左右键或 `h`／`l` 调整 Thinking，回车应用模型与 Thinking，`Esc` 返回 Provider 层，再按 `Esc` 关闭。模型页按 `p` 打开高亮模型所属连接的配置，成功后继续该连接模型页，取消返回发起层并保留草稿；也可通过 Configure Providers 配置其他连接。新配置连接立即出现在 Provider 层，但不自动应用。`/thinking` 可单独调整当前模型的 Thinking 档位。每个模型绑定首选协议，普通菜单不提供独立 API 风格切换；DeepSeek 只列 OpenAI Chat Completions 的首选模型。两个模型共用 `DEEPSEEK_API_KEY`；当前内置 Model Card 的上下文窗口为 1M，输出限制为 64,000 tokens，可通过公开配置调整。`/settings` 集中显示模型、Execution Mode、当前会话状态、本进程用量和 Auto-scroll。照 Claude Code，`/model` 的选择、持久权限规则和 `defaultMode` 位于状态根目录的 `settings.json`；启动时 `--config` 与 `--mode` 分别优先于保存的模型和默认模式。内置默认是 Auto。Chat 内切换、会话级规则和 `/add-dir` 附加目录只在本进程内有效；新建、恢复与 Branch 使用当时的默认模式，不恢复来源 Chat 的临时模式。Auto-scroll 作用于当前终端会话；在途工作结束后模型切换才生效，历史按目标模型投影，协议变化不要求先压缩。已知模型的上下文窗口自动取该模型的最大值。
+输入 `/model` 在已配置 Provider → Model 两级中选择，已有选择时直接进入当前 Provider，`/provider` 也可选择连接并继续模型选择，两者共享 All/Configured 连接目录，`f` 切换过滤；厂商是不可选分组标题，并显示 configured/total 状态。普通 Enter 复用该实际连接的凭据。模型页标题显示厂商及实际产品、地区、服务域名；模型行使用完整 Model Card 名称；按固定厂商顺序、产品/地区连接顺序，再按模型系列（OpenAI 在 Claude 前）和接入目录维护的能力顺序排列。能力顺序不改变默认推荐。光标所在行用整行背景高亮，长列表跟随光标并提示上下方还有内容；当前模型用 `●` 标记，打开时定位到它，但不移到第一项。交互式 Provider、Model、Details 和凭据操作页不显示序号，也不接受数字直接确认；管道模式保留编号文本选择作为非交互回退。上下键、`j`／`k`、`Ctrl+N`／`Ctrl+P` 导航，左右键或 `h`／`l` 调整 Thinking，回车应用模型与 Thinking，`Esc` 返回 Provider 层，再按 `Esc` 关闭。目录或模型页按 `p` 打开该实际连接的 Details；Replace API key、Edit service account、Sign in again 才开启编辑，取消／失败保留旧凭据。替换 key 保存成功前旧 key 仍可用；Remove saved key 与 Sign out 单独确认。模型页 `r` 仅刷新支持的账号目录。返回栈恢复发起页、过滤、连接／模型焦点与 Thinking 草稿；空 Configured 页通过 Add connection 进入 All。连接来源与模型参数采用编译内置值，旧外部覆盖被忽略；不跨地区／产品共享凭据。新配置连接立即出现在 Provider 层，但不自动应用。`/thinking` 可单独调整当前模型的 Thinking 档位。每个模型绑定首选协议，普通菜单不提供独立 API 风格切换；DeepSeek 只列 OpenAI Chat Completions 的首选模型。两个模型共用 `DEEPSEEK_API_KEY`；当前内置 Model Card 的上下文窗口为 1M，输出限制为 64,000 tokens，随程序版本固定。`/settings` 集中显示模型、Execution Mode、当前会话状态、本进程用量和 Auto-scroll。照 Claude Code，`/model` 的选择、持久权限规则和 `defaultMode` 位于状态根目录的 `settings.json`；启动时 `--mode` 优先于保存的默认模式。内置默认是 Auto。Chat 内切换、会话级规则和 `/add-dir` 附加目录只在本进程内有效；新建、恢复与 Branch 使用当时的默认模式，不恢复来源 Chat 的临时模式。Auto-scroll 作用于当前终端会话；在途工作结束后模型切换才生效，历史按目标模型投影，协议变化不要求先压缩。已知模型的上下文窗口自动取该模型的最大值。
 
-内置 DeepSeek 配置的单次输出上限为 64,000 tokens；保存的旧内置 4096 配置在读取时升级，自定义配置与显式 `--config` 的上限保持原值。模型报告输出截断时，Agent 只用已收到的文字续接，最多再请求三次；没有完整文字可续接或次数耗尽时报告失败。上下文自动压缩独立按输入历史与上下文窗口判断。
+内置 DeepSeek 配置的单次输出上限为 64,000 tokens；保存的旧内置 4096 配置在读取时升级，外部输出参数覆盖不再生效。模型报告输出截断时，Agent 只用已收到的文字续接，最多再请求三次；没有完整文字可续接或次数耗尽时报告失败。上下文自动压缩独立按输入历史与上下文窗口判断。
 
 `/settings` 的 Thinking 项独立开启或关闭思考，保存为 `settings.json` 的 `alwaysThinkingEnabled`；仅当前模型的 model card 允许关闭时可切换。`/thinking` 打开按 model card 过滤的档位选择器，也可输入 `/thinking LEVEL`。DeepSeek 的力度档位是 `low`、`high`、`max`；`auto` 恢复模型默认值。Claude 档位按具体模型变化：Opus 4.6 为四档，Opus 5 为五档。选择结果保存为 `effortLevel`，应用于当前 Chat 的后续请求和新 Chat。当前模型不支持的档位不会出现，直接输入也会被拒绝。交互对话在思考期间逐字显示一行实时预览；思考文本换行时预览切到最新一行。运行中的 `Working`、Thinking、工具名与展开任务列表的 `running` 状态统一使用从左向右的文字流光，减少动效时静止显示。普通回复按完整行显示，最后一行没有换行时在回复结束时显示。思考结束后正文仍折叠为 `∴ Thinking (ctrl+o to expand)`；Ctrl+O 在运行中显示已收到的完整思考正文，完成后显示模型提供的可读思考文本。Responses 同时返回摘要和原文时优先显示摘要，并明确标为 `Thinking summary`；加密状态不显示。管道输出直接输出模型返回的思考文本。模型未返回思考内容时不会伪造思考。
 
@@ -215,9 +173,9 @@ Rewind 同时提供 `Summarize from here` 和 `Summarize up to here`，照 Claud
 
 `/help` 或 `/` 打开按功能分组的命令菜单。普通补全显示 23 个公开命令和系统 Skill；`/help advanced` 查看 21 个高级命令，高级命令仍可直接执行。`/resume`、`/loops`、`/tasks` 分别选择 Chat、目标和 Shell 任务；`/plan` 独立进入只读规划，有已保存计划时打开审阅。选择历史只打开内容，不自动恢复执行；计划菜单明确标注“批准并开始”，并校验所审阅的版本。
 
-`examples/deepseek-chat-config.json` 演示默认 OpenAI Chat Completions 适配器配置；`examples/deepseek-config.json` 与 `examples/deepseek-responses-config.json` 保留旧 Anthropic Messages 和 OpenAI Responses 显式配置示例，`examples/deepseek-v4-pro-config.json` 演示改用 `deepseek-v4-pro` 模型。协议属于模型配置；OpenAI Chat Completions 与 OpenAI Responses 的 DeepSeek 服务地址为 `https://api.deepseek.com`，Anthropic Messages 使用 `/anthropic` 地址。
+模型的协议、服务地址和参数由编译进程序的 Model Card 持有。DeepSeek 的主协议为 OpenAI Chat Completions；已有 Messages/Responses 内置卡继续保留独立身份和端点。用户通过 `/model` 选择版本支持的内置卡，不加载外部模型配置文件。
 
-Model Card 与单模型配置的 `input_modalities` 声明模型接受的输入（`"text"`、`"image"`），未声明时只收文字。内置 Anthropic 与 Codex 模型、`deepseek-flash` 的 Messages 与 Chat Completions 条目，以及 `examples/deepseek-config.json`、`examples/deepseek-chat-config.json` 声明 `["text", "image"]`；`deepseek-v4-pro`、`deepseek-v4-flash` 与 DeepSeek Responses 只收文字。当前模型不支持图片时，带 `@图片` 的消息不会发送，草稿保留，并提示去掉 `@图片` 或用 `/model` 切换模型；历史中的图片在请求时替换为说明文字，模型会告知用户它看不到图片，Transcript 中的原图不变，切回支持图片的模型后照常发送。Agent 用 `Read` 读取 PNG、JPEG、GIF 或 WebP 图片时，模型收到图片本身，界面只显示路径、格式与尺寸；当前模型不支持图片时 `Read` 不加载图片，返回说明文字让 Agent 告知用户。
+内置 Model Card 的 `input_modalities` 声明模型接受的输入（`"text"`、`"image"`），能力随程序版本持有。内置 Anthropic 与 Codex 模型、`deepseek-flash` 的 Messages 与 Chat Completions 条目声明 `["text", "image"]`；`deepseek-v4-pro`、`deepseek-v4-flash` 与 DeepSeek Responses 只收文字。当前模型不支持图片时，带 `@图片` 的消息不会发送，草稿保留，并提示去掉 `@图片` 或用 `/model` 切换模型；历史中的图片在请求时替换为说明文字，模型会告知用户它看不到图片，Transcript 中的原图不变，切回支持图片的模型后照常发送。Agent 用 `Read` 读取 PNG、JPEG、GIF 或 WebP 图片时，模型收到图片本身，界面只显示路径、格式与尺寸；当前模型不支持图片时 `Read` 不加载图片，返回说明文字让 Agent 告知用户。
 
 | 分类 | 命令 | 行为 |
 | --- | --- | --- |
@@ -231,7 +189,7 @@ Model Card 与单模型配置的 `input_modalities` 声明模型接受的输入�
 | 高级 | `/allow REQUEST [once\|session\|persistent]`、`/deny REQUEST` | 回答绑定具体操作的权限请求；默认为单次 |
 | 高级 | `/mode [auto\|ask\|fullAccess\|plan]` | 查看或修改当前 Chat 的模式；旧 `acceptEdits` 兼容 Ask，`manual` 与 `default` 是废弃别名；Plan 推荐使用 `/plan` |
 | 公开 | `/provider` | 选择连接，按需认证后选择模型；另可重认证、注销与配置独立 Jev Key，保存凭据不自动切换模型 |
-| 公开 | `/model` | 选择已配置连接的模型，显示 Provider 与 Thinking；按 p 配置连接；选择保存到 `settings.json` |
+| 公开 | `/model` | 选择已配置连接的模型，显示 Provider 与 Thinking；按 p 打开连接 Details，f 切换连接过滤；选择保存到 `settings.json` |
 | 公开 | `/thinking [LEVEL]` | 选择当前模型支持的力度；无参数打开选择器，`auto` 使用模型默认值 |
 | 公开 | `/permissions` | 先选择 Auto／Ask／Full Access，或直接查看近期记录；Auto 下可配置 LLM／Jev 与 Key；Settings 中的 Permissions 打开同一入口 |
 | 公开 | `/settings` | 模型与 adapter、Thinking 开关与档位、Execution Mode、Permissions、当前会话状态、本进程用量、客户端 Auto-scroll 与 Output style |
@@ -265,11 +223,11 @@ Model Card 与单模型配置的 `input_modalities` 声明模型接受的输入�
 | 高级 | `/approve-plan GOAL VERSION MODE` | 批准指定计划版本，下一次输入才开始执行 |
 | Skill | `/tickloop [REQUEST]` | 加载系统 Tick Loop Skill，不额外授权 |
 
-默认不保留 alias；本次移除的名称不再被解析，也不会自动转发。旧 `/new`、`/goal`、`/triggers`、`/schedule` 的能力归入 `/loops`；Theme 位于 `/settings → Theme`，只影响当前终端；退出 Codex 登录位于 `/provider → Sign out`，不会自动重新登录。
+默认不保留 alias；本次移除的名称不再被解析，也不会自动转发。旧 `/new`、`/goal`、`/triggers`、`/schedule` 的能力归入 `/loops`；Theme 位于 `/settings → Theme`，只影响当前终端；退出 Codex 登录位于 `/provider → Codex subscription → p Connection → Sign out`，不会自动重新登录。
 
 Loops 的 Configure timer 把当前配置填入主输入框，使用同一套普通编辑键与 Ctrl+G 外部编辑器。修改 `/loops schedule GOAL_ID SECONDS [--for DURATION_SECONDS] PROMPT` 后 Enter 保存，Ctrl+C 取消草稿；已有草稿不会被覆盖。无 `--for` 时移除期限。当前任务忙时排队；显式参数形式可用于管道。新目标保留当前 Chat 历史，选择目标与查看详情不自动执行任务。
 
-交互菜单仅在 stdin 和 stdout 都是终端时启用。管道输入保持按行命令和详细事件输出，不输出终端控制码；模型／设置选择可以输入菜单编号或 `cancel`。原有 `/model CONFIG_FILE`、`/allow REQUEST`、`/loops UUID`、`/background OPERATION`、`/stop-command OPERATION`、`/approve-plan GOAL VERSION MODE` 等显式参数形式继续可用，适合脚本及高级操作。高级 `/approve-plan` 仅批准版本，再次输入才开始；菜单“批准并开始”明确执行这两步。
+交互菜单仅在 stdin 和 stdout 都是终端时启用。管道输入保持按行命令和详细事件输出，不输出终端控制码；模型／设置选择可以输入菜单编号或 `cancel`。原有 `/allow REQUEST`、`/loops UUID`、`/background OPERATION`、`/stop-command OPERATION`、`/approve-plan GOAL VERSION MODE` 等显式参数形式继续可用，适合脚本及高级操作。高级 `/approve-plan` 仅批准版本，再次输入才开始；菜单“批准并开始”明确执行这两步。
 
 管道输入的 EOF 会等待已提交的输入按序完成；模型失败时以非零状态退出。显式 `/exit` 立即离开 View，已接受工作继续。
 
@@ -324,7 +282,7 @@ cargo test -p tickloop-agent --test terminal
 
 Agent 的呈现与宿主布局分开，Herdr 负责容器外观；颜色、装饰与 Theme 不写入业务上下文和 Agent 存档。
 
-内置主协议卡 ID 采用官方原始服务 ID，保留大小写；`adapter` 表达协议，官方模型名称不添加自造协议/套餐后缀。Provider 的 `model_aliases` 保留旧 ID：例如 `gpt-6.1-sol-responses` → `gpt-6.1-sol`、`minimax-m3-messages` → `MiniMax-M3`。旧 `default_model`、补丁和保存选择可继续解析，下一次明确保存使用 canonical ID；身份规范化不会替换用户路由或能力覆盖，也不升级实际版本。DeepSeek 已有额外 Messages/Responses 卡继续保留独立旧 ID 与原 Adapter/endpoint，避免与同模型主协议卡冲突。
+内置主协议卡 ID 采用官方原始服务 ID，保留大小写；`adapter` 表达协议，官方模型名称不添加自造协议/套餐后缀。Provider 的 `model_aliases` 保留旧 ID：例如 `gpt-6.1-sol-responses` → `gpt-6.1-sol`、`minimax-m3-messages` → `MiniMax-M3`。保存的已知内置身份与别名继续可用，下一次明确保存使用 canonical ID；所有路由、能力及参数均从当前编译目录解析，既有外部定义和覆盖被忽略并显示一条提示。未知外部身份回退内置默认，用户文件与凭据保留；已知内置身份不会自动升级到其他模型版本。DeepSeek 已有额外 Messages/Responses 卡继续保留独立旧 ID 与原 Adapter/endpoint，避免与同模型主协议卡冲突。
 
 The current Chat’s Ticks appear in a 42-column Tick List beside the conversation on wide terminals. The input, both dividers, hints and footer remain full width; narrow-terminal overlays cover only conversation content. Empty lists stay hidden. `/ticks` or the input’s `Ticks N` toggle saves visibility; `→` from an empty input focuses a nonempty list. Clicking either row line selects it and runs Enter. Shells open a detail inside the Tick panel with live output, scrolling and a confirmed `s` stop; Esc returns to the selected row. `/tasks` keeps the existing Task Center. Subscribed Ticks open their subscription, and subscribed artifacts retain browser/copy/feedback actions. `/artifacts` signs in when needed and opens the All/Mine/Shared/Pinned picker. Enter adds an artifact without granting access, connecting feedback or subscribing. Artifact `f` resumes feedback or asks the Agent to connect it. Artifact Service sign-out is in `/settings`.
 

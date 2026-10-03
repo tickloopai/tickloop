@@ -93,6 +93,7 @@ impl Agent {
         chat.todo_completion_graces.remove(&loop_id);
         if let Some(recorder) = &self.inner.recorder {
             recorder.record_todo_retirement(&chat.snapshot, loop_id);
+            chat.start_new_tool_result_message = true;
         }
         let run_id = chat
             .snapshot

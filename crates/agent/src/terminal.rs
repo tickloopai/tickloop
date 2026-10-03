@@ -8,15 +8,15 @@ use std::{
 use tick_connect::{access::TickAccess, herdr::HerdrContext};
 
 use tickloop_agent::{
-    model::{ModelConfig, ReasoningEffort, Usage, cards::ProviderPatch, model_client},
+    model::{ModelConfig, ReasoningEffort, Usage},
     permissions::{Decision, ExecutionMode, PermissionRule, PermissionScope},
     runtime::{
         AgentError, AgentHostOptions, BranchOutcome, BranchRequest, ChatSnapshot,
         DirectoryTrustPolicy, ENTER_PLAN_MODE_TOOL_NAME, EventKind, InputContext, LoopId,
         PermissionChange, PromptPolicy, QuestionRequest, Receipt, RequestKind, RequestOutcome,
-        ShellTaskNotice, ShellTaskPromptWatchdog, ShellTaskSnapshot, ShellTaskState,
-        ShellTaskSubscriptionEvent, TaskNotification, TaskNotificationStatus, TodoStatus, Trigger,
-        TriggerSource, UserShellRecord, UserShellState,
+        ShellTaskNotice, ShellTaskPromptWatchdog, ShellTaskState, ShellTaskSubscriptionEvent,
+        TaskNotification, TaskNotificationStatus, TodoStatus, Trigger, TriggerSource,
+        UserShellRecord, UserShellState,
     },
     settings::{LoadedSettings, UserSettings},
 };
@@ -84,6 +84,7 @@ mod task_surface;
 #[path = "../tests/support/mod.rs"]
 mod test_support;
 mod thinking_preview;
+pub mod tick_actions;
 mod tick_list;
 mod tick_shell;
 mod transcript;
@@ -98,7 +99,6 @@ use execution::{
     ConsoleExecution as Agent, CreateAcknowledgement, CreationAcceptance, DraftCreationError,
     DraftPermissionsError, InputResolution, RuleSave,
 };
-use footer::FooterItemId;
 use login::{LoginFlow, LoginUpdate, LogoutFlow};
 use menus::{MenuOutcome, Menus};
 use new_agent_draft::ConfigTarget;
@@ -122,7 +122,6 @@ use tickloop_agent::agent_access::{
 use task_access::{ShellTaskCenter, ShellTaskSubscription};
 /// How often an open subscription view re-reads the Agent's snapshot; an unchanged one repaints
 /// nothing, so the poll only has to be fast enough to look live.
-use task_surface::{TaskOutputUpdate, TaskSurfaceEffect};
 use thinking_preview::ThinkingPreview;
 use workflows::Workflow;
 
@@ -568,7 +567,7 @@ pub fn print_help() {
 
 fn help_text() -> String {
     let guidance = r#"Tick Loop Agent
-Usage: tickloop [--config FILE] [--cwd DIRECTORY]
+Usage: tickloop [--cwd DIRECTORY]
        [--mode acceptEdits|auto|plan] [--deny-on-prompt | --dangerously-skip-permissions]
        [--working-directory-is-trusted]
        [-c | --continue | -r [CHAT] | --resume [CHAT] | --chat-id CHAT] [--fork-session]
@@ -590,7 +589,7 @@ Chats are saved under ~/.tickloop, or TICKLOOP_CONFIG_DIR when it is set.
 Transcripts, large tool results, plans, file backups and paste cache older than cleanupPeriodDays (default 30) are removed in the background 10 minutes after the first prompt (at start when input is not a terminal), later while you are typing.
 /provider opens Codex subscription authorization; choose browser or device code there. Judgment settings manages the separate Jev (TypeSafe) key.
 /provider: press s to sign out of Codex locally; requests already sent are not revoked.
-/model choices and persistent rules are saved in settings.json there; --config takes precedence over the saved model.
+Built-in /model choices and persistent rules are saved in settings.json there; model definitions are owned by the program version.
 
 Enter a task; follow-up inputs are accepted while the current run continues.
 Queued messages, commands and Shell input appear above the editor; Up on the first visual row restores editable queued input.
@@ -611,7 +610,7 @@ Divider edge titles have a short rule beyond the text; the expanded Subagents li
 Chats you switch away from keep running their goals in this process; /tasks lists Shell tasks from every Chat.
 /tickloop [REQUEST] loads the system Workspace Skill; other discovered Skills also use /NAME [ARGUMENTS].
 /provider configures connections, sign-in and the separate Jev (TypeSafe) key without changing the Chat model.
-/model selects models from configured Providers; p opens Provider configuration. /model FILE loads an advanced Chat configuration. Model choices also apply to new Chats.
+/model selects built-in models from configured connections; p opens Connection details. Model choices also apply to new Chats.
 /thinking opens the Thinking picker; /thinking LEVEL sets a supported level. Auto uses the model default; /settings toggles Thinking.
 /settings opens settings for this Chat; /permissions shows Auto, Ask and Full Access and a separate recent-activity entry.
 /permissions → Auto opens Auto settings, where you can select LLM or Judgment, manage review rules and Environment, and open the shared Jev (TypeSafe) key settings.
@@ -659,9 +658,8 @@ pub async fn run() -> Result<(), String> {
     run_with_arguments(std::env::args().skip(1)).await
 }
 
-async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Result<(), String> {
+pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Result<(), String> {
     let mut arguments = arguments.peekable();
-    let mut config_path = None;
     let mut execution_mode_override = None;
     let mut prompt_policy = PromptPolicy::Interactive;
     let mut deny_on_prompt = false;
@@ -681,11 +679,10 @@ async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Result<(
                 return Ok(());
             }
             "--config" => {
-                config_path = Some(PathBuf::from(
-                    arguments
-                        .next()
-                        .ok_or("--config requires a YAML or JSON file path")?,
-                ))
+                return Err(
+                    "--config is not supported; use /model to choose from the built-in catalog"
+                        .into(),
+                );
             }
             "--auto-reviewer-config" | "--permission-checker-config" => {
                 return Err("Independent Auto reviewer configuration has moved to /permissions → Auto mode. Remove this startup flag and choose LLM or Judgment there.".into());
@@ -815,37 +812,13 @@ async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Result<(
         }
         startup_console = Some((console, input));
     }
-    // 照 Claude Code：启动参数指定的模型优先，其次是 `/model` 保存在用户设置中的选择。
-    let explicit_config = config_path
-        .as_deref()
-        .map(|path| read_config_with_provider(path, user_settings.as_ref()))
-        .transpose()?;
     let mut saved_settings = user_settings.as_ref().map(UserSettings::load);
-    let saved_model = if explicit_config.is_some() {
-        if let Some(settings) = saved_settings.as_mut() {
-            let _ = settings.model();
-        }
-        None
-    } else {
-        saved_settings
-            .as_mut()
-            .map(LoadedSettings::configured_model)
-            .transpose()
-            .map_err(|error| {
-                if let Some(root) = config_root.as_ref()
-                    && root.exists()
-                    && !root.is_dir()
-                {
-                    format!(
-                        "cannot use Agent state root {}: {error}; set TICKLOOP_CONFIG_DIR to a readable directory. --no-session-persistence disables Chat storage but still reads model settings",
-                        safe_text(&root.to_string_lossy())
-                    )
-                } else {
-                    format!("invalid model settings: {error}")
-                }
-            })?
-            .flatten()
-    };
+    let saved_model = saved_settings
+        .as_mut()
+        .map(LoadedSettings::configured_model)
+        .transpose()
+        .map_err(|error| format!("invalid model settings: {error}; use a readable settings directory (TICKLOOP_CONFIG_DIR). --no-session-persistence disables Chat history but settings still need an accessible directory"))?
+        .flatten();
     let display_preferences = saved_settings
         .as_mut()
         .map(LoadedSettings::display_preferences)
@@ -860,26 +833,16 @@ async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Result<(
     let startup_settings_warnings = saved_settings
         .map(LoadedSettings::into_warnings)
         .unwrap_or_default();
-    let explicit_provider = explicit_config
-        .as_ref()
-        .and_then(|(_, provider)| provider.clone());
-    let config = if let Some((config, _)) = explicit_config {
-        config
-    } else if let Some(model) = saved_model {
-        model
-    } else {
+    let config = saved_model.unwrap_or_else(|| {
         crate::model::cards::ModelCatalog::defaults()
             .get(
                 "deepseek-api",
-                tickloop_agent::model::access::AccessCatalog::defaults()
+                crate::model::access::AccessCatalog::defaults()
                     .recommended_model("deepseek-api")
-                    .expect("built-in DeepSeek recommendation"),
+                    .expect("built-in recommendation"),
             )
-            .expect("bundled default model exists")
-    };
-    if let (Some(settings), Some(provider)) = (&user_settings, &explicit_provider) {
-        settings.set_transient_provider(provider.clone());
-    }
+            .expect("built-in default")
+    });
     let host_options = AgentHostOptions {
         execution_mode_override,
         prompt_policy,
@@ -921,7 +884,7 @@ async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Result<(
         workdir: workdir.clone(),
         config_root: config_root.clone(),
         model: Some(config.clone()),
-        transient_provider: explicit_provider.clone(),
+        transient_provider: None,
         host_options,
         session_persistence,
         exact_chat: None,
@@ -1031,7 +994,6 @@ async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Result<(
         input,
         StartupState {
             chat: startup,
-            explicit_provider,
             user_settings,
         },
         config_root,
@@ -1057,7 +1019,6 @@ enum StartupChat {
 
 struct StartupState {
     chat: StartupChat,
-    explicit_provider: Option<ProviderPatch>,
     user_settings: Option<UserSettings>,
 }
 
@@ -1072,7 +1033,6 @@ fn initialize_startup_console(
         execution_mode.to_string(),
         safe_text(&config.model),
         None,
-        Vec::new(),
         Vec::new(),
     )?;
     write_banner(console, config, workdir)?;
@@ -1170,16 +1130,12 @@ async fn interact(
     let mut task_notifications = agent.subscribe_task_notifications();
     let interactive = console.is_interactive();
     let mut menus = Menus::new(user_settings.clone(), config_root.clone());
-    if user_settings.is_none()
-        && let Some(provider) = startup.explicit_provider
-    {
-        menus.add_transient_provider(provider);
-    }
     let mut artifact_loads = tokio::task::JoinSet::new();
     let mut artifact_refresh = tokio::time::interval(std::time::Duration::from_millis(50));
     artifact_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut login: Option<LoginFlow> = None;
     let mut login_from_provider = false;
+    let mut provider_login_chat = None;
     let mut provider_login_succeeded = false;
     let mut reauthenticate_after_logout = false;
     let mut logout_target = login::SignInTarget::Codex;
@@ -1198,8 +1154,6 @@ async fn interact(
     let mut working_shimmer = RunningShimmer::default();
     let task_center = ShellTaskCenter::new(agent.clone());
     let mut task_subscription = None;
-    let mut tick_shell_subscription = None;
-    let mut tick_shell_panel = None;
     let mut prompt_watchdog_refresh = tokio::time::interval(std::time::Duration::from_secs(1));
     prompt_watchdog_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut prompt_watchdog = ShellTaskPromptWatchdog::default();
@@ -1278,9 +1232,9 @@ async fn interact(
             .snapshot(chat)
             .await
             .map_err(|error| error.to_string())?;
-        menus.warm_model_directory(snapshot.model);
+        menus.warm_model_directory(agent, ConfigTarget::Agent(chat), snapshot.model);
     } else if let Some(model) = agent.launch_spec().model {
-        menus.warm_model_directory(model);
+        menus.warm_model_directory(agent, ConfigTarget::NewDraft, model);
     }
     agent
         .display_chat(selected_chat)
@@ -1293,6 +1247,9 @@ async fn interact(
         registration
     });
     loop {
+        if let Some((chat, effect)) = console.take_resumed_task_effect()? {
+            apply_task_surface_effect(&task_center, console, chat, effect).await?;
+        }
         observed_run_starts.retain(|run, _| pending.contains_key(run));
         if let Some(chat) = selected_chat {
             selected_loops.insert(chat, goal);
@@ -1334,8 +1291,15 @@ async fn interact(
         {
             registration.update_chat(selected_chat);
         }
+        menus.sync_dialog_chat(console)?;
         if login.is_none() && logout.is_none() && login_from_provider {
             login_from_provider = false;
+            menus.note_provider_login_result(provider_login_chat, provider_login_succeeded);
+        }
+        if login.is_none()
+            && logout.is_none()
+            && let Some(succeeded) = menus.take_provider_login_result(console)?
+        {
             if let Some(chat) = selected_chat {
                 agent
                     .refresh_configuration(chat)
@@ -1343,7 +1307,7 @@ async fn interact(
                     .map_err(|error| error.to_string())?;
             }
             menus
-                .resume_provider_login(agent, console, provider_login_succeeded)
+                .resume_provider_login(agent, console, succeeded)
                 .await?;
         }
         if let Some(outcome) = menu_outcome.take() {
@@ -1375,8 +1339,9 @@ async fn interact(
             if outcome.provider_logout {
                 menus.invalidate_model_discovery();
                 login_from_provider = true;
+                provider_login_chat = selected_chat;
                 provider_login_succeeded = false;
-                if let Some(root) = config_root.clone() {
+                if let Some(root) = menus.provider_login_root() {
                     reauthenticate_after_logout = outcome.reauthenticate_after_logout;
                     logout_target = outcome.logout_target;
                     logout = Some(LogoutFlow::start(root, console, logout_target)?);
@@ -1389,8 +1354,9 @@ async fn interact(
             }
             if let Some(method) = outcome.provider_login {
                 login_from_provider = true;
+                provider_login_chat = selected_chat;
                 provider_login_succeeded = false;
-                if let Some(root) = config_root.clone() {
+                if let Some(root) = menus.provider_login_root() {
                     match LoginFlow::start(root, console, method) {
                         Ok(flow) => login = Some(flow),
                         Err(error) => outln!(console, "Cannot log in: {}", safe_text(&error)),
@@ -1435,7 +1401,6 @@ async fn interact(
             if let Some((chat, selected_goal)) = outcome.selection {
                 if selected_chat != Some(chat) {
                     message_groups = MessageGroups::default();
-                    task_subscription = None;
                     transcript_dirty = true;
                 }
                 selected_chat = Some(chat);
@@ -1523,7 +1488,6 @@ async fn interact(
                     snapshot.policy.mode.to_string(),
                     safe_text(&snapshot.model.model),
                     context_usage(&snapshot),
-                    task_status_items(&task_snapshot),
                     todo_status_items(&snapshot, goal),
                 )?;
                 let running_receipt = pending
@@ -1704,7 +1668,6 @@ async fn interact(
                         safe_text(&draft.model.model),
                         None,
                         Vec::new(),
-                        Vec::new(),
                     )?;
                 }
             }
@@ -1733,7 +1696,8 @@ async fn interact(
             }
             activity_dirty = false;
         }
-        if login.is_none() && !overview_active {
+        menus.sync_dialog_chat(console)?;
+        if !overview_active {
             menus
                 .refresh_family_permissions(
                     agent,
@@ -1774,7 +1738,6 @@ async fn interact(
             && reply_lines
                 .values()
                 .any(|reply| Some(reply.chat_id) == selected_chat && reply.has_complete_line());
-        let has_visible_running_task = interactive && console.has_visible_running_task()?;
         let todo_refresh_pending = interactive && console.todo_refresh_pending()?;
         let prefers_reduced_motion =
             interactive && console.display_preferences()?.prefers_reduced_motion;
@@ -1787,38 +1750,15 @@ async fn interact(
                 (request, result)
             });
         }
-        let tick_shell_target = console.tick_shell_target()?;
-        if tick_shell_subscription
-            .as_ref()
-            .map(ShellTaskSubscription::chat_id)
-            != tick_shell_target.map(|target| target.0)
-            || tick_shell_panel != tick_shell_target.map(|target| target.1)
-        {
-            tick_shell_subscription = None;
-            tick_shell_panel = tick_shell_target.map(|target| target.1);
-            if let Some((chat, panel, task_id)) = tick_shell_target {
-                match task_center.subscribe(chat).await {
-                    Ok(subscription) => {
-                        match task_center.snapshot(chat).await {
-                            Ok(snapshot) => {
-                                let started = task_center.started_at_ms(chat, task_id).await;
-                                let effect =
-                                    console.load_tick_shell(chat, panel, snapshot, started)?;
-                                apply_tick_shell_effect(&task_center, console, chat, panel, effect)
-                                    .await?;
-                            }
-                            Err(error) => console.tick_shell_failed(
-                                chat,
-                                panel,
-                                safe_text(&error.to_string()),
-                            )?,
-                        }
-                        tick_shell_subscription = Some(subscription);
-                    }
-                    Err(error) => {
-                        console.tick_shell_failed(chat, panel, safe_text(&error.to_string()))?
-                    }
-                }
+        if let Some((chat, action)) = console.poll_tick_detail()? {
+            let context = tick_actions::TickActionContext {
+                agent,
+                console,
+                root: config_root.as_deref(),
+                chat,
+            };
+            if let Err(error) = tick_actions::execute(action, context).await {
+                console.set_status(&safe_text(&error))?;
             }
         }
         let discovery_active = menus.discovery_active();
@@ -1844,12 +1784,13 @@ async fn interact(
                     Some(LoginUpdate::Finished(result)) => {
                         let flow = login.take().unwrap();
                         let provider_label = flow.label();
+                        let login_chat = flow.chat();
                         flow.close(console)?;
                         match result {
                             Ok(account) => {
                                 if provider_label == "Artifact Service" {
                                     if let Some(root) = config_root.as_deref()
-                                        && let Err(error) = artifact_ui::open(agent, console, root, selected_chat, interactive).await {
+                                        && let Err(error) = artifact_ui::open(agent, console, root, login_chat, interactive).await {
                                         outln!(console, "Cannot open artifacts: {} · use /artifacts to retry", safe_text(&error));
                                     }
                                 } else { provider_login_succeeded = true; }
@@ -1895,14 +1836,15 @@ async fn interact(
                     merged_echoes.next_submission_block();
                 }
                 let line = match line {
-                    Some(InputEvent::TickListAction { chat, id, action }) if selected_chat == Some(chat) && !overview_active && !login_active => {
-                        match artifact_ui::tick_action(agent, console, config_root.as_deref(), chat, id, action).await {
+                    Some(InputEvent::TickAction { chat, action }) if selected_chat == Some(chat) && !overview_active && !login_active => {
+                        let context = tick_actions::TickActionContext { agent, console, root:config_root.as_deref(), chat };
+                        match tick_actions::execute(action,context).await {
                             Ok(Some(prompt)) => Some(prompt),
-                            Ok(None) => { status_dirty = true; continue; },
-                            Err(error) => { console.set_status(&safe_text(&error))?; status_dirty = true; continue; }
+                            Ok(None) => { status_dirty=true; continue; },
+                            Err(error) => { console.set_status(&safe_text(&error))?; status_dirty=true; continue; }
                         }
                     }
-                    Some(InputEvent::TickListAction { .. }) => continue,
+                    Some(InputEvent::TickAction { .. }) => continue,
                     other => other,
                 };
                 match line {
@@ -1978,7 +1920,7 @@ async fn interact(
                         };
                         if let Some(snapshot)=opened {
                             overview_active=false;selected_chat=Some(snapshot.id);
-                            goal=selected_loops.get(&snapshot.id).copied().unwrap_or_else(||selected_loop(&snapshot));draft_question=None;task_subscription=None;
+                            goal=selected_loops.get(&snapshot.id).copied().unwrap_or_else(||selected_loop(&snapshot));draft_question=None;
                             displayed_sequences.insert(snapshot.id,snapshot.last_sequence);
                             tools.restore(&snapshot.conversation_events());
                             sync_snapshot(&snapshot,&mut pending,&mut permissions,&mut questions);
@@ -1989,8 +1931,7 @@ async fn interact(
                     } else {console.set_status("This Agent is no longer live; reopen its saved history to recover")?;}
                     status_dirty = true;
                 },
-                Some(InputEvent::Suspend | InputEvent::OpenFooter(_) | InputEvent::OpenStatusTask(_)
-                    | InputEvent::StopStatusTask(_) | InputEvent::OpenRewind | InputEvent::TakeBackQueued { .. }
+                Some(InputEvent::Suspend | InputEvent::OpenRewind | InputEvent::TakeBackQueued { .. }
                     | InputEvent::OpenTranscript { .. } | InputEvent::ExpandChoice { .. }
                     | InputEvent::BackgroundForegroundShell | InputEvent::TaskSurface(_)
                     | InputEvent::Subscription(_) | InputEvent::Permissions(_)
@@ -2040,36 +1981,7 @@ async fn interact(
                     }
                     status_dirty = true;
                 },
-                Some(InputEvent::TickListAction { .. }) => {},
-                Some(InputEvent::OpenTickShell { .. }) => { status_dirty = true; },
-                Some(InputEvent::TickShellEffect { chat, panel, effect }) => {
-                    apply_tick_shell_effect(&task_center, console, chat, panel, effect).await?;
-                },
-                Some(InputEvent::OpenFooter(item)) => {
-                    let result = if let Some(chat) = selected_chat {
-                        match item {
-                            FooterItemId::Tasks => open_tasks(&task_center,console,chat,&mut task_subscription,None,true).await,
-                            FooterItemId::Agents => Ok(()),
-                        }
-                    } else { Ok(()) };
-                    console.finish_footer_open()?;
-                    result?;
-                },
-                Some(InputEvent::OpenStatusTask(task_id)) => {
-                    if let Some(chat) = selected_chat {
-                        let result = open_tasks(&task_center,console,chat,&mut task_subscription,Some(task_id),false).await;
-                        console.finish_footer_open()?;
-                        result?;
-                    }
-                },
-                Some(InputEvent::StopStatusTask(task_id)) => {
-                    if let Some(chat) = selected_chat {
-                        match task_center.dispatch(chat,task_id,tickloop_agent::runtime::ShellTaskAction::Stop).await {
-                            Ok(_) => status_dirty=true,
-                            Err(error) => console.set_status(&format!("Cannot stop Shell task: {}",safe_text(&error.to_string())))?,
-                        }
-                    }
-                },
+                Some(InputEvent::TickAction { .. }) => {},
                 Some(InputEvent::OpenRewind) => {
                     let is_busy=selected_chat.is_some_and(|chat| pending.values().any(|receipt|receipt.chat_id==chat)
                         || compaction_chats.values().any(|(candidate,_)|*candidate==chat)
@@ -2250,7 +2162,7 @@ async fn interact(
                                 match agent.apply_permission_change(chat,change,revision).await {
                                     Ok(view)=>console.permissions_saved(view)?,
                                     Err(tickloop_agent::runtime::PermissionChangeError::Conflict { latest }) => console.permissions_conflict(*latest)?,
-                                    Err(error)=>console.permissions_error(safe_text(&error.to_string()))?,
+                                    Err(error)=>console.permissions_error(Some(chat), safe_text(&error.to_string()))?,
                                 }
                             },
                             // Saved rules and Auto policy are written now; the mode, session rules
@@ -2260,10 +2172,10 @@ async fn interact(
                                     Ok(change)=>{
                                         let kept=change.kept;
                                         console.permissions_saved(change.page)?;
-                                        if kept {console.permissions_notice("Kept for the New Agent; applies when you send the first input".into())?;}
+                                        if kept {console.permissions_notice(None, "Kept for the New Agent; applies when you send the first input".into())?;}
                                     },
                                     Err(DraftPermissionsError::Conflict(latest))=>console.permissions_conflict(*latest)?,
-                                    Err(DraftPermissionsError::Rejected(error))=>console.permissions_error(safe_text(&error.to_string()))?,
+                                    Err(DraftPermissionsError::Rejected(error))=>console.permissions_error(None, safe_text(&error.to_string()))?,
                                 }
                             },
                             None => {},
@@ -2291,8 +2203,9 @@ async fn interact(
                         },
                         PermissionsEffect::OpenJudgmentSettings { select_reviewer } => {
                             let Some(subject)=console.permissions_subject()? else {continue;};
+                            let chat = subject.chat();
                             if let Err(error) = menus.judgment_settings_from_permissions(agent,console,subject,select_reviewer).await {
-                                console.permissions_error(format!("Cannot open Judgment settings: {}",safe_text(&error)))?;
+                                console.permissions_error(chat, format!("Cannot open Judgment settings: {}",safe_text(&error)))?;
                             }
                         },
                     }
@@ -2627,7 +2540,7 @@ async fn interact(
                             agent.display_chat(None).await.map_err(|error|error.to_string())?;
                             goal=None;
                             draft_question=None;
-                            task_subscription=None;
+
                             message_groups=MessageGroups::default();
                             tools.restore(&[]);
                             transcript_dirty=true;
@@ -2648,7 +2561,7 @@ async fn interact(
                         },
                         command if interactive && is_task_surface_command(command) => {
                             if let Some(chat)=selected_chat {
-                                open_tasks(&task_center,console,chat,&mut task_subscription,None,false).await?;
+                                open_tasks(&task_center,console,chat,&mut task_subscription,None).await?;
                             }
                             else {outln!(console,"No Chat is selected. Enter a task first.");}
                         },
@@ -2760,7 +2673,7 @@ async fn interact(
                                     selected_chat=Some(outcome.child_chat_id);
                                     goal=None;
                                     draft_question=None;
-                                    task_subscription=None;
+
                                     message_groups=MessageGroups::default();
                                     displayed_sequences.insert(outcome.child_chat_id,outcome.snapshot.last_sequence);
                                     tools.restore(&outcome.snapshot.conversation_events());
@@ -2791,38 +2704,14 @@ async fn interact(
                             status_dirty=true;
                         },
                         _ if line=="/provider" => {
-                            menus.providers(agent, console, ConfigTarget::visible(selected_chat)).await?;
-                        },
-                        _ if line=="/model" || line.starts_with("/model ") => {
-                            let target=ConfigTarget::visible(selected_chat);
-                            if let Some(path) = line.strip_prefix("/model ") {
-                                let result = async {
-                                    let (config, provider) = read_config_with_provider(std::path::Path::new(path.trim()), user_settings.as_ref())?;
-                                    model_client(config.clone(), config_root.as_deref()).map_err(|error|error.to_string())?;
-                                    let previous = if let (Some(settings), Some(provider)) = (&user_settings, &provider) {
-                                        Some(settings.set_transient_provider(provider.clone()))
-                                    } else {
-                                        None
-                                    };
-                                    let change = agent.change_configuration(target,ConfigurationChange::Model {config:config.clone(),thinking:None}).await;
-                                    if change.is_ok() && target==ConfigTarget::NewDraft && let Some(provider)=&provider {
-                                        agent.stage_transient_provider(provider.clone());
-                                    }
-                                    if change.is_err()
-                                        && let (Some(settings), Some(provider), Some(previous)) = (&user_settings, &provider, previous)
-                                    {
-                                        settings.restore_transient_provider(&provider.id, previous);
-                                    }
-                                    Ok::<_,String>((change.map_err(|error|error.to_string())?,config,provider))
-                                }.await;
-                                match result {
-                                    Ok((change,config,provider)) => { if user_settings.is_none() && let Some(provider) = provider { menus.add_transient_provider(provider); } outln!(console, "Model selection: {change} · {} · {} · {:?}",safe_text(&config.name),safe_text(&config.model),config.protocol); status_dirty=true; },
-                                    Err(error) => outln!(console, "Cannot select model: {}",safe_text(&error)),
-                                }
-                            } else {
-                                menus.models(agent,console,target).await?;
+                            if let Err(error) = menus.providers(agent, console, ConfigTarget::visible(selected_chat)).await {
+                                outln!(console,"Cannot open Provider directory: {}",safe_text(&error));
                             }
                         },
+                        "/model" => {
+                            if let Err(error) = menus.models(agent,console,ConfigTarget::visible(selected_chat)).await { outln!(console,"Cannot open Models: {}",safe_text(&error)); }
+                        },
+                        _ if line.starts_with("/model ") => { outln!(console,"Model files are not supported; use /model to choose from the built-in catalog."); },
                         _ if line=="/thinking" || line.starts_with("/thinking ") => {
                             let target=ConfigTarget::visible(selected_chat);
                             if let Some(level) = line.strip_prefix("/thinking ") {
@@ -3106,7 +2995,7 @@ async fn interact(
                                     goal=show_opened_chat(console,agent,&snapshot,true)?;
                                     selected_chat=Some(snapshot.id);
                                     draft_question=None;
-                                    task_subscription=None;
+
                                     message_groups=MessageGroups::default();
                                     displayed_sequences.insert(snapshot.id,snapshot.last_sequence);
                                     tools.restore(&snapshot.conversation_events());
@@ -3282,6 +3171,13 @@ async fn interact(
                         }
                     },
                     Err(_) => merged_echoes.close_all(),
+                }
+                if let Ok(event) = &event {
+                    match &event.kind {
+                        EventKind::PermissionRequested { request } => menus.note_request(event.chat_id, request.id),
+                        EventKind::QuestionAsked { request } => menus.note_request(event.chat_id, request.id),
+                        _ => {}
+                    }
                 }
                 match event {
                 Ok(event) if !overview_active && (pending.contains_key(&event.run_id) || Some(event.chat_id)==selected_chat) => {
@@ -3788,7 +3684,7 @@ async fn interact(
                     }
                 }
             },
-            _ = animation_refresh.tick(), if interactive && !prefers_reduced_motion && !visual_pacing_pending && (!pending.is_empty() || !directed_summaries.is_empty() || has_visible_running_task) => {
+            _ = animation_refresh.tick(), if interactive && !prefers_reduced_motion && !visual_pacing_pending && (!pending.is_empty() || !directed_summaries.is_empty()) => {
                 activity_dirty = true;
             },
             _ = elapsed_refresh.tick(), if interactive && !visual_pacing_pending && (todo_refresh_pending || prefers_reduced_motion && running_activity.as_ref().is_some_and(|activity| activity.started_at.is_some())) => {
@@ -3799,9 +3695,9 @@ async fn interact(
                     write_next_reply_line(console, reply)?;
                 }
             },
-            _ = subscription_refresh.tick(), if interactive && !overview_active && (console.tick_list_has_entries()? || console.subscription_view_chat()?.is_some()) => {
+            _ = subscription_refresh.tick(), if interactive && ((!overview_active && console.tick_list_has_entries()?) || !console.subscription_dialog_chats()?.is_empty()) => {
                 status_dirty |= console.tick_list_has_entries()?;
-                if let Some(chat)=console.subscription_view_chat()? {
+                for chat in console.subscription_dialog_chats()? {
                     refresh_subscriptions(agent,console,chat).await?;
                 }
             },
@@ -3812,62 +3708,27 @@ async fn interact(
                 }
                 transcript_dirty=false;
             },
-            tick_event = receive_shell_task_event(&mut tick_shell_subscription), if tick_shell_subscription.is_some() => {
-                if let (Some(subscription), Some(panel)) = (tick_shell_subscription.as_mut(), tick_shell_panel) {
-                    let chat = subscription.chat_id();
-                    let result = match tick_event {
-                        Some(Ok(ShellTaskSubscriptionEvent::ResyncRequired { .. })) => subscription.resync().await,
-                        Some(Ok(ShellTaskSubscriptionEvent::Changed(_))) => task_center.snapshot(chat).await,
-                        Some(Err(error)) => Err(error),
-                        None => continue,
-                    };
-                    match result {
-                        Ok(snapshot) => {
-                            console.update_shell_ticks(&snapshot)?;
-                            let effect = console.update_tick_shell(chat, panel, snapshot)?;
-                            apply_tick_shell_effect(&task_center, console, chat, panel, effect).await?;
-                        }
-                        Err(error) => { console.tick_shell_failed(chat, panel, safe_text(&error.to_string()))?; tick_shell_subscription = None; }
-                    }
-                }
-            },
             task_event = receive_shell_task_event(&mut task_subscription), if task_subscription.is_some() => {
                 match task_event {
                     Some(Ok(ShellTaskSubscriptionEvent::Changed(_))) => {
-                        let Some(chat)=task_subscription.as_ref().map(ShellTaskSubscription::chat_id) else {continue;};
-                        match task_center.snapshot(chat).await {
-                            Ok(snapshot) => {
-                                let effect=console.update_tasks(snapshot)?;
-                                if console.task_surface_chat()?==Some(chat) {
-                                    apply_task_surface_effect(&task_center,console,chat,effect).await?;
-                                }
-                            }
-                            Err(error) => {
-                                console.task_updates_failed(chat,safe_text(&error.to_string()))?;
-                                task_subscription=None;
-                            }
-                        }
+                        refresh_task_dialogs(&task_center, console).await?;
                     }
                     Some(Ok(ShellTaskSubscriptionEvent::ResyncRequired { .. })) => {
                         if let Some(subscription)=task_subscription.as_mut() {
-                            let chat=subscription.chat_id();
                             match subscription.resync().await {
-                                Ok(snapshot) => {
-                                    let effect=console.update_tasks(snapshot)?;
-                                    if console.task_surface_chat()?==Some(chat) {
-                                        apply_task_surface_effect(&task_center,console,chat,effect).await?;
-                                    }
-                                }
+                                Ok(_) => refresh_task_dialogs(&task_center, console).await?,
                                 Err(error) => {
-                                    console.task_updates_failed(chat,safe_text(&error.to_string()))?;
+                                    for chat in console.task_dialog_chats()? {
+                                        console.task_updates_failed(chat,safe_text(&error.to_string()))?;
+                                    }
                                     task_subscription=None;
                                 }
                             }
                         }
                     }
                     Some(Err(error)) => {
-                        if let Some(subscription)=task_subscription.as_ref() {
-                            console.task_updates_failed(subscription.chat_id(),safe_text(&error.to_string()))?;
+                        for chat in console.task_dialog_chats()? {
+                            console.task_updates_failed(chat,safe_text(&error.to_string()))?;
                         }
                         task_subscription=None;
                     }
@@ -3973,7 +3834,6 @@ async fn open_tasks(
     chat_id: uuid::Uuid,
     task_subscription: &mut Option<ShellTaskSubscription>,
     selected_task: Option<uuid::Uuid>,
-    from_footer: bool,
 ) -> Result<(), String> {
     let prepared = async {
         let mut subscription = task_center.subscribe(chat_id).await?;
@@ -3983,21 +3843,34 @@ async fn open_tasks(
     .await;
     match prepared {
         Ok((subscription, snapshot)) => {
-            let effect = if from_footer {
-                console.show_footer_tasks_at(snapshot, selected_task)?
-            } else if let Some(task_id) = selected_task {
-                console.show_tasks_at(snapshot, Some(task_id))?
-            } else {
-                console.show_tasks(snapshot)?
-            };
+            let effect = console.show_tasks_at(snapshot, selected_task)?;
             *task_subscription = Some(subscription);
             apply_task_surface_effect(task_center, console, chat_id, effect).await?;
+            refresh_task_dialogs(task_center, console).await?;
         }
         Err(error) => outln!(
             console,
             "Cannot open Shell tasks: {}",
             safe_text(&error.to_string())
         ),
+    }
+    Ok(())
+}
+
+async fn refresh_task_dialogs(
+    task_center: &ShellTaskCenter,
+    console: &Console,
+) -> Result<(), String> {
+    for chat in console.task_dialog_chats()? {
+        match task_center.snapshot(chat).await {
+            Ok(snapshot) => {
+                let effect = console.update_tasks(snapshot)?;
+                if console.task_surface_chat()? == Some(chat) {
+                    apply_task_surface_effect(task_center, console, chat, effect).await?;
+                }
+            }
+            Err(error) => console.task_updates_failed(chat, safe_text(&error.to_string()))?,
+        }
     }
     Ok(())
 }
@@ -4027,10 +3900,13 @@ async fn refresh_subscriptions(
 ) -> Result<(), String> {
     match agent.tick_subscriptions(chat_id).await {
         Ok(rows) => console.update_subscriptions(chat_id, rows),
-        Err(error) => console.subscription_change_failed(format!(
-            "Cannot read Tick Subscriptions: {}",
-            safe_text(&error.to_string())
-        )),
+        Err(error) => console.subscription_change_failed(
+            chat_id,
+            format!(
+                "Cannot read Tick Subscriptions: {}",
+                safe_text(&error.to_string())
+            ),
+        ),
     }
 }
 
@@ -4048,10 +3924,13 @@ async fn apply_subscription_effect(
             .update_tick_subscription(chat_id, subscription, change)
             .await
     {
-        return console.subscription_change_failed(format!(
-            "Cannot update the Tick Subscription: {}",
-            safe_text(&error.to_string())
-        ));
+        return console.subscription_change_failed(
+            chat_id,
+            format!(
+                "Cannot update the Tick Subscription: {}",
+                safe_text(&error.to_string())
+            ),
+        );
     }
     refresh_subscriptions(agent, console, chat_id).await
 }
@@ -4071,189 +3950,8 @@ async fn open_diff(agent: &Agent, console: &Console, chat_id: uuid::Uuid) -> Res
     console.show_diff(chat_id, catalog)
 }
 
-#[derive(Clone, Copy)]
-enum ShellEffectTarget {
-    TaskCenter,
-    TickPanel(uuid::Uuid),
-}
+use tick_actions::builtin::apply_task_surface_effect;
 
-impl ShellEffectTarget {
-    fn snapshot(
-        self,
-        console: &Console,
-        chat: uuid::Uuid,
-        snapshot: task_surface::TaskSurfaceSnapshot,
-    ) -> Result<TaskSurfaceEffect, String> {
-        match self {
-            Self::TaskCenter => console.update_tasks(snapshot),
-            Self::TickPanel(panel) => console.update_tick_shell(chat, panel, snapshot),
-        }
-    }
-    fn output(
-        self,
-        console: &Console,
-        chat: uuid::Uuid,
-        update: TaskOutputUpdate,
-    ) -> Result<TaskSurfaceEffect, String> {
-        match self {
-            Self::TaskCenter => console.update_task_output(update),
-            Self::TickPanel(panel) => console.update_tick_shell_output(chat, panel, update),
-        }
-    }
-    fn action_failed(
-        self,
-        console: &Console,
-        chat: uuid::Uuid,
-        task: uuid::Uuid,
-        error: String,
-    ) -> Result<(), String> {
-        match self {
-            Self::TaskCenter => console.task_action_failed(task, error),
-            Self::TickPanel(panel) => console.tick_shell_control_failed(chat, panel, error),
-        }
-    }
-    fn clear_action_error(self, console: &Console, chat: uuid::Uuid) -> Result<(), String> {
-        match self {
-            Self::TaskCenter => console.clear_task_action_error(),
-            Self::TickPanel(panel) => console.clear_tick_shell_control_error(chat, panel),
-        }
-    }
-    fn updates_failed(
-        self,
-        console: &Console,
-        chat: uuid::Uuid,
-        error: String,
-    ) -> Result<(), String> {
-        match self {
-            Self::TaskCenter => console.task_updates_failed(chat, error),
-            Self::TickPanel(panel) => console.tick_shell_failed(chat, panel, error),
-        }
-    }
-}
-
-async fn apply_task_surface_effect(
-    task_center: &ShellTaskCenter,
-    console: &Console,
-    chat: uuid::Uuid,
-    effect: TaskSurfaceEffect,
-) -> Result<(), String> {
-    apply_shell_effect(
-        task_center,
-        console,
-        chat,
-        ShellEffectTarget::TaskCenter,
-        effect,
-    )
-    .await
-}
-
-async fn apply_tick_shell_effect(
-    task_center: &ShellTaskCenter,
-    console: &Console,
-    chat: uuid::Uuid,
-    panel: uuid::Uuid,
-    effect: TaskSurfaceEffect,
-) -> Result<(), String> {
-    apply_shell_effect(
-        task_center,
-        console,
-        chat,
-        ShellEffectTarget::TickPanel(panel),
-        effect,
-    )
-    .await
-}
-
-async fn apply_shell_effect(
-    task_center: &ShellTaskCenter,
-    console: &Console,
-    chat: uuid::Uuid,
-    target: ShellEffectTarget,
-    mut effect: TaskSurfaceEffect,
-) -> Result<(), String> {
-    loop {
-        if matches!(target, ShellEffectTarget::TickPanel(_))
-            && let TaskSurfaceEffect::Control { task_id, .. }
-            | TaskSurfaceEffect::ReadOutput { task_id, .. } = &effect
-        {
-            match task_center.snapshot(chat).await {
-                Ok(snapshot)
-                    if !snapshot
-                        .tasks
-                        .iter()
-                        .any(|task| task.id == *task_id && task.chat_id == chat) =>
-                {
-                    target.snapshot(console, chat, snapshot)?;
-                    return Ok(());
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    target.updates_failed(console, chat, safe_text(&error.to_string()))?;
-                    return Ok(());
-                }
-            }
-        }
-        match effect {
-            TaskSurfaceEffect::None | TaskSurfaceEffect::Close => return Ok(()),
-            TaskSurfaceEffect::Control { task_id, action } => {
-                match task_center.dispatch(chat, task_id, action).await {
-                    Ok(_) => target.clear_action_error(console, chat)?,
-                    Err(error) => target.action_failed(
-                        console,
-                        chat,
-                        task_id,
-                        format!(
-                            "Cannot update Shell task: {}",
-                            safe_text(&error.to_string())
-                        ),
-                    )?,
-                }
-                match task_center.snapshot(chat).await {
-                    Ok(snapshot) => effect = target.snapshot(console, chat, snapshot)?,
-                    Err(error) => {
-                        target.updates_failed(console, chat, safe_text(&error.to_string()))?;
-                        return Ok(());
-                    }
-                }
-            }
-            TaskSurfaceEffect::ReadOutput {
-                task_id,
-                cursor,
-                limit,
-                generation,
-            } => match task_center.read_output(chat, task_id, cursor, limit).await {
-                Ok(chunk) => {
-                    effect = target.output(
-                        console,
-                        chat,
-                        TaskOutputUpdate::Chunk { generation, chunk },
-                    )?
-                }
-                Err(error) => {
-                    let total_bytes = task_center
-                        .snapshot(chat)
-                        .await
-                        .ok()
-                        .and_then(|snapshot| {
-                            snapshot.tasks.into_iter().find(|task| task.id == task_id)
-                        })
-                        .map_or(0, |task| task.output_bytes);
-                    target.output(
-                        console,
-                        chat,
-                        TaskOutputUpdate::Unavailable {
-                            generation,
-                            task_id,
-                            total_bytes,
-                            message: safe_text(&error.to_string()),
-                        },
-                    )?;
-                    return Ok(());
-                }
-            },
-        }
-    }
-}
 async fn receive_shell_task_event(
     subscription: &mut Option<ShellTaskSubscription>,
 ) -> Option<Result<ShellTaskSubscriptionEvent, tickloop_agent::runtime::ShellTaskCenterError>> {
@@ -5256,47 +4954,6 @@ fn print_command(
         outln!(console, "Reason: {}", safe_text(reason));
     }
     Ok(())
-}
-
-#[cfg(test)]
-fn read_config(path: &std::path::Path) -> Result<ModelConfig, String> {
-    read_config_with_provider(path, None).map(|(config, _)| config)
-}
-
-fn read_config_with_provider(
-    path: &std::path::Path,
-    user_settings: Option<&UserSettings>,
-) -> Result<(ModelConfig, Option<ProviderPatch>), String> {
-    let bytes = std::fs::read(path).map_err(|_| "cannot read the model configuration; check the configuration path and file permissions")?;
-    if path
-        .extension()
-        .is_some_and(|extension| extension == "yaml" || extension == "yml")
-    {
-        let contents = std::str::from_utf8(&bytes)
-            .map_err(|error| format!("invalid provider YAML encoding: {error}"))?;
-        let catalog = user_settings
-            .and_then(|settings| settings.persisted_model_catalog().ok())
-            .unwrap_or_else(tickloop_agent::model::cards::ModelCatalog::defaults);
-        let (config, provider) =
-            tickloop_agent::model::cards::ModelCatalog::resolved_provider_yaml_with_catalog(
-                contents, catalog,
-            )?;
-        return Ok((config, Some(provider)));
-    }
-    let value: serde_json::Value = serde_json::from_slice(&bytes)
-        .map_err(|error| format!("invalid model configuration JSON: {error}; see crates/agent/examples/providers/deepseek-api.yaml for the current configuration format"))?;
-    if value.get("providers").is_some() {
-        let catalog: tickloop_agent::model::cards::ModelCatalogFile = serde_json::from_value(value)
-            .map_err(|error| format!("invalid providers configuration: {error}"))?;
-        catalog.selected_model().map(|config| (config, None))
-    } else {
-        let legacy: ModelConfig = serde_json::from_value(value)
-            .map_err(|error| format!("invalid model configuration: {error}"))?;
-        Ok((
-            tickloop_agent::model::cards::model_for_persistent_selection(legacy),
-            None,
-        ))
-    }
 }
 
 fn normalize_state_root(root: PathBuf) -> PathBuf {
@@ -6457,41 +6114,11 @@ fn recover_background_chat(
     recovery
 }
 
-fn task_status_items(snapshot: &ShellTaskSnapshot) -> Vec<StatusItem> {
-    snapshot
-        .tasks
-        .iter()
-        .filter(|task| task.was_background && !task.state.is_terminal())
-        .enumerate()
-        .map(|(index, task)| {
-            let (state, role) = match task.state {
-                ShellTaskState::Queued => ("queued", Role::MutedText),
-                ShellTaskState::Running | ShellTaskState::Background => {
-                    ("running", Role::MutedText)
-                }
-                ShellTaskState::Cancelling => ("stopping", Role::Warning),
-                ShellTaskState::Completed | ShellTaskState::Failed | ShellTaskState::Unknown => {
-                    unreachable!("terminal tasks are filtered above")
-                }
-            };
-            StatusItem {
-                id: format!("{}.", index + 1),
-                task_id: Some(task.id),
-                can_stop: task.capabilities.can_stop,
-                title: safe_text(&task.command).replace('\n', " "),
-                state,
-                role,
-            }
-        })
-        .collect()
-}
-
 fn todo_status_items(snapshot: &ChatSnapshot, current_loop: Option<uuid::Uuid>) -> Vec<StatusItem> {
     snapshot
         .progress
         .iter()
         .find(|progress| Some(progress.loop_id) == current_loop)
-        .or_else(|| current_loop.and(snapshot.progress.last()))
         .map(|progress| {
             progress
                 .todos
@@ -6505,8 +6132,6 @@ fn todo_status_items(snapshot: &ChatSnapshot, current_loop: Option<uuid::Uuid>) 
                     };
                     StatusItem {
                         id: format!("{}.", index + 1),
-                        task_id: None,
-                        can_stop: false,
                         title: safe_text(&todo.content),
                         state,
                         role,
@@ -6977,6 +6602,7 @@ async fn navigate_agent(
 
 #[cfg(test)]
 mod tests {
+    use super::InputEvent;
     use std::sync::Arc;
 
     #[test]
@@ -7018,45 +6644,13 @@ mod tests {
         assert!(console.awaiting_input_echoes(chat).unwrap().is_empty());
         assert!(console.input_is_echoed(chat, source).unwrap());
     }
-    #[test]
-    fn explicit_provider_yaml_selects_declared_default_model() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("deepseek-api.yaml");
-        std::fs::write(
-            &path,
-            include_str!("../examples/providers/deepseek-api.yaml"),
-        )
-        .unwrap();
-        let selected = super::read_config(&path).unwrap();
-        assert_eq!(selected.provider_id, "deepseek-api");
-        assert_eq!(selected.model_id, "deepseek-flash");
-        std::fs::write(&path, "id: deepseek-api\nmodels:\n  - id: deepseek-flash-messages\n  - id: deepseek-flash-responses\n").unwrap();
-        assert_eq!(
-            super::read_config(&path).unwrap().model_id,
-            "deepseek-flash"
-        );
-        std::fs::write(
-            &path,
-            "id: deepseek-api\ndefault_model: deepseek-flash-messages\n",
-        )
-        .unwrap();
-        let fixed = super::read_config(&path).unwrap();
-        assert_eq!(fixed.model_id, "deepseek-flash-messages");
-        assert_eq!(
-            fixed.adapter(),
-            crate::model::cards::Adapter::DeepseekMessages
-        );
-        assert_eq!(fixed.base_url, "https://api.deepseek.com/anthropic");
-    }
-
-    use super::InputEvent;
     use super::{
         Agent, BranchRequest, CommandTiming, Console, EventKind, Menus, Renderer, TUI_SYNTAX,
         Workflow, branch_failure_message, branch_name, command_timing, help_text,
         is_branch_command, is_rewind_command, is_subscription_view_command,
         is_task_surface_command, open_rewind, safe_line, should_dismiss_menu_before_dispatch,
-        should_pause_input_for_summary, switch_to_saved_branch, task_status_items,
-        test_support as support, tui_renderer_request,
+        should_pause_input_for_summary, switch_to_saved_branch, test_support as support,
+        tui_renderer_request,
     };
     use super::{
         BackgroundRecovery, BackgroundRunNotice, BackgroundWaitKind, Receipt,
@@ -7069,56 +6663,8 @@ mod tests {
         path::PathBuf,
     };
     use tickloop_agent::permissions::{Decision, PermissionRule};
-    use tickloop_agent::runtime::{
-        RequestKind, RequestOutcome, RequestOwner, ShellTask, ShellTaskCapabilities,
-        ShellTaskOrigin, ShellTaskOwner, ShellTaskSnapshot, ShellTaskState,
-    };
+    use tickloop_agent::runtime::{RequestKind, RequestOutcome, RequestOwner};
     use uuid::Uuid;
-
-    #[test]
-    fn status_panel_counts_only_active_background_shell_tasks() {
-        let chat_id = Uuid::new_v4();
-        let tasks = [
-            (false, ShellTaskState::Running),
-            (true, ShellTaskState::Queued),
-            (true, ShellTaskState::Background),
-            (true, ShellTaskState::Cancelling),
-            (true, ShellTaskState::Completed),
-            (true, ShellTaskState::Failed),
-            (true, ShellTaskState::Unknown),
-        ]
-        .into_iter()
-        .enumerate()
-        .map(|(index, (was_background, state))| ShellTask {
-            updated_at_ms: None,
-            id: Uuid::from_u128(index as u128 + 1),
-            chat_id,
-            origin: ShellTaskOrigin::User,
-            owner: ShellTaskOwner::User { chat_id },
-            command: format!("command-{index}"),
-            cwd: PathBuf::from("/tmp"),
-            state,
-            was_background,
-            pid: None,
-            exit_code: None,
-            signal: None,
-            reason: None,
-            output_bytes: 0,
-            capabilities: ShellTaskCapabilities::default(),
-        })
-        .collect();
-        let snapshot = ShellTaskSnapshot {
-            chat_id,
-            live_revision: 1,
-            tasks,
-        };
-
-        let status_items = task_status_items(&snapshot);
-        assert_eq!(status_items.len(), 3);
-        assert_eq!(status_items[0].title, "command-1");
-        assert_eq!(status_items[1].title, "command-2");
-        assert_eq!(status_items[2].title, "command-3");
-    }
 
     #[tokio::test]
     async fn todos_show_their_content_and_the_running_goal_shows_its_active_form() {
@@ -7251,6 +6797,10 @@ mod tests {
             assert_eq!(working_activity(&snapshot, Some(goal)), activity);
         }
         assert!(todo_status_items(&snapshot, None).is_empty());
+        assert!(
+            todo_status_items(&snapshot, Some(Uuid::new_v4())).is_empty(),
+            "a Todo-free selected Loop must not borrow another Loop's list"
+        );
         assert_eq!(working_activity(&snapshot, None), "Working");
         agent.shutdown().await;
     }

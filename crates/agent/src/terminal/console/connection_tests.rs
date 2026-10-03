@@ -27,13 +27,9 @@ fn execution_connection_facts_fit_custom_status_help_and_short_screens() {
                         state.prompt_enabled = true;
                         state.configured_status_lines = configured.clone();
                         state.help_open = help_open;
-                        state.status_area.update(
-                            "Auto".into(),
-                            "loss-model".into(),
-                            None,
-                            vec![],
-                            vec![],
-                        );
+                        state
+                            .status_area
+                            .update("Auto".into(), "loss-model".into(), None, vec![]);
                         state.execution_connection_notice = Some(connection);
                         let (lines, _, _) = state.normal_styled_frame();
                         let text = lines
@@ -103,7 +99,7 @@ fn connection_recovery_removes_the_short_notice_and_restores_core() {
     state.prompt_enabled = true;
     state
         .status_area
-        .update("Auto".into(), "loss-model".into(), None, vec![], vec![]);
+        .update("Auto".into(), "loss-model".into(), None, vec![]);
     let console = super::tests::console_with_state(state);
     console
         .set_execution_connection_notice(
@@ -286,7 +282,9 @@ fn a_creation_prefix_history_and_loss_rebuild_in_order_once_and_stay_with_the_ch
         assert!(!console_frame(&console).contains("Execution connection was lost"));
         console.reset_chat(chat).unwrap();
         crate::terminal::workflows::write_public_history(&console, &snapshot).unwrap();
-        let frame = console_frame(&console);
+        let rendered = console_frame(&console);
+        assert!(rendered.lines().next().unwrap().contains("History user"));
+        let frame = rendered.lines().skip(1).collect::<Vec<_>>().join("\n");
         let mut previous = None;
         for part in [
             "Tick Loop Agent · owned startup",

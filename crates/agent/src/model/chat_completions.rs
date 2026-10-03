@@ -156,6 +156,10 @@ pub(super) fn encode_request(
     }
     if let Some(format) = request.structured_output {
         body["response_format"] = if config.adapter() == Adapter::DeepseekChatCompletions {
+            body["messages"].as_array_mut().expect("messages array").insert(0, json!({
+                "role":"system",
+                "content":format!("Return the {} result as exactly one JSON object conforming to this JSON Schema. Use the exact field names and enum values; emit no prose or code fences.\n{}", format.name, format.schema)
+            }));
             json!({"type":"json_object"})
         } else {
             json!({
@@ -399,5 +403,28 @@ impl ChatStream {
             usage: self.usage,
             stop_reason,
         })
+    }
+
+    pub(super) fn finish_with_policy(
+        self,
+        policy: Option<&super::structured_response::StructuredResponsePolicy>,
+    ) -> Result<ModelOutput, ModelError> {
+        if let Some(policy) = policy {
+            policy.check_tool_names(self.tools.values().map(|tool| tool.name.as_str()))?;
+            let has_result_tool = !self.tools.is_empty() && policy.expected_tool.is_some();
+            return self.finish().map_err(|error| {
+                if has_result_tool
+                    && matches!(
+                        error,
+                        ModelError::ResponseRejected(ModelResponseRejection::InvalidToolCall)
+                    )
+                {
+                    ModelError::ResponseRejected(ModelResponseRejection::MalformedStructuredOutput)
+                } else {
+                    error
+                }
+            });
+        }
+        self.finish()
     }
 }

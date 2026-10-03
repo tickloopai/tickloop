@@ -413,6 +413,45 @@ async fn login_rejects_symlinked_credential_file_without_changing_its_target() {
 }
 
 #[tokio::test]
+async fn pending_device_login_cannot_restore_credentials_after_a_later_sign_out() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let (origin, server) = oauth_server().await;
+    let auth = CodexAuth::new_for_loopback_test(&root, &origin).unwrap();
+    let cancel = CancellationToken::new();
+    let pending = auth.start_device_login(&cancel).await.unwrap();
+    auth.logout(&cancel).await.unwrap();
+    let result = auth.finish_device_login(pending, &cancel).await;
+    server.await.unwrap();
+    assert!(
+        result.is_err(),
+        "An earlier login must not undo explicit sign-out"
+    );
+    assert!(!auth.has_saved_login().unwrap());
+}
+
+#[tokio::test]
+async fn earlier_device_login_cannot_overwrite_a_newer_successful_login() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let (old_origin, old_server) = oauth_server().await;
+    let (new_origin, new_server) = oauth_server_for_account(NEW_ACCESS_TOKEN).await;
+    let old = CodexAuth::new_for_loopback_test(&root, &old_origin).unwrap();
+    let newer = CodexAuth::new_for_loopback_test(&root, &new_origin).unwrap();
+    let cancel = CancellationToken::new();
+    let old_login = old.start_device_login(&cancel).await.unwrap();
+    let new_login = newer.start_device_login(&cancel).await.unwrap();
+    newer.finish_device_login(new_login, &cancel).await.unwrap();
+    new_server.await.unwrap();
+    assert!(old.finish_device_login(old_login, &cancel).await.is_err());
+    old_server.await.unwrap();
+    assert_eq!(
+        newer.resolve_credentials(&cancel).await.unwrap().account_id,
+        "acct-new"
+    );
+}
+
+#[tokio::test]
 async fn oauth_failure_keeps_existing_login_and_hides_response_body() {
     let directory = tempfile::tempdir().unwrap();
     let state_dir = directory.path().canonicalize().unwrap();

@@ -138,6 +138,7 @@ pub(super) struct ConversationPicker {
     matches: Vec<usize>,
     /// Position in `matches` of the first conversation in view.
     top: usize,
+    row_targets: Vec<(std::ops::Range<usize>, usize)>,
     /// Replaces the key hint until the next key, such as an external editor failure.
     notice: Option<String>,
 }
@@ -156,6 +157,7 @@ impl ConversationPicker {
             selected: 0,
             matches,
             top: 0,
+            row_targets: Vec::new(),
             notice: None,
         }
     }
@@ -387,15 +389,53 @@ impl ConversationPicker {
     /// Draws the whole screen: title, search field, conversations and, after them, the key
     /// hint, each row cut to `width` columns. Short screens drop the purpose line, then the
     /// title and hint, and keep the selected conversation and the search field.
+    pub(super) fn frame_in_dialog(
+        &mut self,
+        width: usize,
+        height: usize,
+        display: DisplayProfile,
+    ) -> ConversationPickerFrame {
+        self.frame_with_context(width, height, display, false)
+    }
+
+    pub(super) fn select_entry(&mut self, index: usize) -> bool {
+        if !self.matches.contains(&index) {
+            return false;
+        }
+        self.selected = index;
+        self.focus = ConversationPickerFocus::List;
+        true
+    }
+
+    pub(super) fn select_at_row(&mut self, row: usize) -> bool {
+        let index = self
+            .row_targets
+            .iter()
+            .find(|(rows, _)| rows.contains(&row))
+            .map(|(_, index)| *index);
+        index.is_some_and(|index| self.select_entry(index))
+    }
+
+    #[cfg(test)]
     pub(super) fn frame(
         &mut self,
         width: usize,
         height: usize,
         display: DisplayProfile,
     ) -> ConversationPickerFrame {
+        self.frame_with_context(width, height, display, true)
+    }
+
+    fn frame_with_context(
+        &mut self,
+        width: usize,
+        height: usize,
+        display: DisplayProfile,
+        with_context: bool,
+    ) -> ConversationPickerFrame {
         let show_hint = height >= HINT_MIN_HEIGHT;
         let show_title = height >= TITLE_MIN_HEIGHT;
-        let show_context = height >= CONTEXT_MIN_HEIGHT;
+        let show_context = with_context && height >= CONTEXT_MIN_HEIGHT;
         let show_search = height >= 2 || self.focus == ConversationPickerFocus::Search;
         let chrome_rows = usize::from(show_hint)
             + usize::from(show_title)
@@ -420,11 +460,14 @@ impl ConversationPicker {
             }
             lines.push(line);
         }
+        let list_start = lines.len();
         lines.extend(self.list_lines(width, list_rows, display));
+        for (rows, _) in &mut self.row_targets {
+            rows.start += list_start;
+            rows.end += list_start;
+        }
         if show_hint {
-            if lines.len() + 1 < height {
-                lines.push(RoleLine::default());
-            }
+            lines.resize(height.saturating_sub(1), RoleLine::default());
             lines.push(match &self.notice {
                 Some(notice) => RoleLine::role(ellipsize(notice, width), Role::Warning),
                 None => RoleLine::role(
@@ -485,6 +528,7 @@ impl ConversationPicker {
     }
 
     fn list_lines(&mut self, width: usize, rows: usize, display: DisplayProfile) -> Vec<RoleLine> {
+        self.row_targets.clear();
         if rows == 0 {
             return Vec::new();
         }
@@ -514,6 +558,7 @@ impl ConversationPicker {
             .skip(self.top)
             .take(capacity)
         {
+            let first_row = lines.len();
             let entry = &self.entries[*entry_index];
             let selected = position == selected_position;
             let mut title = RoleLine::default();
@@ -537,6 +582,8 @@ impl ConversationPicker {
                 metadata.truncate(width);
                 lines.push(metadata);
             }
+            self.row_targets
+                .push((first_row..lines.len(), *entry_index));
         }
         lines
     }
@@ -547,14 +594,12 @@ impl ConversationPicker {
         let open = format!("Enter {}", self.purpose.open_action());
         match self.focus {
             ConversationPickerFocus::List => vec![
-                ("↑↓ select".into(), 1),
                 (open, 3),
                 ("type to search".into(), 0),
                 ("Esc cancel".into(), 2),
             ],
             ConversationPickerFocus::Search => vec![
                 (open, 3),
-                ("↓ list".into(), 1),
                 ("Ctrl+G editor".into(), 0),
                 (
                     if self.query().is_empty() {
@@ -617,7 +662,7 @@ fn display_width(text: &str) -> usize {
 
 /// `text` cut to `width` columns, ending in `…` when anything was cut. A space left at the
 /// cut is dropped so the ellipsis follows the last word.
-fn ellipsize(text: &str, width: usize) -> String {
+pub(super) fn ellipsize(text: &str, width: usize) -> String {
     if display_width(text) <= width {
         return text.to_owned();
     }
@@ -1006,7 +1051,7 @@ mod tests {
         );
         assert_eq!(
             hint_row(&list_lines),
-            "↑↓ select · Enter open · type to search · Esc cancel"
+            "Enter open · type to search · Esc cancel"
         );
         assert_eq!(
             hint_row(&texts(&picker.frame(32, 8, DisplayProfile::default()))),
@@ -1048,7 +1093,7 @@ mod tests {
         let lines = texts(&picker.frame(80, 8, DisplayProfile::default()));
         assert_eq!(
             hint_row(&lines),
-            "Enter open · ↓ list · Ctrl+G editor · Esc clear search"
+            "Enter open · Ctrl+G editor · Esc clear search"
         );
     }
 

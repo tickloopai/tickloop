@@ -1,5 +1,75 @@
 use unicode_width::UnicodeWidthChar;
 
+pub fn capture_output(
+    mut reader: impl std::io::Read,
+    output: std::sync::Arc<std::sync::Mutex<String>>,
+) {
+    let mut pending = Vec::new();
+    let mut chunk = [0_u8; 8192];
+    while let Ok(count) = reader.read(&mut chunk) {
+        if count == 0 {
+            break;
+        }
+        pending.extend_from_slice(&chunk[..count]);
+        loop {
+            match std::str::from_utf8(&pending) {
+                Ok(text) => {
+                    output.lock().unwrap().push_str(text);
+                    pending.clear();
+                    break;
+                }
+                Err(error) => {
+                    let valid = error.valid_up_to();
+                    output
+                        .lock()
+                        .unwrap()
+                        .push_str(std::str::from_utf8(&pending[..valid]).unwrap());
+                    pending.drain(..valid);
+                    match error.error_len() {
+                        Some(invalid) => {
+                            output.lock().unwrap().push('\u{fffd}');
+                            pending.drain(..invalid);
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+    }
+    if !pending.is_empty() {
+        output
+            .lock()
+            .unwrap()
+            .push_str(&String::from_utf8_lossy(&pending));
+    }
+}
+
+#[test]
+fn capture_output_preserves_utf8_characters_split_across_reads() {
+    struct SingleByte(std::io::Cursor<Vec<u8>>);
+    impl std::io::Read for SingleByte {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            std::io::Read::read(&mut self.0, &mut buffer[..1])
+        }
+    }
+    let output = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    capture_output(
+        SingleByte(std::io::Cursor::new(
+            "GLM · Context — ✓".as_bytes().to_vec(),
+        )),
+        output.clone(),
+    );
+    assert_eq!(*output.lock().unwrap(), "GLM · Context — ✓");
+}
+
+#[allow(dead_code)]
+pub fn message_flow(frame: &str) -> &str {
+    match frame.split_once('\n') {
+        Some((header, flow)) if header.starts_with("❯ ") => flow,
+        _ => frame,
+    }
+}
+
 /// Reconstructs completed Agent frames, including rows retained by differential redraws.
 pub fn visible_screen(output: &str, width: usize, height: usize) -> String {
     let end = output

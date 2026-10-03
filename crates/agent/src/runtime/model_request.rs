@@ -641,7 +641,9 @@ pub(super) fn model_failure_outcome(error: &ModelError) -> RequestOutcome {
         ModelError::Cancelled => RequestOutcome::Cancelled,
         ModelError::TimedOut => RequestOutcome::TimedOut,
         ModelError::ResponseRejected(reason) => RequestOutcome::HostRejected(match reason {
-            ModelResponseRejection::InvalidToolCall => ResponseRejection::InvalidToolCall,
+            ModelResponseRejection::InvalidToolCall
+            | ModelResponseRejection::UnexpectedToolOperation => ResponseRejection::InvalidToolCall,
+            ModelResponseRejection::MalformedStructuredOutput => ResponseRejection::InvalidVerdict,
             ModelResponseRejection::OutputLimit => ResponseRejection::OutputLimit,
             ModelResponseRejection::ContextLimit => ResponseRejection::ContextLimit,
             ModelResponseRejection::ContentFilter => ResponseRejection::ContentFilter,

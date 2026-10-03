@@ -250,6 +250,10 @@ pub(super) async fn complete(
             }
         }
         let mut stream = ResponsesStream::for_codex();
+        let mut structured_response =
+            crate::model::structured_response::StructuredResponsePolicy::for_codex_body(
+                &request_body,
+            );
         let mut started = false;
         let mut received_bytes = 0usize;
         loop {
@@ -290,6 +294,11 @@ pub(super) async fn complete(
                     started,
                 )
             })?;
+            if let Some(policy) = &mut structured_response {
+                policy
+                    .check_event(Protocol::Responses, &data)
+                    .map_err(|error| failure(error, true))?;
+            }
             if is_missing_continuation(&data) {
                 if !started
                     && request_body.get("previous_response_id").is_some()
@@ -338,10 +347,15 @@ pub(super) async fn complete(
                 }
                 data["type"] = json!(format!("response.{status}"));
             }
-            if stream
-                .accept(data, &events)
-                .map_err(|error| failure(error, true))?
-            {
+            if stream.accept(data, &events).map_err(|error| {
+                failure(
+                    match &structured_response {
+                        Some(policy) => policy.decode_error(error),
+                        None => error,
+                    },
+                    true,
+                )
+            })? {
                 let response_id = stream.response_id().unwrap_or_default().to_owned();
                 let output = stream.finish().map_err(|error| failure(error, true))?;
                 if let Some(chat) = chat_id {

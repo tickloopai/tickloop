@@ -21,10 +21,6 @@ fn incompatible_service_output(terminal: bool) -> String {
     std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
     let config = root.join("config with ' and $(literal)");
     std::fs::create_dir(&config).unwrap();
-    let model_path = root.join("model.json");
-    let mut model = support::config();
-    model.api_key_env = "TICKLOOP_FIXTURE_API_KEY".into();
-    std::fs::write(&model_path, serde_json::to_vec(&model).unwrap()).unwrap();
     let socket = runtime.join("owner.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -92,8 +88,7 @@ fn incompatible_service_output(terminal: bool) -> String {
             })
             .unwrap();
         let mut command = CommandBuilder::new(executable);
-        command.args(["--working-directory-is-trusted", "--config"]);
-        command.arg(&model_path);
+        command.args(["--working-directory-is-trusted"]);
         command.cwd(&working_directory);
         command.env_clear();
         command.env("PATH", "/usr/bin:/bin");
@@ -114,8 +109,7 @@ fn incompatible_service_output(terminal: bool) -> String {
         String::from_utf8(reader.join().unwrap()).unwrap()
     } else {
         let output = Command::new(executable)
-            .args(["--working-directory-is-trusted", "--config"])
-            .arg(&model_path)
+            .args(["--working-directory-is-trusted"])
             .current_dir(&working_directory)
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
@@ -171,7 +165,11 @@ fn incompatible_service_output(terminal: bool) -> String {
     assert!(commands[1].ends_with(quoted_executable.as_ref()));
     assert!(output.contains(&format!("Runtime: {}", runtime.display())));
     assert!(output.contains(&format!("Executable: {executable}")));
-    assert!(output.contains("client 3.1"));
+    assert!(output.contains(&format!(
+        "client {}.{}",
+        tickloop_agent::agent_access::PROTOCOL_MAJOR,
+        tickloop_agent::agent_access::PROTOCOL_MINOR
+    )));
     assert!(output.contains("peer protocol 1.1"));
     let runtime_argument = format!(
         "TICKLOOP_AGENT_RUNTIME_DIR={}",
@@ -186,7 +184,11 @@ fn incompatible_service_output(terminal: bool) -> String {
 #[test]
 fn incompatible_service_has_readable_plain_guidance_without_dispatching() {
     let output = incompatible_service_output(false);
-    assert!(output.starts_with("Error: Agent service version mismatch (client 3.1)."));
+    assert!(output.starts_with(&format!(
+        "Error: Agent service version mismatch (client {}.{}).",
+        tickloop_agent::agent_access::PROTOCOL_MAJOR,
+        tickloop_agent::agent_access::PROTOCOL_MINOR
+    )));
     assert!(!output.contains('\x1b'));
 }
 

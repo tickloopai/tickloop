@@ -211,7 +211,6 @@ async fn run_background_request_fixture() {
     console.set_prompt_enabled(true).unwrap();
     let startup = StartupState {
         chat: StartupChat::Resumed(Box::new(monitor.snapshot(visible).await.unwrap()), false),
-        explicit_provider: None,
         user_settings: None,
     };
     let interaction_agent = monitor.clone();

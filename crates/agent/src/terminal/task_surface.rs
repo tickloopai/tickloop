@@ -320,9 +320,18 @@ impl<Restore> TaskSurface<Restore> {
 
     pub fn reopen(&mut self, snapshot: TaskSurfaceSnapshot) -> TaskSurfaceEffect {
         self.update_snapshot_hidden(snapshot);
+        self.resume()
+    }
+
+    pub fn resume(&mut self) -> TaskSurfaceEffect {
         if let TaskSurfaceFocus::Detail { task_id } = self.focus
             && self.detail_states.get(&task_id).is_none_or(|detail| {
                 detail.output.is_none()
+                    || detail.navigation.follow_tail
+                        && detail
+                            .output
+                            .as_ref()
+                            .is_some_and(|output| output.confirmed_offset < output.total_bytes)
                     || matches!(
                         detail.pending_output_position,
                         Some(PendingOutputPosition::Waiting { .. })
@@ -589,6 +598,22 @@ impl<Restore> TaskSurface<Restore> {
             self.navigation_generation = previous_generation;
         }
         effect
+    }
+
+    pub fn select_at_row(&mut self, row: usize, viewport: TaskViewport) -> bool {
+        if self.focus != TaskSurfaceFocus::List {
+            return false;
+        }
+        let frame = self.frame(viewport);
+        let Some(task_id) = frame.lines.get(row).and_then(|line| line.task_id) else {
+            return false;
+        };
+        let Some(index) = self.tasks.iter().position(|task| task.id == task_id) else {
+            return false;
+        };
+        self.selected_task_id = Some(task_id);
+        self.fallback_task_index = index;
+        true
     }
 
     pub fn frame(&mut self, viewport: TaskViewport) -> TaskSurfaceFrame {

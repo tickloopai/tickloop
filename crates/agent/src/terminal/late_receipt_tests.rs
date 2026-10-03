@@ -77,7 +77,9 @@ impl AgentAccess for LateReceiptOwner {
     async fn execute(&self, command: CommandEnvelope) -> Result<CommandReceipt, AccessError> {
         let (record_name, configured_choice) = match &command.command {
             AgentCommand::Create { .. } => (Some("created-receipt.json"), None),
-            AgentCommand::Configure { execution, change } => (
+            AgentCommand::Configure {
+                execution, change, ..
+            } => (
                 Some("configured-receipt.json"),
                 Some((*execution, change.clone())),
             ),
@@ -251,7 +253,6 @@ async fn run_late_receipt_fixture() {
     console.set_prompt_enabled(true).unwrap();
     let startup = StartupState {
         chat,
-        explicit_provider: None,
         user_settings: None,
     };
     let result = interact(&agent, workdir, &console, input, startup, None).await;
@@ -364,6 +365,7 @@ impl Drop for LateReceiptPty {
 /// The rows above the composer's upper rule, found by the rules themselves, so a Shell-mode
 /// composer is told apart from echoed `❯` lines.
 fn body_above_rules(frame: &str) -> Vec<&str> {
+    let frame = screen::message_flow(frame);
     let lines = frame.lines().collect::<Vec<_>>();
     let rules = lines
         .iter()
@@ -396,6 +398,7 @@ fn echoed(frame: &str, input: &str) -> usize {
 
 /// The rows above the composer's upper rule; restored drafts sit in the composer, not here.
 fn conversation_body(frame: &str) -> String {
+    let frame = screen::message_flow(frame);
     let lines = frame.lines().collect::<Vec<_>>();
     let composer = lines
         .iter()

@@ -215,8 +215,7 @@ fn working_activity_pty_fixture() {
                         Box::new(agent.snapshot(chat).await.unwrap()),
                         false,
                     ),
-                    explicit_provider: None,
-                    user_settings: None,
+                                user_settings: None,
                 };
                 let (console, input) = Console::start_with_display(true, tickloop_agent::settings::DisplayPreferences {
                     prefers_reduced_motion: std::env::var(ACTIVITY_ROUTE).as_deref() == Ok("observe-only"),

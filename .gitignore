@@ -53,3 +53,6 @@ __pycache__/
 
 # Provider hierarchy validation artifacts
 /.scratch/provider-hierarchy/results/
+
+# Provider/model redesign acceptance output
+/.scratch/provider-model-picker/evidence/

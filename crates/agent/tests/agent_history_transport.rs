@@ -507,6 +507,7 @@ async fn large_text_history_is_complete_and_a_corrupt_end_is_never_published() {
         .execute(envelope(
             epoch,
             AgentCommand::Configure {
+                provider: None,
                 execution,
                 change: ConfigurationChange::ContextWindow {
                     tokens: 100_000_000,

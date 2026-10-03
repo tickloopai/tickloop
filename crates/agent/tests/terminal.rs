@@ -18,7 +18,7 @@ fn trust_working_directory(config_root: &std::path::Path, workdir: &std::path::P
 }
 
 fn trusted_agent_command() -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_tickloop"));
+    let mut command = Command::new(support::fixture_cli::executable());
     command.env(
         "TICKLOOP_AGENT_RUNTIME_DIR",
         support::cli_runtime::directory(),
@@ -28,7 +28,7 @@ fn trusted_agent_command() -> Command {
 }
 
 fn trusted_async_agent_command() -> tokio::process::Command {
-    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_tickloop"));
+    let mut command = tokio::process::Command::new(support::fixture_cli::executable());
     command.env(
         "TICKLOOP_AGENT_RUNTIME_DIR",
         support::cli_runtime::directory(),
@@ -38,7 +38,7 @@ fn trusted_async_agent_command() -> tokio::process::Command {
 }
 
 fn product_async_agent_command() -> tokio::process::Command {
-    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_tickloop"));
+    let mut command = tokio::process::Command::new(support::fixture_cli::executable());
     command.env(
         "TICKLOOP_AGENT_RUNTIME_DIR",
         support::cli_runtime::directory(),
@@ -53,7 +53,7 @@ fn malformed_auto_settings_do_not_exit_the_terminal_on_permissions_commands() {
     let config_root = directory.path().join("config-root");
     std::fs::create_dir_all(&config_root).unwrap();
     std::fs::write(config_root.join("settings.json"), r#"{"autoApproval":{"rules":{"softDeny":{"includeBuiltins":false,"custom":[{"id":"invalid","text":"rule"}]}}}}"#).unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_tickloop"))
+    let output = Command::new(support::fixture_cli::executable())
         .env(
             "TICKLOOP_AGENT_RUNTIME_DIR",
             support::cli_runtime::directory(),
@@ -487,7 +487,8 @@ fn terminal_explains_how_to_start_without_credentials() {
         .unwrap();
     assert!(output.status.success());
     let text = String::from_utf8(output.stdout).unwrap();
-    assert!(text.contains("--config"));
+    assert!(!text.contains("--config"));
+    assert!(!text.contains("/model FILE"));
     assert!(text.contains("--cwd"));
     assert!(text.contains("/loops new"));
     assert!(
@@ -512,7 +513,7 @@ fn terminal_explains_how_to_start_without_credentials() {
 fn chat_id_opens_the_exact_chat_identity() {
     let directory = tempfile::tempdir().unwrap();
     let chat_id = "00000000-0000-4000-8000-000000000123";
-    let output = Command::new(env!("CARGO_BIN_EXE_tickloop"))
+    let output = Command::new(support::fixture_cli::executable())
         .env(
             "TICKLOOP_AGENT_RUNTIME_DIR",
             support::cli_runtime::directory(),
@@ -823,7 +824,7 @@ async fn piped_bang_input_stays_a_model_prompt_and_cannot_enter_direct_shell_mod
     let mut child = trusted_async_agent_command()
         .env("TICKLOOP_CONFIG_DIR", directory.path().join("config-root"))
         .args([
-            "--config",
+            "--transport-fixture",
             config_path.to_str().unwrap(),
             "--cwd",
             directory.path().to_str().unwrap(),
@@ -899,7 +900,7 @@ async fn piped_follow_up_keeps_context_and_waits_for_both_replies_before_eof_exi
     let mut child = trusted_async_agent_command()
         .env("TICKLOOP_CONFIG_DIR", directory.path().join("config-root"))
         .args([
-            "--config",
+            "--transport-fixture",
             config_path.to_str().unwrap(),
             "--cwd",
             directory.path().to_str().unwrap(),
@@ -926,7 +927,7 @@ async fn piped_follow_up_keeps_context_and_waits_for_both_replies_before_eof_exi
         String::from_utf8_lossy(&output.stderr)
     );
     let text = String::from_utf8(output.stdout).unwrap();
-    assert!(text.contains("Messages"));
+    assert!(text.contains("deepseek-flash"));
     assert!(text.contains("Remembered violet."));
     assert!(text.contains("The word is violet."));
     assert_eq!(text.matches("Reply completed").count(), 2);
@@ -978,7 +979,7 @@ async fn piped_branch_switches_to_an_independent_child_with_the_source_context()
     let mut child = trusted_async_agent_command()
         .env("TICKLOOP_CONFIG_DIR", directory.path().join("config-root"))
         .args([
-            "--config",
+            "--transport-fixture",
             config_path.to_str().unwrap(),
             "--cwd",
             directory.path().to_str().unwrap(),
@@ -1102,7 +1103,7 @@ async fn terminal_reports_failed_model_work_as_a_failed_process() {
     let mut child = trusted_async_agent_command()
         .env("TICKLOOP_CONFIG_DIR", directory.path().join("config-root"))
         .args([
-            "--config",
+            "--transport-fixture",
             config_path.to_str().unwrap(),
             "--cwd",
             directory.path().to_str().unwrap(),
@@ -1137,7 +1138,7 @@ async fn terminal_reports_failed_model_work_as_a_failed_process() {
 }
 
 #[test]
-fn malformed_configuration_is_actionable_without_echoing_its_contents() {
+fn removed_configuration_flag_is_actionable_without_echoing_its_contents() {
     let directory = tempfile::tempdir().unwrap();
     let config_path = directory.path().join("broken.json");
     std::fs::write(&config_path, "{\"api_key\":\"private-value\"").unwrap();
@@ -1148,8 +1149,8 @@ fn malformed_configuration_is_actionable_without_echoing_its_contents() {
         .unwrap();
     assert!(!output.status.success());
     let error = String::from_utf8(output.stderr).unwrap();
-    assert!(error.contains("model configuration JSON"));
-    assert!(error.contains("examples/providers/deepseek-api.yaml"));
+    assert!(error.contains("not supported"));
+    assert!(error.contains("built-in"));
     assert!(!error.contains("private-value"));
 }
 
@@ -1260,7 +1261,7 @@ async fn a_run_whose_worker_is_lost_is_reported_and_the_cli_exits_at_end_of_inpu
     let runtime_directory = support::cli_runtime::command_directory(command.as_std());
     let mut child = command
         .env("TICKLOOP_CONFIG_DIR", directory.path().join("config-root"))
-        .arg("--config")
+        .arg("--transport-fixture")
         .arg(directory.path().join("model.json"))
         .arg("--cwd")
         .arg(directory.path())
@@ -1446,7 +1447,7 @@ async fn terminal_accepts_a_follow_up_while_the_first_reply_is_still_running() {
     std::fs::write(&config, serde_json::to_vec(&json!({"name":"fixture","protocol":"messages","base_url":format!("http://{address}"),"model":"fixture","api_key_env":"","max_output_tokens":256})).unwrap()).unwrap();
     let mut child = trusted_async_agent_command()
         .env("TICKLOOP_CONFIG_DIR", directory.path().join("config-root"))
-        .arg("--config")
+        .arg("--transport-fixture")
         .arg(config)
         .arg("--no-session-persistence")
         .stdin(Stdio::piped())
@@ -1512,7 +1513,7 @@ async fn terminal_waits_for_explicit_permission_before_reading_an_external_file(
     std::fs::write(&config, serde_json::to_vec(&json!({"name":"fixture","protocol":"messages","base_url":format!("http://{address}"),"model":"fixture","api_key_env":"","max_output_tokens":256})).unwrap()).unwrap();
     let mut child = trusted_async_agent_command()
         .env("TICKLOOP_CONFIG_DIR", directory.path().join("config-root"))
-        .arg("--config")
+        .arg("--transport-fixture")
         .arg(config)
         .arg("--cwd")
         .arg(directory.path())
@@ -1575,7 +1576,7 @@ async fn terminal_can_stop_a_running_goal_and_show_its_stopped_state() {
     std::fs::write(&config, serde_json::to_vec(&json!({"name":"fixture","protocol":"messages","base_url":format!("http://{address}"),"model":"fixture","api_key_env":"","max_output_tokens":256})).unwrap()).unwrap();
     let mut child = trusted_async_agent_command()
         .env("TICKLOOP_CONFIG_DIR", directory.path().join("config-root"))
-        .arg("--config")
+        .arg("--transport-fixture")
         .arg(config)
         .arg("--no-session-persistence")
         .stdin(Stdio::piped())
@@ -1730,7 +1731,7 @@ async fn no_session_persistence_writes_no_files_into_the_working_directory() {
     std::fs::write(&config_path,serde_json::to_vec(&json!({"name":"fixture","protocol":"messages","base_url":format!("http://{address}"),"model":"fixture","api_key_env":"","max_output_tokens":256})).unwrap()).unwrap();
     let mut child = trusted_async_agent_command()
         .env("TICKLOOP_CONFIG_DIR", directory.path().join("config-root"))
-        .arg("--config")
+        .arg("--transport-fixture")
         .arg(&config_path)
         .arg("--cwd")
         .arg(&workdir)
@@ -1875,7 +1876,7 @@ async fn terminal_auto_mode_reviews_with_the_current_chat_model_by_default() {
 #[test]
 fn legacy_independent_reviewer_flags_report_the_permissions_migration() {
     for flag in ["--auto-reviewer-config", "--permission-checker-config"] {
-        let output = Command::new(env!("CARGO_BIN_EXE_tickloop"))
+        let output = Command::new(support::fixture_cli::executable())
             .env(
                 "TICKLOOP_AGENT_RUNTIME_DIR",
                 support::cli_runtime::directory(),
@@ -1890,525 +1891,6 @@ fn legacy_independent_reviewer_flags_report_the_permissions_migration() {
             "{stderr}"
         );
     }
-}
-
-#[tokio::test]
-async fn terminal_can_switch_model_configuration_for_follow_up_input() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        let mut requests = Vec::new();
-        for answer in ["first model answer", "second model answer"] {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            requests.push(read_request(&mut socket).await);
-            let body = messages_stream(answer);
-            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes()).await.unwrap();
-            socket.write_all(body.as_bytes()).await.unwrap();
-        }
-        requests
-    });
-    let directory = tempfile::tempdir().unwrap();
-    let config = directory.path().join("model.json");
-    let second_config = directory.path().join("second-model.json");
-    for (path, model) in [(&config, "first-model"), (&second_config, "second-model")] {
-        std::fs::write(path,serde_json::to_vec(&json!({"name":model,"protocol":"messages","base_url":format!("http://{address}"),"model":model,"api_key_env":"","max_output_tokens":256})).unwrap()).unwrap();
-    }
-    let mut child = trusted_async_agent_command()
-        .env("TICKLOOP_CONFIG_DIR", directory.path().join("config-root"))
-        .arg("--config")
-        .arg(config)
-        .arg("--no-session-persistence")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .unwrap();
-    let mut input = child.stdin.take().unwrap();
-    let mut output = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
-    input.write_all(b"First task\n").await.unwrap();
-    tokio::time::timeout(INTERACTION_TIMEOUT, async {
-        while !output
-            .next_line()
-            .await
-            .unwrap()
-            .unwrap()
-            .starts_with("Reply completed")
-        {}
-    })
-    .await
-    .unwrap();
-    input
-        .write_all(format!("/model {}\nFollow up\n", second_config.display()).as_bytes())
-        .await
-        .unwrap();
-    drop(input);
-    tokio::time::timeout(INTERACTION_TIMEOUT, async {
-        while output.next_line().await.unwrap().is_some() {}
-    })
-    .await
-    .unwrap();
-    assert!(child.wait().await.unwrap().success());
-    let requests = server.await.unwrap();
-    assert_eq!(requests[0]["model"], "first-model");
-    assert_eq!(requests[1]["model"], "second-model");
-    assert!(
-        requests[1]["messages"]
-            .to_string()
-            .contains("first model answer")
-    );
-}
-
-/// 照 Claude Code：`/model` 与持久规则写入 `<root>/settings.json`，
-/// 重启后不带 `--config` 时生效；带 `--config` 时启动参数优先。
-#[tokio::test]
-async fn saved_model_and_rules_apply_after_restart_unless_config_is_given() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let server = tokio::spawn(answer_requests(
-        listener,
-        vec![
-            "Answered by the saved model.",
-            "Answered by the explicit model.",
-        ],
-    ));
-    let directory = tempfile::tempdir().unwrap();
-    let config = directory.path().join("model.json");
-    let second_config = directory.path().join("second-model.json");
-    for (path, model) in [(&config, "first-model"), (&second_config, "second-model")] {
-        std::fs::write(path,serde_json::to_vec(&json!({"name":model,"protocol":"messages","base_url":format!("http://{address}"),"model":model,"api_key_env":"","max_output_tokens":256})).unwrap()).unwrap();
-    }
-    let run = |flags: Vec<String>, text: String| {
-        let directory = directory.path().to_path_buf();
-        async move {
-            let mut child = trusted_async_agent_command()
-                .env("TICKLOOP_CONFIG_DIR", directory.join("config-root"))
-                .arg("--cwd")
-                .arg(&directory)
-                .args(flags)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .kill_on_drop(true)
-                .spawn()
-                .unwrap();
-            child
-                .stdin
-                .take()
-                .unwrap()
-                .write_all(text.as_bytes())
-                .await
-                .unwrap();
-            tokio::time::timeout(INTERACTION_TIMEOUT, child.wait_with_output())
-                .await
-                .unwrap()
-                .unwrap()
-        }
-    };
-
-    let selecting = run(
-        vec!["--config".into(), config.display().to_string()],
-        format!(
-            "/model {}\n/rule allow Read persistent\n/rule allow Glob session\n/exit\n",
-            second_config.display()
-        ),
-    )
-    .await;
-    assert!(
-        selecting.status.success(),
-        "{}",
-        String::from_utf8_lossy(&selecting.stderr)
-    );
-    let settings: Value = serde_json::from_slice(
-        &std::fs::read(directory.path().join("config-root").join("settings.json")).unwrap(),
-    )
-    .unwrap();
-    assert!(settings.get("model").is_none(), "{settings}");
-    assert_eq!(settings["defaultModel"]["model"], "second-model");
-    let selected_provider = settings["defaultModel"]["provider"].as_str().unwrap();
-    assert!(
-        directory
-            .path()
-            .join("config-root/providers")
-            .join(format!("{selected_provider}.yaml"))
-            .is_file()
-    );
-    assert!(settings.get("contextWindowTokens").is_none());
-
-    let restarted = run(Vec::new(), "/rules\nHello after restart\n".into()).await;
-    assert!(
-        restarted.status.success(),
-        "{}",
-        String::from_utf8_lossy(&restarted.stderr)
-    );
-    let text = String::from_utf8(restarted.stdout).unwrap();
-    assert!(text.contains("\"Read\""), "{text}");
-    assert!(
-        !text.contains("\"Glob\""),
-        "session rules must not be saved: {text}"
-    );
-    assert!(text.contains("Answered by the saved model."), "{text}");
-
-    let explicit = run(
-        vec!["--config".into(), config.display().to_string()],
-        "Hello with an explicit configuration\n".into(),
-    )
-    .await;
-    assert!(
-        explicit.status.success(),
-        "{}",
-        String::from_utf8_lossy(&explicit.stderr)
-    );
-    let requests = tokio::time::timeout(INTERACTION_TIMEOUT, server)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(requests[0]["model"], "second-model");
-    assert_eq!(requests[1]["model"], "first-model");
-}
-
-#[tokio::test]
-async fn explicit_provider_yaml_starts_with_an_invalid_saved_model_selection() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let server = tokio::spawn(answer_requests(listener, vec!["Explicit model answer."]));
-    let directory = tempfile::tempdir().unwrap();
-    let config_root = directory.path().join("config-root");
-    std::fs::create_dir_all(&config_root).unwrap();
-    std::fs::write(
-        config_root.join("settings.json"),
-        r#"{"defaultModel":{"provider":"removed-provider","model":"removed-model"}}"#,
-    )
-    .unwrap();
-    let config = directory.path().join("explicit.yaml");
-    std::fs::write(
-        &config,
-        format!(
-            "id: explicit-provider\ndisplay_name: Explicit provider\nauth: api_key_env\napi_key_env: EXPLICIT_TEST_KEY\nendpoints:\n  messages: http://{address}\nmodels:\n  - id: explicit-model\n    service_model_id: explicit-model\n    display_name: Explicit model\n    adapter: messages\n"
-        ),
-    )
-    .unwrap();
-    let mut child = trusted_async_agent_command()
-        .env("TICKLOOP_CONFIG_DIR", &config_root)
-        .env("EXPLICIT_TEST_KEY", "test-key")
-        .arg("--no-session-persistence")
-        .arg("--cwd")
-        .arg(directory.path())
-        .arg("--config")
-        .arg(&config)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(b"Hello from explicit configuration\n")
-        .await
-        .unwrap();
-    let output = tokio::time::timeout(INTERACTION_TIMEOUT, child.wait_with_output())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let text = String::from_utf8_lossy(&output.stdout);
-    assert!(text.contains("Explicit model answer."), "{text}");
-    assert!(text.contains("unknown provider/model"), "{text}");
-    let requests = tokio::time::timeout(INTERACTION_TIMEOUT, server)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(requests[0]["model"], "explicit-model");
-}
-
-#[tokio::test]
-async fn a_new_agent_model_path_whose_save_fails_leaves_no_provider_or_default_behind() {
-    let directory = tempfile::tempdir().unwrap();
-    let config_root = directory.path().join("config-root");
-    let external = directory.path().join("external.yaml");
-    std::fs::write(
-        &external,
-        "id: unsaved-provider\ndefault_model: unsaved-model\ndisplay_name: Unsaved provider\nauth: api_key_env\napi_key_env: UNSAVED_TEST_KEY\nendpoints:\n  messages: http://127.0.0.1:9\nmodels:\n  - id: unsaved-model\n    service_model_id: unsaved-service-model\n    display_name: Unsaved model\n    adapter: messages\n    max_output_tokens: 512\n",
-    )
-    .unwrap();
-    trust_working_directory(&config_root, directory.path());
-    let mut child = trusted_async_agent_command()
-        .env("TICKLOOP_CONFIG_DIR", &config_root)
-        .env("UNSAVED_TEST_KEY", "test-key")
-        .arg("--cwd")
-        .arg(directory.path())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .unwrap();
-    let mut input = child.stdin.take().unwrap();
-    let mut output = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
-    let mut transcript = Vec::new();
-    input.write_all(b"/status\n").await.unwrap();
-    wait_for_line(&mut output, &mut transcript, |line| {
-        line.starts_with("No Chat")
-    })
-    .await;
-    // Saving a provider card fails while `providers` is a file.
-    let providers = config_root.join("providers");
-    std::fs::write(&providers, "not a directory").unwrap();
-    input
-        .write_all(format!("/model {}\n", external.display()).as_bytes())
-        .await
-        .unwrap();
-    wait_for_line(&mut output, &mut transcript, |line| {
-        line.starts_with("Cannot select model")
-    })
-    .await;
-    std::fs::remove_file(&providers).unwrap();
-    input.write_all(b"/model\ncancel\n/exit\n").await.unwrap();
-    drop(input);
-    let status = finish_process(child, output, &mut transcript).await;
-    assert!(status.success(), "{transcript:?}");
-    let after_failure = transcript
-        .iter()
-        .skip_while(|line| !line.starts_with("Cannot select model"))
-        .skip(1)
-        .collect::<Vec<_>>();
-    assert!(
-        after_failure
-            .iter()
-            .any(|line| line.contains("● DeepSeek-V4.1-Flash")),
-        "the New Agent keeps its model: {transcript:?}"
-    );
-    assert!(
-        !after_failure.iter().any(|line| line.contains("Unsaved")),
-        "a provider whose save failed is not left registered for this View: {transcript:?}"
-    );
-    let settings = std::fs::read(config_root.join("settings.json"))
-        .map(|bytes| serde_json::from_slice::<Value>(&bytes).unwrap())
-        .unwrap_or(Value::Null);
-    assert_ne!(
-        settings["defaultModel"]["provider"], "unsaved-provider",
-        "{settings}"
-    );
-}
-
-#[tokio::test]
-async fn selected_external_provider_yaml_is_saved_as_a_provider_and_reloaded() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let server = tokio::spawn(answer_requests(listener, vec!["Reloaded model answer."]));
-    let directory = tempfile::tempdir().unwrap();
-    let config_root = directory.path().join("config-root");
-    let external = directory.path().join("external.yaml");
-    std::fs::write(
-        &external,
-        format!(
-            "id: external-provider\ndefault_model: chosen-model\ndisplay_name: External provider\nauth: api_key_env\napi_key_env: EXTERNAL_TEST_KEY\nendpoints:\n  messages: http://{address}\nmodels:\n  - id: chosen-model\n    service_model_id: original-service-model\n    display_name: Chosen model\n    adapter: messages\n    max_output_tokens: 512\n  - id: sibling-model\n    service_model_id: sibling-service-model\n    display_name: Sibling model\n    adapter: messages\n"
-        ),
-    )
-    .unwrap();
-    let mut first = trusted_async_agent_command()
-        .env("TICKLOOP_CONFIG_DIR", &config_root)
-        .env("EXTERNAL_TEST_KEY", "test-key")
-        .arg("--cwd")
-        .arg(directory.path())
-        .arg("--config")
-        .arg(&external)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .unwrap();
-    first
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(format!("/model {}\n/exit\n", external.display()).as_bytes())
-        .await
-        .unwrap();
-    let output = tokio::time::timeout(INTERACTION_TIMEOUT, first.wait_with_output())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let selection: Value =
-        serde_json::from_slice(&std::fs::read(config_root.join("settings.json")).unwrap()).unwrap();
-    assert!(selection.get("model").is_none(), "{selection}");
-    assert_eq!(selection["defaultModel"]["provider"], "external-provider");
-    assert_eq!(selection["defaultModel"]["model"], "chosen-model");
-    let saved_provider_path = config_root.join("providers/external-provider.yaml");
-    let mut saved_provider: serde_yaml_ng::Value =
-        serde_yaml_ng::from_slice(&std::fs::read(&saved_provider_path).unwrap()).unwrap();
-    assert_eq!(saved_provider["default_model"], "chosen-model");
-    assert_eq!(saved_provider["models"].as_sequence().unwrap().len(), 2);
-    saved_provider["models"][0]["service_model_id"] =
-        serde_yaml_ng::Value::String("edited-service-model".into());
-    std::fs::write(
-        &saved_provider_path,
-        serde_yaml_ng::to_string(&saved_provider).unwrap(),
-    )
-    .unwrap();
-
-    let mut restarted = trusted_async_agent_command()
-        .env("TICKLOOP_CONFIG_DIR", &config_root)
-        .env("EXTERNAL_TEST_KEY", "test-key")
-        .arg("--cwd")
-        .arg(directory.path())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .unwrap();
-    restarted
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(b"Hello after Provider YAML edit\n")
-        .await
-        .unwrap();
-    let output = tokio::time::timeout(INTERACTION_TIMEOUT, restarted.wait_with_output())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let requests = tokio::time::timeout(INTERACTION_TIMEOUT, server)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(requests[0]["model"], "edited-service-model");
-}
-
-#[tokio::test]
-async fn explicit_multimodel_yaml_shows_mixed_protocol_siblings_without_saving_on_load() {
-    let directory = tempfile::tempdir().unwrap();
-    let config_root = directory.path().join("config-root");
-    let config = directory.path().join("multimodel.yaml");
-    std::fs::write(
-        &config,
-        "id: external-provider\ndefault_model: first\ndisplay_name: External provider\nauth: api_key_env\napi_key_env: EXTERNAL_TEST_KEY\nendpoints:\n  messages: https://gateway.example/messages\n  responses: https://gateway.example\nmodels:\n  - id: first\n    service_model_id: first-service\n    display_name: First choice\n    adapter: messages\n  - id: second\n    service_model_id: second-service\n    display_name: Second choice\n    adapter: responses\n",
-    )
-    .unwrap();
-    let mut child = trusted_async_agent_command()
-        .env("TICKLOOP_CONFIG_DIR", &config_root)
-        .env("EXTERNAL_TEST_KEY", "fixture-external-key")
-        .arg("--no-session-persistence")
-        .arg("--cwd")
-        .arg(directory.path())
-        .arg("--config")
-        .arg(&config)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(b"/model\ncancel\ncancel\n/exit\n")
-        .await
-        .unwrap();
-    let output = tokio::time::timeout(INTERACTION_TIMEOUT, child.wait_with_output())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let text = String::from_utf8_lossy(&output.stdout);
-    assert!(text.contains("First choice"), "{text}");
-    assert!(text.contains("Second choice"), "{text}");
-    assert!(
-        !config_root
-            .join("providers/external-provider.yaml")
-            .exists()
-    );
-}
-
-#[tokio::test]
-async fn partial_explicit_yaml_inherits_saved_endpoint_without_freezing_defaults() {
-    let directory = tempfile::tempdir().unwrap();
-    let config_root = directory.path().join("config-root");
-    std::fs::create_dir_all(config_root.join("providers")).unwrap();
-    let saved_endpoint = "http://127.0.0.1:21987/anthropic";
-    std::fs::write(
-        config_root.join("providers/deepseek-api.yaml"),
-        format!("id: deepseek-api\nendpoints:\n  deepseek_messages: {saved_endpoint}\n"),
-    )
-    .unwrap();
-    let explicit = directory.path().join("partial.yaml");
-    std::fs::write(
-        &explicit,
-        "id: deepseek-api\ndefault_model: deepseek-flash-messages\nmodels:\n  - id: deepseek-flash-messages\n    max_output_tokens: 8192\n",
-    )
-    .unwrap();
-    let mut child = trusted_async_agent_command()
-        .env("TICKLOOP_CONFIG_DIR", &config_root)
-        .arg("--no-session-persistence")
-        .arg("--cwd")
-        .arg(directory.path())
-        .arg("--config")
-        .arg(&explicit)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(format!("/model {}\n/exit\n", explicit.display()).as_bytes())
-        .await
-        .unwrap();
-    let output = tokio::time::timeout(INTERACTION_TIMEOUT, child.wait_with_output())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(String::from_utf8_lossy(&output.stdout).contains(saved_endpoint));
-    let saved: tickloop_agent::model::cards::ProviderPatch = serde_yaml_ng::from_slice(
-        &std::fs::read(config_root.join("providers/deepseek-api.yaml")).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(saved.display_name, None);
-    assert_eq!(saved.models.as_ref().unwrap().len(), 1);
-    assert_eq!(
-        saved.models.as_ref().unwrap()[0].max_output_tokens,
-        Some(8192)
-    );
-    assert_eq!(saved.models.as_ref().unwrap()[0].service_model_id, None);
-    let restarted = UserSettings::in_root(&config_root)
-        .load()
-        .configured_model()
-        .unwrap()
-        .unwrap();
-    assert_eq!(restarted.base_url, saved_endpoint);
-    assert_eq!(restarted.max_output_tokens, 8192);
 }
 
 #[test]
@@ -2477,7 +1959,7 @@ async fn terminal_reviews_and_approves_a_specific_plan_version_before_writing() 
     std::fs::write(&config,serde_json::to_vec(&json!({"name":"fixture","protocol":"messages","base_url":format!("http://{address}"),"model":"fixture","api_key_env":"","max_output_tokens":256})).unwrap()).unwrap();
     let mut child = trusted_async_agent_command()
         .env("TICKLOOP_CONFIG_DIR", directory.path().join("config-root"))
-        .arg("--config")
+        .arg("--transport-fixture")
         .arg(config)
         .arg("--cwd")
         .arg(directory.path())
@@ -2558,7 +2040,7 @@ async fn terminal_can_background_read_and_stop_the_same_shell_process() {
     std::fs::write(&config,serde_json::to_vec(&json!({"name":"fixture","protocol":"messages","base_url":format!("http://{address}"),"model":"fixture","api_key_env":"","max_output_tokens":256})).unwrap()).unwrap();
     let mut child = trusted_async_agent_command()
         .env("TICKLOOP_CONFIG_DIR", directory.path().join("config-root"))
-        .arg("--config")
+        .arg("--transport-fixture")
         .arg(config)
         .arg("--cwd")
         .arg(directory.path())
@@ -2643,7 +2125,7 @@ async fn terminal_can_enable_and_deliver_an_explicit_goal_trigger() {
     std::fs::write(&config,serde_json::to_vec(&json!({"name":"fixture","protocol":"messages","base_url":format!("http://{address}"),"model":"fixture","api_key_env":"","max_output_tokens":256})).unwrap()).unwrap();
     let mut child = trusted_async_agent_command()
         .env("TICKLOOP_CONFIG_DIR", directory.path().join("config-root"))
-        .arg("--config")
+        .arg("--transport-fixture")
         .arg(config)
         .arg("--no-session-persistence")
         .stdin(Stdio::piped())
@@ -2777,7 +2259,7 @@ async fn terminal_can_compact_history_and_continue_using_the_summary() {
     std::fs::write(&config,serde_json::to_vec(&json!({"name":"fixture","protocol":"messages","base_url":format!("http://{address}"),"model":"fixture","api_key_env":"","max_output_tokens":256})).unwrap()).unwrap();
     let mut child = trusted_async_agent_command()
         .env("TICKLOOP_CONFIG_DIR", directory.path().join("config-root"))
-        .arg("--config")
+        .arg("--transport-fixture")
         .arg(config)
         .arg("--no-session-persistence")
         .stdin(Stdio::piped())
@@ -2873,7 +2355,7 @@ async fn a_chat_cleared_away_keeps_running_without_writing_into_the_foreground()
     std::fs::write(directory.path().join("model.json"),serde_json::to_vec(&json!({"name":"fixture","protocol":"messages","base_url":format!("http://{address}"),"model":"fixture","api_key_env":"","max_output_tokens":256})).unwrap()).unwrap();
     let mut child = trusted_async_agent_command()
         .env("TICKLOOP_CONFIG_DIR", directory.path().join("config-root"))
-        .arg("--config")
+        .arg("--transport-fixture")
         .arg(directory.path().join("model.json"))
         .arg("--cwd")
         .arg(directory.path())
@@ -2968,7 +2450,7 @@ async fn resuming_recovered_queued_input_starts_no_work_and_exits_at_eof() {
     let runtime_directory = support::cli_runtime::command_directory(command.as_std());
     let mut child = command
         .env("TICKLOOP_CONFIG_DIR", directory.path().join("config-root"))
-        .arg("--config")
+        .arg("--transport-fixture")
         .arg(config)
         .arg("--cwd")
         .arg(directory.path())
@@ -3057,7 +2539,7 @@ async fn operations_from_a_crashed_process_are_not_listed_after_resume() {
     let runtime_directory = support::cli_runtime::command_directory(command.as_std());
     let mut child = command
         .env("TICKLOOP_CONFIG_DIR", directory.path().join("config-root"))
-        .arg("--config")
+        .arg("--transport-fixture")
         .arg(config)
         .arg("--cwd")
         .arg(directory.path())
@@ -3161,7 +2643,7 @@ async fn ordinary_terminal_input_answers_the_visible_questions_one_line_each() {
     std::fs::write(&config,serde_json::to_vec(&json!({"name":"fixture","protocol":"messages","base_url":format!("http://{address}"),"model":"fixture","api_key_env":"","max_output_tokens":256})).unwrap()).unwrap();
     let mut child = trusted_async_agent_command()
         .env("TICKLOOP_CONFIG_DIR", directory.path().join("config-root"))
-        .arg("--config")
+        .arg("--transport-fixture")
         .arg(config)
         .arg("--no-session-persistence")
         .stdin(Stdio::piped())
@@ -3227,7 +2709,7 @@ async fn run_with_config(
     let runtime_directory = support::cli_runtime::command_directory(command.as_std());
     let mut child = command
         .env("TICKLOOP_CONFIG_DIR", directory.join("config-root"))
-        .arg("--config")
+        .arg("--transport-fixture")
         .arg(directory.join("model.json"))
         .arg("--cwd")
         .arg(directory)
@@ -3318,7 +2800,7 @@ async fn model_control_sequences_cannot_change_terminal_state() {
     let mut child = trusted_async_agent_command()
         .env("TICKLOOP_CONFIG_DIR", directory.path().join("config-root"))
         .args([
-            "--config",
+            "--transport-fixture",
             config_path.to_str().unwrap(),
             "--cwd",
             directory.path().to_str().unwrap(),
@@ -3680,7 +3162,7 @@ async fn clear_starts_a_new_chat_and_stops_the_foreground_shell_command() {
     let started = std::time::Instant::now();
     let mut child = trusted_async_agent_command()
         .env("TICKLOOP_CONFIG_DIR", directory.path().join("config-root"))
-        .arg("--config")
+        .arg("--transport-fixture")
         .arg(directory.path().join("model.json"))
         .arg("--cwd")
         .arg(directory.path())
@@ -3787,7 +3269,7 @@ async fn process_registration_follows_the_foreground_chat_and_is_removed_at_exit
     let server = tokio::spawn(async move { accept_skipping_new_agent(&listener).await });
     let mut child = trusted_async_agent_command()
         .env("TICKLOOP_CONFIG_DIR", &config_root)
-        .arg("--config")
+        .arg("--transport-fixture")
         .arg(directory.path().join("model.json"))
         .arg("--cwd")
         .arg(directory.path())
@@ -3915,7 +3397,7 @@ async fn finish_process(
 fn spawn_piped_terminal(directory: &std::path::Path) -> tokio::process::Child {
     trusted_async_agent_command()
         .env("TICKLOOP_CONFIG_DIR", directory.join("config-root"))
-        .arg("--config")
+        .arg("--transport-fixture")
         .arg(directory.join("model.json"))
         .arg("--cwd")
         .arg(directory)

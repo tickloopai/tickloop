@@ -10,7 +10,20 @@ fn shell(id: Uuid, title: &str) -> TickListEntry {
         kind: "Shell".into(),
         status: "exit 0".into(),
         updated_at_ms: Some(1000),
-        running: false,
+        actions: vec![
+            crate::tick_adapter::TickListAction {
+                key: 'o',
+                label: "open",
+                operation: crate::tick_adapter::TickListOperation::Execute(
+                    crate::terminal::tick_actions::builtin::shell(id),
+                ),
+            },
+            crate::tick_adapter::TickListAction {
+                key: 'x',
+                label: "remove",
+                operation: crate::tick_adapter::TickListOperation::RemoveLocal,
+            },
+        ],
     }
 }
 
@@ -20,9 +33,9 @@ fn shell_tick_enter_opens_inside_the_tick_panel() {
     state.tick_list.focus(false, None);
     assert!(matches!(
         state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-        Some(InputEvent::OpenTickShell { .. })
+        Some(InputEvent::TickAction { .. })
     ));
-    assert!(state.tick_list.shell_detail.is_some());
+    assert!(state.tick_list.detail.is_some());
     assert!(state.task_surface.is_none());
 }
 
@@ -94,13 +107,13 @@ fn tick_shell_detail_and_selection_restore_per_agent_and_ignore_obsolete_mouse_t
     let selected = state.tick_list.selected().unwrap().id.clone();
     state.tick_list.focus(false, None);
     state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-    let panel = state.tick_list.shell_detail.as_ref().unwrap().id;
+    let panel = state.tick_list.detail.as_ref().unwrap().id();
     state.draw_frame(&mut Vec::new()).unwrap();
     state.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
     assert_eq!(state.tick_list.selected().unwrap().id, selected);
     state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-    assert_ne!(state.tick_list.shell_detail.as_ref().unwrap().id, panel);
-    let panel = state.tick_list.shell_detail.as_ref().unwrap().id;
+    assert_ne!(state.tick_list.detail.as_ref().unwrap().id(), panel);
+    let panel = state.tick_list.detail.as_ref().unwrap().id();
     let output = (0..40)
         .map(|row| format!("cached-output-{row}\n"))
         .collect::<String>();
@@ -108,7 +121,14 @@ fn tick_shell_detail_and_selection_restore_per_agent_and_ignore_obsolete_mouse_t
     snapshot.tasks[0].id = Uuid::parse_str(&selected).unwrap();
     snapshot.tasks[0].output_bytes = output.len() as u64;
     snapshot.tasks[0].capabilities.can_read_output = true;
-    let detail = state.tick_list.shell_detail.as_mut().unwrap();
+    let detail = state
+        .tick_list
+        .detail
+        .as_mut()
+        .unwrap()
+        .as_any_mut()
+        .downcast_mut::<crate::terminal::tick_shell::TickShell>()
+        .unwrap();
     let Some(TaskSurfaceEffect::ReadOutput {
         generation,
         task_id,
@@ -137,15 +157,18 @@ fn tick_shell_detail_and_selection_restore_per_agent_and_ignore_obsolete_mouse_t
         .map(RoleLine::text)
         .collect::<Vec<_>>();
     state.switch_view_chat(Some(Uuid::new_v4()));
-    assert!(state.tick_list.shell_detail.is_none());
+    assert!(state.tick_list.detail.is_none());
     state.switch_view_chat(Some(a));
-    assert_eq!(state.tick_list.shell_detail.as_ref().unwrap().id, panel);
+    assert_eq!(state.tick_list.detail.as_ref().unwrap().id(), panel);
     assert_eq!(state.tick_list.selected().unwrap().id, selected);
     assert_eq!(
         state
             .tick_list
-            .shell_detail
+            .detail
             .as_mut()
+            .unwrap()
+            .as_any_mut()
+            .downcast_mut::<crate::terminal::tick_shell::TickShell>()
             .unwrap()
             .lines(40, 10, 2000)
             .iter()
@@ -169,7 +192,7 @@ fn tick_shell_detail_and_selection_restore_per_agent_and_ignore_obsolete_mouse_t
             kind: "Artifact".into(),
             status: String::new(),
             updated_at_ms: None,
-            running: false,
+            actions: remote_actions("artifact:https://docs.example/b", true),
         }],
     );
     state.pointer(
@@ -207,7 +230,7 @@ async fn shell_panel_live_subscription_updates_tail_without_covering_the_input()
         )
         .await
         .unwrap();
-    let center = ShellTaskCenter::new(agent);
+    let center = ShellTaskCenter::new(agent.clone());
     let initial = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let snapshot = center.snapshot(chat).await.unwrap();
@@ -230,23 +253,28 @@ async fn shell_panel_live_subscription_updates_tail_without_covering_the_input()
     state.prompt_enabled = true;
     let console = tests::console_with_state(state);
     console.update_shell_ticks(&initial).unwrap();
-    let panel = {
+    let action = {
         let mut state = console.state.lock().unwrap();
         state.tick_list.focus(false, None);
-        let Some(InputEvent::OpenTickShell { panel, .. }) =
+        let Some(InputEvent::TickAction { action, .. }) =
             state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
         else {
             panic!("Shell did not open in panel");
         };
-        panel
+        action
     };
     let mut subscription = center.subscribe(chat).await.unwrap();
-    let effect = console
-        .load_tick_shell(chat, panel, initial, started)
-        .unwrap();
-    crate::terminal::apply_tick_shell_effect(&center, &console, chat, panel, effect)
-        .await
-        .unwrap();
+    super::super::tick_actions::execute(
+        action,
+        super::super::tick_actions::TickActionContext {
+            agent: &agent,
+            console: &console,
+            root: Some(directory.path()),
+            chat,
+        },
+    )
+    .await
+    .unwrap();
     std::fs::write(directory.path().join("release"), "").unwrap();
     let updated = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -264,10 +292,23 @@ async fn shell_panel_live_subscription_updates_tail_without_covering_the_input()
     .await
     .unwrap();
     console.update_shell_ticks(&updated).unwrap();
-    let effect = console.update_tick_shell(chat, panel, updated).unwrap();
-    crate::terminal::apply_tick_shell_effect(&center, &console, chat, panel, effect)
-        .await
-        .unwrap();
+    tokio::time::sleep(Duration::from_millis(260)).await;
+    let (owner, action) = console
+        .poll_tick_detail()
+        .unwrap()
+        .expect("production detail poll");
+    assert_eq!(owner, chat);
+    super::super::tick_actions::execute(
+        action,
+        super::super::tick_actions::TickActionContext {
+            agent: &agent,
+            console: &console,
+            root: Some(directory.path()),
+            chat,
+        },
+    )
+    .await
+    .unwrap();
     {
         let mut state = console.state.lock().unwrap();
         state.draw_frame(&mut Vec::new()).unwrap();
@@ -297,8 +338,11 @@ async fn shell_panel_live_subscription_updates_tail_without_covering_the_input()
 #[tokio::test]
 async fn shared_shell_effect_handler_recovers_output_errors_for_task_center_and_tick_panel() {
     use crate::terminal::{
-        ShellEffectTarget, apply_shell_effect, execution::ConsoleExecution,
-        task_access::ShellTaskCenter, test_support,
+        apply_task_surface_effect,
+        execution::ConsoleExecution,
+        task_access::ShellTaskCenter,
+        test_support,
+        tick_actions::{TickActionContext, execute},
     };
     let directory = tempfile::tempdir().unwrap();
     let core = crate::runtime::Agent::new_embedded(
@@ -342,41 +386,48 @@ async fn shared_shell_effect_handler_recovers_output_errors_for_task_center_and_
         state.switch_view_chat(Some(chat));
         state.prompt_enabled = true;
         let console = tests::console_with_state(state);
-        let (target, effect) = if panel_mode {
+        let (action, effect) = if panel_mode {
             console.update_shell_ticks(&snapshot).unwrap();
-            let panel = {
+            let action = {
                 let mut state = console.state.lock().unwrap();
                 state.tick_list.focus(false, None);
-                let Some(InputEvent::OpenTickShell { panel, .. }) =
+                let Some(InputEvent::TickAction { action, .. }) =
                     state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
                 else {
                     panic!("missing panel");
                 };
-                panel
+                action
             };
-            (
-                ShellEffectTarget::TickPanel(panel),
-                console
-                    .load_tick_shell(chat, panel, snapshot.clone(), None)
-                    .unwrap(),
-            )
+            (Some(action), None)
         } else {
             (
-                ShellEffectTarget::TaskCenter,
-                console
-                    .show_tasks_at(snapshot.clone(), Some(receipt.command_id))
-                    .unwrap(),
+                None,
+                Some(
+                    console
+                        .show_tasks_at(snapshot.clone(), Some(receipt.command_id))
+                        .unwrap(),
+                ),
             )
+        };
+        let context = TickActionContext {
+            agent: &agent,
+            console: &console,
+            root: Some(directory.path()),
+            chat,
         };
         let unavailable = path.with_extension("held-by-test");
         std::fs::rename(&path, &unavailable).unwrap();
-        apply_shell_effect(&center, &console, chat, target, effect.clone())
-            .await
-            .unwrap();
+        if let Some(action) = action {
+            execute(action, context).await.unwrap();
+        } else {
+            apply_task_surface_effect(&center, &console, chat, effect.clone().unwrap())
+                .await
+                .unwrap();
+        }
         {
             let state = console.state.lock().unwrap();
             if panel_mode {
-                let hint = state.tick_list.shell_detail.as_ref().unwrap().hint();
+                let hint = state.tick_list.detail.as_ref().unwrap().hint();
                 assert!(hint.contains("Esc back"));
                 assert_ne!(
                     hint, "Esc back",
@@ -394,9 +445,18 @@ async fn shared_shell_effect_handler_recovers_output_errors_for_task_center_and_
             }
         }
         std::fs::rename(&unavailable, &path).unwrap();
-        apply_shell_effect(&center, &console, chat, target, effect)
-            .await
-            .unwrap();
+        if panel_mode {
+            tokio::time::sleep(Duration::from_millis(260)).await;
+            let (_, action) = console
+                .poll_tick_detail()
+                .unwrap()
+                .expect("detail retry poll");
+            execute(action, context).await.unwrap();
+        } else {
+            apply_task_surface_effect(&center, &console, chat, effect.unwrap())
+                .await
+                .unwrap();
+        }
         {
             let mut state = console.state.lock().unwrap();
             state.draw_frame(&mut Vec::new()).unwrap();
@@ -407,10 +467,7 @@ async fn shared_shell_effect_handler_recovers_output_errors_for_task_center_and_
                     .any(|row| row.contains("recovered-output"))
             );
             if panel_mode {
-                assert_eq!(
-                    state.tick_list.shell_detail.as_ref().unwrap().hint(),
-                    "Esc back"
-                );
+                assert_eq!(state.tick_list.detail.as_ref().unwrap().hint(), "Esc back");
             } else {
                 assert!(
                     state
@@ -435,9 +492,11 @@ fn click_fixture(width: u16, overlay: bool, group: TickGroup) -> State {
     if group == TickGroup::Artifacts {
         entry.id = "artifact:https://docs.example/doc".into();
         entry.glyph = Glyph::ArtifactTick;
-    } else if group == TickGroup::Subscribed {
+        entry.actions = remote_actions(&entry.id, true);
+    } else if group == TickGroup::Ticks {
         entry.glyph = Glyph::ProtocolTick;
         entry.kind = "Tick".into();
+        entry.actions = remote_actions(&entry.id, false);
     }
     state.tick_list.replace(group, vec![entry]);
     state.tick_list.overlay = overlay;
@@ -447,9 +506,9 @@ fn click_fixture(width: u16, overlay: bool, group: TickGroup) -> State {
 
 fn tick_action_signature(input: Option<InputEvent>) -> String {
     match input {
-        Some(InputEvent::TickListAction { chat, id, action }) => format!("{chat}/{id}/{action}"),
-        Some(InputEvent::OpenStatusTask(id)) => format!("shell/{id}"),
-        Some(InputEvent::OpenTickShell { chat, task_id, .. }) => format!("{chat}/shell/{task_id}"),
+        Some(InputEvent::TickAction { chat, action }) => {
+            format!("{chat}/{}/{}", action.instance, action.key)
+        }
         _ => panic!("expected a Tick row action"),
     }
 }
@@ -457,11 +516,7 @@ fn tick_action_signature(input: Option<InputEvent>) -> String {
 #[test]
 fn tick_row_title_and_metadata_clicks_perform_the_same_enter_action() {
     for (width, overlay) in [(140, false), (100, true)] {
-        for group in [
-            TickGroup::Artifacts,
-            TickGroup::Shells,
-            TickGroup::Subscribed,
-        ] {
+        for group in [TickGroup::Artifacts, TickGroup::Shells, TickGroup::Ticks] {
             for meta in [false, true] {
                 let mut state = click_fixture(width, overlay, group);
                 let row = state
@@ -482,7 +537,7 @@ fn tick_row_title_and_metadata_clicks_perform_the_same_enter_action() {
                     &mut Vec::new(),
                 );
                 let clicked = tick_action_signature(state.pointer_input.take());
-                state.tick_list.shell_detail = None;
+                state.tick_list.detail = None;
                 state.tick_list.focus(overlay, None);
                 let entered = tick_action_signature(
                     state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
@@ -495,15 +550,15 @@ fn tick_row_title_and_metadata_clicks_perform_the_same_enter_action() {
 
 #[test]
 fn pending_tick_removal_confirmation_cannot_be_approved_by_clicking_any_row() {
-    for group in [
-        TickGroup::Artifacts,
-        TickGroup::Shells,
-        TickGroup::Subscribed,
-    ] {
+    for group in [TickGroup::Artifacts, TickGroup::Shells, TickGroup::Ticks] {
         for metadata in [false, true] {
             let mut state = click_fixture(140, false, group);
             let previous = "artifact:https://docs.example/previous".to_owned();
-            state.tick_list.confirmation = Some(previous.clone());
+            state.tick_list.confirmation = Some(crate::terminal::tick_list::TickConfirmation {
+                instance: previous.clone(),
+                action: crate::terminal::tick_actions::builtin::artifact(&previous, 'X'),
+                prompt: "Remove artifact?".into(),
+            });
             state.tick_list.focus(false, None);
             state.draw_frame(&mut Vec::new()).unwrap();
             let target = &state.tick_row_targets[usize::from(metadata)];
@@ -520,9 +575,16 @@ fn pending_tick_removal_confirmation_cannot_be_approved_by_clicking_any_row() {
                 state.pointer_input.is_none(),
                 "row click must never confirm removal"
             );
-            assert_eq!(state.tick_list.confirmation, Some(previous.clone()));
+            assert_eq!(
+                state
+                    .tick_list
+                    .confirmation
+                    .as_ref()
+                    .map(|confirmation| &confirmation.instance),
+                Some(&previous)
+            );
             assert!(
-                matches!(state.key(KeyEvent::new(KeyCode::Enter,KeyModifiers::NONE)),Some(InputEvent::TickListAction {id,action:'X',..}) if id==previous)
+                matches!(state.key(KeyEvent::new(KeyCode::Enter,KeyModifiers::NONE)),Some(InputEvent::TickAction {action,..}) if action.instance==previous && action.key=='X')
             );
         }
     }
@@ -649,7 +711,7 @@ fn failed_artifact_refresh_retry_key_only_routes_from_the_focused_list() {
     state.tick_list.focus(false, None);
     assert!(matches!(
         state.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)),
-        Some(InputEvent::TickListAction { action: 'r', .. })
+        Some(InputEvent::TickAction { action, .. }) if action.key == 'r'
     ));
     state.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
     state.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
@@ -664,14 +726,15 @@ fn subscribed_artifact_routes_copy_and_feedback_to_artifact_actions() {
     state.prompt_enabled = true;
     let id = Uuid::new_v4();
     let mut entry = shell(id, "Subscribed document");
-    entry.group = TickGroup::Subscribed;
+    entry.group = TickGroup::Ticks;
     entry.glyph = Glyph::ArtifactTick;
     entry.kind = "Artifact".into();
-    state.tick_list.replace(TickGroup::Subscribed, vec![entry]);
+    entry.actions = remote_actions(&entry.id, true);
+    state.tick_list.replace(TickGroup::Ticks, vec![entry]);
     state.tick_list.focus(false, None);
     for action in ['c', 'f'] {
         assert!(
-            matches!(state.key(KeyEvent::new(KeyCode::Char(action), KeyModifiers::NONE)), Some(InputEvent::TickListAction { action: received, .. }) if received == action)
+            matches!(state.key(KeyEvent::new(KeyCode::Char(action), KeyModifiers::NONE)), Some(InputEvent::TickAction { action: received, .. }) if received.key == action)
         );
     }
 }
@@ -780,11 +843,8 @@ fn passive_todos_allow_tick_list_focus_on_right_and_shift_arrows() {
                 "Auto".into(),
                 "fixture".into(),
                 None,
-                Vec::new(),
                 vec![StatusItem {
                     id: "1".into(),
-                    task_id: None,
-                    can_stop: false,
                     title: "own passive todo".into(),
                     state: "pending",
                     role: Role::MutedText,
@@ -946,13 +1006,9 @@ fn tick_columns_preserve_full_width_input_dividers_cursor_and_mouse_geometry() {
         state
             .editor
             .replace_draft("unchanged input across list toggle".into(), 20);
-        state.status_area.update(
-            "Auto".into(),
-            "model".into(),
-            Some((10, 100)),
-            Vec::new(),
-            Vec::new(),
-        );
+        state
+            .status_area
+            .update("Auto".into(), "model".into(), Some((10, 100)), Vec::new());
         state
             .tick_list
             .replace(TickGroup::Shells, vec![shell(Uuid::new_v4(), "echo A")]);
@@ -1014,7 +1070,7 @@ fn subscribed_ticks_show_live_status_and_ignore_another_chats_refresh() {
     assert_eq!(state.tick_list.entries()[0].status, "live · 60s");
     let id = state.tick_list.entries()[0].id.clone();
     state.switch_view_chat(Some(Uuid::new_v4()));
-    state.update_tick_entries(chat, TickGroup::Subscribed, vec![]);
+    state.update_tick_entries(chat, TickGroup::Ticks, vec![]);
     assert!(state.tick_list.entries().is_empty());
     state.switch_view_chat(Some(chat));
     assert!(state.tick_list.entries().iter().all(|entry| entry.id != id));
@@ -1182,4 +1238,369 @@ fn tick_column_spans_content_top_through_working_and_generic_todo_rows() {
             .iter()
             .all(|row| !row.contains('│'))
     );
+}
+
+fn remote_actions(id: &str, artifact: bool) -> Vec<crate::tick_adapter::TickListAction> {
+    let actions = if artifact {
+        vec![
+            ('o', "open"),
+            ('x', "remove"),
+            ('c', "copy"),
+            ('f', "feedback"),
+        ]
+    } else {
+        vec![('o', "open"), ('x', "remove")]
+    };
+    actions
+        .into_iter()
+        .map(|(key, label)| crate::tick_adapter::TickListAction {
+            key,
+            label,
+            operation: crate::tick_adapter::TickListOperation::Execute(if artifact {
+                crate::terminal::tick_actions::builtin::artifact(id, key)
+            } else {
+                crate::terminal::tick_actions::builtin::subscription(id, key)
+            }),
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_new_adapter_remote_action_and_detail_work_through_enter_and_click() {
+    use crate::tick_adapter::*;
+    use std::{
+        any::Any,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+    struct Calendar {
+        endpoint: String,
+    }
+    struct OpenCalendar {
+        endpoint: String,
+    }
+    struct ReadCalendar {
+        endpoint: String,
+        panel: Uuid,
+    }
+    struct CalendarDetail {
+        id: Uuid,
+        chat: Uuid,
+        text: String,
+    }
+    impl TickDetailView for CalendarDetail {
+        fn id(&self) -> Uuid {
+            self.id
+        }
+        fn chat(&self) -> Uuid {
+            self.chat
+        }
+        fn lines(&mut self, _width: usize, _height: usize, _now: u64) -> Vec<TickDetailLine> {
+            vec![
+                TickDetailLine::new("Calendar detail"),
+                TickDetailLine::new(&self.text),
+            ]
+        }
+        fn hint(&self) -> String {
+            "Esc back".into()
+        }
+        fn key(&mut self, key: KeyEvent, _width: usize, _height: usize) -> TickDetailKey {
+            if matches!(key.code, KeyCode::Esc | KeyCode::Left) {
+                TickDetailKey::Back
+            } else {
+                TickDetailKey::None
+            }
+        }
+        fn as_any_mut(&mut self) -> &mut dyn Any {
+            self
+        }
+    }
+    impl TickActionExecutor for OpenCalendar {
+        fn prepare(&self, ui: &mut TickActionUi<'_>) -> Result<PreparedTickAction, String> {
+            let panel = Uuid::new_v4();
+            ui.open_detail(Box::new(CalendarDetail {
+                id: panel,
+                chat: ui.chat().unwrap(),
+                text: "loading".into(),
+            }));
+            Ok(PreparedTickAction::new(
+                "cal:remote",
+                'o',
+                Arc::new(ReadCalendar {
+                    endpoint: self.endpoint.clone(),
+                    panel,
+                }),
+            ))
+        }
+    }
+    #[async_trait::async_trait]
+    impl TickActionBackend for ReadCalendar {
+        async fn execute(&self, ctx: TickActionContext<'_>) -> Result<TickActionOutcome, String> {
+            let text = reqwest::get(&self.endpoint)
+                .await
+                .map_err(|error| error.to_string())?
+                .text()
+                .await
+                .map_err(|error| error.to_string())?;
+            ctx.update_detail::<CalendarDetail, _>(self.panel, |view| {
+                view.text = text;
+                Some(())
+            })?;
+            Ok(TickActionOutcome::Done)
+        }
+    }
+    impl TickAdapter for Calendar {
+        fn tick_type(&self) -> &'static str {
+            "cal"
+        }
+        fn list(&self, _: &TickListContext) -> Vec<TickDescriptor> {
+            vec![TickDescriptor {
+                instance: crate::tick_stream::InstanceRef::new("cal", "remote").unwrap(),
+                group: TickGroup {
+                    order: 4,
+                    name: "Calendars",
+                },
+                glyph: TickGlyph::Protocol,
+                title: "Remote calendar".into(),
+                kind: "Calendar".into(),
+                status: "live".into(),
+                updated_at_ms: None,
+                running: true,
+                actions: vec![TickListAction {
+                    key: 'o',
+                    label: "open",
+                    operation: TickListOperation::Execute(Arc::new(OpenCalendar {
+                        endpoint: self.endpoint.clone(),
+                    })),
+                }],
+            }]
+        }
+        fn stream(&self) -> Option<Arc<dyn crate::tick_stream::TickStreamPort>> {
+            None
+        }
+        fn tools(&self) -> Option<Arc<dyn crate::host_tools::HostToolProvider>> {
+            None
+        }
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/calendar", listener.local_addr().unwrap());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = calls.clone();
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            let count = socket.read(&mut request).await.unwrap();
+            assert!(String::from_utf8_lossy(&request[..count]).starts_with("GET /calendar "));
+            observed.fetch_add(1, Ordering::SeqCst);
+            let body = "remote earnings detail";
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        }
+    });
+    let directory = tempfile::tempdir().unwrap();
+    let core = crate::runtime::Agent::new_embedded(
+        crate::terminal::test_support::config(),
+        Arc::new(crate::terminal::test_support::ScriptedModel::new(vec![])),
+    );
+    let agent = crate::terminal::execution::ConsoleExecution::from_embedded(
+        core.clone(),
+        crate::terminal::test_support::config(),
+    );
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let mut state = State::new(true, 140, 25);
+    state.switch_view_chat(Some(chat));
+    state.prompt_enabled = true;
+    let rows = TickAdapters::new([Arc::new(Calendar { endpoint }) as Arc<dyn TickAdapter>])
+        .unwrap()
+        .list(&TickListContext::default());
+    state.tick_list.replace(
+        TickGroup {
+            order: 4,
+            name: "Calendars",
+        },
+        rows.into_iter().map(TickListEntry::from).collect(),
+    );
+    let console = tests::console_with_state(state);
+    for click in [false, true] {
+        let action = {
+            let mut state = console.state.lock().unwrap();
+            state.tick_list.focus(false, None);
+            state.draw_frame(&mut Vec::new()).unwrap();
+            let event = if click {
+                let target = &state.tick_row_targets[0];
+                let (row, column) = (target.row, target.columns.start);
+                state.pointer(
+                    MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        row: row as u16,
+                        column: column as u16,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    &mut Vec::new(),
+                );
+                state.pointer_input.take()
+            } else {
+                state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            };
+            let Some(InputEvent::TickAction { action, .. }) = event else {
+                panic!("adapter action was not dispatched")
+            };
+            action
+        };
+        crate::terminal::tick_actions::execute(
+            action,
+            TickActionContext {
+                agent: &agent,
+                console: &console,
+                root: None,
+                chat,
+            },
+        )
+        .await
+        .unwrap();
+        let mut state = console.state.lock().unwrap();
+        state.draw_frame(&mut Vec::new()).unwrap();
+        assert!(
+            state
+                .rendered_screen
+                .iter()
+                .any(|line| line.contains("remote earnings detail"))
+        );
+        state.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(state.tick_list.detail.is_none());
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    server.abort();
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn shell_detail_confirmation_runs_the_production_adapter_control_callback() {
+    use crate::terminal::{
+        execution::ConsoleExecution,
+        task_access::ShellTaskCenter,
+        test_support,
+        tick_actions::{TickActionContext, execute},
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let core = crate::runtime::Agent::new_embedded(
+        test_support::config(),
+        Arc::new(test_support::ScriptedModel::new(vec![])),
+    );
+    let agent = ConsoleExecution::from_embedded(core.clone(), test_support::config());
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let task = agent
+        .submit_user_shell_for_goal(chat, None, "printf ready; sleep 30".into(), true)
+        .await
+        .unwrap();
+    let center = ShellTaskCenter::new(agent.clone());
+    let initial = center.snapshot(chat).await.unwrap();
+    let mut state = State::new(true, 140, 25);
+    state.switch_view_chat(Some(chat));
+    state.prompt_enabled = true;
+    let console = tests::console_with_state(state);
+    console.update_shell_ticks(&initial).unwrap();
+    let action = {
+        let mut state = console.state.lock().unwrap();
+        state.tick_list.focus(false, None);
+        let Some(InputEvent::TickAction { action, .. }) =
+            state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("missing detail callback");
+        };
+        action
+    };
+    let context = TickActionContext {
+        agent: &agent,
+        console: &console,
+        root: Some(directory.path()),
+        chat,
+    };
+    execute(action, context).await.unwrap();
+    let action = {
+        let mut state = console.state.lock().unwrap();
+        assert!(
+            state
+                .key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE))
+                .is_none()
+        );
+        assert!(
+            state
+                .tick_list
+                .detail
+                .as_ref()
+                .unwrap()
+                .hint()
+                .contains("Enter confirm")
+        );
+        let Some(InputEvent::TickAction { action, .. }) =
+            state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("missing control callback");
+        };
+        action
+    };
+    assert!(
+        !center
+            .snapshot(chat)
+            .await
+            .unwrap()
+            .tasks
+            .iter()
+            .find(|row| row.id == task.command_id)
+            .unwrap()
+            .state
+            .is_terminal()
+    );
+    execute(action, context).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if center
+                .snapshot(chat)
+                .await
+                .unwrap()
+                .tasks
+                .iter()
+                .find(|row| row.id == task.command_id)
+                .unwrap()
+                .state
+                .is_terminal()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let (_, action) = console
+        .poll_tick_detail()
+        .unwrap()
+        .expect("production detail poll");
+    execute(action, context).await.unwrap();
+    assert_eq!(
+        console
+            .state
+            .lock()
+            .unwrap()
+            .tick_list
+            .detail
+            .as_ref()
+            .unwrap()
+            .hint(),
+        "Esc back"
+    );
+    core.shutdown().await;
 }

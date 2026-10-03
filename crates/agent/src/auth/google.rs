@@ -223,6 +223,7 @@ impl GoogleAuth {
             client_secret,
             project,
             browser: BrowserLogin {
+                generation,
                 authorization_url: url.into(),
                 callback_uri,
                 session: BrowserSession {

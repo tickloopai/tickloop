@@ -236,9 +236,6 @@ impl ShellTaskCenter {
 }
 
 impl ShellTaskSubscription {
-    pub(super) fn chat_id(&self) -> Uuid {
-        self.chat
-    }
     pub(super) async fn recv(
         &mut self,
     ) -> Result<ShellTaskSubscriptionEvent, ShellTaskCenterError> {

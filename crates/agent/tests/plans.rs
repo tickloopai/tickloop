@@ -485,11 +485,16 @@ async fn ordinary_progress_retires_completed_todos_and_restores_empty_state() {
         .await
         .unwrap();
     let mut observed = Vec::new();
+    let mut retired = false;
     loop {
         match next_event(&mut events).await.kind {
             EventKind::ProgressUpdated { progress } => {
                 assert_eq!(progress.loop_id, receipt.loop_id);
-                observed.push(progress.todos.first().map(|todo| todo.status.clone()));
+                if let Some(todo) = progress.todos.first() {
+                    observed.push(Some(todo.status.clone()));
+                } else {
+                    retired = true;
+                }
                 let snapshot = agent.snapshot(chat).await.unwrap();
                 assert_eq!(snapshot.policy.mode, ExecutionMode::AcceptEdits);
                 assert!(snapshot.plans.is_empty());
@@ -506,13 +511,18 @@ async fn ordinary_progress_retires_completed_todos_and_restores_empty_state() {
         observed,
         [Some(TodoStatus::InProgress), Some(TodoStatus::Completed)]
     );
-    loop {
-        if let EventKind::ProgressUpdated { progress } = next_event(&mut events).await.kind
-            && progress.loop_id == receipt.loop_id
-            && progress.todos.is_empty()
-        {
-            break;
+    if !retired {
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(6)).await;
+        loop {
+            if let EventKind::ProgressUpdated { progress } = next_event(&mut events).await.kind
+                && progress.loop_id == receipt.loop_id
+                && progress.todos.is_empty()
+            {
+                break;
+            }
         }
+        tokio::time::resume();
     }
     assert_eq!(
         std::fs::read_to_string(directory.path().join("report.txt")).unwrap(),
@@ -734,6 +744,61 @@ async fn restoring_unretired_completed_progress_starts_a_fresh_grace() {
             break;
         }
     }
+    restored.shutdown().await;
+}
+
+#[tokio::test]
+async fn retirement_checkpoint_precedes_later_todo_results_in_the_same_assistant_batch() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = directory.path().join("archive");
+    let batch = vec![
+        Content::ToolUse {
+            id: "done".into(),
+            name: "TodoWrite".into(),
+            input: json!({"todos":[{"content":"First list done","activeForm":"Finishing","status":"completed"}]}),
+        },
+        Content::ToolUse {
+            id: "wait".into(),
+            name: "Bash".into(),
+            input: json!({"command":"sleep 6"}),
+        },
+        Content::ToolUse {
+            id: "pending".into(),
+            name: "TodoWrite".into(),
+            input: json!({"todos":[{"content":"Later pending list","activeForm":"Working","status":"pending"}]}),
+        },
+    ];
+    let agent = Agent::open_embedded(
+        store.clone(),
+        config(),
+        Arc::new(ScriptedModel::new(vec![batch, text("done")])),
+    )
+    .unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::FullAccess)
+        .await
+        .unwrap();
+    let receipt = finish_progress_turn(&agent, chat, None).await;
+    assert_eq!(
+        agent.snapshot(chat).await.unwrap().progress[0].todos[0].content,
+        "Later pending list"
+    );
+    agent.shutdown().await;
+    drop(agent);
+    let restored =
+        Agent::open_embedded(store, config(), Arc::new(ScriptedModel::new(vec![]))).unwrap();
+    let snapshot = restored.resume_chat(chat).await.unwrap();
+    assert_eq!(
+        snapshot
+            .progress
+            .iter()
+            .find(|p| p.loop_id == receipt.loop_id)
+            .unwrap()
+            .todos[0]
+            .content,
+        "Later pending list"
+    );
     restored.shutdown().await;
 }
 
