@@ -12,11 +12,11 @@ use tickloop_agent::{
     permissions::{Decision, ExecutionMode, PermissionRule, PermissionScope},
     runtime::{
         AgentError, AgentHostOptions, BranchOutcome, BranchRequest, ChatSnapshot,
-        DirectoryTrustPolicy, ENTER_PLAN_MODE_TOOL_NAME, EventKind, InputContext, LoopId,
-        PermissionChange, PromptPolicy, QuestionRequest, Receipt, RequestKind, RequestOutcome,
-        ShellTaskNotice, ShellTaskPromptWatchdog, ShellTaskState, ShellTaskSubscriptionEvent,
-        TaskNotification, TaskNotificationStatus, TodoItem, Trigger, TriggerSource,
-        UserShellRecord, UserShellState,
+        DirectoryTrustPolicy, ENTER_PLAN_MODE_TOOL_NAME, EXIT_PLAN_MODE_TOOL_NAME, EventKind,
+        InputContext, LoopId, PermissionChange, PromptPolicy, QuestionRequest, Receipt,
+        RequestKind, RequestOutcome, ShellTaskNotice, ShellTaskPromptWatchdog, ShellTaskState,
+        ShellTaskSubscriptionEvent, TaskNotification, TaskNotificationStatus, TodoItem, Trigger,
+        TriggerSource, UserShellRecord, UserShellState,
     },
     settings::{LoadedSettings, UserSettings},
 };
@@ -56,6 +56,9 @@ mod login;
 mod loops;
 mod menus;
 #[cfg(test)]
+#[path = "../tests/model_http_support/mod.rs"]
+pub(crate) mod model_http_support;
+#[cfg(test)]
 mod navigation_tests;
 mod new_agent_draft;
 #[cfg(test)]
@@ -65,6 +68,9 @@ mod pasted_image_paths;
 mod permissions_surface;
 mod presentation;
 mod process_registry;
+mod prompt_suggestion;
+#[cfg(test)]
+mod prompt_suggestion_tests;
 mod questions;
 #[cfg(test)]
 mod recovery_tests;
@@ -238,7 +244,11 @@ fn write_next_reply_line(console: &Console, reply: &mut ReplyLines) -> Result<()
     Ok(())
 }
 
-fn write_completion_notice(console: &Console, usage: &Usage) -> Result<(), String> {
+fn write_completion_notice(
+    console: &Console,
+    usage: &Usage,
+    details: Option<&str>,
+) -> Result<(), String> {
     let display = console.display_profile()?;
     let interactive = console.is_interactive();
     console.write_completion_notice(&[
@@ -251,9 +261,41 @@ fn write_completion_notice(console: &Console, usage: &Usage) -> Result<(), Strin
             },
             Some(Role::Success),
         ),
+        (details.unwrap_or_default().into(), Some(Role::MutedText)),
         (usage_text(usage), Some(Role::MutedText)),
         ("\n".into(), None),
     ])
+}
+
+fn completion_details(elapsed: Option<std::time::Duration>, time: &str, shells: usize) -> String {
+    let mut details = elapsed
+        .map(format_activity_elapsed)
+        .into_iter()
+        .collect::<Vec<_>>();
+    if !time.is_empty() {
+        details.push(format!("done {time}"));
+    }
+    if shells > 0 {
+        details.push(format!(
+            "{shells} {} still running",
+            if shells == 1 { "shell" } else { "shells" }
+        ));
+    }
+    if details.is_empty() {
+        return String::new();
+    }
+    format!(" · {}", details.join(" · "))
+}
+
+fn local_completion_time() -> String {
+    let timestamp = unsafe { libc::time(std::ptr::null_mut()) };
+    let mut local = std::mem::MaybeUninit::<libc::tm>::uninit();
+    // localtime_r initializes the output only when its return pointer is non-null.
+    if unsafe { libc::localtime_r(&timestamp, local.as_mut_ptr()) }.is_null() {
+        return String::new();
+    }
+    let local = unsafe { local.assume_init() };
+    format!("{:02}:{:02}", local.tm_hour, local.tm_min)
 }
 
 fn ends_thinking(kind: &EventKind) -> bool {
@@ -619,6 +661,8 @@ Fullscreen draws on the alternate screen; start with TICKLOOP_AGENT_TUI=inline w
 Fullscreen reads the wheel to scroll the conversation; TICKLOOP_AGENT_DISABLE_MOUSE=1 hands the wheel back to the terminal and restores click-and-drag selection.
 /diff opens current working-tree changes and Agent file changes saved in this process without calling the model.
 Typing / or a command prefix shows completion; Tab fills the first match.
+After a completed turn, a dim prompt suggestion may appear in empty input; /settings turns generation off.
+Tab or Right accepts the suggestion for editing; empty Enter accepts and submits; Esc dismisses after candidates or dialogs.
 ↑/↓ or Ctrl+N/P selects a completion; Enter fills a selected match or sends the draft.
 Typing @ and part of a local path offers files and directories; only an accepted candidate is attached.
 Focused lists also accept j/k and Ctrl+N/P; Enter confirms; Esc cancels or denies.
@@ -829,6 +873,9 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
         .as_ref()
         .map(LoadedSettings::tick_list_preference)
         .unwrap_or_default();
+    if let Some(settings) = saved_settings.as_mut() {
+        settings.prompt_suggestion_enabled();
+    }
     let startup_settings_warnings = saved_settings
         .map(LoadedSettings::into_warnings)
         .unwrap_or_default();
@@ -1114,6 +1161,62 @@ fn startup_banner_spans(
     ]
 }
 
+async fn open_current_plan(
+    agent: &Agent,
+    console: &Console,
+    menus: &mut Menus,
+    chat: Option<uuid::Uuid>,
+    goal: Option<uuid::Uuid>,
+) -> Result<(), String> {
+    if let Some(chat) = chat {
+        let snapshot = agent
+            .snapshot(chat)
+            .await
+            .map_err(|error| error.to_string())?;
+        if let Some(plan) = snapshot
+            .plans
+            .iter()
+            .find(|plan| Some(plan.loop_id) == goal)
+        {
+            if console.is_interactive() || plan.approval_pending {
+                return menus.workflow(console, Workflow::plan(agent, chat, plan.loop_id).await?);
+            }
+            outln!(
+                console,
+                "Plan: {} · version {} · approved mode {:?}\n{}",
+                plan.loop_id,
+                plan.version,
+                plan.approved_execution_mode,
+                safe_text(&plan.markdown)
+            );
+            return Ok(());
+        }
+        if snapshot.delegation.is_some() {
+            return Err(completion::command_refusal(
+                completion::CommandScope::Child,
+                "/plan",
+                "only an existing plan can be reopened; entering Plan mode requires the Agent's consent request",
+            ));
+        }
+        agent
+            .set_execution_mode(chat, ExecutionMode::Plan)
+            .await
+            .map_err(|error| error.to_string())?;
+    } else {
+        agent
+            .change_configuration(
+                ConfigTarget::NewDraft,
+                ConfigurationChange::ExecutionMode {
+                    mode: ExecutionMode::Plan,
+                },
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    outln!(console, "Plan mode is active. Enter a task to make a plan.");
+    Ok(())
+}
+
 async fn interact(
     agent: &Agent,
     workdir: PathBuf,
@@ -1123,6 +1226,11 @@ async fn interact(
     config_root: Option<PathBuf>,
 ) -> Result<(), String> {
     let user_settings = startup.user_settings;
+    console.set_prompt_suggestion_enabled(
+        user_settings
+            .as_ref()
+            .is_none_or(|settings| settings.load().prompt_suggestion_enabled()),
+    )?;
     agent.use_user_settings(user_settings.clone());
     let mut events = agent.subscribe();
     let mut user_shell_events = agent.subscribe_user_shells();
@@ -1130,6 +1238,11 @@ async fn interact(
     let interactive = console.is_interactive();
     let mut menus = Menus::new(user_settings.clone(), config_root.clone());
     let mut artifact_loads = tokio::task::JoinSet::new();
+    let mut suggestions: tokio::task::JoinSet<(
+        prompt_suggestion::SuggestionRequest,
+        Option<String>,
+    )> = tokio::task::JoinSet::new();
+    let mut suggestible_runs = HashSet::new();
     let mut artifact_refresh = tokio::time::interval(std::time::Duration::from_millis(50));
     artifact_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut login: Option<LoginFlow> = None;
@@ -1250,6 +1363,7 @@ async fn interact(
             apply_task_surface_effect(&task_center, console, chat, effect).await?;
         }
         observed_run_starts.retain(|run, _| pending.contains_key(run));
+        suggestible_runs.retain(|run| pending.contains_key(run));
         if let Some(chat) = selected_chat {
             selected_loops.insert(chat, goal);
         }
@@ -1771,6 +1885,13 @@ async fn interact(
             _ = artifact_refresh.tick(), if console.artifacts_picker_is_open()? => {},
             result = artifact_loads.join_next(), if !artifact_loads.is_empty() => {
                 if let Some(Ok((request, result))) = result { console.artifact_page_loaded(&request, result)?; }
+            },
+            result = suggestions.join_next(), if !suggestions.is_empty() => {
+                if let Some(Ok((request, text))) = result {
+                    let text = if selected_chat == Some(request.chat) && !overview_active
+                        && agent.snapshot(request.chat).await.is_ok_and(|snapshot| prompt_suggestion::eligible(&snapshot)) { text } else { None };
+                    console.finish_prompt_suggestion(&request, text)?;
+                }
             },
             result = menus.next_discovery(), if discovery_active => {
                 menus.finish_discovery(agent, console, result).await?;
@@ -2301,6 +2422,7 @@ async fn interact(
                     status_dirty=true;
                 },
                 Some(input @ (InputEvent::Line(_) | InputEvent::Prompt { .. })) => {
+                    console.clear_prompt_suggestion()?;
                     let retry_of = console.take_submitted_retry()?;
                     let (line, file_references, pasted_images, restored_contexts, is_user_prompt) = match input {
                         InputEvent::Line(line) => (line, Vec::new(), Vec::new(), Vec::new(), false),
@@ -2415,7 +2537,7 @@ async fn interact(
                         }
                         match global.dispatch(agent.launch_spec(),input,agent.origin()).await {
                             Ok(receipt)=>match agent.accept_created(receipt).await {
-                                CreationAcceptance::Attached(submitted)=>{if let Some(receipt)=submitted {pending.insert(receipt.run_id,receipt);}},
+                                CreationAcceptance::Attached(submitted)=>{if let Some(receipt)=submitted {suggestible_runs.insert(receipt.run_id);pending.insert(receipt.run_id,receipt);}},
                                 CreationAcceptance::AttachUnavailable(error)=>console.set_status(&creation_attach_unavailable(&error))?,
                                 CreationAcceptance::Rejected(error)=>console.restore_rejected_prompt(restored_contexts,&format!("New Agent was not accepted: {error}"))?,
                             },
@@ -2576,26 +2698,9 @@ async fn interact(
                             else if show && let Some(chat) = selected_chat { artifact_ui::refresh(agent, console, config_root.as_deref(), chat).await?; }
                         },
                         "/plan" => {
-                            let Some(chat)=selected_chat else {
-                                agent.change_configuration(ConfigTarget::NewDraft,ConfigurationChange::ExecutionMode {mode:ExecutionMode::Plan}).await.map_err(|error|error.to_string())?;
-                                outln!(console,"Plan mode is active. Enter a task to make a plan.");
-                                status_dirty=true;
-                                continue;
-                            };
-                            agent.set_execution_mode(chat,ExecutionMode::Plan).await.map_err(|error|error.to_string())?;
-                            if let Some(selected_goal)=goal {
-                                let snapshot=agent.snapshot(chat).await.map_err(|error|error.to_string())?;
-                                if let Some(plan)=snapshot.plans.iter().find(|plan| plan.loop_id==selected_goal) {
-                                    if interactive {
-                                    match Workflow::plan(agent,chat,selected_goal).await {
-                                        Ok(workflow)=>menus.workflow(console,workflow)?,
-                                        Err(error)=>outln!(console,"Cannot open plan: {}",safe_text(&error)),
-                                    }
-                                    } else {
-                                        outln!(console,"Plan: {} · version {} · approved mode {:?}\n{}",plan.loop_id,plan.version,plan.approved_execution_mode,safe_text(&plan.markdown));
-                                    }
-                                } else {outln!(console,"Plan mode is active. Enter a task to make a plan.");}
-                            } else {outln!(console,"Plan mode is active. Enter a task to make a plan.");}
+                            if let Err(error) = open_current_plan(agent,console,&mut menus,selected_chat,goal).await {
+                                outln!(console,"Cannot open plan: {}",safe_text(&error));
+                            }
                         },
                         "/details" if interactive => {
                             let id = console.start_transcript()?;
@@ -2883,25 +2988,8 @@ async fn interact(
                                 let snapshot = agent.snapshot(chat).await.map_err(|error|error.to_string())?;
                                 let selected_goal = if let Some(value)=line.strip_prefix("/plan ") {value.trim().parse().ok()} else {goal};
                                 if let Some(plan)=snapshot.plans.iter().find(|plan|Some(plan.loop_id)==selected_goal) {
-                                    outln!(console, "Plan: {} · version {} · approved mode {:?}\n{}",plan.loop_id,plan.version,plan.approved_execution_mode,safe_text(&plan.markdown));
+                                    if interactive || plan.approval_pending { menus.workflow(console, Workflow::plan(agent,chat,plan.loop_id).await?)?; } else { outln!(console, "Plan: {} · version {} · approved mode {:?}\n{}",plan.loop_id,plan.version,plan.approved_execution_mode,safe_text(&plan.markdown)); }
                                 } else {outln!(console, "The selected goal has no saved plan.");}
-                            } else { outln!(console, "No Chat is selected."); }
-                        },
-                        _ if line.starts_with("/approve-plan ") => {
-                            if let Some(chat) = selected_chat {
-                                let result = async {
-                                    let fields=line.split_whitespace().collect::<Vec<_>>();
-                                    if fields.len()!=4 {return Err("use /approve-plan GOAL VERSION MODE".to_string());}
-                                    let selected_goal=fields[1].parse().map_err(|_|"goal ID must be a UUID")?;
-                                    let version=fields[2].parse().map_err(|_|"plan version must be a number")?;
-                                    let mode=serde_json::from_value::<ExecutionMode>(serde_json::Value::String(fields[3].into())).map_err(|_|"invalid execution mode")?;
-                                    agent.approve_plan(chat,selected_goal,version,mode).await.map_err(|error|error.to_string())?;
-                                    Ok::<_,String>((selected_goal,version,mode))
-                                }.await;
-                                match result {
-                                    Ok((selected_goal,version,mode))=>{goal=Some(selected_goal);outln!(console, "Plan version {version} approved for goal {selected_goal} with mode {mode}. Enter a message to begin implementation.");},
-                                    Err(error)=>outln!(console, "Cannot approve plan: {}",safe_text(&error)),
-                                }
                             } else { outln!(console, "No Chat is selected."); }
                         },
                         "/interrupt" => {
@@ -3028,6 +3116,7 @@ async fn interact(
                                 InputSend::Accepted { value: receipt, adopted } => {
                                     echo=track_accepted_echo(console,agent,&receipt,echo).await?;
                                     merged_echoes.accepted(receipt.run_id,echo);
+                                    suggestible_runs.insert(receipt.run_id);
                                     goal = Some(receipt.loop_id);
                                     if !interactive {outln!(console, "Accepted: Goal {} · Run {}", receipt.loop_id, receipt.run_id);}
                                     track_accepted_input(console,agent,receipt,adopted,&mut pending,&mut permissions,&mut questions).await?;
@@ -3082,6 +3171,7 @@ async fn interact(
                             );
                             match send_input(agent,chat_id,retry_of,submission,submitted_receipt).await {
                                 InputSend::Accepted { value: receipt, adopted } => {
+                                    suggestible_runs.insert(receipt.run_id);
                                     echo=track_accepted_echo(console,agent,&receipt,echo).await?;
                                     merged_echoes.accepted(receipt.run_id,echo);
                                     goal = Some(receipt.loop_id);
@@ -3136,6 +3226,9 @@ async fn interact(
                     events.recv().await
                 }
             } => {
+                if matches!(&event, Ok(event) if Some(event.chat_id) == selected_chat && matches!(event.kind, EventKind::Started | EventKind::InputMerged { .. } | EventKind::ConversationRewound { .. })) {
+                    console.clear_prompt_suggestion()?;
+                }
                 let event = if visual_pacing_pending {
                     match event {
                         Ok(queued_event) if !overview_active && Some(queued_event.chat_id) == selected_chat => {
@@ -3337,9 +3430,24 @@ async fn interact(
                         EventKind::Completed {usage} => {
                             #[cfg(test)]
                             agent.record_recovery_fact(recovery_tests::RecoveryFact::Completed {chat:event.chat_id,run:event.run_id,sequence:event.sequence});
-                            write_completion_notice(console, &usage)?;
+                            let details = if interactive {
+                                let shells = task_center.snapshot(event.chat_id).await.ok().map(|snapshot| snapshot.tasks.into_iter().filter(|task| matches!(task.state, ShellTaskState::Running | ShellTaskState::Background | ShellTaskState::Cancelling)).count()).unwrap_or_default();
+                                Some(completion_details(observed_run_starts.get(&event.run_id).map(std::time::Instant::elapsed), &local_completion_time(), shells))
+                            } else { None };
+                            write_completion_notice(console, &usage, details.as_deref())?;
+                            if suggestible_runs.remove(&event.run_id) && interactive
+                                && let Ok(snapshot) = agent.snapshot(event.chat_id).await
+                                && prompt_suggestion::eligible(&snapshot)
+                                && let Some(request) = console.begin_prompt_suggestion(event.chat_id)? {
+                                let root = config_root.clone();
+                                suggestions.spawn(async move {
+                                    let text = prompt_suggestion::generate(&request, &snapshot, root).await;
+                                    (request, text)
+                                });
+                            }
                         },
                         EventKind::Failed(error) => {
+                            suggestible_runs.remove(&event.run_id);
                             let message = if interactive {
                                 format!(
                                     "{} Failed: {}",
@@ -3367,6 +3475,7 @@ async fn interact(
                             }
                         },
                         EventKind::Interrupted => {
+                            suggestible_runs.remove(&event.run_id);
                             let snapshot=agent.snapshot(event.chat_id).await.map_err(|error|error.to_string())?;
                             let stopped=snapshot.loops.iter().any(|goal|goal.id==event.loop_id&&goal.state==tickloop_agent::runtime::LoopState::Stopped);
                             if interactive && !stopped {
@@ -3393,7 +3502,8 @@ async fn interact(
                             }
                         },
                         EventKind::PermissionRequested {request} => {
-                            if interactive {outln!(console,"\nWaiting for your confirmation to continue.");}
+                            if request.name == EXIT_PLAN_MODE_TOOL_NAME && !interactive {menus.workflow(console,Workflow::plan(agent,event.chat_id,request.loop_id).await?)?;}
+                            else if interactive {outln!(console,"\nWaiting for your confirmation to continue.");}
                             else if request.name==ENTER_PLAN_MODE_TOOL_NAME {outln!(console, "\nEnter plan mode? Request: {}\nThe Agent wants to enter plan mode to explore and design an implementation approach.\nUse /allow {} to enter plan mode or /deny {} to stay in the current mode.", request.id, request.id, request.id);}
                             else {outln!(console, "\nPermission request: {} · {}\nOperation: {}\nUse /allow {} [once|session|persistent] or /deny {}.", request.id, safe_text(&request.name), safe_text(&request.input.to_string()), request.id, request.id);}
 
@@ -3414,11 +3524,7 @@ async fn interact(
                         EventKind::QuestionAsked {request} => print_question(console, &request)?,
                         EventKind::PlanUpdated {plan} => {
                             outln!(console, "\nPlan: {} · version {}\n{}",plan.loop_id,plan.version,safe_text(&plan.markdown));
-                            let snapshot=agent.snapshot(event.chat_id).await.map_err(|error|error.to_string())?;
-                            if snapshot.policy.mode==ExecutionMode::Plan {
-                                if interactive {outln!(console,"Use /plan to review and choose how to start, or enter revisions.");}
-                                else {outln!(console, "Review or request revisions. To approve: /approve-plan {} {} MODE",plan.loop_id,plan.version);}
-                            }
+
                         },
                         EventKind::ProgressUpdated {progress} => {
                             if !interactive {
@@ -4337,7 +4443,7 @@ async fn restore_view(
                     }
                 }
                 EventKind::Completed { usage } => {
-                    write_completion_notice(console, usage)?;
+                    write_completion_notice(console, usage, None)?;
                 }
                 EventKind::Started if console.is_interactive() => {
                     console.hide_completion_notice()?;
@@ -4792,27 +4898,6 @@ async fn parse_after_turn(
                 action: LoopAction::ConfigureTrigger {
                     loop_id,
                     trigger: Some(trigger),
-                },
-            })
-        }
-        "/approve-plan" => {
-            let fields = arguments.split_whitespace().collect::<Vec<_>>();
-            if fields.len() != 3 {
-                return Err(invalid("use /approve-plan GOAL VERSION MODE"));
-            }
-            let loop_id = fields[0]
-                .parse()
-                .map_err(|_| invalid("goal ID must be a UUID"))?;
-            let version = fields[1]
-                .parse()
-                .map_err(|_| invalid("plan version must be a number"))?;
-            let mode = serde_json::from_value(serde_json::Value::String(fields[2].into()))
-                .map_err(|_| invalid("invalid execution mode"))?;
-            Ok(AfterTurnAction::Loop {
-                action: LoopAction::ApprovePlan {
-                    loop_id,
-                    version,
-                    mode,
                 },
             })
         }

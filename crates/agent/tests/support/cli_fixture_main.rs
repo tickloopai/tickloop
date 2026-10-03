@@ -49,6 +49,8 @@ fn main() {
         } else {
             serde_json::json!({})
         };
+        // The fixture replaces worker transport; the View must not query the compiled Provider.
+        state["promptSuggestionEnabled"] = serde_json::json!(false);
         state["defaultModel"] =
             serde_json::json!({"provider":model.provider_id,"model":model.model_id});
         std::fs::write(path, serde_json::to_vec(&state).unwrap()).unwrap();

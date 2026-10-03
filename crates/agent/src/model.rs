@@ -23,6 +23,8 @@ pub mod access;
 pub mod availability;
 pub mod cards;
 mod chat_completions;
+mod generation_budget;
+pub use generation_budget::GenerationBudget;
 mod codex;
 pub mod connection;
 pub mod copilot;

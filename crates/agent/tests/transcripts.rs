@@ -1388,9 +1388,30 @@ async fn transcripts_hold_only_specified_entries_and_restart_rebuilds_the_chat_f
         .set_execution_mode(chat, ExecutionMode::Plan)
         .await
         .unwrap();
-    let goal = complete_turn(&agent, chat, None, "Plan the report")
+    let mut events = agent.subscribe();
+    let receipt = agent
+        .submit(chat, None, "Plan the report".into())
         .await
-        .loop_id;
+        .unwrap();
+    loop {
+        if let EventKind::PermissionRequested { request } = next_event(&mut events).await.kind {
+            assert_eq!(request.name, "ExitPlanMode");
+            agent
+                .approve_plan(chat, receipt.loop_id, 1, ExecutionMode::AcceptEdits)
+                .await
+                .unwrap();
+            break;
+        }
+    }
+    loop {
+        if matches!(
+            next_event(&mut events).await.kind,
+            EventKind::Completed { .. }
+        ) {
+            break;
+        }
+    }
+    let goal = receipt.loop_id;
     agent.compact(chat).await.unwrap();
     agent
         .set_directories(chat, other.clone(), Vec::new())

@@ -356,6 +356,17 @@ fn apply_model_thinking(chat: &mut Chat, selection: Option<PendingModelThinking>
     }
 }
 
+impl ChatSnapshot {
+    pub fn public_model_text_messages(&self) -> Result<Vec<Message>, AgentError> {
+        let mut messages = public_projection_of(self, self.active_start()..self.messages.len())?;
+        for message in &mut messages {
+            message.content.retain(|content| matches!(content, Content::Text { text } if super::LocalMessage::parse(text).is_none()));
+        }
+        messages.retain(|message| !message.content.is_empty());
+        Ok(messages)
+    }
+}
+
 impl Agent {
     pub async fn set_model(
         &self,

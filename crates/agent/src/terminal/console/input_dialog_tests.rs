@@ -51,6 +51,7 @@ async fn input_dialog_top_rule_covers_every_surface_with_semantic_theme_roles() 
             "permission",
             "question",
             "plan",
+            "plan feedback",
             "login",
             "help",
             "resume",
@@ -85,7 +86,16 @@ async fn input_dialog_top_rule_covers_every_surface_with_semantic_theme_roles() 
                         },
                     )
                     .unwrap(),
-                "plan" => console.show_plan_menu(menu(id)).unwrap(),
+                "plan" | "plan feedback" => {
+                    let mut page = menu(id);
+                    page.options = ["Auto", "Ask", "Full Access", "No, keep planning"]
+                        .into_iter()
+                        .map(String::from)
+                        .collect();
+                    console
+                        .show_plan_menu(page, surface == "plan feedback")
+                        .unwrap();
+                }
                 "login" => console
                     .show_login_menu(menu(id), "https://example.test/device", false)
                     .unwrap(),
@@ -134,7 +144,7 @@ async fn input_dialog_top_rule_covers_every_surface_with_semantic_theme_roles() 
             }
             let mut state = console.state.lock().unwrap();
             let role = match surface {
-                "plan" => Role::PlanMode,
+                "plan" | "plan feedback" => Role::PlanMode,
                 "trust" => Role::Warning,
                 _ => Role::Permission,
             };
@@ -164,7 +174,7 @@ fn input_dialog_plan_rule_restores_after_question_and_agent_switch() {
     let plan = Uuid::new_v4();
     let question = Uuid::new_v4();
     console.select_chat(Some(first)).unwrap();
-    console.show_plan_menu(menu(plan)).unwrap();
+    console.show_plan_menu(menu(plan), false).unwrap();
     console.set_request_layout(Some(question)).unwrap();
     console
         .show_question_menu(
@@ -1921,4 +1931,795 @@ fn provider_vendor_headers_never_submit_and_model_rows_keep_mouse_identity() {
     assert!(
         matches!(state.pointer_input, Some(InputEvent::Choice { menu_id, index: 1, .. }) if menu_id == id)
     );
+}
+
+#[tokio::test]
+async fn exit_plan_mode_automatically_opens_the_agent_dialog_and_preserves_it_across_switches() {
+    use crate::terminal::{execution::ConsoleExecution, menus::Menus, test_support};
+    use tickloop_agent::{permissions::ExecutionMode, runtime::EventKind};
+    let directory = tempfile::tempdir().unwrap();
+    let markdown = (0..30)
+        .map(|index| format!("Plan line {index}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let model = Arc::new(test_support::ScriptedModel::new(vec![
+        test_support::submit_plan("plan", &markdown),
+        test_support::text("Implementation started."),
+    ]));
+    let agent = ConsoleExecution::new_embedded(test_support::config(), model.clone());
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let other = agent.create_chat(directory.path().into()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::Plan)
+        .await
+        .unwrap();
+    let mut events = agent.subscribe();
+    agent
+        .submit(chat, None, "Plan the task".into())
+        .await
+        .unwrap();
+    let request = loop {
+        if let EventKind::PermissionRequested { request } =
+            test_support::next_event(&mut events).await.kind
+        {
+            break request;
+        }
+    };
+    let mut state = State::new(true, 80, 24);
+    state.prompt_enabled = true;
+    let console = tests::console_with_state(state);
+    console.select_chat(Some(chat)).unwrap();
+    console
+        .state
+        .lock()
+        .unwrap()
+        .insert("Unsent planning draft");
+    let user_menu = menu(Uuid::new_v4());
+    let user_id = user_menu.id;
+    console.show_menu(user_menu).unwrap();
+    let mut menus = Menus::default();
+    let pending = HashMap::from([(request.id, request.run_id)]);
+    menus
+        .refresh_family_permissions(&agent, &console, &[chat], &pending, &HashMap::new())
+        .await
+        .unwrap();
+    let approval_id = console.dialog_menu_id().unwrap().unwrap();
+    {
+        let mut state = console.state.lock().unwrap();
+        assert_eq!(state.request_layout, Some(request.id));
+        assert_eq!(
+            state.styled_frame().0[0].spans[0].role,
+            Some(Role::PlanMode)
+        );
+        assert!(state.menu_plan);
+        assert_eq!(
+            state.menu_comment.as_ref().unwrap().options,
+            [super::super::workflows::PlanApprovalChoice::KeepPlanning.option_index()]
+        );
+        assert_eq!(
+            state.input_dialog_frame().0.len(),
+            input_dialog::INPUT_DIALOG_ROWS
+        );
+        let frame = state
+            .input_dialog_frame()
+            .0
+            .iter()
+            .map(RoleLine::text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(frame.contains("Plan approval"), "{frame}");
+        assert!(frame.contains("Plan line 0"), "{frame}");
+        state.key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+        assert!(state.full_review);
+        state.key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        let full = state
+            .full_review_frame()
+            .iter()
+            .map(RoleLine::text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(full.contains("Plan line 29"), "{full}");
+        assert!(
+            state
+                .key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+                .is_none()
+        );
+        assert!(!state.full_review);
+    }
+    console.select_chat(Some(other)).unwrap();
+    menus
+        .refresh_family_permissions(&agent, &console, &[other], &pending, &HashMap::new())
+        .await
+        .unwrap();
+    assert!(console.dialog_menu_id().unwrap().is_none());
+    console.select_chat(Some(chat)).unwrap();
+    menus
+        .refresh_family_permissions(&agent, &console, &[chat], &pending, &HashMap::new())
+        .await
+        .unwrap();
+    assert_eq!(console.dialog_menu_id().unwrap(), Some(approval_id));
+    let choice = {
+        let mut state = console.state.lock().unwrap();
+        assert_eq!(
+            state.styled_frame().0[0].spans[0].role,
+            Some(Role::PlanMode)
+        );
+        assert!(state.menu_plan);
+        assert_eq!(state.menu_comment.as_ref().unwrap().label, "Feedback");
+        state.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        state
+            .key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap()
+    };
+    let InputEvent::Choice {
+        menu_id,
+        index,
+        comment,
+    } = choice
+    else {
+        panic!("expected plan choice");
+    };
+    assert_eq!(index, 1);
+    menus
+        .choose(&agent, &console, menu_id, Some(index), comment)
+        .await
+        .unwrap();
+    loop {
+        if matches!(
+            test_support::next_event(&mut events).await.kind,
+            EventKind::Completed { .. }
+        ) {
+            break;
+        }
+    }
+    {
+        let mut state = console.state.lock().unwrap();
+        state.release_finished_submissions();
+        assert_eq!(state.editor.draft(), "Unsent planning draft");
+        assert_eq!(state.menu.as_ref().unwrap().id, user_id);
+    }
+    assert_eq!(
+        agent.snapshot(chat).await.unwrap().policy.mode,
+        ExecutionMode::AcceptEdits
+    );
+    assert_eq!(model.requests.lock().unwrap().len(), 2);
+    let saved = super::super::workflows::Workflow::plan(&agent, chat, request.loop_id)
+        .await
+        .unwrap();
+    menus.workflow(&console, saved).unwrap();
+    {
+        let mut state = console.state.lock().unwrap();
+        assert_eq!(
+            state.styled_frame().0[0].spans[0].role,
+            Some(Role::PlanMode)
+        );
+        assert!(state.menu_plan);
+        assert!(state.menu_comment.is_none());
+        assert_eq!(state.menu.as_ref().unwrap().options, ["Close"]);
+    }
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn restored_pending_plan_automatically_uses_the_same_approval_dialog() {
+    use crate::terminal::{execution::ConsoleExecution, menus::Menus, test_support};
+    use tickloop_agent::{permissions::ExecutionMode, runtime::EventKind};
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("state");
+    let agent = ConsoleExecution::open_embedded(
+        root.clone(),
+        test_support::persisted_config(),
+        Arc::new(test_support::ScriptedModel::new(vec![
+            test_support::submit_plan("plan", "Saved plan for restored approval."),
+        ])),
+    )
+    .unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::Plan)
+        .await
+        .unwrap();
+    let mut events = agent.subscribe();
+    let receipt = agent.submit(chat, None, "Plan".into()).await.unwrap();
+    loop {
+        if matches!(
+            test_support::next_event(&mut events).await.kind,
+            EventKind::PermissionRequested { .. }
+        ) {
+            break;
+        }
+    }
+    agent.shutdown().await;
+    let model = Arc::new(test_support::ScriptedModel::new(vec![test_support::text(
+        "Restored execution started.",
+    )]));
+    let restored =
+        ConsoleExecution::open_embedded(root, test_support::persisted_config(), model.clone())
+            .unwrap();
+    restored.resume_chat(chat).await.unwrap();
+    let console = tests::console_with_state(State::new(true, 80, 24));
+    console.select_chat(Some(chat)).unwrap();
+    let mut menus = Menus::default();
+    menus
+        .refresh_family_permissions(
+            &restored,
+            &console,
+            &[chat],
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+    let id = console
+        .dialog_menu_id()
+        .unwrap()
+        .expect("restored approval opens automatically");
+    assert!(model.requests.lock().unwrap().is_empty());
+    assert_eq!(
+        console.state.lock().unwrap().menu.as_ref().unwrap().title,
+        "Plan approval"
+    );
+    let mut events = restored.subscribe();
+    let effect = menus
+        .choose(&restored, &console, id, Some(1), None)
+        .await
+        .unwrap();
+    assert_eq!(effect.receipt.unwrap().loop_id, receipt.loop_id);
+    loop {
+        if matches!(
+            test_support::next_event(&mut events).await.kind,
+            EventKind::Completed { .. }
+        ) {
+            break;
+        }
+    }
+    assert_eq!(
+        restored.snapshot(chat).await.unwrap().policy.mode,
+        ExecutionMode::AcceptEdits
+    );
+    assert_eq!(model.requests.lock().unwrap().len(), 1);
+    restored.shutdown().await;
+}
+
+#[test]
+fn plan_feedback_uses_text_editing_and_esc_closes_the_field_before_cancelling() {
+    let console = tests::console_with_state(State::new(true, 80, 24));
+    let mut plan = menu(Uuid::new_v4());
+    plan.options = vec![
+        "Auto".into(),
+        "Ask".into(),
+        "Full Access".into(),
+        "No, keep planning".into(),
+    ];
+    plan.selected = 3;
+    plan.confirmation = true;
+    let id = plan.id;
+    console.show_plan_menu(plan, true).unwrap();
+    let mut state = console.state.lock().unwrap();
+    assert_eq!(
+        state.styled_frame().0[0].spans[0].role,
+        Some(Role::PlanMode)
+    );
+    assert!(
+        state
+            .key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .is_none()
+    );
+    assert!(state.menu_comment_is_editing());
+    state.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+    state.paste(" feedback 中文");
+    assert!(
+        state
+            .key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .is_none()
+    );
+    assert!(!state.menu_comment_is_editing());
+    assert_eq!(
+        state.selected_menu_comment().as_deref(),
+        Some("j feedback 中文")
+    );
+    assert!(
+        matches!(state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), Some(InputEvent::Choice { menu_id, index: 3, comment: Some(feedback) }) if menu_id == id && feedback == "j feedback 中文")
+    );
+}
+
+#[tokio::test]
+async fn copied_loop_ids_keep_distinct_pending_plan_dialogs_for_each_agent() {
+    use crate::terminal::{execution::ConsoleExecution, menus::Menus, test_support};
+    use tickloop_agent::{
+        permissions::ExecutionMode,
+        runtime::{BranchRequest, EventKind},
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let agent = ConsoleExecution::open_embedded(
+        directory.path().join("state"),
+        test_support::persisted_config(),
+        Arc::new(test_support::ScriptedModel::new(vec![
+            test_support::submit_plan("plan", "Shared pending plan."),
+            test_support::text("Copy implementation started."),
+        ])),
+    )
+    .unwrap();
+    let source = agent.create_chat(directory.path().into()).await.unwrap();
+    agent
+        .set_execution_mode(source, ExecutionMode::Plan)
+        .await
+        .unwrap();
+    let mut events = agent.subscribe();
+    let receipt = agent.submit(source, None, "Plan".into()).await.unwrap();
+    loop {
+        if matches!(
+            test_support::next_event(&mut events).await.kind,
+            EventKind::PermissionRequested { .. }
+        ) {
+            break;
+        }
+    }
+    agent
+        .decline_plan(source, receipt.loop_id, 1, None)
+        .await
+        .unwrap();
+    loop {
+        if matches!(
+            test_support::next_event(&mut events).await.kind,
+            EventKind::Interrupted
+        ) {
+            break;
+        }
+    }
+    let branch = agent
+        .branch_chat(BranchRequest {
+            request_id: Uuid::new_v4(),
+            source_chat_id: source,
+            source_loop_id: None,
+            name: None,
+        })
+        .await
+        .unwrap();
+    let copy = branch.child_chat_id;
+    assert_eq!(branch.snapshot.plans[0].loop_id, receipt.loop_id);
+    agent.snapshot(source).await.unwrap();
+    agent.snapshot(copy).await.unwrap();
+    let console = tests::console_with_state(State::new(true, 80, 24));
+    let mut menus = Menus::default();
+    console.select_chat(Some(source)).unwrap();
+    menus
+        .refresh_family_permissions(
+            &agent,
+            &console,
+            &[source],
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+    let source_menu = console.dialog_menu_id().unwrap().unwrap();
+    console.select_chat(Some(copy)).unwrap();
+    menus
+        .refresh_family_permissions(&agent, &console, &[copy], &HashMap::new(), &HashMap::new())
+        .await
+        .unwrap();
+    let copy_menu = console.dialog_menu_id().unwrap().unwrap();
+    assert_ne!(copy_menu, source_menu);
+    menus
+        .choose(&agent, &console, copy_menu, Some(1), None)
+        .await
+        .unwrap();
+    loop {
+        if matches!(
+            test_support::next_event(&mut events).await.kind,
+            EventKind::Completed { .. }
+        ) {
+            break;
+        }
+    }
+    assert!(agent.snapshot(source).await.unwrap().plans[0].approval_pending);
+    assert_eq!(
+        agent.snapshot(source).await.unwrap().policy.mode,
+        ExecutionMode::Plan
+    );
+    console.select_chat(Some(source)).unwrap();
+    menus
+        .refresh_family_permissions(
+            &agent,
+            &console,
+            &[source],
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(console.dialog_menu_id().unwrap(), Some(source_menu));
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn another_view_decision_retires_a_restored_plan_dialog_and_stale_esc_cannot_repend_it() {
+    use crate::terminal::{execution::ConsoleExecution, menus::Menus, test_support};
+    use tickloop_agent::{permissions::ExecutionMode, runtime::EventKind};
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("state");
+    let original = ConsoleExecution::open_embedded(
+        root.clone(),
+        test_support::persisted_config(),
+        Arc::new(test_support::ScriptedModel::new(vec![
+            test_support::submit_plan("plan", "Review this plan."),
+        ])),
+    )
+    .unwrap();
+    let chat = original.create_chat(directory.path().into()).await.unwrap();
+    original
+        .set_execution_mode(chat, ExecutionMode::Plan)
+        .await
+        .unwrap();
+    let mut events = original.subscribe();
+    let run = original.submit(chat, None, "Plan".into()).await.unwrap();
+    loop {
+        if matches!(
+            test_support::next_event(&mut events).await.kind,
+            EventKind::PermissionRequested { .. }
+        ) {
+            break;
+        }
+    }
+    original.shutdown().await;
+    let model = Arc::new(test_support::ScriptedModel::new(vec![test_support::text(
+        "Implementation started.",
+    )]));
+    let agent =
+        ConsoleExecution::open_embedded(root, test_support::persisted_config(), model.clone())
+            .unwrap();
+    agent.resume_chat(chat).await.unwrap();
+    let first = tests::console_with_state(State::new(true, 80, 24));
+    let second = tests::console_with_state(State::new(true, 80, 24));
+    first.select_chat(Some(chat)).unwrap();
+    second.select_chat(Some(chat)).unwrap();
+    {
+        let mut state = second.state.lock().unwrap();
+        state.insert("Keep this second View draft");
+        state.last_input_edit = None;
+    }
+    let mut first_menus = Menus::default();
+    let mut second_menus = Menus::default();
+    first_menus
+        .refresh_family_permissions(&agent, &first, &[chat], &HashMap::new(), &HashMap::new())
+        .await
+        .unwrap();
+    second_menus
+        .refresh_family_permissions(&agent, &second, &[chat], &HashMap::new(), &HashMap::new())
+        .await
+        .unwrap();
+    let first_id = first.dialog_menu_id().unwrap().unwrap();
+    let stale_id = second.dialog_menu_id().unwrap().unwrap();
+    let mut events = agent.subscribe();
+    first_menus
+        .choose(&agent, &first, first_id, Some(1), None)
+        .await
+        .unwrap();
+    loop {
+        if matches!(
+            test_support::next_event(&mut events).await.kind,
+            EventKind::Completed { .. }
+        ) {
+            break;
+        }
+    }
+    agent.snapshot(chat).await.unwrap();
+    second_menus
+        .refresh_family_permissions(&agent, &second, &[chat], &HashMap::new(), &HashMap::new())
+        .await
+        .unwrap();
+    assert!(
+        second.dialog_menu_id().unwrap().is_none(),
+        "the other View still owns a processed request"
+    );
+    assert_eq!(second.state.lock().unwrap().request_queue_count, 0);
+    second_menus
+        .choose(&agent, &second, stale_id, None, None)
+        .await
+        .unwrap();
+    assert!(
+        agent
+            .decline_plan(chat, run.loop_id, 1, None)
+            .await
+            .is_err()
+    );
+    let snapshot = agent.snapshot(chat).await.unwrap();
+    assert!(!snapshot.plans[0].approval_pending);
+    assert_eq!(snapshot.policy.mode, ExecutionMode::AcceptEdits);
+    assert_eq!(
+        second.state.lock().unwrap().editor.draft(),
+        "Keep this second View draft"
+    );
+    assert_eq!(model.requests.lock().unwrap().len(), 1);
+    agent.shutdown().await;
+}
+
+#[test]
+fn a_child_can_request_an_existing_plan_without_unlocking_mode_changes() {
+    use crate::terminal::completion::{CommandScope, unavailable_command};
+    assert!(unavailable_command("/plan", CommandScope::Child).is_none());
+    assert!(
+        unavailable_command(
+            "/plan 00000000-0000-0000-0000-000000000001",
+            CommandScope::Child
+        )
+        .is_none()
+    );
+    for command in ["/mode auto", "/rule allow Bash", "/add-dir /tmp"] {
+        assert!(unavailable_command(command, CommandScope::Child).is_some());
+    }
+}
+
+#[tokio::test]
+async fn a_child_reopens_its_dismissed_approval_but_cannot_enter_plan_mode_without_a_plan() {
+    use crate::terminal::{
+        execution::ConsoleExecution, menus::Menus, open_current_plan, test_support,
+    };
+    use tickloop_agent::{
+        permissions::{ExecutionMode, PermissionScope},
+        runtime::EventKind,
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(test_support::ScriptedModel::new(vec![
+        test_support::call(
+            "delegate",
+            "DelegateAgent",
+            serde_json::json!({"task":"Plan the delegated task."}),
+        ),
+        test_support::call("enter", "EnterPlanMode", serde_json::json!({})),
+        test_support::submit_plan("plan", "Child plan to review."),
+        test_support::text("The parent observed the interrupted child."),
+        test_support::call(
+            "execute",
+            "Write",
+            serde_json::json!({"file_path":"child-executed.txt","content":"approved child implementation"}),
+        ),
+        test_support::text("Approved child implementation started."),
+        test_support::text("The parent observed completion."),
+    ]));
+    let core = tickloop_agent::runtime::Agent::new_embedded(test_support::config(), model.clone());
+    let agent = ConsoleExecution::from_embedded(core.clone(), test_support::config());
+    let parent = agent.create_chat(directory.path().into()).await.unwrap();
+    agent
+        .set_execution_mode(parent, ExecutionMode::FullAccess)
+        .await
+        .unwrap();
+    let mut events = core.subscribe();
+    agent
+        .submit(parent, None, "Delegate a plan".into())
+        .await
+        .unwrap();
+    let (child, enter) = loop {
+        let event = test_support::next_event(&mut events).await;
+        match event.kind {
+            EventKind::PermissionRequested { request } => break (event.chat_id, request),
+            EventKind::ToolCompleted { result, .. } if result.is_error => {
+                panic!("child setup failed: {}", result.content)
+            }
+            EventKind::Completed { .. } => panic!("parent completed before child approval request"),
+            EventKind::Failed(error) => panic!("child setup failed: {error}"),
+            _ => {}
+        }
+    };
+    let console = tests::console_with_state(State::new(true, 80, 24));
+    console.select_chat(Some(child)).unwrap();
+    console.set_visible_delegation(true).unwrap();
+    let mut menus = Menus::default();
+    assert!(
+        open_current_plan(
+            &agent,
+            &console,
+            &mut menus,
+            Some(child),
+            Some(enter.loop_id)
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(
+        agent.snapshot(child).await.unwrap().policy.mode,
+        ExecutionMode::FullAccess
+    );
+    agent
+        .answer_permission_with_comment(child, enter.id, true, PermissionScope::Once, None)
+        .await
+        .unwrap();
+    let approval = loop {
+        if let EventKind::PermissionRequested { request } =
+            test_support::next_event(&mut events).await.kind
+        {
+            break request;
+        }
+    };
+    assert_eq!(approval.name, "ExitPlanMode");
+    agent
+        .decline_plan(child, approval.loop_id, 1, None)
+        .await
+        .unwrap();
+    loop {
+        let event = test_support::next_event(&mut events).await;
+        if event.chat_id == child && matches!(event.kind, EventKind::Interrupted) {
+            break;
+        }
+    }
+    loop {
+        let event = test_support::next_event(&mut events).await;
+        if event.chat_id == parent && matches!(event.kind, EventKind::Completed { .. }) {
+            break;
+        }
+    }
+    assert!(
+        crate::terminal::completion::unavailable_command("/plan", console.command_scope())
+            .is_none()
+    );
+    open_current_plan(
+        &agent,
+        &console,
+        &mut menus,
+        Some(child),
+        Some(approval.loop_id),
+    )
+    .await
+    .unwrap();
+    let id = console
+        .dialog_menu_id()
+        .unwrap()
+        .expect("child pending approval must reopen");
+    assert_eq!(
+        console.state.lock().unwrap().menu.as_ref().unwrap().title,
+        "Plan approval"
+    );
+    assert_eq!(
+        agent.snapshot(child).await.unwrap().policy.mode,
+        ExecutionMode::Plan
+    );
+    assert!(!directory.path().join("child-executed.txt").exists());
+    menus
+        .choose(&agent, &console, id, Some(2), None)
+        .await
+        .unwrap();
+    loop {
+        let event = test_support::next_event(&mut events).await;
+        if event.chat_id == child && matches!(event.kind, EventKind::Completed { .. }) {
+            break;
+        }
+    }
+    assert!(!agent.snapshot(child).await.unwrap().plans[0].approval_pending);
+    assert_eq!(
+        agent.snapshot(child).await.unwrap().policy.mode,
+        ExecutionMode::FullAccess
+    );
+    assert_eq!(
+        agent.snapshot(parent).await.unwrap().policy.mode,
+        ExecutionMode::FullAccess
+    );
+    let child_snapshot = core.snapshot(child).await.unwrap();
+    let parent_snapshot = core.snapshot(parent).await.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(directory.path().join("child-executed.txt")).unwrap_or_else(
+            |error| panic!(
+                "{error}: child operations {:?}; parent operations {:?}; model requests {}",
+                child_snapshot.operations,
+                parent_snapshot.operations,
+                model.requests.lock().unwrap().len()
+            )
+        ),
+        "approved child implementation"
+    );
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_new_plan_version_replaces_a_stale_restored_request_in_another_view() {
+    use crate::terminal::{execution::ConsoleExecution, menus::Menus, test_support};
+    use tickloop_agent::{permissions::ExecutionMode, runtime::EventKind};
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("state");
+    let original = ConsoleExecution::open_embedded(
+        root.clone(),
+        test_support::persisted_config(),
+        Arc::new(test_support::ScriptedModel::new(vec![
+            test_support::submit_plan("plan", "First plan."),
+        ])),
+    )
+    .unwrap();
+    let chat = original.create_chat(directory.path().into()).await.unwrap();
+    original
+        .set_execution_mode(chat, ExecutionMode::Plan)
+        .await
+        .unwrap();
+    let mut events = original.subscribe();
+    let run = original.submit(chat, None, "Plan".into()).await.unwrap();
+    loop {
+        if matches!(
+            test_support::next_event(&mut events).await.kind,
+            EventKind::PermissionRequested { .. }
+        ) {
+            break;
+        }
+    }
+    original.shutdown().await;
+    let agent = ConsoleExecution::open_embedded(
+        root,
+        test_support::persisted_config(),
+        Arc::new(test_support::ScriptedModel::new(vec![
+            test_support::call(
+                "read",
+                "Read",
+                serde_json::json!({"file_path":test_support::PLAN_FILE}),
+            ),
+            test_support::submit_plan("revised", "Revised plan."),
+            test_support::text("Implementation started."),
+        ])),
+    )
+    .unwrap();
+    agent.resume_chat(chat).await.unwrap();
+    let console = tests::console_with_state(State::new(true, 80, 24));
+    console.select_chat(Some(chat)).unwrap();
+    let mut menus = Menus::default();
+    menus
+        .refresh_family_permissions(&agent, &console, &[chat], &HashMap::new(), &HashMap::new())
+        .await
+        .unwrap();
+    let old_id = console.dialog_menu_id().unwrap().unwrap();
+    let mut events = agent.subscribe();
+    agent
+        .submit(chat, Some(run.loop_id), "Revise in another View".into())
+        .await
+        .unwrap();
+    let revised = loop {
+        if let EventKind::PermissionRequested { request } =
+            test_support::next_event(&mut events).await.kind
+        {
+            break request;
+        }
+    };
+    agent.snapshot(chat).await.unwrap();
+    menus.note_request(chat, revised.id);
+    let pending = HashMap::from([(revised.id, revised.run_id)]);
+    menus
+        .refresh_family_permissions(&agent, &console, &[chat], &pending, &HashMap::new())
+        .await
+        .unwrap();
+    let new_id = console.dialog_menu_id().unwrap().unwrap();
+    assert_ne!(old_id, new_id);
+    assert!(
+        console
+            .state
+            .lock()
+            .unwrap()
+            .menu
+            .as_ref()
+            .unwrap()
+            .context
+            .iter()
+            .any(|line| line == "Plan version: 2")
+    );
+    assert_eq!(console.state.lock().unwrap().request_queue_count, 1);
+    menus
+        .choose(&agent, &console, old_id, None, None)
+        .await
+        .unwrap();
+    assert!(
+        agent
+            .decline_plan(chat, run.loop_id, 1, None)
+            .await
+            .is_err()
+    );
+    assert!(agent.snapshot(chat).await.unwrap().plans[0].approval_pending);
+    menus
+        .choose(&agent, &console, new_id, Some(1), None)
+        .await
+        .unwrap();
+    loop {
+        if matches!(
+            test_support::next_event(&mut events).await.kind,
+            EventKind::Completed { .. }
+        ) {
+            break;
+        }
+    }
+    assert_eq!(agent.snapshot(chat).await.unwrap().plans[0].version, 2);
+    agent.shutdown().await;
 }

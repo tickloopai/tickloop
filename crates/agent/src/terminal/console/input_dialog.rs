@@ -36,6 +36,7 @@ pub(super) struct DialogState {
     menu_link: Option<(Uuid, String)>,
     menu_review: Option<MenuReviewState>,
     full_review: bool,
+    menu_plan: bool,
     menu_comment: Option<MenuCommentState>,
     menu_expand_options: Vec<usize>,
     question_menu: Option<QuestionMenu>,
@@ -104,6 +105,7 @@ impl DialogState {
         self.menu_link = None;
         self.menu_review = None;
         self.full_review = false;
+        self.menu_plan = false;
         self.menu_comment = None;
         self.menu_expand_options.clear();
         self.question_menu = None;
@@ -217,6 +219,7 @@ impl State {
             ),
             menu_link: std::mem::replace(&mut self.menu_link, next.menu_link),
             full_review: std::mem::replace(&mut self.full_review, next.full_review),
+            menu_plan: std::mem::replace(&mut self.menu_plan, next.menu_plan),
             menu_review: std::mem::replace(&mut self.menu_review, next.menu_review),
             menu_comment: std::mem::replace(&mut self.menu_comment, next.menu_comment),
             menu_expand_options: std::mem::replace(
@@ -455,6 +458,40 @@ impl State {
     }
 
     pub(super) fn full_review_frame(&mut self) -> Vec<RoleLine> {
+        if self.menu_plan {
+            let capacity = self.height.saturating_sub(2).max(1);
+            let content = self
+                .menu
+                .as_ref()
+                .map(|menu| {
+                    menu.context
+                        .iter()
+                        .flat_map(|line| wrap_text(&display_text(line), self.width))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            self.context_offset = self
+                .context_offset
+                .min(content.len().saturating_sub(capacity));
+            let mut lines = vec![RoleLine::role("Plan", Role::DialogTitle)];
+            lines.extend(
+                content
+                    .into_iter()
+                    .skip(self.context_offset)
+                    .take(capacity)
+                    .map(RoleLine::plain),
+            );
+            lines.resize(self.height.saturating_sub(1), RoleLine::default());
+            lines.push(RoleLine::role(
+                "v / Esc return to plan approval",
+                Role::MutedText,
+            ));
+            lines.truncate(self.height);
+            for line in &mut lines {
+                line.truncate(self.width);
+            }
+            return lines;
+        }
         let review = self
             .menu_review
             .as_mut()

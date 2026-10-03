@@ -446,6 +446,11 @@ pub enum LoopAction {
         version: u64,
         mode: ExecutionMode,
     },
+    DeclinePlan {
+        loop_id: Uuid,
+        version: u64,
+        feedback: Option<String>,
+    },
     UpdateSubscription {
         subscription_id: Uuid,
         change: TickSubscriptionChange,

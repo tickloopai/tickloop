@@ -33,6 +33,79 @@ fn configuration(base_url: String, protocol: Protocol) -> ModelConfig {
     }
 }
 
+#[tokio::test]
+async fn responses_raw_reasoning_prefix_rejects_a_conflicting_completed_value() {
+    for added_prefix in [true, false] {
+        let (url, _) = serve_response(
+            200,
+            model_http_support::raw_reasoning_prefix_reply(added_prefix, "Contradictory", false),
+        )
+        .await;
+        let client = HttpModelClient::new(configuration(url, Protocol::Responses)).unwrap();
+        let (events, _) = mpsc::unbounded_channel();
+        let result = client
+            .complete(
+                ModelRequest {
+                    history_sources: vec![],
+                    messages: vec![message(Role::User, "Hello")],
+                    tools: vec![],
+                    structured_output: None,
+                    temperature: None,
+                    reasoning_effort: None,
+                },
+                events,
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(ModelError::InvalidResponse(message)) if message == "completed reasoning differs from its stream")
+        );
+    }
+}
+
+#[tokio::test]
+async fn responses_raw_reasoning_prefix_completion_delivers_the_normal_answer() {
+    for added_prefix in [true, false] {
+        let (url, _) = serve_response(
+            200,
+            model_http_support::raw_reasoning_prefix_reply(added_prefix, "Thinking", false),
+        )
+        .await;
+        let client = HttpModelClient::new(configuration(url, Protocol::Responses)).unwrap();
+        let (events, mut deltas) = mpsc::unbounded_channel();
+        let result = client
+            .complete(
+                ModelRequest {
+                    history_sources: vec![],
+                    messages: vec![message(Role::User, "Hello")],
+                    tools: vec![],
+                    structured_output: None,
+                    temperature: None,
+                    reasoning_effort: None,
+                },
+                events,
+                CancellationToken::new(),
+            )
+            .await;
+        let output =
+            result.expect("a reasoning prefix can be completed without failing the normal turn");
+        let mut thinking = String::new();
+        let mut text = String::new();
+        while let Ok(delta) = deltas.try_recv() {
+            match delta {
+                ModelDelta::Thinking(value) => thinking.push_str(&value),
+                ModelDelta::Text(value) => text.push_str(&value),
+                _ => {}
+            }
+        }
+        assert_eq!(thinking, "Thinking");
+        assert_eq!(text, "Answer");
+        assert!(
+            matches!(&output.content[0], Content::ProtocolData { value, .. } if value["content"][0]["text"] == "Thinking")
+        );
+    }
+}
+
 fn message(role: Role, text: &str) -> Message {
     Message {
         role,

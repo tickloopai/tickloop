@@ -47,6 +47,11 @@ mod layout_tests;
 #[cfg(test)]
 #[path = "console/model_dialog_pty.rs"]
 mod model_dialog_pty;
+mod prompt_suggestion;
+#[cfg(test)]
+mod prompt_suggestion_pty;
+#[cfg(test)]
+mod prompt_suggestion_tests;
 #[cfg(test)]
 #[path = "console/request_layout_tests.rs"]
 mod request_layout_tests;
@@ -541,6 +546,9 @@ pub(super) struct State {
     display: DisplayProfile,
     colour_depth: ColourDepth,
     prompt_enabled: bool,
+    prompt_suggestion_enabled: bool,
+    prompt_suggestion: Option<String>,
+    prompt_suggestion_request: Option<super::prompt_suggestion::SuggestionRequest>,
     foreground_shell: bool,
     shell_background_chord_started_at: Option<Instant>,
     width: usize,
@@ -612,6 +620,7 @@ pub(super) struct State {
     menu_link: Option<(Uuid, String)>,
     menu_review: Option<MenuReviewState>,
     full_review: bool,
+    menu_plan: bool,
     menu_comment: Option<MenuCommentState>,
     menu_expand_options: Vec<usize>,
     question_menu: Option<QuestionMenu>,
@@ -1407,6 +1416,7 @@ impl Console {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         let was_open = state.overview.projection.is_some();
         if !was_open && projection.is_some() {
+            state.clear_prompt_suggestion();
             state.overview.current_draft = state.chat.is_none();
             let dispatch = std::mem::take(&mut state.overview_input);
             let source = state.replace_input(dispatch);
@@ -3191,10 +3201,6 @@ impl Console {
         self.show_menu_with_comments(menu, None, Vec::new(), "Comment", None, MenuFocus::Menu)
     }
 
-    pub(super) fn show_plan_menu(&self, menu: Menu) -> Result<(), String> {
-        self.show_menu_with_comments(menu, None, Vec::new(), "Comment", None, MenuFocus::Plan)
-    }
-
     pub(super) fn show_picker_menu(&self, menu: Menu, kind: PickerKind) -> Result<(), String> {
         self.show_menu_with_comments(
             menu,
@@ -3321,6 +3327,19 @@ impl Console {
             "Comment",
             None,
             MenuFocus::WhenInputEmpty,
+        )
+    }
+
+    pub(super) fn show_plan_menu(&self, menu: Menu, feedback: bool) -> Result<(), String> {
+        self.show_menu_with_comments(
+            menu,
+            feedback.then_some(vec![
+                super::workflows::PlanApprovalChoice::KeepPlanning.option_index(),
+            ]),
+            Vec::new(),
+            "Feedback",
+            None,
+            MenuFocus::Plan,
         )
     }
 
@@ -3480,6 +3499,7 @@ impl Console {
         );
         state.review_focused = false;
         state.menu_rule_role = matches!(focus, MenuFocus::Plan).then_some(Role::PlanMode);
+        state.menu_plan = matches!(focus, MenuFocus::Plan);
         state.request_menu = state.request_layout.map(|_| menu.id);
         state.shell_background_chord_started_at = None;
         state.completion.dismiss();
@@ -3594,6 +3614,7 @@ impl Console {
             let mut output = io::stdout().lock();
             state.prompt_enabled = enabled;
             if !enabled {
+                state.clear_prompt_suggestion();
                 state.shell_background_chord_started_at = None;
             }
             state.draw(&mut output).map_err(|error| error.to_string())?;
@@ -3983,6 +4004,9 @@ pub(super) enum RendererSwitch {
 
 impl Drop for Lifetime {
     fn drop(&mut self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.clear_prompt_suggestion();
+        }
         self.stop.store(true, Ordering::Release);
         if let Ok(reader) = self.reader.get_mut()
             && let Some(reader) = reader.take()
@@ -4324,6 +4348,7 @@ impl State {
         if self.chat == chat {
             return;
         }
+        self.clear_prompt_suggestion();
         self.visible_delegated = false;
         self.activity_interruptible = false;
         self.back_to_bottom_target = None;
@@ -4505,6 +4530,9 @@ impl State {
                 std::env::var("COLORTERM").ok().as_deref(),
             ),
             prompt_enabled: false,
+            prompt_suggestion_enabled: true,
+            prompt_suggestion: None,
+            prompt_suggestion_request: None,
             foreground_shell: false,
             shell_background_chord_started_at: None,
             width: usize::from(width).saturating_sub(1).max(2),
@@ -4562,6 +4590,7 @@ impl State {
             menu_link: None,
             menu_review: None,
             full_review: false,
+            menu_plan: false,
             menu_comment: None,
             menu_expand_options: Vec::new(),
             question_menu: None,
@@ -4966,6 +4995,9 @@ impl State {
     fn draw(&mut self, output: &mut impl Write) -> io::Result<()> {
         if !self.interactive {
             return Ok(());
+        }
+        if self.input_dialog_visible() && self.prompt_suggestion_request.is_some() {
+            self.clear_prompt_suggestion();
         }
         if self.held_frames > 0 {
             self.frame_deferred = true;
@@ -5819,7 +5851,15 @@ impl State {
                 };
                 hints.push((scroll.into(), 7));
             }
-            if self.menu_review.is_some() && comment.is_none() {
+            if self.menu_plan {
+                hints.push(("v full plan".into(), 12));
+                if !editing {
+                    hints.push(("PgUp/PgDn plan".into(), 10));
+                    if self.menu_comment.is_some() {
+                        hints.push(("Tab feedback".into(), 10));
+                    }
+                }
+            } else if self.menu_review.is_some() && comment.is_none() {
                 hints.push(("v full Diff".into(), 12));
                 hints.push(("Shift+Tab review".into(), 7));
             } else if menu
@@ -6738,6 +6778,9 @@ impl State {
     }
 
     fn input_image_marks(&self) -> Vec<(std::ops::Range<usize>, Role)> {
+        if let Some(text) = self.visible_prompt_suggestion() {
+            return vec![(0..text.len(), Role::MutedText)];
+        }
         let offset = usize::from(self.shell_input.kind() == InputKind::Shell);
         self.paste_blocks
             .projection(
@@ -6758,6 +6801,9 @@ impl State {
     }
 
     fn input_display(&self) -> (String, usize) {
+        if let Some(text) = self.visible_prompt_suggestion() {
+            return (text.into(), 0);
+        }
         let projection = self.paste_blocks.projection(
             self.editor.draft(),
             self.editor.cursor(),
@@ -7184,6 +7230,7 @@ impl State {
             .editor
             .apply_keeping_whole(command, &self.paste_blocks.ranges());
         if outcome == EditorOutcome::Changed {
+            self.clear_prompt_suggestion();
             self.retry_of = None;
             self.paste_blocks.reconcile(&before, self.editor.draft());
             self.snap_cursor_out_of_pasted_block(previous_cursor);
@@ -7592,6 +7639,18 @@ impl State {
     }
 
     fn navigate_menu_review(&mut self, action: DiffNavigationAction) {
+        if self.menu_plan {
+            let page = self.height.saturating_sub(3).max(1);
+            self.context_offset = match action {
+                DiffNavigationAction::Up => self.context_offset.saturating_sub(1),
+                DiffNavigationAction::Down => self.context_offset.saturating_add(1),
+                DiffNavigationAction::PageUp => self.context_offset.saturating_sub(page),
+                DiffNavigationAction::PageDown => self.context_offset.saturating_add(page),
+                DiffNavigationAction::Home => 0,
+                DiffNavigationAction::End => usize::MAX,
+            };
+            return;
+        }
         let Some(review_state) = &mut self.menu_review else {
             return;
         };
@@ -7947,6 +8006,9 @@ impl State {
     }
 
     fn paste(&mut self, text: &str) {
+        if self.ordinary_input_is_visible() {
+            self.clear_prompt_suggestion();
+        }
         if self.request_layout.is_some() && self.menu.is_none()
             || self.workspace_trust.is_some()
             || self.full_review
@@ -8732,6 +8794,9 @@ impl State {
         if key.kind == KeyEventKind::Release {
             return None;
         }
+        if self.ordinary_input_is_visible() && matches!(key.code, KeyCode::Char(_)) {
+            self.clear_prompt_suggestion();
+        }
         let dialog_height = self.input_dialog_body_height();
         if let Some(dialog) = &mut self.workspace_trust {
             if self.menu_submission_pending.is_some() {
@@ -8760,7 +8825,7 @@ impl State {
         }
         if key.code == KeyCode::Char('v')
             && key.modifiers == KeyModifiers::NONE
-            && self.menu_review.is_some()
+            && (self.menu_review.is_some() || self.menu_plan)
             && !self.menu_comment_is_editing()
         {
             self.full_review = true;
@@ -8927,6 +8992,20 @@ impl State {
                 _ => {}
             }
             return None;
+        }
+        if self.visible_prompt_suggestion().is_some()
+            && key.modifiers == KeyModifiers::NONE
+            && matches!(key.code, KeyCode::Tab | KeyCode::Right | KeyCode::Enter)
+        {
+            let text = self
+                .prompt_suggestion
+                .take()
+                .expect("visible suggestion exists");
+            self.clear_prompt_suggestion();
+            self.insert(&text);
+            if key.code != KeyCode::Enter {
+                return None;
+            }
         }
         if self.chat.is_some()
             && !self.tick_list.entries().is_empty()
@@ -9467,6 +9546,17 @@ impl State {
             return None;
         }
         let selected_comment = self.selected_menu_comment();
+        if self.menu_plan
+            && key.code == KeyCode::Enter
+            && self.selected_menu_accepts_comment()
+            && !self.menu_comment_is_editing()
+            && selected_comment.is_none()
+        {
+            if let Some(comment) = &mut self.menu_comment {
+                comment.editing = true;
+            }
+            return None;
+        }
         let direct_number_choices =
             self.picker_kind.is_none() && self.menu.as_ref().is_some_and(|menu| !menu.confirmation);
         let approval_review_available = self
@@ -9612,6 +9702,14 @@ impl State {
                 return None;
             }
             return Some(InputEvent::CycleExecutionMode);
+        }
+        if key.code == KeyCode::Esc
+            && self.ordinary_input_is_visible()
+            && (self.prompt_suggestion.is_some() || self.prompt_suggestion_request.is_some())
+        {
+            self.clear_prompt_suggestion();
+            self.escape_confirmation = None;
+            return None;
         }
         if key.code == KeyCode::Down && self.can_enter_footer() {
             self.apply_footer_action(FooterAction::Down);
@@ -11033,10 +11131,10 @@ mod tests {
         );
     }
 
-    struct InteractiveConsoleFixture(Console);
+    pub(super) struct InteractiveConsoleFixture(Console);
 
     impl InteractiveConsoleFixture {
-        fn new(state: State) -> Self {
+        pub(super) fn new(state: State) -> Self {
             assert!(state.interactive);
             let mut console = console_with_state(state);
             Arc::get_mut(&mut console._lifetime).unwrap().interactive = true;
@@ -13012,6 +13110,11 @@ mod tests {
                 menu.options,
                 ["Yes, enter plan mode", "No, start implementing now"]
             );
+            assert_eq!(
+                state.styled_frame().0[0].spans[0].role,
+                Some(Role::PlanMode)
+            );
+            assert!(state.menu_comment.is_none());
             let frame = state.frame().0.join("\n");
             assert!(
                 frame.contains(
@@ -18012,6 +18115,7 @@ mod tests {
                         "Output style",
                         "Permissions",
                         "Artifact Service",
+                        "Prompt suggestions",
                     ]
                 );
                 settings.id

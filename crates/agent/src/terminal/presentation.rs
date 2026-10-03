@@ -1924,6 +1924,7 @@ mod tests {
             version: 1,
             markdown: "private plan".into(),
             approved_execution_mode: None,
+            approval_pending: true,
         });
         snapshot.events.push(Event {
             sequence: 1,

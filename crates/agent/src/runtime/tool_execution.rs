@@ -449,7 +449,7 @@ impl Agent {
                 .await
                 .expect("registered interaction tool has a handler"),
             ToolRoute::Plan => self
-                .control_tool(receipt, &operation.name, &operation.input)
+                .control_tool(receipt, operation, cancel)
                 .await
                 .expect("registered plan tool has a handler"),
             ToolRoute::BuiltIn => unreachable!("built-in tools execute typed operations"),
@@ -742,6 +742,7 @@ impl Agent {
                 name == ENTER_PLAN_MODE_TOOL_NAME && execution_mode != ExecutionMode::Plan;
             let decision = match decision {
                 Decision::Deny => Decision::Deny,
+                _ if name == EXIT_PLAN_MODE_TOOL_NAME => Decision::Allow,
                 _ if requires_plan_mode_consent => Decision::Ask,
                 Decision::Ask
                     if execution_mode == ExecutionMode::Auto
@@ -1434,6 +1435,7 @@ impl Agent {
                             &prepared.name,
                             &prepared.input,
                             Some(&prepared),
+                            plan_file.as_deref(),
                         )
                         .map_err(ToolCallError::from)?;
                         let chat = chats.get_mut(&receipt.chat_id).unwrap();

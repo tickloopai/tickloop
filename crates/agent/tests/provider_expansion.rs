@@ -299,7 +299,7 @@ async fn kimi_code_403_reports_plan_quota_or_denial_without_remote_text() {
         (
             quota_body,
             ModelFailureKind::QuotaExhausted,
-            "model allowance is exhausted (HTTP 403): Kimi Code plan usage limit reached",
+            "model allowance is exhausted (HTTP 403): the Kimi Code plan has no allowance for this model",
         ),
         (
             denied_body,

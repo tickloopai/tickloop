@@ -53,6 +53,7 @@ pub(super) fn check_call(
     name: &str,
     input: &Value,
     prepared: Option<&PreparedTool>,
+    plan_file: Option<&std::path::Path>,
 ) -> Result<(), String> {
     let chat = chats.get(&receipt.chat_id).ok_or("chat is unavailable")?;
     let Some(delegation) = &chat.snapshot.delegation else {
@@ -117,10 +118,14 @@ pub(super) fn check_call(
             workdir: ceiling.workdir.clone(),
             additional_directories: ceiling.additional_directories.clone(),
         };
-        if !prepared.is_supported_in_delegated_scope(&workspace) {
+        let is_plan_file_access = plan_file.is_some_and(|path| prepared.accesses_file(path))
+            && (prepared.is_read_only || chat.snapshot.policy.mode == ExecutionMode::Plan);
+        if !is_plan_file_access && !prepared.is_supported_in_delegated_scope(&workspace) {
             return Err("Unsupported: the operation cannot be proven to stay within the delegated resource scope; unrestricted Shell is unavailable".into());
         }
-        if ceiling.policy.decide(prepared, &workspace, receipt.loop_id) == Decision::Deny {
+        if !is_plan_file_access
+            && ceiling.policy.decide(prepared, &workspace, receipt.loop_id) == Decision::Deny
+        {
             return Err("delegated authorization ceiling denies this operation".into());
         }
     }
@@ -197,7 +202,22 @@ impl Agent {
     ) -> Result<(), String> {
         let chats = self.inner.chats.lock().await;
         let sessions = self.inner.session_permissions.lock().await;
-        check_call(&chats, &sessions, receipt, name, input, prepared)
+        let plan_file = chats.get(&receipt.chat_id).and_then(|chat| {
+            super::plan::current_plan_file(
+                &chat.snapshot,
+                self.plans_directory(&chat.snapshot.workdir).path(),
+                receipt.loop_id,
+            )
+        });
+        check_call(
+            &chats,
+            &sessions,
+            receipt,
+            name,
+            input,
+            prepared,
+            plan_file.as_deref(),
+        )
     }
 
     pub(super) async fn check_delegated_user_shell(
@@ -253,6 +273,7 @@ impl Agent {
             &prepared.name,
             &prepared.input,
             Some(&prepared),
+            None,
         )
         .map_err(AgentError::Invalid)?;
         if delegation

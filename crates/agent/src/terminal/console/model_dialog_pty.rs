@@ -104,7 +104,7 @@ fn model_dialog_pty_fixture() {
                                 let menu = Menu { id: REQUEST, title: if question { "Question fixture" } else if trigger == "plan" { "Plan fixture" } else { "Permission fixture" }.into(), context: vec!["Controlled request".into()], options: vec!["Allow fixture".into(), "Deny fixture".into()], selected: 0, confirmation: !question };
                                 if question {
                                     console.show_question_menu(menu, QuestionMenu { entry_option: None, entry_text: String::new(), multi_select: false, navigable: false }).unwrap();
-                                } else if trigger == "plan" { console.show_plan_menu(menu).unwrap(); }
+                                } else if trigger == "plan" { console.show_plan_menu(menu, false).unwrap(); }
                                 else { console.show_focused_menu(menu).unwrap(); }
                                 chrome(&trigger);
                             }

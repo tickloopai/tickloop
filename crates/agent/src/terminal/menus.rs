@@ -46,6 +46,7 @@ use super::{
 pub(super) const REDUCE_MOTION_SETTING_INDEX: usize = 9;
 pub(super) const OUTPUT_STYLE_SETTING_INDEX: usize = 10;
 pub(super) const PERMISSIONS_SETTING_INDEX: usize = 11;
+const PROMPT_SUGGESTION_SETTING_INDEX: usize = 13;
 
 enum Selection {
     ArtifactSignOut {
@@ -295,7 +296,7 @@ impl Selection {
                 Some(request.id)
             }
             Self::Question(flow) => Some(flow.request().id),
-            Self::Workflow(Workflow::Plan { goal, .. }) => Some(*goal),
+            Self::Workflow(Workflow::Plan { goal, request, .. }) => Some(request.unwrap_or(*goal)),
             _ => None,
         }
     }
@@ -345,6 +346,12 @@ impl Selection {
     }
 }
 
+struct RestoredPlanApproval {
+    chat: Uuid,
+    loop_id: Uuid,
+    version: u64,
+}
+
 pub(super) struct Menus {
     active: Option<(Uuid, Selection)>,
     dialog_chat: Option<Uuid>,
@@ -358,6 +365,8 @@ pub(super) struct Menus {
     deferred_questions: HashSet<Uuid>,
     /// Answers typed so far, one line per question.
     typed_questions: HashMap<Uuid, QuestionFlow>,
+    restored_plans: HashMap<Uuid, RestoredPlanApproval>,
+    scanned_plan_executions: HashMap<Uuid, crate::agent_access::ExecutionRef>,
     user_settings: Option<UserSettings>,
     provider: providers::ProviderSession,
     config_root: Option<PathBuf>,
@@ -388,6 +397,8 @@ impl Menus {
             request_order: VecDeque::new(),
             deferred_questions: HashSet::new(),
             typed_questions: HashMap::new(),
+            restored_plans: HashMap::new(),
+            scanned_plan_executions: HashMap::new(),
             user_settings,
             provider: Default::default(),
             config_root: config_root.clone(),
@@ -841,10 +852,12 @@ impl Menus {
         }
         let id = menu.id;
         if console.is_interactive() {
-            let plan_dialog = matches!(&selection, Selection::Workflow(Workflow::Plan { .. }))
+            let plan_feedback = matches!(&selection, Selection::Workflow(Workflow::Plan { .. }));
+            let plan_dialog = plan_feedback
+                || matches!(&selection, Selection::Workflow(Workflow::PlanView { .. }))
                 || matches!(&selection, Selection::Permission { request, .. } if request.name == ENTER_PLAN_MODE_TOOL_NAME);
             if plan_dialog {
-                console.show_plan_menu(menu)?;
+                console.show_plan_menu(menu, plan_feedback)?;
             } else if matches!(&selection, Selection::Provider { .. }) {
                 console.show_picker_menu(menu, PickerKind::Provider)?;
             } else if matches!(
@@ -1230,7 +1243,7 @@ impl Menus {
             .await
             .map_err(|error| error.to_string())?;
         let mut context = vec![
-            "Model, Thinking, effort, persistent rules, output style, Glyph Set, reduced motion and status line position are saved in user settings; execution mode applies to this process.".into(),
+            "Model, Thinking, effort, persistent rules, output style, Glyph Set, reduced motion and prompt suggestions are saved in user settings; execution mode applies to this process.".into(),
             "Auto-scroll and Theme apply to this terminal session.".into(),
             safe_text(&format!(
                 "Current model: {}",
@@ -1327,6 +1340,14 @@ impl Menus {
                     format!("Output style: {}", self.saved_output_style().label()),
                     "Permissions".into(),
                     format!("Artifact Service: {artifact_account}"),
+                    format!(
+                        "Prompt suggestions: {}",
+                        if console.prompt_suggestion_enabled()? {
+                            "On"
+                        } else {
+                            "Off"
+                        }
+                    ),
                 ],
                 selected: 0,
                 confirmation: false,
@@ -1739,9 +1760,59 @@ impl Menus {
         pending: &HashMap<Uuid, Uuid>,
         questions: &HashMap<Uuid, QuestionRequest>,
     ) -> Result<(), String> {
+        if !console.is_interactive() {
+            return Ok(());
+        }
         self.sync_dialog_chat(console)?;
-        self.request_order
-            .retain(|(_, id)| pending.contains_key(id) || questions.contains_key(id));
+        for chat in family {
+            if let Some((execution, plans)) = agent.cached_pending_plan_approvals(*chat) {
+                self.restored_plans.retain(|_, request| {
+                    request.chat != *chat || plans.contains(&(request.loop_id, request.version))
+                });
+                if self.scanned_plan_executions.get(chat) == Some(&execution) {
+                    continue;
+                }
+                self.scanned_plan_executions.insert(*chat, execution);
+                self.restored_plans
+                    .retain(|_, request| request.chat != *chat);
+                for (goal, version) in plans {
+                    let request = Uuid::new_v4();
+                    self.restored_plans.insert(
+                        request,
+                        RestoredPlanApproval {
+                            chat: *chat,
+                            loop_id: goal,
+                            version,
+                        },
+                    );
+                    self.note_request(*chat, request);
+                }
+            }
+        }
+        self.request_order.retain(|(_, id)| {
+            pending.contains_key(id)
+                || questions.contains_key(id)
+                || self.restored_plans.contains_key(id)
+        });
+        if let Some((
+            _,
+            Selection::Workflow(Workflow::Plan {
+                chat,
+                goal,
+                version,
+                ..
+            }),
+        )) = &self.active
+            && family.contains(chat)
+            && agent.cached_plan_is_pending(*chat, *goal, *version) == Some(false)
+        {
+            let request = self
+                .active
+                .as_ref()
+                .and_then(|(_, selection)| selection.request_id());
+            self.request_order.retain(|(_, id)| Some(*id) != request);
+            self.dismiss(console)?;
+        }
         let queued = self
             .request_order
             .iter()
@@ -1750,7 +1821,17 @@ impl Menus {
         let active_unqueued = usize::from(
             self.active
                 .as_ref()
-                .and_then(|(_, selection)| selection.request_id())
+                .and_then(|(_, selection)| {
+                    selection.request_id().filter(|id| {
+                        pending.contains_key(id)
+                            || questions.contains_key(id)
+                            || self.restored_plans.contains_key(id)
+                            || matches!(
+                                selection,
+                                Selection::Workflow(Workflow::Plan { request: None, .. })
+                            )
+                    })
+                })
                 .is_some_and(|id| !self.request_order.iter().any(|(_, queued)| *queued == id)),
         );
         console.set_request_queue_count(queued + active_unqueued)?;
@@ -1770,7 +1851,7 @@ impl Menus {
         // Only an interactive View presents requests, and only ones already tracked from their
         // events; otherwise every family snapshot below would be read for nothing, once per event.
         if !console.is_interactive()
-            || pending.is_empty() && questions.is_empty()
+            || pending.is_empty() && questions.is_empty() && self.restored_plans.is_empty()
             || !console.can_present_request()?
         {
             return Ok(());
@@ -1827,6 +1908,8 @@ impl Menus {
                 && selection.chat() != chat
                 || matches!(selection, Selection::Permission { request, .. } | Selection::PermissionRule { request, .. } if !pending.contains_key(&request.id))
                 || matches!(selection, Selection::Question(flow) if !questions.contains_key(&flow.request().id));
+            let stale = stale
+                || matches!(selection, Selection::Workflow(Workflow::Plan { request: Some(request), .. }) if !pending.contains_key(request) && !self.restored_plans.contains_key(request));
             if stale {
                 self.dismiss(console)?;
             }
@@ -1836,7 +1919,7 @@ impl Menus {
                 .active
                 .as_ref()
                 .is_some_and(|(_, selection)| selection.request_id().is_some())
-            || pending.is_empty() && questions.is_empty()
+            || pending.is_empty() && questions.is_empty() && self.restored_plans.is_empty()
         {
             return Ok(());
         }
@@ -1851,9 +1934,36 @@ impl Menus {
                 .find(|(requester, id)| *requester == chat && !self.deferred_questions.contains(id))
                 .map(|(_, id)| *id);
             let requester = requester_label(agent, console, &snapshot).await;
+            let restored_request = self
+                .restored_plans
+                .iter()
+                .find(|(id, request)| {
+                    request.chat == chat && next_request.is_none_or(|next| next == **id)
+                })
+                .map(|(id, request)| (*id, request.loop_id));
+            if let Some((request, goal)) = restored_request {
+                let (mut menu, mut workflow) = Workflow::plan(agent, chat, goal).await?;
+                if let Workflow::Plan {
+                    request: current, ..
+                } = &mut workflow
+                {
+                    *current = Some(request);
+                }
+                if console.dialog_chat()? != Some(chat) {
+                    menu.title = format!("Plan approval · {requester}");
+                }
+                return self.workflow(console, (menu, workflow));
+            }
             if let Some(request) = snapshot.permissions.iter().find(|request| {
                 pending.contains_key(&request.id) && next_request.is_none_or(|id| id == request.id)
             }) {
+                if request.name == tickloop_agent::runtime::EXIT_PLAN_MODE_TOOL_NAME {
+                    let (mut menu, workflow) = Workflow::plan(agent, chat, request.loop_id).await?;
+                    if console.dialog_chat()? != Some(chat) {
+                        menu.title = format!("Plan approval · {requester}");
+                    }
+                    return self.workflow(console, (menu, workflow));
+                }
                 let goal = snapshot
                     .loops
                     .iter()
@@ -2268,7 +2378,9 @@ impl Menus {
                     }
                 },
                 Selection::Workflow(workflow) => {
-                    let effect = workflow.choose(agent, console, index).await?;
+                    let permission = match &workflow { Workflow::Plan { request, .. } => *request, _ => None };
+                    let effect = workflow.choose_with_feedback(agent, console, index, comment).await?;
+                    if let Some(request) = permission { self.restored_plans.remove(&request); }
                     if let Some(next) = effect.next {
                         self.workflow(console, next)?;
                     }
@@ -2277,6 +2389,7 @@ impl Menus {
                         self.edit_loop_timer(agent, console, chat, goal).await?;
                     }
                     return Ok(MenuOutcome {
+                        permission,
                         selection: effect.selection,
                         restored: effect.restored,
                         receipt: effect.receipt,
@@ -2590,6 +2703,13 @@ impl Menus {
                     self.settings(agent, console, target).await?;
                 },
                 Selection::Settings { target } => match index {
+                    Some(PROMPT_SUGGESTION_SETTING_INDEX) => {
+                        let enabled = !console.prompt_suggestion_enabled()?;
+                        self.user_settings.as_ref().ok_or("cannot save prompt suggestions because the user settings directory is unavailable")?
+                            .save_prompt_suggestion_enabled(enabled).map_err(|error| error.to_string())?;
+                        console.set_prompt_suggestion_enabled(enabled)?;
+                        self.settings(agent, console, target).await?;
+                    }
                     Some(0) => self.models(agent, console, target).await?,
                     Some(1) => {
                         let configuration = agent.configuration(target).await.map_err(|error| error.to_string())?;

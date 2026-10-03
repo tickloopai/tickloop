@@ -79,15 +79,16 @@ impl CommandSpec {
             .then_some(OVERVIEW_AGENT_COMMAND),
             CommandScope::Child => match self.command {
                 "/clear" | "/branch" | "/rewind" | "/compact" => Some(CHILD_HISTORY_FIXED),
-                "/mode" | "/plan" | "/rule" | "/add-dir" | "/approve-plan" => {
-                    Some(CHILD_AUTHORIZATION_FIXED)
-                }
+                "/mode" | "/rule" | "/add-dir" => Some(CHILD_AUTHORIZATION_FIXED),
                 _ => None,
             },
         }
     }
 
     pub(super) fn description_in(&self, scope: CommandScope) -> String {
+        if scope == CommandScope::Child && self.command == "/plan" {
+            return "Reopens a pending approval or views a saved plan; entering Plan mode is fixed by parent.".into();
+        }
         if scope == CommandScope::Child && self.command == "/permissions" {
             return "Shows current mode and recent activity; child permissions are read-only."
                 .into();
@@ -304,12 +305,6 @@ const COMMANDS: &[CommandSpec] = &[
         command: "/search-config",
         arguments: "FILE|off",
         description: "Configures or disables web search.",
-        menu_group: Some(CommandGroup::Advanced),
-    },
-    CommandSpec {
-        command: "/approve-plan",
-        arguments: "GOAL VERSION MODE",
-        description: "Approves a saved plan version for later execution.",
         menu_group: Some(CommandGroup::Advanced),
     },
     CommandSpec {
@@ -617,13 +612,13 @@ mod tests {
         let mut completion = Completion::default();
         completion.update("/");
         assert_eq!(completion.candidates().len(), 23);
-        assert_eq!(builtin_commands().len(), 44);
+        assert_eq!(builtin_commands().len(), 43);
         assert_eq!(
             builtin_commands()
                 .iter()
                 .filter(|spec| spec.menu_group == Some(CommandGroup::Advanced))
                 .count(),
-            21
+            20
         );
         assert_eq!(completion.selected_index(), None);
         for command in [

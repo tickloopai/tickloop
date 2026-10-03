@@ -1011,7 +1011,7 @@ mod tests {
         [
             event("response.created", 0, json!({"response":{"id":"resp-1","status":"in_progress"}})),
             event("response.output_item.added", 1, json!({"output_index":0,"item":{"type":"reasoning","id":"rs-1","summary":[]}})),
-            event("response.reasoning_summary_text.delta", 2, json!({"output_index":0,"item_id":"rs-1","delta":"Considering"})),
+            event("response.reasoning_summary_text.delta", 2, json!({"output_index":0,"item_id":"rs-1","summary_index":0,"delta":"Considering"})),
             event("response.output_item.done", 3, json!({"output_index":0,"item":reasoning})),
             event("response.output_item.added", 4, json!({"output_index":1,"item":{"type":"message","id":"msg-1","role":"assistant","status":"in_progress","content":[]}})),
             event("response.output_text.delta", 5, json!({"output_index":1,"item_id":"msg-1","content_index":0,"delta":"Hello from Codex"})),
@@ -2021,7 +2021,7 @@ mod tests {
         let partial = [
             event("response.created", 0, json!({"response":{"id":"sse-partial","status":"in_progress"}})),
             event("response.output_item.added", 1, json!({"output_index":0,"item":{"type":"reasoning","id":"rs-partial","summary":[]}})),
-            event("response.reasoning_summary_text.delta", 2, json!({"output_index":0,"item_id":"rs-partial","delta":"Thinking"})),
+            event("response.reasoning_summary_text.delta", 2, json!({"output_index":0,"item_id":"rs-partial","summary_index":0,"delta":"Thinking"})),
         ].concat();
         let (endpoint, captured) = serve_scripted_responses(vec![(200, partial)]).await;
         let client = CodexModelClient::new(config, &state_dir)
@@ -2094,6 +2094,226 @@ mod tests {
                 .unwrap(),
             Err(ModelError::Cancelled)
         ));
+    }
+
+    #[tokio::test]
+    async fn codex_raw_reasoning_prefix_completion_delivers_normal_answers_and_rejects_conflicts() {
+        let (_directory, state_dir) = state_with_credentials();
+        let config = ModelCatalog::defaults()
+            .profiles()
+            .into_iter()
+            .find(|profile| profile.provider == ModelProvider::OpenAiCodex)
+            .unwrap();
+        for added_prefix in [true, false] {
+            for completed in ["Thinking", "Contradictory"] {
+                let (endpoint, captured) = serve_scripted_responses(vec![(
+                    200,
+                    crate::terminal::model_http_support::raw_reasoning_prefix_reply(
+                        added_prefix,
+                        completed,
+                        false,
+                    ),
+                )])
+                .await;
+                let client = CodexModelClient::new(config.clone(), &state_dir)
+                    .unwrap()
+                    .with_loopback_test_endpoint(endpoint.as_str())
+                    .unwrap();
+                let (events, mut deltas) = tokio::sync::mpsc::unbounded_channel();
+                let result = client
+                    .complete(simple_request(), events, CancellationToken::new())
+                    .await;
+                captured.await.unwrap();
+                if completed == "Contradictory" {
+                    assert!(matches!(result, Err(ModelError::InvalidResponse(_))));
+                    continue;
+                }
+                let output = result.expect("Codex reasoning prefixes must allow a normal answer");
+                let mut thinking = String::new();
+                let mut text = String::new();
+                while let Ok(delta) = deltas.try_recv() {
+                    match delta {
+                        ModelDelta::Thinking(value) => thinking.push_str(&value),
+                        ModelDelta::Text(value) => text.push_str(&value),
+                        _ => {}
+                    }
+                }
+                assert_eq!(thinking, "Thinking");
+                assert_eq!(text, "Answer");
+                assert!(
+                    matches!(&output.content[0], Content::ProtocolData { value, .. } if value["content"][0]["text"] == "Thinking" && value["encrypted_content"] == "opaque-fixture")
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn prompt_suggestion_codex_completion_only_reasoning_hits_budget_before_terminal_event() {
+        for phase in ["added", "done"] {
+            let (_directory, state_dir) = state_with_credentials();
+            let config = ModelCatalog::defaults()
+                .profiles()
+                .into_iter()
+                .find(|profile| profile.provider == ModelProvider::OpenAiCodex)
+                .unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}/codex/responses", listener.local_addr().unwrap());
+            let (started, received) = oneshot::channel();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                read_request(&mut socket).await;
+                let reasoning = json!({"type":"reasoning","id":"rs-completion-only","summary":[{"type":"summary_text","text":"x".repeat(2_048)}],"encrypted_content":"opaque-fixture"});
+                let mut initial = reasoning.clone();
+                if phase == "done" {
+                    initial["summary"] = json!([]);
+                }
+                let mut stream = event(
+                    "response.created",
+                    0,
+                    json!({"response":{"id":"completion-only","status":"in_progress"}}),
+                );
+                stream.push_str(&event(
+                    "response.output_item.added",
+                    1,
+                    json!({"output_index":0,"item":initial}),
+                ));
+                if phase == "done" {
+                    stream.push_str(&event(
+                        "response.output_item.done",
+                        2,
+                        json!({"output_index":0,"item":reasoning}),
+                    ));
+                }
+                socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n").await.unwrap();
+                socket.write_all(stream.as_bytes()).await.unwrap();
+                started.send(()).unwrap();
+                let mut byte = [0];
+                let closed =
+                    tokio::time::timeout(Duration::from_secs(2), socket.read(&mut byte)).await;
+                assert!(
+                    matches!(closed, Ok(Ok(0)) | Ok(Err(_))),
+                    "budget must close completion-only transport"
+                );
+            });
+            let budget = super::super::GenerationBudget::new(1_024, Duration::from_secs(10));
+            let client = CodexModelClient::new(config, &state_dir)
+                .unwrap()
+                .with_loopback_test_endpoint(&endpoint)
+                .unwrap();
+            let cancel = CancellationToken::new();
+            let request_cancel = cancel.clone();
+            let generation = tokio::spawn(async move {
+                budget
+                    .complete(
+                        &client,
+                        uuid::Uuid::new_v4(),
+                        simple_request(),
+                        request_cancel,
+                    )
+                    .await
+            });
+            received.await.unwrap();
+            let result = tokio::time::timeout(Duration::from_millis(500), generation).await;
+            assert!(
+                result.is_ok(),
+                "{phase}: completion-only reasoning bypassed budget"
+            );
+            assert!(matches!(
+                result.unwrap().unwrap(),
+                Err(ModelError::ResponseRejected(
+                    ModelResponseRejection::OutputLimit
+                ))
+            ));
+            assert!(cancel.is_cancelled());
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn prompt_suggestion_codex_budget_cuts_text_reasoning_and_deadline_transports() {
+        for kind in ["text", "thinking", "deadline"] {
+            let (_directory, state_dir) = state_with_credentials();
+            let config = ModelCatalog::defaults()
+                .profiles()
+                .into_iter()
+                .find(|profile| profile.provider == ModelProvider::OpenAiCodex)
+                .unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}/codex/responses", listener.local_addr().unwrap());
+            let (started, received) = oneshot::channel();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let (_, body) = read_request(&mut socket).await;
+                assert!(body.get("max_output_tokens").is_none());
+                assert!(body.get("tools").is_none());
+                socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n").await.unwrap();
+                let mut stream = event(
+                    "response.created",
+                    0,
+                    json!({"response":{"id":"bounded","status":"in_progress"}}),
+                );
+                if kind == "text" {
+                    stream.push_str(&event("response.output_item.added", 1, json!({"output_index":0,"item":{"type":"message","id":"msg-bounded","role":"assistant","content":[]}})));
+                    stream.push_str(&event("response.content_part.added", 2, json!({"output_index":0,"item_id":"msg-bounded","content_index":0,"part":{"type":"output_text","text":"","annotations":[]}})));
+                    stream.push_str(&event("response.output_text.delta", 3, json!({"output_index":0,"item_id":"msg-bounded","content_index":0,"delta":"x".repeat(1_024)})));
+                } else if kind == "thinking" {
+                    stream.push_str(&event("response.output_item.added", 1, json!({"output_index":0,"item":{"type":"reasoning","id":"rs-bounded","summary":[]}})));
+                    stream.push_str(&event(
+                        "response.reasoning_summary_text.delta",
+                        2,
+                        json!({"output_index":0,"item_id":"rs-bounded","summary_index":0,"delta":"x".repeat(1_024)}),
+                    ));
+                }
+                socket.write_all(stream.as_bytes()).await.unwrap();
+                started.send(()).unwrap();
+                let mut byte = [0];
+                let closed =
+                    tokio::time::timeout(Duration::from_secs(2), socket.read(&mut byte)).await;
+                assert!(
+                    matches!(closed, Ok(Ok(0)) | Ok(Err(_))),
+                    "budget must close Codex transport"
+                );
+            });
+            let deadline = if kind == "deadline" {
+                Duration::from_millis(100)
+            } else {
+                Duration::from_secs(10)
+            };
+            let budget = super::super::GenerationBudget::new(1_024, deadline);
+            let client = CodexModelClient::new(budget.apply_model_limit(config), &state_dir)
+                .unwrap()
+                .with_loopback_test_endpoint(&endpoint)
+                .unwrap();
+            let cancel = CancellationToken::new();
+            let request_cancel = cancel.clone();
+            let generation = tokio::spawn(async move {
+                budget
+                    .complete(
+                        &client,
+                        uuid::Uuid::new_v4(),
+                        simple_request(),
+                        request_cancel,
+                    )
+                    .await
+            });
+            received.await.unwrap();
+            let result = tokio::time::timeout(Duration::from_millis(500), generation)
+                .await
+                .unwrap()
+                .unwrap();
+            if kind == "deadline" {
+                assert!(matches!(result, Err(ModelError::TimedOut)));
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(ModelError::ResponseRejected(
+                        ModelResponseRejection::OutputLimit
+                    ))
+                ));
+            }
+            assert!(cancel.is_cancelled());
+            server.await.unwrap();
+        }
     }
 
     #[tokio::test]

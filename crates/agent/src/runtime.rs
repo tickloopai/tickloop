@@ -2842,6 +2842,7 @@ impl Agent {
             &operation.name,
             &operation.input,
             None,
+            None,
         )?;
         let chat = chats.get_mut(&receipt.chat_id).unwrap();
         let current_session_operation = SessionPermissionOperation::from_normalized(
@@ -3222,41 +3223,41 @@ impl Agent {
             .iter_mut()
             .find(|goal| goal.id == receipt.loop_id)
             .unwrap();
-        let event = match result {
-            _ if matches!(goal.state, LoopState::Stopped | LoopState::Expired) => {
-                EventKind::Interrupted
-            }
-            Ok(usage) if !cancel.is_cancelled() => {
-                goal.set_state(
-                    if chat.snapshot.policy.mode == ExecutionMode::Plan
-                        && chat.snapshot.plans.iter().any(|plan| {
-                            plan.loop_id == receipt.loop_id
-                                && plan.approved_execution_mode.is_none()
-                        })
-                    {
-                        LoopState::WaitingPlan
-                    } else if goal.trigger.as_ref().is_some_and(|trigger| trigger.armed)
-                        || goal.event_sources.iter().any(|source| {
-                            source.association_epoch.is_some() && !source.resume_required
-                        })
-                    {
-                        LoopState::WaitingTrigger
-                    } else {
-                        LoopState::Completed
-                    },
-                );
-                EventKind::Completed { usage }
-            }
-            _ if cancel.is_cancelled() => {
-                goal.set_state(LoopState::Interrupted);
-                EventKind::Interrupted
-            }
-            Err(error) => {
-                goal.set_state(LoopState::Failed);
-                EventKind::Failed(error)
-            }
-            Ok(_) => unreachable!(),
-        };
+        let event =
+            match result {
+                _ if matches!(goal.state, LoopState::Stopped | LoopState::Expired) => {
+                    EventKind::Interrupted
+                }
+                Ok(usage) if !cancel.is_cancelled() => {
+                    goal.set_state(
+                        if chat.snapshot.policy.mode == ExecutionMode::Plan
+                            && chat.snapshot.plans.iter().any(|plan| {
+                                plan.loop_id == receipt.loop_id && plan.approval_pending
+                            })
+                        {
+                            LoopState::WaitingPlan
+                        } else if goal.trigger.as_ref().is_some_and(|trigger| trigger.armed)
+                            || goal.event_sources.iter().any(|source| {
+                                source.association_epoch.is_some() && !source.resume_required
+                            })
+                        {
+                            LoopState::WaitingTrigger
+                        } else {
+                            LoopState::Completed
+                        },
+                    );
+                    EventKind::Completed { usage }
+                }
+                _ if cancel.is_cancelled() => {
+                    goal.set_state(LoopState::Interrupted);
+                    EventKind::Interrupted
+                }
+                Err(error) => {
+                    goal.set_state(LoopState::Failed);
+                    EventKind::Failed(error)
+                }
+                Ok(_) => unreachable!(),
+            };
         let is_deliverable = chat
             .snapshot
             .loops
@@ -3922,6 +3923,18 @@ impl Agent {
         comment: Option<String>,
         persistent_specifier: Option<String>,
     ) -> Result<(), AgentError> {
+        if allow {
+            let chats = self.inner.chats.lock().await;
+            if chats.get(&chat_id).is_some_and(|chat| {
+                chat.snapshot.permissions.iter().any(|request| {
+                    request.id == request_id && request.name == EXIT_PLAN_MODE_TOOL_NAME
+                })
+            }) {
+                return Err(AgentError::Invalid(
+                    "choose an execution mode in the plan approval dialog".into(),
+                ));
+            }
+        }
         if scope != PermissionScope::Once {
             let chats = self.inner.chats.lock().await;
             let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;

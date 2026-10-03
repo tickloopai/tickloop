@@ -32,6 +32,39 @@ const COMMAND_OUTPUT_PAGE_BYTES: usize = 16 * 1024;
 const PROCESS_LOCAL_TASKS_NOTE: &str =
     "Shell tasks and their output are available only in this process; a restart clears them.";
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum PlanApprovalChoice {
+    Auto,
+    Ask,
+    FullAccess,
+    KeepPlanning,
+}
+
+pub(super) const PLAN_APPROVAL_CHOICES: [PlanApprovalChoice; 4] = [
+    PlanApprovalChoice::Auto,
+    PlanApprovalChoice::Ask,
+    PlanApprovalChoice::FullAccess,
+    PlanApprovalChoice::KeepPlanning,
+];
+
+impl PlanApprovalChoice {
+    pub(super) fn option_index(self) -> usize {
+        PLAN_APPROVAL_CHOICES
+            .iter()
+            .position(|choice| *choice == self)
+            .expect("every plan choice is listed")
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Approve and start · Auto",
+            Self::Ask => "Approve and start · Ask",
+            Self::FullAccess => "Approve and start · Full Access",
+            Self::KeepPlanning => "No, keep planning",
+        }
+    }
+}
+
 pub(super) enum Workflow {
     Chats {
         choices: Vec<Uuid>,
@@ -58,6 +91,10 @@ pub(super) enum Workflow {
         chat: Uuid,
         goal: Uuid,
         version: u64,
+        request: Option<Uuid>,
+    },
+    PlanView {
+        chat: Uuid,
     },
 }
 
@@ -100,7 +137,8 @@ impl Workflow {
             | Self::Goal { chat, .. }
             | Self::Commands { chat, .. }
             | Self::Command { chat, .. }
-            | Self::Plan { chat, .. } => Some(*chat),
+            | Self::Plan { chat, .. }
+            | Self::PlanView { chat } => Some(*chat),
         }
     }
 
@@ -306,18 +344,27 @@ impl Workflow {
             context.push(format!("Already approved with mode: {mode}"));
         }
         context.extend(safe_text(&plan.markdown).split('\n').map(str::to_owned));
-        context.push(
-            "Approve and start submits this goal for execution using the reviewed version.".into(),
-        );
+        if !plan.approval_pending {
+            return Ok((
+                menu("Saved plan", context, vec!["Close".into()]),
+                Self::PlanView { chat },
+            ));
+        }
+        let request = snapshot
+            .permissions
+            .iter()
+            .find(|request| {
+                request.name == tickloop_agent::runtime::EXIT_PLAN_MODE_TOOL_NAME
+                    && request.loop_id == goal
+            })
+            .map(|request| request.id);
         let mut menu = menu(
-            "Review plan",
+            "Plan approval",
             context,
-            vec![
-                "Approve and start · Auto".into(),
-                "Approve and start · Ask".into(),
-                "Approve and start · Full Access".into(),
-                "Keep planning".into(),
-            ],
+            PLAN_APPROVAL_CHOICES
+                .iter()
+                .map(|choice| choice.label().into())
+                .collect(),
         );
         menu.confirmation = true;
         Ok((
@@ -326,18 +373,42 @@ impl Workflow {
                 chat,
                 goal,
                 version: plan.version,
+                request,
             },
         ))
     }
 
+    #[cfg(test)]
     pub(super) async fn choose(
         self,
         agent: &Agent,
         console: &Console,
         index: Option<usize>,
     ) -> Result<WorkflowEffect, String> {
+        self.choose_with_feedback(agent, console, index, None).await
+    }
+
+    pub(super) async fn choose_with_feedback(
+        self,
+        agent: &Agent,
+        console: &Console,
+        index: Option<usize>,
+        feedback: Option<String>,
+    ) -> Result<WorkflowEffect, String> {
         let Some(index) = index else {
             let mut effect = WorkflowEffect::default();
+            if let Self::Plan {
+                chat,
+                goal,
+                version,
+                ..
+            } = self
+            {
+                agent
+                    .decline_plan(chat, goal, version, None)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
             if let Self::Goal { chat, .. } = self {
                 effect.next = Some(Self::goals(agent, chat).await?);
             }
@@ -345,6 +416,7 @@ impl Workflow {
         };
         let mut effect = WorkflowEffect::default();
         match self {
+            Self::PlanView { .. } => {}
             Self::Chats {
                 choices,
                 as_new_chat,
@@ -579,13 +651,17 @@ impl Workflow {
                 chat,
                 goal,
                 version,
+                ..
             } => {
-                let mode = match index {
-                    0 => ExecutionMode::Auto,
-                    1 => ExecutionMode::AcceptEdits,
-                    2 => ExecutionMode::FullAccess,
-                    3 => {
-                        console.write("\nPlan kept for review. Enter the revisions you want.\n")?;
+                let mode = match PLAN_APPROVAL_CHOICES.get(index) {
+                    Some(PlanApprovalChoice::Auto) => ExecutionMode::Auto,
+                    Some(PlanApprovalChoice::Ask) => ExecutionMode::AcceptEdits,
+                    Some(PlanApprovalChoice::FullAccess) => ExecutionMode::FullAccess,
+                    Some(PlanApprovalChoice::KeepPlanning) => {
+                        effect.receipt = agent
+                            .decline_plan(chat, goal, version, feedback)
+                            .await
+                            .map_err(|error| error.to_string())?;
                         return Ok(effect);
                     }
                     _ => return Err("Invalid plan selection.".into()),
@@ -594,11 +670,13 @@ impl Workflow {
                     .approve_plan(chat, goal, version, mode)
                     .await
                     .map_err(|error| error.to_string())?;
-                let receipt=agent.submit(chat,Some(goal),approval).await
-                    .map_err(|error|format!("Plan version {version} was approved, but execution could not start: {error}"))?;
+                if let Some(approval) = approval {
+                    let receipt=agent.submit(chat,Some(goal),approval).await
+                        .map_err(|error|format!("Plan version {version} was approved, but execution could not start: {error}"))?;
+                    effect.receipt = Some(receipt);
+                }
                 console.write(&format!("\nPlan version {version} approved. Starting this goal with {mode} permissions.\n"))?;
                 effect.selection = Some((chat, Some(goal)));
-                effect.receipt = Some(receipt);
             }
         }
         Ok(effect)
@@ -1018,7 +1096,7 @@ pub(super) fn write_public_history(console: &Console, chat: &ChatSnapshot) -> Re
         })
         && let EventKind::Completed { usage } = event.kind
     {
-        super::write_completion_notice(console, &usage)?;
+        super::write_completion_notice(console, &usage, None)?;
     }
     console.replay_execution_losses(chat.id)?;
     Ok(())
@@ -2123,13 +2201,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn plan_selection_approves_only_reviewed_version_then_starts_same_goal() {
+    async fn plan_selection_approves_only_reviewed_version_then_continues_same_run() {
         let directory = tempfile::tempdir().unwrap();
         let model = Arc::new(support::ScriptedModel::new(vec![
             support::submit_plan("p1", "Read notes first."),
-            support::text("Plan ready."),
             support::submit_plan("p2", "Read notes and summarize."),
-            support::text("Revised plan ready."),
             support::text("Approved implementation finished."),
         ]));
         let agent = Agent::new_embedded(support::config(), model.clone());
@@ -2139,31 +2215,47 @@ mod tests {
             .await
             .unwrap();
         let mut events = agent.subscribe();
-        let first = agent
+        let run = agent
             .submit(chat, None, "Prepare a plan.".into())
             .await
             .unwrap();
-        completed(&mut events).await;
-        let (stale_menu, stale) = Workflow::plan(&agent, chat, first.loop_id).await.unwrap();
+        async fn approval(
+            events: &mut tokio::sync::broadcast::Receiver<tickloop_agent::runtime::Event>,
+        ) {
+            loop {
+                match support::next_event(events).await.kind {
+                    EventKind::PermissionRequested { request }
+                        if request.name == tickloop_agent::runtime::EXIT_PLAN_MODE_TOOL_NAME =>
+                    {
+                        return;
+                    }
+                    EventKind::Failed(error) => panic!("{error}"),
+                    _ => {}
+                }
+            }
+        }
+        approval(&mut events).await;
+        let (stale_menu, stale) = Workflow::plan(&agent, chat, run.loop_id).await.unwrap();
         assert_eq!(
-            stale_menu
-                .options
-                .iter()
-                .map(String::as_str)
-                .collect::<Vec<_>>(),
+            stale_menu.options,
             [
                 "Approve and start · Auto",
                 "Approve and start · Ask",
                 "Approve and start · Full Access",
-                "Keep planning",
+                "No, keep planning"
             ]
         );
-        agent
-            .submit(chat, Some(first.loop_id), "Revise it.".into())
-            .await
-            .unwrap();
-        completed(&mut events).await;
         let (console, _) = Console::start(false).unwrap();
+        let (_, review) = Workflow::plan(&agent, chat, run.loop_id).await.unwrap();
+        assert!(
+            review
+                .choose_with_feedback(&agent, &console, Some(3), Some("Add the summary.".into()))
+                .await
+                .unwrap()
+                .receipt
+                .is_none()
+        );
+        approval(&mut events).await;
         assert!(
             stale
                 .choose(&agent, &console, Some(0))
@@ -2172,24 +2264,10 @@ mod tests {
                 .unwrap()
                 .contains("revised")
         );
-        assert_eq!(model.requests.lock().unwrap().len(), 4);
-        let unapproved = agent.snapshot(chat).await.unwrap();
-        assert_eq!(unapproved.policy.mode, ExecutionMode::Plan);
-        assert!(unapproved.plans[0].approved_execution_mode.is_none());
-        let (_, review) = Workflow::plan(&agent, chat, first.loop_id).await.unwrap();
-        assert!(
-            review
-                .choose(&agent, &console, Some(3))
-                .await
-                .unwrap()
-                .receipt
-                .is_none()
-        );
-        assert_eq!(model.requests.lock().unwrap().len(), 4);
-        let (_, current) = Workflow::plan(&agent, chat, first.loop_id).await.unwrap();
+        assert_eq!(model.requests.lock().unwrap().len(), 2);
+        let (_, current) = Workflow::plan(&agent, chat, run.loop_id).await.unwrap();
         let effect = current.choose(&agent, &console, Some(0)).await.unwrap();
-        assert!(effect.restored.is_none());
-        assert_eq!(effect.receipt.unwrap().loop_id, first.loop_id);
+        assert!(effect.receipt.is_none());
         completed(&mut events).await;
         let snapshot = agent.snapshot(chat).await.unwrap();
         assert_eq!(snapshot.plans[0].version, 2);
@@ -2197,23 +2275,12 @@ mod tests {
             snapshot.plans[0].approved_execution_mode,
             Some(ExecutionMode::Auto)
         );
+        assert_eq!(snapshot.loops[0].run_id, Some(run.run_id));
         let requests = model.requests.lock().unwrap().clone();
-        assert_eq!(requests.len(), 5);
-        let plan_file = support::reminded_plan_file(&requests[2]).unwrap();
-        let start = requests[4]
-            .messages
-            .iter()
-            .rev()
-            .find(|message| message.role == Role::User)
-            .unwrap();
-        assert_eq!(
-            start.content,
-            [Content::Text {
-                text: format!(
-                    "User has approved your plan. You can now start coding. Start with updating your todo list if applicable\n\nYour plan has been saved to: {plan_file}\nYou can refer back to it if needed during implementation.\n\n## Approved Plan:\nRead notes and summarize."
-                )
-            }]
-        );
+        assert_eq!(requests.len(), 3);
+        assert!(requests[2].messages.iter().flat_map(|message| &message.content).any(|content| matches!(content, Content::ToolResult {tool_use_id, content, is_error:false} if tool_use_id == "p2" && content.text().contains("User has approved your plan.") && content.text().ends_with("Read notes and summarize."))));
+        let (saved, _) = Workflow::plan(&agent, chat, run.loop_id).await.unwrap();
+        assert_eq!(saved.options, ["Close"]);
         agent.shutdown().await;
     }
 

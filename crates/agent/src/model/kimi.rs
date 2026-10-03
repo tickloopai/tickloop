@@ -7,9 +7,10 @@ use super::ModelError;
 const ACCESS_TERMINATED: &str = "access_terminated_error";
 const USAGE_LIMIT_PHRASE: &str = "usage limit";
 
-/// Kimi Code reports an exhausted plan allowance as HTTP 403 `access_terminated_error`, the same
-/// type it uses for other access denials, so only the message distinguishes them (observed with
-/// a real Kimi Code OAuth account on 2026-10-07).
+/// Kimi Code answers HTTP 403 `access_terminated_error` with a "monthly usage limit" message both
+/// when the plan allowance is spent and when the plan does not include the requested model
+/// (observed with a real Kimi Code OAuth account whose plan excludes K3, 2026-10-07). The same
+/// type also covers other access denials, so only the message identifies the allowance case.
 pub(super) fn http_error(status: u16, body: Option<&Value>) -> Option<ModelError> {
     let error = body?.get("error")?;
     let reports_usage_limit = error["type"].as_str() == Some(ACCESS_TERMINATED)
@@ -18,7 +19,7 @@ pub(super) fn http_error(status: u16, body: Option<&Value>) -> Option<ModelError
             .is_some_and(|message| message.to_ascii_lowercase().contains(USAGE_LIMIT_PHRASE));
     reports_usage_limit.then(|| ModelError::QuotaExhausted {
         status,
-        description: ": Kimi Code plan usage limit reached; wait for the next billing cycle or add quota at kimi.com/membership".into(),
+        description: ": the Kimi Code plan has no allowance for this model; it may not include the model or its usage limit is reached (see kimi.com/membership)".into(),
     })
 }
 

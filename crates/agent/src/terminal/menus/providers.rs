@@ -85,6 +85,7 @@ mod tests {
                         chat,
                         goal: request,
                         version: 1,
+                        request: None,
                     },
                 ),
             )

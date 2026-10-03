@@ -158,10 +158,11 @@ pub(crate) struct LoopRecord {
     pub trigger_awaits_resume: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub event_sources: Vec<serde_json::Value>,
-    /// 写入时该 Loop 的计划版本。只在对话链上缺少之前的计划工具调用时写出（Loop 首次写入
-    /// 当前链段，例如压缩、rewind 截断、Branch 与 `--fork-session` 之后），恢复时与链上的调用取较大值。
+    /// The submitted version is durable before the approval tool receives its result.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_version: Option<u64>,
+    #[serde(default)]
+    pub plan_approval_pending: bool,
     /// 与 `plan_version` 同时写出的进度步骤（原始 JSON）；链上之后的进度工具调用覆盖它。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub progress: Option<serde_json::Value>,
@@ -172,10 +173,9 @@ pub(crate) struct LoopRecord {
 }
 
 impl LoopRecord {
-    /// 不含计划与进度的 Loop 状态，用于判断 Loop 本身是否变化。
-    pub(crate) fn without_plan(&self) -> Self {
+    /// Progress remains a separate checkpoint; plan changes are part of the Loop state.
+    pub(crate) fn without_progress(&self) -> Self {
         Self {
-            plan_version: None,
             progress: None,
             ..self.clone()
         }

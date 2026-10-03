@@ -1925,7 +1925,7 @@ async fn terminal_reviews_and_approves_a_specific_plan_version_before_writing() 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
-        for turn in 0..5 {
+        for turn in 0..4 {
             let (mut socket, _) = listener.accept().await.unwrap();
             let request = read_request(&mut socket).await.to_string();
             let body = match turn {
@@ -1942,8 +1942,7 @@ async fn terminal_reviews_and_approves_a_specific_plan_version_before_writing() 
                     .replace("tool-fixture", "plan-file-tool")
                 }
                 1 => tool_stream("ExitPlanMode", json!({})).replace("tool-fixture", "plan-tool"),
-                2 => messages_stream("The plan is ready for review."),
-                3 => tool_stream(
+                2 => tool_stream(
                     "Write",
                     json!({"file_path":"reviewed.txt","content":"approved plan result"}),
                 )
@@ -1977,15 +1976,11 @@ async fn terminal_reviews_and_approves_a_specific_plan_version_before_writing() 
         .await
         .unwrap();
     let mut transcript = String::new();
-    let mut goal = String::new();
     tokio::time::timeout(INTERACTION_TIMEOUT, async {
         loop {
             let line = output.next_line().await.unwrap().unwrap();
-            if let Some(value) = line.strip_prefix("Goal: ") {
-                goal = value.split_whitespace().next().unwrap().to_owned();
-            }
             transcript.push_str(&line);
-            if line.starts_with("Reply completed") {
+            if line.contains("No, keep planning") {
                 break;
             }
         }
@@ -1994,13 +1989,7 @@ async fn terminal_reviews_and_approves_a_specific_plan_version_before_writing() 
     .unwrap();
     assert!(transcript.contains("Create reviewed.txt with the approved result."));
     assert!(!directory.path().join("reviewed.txt").exists());
-    input
-        .write_all(
-            format!("/approve-plan {goal} 1 acceptEdits\nProceed with the approved plan\n")
-                .as_bytes(),
-        )
-        .await
-        .unwrap();
+    input.write_all(b"2\n").await.unwrap();
     drop(input);
     tokio::time::timeout(INTERACTION_TIMEOUT, async {
         while let Some(line) = output.next_line().await.unwrap() {
