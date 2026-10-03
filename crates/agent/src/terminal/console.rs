@@ -5043,7 +5043,6 @@ impl State {
             && self.conversation_picker.is_none()
             && self.artifacts_picker.is_none()
             && self.task_surface.is_none()
-            && self.todo_detail.is_none()
             && self.history_search.is_none()
             && self.permissions_surface.is_none()
             && self.subscription_surface.is_none()

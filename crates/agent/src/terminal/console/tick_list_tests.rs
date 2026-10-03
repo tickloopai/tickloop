@@ -763,7 +763,7 @@ fn history_search_keeps_focus_on_right_and_shift_arrows() {
 }
 
 #[test]
-fn todo_detail_keeps_focus_on_right_and_shift_arrows() {
+fn passive_todos_allow_tick_list_focus_on_right_and_shift_arrows() {
     for key in [
         KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
         KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT),
@@ -774,20 +774,33 @@ fn todo_detail_keeps_focus_on_right_and_shift_arrows() {
         state
             .tick_list
             .replace(TickGroup::Shells, vec![shell(Uuid::new_v4(), "Task")]);
-        state.todo_detail = Some(TodoDetail {
-            ordinal: 1,
-            item: StatusItem {
-                id: "1".into(),
-                task_id: None,
-                can_stop: false,
-                title: "details".into(),
-                state: "pending",
-                role: Role::MutedText,
-            },
-            offset: 0,
-        });
+        let console = tests::console_with_state(state);
+        console
+            .update_status_area(
+                "Auto".into(),
+                "fixture".into(),
+                None,
+                Vec::new(),
+                vec![StatusItem {
+                    id: "1".into(),
+                    task_id: None,
+                    can_stop: false,
+                    title: "own passive todo".into(),
+                    state: "pending",
+                    role: Role::MutedText,
+                }],
+            )
+            .unwrap();
+        let mut state = console.state.lock().unwrap();
+        state.draw(&mut io::sink()).unwrap();
+        assert!(
+            state
+                .rendered_screen
+                .iter()
+                .any(|row| row.contains("own passive todo"))
+        );
         state.key(key);
-        assert!(!state.tick_list.focused);
+        assert!(state.tick_list.focused);
     }
 }
 
