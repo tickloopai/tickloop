@@ -1240,9 +1240,11 @@ async fn interact(
     let mut artifact_loads = tokio::task::JoinSet::new();
     let mut suggestions: tokio::task::JoinSet<(
         prompt_suggestion::SuggestionRequest,
-        Option<String>,
+        prompt_suggestion::SuggestionResult,
     )> = tokio::task::JoinSet::new();
     let mut suggestible_runs = HashSet::new();
+    let mut suggestion_diagnostics: HashMap<uuid::Uuid, (uuid::Uuid, &'static str)> =
+        HashMap::new();
     let mut artifact_refresh = tokio::time::interval(std::time::Duration::from_millis(50));
     artifact_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut login: Option<LoginFlow> = None;
@@ -1887,10 +1889,28 @@ async fn interact(
                 if let Some(Ok((request, result))) = result { console.artifact_page_loaded(&request, result)?; }
             },
             result = suggestions.join_next(), if !suggestions.is_empty() => {
-                if let Some(Ok((request, text))) = result {
-                    let text = if selected_chat == Some(request.chat) && !overview_active
-                        && agent.snapshot(request.chat).await.is_ok_and(|snapshot| prompt_suggestion::eligible(&snapshot)) { text } else { None };
-                    console.finish_prompt_suggestion(&request, text)?;
+                if let Some(Ok((request, mut result))) = result {
+                    let suppression = if selected_chat != Some(request.chat) || overview_active {
+                        Some("discarded: Agent View changed")
+                    } else {
+                        match agent.snapshot(request.chat).await {
+                            Ok(snapshot) => prompt_suggestion::suppression(&snapshot)
+                                .or(console.prompt_suggestion_suppression()?),
+                            Err(_) => Some("discarded: Agent unavailable"),
+                        }
+                    };
+                    if result.text.is_some() && let Some(reason) = suppression {
+                        result.text = None;
+                        result.diagnostic = reason;
+                    } else if request.cancel.is_cancelled() && result.text.is_some() {
+                        result.text = None;
+                        result.diagnostic = "cancelled";
+                    }
+                    if let Some((id, diagnostic)) = suggestion_diagnostics.get_mut(&request.chat)
+                        && *id == request.id {
+                        *diagnostic = result.diagnostic;
+                    }
+                    console.finish_prompt_suggestion(&request, result.text)?;
                 }
             },
             result = menus.next_discovery(), if discovery_active => {
@@ -2670,6 +2690,12 @@ async fn interact(
                             if let Some(chat)=selected_chat {
                                 let snapshot=agent.snapshot(chat).await.map_err(|error|error.to_string())?;
                                 outln!(console,"Chat {} · {} · {:?} · {} · {} queued",chat,safe_text(&snapshot.model.model),snapshot.model.protocol,snapshot.policy.mode,snapshot.queued_inputs().len());
+                                if console.prompt_suggestion_enabled()? {
+                                    let diagnostic = prompt_suggestion::suppression(&snapshot)
+                                        .map(str::to_owned)
+                                        .unwrap_or_else(|| format!("last: {}", suggestion_diagnostics.get(&chat).map_or("not generated in this View", |(_, reason)| *reason)));
+                                    outln!(console, "Prompt suggestions: On · {diagnostic}");
+                                } else { outln!(console, "Prompt suggestions: Off"); }
                             } else {outln!(console,"No Chat is selected.");}
                         },
                         "/resume" => match Workflow::chats(agent,&workdir,selected_chat,false).await {
@@ -3435,19 +3461,30 @@ async fn interact(
                                 Some(completion_details(observed_run_starts.get(&event.run_id).map(std::time::Instant::elapsed), &local_completion_time(), shells))
                             } else { None };
                             write_completion_notice(console, &usage, details.as_deref())?;
-                            if suggestible_runs.remove(&event.run_id) && interactive
-                                && let Ok(snapshot) = agent.snapshot(event.chat_id).await
-                                && prompt_suggestion::eligible(&snapshot)
-                                && let Some(request) = console.begin_prompt_suggestion(event.chat_id)? {
-                                let root = config_root.clone();
-                                suggestions.spawn(async move {
-                                    let text = prompt_suggestion::generate(&request, &snapshot, root).await;
-                                    (request, text)
-                                });
+                            if suggestible_runs.remove(&event.run_id) && interactive {
+                                if let Ok(snapshot) = agent.snapshot(event.chat_id).await {
+                                    if let Some(reason) = prompt_suggestion::suppression(&snapshot) {
+                                        suggestion_diagnostics.insert(event.chat_id, (event.run_id, reason));
+                                    } else if let Some(request) = console.begin_prompt_suggestion(event.chat_id)? {
+                                        suggestion_diagnostics.insert(event.chat_id, (request.id, "generating"));
+                                        let root = config_root.clone();
+                                        suggestions.spawn(async move {
+                                            let result = prompt_suggestion::generate(&request, &snapshot, root).await;
+                                            (request, result)
+                                        });
+                                    } else {
+                                        let reason = console.prompt_suggestion_suppression()?.unwrap_or("suppressed: Agent View changed");
+                                        suggestion_diagnostics.insert(event.chat_id, (event.run_id, reason));
+                                    }
+                                } else {
+                                    suggestion_diagnostics.insert(event.chat_id, (event.run_id, "suppressed: Agent unavailable"));
+                                }
                             }
                         },
                         EventKind::Failed(error) => {
-                            suggestible_runs.remove(&event.run_id);
+                            if suggestible_runs.remove(&event.run_id) {
+                                suggestion_diagnostics.insert(event.chat_id, (event.run_id, "suppressed: failed turn"));
+                            }
                             let message = if interactive {
                                 format!(
                                     "{} Failed: {}",
@@ -3475,7 +3512,9 @@ async fn interact(
                             }
                         },
                         EventKind::Interrupted => {
-                            suggestible_runs.remove(&event.run_id);
+                            if suggestible_runs.remove(&event.run_id) {
+                                suggestion_diagnostics.insert(event.chat_id, (event.run_id, "suppressed: interrupted turn"));
+                            }
                             let snapshot=agent.snapshot(event.chat_id).await.map_err(|error|error.to_string())?;
                             let stopped=snapshot.loops.iter().any(|goal|goal.id==event.loop_id&&goal.state==tickloop_agent::runtime::LoopState::Stopped);
                             if interactive && !stopped {

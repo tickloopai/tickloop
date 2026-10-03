@@ -11,6 +11,16 @@ impl Console {
             .prompt_suggestion_enabled)
     }
 
+    pub(in crate::terminal) fn prompt_suggestion_suppression(
+        &self,
+    ) -> Result<Option<&'static str>, String> {
+        Ok(self
+            .state
+            .lock()
+            .map_err(|error| error.to_string())?
+            .prompt_suggestion_suppression())
+    }
+
     pub(in crate::terminal) fn set_prompt_suggestion_enabled(
         &self,
         enabled: bool,
@@ -87,19 +97,33 @@ impl State {
     }
 
     fn can_show_prompt_suggestion(&self) -> bool {
-        self.interactive
-            && self.prompt_suggestion_enabled
-            && self.chat.is_some()
-            && !self.visible_delegated
-            && self.ordinary_input_is_visible()
-            && !self.input_dialog_visible()
-            && self.request_layout.is_none()
-            && !self.conversation_focused
-            && !self.footer_list_focused
-            && !self.tick_list.focused
-            && self.editor.draft().is_empty()
-            && self.restored_contexts.is_empty()
-            && self.paste_blocks.images("").is_empty()
+        self.prompt_suggestion_suppression().is_none()
+    }
+
+    fn prompt_suggestion_suppression(&self) -> Option<&'static str> {
+        if !self.interactive {
+            Some("suppressed: noninteractive View")
+        } else if !self.prompt_suggestion_enabled {
+            Some("suppressed: setting Off")
+        } else if self.chat.is_none() {
+            Some("suppressed: no selected Agent")
+        } else if self.visible_delegated {
+            Some("suppressed: delegated Agent (return to Main)")
+        } else if !self.ordinary_input_is_visible()
+            || self.input_dialog_visible()
+            || self.request_layout.is_some()
+        {
+            Some("suppressed: input hidden or Input Dialog active")
+        } else if self.conversation_focused || self.footer_list_focused || self.tick_list.focused {
+            Some("suppressed: input unfocused")
+        } else if !self.editor.draft().is_empty()
+            || !self.restored_contexts.is_empty()
+            || !self.paste_blocks.images("").is_empty()
+        {
+            Some("suppressed: draft or attachments present")
+        } else {
+            None
+        }
     }
 
     pub(super) fn visible_prompt_suggestion(&self) -> Option<&str> {

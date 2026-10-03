@@ -135,7 +135,7 @@ async fn prompt_suggestion_responses_completion_reasoning_is_bounded_without_cou
         let request = request();
         let output = generate(&request, &context, None).await;
         assert_eq!(
-            output.is_some(),
+            output.text.is_some(),
             accepted,
             "bytes={bytes}, prefix={prefix_bytes:?}"
         );
@@ -255,7 +255,7 @@ async fn prompt_suggestion_compaction_then_provider_switch_never_resends_sensiti
             .flat_map(|message| &message.content)
             .any(|content| matches!(content, Content::Text { text } if text.contains(ORIGINAL)))
     );
-    assert!(generate(&request(), &snapshot, None).await.is_some());
+    assert!(generate(&request(), &snapshot, None).await.text.is_some());
     let (_, suggestion) = captured.recv().await.unwrap();
     assert!(
         !suggestion.to_string().contains(ORIGINAL),
@@ -306,7 +306,9 @@ async fn prompt_suggestion_openai_stream_hits_the_output_budget_before_the_deadl
         result.is_ok(),
         "stream budget must cancel before the ten-second deadline"
     );
-    assert!(result.unwrap().unwrap().is_none());
+    let result = result.unwrap().unwrap();
+    assert!(result.text.is_none());
+    assert_eq!(result.diagnostic, "failed: output budget reached");
     assert!(request.cancel.is_cancelled());
     server.await.unwrap();
 }
@@ -341,6 +343,7 @@ async fn prompt_suggestion_http_uses_current_model_without_tools_or_private_hist
     assert_eq!(
         generate(&request(), &snapshot(model, messages).await, None)
             .await
+            .text
             .as_deref(),
         Some("进度怎么样了")
     );
@@ -379,6 +382,7 @@ async fn prompt_suggestion_http_filters_meta_errors_formatting_and_tool_proposal
         assert!(
             generate(&request(), &snapshot(model, conversation()).await, None)
                 .await
+                .text
                 .is_none(),
             "{text}"
         );
@@ -389,6 +393,7 @@ async fn prompt_suggestion_http_filters_meta_errors_formatting_and_tool_proposal
     assert!(
         generate(&request(), &snapshot(model, conversation()).await, None)
             .await
+            .text
             .is_none()
     );
 }
@@ -418,7 +423,16 @@ async fn prompt_suggestion_http_cancellation_and_deadline_drop_a_delayed_result(
         } else {
             request.cancel.cancel();
         }
-        assert!(generation.await.unwrap().is_none());
+        let result = generation.await.unwrap();
+        assert!(result.text.is_none());
+        assert_eq!(
+            result.diagnostic,
+            if timeout {
+                "failed: generation deadline"
+            } else {
+                "cancelled"
+            }
+        );
         assert!(request.cancel.is_cancelled());
         drop(release);
         if timeout {
@@ -428,15 +442,42 @@ async fn prompt_suggestion_http_cancellation_and_deadline_drop_a_delayed_result(
 }
 
 #[tokio::test]
+async fn prompt_suggestion_diagnostics_distinguish_empty_filtered_and_incomplete_results() {
+    for (text, stop, diagnostic, expected) in [
+        ("", "end_turn", "no obvious continuation", None),
+        ("无建议", "end_turn", "rejected: suggestion text", None),
+        (
+            "查看说明文件",
+            "max_tokens",
+            "failed: output budget reached",
+            None,
+        ),
+        (
+            "查看说明文件",
+            "end_turn",
+            "generated",
+            Some("查看说明文件"),
+        ),
+    ] {
+        let (url, received) =
+            http::serve_response(200, response(json!({"type":"text","text":text}), stop)).await;
+        let mut model = test_support::config();
+        model.base_url = url;
+        let result = generate(&request(), &snapshot(model, conversation()).await, None).await;
+        assert_eq!(result.diagnostic, diagnostic);
+        assert_eq!(result.text.as_deref(), expected);
+        received.await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn prompt_suggestion_http_errors_are_silent_and_pre_cancelled_requests_never_connect() {
-    let (url, received) = http::serve_response(500, "fixture failure".into()).await;
+    let (url, received) = http::serve_response(500, "fixture private error payload".into()).await;
     let mut model = test_support::config();
     model.base_url = url;
-    assert!(
-        generate(&request(), &snapshot(model, conversation()).await, None)
-            .await
-            .is_none()
-    );
+    let result = generate(&request(), &snapshot(model, conversation()).await, None).await;
+    assert!(result.text.is_none());
+    assert_eq!(result.diagnostic, "failed: Provider request");
     received.await.unwrap();
     let (url, mut received) = http::serve_response(
         200,
@@ -450,6 +491,7 @@ async fn prompt_suggestion_http_errors_are_silent_and_pre_cancelled_requests_nev
     assert!(
         generate(&request, &snapshot(model, conversation()).await, None)
             .await
+            .text
             .is_none()
     );
     assert!(matches!(

@@ -17,9 +17,26 @@ fn prompt_suggestion_pty_fixture() {
                 .build()
                 .unwrap()
                 .block_on(async {
-                    let mut model = crate::terminal::test_support::config();
+                    let user_case = directory.join("user-case").exists();
+                    let mut model = if user_case {
+                        tickloop_agent::model::cards::ModelCatalog::defaults()
+                            .get("kimi-cn-api", "kimi-k3")
+                            .unwrap()
+                    } else {
+                        crate::terminal::test_support::config()
+                    };
                     model.base_url = std::fs::read_to_string(directory.join("model-url")).unwrap();
-                    let replies = if directory.join("fail-turn").exists() {
+                    model.api_key_env.clear();
+                    let replies = if user_case {
+                        vec![
+                            crate::terminal::test_support::call("delegate", "DelegateAgent", serde_json::json!({"task":"Complete the fixture child"})),
+                            crate::terminal::test_support::text("Child completed."),
+                            crate::terminal::test_support::text("Parent completed."),
+                            crate::terminal::test_support::call("ls", "Bash", serde_json::json!({"command":"ls", "description":"List files in current directory"})),
+                            crate::terminal::test_support::text("当前目录包含 settings.json 和 model-url。"),
+                            crate::terminal::test_support::text("Accepted fixture prompt."),
+                        ]
+                    } else if directory.join("fail-turn").exists() {
                         vec![]
                     } else {
                         vec![
@@ -37,7 +54,20 @@ fn prompt_suggestion_pty_fixture() {
                         core.clone(),
                         model.clone(),
                     );
-                    let chat = agent.create_chat(directory.clone()).await.unwrap();
+                    let mut chat = agent.create_chat(directory.clone()).await.unwrap();
+                    if user_case {
+                        core.set_execution_mode(chat, tickloop_agent::permissions::ExecutionMode::Auto).await.unwrap();
+                        let mut events = core.subscribe();
+                        let receipt = core.submit(chat, None, "Complete the fixture family".into()).await.unwrap();
+                        loop {
+                            let event = crate::terminal::test_support::next_event(&mut events).await;
+                            assert!(!matches!(event.kind, tickloop_agent::runtime::EventKind::Failed(_)), "{event:?}");
+                            if event.run_id == receipt.run_id && matches!(event.kind, tickloop_agent::runtime::EventKind::Completed { .. }) { break; }
+                        }
+                        let child = agent.catalog().await.unwrap().into_iter().find(|row| row.parent.is_some()).unwrap();
+                        assert_eq!(child.state, tickloop_agent::runtime::LoopState::Completed);
+                        if directory.join("delegated-view").exists() { chat = child.chat_id; }
+                    }
                     if directory.join("plan-mode").exists() {
                         agent
                             .set_execution_mode(
@@ -64,7 +94,7 @@ fn prompt_suggestion_pty_fixture() {
                     )
                     .unwrap();
                     console.set_prompt_enabled(true).unwrap();
-                    crate::terminal::interact(
+                    let interaction = crate::terminal::interact(
                         &agent,
                         directory.clone(),
                         &console,
@@ -76,9 +106,23 @@ fn prompt_suggestion_pty_fixture() {
                             )),
                         },
                         Some(directory.clone()),
-                    )
-                    .await
-                    .unwrap();
+                    );
+                    tokio::pin!(interaction);
+                    let mut inspection = tokio::time::interval(Duration::from_millis(10));
+                    loop {
+                        tokio::select! {
+                            result = &mut interaction => { result.unwrap(); break; },
+                            _ = inspection.tick() => {
+                                let state = console.state.lock().unwrap();
+                                std::fs::write(directory.join("editor-state.tmp"), serde_json::to_vec(&serde_json::json!({
+                                    "draft": state.editor.draft(),
+                                    "suggestion": state.visible_prompt_suggestion(),
+                                    "pending": state.prompt_suggestion_request.is_some(),
+                                })).unwrap()).unwrap();
+                                std::fs::rename(directory.join("editor-state.tmp"), directory.join("editor-state")).unwrap();
+                            }
+                        }
+                    }
                     let prompts = scripted
                         .requests
                         .lock()
@@ -183,6 +227,139 @@ async fn prompt_suggestion_pty_generates_ghost_without_submitting_until_accepted
         prompts.iter().any(|prompt| prompt == "进度怎么样了 再检查"),
         "{prompts:?}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prompt_suggestion_pty_chinese_bash_kimi_with_completed_child_shows_and_tab_accepts() {
+    let body = concat!(
+        "data: {\"id\":\"fixture\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"用户在查看目录，接下来可能查看说明。\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"fixture\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"查看 README.md\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"fixture\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let (url, request) = suggestion_http::serve_response(200, body.into()).await;
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("model-url"), url).unwrap();
+    std::fs::write(directory.path().join("user-case"), "").unwrap();
+    let mut fixture = Fixture::start(
+        directory.path(),
+        110,
+        32,
+        "terminal::console::prompt_suggestion_pty::prompt_suggestion_pty_fixture",
+    );
+    fixture.wait(|frame| frame.contains("Chat:") && frame.contains("kimi-k3"));
+    fixture.send("列出当前目录下的文件\r".as_bytes());
+    let frame = fixture.wait(|frame| frame.contains("查看 README.md"));
+    assert!(
+        frame.contains("Done") && frame.contains("Bash") && frame.contains("Subagents 1"),
+        "{frame}"
+    );
+    let editor = || {
+        serde_json::from_slice::<serde_json::Value>(
+            &std::fs::read(directory.path().join("editor-state")).unwrap(),
+        )
+        .unwrap()
+    };
+    fixture.wait(|_| editor()["suggestion"] == "查看 README.md");
+    assert_eq!(editor()["draft"], "");
+    let (_, body) = tokio::time::timeout(TIMEOUT, request)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(body["model"], "kimi-k3");
+    assert_eq!(body["max_completion_tokens"], 1_024);
+    assert!(body.get("tools").is_none());
+    assert!(body.to_string().contains("列出当前目录下的文件"));
+    fixture.send(b"\t");
+    fixture.wait(|_| editor()["draft"] == "查看 README.md" && editor()["suggestion"].is_null());
+    fixture.send(" 再检查\r".as_bytes());
+    fixture.wait(|frame| frame.contains("Accepted fixture prompt."));
+    fixture.send(b"/exit\r");
+    let deadline = Instant::now() + TIMEOUT;
+    while fixture.child.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "{}", fixture.frame());
+        thread::sleep(Duration::from_millis(15));
+    }
+    let prompts: Vec<String> =
+        serde_json::from_slice(&std::fs::read(directory.path().join("submitted-prompts")).unwrap())
+            .unwrap();
+    assert!(
+        prompts
+            .iter()
+            .any(|prompt| prompt == "查看 README.md 再检查"),
+        "{prompts:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prompt_suggestion_pty_delegated_chinese_bash_explains_suppression_without_request() {
+    let (url, request) = suggestion_http::serve_response(200, String::new()).await;
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("model-url"), url).unwrap();
+    std::fs::write(directory.path().join("user-case"), "").unwrap();
+    std::fs::write(directory.path().join("delegated-view"), "").unwrap();
+    let mut fixture = Fixture::start(
+        directory.path(),
+        110,
+        32,
+        "terminal::console::prompt_suggestion_pty::prompt_suggestion_pty_fixture",
+    );
+    fixture.wait(|frame| frame.contains("Chat:") && frame.contains("kimi-k3"));
+    fixture.send("列出当前目录下的文件\r".as_bytes());
+    let frame = fixture.wait(|frame| frame.contains("Done") && frame.contains("当前目录包含"));
+    assert!(frame.contains("Bash"), "{frame}");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), request)
+            .await
+            .is_err()
+    );
+    fixture.send(b"\t");
+    let editor: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(directory.path().join("editor-state")).unwrap())
+            .unwrap();
+    assert_eq!(editor["draft"], "");
+    assert!(editor["suggestion"].is_null());
+    fixture.send(b"/status\r");
+    fixture.wait(|frame| frame.contains("Prompt suggestions: On · suppressed: delegated Agent"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prompt_suggestion_pty_provider_failure_is_quiet_and_status_has_no_private_payload() {
+    let (url, mut requests, release) = suggestion_http::serve_responses_with_gated_response(
+        vec![(500, "private provider error payload".into())],
+        0,
+    )
+    .await;
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("model-url"), url).unwrap();
+    std::fs::write(directory.path().join("user-case"), "").unwrap();
+    let mut fixture = Fixture::start(
+        directory.path(),
+        110,
+        32,
+        "terminal::console::prompt_suggestion_pty::prompt_suggestion_pty_fixture",
+    );
+    fixture.wait(|frame| frame.contains("Chat:") && frame.contains("kimi-k3"));
+    fixture.send("列出当前目录下的文件\r".as_bytes());
+    requests.recv().await.unwrap();
+    let editor = || {
+        serde_json::from_slice::<serde_json::Value>(
+            &std::fs::read(directory.path().join("editor-state")).unwrap(),
+        )
+        .unwrap()
+    };
+    fixture.wait(|_| editor()["pending"] == true);
+    release.send(()).unwrap();
+    let frame = fixture.wait(|frame| frame.contains("Done") && editor()["pending"] == false);
+    assert!(editor()["suggestion"].is_null());
+    assert!(
+        !frame.contains("failed: Provider") && !frame.contains("private provider"),
+        "{frame}"
+    );
+    fixture.send(b"/status\r");
+    let frame = fixture
+        .wait(|frame| frame.contains("Prompt suggestions: On · last: failed: Provider request"));
+    assert!(!frame.contains("private provider"), "{frame}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
