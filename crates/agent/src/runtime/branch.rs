@@ -272,6 +272,7 @@ impl Agent {
         };
         let client = source.client.clone();
         let mut snapshot = ChatSnapshot {
+            tool_call_recoveries: Vec::new(),
             artifact_ticks: source.snapshot.artifact_ticks.clone(),
             request_usage: RequestUsageLedger::new(),
             id: child_chat_id,

@@ -577,6 +577,8 @@ pub struct LiveChatSnapshot {
     pub pending_inputs: Vec<PendingInput>,
     pub pending_commands: Vec<PendingCommand>,
     pub operations: Vec<OperationRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_call_recoveries: Vec<runtime::ToolCallRecovery>,
     pub events: Vec<Event>,
     pub pending_thinking: BTreeMap<Uuid, String>,
     pub pending_model: Option<ModelConfig>,
@@ -618,6 +620,7 @@ impl LiveChatSnapshot {
             pending_inputs: snapshot.pending_inputs.clone(),
             pending_commands: snapshot.pending_commands.clone(),
             operations: snapshot.operations.clone(),
+            tool_call_recoveries: snapshot.tool_call_recoveries.clone(),
             events: snapshot.events.clone(),
             pending_thinking: snapshot.pending_thinking.clone(),
             pending_model: snapshot.pending_model.clone(),
@@ -662,6 +665,7 @@ impl LiveChatSnapshot {
         snapshot.pending_inputs = self.pending_inputs;
         snapshot.pending_commands = self.pending_commands;
         snapshot.operations = self.operations;
+        snapshot.tool_call_recoveries = self.tool_call_recoveries;
         snapshot.events = self.events;
         snapshot.pending_thinking = self.pending_thinking;
         snapshot.pending_model = self.pending_model;

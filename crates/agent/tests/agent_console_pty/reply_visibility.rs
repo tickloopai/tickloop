@@ -650,3 +650,167 @@ async fn actual_cli_interrupted_unadmitted_calls_keep_their_state_in_an_attached
         std::panic::resume_unwind(panic);
     }
 }
+
+async fn interrupted_state_survives_event_eviction(fixture: &PrivateFixture) {
+    const CALL: &str = "RETENTION-CALL";
+    const QUEUED_QUESTION: &str = "RETENTION-QUEUED-QUESTION";
+    const FLOOD_EVENTS: usize = 1100;
+    let marker = fixture.path("retention-marker");
+    let mut deltas = vec![json!({"role":"assistant"})];
+    deltas.extend((0..FLOOD_EVENTS).map(|_| json!({"content":"."})));
+    deltas.push(json!({"content":"RETENTION-FLOOD-DONE"}));
+    let proposal = streamed_reply(
+        vec![
+            json!({"role":"assistant","content":"RETENTION-REPLY","tool_calls":[
+                {"index":0,"id":"retention-call","type":"function","function":{"name":"Bash","arguments":json!({"command":format!("printf forbidden > {}",marker.display()),"description":CALL}).to_string()}},
+                {"index":1,"id":"retention-question","type":"function","function":{"name":"AskUserQuestion","arguments":json!({"questions":[{"question":QUEUED_QUESTION,"header":"Choose","options":[{"label":"One","description":"First"},{"label":"Two","description":"Second"}]}]}).to_string()}}
+            ]}),
+        ],
+        "tool_calls",
+    );
+    let (url, _) = model_http_support::serve_responses(vec![
+        (200, proposal),
+        (200, streamed_reply(deltas, "stop")),
+    ])
+    .await;
+    fixture.set_chat_model(&url);
+    let mut view = PtyView::start_with_flags(fixture, &["--mode", "ask"]);
+    view.wait_for("retention View ready", new_input_is_visible)
+        .await;
+    view.resize(120, 60).await;
+    view.send(b"Retention probe\r");
+    view.wait_for("retention call waits for permission", |frame| {
+        frame.contains(CALL) && frame.contains("Queued")
+    })
+    .await;
+    let client = fixture.client().await;
+    let execution = catalog(&client).await[0].execution;
+    let before = wait_snapshot(
+        &client,
+        execution,
+        "retention permission exists",
+        |snapshot| snapshot.permissions.len() == 1,
+    )
+    .await;
+    let interrupted_run = before.permissions[0].run_id;
+    client
+        .execute(CommandEnvelope {
+            owner_epoch: client.owner_epoch(),
+            command_id: uuid::Uuid::new_v4(),
+            command: AgentCommand::ManageLoop {
+                execution,
+                action: LoopAction::Interrupt,
+            },
+        })
+        .await
+        .unwrap();
+    view.wait_for("live retention header stops", |frame| {
+        conversation_body(frame)
+            .lines()
+            .any(|line| line.contains(CALL) && line.contains("Stopped"))
+    })
+    .await;
+    client
+        .execute(CommandEnvelope {
+            owner_epoch: client.owner_epoch(),
+            command_id: uuid::Uuid::new_v4(),
+            command: AgentCommand::Submit {
+                execution,
+                target_loop: None,
+                input: UserInput::Text {
+                    text: "Roll event log".into(),
+                    contexts: vec![],
+                    paths: vec![],
+                },
+                origin: None,
+            },
+        })
+        .await
+        .unwrap();
+    let evicted = wait_snapshot(
+        &client,
+        execution,
+        "old Run is evicted after the other Loop completes",
+        |snapshot| {
+            snapshot.conversation.loops.iter().any(|goal| {
+                goal.run_id != Some(interrupted_run)
+                    && goal.state == tickloop_agent::runtime::LoopState::Completed
+            }) && !snapshot
+                .events
+                .iter()
+                .any(|event| event.run_id == interrupted_run)
+        },
+    )
+    .await;
+    assert_eq!(evicted.events.len(), 1024);
+    assert!(
+        evicted
+            .tool_call_recoveries
+            .iter()
+            .any(|fact| fact.run_id == Some(interrupted_run)
+                && fact.call_id == "retention-call"
+                && fact.was_admitted == Some(false))
+    );
+    assert!(
+        evicted
+            .tool_call_recoveries
+            .iter()
+            .any(|fact| fact.run_id == Some(interrupted_run)
+                && fact.call_id == "retention-question"
+                && fact.was_admitted.is_none())
+    );
+    let original = view
+        .wait_for("original header remains Stopped after eviction", |frame| {
+            frame.contains("RETENTION-FLOOD-DONE")
+                && conversation_body(frame)
+                    .lines()
+                    .any(|line| line.contains(CALL) && line.contains("Stopped"))
+        })
+        .await;
+    assert!(!marker.exists());
+    let title = catalog(&client).await[0].title.clone();
+    let mut attached = PtyView::start(fixture);
+    attached
+        .wait_for("retention attached View ready", new_input_is_visible)
+        .await;
+    attached.resize(120, 60).await;
+    attached.send(b"\x1b[D");
+    attached
+        .wait_for("Agents lists retained execution", |frame| {
+            frame.contains("Agents · local") && frame.contains(&title)
+        })
+        .await;
+    select_overview_row(&mut attached, &title).await;
+    attached.send(b"\r");
+    let restored = attached
+        .wait_for(
+            "attached retention header remains Stopped without its events",
+            |frame| {
+                !frame.contains("Agents · local")
+                    && conversation_body(frame)
+                        .lines()
+                        .any(|line| line.contains(CALL) && line.contains("Stopped"))
+                    && conversation_body(frame)
+                        .lines()
+                        .any(|line| line.contains(QUEUED_QUESTION) && line.contains("Stopped"))
+            },
+        )
+        .await;
+    assert_eq!(tool_header_count(&restored, "Bash"), 1);
+    assert_eq!(tool_header_count(&restored, "AskUserQuestion"), 1);
+    eprintln!("[retention live]\n{original}\n[retention attached]\n{restored}");
+    attached.close().await;
+    view.close().await;
+}
+
+#[tokio::test]
+async fn actual_cli_interrupted_state_survives_bounded_event_log_eviction() {
+    let fixture = PrivateFixture::new();
+    let result = AssertUnwindSafe(interrupted_state_survives_event_eviction(&fixture))
+        .catch_unwind()
+        .await;
+    fixture.shutdown().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}

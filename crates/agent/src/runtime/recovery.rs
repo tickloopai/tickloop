@@ -82,6 +82,23 @@ pub(super) fn close_dangling_tool_calls(
             .as_ref()
             .map(|operation| operation.run_id)
             .or(call.run_id);
+        if recorded.as_ref().is_none_or(|operation| {
+            !matches!(
+                operation.state,
+                OperationState::Completed | OperationState::Failed
+            )
+        }) {
+            snapshot.tool_call_recoveries.push(super::ToolCallRecovery {
+                run_id: result_run,
+                call_id: call.call_id.clone(),
+                was_admitted: recorded.as_ref().map(|operation| {
+                    matches!(
+                        operation.state,
+                        OperationState::Admitted | OperationState::Unknown
+                    )
+                }),
+            });
+        }
         let result = match recorded {
             Some(operation) if matches!(operation.state, OperationState::Completed | OperationState::Failed) => operation.result.clone().ok_or_else(|| AgentError::Invalid(format!("completed operation {} has no durable result", operation.id)))?,
             Some(operation) if matches!(operation.state, OperationState::Admitted | OperationState::Unknown) => {

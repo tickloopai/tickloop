@@ -598,8 +598,20 @@ pub(super) fn tool_call_states(snapshot: &ChatSnapshot) -> HashMap<(Uuid, String
             }
         }
     }
-    // Interruption can synthesize ToolResults without admission. Observed
-    // transitions take precedence over the message-only saved-history fallback.
+    for recovery in &snapshot.tool_call_recoveries {
+        if let Some(run) = recovery.run_id {
+            states.insert(
+                (run, recovery.call_id.clone()),
+                if recovery.was_admitted == Some(true) {
+                    ToolCallState::Finished
+                } else {
+                    ToolCallState::Stopped
+                },
+            );
+        }
+    }
+    // Recorded recovery facts survive eviction of the event replay. ToolResults
+    // synthesized for interruption are not evidence of admission/completion.
     for event in &snapshot.events {
         match &event.kind {
             EventKind::AssistantMessageCommitted { tool_calls, .. } => {

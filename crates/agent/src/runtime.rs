@@ -312,6 +312,8 @@ impl LoopSnapshot {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ChatSnapshot {
+    #[serde(skip)]
+    pub tool_call_recoveries: Vec<ToolCallRecovery>,
     #[serde(default)]
     pub artifact_ticks: Vec<crate::artifacts::ArtifactTick>,
     /// 本进程内的请求用量账本（不持久化，照 Claude Code 用量只记在 assistant 消息上）。
@@ -545,6 +547,13 @@ pub struct OperationRecord {
     pub file_change: Option<crate::file_change::PreparedFileChange>,
     pub state: OperationState,
     pub result: Option<crate::tools::ToolResult>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ToolCallRecovery {
+    pub run_id: Option<RunId>,
+    pub call_id: String,
+    pub was_admitted: Option<bool>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1192,6 +1201,7 @@ fn answerable_permission_request(
 
 fn empty_snapshot(id: ChatId, workdir: PathBuf, model: ModelConfig) -> ChatSnapshot {
     ChatSnapshot {
+        tool_call_recoveries: Vec::new(),
         artifact_ticks: Vec::new(),
         request_usage: RequestUsageLedger::new(),
         id,
