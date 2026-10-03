@@ -35,7 +35,7 @@ const SUBSCRIBE_TICK_TOOL: &str = "SubscribeTick";
 const UNSUBSCRIBE_TICK_TOOL: &str = "UnsubscribeTick";
 /// An item the stream or a later delivery replaces is itself one dropped Tick Update.
 const SUPERSEDED_UPDATE: u64 = 1;
-const TRUNCATION_HINT: &str = "Tick Update data was too large for this delivery and was left out where `data` is null; read it from the Tick Instance with CallTickTool.";
+const TRUNCATION_HINT: &str = "Tick Update data was too large for this delivery and was left out where `data` is null; use the native tools for that instance type to recover it.";
 
 /// One Loop's association with a Tick Instance: it receives that instance's Tick Updates, and the
 /// latest one is handed to the Agent every `every_seconds`.
@@ -44,6 +44,7 @@ pub struct TickSubscription {
     pub id: Uuid,
     pub instance: InstanceRef,
     pub every_seconds: u64,
+    pub authority: Option<crate::host_tools::HostToolAuthority>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -143,10 +144,17 @@ pub(super) struct TickDeliveries {
     ready_changed: Arc<tokio::sync::Notify>,
 }
 
+struct WatchBinding {
+    watch: WatchId,
+    instance: InstanceRef,
+    authority: Option<crate::host_tools::HostToolAuthority>,
+}
+
 struct SubscriptionRuntime {
     chat_id: ChatId,
     loop_id: LoopId,
     instance: InstanceRef,
+    authority: Option<crate::host_tools::HostToolAuthority>,
     watch: WatchId,
     ready: bool,
     link: TickLinkState,
@@ -170,13 +178,6 @@ struct PendingDelivery {
     items: BTreeMap<InstanceRef, DeliveryItem>,
     /// A cadence elapsed while the Loop was executing, so the delivery flushes the moment it can.
     due: bool,
-}
-
-/// One flush: what the model receives, and what the Loop keeps hold of if the trigger fails.
-struct Delivery {
-    payload: Value,
-    items: Vec<DeliveryItem>,
-    truncated: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -207,6 +208,138 @@ impl DeliveryItem {
 }
 
 impl TickDeliveries {
+    fn apply_event(&mut self, event: TickStreamEvent) {
+        match event {
+            TickStreamEvent::Metadata {
+                instance,
+                audience,
+                metadata,
+            } => {
+                for subscription in self.subscriptions.values_mut().filter(|subscription| {
+                    audience.contains(&subscription.watch) && subscription.instance == instance
+                }) {
+                    subscription.kind = Some(metadata.kind.clone());
+                    subscription.title = Some(metadata.title.clone());
+                    subscription.updated_at_ms = metadata.updated_at_ms;
+                }
+            }
+            TickStreamEvent::Ready { watch } => {
+                if let Some(subscription) = self
+                    .subscriptions
+                    .values_mut()
+                    .find(|subscription| subscription.watch == watch)
+                    && subscription.blocked.is_none()
+                {
+                    subscription.ready = true;
+                    subscription.link = TickLinkState::Live;
+                }
+            }
+            TickStreamEvent::Observation { audience, value } => self.record(&audience, &value),
+            TickStreamEvent::Gap { instance, audience } => self.mark_gap(&instance, &audience),
+            TickStreamEvent::State {
+                instance,
+                state,
+                audience,
+            } => {
+                let link = match state {
+                    TickConnectionState::Initializing => TickLinkState::Initializing,
+                    TickConnectionState::Live => TickLinkState::Live,
+                    TickConnectionState::Disconnected => TickLinkState::Disconnected,
+                    TickConnectionState::Gone => TickLinkState::InstanceGone,
+                    TickConnectionState::IdentityUncertain => TickLinkState::IdentityUncertain,
+                };
+                for subscription in self.subscriptions.values_mut().filter(|subscription| {
+                    subscription.instance == instance && audience.contains(&subscription.watch)
+                }) {
+                    subscription.link = link;
+                    if matches!(
+                        link,
+                        TickLinkState::InstanceGone | TickLinkState::IdentityUncertain
+                    ) {
+                        subscription.blocked = Some(link);
+                        subscription.latest = None;
+                    }
+                }
+                let blocked: BTreeSet<_> = self
+                    .subscriptions
+                    .iter()
+                    .filter(|(_, runtime)| runtime.blocked.is_some())
+                    .map(|(id, _)| *id)
+                    .collect();
+                for pending in self.pending.values_mut() {
+                    pending
+                        .items
+                        .retain(|_, item| !blocked.contains(&item.subscription));
+                }
+                self.publish_desired();
+            }
+        }
+        self.ready_changed.notify_waiters();
+    }
+
+    fn source_bindings(
+        &self,
+        chat_id: ChatId,
+        loop_id: LoopId,
+        payload: &Value,
+        loops: &[LoopSnapshot],
+    ) -> Result<Vec<WatchBinding>, AgentError> {
+        let trigger = loops
+            .iter()
+            .find(|goal| {
+                goal.id == loop_id && !matches!(goal.state, LoopState::Stopped | LoopState::Expired)
+            })
+            .and_then(|goal| goal.trigger.as_ref())
+            .filter(|trigger| {
+                trigger.armed
+                    && trigger.accepts_events
+                    && trigger.expires_at_ms.is_none_or(|deadline| {
+                        deadline > crate::private_fs::unix_time_milliseconds()
+                    })
+            })
+            .ok_or_else(|| {
+                AgentError::Invalid("Tick delivery has no active subscription configuration".into())
+            })?;
+        let items = payload["items"]
+            .as_array()
+            .filter(|items| !items.is_empty())
+            .ok_or_else(|| AgentError::Invalid("Tick delivery has no watch bindings".into()))?;
+        items
+            .iter()
+            .map(|item| {
+                let subscription = serde_json::from_value::<Uuid>(item["subscription"].clone())
+                    .map_err(|error| AgentError::Invalid(error.to_string()))?;
+                let watch = serde_json::from_value::<Uuid>(item["watch"].clone())
+                    .map_err(|error| AgentError::Invalid(error.to_string()))?;
+                let instance = serde_json::from_value::<InstanceRef>(item["instance"].clone())
+                    .map_err(|error| AgentError::Invalid(error.to_string()))?;
+                let runtime = self
+                    .subscriptions
+                    .get(&subscription)
+                    .filter(|runtime| {
+                        runtime.watch == watch
+                            && runtime.instance == instance
+                            && runtime.chat_id == chat_id
+                            && runtime.loop_id == loop_id
+                            && runtime.blocked.is_none()
+                            && trigger.subscriptions.iter().any(|configured| {
+                                configured.id == subscription
+                                    && configured.instance == runtime.instance
+                                    && configured.authority == runtime.authority
+                            })
+                    })
+                    .ok_or_else(|| {
+                        AgentError::Invalid("Tick watch is no longer admitted for this Loop".into())
+                    })?;
+                Ok(WatchBinding {
+                    watch: runtime.watch,
+                    instance: runtime.instance.clone(),
+                    authority: runtime.authority.clone(),
+                })
+            })
+            .collect()
+    }
+
     fn next_due(&self) -> Option<Instant> {
         self.subscriptions
             .values()
@@ -216,6 +349,18 @@ impl TickDeliveries {
 
     fn publish_desired(&self) {
         if let Some(port) = &self.port {
+            port.set_watch_authorities(
+                self.subscriptions
+                    .values()
+                    .filter(|subscription| subscription.blocked.is_none())
+                    .filter_map(|subscription| {
+                        subscription
+                            .authority
+                            .clone()
+                            .map(|authority| (subscription.watch, authority))
+                    })
+                    .collect(),
+            );
             port.set_watch_chats(
                 self.subscriptions
                     .values()
@@ -328,18 +473,13 @@ impl TickDeliveries {
         ready
     }
 
-    fn take_delivery(&mut self, owner: (ChatId, LoopId)) -> Option<Delivery> {
+    fn take_delivery(&mut self, owner: (ChatId, LoopId)) -> Option<Vec<DeliveryItem>> {
         let pending = self.pending.remove(&owner)?;
         if pending.items.is_empty() {
             return None;
         }
         let items: Vec<_> = pending.items.into_values().collect();
-        let (payload, truncated) = fit_delivery_payload(&items);
-        Some(Delivery {
-            payload,
-            items,
-            truncated,
-        })
+        Some(items)
     }
 
     fn restore(&mut self, owner: (ChatId, LoopId), items: Vec<DeliveryItem>) {
@@ -456,9 +596,10 @@ impl Agent {
         receipt: &Receipt,
         name: &str,
         input: &Value,
+        authority: Option<crate::host_tools::HostToolAuthority>,
     ) -> Result<ToolResult, String> {
         let outcome = match name {
-            SUBSCRIBE_TICK_TOOL => self.subscribe_tick(receipt, input).await,
+            SUBSCRIBE_TICK_TOOL => self.subscribe_tick(receipt, input, authority).await,
             UNSUBSCRIBE_TICK_TOOL => self.unsubscribe_tick(receipt, input).await,
             _ => Err("unknown Tick Subscription tool".into()),
         };
@@ -476,7 +617,12 @@ impl Agent {
         })
     }
 
-    async fn subscribe_tick(&self, receipt: &Receipt, input: &Value) -> Result<String, String> {
+    async fn subscribe_tick(
+        &self,
+        receipt: &Receipt,
+        input: &Value,
+        authority: Option<crate::host_tools::HostToolAuthority>,
+    ) -> Result<String, String> {
         let input: SubscribeTickInput = serde_json::from_value(input.clone())
             .map_err(|error| format!("invalid {SUBSCRIBE_TICK_TOOL} input: {error}"))?;
         let every_seconds = input.every_seconds.unwrap_or(DEFAULT_CADENCE_SECONDS);
@@ -521,6 +667,7 @@ impl Agent {
             id: Uuid::new_v4(),
             instance: input.tick_instance_id,
             every_seconds,
+            authority,
         };
         trigger.subscriptions.push(subscription.clone());
         self.configure_trigger(receipt.chat_id, receipt.loop_id, Some(trigger))
@@ -634,74 +781,78 @@ impl Agent {
                     .collect::<Vec<_>>()
             })
             .collect();
-        let mut deliveries = self.tick_deliveries();
-        let now = Instant::now();
-        let kept: BTreeSet<_> = configured
-            .iter()
-            .map(|(_, _, subscription)| subscription.id)
-            .collect();
-        deliveries.subscriptions.retain(|id, runtime| {
-            kept.contains(id)
-                && configured.iter().any(|(chat_id, loop_id, subscription)| {
-                    subscription.id == *id
-                        && subscription.instance == runtime.instance
-                        && *chat_id == runtime.chat_id
-                        && *loop_id == runtime.loop_id
-                })
-        });
-        let owners: BTreeSet<_> = configured
-            .iter()
-            .map(|(chat_id, loop_id, _)| (*chat_id, *loop_id))
-            .collect();
-        let active_watches: BTreeMap<_, _> = deliveries
-            .subscriptions
-            .iter()
-            .map(|(id, runtime)| (*id, runtime.watch))
-            .collect();
-        deliveries.pending.retain(|owner, pending| {
-            pending
-                .items
-                .retain(|_, item| active_watches.get(&item.subscription) == Some(&item.watch));
-            owners.contains(owner) && !pending.items.is_empty()
-        });
-        for (chat_id, loop_id, subscription) in configured {
-            match deliveries.subscriptions.get_mut(&subscription.id) {
-                Some(runtime) if runtime.every_seconds != subscription.every_seconds => {
-                    runtime.every_seconds = subscription.every_seconds;
-                    runtime.due_at = now + Duration::from_secs(subscription.every_seconds);
-                }
-                Some(_) => {}
-                None => {
-                    deliveries.subscriptions.insert(
-                        subscription.id,
-                        SubscriptionRuntime {
-                            chat_id,
-                            loop_id,
-                            instance: subscription.instance.clone(),
-                            watch: Uuid::new_v4(),
-                            ready: false,
-                            link: TickLinkState::Initializing,
-                            blocked: None,
-                            every_seconds: subscription.every_seconds,
-                            due_at: now + Duration::from_secs(subscription.every_seconds),
-                            latest: None,
-                            dropped: 0,
-                            accumulated: 0,
-                            gap: false,
-                            last_delivery_ms: None,
-                            last_delivery: None,
-                            kind: None,
-                            title: None,
-                            updated_at_ms: None,
-                        },
-                    );
+        {
+            let mut deliveries = self.tick_deliveries();
+            let now = Instant::now();
+            let kept: BTreeSet<_> = configured
+                .iter()
+                .map(|(_, _, subscription)| subscription.id)
+                .collect();
+            deliveries.subscriptions.retain(|id, runtime| {
+                kept.contains(id)
+                    && configured.iter().any(|(chat_id, loop_id, subscription)| {
+                        subscription.id == *id
+                            && subscription.instance == runtime.instance
+                            && subscription.authority == runtime.authority
+                            && *chat_id == runtime.chat_id
+                            && *loop_id == runtime.loop_id
+                    })
+            });
+            let owners: BTreeSet<_> = configured
+                .iter()
+                .map(|(chat_id, loop_id, _)| (*chat_id, *loop_id))
+                .collect();
+            let active_watches: BTreeMap<_, _> = deliveries
+                .subscriptions
+                .iter()
+                .map(|(id, runtime)| (*id, runtime.watch))
+                .collect();
+            deliveries.pending.retain(|owner, pending| {
+                pending
+                    .items
+                    .retain(|_, item| active_watches.get(&item.subscription) == Some(&item.watch));
+                owners.contains(owner) && !pending.items.is_empty()
+            });
+            for (chat_id, loop_id, subscription) in configured {
+                match deliveries.subscriptions.get_mut(&subscription.id) {
+                    Some(runtime) if runtime.every_seconds != subscription.every_seconds => {
+                        runtime.every_seconds = subscription.every_seconds;
+                        runtime.due_at = now + Duration::from_secs(subscription.every_seconds);
+                    }
+                    Some(_) => {}
+                    None => {
+                        deliveries.subscriptions.insert(
+                            subscription.id,
+                            SubscriptionRuntime {
+                                chat_id,
+                                loop_id,
+                                instance: subscription.instance.clone(),
+                                authority: subscription.authority.clone(),
+                                watch: Uuid::new_v4(),
+                                ready: false,
+                                link: TickLinkState::Initializing,
+                                blocked: None,
+                                every_seconds: subscription.every_seconds,
+                                due_at: now + Duration::from_secs(subscription.every_seconds),
+                                latest: None,
+                                dropped: 0,
+                                accumulated: 0,
+                                gap: false,
+                                last_delivery_ms: None,
+                                last_delivery: None,
+                                kind: None,
+                                title: None,
+                                updated_at_ms: None,
+                            },
+                        );
+                    }
                 }
             }
+            deliveries.publish_desired();
+            deliveries.ready_changed.notify_waiters();
         }
-        deliveries.publish_desired();
-        deliveries.ready_changed.notify_waiters();
-        drop(deliveries);
         self.inner.tick_wake.notify_one();
+        self.discard_invalid_pending_tick_inputs().await;
     }
 
     /// Flushes a Loop's pending delivery when a cadence elapsed while it was executing.
@@ -746,14 +897,40 @@ impl Agent {
                 _ => None,
             }
         };
-        let Some(Delivery {
-            payload,
-            items,
-            truncated,
-        }) = delivery
-        else {
+        let Some(items) = delivery else {
             return;
         };
+        let mut authorized_items = Vec::new();
+        let port = self.tick_deliveries().port.clone();
+        for item in items {
+            let authority = self
+                .tick_deliveries()
+                .subscriptions
+                .get(&item.subscription)
+                .and_then(|runtime| runtime.authority.clone());
+            let admitted = match &port {
+                Some(port) => port
+                    .revalidate_watch(chat_id, &item.instance, authority.as_ref())
+                    .await
+                    .is_ok(),
+                None => false,
+            };
+            if admitted {
+                authorized_items.push(item);
+            } else {
+                self.apply_stream_event(TickStreamEvent::State {
+                    instance: item.instance,
+                    state: TickConnectionState::IdentityUncertain,
+                    audience: vec![item.watch],
+                })
+                .await;
+            }
+        }
+        if authorized_items.is_empty() {
+            return;
+        }
+        let items = authorized_items;
+        let (payload, truncated) = fit_delivery_payload(&items);
         let source = TriggerSource {
             source: TICK_SUBSCRIPTION_SOURCE.into(),
             payload,
@@ -773,6 +950,128 @@ impl Agent {
                 }
             }
             Err(_) => deliveries.restore(owner, items),
+        }
+    }
+
+    pub(super) fn validate_tick_source_bindings(
+        &self,
+        chat_id: ChatId,
+        loop_id: LoopId,
+        payload: &Value,
+        loops: &[LoopSnapshot],
+    ) -> Result<(), AgentError> {
+        self.tick_deliveries()
+            .source_bindings(chat_id, loop_id, payload, loops)
+            .map(|_| ())
+    }
+
+    pub(super) async fn revalidate_tick_source(
+        &self,
+        chat_id: ChatId,
+        loop_id: LoopId,
+        payload: &Value,
+    ) -> Result<(), AgentError> {
+        let (bindings, loops) = {
+            let chats = self.inner.chats.lock().await;
+            let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
+            let loops = chat.snapshot.loops.clone();
+            let bindings = self
+                .tick_deliveries()
+                .source_bindings(chat_id, loop_id, payload, &loops)?;
+            (bindings, loops)
+        };
+        let port = self
+            .tick_deliveries()
+            .port
+            .clone()
+            .ok_or_else(|| AgentError::Invalid("Tick stream is unavailable".into()))?;
+        for binding in bindings {
+            if let Err(error) = port
+                .revalidate_watch(chat_id, &binding.instance, binding.authority.as_ref())
+                .await
+            {
+                self.tick_deliveries().apply_event(TickStreamEvent::State {
+                    instance: binding.instance,
+                    state: TickConnectionState::IdentityUncertain,
+                    audience: vec![binding.watch],
+                });
+                return Err(AgentError::Invalid(error));
+            }
+        }
+        self.tick_deliveries()
+            .source_bindings(chat_id, loop_id, payload, &loops)?;
+        Ok(())
+    }
+
+    pub(super) fn discard_invalid_tick_inputs(&self, chat: &mut Chat) -> bool {
+        let deliveries = self.tick_deliveries();
+        let mut discarded = Vec::new();
+        let loops = &chat.snapshot.loops;
+        chat.snapshot.pending_inputs.retain(|pending| {
+            let valid = pending.trigger_source.as_ref().is_none_or(|source| {
+                source.source != TICK_SUBSCRIPTION_SOURCE
+                    || deliveries
+                        .source_bindings(
+                            pending.receipt.chat_id,
+                            pending.receipt.loop_id,
+                            &source.payload,
+                            loops,
+                        )
+                        .is_ok()
+            });
+            if !valid {
+                discarded.push(pending.receipt.clone());
+            }
+            valid
+        });
+        if discarded.is_empty() {
+            return false;
+        }
+        for receipt in discarded {
+            self.finish_discarded_trigger_input(chat, &receipt);
+        }
+        true
+    }
+
+    pub(super) fn finish_discarded_trigger_input(&self, chat: &mut Chat, receipt: &Receipt) {
+        self.inner
+            .host_contexts
+            .lock()
+            .unwrap()
+            .runs
+            .remove(&receipt.run_id);
+        if !chat
+            .snapshot
+            .pending_inputs
+            .iter()
+            .any(|pending| pending.receipt.loop_id == receipt.loop_id)
+            && let Some(goal) = chat
+                .snapshot
+                .loops
+                .iter_mut()
+                .find(|goal| goal.id == receipt.loop_id && goal.state == LoopState::Queued)
+        {
+            goal.set_state(
+                if goal.trigger.as_ref().is_some_and(|trigger| trigger.armed)
+                    || goal
+                        .event_sources
+                        .iter()
+                        .any(|source| source.association_epoch.is_some() && !source.resume_required)
+                {
+                    LoopState::WaitingTrigger
+                } else {
+                    LoopState::Completed
+                },
+            );
+        }
+    }
+
+    pub(super) async fn discard_invalid_pending_tick_inputs(&self) {
+        let mut chats = self.inner.chats.lock().await;
+        for chat in chats.values_mut() {
+            if self.discard_invalid_tick_inputs(chat) {
+                self.save(&chat.snapshot);
+            }
         }
     }
 
@@ -797,7 +1096,7 @@ impl Agent {
                     _ = agent.inner.shutdown.cancelled() => return,
                     _ = agent.inner.tick_wake.notified() => {}
                     event = events.recv() => match event {
-                        Some(event) => agent.apply_stream_event(event),
+                        Some(event) => agent.apply_stream_event(event).await,
                         None => return,
                     },
                     _ = async {
@@ -816,74 +1115,18 @@ impl Agent {
         })
     }
 
-    fn apply_stream_event(&self, event: TickStreamEvent) {
-        let mut deliveries = self.tick_deliveries();
-        match event {
-            TickStreamEvent::Metadata {
-                instance,
-                audience,
-                metadata,
-            } => {
-                for subscription in deliveries
-                    .subscriptions
-                    .values_mut()
-                    .filter(|subscription| {
-                        audience.contains(&subscription.watch) && subscription.instance == instance
-                    })
-                {
-                    subscription.kind = Some(metadata.kind.clone());
-                    subscription.title = Some(metadata.title.clone());
-                    subscription.updated_at_ms = metadata.updated_at_ms;
-                }
-            }
-            TickStreamEvent::Ready { watch } => {
-                if let Some(subscription) = deliveries
-                    .subscriptions
-                    .values_mut()
-                    .find(|subscription| subscription.watch == watch)
-                    && subscription.blocked.is_none()
-                {
-                    subscription.ready = true;
-                    subscription.link = TickLinkState::Live;
-                }
-            }
-            TickStreamEvent::Observation { audience, value } => {
-                deliveries.record(&audience, &value)
-            }
-            TickStreamEvent::Gap { instance, audience } => {
-                deliveries.mark_gap(&instance, &audience)
-            }
+    async fn apply_stream_event(&self, event: TickStreamEvent) {
+        let invalidates_watch = matches!(
+            &event,
             TickStreamEvent::State {
-                instance,
-                state,
-                audience,
-            } => {
-                let link = match state {
-                    TickConnectionState::Initializing => TickLinkState::Initializing,
-                    TickConnectionState::Live => TickLinkState::Live,
-                    TickConnectionState::Disconnected => TickLinkState::Disconnected,
-                    TickConnectionState::Gone => TickLinkState::InstanceGone,
-                    TickConnectionState::IdentityUncertain => TickLinkState::IdentityUncertain,
-                };
-                for subscription in deliveries
-                    .subscriptions
-                    .values_mut()
-                    .filter(|subscription| {
-                        subscription.instance == instance && audience.contains(&subscription.watch)
-                    })
-                {
-                    subscription.link = link;
-                    if matches!(
-                        link,
-                        TickLinkState::InstanceGone | TickLinkState::IdentityUncertain
-                    ) {
-                        subscription.blocked = Some(link);
-                    }
-                }
-                deliveries.publish_desired();
+                state: TickConnectionState::Gone | TickConnectionState::IdentityUncertain,
+                ..
             }
+        );
+        self.tick_deliveries().apply_event(event);
+        if invalidates_watch {
+            self.discard_invalid_pending_tick_inputs().await;
         }
-        deliveries.ready_changed.notify_waiters();
     }
 }
 
@@ -913,7 +1156,7 @@ fn delivery_payload(items: &[DeliveryItem], truncated: bool) -> Value {
         } else if let Some(tool) = items.iter().find_map(|item| item.recover_with.as_deref()) {
             if tool.len() <= 128 {
                 format!(
-                    "Tick Update data was too large; use CallTickTool with the declared {tool} query to recover it."
+                    "Tick Update data was too large; recovery guidance from the instance: {tool}. Use Artifact MCP for artifacts, Read on Bash output_file for shells, or CallTickTool for a Herdr protocol query."
                 )
             } else {
                 TRUNCATION_HINT.to_owned()

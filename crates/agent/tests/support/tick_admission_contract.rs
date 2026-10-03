@@ -6,7 +6,7 @@ use tickloop_agent::{
 };
 use uuid::Uuid;
 
-pub struct AliasCase {
+pub struct AdmissionCase {
     pub name: &'static str,
     pub input: Value,
     pub policy_name: &'static str,
@@ -14,11 +14,11 @@ pub struct AliasCase {
     pub plan_denied: bool,
 }
 
-pub async fn verify_alias_policy(
+pub async fn verify_admission_policy(
     agent: &Agent,
     model: &ScriptedModel,
     chat: Uuid,
-    cases: &[AliasCase],
+    cases: &[AdmissionCase],
 ) {
     for mode in [ExecutionMode::FullAccess, ExecutionMode::Plan] {
         agent.set_execution_mode(chat, mode).await.unwrap();
@@ -45,7 +45,7 @@ pub async fn verify_alias_policy(
                     .await
                     .unwrap();
                 let before = agent.tick_subscriptions(chat).await.unwrap().len();
-                model.enqueue(call("alias", case.name, case.input.clone()));
+                model.enqueue(call("admission", case.name, case.input.clone()));
                 if !revoke {
                     model.enqueue(text("done"));
                 }

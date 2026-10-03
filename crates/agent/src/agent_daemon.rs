@@ -590,20 +590,19 @@ pub async fn build_runtime_with_client(
         access,
     ));
     agent.install_tick_stream(adapters.clone()).await;
-    let tools = adapters.host_tools(native_host);
     if let Some(root) = launch.config_root.as_ref()
         && let Ok(artifact) = crate::artifacts::ArtifactClient::new(root)
     {
         agent
             .install_host_tools(Arc::new(
-                crate::mcp_tools::McpHostToolProvider::new(artifact, Some(tools))
+                crate::mcp_tools::McpHostToolProvider::new(artifact, native_host.clone())
                     .with_event_bridge(ARTIFACT_EVENT_BRIDGE_URI)
                     .with_event_bridge_fallback(ARTIFACT_EVENT_BRIDGE_FALLBACK_URI),
             ))
             .map_err(|error| format!("cannot install MCP tools: {error}"))?;
-    } else {
+    } else if let Some(native_host) = native_host {
         agent
-            .install_host_tools(tools)
+            .install_host_tools(native_host)
             .map_err(|error| format!("cannot install Tick tools: {error}"))?;
     }
     Ok(agent)

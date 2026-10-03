@@ -366,9 +366,6 @@ mod adapter_tests {
         fn stream(&self) -> Option<Arc<dyn crate::tick_stream::TickStreamPort>> {
             None
         }
-        fn tools(&self) -> Option<Arc<dyn crate::host_tools::HostToolProvider>> {
-            None
-        }
     }
     #[test]
     fn registered_adapter_groups_rows_and_hints_render_without_list_type_changes() {

@@ -11,20 +11,100 @@ const SHELL_OBSERVATION_INTERVAL: Duration = Duration::from_millis(250);
 pub struct ShellTickStream {
     agent: crate::runtime::WeakAgent,
     chats: watch::Sender<BTreeMap<WatchId, Uuid>>,
+    authorities: watch::Sender<BTreeMap<WatchId, crate::host_tools::HostToolAuthority>>,
 }
 impl ShellTickStream {
     pub fn new(agent: Agent) -> Self {
         Self {
             agent: agent.downgrade(),
             chats: watch::channel(BTreeMap::new()).0,
+            authorities: watch::channel(BTreeMap::new()).0,
         }
+    }
+}
+struct ShellWatchValidator {
+    agent: crate::runtime::WeakAgent,
+    task: Uuid,
+}
+#[async_trait::async_trait]
+impl crate::tick_stream::TickWatchValidator for ShellWatchValidator {
+    async fn revalidate(
+        &self,
+        chat: Uuid,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<(), String> {
+        if cancel.is_cancelled() {
+            return Err("Shell subscription cancelled before admission".into());
+        }
+        let agent = self.agent.upgrade().ok_or("Shell runtime is unavailable")?;
+        let snapshot = ShellTaskCenter::new(agent)
+            .snapshot(chat)
+            .await
+            .map_err(|error| error.to_string())?;
+        if !snapshot
+            .tasks
+            .iter()
+            .any(|task| task.id == self.task && task.chat_id == chat)
+        {
+            return Err("Shell Tick is unavailable in this Chat".into());
+        }
+        Ok(())
     }
 }
 struct Cursor {
     task: ShellTask,
     sequence: u64,
 }
+#[async_trait::async_trait]
 impl TickStreamPort for ShellTickStream {
+    fn set_watch_authorities(
+        &self,
+        authorities: BTreeMap<WatchId, crate::host_tools::HostToolAuthority>,
+    ) {
+        self.authorities.send_replace(authorities);
+    }
+    async fn revalidate_watch(
+        &self,
+        chat: Uuid,
+        instance: &InstanceRef,
+        authority: Option<&crate::host_tools::HostToolAuthority>,
+    ) -> Result<(), String> {
+        use crate::tick_stream::TickWatchValidator;
+        if authority.is_some() || instance.tick_type() != "shell" {
+            return Err("Shell watch requires its local task/Chat scope".into());
+        }
+        ShellWatchValidator {
+            agent: self.agent.clone(),
+            task: Uuid::parse_str(instance.id()).map_err(|error| error.to_string())?,
+        }
+        .revalidate(chat, tokio_util::sync::CancellationToken::new())
+        .await
+    }
+    async fn prepare_watch(
+        &self,
+        chat: Uuid,
+        instance: &InstanceRef,
+        input: &serde_json::Value,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<Option<crate::tick_stream::PreparedTickWatch>, String> {
+        use crate::tick_stream::TickWatchValidator;
+        let validator = Arc::new(ShellWatchValidator {
+            agent: self.agent.clone(),
+            task: Uuid::parse_str(instance.id()).map_err(|error| error.to_string())?,
+        });
+        validator.revalidate(chat, cancel).await?;
+        let admission = crate::host_tools::PreparedHostCall::new(
+            "SubscribeTick".into(),
+            input.clone(),
+            input.clone(),
+            crate::host_tools::HostToolPermission::ReadOnly,
+            format!("Observe Shell task {} in the current Chat", validator.task),
+        );
+        Ok(Some(crate::tick_stream::PreparedTickWatch::with_validator(
+            admission, validator,
+        )))
+    }
+
     fn set_watch_chats(&self, chats: BTreeMap<WatchId, Uuid>) {
         self.chats.send_replace(chats);
     }
@@ -33,6 +113,7 @@ impl TickStreamPort for ShellTickStream {
         let (publisher, events) = EventPublisher::channel();
         let weak = self.agent.clone();
         let mut owners = self.chats.subscribe();
+        let mut authorities = self.authorities.subscribe();
         tokio::spawn(async move {
             let Some(agent) = weak.upgrade() else { return };
             let shutdown = agent.shutdown_token();
@@ -74,7 +155,9 @@ impl TickStreamPort for ShellTickStream {
                                         );
                                         continue;
                                     };
-                                    if owners.borrow().get(watch) != Some(&task.chat_id) {
+                                    if owners.borrow().get(watch) != Some(&task.chat_id)
+                                        || authorities.borrow().contains_key(watch)
+                                    {
                                         publisher.state_to(
                                             instance.clone(),
                                             TickConnectionState::IdentityUncertain,
@@ -131,6 +214,16 @@ impl TickStreamPort for ShellTickStream {
                                             } else {
                                                 None
                                             };
+                                            if owners.borrow().get(watch) != Some(&task.chat_id)
+                                                || authorities.borrow().contains_key(watch)
+                                            {
+                                                publisher.state_to(
+                                                    instance.clone(),
+                                                    TickConnectionState::IdentityUncertain,
+                                                    [*watch],
+                                                );
+                                                continue;
+                                            }
                                             // Read the authoritative tail before advancing; a failed read remains retryable.
                                             if task.capabilities.can_read_output && output.is_none()
                                             {
@@ -142,7 +235,7 @@ impl TickStreamPort for ShellTickStream {
                                                 instance: instance.clone(), sequence: cursor.sequence,
                                                 observed_at: task.updated_at_ms.map(crate::transcript::format_timestamp).unwrap_or_else(crate::transcript::now_timestamp), dropped: 0,
                                                 data: serde_json::json!({"task_id":task.id,"status":shell_status(task),"state":task.state,"exit_code":task.exit_code,"signal":task.signal,"output_bytes":task.output_bytes,"output":output,"truncated":task.output_bytes > OUTPUT_SUMMARY_BYTES as u64}),
-                                                kind: ObservationKind::Protocol, recover_with: Some("output".into()), gap: false,
+                                                kind: ObservationKind::Protocol, recover_with: Some("Read the output_file returned by Bash with Read; use the Shell detail for user commands".into()), gap: false,
                                             });
                                         }
                                     } else {
@@ -180,6 +273,7 @@ impl TickStreamPort for ShellTickStream {
                 tokio::select! {
                     _ = shutdown.cancelled() => return,
                     changed = receiver.changed() => if changed.is_err() { return },
+                    changed = authorities.changed() => if changed.is_err() { return; },
                     changed = owners.changed() => if changed.is_err() { return },
                     _ = agent_events.recv(), if !targets.is_empty() => {},
                     _ = user_events.recv(), if !targets.is_empty() => {},

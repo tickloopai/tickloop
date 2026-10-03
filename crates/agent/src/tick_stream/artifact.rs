@@ -3,23 +3,66 @@ use super::{
     TickStreamHandle, TickStreamPort, WatchId,
 };
 use crate::artifacts::{ArtifactClient, ArtifactError, ArtifactMetadata};
+use crate::host_tools::HostToolAuthority;
 use crate::runtime::{DEFAULT_CADENCE_SECONDS, MAX_CADENCE_SECONDS, MIN_CADENCE_SECONDS};
 use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 use tokio::{sync::watch, time::Instant};
+use uuid::Uuid;
 
 pub struct ArtifactTickStream {
     root: PathBuf,
     cadences: watch::Sender<BTreeMap<WatchId, u64>>,
+    authorities: watch::Sender<BTreeMap<WatchId, HostToolAuthority>>,
 }
 impl ArtifactTickStream {
     pub fn new(root: PathBuf) -> Self {
         Self {
             root,
             cadences: watch::channel(BTreeMap::new()).0,
+            authorities: watch::channel(BTreeMap::new()).0,
         }
     }
 }
+#[async_trait::async_trait]
 impl TickStreamPort for ArtifactTickStream {
+    async fn prepare_watch(
+        &self,
+        chat: Uuid,
+        instance: &InstanceRef,
+        _input: &serde_json::Value,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<Option<super::PreparedTickWatch>, String> {
+        use crate::host_tools::HostToolProvider;
+        let (origin, id) = instance.artifact_parts().ok_or("Invalid Artifact subscription identity; use artifact:<origin>/<artifact_id> from artifact_ticks")?;
+        let provider: std::sync::Arc<dyn HostToolProvider> =
+            std::sync::Arc::new(crate::mcp_tools::McpHostToolProvider::new(
+                ArtifactClient::for_origin(&self.root, origin)
+                    .map_err(|error| error.to_string())?,
+                None,
+            ));
+        provider.refresh(cancel.clone()).await?;
+        let query = provider
+            .prepare_call(
+                chat,
+                "mcp__artifacts__artifact_read",
+                &serde_json::json!({"artifact_id":id}),
+                cancel,
+            )
+            .await?;
+        Ok(Some(super::PreparedTickWatch::new(provider, query)?))
+    }
+
+    fn set_watch_authorities(&self, authorities: BTreeMap<WatchId, HostToolAuthority>) {
+        self.authorities.send_replace(authorities);
+    }
+    async fn revalidate_watch(
+        &self,
+        _chat: Uuid,
+        instance: &InstanceRef,
+        authority: Option<&HostToolAuthority>,
+    ) -> Result<(), String> {
+        authorized_client(&self.root, instance, authority).map(|_| ())
+    }
     fn set_cadences(&self, cadences: BTreeMap<WatchId, u64>) {
         self.cadences.send_replace(cadences);
     }
@@ -30,6 +73,7 @@ impl TickStreamPort for ArtifactTickStream {
             self.root.clone(),
             receiver,
             self.cadences.subscribe(),
+            self.authorities.subscribe(),
             publisher,
         ));
         TickStreamHandle { desired, events }
@@ -46,6 +90,7 @@ async fn observe(
     root: PathBuf,
     mut desired: watch::Receiver<BTreeMap<WatchId, InstanceRef>>,
     mut cadences: watch::Receiver<BTreeMap<WatchId, u64>>,
+    mut authorities: watch::Receiver<BTreeMap<WatchId, HostToolAuthority>>,
     publisher: EventPublisher,
 ) {
     let mut cursors: BTreeMap<WatchId, Cursor> = BTreeMap::new();
@@ -76,16 +121,29 @@ async fn observe(
             }
         }
         let now = Instant::now();
-        let mut due: BTreeMap<InstanceRef, Vec<WatchId>> = BTreeMap::new();
+        let mut due: BTreeMap<(InstanceRef, Option<HostToolAuthority>), Vec<WatchId>> =
+            BTreeMap::new();
         for (watch, cursor) in &cursors {
             if cursor.due <= now {
-                due.entry(cursor.instance.clone()).or_default().push(*watch);
+                due.entry((
+                    cursor.instance.clone(),
+                    authorities.borrow().get(watch).cloned(),
+                ))
+                .or_default()
+                .push(*watch);
             }
         }
-        for (instance, audience) in due {
-            let result = read(&root, &instance).await;
-            let still_desired = desired.borrow().clone();
+        for ((instance, authority), audience) in due {
+            let result = match authorized_client(&root, &instance, authority.as_ref()) {
+                Ok((client, credential)) => {
+                    client
+                        .read_with_credential(instance.artifact_parts().unwrap().1, &credential)
+                        .await
+                }
+                Err(_) => Err(ArtifactError::AccountChanged),
+            };
             for watch in audience {
+                let still_desired = desired.borrow().clone();
                 let Some(cursor) = cursors
                     .get_mut(&watch)
                     .filter(|cursor| still_desired.get(&watch) == Some(&cursor.instance))
@@ -93,6 +151,16 @@ async fn observe(
                     continue;
                 };
                 cursor.due = Instant::now() + Duration::from_secs(cursor.cadence);
+                if authorities.borrow().get(&watch) != authority.as_ref()
+                    || authorized_client(&root, &instance, authority.as_ref()).is_err()
+                {
+                    publisher.state_to(
+                        instance.clone(),
+                        TickConnectionState::IdentityUncertain,
+                        [watch],
+                    );
+                    continue;
+                }
                 match &result {
                     Ok(metadata) => {
                         publisher.metadata(
@@ -139,19 +207,42 @@ async fn observe(
         tokio::select! {
             result = desired.changed() => if result.is_err() { return; },
             result = cadences.changed() => if result.is_err() { return; },
+            result = authorities.changed() => if result.is_err() { return; },
             _ = async { if let Some(next) = next { tokio::time::sleep_until(next).await; } else { std::future::pending::<()>().await; } } => {}
         }
     }
 }
-async fn read(
+fn authorized_client(
     root: &std::path::Path,
     instance: &InstanceRef,
-) -> Result<ArtifactMetadata, ArtifactError> {
-    let (origin, id) = instance
+    authority: Option<&HostToolAuthority>,
+) -> Result<(ArtifactClient, crate::artifacts::CredentialSnapshot), String> {
+    let (origin, _) = instance
         .artifact_parts()
-        .ok_or(ArtifactError::InvalidResponse)?;
-    ArtifactClient::for_origin(root, origin)?.read(id).await
+        .ok_or("Artifact watch identity is invalid")?;
+    let Some(HostToolAuthority::Mcp {
+        server_id,
+        account_id,
+    }) = authority
+    else {
+        return Err(
+            "Artifact watch has no admitted account authority; subscribe explicitly".into(),
+        );
+    };
+    if server_id != origin {
+        return Err("Artifact watch endpoint is outside its admitted authority".into());
+    }
+    let client = ArtifactClient::for_origin(root, origin).map_err(|error| error.to_string())?;
+    let credential = client
+        .credential_snapshot()
+        .map_err(|error| error.to_string())?
+        .ok_or("Artifact watch account is unavailable")?;
+    if credential.origin != *server_id || credential.account_id != *account_id {
+        return Err("Artifact watch account changed outside its admitted authority".into());
+    }
+    Ok((client, credential))
 }
+
 fn observation(instance: &InstanceRef, metadata: &ArtifactMetadata) -> Option<TickObservation> {
     let update = body_update(metadata)?;
     let sequence = update.sequence;

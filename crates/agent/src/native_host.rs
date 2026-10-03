@@ -32,6 +32,22 @@ struct NativePreparedCall {
 
 const PLACEMENT_DIRECTIONS: [&str; 4] = ["left", "right", "up", "down"];
 
+#[derive(Debug, thiserror::Error)]
+pub enum TickToolTargetError {
+    #[error(
+        "NativeToolRequired: {operation} cannot operate on an Artifact Tick; use mcp__artifacts__artifact_read and the installed Artifact MCP edit/publish tools with artifact_id"
+    )]
+    Artifact { operation: String },
+    #[error(
+        "NativeToolRequired: {operation} cannot operate on a Shell Tick; use Bash, Read on its output_file, and TaskStop with task_id"
+    )]
+    Shell { operation: String },
+    #[error(
+        "InvalidTickTarget: {operation} requires the complete herdr:<instance id> from ReadWorkspace; use Artifact MCP tools for artifacts and Bash/Read/TaskStop for shells"
+    )]
+    Invalid { operation: String },
+}
+
 impl NativeHostToolProvider {
     pub fn new(access: Arc<TickAccess>) -> Self {
         Self {
@@ -61,6 +77,24 @@ impl NativeHostToolProvider {
     ) -> Result<PreparedHostCall, String> {
         if cancel.is_cancelled() {
             return Err("Native host operation was cancelled before preparation".into());
+        }
+        if matches!(name, "ReadTick" | "CallTickTool") {
+            let target = input["tick_instance_id"].as_str().unwrap_or_default();
+            let error = match target.split_once(':').map(|(kind, _)| kind) {
+                Some("artifact") => Some(TickToolTargetError::Artifact {
+                    operation: name.into(),
+                }),
+                Some("shell") => Some(TickToolTargetError::Shell {
+                    operation: name.into(),
+                }),
+                Some("herdr") => None,
+                _ => Some(TickToolTargetError::Invalid {
+                    operation: name.into(),
+                }),
+            };
+            if let Some(error) = error {
+                return Err(error.to_string());
+            }
         }
         let endpoint = self.host_endpoint()?;
         let operation_name = match name {
@@ -184,12 +218,12 @@ impl HostToolProvider for NativeHostToolProvider {
             },
             ToolDefinition {
                 name: "ReadTick".into(),
-                description: "Read the current content of a selected Tick Instance. Protocol Ticks return structured content and their declared tool catalog. Ordinary programs return at most 200 recent plain-text lines and 64 KiB; older output is not recoverable from that view.".into(),
+                description: "Read a Herdr Tick using its complete herdr: instance identity. Protocol Ticks return structured content and their declared tool catalog. Ordinary Pane programs return at most 200 recent plain-text lines and 64 KiB. For artifacts use the installed Artifact MCP tools; for Shell tasks use Read on Bash's output_file.".into(),
                 input_schema: json!({"type":"object","properties":{"tick_instance_id":{"type":"string","minLength":1},"workspace_id":{"type":"string","minLength":1}},"required":["tick_instance_id"],"additionalProperties":false}),
             },
             ToolDefinition {
                 name: "CallTickTool".into(),
-                description: "Call one tool declared by a protocol Tick. Read that Tick's catalog first; query tools read content, while modifying tools require permission.".into(),
+                description: "Call one tool declared by a Herdr protocol Tick using its complete herdr: instance identity. Read that Tick's catalog first; query tools read content, while modifying tools require permission. Use native Artifact MCP tools for artifacts and Bash/Read/TaskStop for Shell tasks.".into(),
                 input_schema: json!({"type":"object","properties":{"tick_instance_id":{"type":"string","minLength":1},"workspace_id":{"type":"string","minLength":1},"tool":{"type":"string","minLength":1},"args":{"type":"object"}},"required":["tick_instance_id","tool","args"],"additionalProperties":false}),
             },
             ToolDefinition {

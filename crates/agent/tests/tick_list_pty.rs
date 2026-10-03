@@ -162,7 +162,7 @@ fn shell_tick_appears_can_be_focused_and_removed_in_an_isolated_pty() {
     session.wait_for_editor();
     assert!(!session.output.lock().unwrap().contains("No Ticks"));
     session.send(b"!printf shell-tick-pty; while [ ! -f finish ]; do sleep 0.02; done\r");
-    session.wait("Shell running");
+    session.wait("Shell running · Ctrl+B background");
     session.send(b"\x02");
     session.wait("Shells (1)");
     std::fs::write(directory.path().join("finish"), "").unwrap();

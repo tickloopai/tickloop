@@ -20,7 +20,7 @@ pub struct HerdrInteraction {
     pub pane: tick_connect::herdr::Pane,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum HostEndpointIdentity {
     HerdrSocket {
@@ -34,6 +34,18 @@ pub enum HostEndpointIdentity {
     },
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HostToolAuthority {
+    Native {
+        endpoint: HostEndpointIdentity,
+    },
+    Mcp {
+        server_id: String,
+        account_id: String,
+    },
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub enum HostToolPermission {
     ReadOnly,
@@ -42,11 +54,6 @@ pub enum HostToolPermission {
     Reviewable,
     /// A host requirement for human confirmation, independent of execution mode.
     Confirmation,
-}
-
-pub struct BuiltinToolCall {
-    pub name: String,
-    pub input: Value,
 }
 
 struct HostPolicyIdentity {
@@ -143,7 +150,7 @@ impl PreparedHostCall {
             .as_ref()
             .map_or(&self.input, |identity| &identity.input)
     }
-    /// Aliases inherit the resolved operation's identity for approval, delegation and admission.
+    /// Subscription admission uses the native query's resolved policy identity and arguments.
     pub fn with_policy_identity(mut self, name: String, input: Value) -> Self {
         self.policy_identity = Some(HostPolicyIdentity { name, input });
         self
@@ -435,15 +442,6 @@ impl HostCallResult {
 pub trait HostToolProvider: Send + Sync {
     fn definitions(&self) -> Vec<ToolDefinition>;
 
-    async fn builtin_alias(
-        &self,
-        _chat: ChatId,
-        _name: &str,
-        _input: &Value,
-    ) -> Result<Option<BuiltinToolCall>, String> {
-        Ok(None)
-    }
-
     async fn associate_event_source(
         &self,
         _request: EventAssociationRequest,
@@ -510,6 +508,16 @@ pub trait HostToolProvider: Send + Sync {
 
     fn workspace_host_context(&self) -> Option<WorkspaceHostContext> {
         None
+    }
+
+    fn tool_authority(&self, _name: &str) -> Result<Option<HostToolAuthority>, String> {
+        Ok(self
+            .host_endpoint()?
+            .map(|endpoint| HostToolAuthority::Native { endpoint }))
+    }
+
+    fn service_connections(&self) -> Value {
+        serde_json::json!({})
     }
 
     fn permission(&self, chat_id: ChatId, name: &str, input: &Value) -> HostToolPermission;

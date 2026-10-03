@@ -522,27 +522,28 @@ impl Agent {
             let mut result = agent
                 .compact_history(chat_id, None, instructions, cancel)
                 .await;
-            let mut next = {
+            {
                 let mut chats = agent.inner.chats.lock().await;
                 if let Some(chat) = chats.get_mut(&chat_id) {
                     chat.active = None;
-                    match agent
-                        .apply_pending_model(chat)
-                        .and_then(|()| agent.next_run(chat))
-                    {
-                        Ok(next) => {
-                            if let Ok(outcome) = &mut result {
-                                outcome.snapshot = chat.snapshot.clone();
+                }
+            }
+            let mut next = match agent.next_run(chat_id).await {
+                Ok(next) => {
+                    if let Ok(outcome) = &mut result {
+                        match agent.snapshot(chat_id).await {
+                            Ok(snapshot) => outcome.snapshot = snapshot,
+                            Err(error) => {
+                                let _ = sender.send(Err(error));
+                                return;
                             }
-                            next
-                        }
-                        Err(error) => {
-                            let _ = sender.send(Err(error));
-                            return;
                         }
                     }
-                } else {
-                    None
+                    next
+                }
+                Err(error) => {
+                    let _ = sender.send(Err(error));
+                    return;
                 }
             };
             let _ = sender.send(result);

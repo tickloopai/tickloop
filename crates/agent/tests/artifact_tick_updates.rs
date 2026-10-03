@@ -60,11 +60,11 @@ async fn service() -> (String, Arc<AtomicU64>, Arc<AtomicU64>, Arc<AtomicU64>) {
                 }
             }
             let request = String::from_utf8_lossy(&bytes);
-            let user = json!({"id":"owner","name":"Owner","email":"owner@example.test"});
+            let user = json!({"id":if changes.load(Ordering::SeqCst) >= 20 {"owner-two"} else {"owner"},"name":"Owner","email":"owner@example.test"});
             let body = if request.starts_with("POST /api/v1/auth/device ") {
                 json!({"device_code":"device","user_code":"CODE","verification_uri":format!("{endpoint}/device?code=CODE"),"expires_in":60,"interval":1})
             } else if request.starts_with("POST /api/v1/auth/device/token ") {
-                json!({"access_token":"test-token","token_type":"Bearer","expires_in":600,"user":user})
+                json!({"access_token":if changes.load(Ordering::SeqCst) >= 20 {"test-token-two"} else {"test-token"},"token_type":"Bearer","expires_in":600,"user":user})
             } else if request.starts_with("GET /api/v1/auth/session ") {
                 json!({"user":user,"expires_at":"2099-01-01T00:00:00Z"})
             } else if request.starts_with("POST /api/v1/auth/logout ") {
@@ -139,6 +139,13 @@ async fn feedback_between_polls_does_not_swallow_the_latest_undelivered_body_cha
     login(directory.path(), &origin).await;
     let stream = ArtifactTickStream::new(directory.path().canonicalize().unwrap());
     let watch = Uuid::new_v4();
+    stream.set_watch_authorities(BTreeMap::from([(
+        watch,
+        tickloop_agent::host_tools::HostToolAuthority::Mcp {
+            server_id: origin.clone(),
+            account_id: "owner".into(),
+        },
+    )]));
     stream.set_cadences(BTreeMap::from([(watch, 5)]));
     let mut handle = stream.open();
     handle.desired.send_replace(BTreeMap::from([(
@@ -184,6 +191,13 @@ async fn subscribed_artifact_baselines_each_watch_polls_at_cadence_and_preserves
     login(directory.path(), &origin).await;
     let stream = ArtifactTickStream::new(directory.path().canonicalize().unwrap());
     let watch = Uuid::new_v4();
+    stream.set_watch_authorities(BTreeMap::from([(
+        watch,
+        tickloop_agent::host_tools::HostToolAuthority::Mcp {
+            server_id: origin.clone(),
+            account_id: "owner".into(),
+        },
+    )]));
     stream.set_cadences(BTreeMap::from([(watch, 5)]));
     let mut handle = stream.open();
     let instance = InstanceRef::artifact(&origin, "doc").unwrap();
@@ -208,6 +222,22 @@ async fn subscribed_artifact_baselines_each_watch_polls_at_cadence_and_preserves
     assert_eq!(value.data["change"], "edit");
     assert!(value.data.get("source").is_none());
     let late = Uuid::new_v4();
+    stream.set_watch_authorities(BTreeMap::from([
+        (
+            watch,
+            tickloop_agent::host_tools::HostToolAuthority::Mcp {
+                server_id: origin.clone(),
+                account_id: "owner".into(),
+            },
+        ),
+        (
+            late,
+            tickloop_agent::host_tools::HostToolAuthority::Mcp {
+                server_id: origin.clone(),
+                account_id: "owner".into(),
+            },
+        ),
+    ]));
     handle.desired.send_replace(BTreeMap::from([
         (watch, instance.clone()),
         (late, instance),
@@ -305,91 +335,7 @@ async fn artifact_subscription_reaches_loop_and_quiet_polling_does_not_call_the_
 }
 
 #[tokio::test]
-async fn artifact_adapter_catalog_uses_mcp_queries_and_keeps_identity_and_credentials_bound() {
-    let (origin, _, _, _) = service().await;
-    let directory = tempfile::tempdir().unwrap();
-    login(directory.path(), &origin).await;
-    let instance = InstanceRef::artifact(&origin, "doc").unwrap();
-    let adapters = TickAdapters::new([Arc::new(ArtifactAdapter::new(Some(
-        directory.path().canonicalize().unwrap(),
-    ))) as Arc<dyn TickAdapter>])
-    .unwrap();
-    let tools = adapters.host_tools(None);
-    let chat = Uuid::new_v4();
-    let prepared = tools
-        .prepare_call(
-            chat,
-            "ReadTick",
-            &json!({"tick_instance_id":instance}),
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-    let read = tools
-        .execute_prepared(chat, prepared, CancellationToken::new())
-        .await
-        .into_tool_result();
-    assert!(!read.is_error, "{}", read.content);
-    let data: serde_json::Value = serde_json::from_str(&read.content).unwrap();
-    assert!(
-        data["content"]
-            .as_str()
-            .unwrap()
-            .contains("Recovered artifact body")
-    );
-    assert_eq!(data["tools"].as_array().unwrap().len(), 1);
-    assert_eq!(data["tools"][0]["name"], "artifact_read");
-    assert!(
-        data["tools"][0]["input_schema"]["properties"]
-            .get("artifact_id")
-            .is_none()
-    );
-    assert!(tools.prepare_call(chat,"CallTickTool",&json!({"tick_instance_id":instance,"tool":"artifact_read","args":{"artifact_id":"another"}}),CancellationToken::new()).await.is_err());
-    assert!(
-        tools
-            .prepare_call(
-                chat,
-                "CallTickTool",
-                &json!({"tick_instance_id":instance,"tool":"artifact_publish","args":{}}),
-                CancellationToken::new()
-            )
-            .await
-            .is_err()
-    );
-    let query = tools.prepare_call(chat,"CallTickTool",&json!({"tick_instance_id":instance,"tool":"artifact_read","args":{"version_id":"version-1"}}),CancellationToken::new()).await.unwrap();
-    assert_eq!(
-        query.permission(),
-        tickloop_agent::host_tools::HostToolPermission::ReadOnly
-    );
-    let result = tools
-        .execute_prepared(chat, query, CancellationToken::new())
-        .await
-        .into_tool_result();
-    assert!(!result.is_error, "{}", result.content);
-    let stale = tools
-        .prepare_call(
-            chat,
-            "CallTickTool",
-            &json!({"tick_instance_id":instance,"tool":"artifact_read","args":{}}),
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-    ArtifactClient::for_origin(directory.path().canonicalize().unwrap(), &origin)
-        .unwrap()
-        .logout()
-        .await
-        .unwrap();
-    assert!(matches!(
-        tools
-            .execute_prepared(chat, stale, CancellationToken::new())
-            .await,
-        tickloop_agent::host_tools::HostCallResult::NotDispatched(_)
-    ));
-}
-
-#[tokio::test]
-async fn artifact_aliases_preserve_underlying_read_policy_for_queries_and_subscription() {
+async fn artifact_subscription_preserves_native_mcp_read_policy() {
     use tickloop_agent::{
         host_tools::HostToolProvider,
         permissions::{Decision, ExecutionMode, PermissionRule},
@@ -407,12 +353,6 @@ async fn artifact_aliases_preserve_underlying_read_policy_for_queries_and_subscr
                 "mcp__artifacts__artifact_read",
                 json!({"artifact_id":"doc"}),
             ),
-            support::call("read", "ReadTick", json!({"tick_instance_id":instance})),
-            support::call(
-                "query",
-                "CallTickTool",
-                json!({"tick_instance_id":instance,"tool":"artifact_read","args":{}}),
-            ),
             support::call(
                 "subscribe",
                 "SubscribeTick",
@@ -429,7 +369,7 @@ async fn artifact_aliases_preserve_underlying_read_policy_for_queries_and_subscr
         );
         let provider = Arc::new(tickloop_agent::mcp_tools::McpHostToolProvider::new(
             ArtifactClient::for_origin(&root, &origin).unwrap(),
-            Some(adapters.host_tools(None)),
+            None,
         ));
         provider.refresh(CancellationToken::new()).await.unwrap();
         agent.install_host_tools(provider).unwrap();
@@ -476,8 +416,8 @@ async fn artifact_aliases_preserve_underlying_read_policy_for_queries_and_subscr
                 _ => {}
             }
         }
-        assert_eq!(completed.len(), 4);
-        assert_eq!(asked, if decision == Decision::Ask { 4 } else { 0 });
+        assert_eq!(completed.len(), 2);
+        assert_eq!(asked, if decision == Decision::Ask { 2 } else { 0 });
         for (id, result) in completed {
             assert_eq!(
                 result.is_error,
@@ -495,8 +435,8 @@ async fn artifact_aliases_preserve_underlying_read_policy_for_queries_and_subscr
 }
 
 #[tokio::test]
-async fn artifact_aliases_preserve_plan_and_final_admission_as_the_direct_query() {
-    use support::tick_alias_contract::{AliasCase, verify_alias_policy};
+async fn artifact_subscription_preserves_plan_and_final_admission_as_the_native_query() {
+    use support::tick_admission_contract::{AdmissionCase, verify_admission_policy};
     use tickloop_agent::host_tools::HostToolProvider;
     let (origin, _, _, _) = service().await;
     let directory = tempfile::tempdir().unwrap();
@@ -513,7 +453,7 @@ async fn artifact_aliases_preserve_plan_and_final_admission_as_the_direct_query(
     );
     let provider = Arc::new(tickloop_agent::mcp_tools::McpHostToolProvider::new(
         ArtifactClient::for_origin(&root, &origin).unwrap(),
-        Some(adapters.host_tools(None)),
+        None,
     ));
     provider.refresh(CancellationToken::new()).await.unwrap();
     agent.install_host_tools(provider).unwrap();
@@ -524,11 +464,6 @@ async fn artifact_aliases_preserve_plan_and_final_admission_as_the_direct_query(
             "mcp__artifacts__artifact_read",
             json!({"artifact_id":"doc"}),
         ),
-        ("ReadTick", json!({"tick_instance_id":instance})),
-        (
-            "CallTickTool",
-            json!({"tick_instance_id":instance,"tool":"artifact_read","args":{}}),
-        ),
         (
             "SubscribeTick",
             json!({"tick_instance_id":instance,"every_seconds":5}),
@@ -536,7 +471,7 @@ async fn artifact_aliases_preserve_plan_and_final_admission_as_the_direct_query(
     ];
     let cases = queries
         .into_iter()
-        .map(|(name, input)| AliasCase {
+        .map(|(name, input)| AdmissionCase {
             plan_denied: false,
             name,
             input,
@@ -544,6 +479,519 @@ async fn artifact_aliases_preserve_plan_and_final_admission_as_the_direct_query(
             policy_input: json!({"artifact_id":"doc"}),
         })
         .collect::<Vec<_>>();
-    verify_alias_policy(&agent, &model, chat, &cases).await;
+    verify_admission_policy(&agent, &model, chat, &cases).await;
     agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn delegated_artifact_watch_stays_on_its_admitted_account() {
+    verify_delegated_watch_account(false).await;
+}
+
+#[tokio::test]
+async fn restored_delegated_artifact_watch_stays_on_its_admitted_account() {
+    verify_delegated_watch_account(true).await;
+}
+
+async fn verify_delegated_watch_account(restore: bool) {
+    use tickloop_agent::{
+        mcp_tools::McpHostToolProvider, permissions::ExecutionMode, runtime::EventKind,
+    };
+    let (origin, sequence, _, reads) = service().await;
+    let directory = tempfile::tempdir().unwrap();
+    login(directory.path(), &origin).await;
+    let root = directory.path().canonicalize().unwrap();
+    let instance = InstanceRef::artifact(&origin, "doc").unwrap();
+    let model = Arc::new(support::ScriptedModel::new(vec![
+        support::call(
+            "parent-subscribe",
+            "SubscribeTick",
+            json!({"tick_instance_id":instance,"every_seconds":5}),
+        ),
+        support::call(
+            "delegate",
+            "DelegateAgent",
+            json!({"task":"Watch the same authorized artifact"}),
+        ),
+        support::call(
+            "child-subscribe",
+            "SubscribeTick",
+            json!({"tick_instance_id":instance,"every_seconds":5}),
+        ),
+        support::text("Child watching."),
+        support::text("Parent watching."),
+        support::text("Changed artifact seen."),
+        support::text("Changed artifact seen."),
+    ]));
+    let store = root.join("state");
+    let mut agent = Agent::open_embedded(store.clone(), support::config(), model.clone()).unwrap();
+    agent
+        .install_host_tools(Arc::new(McpHostToolProvider::new(
+            ArtifactClient::for_origin(&root, &origin).unwrap(),
+            None,
+        )))
+        .unwrap();
+    agent
+        .install_tick_stream(Arc::new(
+            TickAdapters::new([
+                Arc::new(ArtifactAdapter::new(Some(root.clone()))) as Arc<dyn TickAdapter>
+            ])
+            .unwrap(),
+        ))
+        .await;
+    let parent = agent.create_chat(root.clone()).await.unwrap();
+    agent
+        .set_execution_mode(parent, ExecutionMode::FullAccess)
+        .await
+        .unwrap();
+    let mut events = agent.subscribe();
+    agent
+        .submit(parent, None, "Subscribe then delegate watching".into())
+        .await
+        .unwrap();
+    loop {
+        let event = support::next_event(&mut events).await;
+        if let EventKind::ToolCompleted { call_id, result } = &event.kind
+            && call_id.ends_with("subscribe")
+        {
+            assert!(!result.is_error, "{}", result.content);
+        }
+        if event.chat_id == parent && matches!(event.kind, EventKind::Completed { .. }) {
+            break;
+        }
+    }
+    let child = agent
+        .list_chats()
+        .await
+        .into_iter()
+        .find(|chat| chat.id != parent)
+        .unwrap()
+        .id;
+    assert_eq!(
+        agent
+            .snapshot(child)
+            .await
+            .unwrap()
+            .delegation
+            .unwrap()
+            .ceiling
+            .host_tools["mcp__artifacts__artifact_read"],
+        tickloop_agent::host_tools::HostToolAuthority::Mcp {
+            server_id: origin.clone(),
+            account_id: "owner".into()
+        }
+    );
+    assert_eq!(agent.tick_subscriptions(child).await.unwrap().len(), 1);
+    let saved = agent.snapshot(child).await.unwrap().loops[0].clone();
+    let authority = saved.trigger.as_ref().unwrap().subscriptions[0]
+        .authority
+        .clone();
+    assert_eq!(
+        authority,
+        Some(tickloop_agent::host_tools::HostToolAuthority::Mcp {
+            server_id: origin.clone(),
+            account_id: "owner".into()
+        })
+    );
+    if restore {
+        agent.shutdown().await;
+    }
+    sequence.store(25, Ordering::SeqCst);
+    login(&root, &origin).await;
+    if restore {
+        agent = Agent::open_embedded(store, support::config(), model.clone()).unwrap();
+        agent
+            .install_host_tools(Arc::new(McpHostToolProvider::new(
+                ArtifactClient::for_origin(&root, &origin).unwrap(),
+                None,
+            )))
+            .unwrap();
+        agent
+            .install_tick_stream(Arc::new(
+                TickAdapters::new([
+                    Arc::new(ArtifactAdapter::new(Some(root.clone()))) as Arc<dyn TickAdapter>
+                ])
+                .unwrap(),
+            ))
+            .await;
+        let snapshot = agent.resume_chat(child).await.unwrap();
+        assert_eq!(
+            snapshot.loops[0].trigger.as_ref().unwrap().subscriptions[0].authority,
+            authority
+        );
+        events = agent.subscribe();
+        agent
+            .submit(
+                child,
+                Some(saved.id),
+                "Continue the authorized watch".into(),
+            )
+            .await
+            .unwrap();
+        loop {
+            let event = support::next_event(&mut events).await;
+            if event.chat_id == child && matches!(event.kind, EventKind::Completed { .. }) {
+                break;
+            }
+        }
+    }
+    let reads_before = reads.load(Ordering::SeqCst);
+    let child_update = tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            let event = events.recv().await.unwrap();
+            if event.chat_id == child && matches!(event.kind, EventKind::Completed { .. }) {
+                return agent
+                    .tick_subscriptions(child)
+                    .await
+                    .unwrap()
+                    .remove(0)
+                    .last_delivery;
+            }
+        }
+    })
+    .await;
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        reads_before,
+        "an active/restored watch issued an Artifact read as the new account"
+    );
+    agent.shutdown().await;
+    assert!(
+        child_update.is_err(),
+        "Account-two data reached a child frozen to owner: {:?}",
+        child_update
+    );
+}
+
+struct BufferedArtifactStream {
+    updates: tickloop_agent::tick_stream::InMemoryTickStream,
+    admission: ArtifactTickStream,
+}
+#[async_trait::async_trait]
+impl TickStreamPort for BufferedArtifactStream {
+    fn set_watch_authorities(
+        &self,
+        authorities: BTreeMap<Uuid, tickloop_agent::host_tools::HostToolAuthority>,
+    ) {
+        self.admission.set_watch_authorities(authorities);
+    }
+    fn open(&self) -> tickloop_agent::tick_stream::TickStreamHandle {
+        self.updates.open()
+    }
+    async fn prepare_watch(
+        &self,
+        chat: Uuid,
+        instance: &InstanceRef,
+        input: &serde_json::Value,
+        cancel: CancellationToken,
+    ) -> Result<Option<tickloop_agent::tick_stream::PreparedTickWatch>, String> {
+        self.admission
+            .prepare_watch(chat, instance, input, cancel)
+            .await
+    }
+    async fn revalidate_watch(
+        &self,
+        chat: Uuid,
+        instance: &InstanceRef,
+        authority: Option<&tickloop_agent::host_tools::HostToolAuthority>,
+    ) -> Result<(), String> {
+        self.admission
+            .revalidate_watch(chat, instance, authority)
+            .await
+    }
+}
+
+#[tokio::test]
+async fn a_buffered_artifact_update_is_revalidated_before_waking_the_loop() {
+    let (origin, sequence, _, _) = service().await;
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    login(&root, &origin).await;
+    let instance = InstanceRef::artifact(&origin, "doc").unwrap();
+    let updates = tickloop_agent::tick_stream::InMemoryTickStream::new();
+    let stream = BufferedArtifactStream {
+        updates: updates.clone(),
+        admission: ArtifactTickStream::new(root.clone()),
+    };
+    let model = Arc::new(support::ScriptedModel::new(vec![
+        support::call(
+            "watch",
+            "SubscribeTick",
+            json!({"tick_instance_id":instance,"every_seconds":5}),
+        ),
+        support::text("Watching."),
+        support::text("Unexpected update."),
+    ]));
+    let agent = Agent::new_embedded(support::config(), model.clone());
+    agent.install_tick_stream(Arc::new(stream)).await;
+    let chat = agent.create_chat(root.clone()).await.unwrap();
+    let mut events = agent.subscribe();
+    agent
+        .submit(chat, None, "Watch this artifact".into())
+        .await
+        .unwrap();
+    loop {
+        if matches!(
+            support::next_event(&mut events).await.kind,
+            tickloop_agent::runtime::EventKind::Completed { .. }
+        ) {
+            break;
+        }
+    }
+    updates.push(tickloop_agent::tick_stream::TickObservation {
+        instance,
+        sequence: 13,
+        observed_at: "2026-10-07T00:00:00Z".into(),
+        dropped: 0,
+        data: json!({"change":"edit"}),
+        kind: tickloop_agent::tick_stream::ObservationKind::Protocol,
+        recover_with: None,
+        gap: false,
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while agent.tick_subscriptions(chat).await.unwrap()[0].accumulated == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    sequence.store(25, Ordering::SeqCst);
+    login(&root, &origin).await;
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    assert_eq!(
+        model.requests.lock().unwrap().len(),
+        2,
+        "a cached old-account update resumed a Loop after switching accounts"
+    );
+    assert_eq!(
+        agent.tick_subscriptions(chat).await.unwrap()[0].link,
+        tickloop_agent::runtime::TickLinkState::IdentityUncertain
+    );
+    agent.shutdown().await;
+}
+
+async fn queued_artifact_update(change_account: bool, invalidate_watch: bool) {
+    use tickloop_agent::model::*;
+    use tokio::sync::{Notify, mpsc::UnboundedSender};
+    struct GatedSiblingModel {
+        gate: Arc<Notify>,
+        entered: Arc<Notify>,
+        calls: std::sync::atomic::AtomicUsize,
+        model: Arc<support::ScriptedModel>,
+    }
+    #[async_trait::async_trait]
+    impl ModelClient for GatedSiblingModel {
+        fn identity(&self) -> ModelIdentity {
+            self.model.identity()
+        }
+        async fn complete(
+            &self,
+            request: ModelRequest,
+            events: UnboundedSender<ModelDelta>,
+            cancel: CancellationToken,
+        ) -> Result<ModelOutput, ModelError> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 2 {
+                self.entered.notify_one();
+                self.gate.notified().await;
+            }
+            self.model.complete(request, events, cancel).await
+        }
+    }
+    let (origin, sequence, _, _) = service().await;
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    login(&root, &origin).await;
+    let instance = InstanceRef::artifact(&origin, "doc").unwrap();
+    let updates = tickloop_agent::tick_stream::InMemoryTickStream::new();
+    let stream = BufferedArtifactStream {
+        updates: updates.clone(),
+        admission: ArtifactTickStream::new(root.clone()),
+    };
+    let model = Arc::new(support::ScriptedModel::new(vec![
+        support::call(
+            "watch",
+            "SubscribeTick",
+            json!({"tick_instance_id":instance,"every_seconds":5}),
+        ),
+        support::text("Watching."),
+        support::text("Busy sibling done."),
+        support::text("Unexpected queued update."),
+    ]));
+    let gate = Arc::new(Notify::new());
+    let entered = Arc::new(Notify::new());
+    let agent = Agent::new_embedded(
+        support::config(),
+        Arc::new(GatedSiblingModel {
+            gate: gate.clone(),
+            entered: entered.clone(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            model: model.clone(),
+        }),
+    );
+    agent.install_tick_stream(Arc::new(stream)).await;
+    let chat = agent.create_chat(root.clone()).await.unwrap();
+    let mut events = agent.subscribe();
+    let watched = agent
+        .submit(chat, None, "Watch this artifact".into())
+        .await
+        .unwrap();
+    loop {
+        if matches!(
+            support::next_event(&mut events).await.kind,
+            tickloop_agent::runtime::EventKind::Completed { .. }
+        ) {
+            break;
+        }
+    }
+    let busy = agent
+        .submit(chat, None, "Busy sibling Loop".into())
+        .await
+        .unwrap();
+    assert_ne!(busy.loop_id, watched.loop_id);
+    tokio::time::timeout(Duration::from_secs(3), entered.notified())
+        .await
+        .unwrap();
+    updates.push(tickloop_agent::tick_stream::TickObservation {
+        instance: instance.clone(),
+        sequence: 13,
+        observed_at: "2026-10-07T00:00:00Z".into(),
+        dropped: 0,
+        data: json!({"change":"QUEUED_OLD_ACCOUNT_MARKER"}),
+        kind: tickloop_agent::tick_stream::ObservationKind::Protocol,
+        recover_with: None,
+        gap: false,
+    });
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let snapshot = agent.snapshot(chat).await.unwrap();
+            if snapshot.pending_inputs.iter().any(|input| {
+                input.receipt.loop_id == watched.loop_id
+                    && input
+                        .trigger_source
+                        .as_ref()
+                        .is_some_and(|source| source.source == "tick_subscription")
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let saved_authority = agent
+        .snapshot(chat)
+        .await
+        .unwrap()
+        .loops
+        .into_iter()
+        .find(|goal| goal.id == watched.loop_id)
+        .unwrap()
+        .trigger
+        .unwrap()
+        .subscriptions[0]
+        .authority
+        .clone();
+    if change_account {
+        sequence.store(25, Ordering::SeqCst);
+        login(&root, &origin).await;
+        let result = ArtifactTickStream::new(root.clone())
+            .revalidate_watch(chat, &instance, saved_authority.as_ref())
+            .await;
+        assert!(result.is_err());
+        if invalidate_watch {
+            let watch = *updates.watches().keys().next().unwrap();
+            updates.emit(TickStreamEvent::State {
+                instance: instance.clone(),
+                state: tickloop_agent::tick_stream::TickConnectionState::IdentityUncertain,
+                audience: vec![watch],
+            });
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while agent.tick_subscriptions(chat).await.unwrap()[0].link
+                    != tickloop_agent::runtime::TickLinkState::IdentityUncertain
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+    }
+    let snapshot = agent.snapshot(chat).await.unwrap();
+    gate.notify_one();
+    loop {
+        let event = support::next_event(&mut events).await;
+        if event.run_id == busy.run_id
+            && matches!(
+                event.kind,
+                tickloop_agent::runtime::EventKind::Completed { .. }
+            )
+        {
+            break;
+        }
+    }
+    if !change_account {
+        loop {
+            let event = support::next_event(&mut events).await;
+            if event.loop_id == watched.loop_id
+                && matches!(
+                    event.kind,
+                    tickloop_agent::runtime::EventKind::Completed { .. }
+                )
+            {
+                break;
+            }
+        }
+    }
+    let finished = agent.snapshot(chat).await.unwrap();
+    let (received_tick, request_count) = {
+        let requests = model.requests.lock().unwrap();
+        let received = requests.iter().any(|request| {
+            request.messages.iter().any(|message| {
+                message.content.iter().any(|content| {
+                    matches!(content, Content::Text { text } if text.contains("QUEUED_OLD_ACCOUNT_MARKER"))
+                })
+            })
+        });
+        (received, requests.len())
+    };
+    agent.shutdown().await;
+    if invalidate_watch {
+        assert!(
+            !snapshot
+                .pending_inputs
+                .iter()
+                .any(|input| input.trigger_source.is_some()),
+            "invalidated Watch retained a queued Tick input"
+        );
+    }
+    assert_eq!(request_count, if change_account { 3 } else { 4 });
+    assert!(finished.pending_inputs.is_empty());
+    assert_eq!(
+        finished
+            .loops
+            .iter()
+            .find(|goal| goal.id == watched.loop_id)
+            .unwrap()
+            .state,
+        tickloop_agent::runtime::LoopState::WaitingTrigger,
+    );
+    assert_eq!(
+        received_tick, !change_account,
+        "queued Tick data resumed the watched Loop after its account authority became invalid"
+    );
+}
+
+#[tokio::test]
+async fn invalidated_artifact_watch_discards_queued_tick_input() {
+    queued_artifact_update(true, true).await;
+}
+
+#[tokio::test]
+async fn queued_artifact_tick_revalidates_authority_at_run_admission() {
+    queued_artifact_update(true, false).await;
+}
+
+#[tokio::test]
+async fn queued_artifact_tick_runs_when_authority_is_unchanged() {
+    queued_artifact_update(false, false).await;
 }

@@ -1380,9 +1380,6 @@ async fn a_new_adapter_remote_action_and_detail_work_through_enter_and_click() {
         fn stream(&self) -> Option<Arc<dyn crate::tick_stream::TickStreamPort>> {
             None
         }
-        fn tools(&self) -> Option<Arc<dyn crate::host_tools::HostToolProvider>> {
-            None
-        }
     }
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}/calendar", listener.local_addr().unwrap());

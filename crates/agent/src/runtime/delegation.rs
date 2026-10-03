@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 
 use super::*;
 use crate::{
-    host_tools::{HostCallContext, HostEndpointIdentity, HostToolProvider},
+    host_tools::{HostCallContext, HostToolAuthority, HostToolProvider},
     model::ToolDefinition,
     tools::{PreparedTool, ToolResult, Workspace},
 };
@@ -19,8 +19,7 @@ pub struct DelegationCeiling {
     #[serde(default)]
     pub session_denials: Option<Vec<SessionPermissionDenial>>,
     pub host_context: Option<HostCallContext>,
-    #[serde(default)]
-    pub host_endpoint: Option<HostEndpointIdentity>,
+    pub host_tools: BTreeMap<String, HostToolAuthority>,
     #[serde(default)]
     pub tick_instances: Vec<tick_connect::instance::InstanceRef>,
 }
@@ -156,24 +155,47 @@ pub(super) fn check_call(
 }
 
 impl Agent {
-    pub(super) async fn check_delegated_host_endpoint(
+    pub(super) async fn check_delegated_host_tool(
         &self,
         receipt: &Receipt,
         provider: &dyn HostToolProvider,
+        name: &str,
+    ) -> Result<(), String> {
+        if self
+            .inner
+            .chats
+            .lock()
+            .await
+            .get(&receipt.chat_id)
+            .ok_or("chat is unavailable")?
+            .snapshot
+            .delegation
+            .is_none()
+        {
+            return Ok(());
+        }
+        self.check_delegated_host_authority(receipt, name, provider.tool_authority(name)?)
+            .await
+    }
+
+    pub(super) async fn check_delegated_host_authority(
+        &self,
+        receipt: &Receipt,
+        name: &str,
+        authority: Option<HostToolAuthority>,
     ) -> Result<(), String> {
         let chats = self.inner.chats.lock().await;
         let chat = chats.get(&receipt.chat_id).ok_or("chat is unavailable")?;
         let Some(delegation) = &chat.snapshot.delegation else {
             return Ok(());
         };
-        let expected = delegation.ceiling.host_endpoint.as_ref().ok_or(
-            "Unsupported: this delegated record has no verified host endpoint authorization",
-        )?;
-        if provider.host_endpoint()?.as_ref() != Some(expected) {
-            return Err(
-                "Unsupported: this host endpoint is outside the child's inherited authorization"
-                    .into(),
-            );
+        let expected = delegation
+            .ceiling
+            .host_tools
+            .get(name)
+            .ok_or("Unsupported: this tool is outside the child's inherited authorization")?;
+        if authority.as_ref() != Some(expected) {
+            return Err("Unsupported: this tool endpoint or account is outside the child's inherited authorization".into());
         }
         Ok(())
     }
@@ -344,15 +366,28 @@ impl Agent {
                         }
                     }
                     let mut host_context = self.host_call_context(parent, &snapshot.workdir);
-                    let host_endpoint = self
+                    let host_tools = self
                         .inner
                         .host_tools
                         .read()
                         .unwrap()
                         .as_ref()
-                        .map(|provider| provider.host_endpoint())
+                        .map(|provider| {
+                            provider
+                                .definitions()
+                                .into_iter()
+                                .map(|tool| {
+                                    Ok(provider
+                                        .tool_authority(&tool.name)?
+                                        .map(|authority| (tool.name, authority)))
+                                })
+                                .collect::<Result<Vec<_>, String>>()
+                        })
                         .transpose()?
-                        .flatten();
+                        .unwrap_or_default()
+                        .into_iter()
+                        .flatten()
+                        .collect();
                     if let Some(context) = &mut host_context {
                         context.interaction = None;
                     }
@@ -383,7 +418,7 @@ impl Agent {
                             policy,
                             session_denials: Some(session_denials),
                             host_context: host_context.clone(),
-                            host_endpoint,
+                            host_tools,
                             tick_instances: snapshot
                                 .loops
                                 .iter()

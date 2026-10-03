@@ -178,7 +178,7 @@ impl Agent {
             } else {
                 None
             };
-            let (mut next, result, removed_loops) = {
+            let (result, removed_loops) = {
                 let mut chats = agent.inner.chats.lock().await;
                 let Some(chat) = chats.get_mut(&chat_id) else {
                     let _ = sender.send(Err(AgentError::NotFound));
@@ -198,18 +198,22 @@ impl Agent {
                         cancel.cancel();
                     }
                 }
-                let next = agent
-                    .apply_pending_model(chat)
-                    .and_then(|()| agent.next_run(chat));
-                let (result, next) = match (result, next) {
-                    (Ok(mut outcome), Ok(next)) => {
-                        outcome.snapshot = chat.snapshot.clone();
-                        (Ok(outcome), next)
+                (result, (removed_loops, chat.tools.clone()))
+            };
+            let next = agent.next_run(chat_id).await;
+            let (result, mut next) = match (result, next) {
+                (Ok(mut outcome), Ok(next)) => {
+                    match agent.snapshot(chat_id).await {
+                        Ok(snapshot) => outcome.snapshot = snapshot,
+                        Err(error) => {
+                            let _ = sender.send(Err(error));
+                            return;
+                        }
                     }
-                    (Ok(_), Err(error)) => (Err(error), None),
-                    (Err(error), next) => (Err(error), next.ok().flatten()),
-                };
-                (next, result, (removed_loops, chat.tools.clone()))
+                    (Ok(outcome), next)
+                }
+                (Ok(_), Err(error)) => (Err(error), None),
+                (Err(error), next) => (Err(error), next.ok().flatten()),
             };
             // 被截断移除的 Loop 若仍有 Trigger 或后台命令在运行，随之停止。移除视为结束：先写结束
             // 状态再归还租约，同一 Loop 在其他进程中的 Trigger 下一次到点时随之停止。

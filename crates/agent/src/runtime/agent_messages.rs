@@ -467,7 +467,6 @@ impl Agent {
                 attached_file_reads: Vec::new(),
             },
         );
-        let next = self.next_run(receiver).map_err(|error| error.to_string())?;
         self.remember_host_context(&receipt, None);
         self.emit(
             receiver,
@@ -492,6 +491,10 @@ impl Agent {
         );
         drop(chats);
         drop(sent);
+        let next = self
+            .next_run(target_id)
+            .await
+            .map_err(|error| error.to_string())?;
         self.inner.input_wakeup.send_replace(());
         if let Some(next) = next {
             self.inner.tasks.lock().await.push(self.run_task(next));
