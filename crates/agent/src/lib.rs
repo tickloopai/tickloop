@@ -21,6 +21,7 @@ pub mod output_style;
 pub mod permissions;
 mod private_fs;
 pub mod runtime;
+mod service_management;
 pub mod settings;
 pub mod skills;
 pub mod terminal;

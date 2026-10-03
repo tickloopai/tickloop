@@ -607,6 +607,7 @@ mod tests {
             original_user_message_id: None,
             agent_message_origin: None,
             run_id: None,
+            tool_call_recoveries: Vec::new(),
             contexts: None,
             continues_message,
             subtype: None,

@@ -1,9 +1,10 @@
+DEV_LAUNCHER := $(shell dirname '$(subst ','"'"',$(strip $(MAKEFILE_LIST)))')/scripts/dev-agent.sh
 # 本地开发入口。密钥放在仓库根目录的 .env（已被 .gitignore 忽略），例如：
 #   DEEPSEEK_API_KEY=sk-...
 -include .env
 export
 
-# dev 以当前目录为工作目录，状态写入独立目录，不影响真实的 ~/.tickloop。
+# dev starts the Agent in the current directory and keeps its state isolated.
 DEV_CONFIG_DIR ?= /tmp/tickloop-dev/config
 ARGS ?=
 
@@ -13,15 +14,14 @@ PACKAGE_ARCHIVE = dist/tickloop-$(PACKAGE_TARGET).tar.gz
 
 .PHONY: dev dev-reset build install package test check release-docs prototype-glyph-set prototype-glyph-set-terminal prototype-earnings-review
 
-## 以当前目录为工作目录启动 Agent，状态写入隔离目录；传参示例：make dev ARGS="-c"
+## Start in the current directory with isolated state; example: make dev ARGS="-c"
 dev:
-	@mkdir -p $(DEV_CONFIG_DIR)
-	cargo build -p tickloop-ticks --bin tick
-	TICKLOOP_CONFIG_DIR=$(DEV_CONFIG_DIR) cargo run $(CARGO_PACKAGE) -- $(ARGS)
+	@mkdir -p "$(DEV_CONFIG_DIR)"
+	TICKLOOP_CONFIG_DIR="$(DEV_CONFIG_DIR)" "$(DEV_LAUNCHER)" $(ARGS)
 
-## 清空 dev 使用的状态目录
+## Remove only the dev state directory
 dev-reset:
-	rm -rf $(DEV_CONFIG_DIR)
+	rm -rf "$(DEV_CONFIG_DIR)"
 
 build:
 	cargo build --locked $(CARGO_PACKAGE) -p tickloop-ticks --bins

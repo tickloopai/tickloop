@@ -83,6 +83,8 @@ pub(crate) struct ChainEntry {
     pub agent_message_origin: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_call_recoveries: Vec<crate::runtime::ToolCallRecovery>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contexts: Option<serde_json::Value>,
     /// Tick Loop 扩展：同一条内存消息拆成多个条目时（向结果消息追加的并行工具结果），后续条目

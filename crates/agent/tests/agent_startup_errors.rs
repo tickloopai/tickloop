@@ -166,14 +166,13 @@ fn incompatible_service_output(terminal: bool) -> String {
     let commands = command.lines().map(str::trim).collect::<Vec<_>>();
     assert_eq!(commands.len(), 2);
     assert!(commands[0].ends_with(" service stop"));
-    if !terminal
-        && let Ok(relative) = std::path::Path::new(executable).strip_prefix(&working_directory)
-    {
-        let executable = std::path::Path::new(".").join(relative);
-        let executable = shell_words::quote(executable.to_str().unwrap());
-        assert!(commands[0].ends_with(&format!("{executable} service stop")));
-        assert!(commands[1].ends_with(executable.as_ref()));
-    }
+    let quoted_executable = shell_words::quote(executable);
+    assert!(commands[0].ends_with(&format!("{quoted_executable} service stop")));
+    assert!(commands[1].ends_with(quoted_executable.as_ref()));
+    assert!(output.contains(&format!("Runtime: {}", runtime.display())));
+    assert!(output.contains(&format!("Executable: {executable}")));
+    assert!(output.contains("client 3.1"));
+    assert!(output.contains("peer protocol 1.1"));
     let runtime_argument = format!(
         "TICKLOOP_AGENT_RUNTIME_DIR={}",
         shell_words::quote(runtime.to_str().unwrap())
@@ -187,7 +186,7 @@ fn incompatible_service_output(terminal: bool) -> String {
 #[test]
 fn incompatible_service_has_readable_plain_guidance_without_dispatching() {
     let output = incompatible_service_output(false);
-    assert!(output.starts_with("Error: Agent service version mismatch\n\n"));
+    assert!(output.starts_with("Error: Agent service version mismatch (client 3.1)."));
     assert!(!output.contains('\x1b'));
 }
 

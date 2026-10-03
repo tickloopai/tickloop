@@ -555,13 +555,29 @@ async fn serve_connection_mode(
     #[cfg(test)] observation_hooks: Option<Arc<ObservationTestHooks>>,
 ) -> Result<(), AccessError> {
     verify_peer(&stream)?;
-    let hello = read_frame::<_, ClientMessage>(&mut stream).await?;
+    let hello =
+        crate::service_management::read::<_, crate::service_management::Request>(&mut stream)
+            .await
+            .map_err(AccessError::invalid)?;
     let minor = match hello {
-        Some(ClientMessage::Hello {
+        Some(crate::service_management::Request::Hello {
             major: PROTOCOL_MAJOR,
             minor,
         }) => minor.min(PROTOCOL_MINOR),
-        Some(ClientMessage::Hello { major, minor }) => {
+        Some(crate::service_management::Request::Hello { major, minor: 0 })
+            if crate::service_management::CONTROL_MAJORS.contains(&major)
+                && owner_shutdown.is_some() =>
+        {
+            return crate::service_management::serve_shutdown(
+                stream,
+                major,
+                epoch,
+                owner_shutdown.expect("owner management session"),
+            )
+            .await
+            .map_err(AccessError::invalid);
+        }
+        Some(crate::service_management::Request::Hello { major, minor }) => {
             write_frame(
                 &mut stream,
                 &ServerMessage::Error {

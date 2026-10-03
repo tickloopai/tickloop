@@ -651,7 +651,7 @@ async fn actual_cli_interrupted_unadmitted_calls_keep_their_state_in_an_attached
     }
 }
 
-async fn interrupted_state_survives_event_eviction(fixture: &PrivateFixture) {
+async fn interrupted_state_survives_event_eviction(fixture: &PrivateFixture, restart_owner: bool) {
     const CALL: &str = "RETENTION-CALL";
     const QUEUED_QUESTION: &str = "RETENTION-QUEUED-QUESTION";
     const FLOOD_EVENTS: usize = 1100;
@@ -668,13 +668,17 @@ async fn interrupted_state_survives_event_eviction(fixture: &PrivateFixture) {
         ],
         "tool_calls",
     );
-    let (url, _) = model_http_support::serve_responses(vec![
-        (200, proposal),
-        (200, streamed_reply(deltas, "stop")),
-    ])
+    let (url, mut requests, _release) = model_http_support::serve_responses_with_gated_response(
+        vec![
+            (200, proposal),
+            (200, streamed_reply(deltas, "stop")),
+            (200, chat_reply(None, "UNEXPECTED-RESUME-REQUEST")),
+        ],
+        2,
+    )
     .await;
     fixture.set_chat_model(&url);
-    let mut view = PtyView::start_with_flags(fixture, &["--mode", "ask"]);
+    let mut view = PtyView::launch(fixture, &["--mode", "ask"], &[], restart_owner);
     view.wait_for("retention View ready", new_input_is_visible)
         .await;
     view.resize(120, 60).await;
@@ -801,12 +805,70 @@ async fn interrupted_state_survives_event_eviction(fixture: &PrivateFixture) {
     eprintln!("[retention live]\n{original}\n[retention attached]\n{restored}");
     attached.close().await;
     view.close().await;
+    for _ in 0..2 {
+        tokio::time::timeout(UI_TIMEOUT, requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    if restart_owner {
+        client
+            .execute(CommandEnvelope {
+                owner_epoch: client.owner_epoch(),
+                command_id: uuid::Uuid::new_v4(),
+                command: AgentCommand::FlushTranscripts,
+            })
+            .await
+            .unwrap();
+        fixture.shutdown().await;
+        let chat_id = evicted.conversation.id.to_string();
+        let mut resumed = PtyView::launch(fixture, &["--resume", &chat_id], &[], true);
+        resumed
+            .wait_for("resumed history is ready", |frame| {
+                frame.contains("History opened.")
+            })
+            .await;
+        resumed.resize(120, 60).await;
+        let restarted = resumed
+            .wait_for("resumed interrupted batch remains Stopped", |frame| {
+                let body = conversation_body(frame);
+                body.lines()
+                    .any(|line| line.contains(CALL) && line.contains("Stopped"))
+                    && body
+                        .lines()
+                        .any(|line| line.contains(QUEUED_QUESTION) && line.contains("Stopped"))
+            })
+            .await;
+        assert_eq!(tool_header_count(&restarted, "Bash"), 1);
+        assert_eq!(tool_header_count(&restarted, "AskUserQuestion"), 1);
+        assert!(!marker.exists());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), requests.recv())
+                .await
+                .is_err(),
+            "loading history must not request the model"
+        );
+        eprintln!("[retention restarted]\n{restarted}");
+        resumed.close().await;
+    }
 }
 
 #[tokio::test]
 async fn actual_cli_interrupted_state_survives_bounded_event_log_eviction() {
     let fixture = PrivateFixture::new();
-    let result = AssertUnwindSafe(interrupted_state_survives_event_eviction(&fixture))
+    let result = AssertUnwindSafe(interrupted_state_survives_event_eviction(&fixture, false))
+        .catch_unwind()
+        .await;
+    fixture.shutdown().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test]
+async fn actual_cli_interrupted_state_survives_eviction_and_owner_restart() {
+    let fixture = PrivateFixture::new();
+    let result = AssertUnwindSafe(interrupted_state_survives_event_eviction(&fixture, true))
         .catch_unwind()
         .await;
     fixture.shutdown().await;

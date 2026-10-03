@@ -81,6 +81,7 @@ impl ProcessWorkerFactory {
                     .is_err()
                 {
                     let _ = process.start_kill();
+                    let _ = process.wait().await;
                 }
             });
         }
@@ -241,9 +242,15 @@ pub async fn connect_or_start_at(
     executable: PathBuf,
 ) -> Result<LocalAgentClient, String> {
     validate_directory(&directory)?;
+    let directory = directory
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
+    let executable = executable
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
     let endpoint = directory.join(SOCKET_NAME);
     check_socket_length(&endpoint)?;
-    if let Some(client) = connect_existing(&endpoint, &executable).await? {
+    if let Some(client) = connect_existing(&endpoint, &executable, false).await? {
         return Ok(client);
     }
     let lock = OpenOptions::new()
@@ -257,8 +264,9 @@ pub async fn connect_or_start_at(
         .map_err(|error| format!("cannot open Agent owner lock: {error}"))?;
     validate_file(&lock, "Agent owner lock")?;
     let deadline = Instant::now() + STARTUP_DEADLINE;
+    let mut spawned_owner = None;
     if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-        if let Some(client) = connect_existing(&endpoint, &executable).await? {
+        if let Some(client) = connect_existing(&endpoint, &executable, false).await? {
             return Ok(client);
         }
         remove_stale_socket(&endpoint)?;
@@ -283,9 +291,11 @@ pub async fn connect_or_start_at(
                 Ok(())
             });
         }
-        command
-            .spawn()
-            .map_err(|error| format!("cannot start local Agent owner: {error}"))?;
+        spawned_owner = Some(
+            command
+                .spawn()
+                .map_err(|error| format!("cannot start local Agent owner: {error}"))?,
+        );
     } else {
         let error = io::Error::last_os_error();
         if error.kind() != io::ErrorKind::WouldBlock {
@@ -294,7 +304,10 @@ pub async fn connect_or_start_at(
     }
     drop(lock);
     loop {
-        if let Some(client) = connect_existing(&endpoint, &executable).await? {
+        let own_startup = spawned_owner
+            .as_mut()
+            .is_some_and(|process| matches!(process.try_wait(), Ok(None)));
+        if let Some(client) = connect_existing(&endpoint, &executable, own_startup).await? {
             return Ok(client);
         }
         if Instant::now() >= deadline {
@@ -307,6 +320,7 @@ pub async fn connect_or_start_at(
 async fn connect_existing(
     endpoint: &Path,
     executable: &Path,
+    own_startup: bool,
 ) -> Result<Option<LocalAgentClient>, String> {
     if !endpoint.exists() {
         return Ok(None);
@@ -315,7 +329,12 @@ async fn connect_existing(
     match tokio::time::timeout(STARTUP_DEADLINE, LocalAgentClient::connect(endpoint)).await {
         Ok(Ok(client)) => Ok(Some(client)),
         Ok(Err(error)) if error.code == crate::agent_access::AccessErrorCode::VersionMismatch => {
-            Err(incompatible_owner_guidance(executable))
+            Err(incompatible_owner_guidance(
+                endpoint,
+                executable,
+                &error,
+                own_startup,
+            ))
         }
         Ok(Err(error)) => {
             if matches!(
@@ -336,38 +355,58 @@ async fn connect_existing(
     }
 }
 
-fn incompatible_owner_guidance(executable: &Path) -> String {
-    let executable = std::env::current_dir()
-        .ok()
-        .and_then(|directory| executable.strip_prefix(directory).ok())
-        .map(|relative| PathBuf::from(".").join(relative))
-        .unwrap_or_else(|| executable.to_path_buf());
-    let Some(executable) = executable.to_str() else {
-        return "Agent service version mismatch\n\nRun this build with service stop, then relaunch.\nThis stops running Agents. Saved history is kept.".into();
+fn incompatible_owner_guidance(
+    endpoint: &Path,
+    executable: &Path,
+    error: &AccessError,
+    own_startup: bool,
+) -> String {
+    let runtime = endpoint
+        .parent()
+        .expect("owner endpoint has a runtime directory");
+    let title = if own_startup {
+        "Agent executable changed during startup"
+    } else {
+        "Agent service version mismatch"
     };
-    let mut stop = String::new();
-    if let Some(directory) = std::env::var_os("TICKLOOP_AGENT_RUNTIME_DIR") {
-        let Some(directory) = directory.to_str() else {
-            return "Agent service version mismatch\n\nKeep TICKLOOP_AGENT_RUNTIME_DIR unchanged. Run this build with service stop, then relaunch.\nThis stops running Agents. Saved history is kept.".into();
-        };
-        stop.push_str(&format!(
-            "TICKLOOP_AGENT_RUNTIME_DIR={} ",
-            shell_words::quote(directory),
-        ));
-    }
-    let mut launch = stop.clone();
+    let details = format!(
+        "{title} (client {}.{}).\nProtocol: {}\nRuntime: {}\nExecutable: {}",
+        crate::agent_access::PROTOCOL_MAJOR,
+        crate::agent_access::PROTOCOL_MINOR,
+        error.message,
+        runtime.display(),
+        executable.display(),
+    );
+    let (Some(runtime), Some(executable)) = (runtime.to_str(), executable.to_str()) else {
+        return format!(
+            "{details}\n\nRun this build with service stop, then relaunch.\nThis stops running Agents. Saved history is kept."
+        );
+    };
+    let stop = format!(
+        "TICKLOOP_AGENT_RUNTIME_DIR={} {}",
+        shell_words::quote(runtime),
+        shell_words::quote(executable)
+    );
+    let mut launch = format!(
+        "TICKLOOP_AGENT_RUNTIME_DIR={} ",
+        shell_words::quote(runtime)
+    );
     if let Some(config) = std::env::var_os("TICKLOOP_CONFIG_DIR")
         && let Some(config) = config.to_str()
     {
         launch.push_str(&format!(
             "TICKLOOP_CONFIG_DIR={} ",
-            shell_words::quote(config),
+            shell_words::quote(config)
         ));
     }
-    stop.push_str(&shell_words::quote(executable));
     launch.push_str(&shell_words::quote(executable));
+    let startup_note = if own_startup {
+        "\nUse a pinned executable for CLI, owner, and workers before relaunching."
+    } else {
+        ""
+    };
     format!(
-        "Agent service version mismatch\n\nStop the service and relaunch:\n  {stop} service stop\n  {launch}\n\nThis stops running Agents. Saved history is kept."
+        "{details}{startup_note}\n\nStop the service and relaunch:\n  {stop} service stop\n  {launch}\n\nThis stops running Agents. Saved history is kept."
     )
 }
 
@@ -393,22 +432,16 @@ async fn run_owner(arguments: &[OsString]) -> Result<(), String> {
         .ok_or("invalid owner lock descriptor")?;
     let lock = unsafe { File::from_raw_fd(descriptor) };
     validate_file(&lock, "Agent owner lock")?;
-    let inherited = lock.metadata().map_err(|error| error.to_string())?;
-    let expected =
-        std::fs::symlink_metadata(directory.join(LOCK_NAME)).map_err(|error| error.to_string())?;
-    if expected.file_type().is_symlink()
-        || inherited.dev() != expected.dev()
-        || inherited.ino() != expected.ino()
-    {
-        return Err("inherited lock does not belong to this Agent owner directory".into());
-    }
+    let lock_path = directory.join(LOCK_NAME);
+    validate_owner_lock_path(&lock, &lock_path)?;
     if unsafe { libc::flock(descriptor, libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         return Err("Agent owner lock is not held by this process".into());
     }
     if unsafe { libc::fcntl(descriptor, libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
         return Err("cannot isolate owner lock from workers".into());
     }
-    let listener = private_listener(&directory.join(SOCKET_NAME))?;
+    let endpoint = directory.join(SOCKET_NAME);
+    let (listener, socket_identity) = private_listener(&endpoint)?;
     let epoch = Uuid::new_v4();
     let factory = Arc::new(ProcessWorkerFactory {
         directory: directory.clone(),
@@ -420,8 +453,10 @@ async fn run_owner(arguments: &[OsString]) -> Result<(), String> {
         .await
         .map_err(|error| error.to_string());
     factory.shutdown().await;
-    let _ = std::fs::remove_file(directory.join(SOCKET_NAME));
+    let cleanup = validate_owner_lock_path(&lock, &lock_path)
+        .and_then(|()| remove_owned_socket(&endpoint, socket_identity));
     drop(lock);
+    cleanup?;
     result
 }
 
@@ -451,7 +486,7 @@ async fn run_worker(arguments: &[OsString]) -> Result<(), String> {
         agent.clone(),
         bootstrap.epoch,
     ));
-    let listener = private_listener(&endpoint)?;
+    let (listener, socket_identity) = private_listener(&endpoint)?;
     let mut housekeeping = bootstrap.launch.config_root.as_ref().map(|root| {
         crate::housekeeping::HousekeepingSchedule::new(
             root.clone(),
@@ -475,7 +510,7 @@ async fn run_worker(arguments: &[OsString]) -> Result<(), String> {
         }
     };
     agent.shutdown().await;
-    let _ = std::fs::remove_file(&endpoint);
+    remove_owned_socket(&endpoint, socket_identity)?;
     result
 }
 
@@ -613,12 +648,42 @@ fn remove_stale_socket(endpoint: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn private_listener(endpoint: &Path) -> Result<UnixListener, String> {
+fn validate_owner_lock_path(lock: &File, path: &Path) -> Result<(), String> {
+    let inherited = lock.metadata().map_err(|error| error.to_string())?;
+    let current = std::fs::symlink_metadata(path).map_err(|error| {
+        format!("Agent service lock path changed; endpoint was preserved: {error}")
+    })?;
+    if !current.file_type().is_file()
+        || current.uid() != unsafe { libc::geteuid() }
+        || current.mode() & 0o777 != 0o600
+        || inherited.dev() != current.dev()
+        || inherited.ino() != current.ino()
+    {
+        return Err("Agent service lock changed; endpoint was preserved.".into());
+    }
+    Ok(())
+}
+
+fn remove_owned_socket(endpoint: &Path, identity: (u64, u64)) -> Result<(), String> {
+    let metadata = match std::fs::symlink_metadata(endpoint) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("Cannot inspect owned Agent endpoint: {error}")),
+    };
+    if (metadata.dev(), metadata.ino()) != identity {
+        return Err("Agent endpoint changed during cleanup; replacement was preserved.".into());
+    }
+    std::fs::remove_file(endpoint)
+        .map_err(|error| format!("Cannot remove owned Agent endpoint: {error}"))
+}
+
+fn private_listener(endpoint: &Path) -> Result<(UnixListener, (u64, u64)), String> {
     check_socket_length(endpoint)?;
     let listener = UnixListener::bind(endpoint).map_err(|error| error.to_string())?;
     std::fs::set_permissions(endpoint, std::fs::Permissions::from_mode(0o600))
         .map_err(|error| error.to_string())?;
-    Ok(listener)
+    let metadata = std::fs::symlink_metadata(endpoint).map_err(|error| error.to_string())?;
+    Ok((listener, (metadata.dev(), metadata.ino())))
 }
 
 fn check_socket_length(endpoint: &Path) -> Result<(), String> {

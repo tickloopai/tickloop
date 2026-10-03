@@ -10,14 +10,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use serde::Deserialize;
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::UnixStream,
-};
+use tokio::net::UnixStream;
 use uuid::Uuid;
 
-use crate::agent_access::{ClientMessage, MAX_FRAME_BYTES, PROTOCOL_MAJOR};
+use crate::service_management::{self as control, CONTROL_MAJORS, Reply as ServiceReply, Request};
 
 use super::{
     CONNECT_INTERVAL, LOCK_NAME, SOCKET_NAME, STARTUP_DEADLINE, check_socket_length,
@@ -25,38 +21,12 @@ use super::{
 };
 
 const STOP_DEADLINE: Duration = Duration::from_secs(10);
-const SUPPORTED_CONTROL_MAJORS: [u16; 3] = [PROTOCOL_MAJOR, 2, 1];
 const SERVICE_USAGE: &str = "Usage: tickloop service stop";
 const SERVICE_HELP: &str = "Usage: tickloop service stop\n\n\
 Stop the local Agent service and its running Agents. Saved history is kept.\n\
 Run tickloop again to start this build.\n\
   -h, --help  Show this help.\n\n\
 TICKLOOP_AGENT_RUNTIME_DIR selects the local service.";
-
-#[derive(Deserialize)]
-struct ServiceHello {
-    major: u16,
-    minor: u16,
-    owner_epoch: Uuid,
-}
-
-#[derive(Deserialize)]
-struct ServiceError {
-    code: String,
-    message: String,
-}
-
-#[derive(Deserialize)]
-enum ServiceReply {
-    Hello(ServiceHello),
-    OwnerStopped {
-        request_id: Uuid,
-    },
-    Error {
-        request_id: Option<Uuid>,
-        error: ServiceError,
-    },
-}
 
 struct ServiceConnection {
     stream: UnixStream,
@@ -67,6 +37,7 @@ struct ServiceFiles {
     endpoint: PathBuf,
     socket_identity: Option<(u64, u64)>,
     lock: Option<File>,
+    lock_path: PathBuf,
 }
 
 pub(super) async fn run(arguments: &[OsString]) -> Result<(), String> {
@@ -120,7 +91,7 @@ async fn stop(directory: &Path) -> Result<(), String> {
     let deadline = Instant::now() + STOP_DEADLINE;
     loop {
         if files.stopped()? {
-            println!("Agent service stopped. Run tickloop again to start this build.");
+            println!("Agent service stopped.");
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -169,6 +140,7 @@ impl ServiceFiles {
             endpoint,
             socket_identity,
             lock,
+            lock_path: directory.join(LOCK_NAME),
         }))
     }
 
@@ -176,7 +148,7 @@ impl ServiceFiles {
         if self.socket_identity.is_none() {
             return Ok(None);
         }
-        for major in SUPPORTED_CONTROL_MAJORS {
+        for major in CONTROL_MAJORS {
             self.validate_original_socket()?;
             let mut stream = match UnixStream::connect(&self.endpoint).await {
                 Ok(stream) => stream,
@@ -196,22 +168,19 @@ impl ServiceFiles {
             if credentials.uid() != unsafe { libc::geteuid() } {
                 return Err("Agent service must belong to the current user.".into());
             }
-            write_message(&mut stream, &ClientMessage::Hello { major, minor: 0 }).await?;
-            match read_message(&mut stream).await? {
-                ServiceReply::Hello(hello) if hello.major == major && hello.minor == 0 => {
+            control::write(&mut stream, &Request::Hello { major, minor: 0 }).await?;
+            match control::read(&mut stream).await? {
+                Some(ServiceReply::Hello(hello)) if hello.major == major && hello.minor == 0 => {
                     return Ok(Some(ServiceConnection {
                         stream,
                         epoch: hello.owner_epoch,
                     }));
                 }
-                ServiceReply::Hello(hello)
-                    if SUPPORTED_CONTROL_MAJORS.contains(&hello.major)
-                        && hello.major != major => {}
-                ServiceReply::Error {
+                Some(ServiceReply::Error {
                     request_id: None,
                     error,
-                } if error.code == "VersionMismatch" => {}
-                ServiceReply::Error { error, .. } => return Err(error.message),
+                }) if error.code == "VersionMismatch" => {}
+                Some(ServiceReply::Error { error, .. }) => return Err(error.message),
                 _ => return Err("This Agent service version cannot be stopped by this build. Use the build that started it.".into()),
             }
         }
@@ -225,6 +194,7 @@ impl ServiceFiles {
     }
 
     fn validate_original_socket_metadata(&self, metadata: &Metadata) -> Result<(), String> {
+        self.validate_original_lock()?;
         validate_socket_metadata(metadata)?;
         if Some((metadata.dev(), metadata.ino())) != self.socket_identity {
             return Err("Agent service changed while stopping; retry service stop.".into());
@@ -232,7 +202,35 @@ impl ServiceFiles {
         Ok(())
     }
 
+    fn validate_original_lock(&self) -> Result<(), String> {
+        let current = match std::fs::symlink_metadata(&self.lock_path) {
+            Ok(metadata) => Some(metadata),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(format!("Cannot inspect Agent owner lock: {error}")),
+        };
+        let original = self
+            .lock
+            .as_ref()
+            .map(File::metadata)
+            .transpose()
+            .map_err(|error| format!("Cannot inspect Agent owner lock: {error}"))?;
+        match (original, current) {
+            (None, None) => Ok(()),
+            (Some(original), Some(current))
+                if current.file_type().is_file()
+                    && original.dev() == current.dev()
+                    && original.ino() == current.ino()
+                    && current.uid() == unsafe { libc::geteuid() }
+                    && current.mode() & 0o777 == 0o600 =>
+            {
+                Ok(())
+            }
+            _ => Err("Agent service changed while stopping; owner lock was replaced.".into()),
+        }
+    }
+
     fn lock_is_held(&self) -> Result<bool, String> {
+        self.validate_original_lock()?;
         let Some(lock) = &self.lock else {
             return Ok(false);
         };
@@ -278,54 +276,24 @@ fn validate_socket_metadata(metadata: &Metadata) -> Result<(), String> {
 impl ServiceConnection {
     async fn shutdown(&mut self) -> Result<(), String> {
         let request_id = Uuid::new_v4();
-        write_message(
+        control::write(
             &mut self.stream,
-            &ClientMessage::ShutdownOwner {
+            &Request::ShutdownOwner {
                 request_id,
                 owner_epoch: self.epoch,
             },
         )
         .await
         .map_err(|_| "Agent service stop was not confirmed; no stop request was resent.")?;
-        match read_message(&mut self.stream).await {
-            Ok(ServiceReply::OwnerStopped {
+        match control::read(&mut self.stream).await {
+            Ok(Some(ServiceReply::OwnerStopped {
                 request_id: response_id,
-            }) if response_id == request_id => Ok(()),
-            Ok(ServiceReply::Error {
+            })) if response_id == request_id => Ok(()),
+            Ok(Some(ServiceReply::Error {
                 request_id: Some(response_id),
                 error,
-            }) if response_id == request_id => Err(error.message),
+            })) if response_id == request_id => Err(error.message),
             _ => Err("Agent service stop was not confirmed; no stop request was resent.".into()),
         }
     }
-}
-
-async fn write_message(stream: &mut UnixStream, message: &ClientMessage) -> Result<(), String> {
-    let bytes = serde_json::to_vec(message).map_err(|error| error.to_string())?;
-    if bytes.len() > MAX_FRAME_BYTES {
-        return Err("Agent service control request exceeds the transport limit.".into());
-    }
-    stream
-        .write_u32(bytes.len() as u32)
-        .await
-        .map_err(|error| error.to_string())?;
-    stream
-        .write_all(&bytes)
-        .await
-        .map_err(|error| error.to_string())?;
-    stream.flush().await.map_err(|error| error.to_string())
-}
-
-async fn read_message(stream: &mut UnixStream) -> Result<ServiceReply, String> {
-    let length = stream.read_u32().await.map_err(|error| error.to_string())? as usize;
-    if length > MAX_FRAME_BYTES {
-        return Err("Agent service control response exceeds the transport limit.".into());
-    }
-    let mut bytes = vec![0; length];
-    stream
-        .read_exact(&mut bytes)
-        .await
-        .map_err(|error| error.to_string())?;
-    serde_json::from_slice(&bytes)
-        .map_err(|_| "Agent service returned an invalid control response.".into())
 }

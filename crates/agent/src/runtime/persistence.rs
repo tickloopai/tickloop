@@ -18,7 +18,7 @@ use uuid::Uuid;
 use super::denials::{ApprovalRecord, DenialRecord, DenialWindow, MAX_RECENT_DENIALS};
 use super::{
     Agent, AgentError, BranchOrigin, Chat, ChatId, ChatSnapshot, InputContext, LocalMessage,
-    LoopId, LoopSnapshot, LoopState, RunId, SummaryDirection, TodoItem, Trigger,
+    LoopId, LoopSnapshot, LoopState, RunId, SummaryDirection, TodoItem, ToolCallRecovery, Trigger,
     compaction::{
         CompactBoundary, CompactTrigger, CompactionLayout, CompactionMarker, MessageSource,
         SummarizeMetadata,
@@ -902,6 +902,18 @@ fn chain_entry(
     timestamp: &str,
 ) -> ChainEntry {
     let is_assistant = message.role == Role::Assistant;
+    let run_id = snapshot.message_runs.get(&index).copied();
+    let tool_call_recoveries = snapshot
+        .tool_call_recoveries
+        .iter()
+        .filter(|fact| {
+            fact.run_id == run_id
+                && message.content.iter().any(|content| {
+                    matches!(content, Content::ToolResult { tool_use_id, .. } if tool_use_id == &fact.call_id)
+                })
+        })
+        .cloned()
+        .collect();
     let marker = snapshot.message_compactions.get(&index);
     let boundary = match marker {
         Some(CompactionMarker::Boundary(boundary)) => Some(boundary),
@@ -941,7 +953,8 @@ fn chain_entry(
             .get(&index)
             .and_then(|id| snapshot.agent_message_origins.get(id))
             .cloned(),
-        run_id: snapshot.message_runs.get(&index).copied(),
+        run_id,
+        tool_call_recoveries,
         contexts: snapshot
             .message_contexts
             .get(&index)
@@ -1068,6 +1081,7 @@ fn record_loop(
         original_user_message_id: None,
         agent_message_origin: None,
         run_id,
+        tool_call_recoveries: Vec::new(),
         contexts: None,
         continues_message: false,
         subtype: Some(subtype.to_owned()),
@@ -1186,6 +1200,7 @@ struct RestoredChain {
     messages: Vec<Message>,
     invoked_skills: Vec<crate::skills::InvokedSkill>,
     message_runs: BTreeMap<usize, RunId>,
+    tool_call_recoveries: BTreeMap<usize, Vec<ToolCallRecovery>>,
     message_contexts: BTreeMap<usize, Vec<InputContext>>,
     message_ids: BTreeMap<usize, Uuid>,
     agent_message_origins: BTreeMap<Uuid, serde_json::Value>,
@@ -1216,6 +1231,7 @@ fn restore_chain(chain: &[ChainEntry]) -> (RestoredChain, Vec<String>) {
         messages: Vec::new(),
         invoked_skills: Vec::new(),
         message_runs: BTreeMap::new(),
+        tool_call_recoveries: BTreeMap::new(),
         message_contexts: BTreeMap::new(),
         message_ids: BTreeMap::new(),
         agent_message_origins: BTreeMap::new(),
@@ -1266,6 +1282,14 @@ fn restore_chain(chain: &[ChainEntry]) -> (RestoredChain, Vec<String>) {
                 .messages
                 .last()
                 .is_some_and(|message| message.role == entry.message.role);
+        let index = restored.messages.len() - usize::from(continues_message);
+        if !entry.tool_call_recoveries.is_empty() {
+            restored
+                .tool_call_recoveries
+                .entry(index)
+                .or_default()
+                .extend(entry.tool_call_recoveries.iter().cloned());
+        }
         if continues_message {
             let index = restored.messages.len() - 1;
             restored.messages[index]
@@ -1400,6 +1424,7 @@ impl RestoredChain {
             messages: Vec::new(),
             invoked_skills: self.invoked_skills.clone(),
             message_runs: BTreeMap::new(),
+            tool_call_recoveries: BTreeMap::new(),
             message_contexts: BTreeMap::new(),
             message_ids: BTreeMap::new(),
             agent_message_origins: self.agent_message_origins.clone(),
@@ -1433,6 +1458,9 @@ impl RestoredChain {
             let index = kept.messages.len();
             if let Some(run_id) = self.message_runs.get(&original) {
                 kept.message_runs.insert(index, *run_id);
+            }
+            if let Some(facts) = self.tool_call_recoveries.get(&original) {
+                kept.tool_call_recoveries.insert(index, facts.clone());
             }
             if let Some(contexts) = self.message_contexts.get(&original) {
                 kept.message_contexts.insert(index, contexts.clone());
@@ -1549,6 +1577,12 @@ impl RestoredChain {
         snapshot.messages = self.messages.clone();
         snapshot.invoked_skills = self.invoked_skills.clone();
         snapshot.message_runs = self.message_runs.clone();
+        snapshot.tool_call_recoveries = self
+            .tool_call_recoveries
+            .values()
+            .flatten()
+            .cloned()
+            .collect();
         snapshot.message_contexts = self.message_contexts.clone();
         snapshot.message_ids = self.message_ids.clone();
         snapshot.agent_message_origins = self.agent_message_origins.clone();

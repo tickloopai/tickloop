@@ -356,19 +356,16 @@ async fn unsafe_runtime_socket_and_lock_are_rejected_before_any_handshake() {
 #[tokio::test]
 async fn malformed_and_unknown_hello_never_receive_shutdown() {
     for hello in [
-        json!({"Hello":{"major":PROTOCOL_MAJOR+1,"minor":0,"owner_epoch":Uuid::new_v4()}}),
-        json!({"Hello":{"major":PROTOCOL_MAJOR,"minor":0}}),
-        json!({"Hello":{"major":PROTOCOL_MAJOR,"minor":1,"owner_epoch":Uuid::new_v4()}}),
+        json!({"Hello":{"major":3,"minor":0,"owner_epoch":Uuid::new_v4()}}),
+        json!({"Hello":{"major":1,"minor":0}}),
+        json!({"Hello":{"major":1,"minor":1,"owner_epoch":Uuid::new_v4()}}),
         json!({"OwnerStopped":{"request_id":Uuid::new_v4()}}),
     ] {
         let fixture = ServiceFixture::new();
         let listener = fixture.listener();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            assert_eq!(
-                read_frame(&mut stream).await.unwrap()["Hello"]["major"],
-                PROTOCOL_MAJOR
-            );
+            assert_eq!(read_frame(&mut stream).await.unwrap()["Hello"]["major"], 1);
             write_frame(&mut stream, &hello).await;
             assert_disconnected(&mut stream, &listener).await;
         });
@@ -402,7 +399,7 @@ async fn shutdown_requires_correlated_ack_and_is_never_resent() {
             let epoch = Uuid::new_v4();
             write_frame(
                 &mut stream,
-                &json!({"Hello":{"major":PROTOCOL_MAJOR,"minor":0,"owner_epoch":epoch}}),
+                &json!({"Hello":{"major":1,"minor":0,"owner_epoch":epoch}}),
             )
             .await;
             let shutdown = read_frame(&mut stream).await.unwrap();
@@ -447,7 +444,7 @@ async fn acknowledged_shutdown_preserves_a_replacement_owner_socket() {
         let epoch = Uuid::new_v4();
         write_frame(
             &mut stream,
-            &json!({"Hello":{"major":PROTOCOL_MAJOR,"minor":0,"owner_epoch":epoch}}),
+            &json!({"Hello":{"major":1,"minor":0,"owner_epoch":epoch}}),
         )
         .await;
         let shutdown = read_frame(&mut stream).await.unwrap();
@@ -485,7 +482,7 @@ async fn shutdown_ack_is_not_success_until_the_original_owner_lock_is_released()
         let epoch = Uuid::new_v4();
         write_frame(
             &mut stream,
-            &json!({"Hello":{"major":PROTOCOL_MAJOR,"minor":0,"owner_epoch":epoch}}),
+            &json!({"Hello":{"major":1,"minor":0,"owner_epoch":epoch}}),
         )
         .await;
         let shutdown = read_frame(&mut stream).await.unwrap();
@@ -599,10 +596,7 @@ async fn verify_stopped_and_restart(
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(
-        String::from_utf8_lossy(&output.stdout)
-            .contains("Agent service stopped. Run tickloop again to start this build.")
-    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Agent service stopped."));
     assert!(!fixture.runtime.join("owner.sock").exists());
     assert!(!worker_socket.exists());
     assert_processes_exited(process_ids).await;
@@ -805,4 +799,438 @@ async fn rejected_startup_then_cli_stop_ends_legacy_owner_and_worker_before_curr
     eprintln!(
         "actual major-1 owner + active worker kept their PID/epoch after startup rejection, then current CLI stopped them; history preserved and current owner starts a new epoch"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn old_stop_wire_can_stop_a_future_business_owner() {
+    let mut fixture = ServiceFixture::new();
+    fixture.launch_in_progress = true;
+    let owner = tickloop_agent::agent_daemon::connect_or_start_at(
+        fixture.runtime.clone(),
+        env!("CARGO_BIN_EXE_tickloop").into(),
+    )
+    .await
+    .unwrap();
+    fixture.owner = Some((PROTOCOL_MAJOR, owner.owner_epoch()));
+    fixture.launch_in_progress = false;
+    let mut stream = UnixStream::connect(fixture.runtime.join("owner.sock"))
+        .await
+        .unwrap();
+    write_frame(&mut stream, &json!({"Hello":{"major":1,"minor":0}})).await;
+    let hello = read_frame(&mut stream).await.unwrap();
+    assert_eq!(hello["Hello"]["major"], 1);
+    assert_eq!(hello["Hello"]["owner_epoch"], json!(owner.owner_epoch()));
+    let request_id = Uuid::new_v4();
+    write_frame(
+        &mut stream,
+        &json!({"ShutdownOwner":{"request_id":request_id,"owner_epoch":owner.owner_epoch()}}),
+    )
+    .await;
+    assert_eq!(
+        read_frame(&mut stream).await.unwrap()["OwnerStopped"]["request_id"],
+        json!(request_id)
+    );
+    tokio::time::timeout(Duration::from_secs(7), async {
+        while fixture.runtime.join("owner.sock").exists() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_processes_exited(&[owner.protocol().process_id]).await;
+    fixture.owner = None;
+}
+
+struct UndispatchedAccess(std::sync::atomic::AtomicUsize);
+
+#[async_trait::async_trait]
+impl AgentAccess for UndispatchedAccess {
+    async fn observe(&self, _query: ObservationRequest) -> Result<Observation, AccessError> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(AccessError::unavailable("unexpected dispatch"))
+    }
+    async fn execute(&self, _command: CommandEnvelope) -> Result<CommandReceipt, AccessError> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(AccessError::unavailable("unexpected dispatch"))
+    }
+    async fn show_view(&self, _update: DisplayUpdate) -> Result<DisplayReceipt, AccessError> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(AccessError::unavailable("unexpected dispatch"))
+    }
+}
+
+#[tokio::test]
+async fn management_aliases_reject_every_business_request_before_dispatch() {
+    let fixture = ServiceFixture::new();
+    let access = std::sync::Arc::new(UndispatchedAccess(std::sync::atomic::AtomicUsize::new(0)));
+    let epoch = Uuid::new_v4();
+    let server = tokio::spawn(serve_owner_listener(
+        fixture.listener(),
+        access.clone(),
+        epoch,
+    ));
+    let request_id = Uuid::new_v4();
+    let requests = [
+        json!({"Observe":{"request_id":request_id,"query":ObservationRequest::Overview {
+            filter: AgentFilter::default(), page: Page { offset:0, limit:10 }, after:None,
+        }}}),
+        json!({"Execute":{"request_id":request_id,"command":create_command(epoch, LaunchSpec::embedded(fixture.directory.path().into()))}}),
+        json!({"ShowView":{"request_id":request_id,"update":DisplayUpdate::SessionClosed {session_id:Uuid::new_v4()}}}),
+    ];
+    for major in [1, 2] {
+        for request in &requests {
+            let mut stream = UnixStream::connect(fixture.runtime.join("owner.sock"))
+                .await
+                .unwrap();
+            write_frame(&mut stream, &json!({"Hello":{"major":major,"minor":0}})).await;
+            let hello = read_frame(&mut stream).await.unwrap();
+            assert_eq!(hello["Hello"]["major"], major);
+            assert_eq!(hello["Hello"]["minor"], 0);
+            write_frame(&mut stream, request).await;
+            let response = read_frame(&mut stream).await.unwrap();
+            assert_eq!(response["Error"]["error"]["code"], "VersionMismatch");
+            assert_eq!(response["Error"]["request_id"], json!(request_id));
+            assert!(read_frame(&mut stream).await.is_none());
+        }
+    }
+    assert_eq!(access.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+    let mut stream = UnixStream::connect(fixture.runtime.join("owner.sock"))
+        .await
+        .unwrap();
+    write_frame(&mut stream, &json!({"Hello":{"major":2,"minor":0}})).await;
+    read_frame(&mut stream).await.unwrap();
+    write_frame(
+        &mut stream,
+        &json!({"ShutdownOwner":{"request_id":request_id,"owner_epoch":epoch}}),
+    )
+    .await;
+    assert_eq!(
+        read_frame(&mut stream).await.unwrap()["OwnerStopped"]["request_id"],
+        json!(request_id)
+    );
+    server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn management_rejects_wrong_epoch_malformed_and_oversize_frames_without_dispatch() {
+    let fixture = ServiceFixture::new();
+    let access = std::sync::Arc::new(UndispatchedAccess(std::sync::atomic::AtomicUsize::new(0)));
+    let epoch = Uuid::new_v4();
+    let server = tokio::spawn(serve_owner_listener(
+        fixture.listener(),
+        access.clone(),
+        epoch,
+    ));
+    let request_id = Uuid::new_v4();
+    for request in [
+        json!({"ShutdownOwner":{"request_id":request_id,"owner_epoch":Uuid::new_v4()}}),
+        json!({"ShutdownOwner":{"request_id":"invalid-uuid","owner_epoch":epoch}}),
+        json!({"Hello":{"major":1,"minor":0}}),
+    ] {
+        let (mut stream, _) = legacy_connect(&fixture.runtime.join("owner.sock")).await;
+        write_frame(&mut stream, &request).await;
+        assert!(
+            read_frame(&mut stream)
+                .await
+                .unwrap()
+                .get("Error")
+                .is_some()
+        );
+        assert!(read_frame(&mut stream).await.is_none());
+        assert!(!server.is_finished());
+    }
+    for after_hello in [false, true] {
+        let mut stream = UnixStream::connect(fixture.runtime.join("owner.sock"))
+            .await
+            .unwrap();
+        if after_hello {
+            write_frame(&mut stream, &json!({"Hello":{"major":1,"minor":0}})).await;
+            read_frame(&mut stream).await.unwrap();
+        }
+        stream.write_u32(65537).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), read_frame(&mut stream))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(!server.is_finished());
+    }
+    let mut stream = UnixStream::connect(fixture.runtime.join("owner.sock"))
+        .await
+        .unwrap();
+    stream.write_u32(1).await.unwrap();
+    stream.write_all(b"{").await.unwrap();
+    assert!(read_frame(&mut stream).await.is_none());
+    let mut ordinary = UnixStream::connect(fixture.runtime.join("owner.sock"))
+        .await
+        .unwrap();
+    write_frame(&mut ordinary, &json!({"Hello":{"major":2,"minor":1}})).await;
+    assert_eq!(
+        read_frame(&mut ordinary).await.unwrap()["Error"]["error"]["code"],
+        "VersionMismatch"
+    );
+    assert!(read_frame(&mut ordinary).await.is_none());
+    assert_eq!(access.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn worker_socket_has_no_cross_version_management_facade() {
+    let fixture = ServiceFixture::new();
+    let access = std::sync::Arc::new(UndispatchedAccess(std::sync::atomic::AtomicUsize::new(0)));
+    let server = tokio::spawn(serve_worker_listener(
+        fixture.listener(),
+        access.clone(),
+        Uuid::new_v4(),
+    ));
+    for major in [1, 2] {
+        let mut stream = UnixStream::connect(fixture.runtime.join("owner.sock"))
+            .await
+            .unwrap();
+        write_frame(&mut stream, &json!({"Hello":{"major":major,"minor":0}})).await;
+        assert_eq!(
+            read_frame(&mut stream).await.unwrap()["Error"]["error"]["code"],
+            "VersionMismatch"
+        );
+        assert!(read_frame(&mut stream).await.is_none());
+    }
+    assert_eq!(access.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn only_version_mismatch_allows_the_legacy_control_alias_retry() {
+    let fixture = ServiceFixture::new();
+    let listener = fixture.listener();
+    let socket = fixture.runtime.join("owner.sock");
+    let server = tokio::spawn(async move {
+        let (mut first, _) = listener.accept().await.unwrap();
+        assert_eq!(
+            read_frame(&mut first).await.unwrap(),
+            json!({"Hello":{"major":1,"minor":0}})
+        );
+        write_frame(&mut first, &json!({"Error":{"request_id":null,"error":{"code":"VersionMismatch","message":"legacy v2"}}})).await;
+        assert!(read_frame(&mut first).await.is_none());
+        let (mut stream, _) = listener.accept().await.unwrap();
+        assert_eq!(
+            read_frame(&mut stream).await.unwrap(),
+            json!({"Hello":{"major":2,"minor":0}})
+        );
+        let epoch = Uuid::new_v4();
+        write_frame(&mut stream, &json!({"Hello":{"major":2,"minor":0,"owner_epoch":epoch,"capabilities":["UnknownFutureBusinessCapability"]}})).await;
+        let shutdown = read_frame(&mut stream).await.unwrap();
+        assert_eq!(shutdown["ShutdownOwner"]["owner_epoch"], json!(epoch));
+        std::fs::remove_file(socket).unwrap();
+        write_frame(
+            &mut stream,
+            &json!({"OwnerStopped":{"request_id":shutdown["ShutdownOwner"]["request_id"]}}),
+        )
+        .await;
+        assert_disconnected(&mut stream, &listener).await;
+    });
+    assert!(fixture.run(&["service", "stop"]).await.status.success());
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn control_oversize_reply_is_rejected_without_shutdown() {
+    let fixture = ServiceFixture::new();
+    let listener = fixture.listener();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_frame(&mut stream).await.unwrap();
+        stream.write_u32(65537).await.unwrap();
+        assert_disconnected(&mut stream, &listener).await;
+    });
+    assert!(assert_failed(&fixture.run(&["service", "stop"]).await).contains("64 KiB"));
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn replacement_lock_before_shutdown_or_after_ack_is_preserved() {
+    for after_ack in [false, true] {
+        let fixture = ServiceFixture::new();
+        let listener = fixture.listener();
+        let original = fixture.lock();
+        assert_eq!(
+            unsafe { libc::flock(original.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        let runtime = fixture.runtime.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_frame(&mut stream).await.unwrap();
+            let epoch = Uuid::new_v4();
+            if after_ack {
+                write_frame(
+                    &mut stream,
+                    &json!({"Hello":{"major":1,"minor":0,"owner_epoch":epoch}}),
+                )
+                .await;
+                let shutdown = read_frame(&mut stream).await.unwrap();
+                assert_eq!(shutdown["ShutdownOwner"]["owner_epoch"], json!(epoch));
+                std::fs::rename(runtime.join("owner.lock"), runtime.join("old.lock")).unwrap();
+                let replacement = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(runtime.join("owner.lock"))
+                    .unwrap();
+                assert_eq!(
+                    unsafe { libc::flock(replacement.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                    0
+                );
+                std::fs::remove_file(runtime.join("owner.sock")).unwrap();
+                write_frame(
+                    &mut stream,
+                    &json!({"OwnerStopped":{"request_id":shutdown["ShutdownOwner"]["request_id"]}}),
+                )
+                .await;
+                assert_disconnected(&mut stream, &listener).await;
+                drop(replacement);
+            } else {
+                std::fs::rename(runtime.join("owner.lock"), runtime.join("old.lock")).unwrap();
+                let replacement = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(runtime.join("owner.lock"))
+                    .unwrap();
+                write_frame(
+                    &mut stream,
+                    &json!({"Hello":{"major":1,"minor":0,"owner_epoch":epoch}}),
+                )
+                .await;
+                assert_disconnected(&mut stream, &listener).await;
+                drop(replacement);
+            }
+            drop(original);
+        });
+        let error = assert_failed(&fixture.run(&["service", "stop"]).await);
+        assert!(error.contains("owner lock was replaced"), "{error}");
+        server.await.unwrap();
+        assert!(fixture.runtime.join("owner.lock").is_file());
+        assert!(fixture.runtime.join("old.lock").is_file());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_owner_preserves_replacement_endpoint_after_shutdown_dispatch() {
+    use std::os::unix::fs::MetadataExt;
+
+    for replace_lock in [false, true] {
+        let fixture = ServiceFixture::new();
+        let lock = fixture.lock();
+        assert_eq!(
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        let lock_fd = lock.as_raw_fd();
+        let mut command = fixture.command(&[
+            "--agent-owner",
+            fixture.runtime.to_str().unwrap(),
+            &lock_fd.to_string(),
+        ]);
+        command.stderr(Stdio::piped());
+        unsafe {
+            command.pre_exec(move || {
+                if libc::fcntl(lock_fd, libc::F_SETFD, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let original = command.spawn().unwrap();
+        drop(lock);
+        let endpoint = fixture.runtime.join("owner.sock");
+        let owner = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(client) = LocalAgentClient::connect(&endpoint).await {
+                    break client;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let (launch, mut requests, _release) = launch_active_worker(&fixture).await;
+        owner
+            .execute(create_command(owner.owner_epoch(), launch))
+            .await
+            .unwrap()
+            .into_result()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let worker_endpoint = std::fs::read_dir(&fixture.runtime)
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| entry.file_name().to_string_lossy().starts_with("w-"))
+            .unwrap()
+            .path();
+        let worker = LocalAgentClient::connect(&worker_endpoint).await.unwrap();
+        let worker_pid = worker.protocol().process_id;
+        assert_eq!(
+            unsafe { libc::kill(worker_pid as libc::pid_t, libc::SIGSTOP) },
+            0
+        );
+
+        let (mut management, _) = legacy_connect(&endpoint).await;
+        let request_id = Uuid::new_v4();
+        write_frame(
+            &mut management,
+            &json!({"ShutdownOwner": {
+                "request_id":request_id,"owner_epoch":owner.owner_epoch(),
+            }}),
+        )
+        .await;
+        assert_eq!(
+            read_frame(&mut management).await.unwrap()["OwnerStopped"]["request_id"],
+            json!(request_id)
+        );
+        std::fs::rename(&endpoint, fixture.runtime.join("original.sock")).unwrap();
+        let replacement_lock = if replace_lock {
+            std::fs::rename(
+                fixture.runtime.join("owner.lock"),
+                fixture.runtime.join("original.lock"),
+            )
+            .unwrap();
+            let replacement_lock = fixture.lock();
+            assert_eq!(
+                unsafe { libc::flock(replacement_lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                0
+            );
+            Some(replacement_lock)
+        } else {
+            None
+        };
+        let replacement = fixture.listener();
+        let metadata = std::fs::symlink_metadata(&endpoint).unwrap();
+        let replacement_identity = (metadata.dev(), metadata.ino());
+        assert_eq!(
+            unsafe { libc::kill(worker_pid as libc::pid_t, libc::SIGCONT) },
+            0
+        );
+        let output = tokio::time::timeout(Duration::from_secs(7), original.wait_with_output())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_processes_exited(&[worker_pid]).await;
+        let remaining = std::fs::symlink_metadata(&endpoint)
+            .expect("original daemon deleted the replacement owner's endpoint");
+        assert_eq!((remaining.dev(), remaining.ino()), replacement_identity);
+        assert!(
+            !output.status.success(),
+            "daemon must report the endpoint/lock change"
+        );
+        assert!(String::from_utf8_lossy(&output.stderr).contains("changed"));
+        let connection = UnixStream::connect(&endpoint).await.unwrap();
+        let accepted = replacement.accept().await.unwrap();
+        drop((connection, accepted, replacement, replacement_lock));
+    }
 }
