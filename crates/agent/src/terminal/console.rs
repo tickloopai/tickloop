@@ -95,7 +95,7 @@ use super::{
         PermissionsSurface,
     },
     renderer::{self, Renderer},
-    scrollback::{InputEcho, ScrollAction, Scrollback},
+    scrollback::{InputEcho, ScrollAction, Scrollback, ToolCallState},
     selection::{Cell, Selection, line_width, split_columns},
     shell_input::{
         InputKind, ShellCompletionKey, ShellCompletionKind, ShellEmptyControl, ShellExecution,
@@ -172,6 +172,9 @@ impl TerminalSurface {
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const INPUT_CHANNEL_CAPACITY: usize = 128;
 const FOOTER_ROWS: usize = 3;
+const STATUS_LINE_LEADING_RULE_COLUMNS: usize = 2;
+const STATUS_LINE_GAP_COLUMNS: usize = 1;
+const STATUS_LINE_MIN_RULE_COLUMNS: usize = 1;
 const FOOTER_ITEMS_ROWS: usize = 1;
 const MIN_FOOTER_ITEMS_TERMINAL_ROWS: usize = FOOTER_ROWS + FOOTER_ITEMS_ROWS;
 const MIN_SCROLL_ROWS: usize = 2;
@@ -223,6 +226,16 @@ pub(super) enum InputEvent {
         action: char,
     },
     OpenStatusTask(Uuid),
+    OpenTickShell {
+        chat: Uuid,
+        task_id: Uuid,
+        panel: Uuid,
+    },
+    TickShellEffect {
+        chat: Uuid,
+        panel: Uuid,
+        effect: TaskSurfaceEffect,
+    },
     StopStatusTask(Uuid),
     TaskSurface(TaskSurfaceEffect),
     Subscription(SubscriptionEffect),
@@ -306,6 +319,26 @@ impl fmt::Debug for InputEvent {
             Self::OpenStatusTask(value) => formatter
                 .debug_tuple("OpenStatusTask")
                 .field(value)
+                .finish(),
+            Self::OpenTickShell {
+                chat,
+                task_id,
+                panel,
+            } => formatter
+                .debug_tuple("OpenTickShell")
+                .field(chat)
+                .field(task_id)
+                .field(panel)
+                .finish(),
+            Self::TickShellEffect {
+                chat,
+                panel,
+                effect,
+            } => formatter
+                .debug_tuple("TickShellEffect")
+                .field(chat)
+                .field(panel)
+                .field(effect)
                 .finish(),
             Self::StopStatusTask(value) => formatter
                 .debug_tuple("StopStatusTask")
@@ -465,7 +498,30 @@ impl ArtifactMetadataSink {
         } else {
             &mut state.view_cache.entry(Some(chat)).or_default().tick_list
         };
+        list.metadata_failures.remove(&id);
         list.metadata.insert(id, metadata);
+    }
+
+    pub(super) fn failed(&self, chat: Uuid, id: String, error: String) {
+        let Some(state) = self.state.upgrade() else {
+            return;
+        };
+        let Ok(mut state) = state.lock() else {
+            return;
+        };
+        let is_current = state.chat == Some(chat);
+        let list = if is_current {
+            &mut state.tick_list
+        } else {
+            &mut state.view_cache.entry(Some(chat)).or_default().tick_list
+        };
+        list.metadata_failures.insert(id, error.clone());
+        if is_current {
+            state.hold_status(&format!(
+                "Artifact refresh failed: {} · r retries",
+                super::safe_text(&error)
+            ));
+        }
     }
 }
 
@@ -515,6 +571,7 @@ struct State {
     back_to_bottom_target: Option<BackToBottomTarget>,
     back_to_bottom_pressed: bool,
     tick_toggle_target: Option<BackToBottomTarget>,
+    tick_row_targets: Vec<TickRowTarget>,
     footer_bar_target: Option<FooterBarTarget>,
     pointer_input: Option<InputEvent>,
     completion: Completion,
@@ -814,6 +871,13 @@ struct FooterBarTarget {
     categories: Vec<(std::ops::Range<usize>, FooterItemId)>,
 }
 
+struct TickRowTarget {
+    chat: Uuid,
+    row: usize,
+    columns: std::ops::Range<usize>,
+    id: String,
+}
+
 fn status_notice_line(
     notice: &str,
     background: Option<&BackgroundStatusNotice>,
@@ -900,7 +964,26 @@ impl Console {
         let mut state = State::new(false, 140, 25);
         state.chat = Some(chat);
         state.prompt_enabled = true;
+        state.clipboard = Clipboard::Captured {
+            copies: Arc::new(Mutex::new(Vec::new())),
+            image: None,
+            remote: true,
+        };
         tests::console_with_state(state)
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_status_text(&self) -> String {
+        self.state.lock().unwrap().status.clone()
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_clipboard_contents(&self) -> Vec<String> {
+        let state = self.state.lock().unwrap();
+        let Clipboard::Captured { copies, .. } = &state.clipboard else {
+            panic!("test clipboard is not isolated");
+        };
+        copies.lock().unwrap().clone()
     }
 
     pub(super) fn artifact_metadata_sink(&self) -> ArtifactMetadataSink {
@@ -1019,6 +1102,8 @@ impl Console {
                     .find(|source| source.source_key == tick.artifact_id);
                 let status = if metadata.is_some_and(Option::is_none) {
                     "unavailable"
+                } else if list.metadata_failures.contains_key(&tick.instance_id()) {
+                    "refresh failed"
                 } else if binding.is_some_and(|source| source.resume_required) {
                     "feedback paused"
                 } else if binding.is_some() {
@@ -1104,6 +1189,7 @@ impl Console {
         } else {
             &mut state.view_cache.entry(Some(chat)).or_default().tick_list
         };
+        list.metadata_failures.remove(&id);
         list.metadata.insert(id, metadata);
         Ok(())
     }
@@ -1256,19 +1342,7 @@ impl Console {
             .iter()
             .filter(|task| task.chat_id == snapshot.chat_id)
             .map(|task| {
-                let status = if task.state == tickloop_agent::runtime::ShellTaskState::Unknown {
-                    "unknown".into()
-                } else if !task.state.is_terminal() {
-                    "running".into()
-                } else if let Some(signal) = task.signal {
-                    format!("signal {signal}")
-                } else if let Some(exit) = task.exit_code {
-                    format!("exit {exit}")
-                } else if task.reason.is_some() {
-                    "stopped".into()
-                } else {
-                    "unknown".into()
-                };
+                let status = super::tick_shell::shell_status(task);
                 TickListEntry {
                     id: task.id.to_string(),
                     group: TickGroup::Shells,
@@ -1286,6 +1360,109 @@ impl Console {
             .map_err(|error| error.to_string())?
             .update_tick_entries(snapshot.chat_id, TickGroup::Shells, entries);
         Ok(())
+    }
+
+    pub(super) fn tick_shell_target(&self) -> Result<Option<(Uuid, Uuid, Uuid)>, String> {
+        let state = self.state.lock().map_err(|error| error.to_string())?;
+        Ok(state
+            .tick_list_visible()
+            .then(|| {
+                state
+                    .tick_list
+                    .shell_detail
+                    .as_ref()
+                    .map(|detail| (detail.chat, detail.id, detail.task_id))
+            })
+            .flatten())
+    }
+    pub(super) fn load_tick_shell(
+        &self,
+        chat: Uuid,
+        panel: Uuid,
+        snapshot: TaskSurfaceSnapshot,
+        started: Option<u64>,
+    ) -> Result<TaskSurfaceEffect, String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        let list = state.tick_list_for_chat_mut(chat);
+        let Some(detail) = list
+            .shell_detail
+            .as_mut()
+            .filter(|detail| detail.id == panel)
+        else {
+            return Ok(TaskSurfaceEffect::None);
+        };
+        let effect = detail.load(snapshot, started);
+        if effect.is_none() {
+            list.shell_detail = None;
+        }
+        state
+            .draw(&mut io::stdout().lock())
+            .map_err(|error| error.to_string())?;
+        Ok(effect.unwrap_or(TaskSurfaceEffect::None))
+    }
+    pub(super) fn update_tick_shell(
+        &self,
+        chat: Uuid,
+        panel: Uuid,
+        snapshot: TaskSurfaceSnapshot,
+    ) -> Result<TaskSurfaceEffect, String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        let list = state.tick_list_for_chat_mut(chat);
+        let Some(detail) = list
+            .shell_detail
+            .as_mut()
+            .filter(|detail| detail.id == panel)
+        else {
+            return Ok(TaskSurfaceEffect::None);
+        };
+        let effect = detail.update(snapshot);
+        if effect.is_none() {
+            list.shell_detail = None;
+        }
+        state
+            .draw(&mut io::stdout().lock())
+            .map_err(|error| error.to_string())?;
+        Ok(effect.unwrap_or(TaskSurfaceEffect::None))
+    }
+    pub(super) fn update_tick_shell_output(
+        &self,
+        chat: Uuid,
+        panel: Uuid,
+        update: TaskOutputUpdate,
+    ) -> Result<TaskSurfaceEffect, String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        let Some(detail) = state
+            .tick_list_for_chat_mut(chat)
+            .shell_detail
+            .as_mut()
+            .filter(|detail| detail.id == panel)
+        else {
+            return Ok(TaskSurfaceEffect::None);
+        };
+        let effect = detail.output(update);
+        state
+            .draw(&mut io::stdout().lock())
+            .map_err(|error| error.to_string())?;
+        Ok(effect)
+    }
+    pub(super) fn tick_shell_failed(
+        &self,
+        chat: Uuid,
+        panel: Uuid,
+        error: String,
+    ) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        if let Some(detail) = state
+            .tick_list_for_chat_mut(chat)
+            .shell_detail
+            .as_mut()
+            .filter(|detail| detail.id == panel)
+        {
+            detail.report(error);
+        }
+        state
+            .draw(&mut io::stdout().lock())
+            .map_err(|error| error.to_string())
     }
 
     pub(super) fn set_background_status_notice(
@@ -2809,15 +2986,14 @@ impl Console {
         })
     }
 
-    /// Writes a tool call header whose glyph shows it running until
-    /// [`Self::finish_tool_call`].
     pub(super) fn write_tool_call(
         &self,
         call_id: &str,
         spans: &[(String, Option<Role>)],
+        state: ToolCallState,
     ) -> Result<(), String> {
         self.write_scrollback_spans(spans, |scrollback| {
-            scrollback.append_tool_call(call_id, spans)
+            scrollback.set_tool_call(call_id, spans, state)
         })
     }
 
@@ -3939,6 +4115,12 @@ pub(super) enum ConversationPiece {
         text: String,
         starts_message: bool,
     },
+    ToolCall {
+        text: String,
+        call_key: String,
+        spans: Vec<(String, Option<Role>)>,
+        state: ToolCallState,
+    },
 }
 
 #[derive(Clone)]
@@ -3950,6 +4132,12 @@ enum CreationPrefixEntry {
 impl ConversationPiece {
     fn append_to(&self, scrollback: &mut Scrollback, display: DisplayProfile) {
         match self {
+            Self::ToolCall {
+                call_key,
+                spans,
+                state,
+                ..
+            } => scrollback.set_tool_call(call_key, spans, *state),
             Self::Styled(text, role) => scrollback.append_as(text, *role, None),
             Self::Linked { text, link } => scrollback.append_span(text, None, None, Some(link)),
             Self::Markdown {
@@ -3964,7 +4152,10 @@ impl ConversationPiece {
 
     pub(super) fn text(&self) -> &str {
         match self {
-            Self::Styled(text, _) | Self::Linked { text, .. } | Self::Markdown { text, .. } => text,
+            Self::Styled(text, _)
+            | Self::Linked { text, .. }
+            | Self::Markdown { text, .. }
+            | Self::ToolCall { text, .. } => text,
         }
     }
 }
@@ -4390,6 +4581,7 @@ impl State {
             back_to_bottom_target: None,
             back_to_bottom_pressed: false,
             tick_toggle_target: None,
+            tick_row_targets: Vec::new(),
             footer_bar_target: None,
             pointer_input: None,
             completion: Completion::default(),
@@ -4520,6 +4712,28 @@ impl State {
                 self.scroll_conversation(ScrollAction::LinesDown(renderer::WHEEL_SCROLL_LINES))
             }
             MouseEventKind::Down(MouseButton::Left) => {
+                if self.tick_list_visible()
+                    && !self.menu_submission_is_pending()
+                    && !self.branch_submission_owns_input()
+                    && let Some(id) = self
+                        .tick_row_targets
+                        .iter()
+                        .find(|target| {
+                            Some(target.chat) == self.chat
+                                && target.row == at.row
+                                && target.columns.contains(&at.column)
+                        })
+                        .map(|target| target.id.clone())
+                {
+                    self.clear_selection();
+                    self.clear_footer_selection();
+                    self.conversation_focused = false;
+                    self.tick_list.focus(self.tick_list.overlay, None);
+                    self.tick_list.select(&id);
+                    self.pointer_input =
+                        self.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                    return true;
+                }
                 if self.tick_toggle_target.as_ref().is_some_and(|target| {
                     target.row == at.row && target.columns.contains(&at.column)
                 }) {
@@ -4781,6 +4995,8 @@ impl State {
             && self.conversation_picker.is_none()
             && self.artifacts_picker.is_none()
             && self.task_surface.is_none()
+            && self.todo_detail.is_none()
+            && self.history_search.is_none()
             && self.permissions_surface.is_none()
             && self.subscription_surface.is_none()
             && self.transcript.is_none()
@@ -4803,6 +5019,14 @@ impl State {
         }
     }
 
+    fn tick_list_for_chat_mut(&mut self, chat: Uuid) -> &mut TickList {
+        if self.chat == Some(chat) {
+            &mut self.tick_list
+        } else {
+            &mut self.view_cache.entry(Some(chat)).or_default().tick_list
+        }
+    }
+
     fn content_columns(&self) -> usize {
         if self.tick_list_visible() && !self.tick_list.overlay {
             self.width.saturating_sub(TICK_LIST_COLUMNS).max(2)
@@ -4812,6 +5036,7 @@ impl State {
     }
 
     fn draw_frame(&mut self, output: &mut impl Write) -> io::Result<()> {
+        self.tick_row_targets.clear();
         if let Some(dialog) = &self.workspace_trust {
             let frame = dialog.frame(self.width, self.height, self.display);
             let mut lines = frame.lines;
@@ -5050,12 +5275,33 @@ impl State {
         let padding = start.saturating_sub(body.lines.len());
         let side_columns = TICK_LIST_COLUMNS.min(self.width);
         let tick_lines = self.tick_list_visible().then(|| {
-            self.tick_list.lines(
+            if let Some(detail) = &mut self.tick_list.shell_detail {
+                return detail.lines(
+                    side_columns.saturating_sub(2),
+                    start,
+                    crate::private_fs::unix_time_milliseconds(),
+                );
+            }
+            let frame = self.tick_list.frame(
                 side_columns.saturating_sub(2),
                 start,
                 self.display,
                 crate::private_fs::unix_time_milliseconds(),
-            )
+            );
+            if let Some(chat) = self.chat {
+                let columns = self.width.saturating_sub(side_columns) + 1..self.width;
+                self.tick_row_targets = frame
+                    .targets
+                    .into_iter()
+                    .map(|(row, id)| TickRowTarget {
+                        chat,
+                        row,
+                        columns: columns.clone(),
+                        id,
+                    })
+                    .collect();
+            }
+            frame.lines
         });
         let rows: Vec<String> = (0..start)
             .map(|row| {
@@ -5064,41 +5310,34 @@ impl State {
                     .and_then(|index| body.lines.get(index))
                     .map(String::as_str)
                     .unwrap_or_default();
-                let resolved = line_index
-                    .and_then(|index| body.styled.get(index))
-                    .map_or_else(
-                        || StyledLine::plain(line),
-                        |styled| styled.resolve(self.display.theme(), content_columns),
-                    );
-                let left = self.with_selection(row, resolved).render(self.colour_depth);
                 if let Some(tick_lines) = &tick_lines {
                     let left_columns = self.width.saturating_sub(side_columns);
-                    let left_text = truncate_width(line, left_columns);
-                    let left = if self.tick_list.overlay {
-                        line_index
-                            .and_then(|index| body.styled.get(index))
-                            .map_or_else(
-                                || StyledLine::plain(&left_text),
-                                |styled| {
-                                    let mut clipped = styled.clone();
-                                    clipped.truncate(left_columns);
-                                    clipped.resolve(self.display.theme(), left_columns)
-                                },
-                            )
-                            .render(self.colour_depth)
-                    } else {
-                        left
-                    };
+                    let mut left = line_index
+                        .and_then(|index| body.styled.get(index))
+                        .cloned()
+                        .unwrap_or_else(|| RoleLine::plain(line));
+                    left.truncate(left_columns);
+                    let left =
+                        self.with_selection(row, left.resolve(self.display.theme(), left_columns));
                     let side = tick_lines.get(row).cloned().unwrap_or_default();
+                    let right = side.resolve(self.display.theme(), side_columns.saturating_sub(2));
                     format!(
-                        "{left}{}│ {}{}",
-                        " ".repeat(left_columns.saturating_sub(display_width(&left_text))),
-                        side.resolve(self.display.theme(), side_columns.saturating_sub(2))
-                            .render(self.colour_depth),
-                        " ".repeat(side_columns.saturating_sub(2 + display_width(&side.text())))
+                        "{}\x1b[0m│ {}",
+                        render_padded_line(&left, left_columns, self.colour_depth),
+                        render_padded_line(
+                            &right,
+                            side_columns.saturating_sub(2),
+                            self.colour_depth
+                        )
                     )
                 } else {
-                    left
+                    let resolved = line_index
+                        .and_then(|index| body.styled.get(index))
+                        .map_or_else(
+                            || StyledLine::plain(line),
+                            |styled| styled.resolve(self.display.theme(), content_columns),
+                        );
+                    self.with_selection(row, resolved).render(self.colour_depth)
                 }
             })
             .chain(lines.iter().enumerate().map(|(index, line)| {
@@ -5878,6 +6117,11 @@ impl State {
         }
         let hints = if let Some(hint) = self.confirmation_hint() {
             hint
+        } else if self.tick_list_visible() && self.tick_list.focused {
+            self.tick_list
+                .shell_detail
+                .as_ref()
+                .map_or_else(|| "Esc input".into(), |detail| detail.hint())
         } else if self.foreground_shell {
             "Shell running · Ctrl+B / Ctrl+X Ctrl+B background · Ctrl+C stop".into()
         } else if self.input_menu_active() {
@@ -6403,12 +6647,22 @@ impl State {
         let core_status = self
             .status_area
             .status_line_with_background(usize::MAX, "", None);
+        let core_columns = display_width(&core_status.text());
+        let status_padding = match self.display.preferences().status_line_position {
+            StatusLinePosition::Right => STATUS_LINE_GAP_COLUMNS + STATUS_LINE_MIN_RULE_COLUMNS,
+            StatusLinePosition::Left => {
+                STATUS_LINE_LEADING_RULE_COLUMNS
+                    + STATUS_LINE_GAP_COLUMNS
+                    + STATUS_LINE_GAP_COLUMNS
+                    + STATUS_LINE_MIN_RULE_COLUMNS
+            }
+        };
         let float_core_status = !short
             && !overview
             && !self.help_open
             && configured_status.is_none()
             && self.status_area.is_configured()
-            && display_width(&core_status.text()) + 2 <= self.width;
+            && core_columns + status_padding <= self.width;
         let mut status_rows = if self.help_open {
             usize::from(!leading_notice.is_empty() || required_status)
         } else {
@@ -6614,8 +6868,12 @@ impl State {
         if borders > 1 {
             let mut divider = RoleLine::role(
                 "─".repeat(if float_core_status {
-                    self.width
-                        .saturating_sub(display_width(&core_status.text()) + 1)
+                    match self.display.preferences().status_line_position {
+                        StatusLinePosition::Right => self
+                            .width
+                            .saturating_sub(core_columns + STATUS_LINE_GAP_COLUMNS),
+                        StatusLinePosition::Left => STATUS_LINE_LEADING_RULE_COLUMNS,
+                    }
                 } else {
                     self.width
                 }),
@@ -6628,10 +6886,18 @@ impl State {
                         divider.spans.extend(core_status.spans);
                     }
                     StatusLinePosition::Left => {
-                        let rule_spans = divider.spans;
-                        divider.spans = core_status.spans;
                         divider.push(" ", None);
-                        divider.spans.extend(rule_spans);
+                        divider.spans.extend(core_status.spans);
+                        divider.push(" ", None);
+                        divider.push(
+                            "─".repeat(self.width.saturating_sub(
+                                core_columns
+                                    + STATUS_LINE_LEADING_RULE_COLUMNS
+                                    + STATUS_LINE_GAP_COLUMNS
+                                    + STATUS_LINE_GAP_COLUMNS,
+                            )),
+                            Some(border),
+                        );
                     }
                 }
             }
@@ -6731,9 +6997,13 @@ impl State {
                         notice = notice_line.text();
                         let overview_list_hint;
                         let return_hint;
+                        let tick_hint;
                         let hints = if self.confirmation_hint().is_some() || self.help_open {
                             // Help is focused and draws its own close hint; only facts remain.
                             ""
+                        } else if self.tick_list_visible() && self.tick_list.focused {
+                            tick_hint = self.tick_list.shell_detail.as_ref().map_or_else(|| "Esc input".into(), |detail| detail.hint());
+                            tick_hint.as_str()
                         } else if let Some(pending) = &self.footer_open_pending {
                             if pending.item == FooterItemId::Tasks {
                                 "Opening Shell · Esc input"
@@ -8306,6 +8576,9 @@ impl State {
             picker.paste(text);
             return;
         }
+        if self.tick_list.focused && self.tick_list_visible() {
+            return;
+        }
         if self.input_menu_active() {
             self.paste_menu_comment(text);
             return;
@@ -9081,14 +9354,16 @@ impl State {
             if self.menu_submission_pending.is_some() {
                 return None;
             }
-            return dialog.key(key, self.width, self.height, self.display).map(|decision| match decision {
-                TrustDecision::Accept => InputEvent::Choice {
-                    menu_id: dialog.id,
-                    index: TRUST_ACCEPT_CHOICE_INDEX,
-                    comment: None,
-                },
-                TrustDecision::Cancel => InputEvent::Cancel { menu_id: dialog.id },
-            });
+            return dialog
+                .key(key, self.width, self.height, self.display)
+                .map(|decision| match decision {
+                    TrustDecision::Accept => InputEvent::Choice {
+                        menu_id: dialog.id,
+                        index: TRUST_ACCEPT_CHOICE_INDEX,
+                        comment: None,
+                    },
+                    TrustDecision::Cancel => InputEvent::Cancel { menu_id: dialog.id },
+                });
         }
         self.status_held = false;
         // Legacy terminals send Ctrl+H as 0x08; crossterm reports Ctrl+h, which Readline treats as Backspace.
@@ -9132,6 +9407,28 @@ impl State {
             return self.conversation_picker_key(key);
         }
         if self.tick_list_visible() && self.tick_list.focused {
+            if self.tick_list.shell_detail.is_some() {
+                let width = TICK_LIST_COLUMNS.min(self.width).saturating_sub(2);
+                let height = self.height.saturating_sub(self.styled_frame().0.len());
+                let detail = self.tick_list.shell_detail.as_mut().unwrap();
+                let chat = detail.chat;
+                let panel = detail.id;
+                return match detail.key(key, width, height) {
+                    super::tick_shell::TickShellKey::None => None,
+                    super::tick_shell::TickShellKey::Back => {
+                        self.tick_list.shell_detail = None;
+                        self.rendered_region = None;
+                        None
+                    }
+                    super::tick_shell::TickShellKey::Effect(effect) => {
+                        Some(InputEvent::TickShellEffect {
+                            chat,
+                            panel,
+                            effect,
+                        })
+                    }
+                };
+            }
             if let Some(id) = self.tick_list.confirmation.clone() {
                 if key.code == KeyCode::Esc {
                     self.tick_list.confirmation = None;
@@ -9147,6 +9444,13 @@ impl State {
                 return None;
             }
             match (key.code, key.modifiers) {
+                (KeyCode::Char('r'), KeyModifiers::NONE) => {
+                    return self.chat.map(|chat| InputEvent::TickListAction {
+                        chat,
+                        id: String::new(),
+                        action: 'r',
+                    });
+                }
                 (KeyCode::Esc | KeyCode::Left, _) => {
                     self.tick_list.focused = false;
                     self.tick_list.overlay = false;
@@ -9165,16 +9469,24 @@ impl State {
                         } else {
                             unreachable!()
                         };
-                        if entry.group == TickGroup::Subscribed && !matches!(action, 'o' | 'x') {
+                        if entry.group == TickGroup::Subscribed
+                            && entry.glyph != Glyph::ArtifactTick
+                            && !matches!(action, 'o' | 'x')
+                        {
                             return None;
                         }
                         if entry.group == TickGroup::Shells {
                             if action == 'o' {
-                                self.tick_list.focused = false;
-                                self.tick_list.overlay = false;
-                                return Uuid::parse_str(&entry.id)
-                                    .ok()
-                                    .map(InputEvent::OpenStatusTask);
+                                let chat = self.chat?;
+                                let task_id = Uuid::parse_str(&entry.id).ok()?;
+                                let detail = super::tick_shell::TickShell::loading(chat, task_id);
+                                let panel = detail.id;
+                                self.tick_list.shell_detail = Some(detail);
+                                return Some(InputEvent::OpenTickShell {
+                                    chat,
+                                    task_id,
+                                    panel,
+                                });
                             }
                             if action == 'x' {
                                 if entry.running {
@@ -9200,16 +9512,10 @@ impl State {
         }
         if self.chat.is_some()
             && !self.tick_list.entries().is_empty()
-            && self.overview.projection.is_none()
-            && !self.help_open
-            && self.menu.is_none()
-            && self.task_surface.is_none()
-            && self.subscription_surface.is_none()
-            && self.permissions_surface.is_none()
-            && self.transcript.is_none()
-            && self.diff_screen.is_none()
+            && self.ordinary_input_is_visible()
+            && !self.conversation_focused
+            && !self.footer_list_focused
             && (self.editor.draft().is_empty() || key.modifiers == KeyModifiers::SHIFT)
-            && self.prompt_enabled
             && !self.completion.is_open()
             && !self.file_mentions.is_open()
             && ((key.code == KeyCode::Right && key.modifiers == KeyModifiers::NONE)
@@ -10729,6 +11035,19 @@ pub(super) fn wrap_text(text: &str, width: usize) -> Vec<String> {
         column += character_width;
     }
     lines
+}
+
+fn render_padded_line(line: &StyledLine, width: usize, depth: ColourDepth) -> String {
+    let columns = line
+        .spans
+        .iter()
+        .map(|span| display_width(&span.text))
+        .sum::<usize>();
+    format!(
+        "{}{}",
+        line.render(depth),
+        " ".repeat(width.saturating_sub(columns))
+    )
 }
 
 pub(super) fn truncate_width(text: &str, width: usize) -> String {
@@ -16870,19 +17189,26 @@ mod tests {
         let snapshot = task_snapshot(chat, 6);
         console.update_shell_ticks(&snapshot).unwrap();
         let task = snapshot.tasks[4].id;
-        {
+        let panel = {
             let mut state = console.state.lock().unwrap();
             state.tick_list.select(&task.to_string());
             state.key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
             state.tick_list.select(&task.to_string());
-            assert!(
-                matches!(state.key(key(KeyCode::Enter)), Some(InputEvent::OpenStatusTask(id)) if id == task)
-            );
-        }
-        console.show_tasks_at(snapshot, Some(task)).unwrap();
+            let Some(InputEvent::OpenTickShell { task_id, panel, .. }) =
+                state.key(key(KeyCode::Enter))
+            else {
+                panic!("Shell did not open the Tick panel");
+            };
+            assert_eq!(task_id, task);
+            panel
+        };
+        console
+            .load_tick_shell(chat, panel, snapshot, None)
+            .unwrap();
         let mut state = console.state.lock().unwrap();
         state.key(key(KeyCode::Esc));
         assert!(state.task_surface.is_none());
+        assert!(state.tick_list.shell_detail.is_none());
         assert_eq!(state.tick_list.selected().unwrap().id, task.to_string());
         assert_eq!(state.editor.draft(), "keep this draft");
     }
@@ -18561,7 +18887,10 @@ mod tests {
     #[tokio::test]
     async fn settings_menu_status_line_position_saves_before_applying_and_keeps_later_actions() {
         use crate::settings::{StatusLinePosition, UserSettings};
-        use crate::terminal::menus::Menus;
+        use crate::terminal::menus::{
+            Menus, OUTPUT_STYLE_SETTING_INDEX, PERMISSIONS_SETTING_INDEX,
+            STATUS_LINE_POSITION_SETTING_INDEX,
+        };
         let directory = tempfile::tempdir().unwrap();
         let settings = UserSettings::in_root(directory.path());
         let agent = Agent::new_embedded(
@@ -18578,7 +18907,13 @@ mod tests {
         menus.settings(&agent, &console, target).await.unwrap();
         let id = console.state.lock().unwrap().menu.as_ref().unwrap().id;
         menus
-            .choose(&agent, &console, id, Some(10), None)
+            .choose(
+                &agent,
+                &console,
+                id,
+                Some(STATUS_LINE_POSITION_SETTING_INDEX),
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -18598,7 +18933,13 @@ mod tests {
         std::fs::write(directory.path().join("settings.json"), "invalid JSON").unwrap();
         assert!(
             menus
-                .choose(&agent, &console, id, Some(10), None)
+                .choose(
+                    &agent,
+                    &console,
+                    id,
+                    Some(STATUS_LINE_POSITION_SETTING_INDEX),
+                    None
+                )
                 .await
                 .is_err()
         );
@@ -18614,7 +18955,7 @@ mod tests {
         menus.settings(&agent, &console, target).await.unwrap();
         let id = console.state.lock().unwrap().menu.as_ref().unwrap().id;
         menus
-            .choose(&agent, &console, id, Some(11), None)
+            .choose(&agent, &console, id, Some(OUTPUT_STYLE_SETTING_INDEX), None)
             .await
             .unwrap();
         assert_eq!(
@@ -18624,7 +18965,7 @@ mod tests {
         menus.settings(&agent, &console, target).await.unwrap();
         let id = console.state.lock().unwrap().menu.as_ref().unwrap().id;
         menus
-            .choose(&agent, &console, id, Some(12), None)
+            .choose(&agent, &console, id, Some(PERMISSIONS_SETTING_INDEX), None)
             .await
             .unwrap();
         assert_eq!(

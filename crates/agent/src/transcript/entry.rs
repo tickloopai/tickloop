@@ -431,5 +431,7 @@ mod tests {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ArtifactTicksEntry {
     pub chat_id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<std::path::PathBuf>,
     pub artifact_ticks: Vec<crate::artifacts::ArtifactTick>,
 }

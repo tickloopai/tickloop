@@ -85,6 +85,7 @@ mod task_surface;
 mod test_support;
 mod thinking_preview;
 mod tick_list;
+mod tick_shell;
 mod transcript;
 mod workflows;
 mod workspace_trust;
@@ -261,6 +262,7 @@ fn ends_thinking(kind: &EventKind) -> bool {
     matches!(
         kind,
         EventKind::Text(_)
+            | EventKind::AssistantMessageCommitted { .. }
             | EventKind::ToolStarted { .. }
             | EventKind::PermissionRequested { .. }
             | EventKind::QuestionAsked { .. }
@@ -519,7 +521,9 @@ async fn await_startup_directory_trust(
         };
         match event {
             Some(InputEvent::Choice {
-                menu_id, index: workspace_trust::TRUST_ACCEPT_CHOICE_INDEX, ..
+                menu_id,
+                index: workspace_trust::TRUST_ACCEPT_CHOICE_INDEX,
+                ..
             }) if menu_id == id => {
                 let settings = settings.clone();
                 let workdir = workdir.to_path_buf();
@@ -1190,6 +1194,8 @@ async fn interact(
     let mut working_shimmer = RunningShimmer::default();
     let task_center = ShellTaskCenter::new(agent.clone());
     let mut task_subscription = None;
+    let mut tick_shell_subscription = None;
+    let mut tick_shell_panel = None;
     let mut prompt_watchdog_refresh = tokio::time::interval(std::time::Duration::from_secs(1));
     prompt_watchdog_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut prompt_watchdog = ShellTaskPromptWatchdog::default();
@@ -1770,6 +1776,40 @@ async fn interact(
                 (request, result)
             });
         }
+        let tick_shell_target = console.tick_shell_target()?;
+        if tick_shell_subscription
+            .as_ref()
+            .map(ShellTaskSubscription::chat_id)
+            != tick_shell_target.map(|target| target.0)
+            || tick_shell_panel != tick_shell_target.map(|target| target.1)
+        {
+            tick_shell_subscription = None;
+            tick_shell_panel = tick_shell_target.map(|target| target.1);
+            if let Some((chat, panel, task_id)) = tick_shell_target {
+                match task_center.subscribe(chat).await {
+                    Ok(subscription) => {
+                        match task_center.snapshot(chat).await {
+                            Ok(snapshot) => {
+                                let started = task_center.started_at_ms(chat, task_id).await;
+                                let effect =
+                                    console.load_tick_shell(chat, panel, snapshot, started)?;
+                                apply_tick_shell_effect(&task_center, console, chat, panel, effect)
+                                    .await?;
+                            }
+                            Err(error) => console.tick_shell_failed(
+                                chat,
+                                panel,
+                                safe_text(&error.to_string()),
+                            )?,
+                        }
+                        tick_shell_subscription = Some(subscription);
+                    }
+                    Err(error) => {
+                        console.tick_shell_failed(chat, panel, safe_text(&error.to_string()))?
+                    }
+                }
+            }
+        }
         let discovery_active = menus.discovery_active();
         let login_active = login.is_some();
         let logout_active = logout.is_some();
@@ -1797,8 +1837,9 @@ async fn interact(
                         match result {
                             Ok(account) => {
                                 if provider_label == "Artifact Service" {
-                                    if let Some(root) = config_root.as_deref() {
-                                        artifact_ui::open(agent, console, root, selected_chat, interactive).await?;
+                                    if let Some(root) = config_root.as_deref()
+                                        && let Err(error) = artifact_ui::open(agent, console, root, selected_chat, interactive).await {
+                                        outln!(console, "Cannot open artifacts: {} · use /artifacts to retry", safe_text(&error));
                                     }
                                 } else { provider_login_succeeded = true; }
                                 outln!(console, "{} login saved · {}", provider_label, safe_text(&account));
@@ -1989,6 +2030,10 @@ async fn interact(
                     status_dirty = true;
                 },
                 Some(InputEvent::TickListAction { .. }) => {},
+                Some(InputEvent::OpenTickShell { .. }) => { status_dirty = true; },
+                Some(InputEvent::TickShellEffect { chat, panel, effect }) => {
+                    apply_tick_shell_effect(&task_center, console, chat, panel, effect).await?;
+                },
                 Some(InputEvent::OpenFooter(item)) => {
                     let result = if let Some(chat) = selected_chat {
                         match item {
@@ -3256,6 +3301,7 @@ async fn interact(
                             }
                         },
                         EventKind::Text(_)
+                        | EventKind::AssistantMessageCommitted { .. }
                         | EventKind::ToolStarted { .. }
                         | EventKind::PermissionRequested { .. }
                         | EventKind::QuestionAsked { .. }
@@ -3332,6 +3378,7 @@ async fn interact(
                     tools.record(&event);
                     if interactive && matches!(&event.kind,
                         EventKind::Thinking(_)
+                        | EventKind::AssistantMessageCommitted { .. }
                         | EventKind::ToolStarted { .. }
                         | EventKind::PermissionRequested { .. }
                         | EventKind::QuestionAsked { .. }
@@ -3342,22 +3389,32 @@ async fn interact(
                     )
                         && let Some(mut reply) = reply_lines.remove(&event.run_id) {
                             reply.finish();
-                            write_next_reply_line(console, &mut reply)?;
+                            write_pending_reply_lines(console, &mut reply)?;
                     }
                     if interactive && stopped_thinking {
                         console.write_roles(&[("\n∴ Thinking (ctrl+o to expand)\n".into(), Some(Role::MutedText))])?;
                     }
                     match &event.kind {
-                        EventKind::ToolCompleted {call_id, ..} => console.finish_tool_call(Some(call_id))?,
+                        EventKind::ToolCompleted {call_id, ..} => console.finish_tool_call(Some(&presentation::tool_call_key(event.run_id, call_id)))?,
                         EventKind::Completed {..} | EventKind::Failed(_) | EventKind::Interrupted => {
                             console.finish_tool_call(None)?;
                             unpaced_runs.remove(&event.run_id);
                         },
                         _ => {},
                     }
+                    if interactive && let EventKind::AssistantMessageCommitted { tool_calls, .. } = &event.kind {
+                        let _frame_hold = console.hold_frames()?;
+                        for call in tool_calls {
+                            let key=presentation::tool_call_key(event.run_id,&call.call_id);
+                            console.for_message(Some(key.clone())).write_tool_call(&key,&presentation::tool_call_roles(&call.name,&call.input,console.display_profile()?),scrollback::ToolCallState::Queued)?;
+                        }
+                    }
                     if let Some(rendered)=tools.render_event_roles(&event, console.display_profile()?) {
                         match &event.kind {
-                            EventKind::ToolStarted {call_id, ..} if interactive && !tools.is_detailed() => console.write_tool_call(call_id, &rendered)?,
+                            EventKind::ToolStarted {call_id, name, input} if interactive => {
+                                console.write_tool_call(&presentation::tool_call_key(event.run_id, call_id), &presentation::tool_call_roles(name,input,console.display_profile()?),scrollback::ToolCallState::Running)?;
+                                if tools.is_detailed() { console.write(&format!("{}\n",safe_text(&serde_json::to_string_pretty(input).map_err(|error|error.to_string())?)))?; }
+                            },
                             _ => console.write_roles(&rendered)?,
                         }
                         continue;
@@ -3489,7 +3546,7 @@ async fn interact(
                             outln!(console, "\nContext compaction: {status:?}");
                             if let Some(error)=error {outln!(console, "{}",safe_text(&error));}
                         },
-                        EventKind::ToolStarted {..} | EventKind::ToolCompleted {..} | EventKind::AgentMessageQueued {..} => {},
+                        EventKind::AssistantMessageCommitted {..} | EventKind::ToolStarted {..} | EventKind::ToolCompleted {..} | EventKind::AgentMessageQueued {..} => {},
                     }
 
                 },
@@ -3764,6 +3821,25 @@ async fn interact(
                     console.update_transcript(id,presentation::transcript_document(&snapshot, console.display_profile()?, &console.image_links()?))?;
                 }
                 transcript_dirty=false;
+            },
+            tick_event = receive_shell_task_event(&mut tick_shell_subscription), if tick_shell_subscription.is_some() => {
+                if let (Some(subscription), Some(panel)) = (tick_shell_subscription.as_mut(), tick_shell_panel) {
+                    let chat = subscription.chat_id();
+                    let result = match tick_event {
+                        Some(Ok(ShellTaskSubscriptionEvent::ResyncRequired { .. })) => subscription.resync().await,
+                        Some(Ok(ShellTaskSubscriptionEvent::Changed(_))) => task_center.snapshot(chat).await,
+                        Some(Err(error)) => Err(error),
+                        None => continue,
+                    };
+                    match result {
+                        Ok(snapshot) => {
+                            console.update_shell_ticks(&snapshot)?;
+                            let effect = console.update_tick_shell(chat, panel, snapshot)?;
+                            apply_tick_shell_effect(&task_center, console, chat, panel, effect).await?;
+                        }
+                        Err(error) => { console.tick_shell_failed(chat, panel, safe_text(&error.to_string()))?; tick_shell_subscription = None; }
+                    }
+                }
             },
             task_event = receive_shell_task_event(&mut task_subscription), if task_subscription.is_some() => {
                 match task_event {
@@ -4067,6 +4143,74 @@ async fn apply_task_surface_effect(
                 }
                 return Ok(());
             }
+        }
+    }
+}
+
+async fn apply_tick_shell_effect(
+    task_center: &ShellTaskCenter,
+    console: &Console,
+    chat: uuid::Uuid,
+    panel: uuid::Uuid,
+    mut effect: TaskSurfaceEffect,
+) -> Result<(), String> {
+    loop {
+        if let TaskSurfaceEffect::Control { task_id, .. }
+        | TaskSurfaceEffect::ReadOutput { task_id, .. } = &effect
+        {
+            match task_center.snapshot(chat).await {
+                Ok(snapshot)
+                    if !snapshot
+                        .tasks
+                        .iter()
+                        .any(|task| task.id == *task_id && task.chat_id == chat) =>
+                {
+                    console.update_tick_shell(chat, panel, snapshot)?;
+                    return Ok(());
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    console.tick_shell_failed(chat, panel, safe_text(&error.to_string()))?;
+                    return Ok(());
+                }
+            }
+        }
+        match effect {
+            TaskSurfaceEffect::None | TaskSurfaceEffect::Close => return Ok(()),
+            TaskSurfaceEffect::Control { task_id, action } => {
+                if let Err(error) = task_center.dispatch(chat, task_id, action).await {
+                    console.tick_shell_failed(
+                        chat,
+                        panel,
+                        format!("Cannot stop Shell: {}", safe_text(&error.to_string())),
+                    )?;
+                }
+                match task_center.snapshot(chat).await {
+                    Ok(snapshot) => effect = console.update_tick_shell(chat, panel, snapshot)?,
+                    Err(error) => {
+                        console.tick_shell_failed(chat, panel, safe_text(&error.to_string()))?;
+                        return Ok(());
+                    }
+                }
+            }
+            TaskSurfaceEffect::ReadOutput {
+                task_id,
+                cursor,
+                limit,
+                generation,
+            } => match task_center.read_output(chat, task_id, cursor, limit).await {
+                Ok(chunk) => {
+                    effect = console.update_tick_shell_output(
+                        chat,
+                        panel,
+                        TaskOutputUpdate::Chunk { generation, chunk },
+                    )?
+                }
+                Err(error) => {
+                    console.tick_shell_failed(chat, panel, safe_text(&error.to_string()))?;
+                    return Ok(());
+                }
+            },
         }
     }
 }
@@ -4407,12 +4551,14 @@ async fn restore_view(
             if matches!(
                 event.kind,
                 EventKind::Thinking(_)
+                    | EventKind::AssistantMessageCommitted { .. }
                     | EventKind::ToolStarted { .. }
                     | EventKind::PermissionRequested { .. }
                     | EventKind::QuestionAsked { .. }
                     | EventKind::ModelRetry { .. }
                     | EventKind::Completed { .. }
                     | EventKind::Interrupted
+                    | EventKind::Failed(_)
             ) && let Some(mut reply) = buffered_replies.remove(&event.run_id)
             {
                 reply.finish();
@@ -4435,21 +4581,52 @@ async fn restore_view(
                 )])?;
             }
             match &event.kind {
-                EventKind::ToolCompleted { call_id, .. } => {
-                    console.finish_tool_call(Some(call_id))?
-                }
+                EventKind::ToolCompleted { call_id, .. } => console
+                    .finish_tool_call(Some(&presentation::tool_call_key(event.run_id, call_id)))?,
                 EventKind::Completed { .. } | EventKind::Failed(_) | EventKind::Interrupted => {
                     console.finish_tool_call(None)?
                 }
                 _ => {}
             }
             tools.record(event);
+            if console.is_interactive()
+                && let EventKind::AssistantMessageCommitted { tool_calls, .. } = &event.kind
+            {
+                let _frame_hold = console.hold_frames()?;
+                for call in tool_calls {
+                    let key = presentation::tool_call_key(event.run_id, &call.call_id);
+                    console.for_message(Some(key.clone())).write_tool_call(
+                        &key,
+                        &presentation::tool_call_roles(
+                            &call.name,
+                            &call.input,
+                            console.display_profile()?,
+                        ),
+                        scrollback::ToolCallState::Queued,
+                    )?;
+                }
+            }
             if let Some(rendered) = tools.render_event_roles(event, console.display_profile()?) {
                 match &event.kind {
-                    EventKind::ToolStarted { call_id, .. }
-                        if console.is_interactive() && !tools.is_detailed() =>
-                    {
-                        console.write_tool_call(call_id, &rendered)?
+                    EventKind::ToolStarted {
+                        call_id,
+                        name,
+                        input,
+                    } if console.is_interactive() => {
+                        console.write_tool_call(
+                            &presentation::tool_call_key(event.run_id, call_id),
+                            &presentation::tool_call_roles(name, input, console.display_profile()?),
+                            scrollback::ToolCallState::Running,
+                        )?;
+                        if tools.is_detailed() {
+                            console.write(&format!(
+                                "{}\n",
+                                safe_text(
+                                    &serde_json::to_string_pretty(input)
+                                        .map_err(|error| error.to_string())?
+                                )
+                            ))?;
+                        }
                     }
                     _ => console.write_roles(&rendered)?,
                 }

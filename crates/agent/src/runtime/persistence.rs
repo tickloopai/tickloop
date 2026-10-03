@@ -323,6 +323,7 @@ impl ChatRecorder {
                 .chain(metadata.artifact_ticks.map(|entry| {
                     Line::ArtifactTicks(ArtifactTicksEntry {
                         chat_id,
+                        cwd: Some(workdir.to_path_buf()),
                         artifact_ticks: entry.artifact_ticks,
                     })
                 }))
@@ -366,6 +367,7 @@ impl ChatRecorder {
         if !source.artifact_ticks.is_empty() {
             lines.push(Line::ArtifactTicks(ArtifactTicksEntry {
                 chat_id: child_chat_id,
+                cwd: Some(source.workdir.clone()),
                 artifact_ticks: source.artifact_ticks.clone(),
             }));
         }
@@ -1491,6 +1493,13 @@ fn recover_transcript(
         .chain
         .last()
         .map(|entry| entry.cwd.clone())
+        .or_else(|| {
+            loaded
+                .metadata
+                .artifact_ticks
+                .as_ref()
+                .and_then(|entry| entry.cwd.clone())
+        })
         .unwrap_or_default();
     let mut snapshot = super::empty_snapshot(chat_id, workdir, super::unselected_model());
     snapshot.branch_origin = restored_branch_origin(loaded, source_chat_id);
@@ -1778,6 +1787,7 @@ impl Agent {
     pub(super) fn record_artifact_ticks(
         &self,
         chat_id: ChatId,
+        workdir: &Path,
         artifact_ticks: Vec<crate::artifacts::ArtifactTick>,
     ) {
         if let Some(recorder) = &self.inner.recorder
@@ -1787,6 +1797,7 @@ impl Agent {
                 &log.path,
                 vec![Line::ArtifactTicks(ArtifactTicksEntry {
                     chat_id,
+                    cwd: Some(workdir.to_path_buf()),
                     artifact_ticks,
                 })],
             );

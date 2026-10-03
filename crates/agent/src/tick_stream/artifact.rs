@@ -70,7 +70,7 @@ impl TickStreamPort for ArtifactTickStream {
 }
 struct Cursor {
     instance: InstanceRef,
-    sequence: Option<u64>,
+    body_sequence: Option<u64>,
     ready: bool,
     due: Instant,
     cadence: u64,
@@ -98,7 +98,7 @@ async fn observe(
                 .clamp(MIN_CADENCE_SECONDS, MAX_CADENCE_SECONDS);
             let cursor = cursors.entry(*watch).or_insert_with(|| Cursor {
                 instance: instance.clone(),
-                sequence: None,
+                body_sequence: None,
                 ready: false,
                 due: Instant::now(),
                 cadence,
@@ -143,22 +143,18 @@ async fn observe(
                         );
                         publisher.state_to(instance.clone(), TickConnectionState::Live, [watch]);
                         if !cursor.ready {
-                            cursor.sequence = metadata.human_sequence;
+                            cursor.body_sequence = body_update(metadata)
+                                .map(|update| update.sequence)
+                                .or(metadata.human_sequence);
                             cursor.ready = true;
                             publisher.ready(watch);
                             continue;
                         }
-                        if metadata
-                            .human_sequence
-                            .is_some_and(|sequence| sequence > cursor.sequence.unwrap_or(0))
+                        if let Some(value) = observation(&instance, metadata)
+                            && value.sequence > cursor.body_sequence.unwrap_or(0)
                         {
-                            cursor.sequence = metadata.human_sequence;
-                            if metadata.human_change.as_deref() == Some("feedback") {
-                                continue;
-                            }
-                            if let Some(value) = observation(&instance, metadata) {
-                                publisher.observation(&[watch], value);
-                            }
+                            cursor.body_sequence = Some(value.sequence);
+                            publisher.observation(&[watch], value);
                         }
                     }
                     Err(ArtifactError::Service { status: 404, .. }) => {
@@ -194,14 +190,12 @@ async fn read(
     ArtifactClient::for_origin(root, origin)?.read(id).await
 }
 fn observation(instance: &InstanceRef, metadata: &ArtifactMetadata) -> Option<TickObservation> {
-    let sequence = metadata.human_sequence?;
-    let updated_at = metadata.human_updated_at.clone()?;
-    let change = metadata.human_change.as_deref()?;
-    if !["edit", "publish", "feedback"].contains(&change) {
-        return None;
-    }
+    let update = body_update(metadata)?;
+    let sequence = update.sequence;
+    let updated_at = update.updated_at.to_owned();
+    let change = update.change;
     let mut data = serde_json::json!({"artifact_id":metadata.id,"title":metadata.title,"change":change,"human_updated_at":updated_at,"human_sequence":sequence});
-    if let Some(version) = &metadata.human_version_id {
+    if let Some(version) = update.version_id {
         data["version_id"] = serde_json::json!(version);
     }
     Some(TickObservation {
@@ -214,4 +208,33 @@ fn observation(instance: &InstanceRef, metadata: &ArtifactMetadata) -> Option<Ti
         recover_with: Some("Read the artifact with its MCP tools".into()),
         gap: false,
     })
+}
+
+struct BodyUpdate<'a> {
+    sequence: u64,
+    updated_at: &'a str,
+    change: &'a str,
+    version_id: Option<&'a str>,
+}
+
+fn body_update(metadata: &ArtifactMetadata) -> Option<BodyUpdate<'_>> {
+    let update = if let Some(sequence) = metadata.human_body_sequence {
+        BodyUpdate {
+            sequence,
+            updated_at: metadata.human_body_updated_at.as_deref()?,
+            change: metadata.human_body_change.as_deref()?,
+            version_id: metadata.human_body_version_id.as_deref(),
+        }
+    } else {
+        BodyUpdate {
+            sequence: metadata.human_sequence?,
+            updated_at: metadata.human_updated_at.as_deref()?,
+            change: metadata.human_change.as_deref()?,
+            version_id: metadata.human_version_id.as_deref(),
+        }
+    };
+    if !["edit", "publish"].contains(&update.change) {
+        return None;
+    }
+    Some(update)
 }

@@ -356,6 +356,11 @@ async fn stale_background_update_cannot_replace_a_user_terminal_fact() {
     assert_eq!(authoritative.exit_code, Some(0));
     assert_eq!(authoritative.output_ref, Some(terminal_output_ref));
     assert_eq!(authoritative.output_bytes, terminal.output_bytes);
+    assert!(terminal.updated_at_ms.is_some());
+    assert_eq!(
+        authoritative.updated_at_ms, terminal.updated_at_ms,
+        "a stale snapshot must preserve the completed Shell update time"
+    );
     assert!(authoritative.starts_in_background);
     assert_eq!(
         conversation_texts(&agent.snapshot(chat).await.unwrap()),

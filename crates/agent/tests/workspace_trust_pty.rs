@@ -78,19 +78,29 @@ struct Terminal {
     child: Box<dyn portable_pty::Child + Send + Sync>,
     writer: Box<dyn Write + Send>,
     output: Arc<Mutex<String>>,
-    _master: Box<dyn portable_pty::MasterPty + Send>,
+    master: Box<dyn portable_pty::MasterPty + Send>,
+    size: PtySize,
 }
 
 impl Terminal {
     fn start(fixture: &Fixture, renderer: &str, flags: &[&str]) -> Self {
-        let pty = native_pty_system()
-            .openpty(PtySize {
-                rows: 30,
-                cols: 120,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .unwrap();
+        Self::start_with_size(fixture, renderer, flags, 120, 30)
+    }
+
+    fn start_with_size(
+        fixture: &Fixture,
+        renderer: &str,
+        flags: &[&str],
+        cols: u16,
+        rows: u16,
+    ) -> Self {
+        let size = PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        let pty = native_pty_system().openpty(size).unwrap();
         let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_tickloop"));
         command.env_clear();
         command.env("PATH", "/usr/bin:/bin");
@@ -126,12 +136,24 @@ impl Terminal {
             child,
             writer,
             output,
-            _master: pty.master,
+            master: pty.master,
+            size,
         }
     }
 
     fn frame(&self) -> String {
-        screen::visible_screen(&self.output.lock().unwrap(), 120, 30)
+        screen::visible_screen(
+            &self.output.lock().unwrap(),
+            self.size.cols as usize,
+            self.size.rows as usize,
+        )
+    }
+
+    fn resize(&mut self, cols: u16, rows: u16) {
+        self.output.lock().unwrap().clear();
+        self.size.cols = cols;
+        self.size.rows = rows;
+        self.master.resize(self.size).unwrap();
     }
 
     fn wait(&self, text: &str) {
@@ -245,6 +267,131 @@ impl Drop for ModelProbe {
 }
 
 #[test]
+fn startup_trust_requires_the_complete_directory_before_confirmation_after_resize() {
+    use tickloop_agent::settings::UserSettings;
+    for renderer in ["inline", "fullscreen"] {
+        let fixture = Fixture::new();
+        fixture.valid_model();
+        let mut terminal = Terminal::start_with_size(&fixture, renderer, &[], 80, 4);
+        terminal.wait("Resize terminal");
+        terminal.send(b"j\r");
+        thread::sleep(Duration::from_millis(100));
+        assert!(terminal.child.try_wait().unwrap().is_none());
+        assert!(!fixture.path("config/settings.json").exists());
+        assert!(!fixture.path("config/projects").exists());
+        assert_eq!(fs::read_dir(fixture.path("runtime")).unwrap().count(), 0);
+        terminal.resize(80, 24);
+        terminal.wait(fixture.path("work").to_str().unwrap());
+        terminal.wait("Enter confirm");
+        terminal.send(b"\r");
+        terminal.wait("Context");
+        assert!(
+            UserSettings::in_root(&fixture.path("config"))
+                .is_working_directory_trusted(&fixture.path("work"))
+        );
+        terminal.send(b"/exit\r");
+        assert_eq!(terminal.exit_code(), 0);
+    }
+}
+
+#[test]
+fn startup_trust_real_input_pty_eof_is_quiet_without_persisting_trust() {
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    fn pty_files() -> (fs::File, fs::File) {
+        let mut master = -1;
+        let mut slave = -1;
+        let mut size = libc::winsize {
+            ws_row: 24,
+            ws_col: 80,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // Separate input/output PTYs preserve output after the input master closes.
+        unsafe {
+            assert_eq!(
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &mut size
+                ),
+                0
+            );
+            let files = (fs::File::from_raw_fd(master), fs::File::from_raw_fd(slave));
+            for file in [&files.0, &files.1] {
+                assert_eq!(
+                    libc::fcntl(file.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC),
+                    0
+                );
+            }
+            files
+        }
+    }
+
+    for renderer in ["inline", "fullscreen"] {
+        let fixture = Fixture::new();
+        let (input_master, input_slave) = pty_files();
+        let (mut output_master, output_slave) = pty_files();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_tickloop"))
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("TERM", "xterm-256color")
+            .env("TICKLOOP_AGENT_TUI", renderer)
+            .envs(fixture.environment())
+            .arg("--cwd")
+            .arg(fixture.path("work"))
+            .arg("--config")
+            .arg(fixture.path("work/model.json"))
+            .stdin(input_slave)
+            .stdout(output_slave)
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let output = Arc::new(Mutex::new(String::new()));
+        let captured = output.clone();
+        let reader = thread::spawn(move || {
+            let mut buffer = [0; 8192];
+            while let Ok(length) = output_master.read(&mut buffer) {
+                if length == 0 {
+                    break;
+                }
+                captured
+                    .lock()
+                    .unwrap()
+                    .push_str(&String::from_utf8_lossy(&buffer[..length]));
+            }
+        });
+        let deadline = Instant::now() + TIMEOUT;
+        while !output.lock().unwrap().contains("Enter confirm") && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let displayed = output
+            .lock()
+            .unwrap()
+            .contains(fixture.path("work").to_str().unwrap());
+        drop(input_master);
+        let deadline = Instant::now() + TIMEOUT;
+        while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        if child.try_wait().unwrap().is_none() {
+            child.kill().unwrap();
+        }
+        let result = child.wait_with_output().unwrap();
+        reader.join().unwrap();
+        assert!(displayed, "{}", output.lock().unwrap());
+        assert_eq!(result.status.code(), Some(0));
+        assert!(result.stderr.is_empty(), "{:?}", result.stderr);
+        assert!(!output.lock().unwrap().contains("Error:"));
+        assert!(!fixture.path("config/settings.json").exists());
+        assert!(!fixture.path("config/projects").exists());
+        assert_eq!(fs::read_dir(fixture.path("runtime")).unwrap().count(), 0);
+    }
+}
+
+#[test]
 fn startup_trust_cancellation_is_quiet_and_precedes_project_configuration() {
     for renderer in ["inline", "fullscreen"] {
         for cancellation in [b"\r".as_slice(), b"j\x1b", b"\x03", b"\x04"] {
@@ -311,6 +458,36 @@ fn startup_trust_accepts_explicit_navigation_and_preserves_exact_scope_on_restar
         );
         restarted.send(b"/exit\r");
         assert_eq!(restarted.exit_code(), 0);
+    }
+}
+
+#[test]
+fn startup_trust_short_write_failure_shows_the_error_and_requires_resize_before_retry() {
+    for renderer in ["inline", "fullscreen"] {
+        let fixture = Fixture::new();
+        fixture.valid_model();
+        fs::write(fixture.path("config/settings.json"), "invalid JSON").unwrap();
+        let mut terminal = Terminal::start_with_size(&fixture, renderer, &[], 80, 5);
+        terminal.wait("Accessing workspace:");
+        terminal.send(b"j\r");
+        terminal.wait("Cannot save directory trust:");
+        terminal.wait("Resize terminal");
+        fs::write(fixture.path("config/settings.json"), "{}").unwrap();
+        terminal.send(b"j\r");
+        thread::sleep(Duration::from_millis(80));
+        assert_eq!(
+            fs::read_to_string(fixture.path("config/settings.json")).unwrap(),
+            "{}"
+        );
+        assert_eq!(fs::read_dir(fixture.path("runtime")).unwrap().count(), 0);
+        terminal.resize(120, 30);
+        terminal.wait("Cannot save directory trust:");
+        terminal.wait("Yes, I trust this folder");
+        terminal.send(b"\x0e\r");
+        terminal.wait("Context");
+        terminal.send(b"/exit\r");
+        assert_eq!(terminal.exit_code(), 0);
+        drop(terminal);
     }
 }
 

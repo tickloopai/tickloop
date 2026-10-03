@@ -6,6 +6,30 @@ use uuid::Uuid;
 use super::{ArtifactClient, ArtifactError, MAX_RESPONSE_BYTES, bearer};
 const MAX_CATALOG_RESPONSE_BYTES: usize = 256 * 1024;
 
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    #[test]
+    fn artifact_tick_uses_the_canonical_subscription_identity() {
+        let tick = ArtifactTick {
+            artifact_id: "doc".into(),
+            origin: "https://docs.example/".into(),
+            title: "Document".into(),
+            format: "markdown".into(),
+            url: "https://docs.example/a/doc".into(),
+            access_role: "owner".into(),
+            added_at_ms: 1,
+        };
+        assert_eq!(
+            tick.instance_id(),
+            tick_connect::instance::InstanceRef::artifact(&tick.origin, &tick.artifact_id)
+                .unwrap()
+                .as_str()
+        );
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ArtifactTick {
     pub artifact_id: String,
@@ -18,11 +42,19 @@ pub struct ArtifactTick {
 }
 impl ArtifactTick {
     pub fn instance_id(&self) -> String {
-        format!("artifact:{}/{}", self.origin, self.artifact_id)
+        tick_connect::instance::artifact_instance_id(&self.origin, &self.artifact_id)
     }
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ArtifactMetadata {
+    #[serde(default)]
+    pub human_body_sequence: Option<u64>,
+    #[serde(default)]
+    pub human_body_updated_at: Option<String>,
+    #[serde(default)]
+    pub human_body_change: Option<String>,
+    #[serde(default)]
+    pub human_body_version_id: Option<String>,
     #[serde(default)]
     pub human_sequence: Option<u64>,
     #[serde(default)]
@@ -50,7 +82,7 @@ impl ArtifactMetadata {
     pub fn tick(&self, origin: &str, added_at_ms: u64) -> ArtifactTick {
         ArtifactTick {
             artifact_id: self.id.clone(),
-            origin: origin.into(),
+            origin: origin.trim_end_matches('/').into(),
             title: self.title.clone(),
             format: self.format.clone(),
             url: self.url.clone(),

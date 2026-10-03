@@ -1590,6 +1590,45 @@ async fn artifact_ticks_survive_restart_branch_and_conversation_rewind() {
 }
 
 #[tokio::test]
+async fn artifact_only_chat_survives_restart_before_its_first_message() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("state");
+    let agent = Agent::open_embedded(
+        root.clone(),
+        config(),
+        Arc::new(ScriptedModel::new(Vec::new())),
+    )
+    .unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let tick = tickloop_agent::artifacts::ArtifactTick {
+        artifact_id: "doc".into(),
+        origin: "https://docs.example".into(),
+        title: "Before first prompt".into(),
+        format: "markdown".into(),
+        url: "https://docs.example/a/doc".into(),
+        access_role: "owner".into(),
+        added_at_ms: 1000,
+    };
+    agent.add_artifact_tick(chat, tick.clone()).await.unwrap();
+    agent.shutdown().await;
+    let reopened =
+        Agent::open_embedded(root, config(), Arc::new(ScriptedModel::new(Vec::new()))).unwrap();
+    assert!(
+        reopened
+            .saved_chats(directory.path())
+            .await
+            .unwrap()
+            .iter()
+            .any(|saved| saved.id == chat)
+    );
+    let snapshot = reopened.resume_chat(chat).await.unwrap();
+    assert_eq!(snapshot.artifact_ticks, vec![tick]);
+    assert_eq!(snapshot.workdir, directory.path().canonicalize().unwrap());
+    assert!(snapshot.messages.is_empty());
+    reopened.shutdown().await;
+}
+
+#[tokio::test]
 async fn artifact_tick_metadata_before_a_compaction_boundary_survives_restart() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("state");

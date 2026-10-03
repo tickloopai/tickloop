@@ -129,6 +129,7 @@ pub struct TaskSurface<Restore = ()> {
 
 #[derive(Default)]
 struct DetailState {
+    metadata: Option<Vec<String>>,
     navigation: DetailNavigation,
     output: Option<StoredOutputChunk>,
     output_error: Option<String>,
@@ -257,6 +258,10 @@ impl<Restore> TaskSurface<Restore> {
 
     pub fn focus(&self) -> TaskSurfaceFocus {
         self.focus
+    }
+
+    pub fn set_detail_metadata(&mut self, task_id: Uuid, lines: Vec<String>) {
+        self.detail_states.entry(task_id).or_default().metadata = Some(lines);
     }
 
     pub fn open_detail(&mut self, task_id: Uuid, viewport: TaskViewport) -> TaskSurfaceEffect {
@@ -1302,6 +1307,19 @@ impl<'a> DetailLayout<'a> {
     }
 
     fn visit(&self, visitor: &mut dyn FnMut(DetailLogicalLine<'_>) -> bool) {
+        if let Some(metadata) = &self.detail.metadata {
+            for (row, line) in metadata.iter().enumerate() {
+                if !visitor(DetailLogicalLine::utf8(
+                    TaskFrameLineKind::Metadata,
+                    line.as_bytes(),
+                    DetailLocation::Metadata { row },
+                )) {
+                    return;
+                }
+            }
+            self.visit_output(visitor);
+            return;
+        }
         let origin = match self.task.origin {
             TaskOrigin::Agent => "Agent",
             TaskOrigin::User => "User",
@@ -1389,6 +1407,10 @@ impl<'a> DetailLayout<'a> {
             metadata_row += 1;
         }
 
+        self.visit_output(visitor);
+    }
+
+    fn visit_output(&self, visitor: &mut dyn FnMut(DetailLogicalLine<'_>) -> bool) {
         if let Some(error) = &self.detail.output_error {
             visitor(DetailLogicalLine::utf8(
                 TaskFrameLineKind::Unavailable,

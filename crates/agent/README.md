@@ -155,7 +155,7 @@ Provider 内的 `id` 是配置身份，`service_model_id` 是服务实际接收�
 
 只有上述公开字段以及已有 settings/config 选项可以修改。未知内部字段、错误类型和非法认证/适配器组合会被拒绝；不能通过配置注入 OAuth 端点、任意请求 JSON 或模型私有状态。登录凭证仍由独立私有存储管理。
 
-`/model` 确认时一次保存模型选择与 Thinking 档位。启动时显式 `--config` 优先于保存选择，保存选择优先于内置默认；升级保留用户的合法显式设置。手工编辑配置后重新启动读取，运行中的请求保持原配置快照。保存失败会显示错误，不会冒充保存成功。开发入口 `make dev-here` 默认读取 `/tmp/tickloop-dev/config/settings.json` 和 `/tmp/tickloop-dev/config/providers/*.yaml`，API Key 则读取同目录的 `.env`；可用 `DEV_CONFIG_DIR` 更改。独立启动仍由 `TICKLOOP_CONFIG_DIR` 或默认状态目录决定。
+`/model` 确认时一次保存模型选择与 Thinking 档位。启动时显式 `--config` 优先于保存选择，保存选择优先于内置默认；升级保留用户的合法显式设置。手工编辑配置后重新启动读取，运行中的请求保持原配置快照。保存失败会显示错误，不会冒充保存成功。开发入口 `make dev` 默认读取 `/tmp/tickloop-dev/config/settings.json` 和 `/tmp/tickloop-dev/config/providers/*.yaml`，API Key 则读取同目录的 `.env`；可用 `DEV_CONFIG_DIR` 更改。独立启动仍由 `TICKLOOP_CONFIG_DIR` 或默认状态目录决定。
 
 旧配置、模型选择与 Transcript 在加载时转换为统一定义，保留原模型、地址、凭据引用及公开历史。已有有效 Codex 登录无需因本次配置升级重新授权。 Codex 普通菜单提供 GPT-6 Astra、GPT-6.1 Sol、GPT-5.6 Terra、GPT-6 Luna；Astra 排在 Sol 前。GPT-5.5、旧 Sol／Luna 卡只供固定配置和历史兼容，当前保存选择不会自动升级。模型显示名相同不会合并不同服务地址的自定义接入。
 
@@ -291,6 +291,8 @@ Jev 非敏感服务配置仍可写在用户 `settings.json` 的 `jev`，例如 `
 
 首次进入未知的规范化工作目录时，先启动终端界面，再显示目录信任选择；默认选中 `No, exit`，用方向键、j/k 或 Ctrl+N/P 选择后 Enter 确认。No、Esc、Ctrl+C 或 EOF 安静退出（exit 0），不保存信任或发起模型、工具请求。明确选择 Yes 后才加载项目内容、连接执行服务并进入普通输入。信任通过用户本地 `settings.json` 保存精确目录（包括 home），等价符号链接共享同一身份，子目录不自动继承；保存失败留在选择页，可重试或取消。非交互启动默认拒绝未知目录；外部宿主已经独立建立信任时才使用 `--working-directory-is-trusted` 明确声明该前提，且该参数不保存信任。
 
+选择时光标停在聚焦选项的指示符。窗口必须完整显示标题、目录路径、两个选项与确认提示；放不下时提示调整窗口并禁止 Yes，仍可取消。真实输入 PTY 关闭也按 EOF 安静退出。
+
 搜索配置示例为 `examples/mwmbl-search-config.json`，指向公开的 Mwmbl 搜索接口。设置服务地址不等于授予联网权限；工具执行前仍按当前规则检查。定时任务、后台进程与切走的 Chat 依赖本机 daemon／worker 存活。退出 View 不停止执行；所有者或机器退出后的恢复需要显式装载与 Continue。
 
 每个 Chat 的对话照 Claude Code 写成只追加的 Transcript：`<root>/projects/<项目目录名>/<chatId>.jsonl`，状态根目录默认为 `~/.tickloop`，可用 `TICKLOOP_CONFIG_DIR` 指定，`--no-session-persistence` 关闭持久保存。项目目录名由工作目录的 canonical 路径生成，文件在第一条消息写入时创建，之后 `/cwd` 改变工作目录也不移动文件。条目每 100ms 批量追加，不加锁；进程被强制结束时最多丢失最后一批。同一目录可以同时运行多个 `tickloop` View；同一 owner 仲裁同 store＋Chat 的装载并返回同一个活执行。独立 Embedded 容器继续保留原文件分叉约定，最近活动链用于恢复；这不是全局 Transcript 写锁。
@@ -324,4 +326,6 @@ Agent 的呈现与宿主布局分开，Herdr 负责容器外观；颜色、装�
 
 内置主协议卡 ID 采用官方原始服务 ID，保留大小写；`adapter` 表达协议，官方模型名称不添加自造协议/套餐后缀。Provider 的 `model_aliases` 保留旧 ID：例如 `gpt-6.1-sol-responses` → `gpt-6.1-sol`、`minimax-m3-messages` → `MiniMax-M3`。旧 `default_model`、补丁和保存选择可继续解析，下一次明确保存使用 canonical ID；身份规范化不会替换用户路由或能力覆盖，也不升级实际版本。DeepSeek 已有额外 Messages/Responses 卡继续保留独立旧 ID 与原 Adapter/endpoint，避免与同模型主协议卡冲突。
 
-The current Chat’s Ticks appear in a 42-column Tick List beside the conversation on wide terminals. The input, both dividers, hints and footer remain full width; narrow-terminal overlays cover only conversation content. Empty lists stay hidden. `/ticks` or the input’s `Ticks N` toggle saves visibility; `→` from an empty input focuses a nonempty list, and `Esc` returns. Shells open the task detail view; subscribed Ticks open their subscription. `/artifacts` signs in when needed and opens the All/Mine/Shared/Pinned picker. Enter adds an artifact without granting access, connecting feedback or subscribing. Artifact `f` resumes feedback or asks the Agent to connect it. Artifact Service sign-out is in `/settings`.
+The current Chat’s Ticks appear in a 42-column Tick List beside the conversation on wide terminals. The input, both dividers, hints and footer remain full width; narrow-terminal overlays cover only conversation content. Empty lists stay hidden. `/ticks` or the input’s `Ticks N` toggle saves visibility; `→` from an empty input focuses a nonempty list. Clicking either row line selects it and runs Enter. Shells open a detail inside the Tick panel with live output, scrolling and a confirmed `s` stop; Esc returns to the selected row. `/tasks` keeps the existing Task Center. Subscribed Ticks open their subscription, and subscribed artifacts retain browser/copy/feedback actions. `/artifacts` signs in when needed and opens the All/Mine/Shared/Pinned picker. Enter adds an artifact without granting access, connecting feedback or subscribing. Artifact `f` resumes feedback or asks the Agent to connect it. Artifact Service sign-out is in `/settings`.
+
+模型回复写入完整消息后，主界面立即显示剩余正文（含未换行尾行），不等待后续工具审批。提议工具先显示 Queued，准入／完成时更新原调用行；排队的问题先预览，到实际提问时才打开回答菜单。工具权限与执行顺序保持原契约。

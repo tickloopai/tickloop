@@ -118,6 +118,7 @@ pub(crate) use plan::{
     MAX_PLAN_SLUG_BYTES, PLAN_FILE_EXTENSION, PLANS_DIRECTORY, is_valid_plan_slug, plan_file_slug,
 };
 pub use rewind::{CodeRewind, RewindDraft, RewindMode, RewindOutcome, RewindPoint};
+pub(crate) use shell_task_center::recover_shell_update_time;
 pub use shell_task_center::{
     SHELL_TASK_OUTPUT_MAX_BYTES, SHELL_TASK_PROMPT_QUIET_PERIOD, ShellTask, ShellTaskAction,
     ShellTaskCapabilities, ShellTaskCenter, ShellTaskCenterError, ShellTaskDelta, ShellTaskNotice,
@@ -562,10 +563,21 @@ pub enum AutoReviewerNotice {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ProposedToolCall {
+    pub call_id: String,
+    pub name: String,
+    pub input: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum EventKind {
     Started,
     Text(String),
     Thinking(String),
+    AssistantMessageCommitted {
+        message_id: Uuid,
+        tool_calls: Vec<ProposedToolCall>,
+    },
     Completed {
         usage: Usage,
     },
@@ -2885,7 +2897,7 @@ impl Agent {
                 is_awaiting_model = false;
                 let assistant_message_id = Uuid::new_v4();
                 let calls = output.content.iter().filter_map(|content| {
-                    if let Content::ToolUse {id,name,input}=content {Some((id.clone(),name.clone(),input.clone()))} else {None}
+                    if let Content::ToolUse {id,name,input}=content {Some(ProposedToolCall {call_id:id.clone(),name:name.clone(),input:input.clone()})} else {None}
                 }).collect::<Vec<_>>();
                 {
                     let mut chats = self.inner.chats.lock().await;
@@ -2901,14 +2913,14 @@ impl Agent {
                     }
                     chat.snapshot.messages.push(Message {role:Role::Assistant,content:output.content});
                     chat.snapshot.last_model_run=Some(receipt.run_id);
-                    self.save(&chat.snapshot);
+                    self.emit(chat, &receipt, EventKind::AssistantMessageCommitted { message_id: assistant_message_id, tool_calls: calls.clone() });
                 }
                 if calls.is_empty() {
                     return self.inner.chats.lock().await.get(&receipt.chat_id).unwrap()
                         .snapshot.request_usage.run_conversation_usage(receipt.run_id)
                         .map_err(|error| error.to_string());
                 }
-                for (id,name,input) in calls {
+                for ProposedToolCall {call_id:id,name,input} in calls {
                     let invocation = ToolInvocation::new(
                         id.clone(), name.clone(), input, registry.resolve(&name),
                     );

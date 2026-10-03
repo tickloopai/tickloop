@@ -67,10 +67,14 @@ impl WorkspaceTrust {
                 self.selected = TRUST_CANCEL_CHOICE_INDEX;
                 None
             }
+            (KeyCode::Enter, KeyModifiers::NONE) if self.selected == TRUST_CANCEL_CHOICE_INDEX => {
+                Some(TrustDecision::Cancel)
+            }
             (KeyCode::Enter, KeyModifiers::NONE)
-                if self.selected == TRUST_CANCEL_CHOICE_INDEX => Some(TrustDecision::Cancel),
-            (KeyCode::Enter, KeyModifiers::NONE)
-                if self.frame(width, height, display).cursor.is_some() => Some(TrustDecision::Accept),
+                if self.frame(width, height, display).cursor.is_some() =>
+            {
+                Some(TrustDecision::Accept)
+            }
             (KeyCode::Esc, _) | (KeyCode::Char('c' | 'd'), KeyModifiers::CONTROL) => {
                 Some(TrustDecision::Cancel)
             }
@@ -121,14 +125,16 @@ impl WorkspaceTrust {
                     wrap_width,
                 )
                 .into_iter()
-                .map(|line| RoleLine::role(
-                    line,
-                    if self.selected == index {
-                        Role::Suggestion
-                    } else {
-                        Role::Text
-                    },
-                )),
+                .map(|line| {
+                    RoleLine::role(
+                        line,
+                        if self.selected == index {
+                            Role::Suggestion
+                        } else {
+                            Role::Text
+                        },
+                    )
+                }),
             );
         }
         actions.extend(
@@ -143,20 +149,31 @@ impl WorkspaceTrust {
             .into_iter()
             .map(|line| RoleLine::role(line, Role::MutedText)),
         );
-        let required_rows = heading.len() + actions.len();
+        let error_lines: Vec<_> = self
+            .error
+            .as_ref()
+            .into_iter()
+            .flat_map(|error| wrap_text(error, wrap_width))
+            .map(|line| RoleLine::role(line, Role::Error))
+            .collect();
+        let required_rows = heading.len() + error_lines.len() + actions.len();
         if width < MIN_TRUST_COLUMNS || required_rows > height {
             let mut lines: Vec<_> = wrap_text(
                 "Resize terminal to review directory · Esc cancel",
                 wrap_width,
             )
             .into_iter()
-            .take(height)
             .map(|line| RoleLine::role(line, Role::MutedText))
             .collect();
+            lines.extend(error_lines);
+            lines.truncate(height);
             for line in &mut lines {
                 line.truncate(width);
             }
-            return WorkspaceTrustFrame { lines, cursor: None };
+            return WorkspaceTrustFrame {
+                lines,
+                cursor: None,
+            };
         }
         let mut body = Vec::new();
         let mut remaining_rows = height - required_rows;
@@ -165,12 +182,8 @@ impl WorkspaceTrust {
             remaining_rows -= 1;
         }
         body.extend(heading);
+        body.extend(error_lines);
         let mut explanation = Vec::new();
-        if let Some(error) = &self.error {
-            explanation.extend(wrap_text(error, width)
-                .into_iter()
-                .map(|line| RoleLine::role(line, Role::Error)));
-        }
         explanation.push(RoleLine::default());
         for text in [
             "Quick safety check: Is this a project you created or a folder you trust? If you're unsure, review its contents before continuing.",
@@ -185,11 +198,17 @@ impl WorkspaceTrust {
         }
         explanation.truncate(remaining_rows);
         body.extend(explanation);
-        let cursor = self.decision.is_none().then_some((body.len() + selected_row, 0));
+        let cursor = self
+            .decision
+            .is_none()
+            .then_some((body.len() + selected_row, 0));
         body.extend(actions);
         for line in &mut body {
             line.truncate(width);
         }
-        WorkspaceTrustFrame { lines: body, cursor }
+        WorkspaceTrustFrame {
+            lines: body,
+            cursor,
+        }
     }
 }

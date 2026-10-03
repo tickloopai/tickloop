@@ -96,7 +96,10 @@ impl TranscriptWriter {
             accepted.push(line);
         }
         if !file.materialized {
-            if !accepted.iter().any(Line::is_conversation_message) {
+            if !accepted.iter().any(|line| {
+                line.is_conversation_message()
+                    || matches!(line, Line::ArtifactTicks(entry) if entry.cwd.is_some() && !entry.artifact_ticks.is_empty())
+            }) {
                 file.buffered.extend(accepted);
                 return;
             }

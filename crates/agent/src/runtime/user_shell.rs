@@ -381,8 +381,10 @@ impl Agent {
                 .find(|record| record.id == command.operation_id)
                 .ok_or(AgentError::NotFound)?;
             let previous = record.clone();
-            if record.output_bytes != command.output_bytes {
-                record.updated_at_ms = command.updated_at_ms;
+            if command.output_bytes > record.output_bytes {
+                record.updated_at_ms = command
+                    .updated_at_ms
+                    .or_else(|| Some(crate::private_fs::unix_time_milliseconds()));
             }
             record.starts_in_background |= command.was_background;
             if user_shell_state_is_terminal(&previous.state) {

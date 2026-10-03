@@ -3,32 +3,25 @@
 -include .env
 export
 
-# dev 使用独立的状态目录与工作目录，不影响真实的 ~/.tickloop 和当前仓库。
+# dev 以当前目录为工作目录，状态写入独立目录，不影响真实的 ~/.tickloop。
 DEV_CONFIG_DIR ?= /tmp/tickloop-dev/config
-DEV_PROJECT_DIR ?= /tmp/tickloop-dev/project
 ARGS ?=
 
 CARGO_PACKAGE := -p tickloop-agent
 PACKAGE_TARGET ?= $(shell rustc -vV | sed -n 's/^host: //p')
 PACKAGE_ARCHIVE = dist/tickloop-$(PACKAGE_TARGET).tar.gz
 
-.PHONY: dev dev-here dev-reset build install package test check release-docs prototype-glyph-set prototype-glyph-set-terminal prototype-earnings-review
+.PHONY: dev dev-reset build install package test check release-docs prototype-glyph-set prototype-glyph-set-terminal prototype-earnings-review
 
-## 用隔离目录启动 Agent；传参示例：make dev ARGS="-c"
+## 以当前目录为工作目录启动 Agent，状态写入隔离目录；传参示例：make dev ARGS="-c"
 dev:
-	@mkdir -p $(DEV_CONFIG_DIR) $(DEV_PROJECT_DIR)
-	cargo build -p tickloop-ticks --bin tick
-	TICKLOOP_CONFIG_DIR=$(DEV_CONFIG_DIR) cargo run $(CARGO_PACKAGE) -- --cwd $(DEV_PROJECT_DIR) $(ARGS)
-
-## 以当前仓库为工作目录启动，状态仍写入隔离目录
-dev-here:
 	@mkdir -p $(DEV_CONFIG_DIR)
 	cargo build -p tickloop-ticks --bin tick
 	TICKLOOP_CONFIG_DIR=$(DEV_CONFIG_DIR) cargo run $(CARGO_PACKAGE) -- $(ARGS)
 
-## 清空 dev 使用的状态目录与工作目录
+## 清空 dev 使用的状态目录
 dev-reset:
-	rm -rf $(DEV_CONFIG_DIR) $(DEV_PROJECT_DIR)
+	rm -rf $(DEV_CONFIG_DIR)
 
 build:
 	cargo build --locked $(CARGO_PACKAGE) -p tickloop-ticks --bins

@@ -10,6 +10,123 @@ use std::{
 };
 
 #[test]
+fn post_login_account_failure_preserves_the_view_and_artifacts_can_retry() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let endpoint = origin.clone();
+    let stopped = Arc::new(AtomicBool::new(false));
+    let stop = stopped.clone();
+    let server = thread::spawn(move || {
+        let mut sessions = 0;
+        while !stop.load(Ordering::SeqCst) {
+            let Ok((mut socket, _)) = listener.accept() else {
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            };
+            let mut bytes = [0_u8; 8192];
+            let count = socket.read(&mut bytes).unwrap();
+            let request = String::from_utf8_lossy(&bytes[..count]);
+            let user =
+                serde_json::json!({"id":"owner","name":"Owner","email":"owner@example.test"});
+            let (status, body) = if request.starts_with("POST /api/v1/auth/device ") {
+                (
+                    200,
+                    serde_json::json!({"device_code":"device","user_code":"CODE","verification_uri":format!("{endpoint}/device?code=CODE"),"expires_in":60,"interval":1}),
+                )
+            } else if request.starts_with("POST /api/v1/auth/device/token ") {
+                (
+                    200,
+                    serde_json::json!({"access_token":"test-token","token_type":"Bearer","expires_in":600,"user":user}),
+                )
+            } else if request.starts_with("GET /api/v1/auth/session ") {
+                sessions += 1;
+                if sessions == 1 {
+                    (503, serde_json::json!({"error":"temporarily_unavailable"}))
+                } else {
+                    (
+                        200,
+                        serde_json::json!({"user":user,"expires_at":"2099-01-01T00:00:00Z"}),
+                    )
+                }
+            } else {
+                (
+                    200,
+                    serde_json::json!({"artifacts":[{"id":"doc","title":"Retry worked","format":"markdown","access_role":"owner","url":format!("{endpoint}/a/doc")}],"next_cursor":null}),
+                )
+            };
+            let body = body.to_string();
+            socket.write_all(format!("HTTP/1.1 {status} Result\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).unwrap();
+        }
+    });
+    let directory = tempfile::tempdir().unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tickloop"))
+        .env(
+            "TICKLOOP_AGENT_RUNTIME_DIR",
+            support::cli_runtime::directory(),
+        )
+        .args(["--working-directory-is-trusted", "--cwd"])
+        .arg(directory.path())
+        .env("TICKLOOP_CONFIG_DIR", directory.path().join("state"))
+        .env("TICKLOOP_ARTIFACT_ORIGIN", &origin)
+        .env_remove("HERDR_ENV")
+        .env_remove("HERDR_PANE_ID")
+        .env_remove("HERDR_SOCKET_PATH")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let output = Arc::new(Mutex::new(String::new()));
+    let captured = output.clone();
+    let mut stdout = child.stdout.take().unwrap();
+    let reader = thread::spawn(move || {
+        let mut buffer = [0_u8; 2048];
+        while let Ok(count) = stdout.read(&mut buffer) {
+            if count == 0 {
+                break;
+            }
+            captured
+                .lock()
+                .unwrap()
+                .push_str(&String::from_utf8_lossy(&buffer[..count]));
+        }
+    });
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(b"/artifacts\n").unwrap();
+    stdin.flush().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !output.lock().unwrap().contains("HTTP 503") && Instant::now() < deadline {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let alive = child.try_wait().unwrap().is_none();
+    if alive {
+        stdin.write_all(b"/artifacts\n").unwrap();
+        stdin.flush().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !output.lock().unwrap().contains("Retry worked") && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        stdin.write_all(b"/exit\n").unwrap();
+    }
+    drop(stdin);
+    let status = child.wait().unwrap();
+    stopped.store(true, Ordering::SeqCst);
+    server.join().unwrap();
+    reader.join().unwrap();
+    let output = output.lock().unwrap();
+    assert!(alive, "post-login refresh closed the View: {output}");
+    assert!(
+        status.success() && output.contains("HTTP 503") && output.contains("Retry worked"),
+        "{output}"
+    );
+}
+
+#[test]
 fn artifact_commands_are_visible_and_device_login_can_be_cancelled_without_a_model_or_herdr() {
     let service = TcpListener::bind("127.0.0.1:0").unwrap();
     let origin = format!("http://{}", service.local_addr().unwrap());

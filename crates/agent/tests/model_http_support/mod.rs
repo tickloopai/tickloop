@@ -54,18 +54,35 @@ pub async fn serve_responses_with_gated_response(
     mpsc::UnboundedReceiver<(String, Value)>,
     oneshot::Sender<()>,
 ) {
-    assert!(gated_response_index < responses.len());
+    let (url, requests, mut releases) =
+        serve_responses_with_gated_responses(responses, &[gated_response_index]).await;
+    (url, requests, releases.remove(0))
+}
+
+pub async fn serve_responses_with_gated_responses(
+    responses: Vec<(u16, String)>,
+    gated_response_indices: &[usize],
+) -> (
+    String,
+    mpsc::UnboundedReceiver<(String, Value)>,
+    Vec<oneshot::Sender<()>>,
+) {
+    let mut gates = std::collections::BTreeMap::new();
+    let mut releases = Vec::new();
+    for &index in gated_response_indices {
+        assert!(index < responses.len());
+        let (release, gate) = oneshot::channel();
+        assert!(gates.insert(index, gate).is_none());
+        releases.push(release);
+    }
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let (sender, receiver) = mpsc::unbounded_channel();
-    let (release, gate) = oneshot::channel();
     tokio::spawn(async move {
-        let mut gate = Some(gate);
         for (index, (status, body)) in responses.into_iter().enumerate() {
             let (mut socket, _) = listener.accept().await.unwrap();
             let _ = sender.send(read_request(&mut socket).await);
-            if index == gated_response_index {
-                let gate = gate.take().unwrap();
+            if let Some(gate) = gates.remove(&index) {
                 tokio::spawn(async move {
                     if gate.await.is_ok() {
                         write_response(&mut socket, status, "", &body).await;
@@ -76,7 +93,7 @@ pub async fn serve_responses_with_gated_response(
             }
         }
     });
-    (format!("http://{address}/anthropic"), receiver, release)
+    (format!("http://{address}/anthropic"), receiver, releases)
 }
 
 fn header_lines(headers: &[(&str, &str)]) -> String {

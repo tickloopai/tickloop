@@ -352,10 +352,17 @@ async fn run_shell_panel(fixture: &PrivateFixture) {
     .await;
     pty.send(b"\r");
     pty.wait_for("Enter opens the exact first task detail", |frame| {
-        shell_panel(frame).contains("shell-first-0123456789abcdef")
-            && shell_panel(frame)
-                .lines()
-                .any(|line| line.trim() == "Shell task")
+        frame.contains("shell-first-0123456789abcdef")
+            && frame.lines().any(|line| {
+                line.split('│')
+                    .nth(1)
+                    .is_some_and(|right| right.trim() == "Shell")
+            })
+    })
+    .await;
+    pty.send(b"\x1b");
+    pty.wait_for("Esc returns to the selected Tick row", |frame| {
+        frame.contains("Shells (2)")
     })
     .await;
     pty.send(b"\x1b");
@@ -411,13 +418,20 @@ async fn run_shell_panel(fixture: &PrivateFixture) {
     .await;
     pty.send(b"\r");
     pty.wait_for("second exact detail", |frame| {
-        shell_panel(frame).contains("shell-second")
-            && shell_panel(frame)
-                .lines()
-                .any(|line| line.trim() == "Shell task")
+        frame.contains("shell-second")
+            && frame.lines().any(|line| {
+                line.split('│')
+                    .nth(1)
+                    .is_some_and(|right| right.trim() == "Shell")
+            })
     })
     .await;
-    pty.send(b"x");
+    pty.send(b"s");
+    pty.wait_for("Tick Shell stop is confirmed", |frame| {
+        frame.contains("Stop this Shell?")
+    })
+    .await;
+    pty.send(b"\r");
     let stopped = wait_shell_tasks(
         &client,
         execution,
@@ -442,6 +456,11 @@ async fn run_shell_panel(fixture: &PrivateFixture) {
             .is_empty()
     );
     assert!(requests.try_recv().is_err());
+    pty.send(b"\x1b");
+    pty.wait_for("stopped detail returns to Tick List", |frame| {
+        frame.contains("Shells (3)")
+    })
+    .await;
     pty.send(b"\x1b");
     wait_editor_ready(&mut pty, "stopped detail closes to input", "").await;
     click_category(&mut pty, "Ticks 3");

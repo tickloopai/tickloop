@@ -272,14 +272,30 @@ fn merge_command_snapshot(
     mut incoming: CommandSnapshot,
 ) -> CommandSnapshot {
     let Some(existing) = existing else {
+        incoming
+            .updated_at_ms
+            .get_or_insert_with(crate::private_fs::unix_time_milliseconds);
         return incoming;
     };
     if command_state_is_terminal(&existing.state) {
         let mut authoritative = existing.clone();
         authoritative.was_background |= incoming.was_background;
         authoritative.backgrounded_on_timeout |= incoming.backgrounded_on_timeout;
+        if incoming.output_bytes > authoritative.output_bytes {
+            authoritative.updated_at_ms = incoming
+                .updated_at_ms
+                .or_else(|| Some(crate::private_fs::unix_time_milliseconds()));
+        }
         authoritative.output_bytes = authoritative.output_bytes.max(incoming.output_bytes);
         return authoritative;
+    }
+    if incoming.updated_at_ms.is_none() {
+        incoming.updated_at_ms =
+            if incoming.state != existing.state || incoming.output_bytes > existing.output_bytes {
+                Some(crate::private_fs::unix_time_milliseconds())
+            } else {
+                existing.updated_at_ms
+            };
     }
     incoming.was_background |= existing.was_background;
     incoming.backgrounded_on_timeout |= existing.backgrounded_on_timeout;

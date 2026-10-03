@@ -17,7 +17,7 @@ use tokio::{
 };
 use uuid::Uuid;
 
-use crate::agent_access::{ClientMessage, MAX_FRAME_BYTES};
+use crate::agent_access::{ClientMessage, MAX_FRAME_BYTES, PROTOCOL_MAJOR};
 
 use super::{
     CONNECT_INTERVAL, LOCK_NAME, SOCKET_NAME, STARTUP_DEADLINE, check_socket_length,
@@ -25,7 +25,7 @@ use super::{
 };
 
 const STOP_DEADLINE: Duration = Duration::from_secs(10);
-const SUPPORTED_CONTROL_MAJORS: [u16; 2] = [2, 1];
+const SUPPORTED_CONTROL_MAJORS: [u16; 3] = [PROTOCOL_MAJOR, 2, 1];
 const SERVICE_USAGE: &str = "Usage: tickloop service stop";
 const SERVICE_HELP: &str = "Usage: tickloop service stop\n\n\
 Stop the local Agent service and its running Agents. Saved history is kept.\n\

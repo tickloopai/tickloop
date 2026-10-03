@@ -250,7 +250,19 @@ fn load_lines(
                 .then_with(|| right.file_index.cmp(&left.file_index))
         });
     let Some(leaf) = leaf else {
-        return (None, true);
+        let has_artifact_chat = metadata
+            .artifact_ticks
+            .as_ref()
+            .is_some_and(|entry| entry.cwd.is_some());
+        let loaded = has_artifact_chat.then(|| LoadedTranscript {
+            uuids,
+            chain: Vec::new(),
+            metadata,
+            file_history_snapshots,
+            content_replacements,
+            warnings,
+        });
+        return (loaded, true);
     };
     let mut chain = Vec::new();
     let mut visited = HashSet::new();

@@ -5,19 +5,81 @@ fn workspace_trust_requires_visible_path_and_positions_the_real_choice_cursor() 
     let mut state = State::new(true, 80, 4);
     state.workspace_trust = Some(WorkspaceTrust::new(PathBuf::from("/workspace/project")));
     state.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
-    assert!(state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)).is_none());
+    assert!(
+        state
+            .key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .is_none()
+    );
     let mut output = Vec::new();
     state.draw(&mut output).unwrap();
     assert!(state.rendered_screen.join("\n").contains("Resize"));
     state.resize(80, 24);
     output.clear();
     state.draw(&mut output).unwrap();
-    let row = state.rendered_screen.iter().position(|line| line.contains("Yes, I trust this folder")).unwrap();
-    let ansi = String::from_utf8(output).unwrap();
-    assert!(ansi.ends_with(&format!("\x1b[{};1H\x1b[?25h", row + 1)), "{ansi:?}");
-    assert!(state.rendered_screen.iter().any(|line| line == "/workspace/project"));
-    assert!(!state.rendered_screen.iter().any(|line| line.contains("Select: arrows")));
-    assert!(matches!(state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), Some(InputEvent::Choice { .. })));
+    let row = state
+        .rendered_screen
+        .iter()
+        .position(|line| line.contains("Yes, I trust this folder"))
+        .unwrap();
+    let ansi = std::str::from_utf8(&output).unwrap();
+    assert!(
+        ansi.ends_with(&format!("\x1b[{};1H\x1b[?25h", row + 1)),
+        "{ansi:?}"
+    );
+    assert!(
+        state
+            .rendered_screen
+            .iter()
+            .any(|line| line == "/workspace/project")
+    );
+    assert!(
+        !state
+            .rendered_screen
+            .iter()
+            .any(|line| line.contains("Select: arrows"))
+    );
+    assert!(matches!(
+        state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        Some(InputEvent::Choice { .. })
+    ));
+    output.clear();
+    state.draw(&mut output).unwrap();
+    assert!(String::from_utf8(output).unwrap().ends_with("\x1b[?25l"));
+}
+
+#[test]
+fn workspace_trust_reserves_the_entire_wrapped_sanitized_path_before_prose() {
+    let path = format!("/workspace/{}\x1b[31m", "long目录-segment/".repeat(9));
+    let mut state = State::new(true, 30, 24);
+    state.workspace_trust = Some(WorkspaceTrust::new(PathBuf::from(&path)));
+    let (lines, row, column) = state.styled_frame();
+    let displayed_path = lines
+        .iter()
+        .flat_map(|line| &line.spans)
+        .filter(|span| span.role == Some(Role::Strong))
+        .map(|span| span.text.as_str())
+        .collect::<String>();
+    assert_eq!(displayed_path, super::super::safe_line(&path));
+    assert!(lines[row].text().contains("No, exit"));
+    assert_eq!(column, 0);
+    let visible = lines
+        .iter()
+        .map(RoleLine::text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(visible.contains("Yes, I trust this folder"));
+    assert!(visible.contains("Enter confirm · Esc cancel"));
+    state.resize(30, 8);
+    state.key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
+    assert!(
+        state
+            .key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .is_none()
+    );
+    assert!(matches!(
+        state.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        Some(InputEvent::Cancel { .. })
+    ));
 }
 
 #[test]
@@ -120,7 +182,10 @@ fn workspace_trust_acceptance_uses_navigation_and_retains_semantic_path_styles()
         state.key(navigation);
         assert!(matches!(
             state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-            Some(InputEvent::Choice { index: 1, .. })
+            Some(InputEvent::Choice {
+                index: TRUST_ACCEPT_CHOICE_INDEX,
+                ..
+            })
         ));
         assert!(
             state

@@ -39,14 +39,21 @@ pub(super) struct TickListEntry {
 
 #[derive(Default)]
 pub(super) struct TickList {
+    pub(super) shell_detail: Option<super::tick_shell::TickShell>,
     pub(super) subscriptions: Vec<crate::runtime::TickSubscriptionStatus>,
     pub(super) metadata: HashMap<String, Option<crate::artifacts::ArtifactMetadata>>,
+    pub(super) metadata_failures: HashMap<String, String>,
     pub(super) confirmation: Option<String>,
     entries: Vec<TickListEntry>,
     selected: Option<String>,
     removed_shells: HashSet<String>,
     pub(super) focused: bool,
     pub(super) overlay: bool,
+}
+
+pub(super) struct TickListFrame {
+    pub(super) lines: Vec<RoleLine>,
+    pub(super) targets: Vec<(usize, String)>,
 }
 
 impl TickList {
@@ -90,6 +97,7 @@ impl TickList {
                 .then_with(|| a.id.cmp(&b.id))
         });
         if self.entries.is_empty() {
+            self.shell_detail = None;
             self.focused = false;
             self.overlay = false;
         }
@@ -137,6 +145,7 @@ impl TickList {
             self.overlay = false;
         }
     }
+    #[cfg(test)]
     pub(super) fn lines(
         &self,
         width: usize,
@@ -144,6 +153,16 @@ impl TickList {
         display: DisplayProfile,
         now_ms: u64,
     ) -> Vec<RoleLine> {
+        self.frame(width, height, display, now_ms).lines
+    }
+
+    pub(super) fn frame(
+        &self,
+        width: usize,
+        height: usize,
+        display: DisplayProfile,
+        now_ms: u64,
+    ) -> TickListFrame {
         let mut lines = vec![RoleLine::role(
             "Ticks",
             if self.focused {
@@ -154,6 +173,7 @@ impl TickList {
         )];
 
         let mut rows = Vec::new();
+        let mut row_ids = Vec::new();
         let mut selected_row = 0;
         for group in [
             TickGroup::Artifacts,
@@ -172,6 +192,7 @@ impl TickList {
                 format!("{} ({})", group.title(), entries.len()),
                 Role::MutedText,
             ));
+            row_ids.push(None);
             for entry in entries {
                 let selected = self.focused && self.selected.as_deref() == Some(&entry.id);
                 if selected {
@@ -190,6 +211,7 @@ impl TickList {
                         Role::MutedText
                     },
                 ));
+                row_ids.push(Some(entry.id.clone()));
                 rows.push(RoleLine::role(
                     format!(
                         "    {}{} · {}",
@@ -203,20 +225,28 @@ impl TickList {
                     ),
                     Role::MutedText,
                 ));
+                row_ids.push(Some(entry.id.clone()));
             }
         }
         let capacity = height.saturating_sub(2);
         let offset = selected_row.saturating_sub(capacity.saturating_sub(2));
+        let targets = row_ids
+            .into_iter()
+            .skip(offset)
+            .take(capacity)
+            .enumerate()
+            .filter_map(|(row, id)| id.map(|id| (row + 1, id)))
+            .collect();
         lines.extend(rows.into_iter().skip(offset).take(capacity));
         if self.focused && height > 2 {
             let artifact = self
                 .selected()
-                .is_some_and(|entry| entry.group == TickGroup::Artifacts);
+                .is_some_and(|entry| entry.glyph == Glyph::ArtifactTick);
             lines.push(RoleLine::role(
                 if artifact {
                     "Enter open · x remove · c copy · f feedback · Esc"
                 } else {
-                    "j/k move · Enter open · x remove · Esc"
+                    "Enter open · x remove · Esc"
                 },
                 Role::MutedText,
             ));
@@ -225,7 +255,7 @@ impl TickList {
         for line in &mut lines {
             line.truncate(width);
         }
-        lines
+        TickListFrame { lines, targets }
     }
 }
 

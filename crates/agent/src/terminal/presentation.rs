@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use uuid::Uuid;
 
 use serde_json::Value;
@@ -23,6 +23,7 @@ use super::{
     display::{DisplayProfile, Glyph},
     image_cache::ImageLinks,
     safe_text,
+    scrollback::ToolCallState,
     style::Role,
     transcript::{LineLink, TranscriptDocument},
 };
@@ -307,7 +308,8 @@ impl ToolPresentation {
     pub(super) fn record(&mut self, event: &Event) {
         if matches!(
             event.kind,
-            EventKind::ToolStarted { .. }
+            EventKind::AssistantMessageCommitted { .. }
+                | EventKind::ToolStarted { .. }
                 | EventKind::ToolCompleted { .. }
                 | EventKind::CommandUpdated { .. }
         ) {
@@ -384,16 +386,7 @@ impl ToolPresentation {
             _ => self.render_event(event)?,
         };
         Some(match &event.kind {
-            EventKind::ToolStarted { name, input, .. } => vec![
-                ("\n".into(), None),
-                (
-                    format!("{} ", display.glyph(Glyph::ToolCall)),
-                    Some(Role::MutedText),
-                ),
-                (tool_name(name), Some(Role::ToolName)),
-                (tool_summary(name, input), None),
-                ("\n".into(), None),
-            ],
+            EventKind::ToolStarted { name, input, .. } => tool_call_roles(name, input, display),
             EventKind::ToolCompleted { result, .. } if result.is_error => {
                 vec![(rendered, Some(Role::Error))]
             }
@@ -408,6 +401,14 @@ impl ToolPresentation {
             .iter()
             .rev()
             .find_map(|recorded| match &recorded.kind {
+                EventKind::AssistantMessageCommitted { tool_calls, .. }
+                    if recorded.run_id == event.run_id =>
+                {
+                    tool_calls
+                        .iter()
+                        .find(|call| call.call_id == call_id)
+                        .map(|call| (call.name.as_str(), Some(&call.input)))
+                }
                 EventKind::ToolStarted {
                     call_id: recorded_call,
                     name,
@@ -437,6 +438,80 @@ impl ToolPresentation {
         }
         text
     }
+}
+
+pub(super) fn tool_call_key(run: Uuid, call_id: &str) -> String {
+    format!("{run}:tool:{call_id}")
+}
+
+pub(super) fn tool_call_roles(
+    name: &str,
+    input: &Value,
+    display: DisplayProfile,
+) -> Vec<(String, Option<Role>)> {
+    vec![
+        ("\n".into(), None),
+        (
+            format!("{} ", display.glyph(Glyph::ToolCall)),
+            Some(Role::MutedText),
+        ),
+        (super::safe_line(&tool_name(name)), Some(Role::ToolName)),
+        (super::safe_line(&tool_summary(name, input)), None),
+        ("\n".into(), None),
+    ]
+}
+
+pub(super) fn tool_call_states(snapshot: &ChatSnapshot) -> HashMap<(Uuid, String), ToolCallState> {
+    use tickloop_agent::model::Content;
+    use tickloop_agent::runtime::{LoopState, OperationState};
+    let active: HashSet<_> = snapshot
+        .loops
+        .iter()
+        .filter(|goal| {
+            matches!(
+                goal.state,
+                LoopState::Running
+                    | LoopState::Queued
+                    | LoopState::WaitingPermission
+                    | LoopState::WaitingQuestion
+                    | LoopState::WaitingPlan
+            )
+        })
+        .filter_map(|goal| goal.run_id)
+        .collect();
+    let mut states = HashMap::new();
+    for operation in &snapshot.operations {
+        let state = match operation.state {
+            OperationState::Proposed if active.contains(&operation.run_id) => ToolCallState::Queued,
+            OperationState::Proposed => ToolCallState::Stopped,
+            OperationState::Admitted => ToolCallState::Running,
+            _ => ToolCallState::Finished,
+        };
+        states.insert((operation.run_id, operation.call_id.clone()), state);
+    }
+    for (index, message) in snapshot.messages.iter().enumerate() {
+        let Some(run) = snapshot.message_runs.get(&index).copied() else {
+            continue;
+        };
+        for content in &message.content {
+            match content {
+                Content::ToolUse { id, .. } => {
+                    states
+                        .entry((run, id.clone()))
+                        .or_insert(if active.contains(&run) {
+                            ToolCallState::Queued
+                        } else {
+                            ToolCallState::Finished
+                        });
+                }
+                Content::ToolResult { tool_use_id, .. } => {
+                    states.insert((run, tool_use_id.clone()), ToolCallState::Finished);
+                }
+                _ => {}
+            }
+        }
+    }
+    states
 }
 
 pub(super) fn tool_name(name: &str) -> String {

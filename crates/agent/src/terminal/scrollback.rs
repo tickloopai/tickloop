@@ -69,6 +69,30 @@ struct LineStyle {
     hidden: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ToolCallState {
+    Queued,
+    Running,
+    Finished,
+    Stopped,
+}
+
+impl ToolCallState {
+    pub(super) fn suffix(self) -> &'static str {
+        match self {
+            Self::Queued => " · Queued",
+            Self::Stopped => " · Stopped",
+            Self::Running | Self::Finished => "",
+        }
+    }
+}
+
+struct ToolCallHeader {
+    line: usize,
+    spans: Vec<(String, Option<Role>)>,
+    state: ToolCallState,
+}
+
 /// An assistant reply held as Markdown source and laid out again for each
 /// width. The whole reply is one logical line whose text stays empty; its rows
 /// come from the layout, with `lead` in front of the first row and a hanging
@@ -136,6 +160,7 @@ pub(super) struct Scrollback {
     activity: Option<RoleLine>,
     /// Header lines of tool calls still executing, by call id.
     running_tool_calls: HashMap<String, usize>,
+    tool_call_headers: HashMap<String, ToolCallHeader>,
     running_shimmer: RunningShimmer,
     completion_notice: Option<Range<usize>>,
     /// Logical lines of each input echo, oldest first.
@@ -161,6 +186,7 @@ impl Default for Scrollback {
             unread: 0,
             activity: None,
             running_tool_calls: HashMap::new(),
+            tool_call_headers: HashMap::new(),
             running_shimmer: RunningShimmer::default(),
             completion_notice: None,
             inputs: Vec::new(),
@@ -395,28 +421,79 @@ impl Scrollback {
         );
     }
 
-    /// Appends a tool call header and shows its glyph as running until
-    /// [`Self::finish_tool_call`]. The header is the line the spans open, or
-    /// the current line when they do not begin with a newline.
-    pub(super) fn append_tool_call(&mut self, call_id: &str, spans: &[(String, Option<Role>)]) {
-        let opens_line = spans
-            .first()
-            .is_some_and(|(text, _)| text.starts_with('\n'));
-        let header_line = self.lines.len() - usize::from(!opens_line);
-        for (text, role) in spans {
-            self.append_as(text, *role, None);
+    pub(super) fn set_tool_call(
+        &mut self,
+        call_id: &str,
+        spans: &[(String, Option<Role>)],
+        state: ToolCallState,
+    ) {
+        let header_line = if let Some(header) = self.tool_call_headers.get(call_id) {
+            header.line
+        } else {
+            self.append("\n");
+            let line = self.lines.len() - 1;
+            self.append("\n");
+            line
+        };
+        let line = &mut self.lines[header_line];
+        line.clear();
+        let style = &mut self.line_styles[header_line];
+        *style = LineStyle::default();
+        for (text, role) in spans.iter().chain(std::iter::once(&(
+            state.suffix().into(),
+            Some(Role::MutedText),
+        ))) {
+            let start = line.len();
+            line.push_str(text.trim_matches('\n'));
+            if let Some(role) = role {
+                style.marks.push((start..line.len(), *role));
+            }
         }
-        self.running_tool_calls
-            .insert(call_id.to_owned(), header_line);
-        self.running_shimmer.reset();
+        self.dirty_from = Some(
+            self.dirty_from
+                .map_or(header_line, |existing| existing.min(header_line)),
+        );
+        self.tool_call_headers.insert(
+            call_id.to_owned(),
+            ToolCallHeader {
+                line: header_line,
+                spans: spans.to_vec(),
+                state,
+            },
+        );
+        if state == ToolCallState::Running {
+            self.running_tool_calls
+                .insert(call_id.to_owned(), header_line);
+            self.running_shimmer.reset();
+        } else {
+            self.running_tool_calls.remove(call_id);
+        }
     }
 
     pub(super) fn finish_tool_call(&mut self, call_id: &str) {
-        self.running_tool_calls.remove(call_id);
+        if let Some(header) = self.tool_call_headers.get(call_id) {
+            let spans = header.spans.clone();
+            self.set_tool_call(call_id, &spans, ToolCallState::Finished);
+        }
     }
 
     pub(super) fn finish_tool_calls(&mut self) {
-        self.running_tool_calls.clear();
+        let unfinished: Vec<_> = self
+            .tool_call_headers
+            .iter()
+            .filter_map(|(id, header)| match header.state {
+                ToolCallState::Queued => {
+                    Some((id.clone(), header.spans.clone(), ToolCallState::Stopped))
+                }
+                ToolCallState::Running => {
+                    Some((id.clone(), header.spans.clone(), ToolCallState::Finished))
+                }
+                _ => None,
+            })
+            .collect();
+        for (id, spans, state) in unfinished {
+            self.set_tool_call(&id, &spans, state);
+        }
     }
 
     /// Returns whether the activity row changed.
@@ -443,6 +520,14 @@ impl Scrollback {
             }
             block.layout = StreamingLayout::default();
             block.row_counts.clear();
+        }
+        let previous_call_glyph = format!("{} ", previous.glyph(Glyph::ToolCall));
+        for header in self.tool_call_headers.values_mut() {
+            for (text, role) in &mut header.spans {
+                if *role == Some(Role::MutedText) && *text == previous_call_glyph {
+                    *text = format!("{} ", next.glyph(Glyph::ToolCall));
+                }
+            }
         }
         for (line, style) in self.lines.iter_mut().zip(&mut self.line_styles) {
             remap_prefix(
@@ -1292,7 +1377,7 @@ mod tests {
     fn a_running_tool_name_shimmers_until_finished() {
         let mut scrollback = Scrollback::new();
         scrollback.append("before");
-        scrollback.append_tool_call(
+        scrollback.set_tool_call(
             "call",
             &[
                 ("\n".into(), None),
@@ -1300,6 +1385,7 @@ mod tests {
                 ("Shell".into(), Some(Role::ToolName)),
                 ("\n".into(), None),
             ],
+            ToolCallState::Running,
         );
         scrollback.append_as("  ⎿ output\n", Some(Role::MutedText), None);
         let running = scrollback.frame_with_motion(20, 5, true);

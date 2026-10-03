@@ -846,6 +846,7 @@ pub(super) fn pending_reply(snapshot: &ChatSnapshot) -> String {
 struct PublicHistoryBuilder {
     pieces: Vec<ConversationPiece>,
     image_links: ImageLinks,
+    tool_states: HashMap<(Uuid, String), super::scrollback::ToolCallState>,
 }
 
 impl PublicHistoryBuilder {
@@ -902,6 +903,7 @@ fn public_history_pieces(
     let mut history = PublicHistoryBuilder {
         pieces: Vec::new(),
         image_links,
+        tool_states: presentation::tool_call_states(chat),
     };
     let Ok(projection) = chat.public_conversation_items() else {
         return vec![ConversationPiece::Styled(
@@ -959,9 +961,9 @@ pub(super) fn public_history(chat: &ChatSnapshot, display: DisplayProfile) -> St
     public_history_pieces(chat, display, ImageLinks::default())
         .iter()
         .map(|piece| match piece {
-            ConversationPiece::Styled(text, _) | ConversationPiece::Linked { text, .. } => {
-                text.clone()
-            }
+            ConversationPiece::Styled(text, _)
+            | ConversationPiece::Linked { text, .. }
+            | ConversationPiece::ToolCall { text, .. } => text.clone(),
             ConversationPiece::Markdown { text, .. } => format!("{assistant_lead}{text}"),
         })
         .collect()
@@ -1083,10 +1085,32 @@ fn append_public_message(
                     (source_chat_id, run_id, id.clone()),
                     (name.clone(), input.clone()),
                 );
-                history.push_role(
-                    presentation::archived_tool_call(name, input, display),
-                    super::style::Role::MutedText,
-                );
+                if let Some(run) = run_id {
+                    let state = history
+                        .tool_states
+                        .get(&(run, id.clone()))
+                        .copied()
+                        .unwrap_or(super::scrollback::ToolCallState::Finished);
+                    let spans = presentation::tool_call_roles(name, input, display);
+                    let mut text = spans
+                        .iter()
+                        .map(|(text, _)| text.as_str())
+                        .collect::<String>();
+                    text.truncate(text.len().saturating_sub(1));
+                    text.push_str(state.suffix());
+                    text.push('\n');
+                    history.pieces.push(ConversationPiece::ToolCall {
+                        text,
+                        call_key: presentation::tool_call_key(run, id),
+                        spans,
+                        state,
+                    });
+                } else {
+                    history.push_role(
+                        presentation::archived_tool_call(name, input, display),
+                        super::style::Role::MutedText,
+                    );
+                }
             }
             Content::ToolResult {
                 tool_use_id,

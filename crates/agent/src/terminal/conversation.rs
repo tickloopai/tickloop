@@ -449,7 +449,8 @@ pub(super) fn project_event(event: &Event) -> Option<ConversationBlock> {
                 command: command.clone(),
             },
         },
-        EventKind::Started
+        EventKind::AssistantMessageCommitted { .. }
+        | EventKind::Started
         | EventKind::ModelRetry { .. }
         | EventKind::InputMerged { .. }
         | EventKind::InputTakenBack

@@ -166,9 +166,7 @@ impl ArtifactsPicker {
         let entries = self
             .entries
             .iter()
-            .map(|entry| {
-                ConversationEntry::new(&entry.title, std::slice::from_ref(&entry.access_role), &[])
-            })
+            .map(|entry| ConversationEntry::new(&entry.title, &[], &[]))
             .collect();
         self.picker.replace_entries(entries);
     }
@@ -453,7 +451,6 @@ impl ArtifactsPicker {
             fit_hint(
                 &[
                     ("Enter add".into(), 10),
-                    ("←/→ tabs".into(), 8),
                     ("/ search".into(), 7),
                     ("o open · c copy · p pin".into(), 5),
                     ("Ctrl+R rename · d delete · r refresh".into(), 4),
@@ -475,6 +472,31 @@ impl ArtifactsPicker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn pinned_search_matches_titles_only_and_hides_basic_navigation_hints() {
+        let mut picker = ArtifactsPicker::new(None, "owner@example.test".into(), HashSet::new());
+        for _ in 0..3 {
+            picker.key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        }
+        load(
+            &mut picker,
+            vec![
+                artifact("a", "Research", "owner"),
+                artifact("b", "Owner notes", "viewer"),
+            ],
+        );
+        picker.replace_query("owner");
+        assert_eq!(picker.selected().map(|entry| entry.id.as_str()), Some("b"));
+        picker.replace_query("research");
+        assert_eq!(picker.selected().map(|entry| entry.id.as_str()), Some("a"));
+        let frame = picker.frame(180, 20, DisplayProfile::default());
+        assert!(
+            !frame
+                .lines
+                .iter()
+                .any(|line| line.text().contains("←/→ tabs"))
+        );
+    }
     fn artifact(id: &str, title: &str, role: &str) -> ArtifactMetadata {
         serde_json::from_value(serde_json::json!({"id":id,"title":title,"format":"markdown","access_role":role,"url":format!("https://docs.example/a/{id}"),"updated_at":"2026-10-06T00:00:00Z"})).unwrap()
     }

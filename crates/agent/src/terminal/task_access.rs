@@ -33,6 +33,48 @@ pub(super) struct ShellTaskSubscription {
 }
 
 impl ShellTaskCenter {
+    pub(super) async fn started_at_ms(&self, chat: Uuid, id: Uuid) -> Option<u64> {
+        let snapshot = self.agent.snapshot(chat).await.ok()?;
+        let command = snapshot
+            .commands
+            .iter()
+            .find(|command| command.operation_id == id);
+        let shell = snapshot.user_shells.iter().find(|shell| shell.id == id);
+        let path = command
+            .map(|command| command.output_ref.as_path())
+            .or_else(|| shell.and_then(|shell| shell.output_ref.as_deref()));
+        let creation = path.and_then(|path| {
+            std::fs::metadata(path)
+                .ok()?
+                .created()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?
+                .as_millis()
+                .try_into()
+                .ok()
+        });
+        creation
+            .or_else(|| {
+                snapshot
+                    .events
+                    .iter()
+                    .filter_map(|event| match &event.kind {
+                        crate::runtime::EventKind::CommandUpdated { command }
+                            if command.operation_id == id =>
+                        {
+                            command.updated_at_ms
+                        }
+                        _ => None,
+                    })
+                    .min()
+            })
+            .or_else(|| {
+                shell
+                    .filter(|shell| matches!(shell.state, crate::runtime::UserShellState::Running))
+                    .and_then(|shell| shell.state_since)
+            })
+    }
     pub(super) fn new(agent: ConsoleExecution) -> Self {
         Self {
             agent,
@@ -249,4 +291,93 @@ impl ShellTaskSubscription {
 
 fn runtime_error(error: crate::runtime::AgentError) -> ShellTaskCenterError {
     ShellTaskCenterError::Runtime(error.to_string())
+}
+
+#[cfg(test)]
+mod timestamp_tests {
+    use super::*;
+    use crate::agent_access::*;
+    use crate::terminal::test_support;
+
+    struct OlderTaskRecords(EmbeddedAgentAccess);
+    #[async_trait::async_trait]
+    impl AgentAccess for OlderTaskRecords {
+        async fn observe(&self, request: ObservationRequest) -> Result<Observation, AccessError> {
+            let mut observation = self.0.observe(request).await?;
+            match &mut observation.initial {
+                ObservationValue::Tasks(tasks) => {
+                    for task in tasks {
+                        task.updated_at_ms = None;
+                    }
+                }
+                ObservationValue::Agent(snapshot) => {
+                    for shell in &mut snapshot.user_shells {
+                        shell.updated_at_ms = None;
+                    }
+                    for command in &mut snapshot.commands {
+                        command.updated_at_ms = None;
+                    }
+                }
+                _ => {}
+            }
+            Ok(observation)
+        }
+        async fn execute(&self, command: CommandEnvelope) -> Result<CommandReceipt, AccessError> {
+            self.0.execute(command).await
+        }
+        async fn show_view(&self, update: DisplayUpdate) -> Result<DisplayReceipt, AccessError> {
+            self.0.show_view(update).await
+        }
+    }
+
+    #[tokio::test]
+    async fn completed_shell_time_is_recovered_when_an_older_owner_snapshot_is_resynced() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = crate::runtime::Agent::new_embedded(
+            test_support::config(),
+            Arc::new(test_support::ScriptedModel::new(Vec::new())),
+        );
+        let access = Arc::new(OlderTaskRecords(EmbeddedAgentAccess::new(runtime.clone())));
+        let agent = ConsoleExecution::from_access_for_test(
+            access.clone(),
+            access.0.owner_epoch(),
+            ViewRef {
+                session_id: Uuid::new_v4(),
+                view_id: Uuid::new_v4(),
+            },
+            LaunchSpec::embedded(directory.path().into()),
+            None,
+        );
+        let chat = agent.create_chat(directory.path().into()).await.unwrap();
+        let mut events = runtime.subscribe_user_shells();
+        let receipt = agent
+            .submit_user_shell_for_goal(chat, None, "printf finished; exit 1".into(), false)
+            .await
+            .unwrap();
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let record = events.recv().await.unwrap();
+                if record.id == receipt.command_id
+                    && record.state == crate::runtime::UserShellState::Failed
+                {
+                    break record;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let center = ShellTaskCenter::new(agent.clone());
+        for _ in 0..2 {
+            let snapshot = center.snapshot(chat).await.unwrap();
+            let task = snapshot
+                .tasks
+                .iter()
+                .find(|task| task.id == receipt.command_id)
+                .unwrap();
+            assert_eq!(task.exit_code, Some(1));
+            assert!(task.updated_at_ms.is_some());
+            assert!(task.updated_at_ms >= terminal.state_since);
+        }
+        runtime.shutdown().await;
+    }
 }

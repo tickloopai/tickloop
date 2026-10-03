@@ -12,6 +12,9 @@ mod family_navigation;
 #[path = "agent_console_pty/resume_picker.rs"]
 mod resume_picker;
 
+#[path = "agent_console_pty/reply_visibility.rs"]
+mod reply_visibility;
+
 #[path = "agent_console_pty/unified_footer.rs"]
 mod unified_footer;
 
@@ -463,9 +466,16 @@ async fn run_lifecycle(fixture: &PrivateFixture) {
         .await;
     reopened.send(b"\r");
     reopened
-        .wait_for("Task detail retrieves real worker output", |frame| {
-            frame.lines().any(|line| line.trim() == "Shell task")
-                && frame.lines().any(|line| line.trim() == "shell began")
+        .wait_for("Tick Shell detail retrieves real worker output", |frame| {
+            frame.lines().any(|line| {
+                line.split('│')
+                    .nth(1)
+                    .is_some_and(|right| right.trim() == "Shell")
+            }) && frame.lines().any(|line| {
+                line.split('│')
+                    .nth(1)
+                    .is_some_and(|right| right.trim() == "shell began")
+            })
         })
         .await;
     std::fs::write(fixture.path("work/finish"), b"finish").unwrap();
@@ -508,9 +518,11 @@ async fn run_lifecycle(fixture: &PrivateFixture) {
         .wait_for(
             "Task detail follows completion after View detach",
             |frame| {
-                frame
-                    .lines()
-                    .any(|line| line.trim() == "shell beganshell ended")
+                frame.lines().any(|line| {
+                    line.split('│')
+                        .nth(1)
+                        .is_some_and(|right| right.trim() == "shell beganshell ended")
+                })
             },
         )
         .await;
@@ -523,8 +535,7 @@ async fn run_lifecycle(fixture: &PrivateFixture) {
             |frame| {
                 let captured = captured_output.lock().unwrap();
                 let fresh = String::from_utf8_lossy(&captured[close_mark..]);
-                fresh.contains("\x1b[?2026l")
-                    && !frame.lines().any(|line| line.trim() == "Shell task")
+                fresh.contains("\x1b[?2026l") && frame.contains("Shells (1)")
             },
         )
         .await;
@@ -533,9 +544,11 @@ async fn run_lifecycle(fixture: &PrivateFixture) {
         .wait_for("Task Esc returns to ordinary input", |frame| {
             let captured = captured_output.lock().unwrap();
             let terminal = String::from_utf8_lossy(&captured);
-            !frame.lines().any(|line| line.trim() == "Shell task")
-                && !frame.lines().any(|line| line.trim() == "Shell tasks")
-                && frame.lines().any(|line| line.trim() == "❯")
+            !frame.lines().any(|line| {
+                line.split('│')
+                    .nth(1)
+                    .is_some_and(|right| right.trim() == "Shell")
+            }) && frame.lines().any(|line| line.trim() == "❯")
                 && terminal.rfind("\x1b[?25h") > terminal.rfind("\x1b[?25l")
         })
         .await;

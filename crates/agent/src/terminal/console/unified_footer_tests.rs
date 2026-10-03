@@ -247,21 +247,27 @@ fn single_shell_activation_and_detail_updates_keep_the_exact_eligible_task() {
         .lock()
         .unwrap()
         .key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
-    assert!(
-        matches!(key(&console, KeyCode::Enter), Some(InputEvent::OpenStatusTask(id)) if id == TASK)
-    );
-    console.show_tasks_at(snapshot, Some(TASK)).unwrap();
-    let effect = console
-        .update_tasks(shell_snapshot(
-            2,
-            vec![(TASK, "selected shell", ShellTaskState::Completed)],
-        ))
+    let Some(InputEvent::OpenTickShell { task_id, panel, .. }) = key(&console, KeyCode::Enter)
+    else {
+        panic!("Shell shortcut did not open the Tick panel");
+    };
+    assert_eq!(task_id, TASK);
+    console
+        .load_tick_shell(CHAT, panel, snapshot, None)
         .unwrap();
+    let mut completed =
+        shell_snapshot(2, vec![(TASK, "selected shell", ShellTaskState::Completed)]);
+    completed.tasks[0].exit_code = Some(0);
+    let effect = console.update_tick_shell(CHAT, panel, completed).unwrap();
     assert!(matches!(
         effect,
         TaskSurfaceEffect::None | TaskSurfaceEffect::ReadOutput { .. }
     ));
-    assert!(frame(&console).iter().any(|row| row.contains("completed")));
+    assert!(
+        frame(&console)
+            .iter()
+            .any(|row| row.contains("State: exit 0"))
+    );
     key(&console, KeyCode::Esc);
     assert_eq!(
         console.state.lock().unwrap().editor.draft(),
@@ -294,7 +300,7 @@ fn multiple_shell_shortcut_opens_the_list_after_an_earlier_single_detail() {
     );
     key(&console, KeyCode::Char('j'));
     assert!(
-        matches!(key(&console, KeyCode::Enter), Some(InputEvent::OpenStatusTask(id)) if id == second)
+        matches!(key(&console, KeyCode::Enter), Some(InputEvent::OpenTickShell {task_id,..}) if task_id == second)
     );
     assert_eq!(
         console.state.lock().unwrap().editor.draft(),
@@ -332,17 +338,21 @@ fn assert_single_shell_shortcut(cached_detail: bool) {
         event,
         Some(InputEvent::TickListAction { action: 'r', .. })
     ));
-    assert!(
-        matches!(key(&console, KeyCode::Enter), Some(InputEvent::OpenStatusTask(id)) if id == target)
-    );
-    console.show_tasks_at(snapshot, Some(target)).unwrap();
+    let Some(InputEvent::OpenTickShell { task_id, panel, .. }) = key(&console, KeyCode::Enter)
+    else {
+        panic!("Shell shortcut did not open Tick panel");
+    };
+    assert_eq!(task_id, target);
+    console
+        .load_tick_shell(CHAT, panel, snapshot, None)
+        .unwrap();
     let detail = frame(&console);
     assert!(
         detail.iter().any(|row| row.contains("sole eligible task")),
         "{detail:?}"
     );
     assert!(
-        detail.iter().any(|row| row.contains("Status: background")),
+        detail.iter().any(|row| row.contains("State: running")),
         "{detail:?}"
     );
     key(&console, KeyCode::Esc);
@@ -550,7 +560,10 @@ fn core_status_position_moves_the_complete_styled_segment_and_preserves_fallback
             .unwrap();
         let left = frame(&console);
         assert_eq!(left.len(), right.len());
-        assert!(left[editor + 1].starts_with(&core), "{left:?}");
+        assert!(
+            left[editor + 1].starts_with(&format!("── {core} ")),
+            "{left:?}"
+        );
         assert!(left[editor + 1].ends_with('─'));
         assert_eq!(display_width(&left[editor + 1]), 79);
         let mut state = console.state.lock().unwrap();
@@ -567,17 +580,32 @@ fn core_status_position_moves_the_complete_styled_segment_and_preserves_fallback
                 .iter()
                 .any(|span| span.text == "模型 fixture" && span.role == Some(Role::Text))
         );
-        for width in [24, display_width(&core) + 1, display_width(&core) + 2] {
+        assert_eq!(
+            display_width(&left[editor + 1][..left[editor + 1].find(&core).unwrap()]),
+            3
+        );
+        let boundary = display_width(&core) + 4;
+        for width in [
+            24,
+            display_width(&core) + 1,
+            display_width(&core) + 2,
+            boundary,
+            boundary + 1,
+        ] {
             state.resize((width + 1).try_into().unwrap(), 24);
             let left_frame = state.frame().0;
             state.display.set_preferences(DisplayPreferences::default());
             let right_frame = state.frame().0;
-            if width == display_width(&core) + 2 {
+            if width > boundary {
+                assert!(left_frame.iter().any(|line| line.starts_with(&format!("── {core} ")) && line.ends_with('─')));
+            } else {
                 assert!(
-                    left_frame
+                    !left_frame
                         .iter()
-                        .any(|line| line.starts_with(&core) && line.ends_with('─'))
+                        .any(|line| line.starts_with(&format!("── {core} ")))
                 );
+            }
+            if width >= display_width(&core) + 2 {
                 assert!(
                     right_frame
                         .iter()

@@ -356,16 +356,19 @@ async fn unsafe_runtime_socket_and_lock_are_rejected_before_any_handshake() {
 #[tokio::test]
 async fn malformed_and_unknown_hello_never_receive_shutdown() {
     for hello in [
-        json!({"Hello":{"major":3,"minor":0,"owner_epoch":Uuid::new_v4()}}),
-        json!({"Hello":{"major":2,"minor":0}}),
-        json!({"Hello":{"major":2,"minor":1,"owner_epoch":Uuid::new_v4()}}),
+        json!({"Hello":{"major":PROTOCOL_MAJOR+1,"minor":0,"owner_epoch":Uuid::new_v4()}}),
+        json!({"Hello":{"major":PROTOCOL_MAJOR,"minor":0}}),
+        json!({"Hello":{"major":PROTOCOL_MAJOR,"minor":1,"owner_epoch":Uuid::new_v4()}}),
         json!({"OwnerStopped":{"request_id":Uuid::new_v4()}}),
     ] {
         let fixture = ServiceFixture::new();
         let listener = fixture.listener();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            assert_eq!(read_frame(&mut stream).await.unwrap()["Hello"]["major"], 2);
+            assert_eq!(
+                read_frame(&mut stream).await.unwrap()["Hello"]["major"],
+                PROTOCOL_MAJOR
+            );
             write_frame(&mut stream, &hello).await;
             assert_disconnected(&mut stream, &listener).await;
         });
@@ -399,7 +402,7 @@ async fn shutdown_requires_correlated_ack_and_is_never_resent() {
             let epoch = Uuid::new_v4();
             write_frame(
                 &mut stream,
-                &json!({"Hello":{"major":2,"minor":0,"owner_epoch":epoch}}),
+                &json!({"Hello":{"major":PROTOCOL_MAJOR,"minor":0,"owner_epoch":epoch}}),
             )
             .await;
             let shutdown = read_frame(&mut stream).await.unwrap();
@@ -444,7 +447,7 @@ async fn acknowledged_shutdown_preserves_a_replacement_owner_socket() {
         let epoch = Uuid::new_v4();
         write_frame(
             &mut stream,
-            &json!({"Hello":{"major":2,"minor":0,"owner_epoch":epoch}}),
+            &json!({"Hello":{"major":PROTOCOL_MAJOR,"minor":0,"owner_epoch":epoch}}),
         )
         .await;
         let shutdown = read_frame(&mut stream).await.unwrap();
@@ -482,7 +485,7 @@ async fn shutdown_ack_is_not_success_until_the_original_owner_lock_is_released()
         let epoch = Uuid::new_v4();
         write_frame(
             &mut stream,
-            &json!({"Hello":{"major":2,"minor":0,"owner_epoch":epoch}}),
+            &json!({"Hello":{"major":PROTOCOL_MAJOR,"minor":0,"owner_epoch":epoch}}),
         )
         .await;
         let shutdown = read_frame(&mut stream).await.unwrap();
@@ -609,7 +612,7 @@ async fn verify_stopped_and_restart(
     )
     .await
     .unwrap();
-    fixture.owner = Some((2, replacement.owner_epoch()));
+    fixture.owner = Some((PROTOCOL_MAJOR, replacement.owner_epoch()));
     assert_ne!(replacement.owner_epoch(), old_epoch);
     let history = replacement
         .observe(ObservationRequest::Transcript {
@@ -673,7 +676,7 @@ async fn explicit_cli_stop_ends_current_owner_and_active_worker_preserving_saved
     .await
     .unwrap();
     let epoch = owner.owner_epoch();
-    fixture.owner = Some((2, epoch));
+    fixture.owner = Some((PROTOCOL_MAJOR, epoch));
     fixture.launch_in_progress = false;
     let (launch, mut requests, _release) = launch_active_worker(&fixture).await;
     let created = owner

@@ -6,6 +6,10 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 const HERDR_SOURCE: &str = "herdr:";
 
+pub fn artifact_instance_id(origin: &str, id: &str) -> String {
+    format!("artifact:{}/{id}", origin.trim_end_matches('/'))
+}
+
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct InstanceRef(String);
 
@@ -35,10 +39,11 @@ impl InstanceRef {
         {
             return Err("an Artifact Tick requires an origin and artifact identity");
         }
-        Ok(Self(format!(
-            "artifact:{}/{id}",
-            origin.trim_end_matches('/')
-        )))
+        Ok(Self(artifact_instance_id(origin, id)))
+    }
+
+    pub fn artifact_parts(&self) -> Option<(&str, &str)> {
+        self.0.strip_prefix("artifact:")?.rsplit_once('/')
     }
 
     pub fn as_str(&self) -> &str {

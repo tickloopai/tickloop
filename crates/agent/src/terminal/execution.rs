@@ -2992,7 +2992,38 @@ impl ConsoleExecution {
         chat: Uuid,
     ) -> Result<Vec<runtime::ShellTask>, AgentError> {
         match self.value(chat, AgentDetailQuery::Tasks).await? {
-            ObservationValue::Tasks(tasks) => Ok(tasks),
+            ObservationValue::Tasks(mut tasks) => {
+                if tasks.iter().any(|task| task.updated_at_ms.is_none()) {
+                    let snapshot = self.snapshot(chat).await?;
+                    for task in tasks.iter_mut().filter(|task| task.updated_at_ms.is_none()) {
+                        task.updated_at_ms = match task.origin {
+                            runtime::ShellTaskOrigin::User => snapshot
+                                .user_shells
+                                .iter()
+                                .find(|record| record.id == task.id)
+                                .and_then(|record| {
+                                    runtime::recover_shell_update_time(
+                                        record.updated_at_ms,
+                                        record.state_since,
+                                        record.output_ref.as_deref(),
+                                    )
+                                }),
+                            runtime::ShellTaskOrigin::Agent => snapshot
+                                .commands
+                                .iter()
+                                .find(|record| record.operation_id == task.id)
+                                .and_then(|record| {
+                                    runtime::recover_shell_update_time(
+                                        record.updated_at_ms,
+                                        None,
+                                        Some(&record.output_ref),
+                                    )
+                                }),
+                        };
+                    }
+                }
+                Ok(tasks)
+            }
             _ => Err(unexpected()),
         }
     }

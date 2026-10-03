@@ -48,7 +48,10 @@ async fn service() -> (String, Arc<AtomicU64>, Arc<AtomicU64>, Arc<AtomicU64>) {
                 json!({"access_token":"test-token","token_type":"Bearer","expires_in":600,"user":user})
             } else {
                 read_count.fetch_add(1, Ordering::SeqCst);
-                json!({"id":"doc","title":"Artifact updates","format":"markdown","access_role":"owner","human_sequence":changes.load(Ordering::SeqCst),"human_updated_at":format!("2026-10-06T04:00:{:02}.000Z",changes.load(Ordering::SeqCst)),"human_change":if kind.load(Ordering::SeqCst) == 1 {"feedback"} else {"edit"},"human_version_id":null})
+                let sequence = changes.load(Ordering::SeqCst);
+                let change = kind.load(Ordering::SeqCst);
+                let body_sequence = sequence - u64::from(change == 1);
+                json!({"id":"doc","title":"Artifact updates","format":"markdown","access_role":"owner","human_sequence":sequence,"human_updated_at":format!("2026-10-06T04:00:{sequence:02}.000Z"),"human_change":if change == 1 {"feedback"} else if change == 2 {"publish"} else {"edit"},"human_version_id":null,"human_body_sequence":body_sequence,"human_body_updated_at":format!("2026-10-06T04:00:{body_sequence:02}.000Z"),"human_body_change":if change == 2 {"publish"} else {"edit"},"human_body_version_id":if change == 2 {Some("version-15")} else {None}})
             };
             let body = body.to_string();
             socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
@@ -78,6 +81,52 @@ async fn ready(events: &mut tokio::sync::mpsc::Receiver<TickStreamEvent>, watch:
             _ => {}
         }
     }
+}
+
+#[tokio::test]
+async fn feedback_between_polls_does_not_swallow_the_latest_undelivered_body_change() {
+    let (origin, sequence, feedback, _) = service().await;
+    let directory = tempfile::tempdir().unwrap();
+    login(directory.path(), &origin).await;
+    let stream = ArtifactTickStream::new(directory.path().canonicalize().unwrap(), None);
+    let watch = Uuid::new_v4();
+    stream.set_cadences(BTreeMap::from([(watch, 5)]));
+    let mut handle = stream.open();
+    handle.desired.send_replace(BTreeMap::from([(
+        watch,
+        InstanceRef::artifact(&origin, "doc").unwrap(),
+    )]));
+    ready(&mut handle.events, watch).await;
+    feedback.store(1, Ordering::SeqCst);
+    sequence.store(14, Ordering::SeqCst);
+    let value = tokio::time::timeout(Duration::from_secs(7), async {
+        loop {
+            if let TickStreamEvent::Observation { value, .. } = handle.events.recv().await.unwrap()
+            {
+                break value;
+            }
+        }
+    })
+    .await
+    .expect("edit 13 was swallowed by feedback 14");
+    assert_eq!(value.sequence, 13);
+    assert_eq!(value.data["change"], "edit");
+    assert_eq!(value.observed_at, "2026-10-06T04:00:13.000Z");
+    feedback.store(2, Ordering::SeqCst);
+    sequence.store(15, Ordering::SeqCst);
+    let value = tokio::time::timeout(Duration::from_secs(7), async {
+        loop {
+            if let TickStreamEvent::Observation { value, .. } = handle.events.recv().await.unwrap()
+            {
+                break value;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(value.sequence, 15);
+    assert_eq!(value.data["change"], "publish");
+    assert_eq!(value.data["version_id"], "version-15");
 }
 #[tokio::test]
 async fn subscribed_artifact_baselines_each_watch_polls_at_cadence_and_preserves_feedback_path() {

@@ -1,4 +1,10 @@
-use std::{cmp::Reverse, collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    cmp::Reverse,
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use serde::Deserialize;
 use tokio::sync::{Mutex, broadcast};
@@ -495,7 +501,14 @@ fn project_tasks(chat: &ChatSnapshot, live_agent_commands: Vec<CommandSnapshot>)
         .cloned()
         .map(|command| (command.operation_id, command))
         .collect::<HashMap<_, _>>();
-    for command in live_agent_commands {
+    for mut command in live_agent_commands {
+        if let Some(recorded) = agent_commands.get(&command.operation_id) {
+            command.updated_at_ms = command
+                .updated_at_ms
+                .into_iter()
+                .chain(recorded.updated_at_ms)
+                .max();
+        }
         agent_commands.insert(command.operation_id, command);
     }
 
@@ -533,10 +546,37 @@ fn project_tasks(chat: &ChatSnapshot, live_agent_commands: Vec<CommandSnapshot>)
     tasks.into_iter().map(|ordered| ordered.task).collect()
 }
 
+pub(crate) fn recover_shell_update_time(
+    updated: Option<u64>,
+    state_since: Option<u64>,
+    output: Option<&Path>,
+) -> Option<u64> {
+    let output_time = output.and_then(|path| {
+        std::fs::metadata(path)
+            .ok()?
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_millis()
+            .try_into()
+            .ok()
+    });
+    updated
+        .into_iter()
+        .chain(state_since)
+        .chain(output_time)
+        .max()
+}
+
 fn agent_task(chat_id: ChatId, command: CommandSnapshot) -> ShellTask {
     let state = map_agent_state(command.state);
     ShellTask {
-        updated_at_ms: command.updated_at_ms,
+        updated_at_ms: recover_shell_update_time(
+            command.updated_at_ms,
+            None,
+            Some(&command.output_ref),
+        ),
         id: command.operation_id,
         chat_id,
         origin: ShellTaskOrigin::Agent,
@@ -559,7 +599,11 @@ fn agent_task(chat_id: ChatId, command: CommandSnapshot) -> ShellTask {
 fn user_task(record: &UserShellRecord) -> ShellTask {
     let state = map_user_state(&record.state);
     ShellTask {
-        updated_at_ms: record.updated_at_ms,
+        updated_at_ms: recover_shell_update_time(
+            record.updated_at_ms,
+            record.state_since,
+            record.output_ref.as_deref(),
+        ),
         id: record.id,
         chat_id: record.chat_id,
         origin: ShellTaskOrigin::User,
