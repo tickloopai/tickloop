@@ -1,6 +1,6 @@
 # Tick Loop Agent
 
-Agent 的权限、问题、确认、设置、帮助，以及 /model、/provider 的内置选择器、连接详情、凭据编辑和登录使用底部固定 12 行的输入对话框，替换输入框与 Subagents 面板。终端过矮时容器缩小，上方内容仍保留；关闭后恢复原草稿与光标。Agent 请求优先于用户打开的菜单，完成后恢复被打断的界面；界面状态随 Chat 保存。最近一条用户消息显示在左栏首行，Tick List 从同一行开始；整页 Agents、Transcript、Diff 与右侧 Shell 详情保留各自的查看方式。
+Agent 的权限、问题、确认、工作目录信任、设置、帮助、`/resume` 与 `/artifacts` 选择器、`/tasks` 任务中心、`/permissions` 管理、订阅管理，以及 `/model`、`/provider` 的内置选择器、连接详情、凭据编辑和登录使用底部固定 12 行的输入对话框（包含顶端全宽规则线、标题和末行提示），替换输入框、上下分隔线和 Subagents 面板。终端过矮时容器缩小，上方内容仍保留；关闭后恢复原草稿与光标。Agent 请求优先于用户打开的菜单，完成后恢复被打断的界面；界面状态随 Chat 保存。最近一条用户消息显示在左栏首行，Tick List 从同一行开始；整页 Agents、Transcript、Diff 与右侧 Shell 详情保留各自的查看方式。
 
 
 主命令为 `tickloop`。Herdr 内自动接入 Tick，宿主外可独立使用；双向操作见[原生 Herdr 接入](../../docs/design/native-herdr.md)。
@@ -37,17 +37,17 @@ This stops the service and its running Agents. Saved history is kept. `TICKLOOP_
 
 owner 自动启动使用当前登录用户私有 Unix socket，启动锁协调并发 CLI，不安装 launchd 服务。关闭终端／Pane、`/exit` 或 View EOF 只撤界面；owner／worker 退出后旧 execution 失效。`/resume` 打开历史不执行，明确向原 Loop Continue 才恢复其原有效 Trigger；没有自动崩溃续跑或跨崩溃 exactly-once 承诺。确认丢失先查询原 CommandId，创建仍未知时保留输入并阻止盲目重复创建；检查总览与历史后，可按提示 `/acknowledge-create COMMAND_ID` 显式承认未知，以允许另一条新提交，此动作不重放旧命令。New Agent 的暂存选择逐条以回执证明后才提交首个输入，未知或被拒的选择不会重发，也不会让输入落到配置不全的 Agent；同一命令可取消其余选择。普通输入结果未知时原样恢复到输入区，在不改动的情况下再次 Enter 只读取原收据：已被接受就采纳原结果、不再发送；改动后的输入等原结果确定后作为新输入发送；`/acknowledge-input COMMAND_ID` 只停止跟踪、不重发。
 
-输入区自然增长并独立滚动，正文使用底部真实占位后的空间。下方展开 Agents 会缩小正文；Todo 始终在消息流左栏的 Working 下方，有条目时空闲也保留，全部完成后保留 5 秒再持久化清空；Shell Tick 在内容区右侧的 Tick 列表中显示，输入和底栏保持全宽；帮助按宽度使用一至三列，并临时替换 status 和任务区。条件顶栏只摘要当前正在阅读且 user 消息已滚出视口的回合。`settings.json` 的可选 `statusLines` 是字符串数组，未配置使用默认状态行，空数组隐藏普通状态行，最多显示三条物理行；必要连接／未知提示仍占一行，帮助或请求界面临时隐藏普通 status。预算、焦点与可交互原型见[布局契约](../../.scratch/agent-layout-redesign/layout-contract.md)，真实运行与未测边界见[实施记录](../../.scratch/agent-layout-redesign/implementation.md)。
+输入区自然增长并独立滚动，正文使用底部真实占位后的空间。下方展开 Agents 会缩小正文；Todo 始终在消息流左栏的 Working 下方，有条目时空闲也保留，全部完成后保留 5 秒再持久化清空；Shell Tick 在内容区右侧的 Tick 列表中显示，输入和底栏保持全宽；帮助在输入对话框内显示，替换整个输入区及 Subagents 面板。条件顶栏只摘要当前正在阅读且 user 消息已滚出视口的回合。`settings.json` 的可选 `statusLines` 是字符串数组，未配置使用默认状态行，空数组隐藏普通状态行，最多显示三条物理行；必要连接／未知提示仍占一行，帮助或请求界面临时隐藏普通 status。预算、焦点与可交互原型见[布局契约](../../.scratch/agent-layout-redesign/layout-contract.md)，真实运行与未测边界见[实施记录](../../.scratch/agent-layout-redesign/implementation.md)。
 
-使用默认 API Key 模式时，可以先启动 Agent，在 `/provider` 中选择连接；没有凭据时会自动要求输入并保存 Key。输入内容以星号遮蔽，不进入对话或输入历史。Key 保存到 Agent 状态目录的 `.env`（文件权限 `0600`），保存后立即生效，重启继续可用。也支持启动前设置 `DEEPSEEK_API_KEY` 等环境变量；同名变量以已保存的 `.env` 值优先。模型 YAML 只保存变量名称，不保存凭据值。未保存模型选择时，默认模型为 DeepSeek 的 `deepseek-flash`，使用 OpenAI Chat Completions。已有模型配置继续按保存的协议读取。
+使用默认 API Key 模式时，可以先启动 Agent，在 `/provider` 中选择连接；没有凭据时会自动要求输入并保存 Key。输入内容以星号遮蔽，不进入对话或输入历史。Key 保存到 Agent 状态目录的 `.env`（文件权限 `0600`），保存后立即生效，重启继续可用。也支持启动前设置 `DEEPSEEK_API_KEY` 等环境变量；同名变量以已保存的 `.env` 值优先。程序内置模型定义只保存认证变量名称，不保存凭据值。未保存模型选择时，默认模型为 DeepSeek 的 `deepseek-flash`，使用 OpenAI Chat Completions。已有内置模型选择继续保留，不自动升级到新模型。
 
-也可使用自己的 Codex 套餐：在 Agent 输入 `/provider`，选择 `OpenAI` → `Codex subscription (chatgpt.com)` 连接；未登录时自动打开官方授权页面。Provider 列表按 `d` 可使用设备码登录，显示地址和设备码，适合远程终端。无需额外脚本或 Codex CLI。
+也可使用自己的 Codex 套餐：在 Agent 输入 `/provider`，选择 OpenAI 分组下的 `Codex subscription (chatgpt.com)` 连接；未登录时显示登录方式菜单。选择 Browser sign-in 打开官方授权页面，选择 Device code sign-in 显示地址和设备码，适合远程终端。无需额外脚本或 Codex CLI。
 
 自动打开的是程序所在机器的浏览器；若没有出现可访问的页面，在自己的设备上打开显示的地址。浏览器无法返回终端时，可在登录界面的 callback 字段粘贴包含 state 的完整重定向 URL；按 Tab 编辑，Enter 提交，Esc 先退出编辑、再取消登录。密码与账号验证只在 OpenAI 官方页面完成，Tick Loop 输入框不收集密码。
 
-如果设备码页面提示启用设备代码授权，需要本人在 ChatGPT 的 Settings → Security 中开启后，在 Provider 列表按 `d` 重试设备码方式，或回车使用浏览器方式。这个账号设置由 OpenAI 管理。官方说明见 [Codex 身份验证](https://developers.openai.com/codex/auth#login-on-headless-devices)。
+如果设备码页面提示启用设备代码授权，需要本人在 ChatGPT 的 Settings → Security 中开启后，在连接登录方式菜单中重试 Device code sign-in，或选择 Browser sign-in。这个账号设置由 OpenAI 管理。官方说明见 [Codex 身份验证](https://developers.openai.com/codex/auth#login-on-headless-devices)。
 
-`/provider` 选择连接：已有可用凭据时回车进入模型页，缺少凭据时先认证，成功后继续模型选择；保存凭据不自动应用模型，明确选择才生效。按 `r` 清除该 Provider 的本地凭据并重新认证；API Key 来自外部 shell 时只删除本地保存值，不修改 shell 环境。`/model` 在已配置 Provider → Model 两级中选择模型，已有选择时直接进入当前 Provider，并查询或复用同连接账号模型目录。明确无权限的模型隐藏，查询失败或无发现接口时保留未验证候选。Herdr 内外使用同一套 Agent 命令。
+`/provider` 选择连接：已有可用凭据时回车进入模型页，缺少凭据时先认证，成功后继续模型选择；保存凭据不自动应用模型，明确选择才生效。按 `p` 打开当前连接的 Details，通过明确的 Replace API key／Sign in again 操作更换凭据；取消或失败保留旧值。Remove saved key／Sign out 需要确认，保留外部 shell 环境，界面说明环境变量回退。`f` 切换 All／Configured；模型页仅在支持账号发现时提供 `r` Refresh。`/model` 在已配置 Provider → Model 两级中选择模型，已有选择时直接进入当前 Provider，并查询或复用同连接账号模型目录。明确无权限的模型隐藏，查询失败或无发现接口时保留未验证候选。Herdr 内外使用同一套 Agent 命令。
 
 同一 `TICKLOOP_CONFIG_DIR` 的 Chat 共用登录，后续模型请求读取最新账户并在到期前刷新。Codex 连接 Details 中的 `Sign out…`（确认后）仅删除本地登录，不撤销已发出的请求或远端授权。凭证单独保存在状态根目录的 `auth/openai-codex-credentials.json`，使用私有文件权限；`auth/openai-codex-generation.json` 是私有的登录代次标记，阻止晚到登录覆盖后续登录／退出，不含 token。不读取 Codex CLI 或 pi 的登录文件。不要分享这份文件；同一系统用户下已经获准执行的任意 Shell 仍可能访问本地文件。
 
@@ -109,7 +109,7 @@ OAuth 使用 Portal 设备授权，终端显示地址和用户码；在自己的
 
 目前只支持随程序编译的 Provider/model 目录，动态 Provider 接入延期。支持的厂商、连接、地区、模型和所有定义参数均随程序版本变化，目录源文件位于 [src/model/providers/](src/model/providers/)，通过 `include_str!` 编译到程序中。
 
-使用 `tickloop --cwd "$PWD"` 启动；`/provider` 和 `/model` 选择内置连接与模型。`/model FILE` 和启动 `--config FILE` 不再支持，也不读取状态目录 `providers/*.yaml`、旧 `settings.json.providers` 或其他外部 Provider/model 定义。单次输出上限、上下文窗口、端点、认证变量和 Model Card 能力参数均采用内置版本值；外部文件不能覆盖它们。
+使用 `tickloop --cwd "$PWD"` 启动；`/provider` 和 `/model` 选择内置连接与模型。模型与 Provider 定义由程序版本提供，不接受外部配置文件，也不读取状态目录 `providers/*.yaml`、旧 `settings.json.providers` 或其他外部 Provider/model 定义。单次输出上限、上下文窗口、端点、认证变量和 Model Card 能力参数均采用内置版本值；外部文件不能覆盖它们。
 
 模型选择和 Thinking 保存在状态目录 `settings.json` 的 `defaultModel`、`effortLevel` 和 `alwaysThinkingEnabled`。旧的内置选择与兼容别名继续使用当前版本内置定义；引用未知外部身份的旧选择给出一条明确提示并回退到内置默认。旧定义/调优文件被忽略，用户文件不会被删除。
 
@@ -165,7 +165,7 @@ Rewind 同时提供 `Summarize from here` 和 `Summarize up to here`，照 Claud
 
 空输入开头键入或粘贴 `!` 会进入 Shell mode，根 Agent 的命令由创建它的用户环境执行，不经过模型工具审批；child 的直接 Shell 仍受冻结的委派范围限制，无法证明范围的操作明确拒绝。Tab 补全当前项目的 Shell history 和路径；空 Shell 输入用 Esc／Backspace／Ctrl+U 返回普通 Prompt。前台命令运行时 Ctrl+B 或 Ctrl+X Ctrl+B 转后台、Ctrl+C 停止，`/tasks` 可继续查看输出或控制同一进程。普通 prompt、pipe 和菜单回填中的 `!` 不会进入直接执行入口。照 Claude Code，命令执行期间不向 Chat 写消息；前台结束、转入后台或启动失败时，`<bash-input>` user 消息与结果一起加入 Chat：结束时以 `<bash-stdout>`／`<bash-stderr>` user 消息记录有界输出（失败时输出与退出码记入 stderr，被 Ctrl+C 停止时改记中断标记，启动失败记 `Command failed`），转入后台时记录后台提示，后台结束后改由任务通知说明结果。命令运行期间到达的任务通知排在这组消息之后。这些消息随 Chat 保存，对话中按 `! 命令` 与 `⎿` 输出块显示；照 Claude Code，后台命令结束时任务通知会继续启动它的 Loop，模型据此决定是否读取输出；Chat 正忙时排在当前一轮之后，多个任务同时结束只继续一轮。新 Chat 不会为 Shell 结果隐式创建 Loop，没有归属 Loop 的 `!` 命令只写通知消息，继续输入问题后模型才能解释结果。
 
-`/tasks` 打开同一个 Shell 任务界面，模型响应期间也可立即进入；Shift+↑／Shift+↓ 聚焦右侧 Tick List 的 Shells 组，Enter 打开所选 Shell。列表和详情贴在屏幕底部，最多占半屏，保留上方的 Chat 内容。单任务直接打开详情，多任务先显示列表；`j/k`、方向键或 Ctrl+N/P 选择，Enter 查看，`b` 转后台，`x` 停止可控任务。详情支持逐行、翻页与 Home/End；向上浏览时保持位置并累计未读输出，End 恢复尾随。Left 返回列表，Esc／Enter／Space 关闭详情，Ctrl+O 查看完整记录。后台输出留在任务详情中；后台 Shell（User 或 Agent）结束后，所属 Chat 收到一条 `<task-notification>` user 消息，包含任务 id、Agent 任务的 tool-use id、输出文件、状态（completed／failed／killed）和摘要，对话中显示为 `● 摘要`，下一次模型请求会带上它。Shell 任务状态与输出读取依赖所属执行 worker，View 退出不丢失；worker 退出后历史不重建活任务。
+`/tasks` 在底部固定 12 行的输入对话框中打开 Shell 任务中心，列表与详情都保留上方的 Chat 内容，模型响应期间也可立即进入。Shift+↑／Shift+↓ 聚焦右侧 Tick List 的 Shells 组，Enter 在右侧列表内打开所选 Shell 的详情，与任务中心分别显示。单任务直接打开详情，多任务先显示列表；`j/k`、方向键或 Ctrl+N/P 选择，Enter 查看，`b` 转后台，`x` 停止可控任务。详情支持逐行、翻页与 Home/End；向上浏览时保持位置并累计未读输出，End 恢复尾随。Left 返回列表，Esc／Enter／Space 关闭详情，Ctrl+O 查看完整记录。后台输出留在任务详情中；后台 Shell（User 或 Agent）结束后，所属 Chat 收到一条 `<task-notification>` user 消息，包含任务 id、Agent 任务的 tool-use id、输出文件、状态（completed／failed／killed）和摘要，对话中显示为 `● 摘要`，下一次模型请求会带上它。Shell 任务状态与输出读取依赖所属执行 worker，View 退出不丢失；worker 退出后历史不重建活任务。
 
 底部只提供有子 Agent 时的 Subagents N 入口，N 只统计子 Agent，不计 Main（当前查看的子 Agent 仍计入），列表默认展开。输入光标在最后视觉行且历史已到底时，Down 聚焦入口；点击或在入口按 Enter／Space 隐藏或显示列表，带修饰键的 Enter 忽略。展开入口再 Down 进入列表，j/k 或 Ctrl+N/P 选择，Enter 打开 Agent，Space 折叠后代，Esc 先回入口，再回输入。隐藏列表不获得焦点或消费导航。Todo 不属于 footer，始终在 Working 下方按当前 Agent 的消息流宽度显示；空闲也保留，全部完成保留 5 秒后清空，没有展开、详情或开关。首项带树形连接，后续图标对齐；Unicode 与 Nerd Font 均提供单列的待办／进行中／完成图标。待办普通、进行中 accent 加粗、完成变暗并划除，颜色跟随当前 Theme；Working 使用当前 Loop 第一项进行中的 activeForm，保留计时与中断提示。差异视图通过独立 /diff 打开；候选、弹层和阅读界面独占各自按键。
 
@@ -284,7 +284,7 @@ Agent 的呈现与宿主布局分开，Herdr 负责容器外观；颜色、装�
 
 内置主协议卡 ID 采用官方原始服务 ID，保留大小写；`adapter` 表达协议，官方模型名称不添加自造协议/套餐后缀。Provider 的 `model_aliases` 保留旧 ID：例如 `gpt-6.1-sol-responses` → `gpt-6.1-sol`、`minimax-m3-messages` → `MiniMax-M3`。保存的已知内置身份与别名继续可用，下一次明确保存使用 canonical ID；所有路由、能力及参数均从当前编译目录解析，既有外部定义和覆盖被忽略并显示一条提示。未知外部身份回退内置默认，用户文件与凭据保留；已知内置身份不会自动升级到其他模型版本。DeepSeek 已有额外 Messages/Responses 卡继续保留独立旧 ID 与原 Adapter/endpoint，避免与同模型主协议卡冲突。
 
-The current Chat’s Ticks appear in a 42-column Tick List beside the conversation on wide terminals. The input, both dividers, hints and footer remain full width; narrow-terminal overlays cover only conversation content. Empty lists stay hidden. `/ticks` or the input’s `Ticks N` toggle saves visibility; `→` from an empty input focuses a nonempty list. Clicking either row line selects it and runs Enter. Shells open a detail inside the Tick panel with live output, scrolling and a confirmed `s` stop; Esc returns to the selected row. `/tasks` keeps the existing Task Center. Subscribed Ticks open their subscription, and subscribed artifacts retain browser/copy/feedback actions. `/artifacts` signs in when needed and opens the All/Mine/Shared/Pinned picker. Enter adds an artifact without granting access, connecting feedback or subscribing. Artifact `f` resumes feedback or asks the Agent to connect it. Artifact Service sign-out is in `/settings`.
+The current Chat’s Ticks appear in a 42-column Tick List beside the conversation on wide terminals. The input, both dividers, hints and footer remain full width; narrow-terminal overlays cover only conversation content. Empty lists stay hidden. `/ticks` or the input’s `Ticks N` toggle saves visibility; `→` from an empty input focuses a nonempty list. Clicking either row line selects it and runs Enter. Shells open a detail inside the Tick panel with live output, scrolling and a confirmed `s` stop; Esc returns to the selected row. `/tasks` opens the Task Center list and detail in the fixed 12-row Input Dialog. Subscribed Ticks open their subscription, and subscribed artifacts retain browser/copy/feedback actions. `/artifacts` signs in when needed and opens the All/Mine/Shared/Pinned picker. Enter adds an artifact without granting access, connecting feedback or subscribing. Artifact `f` resumes feedback or asks the Agent to connect it. Artifact Service sign-out is in `/settings`.
 
 模型回复写入完整消息后，主界面立即显示剩余正文（含未换行尾行），不等待后续工具审批。提议工具先显示 Queued，准入／完成时更新原调用行；排队的问题先预览，到实际提问时才打开回答菜单。工具权限与执行顺序保持原契约。
 

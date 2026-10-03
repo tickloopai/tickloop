@@ -595,6 +595,12 @@ async fn launch_browser_result(address: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    mod input_dialog {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/input_dialog.rs"
+        ));
+    }
     mod screen {
         include!(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -615,6 +621,7 @@ mod tests {
     const TERMINAL_CHILD_STACK_BYTES: usize = 8 * 1024 * 1024;
     const TERMINAL_ESCAPE_KEY: &[u8] = b"\x1b[27u";
     const SYNCHRONIZED_FRAME_END: &str = "\x1b[?2026l";
+    const TERMINAL_FRAME_SETTLE: Duration = Duration::from_millis(40);
 
     #[test]
     fn terminal_child() {
@@ -685,6 +692,7 @@ mod tests {
         ]);
         command.cwd(&root);
         command.env("TICKLOOP_CONFIG_DIR", root.join("state"));
+        command.env("TICKLOOP_AGENT_RUNTIME_DIR", root.join("runtime"));
         let rejected_login = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         command.env(
             "TICKLOOP_TEST_CODEX_OAUTH",
@@ -775,6 +783,9 @@ mod tests {
         writer.write_all(b"j\r").unwrap();
         writer.flush().unwrap();
         wait("Codex browser login");
+        let frame = screen::visible_screen(&output.lock().unwrap(), 150, 40);
+        input_dialog::assert_frame(&frame, 40, "Codex browser login");
+        input_dialog::record_frame("browser-login", &frame);
         writer.write_all(b"\x1b").unwrap();
         writer.flush().unwrap();
         wait("Login cancelled");
@@ -974,6 +985,7 @@ mod tests {
         ]);
         command.cwd(&root);
         command.env("TICKLOOP_CONFIG_DIR", root.join("state"));
+        command.env("TICKLOOP_AGENT_RUNTIME_DIR", root.join("runtime"));
         command.env("TICKLOOP_TEST_CODEX_OAUTH", &origin);
         command.env(
             "TICKLOOP_TEST_CODEX_RESPONSES",
@@ -1048,6 +1060,7 @@ mod tests {
                     if ansi.replace_all(completed_updates, "").contains(needle)
                         || visible.contains(needle)
                     {
+                        std::thread::sleep(TERMINAL_FRAME_SETTLE);
                         break;
                     }
                 }
@@ -1110,6 +1123,22 @@ mod tests {
             .write_all(if browser { b"j\r" } else { b"\r" })
             .unwrap();
         writer.flush().unwrap();
+        if !browser {
+            wait_after("Enter code: ABCD-EFGH", before_login);
+            let captured = output.lock().unwrap().clone();
+            let code_offset = captured[before_login..]
+                .find("Enter code: ABCD-EFGH")
+                .unwrap()
+                + before_login;
+            let frame_end = captured[code_offset..]
+                .find(SYNCHRONIZED_FRAME_END)
+                .unwrap()
+                + code_offset
+                + SYNCHRONIZED_FRAME_END.len();
+            let frame = screen::visible_screen(&captured[..frame_end], 150, 40);
+            input_dialog::assert_frame(&frame, 40, "Log in to Codex");
+            input_dialog::record_frame("device-login", &frame);
+        }
         wait_after("login saved", before_login);
         wait("Codex subscription");
         {
@@ -1123,6 +1152,15 @@ mod tests {
                     && visible.contains("Codex subscription")
                     && !visible.contains("Codex browser login");
                 if picker_returned {
+                    input_dialog::assert_frame(&visible, 40, "Choose model · OpenAI");
+                    input_dialog::record_frame(
+                        if browser {
+                            "browser-login-return"
+                        } else {
+                            "device-login-return"
+                        },
+                        &visible,
+                    );
                     assert!(
                         !text.contains("Model selection:"),
                         "login must not apply a model before confirmation"

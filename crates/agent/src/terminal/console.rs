@@ -45,6 +45,9 @@ mod input_dialog_tests;
 #[path = "console/layout_tests.rs"]
 mod layout_tests;
 #[cfg(test)]
+#[path = "console/model_dialog_pty.rs"]
+mod model_dialog_pty;
+#[cfg(test)]
 #[path = "console/request_layout_tests.rs"]
 mod request_layout_tests;
 #[cfg(test)]
@@ -400,6 +403,7 @@ pub(super) struct PickerPresentation {
 enum MenuFocus {
     WhenInputEmpty,
     Menu,
+    Plan,
     MenuWithLink(String),
     Secret(String),
     Input(String),
@@ -598,6 +602,7 @@ pub(super) struct State {
     dialog_option_rows: Vec<(std::ops::Range<usize>, usize)>,
     request_queue_count: usize,
     menu: Option<Menu>,
+    menu_rule_role: Option<Role>,
     picker_kind: Option<PickerKind>,
     picker_presentation: PickerPresentation,
     /// The `/resume` picker owns input while open; the
@@ -3186,6 +3191,10 @@ impl Console {
         self.show_menu_with_comments(menu, None, Vec::new(), "Comment", None, MenuFocus::Menu)
     }
 
+    pub(super) fn show_plan_menu(&self, menu: Menu) -> Result<(), String> {
+        self.show_menu_with_comments(menu, None, Vec::new(), "Comment", None, MenuFocus::Plan)
+    }
+
     pub(super) fn show_picker_menu(&self, menu: Menu, kind: PickerKind) -> Result<(), String> {
         self.show_menu_with_comments(
             menu,
@@ -3460,6 +3469,7 @@ impl Console {
                                 state.editor.draft().is_empty()
                             }
                             MenuFocus::Menu
+                            | MenuFocus::Plan
                             | MenuFocus::MenuWithLink(_)
                             | MenuFocus::Secret(_)
                             | MenuFocus::Input(_)
@@ -3469,6 +3479,7 @@ impl Console {
             |(_, focused)| focused,
         );
         state.review_focused = false;
+        state.menu_rule_role = matches!(focus, MenuFocus::Plan).then_some(Role::PlanMode);
         state.request_menu = state.request_layout.map(|_| menu.id);
         state.shell_background_chord_started_at = None;
         state.completion.dismiss();
@@ -3526,6 +3537,7 @@ impl Console {
             MenuFocus::MenuWithLink(address) => Some((menu.id, address)),
             MenuFocus::WhenInputEmpty
             | MenuFocus::Menu
+            | MenuFocus::Plan
             | MenuFocus::Secret(_)
             | MenuFocus::Input(_)
             | MenuFocus::Picker(..)
@@ -4542,6 +4554,7 @@ impl State {
             dialog_option_rows: Vec::new(),
             request_queue_count: 0,
             menu: None,
+            menu_rule_role: None,
             picker_kind: None,
             picker_presentation: Default::default(),
             artifacts_picker: None,
@@ -4603,16 +4616,18 @@ impl State {
     fn pointer(&mut self, event: MouseEvent, output: &mut impl Write) -> bool {
         let height = self.input_dialog_height();
         let start = self.height.saturating_sub(height);
+        let body_height = self.input_dialog_body_height();
+        let rule_rows = height - body_height;
         if let Some(dialog) = &mut self.workspace_trust {
             if event.kind == MouseEventKind::Down(MouseButton::Left)
-                && usize::from(event.row) >= start
+                && usize::from(event.row) >= start + rule_rows
                 && usize::from(event.row) < self.height
             {
                 self.pointer_input = dialog
                     .click(
-                        usize::from(event.row) - start,
+                        usize::from(event.row) - start - rule_rows,
                         self.width,
-                        height,
+                        body_height,
                         self.display,
                     )
                     .map(|decision| match decision {
@@ -4657,6 +4672,11 @@ impl State {
             }
             if at.row >= start {
                 let row = at.row - start;
+                let rule_rows = self.input_dialog_height() - self.input_dialog_body_height();
+                if row < rule_rows {
+                    return true;
+                }
+                let body_row = row - rule_rows;
                 if self.menu.is_none()
                     && (self.artifacts_picker.is_some() || self.conversation_picker.is_some())
                 {
@@ -4671,11 +4691,11 @@ impl State {
                         }
                         MouseEventKind::Down(MouseButton::Left) => {
                             let selected = if let Some(picker) = &mut self.artifacts_picker {
-                                picker.select_at_row(row)
+                                picker.select_at_row(body_row)
                             } else {
                                 self.conversation_picker
                                     .as_mut()
-                                    .is_some_and(|picker| picker.select_at_row(row))
+                                    .is_some_and(|picker| picker.select_at_row(body_row))
                             };
                             if selected {
                                 self.pointer_input =
@@ -4701,9 +4721,9 @@ impl State {
                             self.pointer_input = self.key(KeyEvent::new(code, KeyModifiers::NONE));
                         }
                         MouseEventKind::Down(MouseButton::Left) => {
-                            let capacity = self.input_dialog_height();
+                            let capacity = self.input_dialog_body_height();
                             if let Some(surface) = &mut self.permissions_surface {
-                                let effect = surface.click(row, self.width, capacity);
+                                let effect = surface.click(body_row, self.width, capacity);
                                 if let PermissionsEffect::Close { .. } = effect {
                                     self.permissions_surface = None;
                                 }
@@ -4713,12 +4733,13 @@ impl State {
                             } else {
                                 let viewport =
                                     task_surface_content_viewport(self.width, self.height);
-                                let capacity = self.input_dialog_height();
+                                let capacity = self.input_dialog_body_height();
                                 let selected = if let Some(surface) = &mut self.task_surface {
-                                    row.checked_sub(1)
+                                    body_row
+                                        .checked_sub(1)
                                         .is_some_and(|row| surface.select_at_row(row, viewport))
                                 } else {
-                                    row.checked_sub(1).is_some_and(|row| {
+                                    body_row.checked_sub(1).is_some_and(|row| {
                                         self.subscription_surface.as_mut().unwrap().select_at_row(
                                             row,
                                             capacity.saturating_sub(2).max(1),
@@ -4956,7 +4977,6 @@ impl State {
         renderer::write_synchronized(output, |output| self.draw_frame(output))
     }
 
-    /// Draws a list view in the lower half of the screen with the conversation above it.
     fn tick_list_visible(&self) -> bool {
         self.chat.is_some()
             && !self.tick_list.entries().is_empty()
@@ -5448,20 +5468,19 @@ impl State {
             .map(|(_, header)| header.as_str())
     }
 
-    fn request_styled_frame(&mut self) -> (Vec<RoleLine>, usize, usize) {
+    fn request_styled_frame(&mut self, capacity: usize) -> (Vec<RoleLine>, usize, usize) {
         if !self.menu_is_visible() {
             let mut lines = vec![RoleLine::role(
                 "Resize terminal to review · Esc cancel",
                 Role::MutedText,
             )];
-            lines.resize(self.input_dialog_height(), RoleLine::default());
+            lines.resize(capacity, RoleLine::default());
             for line in &mut lines {
                 line.truncate(self.width);
             }
             return (lines, 0, 0);
         }
         let menu = self.menu.as_ref().expect("request menu is visible");
-        let capacity = self.input_dialog_height();
         let selected = menu.selected.min(menu.options.len().saturating_sub(1));
         let title_rows = usize::from(capacity > 1);
         let hint_rows = usize::from(capacity > 2);
@@ -5536,14 +5555,23 @@ impl State {
         let comment_rows = comment_lines
             .len()
             .min(capacity.saturating_sub(title_rows + hint_rows + 1));
+        let picker = self.picker_kind.is_some();
+        let compact = picker && self.width < COMPACT_PICKER_COLUMNS;
+        let minimum_option_rows =
+            1 + usize::from(
+                compact
+                    && self
+                        .picker_presentation
+                        .compact_rows
+                        .get(selected)
+                        .is_some(),
+            ) + usize::from(picker && !self.picker_presentation.headers.is_empty());
         let context_reserve = usize::from(!menu.context.is_empty() || self.menu_review.is_some())
             * capacity
-                .saturating_sub(title_rows + hint_rows + comment_rows + 1)
+                .saturating_sub(title_rows + hint_rows + comment_rows + minimum_option_rows)
                 .min(2);
         let option_capacity =
             capacity.saturating_sub(title_rows + hint_rows + comment_rows + context_reserve);
-        let picker = self.picker_kind.is_some();
-        let compact = picker && self.width < COMPACT_PICKER_COLUMNS;
         let options = menu
             .options
             .iter()
@@ -7167,7 +7195,7 @@ impl State {
     fn menu_is_visible(&self) -> bool {
         if self.menu.as_ref().is_some_and(|menu| menu.confirmation)
             && self.request_layout.is_none()
-            && self.input_dialog_height() < 3
+            && self.input_dialog_body_height() < 3
         {
             return false;
         }
@@ -8704,7 +8732,7 @@ impl State {
         if key.kind == KeyEventKind::Release {
             return None;
         }
-        let dialog_height = self.input_dialog_height();
+        let dialog_height = self.input_dialog_body_height();
         if let Some(dialog) = &mut self.workspace_trust {
             if self.menu_submission_pending.is_some() {
                 return None;
@@ -8788,7 +8816,7 @@ impl State {
             return self.conversation_picker_key(key);
         }
         if self.menu.is_none()
-            && self.input_dialog_height() < 3
+            && self.input_dialog_body_height() < 3
             && key.code == KeyCode::Enter
             && (self.tick_list.confirmation.is_some()
                 || self
@@ -9977,7 +10005,7 @@ fn send_input(sender: &mpsc::Sender<InputEvent>, stop: &AtomicBool, mut input: I
 fn task_surface_content_viewport(width: usize, height: usize) -> TaskViewport {
     TaskViewport {
         width: width.saturating_sub(2).max(1),
-        height: input_dialog::height_for_terminal(height)
+        height: input_dialog::body_height(input_dialog::height_for_terminal(height))
             .saturating_sub(TASK_SURFACE_HEADER_FOOTER_ROWS),
     }
 }
@@ -16787,7 +16815,10 @@ mod tests {
         state.draw(&mut output).unwrap();
         let output = String::from_utf8(output).unwrap();
         assert_eq!(state.frame().0.len(), 12);
-        assert_eq!(state.rendered_screen[6], "Run this command?");
+        assert_eq!(
+            state.rendered_screen[6 + input_dialog::INPUT_DIALOG_RULE_ROWS],
+            "Run this command?"
+        );
         assert!(output.contains("tool log 49"));
         assert!(
             !state

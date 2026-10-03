@@ -1,7 +1,13 @@
 use super::*;
 
 pub(super) const INPUT_DIALOG_ROWS: usize = 12;
+pub(super) const INPUT_DIALOG_RULE_ROWS: usize = 1;
+const INPUT_DIALOG_RULE_GLYPH: &str = "▔";
 const MIN_CONTENT_ROWS: usize = 4;
+
+pub(super) fn body_height(height: usize) -> usize {
+    height.saturating_sub(INPUT_DIALOG_RULE_ROWS).max(1)
+}
 
 pub(super) fn height_for_terminal(height: usize) -> usize {
     height
@@ -22,6 +28,7 @@ fn pad_dialog(lines: &mut Vec<RoleLine>, height: usize) {
 #[derive(Default)]
 pub(super) struct DialogState {
     menu: Option<Menu>,
+    menu_rule_role: Option<Role>,
     picker_kind: Option<PickerKind>,
     picker_presentation: PickerPresentation,
     artifacts_picker: Option<super::super::artifacts_picker::ArtifactsPicker>,
@@ -91,6 +98,7 @@ impl DialogState {
 
     fn reset_menu(&mut self) {
         self.menu = None;
+        self.menu_rule_role = None;
         self.picker_kind = None;
         self.picker_presentation = Default::default();
         self.menu_link = None;
@@ -196,6 +204,7 @@ impl State {
     pub(super) fn replace_dialog(&mut self, next: DialogState) -> DialogState {
         DialogState {
             menu: std::mem::replace(&mut self.menu, next.menu),
+            menu_rule_role: std::mem::replace(&mut self.menu_rule_role, next.menu_rule_role),
             picker_kind: std::mem::replace(&mut self.picker_kind, next.picker_kind),
             picker_presentation: std::mem::replace(
                 &mut self.picker_presentation,
@@ -506,9 +515,35 @@ impl State {
                 .is_some_and(|detail| detail.confirmation().is_some())
     }
 
+    pub(super) fn input_dialog_body_height(&self) -> usize {
+        body_height(self.input_dialog_height())
+    }
+
     pub(super) fn input_dialog_frame(&mut self) -> (Vec<RoleLine>, usize, usize) {
         self.dialog_option_rows.clear();
-        let capacity = self.input_dialog_height();
+        let height = self.input_dialog_height();
+        let capacity = self.input_dialog_body_height();
+        let rule_rows = height - capacity;
+        let role = if self.workspace_trust.is_some() {
+            Role::Warning
+        } else {
+            self.menu_rule_role.unwrap_or(Role::Permission)
+        };
+        let (mut lines, row, column) = self.input_dialog_body_frame(capacity);
+        if rule_rows > 0 {
+            lines.insert(
+                0,
+                RoleLine::role(INPUT_DIALOG_RULE_GLYPH.repeat(self.width), role),
+            );
+            for (rows, _) in &mut self.dialog_option_rows {
+                rows.start += rule_rows;
+                rows.end += rule_rows;
+            }
+        }
+        (lines, row + rule_rows, column)
+    }
+
+    fn input_dialog_body_frame(&mut self, capacity: usize) -> (Vec<RoleLine>, usize, usize) {
         if let Some(dialog) = &self.workspace_trust {
             let frame = dialog.frame(self.width, capacity, self.display);
             self.dialog_cursor_visible = frame.cursor.is_some();
@@ -518,7 +553,7 @@ impl State {
             return (lines, row.min(capacity - 1), column);
         }
         if self.menu.is_some() {
-            return self.request_styled_frame();
+            return self.request_styled_frame(capacity);
         }
         let frame = if let Some(picker) = &mut self.artifacts_picker {
             Some(picker.frame(self.width, capacity, self.display))

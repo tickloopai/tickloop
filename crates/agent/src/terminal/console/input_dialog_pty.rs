@@ -276,7 +276,7 @@ fn input_dialog_pty_preserves_search_and_draft_through_permission_preemption() {
         fixture.wait(|frame| {
             frame
                 .lines()
-                .nth(top)
+                .nth(top + input_dialog::INPUT_DIALOG_RULE_ROWS)
                 .is_some_and(|line| line.starts_with("Resume Chat"))
         });
         fixture.send(b"/Chat 1\x1b[B\x1b[B\x1b[B");
@@ -285,7 +285,7 @@ fn input_dialog_pty_preserves_search_and_draft_through_permission_preemption() {
         let frame = fixture.wait(|frame| {
             frame
                 .lines()
-                .nth(top)
+                .nth(top + input_dialog::INPUT_DIALOG_RULE_ROWS)
                 .is_some_and(|line| line.starts_with("Permission fixture"))
         });
         assert_eq!(frame.matches("Pinned fixture prompt").count(), 1, "{frame}");
@@ -312,7 +312,13 @@ fn input_dialog_pty_preserves_search_and_draft_through_permission_preemption() {
                 && std::fs::read_to_string(directory.path().join("phase"))
                     .is_ok_and(|phase| phase == "resumed")
         });
-        assert!(frame.lines().nth(top).unwrap().starts_with("Resume Chat"));
+        assert!(
+            frame
+                .lines()
+                .nth(top + input_dialog::INPUT_DIALOG_RULE_ROWS)
+                .unwrap()
+                .starts_with("Resume Chat")
+        );
         fixture.send(b"\r");
         fixture.wait(|frame| frame.contains("Unsent fixture draft"));
         std::fs::write(directory.path().join("trigger"), "finish").unwrap();

@@ -4,6 +4,225 @@ use crate::tick_adapter::{
     TickActionOutcome, TickActionUi, TickListAction, TickListOperation,
 };
 
+#[test]
+fn input_dialog_top_rule_matches_claude_code_in_both_themes() {
+    use crate::terminal::style::{Theme, ThemeName};
+    for theme in ThemeName::ALL {
+        for (width, height) in [(80, 24), (120, 40), (32, 10)] {
+            let mut state = State::new(true, width, height);
+            state.display.set_theme(theme);
+            state.menu = Some(menu(Uuid::new_v4()));
+            state.picker_kind = Some(PickerKind::Actions);
+            state.picker_presentation.hint = "Enter open · Esc close".into();
+            let capacity = state.input_dialog_height();
+            let lines = state.styled_frame().0;
+            assert_eq!(lines.len(), capacity);
+            assert_eq!(lines[0].text(), "▔".repeat(state.width));
+            assert_eq!(lines[0].spans[0].role, Some(Role::Permission));
+            assert_eq!(lines[1].spans[0].role, Some(Role::DialogTitle));
+            assert_eq!(lines.last().unwrap().spans[0].role, Some(Role::MutedText));
+            assert_eq!(
+                lines[0].resolve(state.display.theme(), state.width).spans[0].style,
+                Theme::new(theme).style(Role::Permission)
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn input_dialog_top_rule_covers_every_surface_with_semantic_theme_roles() {
+    use crate::terminal::{
+        artifacts_picker::ArtifactsPicker,
+        conversation_picker::{ConversationEntry, ConversationPickerPurpose},
+        execution::ConsoleExecution,
+        style::{Theme, ThemeName},
+        test_support,
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let agent = ConsoleExecution::new_embedded(
+        test_support::config(),
+        Arc::new(test_support::ScriptedModel::new(Vec::new())),
+    );
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let view = agent.permissions_view(chat).await.unwrap();
+    for theme in ThemeName::ALL {
+        for surface in [
+            "settings",
+            "permission",
+            "question",
+            "plan",
+            "login",
+            "help",
+            "resume",
+            "artifacts",
+            "tasks",
+            "permissions",
+            "subscriptions",
+            "trust",
+            "tick confirmation",
+        ] {
+            let mut state = State::new(true, 80, 24);
+            state.chat = Some(chat);
+            state.display.set_theme(theme);
+            let console = tests::console_with_state(state);
+            let id = Uuid::new_v4();
+            match surface {
+                "settings" => console.show_focused_menu(menu(id)).unwrap(),
+                "permission" => {
+                    console.set_request_layout(Some(id)).unwrap();
+                    let mut page = menu(id);
+                    page.confirmation = true;
+                    console.show_focused_menu(page).unwrap();
+                }
+                "question" => console
+                    .show_question_menu(
+                        menu(id),
+                        QuestionMenu {
+                            entry_option: None,
+                            entry_text: String::new(),
+                            multi_select: false,
+                            navigable: false,
+                        },
+                    )
+                    .unwrap(),
+                "plan" => console.show_plan_menu(menu(id)).unwrap(),
+                "login" => console
+                    .show_login_menu(menu(id), "https://example.test/device", false)
+                    .unwrap(),
+                "help" => console.state.lock().unwrap().help_open = true,
+                "resume" => console
+                    .show_conversation_picker(ConversationPicker::new(
+                        ConversationPickerPurpose::Resume,
+                        vec![ConversationEntry::new("Saved Chat", &[], &[])],
+                    ))
+                    .unwrap(),
+                "artifacts" => console
+                    .show_artifacts_picker(ArtifactsPicker::new(
+                        Some(chat),
+                        "fixture@example.test".into(),
+                        HashSet::new(),
+                    ))
+                    .unwrap(),
+                "tasks" => {
+                    console
+                        .show_tasks_at(tests::task_snapshot(chat, 2), None)
+                        .unwrap();
+                }
+                "permissions" => {
+                    console.state.lock().unwrap().permissions_surface =
+                        Some(PermissionsSurface::open(
+                            view.clone(),
+                            PermissionsReturn::ModePicker { settings: false },
+                        ))
+                }
+                "subscriptions" => console
+                    .show_subscriptions(chat, vec![tests::subscription_row(1)])
+                    .unwrap(),
+                "trust" => {
+                    console.state.lock().unwrap().workspace_trust =
+                        Some(WorkspaceTrust::new(PathBuf::from("/fixture/project")))
+                }
+                "tick confirmation" => {
+                    console.state.lock().unwrap().tick_list.confirmation =
+                        Some(super::super::tick_list::TickConfirmation {
+                            instance: "fixture-tick".into(),
+                            action: Arc::new(FixtureTickAction("fixture-tick".into())),
+                            prompt: "Confirm fixture action?".into(),
+                        });
+                }
+                _ => unreachable!(),
+            }
+            let mut state = console.state.lock().unwrap();
+            let role = match surface {
+                "plan" => Role::PlanMode,
+                "trust" => Role::Warning,
+                _ => Role::Permission,
+            };
+            let (lines, row, _) = state.styled_frame();
+            assert_eq!(
+                lines.len(),
+                input_dialog::INPUT_DIALOG_ROWS,
+                "{surface}/{theme:?}"
+            );
+            assert_eq!(lines[0].text(), "▔".repeat(state.width));
+            assert_eq!(lines[0].spans[0].role, Some(role), "{surface}/{theme:?}");
+            assert_eq!(
+                lines[0].resolve(state.display.theme(), state.width).spans[0].style,
+                Theme::new(theme).style(role)
+            );
+            assert!(row < lines.len());
+        }
+    }
+    agent.shutdown().await;
+}
+
+#[test]
+fn input_dialog_plan_rule_restores_after_question_and_agent_switch() {
+    let console = tests::console_with_state(State::new(true, 80, 24));
+    let first = Uuid::new_v4();
+    let second = Uuid::new_v4();
+    let plan = Uuid::new_v4();
+    let question = Uuid::new_v4();
+    console.select_chat(Some(first)).unwrap();
+    console.show_plan_menu(menu(plan)).unwrap();
+    console.set_request_layout(Some(question)).unwrap();
+    console
+        .show_question_menu(
+            menu(question),
+            QuestionMenu {
+                entry_option: None,
+                entry_text: String::new(),
+                multi_select: false,
+                navigable: false,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        console.state.lock().unwrap().styled_frame().0[0].spans[0].role,
+        Some(Role::Permission)
+    );
+    console.select_chat(Some(second)).unwrap();
+    console.show_focused_menu(menu(Uuid::new_v4())).unwrap();
+    assert_eq!(
+        console.state.lock().unwrap().styled_frame().0[0].spans[0].role,
+        Some(Role::Permission)
+    );
+    console.select_chat(Some(first)).unwrap();
+    console.clear_menu(question).unwrap();
+    assert_eq!(console.dialog_menu_id().unwrap(), Some(plan));
+    assert_eq!(
+        console.state.lock().unwrap().styled_frame().0[0].spans[0].role,
+        Some(Role::PlanMode)
+    );
+}
+
+#[test]
+fn input_dialog_rule_click_never_submits_a_menu_or_trust_choice() {
+    for trust in [false, true] {
+        let mut state = State::new(true, 80, 24);
+        state.chat = Some(Uuid::new_v4());
+        if trust {
+            state.workspace_trust = Some(WorkspaceTrust::new(PathBuf::from("/fixture/project")));
+        } else {
+            state.menu = Some(menu(Uuid::new_v4()));
+        }
+        let mut output = Vec::new();
+        state.draw(&mut output).unwrap();
+        let top = state.height - state.input_dialog_height();
+        assert!(state.pointer(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 0,
+                row: top as u16,
+                modifiers: KeyModifiers::NONE
+            },
+            &mut output
+        ));
+        assert!(state.pointer_input.is_none());
+        assert!(state.menu_submission_pending.is_none());
+    }
+}
+
 struct FixtureTickAction(String);
 impl TickActionExecutor for FixtureTickAction {
     fn prepare(&self, _: &mut TickActionUi<'_>) -> Result<PreparedTickAction, String> {
@@ -855,7 +1074,7 @@ fn input_dialog_request_preempts_and_restores_selection_scroll_and_agent_state()
     request_menu.title = "Question".into();
     console.show_focused_menu(request_menu).unwrap();
     assert!(
-        console.state.lock().unwrap().styled_frame().0[0]
+        console.state.lock().unwrap().styled_frame().0[input_dialog::INPUT_DIALOG_RULE_ROWS]
             .text()
             .contains("(1/3)")
     );
@@ -942,7 +1161,11 @@ fn resume_picker_uses_the_bottom_container_and_keeps_the_conversation_visible() 
             .iter()
             .any(|line| line.contains("conversation remains visible"))
     );
-    assert!(state.rendered_screen[12].starts_with("Resume Chat"));
+    assert!(
+        state.rendered_screen
+            [state.height - state.input_dialog_height() + input_dialog::INPUT_DIALOG_RULE_ROWS]
+            .starts_with("Resume Chat")
+    );
     assert_eq!(state.styled_frame().0.len(), 12);
 }
 
@@ -1049,6 +1272,7 @@ fn sticky_prompt_short_conversation_keeps_the_full_content_height() {
     for index in 0..9 {
         state.scrollback.append(&format!("Short reply {index}\n"));
     }
+    state.scrollback.append("Trailing boundary");
     state.draw(&mut Vec::new()).unwrap();
     assert!(state.rendered_screen[0].starts_with("Leading boundary"));
     assert!(state.rendered_screen[0].contains('│'));
@@ -1066,7 +1290,15 @@ fn sticky_prompt_short_conversation_keeps_the_full_content_height() {
             .count(),
         1
     );
-    assert!(state.rendered_screen[12].starts_with("Settings"));
+    assert_eq!(state.input_dialog_height(), input_dialog::INPUT_DIALOG_ROWS);
+    let dialog_top = state.height - state.input_dialog_height();
+    assert!(state.rendered_screen[dialog_top - 1].starts_with("Trailing boundary"));
+    assert!(state.rendered_screen[dialog_top - 1].contains('│'));
+    assert_eq!(state.rendered_screen[dialog_top], "▔".repeat(state.width));
+    assert!(
+        state.rendered_screen[dialog_top + input_dialog::INPUT_DIALOG_RULE_ROWS]
+            .starts_with("Settings")
+    );
 }
 
 #[test]
@@ -1134,7 +1366,11 @@ fn latest_user_message_stays_at_the_top_left_with_ticks_and_an_input_dialog() {
     state.draw(&mut Vec::new()).unwrap();
     assert!(state.rendered_screen[0].starts_with("❯ Most recent user request"));
     assert!(state.rendered_screen[0].contains('│'));
-    assert!(state.rendered_screen[12].starts_with("Settings"));
+    assert!(
+        state.rendered_screen
+            [state.height - state.input_dialog_height() + input_dialog::INPUT_DIALOG_RULE_ROWS]
+            .starts_with("Settings")
+    );
 }
 
 #[test]
@@ -1472,7 +1708,7 @@ fn provider_model_and_connection_dialogs_have_one_fixed_container_and_isolate_in
             let mut state = console.state.lock().unwrap();
             let lines = state.styled_frame().0;
             assert_eq!(lines.len(), expected, "{kind:?}/{width}x{height}");
-            assert!(lines[0].text().contains("Builtin picker"));
+            assert!(lines[1].text().contains("Builtin picker"));
             assert!(
                 !lines
                     .iter()

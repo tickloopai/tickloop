@@ -841,7 +841,11 @@ impl Menus {
         }
         let id = menu.id;
         if console.is_interactive() {
-            if matches!(&selection, Selection::Provider { .. }) {
+            let plan_dialog = matches!(&selection, Selection::Workflow(Workflow::Plan { .. }))
+                || matches!(&selection, Selection::Permission { request, .. } if request.name == ENTER_PLAN_MODE_TOOL_NAME);
+            if plan_dialog {
+                console.show_plan_menu(menu)?;
+            } else if matches!(&selection, Selection::Provider { .. }) {
                 console.show_picker_menu(menu, PickerKind::Provider)?;
             } else if matches!(
                 &selection,
@@ -2863,12 +2867,12 @@ fn enter_plan_mode_menu(request_id: Uuid, goal: String) -> Menu {
             goal,
             "The Agent wants to enter plan mode to explore and design an implementation approach."
                 .into(),
+            "No changes will be made until you approve the plan.".into(),
             "In plan mode, the Agent will:".into(),
             " · Explore the codebase thoroughly".into(),
             " · Identify existing patterns".into(),
             " · Design an implementation strategy".into(),
             " · Present a plan for your approval".into(),
-            "No changes will be made until you approve the plan.".into(),
         ],
         options: vec![
             "Yes, enter plan mode".into(),
