@@ -19,6 +19,10 @@ For `unknown`, retain the original operation ID and report the uncertainty. Only
 
 ## Collaborative editing
 
+Markdown must remain editable in the web editor. If a tool returns `unsupported_markdown` or `rewrite_required: true`, the rejected operation did not save the proposed content. Read its reason, rewrite the unsupported formatting while preserving the user's content, and submit the corrected payload with a new operation ID. Keep the last acknowledged draft/stream offset. Never retry the rejected payload unchanged, ignore the error, or report the document complete. Inline code cannot share bold, italic, underline, strike or link formatting; place those styles outside the code span. Unknown outcomes still require operation reconciliation, not rewriting or resending.
+
+For an existing source-only working document, revise its exact targets and publish the corrected working revision. Once that working copy is confirmed clean, read its exact source and current published head. Publish that source with `artifact_publish` and the copied `expected_version_id` to establish an editable working copy. Re-read and confirm `representation: rich` before calling the repair complete. A dirty working copy or changed head requires a fresh read and reassessment; never discard other edits to perform this conversion.
+
 For revisions to an existing artifact, work in its shared document so browser edits and AI changes meet in one working copy:
 
 1. Read `mcp__artifacts__artifact_edit_read`. If no working copy exists and editing is intended, call `mcp__artifacts__artifact_edit_open` with a new operation ID. Opening preserves the published source. Copy `working_id`, `generation`, and the returned target IDs and hashes.
