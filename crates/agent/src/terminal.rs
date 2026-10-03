@@ -2210,11 +2210,11 @@ async fn interact(
                         && let Some(command_id)=foreground_shells.get(&chat).copied()
                     {
                         match agent.background_user_shell(chat,command_id).await {
-                            Ok(_) => {
+                            Ok(record) => {
                                 foreground_shells.remove(&chat);
                                 backgrounded_shells.insert(command_id);
                                 console.set_foreground_shell(false)?;
-                                outln!(console,"\nUser shell {command_id} continues in the background.");
+                                outln!(console,"\n{}",presentation::background_shell_line(&record.command));
                             },
                             Err(error)=>outln!(console,"Cannot background user shell: {}",safe_text(&error.to_string())),
                         }

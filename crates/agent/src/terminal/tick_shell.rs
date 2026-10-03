@@ -395,6 +395,20 @@ mod tests {
     }
 
     #[test]
+    fn shell_panel_success_clears_stale_load_snapshot_and_output_errors() {
+        let chat=Uuid::new_v4(); let task=Uuid::new_v4(); let mut detail=TickShell::loading(chat,task);
+        detail.report("failed load".into());
+        let effect=detail.load(snapshot(chat,task,1,4,true),None).unwrap();
+        assert!(!detail.hint().contains("failed load"));
+        detail.report("failed snapshot".into());
+        detail.update(snapshot(chat,task,2,4,true));
+        assert!(!detail.hint().contains("failed snapshot"));
+        detail.report("failed output".into());
+        deliver(&mut detail,effect,"tail");
+        assert!(!detail.hint().contains("failed output"));
+    }
+
+    #[test]
     fn panel_scroll_keys_share_line_navigation_and_page_down_returns_to_tail() {
         for key in [
             KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),

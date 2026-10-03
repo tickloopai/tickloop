@@ -362,6 +362,24 @@ fn tick_row_title_and_metadata_clicks_perform_the_same_enter_action() {
 }
 
 #[test]
+fn pending_tick_removal_confirmation_cannot_be_approved_by_clicking_any_row() {
+    for group in [TickGroup::Artifacts,TickGroup::Shells,TickGroup::Subscribed] {
+        for metadata in [false,true] {
+            let mut state=click_fixture(140,false,group);
+            let previous="artifact:https://docs.example/previous".to_owned();
+            state.tick_list.confirmation=Some(previous.clone());
+            state.tick_list.focus(false,None);
+            state.draw_frame(&mut Vec::new()).unwrap();
+            let target=&state.tick_row_targets[usize::from(metadata)];
+            state.pointer(MouseEvent {kind:MouseEventKind::Down(MouseButton::Left),row:target.row as u16,column:target.columns.start as u16,modifiers:KeyModifiers::NONE},&mut Vec::new());
+            assert!(state.pointer_input.is_none(),"row click must never confirm removal");
+            assert_eq!(state.tick_list.confirmation,Some(previous.clone()));
+            assert!(matches!(state.key(KeyEvent::new(KeyCode::Enter,KeyModifiers::NONE)),Some(InputEvent::TickListAction {id,action:'X',..}) if id==previous));
+        }
+    }
+}
+
+#[test]
 fn tick_row_clicks_ignore_non_targets_and_other_input_surfaces() {
     let mut state = click_fixture(140, false, TickGroup::Artifacts);
     let title_row = state

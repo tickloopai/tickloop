@@ -32,6 +32,11 @@ const RETAINED_TOOL_EVENTS: usize = 128;
 const PREVIEW_LINES: usize = 5;
 const PREVIEW_LINE_CHARACTERS: usize = 200;
 const TOOL_SUMMARY_CHARACTERS: usize = 160;
+const BACKGROUND_RUNNING_STATUS: &str = "Running in background";
+const BACKGROUND_LAUNCH_PREFIXES: [&str; 2] = [
+    "Command running in background with ID: ",
+    "Command was manually backgrounded by user with ID: ",
+];
 /// 照 Claude Code 的 `InterruptedByUser` 呈现中断标记。
 const RESPONSE_CONTINUATION: &str = "     ";
 #[cfg(test)]
@@ -100,6 +105,7 @@ pub(super) fn transcript_document(
     };
     let mut interaction_notice_rendered = false;
     let mut command_heading_rendered = false;
+    let mut tool_names = HashMap::new();
     for block in projection.blocks {
         let ConversationBlock {
             id: block_id,
@@ -168,6 +174,7 @@ pub(super) fn transcript_document(
                 name,
                 input,
             } => {
+                tool_names.insert(exchange.clone(), name.clone());
                 text.push_str(&format!(
                     "\nTool {} · {}\n",
                     safe_text(&exchange.call_id),
@@ -182,10 +189,22 @@ pub(super) fn transcript_document(
                 output_ref,
             } => {
                 let _output_ref = output_ref;
+                let result = ToolResult {
+                    content: content.clone(),
+                    is_error,
+                    output_ref: None,
+                };
+                let status = tool_result_status(
+                    tool_names
+                        .get(&exchange)
+                        .map(String::as_str)
+                        .unwrap_or("tool"),
+                    &result,
+                );
                 text.push_str(&format!(
                     "\nResult {} · {}\n",
                     safe_text(&exchange.call_id),
-                    if is_error { "Failed" } else { "Completed" }
+                    status
                 ));
                 if let Ok(value) = serde_json::from_str::<Value>(&content) {
                     append_transcript_value(&mut text, &value);
@@ -322,7 +341,11 @@ impl ToolPresentation {
 
     pub(super) fn render_event(&self, event: &Event) -> Option<String> {
         if self.detailed {
-            return detailed_event(event);
+            let name = match &event.kind {
+                EventKind::ToolCompleted { call_id, .. } => self.started_call(event, call_id).0,
+                _ => "tool",
+            };
+            return detailed_event(event, name);
         }
         match &event.kind {
             EventKind::ToolStarted { name, input, .. } => {
@@ -432,7 +455,7 @@ impl ToolPresentation {
             text.push_str("No tool activity in this view yet.\n");
         }
         for event in &self.events {
-            if let Some(detail) = detailed_event(event) {
+            if let Some(detail) = self.render_event(event) {
                 text.push_str(&detail);
             }
         }
@@ -605,7 +628,7 @@ pub(super) fn permission_context(request: &PermissionRequest) -> Vec<String> {
     lines
 }
 
-fn detailed_event(event: &Event) -> Option<String> {
+fn detailed_event(event: &Event, name: &str) -> Option<String> {
     match &event.kind {
         EventKind::ToolStarted {
             call_id,
@@ -621,11 +644,7 @@ fn detailed_event(event: &Event) -> Option<String> {
             let mut text = format!(
                 "\nTool {} · {}\n{}\n",
                 safe_text(call_id),
-                if result.is_error {
-                    "Failed"
-                } else {
-                    "Completed"
-                },
+                tool_result_status(name, result),
                 safe_text(&result.content),
             );
             if let Some(path) = &result.output_ref {
@@ -771,6 +790,10 @@ pub(super) fn local_message_text(
         LocalMessage::BashInput { command } => format!("\n! {}\n", safe_text(command)),
         LocalMessage::BashOutput { stdout, stderr } => {
             let mut text = String::new();
+            if matches!(detail, OutputDetail::Preview) && background_launch_id(stdout).is_some() {
+                append_response_block(&mut text, BACKGROUND_RUNNING_STATUS, detail, display);
+                return text;
+            }
             for output in [stdout, stderr] {
                 append_response_block(&mut text, output.trim_end(), detail, display);
             }
@@ -879,12 +902,14 @@ fn compact_result_with_prefix(
         return text;
     }
     if name == BASH_TOOL_NAME {
-        let status = if result.is_error {
-            "Failed"
-        } else {
-            "Completed"
-        };
+        let status = tool_result_status(name, result);
         let mut text = format!("  {prefix} {} · {status}\n", tool_name(name));
+        if status == BACKGROUND_RUNNING_STATUS {
+            if let Some(command) = input.and_then(|input| input["command"].as_str()) {
+                text.push_str(&format!("  {}\n", background_shell_line(command)));
+            }
+            return text;
+        }
         append_preview(&mut text, &result.content, false);
         return text;
     }
@@ -1011,6 +1036,34 @@ fn compact_result_with_prefix(
         append_preview(&mut text, &result.content, false);
     }
     text
+}
+
+fn background_launch_id(content: &str) -> Option<Uuid> {
+    let identity = BACKGROUND_LAUNCH_PREFIXES
+        .iter()
+        .find_map(|prefix| content.strip_prefix(prefix))?;
+    let (id, path) = identity.split_once(". Output is being written to: ")?;
+    if path.trim().is_empty() {
+        return None;
+    }
+    Uuid::parse_str(id).ok()
+}
+
+fn tool_result_status(name: &str, result: &ToolResult) -> &'static str {
+    if name == BASH_TOOL_NAME && background_launch_id(&result.content).is_some() {
+        BACKGROUND_RUNNING_STATUS
+    } else if result.is_error {
+        "Failed"
+    } else {
+        "Completed"
+    }
+}
+
+pub(super) fn background_shell_line(command: &str) -> String {
+    format!(
+        "{} · running in background",
+        clipped(&command.replace('\n', " ↵ "), TOOL_SUMMARY_CHARACTERS).0
+    )
 }
 
 /// What a successful `Write` or `Edit` changed, told from its input: Claude Code's result text
@@ -1809,6 +1862,123 @@ mod tests {
         let detailed = view.toggle();
         assert!(detailed.contains("same-call"));
         assert!(detailed.contains("sixth"));
+    }
+
+    #[test]
+    fn background_bash_launch_stays_running_until_its_separate_completion_notice_and_replays() {
+        let run = Uuid::new_v4();
+        let operation = Uuid::new_v4();
+        let path = PathBuf::from("/private/tmp/private-background.log");
+        let input = json!({"command":"sleep 30","run_in_background":true});
+        let started = event(
+            run,
+            EventKind::ToolStarted {
+                call_id: "background-call".into(),
+                name: BASH_TOOL_NAME.into(),
+                input: input.clone(),
+            },
+        );
+        let result = ToolResult {
+            content: format!(
+                "Command running in background with ID: {operation}. Output is being written to: {}",
+                path.display()
+            ),
+            is_error: false,
+            output_ref: Some(path.clone()),
+        };
+        let launched = event(
+            run,
+            EventKind::ToolCompleted {
+                call_id: "background-call".into(),
+                result: result.clone(),
+            },
+        );
+        let mut view = ToolPresentation::new(false);
+        view.record(&started);
+        view.record(&launched);
+        let shown = view.render_event(&launched).unwrap();
+        assert!(shown.contains("Bash · Running in background"), "{shown}");
+        assert!(shown.contains("sleep 30 · running in background"));
+        assert!(
+            !shown.contains("Completed")
+                && !shown.contains("private-background.log")
+                && !shown.contains(&operation.to_string())
+        );
+        let command=serde_json::from_value(json!({"operation_id":operation,"loop_id":launched.loop_id,"command":"sleep 30","cwd":"/tmp","pid":null,"state":"Completed","was_background":true,"exit_code":0,"signal":null,"reason":null,"output_ref":path,"output_bytes":0})).unwrap();
+        let ended = event(run, EventKind::CommandUpdated { command });
+        view.record(&ended);
+        assert!(
+            view.render_event(&ended)
+                .unwrap()
+                .contains("Completed · exit 0")
+        );
+        assert_eq!(view.render_event(&launched).unwrap(), shown);
+        let replay: Vec<Event> = serde_json::from_str(
+            &serde_json::to_string(&vec![started, launched.clone(), ended]).unwrap(),
+        )
+        .unwrap();
+        let mut restored = ToolPresentation::new(false);
+        restored.restore(&replay);
+        assert_eq!(restored.render_event(&launched).unwrap(), shown);
+        let raw = restored.toggle();
+        assert!(raw.contains(&result.content));
+        assert!(raw.contains("Running in background"));
+        let archived = archived_tool_result(
+            BASH_TOOL_NAME,
+            Some(&input),
+            &ToolResult {
+                output_ref: None,
+                ..result
+            },
+            DisplayProfile::default(),
+        );
+        assert!(
+            archived.contains("Running in background")
+                && !archived.contains("private-background.log")
+        );
+    }
+
+    #[test]
+    fn manually_backgrounded_user_shell_has_a_short_preview_and_preserves_raw_details() {
+        let raw = format!(
+            "Command was manually backgrounded by user with ID: {}. Output is being written to: /private/tmp/user-background.log",
+            Uuid::new_v4()
+        );
+        let message = LocalMessage::BashOutput {
+            stdout: raw.clone(),
+            stderr: String::new(),
+        };
+        let shown = local_message_text(&message, OutputDetail::Preview, DisplayProfile::default());
+        assert!(shown.contains("Running in background"), "{shown}");
+        assert!(!shown.contains("/private/tmp") && !shown.contains("with ID"));
+        assert!(
+            local_message_text(&message, OutputDetail::Full, DisplayProfile::default())
+                .contains(&raw)
+        );
+    }
+
+    #[test]
+    fn saved_background_bash_transcript_uses_launch_status_and_keeps_raw_result() {
+        let raw = format!(
+            "Command running in background with ID: {}. Output is being written to: /private/tmp/replayed-background.log",
+            Uuid::new_v4()
+        );
+        let snapshot:ChatSnapshot=serde_json::from_value(json!({
+            "id":Uuid::new_v4(),"workdir":"/work","model":{"name":"fixture","protocol":"messages","base_url":"http://127.0.0.1","model":"fixture","api_key_env":"","max_output_tokens":1024},"loops":[],
+            "messages":[{"role":"assistant","content":[{"type":"tool_use","id":"bg-call","name":"Bash","input":{"command":"sleep 30","run_in_background":true}}]},
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"bg-call","content":raw,"is_error":false}]}]
+        })).unwrap();
+        let restored: ChatSnapshot =
+            serde_json::from_str(&serde_json::to_string(&snapshot).unwrap()).unwrap();
+        let document =
+            transcript_document(&restored, DisplayProfile::default(), &ImageLinks::default())
+                .lines
+                .join("\n");
+        assert!(
+            document.contains("Result bg-call · Running in background"),
+            "{document}"
+        );
+        assert!(document.contains(&raw));
     }
 
     #[test]

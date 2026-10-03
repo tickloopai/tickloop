@@ -472,6 +472,17 @@ fn startup_trust_short_write_failure_shows_the_error_and_requires_resize_before_
         terminal.send(b"j\r");
         terminal.wait("Cannot save directory trust:");
         terminal.wait("Resize terminal");
+        terminal.resize(80, 1);
+        terminal.wait("Cannot save directory trust:");
+        terminal.send(b"j\r");
+        thread::sleep(Duration::from_millis(80));
+        assert_eq!(
+            fs::read_to_string(fixture.path("config/settings.json")).unwrap(),
+            "invalid JSON"
+        );
+        assert_eq!(fs::read_dir(fixture.path("runtime")).unwrap().count(), 0);
+        terminal.resize(80, 5);
+        terminal.wait("Resize terminal");
         fs::write(fixture.path("config/settings.json"), "{}").unwrap();
         terminal.send(b"j\r");
         thread::sleep(Duration::from_millis(80));
