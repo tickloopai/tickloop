@@ -560,10 +560,7 @@ fn core_status_position_moves_the_complete_styled_segment_and_preserves_fallback
             .unwrap();
         let left = frame(&console);
         assert_eq!(left.len(), right.len());
-        assert!(
-            left[editor + 1].starts_with(&format!("── {core} ")),
-            "{left:?}"
-        );
+        assert!(left[editor + 1].starts_with(&core), "{left:?}");
         assert!(left[editor + 1].ends_with('─'));
         assert_eq!(display_width(&left[editor + 1]), 79);
         let mut state = console.state.lock().unwrap();
@@ -580,32 +577,17 @@ fn core_status_position_moves_the_complete_styled_segment_and_preserves_fallback
                 .iter()
                 .any(|span| span.text == "模型 fixture" && span.role == Some(Role::Text))
         );
-        assert_eq!(
-            display_width(&left[editor + 1][..left[editor + 1].find(&core).unwrap()]),
-            3
-        );
-        let boundary = display_width(&core) + 4;
-        for width in [
-            24,
-            display_width(&core) + 1,
-            display_width(&core) + 2,
-            boundary,
-            boundary + 1,
-        ] {
+        for width in [24, display_width(&core) + 1, display_width(&core) + 2] {
             state.resize((width + 1).try_into().unwrap(), 24);
             let left_frame = state.frame().0;
             state.display.set_preferences(DisplayPreferences::default());
             let right_frame = state.frame().0;
-            if width > boundary {
-                assert!(left_frame.iter().any(|line| line.starts_with(&format!("── {core} ")) && line.ends_with('─')));
-            } else {
+            if width == display_width(&core) + 2 {
                 assert!(
-                    !left_frame
+                    left_frame
                         .iter()
-                        .any(|line| line.starts_with(&format!("── {core} ")))
+                        .any(|line| line.starts_with(&core) && line.ends_with('─'))
                 );
-            }
-            if width >= display_width(&core) + 2 {
                 assert!(
                     right_frame
                         .iter()

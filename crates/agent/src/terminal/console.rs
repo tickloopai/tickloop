@@ -172,9 +172,6 @@ impl TerminalSurface {
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const INPUT_CHANNEL_CAPACITY: usize = 128;
 const FOOTER_ROWS: usize = 3;
-const STATUS_LINE_LEADING_RULE_COLUMNS: usize = 2;
-const STATUS_LINE_GAP_COLUMNS: usize = 1;
-const STATUS_LINE_MIN_RULE_COLUMNS: usize = 1;
 const FOOTER_ITEMS_ROWS: usize = 1;
 const MIN_FOOTER_ITEMS_TERMINAL_ROWS: usize = FOOTER_ROWS + FOOTER_ITEMS_ROWS;
 const MIN_SCROLL_ROWS: usize = 2;
@@ -1340,7 +1337,11 @@ impl Console {
         let entries = snapshot
             .tasks
             .iter()
-            .filter(|task| task.chat_id == snapshot.chat_id)
+            .filter(|task| {
+                task.chat_id == snapshot.chat_id
+                    && (task.was_background
+                        || task.state == tickloop_agent::runtime::ShellTaskState::Background)
+            })
             .map(|task| {
                 let status = super::tick_shell::shell_status(task);
                 TickListEntry {
@@ -6647,22 +6648,12 @@ impl State {
         let core_status = self
             .status_area
             .status_line_with_background(usize::MAX, "", None);
-        let core_columns = display_width(&core_status.text());
-        let status_padding = match self.display.preferences().status_line_position {
-            StatusLinePosition::Right => STATUS_LINE_GAP_COLUMNS + STATUS_LINE_MIN_RULE_COLUMNS,
-            StatusLinePosition::Left => {
-                STATUS_LINE_LEADING_RULE_COLUMNS
-                    + STATUS_LINE_GAP_COLUMNS
-                    + STATUS_LINE_GAP_COLUMNS
-                    + STATUS_LINE_MIN_RULE_COLUMNS
-            }
-        };
         let float_core_status = !short
             && !overview
             && !self.help_open
             && configured_status.is_none()
             && self.status_area.is_configured()
-            && core_columns + status_padding <= self.width;
+            && display_width(&core_status.text()) + 2 <= self.width;
         let mut status_rows = if self.help_open {
             usize::from(!leading_notice.is_empty() || required_status)
         } else {
@@ -6868,12 +6859,8 @@ impl State {
         if borders > 1 {
             let mut divider = RoleLine::role(
                 "─".repeat(if float_core_status {
-                    match self.display.preferences().status_line_position {
-                        StatusLinePosition::Right => self
-                            .width
-                            .saturating_sub(core_columns + STATUS_LINE_GAP_COLUMNS),
-                        StatusLinePosition::Left => STATUS_LINE_LEADING_RULE_COLUMNS,
-                    }
+                    self.width
+                        .saturating_sub(display_width(&core_status.text()) + 1)
                 } else {
                     self.width
                 }),
@@ -6886,18 +6873,10 @@ impl State {
                         divider.spans.extend(core_status.spans);
                     }
                     StatusLinePosition::Left => {
+                        let rule_spans = divider.spans;
+                        divider.spans = core_status.spans;
                         divider.push(" ", None);
-                        divider.spans.extend(core_status.spans);
-                        divider.push(" ", None);
-                        divider.push(
-                            "─".repeat(self.width.saturating_sub(
-                                core_columns
-                                    + STATUS_LINE_LEADING_RULE_COLUMNS
-                                    + STATUS_LINE_GAP_COLUMNS
-                                    + STATUS_LINE_GAP_COLUMNS,
-                            )),
-                            Some(border),
-                        );
+                        divider.spans.extend(rule_spans);
                     }
                 }
             }
@@ -17187,6 +17166,10 @@ mod tests {
         state.insert("keep this draft");
         let console = InteractiveConsoleFixture::new(state);
         let snapshot = task_snapshot(chat, 6);
+        let mut snapshot = snapshot;
+        for task in &mut snapshot.tasks {
+            task.was_background = true;
+        }
         console.update_shell_ticks(&snapshot).unwrap();
         let task = snapshot.tasks[4].id;
         let panel = {
@@ -17322,7 +17305,9 @@ mod tests {
             state.prompt_enabled = true;
             state.insert("draft");
             let console = console_with_state(state);
-            console.update_shell_ticks(&task_snapshot(chat, 1)).unwrap();
+            let mut snapshot = task_snapshot(chat, 1);
+            snapshot.tasks[0].was_background = true;
+            console.update_shell_ticks(&snapshot).unwrap();
             let mut state = console.state.lock().unwrap();
             assert!(matches!(
                 state.key(KeyEvent::new(direction, KeyModifiers::SHIFT)),
@@ -17471,7 +17456,9 @@ mod tests {
         state.prompt_enabled = true;
         state.insert("preserved draft");
         let console = console_with_state(state);
-        console.update_shell_ticks(&task_snapshot(chat, 1)).unwrap();
+        let mut snapshot = task_snapshot(chat, 1);
+        snapshot.tasks[0].was_background = true;
+        console.update_shell_ticks(&snapshot).unwrap();
         let mut state = console.state.lock().unwrap();
         state.key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
         assert!(state.key(key(KeyCode::Char('j'))).is_none());

@@ -514,6 +514,7 @@ fn agent_layout_removed_footer_item_chooses_the_nearest_surviving_task() {
     state.insert("cached draft");
     let console = super::tests::console_with_state(state);
     let mut snapshot = super::tests::task_snapshot(chat, 20);
+    for task in &mut snapshot.tasks { task.was_background=true; }
     console.update_shell_ticks(&snapshot).unwrap();
     let selected = snapshot.tasks[12].id;
     console

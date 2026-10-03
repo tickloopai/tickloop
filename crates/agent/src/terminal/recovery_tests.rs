@@ -181,7 +181,7 @@ impl AgentAccess for DelayedTerminalEvents {
                         },
                     };
                     if matches!(&update.change, ObservationChange::Event(event)
-                        if matches!(event.kind, EventKind::Completed { .. } | EventKind::Failed(_) | EventKind::Interrupted))
+                        if matches!(event.kind, EventKind::AssistantMessageCommitted { .. } | EventKind::Completed { .. } | EventKind::Failed(_) | EventKind::Interrupted))
                     {
                         tokio::select! {
                             _ = forward.closed() => break,
@@ -449,10 +449,23 @@ async fn run_completed_reply_recovery_fixture() {
             runtime::LoopState::Completed
         }
     );
-    assert_eq!(
-        last_sequence + u64::from(route == "running"),
-        completed.last_sequence
-    );
+    if route == "running" {
+        let completion_events: Vec<_> = completed
+            .events
+            .iter()
+            .filter(|event| event.run_id == run && event.sequence > last_sequence)
+            .map(|event| &event.kind)
+            .collect();
+        assert!(matches!(
+            completion_events.as_slice(),
+            [
+                EventKind::AssistantMessageCommitted { .. },
+                EventKind::Completed { .. }
+            ]
+        ));
+    } else {
+        assert_eq!(last_sequence, completed.last_sequence);
+    }
     assert!(completed.events.iter().any(|event| event.run_id == run
         && matches!(
             event.kind,
@@ -471,7 +484,7 @@ async fn run_completed_reply_recovery_fixture() {
         } else {
             RECOVERY_TIMEOUT
         },
-        |fact| matches!(fact,RecoveryFact::Skipped {chat:skipped_chat,..} | RecoveryFact::Completed {chat:skipped_chat,..} if *skipped_chat==chat),
+        |fact| matches!(fact,RecoveryFact::Skipped {chat:skipped_chat,sequence,..} | RecoveryFact::Completed {chat:skipped_chat,sequence,..} if *skipped_chat==chat && *sequence==completed.last_sequence),
     )
     .await;
     assert!(

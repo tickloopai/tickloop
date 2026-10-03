@@ -135,8 +135,11 @@ fn shell_tick_appears_can_be_focused_and_removed_in_an_isolated_pty() {
     let mut session = Session::start(directory.path(), None, None);
     session.wait("Auto");
     assert!(!session.output.lock().unwrap().contains("No Ticks"));
-    session.send(b"!printf shell-tick-pty\r");
+    session.send(b"!printf shell-tick-pty; while [ ! -f finish ]; do sleep 0.02; done\r");
+    session.wait("shell-tick-pty");
+    session.send(b"\x02");
     session.wait("Shells (1)");
+    std::fs::write(directory.path().join("finish"), "").unwrap();
     session.wait("exit 0");
     thread::sleep(Duration::from_millis(300));
     session.send(b"\x1b[Cx");

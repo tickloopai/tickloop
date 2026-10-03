@@ -27,6 +27,67 @@ fn shell_tick_enter_opens_inside_the_tick_panel() {
 }
 
 #[test]
+fn shell_ticks_only_list_background_executions_and_keep_them_until_removed() {
+    use crate::runtime::{ShellTaskOrigin, ShellTaskOwner, ShellTaskState};
+    for origin in [ShellTaskOrigin::Agent, ShellTaskOrigin::User] {
+        let chat = Uuid::new_v4();
+        let mut snapshot = tests::task_snapshot(chat, 1);
+        snapshot.tasks[0].origin = origin;
+        snapshot.tasks[0].owner = match origin {
+            ShellTaskOrigin::Agent => ShellTaskOwner::Agent {
+                loop_id: Uuid::new_v4(),
+            },
+            ShellTaskOrigin::User => ShellTaskOwner::User { chat_id: chat },
+        };
+        snapshot.tasks[0].was_background = false;
+        snapshot.tasks[0].state = ShellTaskState::Running;
+        let console = Console::test_for_chat(chat);
+        console.update_shell_ticks(&snapshot).unwrap();
+        assert!(
+            !console.tick_list_has_entries().unwrap(),
+            "running foreground Shell must be hidden"
+        );
+        snapshot.tasks[0].state = ShellTaskState::Completed;
+        console.update_shell_ticks(&snapshot).unwrap();
+        assert!(
+            !console.tick_list_has_entries().unwrap(),
+            "finished foreground Shell must be hidden"
+        );
+        snapshot.tasks[0].state = ShellTaskState::Background;
+        console.update_shell_ticks(&snapshot).unwrap();
+        assert!(
+            console.tick_list_has_entries().unwrap(),
+            "moving foreground to background must show it"
+        );
+        snapshot.tasks[0].was_background = true;
+        snapshot.tasks[0].state = ShellTaskState::Completed;
+        console.update_shell_ticks(&snapshot).unwrap();
+        assert!(
+            console.tick_list_has_entries().unwrap(),
+            "finished background Shell must remain"
+        );
+        {
+            let mut state = console.state.lock().unwrap();
+            state.tick_list.focus(true, None);
+            state.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+            assert!(state.tick_list.entries().is_empty());
+        }
+        console.update_shell_ticks(&snapshot).unwrap();
+        assert!(
+            !console.tick_list_has_entries().unwrap(),
+            "removed background Shell must not reappear"
+        );
+        snapshot.tasks[0].id = Uuid::new_v4();
+        snapshot.tasks[0].state = ShellTaskState::Running;
+        console.update_shell_ticks(&snapshot).unwrap();
+        assert!(
+            console.tick_list_has_entries().unwrap(),
+            "background start is shown even with running state"
+        );
+    }
+}
+
+#[test]
 fn tick_shell_detail_and_selection_restore_per_agent_and_ignore_obsolete_mouse_targets() {
     let mut state = click_fixture(140, false, TickGroup::Shells);
     let a = state.chat.unwrap();
@@ -898,4 +959,47 @@ fn background_rows_never_paint_past_the_left_column_or_hide_the_tick_separator()
             );
         }
     }
+}
+
+#[test]
+fn tick_column_spans_content_top_through_working_and_generic_todo_rows() {
+    let mut state = click_fixture(140, false, TickGroup::Shells);
+    state.scrollback.append_as(
+        "最新用户消息 卡了吗\n消息流\nTodos: 1 检查\n",
+        Some(Role::Text),
+        Some(Role::UserMessageBg),
+    );
+    state.scrollback.set_activity(Some(RoleLine::role(
+        format!("✢ Working {}", "界".repeat(100)),
+        Role::Accent,
+    )));
+    state.draw_frame(&mut Vec::new()).unwrap();
+    let (bottom, _, _) = state.styled_frame();
+    let content = state.height - bottom.len();
+    let left = state.width - TICK_LIST_COLUMNS;
+    for row in &state.rendered_screen[..content] {
+        let (text, _) = row
+            .split_once('│')
+            .expect("Tick column must start at top content row and continue through Working/Todos");
+        assert_eq!(display_width(text), left);
+    }
+    assert!(
+        state.rendered_screen[..content].iter().any(|row| row
+            .split('│')
+            .next()
+            .unwrap()
+            .contains("Todos"))
+    );
+    assert!(
+        state.rendered_screen[..content].iter().any(|row| row
+            .split('│')
+            .next()
+            .unwrap()
+            .contains("Working"))
+    );
+    assert!(
+        state.rendered_screen[content..]
+            .iter()
+            .all(|row| !row.contains('│'))
+    );
 }

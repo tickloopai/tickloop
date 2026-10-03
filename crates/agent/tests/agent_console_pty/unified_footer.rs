@@ -70,7 +70,11 @@ async fn run_default_todo_panel(fixture: &PrivateFixture) {
     .await
     .expect("one actual execution is created");
     let actual = wait_snapshot(&client, execution, "TodoWrite completes", |current| {
-        current.conversation.loops[0].state == tickloop_agent::runtime::LoopState::Completed
+        current
+            .conversation
+            .loops
+            .first()
+            .is_some_and(|goal| goal.state == tickloop_agent::runtime::LoopState::Completed)
             && current.conversation.progress.len() == 1
             && current.conversation.progress[0].todos.len() == 2
     })
@@ -329,7 +333,7 @@ async fn run_shell_panel(fixture: &PrivateFixture) {
         .unwrap()
         .id;
     pty.wait_for("running and completed Shell Ticks are counted", |frame| {
-        frame.contains("Ticks 2")
+        frame.contains("Ticks 1")
     })
     .await;
     wait_editor_ready(&mut pty, "background Shell releases the editor", "").await;
@@ -338,9 +342,9 @@ async fn run_shell_panel(fixture: &PrivateFixture) {
         frame.contains("jk-SHELL-DRAFT")
     })
     .await;
-    click_category(&mut pty, "Ticks 2");
+    click_category(&mut pty, "Ticks 1");
     pty.wait_for("click opens the content-only Tick List", |frame| {
-        frame.contains("Shells (2)")
+        frame.contains("Shells (1)")
     })
     .await;
     pty.send(b"\x1b[1;2B");
@@ -362,7 +366,7 @@ async fn run_shell_panel(fixture: &PrivateFixture) {
     .await;
     pty.send(b"\x1b");
     pty.wait_for("Esc returns to the selected Tick row", |frame| {
-        frame.contains("Shells (2)")
+        frame.contains("Shells (1)")
     })
     .await;
     pty.send(b"\x1b");
@@ -400,13 +404,13 @@ async fn run_shell_panel(fixture: &PrivateFixture) {
         .id;
     assert_ne!(first, second);
     pty.wait_for("completed Shell remains in the Tick count", |frame| {
-        frame.contains("Ticks 3")
+        frame.contains("Ticks 2")
     })
     .await;
     wait_editor_ready(&mut pty, "second Shell releases input", "").await;
-    click_category(&mut pty, "Ticks 3");
+    click_category(&mut pty, "Ticks 2");
     pty.wait_for("all three Shell Ticks appear", |frame| {
-        frame.contains("Shells (3)")
+        frame.contains("Shells (2)")
     })
     .await;
     pty.send(b"\x1b[1;2B");
@@ -458,14 +462,14 @@ async fn run_shell_panel(fixture: &PrivateFixture) {
     assert!(requests.try_recv().is_err());
     pty.send(b"\x1b");
     pty.wait_for("stopped detail returns to Tick List", |frame| {
-        frame.contains("Shells (3)")
+        frame.contains("Shells (2)")
     })
     .await;
     pty.send(b"\x1b");
     wait_editor_ready(&mut pty, "stopped detail closes to input", "").await;
-    click_category(&mut pty, "Ticks 3");
+    click_category(&mut pty, "Ticks 2");
     pty.wait_for("Tick List opens after saved preference", |frame| {
-        frame.contains("Shells (3)")
+        frame.contains("Shells (2)")
     })
     .await;
     pty.send(b"\x1b[C");
@@ -485,7 +489,7 @@ async fn run_shell_panel(fixture: &PrivateFixture) {
     pty.send(b"x");
     pty.wait_for(
         "ended Tick can be removed without stopping its peer",
-        |frame| frame.contains("Shells (2)"),
+        |frame| frame.contains("Shells (1)"),
     )
     .await;
     pty.send(b"\x1b");

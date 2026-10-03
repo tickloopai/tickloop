@@ -955,7 +955,7 @@ async fn run_sustained_owner_loss(
     assert!(busy.user_shells[1].starts_in_background);
     assert!(busy.last_model_run.is_none());
     view.wait_for("actual busy Shell task is cached in the View", |frame| {
-        frame.contains("Ticks 2")
+        frame.contains("Ticks 1")
     })
     .await;
     view.send(b"UNSENT-OWNER-LOSS-DRAFT-jk");
