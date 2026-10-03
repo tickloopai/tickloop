@@ -46,15 +46,23 @@ impl TickShell {
         mut snapshot: ShellTaskSnapshot,
         started_at_ms: Option<u64>,
     ) -> Option<TaskSurfaceEffect> {
-        if self.surface.is_some() {
-            return self.update(snapshot);
-        }
         snapshot
             .tasks
             .retain(|task| task.id == self.task_id && task.chat_id == self.chat);
         self.task = snapshot.tasks.first().cloned();
         self.task.as_ref()?;
-        self.started_at_ms = started_at_ms;
+        self.error = None;
+        self.started_at_ms = self.started_at_ms.or(started_at_ms);
+        if self.surface.is_some() {
+            let effect = self.update(snapshot.clone())?;
+            return if effect == TaskSurfaceEffect::None {
+                self.surface
+                    .as_mut()
+                    .map(|surface| surface.reopen(snapshot))
+            } else {
+                Some(effect)
+            };
+        }
         let mut surface = TaskSurface::open(snapshot, ());
         let effect = surface.initial_effect();
         self.surface = Some(surface);
@@ -66,6 +74,7 @@ impl TickShell {
             .retain(|task| task.id == self.task_id && task.chat_id == self.chat);
         self.task = snapshot.tasks.first().cloned();
         self.task.as_ref()?;
+        self.error = None;
         if !self.can_stop() {
             self.confirm_stop = false;
         }
@@ -78,6 +87,14 @@ impl TickShell {
         )
     }
     pub(super) fn output(&mut self, update: TaskOutputUpdate) -> TaskSurfaceEffect {
+        if matches!(update, TaskOutputUpdate::Chunk { .. })
+            && self
+                .surface
+                .as_ref()
+                .is_some_and(|surface| surface.accepts_output_update(&update))
+        {
+            self.error = None;
+        }
         self.surface
             .as_mut()
             .map_or(TaskSurfaceEffect::None, |surface| {
@@ -86,6 +103,20 @@ impl TickShell {
     }
     pub(super) fn report(&mut self, error: String) {
         self.error = Some(error);
+    }
+
+    pub(super) fn report_control(&mut self, error: String) {
+        if let Some(surface) = &mut self.surface {
+            surface.report_action_error(self.task_id, error);
+        } else {
+            self.report(error);
+        }
+    }
+
+    pub(super) fn clear_control_error(&mut self) {
+        if let Some(surface) = &mut self.surface {
+            surface.clear_action_error();
+        }
     }
     fn can_stop(&self) -> bool {
         self.task
@@ -192,7 +223,11 @@ impl TickShell {
     pub(super) fn hint(&self) -> String {
         if self.confirm_stop {
             "Stop this Shell? Enter confirm · Esc cancel".into()
-        } else if let Some(error) = &self.error {
+        } else if let Some(error) = self
+            .error
+            .as_deref()
+            .or_else(|| self.surface.as_ref().and_then(TaskSurface::visible_error))
+        {
             format!("{} · Esc back", super::safe_line(error))
         } else if self.can_stop() {
             "s stop · Esc back".into()
@@ -396,16 +431,52 @@ mod tests {
 
     #[test]
     fn shell_panel_success_clears_stale_load_snapshot_and_output_errors() {
-        let chat=Uuid::new_v4(); let task=Uuid::new_v4(); let mut detail=TickShell::loading(chat,task);
+        let chat = Uuid::new_v4();
+        let task = Uuid::new_v4();
+        let mut detail = TickShell::loading(chat, task);
         detail.report("failed load".into());
-        let effect=detail.load(snapshot(chat,task,1,4,true),None).unwrap();
+        let effect = detail.load(snapshot(chat, task, 1, 4, true), None).unwrap();
         assert!(!detail.hint().contains("failed load"));
         detail.report("failed snapshot".into());
-        detail.update(snapshot(chat,task,2,4,true));
+        detail.update(snapshot(chat, task, 2, 4, true));
         assert!(!detail.hint().contains("failed snapshot"));
         detail.report("failed output".into());
-        deliver(&mut detail,effect,"tail");
+        deliver(&mut detail, effect, "tail");
         assert!(!detail.hint().contains("failed output"));
+        detail.report_control("failed control".into());
+        detail.update(snapshot(chat, task, 3, 4, true));
+        assert!(
+            detail.hint().contains("failed control"),
+            "snapshot success must not hide a failed control"
+        );
+        detail.clear_control_error();
+        assert!(!detail.hint().contains("failed control"));
+    }
+
+    #[test]
+    fn reopening_a_panel_retries_failed_output_without_new_bytes() {
+        let chat = Uuid::new_v4();
+        let task = Uuid::new_v4();
+        let mut detail = TickShell::loading(chat, task);
+        let initial = snapshot(chat, task, 1, 4, true);
+        let Some(TaskSurfaceEffect::ReadOutput { generation, .. }) =
+            detail.load(initial.clone(), None)
+        else {
+            panic!("missing initial read");
+        };
+        detail.output(TaskOutputUpdate::Unavailable {
+            generation,
+            task_id: task,
+            total_bytes: 4,
+            message: "temporary read failure".into(),
+        });
+        let effect = detail.load(initial, None).unwrap();
+        assert!(
+            matches!(effect, TaskSurfaceEffect::ReadOutput { .. }),
+            "restored panel must retry a failed tail read"
+        );
+        deliver(&mut detail, effect, "tail");
+        assert!(!detail.hint().contains("temporary read failure"));
     }
 
     #[test]

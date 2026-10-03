@@ -9,6 +9,7 @@ use tickloop_ui::{
     settings::AmbiguousWidth,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use uuid::Uuid;
 
 use super::{
     display::{DisplayProfile, Glyph},
@@ -78,6 +79,13 @@ pub(super) enum ToolCallState {
 }
 
 impl ToolCallState {
+    pub(super) fn after_run(self) -> Self {
+        match self {
+            Self::Queued => Self::Stopped,
+            Self::Running => Self::Finished,
+            Self::Finished | Self::Stopped => self,
+        }
+    }
     pub(super) fn suffix(self) -> &'static str {
         match self {
             Self::Queued => " · Queued",
@@ -88,6 +96,7 @@ impl ToolCallState {
 }
 
 struct ToolCallHeader {
+    run_id: Uuid,
     line: usize,
     spans: Vec<(String, Option<Role>)>,
     state: ToolCallState,
@@ -423,6 +432,7 @@ impl Scrollback {
 
     pub(super) fn set_tool_call(
         &mut self,
+        run_id: Uuid,
         call_id: &str,
         spans: &[(String, Option<Role>)],
         state: ToolCallState,
@@ -456,6 +466,7 @@ impl Scrollback {
         self.tool_call_headers.insert(
             call_id.to_owned(),
             ToolCallHeader {
+                run_id,
                 line: header_line,
                 spans: spans.to_vec(),
                 state,
@@ -470,29 +481,29 @@ impl Scrollback {
         }
     }
 
-    pub(super) fn finish_tool_call(&mut self, call_id: &str) {
-        if let Some(header) = self.tool_call_headers.get(call_id) {
+    pub(super) fn finish_tool_call(&mut self, run_id: Uuid, call_id: &str) {
+        if let Some(header) = self
+            .tool_call_headers
+            .get(call_id)
+            .filter(|header| header.run_id == run_id)
+        {
             let spans = header.spans.clone();
-            self.set_tool_call(call_id, &spans, ToolCallState::Finished);
+            self.set_tool_call(run_id, call_id, &spans, ToolCallState::Finished);
         }
     }
 
-    pub(super) fn finish_tool_calls(&mut self) {
+    pub(super) fn finish_tool_calls(&mut self, run_id: Uuid) {
         let unfinished: Vec<_> = self
             .tool_call_headers
             .iter()
-            .filter_map(|(id, header)| match header.state {
-                ToolCallState::Queued => {
-                    Some((id.clone(), header.spans.clone(), ToolCallState::Stopped))
-                }
-                ToolCallState::Running => {
-                    Some((id.clone(), header.spans.clone(), ToolCallState::Finished))
-                }
-                _ => None,
+            .filter(|(_, header)| header.run_id == run_id)
+            .filter_map(|(id, header)| {
+                let state = header.state.after_run();
+                (state != header.state).then(|| (id.clone(), header.spans.clone(), state))
             })
             .collect();
         for (id, spans, state) in unfinished {
-            self.set_tool_call(&id, &spans, state);
+            self.set_tool_call(run_id, &id, &spans, state);
         }
     }
 
@@ -1378,6 +1389,7 @@ mod tests {
         let mut scrollback = Scrollback::new();
         scrollback.append("before");
         scrollback.set_tool_call(
+            Uuid::from_u128(1),
             "call",
             &[
                 ("\n".into(), None),
@@ -1398,7 +1410,7 @@ mod tests {
         );
         assert_eq!(running.styled[2].spans[0].role, Some(Role::MutedText));
 
-        scrollback.finish_tool_call("call");
+        scrollback.finish_tool_call(Uuid::from_u128(1), "call");
         assert_eq!(
             scrollback.frame(20, 5).styled[1]
                 .spans

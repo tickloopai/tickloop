@@ -3,6 +3,7 @@ use super::*;
 const REPLY: &str = "REPLY-COMMITTED-WITHOUT-NEWLINE";
 const BATCH_PROMPT: &str = "Visibility batch probe";
 const QUESTION: &str = "QUEUED-QUESTION-PREVIEW";
+const PARKED_CALL: &str = "PARKED-CALL-AWAITING-PERMISSION";
 
 fn tool_header_count(frame: &str, name: &str) -> usize {
     conversation_body(frame)
@@ -458,6 +459,190 @@ async fn independent_question(fixture: &PrivateFixture) {
 async fn actual_cli_independent_question_still_activates_and_accepts_one_answer() {
     let fixture = PrivateFixture::new();
     let result = AssertUnwindSafe(independent_question(&fixture))
+        .catch_unwind()
+        .await;
+    fixture.shutdown().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+async fn parked_loop_survives_other_completion(fixture: &PrivateFixture) {
+    let marker = fixture.path("parked-marker");
+    let (url,_)=model_http_support::serve_responses(vec![
+        (200,chat_reply(Some(("Bash","parked-call",json!({"command":format!("printf parked > {}",marker.display()),"description":PARKED_CALL}))),"PARKED-REPLY")),
+        (200,chat_reply(None,"INDEPENDENT-LOOP-FINISHED")),
+        (200,chat_reply(None,"PARKED-LOOP-FINISHED")),
+    ]).await;
+    fixture.set_chat_model(&url);
+    let mut view = PtyView::start_with_flags(fixture, &["--mode", "ask"]);
+    view.wait_for("parked Loop View ready", new_input_is_visible)
+        .await;
+    view.resize(120, 50).await;
+    view.send(b"Park this Loop for permission\r");
+    view.wait_for("first call awaits human approval", |frame| {
+        frame.contains(PARKED_CALL) && frame.contains("Queued")
+    })
+    .await;
+    let client = fixture.client().await;
+    let execution = catalog(&client).await[0].execution;
+    let parked = wait_snapshot(
+        &client,
+        execution,
+        "one actionable permission",
+        |snapshot| snapshot.permissions.len() == 1,
+    )
+    .await;
+    let first_run = parked.permissions[0].run_id;
+    client
+        .execute(CommandEnvelope {
+            owner_epoch: client.owner_epoch(),
+            command_id: uuid::Uuid::new_v4(),
+            command: AgentCommand::Submit {
+                execution,
+                target_loop: None,
+                input: UserInput::Text {
+                    text: "Complete an independent Loop".into(),
+                    contexts: vec![],
+                    paths: vec![],
+                },
+                origin: None,
+            },
+        })
+        .await
+        .unwrap();
+    view.wait_for("independent Loop completes", |frame| {
+        frame.contains("INDEPENDENT-LOOP-FINISHED")
+    })
+    .await;
+    let preserved = view.frame();
+    let row = conversation_body(&preserved)
+        .lines()
+        .find(|line| line.contains(PARKED_CALL))
+        .unwrap()
+        .to_owned();
+    assert!(
+        row.contains("Queued") && !row.contains("Stopped"),
+        "{preserved}"
+    );
+    let still_parked = snapshot(&client, execution).await;
+    assert_eq!(still_parked.permissions.len(), 1);
+    assert_eq!(still_parked.permissions[0].run_id, first_run);
+    assert!(!marker.exists());
+    let request = *still_parked
+        .request_refs
+        .iter()
+        .find(|request| request.kind == RequestKind::Permission)
+        .unwrap();
+    client
+        .execute(CommandEnvelope {
+            owner_epoch: client.owner_epoch(),
+            command_id: uuid::Uuid::new_v4(),
+            command: AgentCommand::DecidePermission {
+                request,
+                allow: true,
+                scope: tickloop_agent::permissions::PermissionScope::Once,
+                comment: None,
+                rule: None,
+            },
+        })
+        .await
+        .unwrap();
+    view.wait_for("parked Loop resumes after its own approval", |frame| {
+        frame.contains("PARKED-LOOP-FINISHED")
+    })
+    .await;
+    assert_eq!(std::fs::read_to_string(marker).unwrap(), "parked");
+    view.close().await;
+}
+
+#[tokio::test]
+async fn actual_cli_finishing_one_run_preserves_another_loops_actionable_proposal() {
+    let fixture = PrivateFixture::new();
+    let result = AssertUnwindSafe(parked_loop_survives_other_completion(&fixture))
+        .catch_unwind()
+        .await;
+    fixture.shutdown().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+async fn interrupted_batch_has_the_same_state_on_attach(fixture: &PrivateFixture) {
+    let (url, mut requests, _release) = model_http_support::serve_responses_with_gated_response(
+        vec![(200, batch_reply()), (200, review_allow_reply())],
+        1,
+    )
+    .await;
+    fixture.set_chat_model(&url);
+    let mut view = PtyView::start(fixture);
+    view.wait_for("interrupted attach View ready", new_input_is_visible)
+        .await;
+    view.resize(120, 50).await;
+    view.send(format!("{BATCH_PROMPT}\r").as_bytes());
+    let _ = tokio::time::timeout(UI_TIMEOUT, requests.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let (_, review) = tokio::time::timeout(UI_TIMEOUT, requests.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(review.get("response_format").is_some());
+    view.wait_for("both calls await admission", |frame| {
+        conversation_body(frame).matches("Queued").count() == 2
+    })
+    .await;
+    let client = fixture.client().await;
+    let execution = catalog(&client).await[0].execution;
+    client
+        .execute(CommandEnvelope {
+            owner_epoch: client.owner_epoch(),
+            command_id: uuid::Uuid::new_v4(),
+            command: AgentCommand::ManageLoop {
+                execution,
+                action: LoopAction::Interrupt,
+            },
+        })
+        .await
+        .unwrap();
+    let original = view
+        .wait_for("original View marks unadmitted calls Stopped", |frame| {
+            conversation_body(frame).matches("Stopped").count() == 2
+        })
+        .await;
+    assert!(!fixture.path("work/admission-marker").exists());
+    let mut attached = PtyView::start(fixture);
+    attached
+        .wait_for("new View ready", new_input_is_visible)
+        .await;
+    attached.resize(120, 50).await;
+    attached.send(b"\x1b[D");
+    attached
+        .wait_for("Agents lists interrupted batch", |frame| {
+            frame.contains("Agents · local") && frame.contains(BATCH_PROMPT)
+        })
+        .await;
+    select_overview_row(&mut attached, BATCH_PROMPT).await;
+    attached.send(b"\r");
+    let restored = attached
+        .wait_for("attached interrupted proposals remain Stopped", |frame| {
+            !frame.contains("Agents · local")
+                && conversation_body(frame).matches("Stopped").count() == 2
+        })
+        .await;
+    assert!(original.contains(REPLY) && restored.contains(REPLY));
+    assert_eq!(tool_header_count(&restored, "Bash"), 1);
+    assert_eq!(tool_header_count(&restored, "AskUserQuestion"), 1);
+    eprintln!("[interrupted live]\n{original}\n[interrupted attached]\n{restored}");
+    attached.close().await;
+    view.close().await;
+}
+
+#[tokio::test]
+async fn actual_cli_interrupted_unadmitted_calls_keep_their_state_in_an_attached_view() {
+    let fixture = PrivateFixture::new();
+    let result = AssertUnwindSafe(interrupted_batch_has_the_same_state_on_attach(&fixture))
         .catch_unwind()
         .await;
     fixture.shutdown().await;

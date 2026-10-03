@@ -1466,6 +1466,43 @@ impl Console {
             .map_err(|error| error.to_string())
     }
 
+    pub(super) fn tick_shell_control_failed(
+        &self,
+        chat: Uuid,
+        panel: Uuid,
+        error: String,
+    ) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        if let Some(detail) = state
+            .tick_list_for_chat_mut(chat)
+            .shell_detail
+            .as_mut()
+            .filter(|detail| detail.id == panel)
+        {
+            detail.report_control(error);
+        }
+        state
+            .draw(&mut io::stdout().lock())
+            .map_err(|error| error.to_string())
+    }
+
+    pub(super) fn clear_tick_shell_control_error(
+        &self,
+        chat: Uuid,
+        panel: Uuid,
+    ) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        if let Some(detail) = state
+            .tick_list_for_chat_mut(chat)
+            .shell_detail
+            .as_mut()
+            .filter(|detail| detail.id == panel)
+        {
+            detail.clear_control_error();
+        }
+        Ok(())
+    }
+
     pub(super) fn set_background_status_notice(
         &self,
         notice: Option<BackgroundStatusNotice>,
@@ -2989,12 +3026,13 @@ impl Console {
 
     pub(super) fn write_tool_call(
         &self,
+        run_id: Uuid,
         call_id: &str,
         spans: &[(String, Option<Role>)],
         state: ToolCallState,
     ) -> Result<(), String> {
         self.write_scrollback_spans(spans, |scrollback| {
-            scrollback.set_tool_call(call_id, spans, state)
+            scrollback.set_tool_call(run_id, call_id, spans, state)
         })
     }
 
@@ -3020,13 +3058,16 @@ impl Console {
         Ok(())
     }
 
-    /// Ends the running state of one tool call, or of every tool call when
-    /// `call_id` is `None`. The result written next draws the change.
-    pub(super) fn finish_tool_call(&self, call_id: Option<&str>) -> Result<(), String> {
+    /// Ends one call or the remaining calls of the originating Run.
+    pub(super) fn finish_tool_call(
+        &self,
+        run_id: Uuid,
+        call_id: Option<&str>,
+    ) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         match call_id {
-            Some(call_id) => state.scrollback.finish_tool_call(call_id),
-            None => state.scrollback.finish_tool_calls(),
+            Some(call_id) => state.scrollback.finish_tool_call(run_id, call_id),
+            None => state.scrollback.finish_tool_calls(run_id),
         }
         Ok(())
     }
@@ -4117,6 +4158,7 @@ pub(super) enum ConversationPiece {
         starts_message: bool,
     },
     ToolCall {
+        run_id: Uuid,
         text: String,
         call_key: String,
         spans: Vec<(String, Option<Role>)>,
@@ -4134,11 +4176,12 @@ impl ConversationPiece {
     fn append_to(&self, scrollback: &mut Scrollback, display: DisplayProfile) {
         match self {
             Self::ToolCall {
+                run_id,
                 call_key,
                 spans,
                 state,
                 ..
-            } => scrollback.set_tool_call(call_key, spans, *state),
+            } => scrollback.set_tool_call(*run_id, call_key, spans, *state),
             Self::Styled(text, role) => scrollback.append_as(text, *role, None),
             Self::Linked { text, link } => scrollback.append_span(text, None, None, Some(link)),
             Self::Markdown {
@@ -4714,6 +4757,7 @@ impl State {
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 if self.tick_list_visible()
+                    && self.tick_list.confirmation.is_none()
                     && !self.menu_submission_is_pending()
                     && !self.branch_submission_owns_input()
                     && let Some(id) = self

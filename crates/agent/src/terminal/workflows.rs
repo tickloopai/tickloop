@@ -1100,6 +1100,7 @@ fn append_public_message(
                     text.push_str(state.suffix());
                     text.push('\n');
                     history.pieces.push(ConversationPiece::ToolCall {
+                        run_id: run,
                         text,
                         call_key: presentation::tool_call_key(run, id),
                         spans,

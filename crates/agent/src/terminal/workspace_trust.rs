@@ -158,14 +158,15 @@ impl WorkspaceTrust {
             .collect();
         let required_rows = heading.len() + error_lines.len() + actions.len();
         if width < MIN_TRUST_COLUMNS || required_rows > height {
-            let mut lines: Vec<_> = wrap_text(
-                "Resize terminal to review directory · Esc cancel",
-                wrap_width,
-            )
-            .into_iter()
-            .map(|line| RoleLine::role(line, Role::MutedText))
-            .collect();
-            lines.extend(error_lines);
+            let mut lines = error_lines;
+            lines.extend(
+                wrap_text(
+                    "Resize terminal to review directory · Esc cancel",
+                    wrap_width,
+                )
+                .into_iter()
+                .map(|line| RoleLine::role(line, Role::MutedText)),
+            );
             lines.truncate(height);
             for line in &mut lines {
                 line.truncate(width);

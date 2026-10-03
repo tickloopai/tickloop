@@ -443,7 +443,28 @@ impl<Restore> TaskSurface<Restore> {
         self.action_error = None;
     }
 
+    pub fn visible_error(&self) -> Option<&str> {
+        self.action_error.as_deref().or_else(|| match self.focus {
+            TaskSurfaceFocus::Detail { task_id } => self
+                .detail_states
+                .get(&task_id)
+                .and_then(|detail| detail.output_error.as_deref()),
+            TaskSurfaceFocus::List => None,
+        })
+    }
+
+    pub fn accepts_output_update(&self, update: &TaskOutputUpdate) -> bool {
+        let generation = match update {
+            TaskOutputUpdate::Chunk { generation, .. }
+            | TaskOutputUpdate::Unavailable { generation, .. } => *generation,
+        };
+        generation == self.navigation_generation
+    }
+
     pub fn update_output(&mut self, update: TaskOutputUpdate) -> TaskSurfaceEffect {
+        if !self.accepts_output_update(&update) {
+            return TaskSurfaceEffect::None;
+        }
         let (generation, task_id, total_bytes) = match &update {
             TaskOutputUpdate::Chunk { generation, chunk } => {
                 (*generation, chunk.task_id, chunk.total_bytes)
@@ -455,9 +476,6 @@ impl<Restore> TaskSurface<Restore> {
                 ..
             } => (*generation, *task_id, *total_bytes),
         };
-        if generation != self.navigation_generation {
-            return TaskSurfaceEffect::None;
-        }
         let can_read_output = self
             .task(task_id)
             .is_some_and(|task| task.capabilities.can_read_output);

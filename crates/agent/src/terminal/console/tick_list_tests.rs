@@ -294,6 +294,138 @@ async fn shell_panel_live_subscription_updates_tail_without_covering_the_input()
     core.shutdown().await;
 }
 
+#[tokio::test]
+async fn shared_shell_effect_handler_recovers_output_errors_for_task_center_and_tick_panel() {
+    use crate::terminal::{
+        ShellEffectTarget, apply_shell_effect, execution::ConsoleExecution,
+        task_access::ShellTaskCenter, test_support,
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let core = crate::runtime::Agent::new_embedded(
+        test_support::config(),
+        Arc::new(test_support::ScriptedModel::new(Vec::new())),
+    );
+    let agent = ConsoleExecution::from_embedded(core.clone(), test_support::config());
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let receipt = agent
+        .submit_user_shell_for_goal(chat, None, "printf recovered-output".into(), true)
+        .await
+        .unwrap();
+    let center = ShellTaskCenter::new(agent.clone());
+    let snapshot = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let snapshot = center.snapshot(chat).await.unwrap();
+            if snapshot
+                .tasks
+                .iter()
+                .any(|task| task.id == receipt.command_id && task.state.is_terminal())
+            {
+                break snapshot;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let path = agent
+        .snapshot(chat)
+        .await
+        .unwrap()
+        .user_shells
+        .into_iter()
+        .find(|record| record.id == receipt.command_id)
+        .unwrap()
+        .output_ref
+        .unwrap();
+    for panel_mode in [false, true] {
+        let mut state = State::new(true, 140, 25);
+        state.switch_view_chat(Some(chat));
+        state.prompt_enabled = true;
+        let console = tests::console_with_state(state);
+        let (target, effect) = if panel_mode {
+            console.update_shell_ticks(&snapshot).unwrap();
+            let panel = {
+                let mut state = console.state.lock().unwrap();
+                state.tick_list.focus(false, None);
+                let Some(InputEvent::OpenTickShell { panel, .. }) =
+                    state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                else {
+                    panic!("missing panel");
+                };
+                panel
+            };
+            (
+                ShellEffectTarget::TickPanel(panel),
+                console
+                    .load_tick_shell(chat, panel, snapshot.clone(), None)
+                    .unwrap(),
+            )
+        } else {
+            (
+                ShellEffectTarget::TaskCenter,
+                console
+                    .show_tasks_at(snapshot.clone(), Some(receipt.command_id))
+                    .unwrap(),
+            )
+        };
+        let unavailable = path.with_extension("held-by-test");
+        std::fs::rename(&path, &unavailable).unwrap();
+        apply_shell_effect(&center, &console, chat, target, effect.clone())
+            .await
+            .unwrap();
+        {
+            let state = console.state.lock().unwrap();
+            if panel_mode {
+                let hint = state.tick_list.shell_detail.as_ref().unwrap().hint();
+                assert!(hint.contains("Esc back"));
+                assert_ne!(
+                    hint, "Esc back",
+                    "failed output must be surfaced in the panel"
+                );
+            } else {
+                assert!(
+                    state
+                        .task_surface
+                        .as_ref()
+                        .unwrap()
+                        .visible_error()
+                        .is_some()
+                );
+            }
+        }
+        std::fs::rename(&unavailable, &path).unwrap();
+        apply_shell_effect(&center, &console, chat, target, effect)
+            .await
+            .unwrap();
+        {
+            let mut state = console.state.lock().unwrap();
+            state.draw_frame(&mut Vec::new()).unwrap();
+            assert!(
+                state
+                    .rendered_screen
+                    .iter()
+                    .any(|row| row.contains("recovered-output"))
+            );
+            if panel_mode {
+                assert_eq!(
+                    state.tick_list.shell_detail.as_ref().unwrap().hint(),
+                    "Esc back"
+                );
+            } else {
+                assert!(
+                    state
+                        .task_surface
+                        .as_ref()
+                        .unwrap()
+                        .visible_error()
+                        .is_none()
+                );
+            }
+        }
+    }
+    core.shutdown().await;
+}
+
 fn click_fixture(width: u16, overlay: bool, group: TickGroup) -> State {
     let mut state = State::new(true, width, 25);
     state.switch_view_chat(Some(Uuid::new_v4()));
@@ -363,18 +495,35 @@ fn tick_row_title_and_metadata_clicks_perform_the_same_enter_action() {
 
 #[test]
 fn pending_tick_removal_confirmation_cannot_be_approved_by_clicking_any_row() {
-    for group in [TickGroup::Artifacts,TickGroup::Shells,TickGroup::Subscribed] {
-        for metadata in [false,true] {
-            let mut state=click_fixture(140,false,group);
-            let previous="artifact:https://docs.example/previous".to_owned();
-            state.tick_list.confirmation=Some(previous.clone());
-            state.tick_list.focus(false,None);
+    for group in [
+        TickGroup::Artifacts,
+        TickGroup::Shells,
+        TickGroup::Subscribed,
+    ] {
+        for metadata in [false, true] {
+            let mut state = click_fixture(140, false, group);
+            let previous = "artifact:https://docs.example/previous".to_owned();
+            state.tick_list.confirmation = Some(previous.clone());
+            state.tick_list.focus(false, None);
             state.draw_frame(&mut Vec::new()).unwrap();
-            let target=&state.tick_row_targets[usize::from(metadata)];
-            state.pointer(MouseEvent {kind:MouseEventKind::Down(MouseButton::Left),row:target.row as u16,column:target.columns.start as u16,modifiers:KeyModifiers::NONE},&mut Vec::new());
-            assert!(state.pointer_input.is_none(),"row click must never confirm removal");
-            assert_eq!(state.tick_list.confirmation,Some(previous.clone()));
-            assert!(matches!(state.key(KeyEvent::new(KeyCode::Enter,KeyModifiers::NONE)),Some(InputEvent::TickListAction {id,action:'X',..}) if id==previous));
+            let target = &state.tick_row_targets[usize::from(metadata)];
+            state.pointer(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    row: target.row as u16,
+                    column: target.columns.start as u16,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &mut Vec::new(),
+            );
+            assert!(
+                state.pointer_input.is_none(),
+                "row click must never confirm removal"
+            );
+            assert_eq!(state.tick_list.confirmation, Some(previous.clone()));
+            assert!(
+                matches!(state.key(KeyEvent::new(KeyCode::Enter,KeyModifiers::NONE)),Some(InputEvent::TickListAction {id,action:'X',..}) if id==previous)
+            );
         }
     }
 }

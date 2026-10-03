@@ -15,6 +15,7 @@ use tickloop_agent::{
 use tickloop_ui::markdown;
 
 use super::{
+    console::Console,
     conversation::{
         AssistantState, ConversationBlock, ConversationBlockKind, ConversationOutcome,
         ThinkingSource, project as project_conversation,
@@ -306,6 +307,62 @@ pub(super) struct ToolPresentation {
 }
 
 impl ToolPresentation {
+    pub(super) fn present_event(
+        &mut self,
+        console: &Console,
+        event: &Event,
+    ) -> Result<bool, String> {
+        self.record(event);
+        match &event.kind {
+            EventKind::ToolCompleted { call_id, .. } => console
+                .finish_tool_call(event.run_id, Some(&tool_call_key(event.run_id, call_id)))?,
+            EventKind::Completed { .. } | EventKind::Failed(_) | EventKind::Interrupted => {
+                console.finish_tool_call(event.run_id, None)?
+            }
+            EventKind::AssistantMessageCommitted { tool_calls, .. } if console.is_interactive() => {
+                let _frame_hold = console.hold_frames()?;
+                for call in tool_calls {
+                    let key = tool_call_key(event.run_id, &call.call_id);
+                    console.for_message(Some(key.clone())).write_tool_call(
+                        event.run_id,
+                        &key,
+                        &tool_call_roles(&call.name, &call.input, console.display_profile()?),
+                        ToolCallState::Queued,
+                    )?;
+                }
+            }
+            _ => {}
+        }
+        let Some(rendered) = self.render_event_roles(event, console.display_profile()?) else {
+            return Ok(false);
+        };
+        match &event.kind {
+            EventKind::ToolStarted {
+                call_id,
+                name,
+                input,
+            } if console.is_interactive() => {
+                console.write_tool_call(
+                    event.run_id,
+                    &tool_call_key(event.run_id, call_id),
+                    &tool_call_roles(name, input, console.display_profile()?),
+                    ToolCallState::Running,
+                )?;
+                if self.is_detailed() {
+                    console.write(&format!(
+                        "{}\n",
+                        safe_text(
+                            &serde_json::to_string_pretty(input)
+                                .map_err(|error| error.to_string())?
+                        )
+                    ))?;
+                }
+            }
+            _ => console.write_roles(&rendered)?,
+        }
+        Ok(true)
+    }
+
     pub(super) fn new(detailed: bool) -> Self {
         Self {
             detailed,
@@ -528,10 +585,42 @@ pub(super) fn tool_call_states(snapshot: &ChatSnapshot) -> HashMap<(Uuid, String
                         });
                 }
                 Content::ToolResult { tool_use_id, .. } => {
-                    states.insert((run, tool_use_id.clone()), ToolCallState::Finished);
+                    states
+                        .entry((run, tool_use_id.clone()))
+                        .and_modify(|state| {
+                            if *state != ToolCallState::Stopped {
+                                *state = ToolCallState::Finished;
+                            }
+                        })
+                        .or_insert(ToolCallState::Finished);
                 }
                 _ => {}
             }
+        }
+    }
+    // Interruption can synthesize ToolResults without admission. Observed
+    // transitions take precedence over the message-only saved-history fallback.
+    for event in &snapshot.events {
+        match &event.kind {
+            EventKind::AssistantMessageCommitted { tool_calls, .. } => {
+                for call in tool_calls {
+                    states.insert((event.run_id, call.call_id.clone()), ToolCallState::Queued);
+                }
+            }
+            EventKind::ToolStarted { call_id, .. } => {
+                states.insert((event.run_id, call_id.clone()), ToolCallState::Running);
+            }
+            EventKind::ToolCompleted { call_id, .. } => {
+                states.insert((event.run_id, call_id.clone()), ToolCallState::Finished);
+            }
+            EventKind::Completed { .. } | EventKind::Failed(_) | EventKind::Interrupted => {
+                for ((run, _), state) in &mut states {
+                    if *run == event.run_id {
+                        *state = state.after_run();
+                    }
+                }
+            }
+            _ => {}
         }
     }
     states
