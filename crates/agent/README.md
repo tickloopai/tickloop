@@ -331,3 +331,5 @@ The current Chat’s Ticks appear in a 42-column Tick List beside the conversati
 模型回复写入完整消息后，主界面立即显示剩余正文（含未换行尾行），不等待后续工具审批。提议工具先显示 Queued，准入／完成时更新原调用行；排队的问题先预览，到实际提问时才打开回答菜单。工具权限与执行顺序保持原契约。
 
 分隔线两侧的入口使用短横线边段与相邻空格：`─ ▾ Subagents N …`、`… ◉ Ticks N ─`，核心状态为 `… Auto · Model [· Context N% used] ─`；窄屏先省略边段，鼠标只命中 glyph 与标签。Subagents 展开后直接显示 Main 与子 Agent 列表，不再插入 items／打开提示摘要行。
+
+Subagents 的功能键提示保留原文本与按键行为，位于底部区域最后一行：展开时在列表后，收起时紧接分隔线；不在分隔线与成员之间插入提示。

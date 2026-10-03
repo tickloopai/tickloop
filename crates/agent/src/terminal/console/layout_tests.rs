@@ -104,7 +104,7 @@ fn agent_layout_background_notice_preserves_the_regular_status_and_result() {
         frame.iter().filter(|line| line.contains("⏵⏵ Auto")).count(),
         1
     );
-    assert!(line_with(&frame, "Agents 2").is_some(), "{frame:#?}");
+    assert!(line_with(&frame, "Subagents 1").is_some(), "{frame:#?}");
 }
 
 #[test]
@@ -222,7 +222,7 @@ fn agent_layout_background_titles_use_display_columns_and_the_family_reading_num
                 frame.iter().filter(|line| line.contains("⏵⏵ Auto")).count(),
                 1
             );
-            assert!(line_with(&frame, "Agents 3").is_some(), "{frame:#?}");
+            assert!(line_with(&frame, "Subagents 2").is_some(), "{frame:#?}");
         }
     }
 }
@@ -1490,7 +1490,7 @@ fn agent_layout_visible_family_summary_remains_navigable_after_footer_reset() {
     state.key(key(KeyCode::Down));
     let frame = state.frame().0;
     assert!(
-        frame.iter().any(|line| line.contains("2 items")),
+        frame.iter().any(|line| line.contains("Subagents 1")),
         "{frame:?}"
     );
     assert!(
@@ -1528,7 +1528,7 @@ fn agent_layout_required_connection_notice_borrows_one_row_without_changing_conf
             "{frame:?}"
         );
         assert!(
-            frame.iter().any(|line| line.contains("Agents")),
+            frame.iter().any(|line| line.contains("Subagents")),
             "{frame:?}"
         );
         assert!(
@@ -2172,7 +2172,7 @@ fn agent_layout_real_pty_budget_and_focus_matrix() {
                 .iter()
                 .enumerate()
                 .filter(|(_, row)| {
-                    row.starts_with("──") || row.contains("Agents ") && row.contains("─")
+                    row.starts_with("──") || row.contains("Subagents ") && row.contains("─")
                 })
                 .map(|(index, _)| index)
                 .collect::<Vec<_>>();

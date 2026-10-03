@@ -685,7 +685,16 @@ impl StatusArea {
                 .any(|item| item.id == FooterItemId::Agents);
         let render_header = !family_panel || !footer.items.is_empty();
         let summary = if family_panel {
-            String::new()
+            if render_header && summary_focused {
+                if self.agents_collapsed {
+                    "Enter/Space expand · Esc input"
+                } else {
+                    "Enter/Space hide · Esc input"
+                }
+                .to_owned()
+            } else {
+                String::new()
+            }
         } else if self.is_open()
             && let Some(panel) = self.visible
         {

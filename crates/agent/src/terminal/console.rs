@@ -6756,7 +6756,7 @@ impl State {
         if float_core_status {
             status_rows = status_rows.max(usize::from(
                 self.background_status_notice.is_some()
-                    || self.footer.selected().is_some()
+                    || self.footer.selected().is_some() && agents_entry.is_some()
                     || self.foreground_shell,
             ));
         }
@@ -7011,6 +7011,7 @@ impl State {
             }
             lines.push(divider);
         }
+        let family_notice_start = lines.len();
         if status_rows > 0 {
             let status_start = lines.len();
             let status = if self.status.starts_with(CREATION_ATTACH_UNAVAILABLE_PREFIX) {
@@ -7199,6 +7200,11 @@ impl State {
                 );
             }
         }
+        let family_notices = if agents_entry.is_some() && self.status_area.is_open() {
+            lines.split_off(family_notice_start)
+        } else {
+            Vec::new()
+        };
         let mut footer_bar_row = None;
         if panel_rows > 0 {
             if self.status_area.is_configured() {
@@ -7237,6 +7243,7 @@ impl State {
                 ));
             }
         }
+        lines.extend(family_notices);
         if !help.is_empty() {
             let all = agent_layout::help_lines(
                 self.width,
@@ -17068,17 +17075,17 @@ mod tests {
         state.footer.update(state.status_area.available_panels());
         let (lines, input_row, _) = state.frame();
         assert!(lines[input_row].starts_with('❯'));
-        assert!(lines[input_row + 1].contains("Agents 20"));
+        assert!(lines[input_row + 1].contains("Subagents 19"));
         state.key(key(KeyCode::Down));
         assert_eq!(state.footer.selected(), Some(FooterItemId::Agents));
         state.height = MIN_FOOTER_ITEMS_TERMINAL_ROWS - 1;
         let lines = state.frame().0;
-        assert!(lines.iter().all(|line| !line.contains("Agents 20")));
+        assert!(lines.iter().all(|line| !line.contains("Subagents 19")));
         assert_eq!(state.footer.selected(), None);
         state.height = 24;
         state.width = 23;
         let lines = state.frame().0;
-        assert!(lines.iter().any(|line| line.contains("Agents 20")));
+        assert!(lines.iter().any(|line| line.contains("Subagents 19")));
         assert!(lines.iter().all(|line| display_width(line) <= state.width));
         assert_eq!(state.footer.selected(), None);
     }

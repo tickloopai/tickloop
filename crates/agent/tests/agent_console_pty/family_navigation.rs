@@ -319,7 +319,11 @@ async fn run_family_navigation(fixture: &PrivateFixture) {
     assert!(!pty.frame().contains("reply completed"));
     pty.send(b"\r");
     pty.wait_for("focused Enter expands the family", |frame| {
-        family_rows_are_visible(frame) && frame.contains("Enter/Space hide")
+        family_rows_are_visible(frame)
+            && frame
+                .lines()
+                .rfind(|line| !line.trim().is_empty())
+                .is_some_and(|line| line.contains("Enter/Space hide"))
     })
     .await;
     pty.send(b" ");
@@ -329,7 +333,11 @@ async fn run_family_navigation(fixture: &PrivateFixture) {
     .await;
     super::unified_footer::click_category(&mut pty, "Subagents 2");
     pty.wait_for("mouse reopens the same family", |frame| {
-        family_rows_are_visible(frame) && frame.contains("Enter/Space hide")
+        family_rows_are_visible(frame)
+            && frame
+                .lines()
+                .rfind(|line| !line.trim().is_empty())
+                .is_some_and(|line| line.contains("Enter/Space hide"))
     })
     .await;
     pty.send(b"\x1b");

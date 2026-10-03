@@ -100,6 +100,8 @@ fn subagent_count_excludes_main_and_includes_the_child_currently_viewed() {
             "{rendered:?}"
         );
     }
+    key(&console, KeyCode::Down);
+    key(&console, KeyCode::Down);
     console
         .set_agent_family(
             vec![agent(1, None, "Main count probe")],
@@ -137,6 +139,30 @@ fn expanded_subagents_start_at_the_entry_without_an_items_or_blank_summary_row()
             rendered[entry + 2].contains("child summary probe"),
             "{rendered:?}"
         );
+        key(&console, KeyCode::Down);
+        let focused = frame(&console);
+        let entry = focused
+            .iter()
+            .position(|row| row.contains("Subagents 1"))
+            .unwrap();
+        assert!(
+            focused[entry + 1].contains("Main summary probe"),
+            "{focused:?}"
+        );
+        if width == 80 {
+            assert!(
+                focused.last().unwrap().contains("Enter/Space hide"),
+                "{focused:?}"
+            );
+            key(&console, KeyCode::Enter);
+            let collapsed = frame(&console);
+            assert!(
+                collapsed.last().unwrap().contains("Enter/Space expand"),
+                "{collapsed:?}"
+            );
+            key(&console, KeyCode::Enter);
+        }
+        key(&console, KeyCode::Esc);
         assert!(
             !rendered.iter().any(|row| row.contains("items")
                 || row.contains("↓ open")
@@ -679,7 +705,7 @@ fn core_status_is_always_right_aligned_with_styled_content_and_fallback() {
                 .iter()
                 .any(|span| span.text == "模型 fixture" && span.role == Some(Role::Text))
         );
-        state.resize(24, 24);
+        state.resize(12, 24);
         assert!(state.frame().0.iter().any(|row| row.starts_with("⏵⏵")));
         state.resize(80, 15);
         assert!(state.frame().0.iter().any(|row| row.starts_with("⏵⏵")));
@@ -820,7 +846,7 @@ fn agents_divider_toggle_uses_mouse_hitbox_and_focused_enter_space_without_reope
             .any(|row| row.contains("child unique")),
         "switching Agent keeps this View collapsed"
     );
-    click(12);
+    click(15);
     assert!(
         !frame(&console)
             .iter()

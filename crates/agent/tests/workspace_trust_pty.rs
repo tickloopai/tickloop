@@ -284,7 +284,7 @@ fn startup_trust_requires_the_complete_directory_before_confirmation_after_resiz
         terminal.wait(fixture.path("work").to_str().unwrap());
         terminal.wait("Enter confirm");
         terminal.send(b"\r");
-        terminal.wait("Context");
+        terminal.wait("⏵⏵ ");
         assert!(
             UserSettings::in_root(&fixture.path("config"))
                 .is_working_directory_trusted(&fixture.path("work"))
@@ -434,7 +434,7 @@ fn startup_trust_accepts_explicit_navigation_and_preserves_exact_scope_on_restar
         assert!(!fixture.path("config/settings.json").exists());
         terminal.send(navigation);
         terminal.send(b"\r\r");
-        terminal.wait("Context");
+        terminal.wait("⏵⏵ ");
         thread::sleep(Duration::from_millis(80));
         assert!(!fixture.path("config/projects").exists());
         let settings = UserSettings::in_root(&fixture.path("config"));
@@ -448,7 +448,7 @@ fn startup_trust_accepts_explicit_navigation_and_preserves_exact_scope_on_restar
         assert_eq!(terminal.exit_code(), 0);
         drop(terminal);
         let mut restarted = Terminal::start(&fixture, "fullscreen", &[]);
-        restarted.wait("Context");
+        restarted.wait("⏵⏵ ");
         assert!(
             !restarted
                 .output
@@ -495,7 +495,7 @@ fn startup_trust_short_write_failure_shows_the_error_and_requires_resize_before_
         terminal.wait("Cannot save directory trust:");
         terminal.wait("Yes, I trust this folder");
         terminal.send(b"\x0e\r");
-        terminal.wait("Context");
+        terminal.wait("⏵⏵ ");
         terminal.send(b"/exit\r");
         assert_eq!(terminal.exit_code(), 0);
         drop(terminal);
@@ -524,7 +524,7 @@ fn startup_trust_write_failure_stays_gated_and_requires_explicit_retry() {
             .is_working_directory_trusted(&fixture.path("work"))
     );
     terminal.send(b"\x0e\r");
-    terminal.wait("Context");
+    terminal.wait("⏵⏵ ");
     assert!(
         UserSettings::in_root(&fixture.path("config"))
             .is_working_directory_trusted(&fixture.path("work"))
@@ -560,7 +560,7 @@ fn startup_trust_navigation_and_repeated_enter_never_submit_a_model_request() {
     terminal.wait("Accessing workspace:");
     assert_eq!(probe.requests.load(Ordering::SeqCst), 0);
     terminal.send(b"j\r\r");
-    terminal.wait("Context");
+    terminal.wait("⏵⏵ ");
     thread::sleep(Duration::from_millis(100));
     assert_eq!(probe.requests.load(Ordering::SeqCst), 0);
     assert!(!fixture.path("config/projects").exists());
@@ -621,7 +621,7 @@ fn startup_trust_persists_the_exact_home_directory() {
     let mut terminal = Terminal::start(&fixture, "inline", &["--cwd", home.to_str().unwrap()]);
     terminal.wait("Accessing workspace:");
     terminal.send(b"j\r");
-    terminal.wait("Context");
+    terminal.wait("⏵⏵ ");
     let settings = UserSettings::in_root(&fixture.path("config"));
     assert!(settings.is_working_directory_trusted(&home));
     assert!(!settings.is_working_directory_trusted(&fixture.path("work")));
