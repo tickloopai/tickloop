@@ -188,6 +188,21 @@ impl Agent {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentNotificationDelivery {
+    Foreground,
+    Pending,
+    Queued,
+    Rejected(FamilyMessageRejection),
+}
+
+impl SubagentNotificationDelivery {
+    pub fn is_background(&self) -> bool {
+        !matches!(self, Self::Foreground)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct FamilyCompletion {
     pub child_chat_id: ChatId,
     pub child_loop_id: LoopId,
@@ -199,9 +214,112 @@ pub struct FamilyCompletion {
     pub started_at: Option<u64>,
     pub finished_at: u64,
     pub triggering_message_ids: Vec<Uuid>,
+    pub notification: SubagentNotificationDelivery,
+    pub usage: crate::model::Usage,
 }
 
 impl Agent {
+    pub(super) fn flush_subagent_notifications(
+        &self,
+        parent: ChatId,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            let pending = match self.snapshot(parent).await {
+                Ok(snapshot) => snapshot
+                    .family_completions
+                    .into_iter()
+                    .filter(|completion| {
+                        matches!(
+                            completion.notification,
+                            SubagentNotificationDelivery::Pending
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                Err(_) => return,
+            };
+            for completion in pending {
+                let child = Receipt {
+                    chat_id: completion.child_chat_id,
+                    loop_id: completion.child_loop_id,
+                    run_id: completion.child_run_id,
+                };
+                let Ok(snapshot) = self.snapshot(child.chat_id).await else {
+                    continue;
+                };
+                let Some(delegation) = snapshot.delegation else {
+                    continue;
+                };
+                let target = Receipt {
+                    chat_id: parent,
+                    loop_id: delegation.parent_loop_id,
+                    run_id: delegation.parent_run_id,
+                };
+                let outcome = self
+                    .deliver_subagent_notification(&child, &target, &completion)
+                    .await;
+                let delivery = match outcome {
+                    Ok(result) if !result.is_error => SubagentNotificationDelivery::Queued,
+                    Ok(result) => {
+                        let rejection = serde_json::from_str::<serde_json::Value>(&result.content)
+                            .ok()
+                            .and_then(|value| {
+                                serde_json::from_value::<FamilyMessageRejection>(
+                                    value["rejection"].clone(),
+                                )
+                                .ok()
+                            })
+                            .unwrap_or(FamilyMessageRejection {
+                                code: FamilyMessageRejectionCode::StaleTarget,
+                                message: "completion delivery rejected".into(),
+                            });
+                        if matches!(rejection.code, FamilyMessageRejectionCode::InboxFull) {
+                            break;
+                        }
+                        SubagentNotificationDelivery::Rejected(rejection)
+                    }
+                    Err(message) => {
+                        SubagentNotificationDelivery::Rejected(FamilyMessageRejection {
+                            code: FamilyMessageRejectionCode::StaleTarget,
+                            message,
+                        })
+                    }
+                };
+                let mut chats = self.inner.chats.lock().await;
+                let Some(chat) = chats.get_mut(&parent) else {
+                    return;
+                };
+                if let Some(record) = chat
+                    .snapshot
+                    .family_completions
+                    .iter_mut()
+                    .find(|record| record.child_run_id == completion.child_run_id)
+                {
+                    record.notification = delivery;
+                    if matches!(
+                        record.notification,
+                        SubagentNotificationDelivery::Rejected(_)
+                    ) {
+                        let updated = record.clone();
+                        self.emit(
+                            chat,
+                            &target,
+                            EventKind::FamilyRunCompleted {
+                                completion: updated,
+                            },
+                        );
+                    }
+                }
+                if let Some(recorder) = &self.inner.recorder {
+                    recorder.record_family_completions(
+                        parent,
+                        chat.snapshot.family_completions.clone(),
+                    );
+                }
+                self.save(&chat.snapshot);
+            }
+        })
+    }
+
     pub(super) async fn record_family_completion(&self, child: &Receipt, snapshot: &ChatSnapshot) {
         let Some(delegation) = snapshot.delegation.as_ref() else {
             return;
@@ -222,7 +340,39 @@ impl Agent {
                 None
             }
         });
+        let background = self
+            .inner
+            .subagent_invocations
+            .lock()
+            .await
+            .values()
+            .find(|invocation| invocation.receipt.run_id == child.run_id)
+            .map_or_else(
+                || {
+                    snapshot
+                        .messages
+                        .iter()
+                        .enumerate()
+                        .find(|(index, message)| {
+                            message.role == Role::User
+                                && snapshot.message_runs.get(index) == Some(&child.run_id)
+                        })
+                        .is_none_or(|(index, _)| {
+                            !snapshot.prompt_execution_modes.contains_key(&index)
+                        })
+                },
+                |invocation| invocation.run_in_background,
+            );
         let completion = FamilyCompletion {
+            notification: if background {
+                SubagentNotificationDelivery::Pending
+            } else {
+                SubagentNotificationDelivery::Foreground
+            },
+            usage: snapshot
+                .request_usage
+                .run_conversation_usage(child.run_id)
+                .unwrap_or_default(),
             child_chat_id: child.chat_id,
             child_loop_id: child.loop_id,
             child_run_id: child.run_id,
@@ -244,9 +394,12 @@ impl Agent {
             let Some(parent) = chats.get_mut(&delegation.parent_chat_id) else {
                 return;
             };
-            if !parent.snapshot.family_completions.iter().any(|record| {
+            if parent.snapshot.family_completions.iter().any(|record| {
                 record.child_chat_id == child.chat_id && record.child_run_id == child.run_id
             }) {
+                return;
+            }
+            {
                 parent.snapshot.family_completions.push(completion.clone());
                 if let Some(recorder) = &self.inner.recorder {
                     recorder.record_family_completions(
@@ -262,31 +415,15 @@ impl Agent {
                 self.emit(
                     parent,
                     &parent_receipt,
-                    EventKind::FamilyRunCompleted { completion },
+                    EventKind::FamilyRunCompleted {
+                        completion: completion.clone(),
+                    },
                 );
                 self.save(&parent.snapshot);
             }
         }
-        let waiting_parent = self
-            .inner
-            .parent_result_waits
-            .lock()
-            .await
-            .remove(&child.run_id);
-        if let Some(parent) = waiting_parent
-            && let Some(outcome) = agent_messages::child_run_result(
-                snapshot,
-                child,
-                &parent,
-                self.subagent_registration(child.chat_id)
-                    .await
-                    .ok()
-                    .flatten()
-                    .as_ref(),
-            )
-        {
-            let _ = self
-                .deliver_child_result(child, &parent, &outcome.content)
+        if completion.notification.is_background() {
+            self.flush_subagent_notifications(delegation.parent_chat_id)
                 .await;
         }
     }

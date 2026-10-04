@@ -7041,6 +7041,8 @@ mod tests {
             state: Some(crate::runtime::LoopState::Completed),
         };
         let completion = crate::runtime::FamilyCompletion {
+            notification: crate::runtime::SubagentNotificationDelivery::Pending,
+            usage: Default::default(),
             child_chat_id: record.target_chat_id,
             child_loop_id: loop_id,
             child_run_id: run,
@@ -7099,6 +7101,204 @@ mod tests {
             text.contains("Reply from @audit")
                 && text.contains("Actual reply preview")
                 && text.contains("Actual child completion")
+        );
+        observation.events.retain(|event| event.sequence > 2);
+        super::render_restored_observation(
+            &console,
+            &agent,
+            &mut tools,
+            chat,
+            2,
+            &mut std::collections::HashMap::new(),
+            observation,
+        )
+        .unwrap();
+        assert_eq!(
+            console
+                .test_conversation_text()
+                .matches("Actual reply preview")
+                .count(),
+            1
+        );
+        agent.shutdown().await;
+    }
+    #[tokio::test]
+    async fn cached_event_recovery_suppresses_foreground_completion_notifications() {
+        let chat = uuid::Uuid::new_v4();
+        let run = uuid::Uuid::new_v4();
+        let loop_id = uuid::Uuid::new_v4();
+        let record = crate::runtime::FamilyInputRecord {
+            message_id: uuid::Uuid::new_v4(),
+            target_chat_id: uuid::Uuid::new_v4(),
+            target_handle: "audit".into(),
+            target_run_id: run,
+            submitted_at: 1,
+            response: Some("Actual reply preview".into()),
+            state: Some(crate::runtime::LoopState::Completed),
+        };
+        let completion = crate::runtime::FamilyCompletion {
+            notification: crate::runtime::SubagentNotificationDelivery::Foreground,
+            usage: Default::default(),
+            child_chat_id: record.target_chat_id,
+            child_loop_id: loop_id,
+            child_run_id: run,
+            handle: "audit".into(),
+            state: crate::runtime::LoopState::Completed,
+            result: "Actual child completion".into(),
+            error: None,
+            started_at: Some(1),
+            finished_at: 2,
+            triggering_message_ids: vec![],
+        };
+        let mut snapshot: super::ChatSnapshot = serde_json::from_value(
+            serde_json::json!({"id":chat,"workdir":"/test","messages":[],"loops":[]}),
+        )
+        .unwrap();
+        snapshot.events = vec![
+            crate::runtime::Event {
+                sequence: 1,
+                chat_id: chat,
+                loop_id,
+                run_id: run,
+                kind: crate::runtime::EventKind::FamilyInputUpdated { record },
+            },
+            crate::runtime::Event {
+                sequence: 2,
+                chat_id: chat,
+                loop_id,
+                run_id: run,
+                kind: crate::runtime::EventKind::FamilyRunCompleted { completion },
+            },
+        ];
+        snapshot.last_sequence = 2;
+        let mut observation = crate::runtime::Observation {
+            events: snapshot.events.clone(),
+            snapshot,
+            reset_required: false,
+        };
+        let console = super::Console::test_interactive_for_chat(chat);
+        let agent = super::Agent::new_embedded(
+            super::test_support::config(),
+            std::sync::Arc::new(super::test_support::ScriptedModel::new(vec![])),
+        );
+        let mut tools = super::ToolPresentation::new(true);
+        super::render_restored_observation(
+            &console,
+            &agent,
+            &mut tools,
+            chat,
+            0,
+            &mut std::collections::HashMap::new(),
+            observation.clone(),
+        )
+        .unwrap();
+        let text = console.test_conversation_text();
+        assert!(
+            text.contains("Reply from @audit")
+                && text.contains("Actual reply preview")
+                && !text.contains("Actual child completion")
+        );
+        observation.events.retain(|event| event.sequence > 2);
+        super::render_restored_observation(
+            &console,
+            &agent,
+            &mut tools,
+            chat,
+            2,
+            &mut std::collections::HashMap::new(),
+            observation,
+        )
+        .unwrap();
+        assert_eq!(
+            console
+                .test_conversation_text()
+                .matches("Actual reply preview")
+                .count(),
+            1
+        );
+        agent.shutdown().await;
+    }
+    #[tokio::test]
+    async fn cached_event_recovery_displays_completion_delivery_refusal() {
+        let chat = uuid::Uuid::new_v4();
+        let run = uuid::Uuid::new_v4();
+        let loop_id = uuid::Uuid::new_v4();
+        let record = crate::runtime::FamilyInputRecord {
+            message_id: uuid::Uuid::new_v4(),
+            target_chat_id: uuid::Uuid::new_v4(),
+            target_handle: "audit".into(),
+            target_run_id: run,
+            submitted_at: 1,
+            response: Some("Actual reply preview".into()),
+            state: Some(crate::runtime::LoopState::Completed),
+        };
+        let completion = crate::runtime::FamilyCompletion {
+            notification: crate::runtime::SubagentNotificationDelivery::Rejected(
+                crate::runtime::FamilyMessageRejection {
+                    code: crate::runtime::FamilyMessageRejectionCode::StaleTarget,
+                    message: "The receiving parent is stopped".into(),
+                },
+            ),
+            usage: Default::default(),
+            child_chat_id: record.target_chat_id,
+            child_loop_id: loop_id,
+            child_run_id: run,
+            handle: "audit".into(),
+            state: crate::runtime::LoopState::Completed,
+            result: "Actual child completion".into(),
+            error: None,
+            started_at: Some(1),
+            finished_at: 2,
+            triggering_message_ids: vec![],
+        };
+        let mut snapshot: super::ChatSnapshot = serde_json::from_value(
+            serde_json::json!({"id":chat,"workdir":"/test","messages":[],"loops":[]}),
+        )
+        .unwrap();
+        snapshot.events = vec![
+            crate::runtime::Event {
+                sequence: 1,
+                chat_id: chat,
+                loop_id,
+                run_id: run,
+                kind: crate::runtime::EventKind::FamilyInputUpdated { record },
+            },
+            crate::runtime::Event {
+                sequence: 2,
+                chat_id: chat,
+                loop_id,
+                run_id: run,
+                kind: crate::runtime::EventKind::FamilyRunCompleted { completion },
+            },
+        ];
+        snapshot.last_sequence = 2;
+        let mut observation = crate::runtime::Observation {
+            events: snapshot.events.clone(),
+            snapshot,
+            reset_required: false,
+        };
+        let console = super::Console::test_interactive_for_chat(chat);
+        let agent = super::Agent::new_embedded(
+            super::test_support::config(),
+            std::sync::Arc::new(super::test_support::ScriptedModel::new(vec![])),
+        );
+        let mut tools = super::ToolPresentation::new(true);
+        super::render_restored_observation(
+            &console,
+            &agent,
+            &mut tools,
+            chat,
+            0,
+            &mut std::collections::HashMap::new(),
+            observation.clone(),
+        )
+        .unwrap();
+        let text = console.test_conversation_text();
+        assert!(
+            text.contains("Reply from @audit")
+                && text.contains("Actual reply preview")
+                && text.contains("Actual child completion")
+                && text.contains("Notification not delivered: The receiving parent is stopped")
         );
         observation.events.retain(|event| event.sequence > 2);
         super::render_restored_observation(

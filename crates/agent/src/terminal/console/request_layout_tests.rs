@@ -4,7 +4,7 @@ use tickloop_agent::runtime::{Question, QuestionOption, QuestionRequest};
 
 const REQUEST: Uuid = Uuid::from_u128(480);
 const DESCRIPTION: &str =
-    "用 DelegateAgent 起 4 个并行子 Agent，各自 sleep 对应时长后返回；会占用 4 个模型会话。";
+    "用 Subagent 起 4 个并行子 Agent，各自 sleep 对应时长后返回；会占用 4 个模型会话。";
 
 fn question_console(width: u16, height: u16, multi_select: bool) -> Console {
     let mut state = State::new(true, width, height);
@@ -57,7 +57,7 @@ fn request_question_descriptions_and_other_use_separate_physical_rows() {
         assert!(text[selected_row].contains("4 个子 Agent"), "{text:?}");
         let description = text
             .iter()
-            .position(|line| line.contains("用 DelegateAgent"))
+            .position(|line| line.contains("用 Subagent"))
             .unwrap();
         assert!(selected_row < description, "{text:?}");
         assert!(

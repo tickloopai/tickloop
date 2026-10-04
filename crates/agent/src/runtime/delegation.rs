@@ -9,7 +9,14 @@ use crate::{
     tools::{PreparedTool, ToolResult, Workspace},
 };
 
-pub const DELEGATE_AGENT_TOOL_NAME: &str = "DelegateAgent";
+pub const SUBAGENT_TOOL_NAME: &str = "Subagent";
+
+#[derive(Clone)]
+pub(super) struct SubagentInvocation {
+    pub receipt: Receipt,
+    pub run_in_background: bool,
+}
+
 pub const MAX_SUBAGENT_HANDLE_CHARACTERS: usize = 32;
 const MAX_LABEL_INPUT_CHARACTERS: usize = 160;
 
@@ -49,10 +56,11 @@ pub struct DelegationMetadata {
 
 pub(super) fn definitions() -> Vec<ToolDefinition> {
     vec![ToolDefinition {
-        name: DELEGATE_AGENT_TOOL_NAME.into(),
-        description: "Delegate one bounded task to an independent child Agent and wait for its actual result. Incoming user context or child messages yield this wait while the child keeps working; use SendMessage to reply or steer it and WaitForAgent to observe its result. A yielded wait also delivers the eventual child result to your inbox. If required_action=finish_current_turn is returned, finish this turn to advance a pending after-turn human command instead of waiting again. The child inherits this task's working directories, host context and permission ceiling; follow-up input cannot expand them. The child has its own identity, Loop and approval/question requests. Interrupting this wait does not stop the child. Nested delegation, history rewrites and unrestricted Shell commands are unsupported. This creates a new task, not a Branch or a copy of your conversation.".into(),
+        name: SUBAGENT_TOOL_NAME.into(),
+        description: "Create one bounded independent child under your frozen resource and permission ceiling. Foreground waits for its final report. Set run_in_background=true to return immediately; completion arrives automatically as a task notification. Messages arrive automatically, so finish a turn after asking for clarification. Name and description identify the child separately from its task. The child has its own identity, Loop and approval/question requests. Interrupting foreground observation does not stop the child. Nested delegation, history rewrites and unrestricted Shell are unavailable.".into(),
         input_schema: json!({"type":"object","properties":{
             "task":{"type":"string","minLength":1},
+            "run_in_background":{"type":"boolean","default":false,"description":"Return immediately and receive the final report as an automatic task notification."},
             "name":{"type":"string","minLength":1,"description":"Short lowercase agent name, such as file-check; unique within this parent's children."},
             "description":{"type":"string","minLength":1,"description":"Short 3–5 word task description for the Subagents list; defaults to task."}
         },"required":["task"],"additionalProperties":false}),
@@ -187,7 +195,7 @@ pub(super) fn check_call(
             return Err("Unsupported: the parent's current approval restriction is not represented in this child's frozen authorization; this operation cannot proceed".into());
         }
     }
-    if name == DELEGATE_AGENT_TOOL_NAME {
+    if name == SUBAGENT_TOOL_NAME {
         return Err("Unsupported: nested delegation is unavailable for this child".into());
     }
     if ceiling
@@ -436,7 +444,7 @@ impl Agent {
         Ok(())
     }
 
-    pub(super) fn delegation_tool<'a>(
+    pub(super) fn subagent_tool<'a>(
         &'a self,
         parent: &'a Receipt,
         call_id: &'a str,
@@ -450,6 +458,11 @@ impl Agent {
                 .filter(|task| !task.is_empty())
                 .ok_or("delegation task cannot be empty")?
                 .to_owned();
+            let run_in_background = input
+                .get("run_in_background")
+                .map(|value| value.as_bool().ok_or("run_in_background must be a boolean"))
+                .transpose()?
+                .unwrap_or(false);
             let requested_name = optional_label(input, "name")?;
             let description =
                 optional_label(input, "description")?.unwrap_or_else(|| compact_description(&task));
@@ -459,12 +472,11 @@ impl Agent {
                 .collect::<Vec<_>>()
                 .join(" ");
             let mut events = self.subscribe();
-            let mut input_wakeup = self.inner.input_wakeup.subscribe();
-            let child = {
-                let mut delegations = self.inner.delegations.lock().await;
+            let invocation = {
+                let mut invocations = self.inner.subagent_invocations.lock().await;
                 let key = (parent.run_id, call_id.to_owned());
-                if let Some(receipt) = delegations.get(&key) {
-                    receipt.clone()
+                if let Some(invocation) = invocations.get(&key) {
+                    invocation.clone()
                 } else {
                     if cancel.is_cancelled() {
                         return Err("delegation interrupted before child creation".into());
@@ -496,8 +508,17 @@ impl Agent {
                             ),
                         )
                     };
-                    let cause = family_mailbox::current_cause(&snapshot, parent)
+                    let mut cause = family_mailbox::current_cause(&snapshot, parent)
                         .map_err(|rejection| rejection.message)?;
+                    cause.depth = cause.depth.saturating_add(1);
+                    if cause.depth > family_mailbox::MAX_MESSAGE_DEPTH {
+                        return Ok(FamilyMessageRejection {
+                            code: FamilyMessageRejectionCode::DepthLimit,
+                            message: "Subagent causal depth exhausted; do not retry automatically"
+                                .into(),
+                        }
+                        .result());
+                    }
                     let mut policy = snapshot.policy.clone();
                     for rules in [
                         &mut policy.rules,
@@ -635,10 +656,31 @@ impl Agent {
                         )
                         .await
                         .map_err(|error| error.to_string())?;
-                    delegations.insert(key, receipt.clone());
-                    receipt
+                    let invocation = SubagentInvocation {
+                        receipt,
+                        run_in_background,
+                    };
+                    invocations.insert(key, invocation.clone());
+                    invocation
                 }
             };
+            let child = invocation.receipt;
+            if invocation.run_in_background {
+                let registration = self
+                    .subagent_registration(child.chat_id)
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .ok_or("child handle is unavailable")?;
+                return Ok(ToolResult {
+                    content: json!({"status":"async_launched", "child_chat_id":child.chat_id,
+                        "child_loop_id":child.loop_id,"child_run_id":child.run_id,
+                        "handle":registration.handle,"description":registration.description,
+                        "created_at":registration.created_at})
+                    .to_string(),
+                    is_error: false,
+                    output_ref: None,
+                });
+            }
             loop {
                 let snapshot = self
                     .snapshot(child.chat_id)
@@ -656,23 +698,11 @@ impl Agent {
                 ) {
                     return Ok(result);
                 }
-                if let Some(reason) = self.agent_wait_input(parent).await {
-                    self.register_parent_result_delivery(parent.clone(), child.clone())
-                        .await;
-                    return Ok(ToolResult {
-                        content: json!({"status":"running","child_chat_id":child.chat_id,
-                            "handle":registration.as_ref().map(|registration|registration.handle.as_str()),"description":registration.as_ref().map(|registration|registration.description.as_str()),"created_at":registration.as_ref().map(|registration|registration.created_at),
-                            "child_loop_id":child.loop_id,"child_run_id":child.run_id,
-                            "wait_reason":reason,"required_action":(reason=="after_turn_queue").then_some("finish_current_turn")}).to_string(),
-                        is_error:false, output_ref:None,
-                    });
-                }
                 tokio::select! {
                     _ = cancel.cancelled() => return Ok(ToolResult {
-                        content:json!({"status":"wait_interrupted","child_chat_id":child.chat_id,"handle":registration.as_ref().map(|registration|registration.handle.as_str()),"description":registration.as_ref().map(|registration|registration.description.as_str()),"created_at":registration.as_ref().map(|registration|registration.created_at),"child_loop_id":child.loop_id,"child_run_id":child.run_id,"error":"Delegation wait interrupted; the child Agent remains independently active."}).to_string(),
+                        content:json!({"status":"interrupted","child_chat_id":child.chat_id,"handle":registration.as_ref().map(|registration|registration.handle.as_str()),"description":registration.as_ref().map(|registration|registration.description.as_str()),"created_at":registration.as_ref().map(|registration|registration.created_at),"child_loop_id":child.loop_id,"child_run_id":child.run_id,"error":"Foreground observation interrupted; the child Agent remains independently active."}).to_string(),
                         is_error:true,output_ref:None,
                     }),
-                    _ = input_wakeup.changed()=>{},
                     event = events.recv() => match event {
                         Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {},
                         Err(broadcast::error::RecvError::Closed) => return Err("Agent event stream closed while observing child".into()),
