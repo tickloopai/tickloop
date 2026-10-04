@@ -10,6 +10,16 @@ use crate::{
 };
 
 pub const DELEGATE_AGENT_TOOL_NAME: &str = "DelegateAgent";
+pub const MAX_SUBAGENT_HANDLE_CHARACTERS: usize = 32;
+const MAX_LABEL_INPUT_CHARACTERS: usize = 160;
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SubagentRegistration {
+    pub child_chat_id: ChatId,
+    pub handle: String,
+    pub description: String,
+    pub created_at: u64,
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct DelegationCeiling {
@@ -41,8 +51,83 @@ pub(super) fn definitions() -> Vec<ToolDefinition> {
     vec![ToolDefinition {
         name: DELEGATE_AGENT_TOOL_NAME.into(),
         description: "Delegate one bounded task to an independent child Agent and wait for its actual result. Incoming user context or child messages yield this wait while the child keeps working; use SendMessage to reply or steer it and WaitForAgent to observe its result. A yielded wait also delivers the eventual child result to your inbox. If required_action=finish_current_turn is returned, finish this turn to advance a pending after-turn human command instead of waiting again. The child inherits this task's working directories, host context and permission ceiling; follow-up input cannot expand them. The child has its own identity, Loop and approval/question requests. Interrupting this wait does not stop the child. Nested delegation, history rewrites and unrestricted Shell commands are unsupported. This creates a new task, not a Branch or a copy of your conversation.".into(),
-        input_schema: json!({"type":"object","properties":{"task":{"type":"string","minLength":1}},"required":["task"],"additionalProperties":false}),
+        input_schema: json!({"type":"object","properties":{
+            "task":{"type":"string","minLength":1},
+            "name":{"type":"string","minLength":1,"description":"Short lowercase agent name, such as file-check; unique within this parent's children."},
+            "description":{"type":"string","minLength":1,"description":"Short 3–5 word task description for the Subagents list; defaults to task."}
+        },"required":["task"],"additionalProperties":false}),
     }]
+}
+
+fn optional_label(input: &Value, field: &str) -> Result<Option<String>, String> {
+    input.get(field).map(|value| {
+        let original = value.as_str().ok_or_else(|| format!("delegation {field} must be text"))?;
+        let label=original.trim();
+        if label.is_empty() || original.chars().any(char::is_control) || label.chars().count() > MAX_LABEL_INPUT_CHARACTERS {
+            return Err(format!("delegation {field} must contain 1–{MAX_LABEL_INPUT_CHARACTERS} printable characters"));
+        }
+        Ok(label.to_owned())
+    }).transpose()
+}
+
+fn compact_description(task: &str) -> String {
+    task.chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(MAX_LABEL_INPUT_CHARACTERS)
+        .collect()
+}
+
+fn agent_name_slug(label: &str) -> String {
+    let mut slug = String::new();
+    for character in label.chars() {
+        if character.is_ascii_alphanumeric() {
+            slug.push(character.to_ascii_lowercase());
+        } else if !slug.is_empty() && !slug.ends_with('-') {
+            slug.push('-');
+        }
+        if slug.len() >= MAX_SUBAGENT_HANDLE_CHARACTERS {
+            break;
+        }
+    }
+    let slug = slug.trim_end_matches('-');
+    if slug.is_empty() {
+        "agent".into()
+    } else {
+        slug.into()
+    }
+}
+
+fn unique_agent_name(label: &str, used: &[String]) -> String {
+    let base = agent_name_slug(label);
+    let available = |name: &str| {
+        !matches!(name, "main" | "parent")
+            && !used.iter().any(|used| used.eq_ignore_ascii_case(name))
+    };
+    if available(&base) {
+        return base;
+    }
+    for ordinal in 2.. {
+        let suffix = format!("-{ordinal}");
+        let prefix = &base[..base
+            .len()
+            .min(MAX_SUBAGENT_HANDLE_CHARACTERS.saturating_sub(suffix.len()))];
+        let candidate = format!("{}{suffix}", prefix.trim_end_matches('-'));
+        if available(&candidate) {
+            return candidate;
+        }
+    }
+    unreachable!()
 }
 
 pub(super) fn check_call(
@@ -155,6 +240,47 @@ pub(super) fn check_call(
 }
 
 impl Agent {
+    pub async fn subagents(&self, parent: ChatId) -> Result<Vec<SubagentRegistration>, AgentError> {
+        let mut registry = self.inner.subagent_registry.lock().await;
+        if let Some(entries) = registry.get(&parent) {
+            return Ok(entries.clone());
+        }
+        let entries = match &self.inner.recorder {
+            Some(recorder) => recorder.read_subagents(parent)?,
+            None => return Err(AgentError::NotFound),
+        };
+        registry.insert(parent, entries.clone());
+        Ok(entries)
+    }
+
+    pub async fn subagent_registration(
+        &self,
+        child: ChatId,
+    ) -> Result<Option<SubagentRegistration>, AgentError> {
+        let parent = self
+            .inner
+            .chats
+            .lock()
+            .await
+            .get(&child)
+            .ok_or(AgentError::NotFound)?
+            .snapshot
+            .delegation
+            .as_ref()
+            .map(|metadata| metadata.parent_chat_id);
+        let Some(parent) = parent else {
+            return Ok(None);
+        };
+        self.subagents(parent)
+            .await?
+            .into_iter()
+            .find(|registration| registration.child_chat_id == child)
+            .map(Some)
+            .ok_or_else(|| {
+                AgentError::Invalid("Subagent is missing its immutable family registration".into())
+            })
+    }
+
     pub(super) async fn check_delegated_host_tool(
         &self,
         receipt: &Receipt,
@@ -324,6 +450,14 @@ impl Agent {
                 .filter(|task| !task.is_empty())
                 .ok_or("delegation task cannot be empty")?
                 .to_owned();
+            let requested_name = optional_label(input, "name")?;
+            let description =
+                optional_label(input, "description")?.unwrap_or_else(|| compact_description(&task));
+            let fallback_name = description
+                .split_whitespace()
+                .take(3)
+                .collect::<Vec<_>>()
+                .join(" ");
             let mut events = self.subscribe();
             let mut input_wakeup = self.inner.input_wakeup.subscribe();
             let child = {
@@ -335,7 +469,11 @@ impl Agent {
                     if cancel.is_cancelled() {
                         return Err("delegation interrupted before child creation".into());
                     }
-                    let (snapshot, client, output_style, session_denials) = {
+                    let registrations = self
+                        .subagents(parent.chat_id)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    let (snapshot, client, output_style, session_denials, name) = {
                         let chats = self.inner.chats.lock().await;
                         let chat = chats.get(&parent.chat_id).ok_or("parent is unavailable")?;
                         if chat.snapshot.delegation.is_some() {
@@ -349,8 +487,17 @@ impl Agent {
                             chat.client.clone(),
                             chat.output_style,
                             sessions.freeze_denials(parent_owner),
+                            unique_agent_name(
+                                requested_name.as_deref().unwrap_or(&fallback_name),
+                                &registrations
+                                    .iter()
+                                    .map(|registration| registration.handle.clone())
+                                    .collect::<Vec<_>>(),
+                            ),
                         )
                     };
+                    let cause = family_mailbox::current_cause(&snapshot, parent)
+                        .map_err(|rejection| rejection.message)?;
                     let mut policy = snapshot.policy.clone();
                     for rules in [
                         &mut policy.rules,
@@ -391,6 +538,12 @@ impl Agent {
                     if let Some(context) = &mut host_context {
                         context.interaction = None;
                     }
+                    let registration = SubagentRegistration {
+                        child_chat_id: Uuid::new_v4(),
+                        handle: name,
+                        description: description.clone(),
+                        created_at: crate::private_fs::unix_time_milliseconds(),
+                    };
                     let metadata = DelegationMetadata {
                         delegation_id: Uuid::new_v4(),
                         parent_chat_id: parent.chat_id,
@@ -432,28 +585,42 @@ impl Agent {
                                 .collect(),
                         },
                     };
-                    let sender_label = agent_messages::family_label(&snapshot, parent.loop_id);
+                    let sender_label = agent_messages::family_label(&snapshot, None);
                     let child_id = self
                         .create_chat_with_delegation(
-                            Uuid::new_v4(),
+                            registration.child_chat_id,
                             snapshot.workdir.clone(),
                             Some((metadata.clone(), snapshot, client, output_style)),
                         )
                         .await
                         .map_err(|error| error.to_string())?;
+                    {
+                        let mut registry = self.inner.subagent_registry.lock().await;
+                        let entries = registry.entry(parent.chat_id).or_default();
+                        entries.push(registration);
+                        if let Some(recorder) = &self.inner.recorder {
+                            recorder.record_subagents(parent.chat_id, entries.clone());
+                        }
+                    }
                     if let Some(context) = host_context {
                         self.set_host_work_context(child_id, context)
                             .await
                             .map_err(|error| error.to_string())?;
                     }
+
                     let source = AgentMessageSource {
+                        cause,
                         message_id: Uuid::new_v4(),
+                        call_id: None,
+                        created_at: crate::private_fs::unix_time_milliseconds(),
                         sender_chat_id: parent.chat_id,
                         sender_loop_id: parent.loop_id,
                         sender_run_id: parent.run_id,
                         sender_relationship: "parent".into(),
                         is_result: false,
                         sender_label,
+                        sender_handle: "main".into(),
+                        relay: None,
                     };
                     let receipt = self
                         .submit_internal(
@@ -477,14 +644,24 @@ impl Agent {
                     .snapshot(child.chat_id)
                     .await
                     .map_err(|error| error.to_string())?;
-                if let Some(result) = agent_messages::child_run_result(&snapshot, &child, parent) {
+                let registration = self
+                    .subagent_registration(child.chat_id)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                if let Some(result) = agent_messages::child_run_result(
+                    &snapshot,
+                    &child,
+                    parent,
+                    registration.as_ref(),
+                ) {
                     return Ok(result);
                 }
                 if let Some(reason) = self.agent_wait_input(parent).await {
-                    self.observe_delegated_result(parent.clone(), child.clone())
+                    self.register_parent_result_delivery(parent.clone(), child.clone())
                         .await;
                     return Ok(ToolResult {
                         content: json!({"status":"running","child_chat_id":child.chat_id,
+                            "handle":registration.as_ref().map(|registration|registration.handle.as_str()),"description":registration.as_ref().map(|registration|registration.description.as_str()),"created_at":registration.as_ref().map(|registration|registration.created_at),
                             "child_loop_id":child.loop_id,"child_run_id":child.run_id,
                             "wait_reason":reason,"required_action":(reason=="after_turn_queue").then_some("finish_current_turn")}).to_string(),
                         is_error:false, output_ref:None,
@@ -492,7 +669,7 @@ impl Agent {
                 }
                 tokio::select! {
                     _ = cancel.cancelled() => return Ok(ToolResult {
-                        content:json!({"status":"wait_interrupted","child_chat_id":child.chat_id,"child_loop_id":child.loop_id,"child_run_id":child.run_id,"error":"Delegation wait interrupted; the child Agent remains independently active."}).to_string(),
+                        content:json!({"status":"wait_interrupted","child_chat_id":child.chat_id,"handle":registration.as_ref().map(|registration|registration.handle.as_str()),"description":registration.as_ref().map(|registration|registration.description.as_str()),"created_at":registration.as_ref().map(|registration|registration.created_at),"child_loop_id":child.loop_id,"child_run_id":child.run_id,"error":"Delegation wait interrupted; the child Agent remains independently active."}).to_string(),
                         is_error:true,output_ref:None,
                     }),
                     _ = input_wakeup.changed()=>{},

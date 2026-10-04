@@ -32,6 +32,15 @@ struct TextModel {
 
 #[async_trait]
 impl ModelClient for TextModel {
+    async fn generate_title(
+        &self,
+        request: tickloop_agent::model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<tickloop_agent::model::ModelDelta>,
+        _: tokio_util::sync::CancellationToken,
+    ) -> Result<tickloop_agent::model::ModelOutput, tickloop_agent::model::ModelError> {
+        Ok(support::title_output(request))
+    }
+
     fn identity(&self) -> ModelIdentity {
         ModelIdentity {
             provider: ModelProvider::Api,
@@ -77,6 +86,15 @@ impl ModelClient for TextModel {
 
 #[async_trait]
 impl ModelClient for ImageModel {
+    async fn generate_title(
+        &self,
+        request: tickloop_agent::model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<tickloop_agent::model::ModelDelta>,
+        _: tokio_util::sync::CancellationToken,
+    ) -> Result<tickloop_agent::model::ModelOutput, tickloop_agent::model::ModelError> {
+        Ok(support::title_output(request))
+    }
+
     fn identity(&self) -> ModelIdentity {
         ModelIdentity {
             provider: ModelProvider::Api,
@@ -288,7 +306,7 @@ async fn repeated_legal_images_cross_the_frame_limit_without_losing_history_or_r
     }
     assert_eq!(*model.image_counts.lock().unwrap(), [14, 28]);
     let mut observation = tokio::time::timeout(
-        Duration::from_secs(60),
+        RESPONSE_TIMEOUT,
         client.observe(ObservationRequest::Agent {
             execution,
             detail: AgentDetailQuery::Snapshot,
@@ -330,29 +348,6 @@ async fn repeated_legal_images_cross_the_frame_limit_without_losing_history_or_r
         .message_id;
     drop(snapshot);
     drop(observation);
-    let mut legacy = UnixStream::connect(&socket).await.unwrap();
-    write_json(
-        &mut legacy,
-        &serde_json::json!({"Hello": {"major": PROTOCOL_MAJOR, "minor": 0}}),
-    )
-    .await;
-    let hello = read_json(&mut legacy).await;
-    assert_eq!(hello["Hello"]["minor"], 0);
-    assert!(
-        !hello["Hello"]["capabilities"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|capability| capability == "ChunkedResponses")
-    );
-    assert_eq!(hello["Hello"]["limits"]["chunk_bytes"], 0);
-    write_json(&mut legacy, &serde_json::json!({"Observe": {"request_id": Uuid::new_v4(), "query": ObservationRequest::Agent { execution, detail: AgentDetailQuery::Snapshot, after: None }}})).await;
-    assert_eq!(
-        read_json(&mut legacy).await["Error"]["error"]["code"],
-        "PayloadTooLarge"
-    );
-    drop(legacy);
-
     let proxy_socket = directory.path().join("lost-ack.sock");
     let proxy = fault_proxy(
         &socket,

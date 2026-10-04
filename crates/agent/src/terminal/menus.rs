@@ -3271,14 +3271,16 @@ impl Menus {
     }
 }
 
-/// Names a requester as its rows and background notices do: its task title, plus this View's
-/// reading number when another Agent reads alike. The request itself stays bound to its
+/// Names a requester by its registered child handle or root Chat title, with a View reading
+/// number for duplicate root titles. The request itself stays bound to its
 /// execution.
 async fn requester_label(agent: &Agent, console: &Console, snapshot: &ChatSnapshot) -> String {
-    let title = super::safe_line(&crate::agent_access::agent_title(
-        &snapshot.loops,
-        &snapshot.user_shells,
-    ));
+    let title = super::safe_line(
+        &agent
+            .cached_title(snapshot.id)
+            .map(|(_, title)| title)
+            .unwrap_or_else(|| crate::runtime::chat_display_title(snapshot, &snapshot.user_shells)),
+    );
     agent
         .reference(snapshot.id)
         .await
@@ -3385,6 +3387,7 @@ fn request_kind_label(kind: RequestKind) -> &'static str {
         RequestKind::CompactionDirected => "Directed summary",
         RequestKind::PermissionCheck => "Permission checks",
         RequestKind::WebFetch => "WebFetch",
+        RequestKind::Title => "Chat titles",
     }
 }
 

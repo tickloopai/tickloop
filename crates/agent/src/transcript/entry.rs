@@ -15,6 +15,11 @@ pub(crate) enum Line {
     System(ChainEntry),
     ArtifactTicks(ArtifactTicksEntry),
     CustomTitle(CustomTitleEntry),
+    AiTitle(AiTitleEntry),
+    Subagents(SubagentsEntry),
+    FamilyCompletions(FamilyCompletionsEntry),
+    FamilyInputs(FamilyInputsEntry),
+    SentAgentMessages(SentAgentMessagesEntry),
     LastPrompt(LastPromptEntry),
     BranchOrigin(BranchOriginEntry),
     Delegation(DelegationEntry),
@@ -24,6 +29,43 @@ pub(crate) enum Line {
     ContentReplacement(ContentReplacementEntry),
     #[serde(other)]
     Unknown,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum MetadataKind {
+    User,
+    Assistant,
+    System,
+    CustomTitle,
+    AiTitle,
+    LastPrompt,
+    BranchOrigin,
+    Delegation,
+    ArtifactTicks,
+    Subagents,
+    FamilyInputs,
+    SentAgentMessages,
+    FamilyCompletions,
+    FileHistorySnapshot,
+    ContentReplacement,
+    #[serde(other)]
+    Other,
+}
+impl MetadataKind {
+    pub(crate) fn is_chain(&self) -> bool {
+        matches!(self, Self::User | Self::Assistant | Self::System)
+    }
+    pub(crate) fn is_retained(&self) -> bool {
+        !self.is_chain() && !matches!(self, Self::Other)
+    }
+}
+#[derive(Deserialize)]
+pub(crate) struct MetadataHeader {
+    #[serde(rename = "type")]
+    pub(crate) kind: MetadataKind,
+    #[serde(rename = "agentMessageOrigin")]
+    pub(crate) agent_origin: Option<serde_json::Value>,
 }
 
 impl Line {
@@ -81,6 +123,7 @@ pub(crate) struct ChainEntry {
     pub original_user_message_id: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_message_origin: Option<serde_json::Value>,
+    pub human_family_origin: Option<crate::runtime::DirectedHumanSource>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -172,6 +215,7 @@ pub(crate) struct LoopRecord {
     /// unreadable value leaves the time unknown instead of dropping the record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_since: Option<serde_json::Value>,
+    pub run_started_at: Option<u64>,
 }
 
 impl LoopRecord {
@@ -238,6 +282,20 @@ pub(crate) enum PartialCompactDirection {
 pub(crate) struct CustomTitleEntry {
     pub chat_id: Uuid,
     pub custom_title: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AiTitleEntry {
+    pub chat_id: Uuid,
+    pub ai_title: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SubagentsEntry {
+    pub chat_id: Uuid,
+    pub subagents: Vec<crate::runtime::SubagentRegistration>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -440,4 +498,46 @@ pub(crate) struct ArtifactTicksEntry {
     pub artifact_ticks: Vec<crate::artifacts::ArtifactTick>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
     pub removed_artifact_ticks: std::collections::BTreeSet<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct FamilyCompletionsEntry {
+    pub chat_id: Uuid,
+    pub completions: Vec<crate::runtime::FamilyCompletion>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct FamilyInputsEntry {
+    pub chat_id: Uuid,
+    pub inputs: std::collections::BTreeMap<Uuid, crate::runtime::FamilyInputRecord>,
+}
+
+#[cfg(test)]
+mod record_type_tests {
+    use super::MetadataHeader;
+    fn is_chain(raw: &[u8]) -> bool {
+        serde_json::from_slice::<MetadataHeader>(raw)
+            .unwrap()
+            .kind
+            .is_chain()
+    }
+
+    #[test]
+    fn chain_classification_uses_the_top_level_type_independently_of_field_order() {
+        assert!(is_chain(br#"{"message":{},"type":"user"}"#));
+        assert!(is_chain(br#"{"type":"assistant","message":{}}"#));
+        assert!(is_chain(br#"{"message":{},"type":"\u0075ser"}"#));
+        assert!(!is_chain(
+            br#"{"inputs":{"example":{"type":"user"}},"type":"family-inputs"}"#
+        ));
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SentAgentMessagesEntry {
+    pub chat_id: Uuid,
+    pub messages: std::collections::BTreeMap<Uuid, crate::runtime::AgentMessageSource>,
 }

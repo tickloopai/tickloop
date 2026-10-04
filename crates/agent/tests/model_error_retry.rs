@@ -43,6 +43,15 @@ impl FailingModel {
 
 #[async_trait]
 impl ModelClient for FailingModel {
+    async fn generate_title(
+        &self,
+        request: tickloop_agent::model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<tickloop_agent::model::ModelDelta>,
+        _: tokio_util::sync::CancellationToken,
+    ) -> Result<tickloop_agent::model::ModelOutput, tickloop_agent::model::ModelError> {
+        Ok(support::title_output(request))
+    }
+
     fn identity(&self) -> ModelIdentity {
         ModelIdentity {
             provider: tickloop_agent::model::ModelProvider::Api,
@@ -164,7 +173,7 @@ async fn run_until_finished(agent: &Agent, model: &Arc<FailingModel>) -> (bool, 
     .expect("run did not finish");
     let snapshot = agent.snapshot(chat).await.unwrap();
     assert_eq!(
-        snapshot.request_usage.entries().len(),
+        support::model_script_requests(&snapshot).len(),
         model.request_count()
     );
     if outcome.0 {
@@ -192,7 +201,7 @@ async fn transient_http_error_retries_and_records_each_attempt() {
     assert_eq!(model.request_count(), 2);
     let snapshot = &agent.list_chats().await[0];
     assert_eq!(
-        snapshot.request_usage.entries()[0].outcome,
+        support::model_script_requests(snapshot)[0].outcome,
         RequestOutcome::Failed(RequestFailure::Http { status: 503 })
     );
     agent.shutdown().await;

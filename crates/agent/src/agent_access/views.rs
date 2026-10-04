@@ -161,6 +161,22 @@ impl ViewRegistry {
         Ok(())
     }
 
+    pub async fn validate_displayed_source(
+        &self,
+        source: &InteractionSource,
+        execution: ExecutionRef,
+    ) -> Result<(), AccessError> {
+        let mut entries = self.entries.lock().await;
+        let current = Self::current(&mut entries, source.view, source.display_version)?;
+        if current.host != source.host || current.execution != Some(execution) {
+            return Err(AccessError::new(
+                AccessErrorCode::VersionConflict,
+                "directed input source is no longer the displayed Agent",
+            ));
+        }
+        Ok(())
+    }
+
     pub async fn displayed(&self) -> Vec<DisplayedView> {
         self.entries
             .lock()
@@ -186,6 +202,7 @@ impl ViewRegistry {
 
 pub(crate) fn command_origin(command: &AgentCommand) -> Option<&InteractionSource> {
     match command {
+        AgentCommand::SendFamilyInput { origin, .. } => Some(origin),
         AgentCommand::Create { origin, .. }
         | AgentCommand::Submit { origin, .. }
         | AgentCommand::ContinueLoop { origin, .. } => origin.as_ref(),

@@ -1,4 +1,6 @@
 mod model_http_support;
+#[path = "support/provider_transport.rs"]
+mod provider_transport;
 mod support;
 
 use tickloop_agent::model::{
@@ -281,7 +283,10 @@ async fn quota_is_not_retried_and_success_clears_only_its_connection_failure() {
     config.provider_id = "fixture-api".into();
     config.provider_name = "Fixture API".into();
     let client = Arc::new(HttpModelClient::new(config.clone()).unwrap());
-    let agent = Agent::new_embedded(config.clone(), client);
+    let agent = Agent::new_embedded(
+        config.clone(),
+        provider_transport::without_title_requests(client),
+    );
     let directory = tempfile::tempdir().unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
@@ -330,7 +335,9 @@ async fn quota_is_not_retried_and_success_clears_only_its_connection_failure() {
         .set_model(
             chat,
             other.clone(),
-            Arc::new(HttpModelClient::new(other).unwrap()),
+            provider_transport::without_title_requests(Arc::new(
+                HttpModelClient::new(other).unwrap(),
+            )),
         )
         .await
         .unwrap();
@@ -371,7 +378,9 @@ async fn quota_is_not_retried_and_success_clears_only_its_connection_failure() {
         .set_model(
             chat,
             config.clone(),
-            Arc::new(HttpModelClient::new(config).unwrap()),
+            provider_transport::without_title_requests(Arc::new(
+                HttpModelClient::new(config).unwrap(),
+            )),
         )
         .await
         .unwrap();
@@ -413,7 +422,9 @@ async fn persisted_transcript_retains_provider_explanation_after_reload() {
     let agent = Agent::open_embedded(
         root.clone(),
         config.clone(),
-        Arc::new(HttpModelClient::new(config.clone()).unwrap()),
+        provider_transport::without_title_requests(Arc::new(
+            HttpModelClient::new(config.clone()).unwrap(),
+        )),
     )
     .unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();

@@ -316,7 +316,7 @@ async fn quota_failure_is_terminal_in_agent_with_one_http_request() {
     .await;
     let model = client(&state_dir, &endpoint);
     let config = model.config.clone();
-    let agent = Agent::new_embedded(config, Arc::new(model));
+    let agent = Agent::new_embedded(config, crate::model::fixture_client(Arc::new(model)));
     let chat = agent.create_chat(state_dir).await.unwrap();
     let mut events = agent.subscribe();
     agent.submit(chat, None, "Hello".into()).await.unwrap();
@@ -352,7 +352,7 @@ async fn service_retry_false_stops_agent_after_one_request() {
     .await;
     let model = client(&state_dir, &endpoint);
     let config = model.config.clone();
-    let agent = Agent::new_embedded(config, Arc::new(model));
+    let agent = Agent::new_embedded(config, crate::model::fixture_client(Arc::new(model)));
     let chat = agent.create_chat(state_dir).await.unwrap();
     let mut events = agent.subscribe();
     agent.submit(chat, None, "Hello".into()).await.unwrap();
@@ -396,7 +396,7 @@ async fn transient_429_retries_once_using_retry_after() {
     .await;
     let model = client(&state_dir, &endpoint);
     let config = model.config.clone();
-    let agent = Agent::new_embedded(config, Arc::new(model));
+    let agent = Agent::new_embedded(config, crate::model::fixture_client(Arc::new(model)));
     let chat = agent.create_chat(state_dir).await.unwrap();
     let mut events = agent.subscribe();
     agent.submit(chat, None, "Hello".into()).await.unwrap();
@@ -434,7 +434,7 @@ async fn retry_after_wait_is_cancelled_before_another_http_request() {
     .await;
     let model = client(&state_dir, &endpoint);
     let config = model.config.clone();
-    let agent = Agent::new_embedded(config, Arc::new(model));
+    let agent = Agent::new_embedded(config, crate::model::fixture_client(Arc::new(model)));
     let chat = agent.create_chat(state_dir).await.unwrap();
     let mut events = agent.subscribe();
     agent.submit(chat, None, "Hello".into()).await.unwrap();
@@ -615,13 +615,15 @@ async fn auto_review_refreshes_login_and_denies_after_websocket_output_breaks() 
         .unwrap();
     let agent = Agent::new_with_options(
         main_config,
-        Arc::new(main_client),
+        crate::model::fixture_client(Arc::new(main_client)),
         crate::runtime::AgentHostOptions {
             prompt_policy: crate::runtime::PromptPolicy::DenyOnPrompt,
             ..crate::runtime::AgentHostOptions::embedded_defaults()
         },
     );
-    agent.set_auto_reviewer(Arc::new(reviewer_client)).await;
+    agent
+        .set_auto_reviewer(crate::model::fixture_client(Arc::new(reviewer_client)))
+        .await;
     let chat = agent.create_chat(state_dir.clone()).await.unwrap();
     agent
         .set_execution_mode(chat, ExecutionMode::Auto)

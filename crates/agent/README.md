@@ -31,9 +31,9 @@ This stops the service and its running Agents. Saved history is kept. `TICKLOOP_
 不带参数启动进入空白新 Agent 输入，首次发送才创建执行；空输入按 Left 进入本机全部 Agent 总览。总览输入创建新 Agent，提交后留在总览，默认目录取本次 CLI 启动 cwd；项目／Workspace 筛选不改变派发目录，`/cwd PATH` 可显式替代。总览按状态区分待审批与待回答，根行下展开真实 child；`r` 打开历史选择器。`-c`／`--continue` 继续本目录最近活动的 Chat；`-r`／`--resume CHAT` 按 id 恢复，省略 id 时打开 Chat 选择器；`--fork-session` 只能与 `-c` 或 `-r` 一起使用，把恢复的对话复制成新 Chat 并写入新的 Transcript，原记录不变。自动化可用 `--chat-id CHAT` 打开或创建一个固定身份，不与上述恢复参数或 `--no-session-persistence` 组合。`--no-session-persistence` 让本次运行不保存 Chat，也不在工作目录留下文件；`settings.json` 中 `cleanupPeriodDays` 为 0 时同样不保存 Chat（见下文“过期文件清理”）。一个 View 同一时间显示一个 Agent；已接受任务不因切换或关闭该 View 停止。
 
 
-总览与输入下方 Agents 树都来自真实执行目录。进入当前 Agent 的后代始终原位；其他 Agent 若在同一 Herdr 实例有活 View，优先经核实的 Pane 导航，多位置无法确定首选时选择。否则缓存当前界面后原位连接。进入 child 后，家族仍显示 root／parent 关系，后续文字作用于可见 child；审批／问题附近面板标实际 requester。`DelegateAgent` 创建真实独立 Chat／Loop，后续输入保持冻结授权上限；嵌套委派、团队调度、child 历史改写及 Agent／家族 stop 暂不提供，拒绝不会转发给 parent。
+总览只列顶层家族，以后台生成的短 Chat 标题和最近消息预览辨认；查看子 Agent 不改变家族标题。输入下方 Subagents 面板来自同一执行目录与运行层不可变代号注册表。进入当前 Agent 的后代始终原位；其他 Agent 若在同一 Herdr 实例有活 View，优先经核实的 Pane 导航，多位置无法确定首选时选择。否则缓存当前界面后原位连接。进入 child 后，面板的 main／子代号标明当前查看对象，@handle 标签与 Message @handle… 提示同步显示，后续文字仍路由到其稳定身份；审批／问题附近面板标实际 requester。`DelegateAgent` 创建真实独立 Chat／Loop，后续输入保持冻结授权上限；根可用 StopAgent 停止直接子 Agent；嵌套委派、团队调度、child 历史改写和整家族 stop 不提供，拒绝不会转发给 parent。
 
-父子后续通信使用 `SendMessage`：父可补充已委派 child 的任务方向，child 可向 `parent` 请求澄清。等待收件与等待 child 实际结果分别用 `ReceiveAgentMessage`、`WaitForAgent`；父在同步委派等待中有新输入时让出等待，child 继续。消息来源与真人输入分别记录，不能批准人工请求或改变委派权限。明确中断和只装载历史不因消息自动恢复；独立 root 与 siblings 通信本期不提供。合同与当前验收状态见[父子消息设计](../../.scratch/agent-layout-redesign/parent-child-messaging.md)和[工单37](../../.scratch/agent-layout-redesign/issues/37-parent-child-agent-messages.md)。
+`DelegateAgent {task,name?,description?}` 为子 Agent 注册唯一短代号和描述，永久保留该父家族内已经使用的代号。家族后续通信使用 `SendMessage {to,message,relay_user_message_id?}`：根、直接子和同级子可一对一交换方向和澄清，child 可向 `parent` 请求澄清；`ListFamilyAgents` 列出包括已隐藏成员的不可变代号和实际状态，根用 `StopAgent {to}` 停止直接 child。等待收件与等待 child 实际结果分别用 `ReceiveAgentMessage`、`WaitForAgent {to}`；父在同步委派等待中有新输入时让出等待，child 继续。消息来源与真人输入分别记录，不能批准人工请求或改变委派权限。明确中断和只装载历史不因消息自动恢复；独立 root、跨家族和广播不提供。合同与当前验收状态见[家族消息合同](../../.scratch/agent-layout-redesign/parent-child-messaging.md)和[工单37](../../.scratch/agent-layout-redesign/issues/37-parent-child-agent-messages.md)。
 
 owner 自动启动使用当前登录用户私有 Unix socket，启动锁协调并发 CLI，不安装 launchd 服务。关闭终端／Pane、`/exit` 或 View EOF 只撤界面；owner／worker 退出后旧 execution 失效。`/resume` 打开历史不执行，明确向原 Loop Continue 才恢复其原有效 Trigger；没有自动崩溃续跑或跨崩溃 exactly-once 承诺。确认丢失先查询原 CommandId，创建仍未知时保留输入并阻止盲目重复创建；检查总览与历史后，可按提示 `/acknowledge-create COMMAND_ID` 显式承认未知，以允许另一条新提交，此动作不重放旧命令。New Agent 的暂存选择逐条以回执证明后才提交首个输入，未知或被拒的选择不会重发，也不会让输入落到配置不全的 Agent；同一命令可取消其余选择。普通输入结果未知时原样恢复到输入区，在不改动的情况下再次 Enter 只读取原收据：已被接受就采纳原结果、不再发送；改动后的输入等原结果确定后作为新输入发送；`/acknowledge-input COMMAND_ID` 只停止跟踪、不重发。
 
@@ -301,6 +301,8 @@ The current Chat’s Ticks appear in a 42-column Tick List beside the conversati
 
 模型回复写入完整消息后，主界面立即显示剩余正文（含未换行尾行），不等待后续工具审批。提议工具先显示 Queued，准入／完成时更新原调用行；排队的问题先预览，到实际提问时才打开回答菜单。工具权限与执行顺序保持原契约。
 
-分隔线两侧的入口使用短横线边段与相邻空格：`─ ▾ Subagents N …`、`… ◉ Ticks N ─`，核心状态为 `… Auto · Model [· Context N% used] ─`；窄屏先省略边段，鼠标只命中 glyph 与标签。Subagents 展开后直接显示 Main 与子 Agent 列表，不再插入 items／打开提示摘要行。
+分隔线两侧的入口使用短横线边段与相邻空格：`─ ▾ Subagents N …`、`… ◉ Ticks N ─`，核心状态为 `… Auto · Model [· Context N% used] ─`；窄屏先省略边段，鼠标只命中 glyph 与标签。Subagents 展开后直接显示 main 与子 Agent 列表，不再插入 items／打开提示摘要行。
 
 Subagents 的功能键提示保留原文本与按键行为，位于底部区域最后一行：展开时在列表后，收起时紧接分隔线；不在分隔线与成员之间插入提示。
+
+Subagents 行不填充面板背景，只对键盘选中行使用 Selection。完成／失败／停止行在离开当前查看后保留30秒；查看中的完成子 Agent 不自动移除。隐藏只改变本 View 的面板和返回记忆，不结束执行、不删除上下文、不解除代号；后续 SendMessage 使同身份子 Agent 工作时重新出现。总览返回家族时恢复该 View 最后查看且仍可见的成员，否则 main。命令拒绝反馈位于输入框上方独立 Warning 行，保留草稿；子 Agent 的 /clear 不改写历史，反馈为命令在前的短说明。

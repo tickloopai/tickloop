@@ -1,4 +1,6 @@
 mod model_http_support;
+#[path = "support/provider_transport.rs"]
+mod provider_transport;
 mod support;
 
 use tickloop_agent::{
@@ -136,7 +138,12 @@ async fn confirmation_secret_surfaces() {
         .await;
         config.base_url = url;
         let client = model_client(config.clone(), Some(&root)).unwrap();
-        let agent = Agent::open_embedded(root.clone(), config, client).unwrap();
+        let agent = Agent::open_embedded(
+            root.clone(),
+            config,
+            provider_transport::without_title_requests(client),
+        )
+        .unwrap();
         let chat = agent.create_chat(root.clone()).await.unwrap();
         let mut events = agent.subscribe();
         agent
@@ -302,7 +309,12 @@ async fn confirmation_shared_http_runtime_blind_retry() {
     config.provider_id = "fixture-api".into();
     let client =
         std::sync::Arc::new(tickloop_agent::model::HttpModelClient::new(config.clone()).unwrap());
-    let agent = Agent::open_embedded(directory.path().into(), config, client).unwrap();
+    let agent = Agent::open_embedded(
+        directory.path().into(),
+        config,
+        provider_transport::without_title_requests(client),
+    )
+    .unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     agent
@@ -359,7 +371,12 @@ async fn confirmation_bounded_html_credential_prefix() {
         let (url, _) = model_http_support::serve_response(401, body).await;
         config.base_url = url;
         let client = model_client(config.clone(), Some(&root)).unwrap();
-        let agent = Agent::open_embedded(root.clone(), config, client).unwrap();
+        let agent = Agent::open_embedded(
+            root.clone(),
+            config,
+            provider_transport::without_title_requests(client),
+        )
+        .unwrap();
         let chat = agent.create_chat(root.clone()).await.unwrap();
         let mut events = agent.subscribe();
         agent
@@ -470,7 +487,12 @@ async fn all_64_confirmation_probe_variants_are_safe_on_all_surfaces() {
         config.base_url = url;
         config.api_key_env = "PE_CONFIRM_FIXTURE_KEY".into();
         let client = model_client(config.clone(), Some(&root)).unwrap();
-        let agent = Agent::open_embedded(root.clone(), config, client).unwrap();
+        let agent = Agent::open_embedded(
+            root.clone(),
+            config,
+            provider_transport::without_title_requests(client),
+        )
+        .unwrap();
         let chat = agent.create_chat(root.clone()).await.unwrap();
         let mut events = agent.subscribe();
         agent
@@ -541,7 +563,12 @@ async fn assert_safe_provider_surfaces(cases: Vec<(String, String, String)>) {
         .await;
         config.base_url = url;
         let client = model_client(config.clone(), Some(&root)).unwrap();
-        let agent = Agent::open_embedded(root.clone(), config, client).unwrap();
+        let agent = Agent::open_embedded(
+            root.clone(),
+            config,
+            provider_transport::without_title_requests(client),
+        )
+        .unwrap();
         let chat = agent.create_chat(root.clone()).await.unwrap();
         let mut events = agent.subscribe();
         agent
@@ -671,7 +698,12 @@ async fn incomplete_glm_rejections_keep_http_diagnostics_and_do_not_retry() {
 
         config.base_url = incomplete_glm_server(status, code).await;
         let client = model_client(config.clone(), Some(&root)).unwrap();
-        let agent = Agent::open_embedded(root.clone(), config, client).unwrap();
+        let agent = Agent::open_embedded(
+            root.clone(),
+            config,
+            provider_transport::without_title_requests(client),
+        )
+        .unwrap();
         let chat = agent.create_chat(root.clone()).await.unwrap();
         let mut events = agent.subscribe();
         agent
@@ -881,7 +913,12 @@ async fn redacted_presentation_ids_do_not_change_connection_retention_or_success
     .await;
     config.base_url = url;
     let client = model_client(config.clone(), Some(&root)).unwrap();
-    let agent = Agent::open_embedded(root.clone(), config.clone(), client).unwrap();
+    let agent = Agent::open_embedded(
+        root.clone(),
+        config.clone(),
+        provider_transport::without_title_requests(client),
+    )
+    .unwrap();
     let chat = agent.create_chat(root.clone()).await.unwrap();
     let mut events = agent.subscribe();
     agent
@@ -909,7 +946,14 @@ async fn redacted_presentation_ids_do_not_change_connection_retention_or_success
     let (url, _) = model_http_support::serve_response(200, body.into()).await;
     config.base_url = url;
     let client = model_client(config.clone(), Some(&root)).unwrap();
-    agent.set_model(chat, config, client).await.unwrap();
+    agent
+        .set_model(
+            chat,
+            config,
+            provider_transport::without_title_requests(client),
+        )
+        .await
+        .unwrap();
     agent
         .submit(chat, None, "successful connection fixture".into())
         .await

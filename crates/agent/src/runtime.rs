@@ -33,10 +33,20 @@ pub use usage::{
     UsageSummary,
 };
 mod agent_messages;
+mod family;
+pub(crate) use family::summary_state;
+mod family_mailbox;
+pub use family::{
+    DirectedHumanSource, FamilyAgent, FamilyAvailability, FamilyCompletion, FamilyInputRecord,
+    FamilyRole,
+};
+pub use family_mailbox::MessageCause;
 mod artifact_ticks;
+mod chat_title;
 mod compaction;
 mod context;
 mod delegation;
+pub(crate) use chat_title::chat_display_title;
 mod denials;
 mod event_sources;
 mod source_connection;
@@ -164,10 +174,14 @@ pub type ChatId = Uuid;
 pub type LoopId = Uuid;
 pub type RunId = Uuid;
 pub use agent_messages::{
-    AgentMessageSource, RECEIVE_AGENT_MESSAGE_TOOL_NAME, SEND_AGENT_MESSAGE_TOOL_NAME,
-    WAIT_FOR_AGENT_TOOL_NAME,
+    AgentMessageSource, FamilyMessageRejection, FamilyMessageRejectionCode,
+    LIST_FAMILY_AGENTS_TOOL_NAME, RECEIVE_AGENT_MESSAGE_TOOL_NAME, SEND_AGENT_MESSAGE_TOOL_NAME,
+    VerifiedUserRelay, WAIT_FOR_AGENT_TOOL_NAME,
 };
-pub use delegation::{DELEGATE_AGENT_TOOL_NAME, DelegationCeiling, DelegationMetadata};
+pub use delegation::{
+    DELEGATE_AGENT_TOOL_NAME, DelegationCeiling, DelegationMetadata,
+    MAX_SUBAGENT_HANDLE_CHARACTERS, SubagentRegistration,
+};
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub enum LoopState {
@@ -191,6 +205,7 @@ pub struct LoopSnapshot {
     pub goal: String,
     pub state: LoopState,
     pub run_id: Option<RunId>,
+    pub run_started_at: Option<u64>,
     #[serde(default)]
     pub trigger: Option<Trigger>,
     /// Unix milliseconds when the runtime moved this Loop into its current state. A state set by
@@ -331,6 +346,14 @@ pub struct ChatSnapshot {
     pub branch_origin: Option<BranchOrigin>,
     #[serde(default)]
     pub delegation: Option<DelegationMetadata>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub family_completions: Vec<FamilyCompletion>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub family_inputs: BTreeMap<Uuid, FamilyInputRecord>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sent_agent_messages: BTreeMap<Uuid, AgentMessageSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generated_title: Option<String>,
     pub workdir: PathBuf,
     /// Chat 当前使用的模型，只在本进程内有效；恢复时使用宿主当前选择的模型。
     #[serde(skip, default = "unselected_model")]
@@ -354,6 +377,8 @@ pub struct ChatSnapshot {
     pub message_ids: BTreeMap<usize, Uuid>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub agent_message_origins: BTreeMap<Uuid, serde_json::Value>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub human_family_origins: BTreeMap<Uuid, DirectedHumanSource>,
     /// Stable source IDs for genuine prompts rewritten across directed summaries.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub original_user_message_ids: BTreeMap<usize, Uuid>,
@@ -587,6 +612,12 @@ pub struct ProposedToolCall {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum EventKind {
+    FamilyInputUpdated {
+        record: FamilyInputRecord,
+    },
+    FamilyRunCompleted {
+        completion: FamilyCompletion,
+    },
     Started,
     Text(String),
     Thinking(String),
@@ -675,6 +706,8 @@ pub struct PendingInput {
     pub contexts: Vec<InputContext>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_message: Option<AgentMessageSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directed_human: Option<DirectedHumanSource>,
     #[serde(default)]
     denial_reference: Option<denials::DenialReference>,
     #[serde(default)]
@@ -730,6 +763,31 @@ pub struct QueuedInput {
 }
 
 impl ChatSnapshot {
+    pub(super) fn run_response_text(&self, run: RunId) -> Option<String> {
+        self.messages
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(index, message)| {
+                message.role == Role::Assistant && self.message_runs.get(index) == Some(&run)
+            })
+            .map(|(_, message)| {
+                message
+                    .content
+                    .iter()
+                    .filter_map(|content| match content {
+                        Content::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+    }
+
+    pub fn default_input_loop(&self) -> Option<LoopId> {
+        (self.loops.len() == 1).then(|| self.loops[0].id)
+    }
+
     pub(crate) fn effective_reasoning_effort(&self) -> Option<crate::model::ReasoningEffort> {
         if !self.thinking_enabled
             && crate::model::validate_reasoning_effort(
@@ -949,9 +1007,11 @@ struct Inner {
     trusted_working_directories: std::sync::Mutex<HashSet<PathBuf>>,
     host_contexts: std::sync::Mutex<host_context::HostContexts>,
     delegations: Mutex<HashMap<(RunId, String), Receipt>>,
-    agent_messages: Mutex<HashMap<(RunId, String), agent_messages::SentMessage>>,
+    family_mailbox: Mutex<family_mailbox::FamilyMailbox>,
     input_wakeup: tokio::sync::watch::Sender<()>,
-    delegation_notifications: Mutex<HashSet<RunId>>,
+    parent_result_waits: Mutex<HashMap<RunId, Receipt>>,
+    title_requests: Mutex<HashSet<ChatId>>,
+    subagent_registry: Mutex<HashMap<ChatId, Vec<SubagentRegistration>>>,
     chats: Mutex<HashMap<ChatId, Chat>>,
     events: broadcast::Sender<Event>,
     user_shell_events: broadcast::Sender<UserShellRecord>,
@@ -979,6 +1039,7 @@ struct Inner {
 
 #[derive(Clone)]
 struct Chat {
+    family_generation: u64,
     snapshot: ChatSnapshot,
     todo_completion_graces: HashMap<LoopId, todo_lifecycle::CompletionGrace>,
     start_new_tool_result_message: bool,
@@ -1018,7 +1079,7 @@ struct Chat {
 enum RunAdmission {
     Idle,
     Ready(Receipt, ModelRequest, CancellationToken),
-    ValidateTick(PendingInput),
+    ValidateTick(Box<PendingInput>),
 }
 
 #[derive(Clone, Copy)]
@@ -1044,6 +1105,8 @@ struct ActiveEventClaim {
 
 #[derive(Default)]
 struct SubmissionOptions {
+    attachment_admission: Option<family::AttachmentAdmission>,
+    family_generation: Option<u64>,
     contexts: Vec<InputContext>,
     attached_file_reads: Vec<(PathBuf, crate::tools::FileReadRecord)>,
     denial_reference: Option<denials::DenialReference>,
@@ -1053,6 +1116,7 @@ struct SubmissionOptions {
     invoked_skill: Option<crate::skills::InvokedSkill>,
     host_context: Option<crate::host_tools::HostCallContext>,
     agent_message: Option<AgentMessageSource>,
+    directed_human: Option<DirectedHumanSource>,
     goal_title: Option<String>,
 }
 
@@ -1249,6 +1313,10 @@ fn empty_snapshot(id: ChatId, workdir: PathBuf, model: ModelConfig) -> ChatSnaps
         id,
         branch_origin: None,
         delegation: None,
+        family_completions: Vec::new(),
+        family_inputs: BTreeMap::new(),
+        sent_agent_messages: BTreeMap::new(),
+        generated_title: None,
         workdir,
         model,
         reasoning_effort: None,
@@ -1260,6 +1328,7 @@ fn empty_snapshot(id: ChatId, workdir: PathBuf, model: ModelConfig) -> ChatSnaps
         denial_references: BTreeMap::new(),
         message_ids: BTreeMap::new(),
         agent_message_origins: BTreeMap::new(),
+        human_family_origins: BTreeMap::new(),
         original_user_message_ids: BTreeMap::new(),
         prompt_execution_modes: BTreeMap::new(),
         inherited_prompts: HashSet::new(),
@@ -1856,9 +1925,11 @@ impl Agent {
                 trusted_working_directories: std::sync::Mutex::new(HashSet::new()),
                 host_contexts: std::sync::Mutex::new(host_context::HostContexts::default()),
                 delegations: Mutex::new(HashMap::new()),
-                agent_messages: Mutex::new(HashMap::new()),
+                family_mailbox: Mutex::new(family_mailbox::FamilyMailbox::default()),
                 input_wakeup: tokio::sync::watch::channel(()).0,
-                delegation_notifications: Mutex::new(HashSet::new()),
+                parent_result_waits: Mutex::new(HashMap::new()),
+                title_requests: Mutex::new(HashSet::new()),
+                subagent_registry: Mutex::new(HashMap::new()),
                 chats: Mutex::new(HashMap::new()),
                 events: broadcast::channel(256).0,
                 user_shell_events: broadcast::channel(256).0,
@@ -1997,6 +2068,12 @@ impl Agent {
             } else {
                 self.apply_chat_defaults(&mut snapshot)
             };
+        self.inner
+            .subagent_registry
+            .lock()
+            .await
+            .entry(id)
+            .or_default();
         let tools = self.create_chat_tools(id, &snapshot.workdir);
         let skills = crate::skills::SkillRegistry::discover(
             &snapshot.workdir,
@@ -2021,6 +2098,7 @@ impl Agent {
         chats.insert(
             id,
             Chat {
+                family_generation: 0,
                 snapshot,
                 todo_completion_graces: HashMap::new(),
                 start_new_tool_result_message: false,
@@ -2177,10 +2255,37 @@ impl Agent {
         chat_id: ChatId,
         goal: Option<LoopId>,
         input: String,
-        mut contexts: Vec<InputContext>,
+        contexts: Vec<InputContext>,
         paths: Vec<PathBuf>,
         host_context: Option<crate::host_tools::HostCallContext>,
     ) -> Result<Receipt, AgentError> {
+        self.submit_contexts(family::ContextSubmission {
+            chat_id,
+            goal,
+            input,
+            contexts,
+            paths,
+            host_context,
+            directed_source: None,
+            target_generation: None,
+        })
+        .await
+    }
+
+    async fn submit_contexts(
+        &self,
+        submission: family::ContextSubmission,
+    ) -> Result<Receipt, AgentError> {
+        let family::ContextSubmission {
+            chat_id,
+            goal,
+            input,
+            mut contexts,
+            paths,
+            host_context,
+            directed_source,
+            target_generation,
+        } = submission;
         if contexts.len().saturating_add(paths.len()) > input_context::MAX_REFERENCES {
             return Err(AgentError::Invalid(format!(
                 "a prompt can attach at most {} files or directories",
@@ -2192,87 +2297,47 @@ impl Agent {
                 "restored prompt context is invalid, duplicated, or too large".into(),
             ));
         }
-        let (workspace, policy, permission_loop, permission_owner) = {
+        let admission = {
             let chats = self.inner.chats.lock().await;
             let snapshot = &chats.get(&chat_id).ok_or(AgentError::NotFound)?.snapshot;
-            if let Some(loop_id) = goal
-                && !snapshot.loops.iter().any(|existing| existing.id == loop_id)
-            {
+            if goal.is_some_and(|id| !snapshot.loops.iter().any(|existing| existing.id == id)) {
                 return Err(AgentError::NotFound);
             }
-            (
-                crate::tools::Workspace {
-                    workdir: snapshot.workdir.clone(),
-                    additional_directories: snapshot.additional_directories.clone(),
-                },
-                snapshot.policy.clone(),
-                goal.unwrap_or_else(Uuid::nil),
-                goal.map(|loop_id| PermissionOwner::new(chat_id, loop_id))
-                    .transpose()
-                    .map_err(|error| AgentError::Invalid(error.to_string()))?,
-            )
-        };
-        let mut session_tokens = Vec::new();
-        for path in &paths {
-            let prepared = crate::tools::prepare(
-                &workspace,
-                crate::tools::READ_TOOL_NAME,
-                &serde_json::json!({ "file_path": path }),
-            )
-            .map_err(|error| AgentError::Invalid(error.to_string()))?;
-            if !prepared.in_workspace {
-                return Err(AgentError::Invalid(format!(
-                    "referenced path is outside the configured workspace: {}",
-                    path.display()
-                )));
-            }
-            let session_evaluation = if let Some(owner) = permission_owner {
-                let operation = SessionPermissionOperation::from_prepared(&prepared, &workspace)
-                    .map_err(|error| AgentError::Invalid(error.to_string()))?;
-                let evaluation = self
-                    .inner
-                    .session_permissions
-                    .lock()
-                    .await
-                    .evaluate(owner, &operation);
-                session_tokens.push((owner, operation, evaluation.token.clone()));
-                evaluation.decision
-            } else {
-                None
+            let workspace = crate::tools::Workspace {
+                workdir: snapshot.workdir.clone(),
+                additional_directories: snapshot.additional_directories.clone(),
             };
-            match policy.decide_with_session(
-                &prepared,
-                &workspace,
-                permission_loop,
-                session_evaluation,
-            ) {
-                Decision::Allow => {}
-                Decision::Deny => {
-                    return Err(AgentError::Invalid(format!(
-                        "referenced path is denied by the current file permission rules: {}",
-                        path.display()
-                    )));
-                }
-                Decision::Ask | Decision::Check => {
-                    return Err(AgentError::Invalid(format!(
-                        "referenced path requires separate file approval: {}",
-                        path.display()
-                    )));
-                }
-            }
-        }
-        if !session_tokens.is_empty() {
-            let context = self.inner.session_permissions.lock().await;
-            if session_tokens
+            let reads = paths
                 .iter()
-                .any(|(owner, operation, token)| !context.revalidate(token, *owner, operation))
-            {
-                return Err(AgentError::Invalid(
-                    "session permission changed before attached files were loaded; retry the prompt"
-                        .into(),
-                ));
-            }
-        }
+                .map(PathBuf::as_path)
+                .chain(contexts.iter().filter_map(InputContext::path))
+                .map(|path| {
+                    crate::tools::prepare(
+                        &workspace,
+                        crate::tools::READ_TOOL_NAME,
+                        &serde_json::json!({"file_path":path}),
+                    )
+                    .map_err(|error| AgentError::Invalid(error.to_string()))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let admission = family::AttachmentAdmission { workspace, reads };
+            let sessions = self.inner.session_permissions.lock().await;
+            Self::validate_attachment_admission(&chats, &sessions, chat_id, goal, &admission)?;
+            admission
+        };
+        let workspace = admission.workspace.clone();
+        let paths = admission
+            .reads
+            .iter()
+            .take(paths.len())
+            .map(|prepared| {
+                PathBuf::from(
+                    prepared.input["file_path"]
+                        .as_str()
+                        .expect("prepared Read has a canonical path"),
+                )
+            })
+            .collect();
         let loaded = tokio::task::spawn_blocking(move || input_context::load(&workspace, paths))
             .await
             .map_err(|_| AgentError::Invalid("referenced paths could not be loaded".into()))?
@@ -2288,6 +2353,9 @@ impl Agent {
             SubmissionOptions {
                 contexts,
                 attached_file_reads: loaded.file_reads,
+                directed_human: directed_source,
+                family_generation: target_generation,
+                attachment_admission: Some(admission),
                 host_context,
                 ..Default::default()
             },
@@ -2303,6 +2371,8 @@ impl Agent {
         options: SubmissionOptions,
     ) -> Result<Receipt, AgentError> {
         let SubmissionOptions {
+            attachment_admission,
+            family_generation,
             contexts,
             attached_file_reads,
             denial_reference,
@@ -2312,6 +2382,7 @@ impl Agent {
             invoked_skill,
             host_context,
             agent_message,
+            directed_human,
             goal_title,
         } = options;
         if self.inner.closed.load(Ordering::SeqCst) {
@@ -2324,7 +2395,32 @@ impl Agent {
         if self.inner.closed.load(Ordering::SeqCst) {
             return Err(AgentError::Invalid("agent host has shut down".into()));
         }
+        if let Some(admission) = &attachment_admission {
+            let sessions = self.inner.session_permissions.lock().await;
+            Self::validate_attachment_admission(&chats, &sessions, chat_id, goal, admission)?;
+        }
         let original = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
+        if family_generation.is_some_and(|expected| {
+            expected != original.family_generation
+                || original
+                    .snapshot
+                    .loops
+                    .iter()
+                    .find(|existing| Some(existing.id) == goal)
+                    .is_some_and(|goal| {
+                        matches!(
+                            goal.state,
+                            LoopState::Stopped
+                                | LoopState::Interrupted
+                                | LoopState::Failed
+                                | LoopState::Expired
+                        )
+                    })
+        }) {
+            return Err(AgentError::Invalid(
+                "directed target changed while preparing the input".into(),
+            ));
+        }
         let inherit_branch_session =
             goal.is_none() && trigger_source.is_none() && original.snapshot.branch_origin.is_some();
         let mut candidate = original.clone();
@@ -2346,6 +2442,7 @@ impl Agent {
                 goal: goal_title.unwrap_or_else(|| input.clone()),
                 state: LoopState::Idle,
                 run_id: None,
+                run_started_at: None,
                 trigger: None,
                 event_sources: Vec::new(),
                 state_since: None,
@@ -2453,13 +2550,17 @@ impl Agent {
             chat.snapshot
                 .pending_inputs
                 .iter()
-                .position(|pending| pending.trigger_source.is_some())
+                .position(|pending| {
+                    pending.trigger_source.is_some()
+                        || (agent_message.is_none() && pending.agent_message.is_some())
+                })
                 .unwrap_or(chat.snapshot.pending_inputs.len())
         } else {
             chat.snapshot.pending_inputs.len()
         };
         chat.snapshot.last_queue_sequence += 1;
         let queued_sequence = chat.snapshot.last_queue_sequence;
+        let directed_origin = directed_human.clone();
         chat.snapshot.pending_inputs.insert(
             index,
             PendingInput {
@@ -2467,6 +2568,7 @@ impl Agent {
                 input,
                 contexts,
                 agent_message,
+                directed_human,
                 denial_reference,
                 trigger_source,
                 armed: true,
@@ -2493,6 +2595,12 @@ impl Agent {
             session_candidate = Some(candidate);
         }
         *original = candidate;
+        if let Some(source) = directed_origin {
+            let source_chat = chats
+                .get_mut(&source.source_chat_id)
+                .ok_or(AgentError::NotFound)?;
+            self.record_family_delivery(source_chat, &source, &receipt);
+        }
         self.remember_host_context(&receipt, host_context);
         if let (Some(mut context), Some(candidate)) = (session_context, session_candidate) {
             *context = candidate;
@@ -2520,6 +2628,7 @@ impl Agent {
         }
 
         self.inner.input_wakeup.send_replace(());
+        self.start_title_generation(chat_id).await;
         Ok(requested_receipt)
     }
 
@@ -3299,8 +3408,9 @@ impl Agent {
             self.emit(chat, &receipt, EventKind::Failed(error.to_string()));
             return None;
         }
+        let finished_snapshot = chat.snapshot.clone();
         drop(chats);
-        match self.next_run(receipt.chat_id).await {
+        let next = match self.next_run(receipt.chat_id).await {
             Ok(next) => next,
             Err(error) => {
                 let mut chats = self.inner.chats.lock().await;
@@ -3309,7 +3419,14 @@ impl Agent {
                 }
                 None
             }
+        };
+        self.record_directed_replies(&receipt, &finished_snapshot)
+            .await;
+        if finished_snapshot.delegation.is_some() {
+            self.record_family_completion(&receipt, &finished_snapshot)
+                .await;
         }
+        next
     }
 
     fn run_task(
@@ -3448,7 +3565,15 @@ impl Agent {
             );
             return;
         }
-        let message_id = Uuid::new_v4();
+        let message_id = pending
+            .directed_human
+            .as_ref()
+            .map_or_else(Uuid::new_v4, |source| source.message_id);
+        if let Some(source) = pending.directed_human {
+            chat.snapshot
+                .human_family_origins
+                .insert(message_id, source);
+        }
         chat.snapshot.message_ids.insert(message_index, message_id);
         chat.snapshot
             .prompt_execution_modes
@@ -3601,7 +3726,7 @@ impl Agent {
                 if !validated {
                     self.save(&candidate.snapshot);
                     *chat = candidate;
-                    return Ok(RunAdmission::ValidateTick(pending));
+                    return Ok(RunAdmission::ValidateTick(Box::new(pending)));
                 }
                 if self
                     .validate_tick_source_bindings(
@@ -3677,6 +3802,7 @@ impl Agent {
                 .unwrap();
             goal.set_state(LoopState::Running);
             goal.run_id = Some(pending.receipt.run_id);
+            goal.run_started_at = Some(crate::private_fs::unix_time_milliseconds());
             let cancel = CancellationToken::new();
             candidate.active = Some(cancel.clone());
             candidate.active_run = Some(pending.receipt.run_id);
@@ -4444,6 +4570,7 @@ impl Agent {
             input: String::new(),
             contexts: Vec::new(),
             agent_message: None,
+            directed_human: None,
             denial_reference: None,
             trigger_source: None,
             armed: true,

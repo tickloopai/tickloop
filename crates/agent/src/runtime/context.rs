@@ -1065,12 +1065,14 @@ mod tests {
                 .await
         });
         tokio::time::timeout(Duration::from_secs(5), async {
-            while agent.inner.settings_writes.try_lock().is_ok() {
+            while agent.inner.settings_writes.try_lock().is_ok()
+                || agent.inner.chats.try_lock().is_ok()
+            {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("model selection did not reach settings write");
+        .expect("model selection did not lock the Chat for its settings write");
 
         assert!(
             tokio::time::timeout(Duration::from_millis(100), agent.snapshot(chat))
