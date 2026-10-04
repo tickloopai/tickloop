@@ -10,10 +10,7 @@ use tickloop_agent::{
     runtime::{Agent, BranchRequest, EventKind, ModelChange},
     tools::CommandState,
 };
-use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    net::TcpListener,
-};
+use tokio::{io::AsyncWriteExt, net::TcpListener};
 use uuid::Uuid;
 
 fn frame(kind: &str, mut data: Value) -> String {
@@ -293,24 +290,8 @@ async fn old_endpoint(
     let task = tokio::spawn(async move {
         let mut requests = Vec::new();
         for reply in replies {
-            let (socket, _) = listener.accept().await.unwrap();
-            let mut reader = BufReader::new(socket);
-            let mut headers = String::new();
-            while !headers.ends_with("\r\n\r\n") {
-                assert_ne!(reader.read_line(&mut headers).await.unwrap(), 0);
-            }
-            let length = headers
-                .lines()
-                .find_map(|line| {
-                    let (name, value) = line.split_once(':')?;
-                    name.eq_ignore_ascii_case("content-length")
-                        .then(|| value.trim().parse::<usize>().unwrap())
-                })
-                .unwrap();
-            let mut body = vec![0; length];
-            reader.read_exact(&mut body).await.unwrap();
-            requests.push((headers, serde_json::from_slice(&body).unwrap()));
-            let mut socket = reader.into_inner();
+            let (mut socket, request) = model_http_support::accept_script_request(&listener).await;
+            requests.push(request);
             socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",reply.len()).as_bytes()).await.unwrap();
             for fragment in reply.as_bytes().chunks(11) {
                 socket.write_all(fragment).await.unwrap();

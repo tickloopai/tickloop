@@ -1153,12 +1153,21 @@ mod tests {
                     assert!(body["input"].to_string().contains("hello from terminal"));
                     assert_eq!(body["store"], false);
                     assert_eq!(body["model"], selected_model.unwrap_or("gpt-6-astra"));
-                    model_seen = true;
-                    let text = json!({"type":"message","id":"msg_pty","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Subscription terminal connected","annotations":[]}]});
+                    let is_title = body["tools"].as_array().is_none_or(Vec::is_empty)
+                        && body
+                            .to_string()
+                            .contains("Generate a short sentence-case Chat title");
+                    model_seen = !is_title;
+                    let reply = if is_title {
+                        "Terminal greeting"
+                    } else {
+                        "Subscription terminal connected"
+                    };
+                    let text = json!({"type":"message","id":"msg_pty","role":"assistant","status":"completed","content":[{"type":"output_text","text":reply,"annotations":[]}]});
                     let events = [
                         json!({"type":"response.created","response":{"id":"resp_pty","status":"in_progress"}}),
                         json!({"type":"response.output_item.added","output_index":0,"item":{"id":"msg_pty","type":"message","role":"assistant","content":[]}}),
-                        json!({"type":"response.output_text.delta","output_index":0,"item_id":"msg_pty","content_index":0,"delta":"Subscription terminal connected"}),
+                        json!({"type":"response.output_text.delta","output_index":0,"item_id":"msg_pty","content_index":0,"delta":reply}),
                         json!({"type":"response.output_item.done","output_index":0,"item":text}),
                         json!({"type":"response.completed","response":{"id":"resp_pty","status":"completed","output":[text],"usage":{"input_tokens":10,"output_tokens":3}}}),
                     ];

@@ -14,6 +14,210 @@ fn picker_menu(options: usize) -> Menu {
 }
 
 #[test]
+fn merged_provider_diagnostics_resize_with_the_selected_connection_and_live_clear() {
+    for height in [24, 40] {
+        let chat = Uuid::new_v4();
+        let mut state = State::new(true, 160, height);
+        let mut menu = picker_menu(2);
+        menu.context.clear();
+        let id = menu.id;
+        state.menu = Some(menu);
+        state.menu_focused = true;
+        state.picker_kind = Some(PickerKind::Model);
+        state.picker_presentation.hint = "Enter apply · Esc back".into();
+        state.picker_presentation.failure_target = Some(chat);
+        state.picker_presentation.failure_connections =
+            vec![Some("deepseek-api".into()), Some("minimax-api".into())];
+        assert_eq!(state.styled_frame().0.len(), 5);
+        state.provider_failures.insert(
+            chat,
+            HashMap::from([(
+                "deepseek-api".into(),
+                crate::model::ProviderHttpFailure {
+                    provider_id: "deepseek-api".into(),
+                    provider_name: "DeepSeek".into(),
+                    status: 403,
+                    class: crate::model::ProviderFailureClass::UsageLimit,
+                    message: "Bounded provider notice".into(),
+                    hint: "Check allowance".into(),
+                    retry_after: None,
+                    retryable: false,
+                },
+            )]),
+        );
+        let frame = state.styled_frame().0;
+        assert_eq!(frame.len(), 7);
+        assert!(frame.iter().any(|line| line.text().contains("HTTP 403")));
+        assert!(
+            frame
+                .iter()
+                .any(|line| line.text().contains("Check allowance"))
+        );
+        state.picker_presentation.failure_message = true;
+        assert_eq!(state.styled_frame().0.len(), 8);
+        state.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        let frame = state.styled_frame().0;
+        assert_eq!(frame.len(), 5);
+        assert!(!frame.iter().any(|line| line.text().contains("HTTP 403")));
+        state.key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(state.styled_frame().0.len(), 8);
+        state.provider_failures.insert(chat, HashMap::new());
+        assert_eq!(state.styled_frame().0.len(), 5);
+        assert_eq!(state.menu.as_ref().unwrap().id, id);
+        assert_eq!(state.menu.as_ref().unwrap().selected, 0);
+    }
+}
+
+#[test]
+fn merged_dialog_heights_hide_and_restore_the_family_panel_and_failure_status() {
+    use crate::agent_console::AttentionGroup;
+    for height in [6, 10, 24, 40] {
+        let root = Uuid::new_v4();
+        let child = Uuid::new_v4();
+        let mut state = State::new(true, 140, height);
+        state.chat = Some(root);
+        state.prompt_enabled = true;
+        state.insert("preserved family draft");
+        state.provider_failure = Some("Provider allowance warning".into());
+        state
+            .status_area
+            .update("Ask".into(), "Fixture model".into(), None, Vec::new());
+        let rows = [root, child]
+            .into_iter()
+            .map(|id| AgentRow {
+                agent_id: id,
+                parent_id: (id == child).then_some(root),
+                title: "Fixture family".into(),
+                status: "running".into(),
+                state: crate::runtime::LoopState::Running,
+                project: "fixture".into(),
+                workspace: None,
+                approvals: 0,
+                questions: 0,
+                group: AttentionGroup::Working,
+                glyph: status_glyph(AttentionGroup::Working, false),
+                preview: None,
+                updated_at: None,
+                subagent: (id == child).then_some(crate::runtime::SubagentRegistration {
+                    child_chat_id: child,
+                    handle: "scoped-child".into(),
+                    description: "Controlled panel".into(),
+                    created_at: 1,
+                }),
+            })
+            .collect();
+        state.status_area.update_agents(rows, Some(root));
+        state.footer.update(state.status_area.available_panels());
+        if !state.status_area.is_open() {
+            state.status_area.toggle_agents();
+        }
+        let cursor = state.editor.cursor();
+        if height >= 24 {
+            let frame = state.styled_frame().0;
+            assert!(
+                frame
+                    .iter()
+                    .any(|line| line.text().contains("scoped-child")),
+                "{frame:?}"
+            );
+            assert!(
+                frame
+                    .iter()
+                    .any(|line| line.text().contains("Provider allowance warning")),
+                "{frame:?}"
+            );
+        }
+        for count in [2, 80, 2] {
+            let menu = picker_menu(count);
+            let id = menu.id;
+            state.menu = Some(menu);
+            state.picker_kind = Some(PickerKind::Actions);
+            state.picker_presentation.hint = "Enter change · Esc close".into();
+            state.menu_focused = true;
+            let frame = state.styled_frame().0;
+            assert!(frame.len() <= usize::from(height).saturating_sub(2).max(1));
+            assert!(
+                !frame.iter().any(|line| line.text().contains("scoped-child")
+                    || line.text().contains("Subagents"))
+            );
+            state.clear_menu(id);
+            assert!(state.status_area.is_open());
+            assert_eq!(state.editor.draft(), "preserved family draft");
+            assert_eq!(state.editor.cursor(), cursor);
+            assert_eq!(
+                state.provider_failure.as_deref(),
+                Some("Provider allowance warning")
+            );
+        }
+        if height >= 24 {
+            let frame = state.styled_frame().0;
+            assert!(
+                frame
+                    .iter()
+                    .any(|line| line.text().contains("scoped-child"))
+            );
+            assert!(
+                frame
+                    .iter()
+                    .any(|line| line.text().contains("Provider allowance warning"))
+            );
+        }
+    }
+}
+
+#[test]
+fn hidden_picker_resize_guard_leaves_transcript_navigation_search_and_close_available() {
+    let mut state = State::new(true, 80, 24);
+    let menu = picker_menu(2);
+    let menu_id = menu.id;
+    state.menu = Some(menu);
+    state.picker_kind = Some(PickerKind::Actions);
+    state.menu_focused = true;
+    state.start_transcript();
+    state.height = 5;
+    state.transcript.as_mut().unwrap().1.update(
+        (0..40)
+            .map(|index| format!("Transcript row {index}"))
+            .collect::<Vec<_>>()
+            .into(),
+    );
+    state.key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+    let frame = state.transcript.as_mut().unwrap().1.frame(80, 5);
+    assert!(
+        frame
+            .lines
+            .iter()
+            .any(|line| line.contains("Transcript row 0"))
+    );
+    state.key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+    state.paste("Transcript row 20");
+    let frame = state.transcript.as_mut().unwrap().1.frame(80, 5);
+    assert!(frame.cursor.is_some());
+    assert!(
+        frame
+            .lines
+            .iter()
+            .any(|line| line.contains("Transcript row 20"))
+    );
+    assert!(!state.pointer(
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            row: 4,
+            column: 0,
+            modifiers: KeyModifiers::NONE,
+        },
+        &mut Vec::new(),
+    ));
+    state.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(state.transcript.is_some());
+    state.key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+    assert!(state.transcript.is_none());
+    assert_eq!(state.menu.as_ref().unwrap().id, menu_id);
+    assert_eq!(state.menu.as_ref().unwrap().selected, 0);
+    assert!(state.input_dialog_requires_resize());
+}
+
+#[test]
 fn content_height_short_settings_retains_rule_title_choices_and_hint() {
     for (width, height, expected) in [(80, 24, 6), (80, 40, 6), (20, 24, 7), (80, 8, 6)] {
         let mut state = State::new(true, width, height);

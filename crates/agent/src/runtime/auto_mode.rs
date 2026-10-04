@@ -222,6 +222,11 @@ pub(super) fn unavailable_message(
     error: Option<&ModelError>,
 ) -> String {
     let read_only_guidance = "Reading files, searching code, and other read-only operations do not require the classifier and can still be used.";
+    if let Some(failure) = error.and_then(ModelError::provider_failure) {
+        return format!(
+            "{classifier_model} could not review {tool_name}: {failure}. The action was not run. {read_only_guidance}"
+        );
+    }
     match error.map(ModelError::kind) {
         Some(ModelFailureKind::QuotaExhausted) => format!(
             "{classifier_model} could not review {tool_name}: model allowance is exhausted{}. The action was not run; check the subscription allowance. {read_only_guidance}",

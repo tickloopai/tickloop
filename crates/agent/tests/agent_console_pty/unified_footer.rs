@@ -79,7 +79,7 @@ async fn run_working_todo_list(fixture: &PrivateFixture) {
                 rows.iter()
                     .position(|line| {
                         line.contains("Inspecting the source-owned footer behavior")
-                            && line.contains("Esc")
+                            && line.contains("s · Esc to interrupt)")
                     })
                     .is_some_and(|activity| {
                         rows.get(activity + 1)
@@ -106,10 +106,13 @@ async fn run_working_todo_list(fixture: &PrivateFixture) {
             .lines()
             .any(|line| line.starts_with("     ◻ ") && line.contains(TODO_SECOND))
     );
-    assert!(working.lines().any(
-        |line| line.contains("Inspecting the source-owned footer behavior")
-            && line.contains("s · Esc to interrupt)")
-    ));
+    assert!(
+        working.lines().any(|line| {
+            line.contains("Inspecting the source-owned footer behavior")
+                && line.contains("s · Esc to interrupt)")
+        }),
+        "{working}"
+    );
     releases.remove(0).send(()).unwrap();
     pty.wait_for("idle keeps the same owned Todo list", |frame| {
         frame.contains(TODO_REPLY)

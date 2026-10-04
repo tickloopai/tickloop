@@ -1,3 +1,4 @@
+mod model_http_support;
 mod support;
 
 use std::{
@@ -12,7 +13,7 @@ use tickloop_agent::{
     runtime::{Agent, EventKind},
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    io::AsyncWriteExt,
     net::{TcpListener, TcpStream},
     task::JoinHandle,
 };
@@ -39,13 +40,15 @@ impl ReplayServer {
         let captured = requests.clone();
         let task = tokio::spawn(async move {
             loop {
-                let (socket, _) = listener.accept().await.unwrap();
+                let (socket, (_, body)) =
+                    model_http_support::accept_script_request(&listener).await;
                 let response = if captured.lock().unwrap().is_empty() {
                     first_response.clone()
                 } else {
                     complete_response(protocol)
                 };
-                answer_request(socket, response, &captured).await;
+                captured.lock().unwrap().push(body);
+                answer_request(socket, response).await;
             }
         });
         Self {
@@ -70,25 +73,7 @@ impl Drop for ReplayServer {
     }
 }
 
-async fn answer_request(socket: TcpStream, response: String, requests: &Arc<Mutex<Vec<Value>>>) {
-    let mut reader = BufReader::new(socket);
-    let mut headers = String::new();
-    while !headers.ends_with("\r\n\r\n") {
-        assert_ne!(reader.read_line(&mut headers).await.unwrap(), 0);
-    }
-    let length = headers
-        .lines()
-        .find_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            name.eq_ignore_ascii_case("content-length")
-                .then(|| value.trim().parse::<usize>().unwrap())
-        })
-        .unwrap();
-    let mut body = vec![0; length];
-    reader.read_exact(&mut body).await.unwrap();
-    let body = serde_json::from_slice(&body).unwrap();
-    requests.lock().unwrap().push(body);
-    let mut socket = reader.into_inner();
+async fn answer_request(mut socket: TcpStream, response: String) {
     socket
         .write_all(
             b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",

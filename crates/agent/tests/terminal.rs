@@ -1089,7 +1089,8 @@ async fn terminal_reports_failed_model_work_as_a_failed_process() {
     let server = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
         read_request(&mut socket).await;
-        socket.write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 14\r\nConnection: close\r\n\r\nserver-private").await.unwrap();
+        let body = "Access refused; Authorization: Bearer server-private";
+        socket.write_all(format!("HTTP/1.1 401 Unauthorized\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
     });
     let directory = tempfile::tempdir().unwrap();
     let config_path = directory.path().join("model.json");
@@ -1136,6 +1137,7 @@ async fn terminal_reports_failed_model_work_as_a_failed_process() {
     assert!(text.contains("Failed:"));
     assert!(!text.contains("Reply completed"));
     assert!(!text.contains("server-private"));
+    assert!(text.contains("Access refused"));
     server.await.unwrap();
 }
 

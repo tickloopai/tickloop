@@ -10,6 +10,7 @@ use tickloop_agent::{
 };
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 mod support;
 
@@ -27,6 +28,15 @@ struct PausedParentModel {
 
 #[async_trait]
 impl ModelClient for PausedParentModel {
+    async fn generate_title(
+        &self,
+        request: tickloop_agent::model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<tickloop_agent::model::ModelDelta>,
+        _: tokio_util::sync::CancellationToken,
+    ) -> Result<tickloop_agent::model::ModelOutput, tickloop_agent::model::ModelError> {
+        Ok(support::title_output(request))
+    }
+
     fn identity(&self) -> tickloop_agent::model::ModelIdentity {
         self.routed.identity()
     }
@@ -57,8 +67,145 @@ impl RoutedModel {
     }
 }
 
+#[tokio::test]
+async fn hidden_finished_children_remain_addressable_by_handle_and_reappear_on_message_continuation()
+ {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use tickloop_agent::{agent_access::*, agent_console::AgentConsole, runtime::LoopState};
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(RoutedModel::new(|request| {
+        if !state(request)["delegation"].is_null() {
+            if history_text(request).contains("REACTIVATE") {
+                support::call(
+                    "wait-next",
+                    "ReceiveAgentMessage",
+                    json!({"timeout_ms":60000}),
+                )
+            } else {
+                support::text("child initial result")
+            }
+        } else if !has_tool_result(request, "delegate") {
+            support::call(
+                "delegate",
+                "DelegateAgent",
+                json!({"task":"Audit bounded evidence","name":"audit"}),
+            )
+        } else if history_text(request).contains("reactivate hidden")
+            && !has_tool_result(request, "steer")
+        {
+            support::call(
+                "steer",
+                "SendMessage",
+                json!({"to":"audit","message":"REACTIVATE"}),
+            )
+        } else {
+            support::text("parent done")
+        }
+    }));
+    let core = Agent::new_embedded(support::config(), model);
+    let access = Arc::new(EmbeddedAgentAccess::new(core.clone()));
+    let created = access
+        .execute(CommandEnvelope {
+            owner_epoch: access.owner_epoch(),
+            command_id: Uuid::new_v4(),
+            command: AgentCommand::Create {
+                launch: LaunchSpec::embedded(directory.path().into()),
+                initial: Some(UserInput::Text {
+                    text: "Audit evidence".into(),
+                    contexts: vec![],
+                    paths: vec![],
+                }),
+                origin: None,
+            },
+        })
+        .await
+        .unwrap();
+    let CommandResult::Created {
+        execution,
+        snapshot,
+        ..
+    } = created.into_result().unwrap()
+    else {
+        panic!("creation")
+    };
+    let parent = snapshot.conversation.id;
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if core
+                .snapshot(parent)
+                .await
+                .unwrap()
+                .loops
+                .iter()
+                .all(|goal| goal.state == LoopState::Completed)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let registry = core.subagents(parent).await.unwrap();
+    let child = registry[0].child_chat_id;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let clock = Arc::new(AtomicU64::new(now + 60_000));
+    let injected = clock.clone();
+    let mut view = AgentConsole::new(
+        access.clone(),
+        access.owner_epoch(),
+        directory.path().into(),
+        None,
+    )
+    .with_clock(Arc::new(move || injected.load(Ordering::SeqCst)));
+    view.visible_ready(Some(execution));
+    view.refresh().await.unwrap();
+    assert_eq!(view.family(execution).len(), 1, "finished child is hidden");
+    assert_eq!(core.subagents(parent).await.unwrap()[0].handle, "audit");
+    core.submit(
+        parent,
+        Some(snapshot.conversation.loops[0].id),
+        "reactivate hidden".into(),
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if core.snapshot(child).await.unwrap().loops[0].state == LoopState::Running {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    view.refresh().await.unwrap();
+    assert_eq!(
+        view.family(execution).len(),
+        2,
+        "same child reappears during continuation"
+    );
+    assert_eq!(
+        core.subagents(parent).await.unwrap()[0].child_chat_id,
+        child
+    );
+    core.shutdown().await;
+}
+
 #[async_trait]
 impl ModelClient for RoutedModel {
+    async fn generate_title(
+        &self,
+        request: tickloop_agent::model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<tickloop_agent::model::ModelDelta>,
+        _: tokio_util::sync::CancellationToken,
+    ) -> Result<tickloop_agent::model::ModelOutput, tickloop_agent::model::ModelError> {
+        Ok(support::title_output(request))
+    }
+
     fn identity(&self) -> tickloop_agent::model::ModelIdentity {
         support::ScriptedModel::new(vec![]).identity()
     }
@@ -125,7 +272,7 @@ fn agent_body_count(snapshot: &tickloop_agent::runtime::ChatSnapshot, body: &str
                 && message
                     .content
                     .iter()
-                    .any(|content| matches!(content,Content::Text {text} if text.contains(body)))
+                    .any(|content| matches!(content, Content::Text { text } if matches!(tickloop_agent::runtime::LocalMessage::parse(text), Some(tickloop_agent::runtime::LocalMessage::AgentCommunication { message, .. }) if message.contains(body))))
         })
         .count()
 }
@@ -192,6 +339,15 @@ fn history_text(request: &ModelRequest) -> String {
 
 #[async_trait]
 impl ModelClient for ClarifyingModel {
+    async fn generate_title(
+        &self,
+        request: tickloop_agent::model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<tickloop_agent::model::ModelDelta>,
+        _: tokio_util::sync::CancellationToken,
+    ) -> Result<tickloop_agent::model::ModelOutput, tickloop_agent::model::ModelError> {
+        Ok(support::title_output(request))
+    }
+
     fn identity(&self) -> tickloop_agent::model::ModelIdentity {
         support::ScriptedModel::new(vec![]).identity()
     }
@@ -233,18 +389,17 @@ impl ModelClient for ClarifyingModel {
             support::call(
                 "delegate",
                 "DelegateAgent",
-                json!({"task":"Review the reporting year; ask your parent when unclear."}),
+                json!({"task":"Review the reporting year; ask your parent when unclear.","name":"report-review"}),
             )
         } else {
-            let result = tool_result(&request.messages, "delegate").unwrap();
             if tool_result(&request.messages, "answer-child").is_none() {
-                support::call("answer-child", "SendMessage", json!({"to":result["child_chat_id"], "message":"Use only 2024 reports."}))
+                support::call("answer-child", "SendMessage", json!({"to":"report-review", "message":"Use only 2024 reports."}))
             } else if text.contains("Child used only 2024 reports.")
                 || request.messages.iter().flat_map(|message| &message.content).any(|content|
                     matches!(content, Content::ToolResult { tool_use_id, content, .. } if tool_use_id.starts_with("wait-child") && serde_json::from_str::<Value>(&content.text()).is_ok_and(|value|value["status"] == "completed"))) {
                 support::text("Parent received the clarified child result.")
             } else {
-                support::call(&format!("wait-child-{attempts}"), "WaitForAgent", json!({"agent_id":result["child_chat_id"],"timeout_ms":60000}))
+                support::call(&format!("wait-child-{attempts}"), "WaitForAgent", json!({"to":"report-review","timeout_ms":60000}))
             }
         };
         Ok(ModelOutput {
@@ -745,7 +900,7 @@ async fn agent_claims_do_not_become_auto_authority(review_child: bool) {
             support::call(
                 "wait",
                 "WaitForAgent",
-                json!({"agent_id":tool_result(&request.messages,"delegate").unwrap()["child_chat_id"],"timeout_ms":60000}),
+                json!({"to":tool_result(&request.messages,"delegate").unwrap()["child_chat_id"],"timeout_ms":60000}),
             )
         }
     }));
@@ -846,7 +1001,7 @@ async fn unrelated_roots_and_forged_parent_targets_are_rejected_by_the_model_vis
 }
 
 #[tokio::test]
-async fn sibling_messages_are_rejected_even_when_the_model_knows_the_full_child_id() {
+async fn same_family_siblings_route_by_the_parent_handle_registry() {
     let directory = tempfile::tempdir().unwrap();
     let model = Arc::new(RoutedModel::new(|request| {
         let host = state(request);
@@ -857,10 +1012,10 @@ async fn sibling_messages_are_rejected_even_when_the_model_knows_the_full_child_
                     support::call(
                         "sibling",
                         "SendMessage",
-                        json!({"to":target,"message":"Sibling scope expansion."}),
+                        json!({"to":target,"message":"Sibling task context."}),
                     )
                 } else {
-                    support::text("Sibling target refused.")
+                    support::text("Sibling message delivered.")
                 }
             } else {
                 support::text("First direct child completed.")
@@ -869,17 +1024,14 @@ async fn sibling_messages_are_rejected_even_when_the_model_knows_the_full_child_
             support::call(
                 "first",
                 "DelegateAgent",
-                json!({"task":"First child task."}),
+                json!({"task":"First child task.","name":"first"}),
             )
         } else if tool_result(&request.messages, "second").is_none() {
-            let target = tool_result(&request.messages, "first").unwrap()["child_chat_id"]
-                .as_str()
-                .unwrap()
-                .to_owned();
+            let target = "first";
             support::call(
                 "second",
                 "DelegateAgent",
-                json!({"task":format!("Send to sibling {target}")}),
+                json!({"task":format!("Send to sibling {target}"),"name":"second"}),
             )
         } else {
             support::text("Parent observed the two independent child results.")
@@ -899,12 +1051,42 @@ async fn sibling_messages_are_rejected_even_when_the_model_knows_the_full_child_
     completed(&mut events, &receipt).await;
     let chats = agent.list_chats().await;
     assert_eq!(chats.len(), 3);
-    let attempted=chats.iter().find(|chat|chat.events.iter().any(|event|matches!(&event.kind,EventKind::ToolCompleted {call_id,result} if call_id=="sibling" && result.is_error))).unwrap();
-    assert!(attempted.delegation.is_some());
+    let second = agent
+        .subagents(parent)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|child| child.handle == "second")
+        .unwrap()
+        .child_chat_id;
+    let attempted = agent.snapshot(second).await.unwrap();
+    assert!(attempted.events.iter().any(|event| matches!(&event.kind, EventKind::ToolCompleted {call_id, result} if call_id == "sibling" && !result.is_error)), "sibling send must be admitted: {:?}", attempted.events);
+    let first = agent
+        .subagents(parent)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|child| child.handle == "first")
+        .unwrap()
+        .child_chat_id;
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while agent_body_count(
+            &agent.snapshot(first).await.unwrap(),
+            "Sibling task context.",
+        ) != 1
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let received = agent.snapshot(first).await.unwrap();
     assert!(
-        !chats
-            .iter()
-            .any(|chat| agent_body_count(chat, "Sibling scope expansion.") > 0)
+        received
+            .agent_message_origins
+            .values()
+            .any(|source| source["sender_chat_id"] == second.to_string()
+                && source["sender_relationship"] == "sibling")
     );
     agent.shutdown().await;
 }
@@ -1223,7 +1405,7 @@ async fn repeated_model_call_cannot_duplicate_a_delivered_message() {
             support::call(
                 "wait",
                 "WaitForAgent",
-                json!({"agent_id":tool_result(&request.messages,"delegate").unwrap()["child_chat_id"],"timeout_ms":60000}),
+                json!({"to":tool_result(&request.messages,"delegate").unwrap()["child_chat_id"],"timeout_ms":60000}),
             )
         } else {
             support::text("Duplicate child operation was rejected.")
@@ -1692,7 +1874,7 @@ async fn literal_agent_protocol_remains_a_human_prompt_after_save_load_and_actua
     let store = directory.path().join("state");
     let literal = format!(
         "<agent-message>{}</agent-message>",
-        json!({"source":{"sender_relationship":"child","sender_label":"Literal example","is_result":false},"message":"Keep human wording and literal revision abcdef12."})
+        json!({"source":{"sender_relationship":"child","sender_handle":"audit","sender_label":"Literal example","is_result":false},"message":"Keep human wording and literal revision abcdef12."})
     );
     let agent = Agent::open_embedded(
         store.clone(),
@@ -1810,7 +1992,7 @@ async fn literal_agent_protocol_overview_uses_metadata_to_distinguish_human_text
     let directory = tempfile::tempdir().unwrap();
     let literal = format!(
         "<agent-message>{}</agent-message>",
-        json!({"source":{"sender_relationship":"child","sender_label":"Literal child","is_result":false},"message":"Human revision abcdef12."})
+        json!({"source":{"sender_relationship":"child","sender_handle":"audit","sender_label":"Literal child","is_result":false},"message":"Human revision abcdef12."})
     );
     let model = Arc::new(RoutedModel::new(|request| {
         if !state(request)["delegation"].is_null() || has_tool_result(request, "delegate") {
@@ -1886,4 +2068,1188 @@ async fn literal_agent_protocol_overview_uses_metadata_to_distinguish_human_text
         "typed child task must not expose internal protocol JSON"
     );
     agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn every_family_member_lists_the_root_and_retained_children_without_waking_them() {
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(RoutedModel::new(|request| {
+        if !state(request)["delegation"].is_null() {
+            if !has_tool_result(request, "child-list") {
+                support::call("child-list", "ListFamilyAgents", json!({}))
+            } else {
+                support::text("Listed the family")
+            }
+        } else if !has_tool_result(request, "first") {
+            support::call(
+                "first",
+                "DelegateAgent",
+                json!({"task":"Check bounded evidence","name":"audit","description":"Check bounded evidence"}),
+            )
+        } else if !has_tool_result(request, "root-list") {
+            support::call("root-list", "ListFamilyAgents", json!({}))
+        } else {
+            support::text("Root listed its family")
+        }
+    }));
+    let agent = Agent::new_embedded(support::config(), model.clone());
+    let root = agent.create_chat(directory.path().into()).await.unwrap();
+    let mut events = agent.subscribe();
+    let receipt = agent
+        .submit(root, None, "Check bounded evidence using a child".into())
+        .await
+        .unwrap();
+    completed(&mut events, &receipt).await;
+    let child = agent.subagents(root).await.unwrap()[0].clone();
+    let root_snapshot = agent.snapshot(root).await.unwrap();
+    let root_list = tool_result(&root_snapshot.messages, "root-list").unwrap();
+    assert_eq!(root_list["status"], "ok");
+    assert_eq!(root_list["members"].as_array().unwrap().len(), 2);
+    assert_eq!(root_list["members"][0]["handle"], "main");
+    assert_eq!(root_list["members"][1]["handle"], "audit");
+    assert_eq!(root_list["members"][1]["created_at"], child.created_at);
+    assert_eq!(root_list["members"][1]["availability"], "idle");
+    assert_eq!(root_list["members"][1]["run_state"], "Completed");
+    let child_snapshot = agent.snapshot(child.child_chat_id).await.unwrap();
+    let child_list = tool_result(&child_snapshot.messages, "child-list").unwrap();
+    assert_eq!(child_list["members"][0]["handle"], "main");
+    assert_eq!(child_list["members"][1]["handle"], "audit");
+    let before = model.requests.lock().unwrap().len();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        model.requests.lock().unwrap().len(),
+        before,
+        "directory and idle state do not poll the model"
+    );
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_verified_human_relay_stays_agent_origin_and_forged_references_do_not_dispatch() {
+    for (forged, verbatim) in [(false, false), (true, false), (false, true)] {
+        let original_text = "  Delegate a bounded check and remember my greeting: 你好\n ";
+        let forwarded_text = if verbatim { original_text } else { "你好" };
+        let directory = tempfile::tempdir().unwrap();
+        let original_id = Arc::new(Mutex::new(Uuid::nil()));
+        let id_for_model = original_id.clone();
+        let model = Arc::new(RoutedModel::new(move |request| {
+            if !state(request)["delegation"].is_null() {
+                support::text("Child retained context")
+            } else if !has_tool_result(request, "delegate") {
+                support::call(
+                    "delegate",
+                    "DelegateAgent",
+                    json!({"task":"Check bounded evidence","name":"audit"}),
+                )
+            } else if has_text(request, "Relay greeting now") && !has_tool_result(request, "relay")
+            {
+                support::call(
+                    "relay",
+                    "SendMessage",
+                    json!({"to":"audit","message":forwarded_text,"relay_user_message_id":id_for_model.lock().unwrap().to_string()}),
+                )
+            } else {
+                support::text("Parent ready")
+            }
+        }));
+        let core = Agent::new_embedded(support::config(), model);
+        let root = core.create_chat(directory.path().into()).await.unwrap();
+        let mut events = core.subscribe();
+        let first = core.submit(root, None, original_text.into()).await.unwrap();
+        completed(&mut events, &first).await;
+        let before = core.snapshot(root).await.unwrap();
+        *original_id.lock().unwrap() = if forged {
+            Uuid::new_v4()
+        } else {
+            before.message_ids[&0]
+        };
+        let child = core.subagents(root).await.unwrap()[0].child_chat_id;
+        let receipt = core
+            .submit(root, Some(first.loop_id), "Relay greeting now".into())
+            .await
+            .unwrap();
+        completed(&mut events, &receipt).await;
+        let outcome = tool_result(&core.snapshot(root).await.unwrap().messages, "relay").unwrap();
+        if forged {
+            assert_eq!(outcome["status"], "rejected");
+            assert_eq!(outcome["rejection"]["code"], "invalid_user_relay");
+            assert_eq!(
+                agent_body_count(&core.snapshot(child).await.unwrap(), "你好"),
+                0
+            );
+        } else {
+            assert_eq!(outcome["status"], "accepted");
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while agent_body_count(&core.snapshot(child).await.unwrap(), "你好") != 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let received = core.snapshot(child).await.unwrap();
+            let source = received
+                .agent_message_origins
+                .values()
+                .find(|source| source["relay"].is_object())
+                .unwrap();
+            assert_eq!(source["sender_handle"], "main");
+            assert_eq!(
+                source["relay"]["original_message_id"],
+                original_id.lock().unwrap().to_string()
+            );
+            assert_eq!(source["relay"]["original_text"], original_text);
+            assert_eq!(source["relay"]["forwarded_verbatim"], verbatim);
+            let body = received
+                .messages
+                .iter()
+                .flat_map(|message| &message.content)
+                .find_map(|content| {
+                    if let Content::Text { text } = content
+                        && let Some(tickloop_agent::runtime::LocalMessage::AgentCommunication {
+                            message,
+                            relay: Some(_),
+                            ..
+                        }) = tickloop_agent::runtime::LocalMessage::parse(text)
+                    {
+                        Some(message)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap();
+            assert_eq!(
+                body, forwarded_text,
+                "verbatim audit must describe the delivered bytes"
+            );
+            assert!(received.prompt_execution_modes.keys().all(|index| {
+                received
+                    .message_ids
+                    .get(index)
+                    .is_none_or(|id| !received.agent_message_origins.contains_key(id))
+            }));
+        }
+        core.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn a_sender_burst_is_typed_rejected_after_twenty_admitted_messages() {
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(RoutedModel::new(|request| {
+        if !state(request)["delegation"].is_null() {
+            return support::text("Child retained context");
+        }
+        if !has_tool_result(request, "delegate") {
+            return support::call(
+                "delegate",
+                "DelegateAgent",
+                json!({"task":"Check bounded evidence","name":"audit"}),
+            );
+        }
+        for index in 0..21 {
+            let call = format!("burst-{index}");
+            if !has_tool_result(request, &call) {
+                return support::call(
+                    &call,
+                    "SendMessage",
+                    json!({"to":"audit","message":format!("Burst context {index}")}),
+                );
+            }
+        }
+        support::text("Burst finished")
+    }));
+    let core = Agent::new_embedded(support::config(), model);
+    let root = core.create_chat(directory.path().into()).await.unwrap();
+    let mut events = core.subscribe();
+    let receipt = core
+        .submit(
+            root,
+            None,
+            "Delegate a bounded child and send bounded context".into(),
+        )
+        .await
+        .unwrap();
+    completed(&mut events, &receipt).await;
+    let snapshot = core.snapshot(root).await.unwrap();
+    for index in 0..20 {
+        assert_eq!(
+            tool_result(&snapshot.messages, &format!("burst-{index}")).unwrap()["status"],
+            "accepted"
+        );
+    }
+    let rejected = tool_result(&snapshot.messages, "burst-20").unwrap();
+    assert_eq!(rejected["status"], "rejected");
+    assert_eq!(rejected["rejection"]["code"], "sender_rate_limit");
+    assert_eq!(rejected["retryable"], false);
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn every_child_run_has_one_persisted_parent_notification_without_unsolicited_model_wake() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = directory.path().join("state");
+    let model = Arc::new(RoutedModel::new(|request| {
+        if !state(request)["delegation"].is_null() {
+            support::text(if has_text(request, "FOLLOWUP") {
+                "Follow-up final reply"
+            } else {
+                "Initial final reply"
+            })
+        } else if !has_tool_result(request, "delegate") {
+            support::call(
+                "delegate",
+                "DelegateAgent",
+                json!({"task":"Check bounded evidence","name":"audit"}),
+            )
+        } else if has_text(request, "Steer the completed child")
+            && !has_tool_result(request, "steer")
+        {
+            support::call(
+                "steer",
+                "SendMessage",
+                json!({"to":"audit","message":"FOLLOWUP"}),
+            )
+        } else {
+            support::text("Parent ready")
+        }
+    }));
+    let core = Agent::open_embedded(store.clone(), support::config(), model.clone()).unwrap();
+    let root = core.create_chat(directory.path().into()).await.unwrap();
+    let mut events = core.subscribe();
+    let first = core
+        .submit(root, None, "Delegate a bounded check".into())
+        .await
+        .unwrap();
+    completed(&mut events, &first).await;
+    let child = core.subagents(root).await.unwrap()[0].child_chat_id;
+    let second = core
+        .submit(
+            root,
+            Some(first.loop_id),
+            "Steer the completed child".into(),
+        )
+        .await
+        .unwrap();
+    completed(&mut events, &second).await;
+    let completions = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let value = serde_json::to_value(core.snapshot(root).await.unwrap()).unwrap();
+            if value["family_completions"]
+                .as_array()
+                .is_some_and(|items| items.len() == 2)
+            {
+                break value["family_completions"].clone();
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("every child run must append one parent notification");
+    assert_eq!(completions[0]["child_chat_id"], child.to_string());
+    assert_eq!(completions[0]["handle"], "audit");
+    assert_eq!(completions[0]["result"], "Initial final reply");
+    assert_eq!(completions[1]["result"], "Follow-up final reply");
+    assert_ne!(
+        completions[0]["child_run_id"],
+        completions[1]["child_run_id"]
+    );
+    let parent_requests = model
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| state(request)["delegation"].is_null())
+        .count();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        model
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| state(request)["delegation"].is_null())
+            .count(),
+        parent_requests,
+        "audit completion never wakes the parent's model"
+    );
+    core.shutdown().await;
+    let restored = Agent::open_embedded(
+        store,
+        support::config(),
+        Arc::new(support::ScriptedModel::new(vec![])),
+    )
+    .unwrap();
+    let loaded = restored.resume_chat(root).await.unwrap();
+    assert_eq!(
+        serde_json::to_value(loaded).unwrap()["family_completions"],
+        completions
+    );
+    restored.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_root_can_stop_its_parked_child_idempotently_without_losing_context_or_routing() {
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(RoutedModel::new(|request| {
+        if !state(request)["delegation"].is_null() {
+            if !has_tool_result(request, "ready") {
+                support::call(
+                    "ready",
+                    "SendMessage",
+                    json!({"to":"parent","message":"Child is ready to wait"}),
+                )
+            } else {
+                support::call("wait", "ReceiveAgentMessage", json!({"timeout_ms":600000}))
+            }
+        } else if !has_tool_result(request, "delegate") {
+            support::call(
+                "delegate",
+                "DelegateAgent",
+                json!({"task":"Wait for scoped context","name":"waiter"}),
+            )
+        } else if !has_tool_result(request, "stop-one") {
+            support::call("stop-one", "StopAgent", json!({"to":"waiter"}))
+        } else if !has_tool_result(request, "stop-two") {
+            support::call("stop-two", "StopAgent", json!({"to":"waiter"}))
+        } else {
+            support::text("Stopped the bounded child")
+        }
+    }));
+    let core = Agent::new_embedded(support::config(), model);
+    let root = core.create_chat(directory.path().into()).await.unwrap();
+    let mut events = core.subscribe();
+    let receipt = core
+        .submit(root, None, "Delegate a bounded waiter then stop it".into())
+        .await
+        .unwrap();
+    completed(&mut events, &receipt).await;
+    let root_snapshot = core.snapshot(root).await.unwrap();
+    assert_eq!(
+        tool_result(&root_snapshot.messages, "stop-one").unwrap()["status"],
+        "stopped"
+    );
+    assert_eq!(
+        tool_result(&root_snapshot.messages, "stop-two").unwrap()["status"],
+        "stopped"
+    );
+    let registry = core.subagents(root).await.unwrap();
+    assert_eq!(registry.len(), 1);
+    assert_eq!(registry[0].handle, "waiter");
+    let child = core.snapshot(registry[0].child_chat_id).await.unwrap();
+    assert_eq!(
+        child.loops[0].state,
+        tickloop_agent::runtime::LoopState::Stopped
+    );
+    assert!(!child.messages.is_empty());
+    assert!(
+        child.pending_inputs.is_empty()
+            && child.questions.is_empty()
+            && child.permissions.is_empty()
+    );
+    assert_eq!(child.delegation.as_ref().unwrap().parent_chat_id, root);
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn authenticated_family_input_is_genuine_human_and_never_turns_the_source_agent() {
+    use tickloop_agent::agent_access::*;
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(RoutedModel::new(|request| {
+        if !state(request)["delegation"].is_null() {
+            support::text(if has_text(request, "你好") {
+                "Direct human greeting received"
+            } else {
+                "Child ready"
+            })
+        } else if !has_tool_result(request, "delegate") {
+            support::call(
+                "delegate",
+                "DelegateAgent",
+                json!({"task":"Check bounded evidence","name":"audit"}),
+            )
+        } else {
+            support::text("Root ready")
+        }
+    }));
+    let storage = directory.path().join("storage");
+    let core =
+        Agent::open_embedded(storage.clone(), support::persisted_config(), model.clone()).unwrap();
+    let access = EmbeddedAgentAccess::new(core.clone());
+    let created = access
+        .execute(CommandEnvelope {
+            owner_epoch: access.owner_epoch(),
+            command_id: Uuid::new_v4(),
+            command: AgentCommand::Create {
+                launch: LaunchSpec::embedded(directory.path().into()),
+                initial: Some(UserInput::Text {
+                    text: "Delegate a bounded check".into(),
+                    contexts: vec![],
+                    paths: vec![],
+                }),
+                origin: None,
+            },
+        })
+        .await
+        .unwrap()
+        .into_result()
+        .unwrap();
+    let CommandResult::Created {
+        execution: source,
+        snapshot,
+        submitted: Some(receipt),
+        ..
+    } = created
+    else {
+        panic!("real delegated root");
+    };
+    let root_chat = snapshot.conversation.id;
+    let mut events = core.subscribe();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if core
+                .snapshot(snapshot.conversation.id)
+                .await
+                .unwrap()
+                .loops
+                .iter()
+                .all(|goal| goal.state == tickloop_agent::runtime::LoopState::Completed)
+            {
+                break;
+            }
+            let _ = events.recv().await;
+        }
+    })
+    .await
+    .unwrap();
+    let child = core.subagents(root_chat).await.unwrap()[0].child_chat_id;
+    let ObservationValue::Overview(rows) = access
+        .observe(ObservationRequest::Overview {
+            filter: AgentFilter::default(),
+            page: Page::default(),
+            after: None,
+        })
+        .await
+        .unwrap()
+        .initial
+    else {
+        panic!("catalog");
+    };
+    let target = rows
+        .iter()
+        .find(|row| row.chat_id == child)
+        .unwrap()
+        .execution;
+    let view = ViewRef {
+        session_id: Uuid::new_v4(),
+        view_id: Uuid::new_v4(),
+    };
+    let displayed = access
+        .show_view(DisplayUpdate::Displayed {
+            view,
+            execution: source,
+            host: None,
+            expected_version: 0,
+        })
+        .await
+        .unwrap();
+    let origin = InteractionSource {
+        view,
+        display_version: displayed.version,
+        host: None,
+    };
+    let root_before = core.snapshot(root_chat).await.unwrap();
+    let child_before = core.snapshot(child).await.unwrap();
+    let command: AgentCommand = serde_json::from_value(json!({"kind":"send_family_input","source_execution":source,"target_execution":target,"target_loop":child_before.loops[0].id,"origin":origin,"input":{"kind":"text","text":"@audit 你好","contexts":[],"paths":[]}})).expect("business4 directed input command");
+    let command_id = Uuid::new_v4();
+    let envelope = CommandEnvelope {
+        owner_epoch: access.owner_epoch(),
+        command_id,
+        command: command.clone(),
+    };
+    let sent = access
+        .execute(envelope.clone())
+        .await
+        .unwrap()
+        .into_result()
+        .unwrap();
+    let CommandResult::FamilyInputSent {
+        receipt: target_receipt,
+        ..
+    } = sent
+    else {
+        panic!("directed input receipt");
+    };
+    let duplicate = access
+        .execute(envelope)
+        .await
+        .unwrap()
+        .into_result()
+        .unwrap();
+    assert!(
+        matches!(duplicate, CommandResult::FamilyInputSent { receipt, .. } if receipt.run_id == target_receipt.run_id)
+    );
+    completed(&mut events, &target_receipt).await;
+    let received = core.snapshot(child).await.unwrap();
+    assert_eq!(received.loops.len(), 1);
+    assert_eq!(
+        serde_json::to_value(&received.delegation).unwrap(),
+        serde_json::to_value(&child_before.delegation).unwrap()
+    );
+    let human = received
+        .messages
+        .iter()
+        .enumerate()
+        .find(|(_, message)| {
+            message.role == Role::User
+                && message
+                    .content
+                    .iter()
+                    .any(|content| matches!(content, Content::Text { text } if text == "你好"))
+        })
+        .unwrap();
+    let id = received.message_ids[&human.0];
+    assert!(!received.agent_message_origins.contains_key(&id));
+    assert!(received.prompt_execution_modes.contains_key(&human.0));
+    assert_eq!(
+        serde_json::to_value(&received).unwrap()["human_family_origins"][id.to_string()]["original_submission"],
+        "@audit 你好"
+    );
+    assert_eq!(
+        core.snapshot(root_chat).await.unwrap().messages.len(),
+        root_before.messages.len()
+    );
+    let origin = core.snapshot(root_chat).await.unwrap();
+    assert_eq!(origin.family_inputs.len(), 1);
+    let audit = origin.family_inputs.values().next().unwrap();
+    assert_eq!(audit.target_chat_id, child);
+    assert_eq!(
+        audit.response.as_deref(),
+        Some("Direct human greeting received")
+    );
+    assert_eq!(
+        audit.state,
+        Some(tickloop_agent::runtime::LoopState::Completed)
+    );
+    assert_eq!(receipt.chat_id, root_chat);
+    let mut stale_source = command.clone();
+    if let AgentCommand::SendFamilyInput { origin, .. } = &mut stale_source {
+        origin.display_version += 1;
+    }
+    assert!(
+        access
+            .execute(CommandEnvelope {
+                owner_epoch: access.owner_epoch(),
+                command_id: Uuid::new_v4(),
+                command: stale_source
+            })
+            .await
+            .unwrap()
+            .error
+            .is_some()
+    );
+    let mut wrong_family = command.clone();
+    if let AgentCommand::SendFamilyInput {
+        target_execution, ..
+    } = &mut wrong_family
+    {
+        *target_execution = source;
+    }
+    assert!(
+        access
+            .execute(CommandEnvelope {
+                owner_epoch: access.owner_epoch(),
+                command_id: Uuid::new_v4(),
+                command: wrong_family
+            })
+            .await
+            .unwrap()
+            .error
+            .is_some()
+    );
+    core.shutdown().await;
+    let restarted =
+        Agent::open_embedded(storage, support::persisted_config(), model.clone()).unwrap();
+    let loaded_source = restarted.resume_chat(root_chat).await.unwrap();
+    let loaded_target = restarted.resume_chat(child).await.unwrap();
+    assert_eq!(loaded_source.family_inputs.len(), 1);
+    assert_eq!(
+        loaded_source
+            .family_inputs
+            .values()
+            .next()
+            .unwrap()
+            .response
+            .as_deref(),
+        Some("Direct human greeting received")
+    );
+    assert_eq!(loaded_target.human_family_origins.len(), 1);
+    assert_eq!(loaded_source.messages.len(), root_before.messages.len());
+    assert!(loaded_source.pending_inputs.is_empty() && loaded_target.pending_inputs.is_empty());
+    restarted.shutdown().await;
+}
+
+#[tokio::test]
+async fn family_stop_cancels_owned_background_commands_and_keeps_other_families() {
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(RoutedModel::new(|request| {
+        if !state(request)["delegation"].is_null() {
+            if !has_tool_result(request, "sleep") {
+                support::call(
+                    "sleep",
+                    "Bash",
+                    json!({"command":"sleep 30","run_in_background":true}),
+                )
+            } else if !has_tool_result(request, "ready") {
+                support::call(
+                    "ready",
+                    "SendMessage",
+                    json!({"to":"parent","message":"Owned command ready"}),
+                )
+            } else {
+                support::call("wait", "ReceiveAgentMessage", json!({"timeout_ms":600000}))
+            }
+        } else if !has_tool_result(request, "delegate") {
+            support::call(
+                "delegate",
+                "DelegateAgent",
+                json!({"task":"Run one sleep 30 in background and await stop","name":"worker"}),
+            )
+        } else if !has_tool_result(request, "stop") {
+            support::call("stop", "StopAgent", json!({"to":"worker"}))
+        } else {
+            support::text("Owned child stopped")
+        }
+    }));
+    let core = Agent::new_embedded(support::config(), model);
+    let root = core.create_chat(directory.path().into()).await.unwrap();
+    core.set_execution_mode(root, tickloop_agent::permissions::ExecutionMode::FullAccess)
+        .await
+        .unwrap();
+    let unrelated = core.create_chat(directory.path().into()).await.unwrap();
+    let mut events = core.subscribe();
+    let receipt = core
+        .submit(
+            root,
+            None,
+            "Delegate a sleep command and stop that child".into(),
+        )
+        .await
+        .unwrap();
+    completed(&mut events, &receipt).await;
+    let registration = core.subagents(root).await.unwrap();
+    let child = core.snapshot(registration[0].child_chat_id).await.unwrap();
+    assert!(!child.commands.is_empty());
+    assert!(child.commands.iter().all(|command| !matches!(
+        command.state,
+        tickloop_agent::tools::CommandState::Running
+            | tickloop_agent::tools::CommandState::Background
+    )));
+    assert!(
+        child.pending_inputs.is_empty()
+            && child.permissions.is_empty()
+            && child.questions.is_empty()
+    );
+    assert_eq!(
+        child.loops[0].state,
+        tickloop_agent::runtime::LoopState::Stopped
+    );
+    assert!(core.snapshot(unrelated).await.unwrap().loops.is_empty());
+    assert_eq!(
+        tool_result(&core.snapshot(root).await.unwrap().messages, "stop").unwrap()["status"],
+        "stopped"
+    );
+    core.shutdown().await;
+}
+
+struct DirectedFixture {
+    directory: tempfile::TempDir,
+    core: Agent,
+    access: tickloop_agent::agent_access::EmbeddedAgentAccess,
+    root: tickloop_agent::agent_access::ExecutionRef,
+    child: tickloop_agent::agent_access::ExecutionRef,
+    root_chat: Uuid,
+    child_chat: Uuid,
+    origin: tickloop_agent::agent_access::InteractionSource,
+}
+
+impl DirectedFixture {
+    async fn new() -> Self {
+        use tickloop_agent::agent_access::*;
+        let directory = tempfile::tempdir().unwrap();
+        let model = Arc::new(RoutedModel::new(|request| {
+            if !state(request)["delegation"].is_null() {
+                support::text("Child ready")
+            } else if !has_tool_result(request, "delegate") {
+                support::call(
+                    "delegate",
+                    "DelegateAgent",
+                    json!({"task":"Check bounded evidence","name":"audit"}),
+                )
+            } else {
+                support::text("Root ready")
+            }
+        }));
+        let core = Agent::new_embedded(support::config(), model);
+        let access = EmbeddedAgentAccess::new(core.clone());
+        let CommandResult::Created {
+            execution: root,
+            snapshot,
+            ..
+        } = access
+            .execute(CommandEnvelope {
+                owner_epoch: access.owner_epoch(),
+                command_id: Uuid::new_v4(),
+                command: AgentCommand::Create {
+                    launch: LaunchSpec::embedded(directory.path().into()),
+                    initial: None,
+                    origin: None,
+                },
+            })
+            .await
+            .unwrap()
+            .into_result()
+            .unwrap()
+        else {
+            panic!("root created");
+        };
+        let root_chat = snapshot.conversation.id;
+        let mut events = core.subscribe();
+        let receipt = core
+            .submit(root_chat, None, "Delegate bounded evidence".into())
+            .await
+            .unwrap();
+        completed(&mut events, &receipt).await;
+        let child_chat = core.subagents(root_chat).await.unwrap()[0].child_chat_id;
+        let ObservationValue::Overview(rows) = access
+            .observe(ObservationRequest::Overview {
+                filter: AgentFilter::default(),
+                page: Page::default(),
+                after: None,
+            })
+            .await
+            .unwrap()
+            .initial
+        else {
+            panic!("family catalog");
+        };
+        let child = rows
+            .iter()
+            .find(|row| row.chat_id == child_chat)
+            .unwrap()
+            .execution;
+        let view = ViewRef {
+            session_id: Uuid::new_v4(),
+            view_id: Uuid::new_v4(),
+        };
+        let shown = access
+            .show_view(DisplayUpdate::Displayed {
+                view,
+                execution: root,
+                host: None,
+                expected_version: 0,
+            })
+            .await
+            .unwrap();
+        Self {
+            directory,
+            core,
+            access,
+            root,
+            child,
+            root_chat,
+            child_chat,
+            origin: InteractionSource {
+                view,
+                display_version: shown.version,
+                host: None,
+            },
+        }
+    }
+
+    async fn send(
+        &self,
+        contexts: Vec<tickloop_agent::runtime::InputContext>,
+        paths: Vec<std::path::PathBuf>,
+    ) -> tickloop_agent::agent_access::CommandReceipt {
+        use tickloop_agent::agent_access::*;
+        self.access
+            .execute(CommandEnvelope {
+                owner_epoch: self.access.owner_epoch(),
+                command_id: Uuid::new_v4(),
+                command: AgentCommand::SendFamilyInput {
+                    source_execution: self.root,
+                    target_execution: self.child,
+                    target_loop: None,
+                    origin: self.origin.clone(),
+                    input: UserInput::Text {
+                        text: "@audit Attachment".into(),
+                        contexts,
+                        paths,
+                    },
+                },
+            })
+            .await
+            .unwrap()
+    }
+}
+
+#[tokio::test]
+async fn restored_family_attachments_and_fresh_paths_revalidate_the_parent_current_denial() {
+    use tickloop_agent::{
+        permissions::{Decision, PermissionRule},
+        runtime::{ImageContext, ImageOrigin, InputContext, TextContext},
+    };
+    let fixture = DirectedFixture::new().await;
+    let path = fixture.directory.path().join("denied.txt");
+    std::fs::write(&path, "PRIVATE-FILE-BODY").unwrap();
+    let path = path.canonicalize().unwrap();
+    fixture
+        .core
+        .set_permission_rules(
+            fixture.root_chat,
+            vec![PermissionRule {
+                id: Uuid::new_v4(),
+                decision: Decision::Deny,
+                tool: "Read".into(),
+                specifier: None,
+                input: Some(json!({"file_path":path})),
+                loop_id: None,
+                persistent: false,
+            }],
+        )
+        .await
+        .unwrap();
+    let before = fixture
+        .core
+        .snapshot(fixture.child_chat)
+        .await
+        .unwrap()
+        .messages
+        .len();
+    let contexts = [
+        InputContext::File(TextContext {
+            path: path.clone(),
+            content: "PRIVATE-FILE-BODY".into(),
+            truncated: false,
+        }),
+        InputContext::Directory(TextContext {
+            path: path.clone(),
+            content: "PRIVATE-DIRECTORY-BODY".into(),
+            truncated: false,
+        }),
+        InputContext::Image(ImageContext {
+            origin: ImageOrigin::Mentioned { path: path.clone() },
+            image: tickloop_agent::image::Image {
+                media_type: tickloop_agent::image::ImageMediaType::Png,
+                data: "dGVzdA==".into(),
+                width: 1,
+                height: 1,
+            },
+        }),
+    ];
+    for context in contexts {
+        assert!(
+            fixture.send(vec![context], vec![]).await.error.is_some(),
+            "preloaded recipient content must honor the frozen/current parent denial"
+        );
+    }
+    assert!(
+        fixture.send(vec![], vec![path]).await.error.is_some(),
+        "fresh referenced paths also honor the parent denial"
+    );
+    assert_eq!(
+        fixture
+            .core
+            .snapshot(fixture.child_chat)
+            .await
+            .unwrap()
+            .messages
+            .len(),
+        before
+    );
+    fixture.core.shutdown().await;
+}
+
+#[tokio::test]
+async fn family_human_main_input_uses_normal_multiple_loop_semantics_instead_of_the_oldest_loop() {
+    use tickloop_agent::agent_access::*;
+    let fixture = DirectedFixture::new().await;
+    let oldest = fixture
+        .core
+        .snapshot(fixture.root_chat)
+        .await
+        .unwrap()
+        .loops[0]
+        .id;
+    fixture.core.stop(fixture.root_chat, oldest).await.unwrap();
+    let mut events = fixture.core.subscribe();
+    let current = fixture
+        .core
+        .submit(fixture.root_chat, None, "New root task".into())
+        .await
+        .unwrap();
+    completed(&mut events, &current).await;
+    let shown = fixture
+        .access
+        .show_view(DisplayUpdate::Displayed {
+            view: fixture.origin.view,
+            execution: fixture.child,
+            host: None,
+            expected_version: fixture.origin.display_version,
+        })
+        .await
+        .unwrap();
+    let result = fixture
+        .access
+        .execute(CommandEnvelope {
+            owner_epoch: fixture.access.owner_epoch(),
+            command_id: Uuid::new_v4(),
+            command: AgentCommand::SendFamilyInput {
+                source_execution: fixture.child,
+                target_execution: fixture.root,
+                target_loop: None,
+                origin: InteractionSource {
+                    view: fixture.origin.view,
+                    display_version: shown.version,
+                    host: None,
+                },
+                input: UserInput::Text {
+                    text: "@main New human direction".into(),
+                    contexts: vec![],
+                    paths: vec![],
+                },
+            },
+        })
+        .await
+        .unwrap();
+    assert!(
+        result.error.is_none(),
+        "a stopped old Loop cannot block a live root's directed input: {:?}",
+        result.error
+    );
+    let CommandResult::FamilyInputSent { receipt, .. } = result.into_result().unwrap() else {
+        panic!("directed root receipt");
+    };
+    assert_ne!(receipt.loop_id, oldest);
+    assert_ne!(
+        receipt.loop_id, current.loop_id,
+        "multiple-Loop normal input starts its own new Loop"
+    );
+    completed(&mut events, &receipt).await;
+    assert_eq!(
+        fixture
+            .core
+            .snapshot(fixture.root_chat)
+            .await
+            .unwrap()
+            .loops[0]
+            .state,
+        tickloop_agent::runtime::LoopState::Stopped
+    );
+    fixture.core.shutdown().await;
+}
+
+#[tokio::test]
+async fn family_directory_aggregates_active_user_shell_instead_of_only_completed_loops() {
+    let fixture = DirectedFixture::new().await;
+    let shell = fixture
+        .core
+        .submit_user_shell_for_goal(fixture.root_chat, None, "sleep 30".into(), false)
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while fixture
+            .core
+            .snapshot(fixture.root_chat)
+            .await
+            .unwrap()
+            .user_shells
+            .iter()
+            .all(|shell| shell.state != tickloop_agent::runtime::UserShellState::Running)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let root = fixture
+        .core
+        .family_agents(fixture.root_chat)
+        .await
+        .unwrap()
+        .remove(0);
+    let actual = root.availability;
+    let started_at = root.run_started_at;
+    fixture
+        .core
+        .stop_user_shell(fixture.root_chat, shell.command_id)
+        .await
+        .unwrap();
+    fixture.core.shutdown().await;
+    assert_eq!(actual, tickloop_agent::runtime::FamilyAvailability::Working);
+    assert!(
+        started_at.is_some(),
+        "active Shell exposes its state start time"
+    );
+}
+
+#[tokio::test]
+async fn directed_human_body_preserves_whitespace_after_the_routing_separator() {
+    use tickloop_agent::agent_access::*;
+    let fixture = DirectedFixture::new().await;
+    let text = "@audit \n    print(1)\n";
+    let sent = fixture
+        .access
+        .execute(CommandEnvelope {
+            owner_epoch: fixture.access.owner_epoch(),
+            command_id: Uuid::new_v4(),
+            command: AgentCommand::SendFamilyInput {
+                source_execution: fixture.root,
+                target_execution: fixture.child,
+                target_loop: None,
+                origin: fixture.origin.clone(),
+                input: UserInput::Text {
+                    text: text.into(),
+                    contexts: vec![],
+                    paths: vec![],
+                },
+            },
+        })
+        .await
+        .unwrap()
+        .into_result()
+        .unwrap();
+    let CommandResult::FamilyInputSent { receipt, .. } = sent else {
+        panic!("directed receipt");
+    };
+    let mut events = fixture.core.subscribe();
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while fixture
+            .core
+            .snapshot(fixture.child_chat)
+            .await
+            .unwrap()
+            .loops[0]
+            .state
+            != tickloop_agent::runtime::LoopState::Completed
+        {
+            let _ = events.recv().await;
+        }
+    })
+    .await
+    .unwrap();
+    let snapshot = fixture.core.snapshot(fixture.child_chat).await.unwrap();
+    let body = snapshot
+        .messages
+        .iter()
+        .enumerate()
+        .find(|(index, message)| {
+            snapshot.message_runs.get(index) == Some(&receipt.run_id) && message.role == Role::User
+        })
+        .and_then(|(_, message)| {
+            message.content.iter().find_map(|content| {
+                if let Content::Text { text } = content {
+                    Some(text.clone())
+                } else {
+                    None
+                }
+            })
+        })
+        .unwrap();
+    fixture.core.shutdown().await;
+    assert_eq!(body, "\n    print(1)\n");
+}
+
+#[tokio::test]
+async fn sender_rate_budget_survives_restart_with_the_old_recipient_unloaded() {
+    sender_rate_budget_survives_partial_family_restore(false).await;
+}
+
+#[tokio::test]
+async fn sender_rate_budget_survives_compaction_and_partial_family_restore() {
+    sender_rate_budget_survives_partial_family_restore(true).await;
+}
+
+async fn sender_rate_budget_survives_partial_family_restore(compact: bool) {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = directory.path().join("storage");
+    let model = Arc::new(RoutedModel::new(|request| {
+        if request.tools.is_empty() {
+            return support::text("Root sent twenty contexts to retained child a.");
+        }
+        if !state(request)["delegation"].is_null() {
+            return support::text("Child retained");
+        }
+        if has_text(request, "AFTER-RESTART") {
+            return if has_tool_result(request, "after") {
+                support::text("After handled")
+            } else {
+                support::call(
+                    "after",
+                    "SendMessage",
+                    json!({"to":"b","message":"After restart"}),
+                )
+            };
+        }
+        for (id, name) in [("delegate-a", "a"), ("delegate-b", "b")] {
+            if !has_tool_result(request, id) {
+                return support::call(
+                    id,
+                    "DelegateAgent",
+                    json!({"task":"Retain bounded context","name":name}),
+                );
+            }
+        }
+        for index in 0..20 {
+            let id = format!("send-{index}");
+            if !has_tool_result(request, &id) {
+                return support::call(
+                    &id,
+                    "SendMessage",
+                    json!({"to":"a","message":format!("Context {index}")}),
+                );
+            }
+        }
+        support::text("Sent bounded burst")
+    }));
+    let core =
+        Agent::open_embedded(storage.clone(), support::persisted_config(), model.clone()).unwrap();
+    let root = core.create_chat(directory.path().into()).await.unwrap();
+    let mut events = core.subscribe();
+    let receipt = core
+        .submit(
+            root,
+            None,
+            "Delegate two children and send twenty contexts to a".into(),
+        )
+        .await
+        .unwrap();
+    completed(&mut events, &receipt).await;
+    let b = core
+        .subagents(root)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|child| child.handle == "b")
+        .unwrap()
+        .child_chat_id;
+    if compact {
+        core.compact(root).await.unwrap();
+    }
+    core.shutdown().await;
+    let resumed = Agent::open_embedded(storage, support::persisted_config(), model).unwrap();
+    resumed.resume_chat(root).await.unwrap();
+    resumed.resume_chat(b).await.unwrap();
+    let mut events = resumed.subscribe();
+    let after = resumed
+        .submit(root, None, "AFTER-RESTART send one context to b".into())
+        .await
+        .unwrap();
+    completed(&mut events, &after).await;
+    let result = tool_result(&resumed.snapshot(root).await.unwrap().messages, "after").unwrap();
+    resumed.shutdown().await;
+    assert_eq!(
+        result["rejection"]["code"], "sender_rate_limit",
+        "unloaded old recipient cannot reset the sender window: {result}"
+    );
 }

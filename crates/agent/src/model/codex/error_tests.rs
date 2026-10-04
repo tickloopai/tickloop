@@ -157,7 +157,7 @@ async fn read_request(socket: &mut TcpStream) -> (String, Vec<u8>) {
                     name.eq_ignore_ascii_case("content-length")
                         .then(|| value.trim().parse::<usize>().unwrap())
                 })
-                .unwrap();
+                .unwrap_or(0);
             break (header_end, body_len);
         }
     };
@@ -248,26 +248,26 @@ async fn real_http_errors_classify_auth_entitlement_quota_and_service() {
     for (status, body, expected, retryable) in [
         (
             401,
-            json!({"error":{"message":"bearer-secret"}}),
-            "authentication failed",
+            json!({"error":{"message":"local-test-access-token"}}),
+            "expired or invalid",
             false,
         ),
         (
             403,
-            json!({"error":{"type":"usage_not_included","message":"bearer-secret"}}),
-            "not included",
+            json!({"error":{"type":"usage_not_included","message":"local-test-access-token"}}),
+            "plan access",
             false,
         ),
         (
             429,
-            json!({"error":{"type":"usage_limit_reached","resets_at":1790000000,"message":"bearer-secret"}}),
+            json!({"error":{"type":"usage_limit_reached","resets_at":1790000000,"message":"local-test-access-token"}}),
             "resets at 2026-09-21T14:13:20Z",
             false,
         ),
         (
             503,
-            json!({"error":{"message":"bearer-secret"}}),
-            "temporarily unavailable",
+            json!({"error":{"message":"local-test-access-token"}}),
+            "server error",
             true,
         ),
     ] {
@@ -286,7 +286,7 @@ async fn real_http_errors_classify_auth_entitlement_quota_and_service() {
         server.await.unwrap();
         assert_eq!(count.load(Ordering::SeqCst), 1);
         assert!(error.to_string().contains(expected), "{error}");
-        assert!(!error.to_string().contains("bearer-secret"));
+        assert!(!error.to_string().contains("local-test-access-token"));
         assert_eq!(error.stage(), ModelRequestStage::ResponseHeaders);
         if status != 401 {
             assert_eq!(error.status(), Some(status));
@@ -311,12 +311,12 @@ async fn quota_failure_is_terminal_in_agent_with_one_http_request() {
         status: 429,
         retry_after: Some(30),
         should_retry: None,
-        body: json!({"error":{"type":"usage_limit_reached","resets_at":1790000000,"message":"bearer-secret"}}).to_string(),
+        body: json!({"error":{"type":"usage_limit_reached","resets_at":1790000000,"message":"local-test-access-token"}}).to_string(),
     }])
     .await;
     let model = client(&state_dir, &endpoint);
     let config = model.config.clone();
-    let agent = Agent::new_embedded(config, Arc::new(model));
+    let agent = Agent::new_embedded(config, crate::model::fixture_client(Arc::new(model)));
     let chat = agent.create_chat(state_dir).await.unwrap();
     let mut events = agent.subscribe();
     agent.submit(chat, None, "Hello".into()).await.unwrap();
@@ -328,7 +328,7 @@ async fn quota_failure_is_terminal_in_agent_with_one_http_request() {
         match event.kind {
             EventKind::Failed(reason) => {
                 assert!(reason.contains("resets at 2026-09-21T14:13:20Z"));
-                assert!(!reason.contains("bearer-secret"));
+                assert!(!reason.contains("local-test-access-token"));
                 break;
             }
             EventKind::ModelRetry { .. } => panic!("quota must not retry"),
@@ -347,12 +347,12 @@ async fn service_retry_false_stops_agent_after_one_request() {
         status: 503,
         retry_after: Some(30),
         should_retry: Some(false),
-        body: json!({"error":{"message":"bearer-secret"}}).to_string(),
+        body: json!({"error":{"message":"local-test-access-token"}}).to_string(),
     }])
     .await;
     let model = client(&state_dir, &endpoint);
     let config = model.config.clone();
-    let agent = Agent::new_embedded(config, Arc::new(model));
+    let agent = Agent::new_embedded(config, crate::model::fixture_client(Arc::new(model)));
     let chat = agent.create_chat(state_dir).await.unwrap();
     let mut events = agent.subscribe();
     agent.submit(chat, None, "Hello".into()).await.unwrap();
@@ -364,7 +364,7 @@ async fn service_retry_false_stops_agent_after_one_request() {
         match event.kind {
             EventKind::Failed(reason) => {
                 assert!(reason.contains("HTTP 503"));
-                assert!(!reason.contains("bearer-secret"));
+                assert!(!reason.contains("local-test-access-token"));
                 break;
             }
             EventKind::ModelRetry { .. } => panic!("server explicitly disabled retry"),
@@ -396,7 +396,7 @@ async fn transient_429_retries_once_using_retry_after() {
     .await;
     let model = client(&state_dir, &endpoint);
     let config = model.config.clone();
-    let agent = Agent::new_embedded(config, Arc::new(model));
+    let agent = Agent::new_embedded(config, crate::model::fixture_client(Arc::new(model)));
     let chat = agent.create_chat(state_dir).await.unwrap();
     let mut events = agent.subscribe();
     agent.submit(chat, None, "Hello".into()).await.unwrap();
@@ -434,7 +434,7 @@ async fn retry_after_wait_is_cancelled_before_another_http_request() {
     .await;
     let model = client(&state_dir, &endpoint);
     let config = model.config.clone();
-    let agent = Agent::new_embedded(config, Arc::new(model));
+    let agent = Agent::new_embedded(config, crate::model::fixture_client(Arc::new(model)));
     let chat = agent.create_chat(state_dir).await.unwrap();
     let mut events = agent.subscribe();
     agent.submit(chat, None, "Hello".into()).await.unwrap();
@@ -470,7 +470,7 @@ async fn retry_after_wait_is_cancelled_before_another_http_request() {
 async fn quota_reset_is_shown_when_auto_review_denies_protected_tool() {
     let (requests, kinds, reason) = super::tests::blocked_auto_review_case(vec![(
         429,
-        json!({"error":{"type":"usage_limit_reached","resets_at":1790000000,"message":"bearer-secret"}}).to_string(),
+        json!({"error":{"type":"usage_limit_reached","resets_at":1790000000,"message":"local-test-access-token"}}).to_string(),
     )])
     .await;
     assert_eq!(requests.len(), 3);
@@ -482,7 +482,7 @@ async fn quota_reset_is_shown_when_auto_review_denies_protected_tool() {
         1
     );
     assert!(reason.contains("resets at 2026-09-21T14:13:20Z"));
-    assert!(!reason.contains("bearer-secret"));
+    assert!(!reason.contains("local-test-access-token"));
 }
 
 #[tokio::test]
@@ -615,13 +615,15 @@ async fn auto_review_refreshes_login_and_denies_after_websocket_output_breaks() 
         .unwrap();
     let agent = Agent::new_with_options(
         main_config,
-        Arc::new(main_client),
+        crate::model::fixture_client(Arc::new(main_client)),
         crate::runtime::AgentHostOptions {
             prompt_policy: crate::runtime::PromptPolicy::DenyOnPrompt,
             ..crate::runtime::AgentHostOptions::embedded_defaults()
         },
     );
-    agent.set_auto_reviewer(Arc::new(reviewer_client)).await;
+    agent
+        .set_auto_reviewer(crate::model::fixture_client(Arc::new(reviewer_client)))
+        .await;
     let chat = agent.create_chat(state_dir.clone()).await.unwrap();
     agent
         .set_execution_mode(chat, ExecutionMode::Auto)
@@ -667,4 +669,266 @@ async fn auto_review_refreshes_login_and_denies_after_websocket_output_breaks() 
     );
     oauth_server.await.unwrap();
     agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn websocket_http_refusals_preserve_details_without_blind_http_fallback() {
+    let (_directory, state) = super::tests::state_with_credentials();
+    for (status, code, class) in [
+        (
+            429,
+            "insufficient_quota",
+            crate::model::ProviderFailureClass::UsageLimit,
+        ),
+        (
+            402,
+            "billing_error",
+            crate::model::ProviderFailureClass::Billing,
+        ),
+        (
+            403,
+            "usage_not_included",
+            crate::model::ProviderFailureClass::ModelUnavailable,
+        ),
+        (
+            401,
+            "authentication_error",
+            crate::model::ProviderFailureClass::Authentication,
+        ),
+        (
+            429,
+            "rate_limit_error",
+            crate::model::ProviderFailureClass::RateLimit,
+        ),
+        (
+            503,
+            "api_error",
+            crate::model::ProviderFailureClass::ServerError,
+        ),
+    ] {
+        let (endpoint, count, server) = serve(vec![Reply {status, retry_after: Some(7), should_retry: Some(false),
+            body: json!({"error":{"code":code,"message":"Provider explanation local-test-access-token"}}).to_string()}]).await;
+        let mut client = client(&state, &endpoint);
+        client.prefer_websocket = true;
+        let (events, _) = tokio::sync::mpsc::unbounded_channel();
+        let error = client
+            .complete(request(), events, CancellationToken::new())
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+        let detail = error.provider_failure().unwrap();
+        assert_eq!(detail.class, class, "{error}");
+        assert_eq!(detail.status, status);
+        assert!(
+            !error.retry_hint().0,
+            "explicit server retry policy must be honored"
+        );
+        assert!(error.to_string().contains("Provider explanation"));
+        assert!(!format!("{error:?}").contains("local-test-access-token"));
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn split_http_rejections_are_classified_after_the_entire_bounded_body_arrives() {
+    let (_directory, state) = super::tests::state_with_credentials();
+    for (status, code, class) in [
+        (
+            429,
+            "insufficient_quota",
+            crate::model::ProviderFailureClass::UsageLimit,
+        ),
+        (
+            402,
+            "billing_error",
+            crate::model::ProviderFailureClass::Billing,
+        ),
+        (
+            400,
+            "insufficient_quota",
+            crate::model::ProviderFailureClass::UsageLimit,
+        ),
+        (
+            404,
+            "model_not_found",
+            crate::model::ProviderFailureClass::ModelUnavailable,
+        ),
+        (
+            501,
+            "insufficient_quota",
+            crate::model::ProviderFailureClass::UsageLimit,
+        ),
+    ] {
+        for chunked in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}/codex/responses", listener.local_addr().unwrap());
+            let body=json!({"error":{"code":code,"message":"Delayed provider explanation local-test-access-token"}}).to_string();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let (headers, _) = read_request(&mut socket).await;
+                assert!(headers.to_ascii_lowercase().contains("upgrade: websocket"));
+                let framing = if chunked {
+                    "Transfer-Encoding: chunked\r\n".into()
+                } else {
+                    format!("Content-Length: {}\r\n", body.len())
+                };
+                socket.write_all(format!("HTTP/1.1 {status} Test\r\n{framing}Content-Type: application/json\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                for chunk in body.as_bytes().chunks(11) {
+                    if chunked {
+                        socket
+                            .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
+                            .await
+                            .unwrap();
+                    }
+                    if socket.write_all(chunk).await.is_err() {
+                        break;
+                    }
+                    if chunked {
+                        let _ = socket.write_all(b"\r\n").await;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                if chunked {
+                    let _ = socket.write_all(b"0\r\n\r\n").await;
+                }
+                drop(socket);
+                tokio::time::timeout(Duration::from_millis(250), listener.accept())
+                    .await
+                    .is_ok()
+            });
+            let mut client = client(&state, &endpoint);
+            client.prefer_websocket = true;
+            let (events, _) = tokio::sync::mpsc::unbounded_channel();
+            let error = client
+                .complete(request(), events, CancellationToken::new())
+                .await
+                .unwrap_err();
+            let fallback = server.await.unwrap();
+            assert!(
+                !fallback,
+                "a declared rejection body must not be mistaken for an empty unsupported upgrade"
+            );
+            let detail = error
+                .provider_failure()
+                .expect("HTTP rejection must remain an HTTP error");
+            assert_eq!(detail.class, class, "{error}");
+            assert!(
+                !error.retry_hint().0,
+                "quota/billing/model access must not retry"
+            );
+            assert!(
+                error.to_string().contains("Delayed provider explanation"),
+                "{error}"
+            );
+            assert!(!format!("{error:?}").contains("local-test-access-token"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn confirmation_incomplete_rejection_bodies_fail_closed() {
+    let (_directory, state) = super::tests::state_with_credentials();
+    let mut failures = Vec::new();
+    for websocket in [true, false] {
+        for status in [429, 500, 501, 402] {
+            for mode in ["empty", "truncated", "chunked-truncated", "over-bound"] {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let endpoint = format!("http://{}/codex/responses", listener.local_addr().unwrap());
+                let body = if mode == "over-bound" {
+                    json!({"error":{"message":"x".repeat(16400),"code":"insufficient_quota"}})
+                        .to_string()
+                } else {
+                    json!({"error":{"message":"account limit local-test-access-token","code":"insufficient_quota"}}).to_string()
+                };
+                let server = tokio::spawn(async move {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let _ = read_request(&mut socket).await;
+                    let framing = if mode == "chunked-truncated" {
+                        "Transfer-Encoding: chunked\r\n".into()
+                    } else {
+                        format!("Content-Length: {}\r\n", body.len())
+                    };
+                    socket
+                        .write_all(
+                            format!("HTTP/1.1 {status} Test\r\n{framing}Connection: close\r\n\r\n")
+                                .as_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    match mode {
+                        "empty" => {}
+                        "truncated" => {
+                            let _ = socket.write_all(b"{").await;
+                        }
+                        "chunked-truncated" => {
+                            let _ = socket.write_all(b"1\r\n{\r\n").await;
+                        }
+                        _ => {
+                            let _ = socket.write_all(body.as_bytes()).await;
+                        }
+                    }
+                    drop(socket);
+                    if let Ok(Ok((mut fallback, _))) =
+                        tokio::time::timeout(Duration::from_millis(250), listener.accept()).await
+                    {
+                        let _ = read_request(&mut fallback).await;
+                        let _=fallback.write_all(b"HTTP/1.1 429 Test\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").await;
+                        true
+                    } else {
+                        false
+                    }
+                });
+                let mut c = client(&state, &endpoint);
+                c.prefer_websocket = websocket;
+                let (events, _) = tokio::sync::mpsc::unbounded_channel();
+                let error = c
+                    .complete(request(), events, CancellationToken::new())
+                    .await
+                    .unwrap_err();
+                let fallback = server.await.unwrap();
+                eprintln!(
+                    "INCOMPLETE ws={websocket} status={status} mode={mode} class={:?} retry={} fallback={fallback}",
+                    error.provider_failure().map(|f| f.class),
+                    error.retry_hint().0
+                );
+                assert!(!format!("{error:?}").contains("local-test-access-token"));
+                if error.retry_hint().0 || fallback {
+                    failures.push((websocket, status, mode));
+                }
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "incomplete/over-bound errors must fail closed: {failures:?}"
+    );
+}
+#[tokio::test]
+async fn confirmation_ws_rejection_body_timeout_fails_closed() {
+    let (_directory, state) = super::tests::state_with_credentials();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/codex/responses", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let _ = read_request(&mut socket).await;
+        socket
+            .write_all(b"HTTP/1.1 429 Test\r\nContent-Length: 100\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(16)).await;
+        drop(socket);
+    });
+    let mut c = client(&state, &endpoint);
+    c.prefer_websocket = true;
+    let (events, _) = tokio::sync::mpsc::unbounded_channel();
+    let error = c
+        .complete(request(), events, CancellationToken::new())
+        .await
+        .unwrap_err();
+    eprintln!("TIMEOUT retry={}, error={error}", error.retry_hint().0);
+    assert!(!error.retry_hint().0);
+    assert!(error.to_string().contains("incomplete"));
+    server.await.unwrap();
 }

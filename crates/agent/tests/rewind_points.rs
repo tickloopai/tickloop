@@ -50,6 +50,15 @@ impl GatedFirstRequest {
 
 #[async_trait]
 impl ModelClient for GatedFirstRequest {
+    async fn generate_title(
+        &self,
+        request: tickloop_agent::model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<tickloop_agent::model::ModelDelta>,
+        _: tokio_util::sync::CancellationToken,
+    ) -> Result<tickloop_agent::model::ModelOutput, tickloop_agent::model::ModelError> {
+        Ok(support::title_output(request))
+    }
+
     fn identity(&self) -> ModelIdentity {
         self.model.identity()
     }
@@ -220,7 +229,7 @@ async fn two_queued_inputs_merged_after_a_tool_keep_individual_receipts_and_one_
     ));
     assert!(entries[2].contexts.is_empty());
     assert_eq!(scripted.requests.lock().unwrap().len(), 2);
-    assert_eq!(snapshot.request_usage.entries().len(), 2);
+    assert_eq!(support::model_script_requests(&snapshot).len(), 2);
     agent.shutdown().await;
 }
 
@@ -269,7 +278,7 @@ async fn accepting_and_taking_back_waiting_input_or_commands_does_not_capture_ph
     assert_eq!(scripted.requests.lock().unwrap().len(), 1);
     let snapshot = agent.snapshot(chat).await.unwrap();
     assert_eq!(snapshot.messages.len(), 2);
-    assert_eq!(snapshot.request_usage.entries().len(), 1);
+    assert_eq!(support::model_script_requests(&snapshot).len(), 1);
     agent.shutdown().await;
 }
 
@@ -482,9 +491,9 @@ async fn explicit_events_and_timer_runs_preserve_the_single_real_user_checkpoint
         assert_eq!(checkpoints(&agent, chat).await, before);
         assert_eq!(snapshot.rewind_points().len(), 1);
         assert_eq!(snapshot.messages.len(), 4);
-        assert_eq!(snapshot.request_usage.entries().len(), 2);
+        assert_eq!(support::model_script_requests(&snapshot).len(), 2);
         assert_eq!(
-            snapshot.request_usage.entries()[1].run_id,
+            support::model_script_requests(&snapshot)[1].run_id,
             Some(completed.run_id)
         );
         assert!(snapshot.messages[2].content.iter().any(|content| matches!(content, Content::Text { text } if text.contains("Scheduled or external observation"))));
@@ -566,10 +575,10 @@ async fn more_than_one_hundred_prompts_stay_selectable_and_keep_raw_messages_usa
     assert_eq!(points[100].message_index, 202);
     assert_eq!(snapshot.messages.len(), 204);
     assert_eq!(snapshot.messages[0], initial.messages[0]);
-    assert_eq!(snapshot.request_usage.entries().len(), 102);
+    assert_eq!(support::model_script_requests(&snapshot).len(), 102);
     assert_eq!(
-        snapshot.request_usage.entries()[0],
-        initial.request_usage.entries()[0]
+        support::model_script_requests(&snapshot)[0],
+        support::model_script_requests(&initial)[0]
     );
     assert_eq!(snapshot.operations.len(), 1);
     assert_eq!(

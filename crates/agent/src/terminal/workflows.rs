@@ -1029,6 +1029,18 @@ fn public_history_pieces(
                         super::style::Role::MutedText,
                     );
                 }
+                if let Some(origin) = source
+                    .message_id
+                    .and_then(|id| chat.human_family_origins.get(&id))
+                {
+                    history.push_role(
+                        format!(
+                            "\nUser message · from @{} View\n",
+                            safe_text(&origin.source_handle)
+                        ),
+                        super::style::Role::MutedText,
+                    );
+                }
                 let folded = answers_tick_delivery && is_folded_tick_reply(&message);
                 answers_tick_delivery = is_tick_delivery(&message);
                 append_public_message(
@@ -1047,6 +1059,18 @@ fn public_history_pieces(
     if !pending.is_empty() {
         history.push_str("\n");
         history.push_reply(&safe_text(&pending));
+    }
+    for record in chat.family_inputs.values() {
+        history.push_role(
+            presentation::family_input_text(record, presentation::OutputDetail::Preview),
+            super::style::Role::MutedText,
+        );
+    }
+    for completion in &chat.family_completions {
+        history.push_role(
+            presentation::family_completion_text(completion, presentation::OutputDetail::Preview),
+            super::style::Role::MutedText,
+        );
     }
     history.pieces
 }
@@ -1926,6 +1950,7 @@ mod tests {
             goal: "streaming".into(),
             state: LoopState::Running,
             run_id: Some(streaming_run),
+            run_started_at: None,
             trigger: None,
             event_sources: Vec::new(),
             state_since: None,

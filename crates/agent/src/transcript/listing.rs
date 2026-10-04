@@ -57,7 +57,9 @@ pub(crate) fn list_project(project_directory: &Path) -> io::Result<Vec<Transcrip
             modified: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
             cwd: first_json_string_field(&head, "cwd").map(PathBuf::from),
             title: last_json_string_field(&tail, "customTitle")
-                .or_else(|| last_json_string_field(&head, "customTitle")),
+                .or_else(|| last_json_string_field(&head, "customTitle"))
+                .or_else(|| last_json_string_field(&tail, "aiTitle"))
+                .or_else(|| last_json_string_field(&head, "aiTitle")),
             first_prompt: first_prompt(&head).or_else(|| {
                 head.lines()
                     .find_map(|line| match serde_json::from_str::<Line>(line).ok()? {

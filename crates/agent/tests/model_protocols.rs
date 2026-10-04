@@ -193,8 +193,7 @@ async fn unrelated_bad_requests_remain_http_errors() {
         .unwrap_err();
     assert_eq!(error.status(), Some(400));
     assert_eq!(error.stage(), ModelRequestStage::ResponseHeaders);
-    assert!(error.to_string().contains("invalid_request_error"));
-    assert!(!error.to_string().contains("temperature is unsupported"));
+    assert!(error.to_string().contains("temperature is unsupported"));
 }
 
 #[tokio::test]

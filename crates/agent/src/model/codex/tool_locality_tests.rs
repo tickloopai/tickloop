@@ -160,7 +160,7 @@ async fn one_new_host_tool_round_trips_through_the_real_api_adapter() {
     config.base_url = endpoint.as_str().trim_end_matches("/responses").into();
     config.api_key_env.clear();
     let client = HttpModelClient::new(config.clone()).unwrap();
-    let agent = Agent::new_embedded(config, Arc::new(client));
+    let agent = Agent::new_embedded(config, crate::model::fixture_client(Arc::new(client)));
     run_agent_round_trip(agent, directory.path()).await;
     assert_wire_round_trip(&requests.await.unwrap(), false);
 }
@@ -183,7 +183,7 @@ async fn the_same_new_host_tool_round_trips_through_the_real_codex_adapter() {
         .unwrap()
         .with_loopback_test_endpoint(endpoint.as_str())
         .unwrap();
-    let agent = Agent::new_embedded(config, Arc::new(client));
+    let agent = Agent::new_embedded(config, crate::model::fixture_client(Arc::new(client)));
     run_agent_round_trip(agent, &state_dir).await;
     assert_wire_round_trip(&requests.await.unwrap(), true);
 }

@@ -49,73 +49,21 @@ pub trait AgentAccess: Send + Sync {
     async fn show_view(&self, update: DisplayUpdate) -> Result<DisplayReceipt, AccessError>;
 }
 
-const NEW_AGENT_TITLE: &str = "New Agent";
-
-/// Names an Agent by its first Loop goal, or by its first user Shell command when it has no Loop.
-pub(crate) fn agent_title(
+pub(crate) fn summary_run_id(
     loops: &[crate::runtime::LoopSnapshot],
-    user_shells: &[crate::runtime::UserShellRecord],
-) -> String {
+    state: &crate::runtime::LoopState,
+) -> Option<crate::runtime::RunId> {
     loops
-        .first()
-        .map(|goal| goal.goal.clone())
-        .or_else(|| {
-            user_shells
-                .first()
-                .map(|shell| format!("!{}", shell.command))
-        })
-        .unwrap_or_else(|| NEW_AGENT_TITLE.into())
+        .iter()
+        .filter(|goal| &goal.state == state)
+        .max_by_key(|goal| goal.state_since)
+        .and_then(|goal| goal.run_id)
 }
 
 /// The Loop state an Agent row reports: the goal most in need of attention, so a later completed
 /// Loop cannot mask an earlier goal that still waits for input, plan review or its Trigger, and an
 /// active user Shell keeps the Agent working. Without Loops, the latest user Shell decides between
 /// a confirmed failure and Idle; an unknown Shell outcome is not reported as a failure.
-pub(crate) fn summary_state(
-    loops: &[crate::runtime::LoopSnapshot],
-    user_shells: &[crate::runtime::UserShellRecord],
-) -> crate::runtime::LoopState {
-    use crate::runtime::{LoopState, UserShellState};
-    let any_loop = |state: LoopState| loops.iter().any(|goal| goal.state == state);
-    let any_shell = |states: &[UserShellState]| {
-        user_shells
-            .iter()
-            .any(|shell| states.contains(&shell.state))
-    };
-    if let Some(state) = [
-        LoopState::WaitingPermission,
-        LoopState::WaitingQuestion,
-        LoopState::WaitingPlan,
-    ]
-    .into_iter()
-    .find(|state| any_loop(state.clone()))
-    {
-        return state;
-    }
-    if any_loop(LoopState::Running)
-        || any_shell(&[
-            UserShellState::Running,
-            UserShellState::Background,
-            UserShellState::Cancelling,
-        ])
-    {
-        return LoopState::Running;
-    }
-    if any_loop(LoopState::Queued) || any_shell(&[UserShellState::Queued]) {
-        return LoopState::Queued;
-    }
-    if any_loop(LoopState::WaitingTrigger) {
-        return LoopState::WaitingTrigger;
-    }
-    if let Some(goal) = loops.last() {
-        return goal.state.clone();
-    }
-    match user_shells.last().map(|shell| &shell.state) {
-        Some(UserShellState::Failed) => LoopState::Failed,
-        _ => LoopState::Idle,
-    }
-}
-
 /// Whether an execution ever received work. Configuration changes alone leave it empty.
 pub(crate) fn has_work(
     conversation: &crate::runtime::ChatSnapshot,

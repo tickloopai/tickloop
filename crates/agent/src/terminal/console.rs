@@ -71,7 +71,7 @@ mod workspace_trust_tests;
 use agent_layout::OverviewState;
 use agent_layout::OverviewTarget;
 pub(super) use agent_layout::{
-    AgentOverview, AgentTreeRow, MIN_REQUEST_AGENT_TITLE_COLUMNS, RowExtras, status_glyph,
+    AgentOverview, AgentRow, MIN_REQUEST_AGENT_TITLE_COLUMNS, WIDE_TERMINAL_COLUMNS, status_glyph,
 };
 
 use super::{
@@ -95,8 +95,8 @@ use super::{
     editor::{Editor, EditorCommand, EditorOutcome},
     external_editor::{ExternalEditorLauncher, ExternalEditorOutcome, edit_prompt},
     file_mentions::{
-        AcceptedMention, FileMentionAction, FileMentionIndex, FileMentionKey, FileMentionState,
-        IndexGeneration, IndexReplacement, draft_mentions_path,
+        AcceptedMention, FamilyMentionTarget, FileMentionAction, FileMentionIndex, FileMentionKey,
+        FileMentionState, IndexGeneration, IndexReplacement, MentionTarget, draft_mentions_path,
     },
     footer::{FooterAction, FooterEffect, FooterFrame, FooterItemId, FooterState},
     hyperlink,
@@ -223,6 +223,7 @@ const IMAGE_INPUT_UNSUPPORTED: &str = "Current model does not support image inpu
 pub(super) enum InputEvent {
     Line(String),
     Prompt {
+        family_target: Option<crate::agent_access::ExecutionRef>,
         text: String,
         file_references: Vec<PathBuf>,
         /// Pasted images in the order of their `[Image #N]` placeholders.
@@ -301,11 +302,13 @@ impl fmt::Debug for InputEvent {
             Self::InterruptActivity => formatter.write_str("InterruptActivity"),
             Self::Line(value) => formatter.debug_tuple("Line").field(value).finish(),
             Self::Prompt {
+                family_target,
                 text,
                 file_references,
                 images,
             } => formatter
                 .debug_struct("Prompt")
+                .field("family_target", family_target)
                 .field("text", text)
                 .field("file_references", file_references)
                 .field("images", &images.len())
@@ -409,6 +412,9 @@ pub(super) struct PickerPresentation {
     pub(super) connection_options: Option<usize>,
     pub(super) row_hints: Vec<String>,
     pub(super) compact_rows: Vec<CompactPickerRow>,
+    pub(super) failure_target: Option<Uuid>,
+    pub(super) failure_connections: Vec<Option<String>>,
+    pub(super) failure_message: bool,
 }
 
 #[derive(Clone)]
@@ -663,6 +669,8 @@ pub(super) struct State {
     footer_list_focused: bool,
     conversation_focused: bool,
     status: String,
+    provider_failure: Option<String>,
+    provider_failures: HashMap<Uuid, HashMap<String, crate::model::ProviderHttpFailure>>,
     configured_status_lines: Option<Vec<String>>,
     background_status_notice: Option<BackgroundStatusNotice>,
     connection_notice: Option<String>,
@@ -728,6 +736,7 @@ struct EscapeConfirmation {
 }
 
 struct SubmittedPrompt {
+    family_target: Option<super::file_mentions::FamilyMentionTarget>,
     draft: String,
     paste_blocks: PasteBlocks,
     mentions: Vec<AcceptedMention>,
@@ -746,6 +755,7 @@ struct ChatInput {
 }
 
 struct InputStash {
+    family_target: Option<super::file_mentions::FamilyMentionTarget>,
     paste_blocks: PasteBlocks,
     restored_contexts: Vec<InputContext>,
     accepted_mentions: Vec<AcceptedMention>,
@@ -981,6 +991,17 @@ impl Console {
         let console = Self::test_for_chat(chat);
         console.state.lock().unwrap().interactive = true;
         console
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_conversation_text(&self) -> String {
+        self.state
+            .lock()
+            .unwrap()
+            .scrollback
+            .frame(120, 1000)
+            .lines
+            .join("\n")
     }
 
     #[cfg(test)]
@@ -1304,12 +1325,9 @@ impl Console {
         message_role: Role,
     ) -> Result<BackgroundStatusNotice, String> {
         let state = self.state.lock().map_err(|error| error.to_string())?;
-        let ordinal = agent.as_ref().and_then(|(agent_id, _)| {
-            state
-                .status_area
-                .ordinal(*agent_id)
-                .or_else(|| state.overview.numbers.shared(*agent_id))
-        });
+        let ordinal = agent
+            .as_ref()
+            .and_then(|(agent_id, _)| state.overview.numbers.shared(*agent_id));
         Ok(BackgroundStatusNotice {
             title: agent.map(|(_, title)| title),
             ordinal,
@@ -1511,9 +1529,8 @@ impl Console {
     /// reading number when another Agent the View has listed reads alike.
     pub(super) fn agent_name(&self, agent_id: Uuid, title: &str) -> Result<String, String> {
         let state = self.state.lock().map_err(|error| error.to_string())?;
-        let title = state
-            .status_area
-            .agent_title(agent_id)
+        let family_title = state.status_area.agent_title(agent_id);
+        let title = family_title
             .or_else(|| {
                 state
                     .overview
@@ -1525,10 +1542,7 @@ impl Console {
                     .map(|row| row.title.as_str())
             })
             .unwrap_or(title);
-        let number = state
-            .status_area
-            .ordinal(agent_id)
-            .or_else(|| state.overview.numbers.shared(agent_id));
+        let number = state.overview.numbers.shared(agent_id);
         Ok(match number {
             Some(number) => format!("Agent {title} ({number})"),
             None => format!("Agent {title}"),
@@ -1537,17 +1551,24 @@ impl Console {
 
     /// The visible Agent's family; `visible` names the shown member, which also decides whether
     /// commands act on a child.
+    pub(super) fn set_family_input_targets(
+        &self,
+        targets: Vec<FamilyMentionTarget>,
+    ) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        state.file_mentions.set_family_targets(targets);
+        state
+            .draw(&mut io::stdout().lock())
+            .map_err(|error| error.to_string())
+    }
+
     pub(super) fn set_agent_family(
         &self,
-        rows: Vec<AgentTreeRow>,
+        rows: Vec<AgentRow>,
         visible: Option<Uuid>,
     ) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
-        let ordinals = state
-            .overview
-            .numbers
-            .sharing(&rows, MIN_REQUEST_AGENT_TITLE_COLUMNS);
-        state.status_area.update_agents(rows, visible, ordinals);
+        state.status_area.update_agents(rows, visible);
         let panels = state.status_area.available_panels().collect::<Vec<_>>();
         state.footer.update(panels);
         state.clear_footer_selection_if_hidden();
@@ -1752,6 +1773,27 @@ impl Console {
         state
             .draw(&mut io::stdout().lock())
             .map_err(|error| error.to_string())
+    }
+
+    pub(super) fn set_provider_failure(&self, failure: Option<String>) -> Result<(), String> {
+        self.state
+            .lock()
+            .map_err(|error| error.to_string())?
+            .provider_failure = failure;
+        Ok(())
+    }
+
+    pub(super) fn set_provider_failures(
+        &self,
+        chat: Uuid,
+        failures: &HashMap<String, crate::model::ProviderHttpFailure>,
+    ) -> Result<(), String> {
+        self.state
+            .lock()
+            .map_err(|error| error.to_string())?
+            .provider_failures
+            .insert(chat, failures.clone());
+        Ok(())
     }
 
     pub(super) fn update_status_area(
@@ -3270,7 +3312,15 @@ impl Console {
 
     pub(super) fn menu_snapshot(&self, id: Uuid) -> Result<Option<Menu>, String> {
         let state = self.state.lock().map_err(|error| error.to_string())?;
-        Ok(state.menu.as_ref().filter(|menu| menu.id == id).cloned())
+        Ok(state
+            .menu
+            .as_ref()
+            .filter(|menu| menu.id == id)
+            .map(|menu| {
+                let mut menu = menu.clone();
+                menu.context = state.picker_context(&menu);
+                menu
+            }))
     }
 
     pub(super) fn recover_menu(
@@ -4203,6 +4253,12 @@ impl ConversationPiece {
                 state,
                 ..
             } => scrollback.set_tool_call(*run_id, call_key, spans, *state),
+            Self::Styled(text, role) if *role == Some(Role::Error) => {
+                let links = hyperlink::web_links(text);
+                for (run, link) in hyperlink::runs(text, &links) {
+                    scrollback.append_span(run, *role, None, link);
+                }
+            }
             Self::Styled(text, role) => scrollback.append_as(text, *role, None),
             Self::Input {
                 spans,
@@ -4734,6 +4790,8 @@ impl State {
             footer_list_focused: false,
             conversation_focused: false,
             status: String::new(),
+            provider_failure: None,
+            provider_failures: HashMap::new(),
             configured_status_lines: None,
             background_status_notice: None,
             connection_notice: None,
@@ -4752,6 +4810,9 @@ impl State {
     /// Pointer input scrolls the conversation, selects text and activates the return control.
     /// Other events are captured so the terminal does not translate the wheel into arrow keys.
     fn pointer(&mut self, event: MouseEvent, output: &mut impl Write) -> bool {
+        if self.transcript.is_some() {
+            return false;
+        }
         let height = self.input_dialog_height();
         let start = self.height.saturating_sub(height);
         let body_height = self.input_dialog_body_height();
@@ -5717,6 +5778,31 @@ impl State {
             .collect()
     }
 
+    fn picker_context(&self, menu: &Menu) -> Vec<String> {
+        let mut context = menu.context.clone();
+        if let Some(failure) = self
+            .picker_presentation
+            .failure_target
+            .and_then(|chat| self.provider_failures.get(&chat))
+            .and_then(|failures| {
+                self.picker_presentation
+                    .failure_connections
+                    .get(menu.selected)
+                    .and_then(Option::as_ref)
+                    .and_then(|connection| failures.get(connection))
+            })
+        {
+            context.splice(
+                0..0,
+                super::menus::providers::provider_failure_context(failure),
+            );
+            if self.picker_presentation.failure_message {
+                context.push(format!("Provider message: {}", failure.message));
+            }
+        }
+        context
+    }
+
     fn request_styled_frame(&mut self, capacity: usize) -> (Vec<RoleLine>, usize, usize) {
         if !self.menu_is_visible() {
             let mut lines = vec![RoleLine::role(
@@ -5731,6 +5817,7 @@ impl State {
         }
         let menu = self.menu.as_ref().expect("request menu is visible");
         let selected = menu.selected.min(menu.options.len().saturating_sub(1));
+        let picker_context = self.picker_context(menu);
         let title_rows = usize::from(capacity > 1);
         let hint_rows = usize::from(capacity > 2);
         let input_field = self.input_menu_active();
@@ -5794,7 +5881,7 @@ impl State {
                         .is_some(),
             ) + usize::from(picker && !self.picker_presentation.headers.is_empty());
         let context_rows = if self.input_dialog_has_fixed_height() {
-            2 * usize::from(!menu.context.is_empty() || self.menu_review.is_some())
+            2 * usize::from(!picker_context.is_empty() || self.menu_review.is_some())
         } else {
             self.menu_context_rows(menu, capacity).min(2)
         };
@@ -5913,8 +6000,7 @@ impl State {
                     }
                 }));
             } else {
-                let context = menu
-                    .context
+                let context = picker_context
                     .iter()
                     .flat_map(|line| {
                         let link = self
@@ -6216,6 +6302,9 @@ impl State {
             self.footer.update(panels);
         }
         let overview = self.overview.projection.is_some();
+        let command_feedback =
+            (self.status_held && !self.status.is_empty()).then(|| self.status.clone());
+        let feedback_rows = usize::from(command_feedback.is_some());
         let short = self.height < agent_layout::NORMAL_LAYOUT_MIN_ROWS;
         let cap = agent_layout::bottom_capacity(self.height);
         let (draft, cursor) = self.input_display();
@@ -6317,6 +6406,7 @@ impl State {
         let separate_background_notice = self
             .background_status_notice
             .as_ref()
+            .filter(|_| command_feedback.is_none())
             .filter(|notice| notice.necessary && !overview && !short)
             .filter(|notice| {
                 !leading_notice.is_empty()
@@ -6327,7 +6417,8 @@ impl State {
                         )
                         > self.width
             });
-        let required_status = !self.status.is_empty()
+        let required_status = !self.status.is_empty() && command_feedback.is_none()
+            || self.provider_failure.is_some()
             || self.confirmation_hint().is_some()
             || short && !overview && !self.queued_inputs.is_empty()
             || !overview
@@ -6391,7 +6482,8 @@ impl State {
         };
         if float_core_status {
             status_rows = status_rows.max(usize::from(
-                self.background_status_notice.is_some() || self.foreground_shell,
+                command_feedback.is_none() && self.background_status_notice.is_some()
+                    || self.foreground_shell,
             ));
         }
         if separate_background_notice.is_some() {
@@ -6431,6 +6523,7 @@ impl State {
                 + candidates
                 + help
                 + status_rows
+                + feedback_rows
                 + borders
                 + directory_rows
                 + usize::from(footer_key_hint.is_some())
@@ -6476,7 +6569,7 @@ impl State {
             }
         }
         queue = pending_input_lines(&self.queued_inputs, self.width, queue.len());
-        let input = InputView::frame_with_prompt_and_marks(
+        let mut input = InputView::frame_with_prompt_and_marks(
             &draft,
             cursor,
             self.width,
@@ -6510,11 +6603,44 @@ impl State {
         }
         lines.extend(queue);
         lines.extend(candidates);
+        if let Some(feedback) = &command_feedback {
+            let mut line = RoleLine::role(feedback, Role::Warning);
+            line.truncate(self.width);
+            lines.push(line);
+        }
         let border = if self.shell_input.kind() == InputKind::Shell {
             Role::ShellBorder
         } else {
             Role::PromptBorder
         };
+        let child_badge =
+            (!overview && self.visible_delegated && self.shell_input.kind() != InputKind::Shell)
+                .then(|| {
+                    self.status_area.viewed_child().map(|row| {
+                        (
+                            row.subagent
+                                .as_ref()
+                                .map_or("child", |registration| registration.handle.as_str())
+                                .to_owned(),
+                            super::subagent_panel::agent_color(
+                                row.subagent.as_ref().map_or(row.agent_id, |registration| {
+                                    registration.child_chat_id
+                                }),
+                            ),
+                        )
+                    })
+                })
+                .flatten();
+        if draft.is_empty()
+            && self.prompt_enabled
+            && let Some((handle, _)) = &child_badge
+            && let Some(line) = input.styled_lines.first_mut()
+        {
+            line.push(
+                truncate_width(&format!("Message @{handle}…"), self.width.saturating_sub(2)),
+                Some(Role::MutedText),
+            );
+        }
         let mut return_control = None;
         let mut tick_control = None;
         if borders > 0 {
@@ -6576,6 +6702,16 @@ impl State {
                         self.width - label_width - tick_edge_width - DIVIDER_ENTRY_GAP_COLUMNS;
                     let line = lines.last_mut().unwrap();
                     line.truncate(column);
+                    if let Some((handle, role)) = &child_badge {
+                        super::subagent_panel::child_badge(
+                            line,
+                            column.saturating_sub(1),
+                            handle,
+                            *role,
+                            border,
+                            return_control.as_ref().map_or(0, |(_, range)| range.end),
+                        );
+                    }
                     line.push(" ".repeat(DIVIDER_ENTRY_GAP_COLUMNS), None);
                     line.push(
                         label,
@@ -6600,6 +6736,19 @@ impl State {
                         return_control = None;
                     }
                 }
+            }
+            if tick_control.is_none()
+                && let Some((handle, role)) = &child_badge
+                && let Some(line) = lines.last_mut()
+            {
+                super::subagent_panel::child_badge(
+                    line,
+                    self.width.saturating_sub(1),
+                    handle,
+                    *role,
+                    border,
+                    return_control.as_ref().map_or(0, |(_, range)| range.end),
+                );
             }
         }
         let cursor_row = lines.len() + input.cursor_row;
@@ -6654,7 +6803,9 @@ impl State {
         }
         if status_rows > 0 {
             let status_start = lines.len();
-            let status = if self.status.starts_with(CREATION_ATTACH_UNAVAILABLE_PREFIX) {
+            let status = if command_feedback.is_some()
+                || self.status.starts_with(CREATION_ATTACH_UNAVAILABLE_PREFIX)
+            {
                 ""
             } else {
                 self.status.as_str()
@@ -6671,7 +6822,8 @@ impl State {
                 ((queue_merged || short) && !self.queued_inputs.is_empty() && !overview)
                     .then(|| format!("Pending {}", self.queued_inputs.len()));
             let background = self.background_status_notice.as_ref().filter(|background| {
-                separate_background_notice.is_none()
+                command_feedback.is_none()
+                    && separate_background_notice.is_none()
                     && !overview
                     && (background.necessary || !self.help_open)
             });
@@ -6864,7 +7016,7 @@ impl State {
             }
         }
         if let Some(hint) = footer_key_hint {
-            let mut line = RoleLine::role(hint, Role::MutedText).filled(Role::StatusBar);
+            let mut line = RoleLine::role(hint, Role::MutedText);
             line.truncate(self.width);
             lines.push(line);
         }
@@ -6944,7 +7096,17 @@ impl State {
                 self.file_mentions
                     .candidates()
                     .iter()
-                    .map(|row| (row.display_path.clone(), "file".to_owned()))
+                    .map(|row| {
+                        (
+                            row.display_path.clone(),
+                            match &row.target {
+                                MentionTarget::Agent(target) => {
+                                    format!("Agent · {}", target.description)
+                                }
+                                MentionTarget::File { .. } => "File".into(),
+                            },
+                        )
+                    })
                     .collect(),
             )
         } else if self.completion.is_open() {
@@ -6955,6 +7117,33 @@ impl State {
         } else {
             return Vec::new();
         };
+        if self.file_mentions.is_open() && self.shell_input.active_completion().is_none() {
+            let mut lines = Vec::new();
+            let mut group = None;
+            let mut selected_row = None;
+            for (index, (text, description)) in candidates.into_iter().enumerate() {
+                let current_group = match self.file_mentions.candidates()[index].target {
+                    MentionTarget::Agent(_) => "Agents",
+                    MentionTarget::File { .. } => "Files",
+                };
+                if group != Some(current_group) {
+                    lines.push(RoleLine::role(current_group, Role::MutedText));
+                    group = Some(current_group);
+                }
+                if selected == Some(index) {
+                    selected_row = Some(lines.len());
+                }
+                lines.push(candidate_line(
+                    selected == Some(index),
+                    &text,
+                    &description,
+                    self.display,
+                ));
+            }
+            let start =
+                selected_row.map_or(0, |index| index.saturating_sub(capacity.saturating_sub(1)));
+            return lines.into_iter().skip(start).take(capacity).collect();
+        }
         let start = selected.map_or(0, |index| index.saturating_sub(capacity.saturating_sub(1)));
         candidates
             .into_iter()
@@ -6972,7 +7161,8 @@ impl State {
             return vec![(0..text.len(), Role::MutedText)];
         }
         let offset = usize::from(self.shell_input.kind() == InputKind::Shell);
-        self.paste_blocks
+        let mut marks: Vec<_> = self
+            .paste_blocks
             .projection(
                 self.editor.draft(),
                 self.editor.cursor(),
@@ -6987,7 +7177,12 @@ impl State {
                     Role::Accent,
                 )
             })
-            .collect()
+            .collect();
+        if let Some(target) = self.file_mentions.accepted_family() {
+            let start = self.editor.draft().len() - self.editor.draft().trim_start().len();
+            marks.push((start..start + target.handle.len() + 1, Role::Accent));
+        }
+        marks
     }
 
     fn input_display(&self) -> (String, usize) {
@@ -7142,6 +7337,7 @@ impl State {
         self.paste_blocks.restore(prompt.paste_blocks);
         self.file_mentions
             .restore_accepted(self.editor.draft(), prompt.mentions);
+        self.file_mentions.restore_family(prompt.family_target);
         self.file_mentions.dismiss();
         self.completion.dismiss();
         self.restore_saved_contexts(&contexts);
@@ -7392,6 +7588,7 @@ impl State {
         self.last_input_edit = Some(Instant::now());
         if !self.editor.draft().is_empty() {
             self.input_stash = Some(InputStash {
+                family_target: self.file_mentions.take_family(),
                 paste_blocks: self.paste_blocks.take(),
                 restored_contexts: std::mem::take(&mut self.restored_contexts),
                 accepted_mentions: self.file_mentions.take_accepted(),
@@ -7404,6 +7601,7 @@ impl State {
             self.restored_contexts = stash.restored_contexts;
             self.file_mentions
                 .restore_accepted(self.editor.draft(), stash.accepted_mentions);
+            self.file_mentions.restore_family(stash.family_target);
             self.shell_input = stash.shell_input;
             self.refresh_completion();
         }
@@ -8205,6 +8403,10 @@ impl State {
     }
 
     fn paste(&mut self, text: &str) {
+        if let Some((_, transcript)) = &mut self.transcript {
+            transcript.paste(text);
+            return;
+        }
         if self.input_dialog_requires_resize() {
             return;
         }
@@ -8265,10 +8467,6 @@ impl State {
         if self.menu.is_none()
             && (self.task_surface.is_some() || self.subscription_surface.is_some())
         {
-            return;
-        }
-        if let Some((_, transcript)) = &mut self.transcript {
-            transcript.paste(text);
             return;
         }
         if self.menu.is_none() && self.history_search.is_some() {
@@ -8772,6 +8970,12 @@ impl State {
     }
 
     fn status_notice(&self, status: &str) -> String {
+        let with_failure = match &self.provider_failure {
+            Some(failure) if status.is_empty() => failure.clone(),
+            Some(failure) => format!("{status} · {failure}"),
+            None => status.to_owned(),
+        };
+        let status = with_failure.as_str();
         let Some(hint) = self.confirmation_hint() else {
             return status.to_owned();
         };
@@ -9966,6 +10170,7 @@ impl State {
                 if crate::terminal::is_branch_command(source_text.trim()) {
                     self.branch_submission = BranchSubmission::Pending;
                     return Some(InputEvent::Prompt {
+                        family_target: None,
                         text: source_text,
                         file_references: Vec::new(),
                         images: Vec::new(),
@@ -9984,6 +10189,16 @@ impl State {
                         return None;
                     }
                 };
+                let family_target = match self
+                    .file_mentions
+                    .family_target_for_submission(self.editor.draft())
+                {
+                    Ok(target) => target.map(|target| target.execution),
+                    Err(error) => {
+                        self.hold_status(&error);
+                        return None;
+                    }
+                };
                 let pasted_texts = self.pasted_texts();
                 let draft = self.editor.draft().to_owned();
                 let images = self.paste_blocks.images(&draft);
@@ -9994,6 +10209,7 @@ impl State {
                 self.submitted_pasted_texts = Some((line.clone(), pasted_texts));
                 self.submitted_retry_of = self.retry_of.take();
                 self.submitted_prompt = Some(SubmittedPrompt {
+                    family_target: self.file_mentions.take_family(),
                     draft,
                     paste_blocks: self.paste_blocks.take(),
                     mentions: self.file_mentions.take_accepted(),
@@ -10006,6 +10222,7 @@ impl State {
                     })
                 } else {
                     Some(InputEvent::Prompt {
+                        family_target,
                         text: line,
                         file_references,
                         images,
@@ -11844,10 +12061,10 @@ mod tests {
         state.insert("keep this draft");
 
         assert!(state.key(key(KeyCode::BackTab)).is_none());
-        assert!(state.status.contains("Shift+Tab mode is unavailable here"));
+        assert!(state.status.contains("Shift+Tab mode isn't available"));
         state.refresh_status("Ready");
         assert!(
-            state.status.contains("Shift+Tab mode is unavailable here"),
+            state.status.contains("Shift+Tab mode isn't available"),
             "a periodic refresh keeps the reason"
         );
         assert_eq!(state.editor.draft(), "keep this draft");
@@ -13123,12 +13340,13 @@ mod tests {
             .await
             .unwrap();
         let console = InteractiveConsoleFixture::new(State::new(true, 100, 30));
-        let row = |agent_id: Uuid| AgentTreeRow {
+        let row = |agent_id: Uuid| AgentRow {
             agent_id,
             parent_id: None,
-            depth: 0,
+
             title: TITLE.into(),
             status: "Running".into(),
+            state: crate::runtime::LoopState::Running,
             project: "/work".into(),
             workspace: None,
             approvals: 0,
@@ -13137,6 +13355,7 @@ mod tests {
             glyph: status_glyph(AttentionGroup::Working, false),
             preview: None,
             updated_at: None,
+            subagent: None,
         };
         let requester = agent.reference(chat).await.unwrap().agent_id;
         let other = agent.reference(twin).await.unwrap().agent_id;
@@ -14126,6 +14345,70 @@ mod tests {
                 .any(|line| line.contains(&first_completion))
         );
         assert!(frame[cursor_row].contains("❯\u{a0}/"));
+    }
+
+    #[test]
+    fn family_completion_groups_chip_and_failed_draft_restore_use_editor_keys_in_both_profiles() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("audit.txt"), "evidence").unwrap();
+        let target = FamilyMentionTarget {
+            execution: crate::agent_access::ExecutionRef {
+                owner_epoch: Uuid::new_v4(),
+                agent_id: Uuid::new_v4(),
+                generation: 1,
+            },
+            handle: "audit".into(),
+            description: "Audit evidence".into(),
+            available: true,
+        };
+        for glyph_set in crate::settings::GlyphSet::ALL {
+            let mut state = State::new(true, 80, 24);
+            state.prompt_enabled = true;
+            state.display = DisplayProfile::new(crate::settings::DisplayPreferences {
+                glyph_set,
+                ..Default::default()
+            });
+            state.file_mentions = FileMentionState::with_index(
+                FileMentionIndex::build(directory.path(), &[]).unwrap(),
+            );
+            state.file_mentions.set_family_targets(vec![target.clone()]);
+            state.insert("@a");
+            let candidates = state
+                .candidate_rows(6)
+                .iter()
+                .map(RoleLine::text)
+                .collect::<Vec<_>>();
+            assert_eq!(candidates[0], "Agents");
+            assert_eq!(candidates[2], "Files");
+            state.key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
+            state.file_mentions.set_family_targets(vec![target.clone()]);
+            assert_eq!(state.file_mentions.selected_index(), Some(0));
+            assert!(state.key(key(KeyCode::Enter)).is_none());
+            assert_eq!(state.editor.draft(), "@audit ");
+            assert!(state.input_image_marks().contains(&(0..6, Role::Accent)));
+            state.key(key(KeyCode::Char('j')));
+            state.key(key(KeyCode::Char('k')));
+            assert_eq!(state.editor.draft(), "@audit jk");
+            assert!(
+                matches!(state.key(key(KeyCode::Enter)), Some(InputEvent::Prompt { family_target: Some(execution), .. }) if execution == target.execution)
+            );
+            assert!(state.restore_rejected_prompt(vec![]));
+            assert_eq!(state.editor.draft(), "@audit jk");
+            assert!(state.input_image_marks().contains(&(0..6, Role::Accent)));
+            state.stash_input();
+            assert!(state.editor.draft().is_empty());
+            state.stash_input();
+            assert_eq!(state.editor.draft(), "@audit jk");
+            assert_eq!(
+                state
+                    .file_mentions
+                    .family_target_for_submission(state.editor.draft())
+                    .unwrap()
+                    .unwrap()
+                    .execution,
+                target.execution
+            );
+        }
     }
 
     #[test]
@@ -16756,6 +17039,33 @@ mod tests {
     }
 
     #[test]
+    fn status_area_variant_a_keeps_the_draft_and_switches_exclusive_panels() {
+        let mut state = State::new(true, 80, 24);
+        state.prompt_enabled = true;
+        state.insert("inspect current work");
+        let draft = state.editor.draft().to_owned();
+        state.status_area.update(
+            "Auto".into(),
+            "model".into(),
+            Some((42000, 200000)),
+            vec![TodoItem {
+                content: "review results".into(),
+                status: tickloop_agent::runtime::TodoStatus::Pending,
+                active_form: "Reviewing results".into(),
+            }],
+        );
+        super::layout_tests::set_status_family(&mut state.status_area);
+        state.footer.update(state.status_area.available_panels());
+        state.key(key(KeyCode::Down));
+        state.key(key(KeyCode::Right));
+        let frame = state.frame().0;
+        assert!(frame.iter().any(|row| row.contains("main")));
+        assert!(!frame.iter().any(|row| row.contains("cargo test")));
+        assert!(state.key(key(KeyCode::Esc)).is_none());
+        assert_eq!(state.editor.draft(), draft);
+    }
+
+    #[test]
     fn footer_escape_and_printable_keys_return_to_the_editor() {
         let mut state = State::new(true, 80, 24);
         state.prompt_enabled = true;
@@ -18666,6 +18976,62 @@ mod tests {
                 && line.text().contains(&format!("Model {expected:02}"))));
             state.key(key(KeyCode::Char('k')));
         }
+    }
+
+    #[test]
+    fn provider_diagnostics_follow_model_keys_and_live_snapshot_without_moving_focus() {
+        let chat = Uuid::new_v4();
+        let mut state = State::new(true, 120, 25);
+        state.prompt_enabled = true;
+        state.menu_focused = true;
+        state.picker_kind = Some(PickerKind::Model);
+        let mut picker = menu();
+        picker.options = vec!["DeepSeek".into(), "MiniMax".into()];
+        picker.selected = 0;
+        let id = picker.id;
+        state.menu = Some(picker);
+        state.picker_presentation.failure_target = Some(chat);
+        state.picker_presentation.failure_connections =
+            vec![Some("deepseek-api".into()), Some("minimax-api".into())];
+        state.provider_failures.insert(
+            chat,
+            HashMap::from([(
+                "deepseek-api".into(),
+                crate::model::ProviderHttpFailure {
+                    provider_id: "deepseek-api".into(),
+                    provider_name: "DeepSeek".into(),
+                    status: 403,
+                    class: crate::model::ProviderFailureClass::UsageLimit,
+                    message: "Monthly limit".into(),
+                    hint: "Check allowance".into(),
+                    retry_after: None,
+                    retryable: false,
+                },
+            )]),
+        );
+        let context = |state: &State| {
+            state
+                .picker_context(state.menu.as_ref().unwrap())
+                .join("\n")
+        };
+        assert!(context(&state).contains("DeepSeek · HTTP 403"));
+        for down in [
+            key(KeyCode::Char('j')),
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
+        ] {
+            assert!(state.key(down).is_none());
+            assert!(!context(&state).contains("HTTP 403"));
+            assert!(state.key(key(KeyCode::Char('k'))).is_none());
+            assert!(context(&state).contains("HTTP 403"));
+        }
+        state
+            .provider_failures
+            .insert(Uuid::new_v4(), HashMap::new());
+        assert!(context(&state).contains("HTTP 403"));
+        state.provider_failures.insert(chat, HashMap::new());
+        assert!(!context(&state).contains("HTTP 403"));
+        assert_eq!(state.menu.as_ref().unwrap().id, id);
+        assert_eq!(state.menu.as_ref().unwrap().selected, 0);
     }
 
     #[test]

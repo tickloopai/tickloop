@@ -36,7 +36,7 @@ fn question_console(width: u16, height: u16, multi_select: bool) -> Console {
                 multi_select,
             }],
         },
-        "Agent Main · choose how to run four tasks".into(),
+        "Agent Choose four tasks".into(),
     );
     console.set_request_layout(Some(flow.request().id)).unwrap();
     let (menu, keys) = flow.menu(console.display_profile().unwrap());

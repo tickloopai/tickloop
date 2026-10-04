@@ -616,7 +616,7 @@ impl State {
                 }
             }
         } else {
-            menu.context
+            self.picker_context(menu)
                 .iter()
                 .map(|line| {
                     wrap_text(&display_text(line), self.width.saturating_sub(2).max(1)).len()
@@ -668,7 +668,10 @@ impl State {
     }
 
     pub(super) fn input_dialog_requires_resize(&self) -> bool {
-        if !self.input_dialog_visible() || self.input_dialog_has_fixed_height() || self.full_review
+        if !self.input_dialog_visible()
+            || self.input_dialog_has_fixed_height()
+            || self.full_review
+            || self.transcript.is_some()
         {
             return false;
         }

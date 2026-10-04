@@ -41,44 +41,17 @@ const TIMEOUT: Duration = Duration::from_secs(15);
 const VIEW_REGISTRATION_DELAY: Duration = Duration::from_millis(50);
 
 /// Records every command the View sends, one JSON line each in `commands.jsonl`. On the
-/// requester route, the catalog also lists a Lost sibling whose id shares the child's first ten
-/// digits, so only a longer token tells the two apart. Slow View registration separates the
-/// initial transcript frame from the initialized editor.
+/// Each command retains the stable execution identity used by the View. Slow View
+/// registration separates the initial transcript frame from the initialized editor.
 struct RecordingOwner {
     owner: EmbeddedAgentAccess,
     directory: PathBuf,
-    sibling: bool,
-}
-
-/// An id equal to `id` in its first ten digits and different in the eleventh.
-fn same_prefix_id(id: Uuid) -> Uuid {
-    let mut digits = id.simple().to_string().into_bytes();
-    digits[10] = if digits[10] == b'0' { b'1' } else { b'0' };
-    Uuid::parse_str(std::str::from_utf8(&digits).unwrap()).unwrap()
 }
 
 #[async_trait]
 impl AgentAccess for RecordingOwner {
     async fn observe(&self, query: ObservationRequest) -> Result<Observation, AccessError> {
-        let mut observation = self.owner.observe(query).await?;
-        if self.sibling
-            && let ObservationValue::Overview(rows) = &mut observation.initial
-            && let Some(child) = rows.iter().find(|row| row.parent.is_some()).cloned()
-        {
-            rows.push(AgentSummary {
-                availability: ExecutionAvailability::Lost,
-                execution: ExecutionRef {
-                    agent_id: same_prefix_id(child.execution.agent_id),
-                    ..child.execution
-                },
-                chat_id: Uuid::new_v4(),
-                state: runtime::LoopState::Completed,
-                waiting_permissions: 0,
-                waiting_questions: 0,
-                views: Vec::new(),
-                ..child
-            });
-        }
+        let observation = self.owner.observe(query).await?;
         Ok(observation)
     }
 
@@ -177,7 +150,6 @@ async fn run_child_config_fixture() {
     let adapter = Arc::new(RecordingOwner {
         owner: EmbeddedAgentAccess::new(core.clone()),
         directory: directory.clone(),
-        sibling: requester,
     });
     let mut launch = LaunchSpec::embedded(workdir.clone());
     launch.model = Some(model);
@@ -257,7 +229,6 @@ async fn run_child_config_fixture() {
             "root": agent.reference(root).await.unwrap(),
             "execution": child.execution,
             "chat": child.chat_id,
-            "sibling": same_prefix_id(child.execution.agent_id),
             "policy": core.snapshot(child.chat_id).await.unwrap().policy,
             "delegation": core.snapshot(child.chat_id).await.unwrap().delegation,
         }))
@@ -442,14 +413,51 @@ impl ChildPty {
     /// Opens the delegated child in place from the overview.
     fn open_child(&mut self) {
         self.wait_for_root_editor();
-        self.send(b"\x1b[D");
-        self.wait_for("the overview", |frame| frame.contains("Agents · local"));
-        self.send(b" ");
-        self.wait_for("the child under its root", |frame| {
-            frame.matches(TASK).count() >= 2
-        });
-        self.send(b"\x1b[B\r");
+        self.wait_for("the family panel", |frame| frame.contains("Subagents 1"));
+        self.send(b"\x1b[B\x1b[Bj\r");
     }
+}
+
+#[test]
+fn a_real_delegate_child_clear_refusal_preserves_the_view_and_family_panel() {
+    let directory = tempfile::tempdir_in("/tmp").unwrap();
+    let mut view = ChildPty::start(directory.path(), "child-config");
+    let _child = child_fixture(directory.path(), &view);
+    view.open_child();
+    view.wait_for_child_editor();
+    let opened = view.wait_for("named child view", |frame| {
+        frame.contains("Message @review-notes…")
+    });
+    assert!(opened.contains("● review-notes"), "{opened}");
+    assert!(opened.contains("○ main"), "{opened}");
+    let baseline = commands(directory.path()).len();
+    view.send(b"/clear\r");
+    let refused = view.wait_for("child clear refused", |frame| {
+        frame.contains("/clear isn't available in a child Agent")
+    });
+    let feedback = refused
+        .lines()
+        .position(|line| line.contains("/clear isn't available"))
+        .unwrap();
+    let input = refused
+        .lines()
+        .position(|line| line.trim_start().starts_with('❯') && line.contains("/clear"))
+        .unwrap();
+    assert!(feedback < input, "{refused}");
+    assert!(
+        refused.contains("Subagents 1") && refused.contains("● review-notes"),
+        "{refused}"
+    );
+    assert!(
+        refused.contains("child reviewed"),
+        "history remains visible: {refused}"
+    );
+    assert_eq!(
+        commands(directory.path()).len(),
+        baseline,
+        "no history command was dispatched"
+    );
+    view.close();
 }
 
 impl Drop for ChildPty {
@@ -472,8 +480,10 @@ fn commands(directory: &Path) -> Vec<Value> {
 fn child_fixture(directory: &Path, view: &ChildPty) -> Value {
     let deadline = Instant::now() + TIMEOUT;
     loop {
-        if let Ok(bytes) = std::fs::read(directory.join("child.json")) {
-            return serde_json::from_slice(&bytes).unwrap();
+        if let Ok(bytes) = std::fs::read(directory.join("child.json"))
+            && let Ok(fixture) = serde_json::from_slice(&bytes)
+        {
+            return fixture;
         }
         assert!(
             Instant::now() < deadline,
@@ -692,6 +702,7 @@ fn inherited_auto_permissions_keep_judgment_read_only_and_root_key_settings_edit
     view.wait_for("the Auto child in place", |frame| {
         frame.contains("child reviewed") && status_mode(frame).as_deref() == Some("Auto")
     });
+    view.wait_for_child_editor();
     let baseline = commands(directory.path()).len();
     view.send(b"/permissions\r");
     view.wait_for("the fixed child Auto mode", |frame| {
@@ -866,7 +877,7 @@ fn a_child_opened_in_place_refuses_root_only_changes_before_sending_and_keeps_it
     std::thread::sleep(Duration::from_millis(200));
     view.send(b"\x1b[Z");
     let deadline = Instant::now() + TIMEOUT;
-    while !view.frame().contains("Shift+Tab mode is unavailable here") {
+    while !view.frame().contains("Shift+Tab mode isn't available") {
         assert!(
             Instant::now() < deadline,
             "the refused Shift+Tab never showed: {}\n{:?}",
@@ -877,7 +888,7 @@ fn a_child_opened_in_place_refuses_root_only_changes_before_sending_and_keeps_it
     }
     std::thread::sleep(Duration::from_millis(2500));
     assert!(
-        view.frame().contains("Shift+Tab mode is unavailable here"),
+        view.frame().contains("Shift+Tab mode isn't available"),
         "status refreshes keep the reason: {}",
         view.frame()
     );
@@ -889,7 +900,7 @@ fn a_child_opened_in_place_refuses_root_only_changes_before_sending_and_keeps_it
 
     view.send(b"\x15/cwd sub\r");
     view.wait_for("the refused /cwd PATH", |frame| {
-        frame.contains("/cwd PATH is unavailable here")
+        frame.contains("/cwd PATH isn't available")
     });
     view.send(b"\x15/cwd\r");
     view.wait_for("the readable working directory", |frame| {
@@ -983,7 +994,7 @@ fn shift_tab_in_the_overview_changes_no_hidden_agent_and_the_root_keeps_its_key(
     view.send(b"\x1b[Z");
     view.send(b"\x1b[Z");
     let refused = view.wait_for("Shift+Tab refused in the dispatch input", |frame| {
-        frame.contains("Shift+Tab mode is unavailable here: acts on an open Agent")
+        frame.contains("Shift+Tab mode isn't available here: acts on an open Agent")
     });
     view.assert_alive("Shift+Tab in the overview");
     assert!(
@@ -1005,7 +1016,7 @@ fn shift_tab_in_the_overview_changes_no_hidden_agent_and_the_root_keeps_its_key(
 
     view.send(b"\x1b");
     view.wait_for("the root with its periodic status", |frame| {
-        frame.contains("parent done") && !frame.contains("Shift+Tab mode is unavailable here")
+        frame.contains("parent done") && !frame.contains("Shift+Tab mode isn't available")
     });
     view.send(b"\x1b[D");
     view.wait_for("the overview list again", |frame| {
@@ -1013,7 +1024,7 @@ fn shift_tab_in_the_overview_changes_no_hidden_agent_and_the_root_keeps_its_key(
     });
     view.send(b"\x1b[Z");
     view.wait_for("Shift+Tab refused in the list", |frame| {
-        frame.contains("Shift+Tab mode is unavailable here")
+        frame.contains("Shift+Tab mode isn't available")
     });
     view.send(b"\t");
     view.wait_for("the dispatch input", |frame| {
@@ -1088,30 +1099,19 @@ fn shift_tab_in_the_overview_changes_no_hidden_agent_and_the_root_keeps_its_key(
 }
 
 #[test]
-fn a_child_request_names_the_child_with_its_family_number_and_no_persistent_grant() {
+fn a_child_request_uses_its_handle_and_never_offers_a_persistent_grant() {
     let directory = tempfile::tempdir_in("/tmp").unwrap();
     let mut view = ChildPty::start(directory.path(), "requester");
     let child = child_fixture(directory.path(), &view);
     let child_id = Uuid::parse_str(child["execution"]["agent_id"].as_str().unwrap()).unwrap();
-    let sibling_id = Uuid::parse_str(child["sibling"].as_str().unwrap()).unwrap();
     let question = view.wait_for("the child's question", |frame| {
         frame.contains("Which window?")
     });
-    let named = question
-        .split(&format!("Agent {TASK} ("))
-        .nth(1)
-        .and_then(|rest| rest.split_once(')'))
-        .is_some_and(|(number, _)| number.parse::<usize>().is_ok());
+    assert!(question.contains("Agent review-notes"), "{question}");
     assert!(
-        named,
-        "the request names the child by its title and the family's reading number, since its family repeats the title: {question}"
+        !question.contains(&child_id.simple().to_string()[..4]),
+        "the handle names the child: {question}"
     );
-    for id in [child_id, sibling_id] {
-        assert!(
-            !question.contains(&id.simple().to_string()[..4]),
-            "no execution hash names a requester: {question}"
-        );
-    }
     view.send(b"\r");
     let dialog = view.wait_for("the child's permission request", |frame| {
         frame.contains("Permission required")
@@ -1129,7 +1129,7 @@ fn a_child_request_names_the_child_with_its_family_number_and_no_persistent_gran
                 && !frame.contains("Permission required")
                 && frame
                     .lines()
-                    .any(|line| line.contains(TASK) && line.contains("Completed"))
+                    .any(|line| line.contains(TASK) && line.contains("completed"))
         },
     );
     assert!(

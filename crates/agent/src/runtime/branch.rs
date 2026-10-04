@@ -41,6 +41,7 @@ pub struct BranchSessionPermissionRegistration {
 pub struct BranchPublicSource {
     pub chat_id: ChatId,
     pub run_id: Option<RunId>,
+    pub message_id: Option<Uuid>,
     #[serde(default)]
     pub is_agent_message: bool,
 }
@@ -272,6 +273,8 @@ impl Agent {
         };
         let client = source.client.clone();
         let mut snapshot = ChatSnapshot {
+            failure_events: Vec::new(),
+            provider_failures: Default::default(),
             tool_call_recoveries: Vec::new(),
             artifact_ticks: source.snapshot.artifact_ticks.clone(),
             removed_artifact_ticks: source.snapshot.removed_artifact_ticks.clone(),
@@ -279,6 +282,10 @@ impl Agent {
             id: child_chat_id,
             branch_origin: Some(origin),
             delegation: None,
+            family_completions: Vec::new(),
+            family_inputs: BTreeMap::new(),
+            sent_agent_messages: BTreeMap::new(),
+            generated_title: None,
             workdir,
             model: source.snapshot.model.clone(),
             reasoning_effort: source.snapshot.reasoning_effort,
@@ -290,6 +297,7 @@ impl Agent {
             denial_references: BTreeMap::new(),
             message_ids: BTreeMap::new(),
             agent_message_origins: source.snapshot.agent_message_origins.clone(),
+            human_family_origins: source.snapshot.human_family_origins.clone(),
             original_user_message_ids: BTreeMap::new(),
             prompt_execution_modes: BTreeMap::new(),
             inherited_prompts: HashSet::new(),
@@ -379,9 +387,15 @@ impl Agent {
         if !child_replacements.is_empty() {
             self.record_content_replacements(&snapshot, child_replacements);
         }
+        self.inner
+            .subagent_registry
+            .lock()
+            .await
+            .insert(child_chat_id, Vec::new());
         chats.insert(
             child_chat_id,
             Chat {
+                family_generation: 0,
                 snapshot: snapshot.clone(),
                 todo_completion_graces: Default::default(),
                 start_new_tool_result_message: false,
@@ -532,6 +546,7 @@ fn materialize_active_items(
                         source: BranchPublicSource {
                             chat_id: snapshot.id,
                             run_id,
+                            message_id: snapshot.message_ids.get(&message_index).copied(),
                             is_agent_message: snapshot
                                 .message_ids
                                 .get(&message_index)
@@ -552,6 +567,7 @@ fn materialize_active_items(
                 source: BranchPublicSource {
                     chat_id: snapshot.id,
                     run_id: None,
+                    message_id: None,
                     is_agent_message: false,
                 },
                 direction,
@@ -1019,6 +1035,15 @@ mod tests {
 
     #[async_trait]
     impl ModelClient for UnusedModel {
+        async fn generate_title(
+            &self,
+            request: crate::model::ModelRequest,
+            _: tokio::sync::mpsc::UnboundedSender<crate::model::ModelDelta>,
+            _: tokio_util::sync::CancellationToken,
+        ) -> Result<crate::model::ModelOutput, crate::model::ModelError> {
+            Ok(crate::model::fixture_title(request))
+        }
+
         fn identity(&self) -> ModelIdentity {
             ModelIdentity {
                 provider: crate::model::ModelProvider::Api,
@@ -1114,6 +1139,7 @@ mod tests {
                             input: "queued work".into(),
                             contexts: Vec::new(),
                             agent_message: None,
+                            directed_human: None,
                             denial_reference: None,
                             trigger_source: None,
                             armed: true,
@@ -1177,6 +1203,7 @@ mod tests {
                     goal: "busy goal".into(),
                     state: state.clone(),
                     run_id: Some(run_id),
+                    run_started_at: None,
                     trigger: None,
                     event_sources: Vec::new(),
                     state_since: None,
@@ -1259,6 +1286,7 @@ mod tests {
             source: BranchPublicSource {
                 chat_id: Uuid::from_u128(1),
                 run_id: Some(Uuid::from_u128(2)),
+                message_id: None,
                 is_agent_message: false,
             },
             message: Message {

@@ -696,6 +696,143 @@ mod tests {
     }
 
     #[test]
+    fn kimi_connection_initial_focus_uses_the_recommendation_and_preserves_explicit_focus() {
+        let profiles = crate::model::cards::built_in_model_profiles()
+            .into_iter()
+            .filter(|model| model.provider_id == "kimi-code-oauth")
+            .collect();
+        let provider = ProviderModels::group(profiles).remove(0);
+        assert_eq!(
+            provider.models[0].model_id, "k3",
+            "capability order should remain unchanged"
+        );
+        let key = provider.key();
+        let console = Console::test_interactive_for_chat(Uuid::new_v4());
+        let mut menus = Menus::default();
+        menus.provider.provider_choices = vec![provider.clone()];
+        menus.provider.model_providers = vec![provider.clone()];
+        menus.provider.model_choices = provider
+            .models
+            .iter()
+            .map(|model| ModelChoice {
+                config: model.clone(),
+                thinking: None,
+                availability: ModelAvailability::Unknown {
+                    reason: "Controlled directory fixture".into(),
+                },
+            })
+            .collect();
+        menus
+            .show_provider_models(&console, ConfigTarget::NewDraft, &key, None, None)
+            .unwrap();
+        assert_eq!(
+            menus.provider.focused_model,
+            Some(("kimi-code-oauth".into(), "kimi-for-coding".into()))
+        );
+        menus.dismiss(&console).unwrap();
+        menus
+            .show_provider_models(
+                &console,
+                ConfigTarget::NewDraft,
+                &key,
+                Some(&("kimi-code-oauth".into(), "k3".into())),
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            menus.provider.focused_model,
+            Some(("kimi-code-oauth".into(), "k3".into()))
+        );
+    }
+
+    #[test]
+    fn grouped_models_and_refreshed_details_keep_the_selected_connections_failure() {
+        let catalog = crate::model::cards::ModelCatalog::defaults();
+        let kimi = catalog.get("kimi-code-oauth", "k3").unwrap();
+        let mut deepseek = catalog.get("deepseek-api", "deepseek-flash").unwrap();
+        deepseek.api_key_env = "MERGE_MENU_FIXTURE_KEY".into();
+        let models = vec![deepseek, kimi.clone()];
+        for selected in 0..models.len() {
+            let root = tempfile::tempdir().unwrap();
+            let chat = Uuid::new_v4();
+            let console = Console::test_interactive_for_chat(chat);
+            let mut menus = Menus::new(None, Some(root.path().into()));
+            menus.provider.provider_choices = ProviderModels::group(models.clone());
+            let failure = crate::model::ProviderHttpFailure {
+                provider_id: kimi.provider_id.clone(),
+                provider_name: "Kimi Code".into(),
+                status: 403,
+                class: crate::model::ProviderFailureClass::UsageOrPlan,
+                message: "Monthly usage limit reached".into(),
+                hint: "Usage limit OR plan access; try kimi-for-coding".into(),
+                retry_after: None,
+                retryable: false,
+            };
+            menus
+                .provider
+                .provider_failures
+                .insert(kimi.provider_id.clone(), failure);
+            console
+                .set_provider_failures(chat, &menus.provider.provider_failures)
+                .unwrap();
+            let choices = models
+                .iter()
+                .map(|config| ModelChoice {
+                    config: config.clone(),
+                    thinking: None,
+                    availability: ModelAvailability::Unknown {
+                        reason: "Fixture".into(),
+                    },
+                })
+                .collect();
+            menus
+                .show_model_choices(
+                    &console,
+                    ConfigTarget::Agent(chat),
+                    choices,
+                    selected,
+                    Uuid::new_v4(),
+                )
+                .unwrap();
+            let menu = console.menu_snapshot(menus.id().unwrap()).unwrap().unwrap();
+            assert!(menu.title.contains("Signed-in Providers"));
+            assert_eq!(
+                menu.context.iter().any(|line| line.contains("HTTP 403")),
+                selected == 1
+            );
+            let provider = menus
+                .provider
+                .provider_choices
+                .iter()
+                .find(|provider| provider.models[0].provider_id == kimi.provider_id)
+                .unwrap()
+                .clone();
+            menus
+                .connection_details(&console, ConfigTarget::Agent(chat), provider.clone(), 1)
+                .unwrap();
+            let id = menus.id().unwrap();
+            menus
+                .connection_details(&console, ConfigTarget::Agent(chat), provider, 0)
+                .unwrap();
+            let menu = console.menu_snapshot(id).unwrap().unwrap();
+            assert_eq!(menus.id(), Some(id));
+            assert_eq!(menu.selected, 1);
+            assert!(menu.context[0].contains("HTTP 403"));
+            assert!(
+                menu.context
+                    .iter()
+                    .any(|line| line.contains("Provider message: Monthly usage limit"))
+            );
+            console
+                .set_provider_failures(chat, &HashMap::new())
+                .unwrap();
+            let menu = console.menu_snapshot(id).unwrap().unwrap();
+            assert_eq!(menu.selected, 1);
+            assert!(!menu.context.iter().any(|line| line.contains("HTTP 403")));
+        }
+    }
+
+    #[test]
     fn capability_order_is_stable_and_separate_from_default_recommendations() {
         let mut profiles = tickloop_agent::model::cards::built_in_model_profiles();
         let forward = ProviderModels::group(profiles.clone());
@@ -1133,6 +1270,8 @@ pub(super) enum ConnectionAction {
 
 #[derive(Default)]
 pub(super) struct ProviderSession {
+    pub(super) provider_failures:
+        std::collections::HashMap<String, crate::model::ProviderHttpFailure>,
     pub(super) login_return: Option<(ConfigTarget, ProviderModels)>,
     pub(super) provider_choices: Vec<ProviderModels>,
     pub(super) provider_selected: usize,
@@ -1163,6 +1302,19 @@ impl Menus {
             self.provider_sessions.insert(previous, previous_session);
         }
         self.provider_chat = Some(chat);
+    }
+
+    pub(in crate::terminal) fn note_provider_failures(
+        &mut self,
+        chat: Uuid,
+        failures: &HashMap<String, crate::model::ProviderHttpFailure>,
+    ) {
+        if self.provider_chat == Some(Some(chat)) {
+            self.provider.provider_failures = failures.clone();
+        }
+        if let Some(session) = self.provider_sessions.get_mut(&Some(chat)) {
+            session.provider_failures = failures.clone();
+        }
     }
 
     pub(super) fn key_for_model(&self, model: &ModelConfig) -> Option<String> {
@@ -1353,6 +1505,7 @@ impl Menus {
                         "p Connection · f {} · Enter models/setup · {escape}",
                         if filter == "All" { "Configured" } else { "All" }
                     ),
+                    ..Default::default()
                 },
             )?;
         } else {
@@ -1452,12 +1605,23 @@ impl Menus {
         }
         actions.push(ConnectionAction::CredentialDetails);
         options.push("Credential details…".into());
-        let mut context = vec![
+        let failure = self.provider.provider_failures.get(&config.provider_id);
+        let mut context = if console.is_interactive() {
+            Vec::new()
+        } else {
+            failure.map(provider_failure_context).unwrap_or_default()
+        };
+        context.extend([
             self.provider_auth_label(&provider).into(),
             format!("Endpoint: {}", endpoint_label(&config.base_url)),
-        ];
+        ]);
         if let Err(error) = authenticated {
             context.push(safe_text(&error));
+        }
+        if !console.is_interactive()
+            && let Some(failure) = failure
+        {
+            context.push(format!("Provider message: {}", failure.message));
         }
         let mut selected = selected;
         let mut id = Uuid::new_v4();
@@ -2091,6 +2255,17 @@ impl Menus {
                     choice.config.provider_id == *id && choice.config.model_id == *model
                 })
             })
+            .or_else(|| {
+                let first = choices.first()?;
+                if first.config.provider_id != "kimi-code-oauth" {
+                    return None;
+                }
+                let recommended = crate::model::access::AccessCatalog::defaults()
+                    .recommended_model(&first.config.provider_id)?;
+                choices
+                    .iter()
+                    .position(|choice| choice.config.model_id == recommended)
+            })
             .unwrap_or(0);
         self.provider.model_provider = Some(provider.into());
         let selected = action
@@ -2306,6 +2481,20 @@ impl Menus {
             }
         } else if self.provider.discovery_flow.is_some() {
             context.push("Checking account models…".into());
+        }
+        let failure_provider = choices
+            .get(selected)
+            .map(|choice| choice.config.provider_id.as_str())
+            .or_else(|| {
+                provider
+                    .as_ref()
+                    .map(|provider| provider.models[0].provider_id.as_str())
+            });
+        if !console.is_interactive()
+            && let Some(failure) =
+                failure_provider.and_then(|provider| self.provider.provider_failures.get(provider))
+        {
+            context.splice(0..0, provider_failure_context(failure));
         }
         let title = provider.as_ref().map_or_else(
             || "Choose model · Signed-in Providers".into(),
@@ -2811,4 +3000,18 @@ fn directory_status(
                 .into()
         }
     }
+}
+
+pub(in crate::terminal) fn provider_failure_context(
+    failure: &crate::model::ProviderHttpFailure,
+) -> Vec<String> {
+    let next_step = if failure.class == crate::model::ProviderFailureClass::UsageOrPlan {
+        "Other models may require a higher Kimi Code plan; try kimi-for-coding.".into()
+    } else {
+        failure.hint.clone()
+    };
+    vec![
+        format!("Last request failed: {}", failure.summary()),
+        next_step,
+    ]
 }

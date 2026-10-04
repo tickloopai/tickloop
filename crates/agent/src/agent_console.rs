@@ -7,6 +7,21 @@ use std::{
     sync::Arc,
 };
 use uuid::Uuid;
+const FINISHED_CHILD_GRACE_MS: u64 = 30_000;
+
+#[derive(Clone, PartialEq, Eq)]
+struct TerminalTransition {
+    run_id: Option<crate::runtime::RunId>,
+    state: LoopState,
+    finished_at: Option<u64>,
+}
+
+#[derive(Default)]
+struct ChildRetirement {
+    completion: Option<TerminalTransition>,
+    deadline: Option<u64>,
+    departed_at: Option<u64>,
+}
 
 #[derive(Clone, Debug)]
 pub enum Intent {
@@ -68,6 +83,9 @@ pub struct AgentConsole {
     closed: bool,
     unconfirmed_dispatch: Option<(Uuid, Uuid)>,
     created: Option<ExecutionRef>,
+    clock: Arc<dyn Fn() -> u64 + Send + Sync>,
+    last_viewed: HashMap<ExecutionRef, ExecutionRef>,
+    retirements: HashMap<ExecutionRef, ChildRetirement>,
 }
 
 impl AgentConsole {
@@ -93,7 +111,15 @@ impl AgentConsole {
             closed: false,
             unconfirmed_dispatch: None,
             created: None,
+            clock: Arc::new(crate::private_fs::unix_time_milliseconds),
+            last_viewed: HashMap::new(),
+            retirements: HashMap::new(),
         }
+    }
+
+    pub fn with_clock(mut self, clock: Arc<dyn Fn() -> u64 + Send + Sync>) -> Self {
+        self.clock = clock;
+        self
     }
 
     pub async fn refresh(&mut self) -> Result<Projection, AccessError> {
@@ -122,6 +148,7 @@ impl AgentConsole {
         }
         rows.sort_by_key(|row| (AttentionGroup::of(row), row.execution));
         self.rows = rows;
+        self.refresh_retirements();
         self.unavailable_locations.retain(|(view, version)| {
             self.rows.iter().any(|row| {
                 row.views
@@ -147,7 +174,7 @@ impl AgentConsole {
                         .as_ref()
                         .is_none_or(|workspace| row.workspace.as_ref() == Some(workspace))
             })
-            .map(|row| self.presentation_row(row))
+            .cloned()
             .collect::<Vec<_>>();
         sort_overview_families(&mut rows);
         Projection {
@@ -162,19 +189,6 @@ impl AgentConsole {
             unconfirmed_dispatch: self.unconfirmed_dispatch.map(|(_, id)| id),
             created: self.created,
         }
-    }
-
-    fn presentation_row(&self, row: &AgentSummary) -> AgentSummary {
-        let mut presentation = row.clone();
-        if row.parent.is_none()
-            && self
-                .rows
-                .iter()
-                .any(|member| member.parent == Some(row.execution))
-        {
-            presentation.title = format!("Main · {}", row.title);
-        }
-        presentation
     }
 
     pub fn interpret(&mut self, intent: Intent) -> Result<Option<NavigationEffect>, AccessError> {
@@ -194,7 +208,7 @@ impl AgentConsole {
             Intent::NewDraft => {
                 self.invalidate();
                 self.overview = false;
-                self.visible = None;
+                self.visible_ready(None);
                 self.created = None;
             }
             Intent::Close => {
@@ -221,6 +235,27 @@ impl AgentConsole {
             }
             Intent::Open(target) => {
                 self.invalidate();
+                let root = self.family_root(target);
+                let target = if root == target
+                    && (self.overview
+                        || self
+                            .visible
+                            .is_none_or(|visible| self.family_root(visible) != root))
+                {
+                    self.last_viewed
+                        .get(&root)
+                        .copied()
+                        .filter(|member| {
+                            self.rows.iter().any(|row| {
+                                row.execution == *member
+                                    && row.availability == ExecutionAvailability::Live
+                            }) && self.family_root(*member) == root
+                                && !self.is_retired(*member)
+                        })
+                        .unwrap_or(target)
+                } else {
+                    target
+                };
                 let row = self
                     .rows
                     .iter()
@@ -363,7 +398,7 @@ impl AgentConsole {
         }
         match &effect.destination {
             Destination::Present => {
-                self.visible = Some(effect.target);
+                self.visible_ready(Some(effect.target));
                 self.overview = false;
             }
             Destination::Focus(destination) => {
@@ -387,11 +422,48 @@ impl AgentConsole {
 
     pub fn visible_ready(&mut self, visible: Option<ExecutionRef>) {
         if !self.closed {
+            let now = (self.clock)();
+            if self.visible != visible
+                && let Some(previous) = self.visible
+                && self.retirements.contains_key(&previous)
+            {
+                let retirement = self.retirements.get_mut(&previous).unwrap();
+                retirement.departed_at = Some(now);
+                if retirement.completion.is_some() {
+                    retirement.deadline = Some(now.saturating_add(FINISHED_CHILD_GRACE_MS));
+                }
+            }
             self.visible = visible;
+            if let Some(visible) = visible {
+                if let Some(retirement) = self.retirements.get_mut(&visible) {
+                    retirement.deadline = None;
+                    retirement.departed_at = None;
+                }
+                self.last_viewed.insert(self.family_root(visible), visible);
+            }
         }
     }
 
+    pub fn family_members(&self, visible: ExecutionRef) -> Vec<AgentSummary> {
+        let root = self.family_root(visible);
+        self.rows
+            .iter()
+            .filter(|row| row.execution == root || self.is_descendant(row.execution, Some(root)))
+            .cloned()
+            .collect()
+    }
+
     pub fn family(&self, visible: ExecutionRef) -> Vec<AgentSummary> {
+        let root = self.family_root(visible);
+        self.family_members(visible)
+            .into_iter()
+            .filter(|row| {
+                row.execution == root || row.execution == visible || !self.is_retired(row.execution)
+            })
+            .collect()
+    }
+
+    fn family_root(&self, visible: ExecutionRef) -> ExecutionRef {
         let mut root = visible;
         let mut visited = HashSet::new();
         while visited.insert(root) {
@@ -406,11 +478,78 @@ impl AgentConsole {
             };
             root = parent;
         }
-        self.rows
+        root
+    }
+
+    fn is_retired(&self, execution: ExecutionRef) -> bool {
+        self.visible != Some(execution)
+            && self
+                .retirements
+                .get(&execution)
+                .and_then(|retirement| retirement.deadline)
+                .is_some_and(|deadline| deadline <= (self.clock)())
+    }
+
+    fn refresh_retirements(&mut self) {
+        let now = (self.clock)();
+        self.retirements.retain(|execution, _| {
+            self.rows
+                .iter()
+                .any(|row| row.execution == *execution && row.parent.is_some())
+        });
+        for row in &self.rows {
+            if row.parent.is_none() {
+                continue;
+            }
+            let retirement = self.retirements.entry(row.execution).or_default();
+            let terminal = matches!(
+                row.state,
+                LoopState::Completed
+                    | LoopState::Failed
+                    | LoopState::Stopped
+                    | LoopState::Interrupted
+                    | LoopState::Expired
+            );
+            if row.availability == ExecutionAvailability::Live
+                && terminal
+                && row.waiting_permissions + row.waiting_questions == 0
+            {
+                let completion = TerminalTransition {
+                    run_id: row.run_id,
+                    state: row.state.clone(),
+                    finished_at: row.updated_at,
+                };
+                if retirement.completion.as_ref() != Some(&completion) {
+                    let finished_at = row.updated_at.unwrap_or(now);
+                    let grace_start = retirement
+                        .departed_at
+                        .filter(|departure| *departure >= finished_at)
+                        .unwrap_or(finished_at);
+                    retirement.completion = Some(completion);
+                    retirement.deadline = Some(grace_start.saturating_add(FINISHED_CHILD_GRACE_MS));
+                }
+                if self.visible == Some(row.execution) {
+                    retirement.deadline = None;
+                }
+            } else {
+                retirement.completion = None;
+                retirement.deadline = None;
+            }
+        }
+        let invalid = self
+            .last_viewed
             .iter()
-            .filter(|row| row.execution == root || self.is_descendant(row.execution, Some(root)))
-            .map(|row| self.presentation_row(row))
-            .collect()
+            .filter(|(_, member)| {
+                self.is_retired(**member)
+                    || !self.rows.iter().any(|row| {
+                        row.execution == **member && row.availability == ExecutionAvailability::Live
+                    })
+            })
+            .map(|(root, _)| *root)
+            .collect::<Vec<_>>();
+        for root in invalid {
+            self.last_viewed.remove(&root);
+        }
     }
 
     pub async fn dispatch(

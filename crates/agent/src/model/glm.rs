@@ -50,15 +50,21 @@ pub(super) fn shape_request(
     Ok(())
 }
 
+pub(super) const INSUFFICIENT_BALANCE_CODE: u16 = 1113;
+
+pub(super) fn business_code(body: Option<&Value>) -> Option<u16> {
+    match &body?.get("error")?["code"] {
+        Value::String(code) => code.parse::<u16>().ok(),
+        Value::Number(code) => u16::try_from(code.as_u64()?).ok(),
+        _ => None,
+    }
+}
+
 /// Classifies documented GLM business codes whose HTTP status alone would be retried or
 /// reported as a generic invalid request.
 pub(super) fn http_error(status: u16, body: Option<&Value>) -> Option<ModelError> {
+    let code = business_code(body)?;
     let error = body?.get("error")?;
-    let code = match &error["code"] {
-        Value::String(code) => code.parse::<u16>().ok()?,
-        Value::Number(code) => u16::try_from(code.as_u64()?).ok()?,
-        _ => return None,
-    };
     // Hermes, OpenClaw and pi treat this 1210 text as a prompt over the context window.
     let reports_prompt_overflow = code == 1210
         && error["message"].as_str().is_some_and(|message| {
@@ -69,7 +75,7 @@ pub(super) fn http_error(status: u16, body: Option<&Value>) -> Option<ModelError
     match code {
         // The ordinary API also answers 1113 to GLM Coding Plan keys, whose quota only applies
         // to the plan's own endpoints (observed with a real plan key on both sites).
-        1113 => Some(ModelError::QuotaExhausted {
+        INSUFFICIENT_BALANCE_CODE => Some(ModelError::QuotaExhausted {
             status,
             description: ": no pay-as-you-go balance or resource package (1113); GLM Coding Plan keys do not apply to this API".into(),
         }),

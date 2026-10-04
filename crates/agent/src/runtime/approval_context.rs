@@ -134,15 +134,22 @@ fn originals_for_active_chain_with_legacy(
             else {
                 return Err(ApprovalContextError::MissingOriginalUserInput);
             };
-            let text = message
-                .content
-                .iter()
-                .filter_map(|content| match content {
-                    Content::Text { text } => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n\n");
+            let text = snapshot
+                .message_ids
+                .get(&index)
+                .and_then(|id| snapshot.human_family_origins.get(id))
+                .map(|source| source.original_submission.clone())
+                .unwrap_or_else(|| {
+                    message
+                        .content
+                        .iter()
+                        .filter_map(|content| match content {
+                            Content::Text { text } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n\n")
+                });
             if text.is_empty() {
                 return Err(ApprovalContextError::MissingOriginalUserInput);
             }

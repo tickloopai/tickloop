@@ -7,7 +7,7 @@ use std::{
 use async_trait::async_trait;
 use reqwest::{
     Url,
-    header::{AUTHORIZATION, HeaderValue, RETRY_AFTER},
+    header::{AUTHORIZATION, HeaderValue},
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -15,10 +15,10 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    CODEX_RESPONSES_URL, Content, MAX_ERROR_BODY_BYTES, ModelAuthSource, ModelClient, ModelConfig,
-    ModelDelta, ModelError, ModelIdentity, ModelOutput, ModelProvider, ModelRequest,
-    ModelRequestContext, ModelRequestStage, ModelResponseRejection, Protocol, ReasoningEffort,
-    Role, consume_sse_response, image_outside_user_message, is_context_limit_error,
+    CODEX_RESPONSES_URL, Content, ModelAuthSource, ModelClient, ModelConfig, ModelDelta,
+    ModelError, ModelIdentity, ModelOutput, ModelProvider, ModelRequest, ModelRequestContext,
+    ModelRequestStage, ModelResponseRejection, Protocol, ReasoningEffort, Role,
+    consume_sse_response, image_outside_user_message, is_context_limit_error,
     request_transport_error, responses, validate_reasoning_effort,
 };
 use crate::auth::{AuthError, CodexAuth};
@@ -180,6 +180,8 @@ impl CodexModelClient {
             match transport::complete(
                 &self.websocket_cache,
                 transport::WebSocketRequest {
+                    config: &self.config,
+                    client: &self.client,
                     chat_id,
                     endpoint: &self.endpoint,
                     body: &body,
@@ -279,48 +281,35 @@ impl CodexModelClient {
         let mut response = sent?;
         let status = response.status().as_u16();
         if !(200..=299).contains(&status) {
-            if status == 401 {
-                return Err(ModelError::AuthenticationAt {
-                    stage: ModelRequestStage::ResponseHeaders,
-                });
-            }
-            let retry_after = response
-                .headers()
-                .get(RETRY_AFTER)
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.parse::<u64>().ok())
-                .map(Duration::from_secs);
-            let server_retry = response
-                .headers()
-                .get("x-should-retry")
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| match value {
-                    "true" => Some(true),
-                    "false" => Some(false),
-                    _ => None,
-                });
-            let mut error_bytes = Vec::new();
-            while error_bytes.len() < MAX_ERROR_BODY_BYTES {
-                let chunk = tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => return Err(ModelError::Cancelled),
-                    result = response.chunk() => result.ok().flatten(),
-                };
-                let Some(chunk) = chunk else { break };
-                let remaining = MAX_ERROR_BODY_BYTES - error_bytes.len();
-                error_bytes.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
-            }
-            let body = serde_json::from_slice::<Value>(&error_bytes).ok();
-            if body.as_ref().is_some_and(is_context_limit_error) {
+            let (retry_after, server_retry) =
+                super::provider_failure::retry_headers(response.headers());
+            let error_body =
+                super::provider_failure::read_error_body(&mut response, &cancel).await?;
+            let error_bytes = &error_body.bytes;
+            let body = serde_json::from_slice::<Value>(error_bytes).ok();
+            if error_body.complete && body.as_ref().is_some_and(is_context_limit_error) {
                 return Err(
                     ModelError::ResponseRejected(ModelResponseRejection::ContextLimit)
                         .at_stage(ModelRequestStage::ResponseHeaders),
                 );
             }
-            return Err(
-                errors::http_error(status, body.as_ref(), retry_after, server_retry)
-                    .at_stage(ModelRequestStage::ResponseHeaders),
+            let mut failure = super::ProviderHttpFailure::from_response(
+                &self.config,
+                status,
+                error_bytes,
+                retry_after,
+                server_retry,
+                &[access_token, account_id],
             );
+            let classified = errors::http_error(status, body.as_ref(), retry_after, server_retry);
+            if let Some(body) = body.as_ref()
+                && body["error"]["resets_at"].is_number()
+                && let Some(detail) = classified.safe_quota_detail()
+            {
+                failure.hint.push_str(detail);
+            }
+            failure.require_complete_body(error_body.complete, &[access_token, account_id]);
+            return Err(ModelError::ProviderHttp(Box::new(failure)));
         }
         consume_sse_response(
             response,
@@ -337,6 +326,10 @@ impl CodexModelClient {
 
 #[async_trait]
 impl ModelClient for CodexModelClient {
+    fn connection_id(&self) -> Option<String> {
+        Some(self.config.provider_id.clone())
+    }
+
     fn identity(&self) -> ModelIdentity {
         self.config.identity()
     }
@@ -1331,7 +1324,7 @@ mod tests {
             .with_loopback_test_endpoint(&endpoint)
             .unwrap()
             .with_loopback_test_websocket();
-        let agent = Agent::new_embedded(config, Arc::new(client));
+        let agent = Agent::new_embedded(config, crate::model::fixture_client(Arc::new(client)));
         let chat = agent.create_chat(state_dir.clone()).await.unwrap();
         let mut events = agent.subscribe();
         let first = agent
@@ -1389,7 +1382,7 @@ mod tests {
             .with_loopback_test_endpoint(&endpoint)
             .unwrap()
             .with_loopback_test_websocket();
-        let agent = Agent::new_embedded(config, Arc::new(client));
+        let agent = Agent::new_embedded(config, crate::model::fixture_client(Arc::new(client)));
         let first_chat = agent.create_chat(state_dir.clone()).await.unwrap();
         let second_chat = agent.create_chat(state_dir.clone()).await.unwrap();
         let (ready_tx, ready_rx) = oneshot::channel();
@@ -1650,7 +1643,7 @@ mod tests {
             .with_loopback_test_endpoint(&endpoint)
             .unwrap()
             .with_loopback_test_websocket();
-        let agent = Agent::new_embedded(config, Arc::new(client));
+        let agent = Agent::new_embedded(config, crate::model::fixture_client(Arc::new(client)));
         let chat = agent.create_chat(state_dir.clone()).await.unwrap();
         let mut events = agent.subscribe();
         agent.submit(chat, None, "Hello".into()).await.unwrap();
@@ -1696,7 +1689,7 @@ mod tests {
             .with_loopback_test_endpoint(&endpoint)
             .unwrap()
             .with_loopback_test_websocket();
-        let agent = Agent::new_embedded(config, Arc::new(client));
+        let agent = Agent::new_embedded(config, crate::model::fixture_client(Arc::new(client)));
         let chat = agent.create_chat(state_dir.clone()).await.unwrap();
         let mut events = agent.subscribe();
         agent.submit(chat, None, "Hello".into()).await.unwrap();
@@ -2332,7 +2325,7 @@ mod tests {
         client.endpoint = endpoint;
         client.client = reqwest::Client::builder().no_proxy().build().unwrap();
         client.prefer_websocket = false;
-        let agent = Agent::new_embedded(config, Arc::new(client));
+        let agent = Agent::new_embedded(config, crate::model::fixture_client(Arc::new(client)));
         let chat = agent.create_chat(state_dir.clone()).await.unwrap();
         let mut events = agent.subscribe();
         agent.submit(chat, None, "Say hello".into()).await.unwrap();
@@ -2413,7 +2406,7 @@ mod tests {
             .unwrap()
             .with_loopback_test_endpoint(endpoint.as_str())
             .unwrap();
-        let agent = Agent::new_embedded(config, Arc::new(client));
+        let agent = Agent::new_embedded(config, crate::model::fixture_client(Arc::new(client)));
         let chat = agent.create_chat(state_dir.clone()).await.unwrap();
         let mut events = agent.subscribe();
         let first = agent.submit(chat, None, "Hello".into()).await.unwrap();
@@ -2535,7 +2528,7 @@ mod tests {
             .unwrap()
             .with_loopback_test_auth(&state_dir, &oauth_origin)
             .unwrap();
-        let agent = Agent::new_embedded(config, Arc::new(client));
+        let agent = Agent::new_embedded(config, crate::model::fixture_client(Arc::new(client)));
         let chat = agent.create_chat(state_dir.clone()).await.unwrap();
         let mut events = agent.subscribe();
         agent.submit(chat, None, "Hello".into()).await.unwrap();
@@ -2637,7 +2630,7 @@ mod tests {
             .unwrap()
             .with_loopback_test_endpoint(endpoint.as_str())
             .unwrap();
-        let agent = Agent::new_embedded(config, Arc::new(client));
+        let agent = Agent::new_embedded(config, crate::model::fixture_client(Arc::new(client)));
         let chat = agent.create_chat(state_dir.clone()).await.unwrap();
         let mut events = agent.subscribe();
         let first = agent
@@ -2780,7 +2773,7 @@ mod tests {
                 .unwrap()
                 .with_loopback_test_endpoint(endpoint.as_str())
                 .unwrap();
-            let client = Arc::new(client);
+            let client = crate::model::fixture_client(Arc::new(client));
             let agent = Agent::new_embedded(config, client.clone());
             agent.set_auto_reviewer(client).await;
             let chat = agent.create_chat(state_dir.clone()).await.unwrap();
@@ -2840,7 +2833,12 @@ mod tests {
             assert_eq!(requests[1]["tools"][0]["strict"], true);
             assert!(!requests[1]["tools"].to_string().contains("Bash"));
             let snapshot = agent.snapshot(chat).await.unwrap();
-            let usage = snapshot.request_usage.entries();
+            let usage = snapshot
+                .request_usage
+                .entries()
+                .iter()
+                .filter(|entry| entry.kind != RequestKind::Title)
+                .collect::<Vec<_>>();
             assert_eq!(usage.len(), 3);
             assert_eq!(usage[1].kind, RequestKind::PermissionCheck);
             assert_eq!(usage[1].usage.input_tokens, Some(7));
@@ -2892,8 +2890,13 @@ mod tests {
             .unwrap()
             .with_loopback_test_endpoint(reviewer_endpoint.as_str())
             .unwrap();
-        let agent = Agent::new_embedded(main_config.clone(), Arc::new(main_client));
-        agent.set_auto_reviewer(Arc::new(reviewer_client)).await;
+        let agent = Agent::new_embedded(
+            main_config.clone(),
+            crate::model::fixture_client(Arc::new(main_client)),
+        );
+        agent
+            .set_auto_reviewer(crate::model::fixture_client(Arc::new(reviewer_client)))
+            .await;
         let chat = agent.create_chat(state_dir.clone()).await.unwrap();
         agent
             .set_execution_mode(chat, ExecutionMode::Auto)
@@ -2929,7 +2932,12 @@ mod tests {
         assert_eq!(reviewer_requests[0]["model"], "gpt-5.6-sol");
         assert_eq!(reviewer_requests[0]["tool_choice"], "required");
         let snapshot = agent.snapshot(chat).await.unwrap();
-        let usage = snapshot.request_usage.entries();
+        let usage = snapshot
+            .request_usage
+            .entries()
+            .iter()
+            .filter(|entry| entry.kind != RequestKind::Title)
+            .collect::<Vec<_>>();
         assert_eq!(usage.len(), 3);
         assert_eq!(usage[1].kind, RequestKind::PermissionCheck);
         assert_eq!(usage[1].model, reviewer_config.identity());
@@ -2967,7 +2975,7 @@ mod tests {
             .unwrap()
             .with_loopback_test_endpoint(endpoint.as_str())
             .unwrap();
-        let client = Arc::new(client);
+        let client = crate::model::fixture_client(Arc::new(client));
         let agent = Agent::new_with_options(
             config,
             client.clone(),
@@ -3298,8 +3306,11 @@ mod tests {
                 if websocket {
                     reviewer = reviewer.with_loopback_test_websocket();
                 }
-                let agent = Agent::new_embedded(config, Arc::new(main));
-                agent.set_auto_reviewer(Arc::new(reviewer)).await;
+                let agent =
+                    Agent::new_embedded(config, crate::model::fixture_client(Arc::new(main)));
+                agent
+                    .set_auto_reviewer(crate::model::fixture_client(Arc::new(reviewer)))
+                    .await;
                 let chat = agent.create_chat(state_dir.clone()).await.unwrap();
                 agent
                     .set_execution_mode(chat, ExecutionMode::Auto)
