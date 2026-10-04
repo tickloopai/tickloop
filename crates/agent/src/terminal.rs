@@ -43,6 +43,7 @@ mod font_manager;
 mod footer;
 mod hyperlink;
 mod image_cache;
+mod subagent_panel;
 pub(crate) use image_cache::IMAGE_CACHE_DIRECTORY;
 mod input_history;
 pub(crate) use input_history::{PASTE_CACHE_DIRECTORY, PASTE_FILE_EXTENSION};
@@ -941,7 +942,6 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
         workdir: workdir.clone(),
         config_root: config_root.clone(),
         model: Some(config.clone()),
-        transient_provider: None,
         host_options,
         session_persistence,
         exact_chat: None,
@@ -1659,6 +1659,14 @@ async fn interact(
                 if let Ok(rows) = agent.tick_subscriptions(chat).await {
                     console.update_subscribed_ticks(chat, &rows)?;
                 }
+                console.set_provider_failures(chat, &snapshot.provider_failures)?;
+                menus.note_provider_failures(chat, &snapshot.provider_failures);
+                console.set_provider_failure(
+                    snapshot
+                        .provider_failures
+                        .get(&snapshot.model.provider_id)
+                        .map(|failure| failure.summary()),
+                )?;
                 console.update_status_area(
                     snapshot.policy.mode.to_string(),
                     safe_text(&snapshot.model.model),
@@ -1837,6 +1845,7 @@ async fn interact(
                 console.set_activity(None)?;
                 console.set_background_status_notice(None)?;
                 console.set_footer_items(Vec::new())?;
+                console.set_provider_failure(None)?;
                 if let Ok(draft) = agent.configuration(ConfigTarget::NewDraft).await {
                     console.update_status_area(
                         draft.execution_mode.to_string(),
@@ -2050,7 +2059,7 @@ async fn interact(
                 // Opening the overview, navigating, restoring or any other View action may show
                 // the conversation again, so a merged-input block only spans uninterrupted events.
                 merged_echoes.close_all();
-                if !matches!(&line,Some(InputEvent::Line(input)|InputEvent::Prompt {text:input,..}) if !input.trim_start().starts_with('/')) {
+                if !matches!(&line,Some(InputEvent::Line(input)|InputEvent::Prompt {family_target: None, text:input,..}) if !input.trim_start().starts_with('/')) {
                     merged_echoes.next_submission_block();
                 }
                 // `/monitor add` is the `a` key of Monitor: it opens the same prepared action.
@@ -2154,7 +2163,7 @@ async fn interact(
                         };
                         if let Some(snapshot)=opened {
                             overview_active=false;selected_chat=Some(snapshot.id);
-                            goal=selected_loops.get(&snapshot.id).copied().unwrap_or_else(||selected_loop(&snapshot));draft_question=None;
+                            goal=selected_loops.get(&snapshot.id).copied().unwrap_or_else(||snapshot.default_input_loop());draft_question=None;
                             displayed_sequences.insert(snapshot.id,snapshot.last_sequence);
                             tools.restore(&snapshot.conversation_events());
                             sync_snapshot(&snapshot,&mut pending,&mut permissions,&mut questions);
@@ -2540,15 +2549,15 @@ async fn interact(
                 Some(input @ (InputEvent::Line(_) | InputEvent::Prompt { .. })) => {
                     console.clear_prompt_suggestion()?;
                     let retry_of = console.take_submitted_retry()?;
-                    let (line, file_references, pasted_images, restored_contexts, is_user_prompt) = match input {
-                        InputEvent::Line(line) => (line, Vec::new(), Vec::new(), Vec::new(), false),
-                        InputEvent::Prompt { text, file_references, images } => {
+                    let (line, file_references, pasted_images, restored_contexts, is_user_prompt, family_target) = match input {
+                        InputEvent::Line(line) => (line, Vec::new(), Vec::new(), Vec::new(), false, None),
+                        InputEvent::Prompt { text, file_references, images, family_target } => {
                             let restored_contexts = if is_branch_command(text.trim()) {
                                 Vec::new()
                             } else {
                                 console.take_restored_contexts(&text)?
                             };
-                            (text, file_references, images, restored_contexts, true)
+                            (text, file_references, images, restored_contexts, true, family_target)
                         }
                         _ => unreachable!(),
                     };
@@ -2570,7 +2579,7 @@ async fn interact(
                         if let Some(((generation,session_id),view_id))=parsed {
                             match global.interpret(crate::agent_console::Intent::ChooseLocation {generation,view:crate::agent_access::ViewRef{session_id,view_id}}) {
                                 Ok(Some(effect))=>{if let Some(snapshot)=navigate_agent(&mut global,agent,console,&mut menus,effect,&displayed_sequences,&mut reply_lines).await? {
-                                    selected_chat=Some(snapshot.id);goal=selected_loops.get(&snapshot.id).copied().unwrap_or_else(||selected_loop(&snapshot));overview_active=false;
+                                    selected_chat=Some(snapshot.id);goal=selected_loops.get(&snapshot.id).copied().unwrap_or_else(||snapshot.default_input_loop());overview_active=false;
                                     displayed_sequences.insert(snapshot.id,snapshot.last_sequence);
                                     tools.restore(&snapshot.conversation_events());
                                     sync_snapshot(&snapshot,&mut pending,&mut permissions,&mut questions);
@@ -2668,6 +2677,26 @@ async fn interact(
                         console.restore_rejected_prompt(restored_contexts,"This execution is unavailable; inspect cached history or use /resume explicitly")?;
                         continue;
                     }
+                    if let (Some(source_chat), Some(target)) = (selected_chat, family_target) {
+                        let contexts = pasted_images.into_iter().map(InputContext::Image).chain(restored_contexts.clone()).collect();
+                        match send_input(agent, source_chat, retry_of,
+                            agent.send_family_input(source_chat, target, line.clone(), contexts, file_references, None),
+                            |result| match result {
+                                crate::agent_access::CommandResult::FamilyInputSent { receipt, target_handle, .. } => Some((receipt, target_handle)),
+                                _ => None,
+                            }).await {
+                            InputSend::Accepted { value: (_, handle), adopted } => {
+                                console.record_prompt_history(&line)?;
+                                let _ = handle;
+                                if let Some(id) = adopted { console.set_status(&input_adopted(id))?; }
+                                global_refresh.reset_immediately();
+                            }
+                            InputSend::Unknown(id, error) => console.restore_unknown_prompt(restored_contexts, &error.to_string(), Some(id))?,
+                            InputSend::Held(error) => console.restore_unknown_prompt(restored_contexts, &error.to_string(), None)?,
+                            InputSend::Failed(error) => console.restore_rejected_prompt(restored_contexts, &format!("Directed message failed · {}", safe_line(&error.to_string())))?,
+                        }
+                        status_dirty = true; continue;
+                    }
                     // Retrying an unchanged draft checks its receipt without another optimistic echo.
                     let mut echo=if retry_of.is_none() {console.record_input(&line)?} else {None};
                     let record_after_chat = is_user_prompt
@@ -2756,7 +2785,7 @@ async fn interact(
                             if let Some(chat)=selected_chat {
                                 let snapshot=agent.snapshot(chat).await.map_err(|error|error.to_string())?;
                                 if snapshot.delegation.is_some() {
-                                    console.set_status("Unsupported: child history and derivation commands are not available")?;
+                                    console.hold_status(&completion::command_refusal(completion::CommandScope::Child,"/clear",completion::CHILD_HISTORY_FIXED))?;
                                     continue;
                                 }
                                 let mut shell_stop_failed=false;
@@ -3326,7 +3355,7 @@ async fn interact(
                     let target=ConfigTarget::visible(selected_chat);
                     // The overview shows no Agent; `selected_chat` there is the hidden one.
                     let hidden=overview_active.then(||completion::unavailable_command("/mode",completion::CommandScope::Overview)).flatten();
-                    let result=if let Some((_,reason))=hidden {Err(format!("Shift+Tab mode is unavailable here: {reason}"))} else {match agent.configuration(target).await {
+                    let result=if let Some((_,reason))=hidden {Err(completion::command_refusal(completion::CommandScope::Overview,"Shift+Tab mode",reason))} else {match agent.configuration(target).await {
                         Ok(configuration)=>{
                             let change=ConfigurationChange::ExecutionMode {mode:configuration.execution_mode.next()};
                             match configuration.unavailable_change(&change) {
@@ -3396,7 +3425,7 @@ async fn interact(
                 Ok(event) if !overview_active && (pending.contains_key(&event.run_id) || Some(event.chat_id)==selected_chat) => {
                     if Some(event.chat_id)==selected_chat && matches!(event.kind,EventKind::Started|EventKind::InputMerged {..})
                         && let Ok(snapshot)=agent.snapshot(event.chat_id).await {
-                        show_consumed_agent_message(console,&snapshot,event.run_id)?;
+                        show_consumed_family_input(console,&snapshot,event.run_id)?;
                     }
                     transcript_dirty |= Some(event.chat_id)==selected_chat;
                     if event.sequence<=*displayed_sequences.get(&event.chat_id).unwrap_or(&0) {
@@ -3517,6 +3546,8 @@ async fn interact(
                     }
                     if tools.present_event(console,&event)? { continue; }
                     match event.kind {
+                        EventKind::FamilyInputUpdated { record } => console.write(&presentation::family_input_text(&record, presentation::OutputDetail::Preview))?,
+                        EventKind::FamilyRunCompleted { completion } => console.write(&presentation::family_completion_text(&completion, presentation::OutputDetail::Preview))?,
                         EventKind::Thinking(thinking) => {
                             if !interactive {
                                 if starts_thinking {
@@ -3845,9 +3876,10 @@ async fn interact(
                         if let Some(chat)=selected_chat {
                             if let Some(row)=visible_rows.iter().find(|row|row.chat_id==chat) {
                                 global.visible_ready(Some(row.execution));
+                                console.set_family_input_targets(family_input_targets(&global.family_members(row.execution), row.execution))?;
                                 let family=global.family(row.execution);
                                 visible_family=family.iter().filter(|row|row.availability==crate::agent_access::ExecutionAvailability::Live).map(|row|row.chat_id).collect();
-                                console.set_agent_family(if family.len()>1 {agent_tree_rows(&family,false)}else{Vec::new()},Some(row.execution.agent_id))?;
+                                console.set_agent_family(if family.len()>1 {agent_rows(&family,false)}else{Vec::new()},Some(row.execution.agent_id))?;
                                 for row in family.into_iter().filter(|row|row.availability==crate::agent_access::ExecutionAvailability::Live) {
                                     if let Ok(snapshot)=agent.snapshot(row.chat_id).await {
                                         let awaiting_events=pending.values().filter(|receipt|receipt.chat_id==snapshot.id).cloned().collect::<Vec<_>>();
@@ -3885,8 +3917,8 @@ async fn interact(
                                     show_settings_warnings(console,agent.user_settings_warnings(chat))?;
                                 }
                             }
-                            else {visible_family.clear();console.set_agent_family(Vec::new(),None)?;}
-                        } else {visible_family.clear();console.set_agent_family(Vec::new(),None)?;}
+                            else {visible_family.clear();console.set_agent_family(Vec::new(),None)?;console.set_family_input_targets(Vec::new())?;}
+                        } else {visible_family.clear();console.set_agent_family(Vec::new(),None)?;console.set_family_input_targets(Vec::new())?;}
                         let background_request_chats=permissions.values()
                             .filter_map(|run|pending.get(run).map(|receipt|receipt.chat_id))
                             .chain(questions.values().map(|request|request.chat_id))
@@ -4458,6 +4490,26 @@ async fn restore_view(
         .observe(chat, after)
         .await
         .map_err(|error| error.to_string())?;
+    render_restored_observation(
+        console,
+        agent,
+        tools,
+        chat,
+        after,
+        buffered_replies,
+        observation,
+    )
+}
+
+fn render_restored_observation(
+    console: &Console,
+    _agent: &Agent,
+    tools: &mut ToolPresentation,
+    chat: uuid::Uuid,
+    after: u64,
+    buffered_replies: &mut HashMap<uuid::Uuid, ReplyLines>,
+    observation: tickloop_agent::runtime::Observation,
+) -> Result<tickloop_agent::runtime::Observation, String> {
     let conversation_events = observation.snapshot.conversation_events();
     console.select_chat(Some(chat))?;
     let failed_runs = conversation_events
@@ -4535,7 +4587,7 @@ async fn restore_view(
                 event.kind,
                 EventKind::Started | EventKind::InputMerged { .. }
             ) {
-                show_consumed_agent_message(console, &observation.snapshot, event.run_id)?;
+                show_consumed_family_input(console, &observation.snapshot, event.run_id)?;
             }
             if matches!(
                 event.kind,
@@ -4580,6 +4632,15 @@ async fn restore_view(
                 continue;
             }
             match &event.kind {
+                EventKind::FamilyInputUpdated { record } => console.write(
+                    &presentation::family_input_text(record, presentation::OutputDetail::Preview),
+                )?,
+                EventKind::FamilyRunCompleted { completion } => {
+                    console.write(&presentation::family_completion_text(
+                        completion,
+                        presentation::OutputDetail::Preview,
+                    ))?
+                }
                 EventKind::Thinking(thinking) => {
                     if !console.is_interactive() {
                         console.write(&safe_text(thinking))?;
@@ -4729,7 +4790,7 @@ async fn restore_view(
     }
 
     #[cfg(test)]
-    agent.record_recovery_fact(recovery_tests::RecoveryFact::Restored {
+    _agent.record_recovery_fact(recovery_tests::RecoveryFact::Restored {
         chat,
         after,
         last_sequence: observation.snapshot.last_sequence,
@@ -5558,23 +5619,36 @@ fn consumed_input_text(snapshot: &ChatSnapshot, input: uuid::Uuid) -> Option<&st
         })
 }
 
-fn show_consumed_agent_message(
+fn show_consumed_family_input(
     console: &Console,
     snapshot: &ChatSnapshot,
     run: uuid::Uuid,
 ) -> Result<(), String> {
     for (index, message) in snapshot.messages.iter().enumerate() {
-        let Some(id) = snapshot
-            .message_ids
-            .get(&index)
-            .filter(|id| snapshot.agent_message_origins.contains_key(id))
-        else {
+        let Some(id) = snapshot.message_ids.get(&index).filter(|id| {
+            snapshot.agent_message_origins.contains_key(id)
+                || snapshot.human_family_origins.contains_key(id)
+        }) else {
             continue;
         };
         if snapshot.message_runs.get(&index) != Some(&run)
             || console.input_is_echoed(snapshot.id, *id)?
         {
             continue;
+        }
+        if let Some(origin) = snapshot.human_family_origins.get(id) {
+            console.write_roles(&[(
+                format!(
+                    "\nUser message · from @{} View\n",
+                    safe_text(&origin.source_handle)
+                ),
+                Some(Role::MutedText),
+            )])?;
+            for content in &message.content {
+                if let tickloop_agent::model::Content::Text { text } = content {
+                    console.write(&format!("{}\n", safe_text(text)))?;
+                }
+            }
         }
         for content in &message.content {
             if let tickloop_agent::model::Content::Text { text } = content
@@ -5676,7 +5750,7 @@ fn reconcile_consumed_input_echoes(
             .unwrap_or(usize::MAX)
     });
     for input in inputs {
-        show_consumed_agent_message(console, snapshot, input)?;
+        show_consumed_family_input(console, snapshot, input)?;
         consume_input_echo_from_snapshot(console, snapshot, input)?;
     }
     Ok(())
@@ -5974,7 +6048,7 @@ fn show_opened_chat(
     has_history: bool,
 ) -> Result<Option<uuid::Uuid>, String> {
     console.reset_chat(snapshot.id)?;
-    let goal = (snapshot.loops.len() == 1).then(|| snapshot.loops[0].id);
+    let goal = snapshot.default_input_loop();
     outln!(console, "Chat: {}", snapshot.id);
     for warning in agent.transcript_load_warnings(snapshot.id) {
         write_warning(console, &warning)?;
@@ -6420,6 +6494,7 @@ fn model_retry_notice(
     let request = match kind {
         RequestKind::PermissionCheck => "Auto review",
         RequestKind::WebFetch => "WebFetch",
+        RequestKind::Title => "Chat title",
         _ => "Model request",
     };
     format!(
@@ -6468,10 +6543,6 @@ pub fn safe_line(text: &str) -> String {
     escaped
 }
 
-fn selected_loop(snapshot: &ChatSnapshot) -> Option<uuid::Uuid> {
-    (snapshot.loops.len() == 1).then(|| snapshot.loops[0].id)
-}
-
 fn creation_notice(projection: &crate::agent_console::Projection) -> Option<String> {
     projection.unconfirmed_dispatch.map(|command_id| {
         format!("Creation {command_id} unknown; inspect Agents, then /acknowledge-create {command_id} to allow another submission without replay")
@@ -6493,12 +6564,83 @@ fn show_creation_feedback(
     console.set_global_overview(Some(agent_overview(projection)))
 }
 
+fn family_input_targets(
+    rows: &[crate::agent_access::AgentSummary],
+    viewed: crate::agent_access::ExecutionRef,
+) -> Vec<file_mentions::FamilyMentionTarget> {
+    let mut targets = rows
+        .iter()
+        .map(|row| file_mentions::FamilyMentionTarget {
+            execution: row.execution,
+            handle: row
+                .subagent
+                .as_ref()
+                .map_or("main", |registration| registration.handle.as_str())
+                .into(),
+            description: row
+                .subagent
+                .as_ref()
+                .map(|registration| registration.description.clone())
+                .unwrap_or_else(|| row.title.clone()),
+            available: row.execution != viewed
+                && row.availability == crate::agent_access::ExecutionAvailability::Live
+                && !matches!(
+                    row.state,
+                    tickloop_agent::runtime::LoopState::Stopped
+                        | tickloop_agent::runtime::LoopState::Interrupted
+                        | tickloop_agent::runtime::LoopState::Failed
+                        | tickloop_agent::runtime::LoopState::Expired
+                ),
+        })
+        .collect::<Vec<_>>();
+    targets.sort_by_key(|target| {
+        (
+            target.handle != "main",
+            rows.iter()
+                .find(|row| row.execution == target.execution)
+                .and_then(|row| {
+                    row.subagent
+                        .as_ref()
+                        .map(|registration| registration.created_at)
+                }),
+            target.handle.clone(),
+        )
+    });
+    targets
+}
+
 fn agent_overview(projection: &crate::agent_console::Projection) -> console::AgentOverview {
+    let tree = agent_rows(&projection.rows, true);
+    let mut visible = projection.visible;
+    let mut visited = HashSet::new();
+    while let Some(execution) = visible.filter(|execution| visited.insert(*execution)) {
+        match projection
+            .rows
+            .iter()
+            .find(|row| row.execution == execution)
+            .and_then(|row| row.parent)
+        {
+            Some(parent) if projection.rows.iter().any(|row| row.execution == parent) => {
+                visible = Some(parent)
+            }
+            _ => break,
+        }
+    }
+    let rows = tree
+        .iter()
+        .filter(|row| {
+            row.parent_id.is_none()
+                && projection.rows.iter().any(|summary| {
+                    summary.execution.agent_id == row.agent_id && summary.subagent.is_none()
+                })
+        })
+        .cloned()
+        .collect();
     console::AgentOverview {
-        rows: agent_tree_rows(&projection.rows, true),
+        rows,
         dispatch_directory: projection.dispatch_directory.clone(),
         created: projection.created.map(|execution| execution.agent_id),
-        visible: projection.visible.map(|execution| execution.agent_id),
+        visible: visible.map(|execution| execution.agent_id),
     }
 }
 
@@ -6529,69 +6671,72 @@ fn agent_status_label(row: &crate::agent_access::AgentSummary) -> &'static str {
     }
 }
 
-fn agent_tree_rows(
+fn agent_rows(
     rows: &[crate::agent_access::AgentSummary],
     aggregate: bool,
-) -> Vec<console::AgentTreeRow> {
-    fn append(
-        rows: &[crate::agent_access::AgentSummary],
-        row: &crate::agent_access::AgentSummary,
-        depth: usize,
-        seen: &mut HashSet<crate::agent_access::ExecutionRef>,
-        output: &mut Vec<console::AgentTreeRow>,
-        aggregate: bool,
-    ) -> (usize, usize) {
-        if !seen.insert(row.execution) {
-            return (0, 0);
-        }
-        let position = output.len();
-        let group = crate::agent_console::AttentionGroup::of(row);
-        output.push(console::AgentTreeRow {
-            agent_id: row.execution.agent_id,
-            parent_id: row
-                .parent
-                .filter(|parent| rows.iter().any(|candidate| candidate.execution == *parent))
-                .map(|parent| parent.agent_id),
-            depth,
-            title: safe_line(&row.title),
-            status: agent_status_label(row).into(),
-            project: row.workdir.to_string_lossy().into_owned(),
-            workspace: row.workspace.clone(),
-            approvals: row.waiting_permissions,
-            questions: row.waiting_questions,
-            group,
-            glyph: console::status_glyph(
+) -> Vec<console::AgentRow> {
+    let mut result = rows
+        .iter()
+        .map(|row| {
+            let group = crate::agent_console::AttentionGroup::of(row);
+            let parent_id = row.parent.map(|parent| parent.agent_id);
+            console::AgentRow {
+                agent_id: row.execution.agent_id,
+                parent_id,
+                title: safe_line(&row.title),
+                status: agent_status_label(row).into(),
+                state: row.state.clone(),
+                project: row.workdir.to_string_lossy().into_owned(),
+                workspace: row.workspace.clone(),
+                approvals: row.waiting_permissions,
+                questions: row.waiting_questions,
                 group,
-                row.state == tickloop_agent::runtime::LoopState::Completed,
-            ),
-            preview: row.preview.as_deref().map(safe_line),
-            updated_at: row.updated_at,
-        });
-        let mut counts = (row.waiting_permissions, row.waiting_questions);
-        for child in rows
-            .iter()
-            .filter(|candidate| candidate.parent == Some(row.execution))
+                glyph: console::status_glyph(
+                    group,
+                    row.state == tickloop_agent::runtime::LoopState::Completed,
+                ),
+                preview: row.preview.as_deref().map(safe_line),
+                updated_at: row.updated_at,
+                subagent: row.subagent.clone(),
+            }
+        })
+        .collect::<Vec<_>>();
+    if aggregate {
+        for root in result
+            .iter_mut()
+            .filter(|row| row.parent_id.is_none() && row.subagent.is_none())
         {
-            let child_counts = append(rows, child, depth + 1, seen, output, aggregate);
-            counts.0 += child_counts.0;
-            counts.1 += child_counts.1;
+            let family = rows
+                .iter()
+                .filter(|row| {
+                    row.execution.agent_id == root.agent_id
+                        || row
+                            .parent
+                            .is_some_and(|parent| parent.agent_id == root.agent_id)
+                })
+                .collect::<Vec<_>>();
+            root.approvals = family.iter().map(|row| row.waiting_permissions).sum();
+            root.questions = family.iter().map(|row| row.waiting_questions).sum();
+            root.group = family
+                .iter()
+                .map(|row| crate::agent_console::AttentionGroup::of(row))
+                .min()
+                .unwrap_or(root.group);
+            root.glyph = console::status_glyph(
+                root.group,
+                root.state == tickloop_agent::runtime::LoopState::Completed,
+            );
         }
-        if aggregate && depth == 0 {
-            output[position].approvals = counts.0;
-            output[position].questions = counts.1;
-        }
-        counts
-    }
-    let mut result = Vec::new();
-    let mut seen = HashSet::new();
-    for row in rows.iter().filter(|row| {
-        row.parent
-            .is_none_or(|parent| !rows.iter().any(|candidate| candidate.execution == parent))
-    }) {
-        append(rows, row, 0, &mut seen, &mut result, aggregate);
-    }
-    for row in rows {
-        append(rows, row, 0, &mut seen, &mut result, aggregate);
+    } else {
+        result.sort_by_key(|row| {
+            (
+                row.subagent.is_some() || row.parent_id.is_some(),
+                row.subagent
+                    .as_ref()
+                    .map(|registration| registration.created_at),
+                row.agent_id,
+            )
+        });
     }
     result
 }
@@ -6649,22 +6794,38 @@ async fn navigate_agent(
                 if !global.is_current(&effect) {
                     return Ok(None);
                 }
+                let after = sequences.get(&chat).copied().unwrap_or(0);
+                let observation = if sequences.contains_key(&chat) && snapshot.last_sequence > after
+                {
+                    Some(
+                        agent
+                            .observe(chat, after)
+                            .await
+                            .map_err(|error| error.to_string())?,
+                    )
+                } else {
+                    None
+                };
+                agent
+                    .display_chat(Some(chat))
+                    .await
+                    .map_err(|error| error.to_string())?;
                 menus.dismiss(console)?;
                 console.set_global_overview(None)?;
                 let restored = console.activate_agent(chat)?;
                 if !restored {
                     workflows::write_public_history(console, &snapshot)?;
-                } else if snapshot.last_sequence > sequences.get(&chat).copied().unwrap_or(0) {
+                } else if let Some(observation) = observation {
                     let mut presentation = ToolPresentation::new(!console.is_interactive());
-                    let observation = restore_view(
+                    let observation = render_restored_observation(
                         console,
                         agent,
                         &mut presentation,
                         chat,
-                        sequences.get(&chat).copied().unwrap_or(0),
+                        after,
                         reply_lines,
-                    )
-                    .await?;
+                        observation,
+                    )?;
                     snapshot = observation.snapshot;
                 }
                 console.set_input_context(
@@ -6673,10 +6834,14 @@ async fn navigate_agent(
                     &snapshot.additional_directories,
                 )?;
                 console.set_visible_delegation(snapshot.delegation.is_some())?;
+                console.set_family_input_targets(family_input_targets(
+                    &global.family_members(effect.target),
+                    effect.target,
+                ))?;
                 let family = global.family(effect.target);
                 console.set_agent_family(
                     if family.len() > 1 {
-                        agent_tree_rows(&family, false)
+                        agent_rows(&family, false)
                     } else {
                         Vec::new()
                     },
@@ -6685,10 +6850,6 @@ async fn navigate_agent(
                 if !global.complete(&effect) {
                     return Ok(None);
                 }
-                agent
-                    .display_chat(Some(chat))
-                    .await
-                    .map_err(|error| error.to_string())?;
                 return Ok(Some(snapshot));
             }
             Destination::Focus(destination) => {
@@ -6832,6 +6993,197 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
+    fn global_overview_keeps_the_root_title_and_aggregates_requests_without_child_rows() {
+        let epoch = uuid::Uuid::new_v4();
+        let root = crate::agent_access::ExecutionRef {
+            owner_epoch: epoch,
+            agent_id: uuid::Uuid::from_u128(1),
+            generation: 1,
+        };
+        let child = crate::agent_access::ExecutionRef {
+            agent_id: uuid::Uuid::from_u128(2),
+            ..root
+        };
+        let row = |execution: crate::agent_access::ExecutionRef,
+                   parent: Option<crate::agent_access::ExecutionRef>,
+                   title: &str,
+                   questions: usize| {
+            serde_json::from_value::<crate::agent_access::AgentSummary>(serde_json::json!({"execution":execution,"chat_id":execution.agent_id,"workdir":"/test","state":"Completed","title":title,"has_work":true,"waiting_permissions":0,"waiting_questions":questions,"parent":parent,"record":null,"workspace":null,"capabilities":[],"views":[],"subagent":parent.map(|_|serde_json::json!({"child_chat_id":child.agent_id,"handle":"audit","description":"Audit source","created_at":100000}))})).unwrap()
+        };
+        let projection = crate::agent_console::Projection {
+            overview: true,
+            visible: Some(child),
+            dispatch_directory: "/test".into(),
+            rows: vec![
+                row(root, None, "Generated root title", 0),
+                row(child, Some(root), "Child task", 1),
+            ],
+            waiting_permissions: 0,
+            waiting_questions: 1,
+            generation: 0,
+            closed: false,
+            unconfirmed_dispatch: None,
+            created: None,
+        };
+        let overview = super::agent_overview(&projection);
+        assert_eq!(overview.rows.len(), 1);
+        assert_eq!(overview.rows[0].title, "Generated root title");
+        assert_eq!(overview.visible, Some(root.agent_id));
+        assert_eq!(overview.rows[0].questions, 1);
+        assert_eq!(overview.rows[0].status_role(), super::style::Role::Warning);
+    }
+
+    #[test]
+    fn family_root_aggregate_request_glyph_keeps_warning_role() {
+        let root = crate::agent_access::ExecutionRef {
+            owner_epoch: uuid::Uuid::new_v4(),
+            agent_id: uuid::Uuid::from_u128(1),
+            generation: 1,
+        };
+        let child = crate::agent_access::ExecutionRef {
+            agent_id: uuid::Uuid::from_u128(2),
+            ..root
+        };
+        let make_row = |execution, parent, state, questions| {
+            serde_json::from_value::<crate::agent_access::AgentSummary>(serde_json::json!({"execution":execution,"chat_id":uuid::Uuid::new_v4(),"workdir":"/test","state":state,"title":"Title","has_work":true,"waiting_permissions":0,"waiting_questions":questions,"parent":parent,"record":null,"workspace":null,"capabilities":[],"views":[]})).unwrap()
+        };
+        let rows = super::agent_rows(
+            &[
+                make_row(
+                    root,
+                    None::<crate::agent_access::ExecutionRef>,
+                    "Stopped",
+                    0,
+                ),
+                make_row(child, Some(root), "WaitingQuestion", 1),
+            ],
+            true,
+        );
+        assert_eq!(rows[0].glyph_role(), super::style::Role::Warning);
+        assert_eq!(rows[0].status_role(), super::style::Role::Error);
+    }
+
+    #[test]
+    fn family_child_description_never_emits_terminal_controls() {
+        let child = crate::agent_access::ExecutionRef {
+            owner_epoch: uuid::Uuid::new_v4(),
+            agent_id: uuid::Uuid::new_v4(),
+            generation: 1,
+        };
+        let parent = crate::agent_access::ExecutionRef {
+            agent_id: uuid::Uuid::new_v4(),
+            ..child
+        };
+        let row: crate::agent_access::AgentSummary = serde_json::from_value(serde_json::json!({"execution":child,"chat_id":child.agent_id,"workdir":"/test","state":"Completed","title":"Title","has_work":true,"waiting_permissions":0,"waiting_questions":0,"parent":parent,"record":null,"workspace":null,"capabilities":[],"views":[],"subagent":{"child_chat_id":child.agent_id,"handle":"audit","description":"Check \u{001b}[2J evidence","created_at":1}})).unwrap();
+        let row = super::agent_rows(&[row], false).pop().unwrap();
+        for glyph_set in crate::settings::GlyphSet::ALL {
+            let display =
+                super::display::DisplayProfile::new(crate::settings::DisplayPreferences {
+                    glyph_set,
+                    ..Default::default()
+                });
+            let line =
+                super::subagent_panel::family_line(&row, false, false, (80, 5, display, 1000));
+            assert!(!line.text().chars().any(char::is_control));
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_event_recovery_renders_family_receipts_replies_and_completions_once() {
+        let chat = uuid::Uuid::new_v4();
+        let run = uuid::Uuid::new_v4();
+        let loop_id = uuid::Uuid::new_v4();
+        let record = crate::runtime::FamilyInputRecord {
+            message_id: uuid::Uuid::new_v4(),
+            target_chat_id: uuid::Uuid::new_v4(),
+            target_handle: "audit".into(),
+            target_run_id: run,
+            submitted_at: 1,
+            response: Some("Actual reply preview".into()),
+            state: Some(crate::runtime::LoopState::Completed),
+        };
+        let completion = crate::runtime::FamilyCompletion {
+            child_chat_id: record.target_chat_id,
+            child_loop_id: loop_id,
+            child_run_id: run,
+            handle: "audit".into(),
+            state: crate::runtime::LoopState::Completed,
+            result: "Actual child completion".into(),
+            error: None,
+            started_at: Some(1),
+            finished_at: 2,
+            triggering_message_ids: vec![],
+        };
+        let mut snapshot: super::ChatSnapshot = serde_json::from_value(
+            serde_json::json!({"id":chat,"workdir":"/test","messages":[],"loops":[]}),
+        )
+        .unwrap();
+        snapshot.events = vec![
+            crate::runtime::Event {
+                sequence: 1,
+                chat_id: chat,
+                loop_id,
+                run_id: run,
+                kind: crate::runtime::EventKind::FamilyInputUpdated { record },
+            },
+            crate::runtime::Event {
+                sequence: 2,
+                chat_id: chat,
+                loop_id,
+                run_id: run,
+                kind: crate::runtime::EventKind::FamilyRunCompleted { completion },
+            },
+        ];
+        snapshot.last_sequence = 2;
+        let mut observation = crate::runtime::Observation {
+            events: snapshot.events.clone(),
+            snapshot,
+            reset_required: false,
+        };
+        let console = super::Console::test_interactive_for_chat(chat);
+        let agent = super::Agent::new_embedded(
+            super::test_support::config(),
+            std::sync::Arc::new(super::test_support::ScriptedModel::new(vec![])),
+        );
+        let mut tools = super::ToolPresentation::new(true);
+        super::render_restored_observation(
+            &console,
+            &agent,
+            &mut tools,
+            chat,
+            0,
+            &mut std::collections::HashMap::new(),
+            observation.clone(),
+        )
+        .unwrap();
+        let text = console.test_conversation_text();
+        assert!(
+            text.contains("Reply from @audit")
+                && text.contains("Actual reply preview")
+                && text.contains("Actual child completion")
+        );
+        observation.events.retain(|event| event.sequence > 2);
+        super::render_restored_observation(
+            &console,
+            &agent,
+            &mut tools,
+            chat,
+            2,
+            &mut std::collections::HashMap::new(),
+            observation,
+        )
+        .unwrap();
+        assert_eq!(
+            console
+                .test_conversation_text()
+                .matches("Actual reply preview")
+                .count(),
+            1
+        );
+        agent.shutdown().await;
+    }
+
+    #[test]
     fn consumed_agent_message_stays_deferred_until_the_selected_view_can_render_it() {
         use super::{
             ChatSnapshot, Console, consume_input_echo_from_snapshot,
@@ -6842,7 +7194,7 @@ mod tests {
         let source = uuid::Uuid::new_v4();
         let text = format!(
             "<agent-message>{}</agent-message>",
-            serde_json::json!({"source":{"sender_relationship":"child","sender_label":"Report check","is_result":false},"message":"Which year should I use?"})
+            serde_json::json!({"source":{"sender_relationship":"child","sender_handle":"audit","sender_label":"Report check","is_result":false},"message":"Which year should I use?"})
         );
         let mut snapshot:ChatSnapshot=serde_json::from_value(serde_json::json!({"id":chat,"workdir":"/work","messages":[{"role":"user","content":[{"type":"text","text":text}]}],"loops":[]})).unwrap();
         snapshot.message_ids.insert(0, source);
@@ -7356,6 +7708,7 @@ mod tests {
     #[test]
     fn branch_bypasses_summary_input_deferral_for_immediate_busy_rejection() {
         assert!(!should_pause_input_for_summary(&InputEvent::Prompt {
+            family_target: None,
             text: "/branch summary-busy".into(),
             file_references: Vec::new(),
             images: Vec::new(),
@@ -7364,6 +7717,7 @@ mod tests {
             "/branch".into()
         )));
         assert!(should_pause_input_for_summary(&InputEvent::Prompt {
+            family_target: None,
             text: "continue after summary".into(),
             file_references: Vec::new(),
             images: Vec::new(),

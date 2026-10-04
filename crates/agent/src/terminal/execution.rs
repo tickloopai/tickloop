@@ -255,6 +255,9 @@ impl Drop for Inner {
 /// Shell. A lost reply for one of these must never be followed by the same input under a new id.
 fn input_execution(command: &AgentCommand) -> Option<ExecutionRef> {
     match command {
+        AgentCommand::SendFamilyInput {
+            source_execution, ..
+        } => Some(*source_execution),
         AgentCommand::Submit { execution, .. }
         | AgentCommand::ContinueLoop { execution, .. }
         | AgentCommand::EnqueueAfterTurn { execution, .. }
@@ -507,7 +510,16 @@ impl ConsoleExecution {
         let snapshot = snapshots.get(&chat)?;
         Some((
             snapshot.execution.agent_id,
-            crate::agent_access::agent_title(&snapshot.conversation.loops, &snapshot.user_shells),
+            snapshot
+                .subagent
+                .as_ref()
+                .map(|registration| registration.handle.clone())
+                .unwrap_or_else(|| {
+                    crate::runtime::chat_display_title(
+                        &snapshot.conversation,
+                        &snapshot.user_shells,
+                    )
+                }),
         ))
     }
 
@@ -623,25 +635,36 @@ impl ConsoleExecution {
     ) -> Result<CommandResult, AgentError> {
         if matches!(
             &command,
-            AgentCommand::Create {
-                origin: Some(_),
-                ..
-            } | AgentCommand::Submit {
-                origin: Some(_),
-                ..
-            } | AgentCommand::ContinueLoop {
-                origin: Some(_),
-                ..
-            } | AgentCommand::EnqueueAfterTurn {
-                action: AfterTurnAction::Submit {
+            AgentCommand::SendFamilyInput { .. }
+                | AgentCommand::Create {
                     origin: Some(_),
                     ..
-                },
-                ..
-            }
+                }
+                | AgentCommand::Submit {
+                    origin: Some(_),
+                    ..
+                }
+                | AgentCommand::ContinueLoop {
+                    origin: Some(_),
+                    ..
+                }
+                | AgentCommand::EnqueueAfterTurn {
+                    action: AfterTurnAction::Submit {
+                        origin: Some(_),
+                        ..
+                    },
+                    ..
+                }
         ) {
             self.refresh_interaction_source().await?;
             match &mut command {
+                AgentCommand::SendFamilyInput { origin, .. } => {
+                    *origin = self.origin().ok_or_else(|| {
+                        AgentError::Invalid(
+                            "directed input needs an authenticated displayed View".into(),
+                        )
+                    })?;
+                }
                 AgentCommand::Create { origin, .. }
                 | AgentCommand::Submit { origin, .. }
                 | AgentCommand::ContinueLoop { origin, .. }
@@ -1592,7 +1615,6 @@ impl ConsoleExecution {
         let ConfigTarget::Agent(chat) = target else {
             return Ok(ProviderCredentialScope::current(
                 self.inner.launch.config_root.clone(),
-                None,
             ));
         };
         match self
@@ -2231,6 +2253,46 @@ impl ConsoleExecution {
             _ => Err(unexpected()),
         }
     }
+    pub(super) async fn send_family_input(
+        &self,
+        source_chat: Uuid,
+        target: ExecutionRef,
+        text: String,
+        contexts: Vec<InputContext>,
+        paths: Vec<PathBuf>,
+        retry_of: Option<Uuid>,
+    ) -> Result<(Receipt, String), AgentError> {
+        self.refresh_interaction_source().await?;
+        let source_execution = self.reference(source_chat).await?;
+        let origin = self.origin().ok_or_else(|| {
+            AgentError::Invalid("directed input needs an authenticated displayed View".into())
+        })?;
+        let result = self
+            .command(
+                AgentCommand::SendFamilyInput {
+                    source_execution,
+                    target_execution: target,
+                    target_loop: None,
+                    origin,
+                    input: UserInput::Text {
+                        text,
+                        contexts,
+                        paths,
+                    },
+                },
+                retry_of,
+            )
+            .await?;
+        match result {
+            CommandResult::FamilyInputSent {
+                receipt,
+                target_handle,
+                ..
+            } => Ok((receipt, target_handle)),
+            _ => Err(unexpected()),
+        }
+    }
+
     pub(super) async fn invoke_skill(
         &self,
         chat: Uuid,

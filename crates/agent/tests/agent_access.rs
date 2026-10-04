@@ -568,7 +568,7 @@ async fn embedded_directory_observation_reports_a_new_execution_after_its_snapsh
 }
 
 #[tokio::test]
-async fn overview_titles_name_each_agent_by_its_first_task_including_user_shells() {
+async fn overview_title_fallback_uses_short_task_or_shell_text_before_generation() {
     use tickloop_agent::agent_access::{AgentFilter, Page};
     let temporary = tempfile::tempdir().unwrap();
     let runtime = Agent::new_embedded(

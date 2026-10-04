@@ -1,6 +1,6 @@
 use super::execution::ConsoleExecution as Agent;
 mod judgment;
-mod providers;
+pub(super) mod providers;
 #[cfg(test)]
 mod settings_ux_pty;
 use providers::{ModelChoice, ProviderModels, ProviderRow};
@@ -1000,6 +1000,18 @@ impl Menus {
                     PickerKind::Actions,
                     super::console::PickerPresentation {
                         hint: hint.into(),
+                        failure_target: selection.config_target().and_then(|target| target.agent()),
+                        failure_connections: if let Selection::ConnectionDetails {
+                            provider,
+                            actions,
+                            ..
+                        } = &selection
+                        {
+                            vec![Some(provider.models[0].provider_id.clone()); actions.len()]
+                        } else {
+                            Vec::new()
+                        },
+                        failure_message: matches!(&selection, Selection::ConnectionDetails { .. }),
                         restore_context_offset: if let Selection::Settings { target } = &selection {
                             self.settings_positions
                                 .get(&target.agent())
@@ -1065,6 +1077,18 @@ impl Menus {
                         refresh,
                         refresh_options: Some(refresh_options),
                         row_hints,
+                        failure_target: selection.config_target().and_then(|target| target.agent()),
+                        failure_connections: choices
+                            .iter()
+                            .map(|choice| Some(choice.config.provider_id.clone()))
+                            .chain(actions.iter().map(|_| {
+                                self.provider
+                                    .model_provider
+                                    .as_ref()
+                                    .and_then(|key| self.connection(key).ok())
+                                    .map(|provider| provider.models[0].provider_id.clone())
+                            }))
+                            .collect(),
                         connection_options: Some(choices.len()),
                         hint: "p Connection · Enter apply · Esc back".into(),
                         ..Default::default()
@@ -1251,6 +1275,16 @@ impl Menus {
             .await
             .map_err(|error| error.to_string())?;
         self.refresh_provider_scope(agent, target).await?;
+        self.provider.provider_failures = match target {
+            ConfigTarget::Agent(chat) => {
+                agent
+                    .snapshot(chat)
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .provider_failures
+            }
+            ConfigTarget::NewDraft => HashMap::new(),
+        };
         let catalog = tickloop_agent::model::cards::ModelCatalog::defaults();
         let defaults = tickloop_agent::model::cards::ModelCatalog::defaults();
         let access = tickloop_agent::model::access::AccessCatalog::defaults();
@@ -3237,14 +3271,16 @@ impl Menus {
     }
 }
 
-/// Names a requester as its rows and background notices do: its task title, plus this View's
-/// reading number when another Agent reads alike. The request itself stays bound to its
+/// Names a requester by its registered child handle or root Chat title, with a View reading
+/// number for duplicate root titles. The request itself stays bound to its
 /// execution.
 async fn requester_label(agent: &Agent, console: &Console, snapshot: &ChatSnapshot) -> String {
-    let title = super::safe_line(&crate::agent_access::agent_title(
-        &snapshot.loops,
-        &snapshot.user_shells,
-    ));
+    let title = super::safe_line(
+        &agent
+            .cached_title(snapshot.id)
+            .map(|(_, title)| title)
+            .unwrap_or_else(|| crate::runtime::chat_display_title(snapshot, &snapshot.user_shells)),
+    );
     agent
         .reference(snapshot.id)
         .await
@@ -3351,6 +3387,7 @@ fn request_kind_label(kind: RequestKind) -> &'static str {
         RequestKind::CompactionDirected => "Directed summary",
         RequestKind::PermissionCheck => "Permission checks",
         RequestKind::WebFetch => "WebFetch",
+        RequestKind::Title => "Chat titles",
     }
 }
 

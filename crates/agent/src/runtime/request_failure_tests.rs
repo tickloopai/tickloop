@@ -41,6 +41,15 @@ impl Drop for CompletionGuard<'_> {
 
 #[async_trait::async_trait]
 impl ModelClient for Checker {
+    async fn generate_title(
+        &self,
+        request: crate::model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<crate::model::ModelDelta>,
+        _: tokio_util::sync::CancellationToken,
+    ) -> Result<crate::model::ModelOutput, crate::model::ModelError> {
+        Ok(crate::model::fixture_title(request))
+    }
+
     fn identity(&self) -> ModelIdentity {
         ModelIdentity {
             provider: crate::model::ModelProvider::Api,
@@ -67,6 +76,15 @@ struct UnusedConversationModel;
 
 #[async_trait::async_trait]
 impl ModelClient for UnusedConversationModel {
+    async fn generate_title(
+        &self,
+        request: crate::model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<crate::model::ModelDelta>,
+        _: tokio_util::sync::CancellationToken,
+    ) -> Result<crate::model::ModelOutput, crate::model::ModelError> {
+        Ok(crate::model::fixture_title(request))
+    }
+
     fn identity(&self) -> ModelIdentity {
         ModelIdentity {
             provider: crate::model::ModelProvider::Api,
@@ -134,6 +152,7 @@ async fn fixture(checker: Arc<Checker>) -> (tempfile::TempDir, Agent, Receipt, C
             goal: "inspect the fixture directory".into(),
             state: LoopState::Running,
             run_id: Some(receipt.run_id),
+            run_started_at: None,
             trigger: None,
             event_sources: Vec::new(),
             state_since: None,

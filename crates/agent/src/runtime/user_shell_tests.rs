@@ -29,6 +29,15 @@ struct BlockingModel {
 
 #[async_trait]
 impl ModelClient for BlockingModel {
+    async fn generate_title(
+        &self,
+        request: crate::model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<crate::model::ModelDelta>,
+        _: tokio_util::sync::CancellationToken,
+    ) -> Result<crate::model::ModelOutput, crate::model::ModelError> {
+        Ok(crate::model::fixture_title(request))
+    }
+
     fn identity(&self) -> tickloop_agent::model::ModelIdentity {
         tickloop_agent::model::ModelIdentity {
             provider: crate::model::ModelProvider::Api,
@@ -60,6 +69,15 @@ impl ModelClient for BlockingModel {
 
 #[async_trait]
 impl ModelClient for CapturingModel {
+    async fn generate_title(
+        &self,
+        request: crate::model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<crate::model::ModelDelta>,
+        _: tokio_util::sync::CancellationToken,
+    ) -> Result<crate::model::ModelOutput, crate::model::ModelError> {
+        Ok(crate::model::fixture_title(request))
+    }
+
     fn identity(&self) -> tickloop_agent::model::ModelIdentity {
         tickloop_agent::model::ModelIdentity {
             provider: crate::model::ModelProvider::Api,
@@ -135,6 +153,7 @@ async fn restart_discards_a_stale_trigger_input_and_a_resumed_schedule_ticks_aga
             goal: "persistent schedule".into(),
             state: LoopState::WaitingTrigger,
             run_id: None,
+            run_started_at: None,
             trigger: Some(trigger.clone()),
             event_sources: Vec::new(),
             state_since: None,
@@ -159,6 +178,7 @@ async fn restart_discards_a_stale_trigger_input_and_a_resumed_schedule_ticks_aga
             input: trigger.prompt.clone(),
             contexts: Vec::new(),
             agent_message: None,
+            directed_human: None,
             denial_reference: None,
             trigger_source: Some(TriggerSource {
                 source: "timer".into(),

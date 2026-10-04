@@ -59,29 +59,7 @@ pub(crate) fn load(path: &Path) -> io::Result<Option<LoadedTranscript>> {
     Ok(load_lines(path, &lines, 0).0)
 }
 
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "kebab-case")]
-enum MetadataKind {
-    CustomTitle,
-    BranchOrigin,
-    Delegation,
-    ArtifactTicks,
-    MonitorMembers,
-    #[serde(other)]
-    Other,
-}
-impl MetadataKind {
-    fn is_retained(&self) -> bool {
-        !matches!(self, Self::Other)
-    }
-}
-#[derive(serde::Deserialize)]
-struct MetadataHeader {
-    #[serde(rename = "type")]
-    kind: MetadataKind,
-    #[serde(rename = "agentMessageOrigin")]
-    agent_origin: Option<serde_json::Value>,
-}
+use super::entry::{MetadataHeader, MetadataKind};
 
 fn validate_delegation_records(lines: &[(u64, &[u8])]) -> io::Result<()> {
     let mut has_delegation_authorization = false;
@@ -238,6 +216,26 @@ fn load_lines(
             }
             Line::CustomTitle(entry) => {
                 metadata.custom_title = Some(entry.clone());
+                continue;
+            }
+            Line::AiTitle(entry) => {
+                metadata.ai_title = Some(entry.clone());
+                continue;
+            }
+            Line::Subagents(entry) => {
+                metadata.subagents = Some(entry.clone());
+                continue;
+            }
+            Line::SentAgentMessages(entry) => {
+                metadata.sent_agent_messages = Some(entry.clone());
+                continue;
+            }
+            Line::FamilyInputs(entry) => {
+                metadata.family_inputs = Some(entry.clone());
+                continue;
+            }
+            Line::FamilyCompletions(entry) => {
+                metadata.family_completions = Some(entry.clone());
                 continue;
             }
             Line::LastPrompt(entry) => {
@@ -668,6 +666,7 @@ mod tests {
             is_inherited_prompt: false,
             original_user_message_id: None,
             agent_message_origin: None,
+            human_family_origin: None,
             run_id: None,
             tool_call_recoveries: Vec::new(),
             contexts: None,
@@ -972,6 +971,57 @@ mod tests {
                 .collect::<Vec<_>>(),
             [prompt, answer, rewound]
         );
+    }
+
+    #[test]
+    fn family_delivery_metadata_survives_the_large_file_compact_boundary_loader() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("chat.jsonl");
+        let [prompt, compacted, summary, message_id] = std::array::from_fn(|_| Uuid::new_v4());
+        let record = crate::runtime::FamilyInputRecord {
+            message_id,
+            target_chat_id: Uuid::new_v4(),
+            target_handle: "audit".into(),
+            target_run_id: Uuid::new_v4(),
+            submitted_at: 1000,
+            response: Some("Verified reply".into()),
+            state: Some(crate::runtime::LoopState::Completed),
+        };
+        write(
+            &path,
+            &[
+                Line::FamilyInputs(crate::transcript::FamilyInputsEntry {
+                    chat_id: Uuid::nil(),
+                    inputs: [(message_id, record)].into(),
+                }),
+                Line::User(entry(
+                    prompt,
+                    None,
+                    1000,
+                    false,
+                    text(Role::User, &"x".repeat(SKIP_PRECOMPACT_THRESHOLD as usize)),
+                )),
+                boundary(compacted, 2000, None),
+                Line::User(entry(
+                    summary,
+                    Some(compacted),
+                    2000,
+                    false,
+                    text(Role::User, "Summary"),
+                )),
+            ],
+        );
+        let loaded = load(&path).unwrap().unwrap();
+        let records = &loaded
+            .metadata
+            .family_inputs
+            .expect("source receipts survive the pre-boundary skip")
+            .inputs;
+        assert_eq!(
+            records[&message_id].response.as_deref(),
+            Some("Verified reply")
+        );
+        assert_eq!(loaded.chain.first().unwrap().uuid, compacted);
     }
 
     #[test]

@@ -31,6 +31,17 @@ impl RequestContext {
         }
     }
 
+    pub(super) fn title(chat_id: ChatId) -> Self {
+        Self {
+            owner: RequestOwner {
+                chat_id,
+                loop_id: None,
+                run_id: None,
+            },
+            kind: RequestKind::Title,
+        }
+    }
+
     pub(super) fn manual_compaction(chat_id: ChatId) -> Self {
         Self {
             owner: RequestOwner {
@@ -471,6 +482,11 @@ impl Agent {
         // The scope destroys the actual request future before the receiver is closed and drained.
         let mut result = {
             let response = async {
+                if context.kind == RequestKind::Title {
+                    return client
+                        .generate_title(request, sender, request_cancel.clone())
+                        .await;
+                }
                 match tracking.model_context {
                     Some(model_context) => {
                         client
@@ -573,6 +589,20 @@ impl Agent {
             }
         }
 
+        if let Some(connection) = client.connection_id() {
+            let mut failures = self.inner.provider_failures.lock().unwrap();
+            match &result {
+                Err(AgentError::Model(error)) => {
+                    if let Some(failure) = error.provider_failure() {
+                        failures.insert(connection, failure.clone());
+                    }
+                }
+                Ok(_) => {
+                    failures.remove(&connection);
+                }
+                _ => {}
+            }
+        }
         let caller_captures_text = tracking.captured_text.is_some();
         if let Some(output_started) = tracking.output_started {
             *output_started = progress.output_started;
@@ -597,6 +627,9 @@ impl Agent {
 }
 
 fn retry_error_label(error: &ModelError) -> String {
+    if let Some(failure) = error.provider_failure() {
+        return failure.to_string();
+    }
     if let Some(status) = error.status() {
         return format!("HTTP {status}");
     }
@@ -638,6 +671,7 @@ fn model_error_retry_delay(
 
 pub(super) fn model_failure_outcome(error: &ModelError) -> RequestOutcome {
     match error {
+        ModelError::AtStage { error, .. } => model_failure_outcome(error),
         ModelError::Cancelled => RequestOutcome::Cancelled,
         ModelError::TimedOut => RequestOutcome::TimedOut,
         ModelError::ResponseRejected(reason) => RequestOutcome::HostRejected(match reason {
@@ -660,7 +694,9 @@ pub(super) fn model_failure_outcome(error: &ModelError) -> RequestOutcome {
             ModelFailureKind::QuotaExhausted => RequestFailure::Http {
                 status: error.status().unwrap_or(402),
             },
-            ModelFailureKind::EntitlementDenied => RequestFailure::Http { status: 403 },
+            ModelFailureKind::EntitlementDenied => RequestFailure::Http {
+                status: error.status().unwrap_or(403),
+            },
             ModelFailureKind::RateLimited => RequestFailure::RateLimited,
             ModelFailureKind::Connection => RequestFailure::Connection,
             ModelFailureKind::StreamInterrupted => RequestFailure::StreamInterrupted,
@@ -684,6 +720,19 @@ mod tests {
     use super::*;
     use crate::model::{Content, InputModality, ModelConfig, ModelIdentity, Protocol, Usage};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[test]
+    fn staged_response_rejections_preserve_their_outcome_without_panicking() {
+        for reason in [
+            ModelResponseRejection::ContextLimit,
+            ModelResponseRejection::ContentFilter,
+        ] {
+            let plain = ModelError::ResponseRejected(reason);
+            let expected = model_failure_outcome(&plain);
+            let staged = plain.at_stage(crate::model::ModelRequestStage::ResponseHeaders);
+            assert_eq!(model_failure_outcome(&staged), expected);
+        }
+    }
 
     #[test]
     fn retry_policy_distinguishes_transient_and_terminal_errors() {
@@ -781,6 +830,15 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ModelClient for ControlledModel {
+        async fn generate_title(
+            &self,
+            request: crate::model::ModelRequest,
+            _: tokio::sync::mpsc::UnboundedSender<crate::model::ModelDelta>,
+            _: tokio_util::sync::CancellationToken,
+        ) -> Result<crate::model::ModelOutput, crate::model::ModelError> {
+            Ok(crate::model::fixture_title(request))
+        }
+
         fn identity(&self) -> ModelIdentity {
             ModelIdentity {
                 provider: crate::model::ModelProvider::Api,

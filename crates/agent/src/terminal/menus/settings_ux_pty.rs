@@ -265,6 +265,8 @@ impl Fixture {
         self.writer.flush().unwrap();
     }
 
+    /// Waits for a settled frame: keys are ignored while a submitted choice is still being
+    /// applied, so a frame showing that state never satisfies a wait.
     fn wait(&self, predicate: impl Fn(&str) -> bool) -> String {
         let deadline = Instant::now() + TIMEOUT;
         loop {
@@ -273,7 +275,9 @@ impl Fixture {
                 100,
                 24,
             );
-            if predicate(&frame) {
+            if predicate(&frame)
+                && !frame.contains(super::super::console::MENU_SUBMISSION_PENDING_HINT)
+            {
                 if let Some(root) = std::env::var_os("TICKLOOP_SETTINGS_UX_EVIDENCE_DIR") {
                     static FRAME: std::sync::atomic::AtomicUsize =
                         std::sync::atomic::AtomicUsize::new(0);

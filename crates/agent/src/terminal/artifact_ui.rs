@@ -206,6 +206,7 @@ pub(super) async fn tick_action(
                     }
                 );
                 return Ok(Some(InputEvent::Prompt {
+                    family_target: None,
                     text,
                     file_references: Vec::new(),
                     images: Vec::new(),
@@ -734,6 +735,7 @@ mod tests {
                     goal: "artifact feedback".into(),
                     state: LoopState::Interrupted,
                     run_id: None,
+                    run_started_at: None,
                     trigger: None,
                     state_since: None,
                     event_sources: vec![EventSourceBinding {

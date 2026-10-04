@@ -13,8 +13,8 @@ pub(super) const MIN_CONVERSATION_ROWS: usize = 6;
 pub(super) const NORMAL_LAYOUT_MIN_ROWS: usize = 16;
 pub(super) const TALL_LAYOUT_MIN_ROWS: usize = 24;
 pub(super) const MAX_CANDIDATE_ROWS: usize = 6;
-const MAX_INDENTED_TREE_DEPTH: usize = 3;
-const WIDE_TERMINAL_COLUMNS: usize = 80;
+pub(in crate::terminal) const WIDE_TERMINAL_COLUMNS: usize = 80;
+const AGENT_SPINNER_FRAME_INTERVAL_MS: u64 = 100;
 const MIN_AGENT_TITLE_COLUMNS: usize = 8;
 /// The family panel's title floor before its request labels shrink further.
 pub(in crate::terminal) const MIN_REQUEST_AGENT_TITLE_COLUMNS: usize = 4;
@@ -24,12 +24,12 @@ const PREVIEW_GAP: &str = "  ";
 pub(super) const REQUEST_IDLE_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 
 #[derive(Clone, Debug)]
-pub(crate) struct AgentTreeRow {
+pub(crate) struct AgentRow {
     pub(crate) agent_id: Uuid,
     pub(crate) parent_id: Option<Uuid>,
-    pub(crate) depth: usize,
     pub(crate) title: String,
     pub(crate) status: String,
+    pub(crate) state: crate::runtime::LoopState,
     pub(crate) project: String,
     pub(crate) workspace: Option<String>,
     pub(crate) approvals: usize,
@@ -43,6 +43,7 @@ pub(crate) struct AgentTreeRow {
     pub(crate) preview: Option<String>,
     /// Unix milliseconds of the latest reported state change; `None` when nobody recorded it.
     pub(crate) updated_at: Option<u64>,
+    pub(crate) subagent: Option<crate::runtime::SubagentRegistration>,
 }
 
 /// What a row shows after its title when there is room: the newest message, path metadata and
@@ -69,19 +70,38 @@ struct RowFrame {
     age: Option<String>,
 }
 
-impl AgentTreeRow {
-    pub(in crate::terminal) fn indentation(&self) -> String {
-        let indent = " ".repeat(self.depth.min(MAX_INDENTED_TREE_DEPTH) * 2);
-        if self.depth > MAX_INDENTED_TREE_DEPTH {
-            format!("{indent}{} ", self.depth)
-        } else {
-            indent
+impl AgentRow {
+    pub(in crate::terminal) fn glyph_role(&self) -> Role {
+        match self.group {
+            AttentionGroup::NeedsInput | AttentionGroup::Working => group_role(self.group),
+            _ => self.status_role(),
         }
     }
 
-    /// The role a row's own status word is drawn in; the word itself always carries the state.
+    /// The row's own status word retains its state even when a child's request sets the group.
     pub(in crate::terminal) fn status_role(&self) -> Role {
+        if matches!(
+            self.state,
+            crate::runtime::LoopState::Failed
+                | crate::runtime::LoopState::Stopped
+                | crate::runtime::LoopState::Interrupted
+                | crate::runtime::LoopState::Expired
+        ) {
+            return Role::Error;
+        }
         group_role(self.group)
+    }
+
+    pub(in crate::terminal) fn state_glyph(
+        &self,
+        display: DisplayProfile,
+        now: u64,
+    ) -> &'static str {
+        if self.group == AttentionGroup::Working {
+            display.spinner_frame((now / AGENT_SPINNER_FRAME_INTERVAL_MS) as usize)
+        } else {
+            display.glyph(self.glyph)
+        }
     }
 
     /// A row's own status, unless a narrow row needs that width for its request labels.
@@ -137,7 +157,7 @@ impl AgentTreeRow {
             None => ellipsize(&title, frame.title_columns),
         };
         let mut line = RoleLine::role(frame.marker, Role::Text);
-        line.push(frame.glyph, Some(self.status_role()));
+        line.push(frame.glyph, Some(self.glyph_role()));
         line.push(title.as_str(), Some(Role::Text));
         if frame.preview_columns > 0
             && let Some(preview) = extras.preview
@@ -181,11 +201,7 @@ impl AgentTreeRow {
         min_title: usize,
         ordinal_columns: usize,
     ) -> RowFrame {
-        let marker = format!(
-            "{}{}",
-            if selected { "› " } else { "  " },
-            self.indentation()
-        );
+        let marker = if selected { "› " } else { "  " }.to_owned();
         let shape = if extras.glyph.is_empty() {
             String::new()
         } else {
@@ -381,13 +397,12 @@ fn ellipsize(text: &str, width: usize) -> String {
 /// Status words keep their text; colour only separates attention from finished or empty work.
 fn group_role(group: AttentionGroup) -> Role {
     match group {
-        AttentionGroup::NeedsInput => Role::Permission,
+        AttentionGroup::NeedsInput => Role::Warning,
         AttentionGroup::Errors => Role::Error,
-        AttentionGroup::Working | AttentionGroup::Waiting => Role::Text,
-        AttentionGroup::Idle
-        | AttentionGroup::Done
-        | AttentionGroup::Unknown
-        | AttentionGroup::Empty => Role::MutedText,
+        AttentionGroup::Working => Role::Accent,
+        AttentionGroup::Done => Role::Success,
+        AttentionGroup::Waiting => Role::MutedText,
+        AttentionGroup::Idle | AttentionGroup::Unknown | AttentionGroup::Empty => Role::MutedText,
     }
 }
 
@@ -435,7 +450,7 @@ pub(super) struct ReadingNumbers {
 }
 
 impl ReadingNumbers {
-    pub(super) fn register(&mut self, rows: &[AgentTreeRow]) {
+    pub(super) fn register(&mut self, rows: &[AgentRow]) {
         let mut unnumbered = rows
             .iter()
             .map(|row| (row.agent_id, number_key(&row.title)))
@@ -465,21 +480,6 @@ impl ReadingNumbers {
             .any(|(other, (other_key, _))| *other != id && other_key == key)
             .then_some(*number)
     }
-
-    /// Registers `rows` and returns the numbers for each row that shares its first `columns`
-    /// title columns with another of `rows`: a list whose titles can shrink that far, or a cue
-    /// that names one of these rows.
-    pub(super) fn sharing(
-        &mut self,
-        rows: &[AgentTreeRow],
-        columns: usize,
-    ) -> HashMap<Uuid, usize> {
-        self.register(rows);
-        rows.iter()
-            .filter(|row| shares_title_prefix(rows.iter(), row, columns))
-            .filter_map(|row| Some((row.agent_id, self.get(row.agent_id)?)))
-            .collect()
-    }
 }
 
 /// The fewest columns a list or cue gives a title it names; titles that read alike at this width
@@ -497,8 +497,8 @@ fn number_key(title: &str) -> String {
 
 /// Whether another of `rows` reads like `row` when both titles get `columns` columns.
 fn shares_title_prefix<'a>(
-    rows: impl IntoIterator<Item = &'a AgentTreeRow>,
-    row: &AgentTreeRow,
+    rows: impl IntoIterator<Item = &'a AgentRow>,
+    row: &AgentRow,
     columns: usize,
 ) -> bool {
     let shown = title_in(&row.title, columns);
@@ -508,7 +508,7 @@ fn shares_title_prefix<'a>(
 
 /// Rows whose shown titles another row's would read alike: identical titles, equal shown text,
 /// or a cut title that another title continues. Each row comes with its title columns.
-fn ambiguous_titles(rows: &[(&AgentTreeRow, usize)]) -> HashSet<Uuid> {
+fn ambiguous_titles(rows: &[(&AgentRow, usize)]) -> HashSet<Uuid> {
     let titles = rows
         .iter()
         .map(|(row, columns)| {
@@ -537,7 +537,7 @@ fn ambiguous_titles(rows: &[(&AgentTreeRow, usize)]) -> HashSet<Uuid> {
 
 #[derive(Clone, Debug)]
 pub(crate) struct AgentOverview {
-    pub(crate) rows: Vec<AgentTreeRow>,
+    pub(crate) rows: Vec<AgentRow>,
     pub(crate) dispatch_directory: PathBuf,
     /// The Agent named by this overview's resolved creation receipt.
     pub(crate) created: Option<Uuid>,
@@ -556,76 +556,12 @@ impl AgentOverview {
             })
     }
 
-    fn row(&self, id: Uuid) -> Option<&AgentTreeRow> {
+    fn row(&self, id: Uuid) -> Option<&AgentRow> {
         self.rows.iter().find(|row| row.agent_id == id)
     }
 
-    /// Ancestors of `id` listed in this overview, nearest first.
-    fn ancestors(&self, id: Uuid) -> Vec<Uuid> {
-        let mut ancestors = Vec::new();
-        let mut current = self.row(id).and_then(|row| row.parent_id);
-        while let Some(parent) =
-            current.filter(|parent| *parent != id && !ancestors.contains(parent))
-        {
-            let Some(row) = self.row(parent) else {
-                break;
-            };
-            ancestors.push(parent);
-            current = row.parent_id;
-        }
-        ancestors
-    }
-
-    fn has_children(&self, id: Uuid) -> bool {
-        self.rows.iter().any(|row| row.parent_id == Some(id))
-    }
-
-    /// Root-led families in listing order, each with its members in tree order.
-    fn families(&self) -> Vec<Vec<&AgentTreeRow>> {
-        fn collect<'a>(
-            rows: &'a [AgentTreeRow],
-            row: &'a AgentTreeRow,
-            seen: &mut HashSet<Uuid>,
-            members: &mut Vec<&'a AgentTreeRow>,
-        ) {
-            if !seen.insert(row.agent_id) {
-                return;
-            }
-            members.push(row);
-            for child in rows
-                .iter()
-                .filter(|child| child.parent_id == Some(row.agent_id))
-            {
-                collect(rows, child, seen, members);
-            }
-        }
-        let listed = self
-            .rows
-            .iter()
-            .map(|row| row.agent_id)
-            .collect::<HashSet<_>>();
-        let mut seen = HashSet::new();
-        let mut families = Vec::new();
-        let roots = self
-            .rows
-            .iter()
-            .filter(|row| row.parent_id.is_none_or(|parent| !listed.contains(&parent)));
-        for row in roots.chain(self.rows.iter()) {
-            let mut members = Vec::new();
-            collect(&self.rows, row, &mut seen, &mut members);
-            if !members.is_empty() {
-                families.push(members);
-            }
-        }
-        families
-    }
-
-    /// The group a row's family is listed under: its most urgent member's.
-    fn family_group(&self, id: Uuid) -> Option<AttentionGroup> {
-        self.families()
-            .into_iter()
-            .find(|family| family.iter().any(|row| row.agent_id == id))
-            .and_then(|family| family.iter().map(|row| row.group).min())
+    fn group_of(&self, id: Uuid) -> Option<AttentionGroup> {
+        self.row(id).map(|row| row.group)
     }
 }
 
@@ -650,8 +586,7 @@ enum OverviewEntry<'a> {
         current: bool,
     },
     Agent {
-        row: &'a AgentTreeRow,
-        fold: Option<FamilyFold>,
+        row: &'a AgentRow,
     },
     CurrentDraft,
     Disclosure {
@@ -672,70 +607,6 @@ impl OverviewEntry<'_> {
     }
 }
 
-/// What a row with descendants says about the family hidden beneath it.
-#[derive(Clone, Copy)]
-struct FamilyFold {
-    descendants: usize,
-    /// The most urgent descendant group when it outranks the row itself.
-    urgent: Option<AttentionGroup>,
-    folded: bool,
-}
-
-impl FamilyFold {
-    /// Status candidates from the most to the least detailed, each piece in its role.
-    fn status_variants(
-        &self,
-        row: &AgentTreeRow,
-        terminal_columns: usize,
-    ) -> Vec<Vec<(String, Role)>> {
-        let status = (display_single_line(&row.status), row.status_role());
-        if !self.folded {
-            return row.own_status_variants(vec![status], terminal_columns);
-        }
-        let separator = (" · ".to_owned(), Role::MutedText);
-        let count = self.descendants;
-        let wide = terminal_columns >= WIDE_TERMINAL_COLUMNS;
-        let agents = (format!("+{count} agents"), Role::MutedText);
-        let short = (format!("+{count}"), Role::MutedText);
-        let mut variants = Vec::new();
-        if let Some(urgent) = self.urgent {
-            let child = match urgent {
-                AttentionGroup::NeedsInput => "child needs input",
-                AttentionGroup::Errors => "child failed",
-                AttentionGroup::Working => "child running",
-                AttentionGroup::Waiting => "child waiting",
-                AttentionGroup::Idle => "child idle",
-                AttentionGroup::Done => "child done",
-                AttentionGroup::Unknown => "child unknown",
-                AttentionGroup::Empty => "child empty",
-            };
-            let child = (child.to_owned(), group_role(urgent));
-            if wide {
-                variants.push(vec![
-                    status.clone(),
-                    separator.clone(),
-                    agents.clone(),
-                    separator.clone(),
-                    child.clone(),
-                ]);
-            }
-            variants.push(vec![
-                status.clone(),
-                separator.clone(),
-                short.clone(),
-                separator.clone(),
-                child.clone(),
-            ]);
-            variants.push(vec![short.clone(), separator.clone(), child]);
-        } else if wide {
-            variants.push(vec![status.clone(), separator.clone(), agents]);
-        }
-        variants.push(vec![status, separator, short.clone()]);
-        variants.push(vec![short]);
-        variants
-    }
-}
-
 /// Groups that start folded behind their heading: nothing in them needs the user now.
 fn folds_by_default(group: AttentionGroup) -> bool {
     matches!(
@@ -749,9 +620,6 @@ pub(super) struct OverviewState {
     pub(super) projection: Option<AgentOverview>,
     pub(super) selected: Option<OverviewTarget>,
     pub(super) current_draft: bool,
-    /// Explicit fold choices. Rows with children default to folded unless they lead to this
-    /// View's Agent.
-    pub(super) expanded: HashMap<Uuid, bool>,
     /// Explicit group heading choices (`true` folded); see `folds_by_default` for the rest. They
     /// only change what this View lists.
     pub(super) folded_groups: HashMap<AttentionGroup, bool>,
@@ -779,7 +647,7 @@ pub(super) struct OverviewState {
 impl OverviewState {
     pub(super) fn update(&mut self, projection: Option<AgentOverview>) {
         let entering = self.projection.is_none();
-        let (ancestors, group) = self.selection_context();
+        let group = self.selection_context();
         let screen_row = self
             .selected_line(&self.entries())
             .map(|line| line.saturating_sub(self.offset));
@@ -794,7 +662,7 @@ impl OverviewState {
         if entering && self.current_draft {
             self.folded_groups.insert(AttentionGroup::NeedsInput, false);
             self.selected = Some(OverviewTarget::CurrentDraft);
-            self.settle_selection(&[], Some(AttentionGroup::NeedsInput));
+            self.settle_selection(Some(AttentionGroup::NeedsInput));
             self.offset = self.scroll_offset(&self.entries());
             return;
         }
@@ -802,7 +670,7 @@ impl OverviewState {
             self.locate(source);
             return;
         }
-        self.settle_selection(&ancestors, group);
+        self.settle_selection(group);
         // Rows arriving above keep the selection on its screen line.
         if let (Some(screen_row), Some(line)) = (screen_row, self.selected_line(&self.entries())) {
             self.offset = line.saturating_sub(screen_row);
@@ -813,17 +681,11 @@ impl OverviewState {
     /// is folded or filtered away: its nearest listed ancestor, else its group heading.
     fn locate(&mut self, source: Uuid) {
         let targets = self.targets();
-        let ancestors = self
-            .projection
-            .as_ref()
-            .map(|projection| projection.ancestors(source))
-            .unwrap_or_default();
         let group = self
             .projection
             .as_ref()
-            .and_then(|projection| projection.family_group(source));
+            .and_then(|projection| projection.group_of(source));
         let target = std::iter::once(source)
-            .chain(ancestors)
             .map(OverviewTarget::Agent)
             .chain(group.map(OverviewTarget::Heading))
             .find(|target| targets.contains(target));
@@ -836,7 +698,7 @@ impl OverviewState {
                     .unwrap_or(0);
                 self.offset = self.scroll_offset(&self.entries());
             }
-            None => self.settle_selection(&[], None),
+            None => self.settle_selection(None),
         }
     }
 
@@ -852,19 +714,14 @@ impl OverviewState {
         }
     }
 
-    /// Where the selection can retreat if its row stops being listed: its ancestors, nearest
-    /// first, and its family's group.
-    fn selection_context(&self) -> (Vec<Uuid>, Option<AttentionGroup>) {
+    fn selection_context(&self) -> Option<AttentionGroup> {
         if self.selected == Some(OverviewTarget::CurrentDraft) {
-            return (Vec::new(), Some(AttentionGroup::NeedsInput));
+            return Some(AttentionGroup::NeedsInput);
         }
-        let (Some(projection), Some(id)) = (&self.projection, self.selected_agent()) else {
-            return (Vec::new(), None);
-        };
-        (projection.ancestors(id), projection.family_group(id))
+        self.projection.as_ref()?.group_of(self.selected_agent()?)
     }
 
-    fn settle_selection(&mut self, ancestors: &[Uuid], group: Option<AttentionGroup>) {
+    fn settle_selection(&mut self, group: Option<AttentionGroup>) {
         let entries = self.entries();
         // A vanished group counter falls back to the last row it was folding.
         let counter_group = match self.selected {
@@ -898,10 +755,9 @@ impl OverviewState {
             self.selected_position = position;
             return;
         }
-        let fallback = ancestors
-            .iter()
-            .map(|id| OverviewTarget::Agent(*id))
-            .chain(group.map(OverviewTarget::Disclosure))
+        let fallback = group
+            .map(OverviewTarget::Disclosure)
+            .into_iter()
             .chain(
                 group
                     .filter(|group| self.is_group_folded(*group))
@@ -924,7 +780,7 @@ impl OverviewState {
             .unwrap_or(0);
     }
 
-    fn passes_filters(&self, row: &AgentTreeRow) -> bool {
+    fn passes_filters(&self, row: &AgentRow) -> bool {
         self.project
             .as_ref()
             .is_none_or(|project| row.project == *project)
@@ -932,16 +788,6 @@ impl OverviewState {
                 .workspace
                 .as_ref()
                 .is_none_or(|workspace| row.workspace.as_ref() == Some(workspace))
-    }
-
-    fn is_expanded(&self, id: Uuid) -> bool {
-        self.expanded.get(&id).copied().unwrap_or_else(|| {
-            self.projection.as_ref().is_some_and(|projection| {
-                projection
-                    .visible
-                    .is_some_and(|visible| projection.ancestors(visible).contains(&id))
-            })
-        })
     }
 
     fn is_group_folded(&self, group: AttentionGroup) -> bool {
@@ -978,41 +824,6 @@ impl OverviewState {
         pinned
     }
 
-    fn fold_facts(&self) -> HashMap<Uuid, FamilyFold> {
-        let Some(projection) = &self.projection else {
-            return HashMap::new();
-        };
-        projection
-            .rows
-            .iter()
-            .filter(|row| projection.has_children(row.agent_id))
-            .map(|row| {
-                let descendants = projection
-                    .rows
-                    .iter()
-                    .filter(|candidate| {
-                        projection
-                            .ancestors(candidate.agent_id)
-                            .contains(&row.agent_id)
-                    })
-                    .collect::<Vec<_>>();
-                let urgent = descendants
-                    .iter()
-                    .map(|descendant| descendant.group)
-                    .min()
-                    .filter(|group| *group < row.group);
-                (
-                    row.agent_id,
-                    FamilyFold {
-                        descendants: descendants.len(),
-                        urgent,
-                        folded: !self.is_expanded(row.agent_id),
-                    },
-                )
-            })
-            .collect()
-    }
-
     fn entries(&self) -> Vec<OverviewEntry<'_>> {
         struct Member<'a> {
             pinned: bool,
@@ -1025,7 +836,6 @@ impl OverviewState {
             return Vec::new();
         };
         let pinned = self.pinned();
-        let facts = self.fold_facts();
         let mut grouped = AttentionGroup::ALL
             .iter()
             .map(|group| (*group, Vec::<Member<'_>>::new()))
@@ -1043,31 +853,18 @@ impl OverviewState {
                 lines: vec![OverviewEntry::CurrentDraft],
             });
         }
-        for family in projection.families() {
-            let Some(group) = family.iter().map(|row| row.group).min() else {
-                continue;
-            };
+        for row in &projection.rows {
+            let group = row.group;
             let member = Member {
-                pinned: family.iter().any(|row| pinned.contains(&row.agent_id)),
-                current: family
-                    .iter()
-                    .any(|row| projection.visible == Some(row.agent_id)),
-                approvals: family[0].approvals,
-                questions: family[0].questions,
-                lines: family
-                    .into_iter()
-                    .filter(|row| {
-                        self.passes_filters(row)
-                            && projection
-                                .ancestors(row.agent_id)
-                                .iter()
-                                .all(|ancestor| self.is_expanded(*ancestor))
-                    })
-                    .map(|row| OverviewEntry::Agent {
-                        row,
-                        fold: facts.get(&row.agent_id).copied(),
-                    })
-                    .collect(),
+                pinned: pinned.contains(&row.agent_id),
+                current: projection.visible == Some(row.agent_id),
+                approvals: row.approvals,
+                questions: row.questions,
+                lines: if self.passes_filters(row) {
+                    vec![OverviewEntry::Agent { row }]
+                } else {
+                    Vec::new()
+                },
             };
             if member.lines.is_empty() {
                 continue;
@@ -1181,13 +978,13 @@ impl OverviewState {
     }
 
     fn row_extras(
-        row: &AgentTreeRow,
+        row: &AgentRow,
         terminal_columns: usize,
         now: u64,
         display: DisplayProfile,
     ) -> RowExtras<'_> {
         RowExtras {
-            glyph: display.glyph(row.glyph),
+            glyph: row.state_glyph(display, now),
             project: if terminal_columns >= WIDE_TERMINAL_COLUMNS {
                 row.project.as_str()
             } else {
@@ -1203,19 +1000,11 @@ impl OverviewState {
 
     /// Status candidates for a row, richest first; the row frame keeps the richest that fits. The
     /// Agent this View returns to says so in every candidate.
-    fn row_status(
-        &self,
-        row: &AgentTreeRow,
-        fold: Option<FamilyFold>,
-        terminal_columns: usize,
-    ) -> Vec<Vec<(String, Role)>> {
-        let mut variants = match fold {
-            Some(fold) => fold.status_variants(row, terminal_columns),
-            None => row.own_status_variants(
-                vec![(display_single_line(&row.status), row.status_role())],
-                terminal_columns,
-            ),
-        };
+    fn row_status(&self, row: &AgentRow, terminal_columns: usize) -> Vec<Vec<(String, Role)>> {
+        let mut variants = row.own_status_variants(
+            vec![(display_single_line(&row.status), row.status_role())],
+            terminal_columns,
+        );
         let current = self
             .projection
             .as_ref()
@@ -1237,7 +1026,7 @@ impl OverviewState {
     /// Whether a status cue may name `row`'s title in fewer columns than its list row does: then
     /// the row and the cue both carry its number while another row reads alike at the cue's
     /// narrowest title.
-    fn needs_cue_number(&self, row: &AgentTreeRow) -> bool {
+    fn needs_cue_number(&self, row: &AgentRow) -> bool {
         self.projection.as_ref().is_some_and(|projection| {
             [projection.created, projection.visible].contains(&Some(row.agent_id))
                 && shares_title_prefix(&projection.rows, row, NUMBER_KEY_COLUMNS)
@@ -1245,7 +1034,7 @@ impl OverviewState {
     }
 
     /// A row's title and, when it carries one, its reading number as the status cues name it.
-    fn label(&self, row: &AgentTreeRow) -> (String, Option<String>) {
+    fn label(&self, row: &AgentRow) -> (String, Option<String>) {
         let number = self
             .numbers
             .get(row.agent_id)
@@ -1254,7 +1043,7 @@ impl OverviewState {
         (display_single_line(&row.title), number)
     }
 
-    fn hiding_filters(&self, row: &AgentTreeRow) -> Option<(&'static str, &'static str)> {
+    fn hiding_filters(&self, row: &AgentRow) -> Option<(&'static str, &'static str)> {
         let project = self
             .project
             .as_ref()
@@ -1273,11 +1062,11 @@ impl OverviewState {
 
     /// Why a row is not listed: hidden by this View's filters, in a collapsed group, or folded
     /// under its parent.
-    fn unlisted_details(&self, row: &AgentTreeRow) -> Option<Vec<String>> {
+    fn unlisted_details(&self, row: &AgentRow) -> Option<Vec<String>> {
         let collapsed = self
             .projection
             .as_ref()
-            .and_then(|projection| projection.family_group(row.agent_id))
+            .and_then(|projection| projection.group_of(row.agent_id))
             .filter(|group| self.is_group_collapsed_by_user(*group));
         if let Some((filters, keys)) = self.hiding_filters(row) {
             let mut details = Vec::new();
@@ -1376,7 +1165,7 @@ impl OverviewState {
     fn cue_with_optional_detail(
         &self,
         verb: &str,
-        row: &AgentTreeRow,
+        row: &AgentRow,
         status: &str,
         width: usize,
     ) -> String {
@@ -1401,7 +1190,7 @@ impl OverviewState {
 
     /// `verb` and the row's label with the first detail that fits. When none does, the title
     /// shrinks before its reading number, which stays whole beside the shortest detail.
-    fn cue(&self, verb: &str, row: &AgentTreeRow, details: &[String], width: usize) -> String {
+    fn cue(&self, verb: &str, row: &AgentRow, details: &[String], width: usize) -> String {
         let (title, number) = self.label(row);
         let number = number.unwrap_or_default();
         if let Some(cue) = details
@@ -1487,25 +1276,14 @@ impl OverviewState {
                 let folded = self.is_group_folded(group);
                 self.folded_groups.insert(group, !folded);
             }
-            Some(OverviewTarget::Agent(id)) => {
-                if self
-                    .projection
-                    .as_ref()
-                    .is_some_and(|projection| projection.has_children(id))
-                {
-                    let expanded = self.is_expanded(id);
-                    self.expanded.insert(id, !expanded);
-                }
-            }
             Some(OverviewTarget::Disclosure(group)) => {
                 if !self.opened_groups.remove(&group) {
                     self.opened_groups.insert(group);
                 }
                 self.visited.clear();
-                let (ancestors, group) = (Vec::new(), Some(group));
-                self.settle_selection(&ancestors, group);
+                self.settle_selection(Some(group));
             }
-            Some(OverviewTarget::CurrentDraft) | None => {}
+            Some(OverviewTarget::CurrentDraft | OverviewTarget::Agent(_)) | None => {}
         }
         self.offset = self.scroll_offset(&self.entries());
     }
@@ -1548,7 +1326,7 @@ impl OverviewState {
         {
             self.selected = None;
             self.selected_position = 0;
-            self.settle_selection(&[], None);
+            self.settle_selection(None);
         }
         self.offset = 0;
         self.offset = self.scroll_offset(&self.entries());
@@ -1584,21 +1362,7 @@ impl OverviewState {
             } else {
                 "Enter/→ collapse".to_owned()
             }],
-            Some(OverviewTarget::Agent(id)) => {
-                let mut hints = vec!["Enter open".to_owned()];
-                if self
-                    .projection
-                    .as_ref()
-                    .is_some_and(|projection| projection.has_children(id))
-                {
-                    hints.push(if self.is_expanded(id) {
-                        "Space fold".into()
-                    } else {
-                        "Space expand".into()
-                    });
-                }
-                hints
-            }
+            Some(OverviewTarget::Agent(_)) => vec!["Enter open".to_owned()],
             Some(OverviewTarget::Disclosure(group)) => self
                 .entries()
                 .iter()
@@ -1817,12 +1581,12 @@ impl OverviewState {
         let rooms = entries
             .iter()
             .filter_map(|entry| match entry {
-                OverviewEntry::Agent { row, fold } => Some((
+                OverviewEntry::Agent { row } => Some((
                     *row,
                     row.title_room(
                         width,
                         &Self::row_extras(row, terminal_columns, now, display),
-                        &self.row_status(row, *fold, terminal_columns),
+                        &self.row_status(row, terminal_columns),
                         MIN_AGENT_TITLE_COLUMNS,
                     ),
                 )),
@@ -1855,12 +1619,12 @@ impl OverviewState {
                         (*approvals, *questions),
                         display,
                     ),
-                    OverviewEntry::Agent { row, fold } => row.summary_line(
+                    OverviewEntry::Agent { row } => row.summary_line(
                         width,
                         selected,
                         &Self::row_extras(row, terminal_columns, now, display),
                         ordinals.get(&row.agent_id).copied(),
-                        &self.row_status(row, *fold, terminal_columns),
+                        &self.row_status(row, terminal_columns),
                         MIN_AGENT_TITLE_COLUMNS,
                     ),
                     OverviewEntry::CurrentDraft => current_draft_line(width, selected, display),
@@ -1960,7 +1724,6 @@ pub(super) fn help_lines(
             "Tab list / new Agent".into(),
             "Enter / → open Agent (row)".into(),
             "Enter / → / Space fold group (heading)".into(),
-            "Space fold child tree (row)".into(),
             "Enter dispatch (input)".into(),
             "r open history".into(),
             "/cwd PATH set dispatch directory".into(),

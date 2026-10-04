@@ -106,6 +106,15 @@ struct GatedReply {
 
 #[async_trait]
 impl ModelClient for GatedReply {
+    async fn generate_title(
+        &self,
+        request: crate::model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<crate::model::ModelDelta>,
+        _: tokio_util::sync::CancellationToken,
+    ) -> Result<crate::model::ModelOutput, crate::model::ModelError> {
+        Ok(crate::model::fixture_title(request))
+    }
+
     fn identity(&self) -> ModelIdentity {
         ModelIdentity {
             provider: ModelProvider::Api,
@@ -846,6 +855,15 @@ struct GuardedReplies {
 
 #[async_trait]
 impl ModelClient for GuardedReplies {
+    async fn generate_title(
+        &self,
+        request: crate::model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<crate::model::ModelDelta>,
+        _: tokio_util::sync::CancellationToken,
+    ) -> Result<crate::model::ModelOutput, crate::model::ModelError> {
+        Ok(crate::model::fixture_title(request))
+    }
+
     fn identity(&self) -> ModelIdentity {
         ModelIdentity {
             provider: ModelProvider::Api,
@@ -1226,6 +1244,15 @@ const RETAINED_COMPLETION_STAGE: &str = "retained-completion-stage";
 
 #[async_trait]
 impl ModelClient for RetainedCompletionModel {
+    async fn generate_title(
+        &self,
+        request: crate::model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<crate::model::ModelDelta>,
+        _: tokio_util::sync::CancellationToken,
+    ) -> Result<crate::model::ModelOutput, crate::model::ModelError> {
+        Ok(crate::model::fixture_title(request))
+    }
+
     fn identity(&self) -> ModelIdentity {
         ModelIdentity {
             provider: ModelProvider::Api,
@@ -1740,6 +1767,15 @@ struct HeldRequests {
 
 #[async_trait]
 impl ModelClient for HeldRequests {
+    async fn generate_title(
+        &self,
+        request: crate::model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<crate::model::ModelDelta>,
+        _: tokio_util::sync::CancellationToken,
+    ) -> Result<crate::model::ModelOutput, crate::model::ModelError> {
+        Ok(crate::model::fixture_title(request))
+    }
+
     fn identity(&self) -> ModelIdentity {
         self.model.identity()
     }

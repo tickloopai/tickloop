@@ -84,6 +84,15 @@ struct LostPresentationModel {
 
 #[async_trait]
 impl ModelClient for LostPresentationModel {
+    async fn generate_title(
+        &self,
+        request: crate::model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<crate::model::ModelDelta>,
+        _: tokio_util::sync::CancellationToken,
+    ) -> Result<crate::model::ModelOutput, crate::model::ModelError> {
+        Ok(crate::model::fixture_title(request))
+    }
+
     fn identity(&self) -> ModelIdentity {
         ModelIdentity {
             provider: ModelProvider::Api,

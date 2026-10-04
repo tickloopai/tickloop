@@ -898,7 +898,9 @@ fn display_width(text: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, time::Duration};
+    use std::path::PathBuf;
+    #[cfg(not(unix))]
+    use std::time::Instant;
 
     use super::*;
     use crate::file_change::{FileChangeHunk, FileChangeLine, FileVersion};
@@ -1336,19 +1338,10 @@ mod tests {
             height: 3,
         };
 
-        // CPU time of this thread, so parallel tests on a loaded machine never stretch the bound.
-        let thread_cpu_time = || {
-            let mut time = libc::timespec {
-                tv_sec: 0,
-                tv_nsec: 0,
-            };
-            assert_eq!(
-                unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut time) },
-                0
-            );
-            Duration::new(time.tv_sec as u64, time.tv_nsec as u32)
-        };
+        #[cfg(unix)]
         let started = thread_cpu_time();
+        #[cfg(not(unix))]
+        let started = Instant::now();
         let end = navigate_diff(
             &review,
             &DiffNavigation::default(),
@@ -1367,7 +1360,11 @@ mod tests {
             },
         );
 
-        assert!(thread_cpu_time() - started < Duration::from_secs(10));
+        #[cfg(unix)]
+        let elapsed = thread_cpu_time().saturating_sub(started);
+        #[cfg(not(unix))]
+        let elapsed = started.elapsed();
+        assert!(elapsed.as_secs() < 10, "diff navigation used {elapsed:?}");
         assert_eq!(end_frame.lines.len(), viewport.height);
         assert!(end_frame.total_rows > LONG_LINE_BYTES);
         assert!(!end_frame.can_move_down);
@@ -1387,6 +1384,20 @@ mod tests {
             up.anchor.as_ref().unwrap(),
             resized.navigation.anchor.as_ref().unwrap()
         ));
+    }
+
+    #[cfg(unix)]
+    fn thread_cpu_time() -> std::time::Duration {
+        let mut timestamp = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // Measure renderer work without charging parallel tests' scheduler time.
+        assert_eq!(
+            unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut timestamp) },
+            0
+        );
+        std::time::Duration::new(timestamp.tv_sec as u64, timestamp.tv_nsec as u32)
     }
 
     #[test]

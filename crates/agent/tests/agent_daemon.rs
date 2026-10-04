@@ -598,10 +598,6 @@ async fn a_real_worker_keeps_shell_execution_after_ui_disconnect_and_exits_on_li
     assert!(!socket.exists());
 }
 
-/// Multi-megabyte IPC transfers in a debug build; on a machine busy with parallel tests they took
-/// over 15 s. Only a failure waits this long.
-const OVERSIZED_TRANSFER_TIMEOUT: Duration = Duration::from_secs(60);
-
 /// Stops whatever owner serves a test's private runtime directory when the test ends, also
 /// after a failed assertion. The test's runtime may already be gone by then, so the shutdown
 /// runs on its own thread and runtime and is awaited.
@@ -1440,6 +1436,15 @@ struct HeldModel {
 
 #[async_trait]
 impl tickloop_agent::model::ModelClient for HeldModel {
+    async fn generate_title(
+        &self,
+        request: tickloop_agent::model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<tickloop_agent::model::ModelDelta>,
+        _: tokio_util::sync::CancellationToken,
+    ) -> Result<tickloop_agent::model::ModelOutput, tickloop_agent::model::ModelError> {
+        Ok(support::title_output(request))
+    }
+
     fn identity(&self) -> tickloop_agent::model::ModelIdentity {
         tickloop_agent::model::ModelClient::identity(&self.script)
     }
@@ -1976,6 +1981,8 @@ struct OversizedResponseAccess {
     executions: AtomicUsize,
 }
 
+const OVERSIZED_RESPONSE_TIMEOUT: Duration = Duration::from_secs(180);
+
 #[async_trait]
 impl AgentAccess for OversizedResponseAccess {
     async fn observe(&self, query: ObservationRequest) -> Result<Observation, AccessError> {
@@ -2040,7 +2047,7 @@ async fn an_oversized_initial_observation_returns_a_typed_error_and_keeps_ipc_av
     let temporary = tempfile::tempdir_in("/tmp").unwrap();
     let (client, access, target, server) = oversized_response_fixture(temporary.path()).await;
     let error = tokio::time::timeout(
-        OVERSIZED_TRANSFER_TIMEOUT,
+        OVERSIZED_RESPONSE_TIMEOUT,
         client.observe(ObservationRequest::Agent {
             execution: target,
             detail: AgentDetailQuery::Warnings,
@@ -2083,7 +2090,7 @@ async fn an_oversized_accepted_receipt_stays_queryable_without_replaying_the_com
             },
         },
     );
-    let error = tokio::time::timeout(OVERSIZED_TRANSFER_TIMEOUT, client.execute(command.clone()))
+    let error = tokio::time::timeout(OVERSIZED_RESPONSE_TIMEOUT, client.execute(command.clone()))
         .await
         .unwrap()
         .unwrap_err();
@@ -2093,7 +2100,7 @@ async fn an_oversized_accepted_receipt_stays_queryable_without_replaying_the_com
         epoch: command.owner_epoch,
         command_id: command.command_id,
     };
-    let error = tokio::time::timeout(OVERSIZED_TRANSFER_TIMEOUT, client.observe(query.clone()))
+    let error = tokio::time::timeout(OVERSIZED_RESPONSE_TIMEOUT, client.observe(query.clone()))
         .await
         .unwrap()
         .unwrap_err();

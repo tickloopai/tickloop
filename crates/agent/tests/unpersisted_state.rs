@@ -191,13 +191,7 @@ async fn usage_after_restart_counts_only_requests_made_by_this_process() {
     complete_turn(&first, chat, "First").await;
     complete_turn(&first, chat, "Second").await;
     assert_eq!(
-        first
-            .snapshot(chat)
-            .await
-            .unwrap()
-            .request_usage
-            .summary()
-            .request_count,
+        support::model_script_requests(&first.snapshot(chat).await.unwrap()).len(),
         2
     );
     first.shutdown().await;

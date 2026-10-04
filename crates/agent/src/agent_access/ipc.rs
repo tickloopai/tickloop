@@ -139,7 +139,7 @@ impl Drop for ConnectionCleanup {
 }
 
 enum Reply {
-    Message(ServerMessage),
+    Message(Box<ServerMessage>),
     Opened {
         initial: ObservationValue,
         cursor: Cursor,
@@ -181,6 +181,11 @@ impl LocalAgentClient {
                 ));
             }
             Some(ServerMessage::Error { error, .. }) => return Err(error),
+            None => {
+                return Err(AccessError::unavailable(
+                    "owner disconnected during protocol negotiation",
+                ));
+            }
             _ => {
                 return Err(AccessError::new(
                     AccessErrorCode::VersionMismatch,
@@ -225,7 +230,9 @@ impl LocalAgentClient {
             )
             .await?
         {
-            Reply::Message(ServerMessage::OwnerStopped { .. }) => Ok(()),
+            Reply::Message(message) if matches!(*message, ServerMessage::OwnerStopped { .. }) => {
+                Ok(())
+            }
             _ => Err(AccessError::invalid(
                 "server returned an invalid owner shutdown reply",
             )),
@@ -301,25 +308,19 @@ impl LocalAgentClient {
 #[async_trait]
 impl AgentAccess for LocalAgentClient {
     async fn observe(&self, query: ObservationRequest) -> Result<Observation, AccessError> {
-        query.check_peer_version(self.inner.hello.minor)?;
         let request_id = Uuid::new_v4();
-        let (written, waiting) = if self.inner.hello.minor >= MIN_PREOPEN_OBSERVATION_CANCEL_MINOR {
-            let (written, waiting) = oneshot::channel();
-            (Some(written), Some(waiting))
-        } else {
-            (None, None)
-        };
+        let (written, waiting) = oneshot::channel();
         let mut cancel = PendingObservationCancel {
             writer: Arc::downgrade(&self.inner.writer),
             connection: self.inner.cancel.clone(),
             request_id,
-            written: waiting,
+            written: Some(waiting),
         };
         let result = self
             .request_with_notification(
                 request_id,
                 ClientMessage::Observe { request_id, query },
-                written,
+                Some(written),
             )
             .await;
         cancel.written = None;
@@ -343,7 +344,6 @@ impl AgentAccess for LocalAgentClient {
         }
     }
     async fn execute(&self, command: CommandEnvelope) -> Result<CommandReceipt, AccessError> {
-        command.command.check_peer_version(self.inner.hello.minor)?;
         let request_id = Uuid::new_v4();
         match self
             .request(
@@ -355,7 +355,12 @@ impl AgentAccess for LocalAgentClient {
             )
             .await
         {
-            Ok(Reply::Message(ServerMessage::Receipt { receipt, .. })) => Ok(receipt),
+            Ok(Reply::Message(message)) => match *message {
+                ServerMessage::Receipt { receipt, .. } => Ok(receipt),
+                _ => Err(AccessError::invalid(
+                    "owner returned the wrong command reply",
+                )),
+            },
             Err(error) if error.code == AccessErrorCode::Unavailable => Err(AccessError::new(
                 AccessErrorCode::OutcomeUnknown,
                 "owner disconnected; query the original CommandId before retrying",
@@ -372,7 +377,12 @@ impl AgentAccess for LocalAgentClient {
             .request(request_id, ClientMessage::ShowView { request_id, update })
             .await?
         {
-            Reply::Message(ServerMessage::Display { receipt, .. }) => Ok(receipt),
+            Reply::Message(message) => match *message {
+                ServerMessage::Display { receipt, .. } => Ok(receipt),
+                _ => Err(AccessError::invalid(
+                    "owner returned the wrong display reply",
+                )),
+            },
             _ => Err(AccessError::invalid(
                 "owner returned the wrong display reply",
             )),
@@ -402,11 +412,10 @@ async fn read_responses(
                 total_bytes,
                 chunk_bytes,
             } => {
-                if inner.hello.minor < MIN_CHUNKED_RESPONSE_MINOR
-                    || !inner
-                        .hello
-                        .capabilities
-                        .contains(&AccessCapability::ChunkedResponses)
+                if !inner
+                    .hello
+                    .capabilities
+                    .contains(&AccessCapability::ChunkedResponses)
                     || transfer.is_some()
                     || !inner.pending.lock().await.contains_key(&request_id)
                 {
@@ -549,7 +558,7 @@ async fn read_responses(
             | ServerMessage::OwnerStopped { request_id }
             | ServerMessage::Display { request_id, .. }) => {
                 if let Some(sender) = inner.pending.lock().await.remove(&request_id) {
-                    let _ = sender.send(Ok(Reply::Message(response)));
+                    let _ = sender.send(Ok(Reply::Message(Box::new(response))));
                 }
             }
             _ => {}
@@ -668,8 +677,8 @@ async fn serve_connection_mode(
     let minor = match hello {
         Some(crate::service_management::Request::Hello {
             major: PROTOCOL_MAJOR,
-            minor,
-        }) => minor.min(PROTOCOL_MINOR),
+            ..
+        }) => PROTOCOL_MINOR,
         Some(crate::service_management::Request::Hello { major, minor: 0 })
             if crate::service_management::CONTROL_MAJORS.contains(&major)
                 && owner_shutdown.is_some() =>
@@ -715,7 +724,7 @@ async fn serve_connection_mode(
         }
     };
     let session_id = Uuid::new_v4();
-    let mut capabilities = vec![
+    let capabilities = vec![
         AccessCapability::Overview,
         AccessCapability::AgentDetails,
         AccessCapability::Records,
@@ -734,14 +743,10 @@ async fn serve_connection_mode(
         AccessCapability::RefreshConfiguration,
         AccessCapability::FlushTranscripts,
         AccessCapability::DisplayRegistration,
+        AccessCapability::TrustWorkingDirectory,
+        AccessCapability::ChunkedResponses,
     ];
-    let mut limits = ProtocolLimits::current();
-    if minor >= MIN_CHUNKED_RESPONSE_MINOR {
-        capabilities.push(AccessCapability::TrustWorkingDirectory);
-        capabilities.push(AccessCapability::ChunkedResponses);
-    } else {
-        limits.chunk_bytes = 0;
-    }
+    let limits = ProtocolLimits::current();
     write_frame(
         &mut stream,
         &ServerMessage::Hello(ServerHello {
@@ -818,9 +823,7 @@ async fn serve_connection_mode(
             continue;
         }
         if let ClientMessage::CancelObservation { observation_id } = message {
-            if minor >= MIN_PREOPEN_OBSERVATION_CANCEL_MINOR
-                && let Some(pending) = pending_observations.lock().await.remove(&observation_id)
-            {
+            if let Some(pending) = pending_observations.lock().await.remove(&observation_id) {
                 pending.cancel();
             }
             if let Some(feed) = observations.lock().await.remove(&observation_id) {
@@ -862,7 +865,6 @@ async fn serve_connection_mode(
                     let observation_cancel =
                         observation_cancel.expect("Observe has a cancellation scope");
                     let result = async {
-                        query.check_peer_version(minor)?;
                         tokio::select! {
                             biased;
                             () = observation_cancel.cancelled() => Err(AccessError::unavailable(OBSERVATION_CANCELLED_BEFORE_OPENING)),
@@ -880,11 +882,7 @@ async fn serve_connection_mode(
                     });
                     match result {
                         Ok(observation) => {
-                            let observation_id = if minor >= MIN_PREOPEN_OBSERVATION_CANCEL_MINOR {
-                                request_id
-                            } else {
-                                Uuid::new_v4()
-                            };
+                            let observation_id = request_id;
                             let feed = observation.changes.is_some();
                             let terminal_error = observation.terminal_error.clone();
                             let response = ServerMessage::Opened {
@@ -976,7 +974,6 @@ async fn serve_connection_mode(
                                 response,
                                 request_id,
                                 false,
-                                minor >= MIN_CHUNKED_RESPONSE_MINOR,
                                 &cancel,
                             )
                             .await
@@ -1012,9 +1009,7 @@ async fn serve_connection_mode(
                 ClientMessage::Execute {
                     request_id,
                     command,
-                } => match if let Err(error) = command.command.check_peer_version(minor) {
-                    Err(error)
-                } else if !forwarded_sessions
+                } => match if !forwarded_sessions
                     && super::views::command_origin(&command.command)
                         .is_some_and(|source| source.view.session_id != session_id)
                 {
@@ -1072,7 +1067,6 @@ async fn serve_connection_mode(
                 response,
                 request_id,
                 command_response,
-                minor >= MIN_CHUNKED_RESPONSE_MINOR,
                 &cancel,
             )
             .await;
@@ -1093,7 +1087,6 @@ async fn write_response<W: AsyncWrite + Unpin>(
     response: ServerMessage,
     request_id: Uuid,
     command_response: bool,
-    chunked_responses: bool,
     cancel: &CancellationToken,
 ) -> bool {
     let kind = response_kind(&response);
@@ -1108,13 +1101,9 @@ async fn write_response<W: AsyncWrite + Unpin>(
             Ok(Ok(encoded)) if encoded.total_bytes <= MAX_FRAME_BYTES as u64 => {
                 write_encoded_frame(writer, encoded).await
             }
-            Ok(Ok(encoded)) if chunked_responses => {
+            Ok(Ok(encoded)) => {
                 write_chunked_response(writer, encoded, request_id, kind, cancel).await
             }
-            Ok(Ok(_)) => Err(AccessError::new(
-                AccessErrorCode::PayloadTooLarge,
-                "AgentAccess frame exceeds the transport limit",
-            )),
             Ok(Err(error)) => Err(error),
             Err(error) => Err(AccessError::invalid(format!(
                 "AgentAccess response could not be encoded: {error}"
@@ -1345,6 +1334,67 @@ mod tests {
         async fn show_view(&self, _: DisplayUpdate) -> Result<DisplayReceipt, AccessError> {
             Err(AccessError::invalid("fixture has no display"))
         }
+    }
+
+    #[tokio::test]
+    async fn a_peer_closing_during_hello_is_unavailable_without_a_version_claim() {
+        let temporary = tempfile::tempdir_in("/tmp").unwrap();
+        let path = temporary.path().join("owner.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            assert!(matches!(
+                read_frame::<_, ClientMessage>(&mut stream).await.unwrap(),
+                Some(ClientMessage::Hello { .. })
+            ));
+        });
+        let error = match LocalAgentClient::connect(&path).await {
+            Ok(_) => panic!("closed peer cannot negotiate a connection"),
+            Err(error) => error,
+        };
+        server.await.unwrap();
+        assert_eq!(error.code, AccessErrorCode::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn business_three_is_fenced_before_a_query_can_dispatch() {
+        let epoch = Uuid::new_v4();
+        let source = Arc::new(CompletingLookup {
+            epoch,
+            started: tokio::sync::Notify::new(),
+            release: std::sync::atomic::AtomicBool::new(true),
+        });
+        let (server_stream, mut client) = UnixStream::pair().unwrap();
+        let server = tokio::spawn(serve_connection(server_stream, source.clone(), epoch));
+        write_frame(&mut client, &ClientMessage::Hello { major: 3, minor: 2 })
+            .await
+            .unwrap();
+        let response = read_frame::<_, ServerMessage>(&mut client).await.unwrap();
+        assert!(matches!(
+            response,
+            Some(ServerMessage::Error {
+                error: AccessError {
+                    code: AccessErrorCode::VersionMismatch,
+                    ..
+                },
+                ..
+            })
+        ));
+        assert!(
+            read_frame::<_, ServerMessage>(&mut client)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        server.await.unwrap().unwrap();
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(10),
+                source.started.notified()
+            )
+            .await
+            .is_err()
+        );
     }
 
     struct CompletingLookup {
@@ -2179,96 +2229,7 @@ mod tests {
             .unwrap();
     }
 
-    #[tokio::test]
-    async fn provider_queries_are_rejected_before_sending_to_a_minor_one_peer() {
-        let directory = tempfile::Builder::new()
-            .prefix("pmipc-")
-            .tempdir_in("/tmp")
-            .unwrap();
-        let path = directory.path().join("owner.sock");
-        let listener = UnixListener::bind(&path).unwrap();
-        let epoch = Uuid::new_v4();
-        let server = tokio::spawn(serve_legacy_overview(
-            listener,
-            epoch,
-            serde_json::json!([]),
-        ));
-        let client = LocalAgentClient::connect(&path).await.unwrap();
-        let execution = ExecutionRef {
-            owner_epoch: epoch,
-            agent_id: Uuid::new_v4(),
-            generation: 1,
-        };
-        let config = crate::model::cards::ModelCatalog::defaults()
-            .get("openai-api", "gpt-6.1-sol")
-            .unwrap();
-        for detail in [
-            AgentDetailQuery::ProviderCredentials,
-            AgentDetailQuery::AccountModels {
-                config: Box::new(config),
-                refresh: false,
-            },
-        ] {
-            let result = client
-                .observe(ObservationRequest::Agent {
-                    execution,
-                    detail,
-                    after: None,
-                })
-                .await;
-            assert!(
-                matches!(
-                    result,
-                    Err(AccessError {
-                        code: AccessErrorCode::VersionMismatch,
-                        ..
-                    })
-                ),
-                "New closed queries must be blocked before dispatch to a 2.1 reader"
-            );
-        }
-        let provider: crate::model::cards::ProviderPatch =
-            serde_json::from_value(serde_json::json!({"id":"openai-api"})).unwrap();
-        let config = crate::model::cards::ModelCatalog::defaults()
-            .get("openai-api", "gpt-6.1-sol")
-            .unwrap();
-        let result = client
-            .execute(CommandEnvelope {
-                owner_epoch: epoch,
-                command_id: Uuid::new_v4(),
-                command: AgentCommand::Configure {
-                    execution,
-                    change: ConfigurationChange::Model {
-                        config,
-                        thinking: None,
-                    },
-                    provider: Some(Box::new(provider)),
-                },
-            })
-            .await;
-        assert!(matches!(
-            result,
-            Err(AccessError {
-                code: AccessErrorCode::VersionMismatch,
-                ..
-            })
-        ));
-        assert!(client.is_connected());
-        let safe = client
-            .observe(ObservationRequest::Overview {
-                filter: AgentFilter::default(),
-                page: Page::default(),
-                after: None,
-            })
-            .await
-            .unwrap();
-        assert!(matches!(safe.initial, ObservationValue::Overview(rows) if rows.is_empty()));
-        server.abort();
-    }
-
-    /// Answers every overview request with `rows` as raw JSON, the way an owner built before
-    /// a summary field existed would, after the same 1.1 handshake.
-    async fn serve_legacy_overview(listener: UnixListener, epoch: Uuid, rows: serde_json::Value) {
+    async fn serve_overview_stub(listener: UnixListener, epoch: Uuid, rows: serde_json::Value) {
         let (mut stream, _) = listener.accept().await.unwrap();
         let _: Option<serde_json::Value> = read_frame(&mut stream).await.unwrap();
         write_frame(
@@ -2276,7 +2237,7 @@ mod tests {
             &ServerMessage::Hello(ServerHello {
                 process_id: 0,
                 major: PROTOCOL_MAJOR,
-                minor: 1,
+                minor: PROTOCOL_MINOR,
                 owner_epoch: epoch,
                 session_id: Uuid::new_v4(),
                 capabilities: Vec::new(),
@@ -2303,13 +2264,14 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn legacy_summary_missing_work_fact_is_unknown() {
+    async fn an_explicitly_unknown_work_fact_stays_unknown() {
         use crate::agent_console::AttentionGroup;
         let temporary = tempfile::tempdir_in("/tmp").unwrap();
-        let socket = temporary.path().join("legacy.sock");
+        let socket = temporary.path().join("unknown.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let epoch = Uuid::new_v4();
         let summary = |has_work: Option<bool>| AgentSummary {
+            subagent: None,
             availability: ExecutionAvailability::Live,
             execution: ExecutionRef {
                 owner_epoch: epoch,
@@ -2319,6 +2281,7 @@ mod tests {
             chat_id: Uuid::new_v4(),
             workdir: temporary.path().to_path_buf(),
             state: crate::runtime::LoopState::Idle,
+            run_id: None,
             title: "New Agent".into(),
             has_work,
             updated_at: None,
@@ -2331,17 +2294,14 @@ mod tests {
             capabilities: Vec::new(),
             views: Vec::new(),
         };
-        // The same Idle `New Agent` title three ways: an older producer's summary without the
-        // fact, and current summaries that report it as false and as true.
-        let (legacy, empty, worked) = (summary(None), summary(Some(false)), summary(Some(true)));
-        let mut legacy_json = serde_json::to_value(summary(Some(false))).unwrap();
-        legacy_json["execution"] = serde_json::to_value(legacy.execution).unwrap();
-        legacy_json.as_object_mut().unwrap().remove("has_work");
-        let server = tokio::spawn(serve_legacy_overview(
+        // Unknown, empty and worked are distinct observations with the same display label.
+        let (unknown, empty, worked) = (summary(None), summary(Some(false)), summary(Some(true)));
+        let unknown_json = serde_json::to_value(&unknown).unwrap();
+        let server = tokio::spawn(serve_overview_stub(
             listener,
             epoch,
             serde_json::json!([
-                legacy_json,
+                unknown_json,
                 serde_json::to_value(&empty).unwrap(),
                 serde_json::to_value(&worked).unwrap(),
             ]),
@@ -2361,14 +2321,14 @@ mod tests {
                 .find(|row| row.execution == execution)
                 .unwrap()
         };
-        let forwarded = serde_json::to_value(row(legacy.execution)).unwrap();
+        let forwarded = serde_json::to_value(row(unknown.execution)).unwrap();
         assert!(
             forwarded.get("has_work").is_none(),
-            "a decoded legacy summary must not be re-sent with an invented work fact: {forwarded}"
+            "a explicitly unknown summary must not be re-sent with an invented work fact: {forwarded}"
         );
-        assert_eq!(row(legacy.execution).has_work, None);
+        assert_eq!(row(unknown.execution).has_work, None);
         assert_eq!(
-            AttentionGroup::of(row(legacy.execution)),
+            AttentionGroup::of(row(unknown.execution)),
             AttentionGroup::Unknown,
             "a summary without the fact is neither known worked Idle nor known Empty"
         );

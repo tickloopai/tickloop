@@ -127,7 +127,6 @@ pub(super) enum Role {
     DiffRemovedWord,
     Border,
     StatusBar,
-    StatusPanel,
     ModeIndicator,
     Title,
     /// Dialog and menu headings: bold in the permission colour, as
@@ -180,7 +179,6 @@ impl Role {
         Self::DiffRemovedWord,
         Self::Border,
         Self::StatusBar,
-        Self::StatusPanel,
         Self::ModeIndicator,
         Self::Title,
         Self::DialogTitle,
@@ -195,7 +193,7 @@ impl Role {
     ];
 }
 
-const ROLE_COUNT: usize = 43;
+const ROLE_COUNT: usize = 42;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) enum ThemeName {
@@ -302,7 +300,6 @@ const DARK_PALETTE: [Style; ROLE_COUNT] = [
         background: Some(Rgb::new(38, 49, 43)),
         ..fg(153, 153, 153)
     }, // StatusBar
-    bg(32, 41, 37),    // StatusPanel
     fg(153, 153, 153), // ModeIndicator   <- footer text: dimColor
     strong(255, 255, 255), // Title       <- <Text bold>
     strong(177, 185, 249), // DialogTitle <- Dialog: bold, permission
@@ -355,7 +352,6 @@ const LIGHT_PALETTE: [Style; ROLE_COUNT] = [
         background: Some(Rgb::new(230, 237, 232)),
         ..fg(102, 102, 102)
     }, // StatusBar
-    bg(242, 246, 243), // StatusPanel
     fg(102, 102, 102), // ModeIndicator
     strong(0, 0, 0),   // Title
     strong(87, 105, 247), // DialogTitle

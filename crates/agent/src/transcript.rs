@@ -13,11 +13,12 @@ pub(crate) mod retention;
 mod writer;
 
 pub(crate) use entry::{
-    ArtifactTicksEntry, BranchOriginEntry, COMPACT_BOUNDARY_SUBTYPE, ChainEntry, CompactMetadata,
-    CompactTriggerEntry, ContentReplacementEntry, ContentReplacementRecord, CustomTitleEntry,
-    DelegationEntry, FileHistorySnapshotEntry, ForkedFrom, LOOP_CREATED_SUBTYPE,
-    LOOP_ENDED_SUBTYPE, LOOP_STATE_SUBTYPE, LOOP_TRIGGER_SUBTYPE, LastPromptEntry, Line,
-    LoopRecord, MonitorMembersEntry, PartialCompactDirection,
+    AiTitleEntry, ArtifactTicksEntry, BranchOriginEntry, COMPACT_BOUNDARY_SUBTYPE, ChainEntry,
+    CompactMetadata, CompactTriggerEntry, ContentReplacementEntry, ContentReplacementRecord,
+    CustomTitleEntry, DelegationEntry, FamilyCompletionsEntry, FamilyInputsEntry,
+    FileHistorySnapshotEntry, ForkedFrom, LOOP_CREATED_SUBTYPE, LOOP_ENDED_SUBTYPE,
+    LOOP_STATE_SUBTYPE, LOOP_TRIGGER_SUBTYPE, LastPromptEntry, Line, LoopRecord,
+    MonitorMembersEntry, PartialCompactDirection, SentAgentMessagesEntry, SubagentsEntry,
     SummarizeMetadata as SummarizeMetadataEntry, format_timestamp, now_timestamp,
     parse_timestamp_ms,
 };

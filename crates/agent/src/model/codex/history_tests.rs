@@ -32,12 +32,12 @@ fn config() -> ModelConfig {
 }
 
 fn client(state: &Path, endpoint: &reqwest::Url) -> Arc<dyn ModelClient> {
-    Arc::new(
+    crate::model::fixture_client(Arc::new(
         CodexModelClient::new(config(), state)
             .unwrap()
             .with_loopback_test_endpoint(endpoint.as_str())
             .unwrap(),
-    )
+    ))
 }
 
 async fn completed(events: &mut broadcast::Receiver<Event>) {
@@ -530,13 +530,13 @@ async fn websocket_history_survives_compaction_branch_and_compatible_rewind() {
             ))
             .unwrap();
     });
-    let client = Arc::new(
+    let client = crate::model::fixture_client(Arc::new(
         CodexModelClient::new(config(), &state)
             .unwrap()
             .with_loopback_test_endpoint(endpoint.as_str())
             .unwrap()
             .with_loopback_test_websocket(),
-    );
+    ));
     let agent = Agent::open_embedded(state.clone(), config(), client).unwrap();
     let source = agent.create_chat(state.clone()).await.unwrap();
     agent

@@ -700,9 +700,6 @@ fn validate_file(file: &File, label: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// The extension a private endpoint is bound under before it is published.
-const STAGING_EXTENSION: &str = "new";
-
 fn validate_socket(endpoint: &Path) -> Result<(), String> {
     use std::os::unix::fs::FileTypeExt;
     let metadata = std::fs::symlink_metadata(endpoint).map_err(|error| error.to_string())?;
@@ -752,30 +749,20 @@ fn remove_owned_socket(endpoint: &Path, identity: (u64, u64)) -> Result<(), Stri
         .map_err(|error| format!("Cannot remove owned Agent endpoint: {error}"))
 }
 
-/// Binds under a staging name and publishes the endpoint by rename once it is 0600, so a client
-/// polling for a starting service never finds the endpoint with another mode. Each endpoint has
-/// one binder (the owner under its lock, or a worker with a unique name), so a staging socket
-/// left by a killed process is stale.
 fn private_listener(endpoint: &Path) -> Result<(UnixListener, (u64, u64)), String> {
+    const TEMPORARY_SOCKET_NAME_LENGTH: usize = 8;
     check_socket_length(endpoint)?;
-    let staging = endpoint.with_extension(STAGING_EXTENSION);
-    check_socket_length(&staging)?;
-    if let Ok(metadata) = std::fs::symlink_metadata(&staging) {
-        use std::os::unix::fs::FileTypeExt;
-        if !metadata.file_type().is_socket() || metadata.uid() != unsafe { libc::geteuid() } {
-            return Err("Agent endpoint staging path is occupied by something else".into());
-        }
-        std::fs::remove_file(&staging).map_err(|error| error.to_string())?;
-    }
-    let listener = UnixListener::bind(&staging).map_err(|error| error.to_string())?;
-    std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o600))
-        .and_then(|()| std::fs::rename(&staging, endpoint))
-        .map_err(|error| {
-            let _ = std::fs::remove_file(&staging);
-            error.to_string()
-        })?;
-    let metadata = std::fs::symlink_metadata(endpoint).map_err(|error| error.to_string())?;
-    Ok((listener, (metadata.dev(), metadata.ino())))
+    let temporary = endpoint
+        .with_file_name(&Uuid::new_v4().simple().to_string()[..TEMPORARY_SOCKET_NAME_LENGTH]);
+    let listener = UnixListener::bind(&temporary).map_err(|error| error.to_string())?;
+    let metadata = std::fs::symlink_metadata(&temporary).map_err(|error| error.to_string())?;
+    let identity = (metadata.dev(), metadata.ino());
+    // Publish only after permissions are private; linking never overwrites a replacement.
+    let published = std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))
+        .and_then(|()| std::fs::hard_link(&temporary, endpoint));
+    remove_owned_socket(&temporary, identity)?;
+    published.map_err(|error| error.to_string())?;
+    Ok((listener, identity))
 }
 
 fn check_socket_length(endpoint: &Path) -> Result<(), String> {
@@ -784,4 +771,37 @@ fn check_socket_length(endpoint: &Path) -> Result<(), String> {
         return Err("Agent runtime directory is too long for a Unix socket path".into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_published_listener_is_private_and_accepts_connections() {
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
+        let endpoint = directory.path().join("owner.sock");
+        let (listener, identity) = private_listener(&endpoint).unwrap();
+        validate_socket(&endpoint).unwrap();
+        let client = tokio::net::UnixStream::connect(&endpoint).await.unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut client = client;
+        client.write_all(b"private").await.unwrap();
+        let mut received = [0; 7];
+        server.read_exact(&mut received).await.unwrap();
+        assert_eq!(&received, b"private");
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+        remove_owned_socket(&endpoint, identity).unwrap();
+    }
+
+    #[tokio::test]
+    async fn publishing_a_listener_preserves_an_existing_endpoint() {
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
+        let endpoint = directory.path().join("owner.sock");
+        std::fs::write(&endpoint, "replacement").unwrap();
+        assert!(private_listener(&endpoint).is_err());
+        assert_eq!(std::fs::read_to_string(&endpoint).unwrap(), "replacement");
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
 }
