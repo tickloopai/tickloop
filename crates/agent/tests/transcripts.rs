@@ -66,6 +66,15 @@ impl SequenceModel {
 
 #[async_trait]
 impl ModelClient for SequenceModel {
+    async fn generate_title(
+        &self,
+        request: tickloop_agent::model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<tickloop_agent::model::ModelDelta>,
+        _: tokio_util::sync::CancellationToken,
+    ) -> Result<tickloop_agent::model::ModelOutput, tickloop_agent::model::ModelError> {
+        Ok(support::title_output(request))
+    }
+
     fn identity(&self) -> ModelIdentity {
         ModelIdentity {
             provider: tickloop_agent::model::ModelProvider::Api,
@@ -1088,6 +1097,19 @@ async fn failed_transcript_writes_are_reported_and_retried_once_writable() {
     .unwrap();
     let warm = agent.create_chat(directory.path().into()).await.unwrap();
     complete_turn(&agent, warm, None, "warm prompt").await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while agent
+            .snapshot(warm)
+            .await
+            .unwrap()
+            .generated_title
+            .is_none()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
     agent.flush_transcripts().await;
     let project = transcript_file(&root, warm).parent().unwrap().to_path_buf();
     let set_mode =
@@ -1096,6 +1118,19 @@ async fn failed_transcript_writes_are_reported_and_retried_once_writable() {
     set_mode(0o500);
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let first = complete_turn(&agent, chat, None, "prompt while read-only").await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while agent
+            .snapshot(chat)
+            .await
+            .unwrap()
+            .generated_title
+            .is_none()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
     agent.flush_transcripts().await;
     let error = agent.transcript_write_error();
     let path = project.join(format!("{chat}.jsonl"));
@@ -1276,11 +1311,16 @@ async fn resume_filtering_after_a_compaction_keeps_the_boundary_chain_stable() {
 }
 
 /// 规格"会话内容的表示"中列出的 Transcript 条目类型。
-const SPECIFIED_LINE_TYPES: [&str; 8] = [
+const SPECIFIED_LINE_TYPES: [&str; 13] = [
     "user",
     "assistant",
     "system",
     "custom-title",
+    "ai-title",
+    "subagents",
+    "family-completions",
+    "family-inputs",
+    "sent-agent-messages",
     "last-prompt",
     "branch-origin",
     "file-history-snapshot",

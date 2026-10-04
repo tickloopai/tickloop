@@ -47,6 +47,8 @@ pub(super) enum Glyph {
     AgentStopped,
     AgentUnknown,
     AgentEmpty,
+    AgentViewed,
+    AgentUnviewed,
     /// Group headings that fold their rows.
     Collapsed,
     Expanded,
@@ -109,13 +111,15 @@ impl DisplayProfile {
             (GlyphSet::Unicode, Glyph::Warning) => "!",
             (GlyphSet::Unicode, Glyph::ScrollUp) => "↑",
             (GlyphSet::Unicode, Glyph::ScrollDown) => "↓",
-            (GlyphSet::Unicode, Glyph::AgentNeedsInput) => "●",
-            (GlyphSet::Unicode, Glyph::AgentRunning) => "▶",
-            (GlyphSet::Unicode, Glyph::AgentWaiting) => "◌",
+            (GlyphSet::Unicode, Glyph::AgentNeedsInput) => "◆",
+            (GlyphSet::Unicode, Glyph::AgentRunning) => UNICODE_SPINNER[0],
+            (GlyphSet::Unicode, Glyph::AgentWaiting) => "◷",
             (GlyphSet::Unicode, Glyph::AgentIdle) => "○",
-            (GlyphSet::Unicode, Glyph::AgentStopped) => "■",
+            (GlyphSet::Unicode, Glyph::AgentStopped) => "✗",
             (GlyphSet::Unicode, Glyph::AgentUnknown) => "?",
             (GlyphSet::Unicode, Glyph::AgentEmpty) => "◦",
+            (GlyphSet::Unicode, Glyph::AgentViewed) => "●",
+            (GlyphSet::Unicode, Glyph::AgentUnviewed) => "○",
             (GlyphSet::Unicode, Glyph::Collapsed) => "▸",
             (GlyphSet::Unicode, Glyph::Expanded) => "▾",
             (GlyphSet::NerdFont, Glyph::Prompt) => "\u{f0142}",
@@ -123,18 +127,20 @@ impl DisplayProfile {
             (GlyphSet::NerdFont, Glyph::ToolCall) => "\u{f1064}",
             (GlyphSet::NerdFont, Glyph::ToolResult) => "\u{f060c}",
             (GlyphSet::NerdFont, Glyph::TickDelivery) => "\u{f0318}",
-            (GlyphSet::NerdFont, Glyph::Success) => "\u{f05e0}",
-            (GlyphSet::NerdFont, Glyph::Failure) => "\u{f0159}",
+            (GlyphSet::NerdFont, Glyph::Success) => "\u{f05e1}",
+            (GlyphSet::NerdFont, Glyph::Failure) => "\u{f015a}",
             (GlyphSet::NerdFont, Glyph::Warning) => "\u{f0026}",
             (GlyphSet::NerdFont, Glyph::ScrollUp) => "\u{f0143}",
             (GlyphSet::NerdFont, Glyph::ScrollDown) => "\u{f0140}",
-            (GlyphSet::NerdFont, Glyph::AgentNeedsInput) => "\u{f0f3}",
-            (GlyphSet::NerdFont, Glyph::AgentRunning) => "\u{f04b}",
-            (GlyphSet::NerdFont, Glyph::AgentWaiting) => "\u{f0150}",
-            (GlyphSet::NerdFont, Glyph::AgentIdle) => "\u{f0766}",
-            (GlyphSet::NerdFont, Glyph::AgentStopped) => "\u{f04d}",
+            (GlyphSet::NerdFont, Glyph::AgentNeedsInput) => "\u{f173b}",
+            (GlyphSet::NerdFont, Glyph::AgentRunning) => NERD_FONT_SPINNER[0],
+            (GlyphSet::NerdFont, Glyph::AgentWaiting) => "\u{f051f}",
+            (GlyphSet::NerdFont, Glyph::AgentIdle) => "\u{f03e6}",
+            (GlyphSet::NerdFont, Glyph::AgentStopped) => "\u{f015a}",
             (GlyphSet::NerdFont, Glyph::AgentUnknown) => "\u{f0625}",
             (GlyphSet::NerdFont, Glyph::AgentEmpty) => "\u{f09df}",
+            (GlyphSet::NerdFont, Glyph::AgentViewed) => "\u{f111}",
+            (GlyphSet::NerdFont, Glyph::AgentUnviewed) => "\u{f10c}",
             (GlyphSet::NerdFont, Glyph::Collapsed) => "\u{f0142}",
             (GlyphSet::NerdFont, Glyph::Expanded) => "\u{f0140}",
         }
@@ -190,6 +196,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn overview_state_icons_use_the_verified_nerd_font_names_and_unicode_fallbacks() {
+        let expected = [
+            (Glyph::AgentNeedsInput, "◆", "\u{f173b}"),
+            (Glyph::Success, "✓", "\u{f05e1}"),
+            (Glyph::Failure, "✗", "\u{f015a}"),
+            (Glyph::AgentStopped, "✗", "\u{f015a}"),
+            (Glyph::AgentIdle, "○", "\u{f03e6}"),
+            (Glyph::AgentWaiting, "◷", "\u{f051f}"),
+        ];
+        for glyph_set in [GlyphSet::Unicode, GlyphSet::NerdFont] {
+            let profile = DisplayProfile::new(DisplayPreferences {
+                glyph_set,
+                prefers_reduced_motion: false,
+            });
+            for (glyph, unicode, nerd) in expected {
+                assert_eq!(
+                    profile.glyph(glyph),
+                    if glyph_set == GlyphSet::Unicode {
+                        unicode
+                    } else {
+                        nerd
+                    }
+                );
+                assert_eq!(
+                    unicode_width::UnicodeWidthStr::width(profile.glyph(glyph)),
+                    1
+                );
+            }
+        }
+    }
+
+    #[test]
     fn display_profile_maps_semantic_glyphs_and_reduced_motion() {
         let unicode = DisplayProfile::new(DisplayPreferences::default());
         assert_eq!(unicode.glyph(Glyph::Prompt), "❯");
@@ -225,7 +263,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_state_glyphs_differ_per_state_in_both_glyph_sets() {
+    fn agent_state_glyphs_have_single_cell_geometry_in_both_glyph_sets() {
         let states = [
             Glyph::AgentNeedsInput,
             Glyph::Failure,
@@ -242,11 +280,6 @@ mod tests {
                 glyph_set,
                 prefers_reduced_motion: false,
             });
-            let shapes = states
-                .iter()
-                .map(|glyph| profile.glyph(*glyph))
-                .collect::<std::collections::HashSet<_>>();
-            assert_eq!(shapes.len(), states.len(), "{glyph_set:?}");
             for glyph in states.into_iter().chain([
                 Glyph::Collapsed,
                 Glyph::Expanded,

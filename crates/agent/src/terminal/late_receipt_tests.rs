@@ -169,6 +169,15 @@ struct HeldWhileFlagged {
 
 #[async_trait]
 impl crate::model::ModelClient for HeldWhileFlagged {
+    async fn generate_title(
+        &self,
+        request: crate::model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<crate::model::ModelDelta>,
+        _: tokio_util::sync::CancellationToken,
+    ) -> Result<crate::model::ModelOutput, crate::model::ModelError> {
+        Ok(crate::model::fixture_title(request))
+    }
+
     fn identity(&self) -> crate::model::ModelIdentity {
         self.model.identity()
     }

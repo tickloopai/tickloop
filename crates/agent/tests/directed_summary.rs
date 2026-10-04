@@ -91,6 +91,15 @@ struct SummaryBehaviorModel {
 
 #[async_trait]
 impl ModelClient for SummaryBehaviorModel {
+    async fn generate_title(
+        &self,
+        request: tickloop_agent::model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<tickloop_agent::model::ModelDelta>,
+        _: tokio_util::sync::CancellationToken,
+    ) -> Result<tickloop_agent::model::ModelOutput, tickloop_agent::model::ModelError> {
+        Ok(support::title_output(request))
+    }
+
     fn identity(&self) -> ModelIdentity {
         ModelIdentity {
             provider: tickloop_agent::model::ModelProvider::Api,
@@ -949,6 +958,15 @@ struct PausedSuccessfulSummaryModel {
 
 #[async_trait]
 impl ModelClient for PausedSuccessfulSummaryModel {
+    async fn generate_title(
+        &self,
+        request: tickloop_agent::model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<tickloop_agent::model::ModelDelta>,
+        _: tokio_util::sync::CancellationToken,
+    ) -> Result<tickloop_agent::model::ModelOutput, tickloop_agent::model::ModelError> {
+        Ok(support::title_output(request))
+    }
+
     fn identity(&self) -> ModelIdentity {
         ModelIdentity {
             provider: tickloop_agent::model::ModelProvider::Api,
@@ -999,6 +1017,15 @@ struct UnusedReplacementModel {
 
 #[async_trait]
 impl ModelClient for UnusedReplacementModel {
+    async fn generate_title(
+        &self,
+        request: tickloop_agent::model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<tickloop_agent::model::ModelDelta>,
+        _: tokio_util::sync::CancellationToken,
+    ) -> Result<tickloop_agent::model::ModelOutput, tickloop_agent::model::ModelError> {
+        Ok(support::title_output(request))
+    }
+
     fn identity(&self) -> ModelIdentity {
         self.identity.clone()
     }
@@ -1214,6 +1241,15 @@ struct BlockingSummaryModel {
 
 #[async_trait]
 impl ModelClient for BlockingSummaryModel {
+    async fn generate_title(
+        &self,
+        request: tickloop_agent::model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<tickloop_agent::model::ModelDelta>,
+        _: tokio_util::sync::CancellationToken,
+    ) -> Result<tickloop_agent::model::ModelOutput, tickloop_agent::model::ModelError> {
+        Ok(support::title_output(request))
+    }
+
     fn identity(&self) -> ModelIdentity {
         ModelIdentity {
             provider: tickloop_agent::model::ModelProvider::Api,

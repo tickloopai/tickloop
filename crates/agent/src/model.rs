@@ -803,6 +803,15 @@ fn request_transport_error(error: reqwest::Error) -> ModelError {
 pub trait ModelClient: Send + Sync {
     fn identity(&self) -> ModelIdentity;
 
+    async fn generate_title(
+        &self,
+        request: ModelRequest,
+        events: UnboundedSender<ModelDelta>,
+        cancel: CancellationToken,
+    ) -> Result<ModelOutput, ModelError> {
+        self.complete(request, events, cancel).await
+    }
+
     async fn close_chat(&self, _chat_id: crate::runtime::ChatId) {}
 
     async fn complete_for_chat_with_context(
@@ -2886,6 +2895,82 @@ fn api_key(
     })?;
     key.set_sensitive(true);
     Ok(Some(key))
+}
+
+#[cfg(test)]
+pub(crate) fn fixture_client(client: Arc<dyn ModelClient>) -> Arc<dyn ModelClient> {
+    struct FixtureClient(Arc<dyn ModelClient>);
+    #[async_trait]
+    impl ModelClient for FixtureClient {
+        fn identity(&self) -> ModelIdentity {
+            self.0.identity()
+        }
+        async fn generate_title(
+            &self,
+            request: ModelRequest,
+            _: UnboundedSender<ModelDelta>,
+            _: CancellationToken,
+        ) -> Result<ModelOutput, ModelError> {
+            Ok(fixture_title(request))
+        }
+        async fn close_chat(&self, chat: crate::runtime::ChatId) {
+            self.0.close_chat(chat).await;
+        }
+        async fn complete(
+            &self,
+            request: ModelRequest,
+            events: UnboundedSender<ModelDelta>,
+            cancel: CancellationToken,
+        ) -> Result<ModelOutput, ModelError> {
+            self.0.complete(request, events, cancel).await
+        }
+        async fn complete_for_chat(
+            &self,
+            chat: crate::runtime::ChatId,
+            request: ModelRequest,
+            events: UnboundedSender<ModelDelta>,
+            cancel: CancellationToken,
+        ) -> Result<ModelOutput, ModelError> {
+            self.0
+                .complete_for_chat(chat, request, events, cancel)
+                .await
+        }
+        async fn complete_for_chat_with_context(
+            &self,
+            chat: crate::runtime::ChatId,
+            request: ModelRequest,
+            events: UnboundedSender<ModelDelta>,
+            cancel: CancellationToken,
+            context: ModelRequestContext,
+        ) -> Result<ModelOutput, ModelError> {
+            self.0
+                .complete_for_chat_with_context(chat, request, events, cancel, context)
+                .await
+        }
+    }
+    Arc::new(FixtureClient(client))
+}
+
+#[cfg(test)]
+pub(crate) fn fixture_title(request: ModelRequest) -> ModelOutput {
+    let content = request
+        .messages
+        .into_iter()
+        .rev()
+        .find(|message| message.role == Role::User)
+        .map(|message| message.content)
+        .unwrap_or_default();
+    ModelOutput {
+        private_source: None,
+        content,
+        usage: Usage {
+            input_tokens: Some(0),
+            output_tokens: Some(0),
+            cache_read_input_tokens: Some(0),
+            cache_write_input_tokens: Some(0),
+        },
+        stop_reason: "end_turn".into(),
+    }
 }
 
 #[cfg(test)]

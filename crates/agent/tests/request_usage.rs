@@ -16,8 +16,8 @@ use tickloop_agent::{
     permissions::ExecutionMode,
     runtime::{
         Agent, CounterTotal, Event, EventKind, LedgerError, LoopState, ModelChange,
-        ProtocolFailure, RequestFailure, RequestKind, RequestOutcome, RequestSequence,
-        ResponseRejection, RunId, UsageCounter,
+        ProtocolFailure, RequestFailure, RequestKind, RequestOutcome, ResponseRejection, RunId,
+        UsageCounter,
     },
 };
 use tokio::sync::{Notify, broadcast, mpsc::UnboundedSender};
@@ -86,6 +86,15 @@ impl UsageModel {
 
 #[async_trait]
 impl ModelClient for UsageModel {
+    async fn generate_title(
+        &self,
+        request: tickloop_agent::model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<tickloop_agent::model::ModelDelta>,
+        _: tokio_util::sync::CancellationToken,
+    ) -> Result<tickloop_agent::model::ModelOutput, tickloop_agent::model::ModelError> {
+        Ok(support::title_output(request))
+    }
+
     fn identity(&self) -> ModelIdentity {
         self.identity.clone()
     }
@@ -250,9 +259,9 @@ async fn one_reply_observations_and_final_usage_are_recorded_once() {
     let receipt = agent.submit(chat, None, "Reply".into()).await.unwrap();
     assert_eq!(completed_usage(&mut events, receipt.run_id).await, expected);
     let snapshot = agent.snapshot(chat).await.unwrap();
-    let entries = snapshot.request_usage.entries();
+    let entries = support::model_script_requests(&snapshot);
     assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].sequence, RequestSequence(1));
+    assert!(entries[0].sequence.0 > 0);
     assert_eq!(entries[0].chat_id, chat);
     assert_eq!(entries[0].loop_id, Some(receipt.loop_id));
     assert_eq!(entries[0].run_id, Some(receipt.run_id));
@@ -298,12 +307,12 @@ async fn tool_rounds_and_multiple_calls_share_one_entry_per_model_request() {
         counters(60, 6, 9, 1)
     );
     let snapshot = agent.snapshot(chat).await.unwrap();
-    let entries = snapshot.request_usage.entries();
+    let entries = support::model_script_requests(&snapshot);
     assert_eq!(model.request_count(), 3);
     assert_eq!(snapshot.operations.len(), 3);
     assert_eq!(entries.len(), 3);
     for (index, record) in entries.iter().enumerate() {
-        assert_eq!(record.sequence, RequestSequence(index as u64 + 1));
+        assert!(record.sequence.0 > index as u64);
         assert_eq!(record.kind, RequestKind::Conversation);
         assert_eq!(record.outcome, RequestOutcome::Accepted);
         assert_eq!(record.run_id, Some(receipt.run_id));
@@ -343,11 +352,11 @@ async fn overflowing_run_usage_fails_without_losing_accepted_request_counters() 
         other => panic!("overflow must fail the Run, received {other:?}"),
     }
     let snapshot = agent.snapshot(chat).await.unwrap();
-    let entries = snapshot.request_usage.entries();
+    let entries = support::model_script_requests(&snapshot);
     assert_eq!(model.request_count(), 2);
     assert_eq!(entries.len(), 2);
     for (index, entry) in entries.iter().enumerate() {
-        assert_eq!(entry.sequence, RequestSequence(index as u64 + 1));
+        assert!(entry.sequence.0 > index as u64);
         assert_eq!(entry.kind, RequestKind::Conversation);
         assert_eq!(entry.run_id, Some(receipt.run_id));
         assert_eq!(entry.outcome, RequestOutcome::Accepted);
@@ -412,7 +421,7 @@ async fn a_failed_tool_result_returns_to_the_model_with_each_accepted_request_re
                 if tool_use_id == "missing")
             )
     );
-    let entries = snapshot.request_usage.entries();
+    let entries = support::model_script_requests(&snapshot);
     assert_eq!(entries.len(), 2);
     assert_eq!(entries[0].usage, tool_usage);
     assert_eq!(entries[1].usage, followup_usage);
@@ -459,7 +468,7 @@ async fn manual_compaction_acceptance_and_rejection_have_no_borrowed_run_identit
     assert_eq!(snapshot.messages, accepted.messages);
     assert_eq!(snapshot.loops.len(), 1);
     assert_eq!(model.request_count(), 3);
-    let entries = snapshot.request_usage.entries();
+    let entries = support::model_script_requests(&snapshot);
     assert_eq!(entries.len(), 3);
     for record in &entries[1..] {
         assert_eq!(record.kind, RequestKind::CompactionManual);
@@ -521,7 +530,7 @@ async fn automatic_compaction_is_owned_by_its_run_but_excluded_from_reply_usage(
         counters(20, 4, 2, 0)
     );
     let snapshot = agent.snapshot(chat).await.unwrap();
-    let entries = snapshot.request_usage.entries();
+    let entries = support::model_script_requests(&snapshot);
     assert_eq!(entries.len(), 5);
     assert_eq!(entries[3].kind, RequestKind::CompactionAutomatic);
     assert_eq!(entries[3].loop_id, Some(receipt.loop_id));
@@ -588,7 +597,7 @@ async fn checker_uses_its_actual_identity_and_is_excluded_from_conversation_tota
             counters(30, 3, 0, 0)
         );
         let snapshot = agent.snapshot(chat).await.unwrap();
-        let entries = snapshot.request_usage.entries();
+        let entries = support::model_script_requests(&snapshot);
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[1].kind, RequestKind::PermissionCheck);
         assert_eq!(entries[1].model, checker_identity);
@@ -658,7 +667,7 @@ async fn invalid_checker_verdict_retains_usage_and_blocks_the_call() {
         EventKind::Completed { .. }
     ));
     let snapshot = agent.snapshot(chat).await.unwrap();
-    for entry in &snapshot.request_usage.entries()[1..=2] {
+    for entry in &support::model_script_requests(&snapshot)[1..=2] {
         assert_eq!(entry.kind, RequestKind::PermissionCheck);
         assert_eq!(
             entry.outcome,
@@ -701,14 +710,12 @@ async fn operations_not_needing_review_create_no_auto_review_request_record() {
     completed_usage(&mut events, receipt.run_id).await;
     let snapshot = agent.snapshot(chat).await.unwrap();
     assert!(
-        snapshot
-            .request_usage
-            .entries()
+        support::model_script_requests(&snapshot)
             .iter()
             .all(|record| record.kind == RequestKind::Conversation)
     );
     assert_eq!(
-        snapshot.request_usage.entries().len(),
+        support::model_script_requests(&snapshot).len(),
         model.request_count()
     );
     assert_eq!(reviewer.request_count(), 0);
@@ -754,8 +761,14 @@ async fn switching_models_never_relabels_old_requests() {
         .unwrap();
     completed_usage(&mut events, second.run_id).await;
     let before = agent.snapshot(chat).await.unwrap();
-    assert_eq!(before.request_usage.entries()[0].model, main_identity());
-    assert_eq!(before.request_usage.entries()[1].model, next_identity);
+    assert_eq!(
+        support::model_script_requests(&before)[0].model,
+        main_identity()
+    );
+    assert_eq!(
+        support::model_script_requests(&before)[1].model,
+        next_identity
+    );
     assert_eq!(before.request_usage.summary().groups.len(), 2);
     assert_eq!(first_model.request_count(), 1);
     assert_eq!(next_model.request_count(), 1);
@@ -789,12 +802,12 @@ async fn cancelling_after_usage_was_queued_drains_and_terminalizes_the_same_requ
     let terminal = terminal_event(&mut events, receipt.run_id).await;
     assert!(!matches!(terminal.kind, EventKind::Completed { .. }));
     let snapshot = agent.snapshot(chat).await.unwrap();
-    assert_eq!(snapshot.request_usage.entries().len(), 1);
+    assert_eq!(support::model_script_requests(&snapshot).len(), 1);
     assert_eq!(
-        snapshot.request_usage.entries()[0].outcome,
+        support::model_script_requests(&snapshot)[0].outcome,
         RequestOutcome::Cancelled
     );
-    assert_eq!(snapshot.request_usage.entries()[0].usage, usage);
+    assert_eq!(support::model_script_requests(&snapshot)[0].usage, usage);
     assert_eq!(model.request_count(), 1);
     agent.shutdown().await;
 }
@@ -839,7 +852,7 @@ async fn host_rejection_and_usage_regression_retain_observed_facts_without_compl
         ));
     }
     let snapshot = agent.snapshot(chat).await.unwrap();
-    let entries = snapshot.request_usage.entries();
+    let entries = support::model_script_requests(&snapshot);
     assert_eq!(entries.len(), 2);
     assert_eq!(
         entries[0].outcome,
@@ -898,7 +911,7 @@ async fn failed_requests_keep_reported_usage_and_leave_missing_counters_unknown(
         ));
     }
     let snapshot = agent.snapshot(chat).await.unwrap();
-    let entries = snapshot.request_usage.entries();
+    let entries = support::model_script_requests(&snapshot);
     assert_eq!(
         entries[0].outcome,
         RequestOutcome::Failed(RequestFailure::Http { status: 400 })
@@ -951,7 +964,7 @@ async fn evicting_old_completed_events_preserves_all_request_records_and_totals(
             .iter()
             .all(|event| event.sequence > first_completed.sequence)
     );
-    assert_eq!(snapshot.request_usage.entries().len(), 2);
+    assert_eq!(support::model_script_requests(&snapshot).len(), 2);
     assert_eq!(
         snapshot.request_usage.summary().groups[0]
             .input_tokens

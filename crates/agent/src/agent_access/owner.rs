@@ -265,8 +265,10 @@ impl OwnerServer {
                         store_root,
                         chat_id: snapshot.conversation.id,
                     });
-                let state =
-                    super::summary_state(&snapshot.conversation.loops, &snapshot.user_shells);
+                let state = crate::runtime::summary_state(
+                    &snapshot.conversation.loops,
+                    &snapshot.user_shells,
+                );
                 let parent = snapshot
                     .conversation
                     .delegation
@@ -281,15 +283,20 @@ impl OwnerServer {
                 known
                     .last_directory
                     .retain(|entry| entry.execution != execution);
-                let title = super::agent_title(&snapshot.conversation.loops, &snapshot.user_shells);
+                let title = crate::runtime::chat_display_title(
+                    &snapshot.conversation,
+                    &snapshot.user_shells,
+                );
                 known.last_directory.push(AgentSummary {
                     availability: ExecutionAvailability::Live,
                     execution,
                     chat_id: snapshot.conversation.id,
                     workdir: snapshot.conversation.workdir.clone(),
+                    run_id: super::summary_run_id(&snapshot.conversation.loops, &state),
                     state,
                     preview: super::preview(&snapshot.conversation, &title),
                     title,
+                    subagent: snapshot.subagent.clone(),
                     has_work: Some(super::has_work(
                         &snapshot.conversation,
                         &snapshot.user_shells,
@@ -327,6 +334,23 @@ impl OwnerServer {
         }
     }
     async fn validate_origin(&self, command: &AgentCommand) -> Result<(), AccessError> {
+        if let AgentCommand::SendFamilyInput {
+            source_execution,
+            origin,
+            ..
+        } = command
+        {
+            self.inner
+                .views
+                .validate_displayed_source(origin, *source_execution)
+                .await?;
+            verify_host(origin.host.as_ref()).await?;
+            return self
+                .inner
+                .views
+                .validate_displayed_source(origin, *source_execution)
+                .await;
+        }
         if let Some(origin) = command_origin(command) {
             self.inner
                 .views

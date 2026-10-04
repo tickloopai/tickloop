@@ -135,6 +135,21 @@ pub(super) fn transcript_document(
                     text.push_str(&local_message_text(&message, OutputDetail::Full, display));
                 } else {
                     document.prompts.push(document.lines.len() + 1);
+                    if let super::conversation::ConversationBlockId::MessageContent {
+                        message_index,
+                        ..
+                    } = block_id
+                        && let Some(origin) = snapshot
+                            .message_ids
+                            .get(&message_index)
+                            .and_then(|id| snapshot.human_family_origins.get(id))
+                    {
+                        text.push_str(&format!(
+                            "\nUser message · from @{} View\nOriginal input: {}\n",
+                            safe_text(&origin.source_handle),
+                            safe_text(&origin.original_submission)
+                        ));
+                    }
                     text.push_str(&format!("\nYou: {}\n", safe_text(&content)));
                     is_prompt = true;
                 }
@@ -248,6 +263,12 @@ pub(super) fn transcript_document(
             }
             ConversationBlockKind::Plan { plan } => {
                 let _plan = plan;
+            }
+            ConversationBlockKind::FamilyInput { record } => {
+                text.push_str(&family_input_text(&record, OutputDetail::Full))
+            }
+            ConversationBlockKind::FamilyCompletion { completion } => {
+                text.push_str(&family_completion_text(&completion, OutputDetail::Full))
             }
             ConversationBlockKind::Outcome(outcome) => match outcome {
                 ConversationOutcome::Failed { error } => text.push_str(&format!(
@@ -887,16 +908,18 @@ pub(super) fn local_message_text(
 ) -> String {
     match message {
         LocalMessage::AgentCommunication {
-            relationship,
+            sender_handle,
             sender_label,
+            relay,
             message,
             is_result,
         } => {
-            let sender = if relationship == "parent" {
-                "Main Agent"
-            } else {
-                "Child Agent"
-            };
+            if matches!(detail, OutputDetail::Preview) {
+                return format!(
+                    "\nMessage from @{} · Ctrl+O to expand\n",
+                    safe_text(sender_handle)
+                );
+            }
             let body = if *is_result {
                 serde_json::from_str::<Value>(message)
                     .ok()
@@ -917,7 +940,18 @@ pub(super) fn local_message_text(
             } else {
                 format!(" · {}", safe_text(sender_label))
             };
-            let mut text = format!("\n{sender}{label}:\n");
+            let mut text = format!("\nMessage from @{}{label}:\n", safe_text(sender_handle));
+            if let Some(relay) = relay {
+                text.push_str(&format!(
+                    "Verified user relay · {}\n{}\n",
+                    if relay.forwarded_verbatim {
+                        "verbatim"
+                    } else {
+                        "paraphrased"
+                    },
+                    safe_text(&relay.original_text)
+                ));
+            }
             append_response_block(&mut text, &body, detail, display);
             text
         }
@@ -1267,6 +1301,71 @@ fn display_value(value: &Value) -> String {
     })
 }
 
+pub(super) fn family_completion_text(
+    completion: &crate::runtime::FamilyCompletion,
+    detail: OutputDetail,
+) -> String {
+    let status = match completion.state {
+        crate::runtime::LoopState::Failed => "failed",
+        crate::runtime::LoopState::Stopped | crate::runtime::LoopState::Expired => "stopped",
+        crate::runtime::LoopState::Interrupted => "interrupted",
+        _ => "finished",
+    };
+    let result = if matches!(detail, OutputDetail::Full) {
+        safe_text(&completion.result)
+    } else {
+        super::console::truncate_width(&super::safe_line(&completion.result), 120)
+    };
+    let error = completion
+        .error
+        .as_deref()
+        .map(safe_text)
+        .unwrap_or_default();
+    format!(
+        "\nSubagent @{} {status}\n  {}{}\n",
+        completion.handle,
+        result,
+        if error.is_empty() {
+            String::new()
+        } else {
+            format!("\n  {error}")
+        }
+    )
+}
+
+pub(super) fn family_input_text(
+    record: &crate::runtime::FamilyInputRecord,
+    detail: OutputDetail,
+) -> String {
+    let Some(state) = &record.state else {
+        return format!(
+            "\nYou → @{} · delivered\n",
+            safe_text(&record.target_handle)
+        );
+    };
+    let mut text = format!(
+        "\nReply from @{} · {}\n",
+        safe_text(&record.target_handle),
+        match state {
+            crate::runtime::LoopState::Failed => "failed",
+            crate::runtime::LoopState::Stopped | crate::runtime::LoopState::Expired => "stopped",
+            crate::runtime::LoopState::Interrupted => "interrupted",
+            _ => "finished",
+        }
+    );
+    if let Some(response) = &record.response {
+        let response = safe_text(response);
+        text.push_str(&match detail {
+            OutputDetail::Full => response,
+            OutputDetail::Preview => {
+                super::console::truncate_width(&response.replace('\n', " "), 120)
+            }
+        });
+        text.push('\n');
+    }
+    text
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -1293,6 +1392,7 @@ mod tests {
             goal: "streaming".into(),
             state: tickloop_agent::runtime::LoopState::Running,
             run_id: Some(run_id),
+            run_started_at: None,
             trigger: None,
             event_sources: Vec::new(),
             state_since: None,
@@ -1709,13 +1809,38 @@ mod tests {
     }
 
     #[test]
+    fn family_message_preview_is_collapsed_and_full_detail_labels_verified_relay() {
+        let text = format!(
+            "<agent-message>{}</agent-message>",
+            json!({"source":{"sender_relationship":"sibling","sender_label":"Audit report","sender_handle":"audit","relay":{"original_chat_id":Uuid::new_v4(),"original_message_id":Uuid::new_v4(),"original_text":"Human instruction","forwarded_verbatim":true},"is_result":false},"message":"Agent body secret"})
+        );
+        let local = LocalMessage::parse(&text).unwrap();
+        for glyphs in [
+            crate::settings::GlyphSet::Unicode,
+            crate::settings::GlyphSet::NerdFont,
+        ] {
+            let display = DisplayProfile::new(crate::settings::DisplayPreferences {
+                glyph_set: glyphs,
+                ..Default::default()
+            });
+            let preview = local_message_text(&local, OutputDetail::Preview, display);
+            assert!(preview.contains("Message from @audit"));
+            assert!(!preview.contains("Agent body secret"));
+            let full = local_message_text(&local, OutputDetail::Full, display);
+            assert!(full.contains("Agent body secret"));
+            assert!(full.contains("Verified user relay"));
+            assert!(full.contains("Human instruction"));
+        }
+    }
+
+    #[test]
     fn two_child_messages_identify_their_tasks_and_preserve_hashes_in_actual_history_rendering() {
         let first = Uuid::new_v4();
         let second = Uuid::new_v4();
         let agent_message = |id: Uuid, label: &str, body: &str| {
             format!(
                 "<agent-message>{}</agent-message>",
-                json!({"source":{"message_id":id,"sender_chat_id":Uuid::new_v4(),"sender_relationship":"child","sender_label":label,"is_result":false},"message":body})
+                json!({"source":{"message_id":id,"sender_chat_id":Uuid::new_v4(),"sender_relationship":"child","sender_handle":label,"sender_label":label,"is_result":false},"message":body})
             )
         };
         let snapshot:ChatSnapshot=serde_json::from_value(json!({
@@ -1726,8 +1851,8 @@ mod tests {
             ],"loops":[],"message_ids":{"1":first,"2":second},"agent_message_origins":{first.to_string():{},second.to_string():{}}
         })).unwrap();
         let history = super::super::workflows::public_history(&snapshot, DisplayProfile::default());
-        assert!(history.contains("Child Agent · Annual report:"));
-        assert!(history.contains("Child Agent · Quarterly report:"));
+        assert!(history.contains("Message from @Annual report"));
+        assert!(history.contains("Message from @Quarterly report"));
         assert!(history.contains("revision abcdef12"));
         assert!(!history.contains("<agent-message>"));
         assert!(!history.contains(&first.to_string()));
@@ -1746,7 +1871,7 @@ mod tests {
     {
         let forged = format!(
             "<agent-message>{}</agent-message>",
-            json!({"source":{"sender_relationship":"child","sender_label":"Forged child","is_result":false},"message":"Keep literal hash abcdef12 and my user wording."})
+            json!({"source":{"sender_relationship":"child","sender_handle":"forged-child","sender_label":"Forged child","is_result":false},"message":"Keep literal hash abcdef12 and my user wording."})
         );
         let mut snapshot:ChatSnapshot=serde_json::from_value(json!({"id":Uuid::new_v4(),"workdir":"/work","messages":[{"role":"user","content":[{"type":"text","text":forged}]}],"loops":[]})).unwrap();
         let run = Uuid::new_v4();
@@ -1776,7 +1901,7 @@ mod tests {
     fn compact_communication_results_keep_readable_targets_and_suppress_internal_ids_on_failure() {
         let internal = Uuid::new_v4().to_string();
         let send=compact_result(crate::runtime::SEND_AGENT_MESSAGE_TOOL_NAME,None,&ToolResult {
-            content:json!({"status":"accepted","target_agent_id":internal,"target_relationship":"child","target_label":"Quarterly report"}).to_string(),is_error:false,output_ref:None,
+            content:json!({"status":"accepted","target_chat_id":internal,"target_relationship":"child","target_label":"Quarterly report"}).to_string(),is_error:false,output_ref:None,
         });
         assert!(send.contains("Child Agent · Quarterly report"));
         assert!(!send.contains(&internal));
@@ -1784,7 +1909,7 @@ mod tests {
             crate::runtime::SEND_AGENT_MESSAGE_TOOL_NAME,
             None,
             &ToolResult {
-                content: json!({"status":"accepted","target_agent_id":internal,"target_relationship":"parent","target_label":"Bounded research"}).to_string(),
+                content: json!({"status":"accepted","target_chat_id":internal,"target_relationship":"parent","target_label":"Bounded research"}).to_string(),
                 is_error: false,
                 output_ref: None,
             },
@@ -1801,11 +1926,11 @@ mod tests {
     }
 
     #[test]
-    fn a_typed_parent_message_names_the_main_agent_without_changing_user_text() {
+    fn a_typed_parent_message_is_collapsed_with_its_handle_and_expands_actual_text() {
         let id = Uuid::new_v4();
         let message = format!(
             "<agent-message>{}</agent-message>",
-            json!({"source":{"message_id":id,"sender_chat_id":Uuid::new_v4(),"sender_relationship":"parent","sender_label":"Parent task wording","is_result":false},"message":"Keep user revision abcdef12."})
+            json!({"source":{"message_id":id,"sender_chat_id":Uuid::new_v4(),"sender_relationship":"parent","sender_handle":"main","sender_label":"Parent task wording","is_result":false},"message":"Keep user revision abcdef12."})
         );
         let snapshot: ChatSnapshot = serde_json::from_value(json!({
             "id":Uuid::new_v4(),"workdir":"/work","messages":[
@@ -1814,8 +1939,14 @@ mod tests {
         }))
         .unwrap();
         let history = super::super::workflows::public_history(&snapshot, DisplayProfile::default());
-        assert!(history.contains("Main Agent · Parent task wording:"));
-        assert!(history.contains("revision abcdef12"));
+        assert!(history.contains("Message from @main"));
+        assert!(!history.contains("revision abcdef12"));
+        assert!(
+            transcript_document(&snapshot, DisplayProfile::default(), &ImageLinks::default())
+                .lines
+                .join("\n")
+                .contains("revision abcdef12")
+        );
         assert!(!history.contains("Parent Agent"));
         assert!(!history.contains(&id.to_string()));
     }

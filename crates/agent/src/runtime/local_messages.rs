@@ -114,8 +114,9 @@ impl TaskNotification {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LocalMessage {
     AgentCommunication {
-        relationship: String,
+        sender_handle: String,
         sender_label: String,
+        relay: Option<super::VerifiedUserRelay>,
         message: String,
         is_result: bool,
     },
@@ -154,7 +155,13 @@ impl LocalMessage {
             let payload: serde_json::Value =
                 serde_json::from_str(&unescape_xml(extract_tag(text, AGENT_MESSAGE_TAG)?)).ok()?;
             return Some(Self::AgentCommunication {
-                relationship: payload["source"]["sender_relationship"].as_str()?.into(),
+                sender_handle: payload["source"]["sender_handle"].as_str()?.into(),
+                relay: payload["source"]
+                    .get("relay")
+                    .filter(|value| !value.is_null())
+                    .map(|value| serde_json::from_value(value.clone()))
+                    .transpose()
+                    .ok()?,
                 sender_label: payload["source"]["sender_label"]
                     .as_str()
                     .unwrap_or_default()

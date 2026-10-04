@@ -849,6 +849,15 @@ mod tests {
 
     #[async_trait]
     impl ModelClient for UnusedModel {
+        async fn generate_title(
+            &self,
+            request: crate::model::ModelRequest,
+            _: tokio::sync::mpsc::UnboundedSender<crate::model::ModelDelta>,
+            _: tokio_util::sync::CancellationToken,
+        ) -> Result<crate::model::ModelOutput, crate::model::ModelError> {
+            Ok(crate::model::fixture_title(request))
+        }
+
         fn identity(&self) -> tickloop_agent::model::ModelIdentity {
             tickloop_agent::model::ModelIdentity {
                 provider: crate::model::ModelProvider::Api,
