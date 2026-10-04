@@ -148,25 +148,23 @@ impl Agent {
             let mut result = agent
                 .execute_directed_summary(chat_id, plan, sequence, client, cancel)
                 .await;
-            let next = {
+            {
                 let mut chats = agent.inner.chats.lock().await;
-                match chats.get_mut(&chat_id) {
-                    Some(chat) => {
-                        chat.active = None;
-                        let next = agent
-                            .apply_pending_model(chat)
-                            .and_then(|()| agent.next_run(chat));
-                        if let Ok(outcome) = &mut result {
-                            outcome.snapshot = chat.snapshot.clone();
-                            if let Err(error) = &next {
-                                outcome.continuation_error = Some(error.to_string());
-                            }
-                        }
-                        next.ok().flatten()
-                    }
-                    None => None,
+                if let Some(chat) = chats.get_mut(&chat_id) {
+                    chat.active = None;
                 }
-            };
+            }
+            let next = agent.next_run(chat_id).await;
+            if let Ok(outcome) = &mut result {
+                match agent.snapshot(chat_id).await {
+                    Ok(snapshot) => outcome.snapshot = snapshot,
+                    Err(error) => outcome.continuation_error = Some(error.to_string()),
+                }
+                if let Err(error) = &next {
+                    outcome.continuation_error = Some(error.to_string());
+                }
+            }
+            let next = next.ok().flatten();
             if result.is_ok() {
                 agent.reappend_transcript_metadata(chat_id).await;
             }

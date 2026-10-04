@@ -3,6 +3,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use tickloop_agent::runtime::{TodoItem, TodoStatus};
 use unicode_width::UnicodeWidthStr;
 use uuid::Uuid;
 
@@ -14,6 +15,9 @@ use super::{
 };
 
 const MAX_PANEL_ITEMS: usize = 8;
+const TODO_CONTINUATION_INDENT: &str = "     ";
+const TODO_ROW_PREFIX_COLUMNS: usize = 7;
+const TODO_STATUS_MARK_COLUMNS: usize = 2;
 const TODO_SUBJECT_MARGIN_COLUMNS: usize = 15;
 const TODO_LAYOUT_RESERVED_ROWS: usize = 14;
 const TODO_COMPACT_TERMINAL_ROWS: usize = 10;
@@ -90,22 +94,13 @@ impl BackgroundStatusNotice {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct StatusItem {
-    pub(super) id: String,
-    pub(super) title: String,
-    pub(super) state: &'static str,
-    pub(super) role: Role,
-}
-
 #[derive(Default)]
 pub(super) struct StatusArea {
     mode: String,
     model: String,
     context: Option<(u64, usize)>,
-    todos: Vec<StatusItem>,
-    todos_initialized: bool,
-    todo_completed_at: HashMap<(String, String), Instant>,
+    todos: Vec<TodoItem>,
+    todo_completed_at: HashMap<(usize, String), Instant>,
     agents: Vec<AgentRow>,
     /// The family member this View shows.
     visible_agent: Option<Uuid>,
@@ -137,30 +132,32 @@ impl StatusArea {
         mode: String,
         model: String,
         context: Option<(u64, usize)>,
-        todos: Vec<StatusItem>,
+        todos: Vec<TodoItem>,
     ) {
         self.mode = mode;
         self.model = model;
         self.context = context.filter(|(_, limit)| *limit > 0);
         let now = Instant::now();
-        if self.todos_initialized {
-            for todo in todos.iter().filter(|todo| todo.state == "completed") {
-                if !self.todos.iter().any(|previous| {
-                    previous.id == todo.id
-                        && previous.title == todo.title
-                        && previous.state == "completed"
-                }) {
+        if !self.todos.is_empty() {
+            for (index, todo) in todos
+                .iter()
+                .enumerate()
+                .filter(|(_, todo)| todo.status == TodoStatus::Completed)
+            {
+                let was_completed = self.todos.get(index).is_some_and(|previous| {
+                    previous.content == todo.content && previous.status == TodoStatus::Completed
+                });
+                if !was_completed {
                     self.todo_completed_at
-                        .insert((todo.id.clone(), todo.title.clone()), now);
+                        .insert((index, todo.content.clone()), now);
                 }
             }
         }
-        self.todo_completed_at.retain(|(id, title), _| {
-            todos
-                .iter()
-                .any(|todo| &todo.id == id && &todo.title == title && todo.state == "completed")
+        self.todo_completed_at.retain(|(index, content), _| {
+            todos.get(*index).is_some_and(|todo| {
+                &todo.content == content && todo.status == TodoStatus::Completed
+            })
         });
-        self.todos_initialized = !todos.is_empty();
         self.todos = todos;
 
         self.reconcile_panel();
@@ -357,10 +354,14 @@ impl StatusArea {
             _ => Role::Text,
         };
         line.push(mode.clone(), Some(mode_role));
-        let context = self.context.and_then(|(used, limit)| {
-            let percent = used.saturating_mul(100).saturating_add(limit as u64 / 2) / limit as u64;
-            (percent > 0).then(|| format!("Context {percent}% used"))
-        });
+        let (context, context_role) = match self.context {
+            Some((used, limit)) => {
+                let percent =
+                    used.saturating_mul(100).saturating_add(limit as u64 / 2) / limit as u64;
+                (format!("Context {percent}% used"), Role::Success)
+            }
+            None => ("Context unknown".into(), Role::MutedText),
+        };
         let necessary_background = background.filter(|notice| notice.necessary);
         let ordinary_background = background.filter(|notice| !notice.necessary);
         let mut notice_line = RoleLine::role(notice, Role::Warning);
@@ -390,7 +391,7 @@ impl StatusArea {
         let mut used_width = UnicodeWidthStr::width(mode.as_str());
         for (text, role) in [
             (Some(self.model.as_str()), Role::Text),
-            (context.as_deref(), Role::Success),
+            (Some(context.as_str()), context_role),
         ] {
             let Some(text) = text else {
                 continue;
@@ -440,41 +441,33 @@ impl StatusArea {
                 .saturating_sub(TODO_LAYOUT_RESERVED_ROWS)
                 .clamp(MIN_TODO_DISPLAY_ITEMS, MAX_TODO_DISPLAY_ITEMS)
         };
-        let mut todos = self.todos.iter().collect::<Vec<_>>();
-        let numeric_id = |todo: &StatusItem| {
-            todo.id
-                .trim_end_matches('.')
-                .parse::<usize>()
-                .unwrap_or(usize::MAX)
-        };
+        let mut todos = self.todos.iter().enumerate().collect::<Vec<_>>();
         if todos.len() > capacity {
-            todos.sort_by_key(|todo| {
+            todos.sort_by_key(|(index, todo)| {
                 let rank = if self
                     .todo_completed_at
-                    .contains_key(&(todo.id.clone(), todo.title.clone()))
+                    .contains_key(&(*index, todo.content.clone()))
                 {
                     0
-                } else if todo.state == "in progress" {
-                    1
-                } else if todo.state == "pending" {
-                    2
                 } else {
-                    3
+                    match todo.status {
+                        TodoStatus::InProgress => 1,
+                        TodoStatus::Pending => 2,
+                        TodoStatus::Completed => 3,
+                    }
                 };
-                (rank, numeric_id(todo))
+                (rank, *index)
             });
-        } else {
-            todos.sort_by_key(|todo| numeric_id(todo));
         }
         let completed = self
             .todos
             .iter()
-            .filter(|todo| todo.state == "completed")
+            .filter(|todo| todo.status == TodoStatus::Completed)
             .count();
         let pending = self
             .todos
             .iter()
-            .filter(|todo| todo.state == "pending")
+            .filter(|todo| todo.status == TodoStatus::Pending)
             .count();
         let in_progress = self.todos.len() - completed - pending;
         let mut lines = Vec::new();
@@ -493,24 +486,44 @@ impl StatusArea {
             header.truncate(width);
             lines.push(header);
         }
+        let has_tree_indent = width > TODO_ROW_PREFIX_COLUMNS;
+        let prefix_columns = if has_tree_indent {
+            TODO_ROW_PREFIX_COLUMNS
+        } else {
+            TODO_STATUS_MARK_COLUMNS
+        };
         let subject_columns = width
             .saturating_sub(TODO_SUBJECT_MARGIN_COLUMNS)
             .max(TODO_SUBJECT_MARGIN_COLUMNS)
-            .min(width.saturating_sub(4));
-        for todo in todos.iter().take(capacity) {
-            let (glyph, icon_role, text_role) = match todo.state {
-                "completed" => (Glyph::TodoCompleted, Role::Success, Role::CompletedTodo),
-                "in progress" => (Glyph::TodoInProgress, Role::Accent, Role::Strong),
-                _ => (Glyph::TodoPending, Role::Text, Role::Text),
+            .min(width.saturating_sub(prefix_columns));
+        for (index, (_, todo)) in todos.iter().take(capacity).enumerate() {
+            let (glyph, icon_role, text_role) = match todo.status {
+                TodoStatus::Completed => {
+                    (Glyph::TodoCompleted, Role::MutedText, Role::CompletedTodo)
+                }
+                TodoStatus::InProgress => (
+                    Glyph::TodoInProgress,
+                    Role::InProgressTodo,
+                    Role::InProgressTodo,
+                ),
+                TodoStatus::Pending => (Glyph::TodoPending, Role::Text, Role::Text),
             };
-            let mut title = todo.title.replace('\n', " ");
+            let mut title = super::safe_text(&todo.content).replace(['\n', '\t'], " ");
             if UnicodeWidthStr::width(title.as_str()) > subject_columns {
                 title = format!(
                     "{}…",
                     truncate_width(&title, subject_columns.saturating_sub(1))
                 );
             }
-            let mut line = RoleLine::role(format!("  {} ", display.glyph(glyph)), icon_role);
+            let prefix = if !has_tree_indent {
+                String::new()
+            } else if index == 0 {
+                format!("  {}  ", display.glyph(Glyph::TodoBranch))
+            } else {
+                TODO_CONTINUATION_INDENT.to_owned()
+            };
+            let mut line = RoleLine::role(prefix, Role::MutedText);
+            line.push(format!("{} ", display.glyph(glyph)), Some(icon_role));
             line.push(title, Some(text_role));
             line.truncate(width);
             lines.push(line);
@@ -518,17 +531,26 @@ impl StatusArea {
         let hidden = &todos[capacity.min(todos.len())..];
         if !hidden.is_empty() {
             let parts = [
-                ("in progress", "in progress"),
-                ("pending", "pending"),
-                ("completed", "completed"),
+                (TodoStatus::InProgress, "in progress"),
+                (TodoStatus::Pending, "pending"),
+                (TodoStatus::Completed, "completed"),
             ]
             .into_iter()
-            .filter_map(|(state, label)| {
-                let count = hidden.iter().filter(|todo| todo.state == state).count();
+            .filter_map(|(status, label)| {
+                let count = hidden
+                    .iter()
+                    .filter(|(_, todo)| todo.status == status)
+                    .count();
                 (count > 0).then(|| format!("{count} {label}"))
             })
             .collect::<Vec<_>>();
-            let mut summary = RoleLine::role(format!("  … +{}", parts.join(", ")), Role::MutedText);
+            let indent = if has_tree_indent {
+                TODO_CONTINUATION_INDENT
+            } else {
+                ""
+            };
+            let mut summary =
+                RoleLine::role(format!("{indent}… +{}", parts.join(", ")), Role::MutedText);
             summary.truncate(width);
             lines.push(summary);
         }
@@ -883,12 +905,207 @@ mod tests {
         );
     }
 
-    fn item(id: &str, title: &str) -> StatusItem {
-        StatusItem {
-            id: id.into(),
-            title: title.into(),
-            state: "running",
-            role: Role::Success,
+    fn todo(content: &str) -> TodoItem {
+        TodoItem {
+            content: content.into(),
+            status: TodoStatus::InProgress,
+            active_form: "Working".into(),
+        }
+    }
+
+    #[test]
+    fn todo_rows_use_each_glyph_set_with_a_first_row_branch_and_aligned_continuations() {
+        use tickloop_agent::settings::{DisplayPreferences, GlyphSet};
+
+        for (glyph_set, expected) in [
+            (
+                GlyphSet::Unicode,
+                ["  ⎿  ◻ pending", "     ◼ active", "     ✔ done"],
+            ),
+            (
+                GlyphSet::NerdFont,
+                [
+                    "  \u{f060d}  \u{f0131} pending",
+                    "     \u{f012e} active",
+                    "     \u{f00c} done",
+                ],
+            ),
+        ] {
+            let mut area = StatusArea::default();
+            let mut todos = vec![todo("pending"), todo("active"), todo("done")];
+            for (todo, status) in todos.iter_mut().zip([
+                TodoStatus::Pending,
+                TodoStatus::InProgress,
+                TodoStatus::Completed,
+            ]) {
+                todo.status = status;
+            }
+            area.update("Auto".into(), "fixture".into(), None, todos);
+            let display = DisplayProfile::new(DisplayPreferences {
+                glyph_set,
+                prefers_reduced_motion: false,
+            });
+            let rows = area.todo_lines(80, 24, display, true, Instant::now());
+            assert_eq!(
+                rows.iter().map(RoleLine::text).collect::<Vec<_>>(),
+                expected
+            );
+            for row in &rows {
+                assert_eq!(
+                    UnicodeWidthStr::width(row.text().as_str()),
+                    7 + row.text().chars().skip(7).count()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn todo_status_colours_and_decorations_follow_the_active_theme_in_both_glyph_sets() {
+        use super::super::style::{ColourDepth, ThemeName};
+        use tickloop_agent::settings::{DisplayPreferences, GlyphSet};
+
+        for glyph_set in [GlyphSet::Unicode, GlyphSet::NerdFont] {
+            let mut area = StatusArea::default();
+            let mut todos = vec![todo("pending"), todo("active"), todo("done")];
+            for (todo, status) in todos.iter_mut().zip([
+                TodoStatus::Pending,
+                TodoStatus::InProgress,
+                TodoStatus::Completed,
+            ]) {
+                todo.status = status;
+            }
+            area.update("Auto".into(), "fixture".into(), None, todos);
+            let mut display = DisplayProfile::new(DisplayPreferences {
+                glyph_set,
+                prefers_reduced_motion: false,
+            });
+            let mut themed_rows = Vec::new();
+            for name in ThemeName::ALL {
+                display.set_theme(name);
+                let theme = display.theme();
+                let rows = area.todo_lines(80, 24, display, true, Instant::now());
+                let mut rendered_rows = Vec::new();
+                for (row, (title, glyph, colour, bold, crossed_out)) in rows.iter().zip([
+                    ("pending", Glyph::TodoPending, Role::Text, false, false),
+                    ("active", Glyph::TodoInProgress, Role::Accent, true, false),
+                    ("done", Glyph::TodoCompleted, Role::MutedText, false, true),
+                ]) {
+                    let resolved = row.resolve(theme, 80);
+                    let icon = resolved
+                        .spans
+                        .iter()
+                        .find(|span| span.text.contains(display.glyph(glyph)))
+                        .unwrap();
+                    let text = resolved
+                        .spans
+                        .iter()
+                        .find(|span| span.text.contains(title))
+                        .unwrap();
+                    assert_eq!(
+                        icon.style.foreground,
+                        theme.style(colour).foreground,
+                        "{glyph_set:?} {name:?} {title} icon"
+                    );
+                    assert_eq!(
+                        text.style.foreground,
+                        theme.style(colour).foreground,
+                        "{glyph_set:?} {name:?} {title} text"
+                    );
+                    assert_eq!(icon.style.bold, bold);
+                    assert!(!icon.style.crossed_out);
+                    assert_eq!(text.style.bold, bold);
+                    assert_eq!(text.style.crossed_out, crossed_out);
+                    assert!(!icon.style.dim && !text.style.dim);
+                    rendered_rows.push(resolved.render(ColourDepth::TrueColour));
+                }
+                let branch = rows[0].resolve(theme, 80);
+                assert_eq!(
+                    branch.spans[0].style.foreground,
+                    theme.style(Role::MutedText).foreground
+                );
+                themed_rows.push(rendered_rows);
+            }
+            assert_ne!(
+                themed_rows[0][0], themed_rows[1][0],
+                "pending row must recolour when switching themes"
+            );
+            assert_ne!(
+                themed_rows[0][2], themed_rows[1][2],
+                "completed row must recolour when switching themes"
+            );
+        }
+    }
+
+    #[test]
+    fn narrow_todo_rows_keep_status_marks_and_truncate_subjects_by_display_columns() {
+        use tickloop_agent::settings::{DisplayPreferences, GlyphSet};
+
+        for glyph_set in [GlyphSet::Unicode, GlyphSet::NerdFont] {
+            let mut area = StatusArea::default();
+            let mut todos = vec![
+                todo("中文ab中ab"),
+                todo("e\u{301}中ab"),
+                todo("done\nne\txt\r\u{1b}"),
+            ];
+            for (todo, status) in todos.iter_mut().zip([
+                TodoStatus::Pending,
+                TodoStatus::InProgress,
+                TodoStatus::Completed,
+            ]) {
+                todo.status = status;
+            }
+            area.update("Auto".into(), "fixture".into(), None, todos);
+            let display = DisplayProfile::new(DisplayPreferences {
+                glyph_set,
+                prefers_reduced_motion: false,
+            });
+            for width in 0..=40 {
+                let rows = area.todo_lines(width, 24, display, true, Instant::now());
+                assert_eq!(rows.len(), 3);
+                for row in &rows {
+                    assert!(
+                        UnicodeWidthStr::width(row.text().as_str()) <= width,
+                        "{glyph_set:?} width={width}: {row:?}"
+                    );
+                    assert!(!row.text().contains(['\n', '\t', '\r', '\u{1b}']));
+                }
+                if width > 0 {
+                    for (row, glyph) in rows.iter().zip([
+                        Glyph::TodoPending,
+                        Glyph::TodoInProgress,
+                        Glyph::TodoCompleted,
+                    ]) {
+                        assert!(
+                            row.text().contains(display.glyph(glyph)),
+                            "{glyph_set:?} width={width}: status mark must survive"
+                        );
+                    }
+                }
+            }
+            let rows = area.todo_lines(12, 24, display, true, Instant::now());
+            assert_eq!(
+                rows[0].text(),
+                format!(
+                    "  {}  {} 中文…",
+                    display.glyph(Glyph::TodoBranch),
+                    display.glyph(Glyph::TodoPending)
+                )
+            );
+            assert_eq!(
+                rows[1].text(),
+                format!("     {} e\u{301}中ab", display.glyph(Glyph::TodoInProgress))
+            );
+            assert_eq!(
+                rows[2].text(),
+                format!("     {} done…", display.glyph(Glyph::TodoCompleted))
+            );
+            let short = area.todo_lines(40, 10, display, true, Instant::now());
+            assert!(
+                short[0]
+                    .text()
+                    .contains(display.glyph(Glyph::TodoInProgress))
+            );
+            assert_eq!(short[1].text(), "     … +1 pending, 1 completed");
         }
     }
 
@@ -897,13 +1114,13 @@ mod tests {
         let mut area = StatusArea::default();
         let todos = (1..=13)
             .map(|index| {
-                let mut todo = item(&format!("{index}."), &format!("todo {index}"));
-                todo.state = if index == 1 {
-                    "completed"
+                let mut todo = todo(&format!("todo {index}"));
+                todo.status = if index == 1 {
+                    TodoStatus::Completed
                 } else if index == 13 {
-                    "in progress"
+                    TodoStatus::InProgress
                 } else {
-                    "pending"
+                    TodoStatus::Pending
                 };
                 todo
             })
@@ -929,24 +1146,24 @@ mod tests {
         let mut area = StatusArea::default();
         let initial = (1..=13)
             .map(|index| {
-                let mut todo = item(&format!("{index}."), &format!("todo {index}"));
-                todo.state = if index == 13 {
-                    "in progress"
+                let mut todo = todo(&format!("todo {index}"));
+                todo.status = if index == 13 {
+                    TodoStatus::InProgress
                 } else {
-                    "pending"
+                    TodoStatus::Pending
                 };
                 todo
             })
             .collect::<Vec<_>>();
         area.update("Auto".into(), "fixture".into(), None, initial.clone());
         let mut completed = initial;
-        completed[0].state = "completed";
+        completed[0].status = TodoStatus::Completed;
         area.update("Auto".into(), "fixture".into(), None, completed);
         let now = Instant::now();
         assert!(area.todo_refresh_pending());
         let recent = area.todo_lines(80, 24, DisplayProfile::default(), true, now);
-        assert_eq!(recent[0].text(), "  ✔ todo 1");
-        assert_eq!(recent[1].text(), "  ◼ todo 13");
+        assert_eq!(recent[0].text(), "  ⎿  ✔ todo 1");
+        assert_eq!(recent[1].text(), "     ◼ todo 13");
         assert_eq!(recent.last().unwrap().text().trim(), "… +3 pending");
         let expired = area.todo_lines(
             80,
@@ -955,7 +1172,7 @@ mod tests {
             true,
             now + Duration::from_secs(31),
         );
-        assert_eq!(expired[0].text(), "  ◼ todo 13");
+        assert_eq!(expired[0].text(), "  ⎿  ◼ todo 13");
         assert_eq!(
             expired.last().unwrap().text().trim(),
             "… +2 pending, 1 completed"
@@ -976,16 +1193,12 @@ mod tests {
             "Auto".into(),
             "fixture".into(),
             None,
-            vec![
-                item("3.", "third"),
-                item("1.", "first"),
-                item("2.", "second"),
-            ],
+            vec![todo("third"), todo("first"), todo("second")],
         );
         let ordered = area.todo_lines(80, 24, DisplayProfile::default(), true, now);
-        assert!(ordered[0].text().ends_with("first"));
-        assert!(ordered[1].text().ends_with("second"));
-        assert!(ordered[2].text().ends_with("third"));
+        assert!(ordered[0].text().ends_with("third"));
+        assert!(ordered[1].text().ends_with("first"));
+        assert!(ordered[2].text().ends_with("second"));
         area.update("Auto".into(), "fixture".into(), None, vec![]);
         assert!(
             area.todo_lines(80, 24, DisplayProfile::default(), false, now)
@@ -994,17 +1207,40 @@ mod tests {
     }
 
     #[test]
-    fn context_segment_is_absent_until_rounded_confirmed_usage_is_nonzero() {
+    fn context_segment_shows_zero_before_usage_with_a_known_window() {
         let mut area = StatusArea::default();
-        for context in [
-            None,
-            Some((0, 200_000)),
-            Some((999, 200_000)),
-            Some((42, 0)),
-        ] {
+        area.update("Auto".into(), "model".into(), Some((0, 200_000)), vec![]);
+        assert_eq!(
+            area.status_line(80, "").text(),
+            "⏵⏵ Auto · model · Context 0% used"
+        );
+    }
+
+    #[test]
+    fn context_segment_shows_rounded_zero_usage() {
+        let mut area = StatusArea::default();
+        area.update("Auto".into(), "model".into(), Some((999, 200_000)), vec![]);
+        assert_eq!(
+            area.status_line(80, "").text(),
+            "⏵⏵ Auto · model · Context 0% used"
+        );
+    }
+
+    #[test]
+    fn context_segment_shows_unknown_when_usage_or_window_is_unavailable() {
+        let mut area = StatusArea::default();
+        for context in [None, Some((42, 0))] {
             area.update("Auto".into(), "model".into(), context, vec![]);
-            assert_eq!(area.status_line(80, "").text(), "⏵⏵ Auto · model");
+            assert_eq!(
+                area.status_line(80, "").text(),
+                "⏵⏵ Auto · model · Context unknown"
+            );
         }
+    }
+
+    #[test]
+    fn context_segment_shows_rounded_usage_and_keeps_the_existing_fit_priority() {
+        let mut area = StatusArea::default();
         area.update("Auto".into(), "model".into(), Some((1000, 200_000)), vec![]);
         assert_eq!(
             area.status_line(80, "").text(),
@@ -1014,7 +1250,7 @@ mod tests {
         area.update("Auto".into(), "model".into(), None, vec![]);
         assert_eq!(
             area.status_line(80, "Not saved").text(),
-            "⏵⏵ Auto · model · Not saved"
+            "⏵⏵ Auto · model · Context unknown · Not saved"
         );
     }
 
@@ -1022,12 +1258,18 @@ mod tests {
     fn status_keeps_mode_and_notice_when_narrow_and_never_invents_usage() {
         let mut area = StatusArea::default();
         area.update("Auto".into(), "gpt-5.6".into(), None, vec![]);
-        assert_eq!(area.status_line(80, "").text(), "⏵⏵ Auto · gpt-5.6");
+        assert_eq!(
+            area.status_line(80, "").text(),
+            "⏵⏵ Auto · gpt-5.6 · Context unknown"
+        );
         let narrow = area.status_line(24, "Not saved").text();
         assert!(narrow.starts_with("⏵⏵ Auto · Not saved"));
         assert!(!narrow.contains("gpt-5.6"));
         area.update("Auto".into(), "gpt-5.6".into(), Some((0, 200_000)), vec![]);
-        assert_eq!(area.status_line(80, "").text(), "⏵⏵ Auto · gpt-5.6");
+        assert_eq!(
+            area.status_line(80, "").text(),
+            "⏵⏵ Auto · gpt-5.6 · Context 0% used"
+        );
         area.update(
             "Auto".into(),
             "gpt-5.6".into(),
@@ -1051,7 +1293,7 @@ mod tests {
         };
         let mut area = StatusArea::default();
         area.update("Auto".into(), "model".into(), None, vec![]);
-        assert_eq!(context_role(&area), None);
+        assert_eq!(context_role(&area), Some(Role::MutedText));
         assert_eq!(area.status_line(80, "").spans[0].role, Some(Role::Warning));
         area.update(
             "Auto".into(),

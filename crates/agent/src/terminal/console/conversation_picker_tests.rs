@@ -62,10 +62,10 @@ fn the_open_picker_owns_every_key_and_cancelling_restores_the_same_screen_and_dr
     state.conversation_picker = Some(picker);
     let opened = screen(&mut state);
     assert_eq!(opened.len(), 8);
-    assert!(opened[0].starts_with("Resume Chat · 1 of 3"), "{opened:?}");
-    assert_eq!(opened[1], "⌕ Search…");
-    assert!(opened[2].starts_with("❯ 请分析腾讯控股") && opened[2].ends_with('…'));
-    assert_eq!(opened[3], "  2h ago · main");
+    assert!(opened[1].starts_with("Resume Chat · 1 of 3"), "{opened:?}");
+    assert_eq!(opened[2], "⌕ Search…");
+    assert!(opened[3].starts_with("❯ 请分析腾讯控股") && opened[3].ends_with('…'));
+    assert_eq!(opened[4], "  2h ago · main");
     assert!(
         !opened.iter().any(|line| line.contains(DRAFT)),
         "{opened:?}"
@@ -205,9 +205,9 @@ fn enter_reports_the_original_entry_index_after_filtering_duplicate_titles() {
         state.key(key(KeyCode::Char(character)));
     }
     let filtered = screen(&mut state);
-    assert!(filtered[0].ends_with("1 of 1 matching"), "{filtered:?}");
-    assert_eq!(filtered[2], "❯ Duplicate");
-    assert_eq!(filtered[3], "  3d ago");
+    assert!(filtered[1].ends_with("1 of 1 matching"), "{filtered:?}");
+    assert_eq!(filtered[3], "❯ Duplicate");
+    assert_eq!(filtered[4], "  3d ago");
     for input in [control('u'), control('y'), control('_'), control('7')] {
         assert!(state.key(input).is_none());
     }
@@ -228,7 +228,7 @@ fn an_empty_search_result_cannot_open_an_unrelated_conversation() {
         state.key(key(KeyCode::Char(character)));
     }
     let empty = screen(&mut state);
-    assert!(empty[0].ends_with("no matches"), "{empty:?}");
+    assert!(empty[1].ends_with("no matches"), "{empty:?}");
     assert!(
         empty
             .iter()
@@ -259,7 +259,7 @@ fn control_g_opens_the_search_query_in_the_external_editor_and_never_the_draft()
     assert_eq!(picker.query(), "Duplicate");
     assert_eq!(picker.selection(), Some(1));
     let lines = screen(&mut state);
-    assert!(lines[0].ends_with("1 of 2 matching"), "{lines:?}");
+    assert!(lines[1].ends_with("1 of 2 matching"), "{lines:?}");
     assert!(hint_row(&lines).contains("Ctrl+G editor"), "{lines:?}");
 
     state.external_editor = ExternalEditorLauncher::Scripted {

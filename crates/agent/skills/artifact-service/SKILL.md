@@ -7,7 +7,7 @@ description: Create, find, organize, rename, collaboratively edit or share cloud
 
 Tick Loop's Artifact Service account is separate from model Provider sign-in. The user opens `/artifacts` in their own terminal. It starts device authorization when signed out and opens the picker after login; the user opens the displayed service URL in their browser, signs in with Google, and approves the device. `/settings` shows the service account and its Sign out action. These commands work without Herdr.
 
-When a cloud artifact request needs sign-in, tell the user which command to run. Continue only after the service account is available. A Skill does not grant access to artifacts or bypass tool permission checks. Use only the installed artifact tools for content operations; if none are listed, explain that publishing and management are unavailable in this build.
+Read `service_connections.artifacts` in Current host state: `authentication: signed_in` confirms the account, `signed_out` requires `/artifacts` sign-in, and `unknown` means status could not be verified. `tool_directory: unavailable` or missing tools means tool access is unavailable; it does not establish that the user is signed out. Report account state and tool availability separately. Use the installed Artifact MCP tools for all content operations. A delegated child inherits discovered tools within its frozen endpoint/account and permission ceiling; tool restrictions never grant extra access. A Skill grants no permissions.
 
 The current host state includes `artifact_ticks`: artifacts the user added to this Chat. Operate on them through the discovered MCP tools. Adding a Tick grants no permissions and establishes neither a feedback association nor a Tick Subscription.
 

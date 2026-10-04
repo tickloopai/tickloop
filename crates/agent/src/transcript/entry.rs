@@ -19,6 +19,7 @@ pub(crate) enum Line {
     Subagents(SubagentsEntry),
     FamilyCompletions(FamilyCompletionsEntry),
     FamilyInputs(FamilyInputsEntry),
+    SentAgentMessages(SentAgentMessagesEntry),
     LastPrompt(LastPromptEntry),
     BranchOrigin(BranchOriginEntry),
     Delegation(DelegationEntry),
@@ -30,18 +31,44 @@ pub(crate) enum Line {
     Unknown,
 }
 
-impl Line {
-    pub(crate) fn is_chain_record(raw: &[u8]) -> bool {
-        #[derive(Deserialize)]
-        struct RecordType<'a> {
-            #[serde(rename = "type", borrow)]
-            kind: std::borrow::Cow<'a, str>,
-        }
-        serde_json::from_slice::<RecordType<'_>>(raw)
-            .ok()
-            .is_some_and(|record| matches!(record.kind.as_ref(), "user" | "assistant" | "system"))
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum MetadataKind {
+    User,
+    Assistant,
+    System,
+    CustomTitle,
+    AiTitle,
+    LastPrompt,
+    BranchOrigin,
+    Delegation,
+    ArtifactTicks,
+    Subagents,
+    FamilyInputs,
+    SentAgentMessages,
+    FamilyCompletions,
+    FileHistorySnapshot,
+    ContentReplacement,
+    #[serde(other)]
+    Other,
+}
+impl MetadataKind {
+    pub(crate) fn is_chain(&self) -> bool {
+        matches!(self, Self::User | Self::Assistant | Self::System)
     }
+    pub(crate) fn is_retained(&self) -> bool {
+        !self.is_chain() && !matches!(self, Self::Other)
+    }
+}
+#[derive(Deserialize)]
+pub(crate) struct MetadataHeader {
+    #[serde(rename = "type")]
+    pub(crate) kind: MetadataKind,
+    #[serde(rename = "agentMessageOrigin")]
+    pub(crate) agent_origin: Option<serde_json::Value>,
+}
 
+impl Line {
     pub(crate) fn chain(role: Role, entry: ChainEntry) -> Self {
         match role {
             Role::User => Self::User(entry),
@@ -174,10 +201,11 @@ pub(crate) struct LoopRecord {
     pub trigger_awaits_resume: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub event_sources: Vec<serde_json::Value>,
-    /// 写入时该 Loop 的计划版本。只在对话链上缺少之前的计划工具调用时写出（Loop 首次写入
-    /// 当前链段，例如压缩、rewind 截断、Branch 与 `--fork-session` 之后），恢复时与链上的调用取较大值。
+    /// The submitted version is durable before the approval tool receives its result.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_version: Option<u64>,
+    #[serde(default)]
+    pub plan_approval_pending: bool,
     /// 与 `plan_version` 同时写出的进度步骤（原始 JSON）；链上之后的进度工具调用覆盖它。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub progress: Option<serde_json::Value>,
@@ -189,10 +217,9 @@ pub(crate) struct LoopRecord {
 }
 
 impl LoopRecord {
-    /// 不含计划与进度的 Loop 状态，用于判断 Loop 本身是否变化。
-    pub(crate) fn without_plan(&self) -> Self {
+    /// Progress remains a separate checkpoint; plan changes are part of the Loop state.
+    pub(crate) fn without_progress(&self) -> Self {
         Self {
-            plan_version: None,
             progress: None,
             ..self.clone()
         }
@@ -487,19 +514,28 @@ pub(crate) struct FamilyInputsEntry {
 
 #[cfg(test)]
 mod record_type_tests {
-    use super::Line;
+    use super::MetadataHeader;
+    fn is_chain(raw: &[u8]) -> bool {
+        serde_json::from_slice::<MetadataHeader>(raw)
+            .unwrap()
+            .kind
+            .is_chain()
+    }
 
     #[test]
     fn chain_classification_uses_the_top_level_type_independently_of_field_order() {
-        assert!(Line::is_chain_record(br#"{"message":{},"type":"user"}"#));
-        assert!(Line::is_chain_record(
-            br#"{"type":"assistant","message":{}}"#
-        ));
-        assert!(Line::is_chain_record(
-            br#"{"message":{},"type":"\u0075ser"}"#
-        ));
-        assert!(!Line::is_chain_record(
+        assert!(is_chain(br#"{"message":{},"type":"user"}"#));
+        assert!(is_chain(br#"{"type":"assistant","message":{}}"#));
+        assert!(is_chain(br#"{"message":{},"type":"\u0075ser"}"#));
+        assert!(!is_chain(
             br#"{"inputs":{"example":{"type":"user"}},"type":"family-inputs"}"#
         ));
     }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SentAgentMessagesEntry {
+    pub chat_id: Uuid,
+    pub messages: std::collections::BTreeMap<Uuid, crate::runtime::AgentMessageSource>,
 }

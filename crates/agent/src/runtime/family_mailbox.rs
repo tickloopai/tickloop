@@ -63,6 +63,9 @@ impl FamilyMailbox {
     }
 
     pub fn synchronize(&mut self, snapshot: &ChatSnapshot) {
+        for source in snapshot.sent_agent_messages.values() {
+            self.record_source(source);
+        }
         for source in snapshot
             .agent_message_origins
             .values()

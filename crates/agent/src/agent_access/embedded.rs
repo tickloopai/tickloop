@@ -897,9 +897,18 @@ impl EmbeddedAgentAccess {
                 loop_id,
                 version,
                 mode,
-            } => Ok(CommandResult::Text(
-                agent.approve_plan(chat, loop_id, version, mode).await?,
-            )),
+            } => match agent.approve_plan(chat, loop_id, version, mode).await? {
+                Some(continuation) => Ok(CommandResult::Text(continuation)),
+                None => Ok(CommandResult::Done),
+            },
+            LoopAction::DeclinePlan {
+                loop_id,
+                version,
+                feedback,
+            } => match agent.decline_plan(chat, loop_id, version, feedback).await? {
+                Some(receipt) => Ok(CommandResult::Submitted(receipt)),
+                None => Ok(CommandResult::Done),
+            },
             LoopAction::UpdateSubscription {
                 subscription_id,
                 change,
@@ -1252,7 +1261,8 @@ impl AgentAccess for EmbeddedAgentAccess {
                     {
                         continue;
                     }
-                    let state = super::summary_state(&snapshot.loops, &snapshot.user_shells);
+                    let state =
+                        crate::runtime::summary_state(&snapshot.loops, &snapshot.user_shells);
                     let launch = self.inner.launches.lock().await.get(&execution).cloned();
                     let workspace = launch
                         .as_ref()

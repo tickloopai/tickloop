@@ -18,7 +18,7 @@ use crate::{
     tools::{CommandSnapshot, SearchConfig},
 };
 
-pub const PROTOCOL_MAJOR: u16 = 4;
+pub const PROTOCOL_MAJOR: u16 = 5;
 pub const PROTOCOL_MINOR: u16 = 0;
 pub const MAX_FRAME_BYTES: usize = 128 * 1024 * 1024;
 pub const RESPONSE_CHUNK_BYTES: usize = 4 * 1024 * 1024;
@@ -431,6 +431,11 @@ pub enum LoopAction {
         loop_id: Uuid,
         version: u64,
         mode: ExecutionMode,
+    },
+    DeclinePlan {
+        loop_id: Uuid,
+        version: u64,
+        feedback: Option<String>,
     },
     UpdateSubscription {
         subscription_id: Uuid,

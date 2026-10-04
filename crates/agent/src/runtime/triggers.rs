@@ -128,6 +128,28 @@ impl Agent {
                 return Err(AgentError::Invalid("Unsupported: Tick Subscription is outside the inherited delegated instance scope".into()));
             }
         }
+        if let Some(trigger) = &trigger {
+            let chats = self.inner.chats.lock().await;
+            let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
+            if let Some(delegation) = &chat.snapshot.delegation
+                && trigger
+                    .subscriptions
+                    .iter()
+                    .filter_map(|subscription| subscription.authority.as_ref())
+                    .any(|authority| {
+                        !delegation
+                            .ceiling
+                            .host_tools
+                            .values()
+                            .any(|allowed| allowed == authority)
+                    })
+            {
+                return Err(AgentError::Invalid(
+                    "Tick watch authority is outside the frozen delegated account/endpoint scope"
+                        .into(),
+                ));
+            }
+        }
         if let Some(trigger) = &trigger
             && (trigger.prompt.trim().is_empty()
                 || trigger.interval_seconds == Some(0)
@@ -173,16 +195,10 @@ impl Agent {
         {
             goal.set_state(LoopState::Completed);
         }
-        snapshot.pending_inputs.retain(|pending| {
-            pending.receipt.loop_id != loop_id
-                || pending
-                    .trigger_source
-                    .as_ref()
-                    .is_none_or(|source| source.source == "mcp_event")
-        });
         snapshot.resume_triggers.retain(|id| *id != loop_id);
-        self.save(&snapshot);
         chat.snapshot = snapshot;
+        self.discard_replaced_trigger_inputs(chat, loop_id);
+        self.save(&chat.snapshot);
         if let Some(previous) = chat.trigger_cancellations.remove(&loop_id) {
             previous.cancel();
         }
@@ -214,6 +230,27 @@ impl Agent {
         Ok(())
     }
 
+    fn discard_replaced_trigger_inputs(&self, chat: &mut Chat, loop_id: LoopId) {
+        let mut discarded = Vec::new();
+        chat.snapshot.pending_inputs.retain(|pending| {
+            let keep = pending.receipt.loop_id != loop_id
+                || pending.trigger_source.as_ref().is_none_or(|source| {
+                    matches!(
+                        source.source.as_str(),
+                        "mcp_event" | TICK_SUBSCRIPTION_SOURCE
+                    )
+                });
+            if !keep {
+                discarded.push(pending.receipt.clone());
+            }
+            keep
+        });
+        for receipt in discarded {
+            self.finish_discarded_trigger_input(chat, &receipt);
+        }
+        self.discard_invalid_tick_inputs(chat);
+    }
+
     /// 停止状态显示另一个进程解除了该 Trigger 的武装：本地同样解除武装、取消 Trigger 任务并
     /// 归还租约，不再写停止状态。
     pub(super) async fn disarm_trigger_disarmed_elsewhere(&self, chat_id: ChatId, loop_id: LoopId) {
@@ -235,16 +272,10 @@ impl Agent {
                 goal.set_state(LoopState::Completed);
             }
         }
-        snapshot.pending_inputs.retain(|pending| {
-            pending.receipt.loop_id != loop_id
-                || pending
-                    .trigger_source
-                    .as_ref()
-                    .is_none_or(|source| source.source == "mcp_event")
-        });
         snapshot.resume_triggers.retain(|id| *id != loop_id);
-        self.save(&snapshot);
         chat.snapshot = snapshot;
+        self.discard_replaced_trigger_inputs(chat, loop_id);
+        self.save(&chat.snapshot);
         if let Some(cancel) = chat.trigger_cancellations.remove(&loop_id) {
             cancel.cancel();
         }
@@ -595,6 +626,14 @@ impl Agent {
                 }
                 TriggerPermit::Failed(error) => return Err(AgentError::Storage(error)),
             }
+        }
+        if source.source == TICK_SUBSCRIPTION_SOURCE
+            && let Err(error) = self
+                .revalidate_tick_source(chat_id, loop_id, &source.payload)
+                .await
+        {
+            self.discard_invalid_pending_tick_inputs().await;
+            return Err(error);
         }
         self.submit_internal(
             chat_id,

@@ -1988,16 +1988,27 @@ async fn an_explicit_ask_rule_also_protects_host_plan_operations() {
     loop {
         match next_event(&mut events).await.kind {
             EventKind::PermissionRequested { request } => {
-                assert!(agent.snapshot(chat).await.unwrap().plans.is_empty());
+                assert_eq!(request.name, "ExitPlanMode");
+                assert_eq!(
+                    request.approval_source,
+                    tickloop_agent::runtime::PermissionApprovalSource::ExplicitAsk
+                );
+                let snapshot = agent.snapshot(chat).await.unwrap();
+                assert_eq!(snapshot.plans.len(), 1);
+                assert!(snapshot.plans[0].approval_pending);
+                assert!(
+                    agent
+                        .answer_permission(chat, request.id, true)
+                        .await
+                        .is_err()
+                );
                 agent
-                    .answer_permission(chat, request.id, true)
+                    .approve_plan(chat, request.loop_id, 1, ExecutionMode::AcceptEdits)
                     .await
                     .unwrap();
                 break;
             }
-            EventKind::PlanUpdated { .. } => {
-                panic!("plan changed before its explicit permission question")
-            }
+            EventKind::Completed { .. } => panic!("plan proceeded without explicit approval"),
             _ => {}
         }
     }

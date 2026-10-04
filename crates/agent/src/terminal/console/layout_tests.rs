@@ -129,7 +129,7 @@ fn agent_layout_unsaved_status_and_exit_confirmation_keep_both_required_facts() 
             console.state.lock().unwrap().help_open = help_open;
             let frame = frame_lines(&console);
             if help_open {
-                assert_eq!(frame[12], "Help");
+                assert_eq!(frame[12 + input_dialog::INPUT_DIALOG_RULE_ROWS], "Help");
                 let state = console.state.lock().unwrap();
                 assert!(state.status.contains("Not saved"));
                 assert!(state.exit_confirmation.is_some());
@@ -270,7 +270,7 @@ fn agent_layout_necessary_background_facts_survive_narrow_status_configuration_a
                 console.state.lock().unwrap().help_open = help_open;
                 let frame = frame_lines(&console);
                 if help_open {
-                    assert_eq!(frame[12], "Help");
+                    assert_eq!(frame[12 + input_dialog::INPUT_DIALOG_RULE_ROWS], "Help");
                     let state = console.state.lock().unwrap();
                     assert!(state.background_status_notice.is_some());
                     assert_eq!(state.configured_status_lines, configured);
@@ -549,13 +549,12 @@ pub(super) fn set_status_family(area: &mut StatusArea) {
     );
 }
 
-fn status_items() -> Vec<StatusItem> {
+fn todo_items() -> Vec<TodoItem> {
     (0..20)
-        .map(|index| StatusItem {
-            id: format!("sh-{index:02}"),
-            title: format!("task {index:02}"),
-            state: "running",
-            role: Role::Success,
+        .map(|index| TodoItem {
+            content: format!("task {index:02}"),
+            status: tickloop_agent::runtime::TodoStatus::InProgress,
+            active_form: format!("Working on task {index:02}"),
         })
         .collect()
 }
@@ -648,7 +647,7 @@ fn agent_layout_footer_enters_at_the_bottom_with_following_disabled() {
     state.prompt_enabled = true;
     state
         .status_area
-        .update("Ask".into(), "fixture".into(), None, status_items());
+        .update("Ask".into(), "fixture".into(), None, todo_items());
     set_status_family(&mut state.status_area);
     state
         .footer
@@ -671,7 +670,7 @@ fn agent_layout_first_down_expands_and_list_keys_preserve_the_draft() {
     state.prompt_enabled = true;
     state
         .status_area
-        .update("Ask".into(), "test model".into(), None, status_items());
+        .update("Ask".into(), "test model".into(), None, todo_items());
     set_status_family(&mut state.status_area);
     state
         .footer
@@ -719,7 +718,7 @@ fn agent_layout_return_restores_reading_draft_and_focuses_the_editor() {
     state.insert("parent draft");
     state
         .status_area
-        .update("Ask".into(), "test model".into(), None, status_items());
+        .update("Ask".into(), "test model".into(), None, todo_items());
     set_status_family(&mut state.status_area);
     let panels = state.status_area.available_panels().collect::<Vec<_>>();
     state.footer.update(panels);
@@ -952,7 +951,7 @@ fn agent_layout_float_return_keeps_input_geometry_and_escape_priorities() {
         state.release_finished_submissions();
         state
             .status_area
-            .update("Ask".into(), "fixture".into(), None, status_items());
+            .update("Ask".into(), "fixture".into(), None, todo_items());
         set_status_family(&mut state.status_area);
         let panels = state.status_area.available_panels().collect::<Vec<_>>();
         state.footer.update(panels);
@@ -1461,7 +1460,7 @@ fn agent_layout_required_connection_notice_borrows_one_row_without_changing_conf
         state.prompt_enabled = true;
         state
             .status_area
-            .update("Ask".into(), "fixture".into(), None, status_items());
+            .update("Ask".into(), "fixture".into(), None, todo_items());
         set_status_family(&mut state.status_area);
         state
             .footer
@@ -2693,7 +2692,7 @@ fn agent_layout_real_pty_short_screens_keep_request_actions_reachable() {
 }
 
 #[test]
-fn agent_layout_real_pty_latest_user_message_stays_pinned_while_reading_history() {
+fn agent_layout_real_pty_latest_user_message_is_pinned_only_above_the_viewport() {
     let mut terminal = PtyConsole::start(80, 24);
     terminal.wait_for("ready", |frame| frame.contains("history 99"));
     terminal.send(b"turns\r");
@@ -2716,6 +2715,17 @@ fn agent_layout_real_pty_latest_user_message_stays_pinned_while_reading_history(
     );
     for _ in 0..25 {
         terminal.send_and_wait(b"\x1b[5~");
+        let frame = terminal.frame();
+        if frame
+            .lines()
+            .skip(1)
+            .any(|line| line.contains("latest question"))
+        {
+            assert!(
+                !frame.lines().next().unwrap().contains("latest question"),
+                "{frame}"
+            );
+        }
         if terminal
             .frame()
             .lines()
@@ -2731,7 +2741,7 @@ fn agent_layout_real_pty_latest_user_message_stays_pinned_while_reading_history(
             .skip(1)
             .any(|line| line.contains("earlier question"))
     });
-    assert!(earlier.lines().next().unwrap().contains("latest question"));
+    assert!(!earlier.lines().next().unwrap().contains("latest question"));
     terminal.send_and_wait(b"\x1b[1;5F");
     terminal.wait_for("follow latest keeps pinned message", |frame| {
         frame.contains("latest reply 99")
@@ -4170,7 +4180,7 @@ fn agent_layout_session_hints_name_the_action_of_the_focused_region() {
     state.prompt_enabled = true;
     state
         .status_area
-        .update("Ask".into(), "test model".into(), None, status_items());
+        .update("Ask".into(), "test model".into(), None, todo_items());
     set_status_family(&mut state.status_area);
     state
         .footer
@@ -4200,7 +4210,7 @@ fn agent_layout_session_hints_name_the_action_of_the_focused_region() {
     let mut todo = State::new(true, 100, 32);
     todo.prompt_enabled = true;
     todo.status_area
-        .update("Ask".into(), "test model".into(), None, status_items());
+        .update("Ask".into(), "test model".into(), None, todo_items());
     set_status_family(&mut todo.status_area);
     todo.footer
         .update(todo.status_area.available_panels().collect::<Vec<_>>());
@@ -4460,7 +4470,7 @@ fn agent_layout_conversation_occupancy_toggling_agents_avoids_whole_screen_redra
     state.prompt_enabled = true;
     state
         .status_area
-        .update("Ask".into(), "fixture".into(), None, status_items());
+        .update("Ask".into(), "fixture".into(), None, todo_items());
     set_status_family(&mut state.status_area);
     state.footer.update(state.status_area.available_panels());
     state.scrollback.append("first line\n");

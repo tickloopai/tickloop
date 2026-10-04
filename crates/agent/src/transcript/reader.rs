@@ -35,6 +35,7 @@ struct IndexedEntry {
 pub(crate) const SKIP_PRECOMPACT_THRESHOLD: u64 = 5 * 1024 * 1024;
 const COMPACT_BOUNDARY_MARKER: &[u8] = b"\"compact_boundary\"";
 const SYSTEM_LINE_PREFIX: &[u8] = b"{\"type\":\"system\"";
+const DELEGATION_LINE_PREFIX: &[u8] = b"{\"type\":\"delegation\"";
 /// 照 Claude Code `loadTranscriptFile` 与 `buildConversationChain` 加载 Transcript：
 /// 跳过无法解析的行（含截断的末行），重接部分压缩的保留区段，取时间最新的叶子沿父指针
 /// 重建对话链。没有任何 user／assistant 条目时返回 `None`。
@@ -45,6 +46,7 @@ const SYSTEM_LINE_PREFIX: &[u8] = b"{\"type\":\"system\"";
 pub(crate) fn load(path: &Path) -> io::Result<Option<LoadedTranscript>> {
     let bytes = std::fs::read(path)?;
     let lines = split_lines(&bytes);
+    validate_delegation_records(&lines)?;
     if bytes.len() as u64 > SKIP_PRECOMPACT_THRESHOLD {
         let skip_before = last_unpreserved_boundary_offset(&lines);
         if skip_before > 0 {
@@ -55,6 +57,46 @@ pub(crate) fn load(path: &Path) -> io::Result<Option<LoadedTranscript>> {
         }
     }
     Ok(load_lines(path, &lines, 0).0)
+}
+
+use super::entry::{MetadataHeader, MetadataKind};
+
+fn validate_delegation_records(lines: &[(u64, &[u8])]) -> io::Result<()> {
+    let mut has_delegation_authorization = false;
+    let mut has_parent_origin = false;
+    for (_, raw) in lines {
+        match serde_json::from_slice::<MetadataHeader>(raw) {
+            Ok(header) => {
+                if matches!(header.kind, MetadataKind::Delegation) {
+                    serde_json::from_slice::<Line>(raw).map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "delegated Transcript authorization is invalid or incompatible",
+                        )
+                    })?;
+                    has_delegation_authorization = true;
+                }
+                has_parent_origin |= header
+                    .agent_origin
+                    .is_some_and(|origin| origin["sender_relationship"] == "parent");
+            }
+            Err(_) => {
+                if raw.trim_ascii_start().starts_with(DELEGATION_LINE_PREFIX) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "delegated Transcript authorization is invalid or incompatible",
+                    ));
+                }
+            }
+        }
+    }
+    if has_parent_origin && !has_delegation_authorization {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "delegated Transcript authorization is missing",
+        ));
+    }
+    Ok(())
 }
 
 /// Recovers original prompts from the logical ancestry of an active compact boundary.
@@ -151,7 +193,10 @@ fn load_lines(
         if raw.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        if line_offset < skip_before && Line::is_chain_record(raw) {
+        if line_offset < skip_before
+            && !serde_json::from_slice::<MetadataHeader>(raw)
+                .is_ok_and(|header| header.kind.is_retained())
+        {
             continue;
         }
         let Ok(line) = serde_json::from_slice::<Line>(raw) else {
@@ -175,6 +220,10 @@ fn load_lines(
             }
             Line::Subagents(entry) => {
                 metadata.subagents = Some(entry.clone());
+                continue;
+            }
+            Line::SentAgentMessages(entry) => {
+                metadata.sent_agent_messages = Some(entry.clone());
                 continue;
             }
             Line::FamilyInputs(entry) => {

@@ -84,20 +84,86 @@ pub struct TickStreamHandle {
     pub events: mpsc::Receiver<TickStreamEvent>,
 }
 
-/// A subscription's prepared query binding; admission revalidates it without reading its body.
-pub struct PreparedTickWatch {
+/// Revalidation of one prepared subscription admission, without executing its query body.
+pub struct WatchHostAuthority {
+    pub tool_name: String,
+    pub authority: Option<crate::host_tools::HostToolAuthority>,
+}
+
+#[async_trait::async_trait]
+pub trait TickWatchValidator: Send + Sync {
+    async fn revalidate(
+        &self,
+        chat: Uuid,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<(), String>;
+    fn host_authority(&self) -> Result<Option<WatchHostAuthority>, String> {
+        Ok(None)
+    }
+}
+
+struct HostWatchValidator {
     provider: Arc<dyn crate::host_tools::HostToolProvider>,
     query: crate::host_tools::PreparedHostCall,
+    authority: Option<crate::host_tools::HostToolAuthority>,
+}
+#[async_trait::async_trait]
+impl TickWatchValidator for HostWatchValidator {
+    async fn revalidate(
+        &self,
+        chat: Uuid,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<(), String> {
+        self.provider
+            .revalidate_call(chat, &self.query, cancel)
+            .await
+    }
+    fn host_authority(&self) -> Result<Option<WatchHostAuthority>, String> {
+        Ok(Some(WatchHostAuthority {
+            tool_name: self.query.policy_name().to_owned(),
+            authority: self.authority.clone(),
+        }))
+    }
+}
+
+pub struct PreparedTickWatch {
+    admission: crate::host_tools::PreparedHostCall,
+    validator: Arc<dyn TickWatchValidator>,
 }
 impl PreparedTickWatch {
     pub fn new(
         provider: Arc<dyn crate::host_tools::HostToolProvider>,
         query: crate::host_tools::PreparedHostCall,
-    ) -> Self {
-        Self { provider, query }
+    ) -> Result<Self, String> {
+        let authority = provider.tool_authority(query.policy_name())?;
+        let admission = crate::host_tools::PreparedHostCall::new(
+            query.policy_name().into(),
+            query.policy_input().clone(),
+            query.policy_input().clone(),
+            query.permission(),
+            query.approval_summary().into(),
+        )
+        .with_permission_input(query.permission_input().clone());
+        Ok(Self {
+            admission,
+            validator: Arc::new(HostWatchValidator {
+                provider,
+                query,
+                authority,
+            }),
+        })
     }
-    pub(crate) fn provider(&self) -> &dyn crate::host_tools::HostToolProvider {
-        self.provider.as_ref()
+    pub fn with_validator(
+        admission: crate::host_tools::PreparedHostCall,
+        validator: Arc<dyn TickWatchValidator>,
+    ) -> Self {
+        Self {
+            admission,
+            validator,
+        }
+    }
+    pub(crate) fn host_authority(&self) -> Result<Option<WatchHostAuthority>, String> {
+        self.validator.host_authority()
     }
     pub(crate) fn into_admission(
         self,
@@ -107,14 +173,14 @@ impl PreparedTickWatch {
             "SubscribeTick".into(),
             input.clone(),
             input,
-            self.query.permission(),
-            self.query.approval_summary().into(),
+            self.admission.permission(),
+            self.admission.approval_summary().into(),
         )
         .with_policy_identity(
-            self.query.policy_name().into(),
-            self.query.policy_input().clone(),
+            self.admission.policy_name().into(),
+            self.admission.policy_input().clone(),
         )
-        .with_permission_input(self.query.permission_input().clone())
+        .with_permission_input(self.admission.permission_input().clone())
         .with_payload(self)
     }
     pub(crate) async fn revalidate(
@@ -122,12 +188,10 @@ impl PreparedTickWatch {
         call: &crate::host_tools::PreparedHostCall,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<(), String> {
-        let watch = call
-            .payload::<Self>()
-            .ok_or("Tick watch lost its prepared query")?;
-        watch
-            .provider
-            .revalidate_call(chat, &watch.query, cancel)
+        call.payload::<Self>()
+            .ok_or("Tick watch lost its prepared admission")?
+            .validator
+            .revalidate(chat, cancel)
             .await
     }
 }
@@ -138,11 +202,22 @@ pub trait TickStreamPort: Send + Sync + 'static {
     fn set_cadences(&self, _cadences: BTreeMap<WatchId, u64>) {}
     /// Caller identities for active watches, including restored subscriptions.
     fn set_watch_chats(&self, _chats: BTreeMap<WatchId, Uuid>) {}
-    /// Adapters prepare their read operation so watching inherits its policy and ownership.
+    /// Prepare subscription admission with the native query policy and stable target ownership.
+    fn set_watch_authorities(
+        &self,
+        _authorities: BTreeMap<WatchId, crate::host_tools::HostToolAuthority>,
+    );
+    async fn revalidate_watch(
+        &self,
+        chat: Uuid,
+        instance: &InstanceRef,
+        authority: Option<&crate::host_tools::HostToolAuthority>,
+    ) -> Result<(), String>;
     async fn prepare_watch(
         &self,
         _chat: Uuid,
         _instance: &InstanceRef,
+        _input: &serde_json::Value,
         _cancel: tokio_util::sync::CancellationToken,
     ) -> Result<Option<PreparedTickWatch>, String> {
         Ok(None)
@@ -416,7 +491,24 @@ impl InMemoryTickStream {
     }
 }
 
+#[async_trait::async_trait]
 impl TickStreamPort for InMemoryTickStream {
+    fn set_watch_authorities(
+        &self,
+        _authorities: BTreeMap<WatchId, crate::host_tools::HostToolAuthority>,
+    ) {
+    }
+    async fn revalidate_watch(
+        &self,
+        _chat: Uuid,
+        instance: &InstanceRef,
+        authority: Option<&crate::host_tools::HostToolAuthority>,
+    ) -> Result<(), String> {
+        if authority.is_some() || !self.watched().contains(instance) {
+            return Err("In-memory watch is outside its configured local scope".into());
+        }
+        Ok(())
+    }
     fn open(&self) -> TickStreamHandle {
         let (desired, watched) = watch::channel(BTreeMap::new());
         let (sender, events) = EventPublisher::channel();
@@ -446,27 +538,129 @@ impl TickStreamPort for InMemoryTickStream {
 
 /// Native Herdr observation adapter shared with the Agent's host tools through one TickAccess.
 pub struct NativeTickStream {
-    access: Arc<tick_connect::access::TickAccess>,
+    provider: Arc<crate::native_host::NativeHostToolProvider>,
+    authorities: watch::Sender<BTreeMap<WatchId, crate::host_tools::HostToolAuthority>>,
 }
 
 impl NativeTickStream {
-    pub fn new(access: Arc<tick_connect::access::TickAccess>) -> Self {
-        Self { access }
+    pub fn new(provider: Arc<crate::native_host::NativeHostToolProvider>) -> Self {
+        Self {
+            provider,
+            authorities: watch::channel(BTreeMap::new()).0,
+        }
     }
 }
 
+#[derive(Clone)]
+struct NativeWatchScope {
+    provider: Arc<crate::native_host::NativeHostToolProvider>,
+    authorities: watch::Receiver<BTreeMap<WatchId, crate::host_tools::HostToolAuthority>>,
+}
+impl NativeWatchScope {
+    fn revalidate(
+        &self,
+        authority: Option<&crate::host_tools::HostToolAuthority>,
+    ) -> Result<(), String> {
+        use crate::host_tools::HostToolProvider;
+        let Some(crate::host_tools::HostToolAuthority::Native { .. }) = authority else {
+            return Err(
+                "Native watch has no admitted endpoint authority; subscribe explicitly".into(),
+            );
+        };
+        if self.provider.tool_authority("ReadTick")?.as_ref() != authority {
+            return Err("Native watch endpoint is outside its admitted authority".into());
+        }
+        Ok(())
+    }
+    fn admitted(
+        &self,
+        requested: &BTreeSet<WatchId>,
+        instance: &InstanceRef,
+        publisher: &EventPublisher,
+    ) -> BTreeSet<WatchId> {
+        requested
+            .iter()
+            .filter_map(|watch| {
+                if self
+                    .revalidate(self.authorities.borrow().get(watch))
+                    .is_ok()
+                {
+                    Some(*watch)
+                } else {
+                    publisher.state_to(
+                        instance.clone(),
+                        TickConnectionState::IdentityUncertain,
+                        [*watch],
+                    );
+                    None
+                }
+            })
+            .collect()
+    }
+}
+
+#[async_trait::async_trait]
 impl TickStreamPort for NativeTickStream {
+    async fn prepare_watch(
+        &self,
+        chat: Uuid,
+        instance: &InstanceRef,
+        _input: &serde_json::Value,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<Option<PreparedTickWatch>, String> {
+        use crate::host_tools::HostToolProvider;
+        let query = self
+            .provider
+            .prepare_call(
+                chat,
+                "ReadTick",
+                &serde_json::json!({"tick_instance_id":instance}),
+                cancel,
+            )
+            .await?;
+        let watch = PreparedTickWatch::new(self.provider.clone(), query)?;
+        let authority = watch
+            .host_authority()?
+            .and_then(|binding| binding.authority);
+        self.revalidate_watch(chat, instance, authority.as_ref())
+            .await?;
+        Ok(Some(watch))
+    }
+    fn set_watch_authorities(
+        &self,
+        authorities: BTreeMap<WatchId, crate::host_tools::HostToolAuthority>,
+    ) {
+        self.authorities.send_replace(authorities);
+    }
+    async fn revalidate_watch(
+        &self,
+        _chat: Uuid,
+        instance: &InstanceRef,
+        authority: Option<&crate::host_tools::HostToolAuthority>,
+    ) -> Result<(), String> {
+        if instance.tick_type() != "herdr" {
+            return Err("Native watch requires a Herdr instance".into());
+        }
+        NativeWatchScope {
+            provider: self.provider.clone(),
+            authorities: self.authorities.subscribe(),
+        }
+        .revalidate(authority)
+    }
     fn open(&self) -> TickStreamHandle {
         let (desired, wanted) = watch::channel(BTreeMap::new());
         let (publisher, events) = EventPublisher::channel();
-        let access = self.access.clone();
-        tokio::spawn(async move { follow_native(access, wanted, publisher).await });
+        let scope = NativeWatchScope {
+            provider: self.provider.clone(),
+            authorities: self.authorities.subscribe(),
+        };
+        tokio::spawn(async move { follow_native(scope, wanted, publisher).await });
         TickStreamHandle { desired, events }
     }
 }
 
 async fn follow_native(
-    access: Arc<tick_connect::access::TickAccess>,
+    mut scope: NativeWatchScope,
     mut desired: watch::Receiver<BTreeMap<WatchId, InstanceRef>>,
     publisher: EventPublisher,
 ) {
@@ -510,7 +704,10 @@ async fn follow_native(
         publisher.retain(&wanted);
         let mut groups: BTreeMap<InstanceRef, BTreeSet<WatchId>> = BTreeMap::new();
         for (watch, instance) in eligible {
-            groups.entry(instance).or_default().insert(watch);
+            let admitted = scope.admitted(&BTreeSet::from([watch]), &instance, &publisher);
+            if !admitted.is_empty() {
+                groups.entry(instance).or_default().extend(admitted);
+            }
         }
         workers.retain(|instance, worker| {
             if let Some(watches) = groups.get(instance) {
@@ -540,16 +737,17 @@ async fn follow_native(
                     generation,
                 },
             );
-            let access = access.clone();
+            let scope = scope.clone();
             let publisher = publisher.clone();
             let finished_sender = finished_sender.clone();
             tokio::spawn(async move {
-                observe_native_instance(access, instance.clone(), receiver, publisher).await;
+                observe_native_instance(scope, instance.clone(), receiver, publisher).await;
                 let _ = finished_sender.send((instance, generation));
             });
         }
         tokio::select! {
             changed = desired.changed() => if changed.is_err() { return; },
+            changed = scope.authorities.changed() => if changed.is_err() { return; },
             Some((instance, generation)) = finished.recv() => {
                 if workers.get(&instance).is_some_and(|worker| worker.generation == generation) {
                     let worker = workers.remove(&instance).expect("the worker was present");
@@ -564,7 +762,7 @@ async fn follow_native(
 }
 
 async fn observe_native_instance(
-    access: Arc<tick_connect::access::TickAccess>,
+    scope: NativeWatchScope,
     instance: InstanceRef,
     mut wanted: watch::Receiver<BTreeSet<WatchId>>,
     publisher: EventPublisher,
@@ -574,15 +772,24 @@ async fn observe_native_instance(
         if wanted.borrow().is_empty() {
             return;
         }
-        let attempted = wanted.borrow_and_update().clone();
-        match access.resolve(&instance).await {
+        let attempted = scope.admitted(&wanted.borrow_and_update().clone(), &instance, &publisher);
+        if attempted.is_empty() {
+            return;
+        }
+        let access = scope.provider.access();
+        let location = access.resolve(&instance).await;
+        if scope.admitted(&attempted, &instance, &publisher).is_empty() {
+            return;
+        }
+        match location {
             Ok(location) if location.protocol => {
                 let ended = observe_protocol(
-                    &access,
+                    access,
                     &instance,
                     &mut wanted,
                     &publisher,
                     &mut ready_watches,
+                    &scope,
                 )
                 .await;
                 if ended {
@@ -594,11 +801,12 @@ async fn observe_native_instance(
             }
             Ok(_) => {
                 if observe_terminal(
-                    &access,
+                    access,
                     &instance,
                     &mut wanted,
                     &publisher,
                     &mut ready_watches,
+                    &scope,
                 )
                 .await
                 {
@@ -644,6 +852,7 @@ async fn observe_terminal(
     wanted: &mut watch::Receiver<BTreeSet<WatchId>>,
     publisher: &EventPublisher,
     ready_watches: &mut BTreeSet<WatchId>,
+    scope: &NativeWatchScope,
 ) -> bool {
     let mut cursors: BTreeMap<WatchId, u64> = BTreeMap::new();
     let mut last_text: Option<String> = None;
@@ -659,11 +868,16 @@ async fn observe_terminal(
             _ = cadence.tick() => {}
             changed = wanted.changed() => if changed.is_err() { return true; },
         }
-        let targets = wanted.borrow_and_update().clone();
+        let targets = scope.admitted(&wanted.borrow_and_update().clone(), instance, publisher);
         if targets.is_empty() {
             return true;
         }
-        match access.read(instance).await {
+        let snapshot = access.read(instance).await;
+        let targets = scope.admitted(&targets, instance, publisher);
+        if targets.is_empty() {
+            return true;
+        }
+        match snapshot {
             Ok(snapshot) if snapshot.terminal => {
                 publisher.metadata(
                     instance.clone(),
@@ -755,10 +969,14 @@ async fn observe_protocol(
     wanted: &mut watch::Receiver<BTreeSet<WatchId>>,
     publisher: &EventPublisher,
     ready_watches: &mut BTreeSet<WatchId>,
+    scope: &NativeWatchScope,
 ) -> bool {
     use tick_connect::session::SessionLinkState;
 
-    let attempted = wanted.borrow_and_update().clone();
+    let attempted = scope.admitted(&wanted.borrow_and_update().clone(), instance, publisher);
+    if attempted.is_empty() {
+        return true;
+    }
     let session = match access.session(instance).await {
         Ok(session) => session,
         Err(error) => {
@@ -770,6 +988,9 @@ async fn observe_protocol(
             );
         }
     };
+    if scope.admitted(&attempted, instance, publisher).is_empty() {
+        return true;
+    }
     let recovery_tool = match session.describe().await {
         Ok(descriptor) => descriptor.recover_with,
         Err(_) => {
@@ -781,6 +1002,9 @@ async fn observe_protocol(
             return false;
         }
     };
+    if scope.admitted(&attempted, instance, publisher).is_empty() {
+        return true;
+    }
     let (baseline, registration_received, mut updates) = match session.watch().await {
         Ok(watch) => watch,
         Err(_) => {
@@ -792,11 +1016,14 @@ async fn observe_protocol(
             return false;
         }
     };
+    if scope.admitted(&attempted, instance, publisher).is_empty() {
+        return true;
+    }
     let mut cursors: BTreeMap<WatchId, ProtocolCursor> = BTreeMap::new();
     let initial = updates.borrow_and_update().clone();
     publisher.metadata(
         instance.clone(),
-        wanted.borrow().iter().copied(),
+        scope.admitted(&wanted.borrow().clone(), instance, publisher),
         TickMetadata {
             title: instance.to_string(),
             kind: ObservationKind::Protocol,
@@ -804,7 +1031,7 @@ async fn observe_protocol(
         },
     );
     let mut latest_sequence = baseline.sequence;
-    let baseline_targets = wanted.borrow_and_update().clone();
+    let baseline_targets = scope.admitted(&wanted.borrow_and_update().clone(), instance, publisher);
     for watch in baseline_targets.iter().copied() {
         cursors.insert(
             watch,
@@ -821,7 +1048,7 @@ async fn observe_protocol(
         TickConnectionState::Live,
         baseline_targets.iter().copied(),
     );
-    let initial_targets = wanted.borrow().clone();
+    let initial_targets = scope.admitted(&wanted.borrow().clone(), instance, publisher);
     if let Some(sequence) = publish_protocol_update(
         instance,
         &initial,
@@ -872,7 +1099,7 @@ async fn observe_protocol(
             changed = wanted.changed() => if changed.is_err() { return true; },
         }
         let observation = updates.borrow_and_update().clone();
-        let targets = wanted.borrow_and_update().clone();
+        let targets = scope.admitted(&wanted.borrow_and_update().clone(), instance, publisher);
         if targets.is_empty() {
             return true;
         }

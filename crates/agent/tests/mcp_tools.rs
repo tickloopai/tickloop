@@ -42,8 +42,14 @@ enum PartialAssociationFailure {
 
 #[derive(Default)]
 struct ServiceControl {
+    hold_session_response: AtomicBool,
+    session_response_started: tokio::sync::Notify,
+    release_session_response: tokio::sync::Notify,
     active: AtomicBool,
     reject_mcp: AtomicBool,
+    directory_unavailable: AtomicBool,
+    session_unavailable: AtomicBool,
+    other_account: AtomicBool,
     drop_call_response: AtomicBool,
     drop_association_response: AtomicBool,
     hold_association_response: AtomicBool,
@@ -142,6 +148,11 @@ async fn service() -> (String, Arc<Mutex<Vec<Value>>>, Arc<ServiceControl>) {
                     .lock()
                     .unwrap()
                     .push(json!({"path":path,"headers":head,"body":body}));
+                let account_id = if control.other_account.load(Ordering::SeqCst) {
+                    "user-two"
+                } else {
+                    "user-one"
+                };
                 let response = if path.starts_with("POST /api/v1/auth/device ") {
                     json!({"device_code":"test-device","user_code":"TEST","verification_uri":format!("{origin}/device?code=TEST"),"expires_in":30,"interval":1})
                 } else if path.starts_with("POST /api/v1/auth/device/token ") {
@@ -151,9 +162,9 @@ async fn service() -> (String, Arc<Mutex<Vec<Value>>>, Arc<ServiceControl>) {
                     } else {
                         format!("test-service-token-{revision}")
                     };
-                    json!({"access_token":token,"token_type":"Bearer","expires_in":60,"user":{"id":"user-one","name":"One","email":"one@example.test"}})
+                    json!({"access_token":token,"token_type":"Bearer","expires_in":60,"user":{"id":account_id,"name":"One","email":"one@example.test"}})
                 } else if path.starts_with("GET /api/v1/auth/session ") {
-                    json!({"user":{"id":"user-one","name":"One","email":"one@example.test"},"expires_at":"2099-01-01T00:00:00Z"})
+                    json!({"user":{"id":account_id,"name":"One","email":"one@example.test"},"expires_at":"2099-01-01T00:00:00Z"})
                 } else if path.starts_with("POST /api/v1/auth/logout ") {
                     control.active.store(false, Ordering::SeqCst);
                     json!({"revoked":true})
@@ -527,9 +538,21 @@ async fn service() -> (String, Arc<Mutex<Vec<Value>>>, Arc<ServiceControl>) {
                             || path.starts_with("GET /api/v1/auth/session ")))
                 {
                     401
+                } else if control.directory_unavailable.load(Ordering::SeqCst)
+                    && path.starts_with("POST /mcp ")
+                    || control.session_unavailable.load(Ordering::SeqCst)
+                        && path.starts_with("GET /api/v1/auth/session ")
+                {
+                    503
                 } else {
                     200
                 };
+                if path.starts_with("GET /api/v1/auth/session ")
+                    && control.hold_session_response.swap(false, Ordering::SeqCst)
+                {
+                    control.session_response_started.notify_one();
+                    control.release_session_response.notified().await;
+                }
                 let body = response.to_string();
                 let message = format!(
                     "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -3404,12 +3427,433 @@ async fn late_failed_renewal_cannot_interrupt_a_later_feedback_run_or_its_watche
     agent.shutdown().await;
 }
 
+fn current_host_state(request: &ModelRequest) -> Value {
+    request
+        .messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .find_map(|block| match block {
+            Content::Text { text } => text
+                .rsplit_once("Current host state: ")
+                .map(|(_, state)| serde_json::from_str(state).unwrap()),
+            _ => None,
+        })
+        .unwrap()
+}
+
 async fn login(client: &ArtifactClient) {
     let device = client.start_device_login().await.unwrap();
     client
         .finish_device_login(device, &CancellationToken::new())
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn delegated_chat_inherits_native_artifact_mcp_tools() {
+    let (origin, _, _) = service().await;
+    let directory = tempfile::tempdir().unwrap();
+    let account =
+        ArtifactClient::for_origin(directory.path().canonicalize().unwrap(), &origin).unwrap();
+    login(&account).await;
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "delegate",
+            "DelegateAgent",
+            json!({"task":"Inspect available Artifact tools"}),
+        ),
+        text("Child inspected tools."),
+        text("Done."),
+    ]));
+    let agent = Agent::new_embedded(config(), model.clone());
+    agent
+        .install_host_tools(Arc::new(McpHostToolProvider::new(account, None)))
+        .unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    agent
+        .submit(chat, None, "Delegate tool inspection".into())
+        .await
+        .unwrap();
+    wait_for_completion(&agent, chat).await;
+    agent.shutdown().await;
+    let requests = model.requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    for request in &requests[..2] {
+        assert!(
+            request
+                .tools
+                .iter()
+                .any(|tool| tool.name == "mcp__artifacts__artifact_publish"),
+            "Artifact MCP tools missing from parent or delegated child"
+        );
+        let host = current_host_state(request);
+        assert_eq!(
+            host["service_connections"]["artifacts"]["authentication"],
+            "signed_in"
+        );
+        assert_eq!(
+            host["service_connections"]["artifacts"]["email"],
+            "one@example.test"
+        );
+        assert!(
+            !serde_json::to_string(&request.messages)
+                .unwrap()
+                .contains("test-service-token")
+        );
+    }
+}
+
+#[tokio::test]
+async fn delegated_artifact_calls_obey_frozen_allow_ask_and_deny() {
+    use tickloop_agent::permissions::{Decision, PermissionRule};
+    for decision in [Decision::Allow, Decision::Ask, Decision::Deny] {
+        let (origin, observed, _) = service().await;
+        let directory = tempfile::tempdir().unwrap();
+        let account =
+            ArtifactClient::for_origin(directory.path().canonicalize().unwrap(), &origin).unwrap();
+        login(&account).await;
+        let model = Arc::new(ScriptedModel::new(vec![
+            call(
+                "delegate",
+                "DelegateAgent",
+                json!({"task":"Publish the authorized fixture document"}),
+            ),
+            call(
+                "child-publish",
+                "mcp__artifacts__artifact_publish",
+                json!({"operation_id":"child-publish","source":"# Child"}),
+            ),
+            text("Child done."),
+            text("Parent done."),
+        ]));
+        let agent = Agent::new_embedded(config(), model.clone());
+        agent
+            .install_host_tools(Arc::new(McpHostToolProvider::new(account, None)))
+            .unwrap();
+        let parent = agent.create_chat(directory.path().into()).await.unwrap();
+        agent
+            .set_execution_mode(parent, ExecutionMode::FullAccess)
+            .await
+            .unwrap();
+        agent
+            .set_permission_rules(
+                parent,
+                vec![PermissionRule {
+                    id: uuid::Uuid::new_v4(),
+                    decision,
+                    tool: "mcp__artifacts__artifact_publish".into(),
+                    specifier: None,
+                    input: None,
+                    loop_id: None,
+                    persistent: false,
+                }],
+            )
+            .await
+            .unwrap();
+        let mut events = agent.subscribe();
+        agent
+            .submit(parent, None, "Delegate fixture publication".into())
+            .await
+            .unwrap();
+        let mut asked = 0;
+        let mut child_result = None;
+        loop {
+            let event = support::next_event(&mut events).await;
+            match event.kind {
+                EventKind::PermissionRequested { request } => {
+                    assert_ne!(event.chat_id, parent);
+                    assert_eq!(request.name, "mcp__artifacts__artifact_publish");
+                    asked += 1;
+                    agent
+                        .answer_permission(event.chat_id, request.id, true)
+                        .await
+                        .unwrap();
+                }
+                EventKind::ToolCompleted { call_id, result } if call_id == "child-publish" => {
+                    child_result = Some(result)
+                }
+                EventKind::Completed { .. } if event.chat_id == parent => break,
+                _ => {}
+            }
+        }
+        assert_eq!(asked, usize::from(decision == Decision::Ask));
+        assert_eq!(child_result.unwrap().is_error, decision == Decision::Deny);
+        assert_eq!(
+            observed
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| request["body"]["method"] == "tools/call")
+                .count(),
+            usize::from(decision != Decision::Deny)
+        );
+        {
+            let requests = model.requests.lock().unwrap();
+            assert!(
+                requests[1]
+                    .tools
+                    .iter()
+                    .any(|tool| tool.name == "mcp__artifacts__artifact_publish")
+            );
+        }
+        agent.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn artifact_login_state_is_independent_of_directory_and_connection_failures() {
+    let (origin, _, control) = service().await;
+    let directory = tempfile::tempdir().unwrap();
+    let account =
+        ArtifactClient::for_origin(directory.path().canonicalize().unwrap(), &origin).unwrap();
+    let provider = McpHostToolProvider::new(account, None);
+    provider.refresh(CancellationToken::new()).await.unwrap();
+    assert_eq!(
+        provider.service_connections()["artifacts"]["authentication"],
+        "signed_out"
+    );
+    login(&ArtifactClient::for_origin(directory.path().canonicalize().unwrap(), &origin).unwrap())
+        .await;
+    control.directory_unavailable.store(true, Ordering::SeqCst);
+    provider.refresh(CancellationToken::new()).await.unwrap();
+    assert!(provider.definitions().is_empty());
+    assert_eq!(
+        provider.service_connections()["artifacts"]["authentication"],
+        "signed_in"
+    );
+    assert_eq!(
+        provider.service_connections()["artifacts"]["tool_directory"],
+        "unavailable"
+    );
+    control.session_unavailable.store(true, Ordering::SeqCst);
+    provider.refresh(CancellationToken::new()).await.unwrap();
+    assert_eq!(
+        provider.service_connections()["artifacts"]["authentication"],
+        "unknown"
+    );
+    control.session_unavailable.store(false, Ordering::SeqCst);
+    control.directory_unavailable.store(false, Ordering::SeqCst);
+    provider.refresh(CancellationToken::new()).await.unwrap();
+    assert_eq!(
+        provider.service_connections()["artifacts"]["authentication"],
+        "signed_in"
+    );
+    assert_eq!(
+        provider.service_connections()["artifacts"]["tool_directory"],
+        "available"
+    );
+}
+
+struct GatedDelegatedMcpModel {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    child_turns: AtomicUsize,
+    parent_turns: AtomicUsize,
+}
+impl GatedDelegatedMcpModel {
+    fn new() -> Self {
+        Self {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            child_turns: AtomicUsize::new(0),
+            parent_turns: AtomicUsize::new(0),
+        }
+    }
+}
+#[async_trait]
+impl ModelClient for GatedDelegatedMcpModel {
+    async fn generate_title(
+        &self,
+        request: tickloop_agent::model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<tickloop_agent::model::ModelDelta>,
+        _: tokio_util::sync::CancellationToken,
+    ) -> Result<tickloop_agent::model::ModelOutput, tickloop_agent::model::ModelError> {
+        Ok(support::title_output(request))
+    }
+
+    fn identity(&self) -> ModelIdentity {
+        ScriptedModel::new(vec![]).identity()
+    }
+    async fn complete(
+        &self,
+        request: ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<ModelDelta>,
+        _: CancellationToken,
+    ) -> Result<ModelOutput, ModelError> {
+        let host = current_host_state(&request);
+        let content = if host["delegation"].is_object() {
+            if self.child_turns.fetch_add(1, Ordering::SeqCst) == 0 {
+                assert!(
+                    request
+                        .tools
+                        .iter()
+                        .any(|tool| tool.name == "mcp__artifacts__artifact_publish")
+                );
+                self.entered.notify_one();
+                self.release.notified().await;
+                call(
+                    "frozen-write",
+                    "mcp__artifacts__artifact_publish",
+                    json!({"operation_id":"frozen-write","source":"# Child"}),
+                )
+            } else {
+                text("Child done.")
+            }
+        } else if self.parent_turns.fetch_add(1, Ordering::SeqCst) == 0 {
+            call(
+                "delegate",
+                "DelegateAgent",
+                json!({"task":"Publish fixture under inherited authority"}),
+            )
+        } else {
+            text("Parent done.")
+        };
+        Ok(ModelOutput {
+            private_source: None,
+            content,
+            usage: Default::default(),
+            stop_reason: "end_turn".into(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn delegated_artifact_authority_cannot_expand_after_parent_policy_or_account_changes() {
+    use tickloop_agent::permissions::{Decision, PermissionRule};
+    for change_account in [false, true] {
+        let (origin, observed, control) = service().await;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let account = ArtifactClient::for_origin(&root, &origin).unwrap();
+        login(&account).await;
+        let model = Arc::new(GatedDelegatedMcpModel::new());
+        let agent = Agent::new_embedded(config(), model.clone());
+        agent
+            .install_host_tools(Arc::new(McpHostToolProvider::new(account, None)))
+            .unwrap();
+        let parent = agent.create_chat(root.clone()).await.unwrap();
+        agent
+            .set_execution_mode(parent, ExecutionMode::FullAccess)
+            .await
+            .unwrap();
+        let rules = |decision| {
+            vec![PermissionRule {
+                id: uuid::Uuid::new_v4(),
+                decision,
+                tool: "mcp__artifacts__artifact_publish".into(),
+                specifier: None,
+                input: None,
+                loop_id: None,
+                persistent: false,
+            }]
+        };
+        if !change_account {
+            agent
+                .set_permission_rules(parent, rules(Decision::Deny))
+                .await
+                .unwrap();
+        }
+        let mut events = agent.subscribe();
+        agent
+            .submit(parent, None, "Delegate fixture write".into())
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), model.entered.notified())
+            .await
+            .unwrap();
+        if change_account {
+            control.other_account.store(true, Ordering::SeqCst);
+            login(&ArtifactClient::for_origin(&root, &origin).unwrap()).await;
+        } else {
+            agent
+                .set_permission_rules(parent, rules(Decision::Allow))
+                .await
+                .unwrap();
+        }
+        model.release.notify_one();
+        let result = loop {
+            let event = support::next_event(&mut events).await;
+            if let EventKind::ToolCompleted { call_id, result } = event.kind
+                && call_id == "frozen-write"
+            {
+                break result;
+            }
+        };
+        assert!(result.is_error, "{}", result.content);
+        assert!(
+            result.content.contains(if change_account {
+                "account is outside"
+            } else {
+                "ceiling denies"
+            }),
+            "{}",
+            result.content
+        );
+        wait_for_completion(&agent, parent).await;
+        assert!(
+            !observed
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| request["body"]["method"] == "tools/call")
+        );
+        agent.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn model_tool_inventory_keeps_native_artifact_shell_and_herdr_names() {
+    let (origin, _, _) = service().await;
+    let directory = tempfile::tempdir().unwrap();
+    let account =
+        ArtifactClient::for_origin(directory.path().canonicalize().unwrap(), &origin).unwrap();
+    login(&account).await;
+    let native = tickloop_agent::native_host::NativeHostToolProvider::new(Arc::new(
+        tick_connect::access::TickAccess::new(tick_connect::herdr::HerdrContext::without_view(
+            directory.path().join("unused.sock"),
+        )),
+    ));
+    let model = Arc::new(ScriptedModel::new(vec![text("Ready.")]));
+    let agent = Agent::new_embedded(config(), model.clone());
+    agent
+        .install_host_tools(Arc::new(McpHostToolProvider::new(
+            account,
+            Some(Arc::new(native)),
+        )))
+        .unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    agent
+        .submit(chat, None, "Inspect native tool inventory".into())
+        .await
+        .unwrap();
+    wait_for_completion(&agent, chat).await;
+    agent.shutdown().await;
+    let requests = model.requests.lock().unwrap();
+    for name in [
+        "mcp__artifacts__artifact_publish",
+        "Bash",
+        "Read",
+        "TaskStop",
+        "CallTickTool",
+        "ReadTick",
+    ] {
+        assert!(
+            requests[0].tools.iter().any(|tool| tool.name == name),
+            "{name}"
+        );
+    }
+    let prompt = serde_json::to_string(&requests[0].messages).unwrap();
+    assert!(prompt.contains("Tool absence is not evidence of being signed out"));
+    assert!(prompt.contains("Shared Tick behavior means updates reach the same Loop"));
+    for name in ["CallTickTool", "ReadTick"] {
+        let definition = requests[0]
+            .tools
+            .iter()
+            .find(|tool| tool.name == name)
+            .unwrap();
+        assert!(definition.description.contains("Herdr"));
+        assert!(definition.description.contains("Artifact MCP"));
+    }
 }
 
 async fn wait_for_completion(agent: &Agent, chat: tickloop_agent::runtime::ChatId) {
@@ -6234,5 +6678,77 @@ async fn changed_attachment_mapping_is_rejected_before_dispatch() {
             .unwrap()
             .iter()
             .any(|request| request["body"]["method"] == "tools/call")
+    );
+}
+
+#[tokio::test]
+async fn stale_session_401_never_reports_a_replaced_login_as_signed_out() {
+    let (origin, _, control) = service().await;
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let account = ArtifactClient::for_origin(&root, &origin).unwrap();
+    login(&account).await;
+    let provider = Arc::new(McpHostToolProvider::new(account, None));
+    control.active.store(false, Ordering::SeqCst);
+    control.hold_session_response.store(true, Ordering::SeqCst);
+    let running = provider.clone();
+    let refresh =
+        tokio::spawn(async move { running.refresh(CancellationToken::new()).await.unwrap() });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        control.session_response_started.notified(),
+    )
+    .await
+    .unwrap();
+    control.active.store(true, Ordering::SeqCst);
+    control.credential_revision.store(1, Ordering::SeqCst);
+    let account = ArtifactClient::for_origin(&root, &origin).unwrap();
+    login(&account).await;
+    control.release_session_response.notify_one();
+    refresh.await.unwrap();
+    assert!(
+        account.status().await.unwrap().is_some(),
+        "the new login is valid and retained"
+    );
+    assert_ne!(
+        provider.service_connections()["artifacts"]["authentication"],
+        "signed_out",
+        "a stale 401 response labelled the valid newer login signed_out"
+    );
+}
+
+#[tokio::test]
+async fn account_status_cache_requires_the_current_credential_generation() {
+    let (origin, _, control) = service().await;
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let account = ArtifactClient::for_origin(&root, &origin).unwrap();
+    let provider = McpHostToolProvider::new(account, None);
+    provider.refresh(CancellationToken::new()).await.unwrap();
+    assert_eq!(
+        provider.service_connections()["artifacts"]["authentication"],
+        "signed_out"
+    );
+    let account = ArtifactClient::for_origin(&root, &origin).unwrap();
+    login(&account).await;
+    assert_eq!(
+        provider.service_connections()["artifacts"]["authentication"],
+        "unknown"
+    );
+    provider.refresh(CancellationToken::new()).await.unwrap();
+    assert_eq!(
+        provider.service_connections()["artifacts"]["authentication"],
+        "signed_in"
+    );
+    control.credential_revision.store(1, Ordering::SeqCst);
+    login(&account).await;
+    assert_eq!(
+        provider.service_connections()["artifacts"]["authentication"],
+        "unknown"
+    );
+    provider.refresh(CancellationToken::new()).await.unwrap();
+    assert_eq!(
+        provider.service_connections()["artifacts"]["authentication"],
+        "signed_in"
     );
 }

@@ -29,8 +29,8 @@ use crate::{
         ClaimedEvent, ConnectAction, ConnectSourceEffect, EventAssociationOutcome,
         EventAssociationRequest, EventClaimOutcome, EventClaimRequest, EventLeaseOutcome,
         EventLeaseRequest, EventPendingOutcome, EventSourceLocator, HostCallContext,
-        HostCallResult, HostEffect, HostEndpointIdentity, HostToolPermission, HostToolProvider,
-        PendingEvent, PreparedHostCall, PublishedSourceEffect, RemoteAssociation,
+        HostCallResult, HostEffect, HostEndpointIdentity, HostToolAuthority, HostToolPermission,
+        HostToolProvider, PendingEvent, PreparedHostCall, PublishedSourceEffect, RemoteAssociation,
         RemoteAssociationOperation, WorkspaceHostContext, connection_result,
     },
     mcp_http::McpHttpClient,
@@ -297,10 +297,38 @@ impl ConnectionRequest {
     }
 }
 
+#[derive(Clone, Copy, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ArtifactAuthentication {
+    SignedIn,
+    SignedOut,
+    #[default]
+    Unknown,
+}
+#[derive(Clone, Copy, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum McpToolDirectory {
+    Available,
+    #[default]
+    Unavailable,
+}
+#[derive(Clone, Default, Serialize)]
+struct ArtifactServiceStatus {
+    #[serde(skip)]
+    credential_generation: Option<[u8; 32]>,
+    authentication: ArtifactAuthentication,
+    tool_directory: McpToolDirectory,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    account_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    email: Option<String>,
+}
+
 pub struct McpHostToolProvider {
     artifact: Arc<ArtifactClient>,
     native: Option<Arc<dyn HostToolProvider>>,
     directory: RwLock<Option<Directory>>,
+    service_status: RwLock<ArtifactServiceStatus>,
     event_bridge_uri: Option<String>,
     event_bridge_fallback_uri: Option<String>,
 }
@@ -311,6 +339,7 @@ impl McpHostToolProvider {
             artifact: Arc::new(artifact),
             native,
             directory: RwLock::new(None),
+            service_status: RwLock::new(ArtifactServiceStatus::default()),
             event_bridge_uri: None,
             event_bridge_fallback_uri: None,
         }
@@ -1542,19 +1571,6 @@ impl McpHostToolProvider {
 
 #[async_trait]
 impl HostToolProvider for McpHostToolProvider {
-    async fn builtin_alias(
-        &self,
-        chat: ChatId,
-        name: &str,
-        input: &Value,
-    ) -> Result<Option<crate::host_tools::BuiltinToolCall>, String> {
-        match &self.native {
-            Some(native) if !Self::is_mcp_name(name) => {
-                native.builtin_alias(chat, name, input).await
-            }
-            _ => Ok(None),
-        }
-    }
     fn definitions(&self) -> Vec<ToolDefinition> {
         let mut definitions = self
             .native
@@ -1589,6 +1605,42 @@ impl HostToolProvider for McpHostToolProvider {
             .and_then(|native| native.workspace_host_context())
     }
 
+    fn tool_authority(&self, name: &str) -> Result<Option<HostToolAuthority>, String> {
+        if Self::is_mcp_name(name) {
+            return Ok(self
+                .artifact
+                .credential_snapshot()
+                .map_err(|_| "Artifact credential unavailable")?
+                .map(|credential| HostToolAuthority::Mcp {
+                    server_id: credential.origin,
+                    account_id: credential.account_id,
+                }));
+        }
+        self.native
+            .as_ref()
+            .map_or(Ok(None), |native| native.tool_authority(name))
+    }
+
+    fn service_connections(&self) -> Value {
+        let mut connections = self
+            .native
+            .as_ref()
+            .map(|native| native.service_connections())
+            .unwrap_or_else(|| json!({}));
+        let status = self.service_status.read().unwrap();
+        let generation = self
+            .artifact
+            .credential_snapshot()
+            .map(|credential| credential.as_ref().map(Self::credential_key));
+        connections["artifacts"] =
+            if generation.is_ok_and(|generation| generation == status.credential_generation) {
+                json!(*status)
+            } else {
+                json!(ArtifactServiceStatus::default())
+            };
+        connections
+    }
+
     async fn refresh(&self, cancel: CancellationToken) -> Result<(), String> {
         if let Some(native) = &self.native {
             native.refresh(cancel.clone()).await?;
@@ -1596,21 +1648,78 @@ impl HostToolProvider for McpHostToolProvider {
         if cancel.is_cancelled() {
             return Ok(());
         }
-        let credential = match self.artifact.status().await {
-            Ok(Some(_)) => self
-                .artifact
-                .credential_snapshot()
-                .map_err(|_| "Artifact credential unavailable")?,
-            _ => None,
+        let signed_out = || ArtifactServiceStatus {
+            authentication: ArtifactAuthentication::SignedOut,
+            ..Default::default()
         };
-        let Some(credential) = credential else {
+        let checked_generation = self
+            .artifact
+            .credential_snapshot()
+            .ok()
+            .flatten()
+            .as_ref()
+            .map(Self::credential_key);
+        let (mut status, credential) = match self.artifact.status().await {
+            Ok(Some(user)) => match self.artifact.credential_snapshot() {
+                Ok(Some(credential))
+                    if credential.account_id == user.id
+                        && Some(Self::credential_key(&credential)) == checked_generation =>
+                {
+                    (
+                        ArtifactServiceStatus {
+                            authentication: ArtifactAuthentication::SignedIn,
+                            credential_generation: Some(Self::credential_key(&credential)),
+                            account_id: Some(user.id),
+                            email: Some(user.email),
+                            ..Default::default()
+                        },
+                        Some(credential),
+                    )
+                }
+                Ok(None) => (signed_out(), None),
+                _ => (ArtifactServiceStatus::default(), None),
+            },
+            Ok(None) => (signed_out(), None),
+            Err(_) => (ArtifactServiceStatus::default(), None),
+        };
+        if let Some(credential) = credential {
+            let directory = self.load_directory(&credential).await;
+            match self.artifact.credential_snapshot() {
+                Ok(Some(current))
+                    if Self::credential_key(&current) == Self::credential_key(&credential) =>
+                {
+                    match directory {
+                        Ok(directory) => {
+                            status.tool_directory = McpToolDirectory::Available;
+                            *self.directory.write().unwrap() = Some(directory);
+                        }
+                        Err(_) => self.clear_directory(),
+                    }
+                }
+                Ok(None) => {
+                    self.clear_directory();
+                    status = signed_out();
+                }
+                _ => {
+                    self.clear_directory();
+                    status = ArtifactServiceStatus::default();
+                }
+            }
+        } else {
             self.clear_directory();
-            return Ok(());
-        };
-        match self.load_directory(&credential).await {
-            Ok(directory) => *self.directory.write().unwrap() = Some(directory),
-            Err(_) => self.clear_directory(),
         }
+        if !self
+            .artifact
+            .credential_snapshot()
+            .map(|credential| {
+                credential.as_ref().map(Self::credential_key) == status.credential_generation
+            })
+            .unwrap_or(false)
+        {
+            self.clear_directory();
+            status = ArtifactServiceStatus::default();
+        }
+        *self.service_status.write().unwrap() = status;
         Ok(())
     }
 

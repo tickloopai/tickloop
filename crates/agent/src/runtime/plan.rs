@@ -1,15 +1,11 @@
-//! 计划与进度。
+//! Loop-scoped plans and progress.
 //!
-//! 计划属于 Loop：照 Claude Code 为子代理生成 `<slug>-agent-<id>.md` 的方式，计划文件为
-//! `<计划目录>/<slug>-loop-<loopId>.md`，slug 按 Chat 生成并记录在链上条目中。Plan 模式下模型用
-//! `Write`／`Edit` 编写当前 Loop 的计划文件，`ExitPlanMode` 由宿主读取并提交审批。进度是该 Loop 的
-//! 待办列表，由 `TodoWrite` 整体替换。计划版本与进度不单独保存，恢复时沿对话链重建：版本取该 Loop
-//! 成功提交计划的调用，进度取最后一次成功的 `TodoWrite` 调用的输入（照 Claude Code 从最后一次
-//! TodoWrite 调用重建）。
-//!
-//! 提交时宿主把版本号与内容摘要写成计划文件首行的 HTML 注释（Markdown 渲染时不可见），与内容
-//! 一起原子替换。按版本批准只对与该版本号一同写出的内容生效：恢复时文件中的版本与链上记录不一致，
-//! 或摘要与内容不符（提交后又被编辑、写出结果前崩溃等），计划以从未使用过的新版本恢复。
+//! Each Chat chooses a validated slug; each Loop owns `<slug>-loop-<loopId>.md`.
+//! ExitPlanMode snapshots the plan and waits for a version-bound user decision. Versions and
+//! pending approvals are checkpointed in the Transcript before requesting that decision.
+//! The version and body digest are atomically saved in an HTML comment in the plan file.
+//! Recovery assigns a fresh, unapproved version when the file disagrees with its checkpoint.
+//! TodoWrite replaces the Loop's progress, rebuilt from the last successful call or checkpoint.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::OpenOptions;
@@ -161,6 +157,8 @@ pub struct Plan {
     pub markdown: String,
     /// The execution mode selected for this process-local plan approval.
     pub approved_execution_mode: Option<ExecutionMode>,
+    #[serde(default)]
+    pub approval_pending: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -251,6 +249,7 @@ pub(super) struct PlanCheckpoint {
     pub position: usize,
     pub loop_id: LoopId,
     pub plan_version: Option<u64>,
+    pub approval_pending: bool,
     pub progress: Option<Vec<TodoItem>>,
 }
 
@@ -522,7 +521,6 @@ pub(super) fn rebuild_plans_and_progress(
 ) -> Result<Vec<String>, AgentError> {
     enum Change {
         Version(u64),
-        NextVersion,
         Progress(Vec<TodoItem>),
     }
     // 排序键：位置为 p 的检查点在第 p 条消息之前（2p），结果位于第 r 条消息的调用紧随其后（2r+1）。
@@ -546,36 +544,20 @@ pub(super) fn rebuild_plans_and_progress(
         else {
             continue;
         };
-        let (
-            Content::ToolUse { name, input, .. },
-            Content::ToolResult {
-                content, is_error, ..
-            },
-        ) = (
+        let (Content::ToolUse { name, input, .. }, Content::ToolResult { is_error, .. }) = (
             &snapshot.messages[call.message_index].content[call.content_index],
             &snapshot.messages[result_message].content[result_content],
-        )
-        else {
+        ) else {
             continue;
         };
         if *is_error {
             continue;
         }
         let position = result_message * 2 + 1;
-        match name.as_str() {
-            EXIT_PLAN_MODE_TOOL_NAME => {
-                let change = match prompts::submitted_plan_version(&content.text()) {
-                    Some(version) => Change::Version(version),
-                    None => Change::NextVersion,
-                };
-                changes.push((position, loop_id, change));
-            }
-            TODO_WRITE_TOOL_NAME => {
-                if let Ok(todos) = TodoWriteInput::parse(input) {
-                    changes.push((position, loop_id, Change::Progress(todos)));
-                }
-            }
-            _ => {}
+        if name == TODO_WRITE_TOOL_NAME
+            && let Ok(todos) = TodoWriteInput::parse(input)
+        {
+            changes.push((position, loop_id, Change::Progress(todos)));
         }
     }
     changes.sort_by_key(|(position, _, _)| *position);
@@ -587,15 +569,20 @@ pub(super) fn rebuild_plans_and_progress(
                 let current = versions.entry(loop_id).or_default();
                 *current = (*current).max(version);
             }
-            Change::NextVersion => {
-                *versions.entry(loop_id).or_default() += 1;
-            }
             Change::Progress(todos) => {
                 progress.insert(loop_id, todos);
             }
         }
     }
     let mut warnings = Vec::new();
+    let pending = checkpoints
+        .iter()
+        .filter_map(|checkpoint| {
+            checkpoint
+                .plan_version
+                .map(|_| (checkpoint.loop_id, checkpoint.approval_pending))
+        })
+        .collect::<HashMap<_, _>>();
     // 与 `--fork-session` 相同，换用新的 slug；旧 slug 无法安全定位计划文件，已记录版本的计划按缺失处理。
     let mut location = directory.zip(snapshot.plan_slug.clone());
     if let Some(slug) = snapshot.plan_slug.take_if(|slug| !is_valid_plan_slug(slug)) {
@@ -628,11 +615,23 @@ pub(super) fn rebuild_plans_and_progress(
                     ));
                     fresh
                 };
+                if restored_version != version {
+                    let (directory, slug) = location.as_ref().expect("readable plan location");
+                    if let Err(error) =
+                        write_plan_file(directory, slug, *loop_id, restored_version, &file.markdown)
+                    {
+                        warnings.push(format!("cannot save recovered plan version {restored_version} of goal {loop_id}: {error}"));
+                        unavailable.insert(*loop_id, restored_version);
+                        continue;
+                    }
+                }
                 plans.push(Plan {
                     loop_id: *loop_id,
                     version: restored_version,
                     markdown: file.markdown,
                     approved_execution_mode: None,
+                    approval_pending: restored_version != version
+                        || pending.get(loop_id).copied().unwrap_or(true),
                 });
             }
             (
@@ -647,11 +646,20 @@ pub(super) fn rebuild_plans_and_progress(
                 warnings.push(format!(
                     "the plan file of goal {loop_id} was not recorded in the conversation; it is restored as unapproved version {fresh}"
                 ));
+                let (directory, slug) = location.as_ref().expect("readable plan location");
+                if let Err(error) = write_plan_file(directory, slug, *loop_id, fresh, &markdown) {
+                    warnings.push(format!(
+                        "cannot save recovered plan version {fresh} of goal {loop_id}: {error}"
+                    ));
+                    unavailable.insert(*loop_id, fresh);
+                    continue;
+                }
                 plans.push(Plan {
                     loop_id: *loop_id,
                     version: fresh,
                     markdown,
                     approved_execution_mode: None,
+                    approval_pending: true,
                 });
             }
             (Some(version), file) => {
@@ -683,15 +691,82 @@ pub(super) fn rebuild_plans_and_progress(
 }
 
 impl Agent {
-    /// Approves the reviewed plan version and switches the Chat to `mode`. Returns the message
-    /// that starts implementing it, in the words of Claude Code's approved `ExitPlanMode` result.
+    pub async fn decline_plan(
+        &self,
+        chat_id: ChatId,
+        loop_id: LoopId,
+        version: u64,
+        feedback: Option<String>,
+    ) -> Result<Option<Receipt>, AgentError> {
+        let feedback = feedback
+            .map(|text| text.trim().to_owned())
+            .filter(|text| !text.is_empty());
+        let mut chats = self.inner.chats.lock().await;
+        let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
+        let plan = chat
+            .snapshot
+            .plans
+            .iter_mut()
+            .find(|plan| plan.loop_id == loop_id)
+            .ok_or(AgentError::NotFound)?;
+        if plan.version != version {
+            return Err(AgentError::Invalid(
+                "plan was revised; review the current version".into(),
+            ));
+        }
+        if !plan.approval_pending {
+            return Err(AgentError::Invalid(
+                "plan approval was already processed".into(),
+            ));
+        }
+        let request = chat
+            .snapshot
+            .permissions
+            .iter()
+            .find(|request| request.name == EXIT_PLAN_MODE_TOOL_NAME && request.loop_id == loop_id)
+            .map(|request| request.id);
+        if let Some(request) = request {
+            drop(chats);
+            self.answer_permission_with_comment(
+                chat_id,
+                request,
+                false,
+                PermissionScope::Once,
+                feedback,
+            )
+            .await?;
+            return Ok(None);
+        }
+        if chat.active.is_some() {
+            return Err(AgentError::Busy);
+        }
+        plan.approval_pending = feedback.is_none();
+        chat.snapshot.policy.mode = ExecutionMode::Plan;
+        chat.snapshot.policy.revision += 1;
+        self.save(&chat.snapshot);
+        drop(chats);
+        match feedback {
+            Some(feedback) => self
+                .submit(
+                    chat_id,
+                    Some(loop_id),
+                    prompts::declined_plan(Some(&feedback)),
+                )
+                .await
+                .map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Approves the reviewed version and resumes its waiting tool. If that Run already ended,
+    /// returns the approved-plan input needed to start an explicit continuation.
     pub async fn approve_plan(
         &self,
         chat_id: ChatId,
         loop_id: LoopId,
         version: u64,
         mode: ExecutionMode,
-    ) -> Result<String, AgentError> {
+    ) -> Result<Option<String>, AgentError> {
         if mode == ExecutionMode::Plan {
             return Err(AgentError::Invalid(
                 "select an execution mode when approving a plan".into(),
@@ -710,7 +785,22 @@ impl Agent {
                     .into(),
             ));
         }
-        if chat.active.is_some() {
+        let request = chat
+            .snapshot
+            .permissions
+            .iter()
+            .find(|request| request.name == EXIT_PLAN_MODE_TOOL_NAME && request.loop_id == loop_id)
+            .cloned();
+        let mut approvals = self.inner.approvals.lock().await;
+        if let Some(request) = &request {
+            let pending = approvals
+                .get(&request.id)
+                .ok_or_else(|| AgentError::Invalid("plan approval was already answered".into()))?;
+            if pending.sender.is_closed() {
+                return Err(AgentError::Invalid("plan approval expired".into()));
+            }
+        }
+        if chat.active.is_some() && request.is_none() {
             return Err(AgentError::Busy);
         }
         let mut snapshot = chat.snapshot.clone();
@@ -732,7 +822,34 @@ impl Agent {
                 "plan was revised; review the current version".into(),
             ));
         }
+        if !plan.approval_pending {
+            return Err(AgentError::Invalid(
+                "plan approval was already processed".into(),
+            ));
+        }
+        let directory = self.plans_directory(&snapshot.workdir);
+        let slug = snapshot
+            .plan_slug
+            .as_deref()
+            .ok_or_else(|| AgentError::Invalid("the plan file cannot be located".into()))?;
+        let file = read_plan_file(directory.path(), slug, loop_id).map_err(|error| {
+            AgentError::Invalid(format!("cannot verify the reviewed plan: {error}"))
+        })?;
+        if file.version != Some(version) || !file.is_submitted || file.markdown != plan.markdown {
+            return Err(AgentError::Invalid(
+                "plan was revised; review the current version".into(),
+            ));
+        }
+        if let Some(request) = &request {
+            answerable_permission_request(chat, request.id, true)?;
+            if request.input["plan_version"].as_u64() != Some(version) {
+                return Err(AgentError::Invalid(
+                    "plan was revised; review the current version".into(),
+                ));
+            }
+        }
         plan.approved_execution_mode = Some(mode);
+        plan.approval_pending = false;
         let markdown = plan.markdown.clone();
         let plan_file = current_plan_file(
             &snapshot,
@@ -744,7 +861,24 @@ impl Agent {
         snapshot.policy.revision += 1;
         self.save(&snapshot);
         chat.snapshot = snapshot;
-        Ok(prompts::approved_plan(&plan_file, &markdown))
+        if let Some(request) = request {
+            let pending = approvals
+                .remove(&request.id)
+                .ok_or_else(|| AgentError::Invalid("plan approval was already answered".into()))?;
+            pending
+                .sender
+                .send(PermissionAnswer {
+                    allow: true,
+                    revision: chat.snapshot.policy.revision,
+                    comment: None,
+                })
+                .map_err(|_| AgentError::Invalid("plan approval expired".into()))?;
+            chat.snapshot
+                .permissions
+                .retain(|permission| permission.id != request.id);
+            return Ok(None);
+        }
+        Ok(Some(prompts::approved_plan(&plan_file, &markdown)))
     }
 
     /// The directory of plan files: `<root>/plans` when Chats are saved, otherwise `plans` under
@@ -776,84 +910,172 @@ impl Agent {
     pub(super) async fn control_tool(
         &self,
         receipt: &Receipt,
-        name: &str,
-        input: &Value,
+        operation: &OperationRecord,
+        cancel: CancellationToken,
     ) -> Option<Result<ToolResult, String>> {
+        let name = operation.name.as_str();
+        let input = &operation.input;
         if !matches!(
             name,
             ENTER_PLAN_MODE_TOOL_NAME | EXIT_PLAN_MODE_TOOL_NAME | TODO_WRITE_TOOL_NAME
         ) {
             return None;
         }
-        Some(
-            async {
-                let mut chats = self.inner.chats.lock().await;
-                let chat = chats
-                    .get_mut(&receipt.chat_id)
-                    .ok_or_else(|| "chat is unavailable".to_string())?;
-                if chat
-                    .active
-                    .as_ref()
-                    .is_none_or(CancellationToken::is_cancelled)
-                {
-                    return Err("run was cancelled".into());
-                }
-                if chat.snapshot.policy.rules.iter().any(|rule| {
-                    rule.decision == Decision::Deny
-                        && (rule.tool == name || rule.tool == "*")
-                        && rule.loop_id.is_none_or(|id| id == receipt.loop_id)
-                        && rule.input.as_ref().is_none_or(|value| value == input)
-                }) {
-                    return Err("permission denied".into());
-                }
-                let mut snapshot = chat.snapshot.clone();
-                let (kind, content) = match name {
-                    ENTER_PLAN_MODE_TOOL_NAME => {
-                        if snapshot.policy.mode == ExecutionMode::Plan {
-                            return Ok(ToolResult {
-                                content: prompts::already_in_plan_mode(),
-                                is_error: false,
-                                output_ref: None,
-                            });
-                        }
-                        snapshot.policy.mode = ExecutionMode::Plan;
-                        snapshot.policy.revision += 1;
-                        (None, prompts::entered_plan_mode())
-                    }
-                    EXIT_PLAN_MODE_TOOL_NAME => {
-                        let (plan, content) =
-                            self.submit_plan_file(chat, &mut snapshot, receipt.loop_id)?;
-                        (Some(EventKind::PlanUpdated { plan }), content)
-                    }
-                    _ => {
-                        let progress = Progress {
-                            loop_id: receipt.loop_id,
-                            todos: TodoWriteInput::parse(input)?,
-                        };
-                        snapshot
-                            .progress
-                            .retain(|progress| progress.loop_id != receipt.loop_id);
-                        snapshot.progress.push(progress.clone());
-                        self.track_todo_progress(chat, &progress);
-                        (
-                            Some(EventKind::ProgressUpdated { progress }),
-                            prompts::TODO_WRITE_RESULT.into(),
-                        )
-                    }
-                };
-                self.save(&snapshot);
-                chat.snapshot = snapshot;
-                if let Some(kind) = kind {
-                    self.emit(chat, receipt, kind);
-                }
-                Ok(ToolResult {
-                    content,
-                    is_error: false,
-                    output_ref: None,
-                })
+        let result = async {
+            let mut chats = self.inner.chats.lock().await;
+            let chat = chats
+                .get_mut(&receipt.chat_id)
+                .ok_or_else(|| "chat is unavailable".to_string())?;
+            if chat
+                .active
+                .as_ref()
+                .is_none_or(CancellationToken::is_cancelled)
+            {
+                return Err("run was cancelled".into());
             }
-            .await,
+            if chat.snapshot.policy.rules.iter().any(|rule| {
+                rule.decision == Decision::Deny
+                    && (rule.tool == name || rule.tool == "*")
+                    && rule.loop_id.is_none_or(|id| id == receipt.loop_id)
+                    && rule.input.as_ref().is_none_or(|value| value == input)
+            }) {
+                return Err("permission denied".into());
+            }
+            let mut snapshot = chat.snapshot.clone();
+            let (kind, content) = match name {
+                ENTER_PLAN_MODE_TOOL_NAME => {
+                    if snapshot.policy.mode == ExecutionMode::Plan {
+                        return Ok(Some(ToolResult {
+                            content: prompts::already_in_plan_mode(),
+                            is_error: false,
+                            output_ref: None,
+                        }));
+                    }
+                    snapshot.policy.mode = ExecutionMode::Plan;
+                    snapshot.policy.revision += 1;
+                    (None, Some(prompts::entered_plan_mode()))
+                }
+                EXIT_PLAN_MODE_TOOL_NAME => {
+                    let plan = self.submit_plan_file(chat, &mut snapshot, receipt.loop_id)?;
+                    (Some(EventKind::PlanUpdated { plan }), None)
+                }
+                _ => {
+                    let progress = Progress {
+                        loop_id: receipt.loop_id,
+                        todos: TodoWriteInput::parse(input)?,
+                    };
+                    snapshot
+                        .progress
+                        .retain(|progress| progress.loop_id != receipt.loop_id);
+                    snapshot.progress.push(progress.clone());
+                    self.track_todo_progress(chat, &progress);
+                    (
+                        Some(EventKind::ProgressUpdated { progress }),
+                        Some(prompts::TODO_WRITE_RESULT.into()),
+                    )
+                }
+            };
+            self.save(&snapshot);
+            chat.snapshot = snapshot;
+            if let Some(kind) = kind {
+                self.emit(chat, receipt, kind);
+            }
+            Ok(content.map(|content| ToolResult {
+                content,
+                is_error: false,
+                output_ref: None,
+            }))
+        }
+        .await;
+        Some(match result {
+            Ok(Some(result)) => Ok(result),
+            Ok(None) => {
+                self.wait_for_plan_approval(receipt, operation, cancel)
+                    .await
+            }
+            Err(error) => Err(error),
+        })
+    }
+
+    async fn wait_for_plan_approval(
+        &self,
+        receipt: &Receipt,
+        operation: &OperationRecord,
+        cancel: CancellationToken,
+    ) -> Result<ToolResult, String> {
+        if self.inner.host_options.prompt_policy == PromptPolicy::DenyOnPrompt {
+            return Err(
+                "ExitPlanMode requires user approval, but user prompts are unavailable.".into(),
+            );
+        }
+        let (plan, path, workspace, snapshot) = {
+            let chats = self.inner.chats.lock().await;
+            let chat = chats.get(&receipt.chat_id).ok_or("chat is unavailable")?;
+            let plan = chat
+                .snapshot
+                .plans
+                .iter()
+                .find(|plan| plan.loop_id == receipt.loop_id)
+                .cloned()
+                .ok_or("plan is unavailable")?;
+            let path = current_plan_file(
+                &chat.snapshot,
+                self.plans_directory(&chat.snapshot.workdir).path(),
+                receipt.loop_id,
+            )
+            .ok_or("plan file is unavailable")?;
+            (
+                plan,
+                path,
+                WorkspaceScope::capture(&configured_workspace_for_chat(chat))
+                    .map_err(|error| error.to_string())?,
+                chat.snapshot.clone(),
+            )
+        };
+        self.checkpoint_plan_approval(&snapshot).await?;
+        let mut request_operation = operation.clone();
+        request_operation.input = json!({"plan_version": plan.version});
+        let session_operation = SessionPermissionOperation::from_normalized(
+            operation.name.clone(),
+            operation.input.clone(),
+            workspace,
         )
+        .map_err(|error| error.to_string())?;
+        let answer = self
+            .request_permission(
+                receipt,
+                &request_operation,
+                session_operation,
+                PermissionApprovalSource::ExplicitAsk,
+                Some("Approve the reviewed plan and choose an execution mode".into()),
+                cancel.clone(),
+            )
+            .await?;
+        if !answer.allow {
+            let mut chats = self.inner.chats.lock().await;
+            let chat = chats
+                .get_mut(&receipt.chat_id)
+                .ok_or("chat is unavailable")?;
+            if let Some(current) = chat.snapshot.plans.iter_mut().find(|current| {
+                current.loop_id == receipt.loop_id && current.version == plan.version
+            }) {
+                current.approval_pending = answer.comment.is_none();
+            }
+            self.save(&chat.snapshot);
+            if answer.comment.is_none() {
+                chat.user_cancelled_runs.insert(receipt.run_id);
+                cancel.cancel();
+            }
+        }
+        Ok(ToolResult {
+            content: if answer.allow {
+                prompts::approved_plan(&path, &plan.markdown)
+            } else {
+                prompts::declined_plan(answer.comment.as_deref())
+            },
+            is_error: !answer.allow,
+            output_ref: None,
+        })
     }
 
     /// `ExitPlanMode`: reads the Loop's plan file and records its content as the next plan
@@ -864,7 +1086,7 @@ impl Agent {
         chat: &Chat,
         snapshot: &mut ChatSnapshot,
         loop_id: LoopId,
-    ) -> Result<(Plan, String), String> {
+    ) -> Result<Plan, String> {
         if snapshot.policy.mode != ExecutionMode::Plan {
             return Err(prompts::NOT_IN_PLAN_MODE.into());
         }
@@ -909,10 +1131,10 @@ impl Agent {
             version,
             markdown,
             approved_execution_mode: None,
+            approval_pending: true,
         };
         snapshot.plans.retain(|plan| plan.loop_id != loop_id);
         snapshot.plans.push(plan.clone());
-        let content = prompts::submitted_plan(version, &path, &plan.markdown);
-        Ok((plan, content))
+        Ok(plan)
     }
 }

@@ -18,8 +18,9 @@ pub(crate) use entry::{
     CustomTitleEntry, DelegationEntry, FamilyCompletionsEntry, FamilyInputsEntry,
     FileHistorySnapshotEntry, ForkedFrom, LOOP_CREATED_SUBTYPE, LOOP_ENDED_SUBTYPE,
     LOOP_STATE_SUBTYPE, LOOP_TRIGGER_SUBTYPE, LastPromptEntry, Line, LoopRecord,
-    PartialCompactDirection, SubagentsEntry, SummarizeMetadata as SummarizeMetadataEntry,
-    format_timestamp, now_timestamp, parse_timestamp_ms,
+    PartialCompactDirection, SentAgentMessagesEntry, SubagentsEntry,
+    SummarizeMetadata as SummarizeMetadataEntry, format_timestamp, now_timestamp,
+    parse_timestamp_ms,
 };
 pub(crate) use listing::{LITE_READ_BUF_SIZE, list_project};
 pub(crate) use path::{

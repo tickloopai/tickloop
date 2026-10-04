@@ -119,6 +119,25 @@ impl ArtifactClient {
         let credential = self
             .credential_snapshot()?
             .ok_or(ArtifactError::AccessDenied)?;
+        self.catalog_request_with_credential(method, path, query, body, limit, &credential)
+            .await
+    }
+
+    async fn catalog_request_with_credential<T: for<'de> Deserialize<'de>>(
+        &self,
+        method: Method,
+        path: &str,
+        query: &[(&str, &str)],
+        body: Option<Value>,
+        limit: usize,
+        credential: &super::CredentialSnapshot,
+    ) -> Result<T, ArtifactError> {
+        if !self
+            .credential_snapshot()?
+            .is_some_and(|current| current.identity_matches(credential))
+        {
+            return Err(ArtifactError::AccountChanged);
+        }
         let mut request = self
             .request(method, path)?
             .header(
@@ -193,13 +212,24 @@ impl ArtifactClient {
         Ok(format!("/api/v1/artifacts/{id}"))
     }
     pub async fn read(&self, id: &str) -> Result<ArtifactMetadata, ArtifactError> {
+        let credential = self
+            .credential_snapshot()?
+            .ok_or(ArtifactError::AccessDenied)?;
+        self.read_with_credential(id, &credential).await
+    }
+    pub(crate) async fn read_with_credential(
+        &self,
+        id: &str,
+        credential: &super::CredentialSnapshot,
+    ) -> Result<ArtifactMetadata, ArtifactError> {
         let mut metadata: ArtifactMetadata = self
-            .catalog_request(
+            .catalog_request_with_credential(
                 Method::GET,
                 &self.artifact_path(id)?,
                 &[],
                 None,
                 MAX_RESPONSE_BYTES,
+                credential,
             )
             .await?;
         if metadata.id != id {

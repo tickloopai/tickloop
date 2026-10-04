@@ -142,6 +142,7 @@ pub(super) enum Role {
     Heading,
     /// The dim bar in front of each quoted Markdown line.
     QuoteBar,
+    InProgressTodo,
     CompletedTodo,
 }
 
@@ -187,11 +188,12 @@ impl Role {
         Self::StrongEmphasis,
         Self::Heading,
         Self::QuoteBar,
+        Self::InProgressTodo,
         Self::CompletedTodo,
     ];
 }
 
-const ROLE_COUNT: usize = 41;
+const ROLE_COUNT: usize = 42;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) enum ThemeName {
@@ -307,6 +309,7 @@ const DARK_PALETTE: [Style; ROLE_COUNT] = [
     strong_italic(255, 255, 255), // StrongEmphasis <- chalk.bold.italic
     heading(255, 255, 255), // Heading        <- chalk.bold.italic.underline
     dim(255, 255, 255), // QuoteBar       <- chalk.dim
+    strong(215, 119, 87), // InProgressTodo <- accent + bold
     Style {
         crossed_out: true,
         ..fg(153, 153, 153)
@@ -358,6 +361,7 @@ const LIGHT_PALETTE: [Style; ROLE_COUNT] = [
     strong_italic(0, 0, 0), // StrongEmphasis
     heading(0, 0, 0),  // Heading
     dim(0, 0, 0),      // QuoteBar
+    strong(215, 119, 87), // InProgressTodo
     Style {
         crossed_out: true,
         ..fg(102, 102, 102)

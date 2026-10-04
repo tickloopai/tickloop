@@ -181,6 +181,11 @@ impl LocalAgentClient {
                 ));
             }
             Some(ServerMessage::Error { error, .. }) => return Err(error),
+            None => {
+                return Err(AccessError::unavailable(
+                    "owner disconnected during protocol negotiation",
+                ));
+            }
             _ => {
                 return Err(AccessError::new(
                     AccessErrorCode::VersionMismatch,
@@ -1327,6 +1332,26 @@ mod tests {
         async fn show_view(&self, _: DisplayUpdate) -> Result<DisplayReceipt, AccessError> {
             Err(AccessError::invalid("fixture has no display"))
         }
+    }
+
+    #[tokio::test]
+    async fn a_peer_closing_during_hello_is_unavailable_without_a_version_claim() {
+        let temporary = tempfile::tempdir_in("/tmp").unwrap();
+        let path = temporary.path().join("owner.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            assert!(matches!(
+                read_frame::<_, ClientMessage>(&mut stream).await.unwrap(),
+                Some(ClientMessage::Hello { .. })
+            ));
+        });
+        let error = match LocalAgentClient::connect(&path).await {
+            Ok(_) => panic!("closed peer cannot negotiate a connection"),
+            Err(error) => error,
+        };
+        server.await.unwrap();
+        assert_eq!(error.code, AccessErrorCode::Unavailable);
     }
 
     #[tokio::test]

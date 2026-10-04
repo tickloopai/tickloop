@@ -153,6 +153,52 @@ struct ResponseItem {
     final_item: Option<Value>,
     arguments: String,
     text: BTreeMap<u64, String>,
+    summary_text: BTreeMap<u64, String>,
+}
+
+impl ResponseItem {
+    fn recover_readable_reasoning(
+        &mut self,
+        value: &Value,
+        events: &UnboundedSender<ModelDelta>,
+    ) -> Result<(), ModelError> {
+        if value["type"] != "reasoning" {
+            return Ok(());
+        }
+        for (parts, kind, observed) in [
+            (&value["summary"], "summary_text", &mut self.summary_text),
+            (&value["content"], "reasoning_text", &mut self.text),
+        ] {
+            for (index, part) in parts.as_array().into_iter().flatten().enumerate() {
+                if part["type"] == kind {
+                    Self::recover_reasoning_part(
+                        observed,
+                        index as u64,
+                        required_string(part, "text")?,
+                        events,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn recover_reasoning_part(
+        observed: &mut BTreeMap<u64, String>,
+        index: u64,
+        text: &str,
+        events: &UnboundedSender<ModelDelta>,
+    ) -> Result<(), ModelError> {
+        let streamed = observed.entry(index).or_default();
+        let suffix = text
+            .strip_prefix(streamed.as_str())
+            .ok_or_else(|| invalid_response("completed reasoning differs from its stream"))?;
+        if !suffix.is_empty() {
+            let _ = events.send(ModelDelta::Thinking(suffix.into()));
+        }
+        *streamed = text.into();
+        Ok(())
+    }
 }
 
 impl ResponsesStream {
@@ -247,15 +293,15 @@ impl ResponsesStream {
                 {
                     return Err(invalid_response("duplicate or out-of-order response item"));
                 }
-                self.items.insert(
-                    index,
-                    ResponseItem {
-                        initial: item.clone(),
-                        final_item: None,
-                        arguments: item["arguments"].as_str().unwrap_or_default().into(),
-                        text: BTreeMap::new(),
-                    },
-                );
+                let mut tracked = ResponseItem {
+                    initial: item.clone(),
+                    final_item: None,
+                    arguments: item["arguments"].as_str().unwrap_or_default().into(),
+                    text: BTreeMap::new(),
+                    summary_text: BTreeMap::new(),
+                };
+                tracked.recover_readable_reasoning(item, events)?;
+                self.items.insert(index, tracked);
             }
             "response.output_text.delta" | "response.reasoning_text.delta" => {
                 let item = self.item_mut(&data)?;
@@ -278,9 +324,12 @@ impl ResponsesStream {
                         "reasoning summary targets a non-reasoning item",
                     ));
                 }
-                let _ = events.send(ModelDelta::Thinking(
-                    required_string(&data, "delta")?.into(),
-                ));
+                let index = data["summary_index"]
+                    .as_u64()
+                    .ok_or_else(|| invalid_response("missing summary index"))?;
+                let text = required_string(&data, "delta")?;
+                item.summary_text.entry(index).or_default().push_str(text);
+                let _ = events.send(ModelDelta::Thinking(text.into()));
             }
             "response.reasoning_summary_part.done" => {
                 let item = self.item_mut(&data)?;
@@ -289,6 +338,15 @@ impl ResponsesStream {
                         "reasoning summary targets a non-reasoning item",
                     ));
                 }
+                let index = data["summary_index"]
+                    .as_u64()
+                    .ok_or_else(|| invalid_response("missing summary index"))?;
+                ResponseItem::recover_reasoning_part(
+                    &mut item.summary_text,
+                    index,
+                    required_string(&data["part"], "text")?,
+                    events,
+                )?;
                 let _ = events.send(ModelDelta::Thinking("\n\n".into()));
             }
             "response.function_call_arguments.delta" => {
@@ -323,6 +381,7 @@ impl ResponsesStream {
                 {
                     return Err(invalid_response("duplicate or mismatched completed item"));
                 }
+                item.recover_readable_reasoning(completed, events)?;
                 if completed["type"] == "function_call" {
                     if completed["call_id"] != item.initial["call_id"]
                         || completed["name"] != item.initial["name"]

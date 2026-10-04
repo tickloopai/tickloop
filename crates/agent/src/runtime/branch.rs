@@ -282,6 +282,7 @@ impl Agent {
             delegation: None,
             family_completions: Vec::new(),
             family_inputs: BTreeMap::new(),
+            sent_agent_messages: BTreeMap::new(),
             generated_title: None,
             workdir,
             model: source.snapshot.model.clone(),
@@ -437,15 +438,19 @@ impl Agent {
         for copied in &copied_snapshots {
             self.record_file_history_snapshot(child_chat_id, copied.message_id, copied, false);
         }
-        let next = {
+        let schedule = {
             let mut chats = self.inner.chats.lock().await;
-            match chats.get_mut(&child_chat_id) {
-                Some(child) => {
-                    child.active = None;
-                    self.next_run(child)?
-                }
-                None => None,
+            if let Some(child) = chats.get_mut(&child_chat_id) {
+                child.active = None;
+                true
+            } else {
+                false
             }
+        };
+        let next = if schedule {
+            self.next_run(child_chat_id).await?
+        } else {
+            None
         };
         if let Some(next) = next {
             self.inner.tasks.lock().await.push(self.run_task(next));

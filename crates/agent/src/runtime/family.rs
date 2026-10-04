@@ -1,5 +1,50 @@
 use super::*;
 
+pub(crate) fn summary_state(
+    loops: &[crate::runtime::LoopSnapshot],
+    user_shells: &[crate::runtime::UserShellRecord],
+) -> crate::runtime::LoopState {
+    use crate::runtime::{LoopState, UserShellState};
+    let any_loop = |state: LoopState| loops.iter().any(|goal| goal.state == state);
+    let any_shell = |states: &[UserShellState]| {
+        user_shells
+            .iter()
+            .any(|shell| states.contains(&shell.state))
+    };
+    if let Some(state) = [
+        LoopState::WaitingPermission,
+        LoopState::WaitingQuestion,
+        LoopState::WaitingPlan,
+    ]
+    .into_iter()
+    .find(|state| any_loop(state.clone()))
+    {
+        return state;
+    }
+    if any_loop(LoopState::Running)
+        || any_shell(&[
+            UserShellState::Running,
+            UserShellState::Background,
+            UserShellState::Cancelling,
+        ])
+    {
+        return LoopState::Running;
+    }
+    if any_loop(LoopState::Queued) || any_shell(&[UserShellState::Queued]) {
+        return LoopState::Queued;
+    }
+    if any_loop(LoopState::WaitingTrigger) {
+        return LoopState::WaitingTrigger;
+    }
+    if let Some(goal) = loops.last() {
+        return goal.state.clone();
+    }
+    match user_shells.last().map(|shell| &shell.state) {
+        Some(UserShellState::Failed) => LoopState::Failed,
+        _ => LoopState::Idle,
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum FamilyRole {
@@ -61,8 +106,30 @@ impl Agent {
             .into_iter()
             .map(|(id, registration)| {
                 let chat = chats.get(&id);
-                let goal = chat.and_then(|chat| chat.snapshot.loops.last());
-                let state = goal.map(|goal| goal.state.clone());
+                let state = chat
+                    .map(|chat| summary_state(&chat.snapshot.loops, &chat.snapshot.user_shells));
+                let goal = chat.and_then(|chat| {
+                    chat.snapshot
+                        .loops
+                        .iter()
+                        .rev()
+                        .find(|goal| Some(&goal.state) == state.as_ref())
+                });
+                let shell_started_at = chat.and_then(|chat| {
+                    chat.snapshot.user_shells.iter().rev().find_map(|shell| {
+                        let matches_state = match state.as_ref() {
+                            Some(LoopState::Running) => matches!(
+                                shell.state,
+                                UserShellState::Running
+                                    | UserShellState::Background
+                                    | UserShellState::Cancelling
+                            ),
+                            Some(LoopState::Queued) => shell.state == UserShellState::Queued,
+                            _ => false,
+                        };
+                        matches_state.then_some(shell.state_since).flatten()
+                    })
+                });
                 let availability = match state.as_ref() {
                     None if chat.is_none() => FamilyAvailability::Unloaded,
                     Some(LoopState::Failed) => FamilyAvailability::Failed,
@@ -103,7 +170,9 @@ impl Agent {
                     availability,
                     run_state: state,
                     created_at: registration.map(|registration| registration.created_at),
-                    run_started_at: goal.and_then(|goal| goal.run_started_at),
+                    run_started_at: goal
+                        .and_then(|goal| goal.run_started_at)
+                        .or(shell_started_at),
                     idle_since: goal
                         .filter(|goal| {
                             matches!(
@@ -143,30 +212,7 @@ impl Agent {
         let Some(goal) = snapshot.loops.iter().find(|goal| goal.id == child.loop_id) else {
             return;
         };
-        let result = snapshot
-            .messages
-            .iter()
-            .enumerate()
-            .rev()
-            .find(|(index, message)| {
-                message.role == Role::Assistant
-                    && snapshot.message_runs.get(index) == Some(&child.run_id)
-            })
-            .map(|(_, message)| {
-                message
-                    .content
-                    .iter()
-                    .filter_map(|content| {
-                        if let Content::Text { text } = content {
-                            Some(text.as_str())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-            .unwrap_or_default();
+        let result = snapshot.run_response_text(child.run_id).unwrap_or_default();
         let error = snapshot.events.iter().rev().find_map(|event| {
             if event.run_id == child.run_id
                 && let EventKind::Failed(error) = &event.kind
@@ -318,6 +364,7 @@ impl Agent {
                 &prepared.name,
                 &prepared.input,
                 Some(prepared),
+                None,
             )
             .map_err(AgentError::Invalid)?;
             let decision = if let Some(owner) = owner {
@@ -410,7 +457,7 @@ impl Agent {
                 "target requires explicit human Continue".into(),
             ));
         }
-        let body = body.trim_start().to_owned();
+        let body = body.to_owned();
         let target_generation = self
             .inner
             .chats
@@ -478,26 +525,7 @@ impl Agent {
             .filter(|(_, run)| **run == receipt.run_id || snapshot.events.iter().any(|event| event.run_id == **run && matches!(event.kind, EventKind::InputMerged { into_run_id } if into_run_id == receipt.run_id)))
             .filter_map(|(index, _)| snapshot.message_ids.get(index))
             .filter_map(|id| snapshot.human_family_origins.get(id));
-        let response = snapshot
-            .messages
-            .iter()
-            .enumerate()
-            .rev()
-            .find(|(index, message)| {
-                message.role == Role::Assistant
-                    && snapshot.message_runs.get(index) == Some(&receipt.run_id)
-            })
-            .map(|(_, message)| {
-                message
-                    .content
-                    .iter()
-                    .filter_map(|content| match content {
-                        Content::Text { text } => Some(text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            });
+        let response = snapshot.run_response_text(receipt.run_id);
         let state = snapshot
             .loops
             .iter()
@@ -533,5 +561,44 @@ fn notification_receipt(snapshot: &ChatSnapshot) -> Receipt {
         chat_id: snapshot.id,
         loop_id: goal.map_or(Uuid::nil(), |goal| goal.id),
         run_id: goal.and_then(|goal| goal.run_id).unwrap_or(Uuid::nil()),
+    }
+}
+
+#[cfg(test)]
+mod state_tests {
+    use super::*;
+
+    fn goal(state: LoopState) -> LoopSnapshot {
+        LoopSnapshot {
+            id: Uuid::new_v4(),
+            goal: "State fixture".into(),
+            state,
+            run_id: None,
+            run_started_at: Some(100),
+            trigger: None,
+            state_since: Some(200),
+            event_sources: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn older_actionable_loops_survive_a_newer_completed_loop() {
+        for state in [
+            LoopState::WaitingPermission,
+            LoopState::WaitingQuestion,
+            LoopState::WaitingPlan,
+            LoopState::Running,
+            LoopState::Queued,
+            LoopState::WaitingTrigger,
+        ] {
+            let loops = [goal(state.clone()), goal(LoopState::Completed)];
+            assert_eq!(summary_state(&loops, &[]), state);
+        }
+    }
+
+    #[test]
+    fn input_attention_precedes_other_running_loops() {
+        let loops = [goal(LoopState::WaitingQuestion), goal(LoopState::Running)];
+        assert_eq!(summary_state(&loops, &[]), LoopState::WaitingQuestion);
     }
 }

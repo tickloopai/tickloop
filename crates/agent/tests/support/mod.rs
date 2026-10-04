@@ -2,7 +2,7 @@
 
 pub mod cli_runtime;
 pub mod fixture_cli;
-pub mod tick_alias_contract;
+pub mod tick_admission_contract;
 
 use async_trait::async_trait;
 use std::{collections::VecDeque, sync::Mutex};

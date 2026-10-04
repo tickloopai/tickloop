@@ -12,11 +12,11 @@ use tickloop_agent::{
     permissions::{Decision, ExecutionMode, PermissionRule, PermissionScope},
     runtime::{
         AgentError, AgentHostOptions, BranchOutcome, BranchRequest, ChatSnapshot,
-        DirectoryTrustPolicy, ENTER_PLAN_MODE_TOOL_NAME, EventKind, InputContext, LoopId,
-        PermissionChange, PromptPolicy, QuestionRequest, Receipt, RequestKind, RequestOutcome,
-        ShellTaskNotice, ShellTaskPromptWatchdog, ShellTaskState, ShellTaskSubscriptionEvent,
-        TaskNotification, TaskNotificationStatus, TodoStatus, Trigger, TriggerSource,
-        UserShellRecord, UserShellState,
+        DirectoryTrustPolicy, ENTER_PLAN_MODE_TOOL_NAME, EXIT_PLAN_MODE_TOOL_NAME, EventKind,
+        InputContext, LoopId, PermissionChange, PromptPolicy, QuestionRequest, Receipt,
+        RequestKind, RequestOutcome, ShellTaskNotice, ShellTaskPromptWatchdog, ShellTaskState,
+        ShellTaskSubscriptionEvent, TaskNotification, TaskNotificationStatus, TodoItem, Trigger,
+        TriggerSource, UserShellRecord, UserShellState,
     },
     settings::{LoadedSettings, UserSettings},
 };
@@ -57,6 +57,9 @@ mod login;
 mod loops;
 mod menus;
 #[cfg(test)]
+#[path = "../tests/model_http_support/mod.rs"]
+pub(crate) mod model_http_support;
+#[cfg(test)]
 mod navigation_tests;
 mod new_agent_draft;
 #[cfg(test)]
@@ -66,6 +69,9 @@ mod pasted_image_paths;
 mod permissions_surface;
 mod presentation;
 mod process_registry;
+mod prompt_suggestion;
+#[cfg(test)]
+mod prompt_suggestion_tests;
 mod questions;
 #[cfg(test)]
 mod recovery_tests;
@@ -100,7 +106,7 @@ use execution::{
     ConsoleExecution as Agent, CreateAcknowledgement, CreationAcceptance, DraftCreationError,
     DraftPermissionsError, InputResolution, RuleSave,
 };
-use login::{LoginFlow, LoginUpdate, LogoutFlow};
+use login::{LoginFlow, LoginSession, LoginUpdate, LogoutFlow};
 use menus::{MenuOutcome, Menus};
 use new_agent_draft::ConfigTarget;
 use permissions_surface::{PermissionsEffect, PermissionsReturn, PermissionsSubject};
@@ -110,7 +116,6 @@ use renderer::Renderer;
 use reply_lines::ReplyLines;
 use running_shimmer::RunningShimmer;
 use scrollback::InputEcho;
-use status_area::StatusItem;
 use style::Role;
 
 const DISCONNECTED_CACHED_VIEW_NOTICE: &str = "Disconnected · cached view";
@@ -240,7 +245,11 @@ fn write_next_reply_line(console: &Console, reply: &mut ReplyLines) -> Result<()
     Ok(())
 }
 
-fn write_completion_notice(console: &Console, usage: &Usage) -> Result<(), String> {
+fn write_completion_notice(
+    console: &Console,
+    usage: &Usage,
+    details: Option<&str>,
+) -> Result<(), String> {
     let display = console.display_profile()?;
     let interactive = console.is_interactive();
     console.write_completion_notice(&[
@@ -253,9 +262,41 @@ fn write_completion_notice(console: &Console, usage: &Usage) -> Result<(), Strin
             },
             Some(Role::Success),
         ),
+        (details.unwrap_or_default().into(), Some(Role::MutedText)),
         (usage_text(usage), Some(Role::MutedText)),
         ("\n".into(), None),
     ])
+}
+
+fn completion_details(elapsed: Option<std::time::Duration>, time: &str, shells: usize) -> String {
+    let mut details = elapsed
+        .map(format_activity_elapsed)
+        .into_iter()
+        .collect::<Vec<_>>();
+    if !time.is_empty() {
+        details.push(format!("done {time}"));
+    }
+    if shells > 0 {
+        details.push(format!(
+            "{shells} {} still running",
+            if shells == 1 { "shell" } else { "shells" }
+        ));
+    }
+    if details.is_empty() {
+        return String::new();
+    }
+    format!(" · {}", details.join(" · "))
+}
+
+fn local_completion_time() -> String {
+    let timestamp = unsafe { libc::time(std::ptr::null_mut()) };
+    let mut local = std::mem::MaybeUninit::<libc::tm>::uninit();
+    // localtime_r initializes the output only when its return pointer is non-null.
+    if unsafe { libc::localtime_r(&timestamp, local.as_mut_ptr()) }.is_null() {
+        return String::new();
+    }
+    let local = unsafe { local.assume_init() };
+    format!("{:02}:{:02}", local.tm_hour, local.tm_min)
 }
 
 fn ends_thinking(kind: &EventKind) -> bool {
@@ -621,6 +662,8 @@ Fullscreen draws on the alternate screen; start with TICKLOOP_AGENT_TUI=inline w
 Fullscreen reads the wheel to scroll the conversation; TICKLOOP_AGENT_DISABLE_MOUSE=1 hands the wheel back to the terminal and restores click-and-drag selection.
 /diff opens current working-tree changes and Agent file changes saved in this process without calling the model.
 Typing / or a command prefix shows completion; Tab fills the first match.
+After a completed turn, a dim prompt suggestion may appear in empty input; /settings turns generation off.
+Tab or Right accepts the suggestion for editing; empty Enter accepts and submits; Esc dismisses after candidates or dialogs.
 ↑/↓ or Ctrl+N/P selects a completion; Enter fills a selected match or sends the draft.
 Typing @ and part of a local path offers files and directories; only an accepted candidate is attached.
 Focused lists also accept j/k and Ctrl+N/P; Enter confirms; Esc cancels or denies.
@@ -831,6 +874,9 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
         .as_ref()
         .map(LoadedSettings::tick_list_preference)
         .unwrap_or_default();
+    if let Some(settings) = saved_settings.as_mut() {
+        settings.prompt_suggestion_enabled();
+    }
     let startup_settings_warnings = saved_settings
         .map(LoadedSettings::into_warnings)
         .unwrap_or_default();
@@ -1032,7 +1078,7 @@ fn initialize_startup_console(
     console.update_status_area(
         execution_mode.to_string(),
         safe_text(&config.model),
-        None,
+        initial_context_usage(config),
         Vec::new(),
     )?;
     write_banner(console, config, workdir)?;
@@ -1115,6 +1161,100 @@ fn startup_banner_spans(
     ]
 }
 
+async fn open_current_plan(
+    agent: &Agent,
+    console: &Console,
+    menus: &mut Menus,
+    chat: Option<uuid::Uuid>,
+    goal: Option<uuid::Uuid>,
+) -> Result<(), String> {
+    if let Some(chat) = chat {
+        let snapshot = agent
+            .snapshot(chat)
+            .await
+            .map_err(|error| error.to_string())?;
+        if let Some(plan) = snapshot
+            .plans
+            .iter()
+            .find(|plan| Some(plan.loop_id) == goal)
+        {
+            if console.is_interactive() || plan.approval_pending {
+                return menus.workflow(console, Workflow::plan(agent, chat, plan.loop_id).await?);
+            }
+            outln!(
+                console,
+                "Plan: {} · version {} · approved mode {:?}\n{}",
+                plan.loop_id,
+                plan.version,
+                plan.approved_execution_mode,
+                safe_text(&plan.markdown)
+            );
+            return Ok(());
+        }
+        if snapshot.delegation.is_some() {
+            return Err(completion::command_refusal(
+                completion::CommandScope::Child,
+                "/plan",
+                "only an existing plan can be reopened; entering Plan mode requires the Agent's consent request",
+            ));
+        }
+        agent
+            .set_execution_mode(chat, ExecutionMode::Plan)
+            .await
+            .map_err(|error| error.to_string())?;
+    } else {
+        agent
+            .change_configuration(
+                ConfigTarget::NewDraft,
+                ConfigurationChange::ExecutionMode {
+                    mode: ExecutionMode::Plan,
+                },
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    outln!(console, "Plan mode is active. Enter a task to make a plan.");
+    Ok(())
+}
+
+fn close_login_session(
+    session: LoginSession,
+    console: &Console,
+    menus: &mut Menus,
+    cancelled: bool,
+) -> Result<(), String> {
+    let chat = session.flow.chat();
+    let completed = session.flow.completed();
+    session.flow.close(console)?;
+    if session.from_provider {
+        menus.note_provider_login_result(chat, session.succeeded);
+    }
+    if cancelled && !completed {
+        console.write("Login cancelled.\n")?;
+    }
+    Ok(())
+}
+
+async fn finish_provider_login(
+    agent: &Agent,
+    console: &Console,
+    session: &mut LoginSession,
+    result: &Result<String, String>,
+) -> Result<(), String> {
+    session.succeeded = result.is_ok();
+    let mut notice = result.clone();
+    if let Ok(account) = result
+        && let Some(chat) = session.flow.chat()
+        && let Err(error) = agent.refresh_configuration(chat).await
+    {
+        notice = Ok(format!(
+            "{account} · Cannot refresh Agent configuration: {}",
+            safe_text(&error.to_string())
+        ));
+    }
+    login::complete_provider_login(&mut session.flow, console, &notice)
+}
+
 async fn interact(
     agent: &Agent,
     workdir: PathBuf,
@@ -1124,6 +1264,11 @@ async fn interact(
     config_root: Option<PathBuf>,
 ) -> Result<(), String> {
     let user_settings = startup.user_settings;
+    console.set_prompt_suggestion_enabled(
+        user_settings
+            .as_ref()
+            .is_none_or(|settings| settings.load().prompt_suggestion_enabled()),
+    )?;
     agent.use_user_settings(user_settings.clone());
     let mut events = agent.subscribe();
     let mut user_shell_events = agent.subscribe_user_shells();
@@ -1131,12 +1276,17 @@ async fn interact(
     let interactive = console.is_interactive();
     let mut menus = Menus::new(user_settings.clone(), config_root.clone());
     let mut artifact_loads = tokio::task::JoinSet::new();
+    let mut suggestions: tokio::task::JoinSet<(
+        prompt_suggestion::SuggestionRequest,
+        prompt_suggestion::SuggestionResult,
+    )> = tokio::task::JoinSet::new();
+    let mut suggestible_runs = HashSet::new();
+    let mut suggestion_diagnostics: HashMap<uuid::Uuid, (uuid::Uuid, &'static str)> =
+        HashMap::new();
     let mut artifact_refresh = tokio::time::interval(std::time::Duration::from_millis(50));
     artifact_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut login: Option<LoginFlow> = None;
-    let mut login_from_provider = false;
-    let mut provider_login_chat = None;
-    let mut provider_login_succeeded = false;
+    let mut logins: HashMap<uuid::Uuid, LoginSession> = HashMap::new();
+    let mut provider_logout_chat = None;
     let mut reauthenticate_after_logout = false;
     let mut logout_target = login::SignInTarget::Codex;
     let mut logout: Option<LogoutFlow> = None;
@@ -1251,6 +1401,7 @@ async fn interact(
             apply_task_surface_effect(&task_center, console, chat, effect).await?;
         }
         observed_run_starts.retain(|run, _| pending.contains_key(run));
+        suggestible_runs.retain(|run| pending.contains_key(run));
         if let Some(chat) = selected_chat {
             selected_loops.insert(chat, goal);
         }
@@ -1292,23 +1443,26 @@ async fn interact(
             registration.update_chat(selected_chat);
         }
         menus.sync_dialog_chat(console)?;
-        if login.is_none() && logout.is_none() && login_from_provider {
-            login_from_provider = false;
-            menus.note_provider_login_result(provider_login_chat, provider_login_succeeded);
+        if logout.is_none()
+            && let Some(chat) = provider_logout_chat.take()
+        {
+            menus.note_provider_login_result(chat, false);
         }
-        if login.is_none()
-            && logout.is_none()
+        if logout.is_none()
             && let Some(succeeded) = menus.take_provider_login_result(console)?
         {
-            if let Some(chat) = selected_chat {
-                agent
-                    .refresh_configuration(chat)
-                    .await
-                    .map_err(|error| error.to_string())?;
+            if let Some(chat) = selected_chat
+                && let Err(error) = agent.refresh_configuration(chat).await
+            {
+                outln!(
+                    console,
+                    "Cannot refresh Agent configuration: {}",
+                    safe_text(&error.to_string())
+                );
             }
-            menus
-                .resume_provider_login(agent, console, succeeded)
-                .await?;
+            if let Err(error) = menus.resume_provider_login(agent, console, succeeded).await {
+                outln!(console, "Cannot return to Provider: {}", safe_text(&error));
+            }
         }
         if let Some(outcome) = menu_outcome.take() {
             if history_return_overview {
@@ -1338,9 +1492,7 @@ async fn interact(
             }
             if outcome.provider_logout {
                 menus.invalidate_model_discovery();
-                login_from_provider = true;
-                provider_login_chat = selected_chat;
-                provider_login_succeeded = false;
+                provider_logout_chat = Some(selected_chat);
                 if let Some(root) = menus.provider_login_root() {
                     reauthenticate_after_logout = outcome.reauthenticate_after_logout;
                     logout_target = outcome.logout_target;
@@ -1353,12 +1505,18 @@ async fn interact(
                 }
             }
             if let Some(method) = outcome.provider_login {
-                login_from_provider = true;
-                provider_login_chat = selected_chat;
-                provider_login_succeeded = false;
                 if let Some(root) = menus.provider_login_root() {
                     match LoginFlow::start(root, console, method) {
-                        Ok(flow) => login = Some(flow),
+                        Ok(flow) => {
+                            logins.insert(
+                                flow.id(),
+                                LoginSession {
+                                    flow,
+                                    from_provider: true,
+                                    succeeded: false,
+                                },
+                            );
+                        }
                         Err(error) => outln!(console, "Cannot log in: {}", safe_text(&error)),
                     }
                 } else {
@@ -1488,7 +1646,7 @@ async fn interact(
                     snapshot.policy.mode.to_string(),
                     safe_text(&snapshot.model.model),
                     context_usage(&snapshot),
-                    todo_status_items(&snapshot, goal),
+                    current_loop_todos(&snapshot, goal),
                 )?;
                 let running_receipt = pending
                     .values()
@@ -1666,7 +1824,7 @@ async fn interact(
                     console.update_status_area(
                         draft.execution_mode.to_string(),
                         safe_text(&draft.model.model),
-                        None,
+                        initial_context_usage(&draft.model),
                         Vec::new(),
                     )?;
                 }
@@ -1719,7 +1877,7 @@ async fn interact(
             && directed_summaries.is_empty()
             && deferred_events.is_empty()
             && !reply_lines.values().any(ReplyLines::has_complete_line)
-            && login.is_none()
+            && logins.is_empty()
             && logout.is_none()
             && paused_inputs.is_empty()
             && menu_commands.is_empty()
@@ -1762,7 +1920,11 @@ async fn interact(
             }
         }
         let discovery_active = menus.discovery_active();
-        let login_active = login.is_some();
+        let active_login = login::active_login_id(&logins, console)?;
+        let login_active = active_login.is_some();
+        let login_updates_pending = logins
+            .values()
+            .any(|session| session.flow.updates_pending());
         let logout_active = logout.is_some();
         #[cfg(test)]
         let global_refresh_enabled = agent.recovery_refresh_enabled();
@@ -1773,35 +1935,71 @@ async fn interact(
             result = artifact_loads.join_next(), if !artifact_loads.is_empty() => {
                 if let Some(Ok((request, result))) = result { console.artifact_page_loaded(&request, result)?; }
             },
+            result = suggestions.join_next(), if !suggestions.is_empty() => {
+                if let Some(Ok((request, mut result))) = result {
+                    let suppression = if selected_chat != Some(request.chat) || overview_active {
+                        Some("discarded: Agent View changed")
+                    } else {
+                        match agent.snapshot(request.chat).await {
+                            Ok(snapshot) => prompt_suggestion::suppression(&snapshot)
+                                .or(console.prompt_suggestion_suppression()?),
+                            Err(_) => Some("discarded: Agent unavailable"),
+                        }
+                    };
+                    if result.text.is_some() && let Some(reason) = suppression {
+                        result.text = None;
+                        result.diagnostic = reason;
+                    } else if request.cancel.is_cancelled() && result.text.is_some() {
+                        result.text = None;
+                        result.diagnostic = "cancelled";
+                    }
+                    if let Some((id, diagnostic)) = suggestion_diagnostics.get_mut(&request.chat)
+                        && *id == request.id {
+                        *diagnostic = result.diagnostic;
+                    }
+                    console.finish_prompt_suggestion(&request, result.text)?;
+                }
+            },
             result = menus.next_discovery(), if discovery_active => {
                 menus.finish_discovery(agent, console, result).await?;
                 status_dirty = true;
             },
-            update = async { login.as_mut().unwrap().next().await }, if login_active => {
+            (login_id, update) = login::next_login_update(&mut logins), if login_updates_pending => {
                 match update {
-                    Some(LoginUpdate::Device { address, code }) => login.as_ref().unwrap().show_device(console, &address, &code)?,
-                    Some(LoginUpdate::Browser { address, callback }) => login.as_mut().unwrap().show_browser(console, address, callback)?,
+                    Some(LoginUpdate::Device { address, code }) => logins[&login_id].flow.show_device(console, &address, &code)?,
+                    Some(LoginUpdate::Browser { address, callback }) => logins.get_mut(&login_id).unwrap().flow.show_browser(console, address, callback)?,
                     Some(LoginUpdate::Finished(result)) => {
-                        let flow = login.take().unwrap();
-                        let provider_label = flow.label();
-                        let login_chat = flow.chat();
-                        flow.close(console)?;
+                        let session = logins.get_mut(&login_id).unwrap();
+                        let provider_label = session.flow.label();
+                        let login_chat = session.flow.chat();
+                        let from_provider = session.from_provider;
+                        session.succeeded = result.is_ok();
+                        if interactive && from_provider {
+                            finish_provider_login(agent, console, session, &result).await?;
+                        } else {
+                            close_login_session(logins.remove(&login_id).unwrap(), console, &mut menus, false)?;
+                        }
                         match result {
                             Ok(account) => {
-                                if provider_label == "Artifact Service" {
-                                    if let Some(root) = config_root.as_deref()
-                                        && let Err(error) = artifact_ui::open(agent, console, root, login_chat, interactive).await {
-                                        outln!(console, "Cannot open artifacts: {} · use /artifacts to retry", safe_text(&error));
-                                    }
-                                } else { provider_login_succeeded = true; }
-                                outln!(console, "{} login saved · {}", provider_label, safe_text(&account));
+                                if provider_label == "Artifact Service"
+                                    && let Some(root) = config_root.as_deref()
+                                    && let Err(error) = artifact_ui::open(agent, console, root, login_chat, interactive).await {
+                                    outln!(console, "Cannot open artifacts: {} · use /artifacts to retry", safe_text(&error));
+                                }
+                                if !interactive || !from_provider { outln!(console, "{} login saved · {}", provider_label, safe_text(&account)); }
                             }
-                            Err(error) => outln!(console, "Cannot log in: {}", safe_text(&error)),
+                            Err(error) if !interactive || !from_provider => outln!(console, "Cannot log in: {}", safe_text(&error)),
+                            Err(_) => {},
                         }
                     }
                     None => {
-                        login.take().unwrap().close(console)?;
-                        outln!(console, "Sign-in ended before completion; use /provider to retry.");
+                        let session = logins.get_mut(&login_id).unwrap();
+                        if interactive && session.from_provider {
+                            login::complete_provider_login(&mut session.flow, console, &Err("Sign-in ended before completion; return to Provider to retry.".into()))?;
+                        } else {
+                            close_login_session(logins.remove(&login_id).unwrap(), console, &mut menus, false)?;
+                            outln!(console, "Sign-in ended before completion; use /provider to retry.");
+                        }
                     }
                 }
                 status_dirty = true;
@@ -1813,7 +2011,10 @@ async fn interact(
                         outln!(console, "{} login removed locally.", logout_target.label());
                         if reauthenticate_after_logout && let Some(root) = config_root.clone() {
                             match LoginFlow::start(root, console, logout_target.login_method()) {
-                                Ok(flow) => login = Some(flow),
+                                Ok(flow) => {
+                                    logins.insert(flow.id(), LoginSession { flow, from_provider: true, succeeded: false });
+                                    provider_logout_chat = None;
+                                },
                                 Err(error) => outln!(console, "Cannot log in: {}", safe_text(&error)),
                             }
                         }
@@ -1935,11 +2136,10 @@ async fn interact(
                     | InputEvent::OpenTranscript { .. } | InputEvent::ExpandChoice { .. }
                     | InputEvent::BackgroundForegroundShell | InputEvent::TaskSurface(_)
                     | InputEvent::Subscription(_) | InputEvent::Permissions(_)
-                    | InputEvent::UserShellSubmitted(_) | InputEvent::CycleExecutionMode) if login.is_some() => {},
+                    | InputEvent::UserShellSubmitted(_) | InputEvent::CycleExecutionMode) if login_active => {},
                 Some(InputEvent::Escape) => {
-                    if let Some(flow) = login.take() {
-                        flow.close(console)?;
-                        outln!(console, "Login cancelled.");
+                    if let Some(id) = active_login {
+                        close_login_session(logins.remove(&id).unwrap(), console, &mut menus, true)?;
                         status_dirty = true;
                         continue;
                     }
@@ -1953,6 +2153,12 @@ async fn interact(
                 },
                 Some(InputEvent::Interrupt) if logout_active => {
                     logout.as_ref().unwrap().cancel();
+                    console.set_status("Cancelling logout…")?;
+                    status_dirty = true;
+                },
+                Some(event @ InputEvent::Cancel { menu_id }) if logout_active && menus.provider_logout_menu_is_active(menu_id) => {
+                    logout.as_ref().unwrap().cancel();
+                    paused_inputs.push_back(event);
                     console.set_status("Cancelling logout…")?;
                     status_dirty = true;
                 },
@@ -1991,9 +2197,8 @@ async fn interact(
                     open_rewind(agent,console,&mut menus,selected_chat,is_busy).await?;
                 },
                 Some(InputEvent::Interrupt) => {
-                    if let Some(flow) = login.take() {
-                        flow.close(console)?;
-                        outln!(console, "Login cancelled.");
+                    if let Some(id) = active_login {
+                        close_login_session(logins.remove(&id).unwrap(), console, &mut menus, true)?;
                         status_dirty = true;
                         continue;
                     }
@@ -2076,7 +2281,7 @@ async fn interact(
                     transcript_dirty=false;
                 },
                 Some(InputEvent::PickerAction { menu_id, index, action }) => {
-                    if login.is_none() && logout.is_none() {
+                    if !login_active && logout.is_none() {
                         match menus.picker_action(agent, console, menu_id, index, action).await {
                             Ok(outcome) => menu_outcome = Some(outcome),
                             Err(error) => outln!(console, "Cannot apply selection: {}", safe_text(&error)),
@@ -2085,14 +2290,13 @@ async fn interact(
                     }
                 },
                 Some(InputEvent::Choice {menu_id,index,comment}) => {
-                    if login.as_ref().is_some_and(|flow| flow.id() == menu_id) {
-                        if index == 0 && login.as_ref().unwrap().is_browser() {
-                            login.as_ref().unwrap().submit_callback(console, comment.as_deref())?;
-                            console.finish_menu_submission(menu_id)?;
+                    if let Some(session) = logins.get(&menu_id) {
+                        if index == 0 && session.flow.is_browser() && !session.flow.completed() {
+                            session.flow.submit_callback(console, comment.as_deref())?;
+                            console.continue_menu_submission(menu_id)?;
                             continue;
                         }
-                        login.take().unwrap().close(console)?;
-                        outln!(console, "Login cancelled.");
+                        close_login_session(logins.remove(&menu_id).unwrap(), console, &mut menus, true)?;
                         status_dirty = true;
                         continue;
                     }
@@ -2115,9 +2319,8 @@ async fn interact(
                     }
                 },
                 Some(InputEvent::Cancel {menu_id}) => {
-                    if login.as_ref().is_some_and(|flow| flow.id() == menu_id) {
-                        login.take().unwrap().close(console)?;
-                        outln!(console, "Login cancelled.");
+                    if let Some(session) = logins.remove(&menu_id) {
+                        close_login_session(session, console, &mut menus, true)?;
                         status_dirty = true;
                         continue;
                     }
@@ -2302,6 +2505,7 @@ async fn interact(
                     status_dirty=true;
                 },
                 Some(input @ (InputEvent::Line(_) | InputEvent::Prompt { .. })) => {
+                    console.clear_prompt_suggestion()?;
                     let retry_of = console.take_submitted_retry()?;
                     let (line, file_references, pasted_images, restored_contexts, is_user_prompt, family_target) = match input {
                         InputEvent::Line(line) => (line, Vec::new(), Vec::new(), Vec::new(), false, None),
@@ -2315,13 +2519,12 @@ async fn interact(
                         }
                         _ => unreachable!(),
                     };
-                    if login.is_some() {
+                    if let Some(id) = active_login {
                         if matches!(line.trim(), "cancel" | "/cancel" | "/exit") {
-                            login.take().unwrap().close(console)?;
-                            outln!(console, "Login cancelled.");
+                            close_login_session(logins.remove(&id).unwrap(), console, &mut menus, true)?;
                             if line.trim() == "/exit" { return Ok(()); }
-                        } else if login.as_ref().unwrap().is_browser() {
-                            login.as_ref().unwrap().submit_callback(console, Some(&line))?;
+                        } else if logins[&id].flow.is_browser() && !logins[&id].flow.completed() {
+                            logins[&id].flow.submit_callback(console, Some(&line))?;
                         } else {
                             outln!(console, "Login is waiting. Complete the official authorization or enter cancel.");
                         }
@@ -2416,7 +2619,7 @@ async fn interact(
                         }
                         match global.dispatch(agent.launch_spec(),input,agent.origin()).await {
                             Ok(receipt)=>match agent.accept_created(receipt).await {
-                                CreationAcceptance::Attached(submitted)=>{if let Some(receipt)=submitted {pending.insert(receipt.run_id,receipt);}},
+                                CreationAcceptance::Attached(submitted)=>{if let Some(receipt)=submitted {suggestible_runs.insert(receipt.run_id);pending.insert(receipt.run_id,receipt);}},
                                 CreationAcceptance::AttachUnavailable(error)=>console.set_status(&creation_attach_unavailable(&error))?,
                                 CreationAcceptance::Rejected(error)=>console.restore_rejected_prompt(restored_contexts,&format!("New Agent was not accepted: {error}"))?,
                             },
@@ -2520,7 +2723,7 @@ async fn interact(
                             match tickloop_agent::artifacts::ArtifactClient::new(root).map_err(|error| error.to_string()) {
                                 Ok(client) => match client.status().await {
                                     Ok(Some(_)) => { if let Err(error) = artifact_ui::open(agent, console, root, selected_chat, interactive).await { outln!(console, "Cannot open Artifacts: {}", safe_text(&error)); } }
-                                    Ok(None) => match LoginFlow::start(root.clone(), console, login::LoginMethod::Artifact) { Ok(flow) => login = Some(flow), Err(error) => outln!(console, "Cannot start Artifact Service login: {}", safe_text(&error)) },
+                                    Ok(None) => match LoginFlow::start(root.clone(), console, login::LoginMethod::Artifact) { Ok(flow) => { logins.insert(flow.id(), LoginSession { flow, from_provider: false, succeeded: false }); }, Err(error) => outln!(console, "Cannot start Artifact Service login: {}", safe_text(&error)) },
                                     Err(error) => outln!(console, "Cannot check Artifact Service account: {}", safe_text(&error.to_string())),
                                 },
                                 Err(error) => outln!(console, "Cannot configure Artifact Service: {}", safe_text(&error)),
@@ -2569,6 +2772,12 @@ async fn interact(
                             if let Some(chat)=selected_chat {
                                 let snapshot=agent.snapshot(chat).await.map_err(|error|error.to_string())?;
                                 outln!(console,"Chat {} · {} · {:?} · {} · {} queued",chat,safe_text(&snapshot.model.model),snapshot.model.protocol,snapshot.policy.mode,snapshot.queued_inputs().len());
+                                if console.prompt_suggestion_enabled()? {
+                                    let diagnostic = prompt_suggestion::suppression(&snapshot)
+                                        .map(str::to_owned)
+                                        .unwrap_or_else(|| format!("last: {}", suggestion_diagnostics.get(&chat).map_or("not generated in this View", |(_, reason)| *reason)));
+                                    outln!(console, "Prompt suggestions: On · {diagnostic}");
+                                } else { outln!(console, "Prompt suggestions: Off"); }
                             } else {outln!(console,"No Chat is selected.");}
                         },
                         "/resume" => match Workflow::chats(agent,&workdir,selected_chat,false).await {
@@ -2597,26 +2806,9 @@ async fn interact(
                             else if show && let Some(chat) = selected_chat { artifact_ui::refresh(agent, console, config_root.as_deref(), chat).await?; }
                         },
                         "/plan" => {
-                            let Some(chat)=selected_chat else {
-                                agent.change_configuration(ConfigTarget::NewDraft,ConfigurationChange::ExecutionMode {mode:ExecutionMode::Plan}).await.map_err(|error|error.to_string())?;
-                                outln!(console,"Plan mode is active. Enter a task to make a plan.");
-                                status_dirty=true;
-                                continue;
-                            };
-                            agent.set_execution_mode(chat,ExecutionMode::Plan).await.map_err(|error|error.to_string())?;
-                            if let Some(selected_goal)=goal {
-                                let snapshot=agent.snapshot(chat).await.map_err(|error|error.to_string())?;
-                                if let Some(plan)=snapshot.plans.iter().find(|plan| plan.loop_id==selected_goal) {
-                                    if interactive {
-                                    match Workflow::plan(agent,chat,selected_goal).await {
-                                        Ok(workflow)=>menus.workflow(console,workflow)?,
-                                        Err(error)=>outln!(console,"Cannot open plan: {}",safe_text(&error)),
-                                    }
-                                    } else {
-                                        outln!(console,"Plan: {} · version {} · approved mode {:?}\n{}",plan.loop_id,plan.version,plan.approved_execution_mode,safe_text(&plan.markdown));
-                                    }
-                                } else {outln!(console,"Plan mode is active. Enter a task to make a plan.");}
-                            } else {outln!(console,"Plan mode is active. Enter a task to make a plan.");}
+                            if let Err(error) = open_current_plan(agent,console,&mut menus,selected_chat,goal).await {
+                                outln!(console,"Cannot open plan: {}",safe_text(&error));
+                            }
                         },
                         "/details" if interactive => {
                             let id = console.start_transcript()?;
@@ -2904,25 +3096,8 @@ async fn interact(
                                 let snapshot = agent.snapshot(chat).await.map_err(|error|error.to_string())?;
                                 let selected_goal = if let Some(value)=line.strip_prefix("/plan ") {value.trim().parse().ok()} else {goal};
                                 if let Some(plan)=snapshot.plans.iter().find(|plan|Some(plan.loop_id)==selected_goal) {
-                                    outln!(console, "Plan: {} · version {} · approved mode {:?}\n{}",plan.loop_id,plan.version,plan.approved_execution_mode,safe_text(&plan.markdown));
+                                    if interactive || plan.approval_pending { menus.workflow(console, Workflow::plan(agent,chat,plan.loop_id).await?)?; } else { outln!(console, "Plan: {} · version {} · approved mode {:?}\n{}",plan.loop_id,plan.version,plan.approved_execution_mode,safe_text(&plan.markdown)); }
                                 } else {outln!(console, "The selected goal has no saved plan.");}
-                            } else { outln!(console, "No Chat is selected."); }
-                        },
-                        _ if line.starts_with("/approve-plan ") => {
-                            if let Some(chat) = selected_chat {
-                                let result = async {
-                                    let fields=line.split_whitespace().collect::<Vec<_>>();
-                                    if fields.len()!=4 {return Err("use /approve-plan GOAL VERSION MODE".to_string());}
-                                    let selected_goal=fields[1].parse().map_err(|_|"goal ID must be a UUID")?;
-                                    let version=fields[2].parse().map_err(|_|"plan version must be a number")?;
-                                    let mode=serde_json::from_value::<ExecutionMode>(serde_json::Value::String(fields[3].into())).map_err(|_|"invalid execution mode")?;
-                                    agent.approve_plan(chat,selected_goal,version,mode).await.map_err(|error|error.to_string())?;
-                                    Ok::<_,String>((selected_goal,version,mode))
-                                }.await;
-                                match result {
-                                    Ok((selected_goal,version,mode))=>{goal=Some(selected_goal);outln!(console, "Plan version {version} approved for goal {selected_goal} with mode {mode}. Enter a message to begin implementation.");},
-                                    Err(error)=>outln!(console, "Cannot approve plan: {}",safe_text(&error)),
-                                }
                             } else { outln!(console, "No Chat is selected."); }
                         },
                         "/interrupt" => {
@@ -3049,6 +3224,7 @@ async fn interact(
                                 InputSend::Accepted { value: receipt, adopted } => {
                                     echo=track_accepted_echo(console,agent,&receipt,echo).await?;
                                     merged_echoes.accepted(receipt.run_id,echo);
+                                    suggestible_runs.insert(receipt.run_id);
                                     goal = Some(receipt.loop_id);
                                     if !interactive {outln!(console, "Accepted: Goal {} · Run {}", receipt.loop_id, receipt.run_id);}
                                     track_accepted_input(console,agent,receipt,adopted,&mut pending,&mut permissions,&mut questions).await?;
@@ -3103,6 +3279,7 @@ async fn interact(
                             );
                             match send_input(agent,chat_id,retry_of,submission,submitted_receipt).await {
                                 InputSend::Accepted { value: receipt, adopted } => {
+                                    suggestible_runs.insert(receipt.run_id);
                                     echo=track_accepted_echo(console,agent,&receipt,echo).await?;
                                     merged_echoes.accepted(receipt.run_id,echo);
                                     goal = Some(receipt.loop_id);
@@ -3157,6 +3334,9 @@ async fn interact(
                     events.recv().await
                 }
             } => {
+                if matches!(&event, Ok(event) if Some(event.chat_id) == selected_chat && matches!(event.kind, EventKind::Started | EventKind::InputMerged { .. } | EventKind::ConversationRewound { .. })) {
+                    console.clear_prompt_suggestion()?;
+                }
                 let event = if visual_pacing_pending {
                     match event {
                         Ok(queued_event) if !overview_active && Some(queued_event.chat_id) == selected_chat => {
@@ -3360,9 +3540,35 @@ async fn interact(
                         EventKind::Completed {usage} => {
                             #[cfg(test)]
                             agent.record_recovery_fact(recovery_tests::RecoveryFact::Completed {chat:event.chat_id,run:event.run_id,sequence:event.sequence});
-                            write_completion_notice(console, &usage)?;
+                            let details = if interactive {
+                                let shells = task_center.snapshot(event.chat_id).await.ok().map(|snapshot| snapshot.tasks.into_iter().filter(|task| matches!(task.state, ShellTaskState::Running | ShellTaskState::Background | ShellTaskState::Cancelling)).count()).unwrap_or_default();
+                                Some(completion_details(observed_run_starts.get(&event.run_id).map(std::time::Instant::elapsed), &local_completion_time(), shells))
+                            } else { None };
+                            write_completion_notice(console, &usage, details.as_deref())?;
+                            if suggestible_runs.remove(&event.run_id) && interactive {
+                                if let Ok(snapshot) = agent.snapshot(event.chat_id).await {
+                                    if let Some(reason) = prompt_suggestion::suppression(&snapshot) {
+                                        suggestion_diagnostics.insert(event.chat_id, (event.run_id, reason));
+                                    } else if let Some(request) = console.begin_prompt_suggestion(event.chat_id)? {
+                                        suggestion_diagnostics.insert(event.chat_id, (request.id, "generating"));
+                                        let root = config_root.clone();
+                                        suggestions.spawn(async move {
+                                            let result = prompt_suggestion::generate(&request, &snapshot, root).await;
+                                            (request, result)
+                                        });
+                                    } else {
+                                        let reason = console.prompt_suggestion_suppression()?.unwrap_or("suppressed: Agent View changed");
+                                        suggestion_diagnostics.insert(event.chat_id, (event.run_id, reason));
+                                    }
+                                } else {
+                                    suggestion_diagnostics.insert(event.chat_id, (event.run_id, "suppressed: Agent unavailable"));
+                                }
+                            }
                         },
                         EventKind::Failed(error) => {
+                            if suggestible_runs.remove(&event.run_id) {
+                                suggestion_diagnostics.insert(event.chat_id, (event.run_id, "suppressed: failed turn"));
+                            }
                             let message = if interactive {
                                 format!(
                                     "{} Failed: {}",
@@ -3390,6 +3596,9 @@ async fn interact(
                             }
                         },
                         EventKind::Interrupted => {
+                            if suggestible_runs.remove(&event.run_id) {
+                                suggestion_diagnostics.insert(event.chat_id, (event.run_id, "suppressed: interrupted turn"));
+                            }
                             let snapshot=agent.snapshot(event.chat_id).await.map_err(|error|error.to_string())?;
                             let stopped=snapshot.loops.iter().any(|goal|goal.id==event.loop_id&&goal.state==tickloop_agent::runtime::LoopState::Stopped);
                             if interactive && !stopped {
@@ -3416,7 +3625,8 @@ async fn interact(
                             }
                         },
                         EventKind::PermissionRequested {request} => {
-                            if interactive {outln!(console,"\nWaiting for your confirmation to continue.");}
+                            if request.name == EXIT_PLAN_MODE_TOOL_NAME && !interactive {menus.workflow(console,Workflow::plan(agent,event.chat_id,request.loop_id).await?)?;}
+                            else if interactive {outln!(console,"\nWaiting for your confirmation to continue.");}
                             else if request.name==ENTER_PLAN_MODE_TOOL_NAME {outln!(console, "\nEnter plan mode? Request: {}\nThe Agent wants to enter plan mode to explore and design an implementation approach.\nUse /allow {} to enter plan mode or /deny {} to stay in the current mode.", request.id, request.id, request.id);}
                             else {outln!(console, "\nPermission request: {} · {}\nOperation: {}\nUse /allow {} [once|session|persistent] or /deny {}.", request.id, safe_text(&request.name), safe_text(&request.input.to_string()), request.id, request.id);}
 
@@ -3437,11 +3647,7 @@ async fn interact(
                         EventKind::QuestionAsked {request} => print_question(console, &request)?,
                         EventKind::PlanUpdated {plan} => {
                             outln!(console, "\nPlan: {} · version {}\n{}",plan.loop_id,plan.version,safe_text(&plan.markdown));
-                            let snapshot=agent.snapshot(event.chat_id).await.map_err(|error|error.to_string())?;
-                            if snapshot.policy.mode==ExecutionMode::Plan {
-                                if interactive {outln!(console,"Use /plan to review and choose how to start, or enter revisions.");}
-                                else {outln!(console, "Review or request revisions. To approve: /approve-plan {} {} MODE",plan.loop_id,plan.version);}
-                            }
+
                         },
                         EventKind::ProgressUpdated {progress} => {
                             if !interactive {
@@ -3593,7 +3799,7 @@ async fn interact(
                         failed=true;
                     },
                 }
-                if directed_summaries.is_empty() && summary_recovery_required.is_empty() && login.is_none() {
+                if directed_summaries.is_empty() && summary_recovery_required.is_empty() {
                     console.set_prompt_enabled(true)?;
                 }
             },
@@ -4390,7 +4596,7 @@ fn render_restored_observation(
                     }
                 }
                 EventKind::Completed { usage } => {
-                    write_completion_notice(console, usage)?;
+                    write_completion_notice(console, usage, None)?;
                 }
                 EventKind::Started if console.is_interactive() => {
                     console.hide_completion_notice()?;
@@ -4845,27 +5051,6 @@ async fn parse_after_turn(
                 action: LoopAction::ConfigureTrigger {
                     loop_id,
                     trigger: Some(trigger),
-                },
-            })
-        }
-        "/approve-plan" => {
-            let fields = arguments.split_whitespace().collect::<Vec<_>>();
-            if fields.len() != 3 {
-                return Err(invalid("use /approve-plan GOAL VERSION MODE"));
-            }
-            let loop_id = fields[0]
-                .parse()
-                .map_err(|_| invalid("goal ID must be a UUID"))?;
-            let version = fields[1]
-                .parse()
-                .map_err(|_| invalid("plan version must be a number"))?;
-            let mode = serde_json::from_value(serde_json::Value::String(fields[2].into()))
-                .map_err(|_| invalid("invalid execution mode"))?;
-            Ok(AfterTurnAction::Loop {
-                action: LoopAction::ApprovePlan {
-                    loop_id,
-                    version,
-                    mode,
                 },
             })
         }
@@ -6179,31 +6364,12 @@ fn recover_background_chat(
     recovery
 }
 
-fn todo_status_items(snapshot: &ChatSnapshot, current_loop: Option<uuid::Uuid>) -> Vec<StatusItem> {
+fn current_loop_todos(snapshot: &ChatSnapshot, current_loop: Option<uuid::Uuid>) -> Vec<TodoItem> {
     snapshot
         .progress
         .iter()
         .find(|progress| Some(progress.loop_id) == current_loop)
-        .map(|progress| {
-            progress
-                .todos
-                .iter()
-                .enumerate()
-                .map(|(index, todo)| {
-                    let (state, role) = match todo.status {
-                        TodoStatus::Pending => ("pending", Role::MutedText),
-                        TodoStatus::InProgress => ("in progress", Role::Warning),
-                        TodoStatus::Completed => ("completed", Role::Success),
-                    };
-                    StatusItem {
-                        id: format!("{}.", index + 1),
-                        title: safe_text(&todo.content),
-                        state,
-                        role,
-                    }
-                })
-                .collect()
-        })
+        .map(|progress| progress.todos.clone())
         .unwrap_or_default()
 }
 
@@ -6220,8 +6386,15 @@ fn working_activity(snapshot: &ChatSnapshot, running_loop: Option<LoopId>) -> St
         .and_then(|progress| progress.active_form())
         .map_or_else(
             || WORKING_ACTIVITY.to_owned(),
-            |active_form| safe_text(active_form).replace('\n', " "),
+            |active_form| safe_text(active_form).replace(['\n', '\t'], " "),
         )
+}
+
+fn initial_context_usage(model: &ModelConfig) -> Option<(u64, usize)> {
+    model
+        .maximum_context_window_tokens()
+        .filter(|limit| *limit > 0)
+        .map(|limit| (0, limit))
 }
 
 fn context_usage(snapshot: &ChatSnapshot) -> Option<(u64, usize)> {
@@ -6997,9 +7170,9 @@ mod tests {
     };
     use super::{
         BackgroundRecovery, BackgroundRunNotice, BackgroundWaitKind, Receipt,
-        UNLABELED_BACKGROUND_AGENT, background_wait, context_usage, input_closed_while_waiting,
-        observe_user_shell_record, readable_background_label, recover_background_chat,
-        todo_status_items, track_run_requests, working_activity,
+        UNLABELED_BACKGROUND_AGENT, background_wait, context_usage, current_loop_todos,
+        input_closed_while_waiting, observe_user_shell_record, readable_background_label,
+        recover_background_chat, track_run_requests, working_activity,
     };
     use std::{
         collections::{HashMap, HashSet},
@@ -7011,6 +7184,9 @@ mod tests {
 
     #[tokio::test]
     async fn todos_show_their_content_and_the_running_goal_shows_its_active_form() {
+        use super::{RunningShimmer, style};
+        use tickloop_agent::settings;
+
         let directory = tempfile::tempdir().unwrap();
         let model = Arc::new(support::ScriptedModel::new(vec![
             support::call(
@@ -7018,7 +7194,7 @@ mod tests {
                 tickloop_agent::runtime::TODO_WRITE_TOOL_NAME,
                 serde_json::json!({"todos": [
                     {"content": "Read the notes", "status": "completed", "activeForm": "Reading the notes"},
-                    {"content": "Draft the\nreport", "status": "in_progress", "activeForm": "Drafting the\nreport"},
+                    {"content": "Draft the\nreport", "status": "in_progress", "activeForm": "Drafting\tthe\nreport"},
                     {"content": "Check the figures", "status": "pending", "activeForm": "Checking the figures"},
                 ]}),
             ),
@@ -7040,25 +7216,83 @@ mod tests {
         }
         let mut snapshot = agent.snapshot(chat).await.unwrap();
 
-        let todos = todo_status_items(&snapshot, Some(receipt.loop_id));
+        let todos = current_loop_todos(&snapshot, Some(receipt.loop_id));
+        assert_eq!(todos[1].active_form, "Drafting\tthe\nreport");
         assert_eq!(
             todos
                 .iter()
-                .map(|item| (item.title.as_str(), item.state))
+                .map(|todo| (todo.content.as_str(), todo.status.clone()))
                 .collect::<Vec<_>>(),
             [
-                ("Read the notes", "completed"),
-                ("Draft the\nreport", "in progress"),
-                ("Check the figures", "pending"),
+                (
+                    "Read the notes",
+                    tickloop_agent::runtime::TodoStatus::Completed
+                ),
+                (
+                    "Draft the\nreport",
+                    tickloop_agent::runtime::TodoStatus::InProgress
+                ),
+                (
+                    "Check the figures",
+                    tickloop_agent::runtime::TodoStatus::Pending
+                ),
             ]
         );
         assert_eq!(
             working_activity(&snapshot, Some(receipt.loop_id)),
             "Drafting the report"
         );
+        for glyph_set in [settings::GlyphSet::Unicode, settings::GlyphSet::NerdFont] {
+            let (console, _) = Console::start_with_display(
+                false,
+                settings::DisplayPreferences {
+                    glyph_set,
+                    prefers_reduced_motion: true,
+                },
+            )
+            .unwrap();
+            let activity = super::RunningActivity {
+                chat_id: chat,
+                label: working_activity(&snapshot, Some(receipt.loop_id)),
+                started_at: Some(std::time::Instant::now()),
+                interruptible: true,
+            };
+            let spans = activity
+                .spans(&console, None, &RunningShimmer::default())
+                .unwrap();
+            let mut row = style::RoleLine::default();
+            for (text, role) in spans {
+                row.push(text, role);
+            }
+            assert!(row.text().starts_with("• Drafting the report ("));
+            assert!(row.text().ends_with("s · Esc to interrupt)"));
+            assert_eq!(row.spans[0].role, Some(style::Role::MutedText));
+            assert_eq!(row.spans[1].role, Some(style::Role::RunningShade0));
+            assert_eq!(row.spans[2].role, Some(style::Role::MutedText));
+            let themed = style::ThemeName::ALL.map(|name| {
+                row.resolve(style::Theme::new(name), 80)
+                    .render(style::ColourDepth::TrueColour)
+            });
+            assert_ne!(themed[0], themed[1]);
+            for width in [0, 1, 12, 40, 80] {
+                let mut narrow = row.clone();
+                narrow.truncate(width);
+                assert!(unicode_width::UnicodeWidthStr::width(narrow.text().as_str()) <= width);
+            }
+        }
         assert_eq!(working_activity(&snapshot, None), "Working");
         assert_eq!(working_activity(&snapshot, Some(Uuid::new_v4())), "Working");
+        snapshot.progress[0].todos[2].status = tickloop_agent::runtime::TodoStatus::InProgress;
+        assert_eq!(
+            working_activity(&snapshot, Some(receipt.loop_id)),
+            "Drafting the report"
+        );
         snapshot.progress[0].todos[1].status = tickloop_agent::runtime::TodoStatus::Completed;
+        assert_eq!(
+            working_activity(&snapshot, Some(receipt.loop_id)),
+            "Checking the figures"
+        );
+        snapshot.progress[0].todos[2].status = tickloop_agent::runtime::TodoStatus::Completed;
         assert_eq!(
             working_activity(&snapshot, Some(receipt.loop_id)),
             "Working"
@@ -7115,33 +7349,45 @@ mod tests {
             (
                 goals[0],
                 vec![
-                    ("Draft the first report", "in progress"),
-                    ("Review the first report", "pending"),
+                    (
+                        "Draft the first report",
+                        tickloop_agent::runtime::TodoStatus::InProgress,
+                    ),
+                    (
+                        "Review the first report",
+                        tickloop_agent::runtime::TodoStatus::Pending,
+                    ),
                 ],
                 "Drafting the first report",
             ),
             (
                 goals[1],
                 vec![
-                    ("Check the second dataset", "completed"),
-                    ("Summarize the second dataset", "in progress"),
+                    (
+                        "Check the second dataset",
+                        tickloop_agent::runtime::TodoStatus::Completed,
+                    ),
+                    (
+                        "Summarize the second dataset",
+                        tickloop_agent::runtime::TodoStatus::InProgress,
+                    ),
                 ],
                 "Summarizing the second dataset",
             ),
         ] {
-            let todos = todo_status_items(&snapshot, Some(goal));
+            let todos = current_loop_todos(&snapshot, Some(goal));
             assert_eq!(
                 todos
                     .iter()
-                    .map(|item| (item.title.as_str(), item.state))
+                    .map(|todo| (todo.content.as_str(), todo.status.clone()))
                     .collect::<Vec<_>>(),
                 expected
             );
             assert_eq!(working_activity(&snapshot, Some(goal)), activity);
         }
-        assert!(todo_status_items(&snapshot, None).is_empty());
+        assert!(current_loop_todos(&snapshot, None).is_empty());
         assert!(
-            todo_status_items(&snapshot, Some(Uuid::new_v4())).is_empty(),
+            current_loop_todos(&snapshot, Some(Uuid::new_v4())).is_empty(),
             "a Todo-free selected Loop must not borrow another Loop's list"
         );
         assert_eq!(working_activity(&snapshot, None), "Working");
@@ -7156,6 +7402,7 @@ mod tests {
         );
         let chat_id = agent.create_chat(PathBuf::from("/tmp")).await.unwrap();
         let mut snapshot = agent.snapshot(chat_id).await.unwrap();
+        assert_eq!(context_usage(&snapshot), None);
         snapshot.model = tickloop_agent::model::cards::ModelCatalog::defaults()
             .get("deepseek-api", "deepseek-flash-messages")
             .unwrap();

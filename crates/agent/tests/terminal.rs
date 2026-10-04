@@ -1,3 +1,6 @@
+#[path = "support/screen.rs"]
+mod screen;
+
 mod support;
 
 use std::io::{Read, Write};
@@ -208,18 +211,22 @@ fn interactive_pty_trusts_the_directory_and_cycles_all_execution_modes() {
 
 #[test]
 fn interactive_pty_opens_the_subscription_view_and_closes_it_with_escape() {
+    const TERMINAL_WIDTH: usize = 120;
+    const TERMINAL_HEIGHT: usize = 30;
+    const COMPLETED_FRAME_END: &str = "\x1b[?2026l";
+
     let directory = tempfile::tempdir().unwrap();
     let config_root = directory.path().join("config-root");
     trust_working_directory(&config_root, &directory.path().canonicalize().unwrap());
     let pty = native_pty_system()
         .openpty(PtySize {
-            rows: 30,
-            cols: 120,
+            rows: TERMINAL_HEIGHT as u16,
+            cols: TERMINAL_WIDTH as u16,
             pixel_width: 0,
             pixel_height: 0,
         })
         .unwrap();
-    let mut reader = pty.master.try_clone_reader().unwrap();
+    let reader = pty.master.try_clone_reader().unwrap();
     let mut writer = pty.master.take_writer().unwrap();
     let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_tickloop"));
     command.env(
@@ -234,18 +241,7 @@ fn interactive_pty_opens_the_subscription_view_and_closes_it_with_escape() {
     drop(pty.slave);
     let output = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
     let reader_output = output.clone();
-    let output_reader = thread::spawn(move || {
-        let mut buffer = [0_u8; 4096];
-        while let Ok(length) = reader.read(&mut buffer) {
-            if length == 0 {
-                break;
-            }
-            reader_output
-                .lock()
-                .unwrap()
-                .push_str(&String::from_utf8_lossy(&buffer[..length]));
-        }
-    });
+    let output_reader = thread::spawn(move || screen::capture_output(reader, reader_output));
     let ansi = regex::Regex::new(r"\x1b\[[0-9;?]*[ -/]*[@-~]").unwrap();
     let wait_for_output = |needle: &str, after: usize| {
         let deadline = std::time::Instant::now() + INTERACTION_TIMEOUT;
@@ -253,7 +249,9 @@ fn interactive_pty_opens_the_subscription_view_and_closes_it_with_escape() {
             let captured = output.lock().unwrap();
             if captured
                 .get(after..)
-                .is_some_and(|suffix| ansi.replace_all(suffix, "").contains(needle))
+                .is_some_and(|suffix| suffix.contains(COMPLETED_FRAME_END))
+                && screen::visible_screen(&captured, TERMINAL_WIDTH, TERMINAL_HEIGHT)
+                    .contains(needle)
             {
                 return;
             }
@@ -556,7 +554,7 @@ async fn piped_provider_model_and_settings_menus_apply_numbered_choices() {
         .take()
         .unwrap()
         .write_all(
-            b"/model\n2\n/model\ncancel\ncancel\n/settings\n4\n2\n/settings\ncancel\n/exit\n",
+            b"/provider\n1\n2\ncancel\ncancel\n/model\n2\ncancel\n/model\ncancel\n/settings\n4\n2\ncancel\n/settings\ncancel\n/exit\n",
         )
         .await
         .unwrap();
@@ -585,9 +583,13 @@ async fn piped_provider_model_and_settings_menus_apply_numbered_choices() {
         "{transcript}"
     );
     assert!(
-        transcript.contains("Selection cancelled; configuration unchanged."),
+        transcript.contains("Choose Provider · All")
+            && transcript.contains("Choose model · Signed-in Providers")
+            && transcript
+                .contains("Model selection: Applied · DeepSeek-V4.1-Flash · Thinking auto"),
         "{transcript}"
     );
+    assert!(!transcript.contains("Accepted: Goal"), "{transcript}");
     assert!(!transcript.contains("Cannot"), "{transcript}");
     assert!(
         !transcript.contains('\u{1b}'),
@@ -1925,7 +1927,7 @@ async fn terminal_reviews_and_approves_a_specific_plan_version_before_writing() 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
-        for turn in 0..5 {
+        for turn in 0..4 {
             let (mut socket, _) = listener.accept().await.unwrap();
             let request = read_request(&mut socket).await.to_string();
             let body = match turn {
@@ -1942,8 +1944,7 @@ async fn terminal_reviews_and_approves_a_specific_plan_version_before_writing() 
                     .replace("tool-fixture", "plan-file-tool")
                 }
                 1 => tool_stream("ExitPlanMode", json!({})).replace("tool-fixture", "plan-tool"),
-                2 => messages_stream("The plan is ready for review."),
-                3 => tool_stream(
+                2 => tool_stream(
                     "Write",
                     json!({"file_path":"reviewed.txt","content":"approved plan result"}),
                 )
@@ -1977,15 +1978,11 @@ async fn terminal_reviews_and_approves_a_specific_plan_version_before_writing() 
         .await
         .unwrap();
     let mut transcript = String::new();
-    let mut goal = String::new();
     tokio::time::timeout(INTERACTION_TIMEOUT, async {
         loop {
             let line = output.next_line().await.unwrap().unwrap();
-            if let Some(value) = line.strip_prefix("Goal: ") {
-                goal = value.split_whitespace().next().unwrap().to_owned();
-            }
             transcript.push_str(&line);
-            if line.starts_with("Reply completed") {
+            if line.contains("No, keep planning") {
                 break;
             }
         }
@@ -1994,13 +1991,7 @@ async fn terminal_reviews_and_approves_a_specific_plan_version_before_writing() 
     .unwrap();
     assert!(transcript.contains("Create reviewed.txt with the approved result."));
     assert!(!directory.path().join("reviewed.txt").exists());
-    input
-        .write_all(
-            format!("/approve-plan {goal} 1 acceptEdits\nProceed with the approved plan\n")
-                .as_bytes(),
-        )
-        .await
-        .unwrap();
+    input.write_all(b"2\n").await.unwrap();
     drop(input);
     tokio::time::timeout(INTERACTION_TIMEOUT, async {
         while let Some(line) = output.next_line().await.unwrap() {

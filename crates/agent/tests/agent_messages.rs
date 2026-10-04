@@ -2126,7 +2126,9 @@ async fn every_family_member_lists_the_root_and_retained_children_without_waking
 
 #[tokio::test]
 async fn a_verified_human_relay_stays_agent_origin_and_forged_references_do_not_dispatch() {
-    for forged in [false, true] {
+    for (forged, verbatim) in [(false, false), (true, false), (false, true)] {
+        let original_text = "  Delegate a bounded check and remember my greeting: 你好\n ";
+        let forwarded_text = if verbatim { original_text } else { "你好" };
         let directory = tempfile::tempdir().unwrap();
         let original_id = Arc::new(Mutex::new(Uuid::nil()));
         let id_for_model = original_id.clone();
@@ -2144,7 +2146,7 @@ async fn a_verified_human_relay_stays_agent_origin_and_forged_references_do_not_
                 support::call(
                     "relay",
                     "SendMessage",
-                    json!({"to":"audit","message":"你好","relay_user_message_id":id_for_model.lock().unwrap().to_string()}),
+                    json!({"to":"audit","message":forwarded_text,"relay_user_message_id":id_for_model.lock().unwrap().to_string()}),
                 )
             } else {
                 support::text("Parent ready")
@@ -2153,14 +2155,7 @@ async fn a_verified_human_relay_stays_agent_origin_and_forged_references_do_not_
         let core = Agent::new_embedded(support::config(), model);
         let root = core.create_chat(directory.path().into()).await.unwrap();
         let mut events = core.subscribe();
-        let first = core
-            .submit(
-                root,
-                None,
-                "Delegate a bounded check and remember my greeting: 你好".into(),
-            )
-            .await
-            .unwrap();
+        let first = core.submit(root, None, original_text.into()).await.unwrap();
         completed(&mut events, &first).await;
         let before = core.snapshot(root).await.unwrap();
         *original_id.lock().unwrap() = if forged {
@@ -2202,11 +2197,30 @@ async fn a_verified_human_relay_stays_agent_origin_and_forged_references_do_not_
                 source["relay"]["original_message_id"],
                 original_id.lock().unwrap().to_string()
             );
+            assert_eq!(source["relay"]["original_text"], original_text);
+            assert_eq!(source["relay"]["forwarded_verbatim"], verbatim);
+            let body = received
+                .messages
+                .iter()
+                .flat_map(|message| &message.content)
+                .find_map(|content| {
+                    if let Content::Text { text } = content
+                        && let Some(tickloop_agent::runtime::LocalMessage::AgentCommunication {
+                            message,
+                            relay: Some(_),
+                            ..
+                        }) = tickloop_agent::runtime::LocalMessage::parse(text)
+                    {
+                        Some(message)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap();
             assert_eq!(
-                source["relay"]["original_text"],
-                "Delegate a bounded check and remember my greeting: 你好"
+                body, forwarded_text,
+                "verbatim audit must describe the delivered bytes"
             );
-            assert_eq!(source["relay"]["forwarded_verbatim"], false);
             assert!(received.prompt_execution_modes.keys().all(|index| {
                 received
                     .message_ids
@@ -3033,4 +3047,209 @@ async fn family_human_main_input_uses_normal_multiple_loop_semantics_instead_of_
         tickloop_agent::runtime::LoopState::Stopped
     );
     fixture.core.shutdown().await;
+}
+
+#[tokio::test]
+async fn family_directory_aggregates_active_user_shell_instead_of_only_completed_loops() {
+    let fixture = DirectedFixture::new().await;
+    let shell = fixture
+        .core
+        .submit_user_shell_for_goal(fixture.root_chat, None, "sleep 30".into(), false)
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while fixture
+            .core
+            .snapshot(fixture.root_chat)
+            .await
+            .unwrap()
+            .user_shells
+            .iter()
+            .all(|shell| shell.state != tickloop_agent::runtime::UserShellState::Running)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let root = fixture
+        .core
+        .family_agents(fixture.root_chat)
+        .await
+        .unwrap()
+        .remove(0);
+    let actual = root.availability;
+    let started_at = root.run_started_at;
+    fixture
+        .core
+        .stop_user_shell(fixture.root_chat, shell.command_id)
+        .await
+        .unwrap();
+    fixture.core.shutdown().await;
+    assert_eq!(actual, tickloop_agent::runtime::FamilyAvailability::Working);
+    assert!(
+        started_at.is_some(),
+        "active Shell exposes its state start time"
+    );
+}
+
+#[tokio::test]
+async fn directed_human_body_preserves_whitespace_after_the_routing_separator() {
+    use tickloop_agent::agent_access::*;
+    let fixture = DirectedFixture::new().await;
+    let text = "@audit \n    print(1)\n";
+    let sent = fixture
+        .access
+        .execute(CommandEnvelope {
+            owner_epoch: fixture.access.owner_epoch(),
+            command_id: Uuid::new_v4(),
+            command: AgentCommand::SendFamilyInput {
+                source_execution: fixture.root,
+                target_execution: fixture.child,
+                target_loop: None,
+                origin: fixture.origin.clone(),
+                input: UserInput::Text {
+                    text: text.into(),
+                    contexts: vec![],
+                    paths: vec![],
+                },
+            },
+        })
+        .await
+        .unwrap()
+        .into_result()
+        .unwrap();
+    let CommandResult::FamilyInputSent { receipt, .. } = sent else {
+        panic!("directed receipt");
+    };
+    let mut events = fixture.core.subscribe();
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while fixture
+            .core
+            .snapshot(fixture.child_chat)
+            .await
+            .unwrap()
+            .loops[0]
+            .state
+            != tickloop_agent::runtime::LoopState::Completed
+        {
+            let _ = events.recv().await;
+        }
+    })
+    .await
+    .unwrap();
+    let snapshot = fixture.core.snapshot(fixture.child_chat).await.unwrap();
+    let body = snapshot
+        .messages
+        .iter()
+        .enumerate()
+        .find(|(index, message)| {
+            snapshot.message_runs.get(index) == Some(&receipt.run_id) && message.role == Role::User
+        })
+        .and_then(|(_, message)| {
+            message.content.iter().find_map(|content| {
+                if let Content::Text { text } = content {
+                    Some(text.clone())
+                } else {
+                    None
+                }
+            })
+        })
+        .unwrap();
+    fixture.core.shutdown().await;
+    assert_eq!(body, "\n    print(1)\n");
+}
+
+#[tokio::test]
+async fn sender_rate_budget_survives_restart_with_the_old_recipient_unloaded() {
+    sender_rate_budget_survives_partial_family_restore(false).await;
+}
+
+#[tokio::test]
+async fn sender_rate_budget_survives_compaction_and_partial_family_restore() {
+    sender_rate_budget_survives_partial_family_restore(true).await;
+}
+
+async fn sender_rate_budget_survives_partial_family_restore(compact: bool) {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = directory.path().join("storage");
+    let model = Arc::new(RoutedModel::new(|request| {
+        if request.tools.is_empty() {
+            return support::text("Root sent twenty contexts to retained child a.");
+        }
+        if !state(request)["delegation"].is_null() {
+            return support::text("Child retained");
+        }
+        if has_text(request, "AFTER-RESTART") {
+            return if has_tool_result(request, "after") {
+                support::text("After handled")
+            } else {
+                support::call(
+                    "after",
+                    "SendMessage",
+                    json!({"to":"b","message":"After restart"}),
+                )
+            };
+        }
+        for (id, name) in [("delegate-a", "a"), ("delegate-b", "b")] {
+            if !has_tool_result(request, id) {
+                return support::call(
+                    id,
+                    "DelegateAgent",
+                    json!({"task":"Retain bounded context","name":name}),
+                );
+            }
+        }
+        for index in 0..20 {
+            let id = format!("send-{index}");
+            if !has_tool_result(request, &id) {
+                return support::call(
+                    &id,
+                    "SendMessage",
+                    json!({"to":"a","message":format!("Context {index}")}),
+                );
+            }
+        }
+        support::text("Sent bounded burst")
+    }));
+    let core =
+        Agent::open_embedded(storage.clone(), support::persisted_config(), model.clone()).unwrap();
+    let root = core.create_chat(directory.path().into()).await.unwrap();
+    let mut events = core.subscribe();
+    let receipt = core
+        .submit(
+            root,
+            None,
+            "Delegate two children and send twenty contexts to a".into(),
+        )
+        .await
+        .unwrap();
+    completed(&mut events, &receipt).await;
+    let b = core
+        .subagents(root)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|child| child.handle == "b")
+        .unwrap()
+        .child_chat_id;
+    if compact {
+        core.compact(root).await.unwrap();
+    }
+    core.shutdown().await;
+    let resumed = Agent::open_embedded(storage, support::persisted_config(), model).unwrap();
+    resumed.resume_chat(root).await.unwrap();
+    resumed.resume_chat(b).await.unwrap();
+    let mut events = resumed.subscribe();
+    let after = resumed
+        .submit(root, None, "AFTER-RESTART send one context to b".into())
+        .await
+        .unwrap();
+    completed(&mut events, &after).await;
+    let result = tool_result(&resumed.snapshot(root).await.unwrap().messages, "after").unwrap();
+    resumed.shutdown().await;
+    assert_eq!(
+        result["rejection"]["code"], "sender_rate_limit",
+        "unloaded old recipient cannot reset the sender window: {result}"
+    );
 }

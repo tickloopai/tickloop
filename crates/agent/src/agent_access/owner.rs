@@ -265,8 +265,10 @@ impl OwnerServer {
                         store_root,
                         chat_id: snapshot.conversation.id,
                     });
-                let state =
-                    super::summary_state(&snapshot.conversation.loops, &snapshot.user_shells);
+                let state = crate::runtime::summary_state(
+                    &snapshot.conversation.loops,
+                    &snapshot.user_shells,
+                );
                 let parent = snapshot
                     .conversation
                     .delegation

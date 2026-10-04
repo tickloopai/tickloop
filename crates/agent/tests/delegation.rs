@@ -352,28 +352,7 @@ async fn loaded_delegated_host_authority_stays_with_its_original_socket_and_work
         ("same-host-other-workspace", &original, Some("W2"), true),
         ("same-host-headless-launch", &original, None, true),
         ("other-host-same-workspace", &other, Some("W1"), false),
-        ("legacy-unknown-endpoint", &original, Some("W1"), false),
     ] {
-        if case == "legacy-unknown-endpoint" {
-            let transcript = support::transcript_file(&store, child);
-            let rewritten = std::fs::read_to_string(&transcript)
-                .unwrap()
-                .lines()
-                .map(|line| {
-                    let mut entry: Value = serde_json::from_str(line).unwrap();
-                    if entry["type"] == "delegation" {
-                        entry["delegation"]["ceiling"]
-                            .as_object_mut()
-                            .unwrap()
-                            .remove("host_endpoint");
-                    }
-                    serde_json::to_string(&entry).unwrap()
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-                + "\n";
-            std::fs::write(transcript, rewritten).unwrap();
-        }
         let restored = Agent::open_embedded(
             store.clone(),
             config(),
@@ -1601,4 +1580,187 @@ async fn interrupting_the_parent_wait_does_not_stop_or_redelegate_the_child() {
         LoopState::Completed
     );
     agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn missing_frozen_tool_authority_refuses_child_restore_instead_of_becoming_root() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = directory.path().join("state");
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "delegate",
+            "DelegateAgent",
+            json!({"task":"Inspect fixture"}),
+        ),
+        text("Child done."),
+        text("Parent done."),
+    ]));
+    let agent = Agent::open_embedded(store.clone(), config(), model).unwrap();
+    let parent = agent.create_chat(directory.path().into()).await.unwrap();
+    let mut events = agent.subscribe();
+    agent
+        .submit(parent, None, "Delegate fixture inspection".into())
+        .await
+        .unwrap();
+    loop {
+        let event = support::next_event(&mut events).await;
+        if event.chat_id == parent && matches!(event.kind, EventKind::Completed { .. }) {
+            break;
+        }
+    }
+    let child = agent
+        .list_chats()
+        .await
+        .into_iter()
+        .find(|chat| chat.id != parent)
+        .unwrap()
+        .id;
+    agent.shutdown().await;
+    let transcript = support::transcript_file(&store, child);
+    let original = std::fs::read_to_string(&transcript).unwrap();
+    for remove_record in [false, true] {
+        let rewritten = original
+            .lines()
+            .filter_map(|line| {
+                let mut entry: Value = serde_json::from_str(line).unwrap();
+                if entry["type"] == "delegation" {
+                    if remove_record {
+                        return None;
+                    }
+                    entry["delegation"]["ceiling"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("host_tools");
+                }
+                Some(serde_json::to_string(&entry).unwrap())
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(&transcript, rewritten).unwrap();
+        let restored = Agent::open_embedded(
+            store.clone(),
+            config(),
+            Arc::new(ScriptedModel::new(vec![])),
+        )
+        .unwrap();
+        let result = restored.resume_chat(child).await;
+        assert!(
+            result.is_err(),
+            "a child with missing frozen authority was restored as an unrestricted root"
+        );
+        assert!(result.unwrap_err().to_string().contains("delegat"));
+        restored.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn compacted_child_retains_authorization_with_legal_metadata_whitespace_and_field_order() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = directory.path().join("state");
+    let agent = Agent::open_embedded(
+        store.clone(),
+        config(),
+        Arc::new(ScriptedModel::new(vec![
+            call("delegate", "DelegateAgent", json!({"task":"Fixture task"})),
+            text("Child done."),
+            text("Parent done."),
+        ])),
+    )
+    .unwrap();
+    let parent = agent.create_chat(directory.path().into()).await.unwrap();
+    let mut events = agent.subscribe();
+    agent
+        .submit(parent, None, "Delegate fixture task".into())
+        .await
+        .unwrap();
+    loop {
+        let event = support::next_event(&mut events).await;
+        if event.chat_id == parent && matches!(event.kind, EventKind::Completed { .. }) {
+            break;
+        }
+    }
+    let child = agent
+        .list_chats()
+        .await
+        .into_iter()
+        .find(|chat| chat.id != parent)
+        .unwrap()
+        .id;
+    let expected = serde_json::to_value(
+        agent
+            .snapshot(child)
+            .await
+            .unwrap()
+            .delegation
+            .unwrap()
+            .ceiling,
+    )
+    .unwrap();
+    agent.shutdown().await;
+    let transcript = support::transcript_file(&store, child);
+    let original = std::fs::read_to_string(&transcript).unwrap();
+    for reorder in [false, true] {
+        let mut initial_user = None;
+        let mut rewritten = String::new();
+        for line in original.lines() {
+            let entry: Value = serde_json::from_str(line).unwrap();
+            if entry["type"] == "user" && initial_user.is_none() {
+                initial_user = Some(entry.clone());
+            }
+            if entry["type"] == "delegation" {
+                if reorder {
+                    rewritten.push_str(&entry.to_string());
+                } else {
+                    rewritten.push(' ');
+                    rewritten.push_str(line);
+                }
+            } else {
+                rewritten.push_str(line);
+            }
+            rewritten.push('\n');
+        }
+        rewritten
+            .push_str(&json!({"type":"unknown","padding":"x".repeat(6 * 1024 * 1024)}).to_string());
+        rewritten.push('\n');
+        let mut boundary = initial_user.unwrap();
+        let boundary_id = uuid::Uuid::new_v4();
+        boundary["uuid"] = json!(boundary_id);
+        boundary["parentUuid"] = Value::Null;
+        boundary["subtype"] = json!("compact_boundary");
+        boundary["type"] = json!("system");
+        boundary["message"] =
+            json!({"role":"system","content":[{"type":"text","text":"Context summary"}]});
+        boundary
+            .as_object_mut()
+            .unwrap()
+            .remove("agentMessageOrigin");
+        let mut serialized = boundary.clone();
+        serialized.as_object_mut().unwrap().remove("type");
+        rewritten.push_str(&format!(
+            "{{\"type\":\"system\",{}\n",
+            serialized.to_string().trim_start_matches('{')
+        ));
+        boundary["uuid"] = json!(uuid::Uuid::new_v4());
+        boundary["parentUuid"] = json!(boundary_id);
+        boundary["type"] = json!("user");
+        boundary.as_object_mut().unwrap().remove("subtype");
+        boundary["message"] =
+            json!({"role":"user","content":[{"type":"text","text":"Continue fixture"}]});
+        rewritten.push_str(&boundary.to_string());
+        rewritten.push('\n');
+        std::fs::write(&transcript, rewritten).unwrap();
+        let restored = Agent::open_embedded(
+            store.clone(),
+            config(),
+            Arc::new(ScriptedModel::new(vec![])),
+        )
+        .unwrap();
+        let snapshot = restored.resume_chat(child).await.unwrap();
+        let delegation = snapshot
+            .delegation
+            .expect("compaction discarded delegated authority and restored a root");
+        assert_eq!(serde_json::to_value(delegation.ceiling).unwrap(), expected);
+        restored.shutdown().await;
+    }
 }

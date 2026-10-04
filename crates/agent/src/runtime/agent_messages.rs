@@ -306,30 +306,7 @@ pub(super) fn child_run_result(
                 })
                 .flatten()
         })?;
-    let text = snapshot
-        .messages
-        .iter()
-        .enumerate()
-        .rev()
-        .find(|(index, message)| {
-            message.role == Role::Assistant
-                && snapshot.message_runs.get(index) == Some(&child.run_id)
-        })
-        .map(|(_, message)| {
-            message
-                .content
-                .iter()
-                .filter_map(|block| {
-                    if let Content::Text { text } = block {
-                        Some(text.as_str())
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
-        .unwrap_or_default();
+    let text = snapshot.run_response_text(child.run_id).unwrap_or_default();
     let metadata = snapshot.delegation.as_ref()?;
     Some(ToolResult {
         content: json!({"delegation_id":metadata.delegation_id,"child_chat_id":child.chat_id,
@@ -529,8 +506,7 @@ impl Agent {
             SEND_AGENT_MESSAGE_TOOL_NAME => {
                 let message = input["message"]
                     .as_str()
-                    .map(str::trim)
-                    .filter(|message| !message.is_empty())
+                    .filter(|message| !message.trim().is_empty())
                     .ok_or("message cannot be empty")?;
                 let Some(PreparedFamilyCall::Message(prepared)) = prepared else {
                     return Err("SendMessage was not prepared".into());
@@ -834,7 +810,6 @@ impl Agent {
                 attached_file_reads: Vec::new(),
             },
         );
-        let next = self.next_run(receiver).map_err(|error| error.to_string())?;
         self.remember_host_context(&receipt, None);
         self.emit(
             receiver,
@@ -847,6 +822,19 @@ impl Agent {
         *original = candidate;
         if !is_result {
             mailbox.record_source(&source);
+            let sender_chat = chats
+                .get_mut(&sender.chat_id)
+                .expect("admitted sender remains loaded");
+            sender_chat
+                .snapshot
+                .sent_agent_messages
+                .insert(source.message_id, source.clone());
+            if let Some(recorder) = &self.inner.recorder {
+                recorder.record_sent_agent_messages(
+                    sender.chat_id,
+                    sender_chat.snapshot.sent_agent_messages.clone(),
+                );
+            }
         }
         let delivered = result(
             json!({"status":"accepted","message_id":source.message_id,"target_chat_id":target_id,
@@ -863,6 +851,10 @@ impl Agent {
         );
         drop(chats);
         drop(mailbox);
+        let next = self
+            .next_run(target_id)
+            .await
+            .map_err(|error| error.to_string())?;
         self.inner.input_wakeup.send_replace(());
         if let Some(next) = next {
             self.inner.tasks.lock().await.push(self.run_task(next));

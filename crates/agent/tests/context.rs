@@ -796,7 +796,12 @@ async fn compaction_pins_the_approved_plan_even_when_the_model_omits_it() {
         .submit(chat, None, "Prepare my report".into())
         .await
         .unwrap();
-    wait_for_completion(&mut events).await;
+    loop {
+        if let EventKind::PermissionRequested { request } = next_event(&mut events).await.kind {
+            assert_eq!(request.name, "ExitPlanMode");
+            break;
+        }
+    }
     agent
         .approve_plan(
             chat,
@@ -806,6 +811,7 @@ async fn compaction_pins_the_approved_plan_even_when_the_model_omits_it() {
         )
         .await
         .unwrap();
+    wait_for_completion(&mut events).await;
     let outcome = agent.compact(chat).await.unwrap();
     assert!(outcome.snapshot.conversation_messages().unwrap().iter().flat_map(|message|&message.content).any(|content|matches!(content,Content::Text{text} if text.contains("Brief summary") && text.contains("Preserve original.txt; write only report.txt.") && text.contains("acceptEdits"))));
     assert_eq!(agent.snapshot(chat).await.unwrap().plans[0].version, 1);

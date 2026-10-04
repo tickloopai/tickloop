@@ -484,7 +484,7 @@ impl Agent {
             questions: parsed.questions,
         };
         let (sender, receiver) = oneshot::channel();
-        let next = {
+        {
             let mut chats = self.inner.chats.lock().await;
             let chat = chats
                 .get_mut(&receipt.chat_id)
@@ -525,8 +525,11 @@ impl Agent {
                     request: request.clone(),
                 },
             );
-            self.next_run(chat).map_err(|error| error.to_string())?
-        };
+        }
+        let next = self
+            .next_run(receipt.chat_id)
+            .await
+            .map_err(|error| error.to_string())?;
         if let Some(next) = next {
             self.inner.tasks.lock().await.push(self.run_task(next));
         }

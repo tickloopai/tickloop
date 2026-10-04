@@ -25,6 +25,7 @@ pub(crate) struct CachedMetadata {
     pub subagents: Option<SubagentsEntry>,
     pub family_completions: Option<super::entry::FamilyCompletionsEntry>,
     pub family_inputs: Option<super::entry::FamilyInputsEntry>,
+    pub sent_agent_messages: Option<super::entry::SentAgentMessagesEntry>,
     pub last_prompt: Option<LastPromptEntry>,
     pub branch_origin: Option<BranchOriginEntry>,
     pub delegation: Option<DelegationEntry>,
@@ -39,6 +40,7 @@ impl CachedMetadata {
             Line::Subagents(entry) => self.subagents = Some(entry.clone()),
             Line::FamilyCompletions(entry) => self.family_completions = Some(entry.clone()),
             Line::FamilyInputs(entry) => self.family_inputs = Some(entry.clone()),
+            Line::SentAgentMessages(entry) => self.sent_agent_messages = Some(entry.clone()),
             Line::LastPrompt(entry) => self.last_prompt = Some(entry.clone()),
             Line::BranchOrigin(entry) => self.branch_origin = Some(entry.clone()),
             Line::Delegation(entry) => self.delegation = Some(entry.clone()),
@@ -55,6 +57,11 @@ impl CachedMetadata {
             .chain(self.subagents.clone().map(Line::Subagents))
             .chain(self.family_completions.clone().map(Line::FamilyCompletions))
             .chain(self.family_inputs.clone().map(Line::FamilyInputs))
+            .chain(
+                self.sent_agent_messages
+                    .clone()
+                    .map(Line::SentAgentMessages),
+            )
             .chain(self.last_prompt.clone().map(Line::LastPrompt))
             .chain(self.branch_origin.clone().map(Line::BranchOrigin))
             .chain(self.delegation.clone().map(Line::Delegation))

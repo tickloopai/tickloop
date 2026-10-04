@@ -4,8 +4,6 @@ use serde_json::json;
 use std::{sync::Arc, time::Duration};
 use support::*;
 use tickloop_agent::{
-    host_tools::{HostToolPermission, HostToolProvider},
-    model::ToolDefinition,
     runtime::{Agent, EventKind, ShellTaskCenter, TickSubscriptionChange},
     tick_adapter::{
         ShellAdapter, TickAdapter, TickAdapters, TickDescriptor, TickGlyph, TickGroup,
@@ -14,35 +12,11 @@ use tickloop_agent::{
     tick_stream::{
         InMemoryTickStream, InstanceRef, ObservationKind, TickObservation, TickStreamPort,
     },
-    tools::ToolResult,
 };
-use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 struct CalendarAdapter {
     stream: InMemoryTickStream,
-}
-#[async_trait::async_trait]
-impl HostToolProvider for CalendarAdapter {
-    fn definitions(&self) -> Vec<ToolDefinition> {
-        vec![]
-    }
-    fn permission(&self, _: Uuid, _: &str, _: &serde_json::Value) -> HostToolPermission {
-        HostToolPermission::ReadOnly
-    }
-    async fn execute(
-        &self,
-        _: Uuid,
-        _: &str,
-        _: serde_json::Value,
-        _: CancellationToken,
-    ) -> ToolResult {
-        ToolResult {
-            content: json!({"tools":[{"name":"meetings","mutates":false}]}).to_string(),
-            is_error: false,
-            output_ref: None,
-        }
-    }
 }
 impl TickAdapter for CalendarAdapter {
     fn tick_type(&self) -> &'static str {
@@ -71,11 +45,6 @@ impl TickAdapter for CalendarAdapter {
     fn stream(&self) -> Option<Arc<dyn TickStreamPort>> {
         Some(Arc::new(self.stream.clone()))
     }
-    fn tools(&self) -> Option<Arc<dyn HostToolProvider>> {
-        Some(Arc::new(CalendarAdapter {
-            stream: self.stream.clone(),
-        }))
-    }
 }
 fn calendar() -> InstanceRef {
     InstanceRef::new("cal", "a").unwrap()
@@ -94,7 +63,7 @@ async fn settle() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_registered_type_lists_reads_subscribes_and_triggers_without_type_branches() {
+async fn a_registered_type_lists_subscribes_and_triggers_without_type_branches() {
     let directory = tempfile::tempdir().unwrap();
     let stream = InMemoryTickStream::new();
     let adapters = Arc::new(
@@ -115,22 +84,6 @@ async fn a_registered_type_lists_reads_subscribes_and_triggers_without_type_bran
     let agent = Agent::new_embedded(config(), model.clone());
     agent.install_tick_stream(adapters.clone()).await;
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    let tools = adapters.host_tools(None);
-    let call = tools
-        .prepare_call(
-            chat,
-            "ReadTick",
-            &json!({"tick_instance_id":calendar()}),
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-    let read = tools
-        .execute_prepared(chat, call, CancellationToken::new())
-        .await
-        .into_tool_result();
-    assert!(!read.is_error);
-    assert!(read.content.contains("meetings"));
     let mut events = agent.subscribe();
     let receipt = agent
         .submit(chat, None, "watch the earnings calendar".into())
@@ -283,140 +236,6 @@ async fn shell_baseline_output_and_final_exit_use_the_same_subscription_to_loop_
 }
 
 #[tokio::test]
-async fn shell_catalog_queries_and_stop_keep_the_existing_task_boundary() {
-    let directory = tempfile::tempdir().unwrap();
-    let agent = Agent::new_embedded(config(), Arc::new(ScriptedModel::new(vec![])));
-    let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    let task = agent
-        .submit_user_shell_for_goal(
-            chat,
-            None,
-            "printf 'recoverable output'; while :; do sleep 0.02; done".into(),
-            true,
-        )
-        .await
-        .unwrap();
-    let center = ShellTaskCenter::new(agent.clone());
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if center
-                .snapshot(chat)
-                .await
-                .unwrap()
-                .tasks
-                .iter()
-                .any(|row| row.id == task.command_id && row.output_bytes >= 18)
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .unwrap();
-    let adapters = TickAdapters::builtin(Some(agent.clone()), None, None);
-    let tools = adapters.host_tools(None);
-    let instance = InstanceRef::shell(task.command_id);
-    let read = tools
-        .prepare_call(
-            chat,
-            "ReadTick",
-            &json!({"tick_instance_id":instance}),
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-    let read = tools
-        .execute_prepared(chat, read, CancellationToken::new())
-        .await
-        .into_tool_result();
-    let data: serde_json::Value = serde_json::from_str(&read.content).unwrap();
-    assert_eq!(data["tools"][0]["name"], "output");
-    assert_eq!(data["tools"][1]["name"], "stop");
-    assert_eq!(data["tools"][1]["mutates"], true);
-    let output = tools
-        .prepare_call(
-            chat,
-            "CallTickTool",
-            &json!({"tick_instance_id":instance,"tool":"output","args":{"offset":0,"limit":64}}),
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(output.permission(), HostToolPermission::ReadOnly);
-    let output = tools
-        .execute_prepared(chat, output, CancellationToken::new())
-        .await
-        .into_tool_result();
-    assert!(output.content.contains("recoverable output"));
-    assert!(
-        tools
-            .prepare_call(
-                chat,
-                "CallTickTool",
-                &json!({"tick_instance_id":instance,"tool":"output","args":{"limit":0}}),
-                CancellationToken::new()
-            )
-            .await
-            .is_err()
-    );
-    let other = agent.create_chat(directory.path().into()).await.unwrap();
-    assert!(
-        tools
-            .prepare_call(
-                other,
-                "ReadTick",
-                &json!({"tick_instance_id":instance}),
-                CancellationToken::new()
-            )
-            .await
-            .is_err()
-    );
-    let cancelled_call = tools
-        .prepare_call(
-            chat,
-            "CallTickTool",
-            &json!({"tick_instance_id":instance,"tool":"output","args":{}}),
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-    let cancelled = CancellationToken::new();
-    cancelled.cancel();
-    assert!(matches!(
-        tools
-            .execute_prepared(chat, cancelled_call, cancelled)
-            .await,
-        tickloop_agent::host_tools::HostCallResult::NotDispatched(_)
-    ));
-    assert!(
-        tools
-            .prepare_call(
-                chat,
-                "CallTickTool",
-                &json!({"tick_instance_id":instance,"tool":"stop","args":{}}),
-                CancellationToken::new()
-            )
-            .await
-            .is_err(),
-        "direct host dispatch must not bypass TaskStop's caller loop boundary"
-    );
-    assert!(
-        !center
-            .snapshot(chat)
-            .await
-            .unwrap()
-            .tasks
-            .iter()
-            .find(|row| row.id == task.command_id)
-            .unwrap()
-            .state
-            .is_terminal()
-    );
-    agent.shutdown().await;
-}
-
-#[tokio::test]
 async fn shell_output_changes_before_exit_and_a_late_watch_uses_a_new_baseline() {
     use tickloop_agent::tick_stream::TickStreamEvent;
     let directory = tempfile::tempdir().unwrap();
@@ -518,197 +337,6 @@ async fn shell_output_changes_before_exit_and_a_late_watch_uses_a_new_baseline()
     agent.shutdown().await;
 }
 
-#[tokio::test]
-async fn shell_call_tick_tool_rejects_an_undeclared_read_name() {
-    let directory = tempfile::tempdir().unwrap();
-    let agent = Agent::new_embedded(config(), Arc::new(ScriptedModel::new(vec![])));
-    let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    let task = agent
-        .submit_user_shell_for_goal(chat, None, "sleep 30".into(), true)
-        .await
-        .unwrap();
-    let tools = TickAdapters::builtin(Some(agent.clone()), None, None).host_tools(None);
-    assert!(tools.prepare_call(chat,"CallTickTool",&json!({"tick_instance_id":InstanceRef::shell(task.command_id),"tool":"read","args":{"ignored":true}}),CancellationToken::new()).await.is_err());
-    agent.shutdown().await;
-}
-
-async fn stop_fixture() -> (
-    tempfile::TempDir,
-    Agent,
-    Arc<ScriptedModel>,
-    Uuid,
-    Uuid,
-    Uuid,
-) {
-    use tickloop_agent::permissions::ExecutionMode;
-    let directory = tempfile::tempdir().unwrap();
-    let model = Arc::new(ScriptedModel::new(vec![
-        call(
-            "start",
-            "Bash",
-            json!({"command":"sleep 30","run_in_background":true}),
-        ),
-        text("started"),
-    ]));
-    let agent = Agent::new_embedded(config(), model.clone());
-    let adapters = TickAdapters::builtin(Some(agent.clone()), None, None);
-    agent.install_host_tools(adapters.host_tools(None)).unwrap();
-    let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    agent
-        .set_execution_mode(chat, ExecutionMode::FullAccess)
-        .await
-        .unwrap();
-    let mut events = agent.subscribe();
-    let receipt = agent
-        .submit(chat, None, "start a background command".into())
-        .await
-        .unwrap();
-    complete(&mut events).await;
-    let task = agent.commands(chat).await.unwrap().remove(0).operation_id;
-    (directory, agent, model, chat, receipt.loop_id, task)
-}
-fn enqueue_stop(model: &ScriptedModel, task: Uuid) {
-    model.enqueue(call(
-        "adapter-stop",
-        "CallTickTool",
-        json!({"tick_instance_id":InstanceRef::shell(task),"tool":"stop","args":{}}),
-    ));
-    model.enqueue(text("stop result received"));
-}
-#[tokio::test]
-async fn adapter_stop_refuses_other_loops_and_user_shells() {
-    let (_directory, agent, model, chat, _, task) = stop_fixture().await;
-    let mut events = agent.subscribe();
-    enqueue_stop(&model, task);
-    agent
-        .submit(chat, None, "stop another goal's command".into())
-        .await
-        .unwrap();
-    complete(&mut events).await;
-    assert!(!command_finished(
-        &agent
-            .commands(chat)
-            .await
-            .unwrap()
-            .iter()
-            .find(|row| row.operation_id == task)
-            .unwrap()
-            .state
-    ));
-    let user = agent
-        .submit_user_shell_for_goal(chat, None, "sleep 30".into(), true)
-        .await
-        .unwrap();
-    enqueue_stop(&model, user.command_id);
-    agent
-        .submit(chat, None, "stop the user shell through the model".into())
-        .await
-        .unwrap();
-    complete(&mut events).await;
-    assert!(
-        !ShellTaskCenter::new(agent.clone())
-            .snapshot(chat)
-            .await
-            .unwrap()
-            .tasks
-            .iter()
-            .find(|row| row.id == user.command_id)
-            .unwrap()
-            .state
-            .is_terminal()
-    );
-    agent.shutdown().await;
-}
-#[tokio::test]
-async fn adapter_stop_obeys_task_stop_deny_and_ask_rules() {
-    use tickloop_agent::permissions::{Decision, PermissionRule};
-    for decision in [Decision::Deny, Decision::Ask] {
-        let (_directory, agent, model, chat, goal, task) = stop_fixture().await;
-        agent
-            .set_permission_rules(
-                chat,
-                vec![PermissionRule {
-                    id: Uuid::new_v4(),
-                    decision,
-                    tool: "TaskStop".into(),
-                    specifier: None,
-                    input: None,
-                    loop_id: None,
-                    persistent: false,
-                }],
-            )
-            .await
-            .unwrap();
-        let mut events = agent.subscribe();
-        enqueue_stop(&model, task);
-        agent
-            .submit(chat, Some(goal), "stop this goal's command".into())
-            .await
-            .unwrap();
-        let mut asked = false;
-        loop {
-            match next_event(&mut events).await.kind {
-                EventKind::PermissionRequested { request } => {
-                    assert_eq!(request.name, "TaskStop");
-                    asked = true;
-                    agent
-                        .answer_permission(chat, request.id, true)
-                        .await
-                        .unwrap();
-                }
-                EventKind::Completed { .. } => break,
-                _ => {}
-            }
-        }
-        let command = agent
-            .commands(chat)
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|row| row.operation_id == task)
-            .unwrap();
-        assert_eq!(asked, decision == Decision::Ask);
-        assert_eq!(command_finished(&command.state), decision == Decision::Ask);
-        agent.shutdown().await;
-    }
-}
-#[tokio::test]
-async fn adapter_stop_has_the_same_plan_behavior_as_task_stop() {
-    use tickloop_agent::permissions::ExecutionMode;
-    let (_directory, agent, model, chat, goal, task) = stop_fixture().await;
-    agent
-        .set_execution_mode(chat, ExecutionMode::Plan)
-        .await
-        .unwrap();
-    enqueue_stop(&model, task);
-    let mut events = agent.subscribe();
-    agent
-        .submit(chat, Some(goal), "stop this goal's command in Plan".into())
-        .await
-        .unwrap();
-    complete(&mut events).await;
-    assert!(command_finished(
-        &agent
-            .commands(chat)
-            .await
-            .unwrap()
-            .iter()
-            .find(|row| row.operation_id == task)
-            .unwrap()
-            .state
-    ));
-    agent.shutdown().await;
-}
-
-fn command_finished(state: &tickloop_agent::tools::CommandState) -> bool {
-    matches!(
-        state,
-        tickloop_agent::tools::CommandState::Completed
-            | tickloop_agent::tools::CommandState::Failed
-            | tickloop_agent::tools::CommandState::Unknown
-    )
-}
-
 #[test]
 fn duplicate_instance_projection_keeps_the_newest_delivery_in_any_subscription_order() {
     use tickloop_agent::runtime::TickSubscriptionStatus;
@@ -738,7 +366,7 @@ fn duplicate_instance_projection_keeps_the_newest_delivery_in_any_subscription_o
 }
 
 #[tokio::test]
-async fn shell_subscription_refuses_the_same_foreign_chat_as_its_query_aliases() {
+async fn shell_subscription_refuses_foreign_chat_before_baseline_and_restoration() {
     let directory = tempfile::tempdir().unwrap();
     let model = Arc::new(ScriptedModel::new(vec![]));
     let agent = Agent::new_embedded(config(), model.clone());
@@ -754,35 +382,36 @@ async fn shell_subscription_refuses_the_same_foreign_chat_as_its_query_aliases()
         )
         .await
         .unwrap();
+    let shell_stream = tickloop_agent::tick_adapter::ShellTickStream::new(agent.clone());
+    let target = InstanceRef::shell(task.command_id);
+    assert!(
+        shell_stream
+            .revalidate_watch(observer, &target, None)
+            .await
+            .is_err()
+    );
+    assert!(
+        shell_stream
+            .revalidate_watch(owner, &target, None)
+            .await
+            .is_ok()
+    );
+    assert!(
+        shell_stream
+            .revalidate_watch(
+                owner,
+                &target,
+                Some(&tickloop_agent::host_tools::HostToolAuthority::Mcp {
+                    server_id: "https://unrelated.example".into(),
+                    account_id: "unrelated".into()
+                })
+            )
+            .await
+            .is_err()
+    );
     let adapters = Arc::new(TickAdapters::builtin(Some(agent.clone()), None, None));
-    let tools = adapters.host_tools(None);
     let instance = InstanceRef::shell(task.command_id);
-    for (name, input) in [
-        ("ReadTick", json!({"tick_instance_id":instance})),
-        (
-            "CallTickTool",
-            json!({"tick_instance_id":instance,"tool":"output","args":{}}),
-        ),
-    ] {
-        assert!(
-            tools
-                .prepare_call(observer, name, &input, CancellationToken::new())
-                .await
-                .is_err()
-        );
-    }
-    agent.install_host_tools(tools).unwrap();
     agent.install_tick_stream(adapters).await;
-    model.enqueue(call(
-        "foreign-read",
-        "ReadTick",
-        json!({"tick_instance_id":instance}),
-    ));
-    model.enqueue(call(
-        "foreign-output",
-        "CallTickTool",
-        json!({"tick_instance_id":instance,"tool":"output","args":{}}),
-    ));
     model.enqueue(call(
         "foreign-watch",
         "SubscribeTick",
@@ -805,7 +434,7 @@ async fn shell_subscription_refuses_the_same_foreign_chat_as_its_query_aliases()
             _ => {}
         }
     }
-    assert_eq!(refused, 3);
+    assert_eq!(refused, 1);
     assert!(
         agent.tick_subscriptions(observer).await.unwrap().is_empty(),
         "foreign Shell watch became configured"
@@ -825,6 +454,7 @@ async fn shell_subscription_refuses_the_same_foreign_chat_as_its_query_aliases()
                     id: Uuid::new_v4(),
                     instance: instance.clone(),
                     every_seconds: 5,
+                    authority: None,
                 }],
             }),
         )
@@ -883,63 +513,36 @@ async fn a_titleless_artifact_subscription_preserves_joined_and_cached_titles() 
 }
 
 #[tokio::test]
-async fn shell_and_new_adapter_aliases_preserve_read_policy_including_final_admission() {
-    use support::tick_alias_contract::{AliasCase, verify_alias_policy};
+async fn shell_subscription_preserves_its_policy_including_final_admission() {
+    use support::tick_admission_contract::{AdmissionCase, verify_admission_policy};
     let directory = tempfile::tempdir().unwrap();
-    for use_shell in [true, false] {
-        let model = Arc::new(ScriptedModel::new(vec![]));
-        let agent = Agent::new_embedded(config(), model.clone());
-        let chat = agent.create_chat(directory.path().into()).await.unwrap();
-        let (adapters, instance, tool) = if use_shell {
-            let task = agent
-                .submit_user_shell_for_goal(chat, None, "printf shell-body".into(), true)
-                .await
-                .unwrap();
-            (
-                TickAdapters::builtin(Some(agent.clone()), None, None),
-                InstanceRef::shell(task.command_id),
-                "output",
-            )
-        } else {
-            (
-                TickAdapters::new([Arc::new(CalendarAdapter {
-                    stream: InMemoryTickStream::new(),
-                }) as Arc<dyn TickAdapter>])
-                .unwrap(),
-                calendar(),
-                "meetings",
-            )
-        };
-        let adapters = Arc::new(adapters);
-        let provider = adapters.host_tools(None);
-        let read_input = json!({"tick_instance_id":instance});
-        let query_input = json!({"tick_instance_id":instance,"tool":tool,"args":{}});
-        let cases = [
-            AliasCase {
-                plan_denied: false,
-                name: "ReadTick",
-                input: read_input.clone(),
-                policy_name: "ReadTick",
-                policy_input: read_input.clone(),
-            },
-            AliasCase {
-                plan_denied: false,
-                name: "CallTickTool",
-                input: query_input.clone(),
-                policy_name: "CallTickTool",
-                policy_input: query_input,
-            },
-            AliasCase {
-                plan_denied: false,
-                name: "SubscribeTick",
-                input: json!({"tick_instance_id":instance,"every_seconds":5}),
-                policy_name: "ReadTick",
-                policy_input: read_input,
-            },
-        ];
-        agent.install_host_tools(provider).unwrap();
-        agent.install_tick_stream(adapters).await;
-        verify_alias_policy(&agent, &model, chat, &cases).await;
-        agent.shutdown().await;
-    }
+    let model = Arc::new(ScriptedModel::new(vec![]));
+    let agent = Agent::new_embedded(config(), model.clone());
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let task = agent
+        .submit_user_shell_for_goal(chat, None, "printf shell-body".into(), true)
+        .await
+        .unwrap();
+    let instance = InstanceRef::shell(task.command_id);
+    agent
+        .install_tick_stream(Arc::new(TickAdapters::builtin(
+            Some(agent.clone()),
+            None,
+            None,
+        )))
+        .await;
+    verify_admission_policy(
+        &agent,
+        &model,
+        chat,
+        &[AdmissionCase {
+            plan_denied: false,
+            name: "SubscribeTick",
+            input: json!({"tick_instance_id":instance,"every_seconds":5}),
+            policy_name: "SubscribeTick",
+            policy_input: json!({"tick_instance_id":instance,"every_seconds":5}),
+        }],
+    )
+    .await;
+    agent.shutdown().await;
 }

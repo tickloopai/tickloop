@@ -20,6 +20,12 @@ mod screen {
         "/tests/support/screen.rs"
     ));
 }
+mod input_dialog {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/support/input_dialog.rs"
+    ));
+}
 
 const FIXTURE_VARIABLE: &str = "TICKLOOP_CHILD_CONFIG_FIXTURE";
 const DIRECTORY_VARIABLE: &str = "TICKLOOP_CHILD_CONFIG_DIRECTORY";
@@ -32,9 +38,11 @@ const CURSOR_HIDDEN: &str = "\x1b[?25l";
 const COMPLETED_FRAME_END: &str = "\x1b[?2026l";
 const CHILD_VIEW_HEADING: &str = "Delegated Agent ·";
 const TIMEOUT: Duration = Duration::from_secs(15);
+const VIEW_REGISTRATION_DELAY: Duration = Duration::from_millis(50);
 
 /// Records every command the View sends, one JSON line each in `commands.jsonl`. On the
-/// Each command retains the stable execution identity used by the View.
+/// Each command retains the stable execution identity used by the View. Slow View
+/// registration separates the initial transcript frame from the initialized editor.
 struct RecordingOwner {
     owner: EmbeddedAgentAccess,
     directory: PathBuf,
@@ -63,6 +71,7 @@ impl AgentAccess for RecordingOwner {
     }
 
     async fn show_view(&self, update: DisplayUpdate) -> Result<DisplayReceipt, AccessError> {
+        tokio::time::sleep(VIEW_REGISTRATION_DELAY).await;
         self.owner.show_view(update).await
     }
 }
@@ -93,8 +102,22 @@ async fn run_child_config_fixture() {
     let route = std::env::var(ROUTE_VARIABLE).unwrap();
     let requester = route == "requester";
     let auto_permissions = route == "auto-permissions";
-    let config_root =
-        auto_permissions.then(|| directory.canonicalize().unwrap().join("config-root"));
+    let model_dialog = route == "model-dialog";
+    let config_root = (auto_permissions || model_dialog)
+        .then(|| directory.canonicalize().unwrap().join("config-root"));
+    let model = if model_dialog {
+        crate::model::credentials::save_api_key(
+            config_root.as_ref().unwrap(),
+            "DEEPSEEK_API_KEY",
+            "fixture-key",
+        )
+        .unwrap();
+        crate::model::cards::ModelCatalog::defaults()
+            .get("deepseek-api", "deepseek-flash")
+            .unwrap()
+    } else {
+        test_support::config()
+    };
     let replies = if requester {
         vec![
             test_support::call("delegate", "DelegateAgent", json!({"task":TASK})),
@@ -120,7 +143,7 @@ async fn run_child_config_fixture() {
         ]
     };
     let core = runtime::Agent::new_embedded(
-        test_support::config(),
+        model.clone(),
         Arc::new(test_support::ScriptedModel::new(replies)),
     );
     let workdir = std::env::current_dir().unwrap();
@@ -129,7 +152,7 @@ async fn run_child_config_fixture() {
         directory: directory.clone(),
     });
     let mut launch = LaunchSpec::embedded(workdir.clone());
-    launch.model = Some(test_support::config());
+    launch.model = Some(model);
     launch.session_persistence = false;
     launch.config_root = config_root.clone();
     let agent = Agent::from_access_for_test(
@@ -255,6 +278,9 @@ impl ChildPty {
             })
             .unwrap();
         let mut command = CommandBuilder::new(std::env::current_exe().unwrap());
+        if route == "model-dialog" {
+            command.env_clear();
+        }
         command.args([
             "--ignored",
             "--exact",
@@ -267,6 +293,17 @@ impl ChildPty {
         command.env("TICKLOOP_AGENT_TUI", "fullscreen");
         command.env("TERM", "xterm-256color");
         command.env("HOME", directory);
+        command.env("TICKLOOP_CONFIG_DIR", directory.join("config-root"));
+        command.env("TICKLOOP_AGENT_RUNTIME_DIR", directory.join("runtime"));
+        command.env("TICKLOOP_TMPDIR", directory);
+        for model in crate::model::cards::built_in_model_profiles() {
+            if !model.api_key_env.is_empty() {
+                command.env_remove(model.api_key_env);
+            }
+        }
+        if route == "model-dialog" {
+            command.env("DEEPSEEK_API_KEY", "fixture-key");
+        }
         if route == "auto-permissions" {
             command.env_remove(crate::judgment::JEV_API_KEY_ENV);
         }
@@ -324,6 +361,12 @@ impl ChildPty {
         panic!("child View never showed {label}: {}", self.frame());
     }
 
+    fn wait_for_root_editor(&mut self) -> String {
+        self.wait_for("the initialized root editor", |frame| {
+            frame.contains("❯") && status_mode(frame).is_some()
+        })
+    }
+
     fn wait_for_child_editor(&mut self) {
         let captured = self.output.clone();
         self.wait_for("the child editor owns input", |frame| {
@@ -369,7 +412,7 @@ impl ChildPty {
 
     /// Opens the delegated child in place from the overview.
     fn open_child(&mut self) {
-        self.wait_for("the root View", |frame| frame.contains("❯"));
+        self.wait_for_root_editor();
         self.wait_for("the family panel", |frame| frame.contains("Subagents 1"));
         self.send(b"\x1b[B\x1b[Bj\r");
     }
@@ -437,8 +480,10 @@ fn commands(directory: &Path) -> Vec<Value> {
 fn child_fixture(directory: &Path, view: &ChildPty) -> Value {
     let deadline = Instant::now() + TIMEOUT;
     loop {
-        if let Ok(bytes) = std::fs::read(directory.join("child.json")) {
-            return serde_json::from_slice(&bytes).unwrap();
+        if let Ok(bytes) = std::fs::read(directory.join("child.json"))
+            && let Ok(fixture) = serde_json::from_slice(&bytes)
+        {
+            return fixture;
         }
         assert!(
             Instant::now() < deadline,
@@ -447,6 +492,53 @@ fn child_fixture(directory: &Path, view: &ChildPty) -> Value {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+#[test]
+fn child_model_provider_and_settings_entries_use_the_input_dialog() {
+    let directory = tempfile::tempdir_in("/tmp").unwrap();
+    let mut view = ChildPty::start(directory.path(), "model-dialog");
+    child_fixture(directory.path(), &view);
+    view.open_child();
+    view.wait_for("the child in place", |frame| {
+        frame.contains("child reviewed")
+    });
+    view.wait_for_child_editor();
+    for (command, title, label) in [
+        (b"/model\r".as_slice(), "Choose model", "child-model"),
+        (
+            b"/provider\r".as_slice(),
+            "Choose Provider",
+            "child-provider",
+        ),
+        (b"/settings\r".as_slice(), "Settings", "child-settings"),
+    ] {
+        view.send(command);
+        let frame = view.wait_for(label, |frame| frame.contains(title));
+        input_dialog::assert_frame(&frame, HEIGHT, title);
+        input_dialog::record_frame(label, &frame);
+        if title == "Settings" {
+            view.send(b"\r");
+            let frame = view.wait_for("child settings model", |frame| {
+                frame.contains("Choose model")
+            });
+            input_dialog::assert_frame(&frame, HEIGHT, "Choose model");
+            input_dialog::record_frame("child-settings-model", &frame);
+        }
+        if title == "Settings" {
+            view.send(b"\x1b");
+            view.wait_for("settings parent", |frame| {
+                frame.lines().any(|line| line == "Settings") && !frame.contains("Choose model")
+            });
+        }
+        view.send(b"\x1b");
+        view.wait_for("child composer", |frame| {
+            !frame.contains("Choose Provider")
+                && !frame.contains("Choose model")
+                && !frame.lines().any(|line| line == "Settings")
+        });
+    }
+    view.close();
 }
 
 /// The execution mode label on the status row or lower input divider.
@@ -496,7 +588,7 @@ fn child_permission_candidates_and_help_describe_the_read_only_view() {
     let directory = tempfile::tempdir_in("/tmp").unwrap();
     let mut view = ChildPty::start(directory.path(), "child-config");
     child_fixture(directory.path(), &view);
-    view.wait_for("the root View", |frame| frame.contains("parent done"));
+    view.wait_for_root_editor();
     view.send(b"/per");
     let root = view.wait_for("the root permission candidate", |frame| {
         frame.contains("/permissions") && frame.contains("Choose Auto")
@@ -853,7 +945,7 @@ fn shift_tab_on_the_root_still_changes_its_mode() {
     let directory = tempfile::tempdir_in("/tmp").unwrap();
     let mut view = ChildPty::start(directory.path(), "child-config");
     child_fixture(directory.path(), &view);
-    let before = view.wait_for("the root View", |frame| frame.contains("parent done"));
+    let before = view.wait_for_root_editor();
     let initial = status_mode(&before);
     let baseline = commands(directory.path()).len();
     view.send(b"\x1b[Z");
@@ -883,11 +975,8 @@ fn shift_tab_in_the_overview_changes_no_hidden_agent_and_the_root_keeps_its_key(
     let directory = tempfile::tempdir_in("/tmp").unwrap();
     let mut view = ChildPty::start(directory.path(), "child-config");
     let fixture = child_fixture(directory.path(), &view);
-    let root = view.wait_for("the root View and its core mode", |frame| {
-        frame.contains("parent done") && status_mode(frame).is_some()
-    });
+    let root = view.wait_for_root_editor();
     let root_mode = status_mode(&root);
-    assert!(root_mode.is_some(), "the root shows its mode: {root}");
     let baseline = commands(directory.path()).len();
 
     view.send(b"\x1b[D");

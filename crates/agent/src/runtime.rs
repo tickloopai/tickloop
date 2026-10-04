@@ -34,6 +34,7 @@ pub use usage::{
 };
 mod agent_messages;
 mod family;
+pub(crate) use family::summary_state;
 mod family_mailbox;
 pub use family::{
     DirectedHumanSource, FamilyAgent, FamilyAvailability, FamilyCompletion, FamilyInputRecord,
@@ -345,6 +346,8 @@ pub struct ChatSnapshot {
     pub family_completions: Vec<FamilyCompletion>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub family_inputs: BTreeMap<Uuid, FamilyInputRecord>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sent_agent_messages: BTreeMap<Uuid, AgentMessageSource>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generated_title: Option<String>,
     pub workdir: PathBuf,
@@ -756,6 +759,27 @@ pub struct QueuedInput {
 }
 
 impl ChatSnapshot {
+    pub(super) fn run_response_text(&self, run: RunId) -> Option<String> {
+        self.messages
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(index, message)| {
+                message.role == Role::Assistant && self.message_runs.get(index) == Some(&run)
+            })
+            .map(|(_, message)| {
+                message
+                    .content
+                    .iter()
+                    .filter_map(|content| match content {
+                        Content::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+    }
+
     pub fn default_input_loop(&self) -> Option<LoopId> {
         (self.loops.len() == 1).then(|| self.loops[0].id)
     }
@@ -1047,6 +1071,12 @@ struct Chat {
     denial_window: denials::DenialWindow,
 }
 
+enum RunAdmission {
+    Idle,
+    Ready(Receipt, ModelRequest, CancellationToken),
+    ValidateTick(Box<PendingInput>),
+}
+
 #[derive(Clone, Copy)]
 struct PendingModelThinking {
     effort: Option<ReasoningEffort>,
@@ -1278,6 +1308,7 @@ fn empty_snapshot(id: ChatId, workdir: PathBuf, model: ModelConfig) -> ChatSnaps
         delegation: None,
         family_completions: Vec::new(),
         family_inputs: BTreeMap::new(),
+        sent_agent_messages: BTreeMap::new(),
         generated_title: None,
         workdir,
         model,
@@ -2492,9 +2523,9 @@ impl Agent {
                 })
                 .map(|pending| pending.receipt.clone());
             if let Some(pending_receipt) = pending_receipt {
-                let next = self.next_run(chat)?;
                 *original = candidate;
                 drop(chats);
+                let next = self.next_run(chat_id).await?;
                 if let Some(next) = next {
                     self.inner.tasks.lock().await.push(self.run_task(next));
                 }
@@ -2555,7 +2586,6 @@ impl Agent {
             session_context = Some(context);
             session_candidate = Some(candidate);
         }
-        let next = self.next_run(chat)?;
         *original = candidate;
         if let Some(source) = directed_origin {
             let source_chat = chats
@@ -2568,6 +2598,7 @@ impl Agent {
             *context = candidate;
         }
         drop(chats);
+        let next = self.next_run(chat_id).await?;
         if let Some((trigger, cancel)) = resume_watcher {
             // 先写出重新武装再启动 Trigger 任务：任务第一次读取停止状态时已知道这次武装。
             let recorded = self
@@ -2668,6 +2699,7 @@ impl Agent {
                 "workdir": chat.snapshot.workdir,
                 "delegation": chat.snapshot.delegation,
                 "workspace_host": workspace_host,
+                "service_connections": self.inner.host_tools.read().unwrap().as_ref().map(|provider| provider.service_connections()).unwrap_or_else(|| serde_json::json!({})),
                 "artifact_ticks": chat.snapshot.artifact_ticks,
                 "goal": chat.snapshot.loops.iter().find(|goal| goal.id == receipt.loop_id),
                 "chat_goals": chat.snapshot.loops,
@@ -2925,6 +2957,7 @@ impl Agent {
             receipt,
             &operation.name,
             &operation.input,
+            None,
             None,
         )?;
         let chat = chats.get_mut(&receipt.chat_id).unwrap();
@@ -3306,41 +3339,41 @@ impl Agent {
             .iter_mut()
             .find(|goal| goal.id == receipt.loop_id)
             .unwrap();
-        let event = match result {
-            _ if matches!(goal.state, LoopState::Stopped | LoopState::Expired) => {
-                EventKind::Interrupted
-            }
-            Ok(usage) if !cancel.is_cancelled() => {
-                goal.set_state(
-                    if chat.snapshot.policy.mode == ExecutionMode::Plan
-                        && chat.snapshot.plans.iter().any(|plan| {
-                            plan.loop_id == receipt.loop_id
-                                && plan.approved_execution_mode.is_none()
-                        })
-                    {
-                        LoopState::WaitingPlan
-                    } else if goal.trigger.as_ref().is_some_and(|trigger| trigger.armed)
-                        || goal.event_sources.iter().any(|source| {
-                            source.association_epoch.is_some() && !source.resume_required
-                        })
-                    {
-                        LoopState::WaitingTrigger
-                    } else {
-                        LoopState::Completed
-                    },
-                );
-                EventKind::Completed { usage }
-            }
-            _ if cancel.is_cancelled() => {
-                goal.set_state(LoopState::Interrupted);
-                EventKind::Interrupted
-            }
-            Err(error) => {
-                goal.set_state(LoopState::Failed);
-                EventKind::Failed(error)
-            }
-            Ok(_) => unreachable!(),
-        };
+        let event =
+            match result {
+                _ if matches!(goal.state, LoopState::Stopped | LoopState::Expired) => {
+                    EventKind::Interrupted
+                }
+                Ok(usage) if !cancel.is_cancelled() => {
+                    goal.set_state(
+                        if chat.snapshot.policy.mode == ExecutionMode::Plan
+                            && chat.snapshot.plans.iter().any(|plan| {
+                                plan.loop_id == receipt.loop_id && plan.approval_pending
+                            })
+                        {
+                            LoopState::WaitingPlan
+                        } else if goal.trigger.as_ref().is_some_and(|trigger| trigger.armed)
+                            || goal.event_sources.iter().any(|source| {
+                                source.association_epoch.is_some() && !source.resume_required
+                            })
+                        {
+                            LoopState::WaitingTrigger
+                        } else {
+                            LoopState::Completed
+                        },
+                    );
+                    EventKind::Completed { usage }
+                }
+                _ if cancel.is_cancelled() => {
+                    goal.set_state(LoopState::Interrupted);
+                    EventKind::Interrupted
+                }
+                Err(error) => {
+                    goal.set_state(LoopState::Failed);
+                    EventKind::Failed(error)
+                }
+                Ok(_) => unreachable!(),
+            };
         let is_deliverable = chat
             .snapshot
             .loops
@@ -3365,14 +3398,17 @@ impl Agent {
             return None;
         }
         let finished_snapshot = chat.snapshot.clone();
-        let next = match self.next_run(chat) {
+        drop(chats);
+        let next = match self.next_run(receipt.chat_id).await {
             Ok(next) => next,
             Err(error) => {
-                self.emit(chat, &receipt, EventKind::Failed(error.to_string()));
+                let mut chats = self.inner.chats.lock().await;
+                if let Some(chat) = chats.get_mut(&receipt.chat_id) {
+                    self.emit(chat, &receipt, EventKind::Failed(error.to_string()));
+                }
                 None
             }
         };
-        drop(chats);
         self.record_directed_replies(&receipt, &finished_snapshot)
             .await;
         if finished_snapshot.delegation.is_some() {
@@ -3442,8 +3478,11 @@ impl Agent {
         if !chat.ready_runs.contains(&receipt.run_id) {
             chat.ready_runs.push_back(receipt.run_id);
         }
-        let next = self.next_run(chat).map_err(|error| error.to_string())?;
         drop(chats);
+        let next = self
+            .next_run(receipt.chat_id)
+            .await
+            .map_err(|error| error.to_string())?;
         if let Some(next) = next {
             self.inner.tasks.lock().await.push(self.run_task(next));
         }
@@ -3531,17 +3570,66 @@ impl Agent {
         chat.file_history.begin_snapshot(message_id);
     }
 
-    fn next_run(
+    async fn next_run(
+        &self,
+        chat_id: ChatId,
+    ) -> Result<Option<(Receipt, ModelRequest, CancellationToken)>, AgentError> {
+        loop {
+            let admission = {
+                let mut chats = self.inner.chats.lock().await;
+                let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
+                self.select_next_run(chat, None)?
+            };
+            match admission {
+                RunAdmission::Idle => return Ok(None),
+                RunAdmission::Ready(receipt, request, cancel) => {
+                    return Ok(Some((receipt, request, cancel)));
+                }
+                RunAdmission::ValidateTick(pending) => {
+                    let source = pending.trigger_source.as_ref().unwrap();
+                    if self
+                        .revalidate_tick_source(chat_id, pending.receipt.loop_id, &source.payload)
+                        .await
+                        .is_ok()
+                    {
+                        if let Ok(mut chats) = self.inner.chats.try_lock() {
+                            let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
+                            match self.select_next_run(chat, Some(&pending))? {
+                                RunAdmission::Idle => return Ok(None),
+                                RunAdmission::Ready(receipt, request, cancel) => {
+                                    return Ok(Some((receipt, request, cancel)));
+                                }
+                                RunAdmission::ValidateTick(_) => {}
+                            }
+                        }
+                    } else {
+                        let mut chats = self.inner.chats.lock().await;
+                        if let Some(chat) = chats.get_mut(&chat_id) {
+                            chat.snapshot
+                                .pending_inputs
+                                .retain(|queued| queued.receipt.run_id != pending.receipt.run_id);
+                            self.finish_discarded_trigger_input(chat, &pending.receipt);
+                            self.discard_invalid_tick_inputs(chat);
+                            self.save(&chat.snapshot);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn select_next_run(
         &self,
         chat: &mut Chat,
-    ) -> Result<Option<(Receipt, ModelRequest, CancellationToken)>, AgentError> {
+        validated_tick: Option<&PendingInput>,
+    ) -> Result<RunAdmission, AgentError> {
         self.flush_deferred_messages(chat, MessageBoundary::Idle)?;
         if self.inner.closed.load(Ordering::SeqCst)
             || chat.active.is_some()
             || chat.has_foreground_user_shell()
         {
             self.save(&chat.snapshot);
-            return Ok(None);
+            return Ok(RunAdmission::Idle);
         }
         let mut candidate = chat.clone();
         while let Some(run_id) = candidate.ready_runs.pop_front() {
@@ -3567,7 +3655,7 @@ impl Agent {
             self.save(&candidate.snapshot);
             *chat = candidate;
             parked.resume.notify_one();
-            return Ok(None);
+            return Ok(RunAdmission::Idle);
         }
         let preceding_model_runs = candidate
             .snapshot
@@ -3613,6 +3701,36 @@ impl Agent {
             {
                 candidate.snapshot.pending_inputs.remove(index);
                 continue;
+            }
+            if let Some(source) = &pending.trigger_source
+                && source.source == tick_subscriptions::TICK_SUBSCRIPTION_SOURCE
+            {
+                let validated = validated_tick.is_some_and(|validated| {
+                    validated.receipt.run_id == pending.receipt.run_id
+                        && validated.input == pending.input
+                        && validated.trigger_source.as_ref().is_some_and(|previous| {
+                            previous.source == source.source && previous.payload == source.payload
+                        })
+                });
+                if !validated {
+                    self.save(&candidate.snapshot);
+                    *chat = candidate;
+                    return Ok(RunAdmission::ValidateTick(Box::new(pending)));
+                }
+                if self
+                    .validate_tick_source_bindings(
+                        pending.receipt.chat_id,
+                        pending.receipt.loop_id,
+                        &source.payload,
+                        &candidate.snapshot.loops,
+                    )
+                    .is_err()
+                {
+                    candidate.snapshot.pending_inputs.remove(index);
+                    self.finish_discarded_trigger_input(&mut candidate, &pending.receipt);
+                    self.discard_invalid_tick_inputs(&mut candidate);
+                    continue;
+                }
             }
             recovery::before_resume(
                 &mut candidate.snapshot,
@@ -3716,7 +3834,7 @@ impl Agent {
                 reasoning_effort: candidate.snapshot.effective_reasoning_effort(),
             };
             *chat = candidate;
-            return Ok(Some((receipt, request, cancel)));
+            return Ok(RunAdmission::Ready(receipt, request, cancel));
         }
         if preceding_model_runs.is_some()
             && command_barrier.is_none_or(|command_sequence| {
@@ -3731,11 +3849,11 @@ impl Agent {
             self.save(&candidate.snapshot);
             *chat = candidate;
             chat.user_shell_queue.notify_one();
-            return Ok(None);
+            return Ok(RunAdmission::Idle);
         }
         self.save(&candidate.snapshot);
         *chat = candidate;
-        Ok(None)
+        Ok(RunAdmission::Idle)
     }
 
     async fn request_permission(
@@ -3761,7 +3879,7 @@ impl Agent {
         let (sender, receiver) = oneshot::channel();
         let owner = PermissionOwner::new(receipt.chat_id, receipt.loop_id)
             .map_err(|error| error.to_string())?;
-        let next = {
+        {
             let mut chats = self.inner.chats.lock().await;
             let chat = chats.get_mut(&receipt.chat_id).unwrap();
             if cancel.is_cancelled() {
@@ -3791,8 +3909,11 @@ impl Agent {
                     request: request.clone(),
                 },
             );
-            self.next_run(chat).map_err(|error| error.to_string())?
-        };
+        }
+        let next = self
+            .next_run(receipt.chat_id)
+            .await
+            .map_err(|error| error.to_string())?;
         if let Some(next) = next {
             self.inner.tasks.lock().await.push(self.run_task(next));
         }
@@ -4024,6 +4145,18 @@ impl Agent {
         comment: Option<String>,
         persistent_specifier: Option<String>,
     ) -> Result<(), AgentError> {
+        if allow {
+            let chats = self.inner.chats.lock().await;
+            if chats.get(&chat_id).is_some_and(|chat| {
+                chat.snapshot.permissions.iter().any(|request| {
+                    request.id == request_id && request.name == EXIT_PLAN_MODE_TOOL_NAME
+                })
+            }) {
+                return Err(AgentError::Invalid(
+                    "choose an execution mode in the plan approval dialog".into(),
+                ));
+            }
+        }
         if scope != PermissionScope::Once {
             let chats = self.inner.chats.lock().await;
             let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
