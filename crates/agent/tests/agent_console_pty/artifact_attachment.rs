@@ -119,7 +119,7 @@ async fn actual_cli_creation_adds_an_artifact_tick_before_the_next_model_reply()
         assert!(next.is_ok(), "frame: {}\ncalls: {:?}", pty.frame(), calls.lock().unwrap());
         next.unwrap().unwrap();
 
-        let frame = pty.wait_for("creation is attached before the reply",|frame|frame.contains("Ticks 1") && frame.contains(CREATED_TITLE) && frame.contains("Artifacts (1)")).await;
+        let frame = pty.wait_for("creation is attached before the reply",|frame|frame.contains("Monitor 1") && frame.contains(CREATED_TITLE) && frame.contains("Artifacts (1)")).await;
         assert!(!frame.contains("CREATION-REPLY-FINISHED"));
         eprintln!("[artifact-created-live]\n{frame}\n[/artifact-created-live]");
         assert!(!calls.lock().unwrap().iter().any(|body|body["params"]["name"]=="event_associate"));

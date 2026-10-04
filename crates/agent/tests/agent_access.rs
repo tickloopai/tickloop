@@ -761,3 +761,89 @@ async fn embedded_artifact_commands_add_list_and_remove_from_the_selected_chat()
     assert!(snapshot.loops.is_empty());
     runtime.shutdown().await;
 }
+
+#[tokio::test]
+async fn embedded_monitor_commands_add_and_remove_members_of_the_selected_chat() {
+    let directory = tempfile::tempdir().unwrap();
+    let runtime = Agent::new_embedded(
+        support::config(),
+        Arc::new(support::ScriptedModel::new(Vec::new())),
+    );
+    let access = EmbeddedAgentAccess::new(runtime.clone());
+    let envelope = |command| CommandEnvelope {
+        owner_epoch: access.owner_epoch(),
+        command_id: Uuid::new_v4(),
+        command,
+    };
+    let create = || AgentCommand::Create {
+        launch: LaunchSpec::embedded(directory.path().into()),
+        initial: None,
+        origin: None,
+    };
+    let created = access.execute(envelope(create())).await.unwrap();
+    let Some(CommandResult::Created {
+        execution,
+        snapshot,
+        ..
+    }) = created.result
+    else {
+        panic!("missing created execution");
+    };
+    let other = access.execute(envelope(create())).await.unwrap();
+    let Some(CommandResult::Created {
+        snapshot: other, ..
+    }) = other.result
+    else {
+        panic!("missing second execution");
+    };
+    let instance: tickloop_agent::tick_stream::InstanceRef = "herdr:counter".parse().unwrap();
+    let added = access
+        .execute(envelope(AgentCommand::AddMonitorMember {
+            execution,
+            instance: instance.clone(),
+            title: Some("Counter".into()),
+        }))
+        .await
+        .unwrap();
+    let Some(CommandResult::MonitorMembership(membership)) = added.result else {
+        panic!("add returned {added:?}");
+    };
+    assert_eq!(membership.members[0].instance, instance);
+    assert_eq!(
+        membership.members[0].source,
+        tickloop_agent::runtime::MonitorMemberSource::Added
+    );
+    let removed = access
+        .execute(envelope(AgentCommand::RemoveMonitorMember {
+            execution,
+            instance: instance.clone(),
+        }))
+        .await
+        .unwrap();
+    let Some(CommandResult::MonitorMembership(membership)) = removed.result else {
+        panic!("remove returned {removed:?}");
+    };
+    assert!(membership.is_removed(&instance));
+    let live = runtime.snapshot(snapshot.conversation.id).await.unwrap();
+    assert_eq!(
+        live.monitor, membership,
+        "the live snapshot carries membership"
+    );
+    assert!(
+        runtime
+            .snapshot(other.conversation.id)
+            .await
+            .unwrap()
+            .monitor
+            .is_empty(),
+        "another Chat is untouched"
+    );
+    assert!(
+        runtime
+            .tick_subscriptions(snapshot.conversation.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    runtime.shutdown().await;
+}

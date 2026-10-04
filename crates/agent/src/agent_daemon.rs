@@ -53,6 +53,8 @@ const LOCK_NAME: &str = "owner.lock";
 struct WorkerBootstrap {
     epoch: Uuid,
     launch: LaunchSpec,
+    /// The worker's private grant for hosted Tick requests to its owner.
+    control: crate::hosted::worker_control::WorkerControlGrant,
 }
 
 struct ManagedWorker {
@@ -65,6 +67,7 @@ struct ProcessWorkerFactory {
     directory: PathBuf,
     workers: Mutex<Vec<ManagedWorker>>,
     shutting_down: AtomicBool,
+    control: Arc<crate::hosted::worker_control::WorkerControl>,
 }
 
 impl ProcessWorkerFactory {
@@ -127,9 +130,11 @@ impl WorkerFactory for ProcessWorkerFactory {
             .stdin
             .take()
             .ok_or_else(|| AccessError::unavailable("cannot open worker bootstrap pipe"))?;
+        let grant = self.control.grant();
         let mut bootstrap = serde_json::to_vec(&WorkerBootstrap {
             epoch: owner_epoch,
             launch: launch.clone(),
+            control: grant.clone(),
         })
         .map_err(|error| AccessError::invalid(error.to_string()))?;
         bootstrap.push(b'\n');
@@ -183,6 +188,9 @@ impl WorkerFactory for ProcessWorkerFactory {
                             process,
                             lifeline,
                         });
+                        self.control
+                            .register(&grant, access.clone(), launch.config_root.as_deref())
+                            .await;
                         return Ok(access);
                     }
                     Ok(Err(error))
@@ -213,10 +221,14 @@ impl WorkerFactory for ProcessWorkerFactory {
             .iter()
             .find(|managed| Arc::ptr_eq(&managed.access, worker))
             .map(|managed| managed.process.clone());
-        match process {
+        let exited = match process {
             Some(process) => matches!(process.lock().await.try_wait(), Ok(Some(_))),
             None => false,
+        };
+        if exited {
+            self.control.revoke(worker).await;
         }
+        exited
     }
 }
 
@@ -414,6 +426,7 @@ pub async fn run_internal(arguments: &[OsString]) -> Option<Result<(), String>> 
     match arguments.first().and_then(|value| value.to_str()) {
         Some("--agent-owner") => Some(run_owner(arguments).await),
         Some("--agent-worker") => Some(run_worker(arguments).await),
+        Some(crate::hosted::controller::HOST_MODE) => Some(run_tick_host().await),
         Some("service") => Some(service_control::run(&arguments[1..]).await),
         _ => None,
     }
@@ -443,21 +456,50 @@ async fn run_owner(arguments: &[OsString]) -> Result<(), String> {
     let endpoint = directory.join(SOCKET_NAME);
     let (listener, socket_identity) = private_listener(&endpoint)?;
     let epoch = Uuid::new_v4();
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let controller = Arc::new(crate::hosted::controller::HostController::new(
+        &directory,
+        tick_host::paths::HostPaths::from_environment(),
+        epoch,
+        executable,
+    ));
+    let control = Arc::new(crate::hosted::worker_control::WorkerControl::new(
+        &directory, epoch, controller,
+    ));
+    let control_endpoint = control.endpoint().to_path_buf();
+    // The owner lock proves no other owner serves this endpoint; a socket left by an owner that
+    // was killed is stale.
+    remove_stale_socket(&control_endpoint)?;
+    let (control_listener, control_identity) = private_listener(&control_endpoint)?;
     let factory = Arc::new(ProcessWorkerFactory {
         directory: directory.clone(),
         workers: Mutex::new(Vec::new()),
         shutting_down: AtomicBool::new(false),
+        control: control.clone(),
     });
     let owner = Arc::new(OwnerServer::new(epoch, factory.clone()));
+    control.attach_owner((*owner).clone());
+    let control_service = tokio::spawn(control.clone().serve(control_listener));
     let result = crate::agent_access::serve_owner_listener(listener, owner, epoch)
         .await
         .map_err(|error| error.to_string());
     factory.shutdown().await;
+    control_service.abort();
     let cleanup = validate_owner_lock_path(&lock, &lock_path)
-        .and_then(|()| remove_owned_socket(&endpoint, socket_identity));
+        .and_then(|()| remove_owned_socket(&endpoint, socket_identity))
+        .and_then(|()| remove_owned_socket(&control_endpoint, control_identity));
     drop(lock);
     cleanup?;
     result
+}
+
+/// The Tick host process the owner starts on demand. It runs only the host library.
+async fn run_tick_host() -> Result<(), String> {
+    let key = tick_host::host::read_controller_key(std::io::stdin().lock())
+        .map_err(|error| error.to_string())?;
+    tick_host::host::serve(tick_host::paths::HostPaths::from_environment(), key)
+        .await
+        .map_err(|error| format!("Tick host: {error}"))
 }
 
 async fn run_worker(arguments: &[OsString]) -> Result<(), String> {
@@ -479,7 +521,7 @@ async fn run_worker(arguments: &[OsString]) -> Result<(), String> {
     }
     let bootstrap: WorkerBootstrap =
         serde_json::from_slice(&bytes).map_err(|_| "invalid worker bootstrap")?;
-    let agent = build_runtime(&bootstrap.launch).await?;
+    let agent = build_runtime(&bootstrap.launch, Some(bootstrap.control.clone())).await?;
     let mut execution_events = agent.subscribe();
     let mut shell_events = agent.subscribe_user_shells();
     let access = Arc::new(EmbeddedAgentAccess::for_worker(
@@ -528,11 +570,14 @@ pub(crate) fn launch_model(launch: &LaunchSpec) -> ModelConfig {
         })
 }
 
-pub(crate) async fn build_runtime(launch: &LaunchSpec) -> Result<Agent, String> {
+pub(crate) async fn build_runtime(
+    launch: &LaunchSpec,
+    control: Option<crate::hosted::worker_control::WorkerControlGrant>,
+) -> Result<Agent, String> {
     let model = launch_model(launch);
     let client =
         model_client(model, launch.config_root.as_deref()).map_err(|error| error.to_string())?;
-    build_runtime_with_client(launch, client).await
+    build_runtime_with_client(launch, client, control).await
 }
 
 /// Build the same version-owned runtime with a caller-supplied model transport.
@@ -541,6 +586,7 @@ pub(crate) async fn build_runtime(launch: &LaunchSpec) -> Result<Agent, String> 
 pub async fn build_runtime_with_client(
     launch: &LaunchSpec,
     client: Arc<dyn ModelClient>,
+    control: Option<crate::hosted::worker_control::WorkerControlGrant>,
 ) -> Result<Agent, String> {
     let model = launch_model(launch);
     let settings = launch
@@ -579,11 +625,27 @@ pub async fn build_runtime_with_client(
             },
         ))
     });
-    let native_host = access.as_ref().map(|access| {
-        Arc::new(crate::native_host::NativeHostToolProvider::new(
+    // A worker with a Herdr View keeps the Herdr tools; one without gets hosted Ticks, opened
+    // through its owner, whose authority is the Tick host's own endpoint.
+    let native_host = match (&access, control) {
+        (Some(access), _) => Some(Arc::new(crate::native_host::NativeHostToolProvider::new(
             access.clone(),
-        )) as Arc<dyn crate::host_tools::HostToolProvider>
-    });
+        )) as Arc<dyn crate::host_tools::HostToolProvider>),
+        (None, Some(grant)) => Some(Arc::new(crate::hosted::tools::HostedTickTools::new(
+            crate::hosted::worker_control::OwnerControl::new(grant),
+            launch
+                .environment
+                .iter()
+                .filter_map(|entry| {
+                    Some((
+                        String::from_utf8(entry.name.clone()).ok()?,
+                        String::from_utf8(entry.value.clone()).ok()?,
+                    ))
+                })
+                .collect(),
+        )) as Arc<dyn crate::host_tools::HostToolProvider>),
+        (None, None) => None,
+    };
     let adapters = Arc::new(TickAdapters::builtin(
         Some(agent.clone()),
         launch.config_root.clone(),

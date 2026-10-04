@@ -508,8 +508,17 @@ async fn a_real_worker_keeps_shell_execution_after_ui_disconnect_and_exits_on_li
         .spawn()
         .unwrap();
     let mut lifeline = worker.stdin.take().unwrap();
-    let mut bootstrap =
-        serde_json::to_vec(&serde_json::json!({ "epoch": epoch, "launch": launch })).unwrap();
+    let control = serde_json::json!({
+        "endpoint": temporary.path().join("worker-control.sock"),
+        "owner_epoch": epoch,
+        "binding": Uuid::new_v4(),
+        "capability": "0".repeat(64),
+        "host_endpoint": temporary.path().join("host.sock"),
+    });
+    let mut bootstrap = serde_json::to_vec(
+        &serde_json::json!({ "epoch": epoch, "launch": launch, "control": control }),
+    )
+    .unwrap();
     bootstrap.push(b'\n');
     lifeline.write_all(&bootstrap).await.unwrap();
     let client = tokio::time::timeout(Duration::from_secs(5), async {
@@ -602,6 +611,100 @@ impl Drop for PrivateOwnerGuard {
             });
         }
     }
+}
+
+#[tokio::test]
+async fn an_owner_killed_without_cleanup_never_blocks_the_next_owner() {
+    use std::os::unix::fs::PermissionsExt;
+    let temporary = tempfile::tempdir_in("/tmp").unwrap();
+    let private_directory = temporary.path().join("agent-runtime");
+    std::fs::create_dir(&private_directory).unwrap();
+    std::fs::set_permissions(&private_directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let executable = std::path::PathBuf::from(env!("CARGO_BIN_EXE_tickloop"));
+    let killed = tickloop_agent::agent_daemon::connect_or_start_at(
+        private_directory.clone(),
+        executable.clone(),
+    )
+    .await
+    .unwrap();
+    let killed_pid = killed.server_process_id() as libc::pid_t;
+    assert!(private_directory.join("worker-control.sock").exists());
+    unsafe { libc::kill(killed_pid, libc::SIGKILL) };
+    for _ in 0..400 {
+        if unsafe { libc::kill(killed_pid, 0) } != 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        private_directory.join("worker-control.sock").exists(),
+        "a killed owner leaves its endpoints behind"
+    );
+    let mut guard = PrivateOwnerGuard { client: None };
+    let next = tickloop_agent::agent_daemon::connect_or_start_at(private_directory, executable)
+        .await
+        .expect("the next owner replaces the stale endpoints");
+    assert_ne!(next.owner_epoch(), killed.owner_epoch());
+    guard.client = Some(next);
+}
+
+#[tokio::test]
+async fn a_real_owner_answers_hosted_lifecycle_requests_only_for_live_grants() {
+    use std::os::unix::fs::PermissionsExt;
+    use tickloop_agent::hosted::worker_control::{OwnerControl, WorkerControlGrant, WorkerRequest};
+    let temporary = tempfile::tempdir_in("/tmp").unwrap();
+    let private_directory = temporary.path().join("agent-runtime");
+    std::fs::create_dir(&private_directory).unwrap();
+    std::fs::set_permissions(&private_directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut guard = PrivateOwnerGuard { client: None };
+    let client = tickloop_agent::agent_daemon::connect_or_start_at(
+        private_directory.clone(),
+        std::path::PathBuf::from(env!("CARGO_BIN_EXE_tickloop")),
+    )
+    .await
+    .unwrap();
+    let epoch = client.owner_epoch();
+    guard.client = Some(client);
+    let endpoint = private_directory.join("worker-control.sock");
+    assert_eq!(
+        std::fs::metadata(&endpoint).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let forged = |owner_epoch| WorkerControlGrant {
+        endpoint: endpoint.clone(),
+        owner_epoch,
+        binding: Uuid::new_v4(),
+        capability: "0".repeat(64),
+        host_endpoint: temporary.path().join("host.sock"),
+    };
+    let list = |chat| WorkerRequest::ListHostedTicks { chat, cursor: None };
+    let unknown_grant = OwnerControl::new(forged(epoch))
+        .request(list(Uuid::new_v4()))
+        .await
+        .unwrap_err();
+    assert_eq!(unknown_grant.code, "Forbidden");
+    assert!(!unknown_grant.dispatched);
+    let earlier_owner = OwnerControl::new(forged(Uuid::new_v4()))
+        .request(list(Uuid::new_v4()))
+        .await
+        .unwrap_err();
+    assert_eq!(earlier_owner.code, "EpochChanged");
+    let reconcile = {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::UnixStream::connect(&endpoint).await.unwrap();
+        let envelope = serde_json::json!({"id":1,"envelope":{"owner_epoch":epoch,"binding":Uuid::new_v4(),"capability":"0".repeat(64),"request":{"method":"reconcile"}}});
+        stream
+            .write_all(format!("{envelope}\n").as_bytes())
+            .await
+            .unwrap();
+        let mut line = String::new();
+        tokio::io::BufReader::new(stream)
+            .read_line(&mut line)
+            .await
+            .unwrap();
+        serde_json::from_str::<serde_json::Value>(&line).unwrap()
+    };
+    assert_eq!(reconcile["error"]["code"], "InvalidArguments");
 }
 
 #[tokio::test]

@@ -19,7 +19,7 @@ pub(super) async fn refresh(
         .snapshot(chat)
         .await
         .map_err(|error| error.to_string())?;
-    console.update_artifact_ticks(&snapshot)?;
+    console.update_monitor_chat(&snapshot)?;
     let Some(root) = root else {
         return Ok(());
     };
@@ -246,7 +246,7 @@ async fn remove_local_artifact(
             .await
             .map_err(|error| error.to_string())?,
     )?;
-    console.update_artifact_ticks(
+    console.update_monitor_chat(
         &agent
             .snapshot(chat)
             .await
@@ -365,7 +365,7 @@ async fn apply_choice_with_client(
                 .add_artifact_tick(chat, tick)
                 .await
                 .map_err(|error| error.to_string())?;
-            console.update_artifact_ticks(
+            console.update_monitor_chat(
                 &agent
                     .snapshot(chat)
                     .await
@@ -629,7 +629,7 @@ mod tests {
             if !remote_delete {
                 agent.add_artifact_tick(chat, tick.clone()).await.unwrap();
                 console
-                    .update_artifact_ticks(&agent.snapshot(chat).await.unwrap())
+                    .update_monitor_chat(&agent.snapshot(chat).await.unwrap())
                     .unwrap();
             }
             let subscription = remote.rows.lock().unwrap()[0].id;
@@ -665,7 +665,7 @@ mod tests {
             assert!(agent.tick_subscriptions(chat).await.unwrap().is_empty());
             assert!(agent.artifact_ticks(chat).await.unwrap().is_empty());
             assert!(
-                !console.tick_list_has_entries().unwrap(),
+                !console.monitor_has_entries().unwrap(),
                 "local cleanup left a cancelled subscription visible"
             );
             core.shutdown().await;

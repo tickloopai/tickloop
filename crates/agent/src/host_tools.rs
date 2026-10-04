@@ -32,6 +32,12 @@ pub enum HostEndpointIdentity {
     TrustedAdapter {
         scope: uuid::Uuid,
     },
+    /// The user's Tick host endpoint. Its process epoch changes across restarts and is checked
+    /// per call through each instance's binding, not here.
+    TickHost {
+        endpoint: PathBuf,
+        uid: u32,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -187,6 +193,12 @@ pub enum HostCallResult {
 pub enum HostEffect {
     PublishedSource(PublishedSourceEffect),
     CreatedArtifact(crate::artifacts::ArtifactTick),
+    /// A verified open created this Tick Instance for the calling Chat. It joins that Chat's
+    /// Monitor without subscribing; a failed or unknown open never produces this effect.
+    OpenedTick {
+        instance: tick_connect::instance::InstanceRef,
+        title: Option<String>,
+    },
     /// A strictly validated connection read. It carries the private service envelope, so it is
     /// never serialized; Runtime turns it into the model-visible result.
     ConnectSource(ConnectSourceEffect),

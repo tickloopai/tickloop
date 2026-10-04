@@ -19,12 +19,13 @@ use crate::{
 };
 
 pub const PROTOCOL_MAJOR: u16 = 4;
-pub const PROTOCOL_MINOR: u16 = 2;
+pub const PROTOCOL_MINOR: u16 = 3;
 pub const MIN_CHUNKED_RESPONSE_MINOR: u16 = 1;
 pub const MIN_PROVIDER_CREDENTIALS_MINOR: u16 = 2;
 pub const MIN_ACCOUNT_MODELS_MINOR: u16 = 2;
 pub const MIN_PREOPEN_OBSERVATION_CANCEL_MINOR: u16 = 2;
 pub const MIN_PROVIDER_MODEL_SELECTION_MINOR: u16 = 2;
+pub const MIN_MONITOR_MEMBERSHIP_MINOR: u16 = 3;
 pub const MAX_FRAME_BYTES: usize = 128 * 1024 * 1024;
 pub const RESPONSE_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 pub const FEED_CAPACITY: usize = 128;
@@ -258,6 +259,17 @@ pub enum AgentCommand {
     ListArtifactTicks {
         execution: ExecutionRef,
     },
+    /// Adds an existing Tick Instance to the Chat's Monitor without ownership or permission.
+    AddMonitorMember {
+        execution: ExecutionRef,
+        instance: tick_connect::instance::InstanceRef,
+        title: Option<String>,
+    },
+    /// Removes an instance from the Chat's Monitor view only.
+    RemoveMonitorMember {
+        execution: ExecutionRef,
+        instance: tick_connect::instance::InstanceRef,
+    },
     Create {
         launch: LaunchSpec,
         initial: Option<UserInput>,
@@ -335,6 +347,12 @@ impl AgentCommand {
         ) {
             check_provider_peer_version(minor, MIN_PROVIDER_MODEL_SELECTION_MINOR)?;
         }
+        if matches!(
+            self,
+            Self::AddMonitorMember { .. } | Self::RemoveMonitorMember { .. }
+        ) {
+            check_peer_minor(minor, MIN_MONITOR_MEMBERSHIP_MINOR, "Monitor membership")?;
+        }
         Ok(())
     }
 
@@ -349,6 +367,8 @@ impl AgentCommand {
             | Self::AddArtifactTick { execution, .. }
             | Self::RemoveArtifactTick { execution, .. }
             | Self::ListArtifactTicks { execution }
+            | Self::AddMonitorMember { execution, .. }
+            | Self::RemoveMonitorMember { execution, .. }
             | Self::EnqueueAfterTurn { execution, .. }
             | Self::RefreshConfiguration { execution } => Some(*execution),
             Self::DecidePermission { request, .. } | Self::AnswerQuestion { request, .. } => {
@@ -656,11 +676,15 @@ impl ObservationRequest {
 }
 
 fn check_provider_peer_version(minor: u16, required: u16) -> Result<(), AccessError> {
+    check_peer_minor(minor, required, "Provider/model management")
+}
+
+fn check_peer_minor(minor: u16, required: u16, feature: &str) -> Result<(), AccessError> {
     if minor < required {
         return Err(AccessError::new(
             AccessErrorCode::VersionMismatch,
             format!(
-                "Provider/model management requires AgentAccess {PROTOCOL_MAJOR}.{required} or newer; this connection negotiated {PROTOCOL_MAJOR}.{minor}. Existing Agent work and compatible operations remain available."
+                "{feature} requires AgentAccess {PROTOCOL_MAJOR}.{required} or newer; this connection negotiated {PROTOCOL_MAJOR}.{minor}. Existing Agent work and compatible operations remain available."
             ),
         ));
     }
@@ -872,6 +896,7 @@ impl CommandReceipt {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum CommandResult {
     ArtifactTicks(Vec<crate::artifacts::ArtifactTick>),
+    MonitorMembership(crate::runtime::MonitorMembership),
     Created {
         execution: ExecutionRef,
         snapshot: Box<LiveChatSnapshot>,
@@ -1203,4 +1228,46 @@ pub(crate) enum ServerMessage {
         request_id: Option<Uuid>,
         error: AccessError,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn monitor_membership_commands_require_the_negotiated_minor() {
+        let execution = ExecutionRef {
+            owner_epoch: Uuid::new_v4(),
+            agent_id: Uuid::new_v4(),
+            generation: 1,
+        };
+        let instance: tick_connect::instance::InstanceRef = "herdr:counter".parse().unwrap();
+        for command in [
+            AgentCommand::AddMonitorMember {
+                execution,
+                instance: instance.clone(),
+                title: None,
+            },
+            AgentCommand::RemoveMonitorMember {
+                execution,
+                instance: instance.clone(),
+            },
+        ] {
+            let error = command
+                .check_peer_version(MIN_MONITOR_MEMBERSHIP_MINOR - 1)
+                .unwrap_err();
+            assert_eq!(error.code, AccessErrorCode::VersionMismatch);
+            assert!(
+                error.message.contains("Monitor membership"),
+                "{}",
+                error.message
+            );
+            assert!(
+                command
+                    .check_peer_version(MIN_MONITOR_MEMBERSHIP_MINOR)
+                    .is_ok()
+            );
+            assert_eq!(command.execution(), Some(execution));
+        }
+    }
 }

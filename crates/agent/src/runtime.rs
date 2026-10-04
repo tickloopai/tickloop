@@ -34,6 +34,8 @@ pub use usage::{
 };
 mod agent_messages;
 mod artifact_ticks;
+mod monitor_members;
+pub use monitor_members::{MonitorMember, MonitorMemberSource, MonitorMembership};
 mod compaction;
 mod context;
 mod delegation;
@@ -319,6 +321,8 @@ pub struct ChatSnapshot {
     pub artifact_ticks: Vec<crate::artifacts::ArtifactTick>,
     #[serde(skip)]
     pub removed_artifact_ticks: std::collections::BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "MonitorMembership::is_empty")]
+    pub monitor: MonitorMembership,
     /// 本进程内的请求用量账本（不持久化，照 Claude Code 用量只记在 assistant 消息上）。
     #[serde(skip)]
     pub request_usage: RequestUsageLedger,
@@ -1238,6 +1242,7 @@ fn empty_snapshot(id: ChatId, workdir: PathBuf, model: ModelConfig) -> ChatSnaps
         tool_call_recoveries: Vec::new(),
         artifact_ticks: Vec::new(),
         removed_artifact_ticks: Default::default(),
+        monitor: MonitorMembership::default(),
         request_usage: RequestUsageLedger::new(),
         id,
         branch_origin: None,
@@ -3058,6 +3063,9 @@ impl Agent {
                             _ => None,
                         };
                         if let Some(tick) = tick { self.auto_attach_artifact_tick(chat, tick.clone()); }
+                        if let Some(crate::host_tools::HostEffect::OpenedTick { instance, title }) = &host_effect {
+                            self.record_opened_tick(chat, instance.clone(), title.clone());
+                        }
                     }
                     if let Some(crate::host_tools::HostEffect::PublishedSource(effect)) = host_effect
                         && !source_connection::has_recorded_publication(&chat.snapshot, &effect)

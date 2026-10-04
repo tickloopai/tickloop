@@ -122,9 +122,9 @@ impl CommandSpec {
 
 const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
-        command: "/ticks",
-        arguments: "",
-        description: "Show or hide the Tick List.",
+        command: "/monitor",
+        arguments: "[add]",
+        description: "Show or hide Monitor; add lists Ticks removed here and, in Herdr, Workspace programs.",
         menu_group: Some(CommandGroup::ToolsAndPermissions),
     },
     CommandSpec {
@@ -754,7 +754,7 @@ mod tests {
     #[test]
     fn arrows_move_the_selection_and_enter_only_replaces_the_draft() {
         let mut completion = Completion::default();
-        completion.update("/mo");
+        completion.update("/mod");
 
         assert_eq!(command_names(&completion), ["/model"]);
         assert_eq!(
@@ -785,7 +785,7 @@ mod tests {
     #[test]
     fn enter_without_a_selection_leaves_submission_to_the_editor() {
         let mut completion = Completion::default();
-        completion.update("/mo");
+        completion.update("/mod");
 
         assert_eq!(
             completion.handle_key(CompletionKey::Choose),
@@ -848,8 +848,8 @@ mod tests {
 
     #[test]
     fn command_after_unicode_whitespace_replaces_only_the_token() {
-        let draft = "研究一下\u{3000}/mo 保留后缀";
-        let cursor = "研究一下\u{3000}/mo".len();
+        let draft = "研究一下\u{3000}/mod 保留后缀";
+        let cursor = "研究一下\u{3000}/mod".len();
         let mut completion = Completion::default();
         completion.update_at(draft, cursor, CommandScope::Root);
         completion.handle_key(CompletionKey::Next);
@@ -867,7 +867,7 @@ mod tests {
     #[test]
     fn completion_in_the_middle_replaces_the_whole_token_and_preserves_the_suffix() {
         let draft = "before /modelish after";
-        let cursor = "before /mo".len();
+        let cursor = "before /mod".len();
         let mut completion = Completion::default();
         completion.update_at(draft, cursor, CommandScope::Root);
         completion.handle_key(CompletionKey::Next);
@@ -884,8 +884,8 @@ mod tests {
 
     #[test]
     fn line_start_completion_preserves_multiline_text() {
-        let draft = "第一行\n/mo\n第二行";
-        let cursor = "第一行\n/mo".len();
+        let draft = "第一行\n/mod\n第二行";
+        let cursor = "第一行\n/mod".len();
         let mut completion = Completion::default();
         completion.update_at(draft, cursor, CommandScope::Root);
         completion.handle_key(CompletionKey::Next);

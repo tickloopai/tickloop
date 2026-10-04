@@ -2,12 +2,12 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use uuid::Uuid;
 
 use super::{
+    monitor::relative_time,
     style::{Role, RoleLine},
     task_surface::{
         TaskFrameLineKind, TaskOutputUpdate, TaskSurface, TaskSurfaceAction, TaskSurfaceEffect,
         TaskViewport,
     },
-    tick_list::relative_time,
 };
 use crate::runtime::{ShellTask, ShellTaskAction, ShellTaskSnapshot};
 

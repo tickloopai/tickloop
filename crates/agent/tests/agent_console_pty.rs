@@ -502,7 +502,7 @@ async fn run_lifecycle(fixture: &PrivateFixture) {
     reopened
         .wait_for(
             "open live Agent exposes its real background Task",
-            |frame| frame.contains("Ticks 1") && !frame.contains("Agents · local"),
+            |frame| frame.contains("Monitor 1") && !frame.contains("Agents · local"),
         )
         .await;
     let rows = catalog(&client).await;
@@ -512,13 +512,13 @@ async fn run_lifecycle(fixture: &PrivateFixture) {
     reopened.send(b"?");
     reopened
         .wait_for("help replaces the real Task summary", |frame| {
-            frame.contains("Ctrl+J newline") && !frame.contains("Ticks 1")
+            frame.contains("Ctrl+J newline") && !frame.contains("Monitor 1")
         })
         .await;
     reopened.send(b"\x1b");
     reopened
         .wait_for("help restores the real Task summary", |frame| {
-            frame.contains("Ticks 1")
+            frame.contains("Monitor 1")
         })
         .await;
     reopened.send(b"\x1b[C");
@@ -1018,7 +1018,7 @@ async fn run_sustained_owner_loss(
     assert!(busy.user_shells[1].starts_in_background);
     assert!(busy.last_model_run.is_none());
     view.wait_for("actual busy Shell task is cached in the View", |frame| {
-        frame.contains("Ticks 1")
+        frame.contains("Monitor 1")
     })
     .await;
     view.send(b"UNSENT-OWNER-LOSS-DRAFT-jk");

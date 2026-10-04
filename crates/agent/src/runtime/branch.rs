@@ -275,6 +275,7 @@ impl Agent {
             tool_call_recoveries: Vec::new(),
             artifact_ticks: source.snapshot.artifact_ticks.clone(),
             removed_artifact_ticks: source.snapshot.removed_artifact_ticks.clone(),
+            monitor: source.snapshot.monitor.for_new_chat(),
             request_usage: RequestUsageLedger::new(),
             id: child_chat_id,
             branch_origin: Some(origin),

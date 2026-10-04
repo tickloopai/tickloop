@@ -11,7 +11,8 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use tick_connect::{
     access::TickAccess,
-    herdr::{HerdrContext, HerdrPort, HostError, Pane},
+    herdr::{HerdrContext, HerdrPort, Pane},
+    host_error::HostError,
 };
 use tickloop_agent::{
     host_tools::{

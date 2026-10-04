@@ -39,6 +39,10 @@ pub trait TickDetailView: Send + Any {
 
     fn id(&self) -> Uuid;
     fn chat(&self) -> Uuid;
+    /// Whether the view stays open while the Monitor has no rows, as the add picker does.
+    fn keeps_empty_monitor(&self) -> bool {
+        false
+    }
     fn lines(&mut self, width: usize, height: usize, now: u64) -> Vec<TickDetailLine>;
     fn hint(&self) -> String;
     fn key(&mut self, key: KeyEvent, width: usize, height: usize) -> TickDetailKey;
@@ -56,11 +60,32 @@ impl TickActionUi<'_> {
         self.state.chat
     }
     pub fn open_detail(&mut self, detail: Box<dyn TickDetailView>) {
-        self.state.tick_list.detail = Some(detail);
+        self.state.monitor.detail = Some(detail);
         self.state.rendered_region = None;
     }
     pub fn notify(&mut self, message: &str) {
         self.state.hold_status(message);
+    }
+    pub(super) fn monitor_members(
+        &self,
+    ) -> std::collections::BTreeSet<crate::tick_stream::InstanceRef> {
+        self.state.monitor.members()
+    }
+    pub(super) fn monitor_removed(
+        &self,
+    ) -> std::collections::BTreeSet<crate::tick_stream::InstanceRef> {
+        self.state.monitor.removed()
+    }
+    pub(super) fn monitor_entry(
+        &self,
+        instance: &crate::tick_stream::InstanceRef,
+    ) -> Option<super::monitor::MonitorEntry> {
+        self.state
+            .monitor
+            .entries()
+            .iter()
+            .find(|entry| &entry.instance == instance)
+            .cloned()
     }
 }
 

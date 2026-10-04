@@ -16,6 +16,7 @@ const TRANSPORT_FILE: &str = "TICKLOOP_TRANSPORT_FIXTURE";
 struct Bootstrap {
     epoch: Uuid,
     launch: LaunchSpec,
+    control: tickloop_agent::hosted::worker_control::WorkerControlGrant,
 }
 
 fn main() {
@@ -31,10 +32,9 @@ fn main() {
             std::env::set_var(TRANSPORT_FILE, &path);
         }
     }
-    if !arguments
-        .first()
-        .is_some_and(|arg| arg == "--agent-owner" || arg == "--agent-worker")
-        && let Some(path) = std::env::var_os(TRANSPORT_FILE)
+    if !arguments.first().is_some_and(|arg| {
+        arg == "--agent-owner" || arg == "--agent-worker" || arg == "--tick-host"
+    }) && let Some(path) = std::env::var_os(TRANSPORT_FILE)
         && let Ok(bytes) = std::fs::read(path)
         && let Ok(transport) = serde_json::from_slice::<ModelConfig>(&bytes)
         && let Some(model) = tickloop_agent::model::cards::ModelCatalog::defaults()
@@ -65,6 +65,34 @@ fn main() {
         .enable_all()
         .build()
         .unwrap();
+    if arguments.first().is_some_and(|arg| arg == "--tick-launch") {
+        // A test launcher for hosted Ticks: the same launch contract `tick run` uses.
+        let command = arguments
+            .iter()
+            .skip_while(|arg| *arg != "--")
+            .skip(1)
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let status = runtime.block_on(async {
+            let context = tick_connect::launch::LaunchContext::from_environment()?
+                .ok_or("no Tick launch context")?;
+            let host = context
+                .verify_foreground()
+                .await
+                .map_err(|error| error.to_string())?;
+            tick_connect::launch::run(host, command, std::env::current_dir().unwrap())
+                .await
+                .map_err(|error| error.to_string())
+        });
+        match status {
+            Ok(status) if status.success() => std::process::exit(0),
+            Ok(_) => std::process::exit(1),
+            Err(error) => {
+                eprintln!("fixture launcher: {error}");
+                std::process::exit(2);
+            }
+        }
+    }
     let result = runtime.block_on(async {
         if arguments.is_empty()
             || arguments
@@ -112,9 +140,12 @@ async fn worker(arguments: &[OsString]) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     let client: Arc<dyn tickloop_agent::model::ModelClient> =
         Arc::new(TransportClient { inner, config });
-    let agent =
-        tickloop_agent::agent_daemon::build_runtime_with_client(&bootstrap.launch, client.clone())
-            .await?;
+    let agent = tickloop_agent::agent_daemon::build_runtime_with_client(
+        &bootstrap.launch,
+        client.clone(),
+        Some(bootstrap.control),
+    )
+    .await?;
     let access = Arc::new(TransportAccess {
         inner: EmbeddedAgentAccess::for_worker(agent.clone(), bootstrap.epoch),
         client,

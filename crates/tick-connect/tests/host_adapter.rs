@@ -270,3 +270,133 @@ async fn open_forwards_the_agents_locale_to_the_new_pane() {
         assert_eq!(environment[name], value, "{name} was not forwarded");
     }
 }
+
+struct ManyPanes {
+    panes: std::sync::Mutex<usize>,
+}
+
+#[async_trait::async_trait]
+impl HerdrPort for ManyPanes {
+    async fn request(
+        &self,
+        method: &str,
+        params: Value,
+        _: CancellationToken,
+    ) -> Result<Value, tick_connect::host_error::HostError> {
+        let pane = |index: usize| json!({"pane_id":format!("p{index:03}"),"terminal_id":format!("t{index:03}"),"workspace_id":"w1","tab_id":"tab1","cwd":"/tmp","foreground_cwd":"/tmp"});
+        Ok(match method {
+            "pane.list" => {
+                json!({"panes":(0..*self.panes.lock().unwrap()).map(pane).collect::<Vec<_>>()})
+            }
+            "pane.process_info" => {
+                json!({"process_info":{"foreground_process_group_id":1,"foreground_processes":[{"pid":std::process::id()}]}})
+            }
+            "pane.get" => {
+                let index = params["pane_id"].as_str().unwrap()[1..].parse().unwrap();
+                json!({"pane":pane(index)})
+            }
+            method => panic!("unexpected Herdr method {method}"),
+        })
+    }
+}
+
+async fn read_workspace(access: &TickAccess, input: Value) -> Result<Value, String> {
+    let prepared = access
+        .prepare("read_workspace", &input)
+        .await
+        .map_err(|error| error.to_string())?;
+    access
+        .execute(prepared, CancellationToken::new())
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tokio::test]
+async fn workspace_discovery_pages_the_complete_set_and_expires_changed_cursors() {
+    let host = std::sync::Arc::new(ManyPanes {
+        panes: std::sync::Mutex::new(300),
+    });
+    let access = TickAccess::with_host(
+        HerdrContext::without_view("/tmp/paged-herdr.sock".into()),
+        host.clone(),
+    );
+    let mut seen = std::collections::BTreeSet::new();
+    let mut cursor = Value::Null;
+    loop {
+        let mut input = json!({"workspace_id":"w1"});
+        if !cursor.is_null() {
+            input["cursor"] = cursor.clone();
+        }
+        let page = read_workspace(&access, input).await.unwrap();
+        assert_eq!(page["total"], 300);
+        let ticks = page["ticks"].as_array().unwrap();
+        assert!(ticks.len() <= 128, "a page holds at most 128 programs");
+        for tick in ticks {
+            assert!(
+                seen.insert(tick["tick_instance_id"].as_str().unwrap().to_owned()),
+                "no program repeats across pages"
+            );
+        }
+        cursor = page["next_cursor"].clone();
+        if cursor.is_null() {
+            break;
+        }
+    }
+    assert_eq!(seen.len(), 300, "every program is reachable");
+
+    let first = read_workspace(&access, json!({"workspace_id":"w1","limit":10}))
+        .await
+        .unwrap();
+    assert_eq!(first["ticks"].as_array().unwrap().len(), 10);
+    *host.panes.lock().unwrap() = 299;
+    let expired = read_workspace(
+        &access,
+        json!({"workspace_id":"w1","cursor":first["next_cursor"].clone()}),
+    )
+    .await
+    .unwrap_err();
+    assert!(expired.contains("CursorExpired"), "{expired}");
+    for limit in [0, 129] {
+        let error = read_workspace(&access, json!({"workspace_id":"w1","limit":limit}))
+            .await
+            .unwrap_err();
+        assert!(error.contains("InvalidArguments"), "{error}");
+    }
+}
+
+struct FailingProcessInfo;
+
+#[async_trait::async_trait]
+impl HerdrPort for FailingProcessInfo {
+    async fn request(
+        &self,
+        method: &str,
+        _: Value,
+        _: CancellationToken,
+    ) -> Result<Value, tick_connect::host_error::HostError> {
+        match method {
+            "pane.list" => Ok(
+                json!({"panes":[{"pane_id":"p1","terminal_id":"t1","workspace_id":"w1","tab_id":"tab1"}]}),
+            ),
+            "pane.process_info" => Err(tick_connect::host_error::HostError::before(
+                "HostUnavailable",
+                "process_info failed",
+            )),
+            method => panic!("unexpected Herdr method {method}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_program_that_cannot_be_identified_counts_as_uncertain_not_absent() {
+    let access = TickAccess::with_host(
+        HerdrContext::without_view("/tmp/failing-herdr.sock".into()),
+        std::sync::Arc::new(FailingProcessInfo),
+    );
+    let (located, uncertain) = access.locate_all().await.unwrap();
+    assert!(located.is_empty());
+    assert_eq!(
+        uncertain, 1,
+        "an unanswered program may still be the member"
+    );
+}
