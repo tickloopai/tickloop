@@ -79,6 +79,48 @@ fn agent(id: u128, parent: Option<Uuid>, title: &str) -> AgentRow {
 }
 
 #[test]
+fn command_feedback_keeps_provider_failure_visible_with_an_empty_custom_status() {
+    for width in [80, 120] {
+        for height in [8, 24] {
+            let mut state = State::new(true, width, height);
+            state.prompt_enabled = true;
+            state
+                .editor
+                .replace_draft("keep literal jk draft".into(), 0);
+            state.configured_status_lines = Some(vec![]);
+            state.status = "Cannot clear a child Agent's history".into();
+            state.status_held = true;
+            state.provider_failure = Some("Kimi Code · HTTP 403 · usage / plan limit".into());
+            let (lines, _, _) = state.normal_styled_frame();
+            let feedback = lines
+                .iter()
+                .filter(|line| line.text().contains("Cannot clear"))
+                .collect::<Vec<_>>();
+            assert_eq!(feedback.len(), 1);
+            assert!(
+                feedback[0]
+                    .spans
+                    .iter()
+                    .all(|span| span.role == Some(Role::Warning))
+            );
+            assert!(!feedback[0].text().contains("HTTP 403"));
+            assert!(lines.iter().any(|line| line.text().contains("HTTP 403")));
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.text().contains("keep literal jk draft"))
+            );
+            assert!(
+                lines
+                    .iter()
+                    .all(|line| display_width(&line.text()) <= usize::from(width))
+            );
+            assert_eq!(state.editor.draft(), "keep literal jk draft");
+        }
+    }
+}
+
+#[test]
 fn child_input_badge_placeholder_and_panel_background_are_display_only() {
     use crate::settings::{DisplayPreferences, GlyphSet};
     for glyph_set in [GlyphSet::Unicode, GlyphSet::NerdFont] {

@@ -21,6 +21,7 @@ async-trait = "0.1"
 futures-util = "0.3"
 hyper-util = { version = "0.1", features = ["client-proxy"] }
 base64 = "0.22"
+percent-encoding = "2"
 crossterm = "0.29"
 fastrand = "2"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
@@ -40,7 +41,7 @@ similar = "2.7"
 tickloop-ui = { path = "../ui" }
 tick-connect = { path = "../tick-connect" }
 thiserror = "2"
-time = { version = "0.3", features = ["formatting"] }
+time = { version = "0.3", features = ["formatting", "parsing"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 tokio-tungstenite = { version = "0.27", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 tokio-util = "0.7"
@@ -55,6 +56,8 @@ grep-regex = "0.1"
 grep-searcher = "0.1"
 libc = "0.2"
 icu_normalizer = "2"
+icu_properties = "2"
+web_atoms = "0.2"
 htmd = "0.5"
 shell-words = "1"
 

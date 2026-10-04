@@ -427,7 +427,13 @@ async fn a_failed_retry_reports_the_normal_error_without_retrying_again() {
         .unwrap_err();
 
     assert_eq!(error.status(), Some(400), "{error}");
-    assert!(!format!("{error:?}").contains("image exceeds"));
+    assert!(
+        error
+            .provider_failure()
+            .unwrap()
+            .message
+            .contains("image exceeds")
+    );
     next_request(&mut requests).await;
     next_request(&mut requests).await;
     assert!(requests.try_recv().is_err());

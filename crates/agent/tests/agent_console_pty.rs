@@ -27,6 +27,9 @@ mod unified_footer;
 #[path = "agent_console_pty/auto_review.rs"]
 mod auto_review;
 
+#[path = "agent_console_pty/provider_errors.rs"]
+mod provider_errors;
+
 use std::{
     io::{Read, Write},
     panic::AssertUnwindSafe,
@@ -2695,11 +2698,16 @@ async fn select_overview_row(view: &mut PtyView, title: &str) {
 
 /// Opens the folded `group` heading with real keys: up to the first line, then down to it.
 async fn open_group_heading(view: &mut PtyView, group: &str) {
-    view.send(&b"k".repeat(40));
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    view.send(b"\x1b[5~");
+    view.wait_for("overview selection reaches its first group", |frame| {
+        selected_row_title(frame)
+            .is_some_and(|title| title.starts_with("Needs input") || title.starts_with("New Agent"))
+    })
+    .await;
     let folded = format!("› ▸ {group} · ");
     for _ in 0..40 {
-        if view.frame().contains(&folded) {
+        let frame = view.frame();
+        if frame.contains(&folded) {
             view.send(b"\r");
             view.wait_for("the group heading opens", |frame| {
                 frame.contains(&format!("› ▾ {group} · "))
@@ -2707,8 +2715,12 @@ async fn open_group_heading(view: &mut PtyView, group: &str) {
             .await;
             return;
         }
+        let selected = selected_row_title(&frame).map(str::to_owned);
         view.send(b"j");
-        tokio::time::sleep(Duration::from_millis(40)).await;
+        view.wait_for("overview navigation changes its selected row", |frame| {
+            selected_row_title(frame) != selected.as_deref()
+        })
+        .await;
     }
     panic!("no folded {group} heading: {}", view.frame());
 }

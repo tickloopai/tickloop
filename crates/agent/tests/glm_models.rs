@@ -711,7 +711,8 @@ async fn business_error_codes_decide_retry_and_failure_kind() {
     ] {
         let root = tempfile::tempdir().unwrap();
         let root = root.path().canonicalize().unwrap();
-        let body = json!({"error":{"code":code,"message":"secret remote detail"}}).to_string();
+        let body =
+            json!({"error":{"code":code,"message":"Request refused by the provider"}}).to_string();
         let (url, _) = model_http_support::serve_response(status, body).await;
         let config = configured("zai-global-api", "glm-5.3-chat-completions", &root, url);
         let (events, _) = mpsc::unbounded_channel();
@@ -722,10 +723,14 @@ async fn business_error_codes_decide_retry_and_failure_kind() {
             .unwrap_err();
         assert_eq!(error.kind(), kind, "{code}");
         assert_eq!(error.retry_hint().0, retry, "{code}");
-        assert!(
-            !error.to_string().contains("secret remote detail"),
-            "{code}"
-        );
+        if kind != ModelFailureKind::ResponseRejected {
+            assert!(
+                error
+                    .to_string()
+                    .contains("Request refused by the provider"),
+                "{code}"
+            );
+        }
     }
 }
 
@@ -894,4 +899,40 @@ async fn network_error_on_the_documented_empty_final_chunk_is_retried_by_the_run
             }))
     );
     agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn typed_balance_and_allowance_codes_determine_http_classification() {
+    for (code, class) in [
+        (
+            json!(1113),
+            tickloop_agent::model::ProviderFailureClass::Billing,
+        ),
+        (
+            json!("1113"),
+            tickloop_agent::model::ProviderFailureClass::Billing,
+        ),
+        (
+            json!(1308),
+            tickloop_agent::model::ProviderFailureClass::UsageLimit,
+        ),
+        (
+            json!("1310"),
+            tickloop_agent::model::ProviderFailureClass::UsageLimit,
+        ),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let body = json!({"error":{"code":code,"message":"Account request refused"}}).to_string();
+        let (url, _) = model_http_support::serve_response(429, body).await;
+        let config = configured("zai-global-api", "glm-5.3-chat-completions", &root, url);
+        let (events, _) = mpsc::unbounded_channel();
+        let error = model_client(config, Some(&root))
+            .unwrap()
+            .complete(user_request(None), events, CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert_eq!(error.provider_failure().unwrap().class, class, "{error}");
+        assert!(!error.retry_hint().0);
+    }
 }

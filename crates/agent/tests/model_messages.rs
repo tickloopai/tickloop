@@ -13,15 +13,18 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 #[tokio::test]
-async fn reports_authentication_and_rate_limits_without_echoing_remote_error_bodies() {
+async fn reports_authentication_and_rate_limits_without_echoing_credentials() {
     for (status, expected) in [
-        (401, "authentication"),
+        (401, "expired or invalid"),
         (403, "HTTP 403"),
-        (429, "rate limited"),
+        (429, "Rate limit"),
         (500, "HTTP 500"),
     ] {
-        let (base_url, _) =
-            serve_response(status, "secret-api-key must never appear in errors".into()).await;
+        let (base_url, _) = serve_response(
+            status,
+            "Request refused; Authorization: Bearer secret-api-key".into(),
+        )
+        .await;
         let client = HttpModelClient::new(configuration(base_url)).unwrap();
         let (events, _) = mpsc::unbounded_channel();
         let error = client
@@ -40,6 +43,8 @@ async fn reports_authentication_and_rate_limits_without_echoing_remote_error_bod
             .await
             .unwrap_err();
         assert!(error.to_string().contains(expected), "{error}");
+        assert!(error.to_string().contains(&format!("HTTP {status}")));
+        assert!(error.to_string().contains("Request refused"));
         assert!(!format!("{error:?}").contains("secret-api-key"));
     }
 }

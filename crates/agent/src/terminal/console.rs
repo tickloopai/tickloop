@@ -408,6 +408,9 @@ pub(super) struct PickerPresentation {
     pub(super) connection_options: Option<usize>,
     pub(super) row_hints: Vec<String>,
     pub(super) compact_rows: Vec<CompactPickerRow>,
+    pub(super) failure_target: Option<Uuid>,
+    pub(super) failure_connections: Vec<Option<String>>,
+    pub(super) failure_message: bool,
 }
 
 #[derive(Clone)]
@@ -662,6 +665,8 @@ pub(super) struct State {
     footer_list_focused: bool,
     conversation_focused: bool,
     status: String,
+    provider_failure: Option<String>,
+    provider_failures: HashMap<Uuid, HashMap<String, crate::model::ProviderHttpFailure>>,
     configured_status_lines: Option<Vec<String>>,
     background_status_notice: Option<BackgroundStatusNotice>,
     connection_notice: Option<String>,
@@ -1753,6 +1758,27 @@ impl Console {
         state
             .draw(&mut io::stdout().lock())
             .map_err(|error| error.to_string())
+    }
+
+    pub(super) fn set_provider_failure(&self, failure: Option<String>) -> Result<(), String> {
+        self.state
+            .lock()
+            .map_err(|error| error.to_string())?
+            .provider_failure = failure;
+        Ok(())
+    }
+
+    pub(super) fn set_provider_failures(
+        &self,
+        chat: Uuid,
+        failures: &HashMap<String, crate::model::ProviderHttpFailure>,
+    ) -> Result<(), String> {
+        self.state
+            .lock()
+            .map_err(|error| error.to_string())?
+            .provider_failures
+            .insert(chat, failures.clone());
+        Ok(())
     }
 
     pub(super) fn update_status_area(
@@ -3267,7 +3293,15 @@ impl Console {
 
     pub(super) fn menu_snapshot(&self, id: Uuid) -> Result<Option<Menu>, String> {
         let state = self.state.lock().map_err(|error| error.to_string())?;
-        Ok(state.menu.as_ref().filter(|menu| menu.id == id).cloned())
+        Ok(state
+            .menu
+            .as_ref()
+            .filter(|menu| menu.id == id)
+            .map(|menu| {
+                let mut menu = menu.clone();
+                menu.context = state.picker_context(&menu);
+                menu
+            }))
     }
 
     pub(super) fn recover_menu(
@@ -4200,6 +4234,12 @@ impl ConversationPiece {
                 state,
                 ..
             } => scrollback.set_tool_call(*run_id, call_key, spans, *state),
+            Self::Styled(text, role) if *role == Some(Role::Error) => {
+                let links = hyperlink::web_links(text);
+                for (run, link) in hyperlink::runs(text, &links) {
+                    scrollback.append_span(run, *role, None, link);
+                }
+            }
             Self::Styled(text, role) => scrollback.append_as(text, *role, None),
             Self::Input {
                 spans,
@@ -4731,6 +4771,8 @@ impl State {
             footer_list_focused: false,
             conversation_focused: false,
             status: String::new(),
+            provider_failure: None,
+            provider_failures: HashMap::new(),
             configured_status_lines: None,
             background_status_notice: None,
             connection_notice: None,
@@ -5606,6 +5648,31 @@ impl State {
             .map(|(_, header)| header.as_str())
     }
 
+    fn picker_context(&self, menu: &Menu) -> Vec<String> {
+        let mut context = menu.context.clone();
+        if let Some(failure) = self
+            .picker_presentation
+            .failure_target
+            .and_then(|chat| self.provider_failures.get(&chat))
+            .and_then(|failures| {
+                self.picker_presentation
+                    .failure_connections
+                    .get(menu.selected)
+                    .and_then(Option::as_ref)
+                    .and_then(|connection| failures.get(connection))
+            })
+        {
+            context.splice(
+                0..0,
+                super::menus::providers::provider_failure_context(failure),
+            );
+            if self.picker_presentation.failure_message {
+                context.push(format!("Provider message: {}", failure.message));
+            }
+        }
+        context
+    }
+
     fn request_styled_frame(&mut self, capacity: usize) -> (Vec<RoleLine>, usize, usize) {
         if !self.menu_is_visible() {
             let mut lines = vec![RoleLine::role(
@@ -5620,6 +5687,7 @@ impl State {
         }
         let menu = self.menu.as_ref().expect("request menu is visible");
         let selected = menu.selected.min(menu.options.len().saturating_sub(1));
+        let picker_context = self.picker_context(menu);
         let title_rows = usize::from(capacity > 1);
         let hint_rows = usize::from(capacity > 2);
         let input_field = self.input_menu_active();
@@ -5704,7 +5772,7 @@ impl State {
                         .get(selected)
                         .is_some(),
             ) + usize::from(picker && !self.picker_presentation.headers.is_empty());
-        let context_reserve = usize::from(!menu.context.is_empty() || self.menu_review.is_some())
+        let context_reserve = usize::from(!picker_context.is_empty() || self.menu_review.is_some())
             * capacity
                 .saturating_sub(title_rows + hint_rows + comment_rows + minimum_option_rows)
                 .min(2);
@@ -5820,8 +5888,7 @@ impl State {
                     }
                 }));
             } else {
-                let context = menu
-                    .context
+                let context = picker_context
                     .iter()
                     .flat_map(|line| {
                         let link = self
@@ -6250,6 +6317,7 @@ impl State {
                         > self.width
             });
         let required_status = !self.status.is_empty() && command_feedback.is_none()
+            || self.provider_failure.is_some()
             || self.confirmation_hint().is_some()
             || short && !overview && !self.queued_inputs.is_empty()
             || !overview
@@ -8792,6 +8860,12 @@ impl State {
     }
 
     fn status_notice(&self, status: &str) -> String {
+        let with_failure = match &self.provider_failure {
+            Some(failure) if status.is_empty() => failure.clone(),
+            Some(failure) => format!("{status} · {failure}"),
+            None => status.to_owned(),
+        };
+        let status = with_failure.as_str();
         let Some(hint) = self.confirmation_hint() else {
             return status.to_owned();
         };
@@ -18783,6 +18857,62 @@ mod tests {
                 && line.text().contains(&format!("Model {expected:02}"))));
             state.key(key(KeyCode::Char('k')));
         }
+    }
+
+    #[test]
+    fn provider_diagnostics_follow_model_keys_and_live_snapshot_without_moving_focus() {
+        let chat = Uuid::new_v4();
+        let mut state = State::new(true, 120, 25);
+        state.prompt_enabled = true;
+        state.menu_focused = true;
+        state.picker_kind = Some(PickerKind::Model);
+        let mut picker = menu();
+        picker.options = vec!["DeepSeek".into(), "MiniMax".into()];
+        picker.selected = 0;
+        let id = picker.id;
+        state.menu = Some(picker);
+        state.picker_presentation.failure_target = Some(chat);
+        state.picker_presentation.failure_connections =
+            vec![Some("deepseek-api".into()), Some("minimax-api".into())];
+        state.provider_failures.insert(
+            chat,
+            HashMap::from([(
+                "deepseek-api".into(),
+                crate::model::ProviderHttpFailure {
+                    provider_id: "deepseek-api".into(),
+                    provider_name: "DeepSeek".into(),
+                    status: 403,
+                    class: crate::model::ProviderFailureClass::UsageLimit,
+                    message: "Monthly limit".into(),
+                    hint: "Check allowance".into(),
+                    retry_after: None,
+                    retryable: false,
+                },
+            )]),
+        );
+        let context = |state: &State| {
+            state
+                .picker_context(state.menu.as_ref().unwrap())
+                .join("\n")
+        };
+        assert!(context(&state).contains("DeepSeek · HTTP 403"));
+        for down in [
+            key(KeyCode::Char('j')),
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
+        ] {
+            assert!(state.key(down).is_none());
+            assert!(!context(&state).contains("HTTP 403"));
+            assert!(state.key(key(KeyCode::Char('k'))).is_none());
+            assert!(context(&state).contains("HTTP 403"));
+        }
+        state
+            .provider_failures
+            .insert(Uuid::new_v4(), HashMap::new());
+        assert!(context(&state).contains("HTTP 403"));
+        state.provider_failures.insert(chat, HashMap::new());
+        assert!(!context(&state).contains("HTTP 403"));
+        assert_eq!(state.menu.as_ref().unwrap().id, id);
+        assert_eq!(state.menu.as_ref().unwrap().selected, 0);
     }
 
     #[test]

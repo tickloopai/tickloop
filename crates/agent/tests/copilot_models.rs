@@ -910,17 +910,17 @@ async fn revoked_sign_in_and_entitlement_refusals_are_not_retried_as_service_err
     let revoked = complete(config.clone(), &root, request(vec![user("Hi")], None))
         .await
         .unwrap_err();
-    assert!(
-        matches!(&revoked, ModelError::AtStage { error, .. } if matches!(**error, ModelError::CopilotAuthentication)),
-        "{revoked:?}"
-    );
+    assert!(revoked.provider_failure().is_some(), "{revoked:?}");
     assert_eq!(revoked.kind(), ModelFailureKind::AuthenticationFailed);
     let refused = complete(config.clone(), &root, request(vec![user("Hi")], None))
         .await
         .unwrap_err();
     assert_eq!(refused.kind(), ModelFailureKind::EntitlementDenied);
     assert!(!refused.retry_hint().0);
-    assert!(!refused.to_string().contains("model not enabled"));
+    assert!(
+        refused.to_string().contains("model not enabled"),
+        "{refused:?}"
+    );
     let not_enabled = complete(config, &root, request(vec![user("Hi")], None))
         .await
         .unwrap_err();
@@ -929,7 +929,7 @@ async fn revoked_sign_in_and_entitlement_refusals_are_not_retried_as_service_err
     assert!(
         not_enabled
             .to_string()
-            .contains("plan, organization policy or client")
+            .contains("The requested model is not supported.")
     );
 }
 

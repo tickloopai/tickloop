@@ -32,6 +32,20 @@ const ADDITIONAL_HYPERLINK_TERMINALS: [&str; 6] = [
 pub(super) struct Hyperlink(Arc<str>);
 
 impl Hyperlink {
+    pub(super) fn web(url: &str) -> Option<Self> {
+        if url.chars().any(char::is_control) {
+            return None;
+        }
+        let parsed = reqwest::Url::parse(url).ok()?;
+        if !matches!(parsed.scheme(), "http" | "https")
+            || parsed.host_str().is_none()
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+        {
+            return None;
+        }
+        Some(Self(url.into()))
+    }
     /// Node's `pathToFileURL` for an absolute path; a relative path has no file URL.
     pub(super) fn file(path: &Path) -> Option<Self> {
         if !path.is_absolute() {
@@ -59,6 +73,17 @@ impl Hyperlink {
     pub(super) fn close() -> String {
         format!("{OSC8_START}{OSC8_END}")
     }
+}
+
+pub(super) fn web_links(text: &str) -> Vec<(Range<usize>, Hyperlink)> {
+    static URL: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    URL.get_or_init(|| regex::Regex::new(r#"https?://[^\s<>\[\]"']+"#).expect("valid URL regex"))
+        .find_iter(text)
+        .filter_map(|found| {
+            let url = found.as_str().trim_end_matches(['.', ',', ';', ')']);
+            Hyperlink::web(url).map(|link| (found.start()..found.start() + url.len(), link))
+        })
+        .collect()
 }
 
 /// Splits `text` into non-empty runs, each carrying the link of its byte range or none.

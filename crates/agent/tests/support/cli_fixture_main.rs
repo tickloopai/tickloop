@@ -194,6 +194,10 @@ struct TransportClient {
 
 #[async_trait]
 impl tickloop_agent::model::ModelClient for TransportClient {
+    fn connection_id(&self) -> Option<String> {
+        self.inner.connection_id()
+    }
+
     async fn generate_title(
         &self,
         request: tickloop_agent::model::ModelRequest,

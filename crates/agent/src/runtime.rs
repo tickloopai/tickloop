@@ -328,6 +328,10 @@ impl LoopSnapshot {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ChatSnapshot {
+    #[serde(default)]
+    pub failure_events: Vec<Event>,
+    #[serde(default)]
+    pub provider_failures: HashMap<String, crate::model::ProviderHttpFailure>,
     #[serde(skip)]
     pub tool_call_recoveries: Vec<ToolCallRecovery>,
     #[serde(default)]
@@ -999,6 +1003,7 @@ struct Inner {
     settings_writes: Mutex<()>,
     /// 最近一次为各 Chat 读取用户设置时发现的问题。
     settings_warnings: std::sync::Mutex<HashMap<ChatId, Vec<String>>>,
+    provider_failures: std::sync::Mutex<HashMap<String, crate::model::ProviderHttpFailure>>,
     trusted_working_directories: std::sync::Mutex<HashSet<PathBuf>>,
     host_contexts: std::sync::Mutex<host_context::HostContexts>,
     delegations: Mutex<HashMap<(RunId, String), Receipt>>,
@@ -1299,6 +1304,8 @@ fn answerable_permission_request(
 
 fn empty_snapshot(id: ChatId, workdir: PathBuf, model: ModelConfig) -> ChatSnapshot {
     ChatSnapshot {
+        failure_events: Vec::new(),
+        provider_failures: HashMap::new(),
         tool_call_recoveries: Vec::new(),
         artifact_ticks: Vec::new(),
         removed_artifact_ticks: Default::default(),
@@ -1914,6 +1921,7 @@ impl Agent {
                 user_skills_directory,
                 settings_writes: Mutex::new(()),
                 settings_warnings: std::sync::Mutex::new(HashMap::new()),
+                provider_failures: std::sync::Mutex::new(HashMap::new()),
                 trusted_working_directories: std::sync::Mutex::new(HashSet::new()),
                 host_contexts: std::sync::Mutex::new(host_context::HostContexts::default()),
                 delegations: Mutex::new(HashMap::new()),
@@ -2636,6 +2644,9 @@ impl Agent {
             run_id: receipt.run_id,
             kind,
         };
+        if matches!(event.kind, EventKind::Failed(_)) {
+            chat.snapshot.failure_events.push(event.clone());
+        }
         chat.snapshot.events.push(event.clone());
         if chat.snapshot.events.len() > EVENT_REPLAY_LIMIT {
             chat.snapshot.events.remove(0);
@@ -4294,7 +4305,11 @@ impl Agent {
             .lock()
             .await
             .get(&chat)
-            .map(|chat| chat.snapshot.clone())
+            .map(|chat| {
+                let mut snapshot = chat.snapshot.clone();
+                snapshot.provider_failures = self.inner.provider_failures.lock().unwrap().clone();
+                snapshot
+            })
             .ok_or(AgentError::NotFound)
     }
 
