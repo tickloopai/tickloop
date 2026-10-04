@@ -261,6 +261,10 @@ impl SubscriptionSurface {
         true
     }
 
+    pub fn content_rows(&self) -> usize {
+        self.rows.len().max(1)
+    }
+
     pub fn frame(
         &mut self,
         viewport: SubscriptionViewport,

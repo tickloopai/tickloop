@@ -129,7 +129,11 @@ fn agent_layout_unsaved_status_and_exit_confirmation_keep_both_required_facts() 
             console.state.lock().unwrap().help_open = help_open;
             let frame = frame_lines(&console);
             if help_open {
-                assert_eq!(frame[12 + input_dialog::INPUT_DIALOG_RULE_ROWS], "Help");
+                let height = console.state.lock().unwrap().input_dialog_height();
+                assert_eq!(
+                    frame[frame.len() - height + input_dialog::INPUT_DIALOG_RULE_ROWS],
+                    "Help"
+                );
                 let state = console.state.lock().unwrap();
                 assert!(state.status.contains("Not saved"));
                 assert!(state.exit_confirmation.is_some());
@@ -270,7 +274,11 @@ fn agent_layout_necessary_background_facts_survive_narrow_status_configuration_a
                 console.state.lock().unwrap().help_open = help_open;
                 let frame = frame_lines(&console);
                 if help_open {
-                    assert_eq!(frame[12 + input_dialog::INPUT_DIALOG_RULE_ROWS], "Help");
+                    let height = console.state.lock().unwrap().input_dialog_height();
+                    assert_eq!(
+                        frame[frame.len() - height + input_dialog::INPUT_DIALOG_RULE_ROWS],
+                        "Help"
+                    );
                     let state = console.state.lock().unwrap();
                     assert!(state.background_status_notice.is_some());
                     assert_eq!(state.configured_status_lines, configured);

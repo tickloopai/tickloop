@@ -1058,6 +1058,7 @@ mod tests {
         let origin = format!("http://{}", listener.local_addr().unwrap());
         let (callback_sender, callback_receiver) = tokio::sync::oneshot::channel();
         let (token_release, token_pending) = tokio::sync::oneshot::channel();
+        let mut token_release = Some(token_release);
         let (token_requested, token_request) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
             let mut callback_sender = Some(callback_sender);
@@ -1128,6 +1129,7 @@ mod tests {
                         stream.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
                         continue;
                     }
+                    token_pending.take().unwrap().await.unwrap();
                     (
                         json!({"authorization_code":"test-code","code_verifier":"test-verifier"})
                             .to_string(),
@@ -1234,7 +1236,7 @@ mod tests {
             let deadline = Instant::now() + Duration::from_secs(20);
             loop {
                 let text = output.lock().unwrap().clone();
-                if ansi.replace_all(&text, "").contains(needle) {
+                if screen::visible_screen(&text, 150, 40).contains(needle) {
                     break;
                 }
                 assert!(
@@ -1260,10 +1262,7 @@ mod tests {
                 if let Some(end) = updates.rfind(SYNCHRONIZED_FRAME_END) {
                     let completed = &text[..offset + end + SYNCHRONIZED_FRAME_END.len()];
                     let visible = screen::visible_screen(completed, 150, 40);
-                    let completed_updates = &updates[..end + SYNCHRONIZED_FRAME_END.len()];
-                    if ansi.replace_all(completed_updates, "").contains(needle)
-                        || visible.contains(needle)
-                    {
+                    if visible.contains(needle) {
                         std::thread::sleep(TERMINAL_FRAME_SETTLE);
                         break;
                     }
@@ -1342,6 +1341,7 @@ mod tests {
             let frame = screen::visible_screen(&captured[..frame_end], 150, 40);
             input_dialog::assert_frame(&frame, 40, "Log in to Codex");
             input_dialog::record_frame("device-login", &frame);
+            token_release.take().unwrap().send(()).unwrap();
         }
         if manual_callback {
             let callback = callback_receiver.await.unwrap();
@@ -1389,10 +1389,10 @@ mod tests {
                 "Accepted submission dismissed editor: {frame}"
             );
             input_dialog::record_frame("callback-accepted", &frame);
-            token_release.send(()).unwrap();
+            token_release.take().unwrap().send(()).unwrap();
         }
         wait_after("Back to Provider", before_login);
-        wait("Codex subscription");
+        wait("Login saved");
         let completed_frame = screen::visible_screen(&output.lock().unwrap(), 150, 40);
         assert!(
             completed_frame.contains("Back to Provider")

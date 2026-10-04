@@ -280,7 +280,7 @@ fn input_dialog_pty_preserves_search_and_draft_through_permission_preemption() {
         fixture.wait(|frame| {
             frame
                 .lines()
-                .nth(top + input_dialog::INPUT_DIALOG_RULE_ROWS)
+                .nth(2 + input_dialog::INPUT_DIALOG_RULE_ROWS)
                 .is_some_and(|line| line.starts_with("Resume Chat"))
         });
         fixture.send(b"/Chat 1\x1b[B\x1b[B\x1b[B");
@@ -319,7 +319,7 @@ fn input_dialog_pty_preserves_search_and_draft_through_permission_preemption() {
         assert!(
             frame
                 .lines()
-                .nth(top + input_dialog::INPUT_DIALOG_RULE_ROWS)
+                .nth(if height == 40 { 14 } else { 2 } + input_dialog::INPUT_DIALOG_RULE_ROWS)
                 .unwrap()
                 .starts_with("Resume Chat")
         );
