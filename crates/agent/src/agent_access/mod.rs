@@ -49,22 +49,15 @@ pub trait AgentAccess: Send + Sync {
     async fn show_view(&self, update: DisplayUpdate) -> Result<DisplayReceipt, AccessError>;
 }
 
-const NEW_AGENT_TITLE: &str = "New Agent";
-
-/// Names an Agent by its first Loop goal, or by its first user Shell command when it has no Loop.
-pub(crate) fn agent_title(
+pub(crate) fn summary_run_id(
     loops: &[crate::runtime::LoopSnapshot],
-    user_shells: &[crate::runtime::UserShellRecord],
-) -> String {
+    state: &crate::runtime::LoopState,
+) -> Option<crate::runtime::RunId> {
     loops
-        .first()
-        .map(|goal| goal.goal.clone())
-        .or_else(|| {
-            user_shells
-                .first()
-                .map(|shell| format!("!{}", shell.command))
-        })
-        .unwrap_or_else(|| NEW_AGENT_TITLE.into())
+        .iter()
+        .filter(|goal| &goal.state == state)
+        .max_by_key(|goal| goal.state_since)
+        .and_then(|goal| goal.run_id)
 }
 
 /// The Loop state an Agent row reports: the goal most in need of attention, so a later completed

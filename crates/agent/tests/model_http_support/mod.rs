@@ -22,8 +22,8 @@ pub async fn serve_response_with_headers(
     let address = listener.local_addr().unwrap();
     let (sender, receiver) = oneshot::channel();
     tokio::spawn(async move {
-        let (mut socket, _) = listener.accept().await.unwrap();
-        let _ = sender.send(read_request(&mut socket).await);
+        let (mut socket, request) = accept_script_request(&listener).await;
+        let _ = sender.send(request);
         write_response(&mut socket, status, &response_headers, &body).await;
     });
     (format!("http://{address}/anthropic"), receiver)
@@ -38,8 +38,8 @@ pub async fn serve_responses(
     let (sender, receiver) = mpsc::unbounded_channel();
     tokio::spawn(async move {
         for (status, body) in responses {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let _ = sender.send(read_request(&mut socket).await);
+            let (mut socket, request) = accept_script_request(&listener).await;
+            let _ = sender.send(request);
             write_response(&mut socket, status, "", &body).await;
         }
     });
@@ -80,8 +80,8 @@ pub async fn serve_responses_with_gated_responses(
     let (sender, receiver) = mpsc::unbounded_channel();
     tokio::spawn(async move {
         for (index, (status, body)) in responses.into_iter().enumerate() {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let _ = sender.send(read_request(&mut socket).await);
+            let (mut socket, request) = accept_script_request(&listener).await;
+            let _ = sender.send(request);
             if let Some(gate) = gates.remove(&index) {
                 tokio::spawn(async move {
                     if gate.await.is_ok() {
@@ -96,11 +96,93 @@ pub async fn serve_responses_with_gated_responses(
     (format!("http://{address}/anthropic"), receiver, releases)
 }
 
+pub async fn serve_router(
+    mut reply: impl FnMut(&Value) -> String + Send + 'static,
+) -> (String, mpsc::UnboundedReceiver<(String, Value)>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (sender, receiver) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        loop {
+            let (mut socket, request) = accept_script_request(&listener).await;
+            let response = reply(&request.1);
+            if sender.send(request).is_err() {
+                break;
+            }
+            write_response(&mut socket, 200, "", &response).await;
+        }
+    });
+    (format!("http://{address}/anthropic"), receiver)
+}
+
 fn header_lines(headers: &[(&str, &str)]) -> String {
     headers
         .iter()
         .map(|(name, value)| format!("{name}: {value}\r\n"))
         .collect()
+}
+
+pub async fn accept_script_request(listener: &TcpListener) -> (TcpStream, (String, Value)) {
+    loop {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let request = read_request(&mut socket).await;
+        if request
+            .1
+            .get("tools")
+            .and_then(Value::as_array)
+            .is_none_or(Vec::is_empty)
+            && request
+                .1
+                .to_string()
+                .contains("Generate a short sentence-case Chat title")
+        {
+            let title = request
+                .1
+                .get("messages")
+                .or_else(|| request.1.get("input"))
+                .and_then(Value::as_array)
+                .and_then(|messages| messages.last())
+                .and_then(|message| message.get("content"))
+                .map(|content| {
+                    content.as_str().map(str::to_owned).unwrap_or_else(|| {
+                        content
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|block| block.get("text").and_then(Value::as_str))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    })
+                })
+                .unwrap_or_else(|| "Fixture session".into());
+            write_response(&mut socket, 200, "", &title_stream(&request.1, &title)).await;
+        } else {
+            return (socket, request);
+        }
+    }
+}
+
+fn title_stream(request: &Value, title: &str) -> String {
+    let frame = |event: &str, data: Value| format!("event: {event}\ndata: {data}\n\n");
+    if request.get("input").is_some() {
+        let message = serde_json::json!({"id":"title-message","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":title,"annotations":[]}]});
+        frame(
+            "response.completed",
+            serde_json::json!({"type":"response.completed","response":{"id":"title-response","status":"completed","output":[message],"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}),
+        )
+    } else if request.get("max_tokens").is_some() {
+        [frame("message_start", serde_json::json!({"type":"message_start","message":{"id":"title","type":"message","role":"assistant","model":request["model"],"content":[],"usage":{"input_tokens":0,"output_tokens":0}}})),
+         frame("content_block_start", serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}})),
+         frame("content_block_delta", serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":title}})),
+         frame("content_block_stop", serde_json::json!({"type":"content_block_stop","index":0})),
+         frame("message_delta", serde_json::json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":0}})),
+         frame("message_stop", serde_json::json!({"type":"message_stop"}))].concat()
+    } else {
+        format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            serde_json::json!({"id":"title","choices":[{"index":0,"delta":{"role":"assistant","content":title},"finish_reason":"stop"}],"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}})
+        )
+    }
 }
 
 async fn read_request(socket: &mut TcpStream) -> (String, Value) {

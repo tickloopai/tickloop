@@ -156,7 +156,7 @@ fn agent_layout_unsaved_status_and_exit_confirmation_keep_both_required_facts() 
 }
 
 #[test]
-fn agent_layout_background_titles_use_display_columns_and_the_family_reading_number() {
+fn agent_layout_background_titles_use_display_columns_without_family_reading_numbers() {
     for width in [80, 120] {
         for title in [
             "Review the entire implementation in /fixture/project/very/long/worktree/path",
@@ -205,7 +205,7 @@ fn agent_layout_background_titles_use_display_columns_and_the_family_reading_num
             );
             let notice = line_with(&frame, "Shell task completed").unwrap();
             assert!(
-                notice.contains("(2)") && notice.contains("Shell task completed"),
+                notice.contains("Shell task completed") && !notice.contains("(2)"),
                 "{width} columns: {frame:#?}"
             );
             assert!(
@@ -373,7 +373,7 @@ fn agent_layout_held_overview_refusal_precedes_hints_at_narrow_widths() {
         assert!(state.key(key(KeyCode::Enter)).is_none());
         let frame = drawn(&mut state);
         assert!(
-            line_with(&frame, "/model is unavailable").is_some(),
+            line_with(&frame, "/model isn't available").is_some(),
             "{width} columns: {frame:#?}"
         );
         state.key(key(KeyCode::Char('x')));
@@ -387,7 +387,7 @@ fn agent_layout_held_overview_refusal_precedes_hints_at_narrow_widths() {
             assert!(state.key(key(KeyCode::BackTab)).is_none());
             let frame = drawn(&mut state);
             assert!(
-                line_with(&frame, "Shift+Tab mode is unava").is_some(),
+                line_with(&frame, "Shift+Tab mode isn't").is_some(),
                 "{width} columns, input focused {input_focused}: {frame:#?}"
             );
         }
@@ -407,36 +407,105 @@ fn agent_layout_child_refusal_keeps_the_parent_reason_at_narrow_widths() {
         assert!(state.key(key(KeyCode::Enter)).is_none());
         let frame = drawn(&mut state);
         assert!(
-            line_with(&frame, "Parent fixed").is_some(),
+            line_with(&frame, "/mode isn't available").is_some(),
             "{width} columns: {frame:#?}"
         );
         assert_eq!(state.editor.draft(), "/mode full");
         assert!(state.key(key(KeyCode::BackTab)).is_none());
         let frame = drawn(&mut state);
         assert!(
-            line_with(&frame, "Parent fixed").is_some(),
+            line_with(&frame, "Shift+Tab mode isn't").is_some(),
             "{width} columns: {frame:#?}"
         );
         if width == 120 {
             assert!(
-                line_with(&frame, "Shift+Tab mode is unavailable here").is_some(),
+                line_with(&frame, "Shift+Tab mode isn't available").is_some(),
                 "{frame:#?}"
             );
             assert!(
-                line_with(&frame, "authorization is fixed by its parent").is_some(),
+                line_with(&frame, "authorization is set by the parent").is_some(),
                 "{frame:#?}"
             );
         }
     }
 }
 
-fn agent_row(id: Uuid, parent: Option<Uuid>, title: &str) -> AgentTreeRow {
-    AgentTreeRow {
+#[test]
+fn child_clear_feedback_has_its_own_row_above_the_composer_and_expanded_family() {
+    for width in [80, 120] {
+        let mut state = State::new(true, width, 40);
+        state.chat = Some(ROOT_AGENT);
+        state.prompt_enabled = true;
+        state.visible_delegated = true;
+        state.status_area.update(
+            "Auto".into(),
+            "fixture".into(),
+            Some((20000, 200000)),
+            vec![],
+        );
+        state.status_area.update_agents(
+            vec![
+                agent_row(ROOT_AGENT, None, "long root title"),
+                agent_row(Uuid::from_u128(202), Some(ROOT_AGENT), "First child"),
+                agent_row(Uuid::from_u128(203), Some(ROOT_AGENT), "Second child"),
+                agent_row(Uuid::from_u128(204), Some(ROOT_AGENT), "Third child"),
+            ],
+            Some(Uuid::from_u128(202)),
+        );
+        state.background_status_notice = Some(BackgroundStatusNotice {
+            title: Some("background title must stay out of command feedback".into()),
+            ordinal: None,
+            message: "working".into(),
+            message_role: Role::Text,
+            compact_message: None,
+            necessary: false,
+        });
+        state.insert("/clear");
+        assert!(state.key(key(KeyCode::Enter)).is_none());
+        let (lines, _, _) = state.normal_styled_frame();
+        let input = lines
+            .iter()
+            .position(|line| line.text().starts_with('❯'))
+            .unwrap();
+        let feedback = lines
+            .iter()
+            .position(|line| line.text().contains("/clear") && !line.text().starts_with('❯'))
+            .unwrap();
+        let divider = lines
+            .iter()
+            .position(|line| line.text().contains("Subagents 3"))
+            .unwrap();
+        assert!(
+            feedback < input,
+            "feedback belongs above the composer, not between the Subagents divider and rows: {lines:?}"
+        );
+        assert_eq!(
+            feedback + 2,
+            input,
+            "one feedback row then the input border"
+        );
+        assert!(lines[feedback].text().contains("/clear"));
+        assert!(!lines[feedback].text().contains("background title"));
+        assert!(!lines[feedback].text().contains("Auto"));
+        assert!(lines[divider].text().contains("Auto · fixture"));
+        assert!(lines[divider + 1].text().contains("main"));
+        assert!(
+            lines
+                .iter()
+                .all(|line| display_width(&line.text()) <= usize::from(width))
+        );
+        assert_eq!(state.editor.draft(), "/clear");
+    }
+}
+
+fn agent_row(id: Uuid, parent: Option<Uuid>, title: &str) -> AgentRow {
+    AgentRow {
         agent_id: id,
         parent_id: parent,
-        depth: usize::from(parent.is_some()),
+
         title: title.into(),
         status: "running".into(),
+        state: crate::runtime::LoopState::Running,
         project: "project-a".into(),
         workspace: Some("workspace-a".into()),
         approvals: usize::from(id == ROOT_AGENT),
@@ -456,6 +525,12 @@ fn agent_row(id: Uuid, parent: Option<Uuid>, title: &str) -> AgentTreeRow {
         ),
         preview: None,
         updated_at: None,
+        subagent: parent.map(|_| crate::runtime::SubagentRegistration {
+            child_chat_id: id,
+            handle: format!("child-{}", id.as_u128() % 1000),
+            description: title.into(),
+            created_at: crate::private_fs::unix_time_milliseconds(),
+        }),
     }
 }
 
@@ -471,7 +546,6 @@ pub(super) fn set_status_family(area: &mut StatusArea) {
             })
             .collect(),
         Some(ROOT_AGENT),
-        HashMap::new(),
     );
 }
 
@@ -559,11 +633,8 @@ fn agent_layout_narrow_agent_rows_keep_request_types_when_the_title_is_long() {
     let mut state = console.state.lock().unwrap();
     state.key(key(KeyCode::Down));
     let frame = state.frame().0;
-    let row = frame
-        .iter()
-        .find(|line| line.contains("approvals 1"))
-        .unwrap();
-    assert!(row.contains("questions 2"), "{frame:?}");
+    let row = frame.iter().find(|line| line.contains("A1 Q2")).unwrap();
+    assert!(row.contains("A1 Q2"), "{frame:?}");
     assert!(row.contains("很长"), "{frame:?}");
     state.key(key(KeyCode::Down));
     assert!(
@@ -589,7 +660,7 @@ fn agent_layout_footer_enters_at_the_bottom_with_following_disabled() {
     state.insert("keep this draft");
     state.key(key(KeyCode::Down));
     assert_eq!(state.footer.selected(), Some(FooterItemId::Agents));
-    assert!(state.frame().0.iter().any(|row| row.contains("task 00")));
+    assert!(state.frame().0.iter().any(|row| row.contains("main")));
     assert_eq!(state.editor.draft(), "keep this draft");
     assert!(!state.scrollback.is_following());
 }
@@ -606,12 +677,12 @@ fn agent_layout_first_down_expands_and_list_keys_preserve_the_draft() {
         .footer
         .update(state.status_area.available_panels().collect::<Vec<_>>());
     state.insert("keep jk");
-    assert!(state.frame().0.iter().any(|line| line.contains("task 00")));
+    assert!(state.frame().0.iter().any(|line| line.contains("main")));
     assert!(state.footer.selected().is_none());
     assert!(!state.footer_list_focused);
     state.key(key(KeyCode::Down));
     assert_eq!(state.footer.selected(), Some(FooterItemId::Agents));
-    assert!(state.frame().0.iter().any(|line| line.contains("task 00")));
+    assert!(state.frame().0.iter().any(|line| line.contains("main")));
     assert!(!state.footer_list_focused);
     state.key(key(KeyCode::Down));
     assert!(state.footer_list_focused);
@@ -1229,7 +1300,7 @@ fn agent_layout_current_draft_keeps_its_name_and_return_cue_at_supported_sizes()
             }))
             .unwrap();
         let frame = frame_lines(&console);
-        let draft = line_with(&frame, "› ● New Agent").unwrap();
+        let draft = line_with(&frame, "› ◆ New Agent").unwrap();
         assert!(draft.contains("current"), "{frame:#?}");
         if width >= 41 {
             assert!(draft.contains("current session"), "{frame:#?}");
@@ -1347,94 +1418,6 @@ fn agent_layout_overview_context_updates_keep_the_dispatch_draft_and_source_focu
     let state = console.state.lock().unwrap();
     assert_eq!(state.editor.draft(), "parent draft");
     assert!(state.help_open);
-}
-
-#[test]
-fn agent_layout_overview_family_reordering_preserves_child_selection_and_dispatch_focus() {
-    let mut state = State::new(true, 100, 32);
-    state.chat = Some(CHILD_AGENT);
-    state.prompt_enabled = true;
-    let console = super::tests::console_with_state(state);
-    let mut independent = agent_row(Uuid::from_u128(103), None, "independent work");
-    independent.status = "Running".into();
-    independent.approvals = 0;
-    let mut parent = agent_row(ROOT_AGENT, None, "parent work");
-    parent.status = "Running".into();
-    parent.approvals = 0;
-    parent.group = AttentionGroup::Working;
-    parent.glyph = status_glyph(AttentionGroup::Working, false);
-    let mut child = agent_row(CHILD_AGENT, Some(ROOT_AGENT), "child pending");
-    child.status = "Running".into();
-    console
-        .set_global_overview(Some(AgentOverview {
-            rows: vec![independent.clone(), parent.clone(), child.clone()],
-            dispatch_directory: PathBuf::from("/fixture/launch"),
-            created: None,
-            visible: None,
-        }))
-        .unwrap();
-    {
-        let mut state = console.state.lock().unwrap();
-        state.key(key(KeyCode::Down));
-        state.key(key(KeyCode::Char(' ')));
-        state.key(key(KeyCode::Down));
-        assert_eq!(state.overview.selected_agent(), Some(CHILD_AGENT));
-    }
-    parent.questions = 1;
-    child.questions = 1;
-    child.status = "Needs answer".into();
-    child.group = AttentionGroup::NeedsInput;
-    child.glyph = status_glyph(AttentionGroup::NeedsInput, false);
-    let reordered = AgentOverview {
-        rows: vec![parent, child, independent],
-        dispatch_directory: PathBuf::from("/fixture/launch"),
-        created: None,
-        visible: None,
-    };
-    console
-        .set_global_overview(Some(reordered.clone()))
-        .unwrap();
-    {
-        let mut state = console.state.lock().unwrap();
-        let frame = &state.rendered_screen;
-        let headings = heading_order(frame);
-        assert_eq!(
-            headings
-                .iter()
-                .filter(|heading| *heading == "Needs input · 1")
-                .count(),
-            1
-        );
-        assert_eq!(
-            headings
-                .iter()
-                .filter(|heading| *heading == "Working · 1")
-                .count(),
-            1
-        );
-        assert!(frame.iter().any(|line| line.starts_with("›   ")
-            && line.contains("child pending")
-            && line.contains("questions 1")));
-        assert!(matches!(
-            state.key(key(KeyCode::Enter)),
-            Some(InputEvent::OpenAgent(CHILD_AGENT))
-        ));
-        state.key(key(KeyCode::Tab));
-        state.insert("dispatch draft");
-    }
-    console.set_global_overview(Some(reordered)).unwrap();
-    let mut state = console.state.lock().unwrap();
-    assert!(
-        state
-            .frame()
-            .0
-            .iter()
-            .any(|line| line.contains("dispatch draft"))
-    );
-    assert!(state.overview.input_focused);
-    assert_eq!(state.overview.selected_agent(), Some(CHILD_AGENT));
-    state.key(key(KeyCode::Char('j')));
-    assert_eq!(state.editor.draft(), "dispatch draftj");
 }
 
 #[test]
@@ -1729,8 +1712,6 @@ fn agent_layout_pty_fixture() {
                 let mut root = agent_row(ROOT_AGENT, None, "root one");
                 root.approvals = 12_345_000;
                 root.questions = 87_654_000;
-                let mut child = agent_row(CHILD_AGENT, Some(ROOT_AGENT), "child one");
-                child.questions = 345;
                 let mut other = agent_row(Uuid::from_u128(103), None, "other");
                 other.approvals = 678;
                 other.questions = 321;
@@ -1739,9 +1720,9 @@ fn agent_layout_pty_fixture() {
                 let rows = if text == "max-counted-overview" {
                     root.approvals = usize::MAX;
                     root.questions = usize::MAX;
-                    vec![root, child]
+                    vec![root]
                 } else {
-                    vec![root, child, other]
+                    vec![root, other]
                 };
                 console
                     .set_status("Cached status from the previously displayed Agent")
@@ -2125,7 +2106,7 @@ fn agent_layout_real_pty_budget_and_focus_matrix() {
                 frame.contains("history 99")
                     && !frame.contains("Shell 20")
                     && frame.contains("child one")
-                    && !frame.contains("task 00")
+                    && !frame.contains("main")
             });
             terminal.send(b"draftjk");
             terminal.wait_for("text jk", |frame| frame.contains("draftjk"));
@@ -2318,8 +2299,8 @@ fn agent_layout_real_pty_narrow_overview_keeps_global_counts_and_help_reachable(
             "{root}"
         );
         assert!(
-            root.contains("· +1 ·"),
-            "the folded root keeps its family count: {root}"
+            !frame.contains("child one"),
+            "the overview lists families: {frame}"
         );
         assert!(frame.contains("other"), "{height}×40: {frame}");
         terminal.send_and_wait(b"p");
@@ -2357,128 +2338,6 @@ fn agent_layout_real_pty_narrow_overview_keeps_global_counts_and_help_reachable(
 /// form does not fit. A cut wide character may leave one reserved column beside the ellipsis
 /// unused. At 24 columns the short number leaves room for the counts (`A1 Q1`). The same-title row
 /// has no requests and keeps its existing status layout.
-#[test]
-fn agent_layout_narrow_family_requests_keep_title_number_fold_and_both_types() {
-    use crate::{
-        agent_access::{AgentSummary, ExecutionAvailability, ExecutionRef},
-        runtime::LoopState,
-    };
-    const ASKING: u128 = 0x1a2b << 112;
-    const APPROVING_CHILD: u128 = 0x2c3d << 112;
-    const SAME_TITLE: u128 = 0x9c8d << 112;
-    const ONE_REQUEST: u128 = 0x4e5f << 112;
-    const ASKING_CHILD: u128 = 0x6a7b << 112;
-    let execution = |agent: u128| ExecutionRef {
-        owner_epoch: Uuid::nil(),
-        agent_id: Uuid::from_u128(agent),
-        generation: 1,
-    };
-    let summary = |agent: u128,
-                   parent: Option<u128>,
-                   title: &str,
-                   state: LoopState,
-                   approvals: usize,
-                   questions: usize| AgentSummary {
-        availability: ExecutionAvailability::Live,
-        execution: execution(agent),
-        chat_id: Uuid::from_u128(agent + 1),
-        workdir: PathBuf::from("/fixture/project-a"),
-        state,
-        title: title.into(),
-        has_work: Some(true),
-        updated_at: None,
-        preview: None,
-        waiting_permissions: approvals,
-        waiting_questions: questions,
-        parent: parent.map(&execution),
-        record: None,
-        workspace: None,
-        capabilities: Vec::new(),
-        views: Vec::new(),
-    };
-    let rows = crate::terminal::agent_tree_rows(
-        &[
-            summary(
-                ASKING,
-                None,
-                "研究财报风险",
-                LoopState::WaitingQuestion,
-                0,
-                1,
-            ),
-            summary(
-                APPROVING_CHILD,
-                Some(ASKING),
-                "核对附注",
-                LoopState::WaitingPermission,
-                1,
-                0,
-            ),
-            summary(SAME_TITLE, None, "研究财报风险", LoopState::Completed, 0, 0),
-            summary(ONE_REQUEST, None, "季度复盘", LoopState::Idle, 0, 0),
-            summary(
-                ASKING_CHILD,
-                Some(ONE_REQUEST),
-                "复盘问题",
-                LoopState::WaitingQuestion,
-                0,
-                1,
-            ),
-        ],
-        true,
-    );
-    for (width, both_types, one_type) in [
-        (24, "(1) +1 A1 Q1", "· +1 · Q1"),
-        (40, "(1) · +1 · A1 Q1", "· +1 · questions 1"),
-    ] {
-        let mut state = State::new(true, width, 32);
-        state.prompt_enabled = true;
-        let console = super::tests::console_with_state(state);
-        console
-            .set_global_overview(Some(AgentOverview {
-                rows: rows.clone(),
-                dispatch_directory: PathBuf::from("/fixture/launch"),
-                created: None,
-                visible: None,
-            }))
-            .unwrap();
-        let frame = frame_lines(&console);
-        let row = |needle: &str| {
-            line_with(&frame, needle)
-                .unwrap_or_else(|| panic!("{width}: no row with {needle}: {frame:#?}"))
-                .clone()
-        };
-        let title_text = |row: &str, end: &str| {
-            display_width(
-                row.trim_start_matches(['›', ' '])
-                    .split(end)
-                    .next()
-                    .unwrap()
-                    .trim_end(),
-            )
-        };
-        let both = row(" (1)");
-        assert!(both.contains(both_types), "{width}: {both}");
-        // Eight columns stay reserved for the title; a cut wide character may leave one unused
-        // beside the ellipsis.
-        assert!(
-            title_text(&both, " (1)") >= 7,
-            "{width}: the title text itself keeps its columns beside its number: {both}"
-        );
-        assert!(!frame.iter().any(|line| has_hex_token(line)), "{frame:#?}");
-        let same_title = row(" (2)");
-        assert!(same_title.contains("Completed"), "{width}: {same_title}");
-        let single = row("季度复盘");
-        assert!(single.contains(one_type), "{width}: {single}");
-        assert!(title_text(&single, " · ") >= 8, "{width}: {single}");
-        if width == 40 {
-            assert!(both.contains("研究财报风险 (1)"), "{both}");
-        }
-        for line in &frame {
-            assert!(display_width(line) < usize::from(width), "{width}: {line}");
-        }
-    }
-}
 
 #[test]
 fn agent_layout_compact_request_letters_are_explained_in_both_helps() {
@@ -2652,15 +2511,15 @@ fn agent_layout_real_pty_project_filter_labels_keep_the_selected_path_tail() {
                 terminal.send_and_wait(b"p");
                 let frame = terminal.frame();
                 assert!(
-                    frame
-                        .lines()
-                        .any(|line| line.contains(selected) && line.contains("approvals 1")),
+                    frame.lines().any(|line| line.contains(selected)
+                        && (line.contains("A1 Q2")
+                            || line.contains("approvals 1") && line.contains("questions 2"))),
                     "{frame}"
                 );
                 assert!(
-                    !frame
-                        .lines()
-                        .any(|line| line.contains(hidden) && line.contains("approvals 1")),
+                    !frame.lines().any(|line| line.contains(hidden)
+                        && (line.contains("A1 Q2")
+                            || line.contains("approvals 1") && line.contains("questions 2"))),
                     "{frame}"
                 );
                 let heading = frame
@@ -2709,9 +2568,9 @@ fn agent_layout_real_pty_project_filter_labels_keep_the_selected_path_tail() {
                         "{filtered}"
                     );
                     assert!(
-                        filtered
-                            .lines()
-                            .any(|line| line.contains(selected) && line.contains("approvals 1")),
+                        filtered.lines().any(|line| line.contains(selected)
+                            && (line.contains("A1 Q2")
+                                || line.contains("approvals 1") && line.contains("questions 2"))),
                         "{filtered}"
                     );
                     assert!(filtered.contains("? help"), "{filtered}");
@@ -2885,9 +2744,10 @@ const NEW_SHELL_AGENT: Uuid = Uuid::from_u128(0x2c7e_0000_0000_0000_0000_0000_00
 const BRAVO_AGENT: Uuid = Uuid::from_u128(0x77b4_0000_0000_0000_0000_0000_0000_0003);
 
 /// A finished root Agent; Done stays expanded, so these rows are listed without unfolding.
-fn finished_row(id: Uuid, title: &str, project: &str) -> AgentTreeRow {
+fn finished_row(id: Uuid, title: &str, project: &str) -> AgentRow {
     let mut row = agent_row(id, None, title);
     row.status = "Completed".into();
+    row.state = crate::runtime::LoopState::Completed;
     row.approvals = 0;
     row.group = AttentionGroup::Done;
     row.glyph = status_glyph(AttentionGroup::Done, true);
@@ -2895,7 +2755,7 @@ fn finished_row(id: Uuid, title: &str, project: &str) -> AgentTreeRow {
     row
 }
 
-fn dispatch_rows(include_new: bool) -> Vec<AgentTreeRow> {
+fn dispatch_rows(include_new: bool) -> Vec<AgentRow> {
     let mut rows = vec![
         finished_row(OLD_SHELL_AGENT, "!pwd", "project-a"),
         finished_row(BRAVO_AGENT, "!printf bravo", "project-b"),
@@ -2906,7 +2766,7 @@ fn dispatch_rows(include_new: bool) -> Vec<AgentTreeRow> {
     rows
 }
 
-fn dispatch_overview(rows: Vec<AgentTreeRow>, created: Option<Uuid>) -> AgentOverview {
+fn dispatch_overview(rows: Vec<AgentRow>, created: Option<Uuid>) -> AgentOverview {
     AgentOverview {
         rows,
         dispatch_directory: PathBuf::from("/fixture/launch"),
@@ -3001,7 +2861,7 @@ fn agent_layout_reading_numbers_cover_identical_and_cut_titles() {
     let arriving = Uuid::from_u128(0x1000);
     for (width, numbers_expected) in [(40, true), (120, false)] {
         let console = super::tests::console_with_state(State::new(true, width, 24));
-        let overview = |rows: Vec<AgentTreeRow>| dispatch_overview(rows, None);
+        let overview = |rows: Vec<AgentRow>| dispatch_overview(rows, None);
         console
             .set_global_overview(Some(overview(vec![
                 finished_row(OLD_SHELL_AGENT, drift, "project-a"),
@@ -3071,7 +2931,7 @@ fn agent_layout_reading_numbers_cover_identical_and_cut_titles() {
 #[test]
 fn agent_layout_created_row_and_cue_share_a_reading_number_when_titles_read_alike() {
     let console = super::tests::console_with_state(State::new(true, 40, 24));
-    let overview = |rows: Vec<AgentTreeRow>| dispatch_overview(rows, Some(NEW_SHELL_AGENT));
+    let overview = |rows: Vec<AgentRow>| dispatch_overview(rows, Some(NEW_SHELL_AGENT));
     let alpha = || {
         finished_row(
             OLD_SHELL_AGENT,
@@ -3664,9 +3524,7 @@ fn agent_layout_real_pty_unchanged_creation_notice_does_not_clear_or_repaint_the
 }
 
 const ASKING_ROOT: Uuid = Uuid::from_u128(0x5100);
-const ASKING_CHILD: Uuid = Uuid::from_u128(0x5101);
 const FAILED_FAMILY: Uuid = Uuid::from_u128(0x5200);
-const FAILED_CHILD: Uuid = Uuid::from_u128(0x5201);
 const INTERRUPTED_FAMILY: Uuid = Uuid::from_u128(0x5300);
 const RUNNING_CHILD: Uuid = Uuid::from_u128(0x5301);
 const VISIBLE_EMPTY: Uuid = Uuid::from_u128(0x5f00);
@@ -3675,23 +3533,31 @@ fn fleet_row(
     id: Uuid,
     parent: Option<Uuid>,
     title: &str,
-    status: &str,
+    (state, status): (crate::runtime::LoopState, &str),
     group: AttentionGroup,
-) -> AgentTreeRow {
-    AgentTreeRow {
+) -> AgentRow {
+    let glyph = status_glyph(group, state == crate::runtime::LoopState::Completed);
+    AgentRow {
         agent_id: id,
         parent_id: parent,
-        depth: usize::from(parent.is_some()),
+
         title: title.into(),
         status: status.into(),
+        state,
         project: "/work/fleet".into(),
         workspace: Some("w1".into()),
         approvals: 0,
         questions: 0,
         group,
-        glyph: status_glyph(group, status == "Completed"),
+        glyph,
         preview: None,
         updated_at: None,
+        subagent: parent.map(|_| crate::runtime::SubagentRegistration {
+            child_chat_id: id,
+            handle: format!("child-{}", id.as_u128() % 1000),
+            description: title.into(),
+            created_at: crate::private_fs::unix_time_milliseconds(),
+        }),
     }
 }
 
@@ -3706,97 +3572,66 @@ fn empty_session(index: u128) -> Uuid {
 /// A screenshot-scale fleet: many never-used sessions, many finished roots with children, and a
 /// few families whose urgent member is a child.
 fn fleet_overview() -> AgentOverview {
-    let mut asking_root = fleet_row(
+    let mut asking = fleet_row(
         ASKING_ROOT,
         None,
         "Research NVDA",
-        "Running",
-        AttentionGroup::Working,
-    );
-    asking_root.questions = 1;
-    let mut asking_child = fleet_row(
-        ASKING_CHILD,
-        Some(ASKING_ROOT),
-        "Ask cadence",
-        "Needs answer",
+        (crate::runtime::LoopState::WaitingQuestion, "Needs answer"),
         AttentionGroup::NeedsInput,
     );
-    asking_child.questions = 1;
+    asking.questions = 1;
     let mut rows = vec![
-        asking_root,
-        asking_child,
+        asking,
         fleet_row(
             Uuid::from_u128(0x5400),
             None,
             "Plan the hedge",
-            "Plan review",
+            (crate::runtime::LoopState::WaitingPlan, "Plan review"),
             AttentionGroup::NeedsInput,
         ),
         fleet_row(
             FAILED_FAMILY,
             None,
             "Rebalance",
-            "Completed",
-            AttentionGroup::Done,
-        ),
-        fleet_row(
-            FAILED_CHILD,
-            Some(FAILED_FAMILY),
-            "Fetch quotes",
-            "Failed",
+            (crate::runtime::LoopState::Failed, "Failed"),
             AttentionGroup::Errors,
         ),
         fleet_row(
             INTERRUPTED_FAMILY,
             None,
-            "Interrupted parent",
-            "Interrupted",
-            AttentionGroup::Done,
-        ),
-        fleet_row(
-            RUNNING_CHILD,
-            Some(INTERRUPTED_FAMILY),
             "Long scan",
-            "Running",
+            (crate::runtime::LoopState::Running, "Running"),
             AttentionGroup::Working,
         ),
         fleet_row(
             Uuid::from_u128(0x5500),
             None,
             "Watch earnings",
-            "Waiting · trigger",
+            (
+                crate::runtime::LoopState::WaitingTrigger,
+                "Waiting · trigger",
+            ),
             AttentionGroup::Waiting,
         ),
         fleet_row(
             Uuid::from_u128(0x5600),
             None,
             "!tail -f log",
-            "Idle",
+            (crate::runtime::LoopState::Idle, "Idle"),
             AttentionGroup::Idle,
         ),
     ];
-    for index in 0..16 {
-        rows.push(fleet_row(
+    rows.extend((0..16).map(|index| {
+        fleet_row(
             done_task(index),
             None,
             &format!("Done task {index:02}"),
-            "Completed",
+            (crate::runtime::LoopState::Completed, "Completed"),
             AttentionGroup::Done,
-        ));
-        if index == 0 {
-            for child in 1..=2 {
-                rows.push(fleet_row(
-                    done_task(100 + child),
-                    Some(done_task(0)),
-                    &format!("Done child {child}"),
-                    "Completed",
-                    AttentionGroup::Done,
-                ));
-            }
-        }
-    }
-    for index in 0..14 {
-        rows.push(fleet_row(
+        )
+    }));
+    rows.extend((0..14).map(|index| {
+        fleet_row(
             if index == 7 {
                 VISIBLE_EMPTY
             } else {
@@ -3804,10 +3639,10 @@ fn fleet_overview() -> AgentOverview {
             },
             None,
             "New Agent",
-            "Empty",
+            (crate::runtime::LoopState::Idle, "Empty"),
             AttentionGroup::Empty,
-        ));
-    }
+        )
+    }));
     AgentOverview {
         rows,
         dispatch_directory: PathBuf::from("/work/fleet"),
@@ -3840,7 +3675,7 @@ fn heading_order(frame: &[String]) -> Vec<String> {
 }
 
 #[test]
-fn agent_layout_dense_overview_folds_children_done_and_empty_without_hiding_attention() {
+fn agent_layout_dense_overview_folds_done_and_empty_without_hiding_attention() {
     let mut state = State::new(true, 100, 32);
     state.chat = Some(VISIBLE_EMPTY);
     state.prompt_enabled = true;
@@ -3861,25 +3696,8 @@ fn agent_layout_dense_overview_folds_children_done_and_empty_without_hiding_atte
         ],
         "every group heading and the Done counter fit the first screen: {frame:#?}"
     );
-    for child in [
-        "Ask cadence",
-        "Fetch quotes",
-        "Long scan",
-        "Done child",
-        "!tail -f log",
-    ] {
-        assert!(
-            line_with(&frame, child).is_none(),
-            "{child} is folded: {frame:#?}"
-        );
-    }
-    let failed = line_with(&frame, "Rebalance").unwrap();
-    assert!(
-        failed.contains("+1 agents") && failed.contains("child failed"),
-        "{failed}"
-    );
-    let interrupted = line_with(&frame, "Interrupted parent").unwrap();
-    assert!(interrupted.contains("child running"), "{interrupted}");
+    assert!(line_with(&frame, "Rebalance").unwrap().contains("Failed"));
+    assert!(line_with(&frame, "Long scan").unwrap().contains("Running"));
     let asking = line_with(&frame, "Research NVDA").unwrap();
     assert!(asking.contains("questions 1"), "{asking}");
     let more = line_with(&frame, "more done").unwrap();
@@ -3925,103 +3743,6 @@ fn agent_layout_dense_overview_folds_children_done_and_empty_without_hiding_atte
     assert!(
         line_with(&frame, "Current New Agent (").is_some_and(|cue| cue.contains("collapsed")),
         "the status line still says where the current Agent is: {frame:#?}"
-    );
-
-    select_target(&mut state, OverviewTarget::Disclosure(AttentionGroup::Done));
-    state.key(key(KeyCode::Enter));
-    select_target(&mut state, OverviewTarget::Agent(INTERRUPTED_FAMILY));
-    state.key(key(KeyCode::Char(' ')));
-    state.key(key(KeyCode::Char('j')));
-    assert!(matches!(
-        state.key(key(KeyCode::Enter)),
-        Some(InputEvent::OpenAgent(RUNNING_CHILD))
-    ));
-    drop(state);
-
-    let mut reordered = fleet_overview();
-    reordered.rows.reverse();
-    console.set_global_overview(Some(reordered)).unwrap();
-    let mut state = console.state.lock().unwrap();
-    assert_eq!(
-        state.overview.selected,
-        Some(OverviewTarget::Agent(RUNNING_CHILD))
-    );
-    let frame = drawn(&mut state);
-    assert!(
-        line_with(&frame, "Long scan").is_some(),
-        "explicit expansion survives refresh"
-    );
-    state.key(key(KeyCode::PageDown));
-    state.key(key(KeyCode::PageDown));
-    let frame = drawn(&mut state);
-    assert!(
-        line_with(&frame, "show fewer done").is_some()
-            || line_with(&frame, "Done task 15").is_some(),
-        "the opened Done group stays open: {frame:#?}"
-    );
-}
-
-#[test]
-fn agent_layout_narrow_dense_overview_keeps_family_facts_on_one_line() {
-    let mut state = State::new(true, 40, 24);
-    state.chat = Some(VISIBLE_EMPTY);
-    state.prompt_enabled = true;
-    let console = super::tests::console_with_state(state);
-    console.set_global_overview(Some(fleet_overview())).unwrap();
-    let frame = frame_lines(&console);
-    assert!(
-        frame.iter().all(|line| display_width(line) <= 40),
-        "{frame:#?}"
-    );
-    let failed = line_with(&frame, "Rebal").unwrap();
-    assert!(failed.contains("+1"), "{failed}");
-    assert!(
-        heading_order(&frame)
-            .first()
-            .is_some_and(|heading| heading == "Needs input · 2")
-    );
-}
-
-#[test]
-fn agent_layout_overview_selection_falls_back_to_the_nearest_visible_entry() {
-    let mut state = State::new(true, 100, 40);
-    state.prompt_enabled = true;
-    let console = super::tests::console_with_state(state);
-    console.set_global_overview(Some(fleet_overview())).unwrap();
-    {
-        let mut state = console.state.lock().unwrap();
-        select_target(&mut state, OverviewTarget::Agent(INTERRUPTED_FAMILY));
-        state.key(key(KeyCode::Char(' ')));
-        state.key(key(KeyCode::Char('j')));
-        assert_eq!(
-            state.overview.selected,
-            Some(OverviewTarget::Agent(RUNNING_CHILD))
-        );
-    }
-    let mut without_child = fleet_overview();
-    without_child
-        .rows
-        .retain(|row| row.agent_id != RUNNING_CHILD);
-    console
-        .set_global_overview(Some(without_child.clone()))
-        .unwrap();
-    {
-        let mut state = console.state.lock().unwrap();
-        assert_eq!(
-            state.overview.selected,
-            Some(OverviewTarget::Agent(INTERRUPTED_FAMILY)),
-            "a vanished child selects its parent, not the first row"
-        );
-        select_target(&mut state, OverviewTarget::Agent(done_task(3)));
-    }
-    let mut without_done = without_child;
-    without_done.rows.retain(|row| row.agent_id != done_task(3));
-    console.set_global_overview(Some(without_done)).unwrap();
-    let state = console.state.lock().unwrap();
-    assert_eq!(
-        state.overview.selected,
-        Some(OverviewTarget::Agent(done_task(4))),
-        "a vanished row selects its neighbour at the same position"
     );
 }
 
@@ -4074,7 +3795,10 @@ fn agent_layout_rows_arriving_above_keep_the_selection_on_its_screen_line() {
         Uuid::from_u128(0x5700),
         None,
         "Approve the order preview",
-        "Needs approval",
+        (
+            crate::runtime::LoopState::WaitingPermission,
+            "Needs approval",
+        ),
         AttentionGroup::NeedsInput,
     );
     asking.approvals = 1;
@@ -4129,6 +3853,7 @@ fn agent_layout_a_visited_row_that_finishes_stays_listed_while_the_cursor_moves_
         .cloned()
         .map(|mut row| {
             row.status = "Completed".into();
+            row.state = crate::runtime::LoopState::Completed;
             row.group = AttentionGroup::Done;
             row.glyph = status_glyph(AttentionGroup::Done, true);
             row
@@ -4141,14 +3866,11 @@ fn agent_layout_a_visited_row_that_finishes_stays_listed_while_the_cursor_moves_
     console.set_global_overview(Some(finished)).unwrap();
     let mut state = console.state.lock().unwrap();
     let frame = drawn(&mut state);
-    assert!(
-        line_with(&frame, "› ✓ Interrupted parent").is_some(),
-        "{frame:#?}"
-    );
+    assert!(line_with(&frame, "› ✓ Long scan").is_some(), "{frame:#?}");
     state.key(key(KeyCode::Char('k')));
     let frame = drawn(&mut state);
     assert!(
-        line_with(&frame, "Interrupted parent").is_some(),
+        line_with(&frame, "Long scan").is_some(),
         "the row just left stays listed during this visit: {frame:#?}"
     );
     drop(state);
@@ -4169,7 +3891,7 @@ fn agent_layout_folded_counts_stay_visible_when_priority_groups_fill_the_list() 
                 Uuid::from_u128(0x8000 + index),
                 None,
                 &format!("Working task {index:02}"),
-                "Running",
+                (crate::runtime::LoopState::Running, "Running"),
                 AttentionGroup::Working,
             )
         })
@@ -4179,7 +3901,7 @@ fn agent_layout_folded_counts_stay_visible_when_priority_groups_fill_the_list() 
             done_task(index),
             None,
             &format!("Done task {index:02}"),
-            "Completed",
+            (crate::runtime::LoopState::Completed, "Completed"),
             AttentionGroup::Done,
         )
     }));
@@ -4188,7 +3910,7 @@ fn agent_layout_folded_counts_stay_visible_when_priority_groups_fill_the_list() 
             empty_session(index),
             None,
             "New Agent",
-            "Empty",
+            (crate::runtime::LoopState::Idle, "Empty"),
             AttentionGroup::Empty,
         )
     }));
@@ -4223,7 +3945,7 @@ fn agent_layout_a_fully_pinned_empty_group_reserves_no_counter_row_for_done() {
         Uuid::from_u128(0x8000),
         None,
         "Working task",
-        "Running",
+        (crate::runtime::LoopState::Running, "Running"),
         AttentionGroup::Working,
     )];
     rows.extend((0..30).map(|index| {
@@ -4231,7 +3953,7 @@ fn agent_layout_a_fully_pinned_empty_group_reserves_no_counter_row_for_done() {
             done_task(index),
             None,
             &format!("Done task {index:02}"),
-            "Completed",
+            (crate::runtime::LoopState::Completed, "Completed"),
             AttentionGroup::Done,
         )
     }));
@@ -4239,7 +3961,7 @@ fn agent_layout_a_fully_pinned_empty_group_reserves_no_counter_row_for_done() {
         VISIBLE_EMPTY,
         None,
         "New Agent",
-        "Empty",
+        (crate::runtime::LoopState::Idle, "Empty"),
         AttentionGroup::Empty,
     ));
     console
@@ -4306,7 +4028,7 @@ fn agent_layout_overview_never_routes_keys_to_a_surface_it_does_not_draw() {
     let event = state.key(key(KeyCode::Enter));
     assert!(state.transcript.is_none());
     assert!(
-        event.is_none() && state.status.contains("/details is unavailable here"),
+        event.is_none() && state.status.contains("/details isn't available"),
         "the overview explains the command instead of opening a hidden transcript: {event:?}"
     );
     state.key(key(KeyCode::Char('x')));
@@ -4458,7 +4180,7 @@ fn agent_layout_session_hints_name_the_action_of_the_focused_region() {
         !editor.contains("Enter/Space expand"),
         "Enter submits from the editor, so the summary cannot promise Enter: {editor}"
     );
-    assert!(editor.contains("task 00"), "{editor}");
+    assert!(editor.contains("main"), "{editor}");
     assert!(state.footer.selected().is_none());
     assert!(!state.footer_list_focused);
     state.insert("draft");
@@ -4507,7 +4229,7 @@ fn agent_layout_overview_hints_follow_the_selected_row_kind_and_draft() {
     select_agent(&mut state, FAILED_FAMILY);
     let frame = drawn(&mut state);
     assert!(
-        frame[1].contains("Enter open") && frame[1].contains("Space expand"),
+        frame[1].contains("Enter open") && !frame[1].contains("Space"),
         "{frame:#?}"
     );
     select_agent(&mut state, Uuid::from_u128(0x5500));
@@ -4565,36 +4287,21 @@ fn agent_layout_overview_rows_carry_state_in_words_and_semantic_roles() {
             .unwrap_or_else(|| panic!("{title} is listed"))
     };
     let failed = row("Rebalance");
-    assert!(
-        failed
-            .text()
-            .contains("Completed · +1 agents · child failed")
-    );
-    assert_eq!(role_of(failed, "child failed"), Some(Role::Error));
-    assert_eq!(role_of(failed, "Completed"), Some(Role::MutedText));
+    assert!(failed.text().contains("Failed"));
+    assert_eq!(role_of(failed, "Failed"), Some(Role::Error));
     assert_eq!(role_of(failed, "/work/fleet"), Some(Role::MutedText));
     assert_eq!(role_of(failed, "Rebalance"), Some(Role::Text));
     let asking = row("Research NVDA");
     assert_eq!(role_of(asking, "questions 1"), Some(Role::Permission));
     assert_eq!(
         role_of(row("Plan the hedge"), "Plan review"),
-        Some(Role::Permission)
+        Some(Role::Warning)
     );
     assert_eq!(
         role_of(row("Watch earnings"), "Waiting · trigger"),
-        Some(Role::Text)
+        Some(Role::MutedText)
     );
-    assert_eq!(
-        role_of(row("Interrupted parent"), "child running"),
-        Some(Role::Text)
-    );
-    assert!(
-        lines.iter().all(|line| line
-            .spans
-            .iter()
-            .all(|span| span.role != Some(Role::Success))),
-        "no list state borrows the success colour"
-    );
+    assert_eq!(role_of(row("Long scan"), "Running"), Some(Role::Accent));
 }
 
 #[test]
@@ -4748,71 +4455,6 @@ fn agent_layout_real_pty_an_unchanged_external_edit_restores_every_row() {
 }
 
 #[test]
-fn agent_layout_twenty_four_columns_keep_identity_focus_help_draft_and_discovery() {
-    let mut state = State::new(true, 100, 32);
-    state.prompt_enabled = true;
-    let console = super::tests::console_with_state(state);
-    console.set_global_overview(Some(fleet_overview())).unwrap();
-    let mut state = console.state.lock().unwrap();
-    drawn(&mut state);
-    select_agent(&mut state, INTERRUPTED_FAMILY);
-    state.key(key(KeyCode::Char(' ')));
-    state.key(key(KeyCode::Tab));
-    state.insert("narrow draft");
-    state.key(key(KeyCode::Tab));
-    state.resize(25, 16);
-    assert_eq!(state.width, 24);
-    let frame = drawn(&mut state);
-    assert_eq!(frame.len(), 16);
-    assert!(
-        frame.iter().all(|line| display_width(line) <= 24),
-        "{frame:#?}"
-    );
-    assert_eq!(
-        state.overview.selected,
-        Some(OverviewTarget::Agent(INTERRUPTED_FAMILY))
-    );
-    let selected = line_with(&frame, "› ").expect("the selection stays on screen");
-    assert!(selected.contains("Interr"), "{selected}");
-    assert!(
-        frame.last().is_some_and(|line| line.starts_with("? help")),
-        "help stays reachable at 24 columns: {frame:#?}"
-    );
-    state.key(key(KeyCode::Char('j')));
-    assert_eq!(
-        state.overview.selected,
-        Some(OverviewTarget::Agent(RUNNING_CHILD)),
-        "the expanded family survives the resize"
-    );
-    select_target(&mut state, OverviewTarget::Heading(AttentionGroup::Empty));
-    let frame = drawn(&mut state);
-    assert!(
-        line_with(&frame, "› ▸ Empty · 14").is_some(),
-        "folded sessions stay reachable at 24 columns: {frame:#?}"
-    );
-    state.key(key(KeyCode::Char('?')));
-    assert!(state.help_open);
-    let help = drawn(&mut state);
-    assert!(line_with(&help, "close help").is_some(), "{help:#?}");
-    state.key(key(KeyCode::Esc));
-    assert!(!state.help_open);
-    assert_eq!(
-        state.overview.selected,
-        Some(OverviewTarget::Heading(AttentionGroup::Empty))
-    );
-    state.key(key(KeyCode::Tab));
-    assert_eq!(state.editor.draft(), "narrow draft");
-    state.resize(101, 32);
-    state.key(key(KeyCode::Tab));
-    let frame = drawn(&mut state);
-    assert!(line_with(&frame, "Long scan").is_some(), "{frame:#?}");
-    assert_eq!(
-        state.overview.selected,
-        Some(OverviewTarget::Heading(AttentionGroup::Empty))
-    );
-}
-
-#[test]
 fn agent_layout_conversation_occupancy_toggling_agents_avoids_whole_screen_redraw() {
     let mut state = State::new(true, 80, 24);
     state.prompt_enabled = true;
@@ -4833,7 +4475,7 @@ fn agent_layout_conversation_occupancy_toggling_agents_avoids_whole_screen_redra
     );
     assert_eq!(state.editor.draft(), "draft line");
     assert!(
-        !state.frame().0.iter().any(|line| line.contains("task 00")),
+        !state.frame().0.iter().any(|line| line.contains("main")),
         "{expanded:?}"
     );
 }
@@ -4858,14 +4500,17 @@ fn screenshot_overview(visible: Option<Uuid>) -> AgentOverview {
             SCREENSHOT_RUNNING,
             None,
             SCREENSHOT_TITLE,
-            "Running",
+            (crate::runtime::LoopState::Running, "Running"),
             AttentionGroup::Working,
         ),
         fleet_row(
             Uuid::from_u128(0x5500),
             None,
             "Keep this goal",
-            "Waiting · trigger",
+            (
+                crate::runtime::LoopState::WaitingTrigger,
+                "Waiting · trigger",
+            ),
             AttentionGroup::Waiting,
         ),
     ];
@@ -4874,7 +4519,7 @@ fn screenshot_overview(visible: Option<Uuid>) -> AgentOverview {
             screenshot_idle(index),
             None,
             "New Agent",
-            "Idle",
+            (crate::runtime::LoopState::Idle, "Idle"),
             AttentionGroup::Idle,
         )
     }));
@@ -4883,7 +4528,7 @@ fn screenshot_overview(visible: Option<Uuid>) -> AgentOverview {
             screenshot_done(index),
             None,
             SCREENSHOT_TITLE,
-            "Completed",
+            (crate::runtime::LoopState::Completed, "Completed"),
             AttentionGroup::Done,
         )
     }));
@@ -4891,7 +4536,7 @@ fn screenshot_overview(visible: Option<Uuid>) -> AgentOverview {
         SCREENSHOT_SOURCE,
         None,
         "Tick 的标准化设计",
-        "Completed",
+        (crate::runtime::LoopState::Completed, "Completed"),
         AttentionGroup::Done,
     ));
     AgentOverview {
@@ -5045,8 +4690,14 @@ fn agent_layout_repeated_long_titles_stay_distinguishable_without_hashes() {
     }
 }
 
-fn repeated_done(id: Uuid, parent: Option<Uuid>, title: &str) -> AgentTreeRow {
-    fleet_row(id, parent, title, "Completed", AttentionGroup::Done)
+fn repeated_done(id: Uuid, parent: Option<Uuid>, title: &str) -> AgentRow {
+    fleet_row(
+        id,
+        parent,
+        title,
+        (crate::runtime::LoopState::Completed, "Completed"),
+        AttentionGroup::Done,
+    )
 }
 
 #[test]
@@ -5111,109 +4762,6 @@ fn agent_layout_reading_numbers_stay_bound_through_arrivals_and_removals() {
     ));
 }
 
-#[test]
-fn agent_layout_collapsing_a_group_hides_its_current_created_and_selected_rows() {
-    let (root, child, created, running) = (
-        Uuid::from_u128(0xd100),
-        Uuid::from_u128(0xd101),
-        Uuid::from_u128(0xd200),
-        Uuid::from_u128(0xd300),
-    );
-    let overview = |reversed: bool| {
-        let mut rows = vec![
-            fleet_row(
-                running,
-                None,
-                "Scan quotes",
-                "Running",
-                AttentionGroup::Working,
-            ),
-            repeated_done(root, None, "Rebalance plan"),
-            repeated_done(child, Some(root), "Check hedges"),
-            repeated_done(created, None, "Draft summary"),
-            repeated_done(Uuid::from_u128(0xd400), None, "Older report"),
-        ];
-        if reversed {
-            rows.reverse();
-        }
-        AgentOverview {
-            rows,
-            dispatch_directory: PathBuf::from("/work/fleet"),
-            created: Some(created),
-            visible: Some(child),
-        }
-    };
-    let mut state = State::new(true, 100, 32);
-    state.chat = Some(child);
-    state.prompt_enabled = true;
-    let console = super::tests::console_with_state(state);
-    console.set_global_overview(Some(overview(false))).unwrap();
-    let mut state = console.state.lock().unwrap();
-    assert_eq!(
-        state.overview.selected,
-        Some(OverviewTarget::Agent(child)),
-        "entering from the child's conversation selects that child"
-    );
-    select_target(&mut state, OverviewTarget::Heading(AttentionGroup::Done));
-    assert!(
-        state.key(key(KeyCode::Enter)).is_none(),
-        "Enter on a heading folds the group and opens no Agent"
-    );
-    let collapsed = |frame: &[String]| {
-        assert!(line_with(frame, "▸ Done · 3").is_some(), "{frame:#?}");
-        for title in [
-            "Rebalance plan",
-            "Check hedges",
-            "Draft summary",
-            "Older report",
-        ] {
-            assert!(
-                line_with(list_lines(frame), title).is_none(),
-                "{title} folds with its group: {frame:#?}"
-            );
-        }
-        assert!(
-            line_with(frame, "Created Draft summary · in collapsed Done").is_some(),
-            "{frame:#?}"
-        );
-        assert!(
-            line_with(frame, "Current Check hedges · in collapsed Done").is_some(),
-            "{frame:#?}"
-        );
-        assert!(line_with(frame, "Scan quotes").is_some(), "{frame:#?}");
-    };
-    collapsed(&drawn(&mut state));
-    assert_eq!(
-        state.overview.selected,
-        Some(OverviewTarget::Heading(AttentionGroup::Done))
-    );
-    drop(state);
-    for reversed in [true, false] {
-        console
-            .set_global_overview(Some(overview(reversed)))
-            .unwrap();
-        let mut state = console.state.lock().unwrap();
-        collapsed(&drawn(&mut state));
-        assert_eq!(
-            state.overview.selected,
-            Some(OverviewTarget::Heading(AttentionGroup::Done)),
-            "a refresh keeps the fold and the selection"
-        );
-    }
-    let mut state = console.state.lock().unwrap();
-    assert!(state.key(key(KeyCode::Enter)).is_none());
-    let frame = drawn(&mut state);
-    assert!(line_with(&frame, "▾ Done · 3").is_some(), "{frame:#?}");
-    assert!(
-        line_with(list_lines(&frame), "Check hedges").is_some(),
-        "{frame:#?}"
-    );
-    assert!(
-        line_with(&frame, "Current Check hedges").is_none(),
-        "{frame:#?}"
-    );
-}
-
 /// A listed row's text after its selection marker, indentation and state glyph.
 fn row_title(line: &str) -> &str {
     let rest = line.trim_start_matches(['›', ' ']);
@@ -5239,33 +4787,16 @@ fn list_lines(frame: &[String]) -> &[String] {
 }
 
 /// Titles that differ only in the column a narrow cut gives to the ellipsis read alike there;
-/// they share one sequence of reading numbers, so the family panel, the requester label and the
-/// receipt cue never show the same number for both.
+/// they share one sequence of reading numbers, so the overview and receipt cue remain distinct.
 #[test]
 fn agent_layout_titles_cut_alike_at_the_ellipsis_never_share_a_number() {
     for (first, second) in [
         ("Abcd long task", "Abce long task"),
         ("研究财报", "研发投入"),
     ] {
-        let (parent, child, created) = (
-            Uuid::from_u128(0xe100),
-            Uuid::from_u128(0xe101),
-            Uuid::from_u128(0xe200),
-        );
-        let mut asking = repeated_done(child, Some(parent), second);
-        asking.questions = 1;
-        asking.group = AttentionGroup::NeedsInput;
-        asking.glyph = status_glyph(AttentionGroup::NeedsInput, false);
-        let family = vec![repeated_done(parent, None, first), asking];
+        let created = Uuid::from_u128(0xe200);
         let state = State::new(true, 24, 32);
         let console = super::tests::console_with_state(state);
-        console.set_agent_family(family, Some(parent)).unwrap();
-        let numbers =
-            [parent, child].map(|id| console.state.lock().unwrap().status_area.ordinal(id));
-        assert!(
-            numbers.iter().all(Option::is_some) && numbers[0] != numbers[1],
-            "{first} / {second}: {numbers:?}"
-        );
         console
             .set_global_overview(Some(AgentOverview {
                 rows: vec![
@@ -5316,14 +4847,14 @@ fn agent_layout_receipt_and_hidden_current_cues_survive_together() {
                     scan,
                     None,
                     "Scan quotes",
-                    "Running",
+                    (crate::runtime::LoopState::Running, "Running"),
                     AttentionGroup::Working,
                 ),
                 fleet_row(
                     created,
                     None,
                     "Draft summary",
-                    "Running",
+                    (crate::runtime::LoopState::Running, "Running"),
                     AttentionGroup::Working,
                 ),
                 source_root,
@@ -5400,7 +4931,7 @@ fn agent_layout_filter_cycling_keeps_a_still_listed_heading_selected() {
             running,
             None,
             "Scan quotes",
-            "Running",
+            (crate::runtime::LoopState::Running, "Running"),
             AttentionGroup::Working,
         );
         scan.project = "project-b".into();
@@ -5453,9 +4984,21 @@ fn agent_layout_known_age_ends_the_row_and_the_glyph_carries_the_state_role() {
     let finished = Uuid::from_u128(0xa100);
     let asking = Uuid::from_u128(0xa200);
     for (width, height) in [(24, 24), (40, 24), (80, 24), (120, 32)] {
-        let mut done = fleet_row(finished, None, "Alpha", "Completed", AttentionGroup::Done);
+        let mut done = fleet_row(
+            finished,
+            None,
+            "Alpha",
+            (crate::runtime::LoopState::Completed, "Completed"),
+            AttentionGroup::Done,
+        );
         done.updated_at = Some(six_minutes_ago);
-        let mut approval = fleet_row(asking, None, "Bravo", "Running", AttentionGroup::NeedsInput);
+        let mut approval = fleet_row(
+            asking,
+            None,
+            "Bravo",
+            (crate::runtime::LoopState::Running, "Running"),
+            AttentionGroup::NeedsInput,
+        );
         approval.approvals = 1;
         approval.questions = 1;
         approval.updated_at = Some(six_minutes_ago);
@@ -5463,7 +5006,7 @@ fn agent_layout_known_age_ends_the_row_and_the_glyph_carries_the_state_role() {
             Uuid::from_u128(0xa300),
             None,
             "Charlie",
-            "Completed",
+            (crate::runtime::LoopState::Completed, "Completed"),
             AttentionGroup::Done,
         );
         let mut state = State::new(true, width, height);
@@ -5498,10 +5041,8 @@ fn agent_layout_known_age_ends_the_row_and_the_glyph_carries_the_state_role() {
                 .unwrap_or_else(|| panic!("{width} columns: {title} is listed: {screen:#?}"))
         };
         let content_columns = usize::from(width) - 1;
-        for (title, glyph, role) in [
-            ("Alpha", '✓', Role::MutedText),
-            ("Bravo", '●', Role::Permission),
-        ] {
+        for (title, glyph, role) in [("Alpha", '✓', Role::Success), ("Bravo", '◆', Role::Warning)]
+        {
             let text = screen_row(title);
             let line = lines
                 .iter()

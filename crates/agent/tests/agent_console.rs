@@ -440,7 +440,7 @@ async fn overview_prioritizes_a_waiting_child_family_before_an_independent_runni
             .find(|row| row.execution == parent)
             .unwrap()
             .title,
-        "Main · Run the bounded task."
+        "Run the bounded task."
     );
     assert_eq!(
         projection
@@ -469,6 +469,18 @@ async fn overview_prioritizes_a_waiting_child_family_before_an_independent_runni
     assert!(matches!(navigation.destination, Destination::Present));
     assert!(console.complete(&navigation));
     assert_eq!(console.projection().visible, Some(child));
+    let away = console
+        .interpret(Intent::Open(independent))
+        .unwrap()
+        .unwrap();
+    assert!(console.complete(&away));
+    console.interpret(Intent::Overview).unwrap();
+    let returning = console.interpret(Intent::Open(parent)).unwrap().unwrap();
+    assert_eq!(
+        returning.target, child,
+        "a family restores its last viewed member"
+    );
+    assert!(console.complete(&returning));
     let other_directory = tempfile::tempdir().unwrap();
     console
         .interpret(Intent::Filter(AgentFilter {
@@ -489,7 +501,7 @@ async fn overview_prioritizes_a_waiting_child_family_before_an_independent_runni
             .find(|row| row.execution == parent)
             .unwrap()
             .title,
-        "Main · Run the bounded task."
+        "Run the bounded task."
     );
     let observed = access
         .observe(ObservationRequest::Overview {

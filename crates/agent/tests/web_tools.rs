@@ -1,3 +1,5 @@
+#[path = "support/mod.rs"]
+mod support;
 use std::{
     sync::{
         Arc, Mutex,
@@ -79,6 +81,15 @@ impl WebModel {
 
 #[async_trait]
 impl ModelClient for WebModel {
+    async fn generate_title(
+        &self,
+        request: tickloop_agent::model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<tickloop_agent::model::ModelDelta>,
+        _: tokio_util::sync::CancellationToken,
+    ) -> Result<tickloop_agent::model::ModelOutput, tickloop_agent::model::ModelError> {
+        Ok(support::title_output(request))
+    }
+
     fn identity(&self) -> tickloop_agent::model::ModelIdentity {
         tickloop_agent::model::ModelIdentity {
             provider: tickloop_agent::model::ModelProvider::Api,
@@ -304,9 +315,7 @@ fn conversation_mentions(snapshot: &ChatSnapshot, text: &str) -> bool {
 }
 
 fn request_kinds(snapshot: &ChatSnapshot) -> Vec<(RequestKind, RequestOutcome)> {
-    snapshot
-        .request_usage
-        .entries()
+    support::model_script_requests(snapshot)
         .iter()
         .map(|entry| (entry.kind, entry.outcome))
         .collect()
@@ -365,7 +374,7 @@ async fn fetch_answers_the_prompt_about_the_page_markdown_in_a_request_outside_t
             (RequestKind::Conversation, RequestOutcome::Accepted),
         ]
     );
-    let entries = run.snapshot.request_usage.entries();
+    let entries = support::model_script_requests(&run.snapshot);
     assert_eq!(entries[1].run_id, entries[0].run_id);
     assert_eq!(entries[1].loop_id, entries[0].loop_id);
 }

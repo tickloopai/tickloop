@@ -1331,7 +1331,7 @@ mod tests {
             .with_loopback_test_endpoint(&endpoint)
             .unwrap()
             .with_loopback_test_websocket();
-        let agent = Agent::new_embedded(config, Arc::new(client));
+        let agent = Agent::new_embedded(config, crate::model::fixture_client(Arc::new(client)));
         let chat = agent.create_chat(state_dir.clone()).await.unwrap();
         let mut events = agent.subscribe();
         let first = agent
@@ -1389,7 +1389,7 @@ mod tests {
             .with_loopback_test_endpoint(&endpoint)
             .unwrap()
             .with_loopback_test_websocket();
-        let agent = Agent::new_embedded(config, Arc::new(client));
+        let agent = Agent::new_embedded(config, crate::model::fixture_client(Arc::new(client)));
         let first_chat = agent.create_chat(state_dir.clone()).await.unwrap();
         let second_chat = agent.create_chat(state_dir.clone()).await.unwrap();
         let (ready_tx, ready_rx) = oneshot::channel();
@@ -1650,7 +1650,7 @@ mod tests {
             .with_loopback_test_endpoint(&endpoint)
             .unwrap()
             .with_loopback_test_websocket();
-        let agent = Agent::new_embedded(config, Arc::new(client));
+        let agent = Agent::new_embedded(config, crate::model::fixture_client(Arc::new(client)));
         let chat = agent.create_chat(state_dir.clone()).await.unwrap();
         let mut events = agent.subscribe();
         agent.submit(chat, None, "Hello".into()).await.unwrap();
@@ -1696,7 +1696,7 @@ mod tests {
             .with_loopback_test_endpoint(&endpoint)
             .unwrap()
             .with_loopback_test_websocket();
-        let agent = Agent::new_embedded(config, Arc::new(client));
+        let agent = Agent::new_embedded(config, crate::model::fixture_client(Arc::new(client)));
         let chat = agent.create_chat(state_dir.clone()).await.unwrap();
         let mut events = agent.subscribe();
         agent.submit(chat, None, "Hello".into()).await.unwrap();
@@ -2112,7 +2112,7 @@ mod tests {
         client.endpoint = endpoint;
         client.client = reqwest::Client::builder().no_proxy().build().unwrap();
         client.prefer_websocket = false;
-        let agent = Agent::new_embedded(config, Arc::new(client));
+        let agent = Agent::new_embedded(config, crate::model::fixture_client(Arc::new(client)));
         let chat = agent.create_chat(state_dir.clone()).await.unwrap();
         let mut events = agent.subscribe();
         agent.submit(chat, None, "Say hello".into()).await.unwrap();
@@ -2193,7 +2193,7 @@ mod tests {
             .unwrap()
             .with_loopback_test_endpoint(endpoint.as_str())
             .unwrap();
-        let agent = Agent::new_embedded(config, Arc::new(client));
+        let agent = Agent::new_embedded(config, crate::model::fixture_client(Arc::new(client)));
         let chat = agent.create_chat(state_dir.clone()).await.unwrap();
         let mut events = agent.subscribe();
         let first = agent.submit(chat, None, "Hello".into()).await.unwrap();
@@ -2315,7 +2315,7 @@ mod tests {
             .unwrap()
             .with_loopback_test_auth(&state_dir, &oauth_origin)
             .unwrap();
-        let agent = Agent::new_embedded(config, Arc::new(client));
+        let agent = Agent::new_embedded(config, crate::model::fixture_client(Arc::new(client)));
         let chat = agent.create_chat(state_dir.clone()).await.unwrap();
         let mut events = agent.subscribe();
         agent.submit(chat, None, "Hello".into()).await.unwrap();
@@ -2417,7 +2417,7 @@ mod tests {
             .unwrap()
             .with_loopback_test_endpoint(endpoint.as_str())
             .unwrap();
-        let agent = Agent::new_embedded(config, Arc::new(client));
+        let agent = Agent::new_embedded(config, crate::model::fixture_client(Arc::new(client)));
         let chat = agent.create_chat(state_dir.clone()).await.unwrap();
         let mut events = agent.subscribe();
         let first = agent
@@ -2560,7 +2560,7 @@ mod tests {
                 .unwrap()
                 .with_loopback_test_endpoint(endpoint.as_str())
                 .unwrap();
-            let client = Arc::new(client);
+            let client = crate::model::fixture_client(Arc::new(client));
             let agent = Agent::new_embedded(config, client.clone());
             agent.set_auto_reviewer(client).await;
             let chat = agent.create_chat(state_dir.clone()).await.unwrap();
@@ -2620,7 +2620,12 @@ mod tests {
             assert_eq!(requests[1]["tools"][0]["strict"], true);
             assert!(!requests[1]["tools"].to_string().contains("Bash"));
             let snapshot = agent.snapshot(chat).await.unwrap();
-            let usage = snapshot.request_usage.entries();
+            let usage = snapshot
+                .request_usage
+                .entries()
+                .iter()
+                .filter(|entry| entry.kind != RequestKind::Title)
+                .collect::<Vec<_>>();
             assert_eq!(usage.len(), 3);
             assert_eq!(usage[1].kind, RequestKind::PermissionCheck);
             assert_eq!(usage[1].usage.input_tokens, Some(7));
@@ -2672,8 +2677,13 @@ mod tests {
             .unwrap()
             .with_loopback_test_endpoint(reviewer_endpoint.as_str())
             .unwrap();
-        let agent = Agent::new_embedded(main_config.clone(), Arc::new(main_client));
-        agent.set_auto_reviewer(Arc::new(reviewer_client)).await;
+        let agent = Agent::new_embedded(
+            main_config.clone(),
+            crate::model::fixture_client(Arc::new(main_client)),
+        );
+        agent
+            .set_auto_reviewer(crate::model::fixture_client(Arc::new(reviewer_client)))
+            .await;
         let chat = agent.create_chat(state_dir.clone()).await.unwrap();
         agent
             .set_execution_mode(chat, ExecutionMode::Auto)
@@ -2709,7 +2719,12 @@ mod tests {
         assert_eq!(reviewer_requests[0]["model"], "gpt-5.6-sol");
         assert_eq!(reviewer_requests[0]["tool_choice"], "required");
         let snapshot = agent.snapshot(chat).await.unwrap();
-        let usage = snapshot.request_usage.entries();
+        let usage = snapshot
+            .request_usage
+            .entries()
+            .iter()
+            .filter(|entry| entry.kind != RequestKind::Title)
+            .collect::<Vec<_>>();
         assert_eq!(usage.len(), 3);
         assert_eq!(usage[1].kind, RequestKind::PermissionCheck);
         assert_eq!(usage[1].model, reviewer_config.identity());
@@ -2747,7 +2762,7 @@ mod tests {
             .unwrap()
             .with_loopback_test_endpoint(endpoint.as_str())
             .unwrap();
-        let client = Arc::new(client);
+        let client = crate::model::fixture_client(Arc::new(client));
         let agent = Agent::new_with_options(
             config,
             client.clone(),
@@ -3078,8 +3093,11 @@ mod tests {
                 if websocket {
                     reviewer = reviewer.with_loopback_test_websocket();
                 }
-                let agent = Agent::new_embedded(config, Arc::new(main));
-                agent.set_auto_reviewer(Arc::new(reviewer)).await;
+                let agent =
+                    Agent::new_embedded(config, crate::model::fixture_client(Arc::new(main)));
+                agent
+                    .set_auto_reviewer(crate::model::fixture_client(Arc::new(reviewer)))
+                    .await;
                 let chat = agent.create_chat(state_dir.clone()).await.unwrap();
                 agent
                     .set_execution_mode(chat, ExecutionMode::Auto)

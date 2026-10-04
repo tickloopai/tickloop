@@ -408,6 +408,7 @@ impl Agent {
         receipt: &Receipt,
         operation: &OperationRecord,
         registered: &RegisteredTool,
+        family_message: Option<&agent_messages::PreparedFamilyCall>,
         cancel: CancellationToken,
     ) -> Result<ToolResult, String> {
         match &registered.route {
@@ -417,6 +418,7 @@ impl Agent {
                     &operation.call_id,
                     &operation.name,
                     &operation.input,
+                    family_message,
                     cancel,
                 )
                 .await
@@ -656,16 +658,45 @@ impl Agent {
         } else {
             None
         };
+        let prepared_family_message = if matches!(
+            name.as_str(),
+            SEND_AGENT_MESSAGE_TOOL_NAME | agent_messages::STOP_AGENT_TOOL_NAME
+        ) && matches!(
+            registration.as_ref().map(|registered| &registered.route),
+            Some(ToolRoute::AgentMessage)
+        ) {
+            match self.prepare_family_call(receipt, &name, &input).await {
+                Ok(prepared) => Some(prepared),
+                Err(rejection) => {
+                    return Ok(ToolCallOutcome {
+                        result: rejection.result(),
+                        ..ToolCallOutcome::not_admitted(String::new())
+                    });
+                }
+            }
+        } else {
+            None
+        };
         let host_permission = prepared_host_call.as_ref().map(|call| call.permission());
         let normalized_name = prepared_host_call
             .as_ref()
             .map_or(name.as_str(), |call| call.policy_name());
-        let normalized_input = prepared_host_call
+        let normalized_input = prepared_family_message
             .as_ref()
-            .map_or(&input, |call| call.policy_input());
-        let permission_input = prepared_host_call
+            .map(|prepared| prepared.policy_input())
+            .unwrap_or_else(|| {
+                prepared_host_call
+                    .as_ref()
+                    .map_or(&input, |call| call.policy_input())
+            });
+        let permission_input = prepared_family_message
             .as_ref()
-            .map_or(&input, |call| call.permission_input());
+            .map(|prepared| prepared.policy_input())
+            .unwrap_or_else(|| {
+                prepared_host_call
+                    .as_ref()
+                    .map_or(&input, |call| call.permission_input())
+            });
         if let Err(error) = self
             .check_delegated_call(receipt, normalized_name, normalized_input, None)
             .await
@@ -1044,6 +1075,7 @@ impl Agent {
                                 registration
                                     .as_ref()
                                     .expect("registered local or Host tool"),
+                                prepared_family_message.as_ref(),
                                 cancel.clone(),
                             )
                             .await

@@ -55,17 +55,16 @@ const OVERVIEW_COMMANDS: &[(&str, &str)] = &[
 
 const OVERVIEW_AGENT_COMMAND: &str =
     "acts on an open Agent; Enter opens the selected Agent, /clear starts a new draft";
-const CHILD_HISTORY_FIXED: &str = "a child Agent's history is fixed by its delegation";
-pub(super) const CHILD_AUTHORIZATION_FIXED: &str =
-    "a child Agent's authorization is fixed by its parent";
+pub(super) const CHILD_HISTORY_FIXED: &str = "its history belongs to the delegation";
+pub(super) const CHILD_AUTHORIZATION_FIXED: &str = "its authorization is set by the parent";
 
 pub(super) fn command_refusal(scope: CommandScope, command: &str, reason: &str) -> String {
-    let prefix = if scope == CommandScope::Child {
-        "Parent fixed · "
+    let location = if scope == CommandScope::Child {
+        "in a child Agent"
     } else {
-        ""
+        "here"
     };
-    format!("{prefix}{command} is unavailable here: {reason}")
+    format!("{command} isn't available {location}: {reason}")
 }
 
 impl CommandSpec {

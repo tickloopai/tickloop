@@ -18,13 +18,8 @@ use crate::{
     tools::{CommandSnapshot, SearchConfig},
 };
 
-pub const PROTOCOL_MAJOR: u16 = 3;
-pub const PROTOCOL_MINOR: u16 = 2;
-pub const MIN_CHUNKED_RESPONSE_MINOR: u16 = 1;
-pub const MIN_PROVIDER_CREDENTIALS_MINOR: u16 = 2;
-pub const MIN_ACCOUNT_MODELS_MINOR: u16 = 2;
-pub const MIN_PREOPEN_OBSERVATION_CANCEL_MINOR: u16 = 2;
-pub const MIN_PROVIDER_MODEL_SELECTION_MINOR: u16 = 2;
+pub const PROTOCOL_MAJOR: u16 = 4;
+pub const PROTOCOL_MINOR: u16 = 0;
 pub const MAX_FRAME_BYTES: usize = 128 * 1024 * 1024;
 pub const RESPONSE_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 pub const FEED_CAPACITY: usize = 128;
@@ -150,14 +145,12 @@ impl std::fmt::Debug for EnvironmentValue {
 pub struct ProviderCredentialScope {
     pub config_root: Option<PathBuf>,
     pub environment_keys: Vec<String>,
-    /// Retained for older wire decoders; built-in-only processes never apply this definition.
-    pub transient_provider: Option<ProviderPatch>,
     pub service_account_path: Result<Option<String>, String>,
     pub service_account_configured: Result<bool, String>,
 }
 
 impl ProviderCredentialScope {
-    pub fn current(config_root: Option<PathBuf>, _legacy_provider: Option<ProviderPatch>) -> Self {
+    pub fn current(config_root: Option<PathBuf>) -> Self {
         let environment_keys = std::env::vars_os()
             .filter_map(|(name, value)| {
                 let name = name.into_string().ok()?;
@@ -181,7 +174,6 @@ impl ProviderCredentialScope {
         Self {
             config_root,
             environment_keys,
-            transient_provider: None,
             service_account_path,
             service_account_configured,
         }
@@ -193,8 +185,6 @@ pub struct LaunchSpec {
     pub workdir: PathBuf,
     pub config_root: Option<PathBuf>,
     pub model: Option<ModelConfig>,
-    /// Retained for older wire decoders; built-in-only processes never apply this definition.
-    pub transient_provider: Option<ProviderPatch>,
     pub host_options: AgentHostOptions,
     pub session_persistence: bool,
     pub exact_chat: Option<Uuid>,
@@ -208,7 +198,6 @@ impl LaunchSpec {
             workdir,
             config_root: None,
             model: None,
-            transient_provider: None,
             host_options: AgentHostOptions::embedded_defaults(),
             session_persistence: true,
             exact_chat: None,
@@ -268,6 +257,13 @@ pub enum AgentCommand {
         as_new: bool,
         launch: Option<LaunchSpec>,
     },
+    SendFamilyInput {
+        source_execution: ExecutionRef,
+        target_execution: ExecutionRef,
+        target_loop: Option<Uuid>,
+        origin: InteractionSource,
+        input: UserInput,
+    },
     Submit {
         execution: ExecutionRef,
         target_loop: Option<Uuid>,
@@ -325,21 +321,11 @@ pub enum AgentCommand {
 }
 
 impl AgentCommand {
-    pub(crate) fn check_peer_version(&self, minor: u16) -> Result<(), AccessError> {
-        if matches!(
-            self,
-            Self::Configure {
-                provider: Some(_),
-                ..
-            }
-        ) {
-            check_provider_peer_version(minor, MIN_PROVIDER_MODEL_SELECTION_MINOR)?;
-        }
-        Ok(())
-    }
-
     pub fn execution(&self) -> Option<ExecutionRef> {
         match self {
+            Self::SendFamilyInput {
+                source_execution, ..
+            } => Some(*source_execution),
             Self::Submit { execution, .. }
             | Self::ContinueLoop { execution, .. }
             | Self::Configure { execution, .. }
@@ -600,7 +586,10 @@ pub struct AgentSummary {
     pub chat_id: Uuid,
     pub workdir: PathBuf,
     pub state: runtime::LoopState,
+    pub run_id: Option<runtime::RunId>,
     pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent: Option<runtime::SubagentRegistration>,
     /// Whether this execution ever received work: a Loop, a message, a user Shell or queued input.
     /// Configuration alone does not count. `None` means the producer did not report the fact (an
     /// older owner or worker); it is neither worked nor empty and stays absent when re-sent.
@@ -630,41 +619,11 @@ pub struct QueuedCommandFailure {
     pub error: AccessError,
 }
 
-impl ObservationRequest {
-    pub(crate) fn minimum_minor(&self) -> u16 {
-        match self {
-            Self::Agent {
-                detail: AgentDetailQuery::ProviderCredentials,
-                ..
-            } => MIN_PROVIDER_CREDENTIALS_MINOR,
-            Self::Agent {
-                detail: AgentDetailQuery::AccountModels { .. },
-                ..
-            } => MIN_ACCOUNT_MODELS_MINOR,
-            _ => 0,
-        }
-    }
-
-    pub(crate) fn check_peer_version(&self, minor: u16) -> Result<(), AccessError> {
-        check_provider_peer_version(minor, self.minimum_minor())
-    }
-}
-
-fn check_provider_peer_version(minor: u16, required: u16) -> Result<(), AccessError> {
-    if minor < required {
-        return Err(AccessError::new(
-            AccessErrorCode::VersionMismatch,
-            format!(
-                "Provider/model management requires AgentAccess {PROTOCOL_MAJOR}.{required} or newer; this connection negotiated {PROTOCOL_MAJOR}.{minor}. Existing Agent work and compatible operations remain available."
-            ),
-        ));
-    }
-    Ok(())
-}
-
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct LiveChatSnapshot {
     pub execution: ExecutionRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent: Option<runtime::SubagentRegistration>,
     pub conversation: ChatSnapshot,
     pub model: ModelConfig,
     pub reasoning_effort: Option<ReasoningEffort>,
@@ -704,6 +663,7 @@ impl LiveChatSnapshot {
     ) -> Self {
         Self {
             execution,
+            subagent: None,
             resume_triggers: snapshot.resume_triggers.clone(),
             last_queue_sequence: snapshot.last_queue_sequence,
             transcript_write_error: None,
@@ -876,6 +836,13 @@ pub enum CommandResult {
     Loaded {
         execution: ExecutionRef,
         snapshot: Box<LiveChatSnapshot>,
+    },
+    FamilyInputSent {
+        source_execution: ExecutionRef,
+        target_execution: ExecutionRef,
+        receipt: Receipt,
+        message_id: Uuid,
+        target_handle: String,
     },
     Submitted(Receipt),
     ShellSubmitted(UserShellReceipt),

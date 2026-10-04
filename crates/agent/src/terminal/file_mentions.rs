@@ -11,11 +11,27 @@ pub(super) enum MentionKind {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct FamilyMentionTarget {
+    pub execution: crate::agent_access::ExecutionRef,
+    pub handle: String,
+    pub description: String,
+    pub available: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct MentionCandidate {
     pub display_path: String,
     pub replacement: String,
-    pub canonical_path: PathBuf,
-    pub kind: MentionKind,
+    pub target: MentionTarget,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum MentionTarget {
+    File {
+        canonical_path: PathBuf,
+        kind: MentionKind,
+    },
+    Agent(FamilyMentionTarget),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -78,6 +94,8 @@ pub(super) enum FileMentionAction {
 #[derive(Debug, Default)]
 pub(super) struct FileMentionState {
     index: Option<FileMentionIndex>,
+    family_targets: Vec<FamilyMentionTarget>,
+    accepted_family: Option<FamilyMentionTarget>,
     next_generation: u64,
     requested_generation: Option<IndexGeneration>,
     completion: Option<FileMentionCompletion>,
@@ -120,6 +138,13 @@ impl FileMentionState {
         }
     }
 
+    pub(super) fn set_family_targets(&mut self, targets: Vec<FamilyMentionTarget>) {
+        if self.family_targets != targets {
+            self.family_targets = targets;
+            self.refresh_completion();
+        }
+    }
+
     pub(super) fn request_index_generation(&mut self) -> IndexGeneration {
         self.next_generation = self
             .next_generation
@@ -149,6 +174,11 @@ impl FileMentionState {
 
     pub(super) fn update_at(&mut self, draft: &str, cursor: usize, limit: usize) {
         self.sync_accepted_mentions(draft);
+        if self.accepted_family.as_ref().is_some_and(|target| {
+            draft.split_whitespace().next() != Some(format!("@{}", target.handle).as_str())
+        }) {
+            self.accepted_family = None;
+        }
         self.draft.clear();
         self.draft.push_str(draft);
         self.cursor = floor_char_boundary(draft, cursor.min(draft.len()));
@@ -180,6 +210,18 @@ impl FileMentionState {
     #[cfg(test)]
     pub(super) fn accepted_mentions(&self) -> impl ExactSizeIterator<Item = &AcceptedMention> {
         self.accepted.iter()
+    }
+
+    pub(super) fn accepted_family(&self) -> Option<&FamilyMentionTarget> {
+        self.accepted_family.as_ref()
+    }
+
+    pub(super) fn take_family(&mut self) -> Option<FamilyMentionTarget> {
+        self.accepted_family.take()
+    }
+
+    pub(super) fn restore_family(&mut self, target: Option<FamilyMentionTarget>) {
+        self.accepted_family = target;
     }
 
     pub(super) fn take_accepted(&mut self) -> Vec<AcceptedMention> {
@@ -266,14 +308,129 @@ impl FileMentionState {
 
     fn refresh_completion(&mut self) {
         self.selected = None;
-        self.completion = self
+        let files = self
             .index
             .as_ref()
-            .and_then(|index| index.complete(&self.draft, self.cursor, self.limit))
-            .filter(|completion| !completion.candidates.is_empty());
+            .and_then(|index| index.complete(&self.draft, self.cursor, self.limit));
+        self.completion = files;
+        if let Some(token) = mention_token(&self.draft, self.cursor) {
+            let raw = &self.draft[token.start..token.cursor];
+            let leading = self.draft[..token.start].trim().is_empty();
+            if leading && !raw.contains('/') && !raw.contains('\\') {
+                let query = raw.trim_start_matches('@');
+                let mut agents = self
+                    .family_targets
+                    .iter()
+                    .filter(|target| target.available && target.handle.starts_with(query))
+                    .take(self.limit)
+                    .map(|target| MentionCandidate {
+                        display_path: target.handle.clone(),
+                        replacement: format!("@{}", target.handle),
+                        target: MentionTarget::Agent(target.clone()),
+                    })
+                    .collect::<Vec<_>>();
+                if !agents.is_empty() {
+                    let mut completion =
+                        self.completion
+                            .take()
+                            .unwrap_or_else(|| FileMentionCompletion {
+                                replacement_range: token.start..token.end,
+                                original_token: self.draft[token.start..token.end].into(),
+                                candidates: Vec::new(),
+                            });
+                    agents.append(&mut completion.candidates);
+                    agents.truncate(self.limit);
+                    completion.candidates = agents;
+                    self.completion = Some(completion);
+                }
+            }
+        }
+        if self
+            .completion
+            .as_ref()
+            .is_some_and(|completion| completion.candidates.is_empty())
+        {
+            self.completion = None;
+        }
+    }
+
+    pub(super) fn family_target_for_submission(
+        &self,
+        draft: &str,
+    ) -> Result<Option<FamilyMentionTarget>, String> {
+        let leading = draft.trim_start();
+        let Some(token) = leading
+            .split_whitespace()
+            .next()
+            .and_then(|token| token.strip_prefix('@'))
+        else {
+            return Ok(None);
+        };
+        if token.contains('/') || token.contains('\\') {
+            return Ok(None);
+        }
+        let start = draft.len() - leading.len();
+        if self
+            .accepted
+            .iter()
+            .any(|file| file.replacement_range.start == start)
+        {
+            return Ok(None);
+        }
+        let selected = self
+            .accepted_family
+            .as_ref()
+            .filter(|target| target.handle == token);
+        let current = self
+            .family_targets
+            .iter()
+            .find(|target| target.handle == token);
+        if let Some(selected) = selected
+            && current.is_none_or(|current| current.execution != selected.execution)
+        {
+            return Err("selected Agent is no longer the same execution".into());
+        }
+        let Some(target) = current else {
+            return Ok(None);
+        };
+        if !target.available {
+            return Err("Agent target is unavailable or is the current Agent".into());
+        }
+        if leading
+            .split_once(char::is_whitespace)
+            .is_none_or(|(_, body)| body.trim().is_empty())
+        {
+            return Err("enter a message after the Agent target".into());
+        }
+        Ok(Some(target.clone()))
     }
 
     fn accept_candidate(&mut self, candidate_index: usize) -> FileMentionAction {
+        if let Some(MentionCandidate {
+            target: MentionTarget::Agent(target),
+            ..
+        }) = self.candidates().get(candidate_index)
+        {
+            let target = target.clone();
+            let Some((mut draft, mut cursor)) = self
+                .completion
+                .as_ref()
+                .and_then(|completion| completion.apply_text(&self.draft, candidate_index))
+            else {
+                return FileMentionAction::Ignored;
+            };
+            if draft[cursor..].starts_with(char::is_whitespace) {
+                cursor += draft[cursor..].chars().next().unwrap().len_utf8();
+            } else {
+                draft.insert(cursor, ' ');
+                cursor += 1;
+            }
+            self.accepted_family = Some(target);
+            self.draft.clone_from(&draft);
+            self.cursor = cursor;
+            self.dismiss();
+            return FileMentionAction::ReplaceDraft { draft, cursor };
+        }
         let Some(applied) = self
             .completion
             .as_ref()
@@ -467,8 +624,10 @@ impl FileMentionIndex {
                 MentionCandidate {
                     replacement: format!("@{}", escape_path_token(&display_path)),
                     display_path,
-                    canonical_path: entry.canonical_path.clone(),
-                    kind: entry.kind,
+                    target: MentionTarget::File {
+                        canonical_path: entry.canonical_path.clone(),
+                        kind: entry.kind,
+                    },
                 }
             })
             .collect();
@@ -517,30 +676,40 @@ impl FileMentionIndex {
 }
 
 impl FileMentionCompletion {
-    pub(super) fn apply(&self, draft: &str, candidate_index: usize) -> Option<AppliedMention> {
+    fn apply_text(&self, draft: &str, candidate_index: usize) -> Option<(String, usize)> {
         if draft.get(self.replacement_range.clone())? != self.original_token {
             return None;
         }
-        let current_token = mention_token(draft, self.replacement_range.end)?;
-        if current_token.start != self.replacement_range.start
-            || current_token.end != self.replacement_range.end
+        let current = mention_token(draft, self.replacement_range.end)?;
+        if current.start != self.replacement_range.start
+            || current.end != self.replacement_range.end
         {
             return None;
         }
         let candidate = self.candidates.get(candidate_index)?;
-        let mut updated = String::with_capacity(
-            draft.len() - self.replacement_range.len() + candidate.replacement.len(),
-        );
-        updated.push_str(&draft[..self.replacement_range.start]);
-        updated.push_str(&candidate.replacement);
-        updated.push_str(&draft[self.replacement_range.end..]);
-        let cursor = self.replacement_range.start + candidate.replacement.len();
+        let mut updated = draft.to_owned();
+        updated.replace_range(self.replacement_range.clone(), &candidate.replacement);
+        Some((
+            updated,
+            self.replacement_range.start + candidate.replacement.len(),
+        ))
+    }
 
+    pub(super) fn apply(&self, draft: &str, candidate_index: usize) -> Option<AppliedMention> {
+        let candidate = self.candidates.get(candidate_index)?;
+        let MentionTarget::File {
+            canonical_path,
+            kind,
+        } = &candidate.target
+        else {
+            return None;
+        };
+        let (draft, cursor) = self.apply_text(draft, candidate_index)?;
         Some(AppliedMention {
-            draft: updated,
+            draft,
             cursor,
-            path: candidate.canonical_path.clone(),
-            kind: candidate.kind,
+            path: canonical_path.clone(),
+            kind: *kind,
             token: candidate.replacement.clone(),
         })
     }
@@ -1021,6 +1190,108 @@ mod tests {
     }
 
     #[test]
+    fn leading_family_targets_precede_files_and_later_or_explicit_paths_stay_files() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("audit.txt"), "file").unwrap();
+        let index = FileMentionIndex::build(directory.path(), &[]).unwrap();
+        let mut state = FileMentionState::with_index(index);
+        let target = FamilyMentionTarget {
+            execution: crate::agent_access::ExecutionRef {
+                owner_epoch: uuid::Uuid::new_v4(),
+                agent_id: uuid::Uuid::new_v4(),
+                generation: 1,
+            },
+            handle: "audit".into(),
+            description: "Audit evidence".into(),
+            available: true,
+        };
+        state.set_family_targets(vec![target]);
+        state.update_at("@a", 2, 15);
+        assert_eq!(state.candidates()[0].display_path, "audit");
+        state.update_at("words @a", 8, 15);
+        assert!(
+            state
+                .candidates()
+                .iter()
+                .all(|row| row.display_path != "audit")
+        );
+        state.update_at("@./a", 5, 15);
+        assert!(
+            state
+                .candidates()
+                .iter()
+                .all(|row| row.display_path != "audit")
+        );
+    }
+
+    #[test]
+    fn selected_agent_and_file_collisions_keep_identity_and_reject_empty_stale_or_self_targets() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("audit"), "evidence").unwrap();
+        let mut state =
+            FileMentionState::with_index(FileMentionIndex::build(directory.path(), &[]).unwrap());
+        let target = FamilyMentionTarget {
+            execution: crate::agent_access::ExecutionRef {
+                owner_epoch: uuid::Uuid::new_v4(),
+                agent_id: uuid::Uuid::new_v4(),
+                generation: 1,
+            },
+            handle: "audit".into(),
+            description: "Check evidence".into(),
+            available: true,
+        };
+        state.set_family_targets(vec![target.clone()]);
+        state.update_at("@a", 2, 15);
+        assert!(matches!(
+            state.handle_key(FileMentionKey::Complete),
+            FileMentionAction::ReplaceDraft { .. }
+        ));
+        assert!(state.family_target_for_submission("@audit").is_err());
+        assert_eq!(
+            state
+                .family_target_for_submission("@audit hello")
+                .unwrap()
+                .unwrap()
+                .execution,
+            target.execution
+        );
+        let chip = state.take_family();
+        state.update_at("", 0, 15);
+        state.restore_accepted("@audit hello", vec![]);
+        state.restore_family(chip);
+        assert_eq!(
+            state
+                .family_target_for_submission("@audit hello")
+                .unwrap()
+                .unwrap()
+                .execution,
+            target.execution
+        );
+        let mut stale = target.clone();
+        stale.execution.generation += 1;
+        state.set_family_targets(vec![stale]);
+        assert!(state.family_target_for_submission("@audit hello").is_err());
+        state.restore_family(None);
+        let mut unavailable = target.clone();
+        unavailable.available = false;
+        state.set_family_targets(vec![unavailable]);
+        assert!(state.family_target_for_submission("@audit hello").is_err());
+        state.set_family_targets(vec![target]);
+        state.update_at("@a", 2, 15);
+        assert!(matches!(
+            state.accept_candidate(1),
+            FileMentionAction::ReplaceDraft { .. }
+        ));
+        assert!(
+            state
+                .family_target_for_submission("@audit hello")
+                .unwrap()
+                .is_none(),
+            "accepted file metadata beats a bare Agent handle collision"
+        );
+    }
+
+    #[test]
     fn completes_files_and_directories_with_fuzzy_matching() {
         let fixture = Fixture::new();
         fixture.file("src/terminal/file_mentions.rs");
@@ -1035,11 +1306,23 @@ mod tests {
             completion.candidates[0].display_path,
             "src/terminal/file_mentions.rs"
         );
-        assert_eq!(completion.candidates[0].kind, MentionKind::File);
+        assert!(matches!(
+            completion.candidates[0].target,
+            MentionTarget::File {
+                kind: MentionKind::File,
+                ..
+            }
+        ));
 
         let directories = index.complete("@doc", 4, 8).unwrap();
         assert_eq!(directories.candidates[0].display_path, "docs/");
-        assert_eq!(directories.candidates[0].kind, MentionKind::Directory);
+        assert!(matches!(
+            directories.candidates[0].target,
+            MentionTarget::File {
+                kind: MentionKind::Directory,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1130,7 +1413,14 @@ mod tests {
         let completion = index.complete(&draft, draft.len(), 8).unwrap();
 
         assert!(completion.candidates.iter().any(|candidate| {
-            candidate.display_path.ends_with("/src/") && candidate.kind == MentionKind::Directory
+            candidate.display_path.ends_with("/src/")
+                && matches!(
+                    candidate.target,
+                    MentionTarget::File {
+                        kind: MentionKind::Directory,
+                        ..
+                    }
+                )
         }));
     }
 

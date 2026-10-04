@@ -7,7 +7,7 @@ use unicode_width::UnicodeWidthStr;
 use uuid::Uuid;
 
 use super::{
-    console::{AgentTreeRow, MIN_REQUEST_AGENT_TITLE_COLUMNS, RowExtras, truncate_width},
+    console::{AgentRow, truncate_width},
     display::{DisplayProfile, Glyph},
     footer::{FooterFrame, FooterItemId},
     style::{Role, RoleLine},
@@ -106,9 +106,7 @@ pub(super) struct StatusArea {
     todos: Vec<StatusItem>,
     todos_initialized: bool,
     todo_completed_at: HashMap<(String, String), Instant>,
-    agents: Vec<AgentTreeRow>,
-    /// Reading numbers shown after repeated family titles.
-    agent_ordinals: HashMap<Uuid, usize>,
+    agents: Vec<AgentRow>,
     /// The family member this View shows.
     visible_agent: Option<Uuid>,
     selected_agent: Option<Uuid>,
@@ -175,28 +173,29 @@ impl StatusArea {
             .filter(|_| self.family_row_count() > 0)
     }
 
-    /// The reading number this family panel shows for `agent_id` when another family row reads
-    /// alike, so a request header and the row it names always agree.
-    pub(super) fn ordinal(&self, agent_id: Uuid) -> Option<usize> {
-        self.agent_ordinals.get(&agent_id).copied()
-    }
-
     pub(super) fn agent_title(&self, agent_id: Uuid) -> Option<&str> {
         self.agents
             .iter()
             .find(|row| row.agent_id == agent_id)
-            .map(|row| row.title.as_str())
+            .map(|row| {
+                row.subagent
+                    .as_ref()
+                    .map_or(row.title.as_str(), |registration| {
+                        registration.handle.as_str()
+                    })
+            })
     }
 
-    /// Replaces the family rows; `ordinals` are the View's reading numbers for repeated titles.
-    pub(super) fn update_agents(
-        &mut self,
-        rows: Vec<AgentTreeRow>,
-        visible: Option<Uuid>,
-        ordinals: HashMap<Uuid, usize>,
-    ) {
+    pub(super) fn viewed_child(&self) -> Option<&AgentRow> {
+        self.agents.iter().find(|row| {
+            Some(row.agent_id) == self.visible_agent
+                && (row.subagent.is_some() || row.parent_id.is_some())
+        })
+    }
+
+    /// Replaces the visible family rows.
+    pub(super) fn update_agents(&mut self, rows: Vec<AgentRow>, visible: Option<Uuid>) {
         self.visible_agent = visible;
-        self.agent_ordinals = ordinals;
         let selected_index = self
             .agents
             .iter()
@@ -222,7 +221,7 @@ impl StatusArea {
             .flatten()
     }
 
-    fn visible_agents(&self) -> Vec<&AgentTreeRow> {
+    fn visible_agents(&self) -> Vec<&AgentRow> {
         self.agents
             .iter()
             .filter(|row| {
@@ -543,6 +542,23 @@ impl StatusArea {
         row_count: usize,
         display: DisplayProfile,
     ) -> Vec<RoleLine> {
+        self.panel_lines_at(
+            footer,
+            width,
+            row_count,
+            display,
+            crate::private_fs::unix_time_milliseconds(),
+        )
+    }
+
+    pub(super) fn panel_lines_at(
+        &self,
+        footer: &FooterFrame,
+        width: usize,
+        row_count: usize,
+        display: DisplayProfile,
+        now: u64,
+    ) -> Vec<RoleLine> {
         if row_count == 0 {
             return Vec::new();
         }
@@ -562,7 +578,7 @@ impl StatusArea {
         let render_header = !footer.items.is_empty();
         header.truncate(width);
         let mut lines = if render_header {
-            vec![header.filled(Role::StatusPanel)]
+            vec![header]
         } else {
             Vec::new()
         };
@@ -582,40 +598,43 @@ impl StatusArea {
         } else {
             self.offset
         };
-        let status = |row: &AgentTreeRow| {
-            let mut status = vec![(row.status.clone(), row.status_role())];
-            if Some(row.agent_id) == self.visible_agent {
-                status.push((" · ".into(), Role::MutedText));
-                status.push(("viewing".into(), Role::Text));
-            }
-            row.own_status_variants(status, width + 1)
-        };
+        let name_columns = agents
+            .iter()
+            .filter(|row| row.subagent.is_some() || row.parent_id.is_some())
+            .map(|row| {
+                UnicodeWidthStr::width(
+                    row.subagent
+                        .as_ref()
+                        .map_or("child", |registration| registration.handle.as_str()),
+                )
+            })
+            .max()
+            .unwrap_or(4);
         for row in agents.iter().skip(offset).take(capacity) {
             let selected = footer.list_focused
                 && footer.selected == Some(FooterItemId::Agents)
                 && Some(row.agent_id) == self.selected_agent;
-            let line = row.summary_line(
-                width,
+            let line = super::subagent_panel::family_line(
+                row,
                 selected,
-                &RowExtras {
-                    glyph: display.glyph(row.glyph),
-                    ..RowExtras::default()
-                },
-                self.agent_ordinals.get(&row.agent_id).copied(),
-                &status(row),
-                MIN_REQUEST_AGENT_TITLE_COLUMNS,
+                Some(row.agent_id) == self.visible_agent,
+                (width, name_columns, display, now),
             );
             lines.push(if selected {
                 line.filled(Role::Selection)
             } else {
-                line.filled(Role::StatusPanel)
+                line
             });
         }
         lines
     }
 
     fn family_row_count(&self) -> usize {
-        if self.agents.iter().any(|row| row.parent_id.is_some()) {
+        if self
+            .agents
+            .iter()
+            .any(|row| row.subagent.is_some() || row.parent_id.is_some())
+        {
             self.agents.len()
         } else {
             0
@@ -628,7 +647,7 @@ impl StatusArea {
                 let subagent_count = self
                     .agents
                     .iter()
-                    .filter(|row| row.parent_id.is_some())
+                    .filter(|row| row.subagent.is_some() || row.parent_id.is_some())
                     .count();
                 format!("Subagents {subagent_count}")
             }
@@ -661,6 +680,208 @@ impl StatusArea {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subagent_panel_labels_only_the_family_root_main() {
+        let root = Uuid::from_u128(1);
+        let row = |id, parent, title: &str| AgentRow {
+            agent_id: Uuid::from_u128(id),
+            parent_id: parent,
+            title: title.into(),
+            status: "Running".into(),
+            state: crate::runtime::LoopState::Running,
+            project: String::new(),
+            workspace: None,
+            approvals: 0,
+            questions: 0,
+            group: crate::agent_console::AttentionGroup::Working,
+            glyph: Glyph::AgentRunning,
+            preview: None,
+            updated_at: None,
+            subagent: parent.map(|_| crate::runtime::SubagentRegistration {
+                child_chat_id: Uuid::from_u128(id),
+                handle: title.into(),
+                description: title.into(),
+                created_at: crate::private_fs::unix_time_milliseconds(),
+            }),
+        };
+        let mut area = StatusArea::default();
+        area.update_agents(
+            vec![
+                row(1, None, "Long original human message"),
+                row(2, Some(root), "file-check"),
+            ],
+            Some(root),
+        );
+        let footer = FooterFrame {
+            items: Vec::new(),
+            selected: None,
+            list_focused: false,
+        };
+        let lines = area.panel_lines_with_rows(&footer, 48, 3, DisplayProfile::default());
+        assert_eq!(lines[0].text(), "  ● main");
+        assert!(lines[1].text().contains("○ file-check"), "{lines:?}");
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.text().contains("Long original"))
+        );
+    }
+
+    #[test]
+    fn subagent_panel_elapsed_idle_and_backgrounds_follow_the_view_clock() {
+        use crate::{
+            agent_console::AttentionGroup,
+            settings::{DisplayPreferences, GlyphSet},
+            terminal::style::ThemeName,
+        };
+        let root = Uuid::from_u128(1);
+        let child = Uuid::from_u128(2);
+        let row = |id, parent, title: &str| AgentRow {
+            agent_id: id,
+            parent_id: parent,
+            title: title.into(),
+            status: "Running".into(),
+            state: crate::runtime::LoopState::Running,
+            project: String::new(),
+            workspace: None,
+            approvals: 0,
+            questions: 0,
+            group: AttentionGroup::Working,
+            glyph: Glyph::AgentRunning,
+            preview: Some("Run sleep 30".into()),
+            updated_at: Some(100_000),
+            subagent: parent.map(|_| crate::runtime::SubagentRegistration {
+                child_chat_id: id,
+                handle: title.into(),
+                description: "Run sleep 30".into(),
+                created_at: 100_000,
+            }),
+        };
+        let mut area = StatusArea::default();
+        let mut rows = vec![
+            row(root, None, "root title"),
+            row(child, Some(root), "sleep-30"),
+        ];
+        area.update_agents(rows.clone(), Some(child));
+        for glyph_set in [GlyphSet::Unicode, GlyphSet::NerdFont] {
+            for theme in ThemeName::ALL {
+                let mut display = DisplayProfile::new(DisplayPreferences {
+                    glyph_set,
+                    prefers_reduced_motion: false,
+                });
+                display.set_theme(theme);
+                let footer = FooterFrame {
+                    items: Vec::new(),
+                    selected: None,
+                    list_focused: false,
+                };
+                let lines = area.panel_lines_at(&footer, 80, 3, display, 161_000);
+                assert!(lines[1].text().ends_with("1m 1s"), "{lines:?}");
+                assert!(lines[1].text().contains("Run sleep 30"));
+                assert!(lines.iter().all(|line| line.fill.is_none()));
+                assert_eq!(lines[1].spans[0].role, Some(Role::Title));
+                assert_eq!(lines[0].spans[0].role, Some(Role::MutedText));
+                for width in [1, 8, 16, 32, 80] {
+                    assert!(
+                        area.panel_lines_at(&footer, width, 3, display, 161_000)
+                            .iter()
+                            .all(|line| UnicodeWidthStr::width(line.text().as_str()) <= width)
+                    );
+                }
+                let focused = FooterFrame {
+                    items: Vec::new(),
+                    selected: Some(FooterItemId::Agents),
+                    list_focused: true,
+                };
+                let selected = area.panel_lines_at(&focused, 80, 3, display, 161_000);
+                assert_eq!(
+                    selected
+                        .iter()
+                        .filter(|line| line.fill == Some(Role::Selection))
+                        .count(),
+                    1
+                );
+                assert!(
+                    selected
+                        .iter()
+                        .all(|line| line.fill.is_none() || line.fill == Some(Role::Selection))
+                );
+            }
+        }
+        rows[1].status = "En cours".into();
+        area.update_agents(rows.clone(), Some(child));
+        let unfocused = FooterFrame {
+            items: Vec::new(),
+            selected: None,
+            list_focused: false,
+        };
+        assert!(
+            area.panel_lines_at(&unfocused, 80, 3, DisplayProfile::default(), 161_000)[1]
+                .text()
+                .ends_with("1m 1s")
+        );
+        rows[1].group = AttentionGroup::Waiting;
+        rows[1].state = crate::runtime::LoopState::WaitingTrigger;
+        rows[1].glyph = Glyph::AgentWaiting;
+        rows[1].status = "Waiting · trigger".into();
+        area.update_agents(rows.clone(), Some(child));
+        for glyph_set in [GlyphSet::Unicode, GlyphSet::NerdFont] {
+            let display = DisplayProfile::new(DisplayPreferences {
+                glyph_set,
+                prefers_reduced_motion: false,
+            });
+            assert_ne!(
+                display.glyph(Glyph::AgentWaiting),
+                display.glyph(Glyph::AgentIdle)
+            );
+            assert!(
+                area.panel_lines_at(&unfocused, 80, 3, display, 181_000)[1]
+                    .text()
+                    .ends_with("waiting · trigger")
+            );
+        }
+        rows[1].group = AttentionGroup::Idle;
+        rows[1].state = crate::runtime::LoopState::Idle;
+        rows[1].status = "Idle".into();
+        rows[1].glyph = Glyph::AgentIdle;
+        area.update_agents(rows.clone(), Some(child));
+        let footer = FooterFrame {
+            items: Vec::new(),
+            selected: None,
+            list_focused: false,
+        };
+        assert!(
+            area.panel_lines_at(&footer, 80, 3, DisplayProfile::default(), 181_000)[1]
+                .text()
+                .ends_with("idle")
+        );
+        rows[1].group = AttentionGroup::Working;
+        rows[1].state = crate::runtime::LoopState::Running;
+        rows[1].status = "Running".into();
+        rows[1].glyph = Glyph::AgentRunning;
+        area.update_agents(rows, Some(child));
+        for (elapsed, expected) in [
+            (500, "0s"),
+            (59_999, "59s"),
+            (60_000, "1m 0s"),
+            (119_500, "2m 0s"),
+            (3_600_000, "1h 0m 0s"),
+            (86_400_000, "1d 0h 0m"),
+        ] {
+            assert!(
+                area.panel_lines_at(&footer, 80, 3, DisplayProfile::default(), 100_000 + elapsed)
+                    [1]
+                .text()
+                .ends_with(expected)
+            );
+        }
+        assert!(
+            area.panel_lines_at(&footer, 80, 3, DisplayProfile::default(), 221_000)[1]
+                .text()
+                .ends_with("2m 1s")
+        );
+    }
 
     fn item(id: &str, title: &str) -> StatusItem {
         StatusItem {

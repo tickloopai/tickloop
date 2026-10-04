@@ -168,6 +168,7 @@ impl EmbeddedAgentAccess {
             warnings.push(error);
         }
         let mut snapshot = LiveChatSnapshot::from_snapshot(execution, snapshot, warnings);
+        snapshot.subagent = self.inner.agent.subagent_registration(chat).await?;
         snapshot.transcript_write_error = self.inner.agent.transcript_write_error();
         snapshot.loop_trigger_notices = self
             .inner
@@ -449,6 +450,78 @@ impl EmbeddedAgentAccess {
                 Ok(CommandResult::Loaded {
                     execution,
                     snapshot: Box::new(self.snapshot(execution).await?),
+                })
+            }
+            AgentCommand::SendFamilyInput {
+                source_execution,
+                target_execution,
+                target_loop,
+                origin,
+                input,
+            } => {
+                if !self.inner.verified_sources.load(Ordering::SeqCst) {
+                    self.inner
+                        .views
+                        .validate_displayed_source(&origin, source_execution)
+                        .await?;
+                }
+                let source_chat = self.chat(source_execution).await?;
+                let target_chat = self.chat(target_execution).await?;
+                let UserInput::Text {
+                    text,
+                    contexts,
+                    paths,
+                } = input
+                else {
+                    return Err(AccessError::invalid("directed family input is text only"));
+                };
+                let message_id = Uuid::new_v4();
+                let source_handle = self
+                    .inner
+                    .agent
+                    .subagent_registration(source_chat)
+                    .await?
+                    .map(|record| record.handle)
+                    .unwrap_or_else(|| "main".into());
+                let target_handle = self
+                    .inner
+                    .agent
+                    .subagent_registration(target_chat)
+                    .await?
+                    .map(|record| record.handle)
+                    .unwrap_or_else(|| "main".into());
+                let directed = crate::runtime::DirectedHumanSource {
+                    message_id,
+                    source_chat_id: source_chat,
+                    source_handle,
+                    original_submission: text,
+                    original_contexts: contexts.clone(),
+                    original_paths: paths.clone(),
+                    source_session_id: origin.view.session_id,
+                    source_view_id: origin.view.view_id,
+                    source_display_version: origin.display_version,
+                };
+                let context = self
+                    .host_context(target_execution, target_chat, None, false)
+                    .await?;
+                let receipt = self
+                    .inner
+                    .agent
+                    .submit_family_input(
+                        target_chat,
+                        target_loop,
+                        directed,
+                        contexts,
+                        paths,
+                        context,
+                    )
+                    .await?;
+                Ok(CommandResult::FamilyInputSent {
+                    source_execution,
+                    target_execution,
+                    receipt,
+                    message_id,
+                    target_handle,
                 })
             }
             AgentCommand::Submit {
@@ -1022,7 +1095,6 @@ impl EmbeddedAgentAccess {
                 let launch = launches.get(&execution);
                 ObservationValue::ProviderCredentials(Box::new(ProviderCredentialScope::current(
                     launch.and_then(|launch| launch.config_root.clone()),
-                    None,
                 )))
             }
             AgentDetailQuery::AccountModels { .. } => {
@@ -1206,7 +1278,9 @@ impl AgentAccess for EmbeddedAgentAccess {
                         &snapshot.user_shells,
                         snapshot.pending_inputs.len() + snapshot.pending_commands.len(),
                     );
-                    let title = super::agent_title(&snapshot.loops, &snapshot.user_shells);
+                    let title =
+                        crate::runtime::chat_display_title(&snapshot, &snapshot.user_shells);
+                    let registration = self.inner.agent.subagent_registration(chat).await?;
                     entries.push(AgentSummary {
                         availability: ExecutionAvailability::Live,
                         execution,
@@ -1214,8 +1288,10 @@ impl AgentAccess for EmbeddedAgentAccess {
                         preview: super::preview(&snapshot, &title),
                         updated_at: super::updated_at(&snapshot.loops, &snapshot.user_shells),
                         workdir: snapshot.workdir,
+                        run_id: super::summary_run_id(&snapshot.loops, &state),
                         state,
                         title,
+                        subagent: registration,
                         has_work: Some(has_work),
                         waiting_permissions: snapshot.permissions.len(),
                         waiting_questions: snapshot.questions.len(),

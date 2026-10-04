@@ -50,13 +50,14 @@ fn update(console: &Console, todos: Vec<StatusItem>) {
         .unwrap();
 }
 
-fn agent(id: u128, parent: Option<Uuid>, title: &str) -> AgentTreeRow {
-    AgentTreeRow {
+fn agent(id: u128, parent: Option<Uuid>, title: &str) -> AgentRow {
+    AgentRow {
         agent_id: Uuid::from_u128(id),
         parent_id: parent,
-        depth: usize::from(parent.is_some()),
+
         title: title.into(),
         status: "running".into(),
+        state: crate::runtime::LoopState::Running,
         project: "fixture".into(),
         workspace: None,
         approvals: 0,
@@ -65,6 +66,74 @@ fn agent(id: u128, parent: Option<Uuid>, title: &str) -> AgentTreeRow {
         glyph: status_glyph(AttentionGroup::Working, false),
         preview: None,
         updated_at: None,
+        subagent: parent.map(|_| crate::runtime::SubagentRegistration {
+            child_chat_id: Uuid::from_u128(id),
+            handle: if title.contains(' ') {
+                format!("child-{id}")
+            } else {
+                title.into()
+            },
+            description: title.into(),
+            created_at: crate::private_fs::unix_time_milliseconds(),
+        }),
+    }
+}
+
+#[test]
+fn child_input_badge_placeholder_and_panel_background_are_display_only() {
+    use crate::settings::{DisplayPreferences, GlyphSet};
+    for glyph_set in [GlyphSet::Unicode, GlyphSet::NerdFont] {
+        for theme in ThemeName::ALL {
+            let console = fixture();
+            update(&console, vec![]);
+            console
+                .set_agent_family(
+                    vec![
+                        agent(1, None, "Root title"),
+                        agent(2, Some(Uuid::from_u128(1)), "sleep-30-2"),
+                    ],
+                    Some(Uuid::from_u128(2)),
+                )
+                .unwrap();
+            console.set_visible_delegation(true).unwrap();
+            let mut state = console.state.lock().unwrap();
+            state.editor.replace_draft(String::new(), 0);
+            state.display.set_preferences(DisplayPreferences {
+                glyph_set,
+                prefers_reduced_motion: false,
+            });
+            state.display.set_theme(theme);
+            let (lines, _, _) = state.normal_styled_frame();
+            let badge = lines
+                .iter()
+                .find(|line| line.text().contains("@sleep-30-2") && line.text().contains('─'))
+                .expect("child handle on upper divider");
+            assert!(
+                badge
+                    .spans
+                    .iter()
+                    .any(|span| span.text.contains("@sleep-30-2")
+                        && span.role
+                            == Some(super::super::subagent_panel::agent_color(Uuid::from_u128(
+                                2
+                            ))))
+            );
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.text().contains("Message @sleep-30-2…"))
+            );
+            assert!(state.editor.draft().is_empty());
+            assert_eq!(state.input_display().0, "");
+            assert!(
+                lines
+                    .iter()
+                    .filter(
+                        |line| line.text().contains("sleep-30-2") || line.text().contains(" main")
+                    )
+                    .all(|line| line.fill.is_none())
+            );
+        }
     }
 }
 
@@ -88,7 +157,7 @@ fn subagent_count_excludes_main_and_includes_the_child_currently_viewed() {
         "{rendered:?}"
     );
     for title in [
-        "Main count probe",
+        "main",
         "viewed child count probe",
         "nested child count probe",
     ] {
@@ -128,10 +197,7 @@ fn expanded_subagents_start_at_the_entry_without_an_items_or_blank_summary_row()
             .iter()
             .position(|row| row.contains("Subagents 1"))
             .unwrap();
-        assert!(
-            rendered[entry + 1].contains("Main summary probe"),
-            "{rendered:?}"
-        );
+        assert!(rendered[entry + 1].contains("main"), "{rendered:?}");
         assert!(
             rendered[entry + 2].contains("child summary probe"),
             "{rendered:?}"
@@ -142,10 +208,7 @@ fn expanded_subagents_start_at_the_entry_without_an_items_or_blank_summary_row()
             .iter()
             .position(|row| row.contains("Subagents 1"))
             .unwrap();
-        assert!(
-            focused[entry + 1].contains("Main summary probe"),
-            "{focused:?}"
-        );
+        assert!(focused[entry + 1].contains("main"), "{focused:?}");
         {
             assert!(
                 focused.last().unwrap().contains("Enter/Space hide"),

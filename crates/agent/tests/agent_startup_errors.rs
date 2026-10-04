@@ -69,7 +69,8 @@ fn incompatible_service_output(terminal: bool) -> String {
             matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
         );
     });
-    let executable = env!("CARGO_BIN_EXE_tickloop");
+    let canonical_executable = std::fs::canonicalize(env!("CARGO_BIN_EXE_tickloop")).unwrap();
+    let executable = canonical_executable.to_str().unwrap();
     let working_directory = if terminal {
         root.clone()
     } else {

@@ -36,6 +36,15 @@ impl ScriptedModel {
 
 #[async_trait]
 impl ModelClient for ScriptedModel {
+    async fn generate_title(
+        &self,
+        request: tickloop_agent::model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<tickloop_agent::model::ModelDelta>,
+        _: tokio_util::sync::CancellationToken,
+    ) -> Result<tickloop_agent::model::ModelOutput, tickloop_agent::model::ModelError> {
+        Ok(title_output(request))
+    }
+
     fn identity(&self) -> tickloop_agent::model::ModelIdentity {
         tickloop_agent::model::ModelIdentity {
             provider: tickloop_agent::model::ModelProvider::Api,
@@ -244,4 +253,36 @@ pub fn truncate_transcript_before(path: &std::path::Path, is_cut: impl Fn(&str) 
 /// 匹配某个工具调用的结果条目。
 pub fn is_tool_result_line(line: &str, call_id: &str) -> bool {
     line.contains("\"tool_result\"") && line.contains(&format!("\"tool_use_id\":\"{call_id}\""))
+}
+
+pub fn title_output(request: ModelRequest) -> ModelOutput {
+    let content = request
+        .messages
+        .into_iter()
+        .rev()
+        .find(|message| message.role == Role::User)
+        .map(|message| message.content)
+        .unwrap_or_default();
+    ModelOutput {
+        private_source: None,
+        content,
+        usage: Usage {
+            input_tokens: Some(0),
+            output_tokens: Some(0),
+            cache_read_input_tokens: Some(0),
+            cache_write_input_tokens: Some(0),
+        },
+        stop_reason: "end_turn".into(),
+    }
+}
+
+pub fn model_script_requests(
+    snapshot: &tickloop_agent::runtime::ChatSnapshot,
+) -> Vec<&tickloop_agent::runtime::RequestUsageRecord> {
+    snapshot
+        .request_usage
+        .entries()
+        .iter()
+        .filter(|entry| entry.kind != tickloop_agent::runtime::RequestKind::Title)
+        .collect()
 }

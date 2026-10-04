@@ -9,6 +9,9 @@ mod artifact_attachment;
 #[path = "agent_console_pty/command_feedback.rs"]
 mod command_feedback;
 
+#[path = "agent_console_pty/family_messaging.rs"]
+mod family_messaging;
+
 #[path = "agent_console_pty/family_navigation.rs"]
 mod family_navigation;
 
@@ -328,7 +331,7 @@ fn family_panel_has_viewing_row(frame: &str) -> bool {
         .lines()
         .skip_while(|line| !line.contains("Subagents "))
         .skip(1)
-        .any(|line| line.contains("viewing"))
+        .any(|line| line.contains('●'))
 }
 
 fn new_input_is_visible(frame: &str) -> bool {
@@ -373,7 +376,7 @@ async fn run_lifecycle(fixture: &PrivateFixture) {
     let overview = first.frame();
     assert!(overview.contains("Needs input"), "{overview}");
     assert!(
-        overview.contains("› ● New Agent · current session · send a prompt to start"),
+        overview.contains("› ◆ New Agent · current session · send a prompt to start"),
         "{overview}"
     );
     assert!(overview.contains("approvals 0 · questions 0"), "{overview}");
@@ -388,7 +391,7 @@ async fn run_lifecycle(fixture: &PrivateFixture) {
         first.send(b"\x1b[D");
         first
             .wait_for("Left selects current draft again", |frame| {
-                frame.contains("› ● New Agent · current session")
+                frame.contains("› ◆ New Agent · current session")
             })
             .await;
     }
@@ -1121,7 +1124,11 @@ async fn run_child_views(fixture: &PrivateFixture) {
     const PARENT_RESULT_RESPONSE_INDEX: usize = 4;
     let replies = vec![
         chat_reply(
-            Some(("DelegateAgent", "delegate-cli", json!({"task":CHILD_TASK}))),
+            Some((
+                "DelegateAgent",
+                "delegate-cli",
+                json!({"task":CHILD_TASK,"name":"cadence","description":CHILD_TASK}),
+            )),
             "",
         ),
         chat_reply(
@@ -1267,7 +1274,7 @@ async fn run_child_views(fixture: &PrivateFixture) {
         .wait_for("real child folded under its root", |frame| {
             frame.contains("Agents · local")
                 && frame.contains("Project: all")
-                && frame.contains("child needs input")
+                && frame.contains("questions 1")
                 && frame.contains("questions 1")
         })
         .await;
@@ -1276,32 +1283,20 @@ async fn run_child_views(fixture: &PrivateFixture) {
         folded.contains("▸ Empty · 1"),
         "the never-used root stays discoverable behind its heading: {folded}"
     );
-    // Cycling the filter keeps a selection it still lists (here the Empty heading), so the cursor
-    // moves to the parent row by real keys before Space unfolds its family.
     select_overview_row(&mut first, "Delegate bounded cadence.").await;
+    let overview = first.frame();
     assert!(
-        first
-            .frame()
-            .lines()
-            .any(|line| line.starts_with('›') && line.contains("Delegate bounded cadence.")),
-        "the parent row is selected: {}",
-        first.frame()
+        !overview.contains(CHILD_TASK),
+        "children are selected inside the family: {overview}"
     );
-    first.send(b" ");
-    let overview = first
-        .wait_for("real child nested in overview", |frame| {
-            frame.contains(CHILD_TASK) && frame.contains("questions 1")
+    first.send(b"\r");
+    first
+        .wait_for("overview opens the family root", |frame| {
+            frame.contains("Subagents 1") && !frame.contains("Agents · local")
         })
         .await;
-    assert!(
-        overview
-            .lines()
-            .any(|line| line.starts_with("    ") && line.contains(CHILD_TASK)),
-        "{overview}"
-    );
-    first.send(b"\x1b[B\r");
-    // Its family repeats no title, so the requester is named by its title alone.
-    let child_label = format!("Agent {CHILD_TASK}");
+    first.send(b"\x1b[B\x1b[Bj\r");
+    let child_label = "Agent cadence".to_owned();
     let child_frame = first
         .wait_for("overview enters child requester", |frame| {
             request_dialog_visible(frame, "Which bounded cadence?", &child_label)
@@ -1335,7 +1330,7 @@ async fn run_child_views(fixture: &PrivateFixture) {
     second.send(b"\x1b[D");
     second
         .wait_for("second overview", |frame| {
-            frame.contains("Agents · local") && frame.contains("child needs input")
+            frame.contains("Agents · local") && frame.contains("questions 1")
         })
         .await;
     select_overview_row(&mut second, "Delegate bounded cadence.").await;
@@ -1347,27 +1342,33 @@ async fn run_child_views(fixture: &PrivateFixture) {
         "the parent row is selected in the second View: {}",
         second.frame()
     );
-    second.send(b" ");
+    second.send(b"\r");
     second
-        .wait_for("second overview expands the requesting child", |frame| {
-            frame.contains(CHILD_TASK)
+        .wait_for("second View opens the family root", |frame| {
+            frame.contains("Subagents 1") && !frame.contains("Agents · local")
         })
         .await;
-    second.send(b"\x1b[B\r");
+    second.send(b"\x1b[B\x1b[Bj\r");
     second
         .wait_for("same real request in second View", |frame| {
             request_dialog_visible(frame, "Which bounded cadence?", &child_label)
         })
         .await;
-    let rows = catalog(&client).await;
-    assert_eq!(
-        rows.iter()
-            .find(|row| row.execution == child)
-            .unwrap()
-            .views
-            .len(),
-        2
-    );
+    tokio::time::timeout(UI_TIMEOUT, async {
+        loop {
+            let rows = catalog(&client).await;
+            if rows
+                .iter()
+                .find(|row| row.execution == child)
+                .is_some_and(|row| row.views.len() == 2)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("both rendered child Views must finish owner display registration");
     let wrong = client
         .execute(CommandEnvelope {
             owner_epoch: client.owner_epoch(),
@@ -1463,7 +1464,9 @@ async fn run_child_views(fixture: &PrivateFixture) {
     first.send(b"\x1b[B");
     first
         .wait_for("real family expands below input", |frame| {
-            frame.contains("Subagents 1") && family_panel_has_viewing_row(frame)
+            frame.contains("Subagents 1")
+                && family_panel_has_viewing_row(frame)
+                && frame.contains("Enter/Space hide")
         })
         .await;
     first.send(b"\x1b[B\r");
@@ -1482,7 +1485,11 @@ async fn run_child_views(fixture: &PrivateFixture) {
     first
         .wait_for(
             "parent family expands without consuming its draft",
-            |frame| family_panel_has_viewing_row(frame) && frame.contains("PARENT-DRAFT-ONE"),
+            |frame| {
+                family_panel_has_viewing_row(frame)
+                    && frame.contains("PARENT-DRAFT-ONE")
+                    && frame.contains("Enter/Space hide")
+            },
         )
         .await;
     first.send(b"\x1b[Bj\r");
@@ -1526,7 +1533,7 @@ async fn run_child_views(fixture: &PrivateFixture) {
                 let fresh = String::from_utf8_lossy(&captured[clear_mark..]);
                 fresh.contains("\x1b[?2026l")
                     && !frame.contains("CHILD-DRAFT-ONE")
-                    && frame.lines().any(|line| line.trim() == "❯")
+                    && frame.lines().any(|line| line.contains("Message @cadence…"))
             },
         )
         .await;
@@ -1538,10 +1545,20 @@ async fn run_child_views(fixture: &PrivateFixture) {
         serde_json::to_value(followed.conversation.delegation.as_ref().unwrap()).unwrap(),
         metadata
     );
-    let parent_after_follow_up = snapshot(&client, parent).await;
+    let parent_after_follow_up = wait_snapshot(
+        &client,
+        parent,
+        "one audit for the completed child continuation without a parent model turn",
+        |snapshot| {
+            snapshot.conversation.family_completions.len()
+                == parent_running.conversation.family_completions.len() + 1
+        },
+    )
+    .await;
+    assert!(parent_after_follow_up.last_sequence > parent_running.last_sequence);
     assert_eq!(
-        parent_after_follow_up.last_sequence,
-        parent_running.last_sequence
+        parent_after_follow_up.conversation.messages.len(),
+        parent_running.conversation.messages.len()
     );
     assert_eq!(
         parent_after_follow_up.conversation.loops[0].state,
@@ -1645,7 +1662,7 @@ async fn run_child_views(fixture: &PrivateFixture) {
 }
 
 #[tokio::test]
-async fn actual_cli_real_child_dual_tree_requests_drafts_and_follow_up_keep_the_ceiling() {
+async fn actual_cli_real_child_family_requests_drafts_and_follow_up_keep_the_ceiling() {
     let fixture = PrivateFixture::new();
     let result = AssertUnwindSafe(run_child_views(&fixture))
         .catch_unwind()

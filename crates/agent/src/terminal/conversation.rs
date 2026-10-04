@@ -51,6 +51,14 @@ pub(super) enum ConversationBlockId {
         loop_id: Uuid,
         version: u64,
     },
+    FamilyInput {
+        chat_id: Uuid,
+        message_id: Uuid,
+    },
+    FamilyCompletion {
+        chat_id: Uuid,
+        child_run_id: Uuid,
+    },
     Outcome {
         chat_id: Uuid,
         sequence: u64,
@@ -154,6 +162,12 @@ pub(super) enum ConversationBlockKind {
         plan: Plan,
     },
     Outcome(ConversationOutcome),
+    FamilyInput {
+        record: crate::runtime::FamilyInputRecord,
+    },
+    FamilyCompletion {
+        completion: crate::runtime::FamilyCompletion,
+    },
     Command {
         command: CommandSnapshot,
     },
@@ -316,6 +330,34 @@ pub(super) fn project(snapshot: &ChatSnapshot) -> ConversationProjection {
                 kind: ConversationBlockKind::Command { command },
             }),
     );
+    blocks.extend(
+        snapshot
+            .family_inputs
+            .values()
+            .cloned()
+            .map(|record| ConversationBlock {
+                id: ConversationBlockId::FamilyInput {
+                    chat_id: snapshot.id,
+                    message_id: record.message_id,
+                },
+                metadata: metadata(None, None, None),
+                kind: ConversationBlockKind::FamilyInput { record },
+            }),
+    );
+    blocks.extend(
+        snapshot
+            .family_completions
+            .iter()
+            .cloned()
+            .map(|completion| ConversationBlock {
+                id: ConversationBlockId::FamilyCompletion {
+                    chat_id: snapshot.id,
+                    child_run_id: completion.child_run_id,
+                },
+                metadata: metadata(None, None, None),
+                kind: ConversationBlockKind::FamilyCompletion { completion },
+            }),
+    );
     ConversationProjection {
         current_model: ConversationModelMetadata {
             model: snapshot.model.model.clone(),
@@ -332,6 +374,26 @@ pub(super) fn project_event(event: &Event) -> Option<ConversationBlock> {
         Some(event.sequence),
     );
     let block = match &event.kind {
+        EventKind::FamilyInputUpdated { record } => ConversationBlock {
+            id: ConversationBlockId::FamilyInput {
+                chat_id: event.chat_id,
+                message_id: record.message_id,
+            },
+            metadata: event_metadata,
+            kind: ConversationBlockKind::FamilyInput {
+                record: record.clone(),
+            },
+        },
+        EventKind::FamilyRunCompleted { completion } => ConversationBlock {
+            id: ConversationBlockId::FamilyCompletion {
+                chat_id: event.chat_id,
+                child_run_id: completion.child_run_id,
+            },
+            metadata: event_metadata,
+            kind: ConversationBlockKind::FamilyCompletion {
+                completion: completion.clone(),
+            },
+        },
         EventKind::Text(text) => ConversationBlock {
             id: ConversationBlockId::Event {
                 chat_id: event.chat_id,

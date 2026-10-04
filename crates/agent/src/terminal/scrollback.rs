@@ -1176,7 +1176,7 @@ mod tests {
                 "\u{f06a9} assistant",
                 "\u{f1064} tool",
                 "  \u{f060c} result",
-                "\u{f05e0} Done",
+                "\u{f05e1} Done",
             ]
         );
         let before_reduced_motion = scrollback.frame(80, 8).lines;

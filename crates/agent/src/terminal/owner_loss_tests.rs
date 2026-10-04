@@ -220,12 +220,12 @@ fn an_unreachable_owner_keeps_the_view_drafts_and_feedback_alive() {
     });
     view.send(b"\x15/model\r");
     view.wait_for("the rejected command feedback", |frame| {
-        frame.contains("/model is unavailable here")
+        frame.contains("/model isn't available")
     });
     std::thread::sleep(Duration::from_millis(2500));
     let frame = view.frame();
     assert!(
-        frame.contains("/model is unavailable here"),
+        frame.contains("/model isn't available"),
         "overview refreshes keep the latest action feedback: {frame}"
     );
     view.send(b"\x15\x04\x04");

@@ -31,6 +31,17 @@ impl RequestContext {
         }
     }
 
+    pub(super) fn title(chat_id: ChatId) -> Self {
+        Self {
+            owner: RequestOwner {
+                chat_id,
+                loop_id: None,
+                run_id: None,
+            },
+            kind: RequestKind::Title,
+        }
+    }
+
     pub(super) fn manual_compaction(chat_id: ChatId) -> Self {
         Self {
             owner: RequestOwner {
@@ -471,6 +482,11 @@ impl Agent {
         // The scope destroys the actual request future before the receiver is closed and drained.
         let mut result = {
             let response = async {
+                if context.kind == RequestKind::Title {
+                    return client
+                        .generate_title(request, sender, request_cancel.clone())
+                        .await;
+                }
                 match tracking.model_context {
                     Some(model_context) => {
                         client
@@ -781,6 +797,15 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ModelClient for ControlledModel {
+        async fn generate_title(
+            &self,
+            request: crate::model::ModelRequest,
+            _: tokio::sync::mpsc::UnboundedSender<crate::model::ModelDelta>,
+            _: tokio_util::sync::CancellationToken,
+        ) -> Result<crate::model::ModelOutput, crate::model::ModelError> {
+            Ok(crate::model::fixture_title(request))
+        }
+
         fn identity(&self) -> ModelIdentity {
             ModelIdentity {
                 provider: crate::model::ModelProvider::Api,

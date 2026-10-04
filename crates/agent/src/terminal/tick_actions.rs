@@ -131,6 +131,7 @@ pub(super) async fn execute(
     match action.backend.execute(context).await? {
         TickActionOutcome::Done => Ok(None),
         TickActionOutcome::Prompt(text) => Ok(Some(InputEvent::Prompt {
+            family_target: None,
             text,
             file_references: Vec::new(),
             images: Vec::new(),

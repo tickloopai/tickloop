@@ -6,6 +6,176 @@ use tickloop_agent::runtime::{Agent, EventKind};
 mod support;
 use support::{ScriptedModel, call, config, text};
 
+#[tokio::test]
+async fn handles_use_short_description_fallback_and_reserve_parent_keywords() {
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "one",
+            "DelegateAgent",
+            json!({"task":"Audit the report in detail","description":"Audit revenue growth"}),
+        ),
+        text("one done"),
+        call(
+            "two",
+            "DelegateAgent",
+            json!({"task":"Audit another report","description":"Audit revenue growth"}),
+        ),
+        text("two done"),
+        call(
+            "three",
+            "DelegateAgent",
+            json!({"task":"Check metadata","name":"parent"}),
+        ),
+        text("three done"),
+        text("parent done"),
+    ]));
+    let core = Agent::new_embedded(config(), model);
+    let parent = core.create_chat(directory.path().into()).await.unwrap();
+    let mut events = core.subscribe();
+    let receipt = core
+        .submit(parent, None, "Audit the reports".into())
+        .await
+        .unwrap();
+    loop {
+        let event = support::next_event(&mut events).await;
+        if event.run_id == receipt.run_id && matches!(event.kind, EventKind::Completed { .. }) {
+            break;
+        }
+    }
+    let registry = core.subagents(parent).await.unwrap();
+    assert_eq!(
+        registry
+            .iter()
+            .map(|entry| entry.handle.as_str())
+            .collect::<Vec<_>>(),
+        ["audit-revenue-growth", "audit-revenue-growth-2", "parent-2"]
+    );
+    assert!(registry.iter().all(|entry| entry.handle.len() <= 32));
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn invalid_handles_never_create_a_child_or_reserve_a_name() {
+    for name in [
+        json!(""),
+        json!("line\nbreak"),
+        json!("x".repeat(161)),
+        json!(5),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let core = Agent::new_embedded(
+            config(),
+            Arc::new(ScriptedModel::new(vec![
+                call(
+                    "invalid",
+                    "DelegateAgent",
+                    json!({"task":"Check input","name":name}),
+                ),
+                text("invalid handled"),
+            ])),
+        );
+        let parent = core.create_chat(directory.path().into()).await.unwrap();
+        let mut events = core.subscribe();
+        let receipt = core
+            .submit(parent, None, "Check handles".into())
+            .await
+            .unwrap();
+        let mut refused = false;
+        loop {
+            let event = support::next_event(&mut events).await;
+            if event.run_id != receipt.run_id {
+                continue;
+            }
+            match event.kind {
+                EventKind::ToolCompleted { result, .. } => refused = result.is_error,
+                EventKind::Completed { .. } => break,
+                _ => {}
+            }
+        }
+        assert!(refused);
+        assert!(core.subagents(parent).await.unwrap().is_empty());
+        assert_eq!(core.list_chats().await.len(), 1);
+        core.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn child_handles_are_reserved_in_the_parent_registry_across_completion_and_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = directory.path().join("state");
+    let replies = vec![
+        call(
+            "first",
+            "DelegateAgent",
+            json!({"task":"Audit the first file","name":"Audit"}),
+        ),
+        text("first done"),
+        call(
+            "second",
+            "DelegateAgent",
+            json!({"task":"Audit the second file","name":"audit"}),
+        ),
+        text("second done"),
+        text("parent done"),
+    ];
+    let core = Agent::open_embedded(
+        store.clone(),
+        config(),
+        Arc::new(ScriptedModel::new(replies)),
+    )
+    .unwrap();
+    let parent = core.create_chat(directory.path().into()).await.unwrap();
+    let mut events = core.subscribe();
+    let receipt = core
+        .submit(parent, None, "Audit both files".into())
+        .await
+        .unwrap();
+    loop {
+        let event = support::next_event(&mut events).await;
+        if event.run_id == receipt.run_id && matches!(event.kind, EventKind::Completed { .. }) {
+            break;
+        }
+    }
+    let registry = serde_json::to_value(core.subagents(parent).await.unwrap()).unwrap();
+    assert_eq!(registry[0]["handle"], "audit");
+    assert_eq!(registry[1]["handle"], "audit-2");
+    assert!(registry[0]["created_at"].as_u64().is_some());
+    core.shutdown().await;
+    let restored = Agent::open_embedded(
+        store,
+        config(),
+        Arc::new(ScriptedModel::new(vec![
+            call(
+                "third",
+                "DelegateAgent",
+                json!({"task":"Audit a third file","name":"audit"}),
+            ),
+            text("third done"),
+            text("parent follow-up done"),
+        ])),
+    )
+    .unwrap();
+    restored.resume_chat(parent).await.unwrap();
+    let mut events = restored.subscribe();
+    let receipt = restored
+        .submit(parent, Some(receipt.loop_id), "Audit the third file".into())
+        .await
+        .unwrap();
+    loop {
+        let event = support::next_event(&mut events).await;
+        if event.run_id == receipt.run_id && matches!(event.kind, EventKind::Completed { .. }) {
+            break;
+        }
+    }
+    let registry = serde_json::to_value(restored.subagents(parent).await.unwrap()).unwrap();
+    assert_eq!(
+        registry[2]["handle"], "audit-3",
+        "completed or hidden handles are never reused"
+    );
+    restored.shutdown().await;
+}
+
 struct ScopedHostSocket {
     path: std::path::PathBuf,
     requests: Arc<std::sync::Mutex<Vec<Value>>>,
@@ -641,7 +811,7 @@ async fn model_delegates_a_real_child_and_observes_its_result() {
         call(
             "delegate",
             "DelegateAgent",
-            json!({"task":"Read task.txt and report the evidence."}),
+            json!({"task":"Read task.txt and report the evidence.","name":" File CHECK ","description":"Check file evidence"}),
         ),
         call("read", "Read", json!({"file_path":"task.txt"})),
         text("verified child evidence"),
@@ -684,6 +854,9 @@ async fn model_delegates_a_real_child_and_observes_its_result() {
     assert_eq!(child_snapshot.loops.len(), 1);
     assert_ne!(child_snapshot.loops[0].id, parent_receipt.loop_id);
     let metadata = child_snapshot.delegation.clone().unwrap();
+    let registration = agent.subagent_registration(child).await.unwrap().unwrap();
+    assert_eq!(registration.handle, "file-check");
+    assert_eq!(registration.description, "Check file evidence");
     assert_eq!(metadata.parent_chat_id, parent);
     assert_eq!(metadata.parent_loop_id, parent_receipt.loop_id);
     assert_eq!(metadata.parent_run_id, parent_receipt.run_id);
@@ -730,9 +903,16 @@ async fn model_delegates_a_real_child_and_observes_its_result() {
     let restored =
         Agent::open_embedded(store, config(), Arc::new(ScriptedModel::new(vec![]))).unwrap();
     let child_snapshot = restored.resume_chat(child).await.unwrap();
+    let restored_metadata = child_snapshot.delegation.unwrap();
+    assert_eq!(restored_metadata.delegation_id, metadata.delegation_id);
     assert_eq!(
-        child_snapshot.delegation.unwrap().delegation_id,
-        metadata.delegation_id
+        restored
+            .subagent_registration(child)
+            .await
+            .unwrap()
+            .unwrap()
+            .handle,
+        "file-check"
     );
     assert_eq!(child_snapshot.policy.mode, ExecutionMode::FullAccess);
     assert!(

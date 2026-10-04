@@ -62,6 +62,15 @@ struct PausedSummary {
 
 #[async_trait::async_trait]
 impl tickloop_agent::model::ModelClient for PausedSummary {
+    async fn generate_title(
+        &self,
+        request: tickloop_agent::model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<tickloop_agent::model::ModelDelta>,
+        _: tokio_util::sync::CancellationToken,
+    ) -> Result<tickloop_agent::model::ModelOutput, tickloop_agent::model::ModelError> {
+        Ok(support::title_output(request))
+    }
+
     fn identity(&self) -> tickloop_agent::model::ModelIdentity {
         tickloop_agent::model::ModelIdentity {
             provider: tickloop_agent::model::ModelProvider::Api,

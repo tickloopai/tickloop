@@ -15,6 +15,10 @@ pub(crate) enum Line {
     System(ChainEntry),
     ArtifactTicks(ArtifactTicksEntry),
     CustomTitle(CustomTitleEntry),
+    AiTitle(AiTitleEntry),
+    Subagents(SubagentsEntry),
+    FamilyCompletions(FamilyCompletionsEntry),
+    FamilyInputs(FamilyInputsEntry),
     LastPrompt(LastPromptEntry),
     BranchOrigin(BranchOriginEntry),
     Delegation(DelegationEntry),
@@ -27,6 +31,17 @@ pub(crate) enum Line {
 }
 
 impl Line {
+    pub(crate) fn is_chain_record(raw: &[u8]) -> bool {
+        #[derive(Deserialize)]
+        struct RecordType<'a> {
+            #[serde(rename = "type", borrow)]
+            kind: std::borrow::Cow<'a, str>,
+        }
+        serde_json::from_slice::<RecordType<'_>>(raw)
+            .ok()
+            .is_some_and(|record| matches!(record.kind.as_ref(), "user" | "assistant" | "system"))
+    }
+
     pub(crate) fn chain(role: Role, entry: ChainEntry) -> Self {
         match role {
             Role::User => Self::User(entry),
@@ -81,6 +96,7 @@ pub(crate) struct ChainEntry {
     pub original_user_message_id: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_message_origin: Option<serde_json::Value>,
+    pub human_family_origin: Option<crate::runtime::DirectedHumanSource>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -169,6 +185,7 @@ pub(crate) struct LoopRecord {
     /// unreadable value leaves the time unknown instead of dropping the record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_since: Option<serde_json::Value>,
+    pub run_started_at: Option<u64>,
 }
 
 impl LoopRecord {
@@ -236,6 +253,20 @@ pub(crate) enum PartialCompactDirection {
 pub(crate) struct CustomTitleEntry {
     pub chat_id: Uuid,
     pub custom_title: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AiTitleEntry {
+    pub chat_id: Uuid,
+    pub ai_title: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SubagentsEntry {
+    pub chat_id: Uuid,
+    pub subagents: Vec<crate::runtime::SubagentRegistration>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -438,4 +469,37 @@ pub(crate) struct ArtifactTicksEntry {
     pub artifact_ticks: Vec<crate::artifacts::ArtifactTick>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
     pub removed_artifact_ticks: std::collections::BTreeSet<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct FamilyCompletionsEntry {
+    pub chat_id: Uuid,
+    pub completions: Vec<crate::runtime::FamilyCompletion>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct FamilyInputsEntry {
+    pub chat_id: Uuid,
+    pub inputs: std::collections::BTreeMap<Uuid, crate::runtime::FamilyInputRecord>,
+}
+
+#[cfg(test)]
+mod record_type_tests {
+    use super::Line;
+
+    #[test]
+    fn chain_classification_uses_the_top_level_type_independently_of_field_order() {
+        assert!(Line::is_chain_record(br#"{"message":{},"type":"user"}"#));
+        assert!(Line::is_chain_record(
+            br#"{"type":"assistant","message":{}}"#
+        ));
+        assert!(Line::is_chain_record(
+            br#"{"message":{},"type":"\u0075ser"}"#
+        ));
+        assert!(!Line::is_chain_record(
+            br#"{"inputs":{"example":{"type":"user"}},"type":"family-inputs"}"#
+        ));
+    }
 }

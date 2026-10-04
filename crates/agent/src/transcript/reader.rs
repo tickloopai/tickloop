@@ -35,15 +35,6 @@ struct IndexedEntry {
 pub(crate) const SKIP_PRECOMPACT_THRESHOLD: u64 = 5 * 1024 * 1024;
 const COMPACT_BOUNDARY_MARKER: &[u8] = b"\"compact_boundary\"";
 const SYSTEM_LINE_PREFIX: &[u8] = b"{\"type\":\"system\"";
-/// 照 Claude Code `METADATA_TYPE_MARKERS`：边界之前仍要读取的 Chat 级元数据。Tick Loop 的 Chat 级
-/// 元数据只有标题，另外保留 Branch 来源。
-const PRE_BOUNDARY_METADATA_MARKERS: [&[u8]; 4] = [
-    b"{\"type\":\"custom-title\"",
-    b"{\"type\":\"branch-origin\"",
-    b"{\"type\":\"delegation\"",
-    b"{\"type\":\"artifact-ticks\"",
-];
-
 /// 照 Claude Code `loadTranscriptFile` 与 `buildConversationChain` 加载 Transcript：
 /// 跳过无法解析的行（含截断的末行），重接部分压缩的保留区段，取时间最新的叶子沿父指针
 /// 重建对话链。没有任何 user／assistant 条目时返回 `None`。
@@ -160,11 +151,7 @@ fn load_lines(
         if raw.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        if line_offset < skip_before
-            && !PRE_BOUNDARY_METADATA_MARKERS
-                .iter()
-                .any(|marker| raw.starts_with(marker))
-        {
+        if line_offset < skip_before && Line::is_chain_record(raw) {
             continue;
         }
         let Ok(line) = serde_json::from_slice::<Line>(raw) else {
@@ -180,6 +167,22 @@ fn load_lines(
             }
             Line::CustomTitle(entry) => {
                 metadata.custom_title = Some(entry.clone());
+                continue;
+            }
+            Line::AiTitle(entry) => {
+                metadata.ai_title = Some(entry.clone());
+                continue;
+            }
+            Line::Subagents(entry) => {
+                metadata.subagents = Some(entry.clone());
+                continue;
+            }
+            Line::FamilyInputs(entry) => {
+                metadata.family_inputs = Some(entry.clone());
+                continue;
+            }
+            Line::FamilyCompletions(entry) => {
+                metadata.family_completions = Some(entry.clone());
                 continue;
             }
             Line::LastPrompt(entry) => {
@@ -606,6 +609,7 @@ mod tests {
             is_inherited_prompt: false,
             original_user_message_id: None,
             agent_message_origin: None,
+            human_family_origin: None,
             run_id: None,
             tool_call_recoveries: Vec::new(),
             contexts: None,
@@ -910,6 +914,57 @@ mod tests {
                 .collect::<Vec<_>>(),
             [prompt, answer, rewound]
         );
+    }
+
+    #[test]
+    fn family_delivery_metadata_survives_the_large_file_compact_boundary_loader() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("chat.jsonl");
+        let [prompt, compacted, summary, message_id] = std::array::from_fn(|_| Uuid::new_v4());
+        let record = crate::runtime::FamilyInputRecord {
+            message_id,
+            target_chat_id: Uuid::new_v4(),
+            target_handle: "audit".into(),
+            target_run_id: Uuid::new_v4(),
+            submitted_at: 1000,
+            response: Some("Verified reply".into()),
+            state: Some(crate::runtime::LoopState::Completed),
+        };
+        write(
+            &path,
+            &[
+                Line::FamilyInputs(crate::transcript::FamilyInputsEntry {
+                    chat_id: Uuid::nil(),
+                    inputs: [(message_id, record)].into(),
+                }),
+                Line::User(entry(
+                    prompt,
+                    None,
+                    1000,
+                    false,
+                    text(Role::User, &"x".repeat(SKIP_PRECOMPACT_THRESHOLD as usize)),
+                )),
+                boundary(compacted, 2000, None),
+                Line::User(entry(
+                    summary,
+                    Some(compacted),
+                    2000,
+                    false,
+                    text(Role::User, "Summary"),
+                )),
+            ],
+        );
+        let loaded = load(&path).unwrap().unwrap();
+        let records = &loaded
+            .metadata
+            .family_inputs
+            .expect("source receipts survive the pre-boundary skip")
+            .inputs;
+        assert_eq!(
+            records[&message_id].response.as_deref(),
+            Some("Verified reply")
+        );
+        assert_eq!(loaded.chain.first().unwrap().uuid, compacted);
     }
 
     #[test]

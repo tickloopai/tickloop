@@ -20,6 +20,7 @@ pub struct RequestOwner {
 #[serde(rename_all = "snake_case")]
 pub enum RequestKind {
     Conversation,
+    Title,
     CompactionAutomatic,
     CompactionManual,
     CompactionDirected,
@@ -135,7 +136,7 @@ impl RequestUsageRecord {
 
 /// 本进程内的请求用量账本。照 Claude Code，用量只记在 assistant 消息上并随对话保存；
 /// 账本不持久化，恢复的 Chat 从空账本开始。
-#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RequestUsageLedger {
     last_sequence: u64,
     entries: Vec<RequestUsageRecord>,
@@ -282,9 +283,9 @@ impl RequestUsageLedger {
         identity: ModelIdentity,
     ) -> Result<RequestSequence, LedgerError> {
         let valid_owner = match kind {
-            RequestKind::CompactionManual | RequestKind::CompactionDirected => {
-                owner.loop_id.is_none() && owner.run_id.is_none()
-            }
+            RequestKind::CompactionManual
+            | RequestKind::CompactionDirected
+            | RequestKind::Title => owner.loop_id.is_none() && owner.run_id.is_none(),
             _ => owner.loop_id.is_some() && owner.run_id.is_some(),
         };
         if !valid_owner {
@@ -451,6 +452,31 @@ impl RequestUsageLedger {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn all_request_kinds_use_one_current_ledger_wire() {
+        let mut ledger = RequestUsageLedger::new();
+        ledger
+            .start(owner(), RequestKind::Conversation, identity())
+            .unwrap();
+        ledger
+            .start(
+                RequestOwner {
+                    chat_id: owner().chat_id,
+                    loop_id: None,
+                    run_id: None,
+                },
+                RequestKind::Title,
+                identity(),
+            )
+            .unwrap();
+        let wire = serde_json::to_value(&ledger).unwrap();
+        assert_eq!(wire["entries"].as_array().unwrap().len(), 2);
+        assert_eq!(wire["entries"][1]["kind"], "title");
+        assert!(wire.get("auxiliary_entries").is_none());
+        let restored: RequestUsageLedger = serde_json::from_value(wire).unwrap();
+        assert_eq!(restored, ledger);
+    }
     use crate::model::Protocol;
     use uuid::Uuid;
 

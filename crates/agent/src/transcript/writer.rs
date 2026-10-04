@@ -6,7 +6,10 @@ use std::time::Duration;
 
 use uuid::Uuid;
 
-use super::entry::{BranchOriginEntry, CustomTitleEntry, DelegationEntry, LastPromptEntry, Line};
+use super::entry::{
+    AiTitleEntry, BranchOriginEntry, CustomTitleEntry, DelegationEntry, LastPromptEntry, Line,
+    SubagentsEntry,
+};
 use super::listing::{LITE_READ_BUF_SIZE, last_json_string_field};
 use crate::private_fs::{PRIVATE_FILE_MODE, create_private_directory};
 
@@ -18,6 +21,10 @@ pub(crate) const FLUSH_INTERVAL: Duration = Duration::from_millis(100);
 pub(crate) struct CachedMetadata {
     pub artifact_ticks: Option<super::entry::ArtifactTicksEntry>,
     pub custom_title: Option<CustomTitleEntry>,
+    pub ai_title: Option<AiTitleEntry>,
+    pub subagents: Option<SubagentsEntry>,
+    pub family_completions: Option<super::entry::FamilyCompletionsEntry>,
+    pub family_inputs: Option<super::entry::FamilyInputsEntry>,
     pub last_prompt: Option<LastPromptEntry>,
     pub branch_origin: Option<BranchOriginEntry>,
     pub delegation: Option<DelegationEntry>,
@@ -28,6 +35,10 @@ impl CachedMetadata {
         match line {
             Line::ArtifactTicks(entry) => self.artifact_ticks = Some(entry.clone()),
             Line::CustomTitle(entry) => self.custom_title = Some(entry.clone()),
+            Line::AiTitle(entry) => self.ai_title = Some(entry.clone()),
+            Line::Subagents(entry) => self.subagents = Some(entry.clone()),
+            Line::FamilyCompletions(entry) => self.family_completions = Some(entry.clone()),
+            Line::FamilyInputs(entry) => self.family_inputs = Some(entry.clone()),
             Line::LastPrompt(entry) => self.last_prompt = Some(entry.clone()),
             Line::BranchOrigin(entry) => self.branch_origin = Some(entry.clone()),
             Line::Delegation(entry) => self.delegation = Some(entry.clone()),
@@ -40,6 +51,10 @@ impl CachedMetadata {
             .clone()
             .map(Line::CustomTitle)
             .into_iter()
+            .chain(self.ai_title.clone().map(Line::AiTitle))
+            .chain(self.subagents.clone().map(Line::Subagents))
+            .chain(self.family_completions.clone().map(Line::FamilyCompletions))
+            .chain(self.family_inputs.clone().map(Line::FamilyInputs))
             .chain(self.last_prompt.clone().map(Line::LastPrompt))
             .chain(self.branch_origin.clone().map(Line::BranchOrigin))
             .chain(self.delegation.clone().map(Line::Delegation))
@@ -355,6 +370,7 @@ mod tests {
                 is_inherited_prompt: false,
                 original_user_message_id: None,
                 agent_message_origin: None,
+                human_family_origin: None,
                 run_id: None,
                 tool_call_recoveries: Vec::new(),
                 contexts: None,

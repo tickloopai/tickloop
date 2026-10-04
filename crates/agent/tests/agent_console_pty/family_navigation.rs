@@ -68,6 +68,7 @@ async fn open_family_member(
     view: ViewRef,
     after: u64,
 ) -> u64 {
+    let panel_title = if title == MAIN_TASK { "main" } else { title };
     let already_visible = catalog(client).await.iter().any(|row| {
         row.execution == target && row.views.iter().any(|location| location.view == view)
     });
@@ -85,7 +86,7 @@ async fn open_family_member(
         let frame = pty.frame();
         if frame
             .lines()
-            .any(|line| line.starts_with('›') && line.contains(title))
+            .any(|line| line.starts_with('›') && line.contains(panel_title))
         {
             pty.send(b"\r");
             let version = displayed_version(
@@ -128,8 +129,11 @@ async fn open_family_member(
             .skip(1)
             .collect::<Vec<_>>();
         let selected = rows.iter().position(|line| line.starts_with('›')).unwrap();
-        let target_row = rows.iter().position(|line| line.contains(title)).unwrap();
-        let previous_title = [MAIN_TASK, FIRST_CHILD_TASK, SECOND_CHILD_TASK]
+        let target_row = rows
+            .iter()
+            .position(|line| line.contains(panel_title))
+            .unwrap();
+        let previous_title = ["main", FIRST_CHILD_TASK, SECOND_CHILD_TASK]
             .into_iter()
             .find(|title| rows[selected].contains(title))
             .unwrap();
@@ -196,7 +200,7 @@ async fn run_family_navigation(fixture: &PrivateFixture) {
             Some((
                 "DelegateAgent",
                 "family-first-child",
-                json!({"task":FIRST_CHILD_TASK}),
+                json!({"task":FIRST_CHILD_TASK,"name":"family-one","description":FIRST_CHILD_TASK}),
             )),
             "",
         ),
@@ -205,7 +209,7 @@ async fn run_family_navigation(fixture: &PrivateFixture) {
             Some((
                 "DelegateAgent",
                 "family-second-child",
-                json!({"task":SECOND_CHILD_TASK}),
+                json!({"task":SECOND_CHILD_TASK,"name":"family-two","description":SECOND_CHILD_TASK}),
             )),
             "",
         ),
@@ -331,7 +335,7 @@ async fn run_family_navigation(fixture: &PrivateFixture) {
         .iter()
         .position(|line| line.contains("Subagents 2"))
         .unwrap();
-    assert!(rows[entry + 1].contains("Main ·"), "{entry_focused}");
+    assert!(rows[entry + 1].contains("main"), "{entry_focused}");
     assert!(!entry_focused.contains("items"));
     pty.send(b"\x1b[B");
     let list_focused = pty
@@ -507,24 +511,34 @@ async fn run_family_navigation(fixture: &PrivateFixture) {
         assert!(pty.frame().contains(draft));
         assert_eq!(catalog(&client).await.len(), 3);
     }
+    version = open_family_member(
+        &mut pty,
+        &client,
+        second_execution,
+        SECOND_CHILD_TASK,
+        SECOND_CHILD_REPLY,
+        view,
+        version,
+    )
+    .await;
     pty.send(b"\x15\x1b[D");
     pty.wait_for("busy family enters global overview", |frame| {
         frame.contains("Agents · local")
     })
     .await;
     let overview = pty.frame();
-    assert!(overview.contains("Main · FAMILY-MAIN"), "{overview}");
+    assert!(overview.contains(MAIN_TASK), "{overview}");
+    assert!(
+        !overview.contains(FIRST_CHILD_TASK) && !overview.contains(SECOND_CHILD_TASK),
+        "{overview}"
+    );
     select_overview_row(&mut pty, MAIN_TASK).await;
-    pty.send(b" ");
-    pty.wait_for("overview unfolds the selected Main family", |frame| {
-        frame.contains(FIRST_CHILD_TASK) && frame.contains(SECOND_CHILD_TASK)
-    })
-    .await;
-    select_overview_row(&mut pty, SECOND_CHILD_TASK).await;
     pty.send(b"\r");
     version = displayed_version(&client, second_execution, view, version).await;
     pty.wait_for("overview returns to second child editor", |frame| {
-        frame.contains(SECOND_CHILD_DRAFT) && !frame.contains("Agents · local")
+        frame.contains("@family-two")
+            && frame.contains(SECOND_CHILD_REPLY)
+            && !frame.contains("Agents · local")
     })
     .await;
     assert!(editor_has_focus(&pty.output));
