@@ -19,6 +19,140 @@ pub(in crate::terminal) struct ProviderModels {
 mod tests {
     use super::*;
 
+    #[test]
+    fn scoped_discovery_preserves_other_and_newer_refreshes_until_check_completion() {
+        let catalog = crate::model::cards::ModelCatalog::defaults();
+        let providers = ProviderModels::group(vec![
+            catalog.get("anthropic-api", "claude-opus-5").unwrap(),
+            catalog.get("openai-api", "gpt-6.1-sol").unwrap(),
+        ]);
+        assert!(providers.iter().all(ProviderModels::supports_discovery));
+        let first = providers[0].key();
+        let second = providers[1].key();
+        let target = ConfigTarget::Agent(Uuid::new_v4());
+        let mut menus = Menus::default();
+        menus
+            .refresh_connections
+            .insert((target.agent(), first.clone()), Uuid::new_v4());
+        menus
+            .refresh_connections
+            .insert((target.agent(), second.clone()), Uuid::new_v4());
+        let scoped = menus.discovery_refreshes(target, &providers, Some(&first));
+        assert_eq!(
+            scoped.keys().cloned().collect::<HashSet<_>>(),
+            HashSet::from([first.clone()])
+        );
+        assert_eq!(
+            menus.refresh_connections.len(),
+            2,
+            "Preparing a query must not consume invalidations"
+        );
+        menus.finish_discovery_refreshes(target, &scoped);
+        assert!(
+            !menus
+                .refresh_connections
+                .contains_key(&(target.agent(), first))
+        );
+        let grouped = menus.discovery_refreshes(target, &providers, None);
+        assert_eq!(
+            grouped.keys().cloned().collect::<HashSet<_>>(),
+            HashSet::from([second.clone()])
+        );
+        let newer = Uuid::new_v4();
+        menus
+            .refresh_connections
+            .insert((target.agent(), second.clone()), newer);
+        menus.finish_discovery_refreshes(target, &grouped);
+        assert_eq!(
+            menus.refresh_connections.get(&(target.agent(), second)),
+            Some(&newer)
+        );
+        let latest = menus.discovery_refreshes(target, &providers, None);
+        menus.finish_discovery_refreshes(target, &latest);
+        assert!(menus.refresh_connections.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelled_grouped_discovery_keeps_refreshes_for_unqueried_providers() {
+        let (mut menus, console, cancel, chat) = pending_model_discovery();
+        let catalog = crate::model::cards::ModelCatalog::defaults();
+        let providers = ProviderModels::group(vec![
+            catalog.get("anthropic-api", "claude-opus-5").unwrap(),
+            catalog.get("openai-api", "gpt-6.1-sol").unwrap(),
+        ]);
+        let target = ConfigTarget::Agent(chat);
+        for provider in &providers {
+            menus
+                .refresh_connections
+                .insert((target.agent(), provider.key()), Uuid::new_v4());
+        }
+        let requested = menus.discovery_refreshes(target, &providers, None);
+        assert_eq!(requested.len(), 2);
+        menus.dismiss(&console).unwrap();
+        assert!(cancel.is_cancelled());
+        for provider in &providers {
+            assert!(
+                menus
+                    .refresh_connections
+                    .contains_key(&(target.agent(), provider.key())),
+                "Cancelled discovery must retain {} refresh",
+                provider.key()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_logout_confirmation_keeps_the_connection_surface_open() {
+        let model = crate::model::cards::ModelCatalog::defaults()
+            .get("openai-codex", "gpt-6-astra")
+            .unwrap();
+        let agent = Agent::new_embedded(
+            model.clone(),
+            std::sync::Arc::new(crate::terminal::test_support::ScriptedModel::new(Vec::new())),
+        );
+        let console = Console::test_interactive_for_chat(Uuid::new_v4());
+        let mut menus = Menus::default();
+        let provider = ProviderModels::group(vec![model]).remove(0);
+        menus.provider.provider_choices = vec![provider.clone()];
+        menus
+            .provider
+            .provider_nav
+            .back_stack
+            .push(ProviderPage::Details {
+                connection: provider.key(),
+                selected: 2,
+            });
+        let id = Uuid::new_v4();
+        menus
+            .show(
+                &console,
+                Menu {
+                    id,
+                    title: "Sign out fixture".into(),
+                    context: Vec::new(),
+                    options: vec!["Cancel".into(), "Sign out".into()],
+                    selected: 1,
+                    confirmation: false,
+                },
+                Selection::ConnectionConfirm {
+                    target: ConfigTarget::NewDraft,
+                    provider,
+                    action: ConnectionAction::SignOut,
+                },
+            )
+            .unwrap();
+        let result = menus
+            .choose(&agent, &console, id, Some(1), None)
+            .await
+            .unwrap();
+        assert!(result.provider_logout);
+        assert!(matches!(
+            menus.active,
+            Some((_, Selection::ConnectionDetails { .. }))
+        ));
+        agent.shutdown().await;
+    }
+
     fn pending_model_discovery() -> (Menus, Console, tokio_util::sync::CancellationToken, Uuid) {
         let chat = Uuid::new_v4();
         let console = Console::test_for_chat(chat);
@@ -54,6 +188,7 @@ mod tests {
         let (_, receiver) = tokio::sync::mpsc::unbounded_channel();
         let cancel = tokio_util::sync::CancellationToken::new();
         menus.provider.discovery_flow = Some(DiscoveryFlow {
+            refreshes: HashMap::new(),
             id,
             target: ConfigTarget::Agent(chat),
             providers: vec![provider],
@@ -163,6 +298,7 @@ mod tests {
         let (_, receiver) = tokio::sync::mpsc::unbounded_channel();
         let cancel = tokio_util::sync::CancellationToken::new();
         menus.provider.discovery_flow = Some(DiscoveryFlow {
+            refreshes: HashMap::new(),
             id: first_menu,
             target: ConfigTarget::Agent(first),
             providers: vec![provider.clone()],
@@ -292,6 +428,7 @@ mod tests {
             }
         });
         menus.provider.discovery_flow = Some(DiscoveryFlow {
+            refreshes: HashMap::new(),
             id: model_menu,
             target: ConfigTarget::Agent(chat),
             providers: vec![provider],
@@ -449,6 +586,7 @@ mod tests {
             .unwrap();
         let (_, receiver) = tokio::sync::mpsc::unbounded_channel();
         menus.provider.discovery_flow = Some(DiscoveryFlow {
+            refreshes: HashMap::new(),
             id: before,
             target: ConfigTarget::NewDraft,
             providers: vec![provider.clone()],
@@ -926,9 +1064,11 @@ pub(super) enum ProviderPage {
         focused: Option<String>,
     },
     Models {
-        connection: String,
+        connection: Option<String>,
         focused: Option<(String, String)>,
+        action: Option<ModelAction>,
     },
+    Settings,
     Details {
         connection: String,
         selected: usize,
@@ -944,7 +1084,7 @@ pub(super) enum CredentialIntent {
     Replace,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct ProviderNavigator {
     pub(super) filter: ConnectionFilter,
     pub(super) focused: Option<String>,
@@ -952,7 +1092,37 @@ pub(super) struct ProviderNavigator {
     pub(super) credential_intent: Option<CredentialIntent>,
 }
 
-#[derive(Clone, Copy)]
+impl ProviderNavigator {
+    pub(super) fn escape_hint(&self) -> &'static str {
+        match self.back_stack.last() {
+            Some(ProviderPage::Directory { .. }) => "Esc back to Providers",
+            Some(ProviderPage::Models { .. }) => "Esc back to models",
+            Some(ProviderPage::Settings) => "Esc back to Settings",
+            Some(ProviderPage::Details { .. }) => "Esc back to Connection",
+            Some(ProviderPage::LoginMethods { .. }) => "Esc back to sign-in",
+            None => "Esc close",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ModelAction {
+    ConnectionDetails,
+    RefreshAccountModels,
+    Providers,
+}
+
+impl ModelAction {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::ConnectionDetails => "Connection details",
+            Self::RefreshAccountModels => super::super::console::REFRESH_ACCOUNT_MODELS_LABEL,
+            Self::Providers => "Manage Providers…",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub(super) enum ConnectionAction {
     Browse,
     Configure,
@@ -978,7 +1148,7 @@ pub(super) struct ProviderSession {
     pub(super) model_warmup: Option<ModelWarmup>,
     pub(super) discovery_flow: Option<DiscoveryFlow>,
     // A directory repaint can race Escape; row choices stay fenced to the new menu ID.
-    pub(super) refreshed_model_cancel: Option<(Uuid, Uuid)>,
+    pub(super) refreshed_picker_cancel: Option<(Uuid, Uuid)>,
     pub(super) model_directory_status: BTreeMap<String, String>,
 }
 
@@ -1145,12 +1315,13 @@ impl Menus {
             ConnectionFilter::Configured => "Configured",
         };
         let toggle = if filter == "All" { "Configured" } else { "All" };
+        let escape = self.provider.provider_nav.escape_hint();
         let mut row_hints =
-            vec![format!("p Connection · f Filter · Enter · Esc close"); rows.len()];
+            vec![format!("p Connection · f Filter · Enter · {escape}"); rows.len()];
         if empty {
-            row_hints.push(format!("f {toggle} · Enter add connection · Esc close"));
+            row_hints.push(format!("f {toggle} · Enter add connection · {escape}"));
         }
-        row_hints.push(format!("f {toggle} · Enter Judgment settings · Esc close"));
+        row_hints.push(format!("f {toggle} · Enter Judgment settings · {escape}"));
         let context = if empty {
             vec!["No connections configured. Add a connection to browse models.".into()]
         } else {
@@ -1171,12 +1342,15 @@ impl Menus {
                 PickerKind::Provider,
                 super::super::console::PickerPresentation {
                     headers,
+                    editing_hint: None,
+                    restore_context_offset: None,
                     refresh: false,
+                    refresh_options: None,
                     connection_options: Some(rows.len()),
                     row_hints,
                     compact_rows,
                     hint: format!(
-                        "p Connection · f {} · Enter models/setup · Esc close",
+                        "p Connection · f {} · Enter models/setup · {escape}",
                         if filter == "All" { "Configured" } else { "All" }
                     ),
                 },
@@ -1285,10 +1459,34 @@ impl Menus {
         if let Err(error) = authenticated {
             context.push(safe_text(&error));
         }
+        let mut selected = selected;
+        let mut id = Uuid::new_v4();
+        if let Some((
+            previous_id,
+            Selection::ConnectionDetails {
+                target: previous_target,
+                provider: previous_provider,
+                actions: previous_actions,
+            },
+        )) = self.active.as_ref()
+            && *previous_target == target
+            && previous_provider.key() == provider.key()
+        {
+            let previous_selected = console.picker_selection(*previous_id)?.unwrap_or(selected);
+            selected = previous_actions
+                .get(previous_selected)
+                .and_then(|action| actions.iter().position(|candidate| candidate == action))
+                .unwrap_or(previous_selected.min(actions.len().saturating_sub(1)));
+            if *previous_actions == actions {
+                id = *previous_id;
+            } else {
+                self.provider.refreshed_picker_cancel = Some((*previous_id, id));
+            }
+        }
         self.show(
             console,
             Menu {
-                id: Uuid::new_v4(),
+                id,
                 title: safe_text(&format!("Connection · {}", provider.model_page_name())),
                 context,
                 options,
@@ -1324,9 +1522,11 @@ impl Menus {
             Some(ProviderPage::Models {
                 connection,
                 focused,
+                action,
             }) => {
                 self.provider.model_return = Some(ModelPickerDraft {
-                    provider: Some(connection),
+                    provider: connection,
+                    action,
                     selected: focused,
                     choices: self.provider.model_choices.clone(),
                 });
@@ -1339,10 +1539,8 @@ impl Menus {
             Some(ProviderPage::LoginMethods { connection }) => {
                 self.login_methods(console, target, self.connection(&connection)?)
             }
-            None => {
-                self.dismiss(console)?;
-                console.write("Selection cancelled; configuration unchanged.\n")
-            }
+            Some(ProviderPage::Settings) => self.settings(agent, console, target).await,
+            None => self.dismiss(console),
         }
     }
 
@@ -1381,7 +1579,7 @@ impl Menus {
         provider: &ProviderModels,
     ) -> Result<(), String> {
         self.refresh_connections
-            .insert((target.agent(), provider.key()));
+            .insert((target.agent(), provider.key()), Uuid::new_v4());
         self.refresh_provider_scope(agent, target).await?;
         if matches!(
             self.provider.provider_nav.back_stack.last(),
@@ -1400,7 +1598,7 @@ impl Menus {
             ) {
                 self.provider.provider_nav.back_stack.pop();
             }
-            if matches!(self.provider.provider_nav.back_stack.last(), Some(ProviderPage::Models { connection, .. }) if *connection == provider.key())
+            if matches!(self.provider.provider_nav.back_stack.last(), Some(ProviderPage::Models { connection, .. }) if connection.as_deref().is_none_or(|key| key == provider.key()))
             {
                 return self.provider_back(agent, console, target).await;
             }
@@ -1569,11 +1767,14 @@ impl Menus {
         }
         if request.model == snapshot.model.identity() {
             self.model_discovery.invalidate(&snapshot.model.provider_id);
-            self.refresh_connections.insert((
-                Some(snapshot.id),
-                self.key_for_model(&snapshot.model)
-                    .unwrap_or_else(|| connection_key(&snapshot.model)),
-            ));
+            self.refresh_connections.insert(
+                (
+                    Some(snapshot.id),
+                    self.key_for_model(&snapshot.model)
+                        .unwrap_or_else(|| connection_key(&snapshot.model)),
+                ),
+                Uuid::new_v4(),
+            );
         } else {
             for provider in &self.provider.provider_choices {
                 if provider
@@ -1584,10 +1785,42 @@ impl Menus {
                     self.model_discovery
                         .invalidate(&provider.models[0].provider_id);
                     self.refresh_connections
-                        .insert((Some(snapshot.id), provider.key()));
+                        .insert((Some(snapshot.id), provider.key()), Uuid::new_v4());
                 }
             }
         }
+    }
+
+    fn discovery_refreshes(
+        &self,
+        target: ConfigTarget,
+        providers: &[ProviderModels],
+        selected_provider: Option<&str>,
+    ) -> HashMap<String, Uuid> {
+        providers
+            .iter()
+            .filter(|provider| {
+                provider.supports_discovery()
+                    && selected_provider.is_none_or(|key| key == provider.key())
+            })
+            .filter_map(|provider| {
+                let key = provider.key();
+                self.refresh_connections
+                    .get(&(target.agent(), key.clone()))
+                    .map(|generation| (key, *generation))
+            })
+            .collect()
+    }
+
+    fn finish_discovery_refreshes(
+        &mut self,
+        target: ConfigTarget,
+        refreshes: &HashMap<String, Uuid>,
+    ) {
+        self.refresh_connections
+            .retain(|(chat, connection), generation| {
+                *chat != target.agent() || refreshes.get(connection) != Some(generation)
+            });
     }
 
     pub(super) async fn configured_models(
@@ -1617,7 +1850,9 @@ impl Menus {
             |draft| draft.provider.clone(),
         );
         if !providers.iter().any(|provider| {
-            Some(&provider.key()) == selected_provider.as_ref()
+            selected_provider
+                .as_ref()
+                .is_none_or(|key| *key == provider.key())
                 && provider.supports_discovery()
                 && self.provider_authenticated(provider) == Ok(true)
         }) {
@@ -1650,14 +1885,14 @@ impl Menus {
         let task_cancel = cancel.clone();
         let task_providers = providers.clone();
         let execution = agent.clone();
-        let refresh = selected_provider.as_ref().is_some_and(|key| {
-            self.refresh_connections
-                .remove(&(target.agent(), key.clone()))
-        });
+        let refreshed = self.discovery_refreshes(target, &providers, selected_provider.as_deref());
+        let refreshes = refreshed.clone();
         let warmup = if self.provider.model_warmup.as_ref().is_some_and(|warmup| {
             warmup.target == target
                 && providers.iter().any(|provider| {
-                    Some(&provider.key()) == selected_provider.as_ref()
+                    selected_provider
+                        .as_ref()
+                        .is_none_or(|key| *key == provider.key())
                         && connection_key(&provider.models[0]) == warmup.provider
                 })
         }) {
@@ -1674,16 +1909,27 @@ impl Menus {
 
             let mut directories = Vec::new();
             for provider in task_providers {
-                let result = if Some(&provider.key()) == selected_provider.as_ref()
+                let result = if selected_provider
+                    .as_ref()
+                    .is_none_or(|key| *key == provider.key())
                     && provider.supports_discovery()
                 {
                     if target.agent().is_some() {
                         execution
-                            .account_models(target, provider.models[0].clone(), refresh)
+                            .account_models(
+                                target,
+                                provider.models[0].clone(),
+                                refreshed.contains_key(&provider.key()),
+                            )
                             .await
                     } else {
                         cache
-                            .discover(&provider.models[0], root.as_deref(), refresh, &task_cancel)
+                            .discover(
+                                &provider.models[0],
+                                root.as_deref(),
+                                refreshed.contains_key(&provider.key()),
+                                &task_cancel,
+                            )
                             .await
                     }
                 } else {
@@ -1694,6 +1940,7 @@ impl Menus {
             let _ = sender.send(directories);
         });
         self.provider.discovery_flow = Some(DiscoveryFlow {
+            refreshes,
             id,
             target,
             providers,
@@ -1777,10 +2024,8 @@ impl Menus {
             .or(self.provider.current_model.as_ref())
             .cloned();
         self.provider.model_choices = choices;
-        let page_provider = match draft {
-            Some(draft) => draft.provider,
-            None => self.provider.current_connection.clone(),
-        };
+        let action = draft.as_ref().and_then(|draft| draft.action);
+        let page_provider = draft.and_then(|draft| draft.provider);
         if let Some(provider) = page_provider
             && self
                 .provider
@@ -1788,13 +2033,26 @@ impl Menus {
                 .iter()
                 .any(|candidate| candidate.key() == provider)
         {
-            return self.show_provider_models(console, target, &provider, focus.as_ref());
+            return self.show_provider_models(console, target, &provider, focus.as_ref(), action);
         }
-        self.show_model_providers(
-            console,
-            target,
-            focus.as_ref().map(|(provider, _)| provider.as_str()),
-        )
+        self.provider.model_provider = None;
+        let choices = self.provider.model_choices.clone();
+        let selected = choices
+            .iter()
+            .position(|choice| {
+                focus.as_ref().is_some_and(|(provider, model)| {
+                    choice.config.provider_id == *provider && choice.config.model_id == *model
+                })
+            })
+            .unwrap_or(0);
+        let selected = action
+            .and_then(|action| {
+                self.model_actions(&choices)
+                    .iter()
+                    .position(|candidate| *candidate == action)
+            })
+            .map_or(selected, |index| choices.len() + index);
+        self.show_model_choices(console, target, choices, selected, Uuid::new_v4())
     }
 
     pub(super) fn remember_model_drafts(&mut self, choices: &[ModelChoice]) {
@@ -1810,24 +2068,13 @@ impl Menus {
         }
     }
 
-    pub(super) fn show_model_providers(
-        &mut self,
-        console: &Console,
-        target: ConfigTarget,
-        focused: Option<&str>,
-    ) -> Result<(), String> {
-        if let Some(focused) = focused {
-            self.provider.provider_nav.focused = Some(focused.into());
-        }
-        self.back_to_providers(console, target)
-    }
-
     pub(super) fn show_provider_models(
         &mut self,
         console: &Console,
         target: ConfigTarget,
         provider: &str,
         focused: Option<&(String, String)>,
+        action: Option<ModelAction>,
     ) -> Result<(), String> {
         let choices: Vec<_> = self
             .provider
@@ -1846,6 +2093,13 @@ impl Menus {
             })
             .unwrap_or(0);
         self.provider.model_provider = Some(provider.into());
+        let selected = action
+            .and_then(|action| {
+                self.model_actions(&choices)
+                    .iter()
+                    .position(|candidate| *candidate == action)
+            })
+            .map_or(selected, |index| choices.len() + index);
         self.show_model_choices(console, target, choices, selected, Uuid::new_v4())
     }
 
@@ -1854,12 +2108,22 @@ impl Menus {
         agent: &Agent,
         console: &Console,
         target: ConfigTarget,
+        connection: Option<&str>,
+        action: Option<ModelAction>,
     ) -> Result<(), String> {
-        if let Some(key) = &self.provider.model_provider {
-            self.refresh_connections
-                .insert((target.agent(), key.clone()));
+        let connection = connection
+            .map(str::to_owned)
+            .or_else(|| self.provider.model_provider.clone());
+        for provider in &self.provider.model_providers {
+            if provider.supports_discovery()
+                && connection.as_ref().is_none_or(|key| *key == provider.key())
+            {
+                self.refresh_connections
+                    .insert((target.agent(), provider.key()), Uuid::new_v4());
+            }
         }
         self.provider.model_return = Some(ModelPickerDraft {
+            action,
             selected: self.provider.focused_model.clone(),
             choices: self.provider.model_choices.clone(),
             provider: self.provider.model_provider.clone(),
@@ -1875,6 +2139,7 @@ impl Menus {
         provider: &str,
     ) -> Result<(), String> {
         self.provider.model_return = Some(ModelPickerDraft {
+            action: None,
             selected: self.provider.focused_model.clone(),
             choices: self.provider.model_choices.clone(),
             provider: Some(provider.into()),
@@ -1894,6 +2159,7 @@ impl Menus {
             .get(index)
             .and_then(|choice| self.key_for_model(&choice.config))
             .or_else(|| self.provider.model_provider.clone())
+            .or_else(|| self.provider.current_connection.clone())
             .ok_or("Model connection no longer exists")?;
         self.provider.focused_model = choices.get(index).map(|choice| {
             (
@@ -1905,8 +2171,11 @@ impl Menus {
             .provider_nav
             .back_stack
             .push(ProviderPage::Models {
-                connection: connection.clone(),
+                connection: self.provider.model_provider.clone(),
                 focused: self.provider.focused_model.clone(),
+                action: index
+                    .checked_sub(choices.len())
+                    .and_then(|index| self.model_actions(&choices).get(index).copied()),
             });
         self.connection_details(console, target, self.connection(&connection)?, 0)
     }
@@ -1967,36 +2236,81 @@ impl Menus {
             })
             .collect();
         self.remember_model_drafts(&choices);
-        let provider = self
-            .provider
-            .model_providers
-            .iter()
-            .find(|provider| Some(&provider.key()) == self.provider.model_provider.as_ref())
-            .ok_or("model Provider does not exist")?;
-        options.push("Connection details".into());
-        if provider.supports_discovery() {
-            options.push(super::super::console::REFRESH_ACCOUNT_MODELS_LABEL.into());
+        let actions = self.model_actions(&choices);
+        let mut selected = selected;
+        let mut id = id;
+        if console.is_interactive()
+            && let Some((
+                previous_id,
+                Selection::Model {
+                    target: previous_target,
+                    choices: previous_choices,
+                    actions: previous_actions,
+                },
+            )) = self.active.as_ref()
+            && *previous_target == target
+            && console.dialog_menu_id()? == Some(*previous_id)
+        {
+            let previous_selected = console.picker_selection(*previous_id)?.unwrap_or(selected);
+            selected = if let Some(previous) = previous_choices.get(previous_selected) {
+                choices
+                    .iter()
+                    .position(|choice| same_model(&previous.config, &choice.config))
+                    .unwrap_or(previous_selected.min(choices.len().saturating_sub(1)))
+            } else {
+                previous_selected
+                    .checked_sub(previous_choices.len())
+                    .and_then(|index| previous_actions.get(index))
+                    .and_then(|action| actions.iter().position(|candidate| candidate == action))
+                    .map_or(selected, |index| choices.len() + index)
+            };
+            if previous_choices.len() == choices.len()
+                && previous_choices
+                    .iter()
+                    .zip(&choices)
+                    .all(|(previous, current)| same_model(&previous.config, &current.config))
+                && *previous_actions == actions
+            {
+                id = *previous_id;
+            }
         }
+        options.extend(actions.iter().map(|action| action.label().to_owned()));
         self.provider.focused_model = choices.get(selected).map(|choice| {
             (
                 choice.config.provider_id.clone(),
                 choice.config.model_id.clone(),
             )
         });
-        let mut context = vec![self.provider_auth_label(provider).into()];
+        let provider = self
+            .provider
+            .model_provider
+            .as_ref()
+            .and_then(|key| self.connection(key).ok());
+        let mut context = provider.as_ref().map_or_else(Vec::new, |provider| {
+            vec![self.provider_auth_label(provider).into()]
+        });
         if choices.is_empty() {
-            context.push("No models available for this account. Configure the Provider or refresh account models.".into());
+            context.push(
+                "No models available. Use /provider to sign in or configure a connection.".into(),
+            );
         }
-        if let Some(status) = self.provider.model_directory_status.get(&provider.key()) {
-            context.push(status.clone());
+        if let Some(provider) = &provider {
+            if let Some(status) = self.provider.model_directory_status.get(&provider.key()) {
+                context.push(status.clone());
+            }
+            if let Some(notice) = tickloop_agent::model::access::AccessCatalog::defaults()
+                .provider(&provider.models[0].provider_id)
+                .and_then(|access| access.notice.as_deref())
+            {
+                context.push(safe_text(notice));
+            }
+        } else if self.provider.discovery_flow.is_some() {
+            context.push("Checking account models…".into());
         }
-        if let Some(notice) = tickloop_agent::model::access::AccessCatalog::defaults()
-            .provider(&provider.models[0].provider_id)
-            .and_then(|access| access.notice.as_deref())
-        {
-            context.push(safe_text(notice));
-        }
-        let title = format!("Choose model · {}", provider.model_page_name());
+        let title = provider.as_ref().map_or_else(
+            || "Choose model · Signed-in Providers".into(),
+            |provider| format!("Choose model · {}", provider.model_page_name()),
+        );
         self.show(
             console,
             Menu {
@@ -2007,8 +2321,38 @@ impl Menus {
                 selected,
                 confirmation: false,
             },
-            Selection::Model { target, choices },
-        )
+            Selection::Model {
+                target,
+                choices,
+                actions,
+            },
+        )?;
+        if let Some(flow) = &mut self.provider.discovery_flow
+            && flow.target == target
+        {
+            flow.id = id;
+        }
+        Ok(())
+    }
+
+    pub(super) fn model_actions(&self, choices: &[ModelChoice]) -> Vec<ModelAction> {
+        let mut actions = Vec::new();
+        if !choices.is_empty() || self.provider.model_provider.is_some() {
+            actions.push(ModelAction::ConnectionDetails);
+        }
+        if self.provider.model_providers.iter().any(|provider| {
+            self.provider
+                .model_provider
+                .as_ref()
+                .is_none_or(|key| *key == provider.key())
+                && provider.supports_discovery()
+        }) {
+            actions.push(ModelAction::RefreshAccountModels);
+        }
+        if self.provider.model_provider.is_none() {
+            actions.push(ModelAction::Providers);
+        }
+        actions
     }
 
     pub(in crate::terminal) async fn picker_action(
@@ -2064,6 +2408,7 @@ impl Menus {
             Selection::Model {
                 target,
                 mut choices,
+                ..
             } => {
                 self.provider.focused_model = choices.get(index).map(|choice| {
                     (
@@ -2072,8 +2417,12 @@ impl Menus {
                     )
                 });
                 if action == PickerAction::RefreshAccountModels {
+                    let connection = choices
+                        .get(index)
+                        .and_then(|choice| self.key_for_model(&choice.config));
                     self.remember_model_drafts(&choices);
-                    self.refresh_model_choices(agent, console, target).await?;
+                    self.refresh_model_choices(agent, console, target, connection.as_deref(), None)
+                        .await?;
                 } else if action == PickerAction::ConfigureProvider {
                     self.open_model_providers(console, target, choices, index)?;
                 } else {
@@ -2142,6 +2491,8 @@ impl Menus {
         provider: ProviderModels,
         method: super::super::login::LoginMethod,
     ) -> Result<MenuOutcome, String> {
+        self.provider_root()
+            .ok_or("Cannot locate the Agent state directory; set TICKLOOP_CONFIG_DIR.")?;
         self.dismiss(console)?;
         self.provider.login_return = Some((target, provider));
         Ok(MenuOutcome {
@@ -2239,6 +2590,21 @@ impl Menus {
         chat: Option<Uuid>,
         succeeded: bool,
     ) {
+        if succeeded {
+            let session = if self.provider_chat == Some(chat) {
+                Some(&self.provider)
+            } else {
+                self.provider_sessions.get(&chat)
+            };
+            if let Some((target, provider)) =
+                session.and_then(|session| session.login_return.as_ref())
+            {
+                self.model_discovery
+                    .invalidate(&provider.models[0].provider_id);
+                self.refresh_connections
+                    .insert((target.agent(), provider.key()), Uuid::new_v4());
+            }
+        }
         self.provider_login_results.insert(chat, succeeded);
     }
 
@@ -2263,14 +2629,25 @@ impl Menus {
             if succeeded {
                 self.model_discovery
                     .invalidate(&provider.models[0].provider_id);
-                self.credential_saved(agent, console, target, &provider)
-                    .await?;
-            } else {
+                self.refresh_connections
+                    .insert((target.agent(), provider.key()), Uuid::new_v4());
+            }
+            if matches!(&self.active, Some((_, Selection::ConnectionDetails { target: current_target, provider: current_provider, .. })) if *current_target == target && current_provider.key() == provider.key())
+            {
+                self.refresh_provider_scope(agent, target).await?;
+                self.connection_details(console, target, provider, 0)?;
+            } else if self.active.is_none() {
                 self.provider_back(agent, console, target).await?;
             }
         }
         Ok(())
     }
+    pub(in crate::terminal) fn provider_logout_menu_is_active(&self, id: Uuid) -> bool {
+        matches!((&self.active, &self.provider.login_return),
+            (Some((menu_id, Selection::ConnectionDetails { target, provider, .. })), Some((login_target, login_provider)))
+            if *menu_id == id && target == login_target && provider.key() == login_provider.key())
+    }
+
     pub(in crate::terminal) fn discovery_active(&self) -> bool {
         self.provider.discovery_flow.as_ref().is_some_and(
             |flow| matches!(self.active, Some((id, Selection::Model { .. })) if id == flow.id),
@@ -2293,6 +2670,9 @@ impl Menus {
         if self.id() != Some(flow.id) {
             return Ok(());
         }
+        if result.is_some() {
+            self.finish_discovery_refreshes(flow.target, &flow.refreshes);
+        }
         if let Some((_, Selection::Model { choices, .. })) = self.active.as_ref() {
             let selected = console
                 .picker_selection(flow.id)?
@@ -2303,9 +2683,14 @@ impl Menus {
                         choice.config.model_id.clone(),
                     )
                 });
+            let action = console
+                .picker_selection(flow.id)?
+                .and_then(|index| index.checked_sub(choices.len()))
+                .and_then(|index| self.model_actions(choices).get(index).copied());
             let drafts = choices.clone();
             self.remember_model_drafts(&drafts);
             self.provider.model_return = Some(ModelPickerDraft {
+                action,
                 provider: self.provider.model_provider.clone(),
                 selected,
                 choices: self.provider.model_choices.clone(),
@@ -2330,7 +2715,7 @@ impl Menus {
         )
         .await?;
         if let Some((updated, Selection::Model { .. })) = self.active.as_ref() {
-            self.provider.refreshed_model_cancel = Some((flow.id, *updated));
+            self.provider.refreshed_picker_cancel = Some((flow.id, *updated));
         }
         Ok(())
     }
@@ -2338,7 +2723,7 @@ impl Menus {
     pub(in crate::terminal) fn invalidate_model_discovery(&mut self) {
         if let Some((target, provider)) = &self.provider.login_return {
             self.refresh_connections
-                .insert((target.agent(), provider.key()));
+                .insert((target.agent(), provider.key()), Uuid::new_v4());
             self.model_discovery
                 .invalidate(&provider.models[0].provider_id);
         }
@@ -2361,6 +2746,7 @@ pub(super) struct DiscoveryFlow {
     pub(super) id: Uuid,
     target: ConfigTarget,
     pub(super) providers: Vec<ProviderModels>,
+    refreshes: HashMap<String, Uuid>,
     cancel: tokio_util::sync::CancellationToken,
     task: tokio::task::JoinHandle<()>,
     receiver: tokio::sync::mpsc::UnboundedReceiver<ModelDirectories>,
@@ -2376,6 +2762,7 @@ impl Drop for DiscoveryFlow {
 type ModelDirectories = Vec<(ProviderModels, Result<AccountModelDirectory, String>)>;
 
 pub(super) struct ModelPickerDraft {
+    pub(super) action: Option<ModelAction>,
     pub(super) provider: Option<String>,
     pub(super) selected: Option<(String, String)>,
     pub(super) choices: Vec<ModelChoice>,

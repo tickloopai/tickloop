@@ -1783,7 +1783,7 @@ fn provider_credential_dialog_hides_ordinals_and_keeps_secret_editing_hints() {
         closed.contains(&format!("API key: {}", "*".repeat("secret-value".len()))),
         "{closed}"
     );
-    assert!(closed.contains("Esc cancel"), "{closed}");
+    assert!(closed.contains("Esc back"), "{closed}");
     state.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
     state.key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
     state.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
@@ -2722,4 +2722,320 @@ async fn a_new_plan_version_replaces_a_stale_restored_request_in_another_view() 
     }
     assert_eq!(agent.snapshot(chat).await.unwrap().plans[0].version, 2);
     agent.shutdown().await;
+}
+
+#[test]
+fn input_dialog_finished_settings_transition_accepts_the_next_key_without_idle() {
+    let mut state = State::new(true, 100, 24);
+    state.prompt_enabled = true;
+    let console = tests::console_with_state(state);
+    let first = Uuid::new_v4();
+    let next = Uuid::new_v4();
+    console
+        .show_picker_menu(menu(first), PickerKind::Actions)
+        .unwrap();
+    assert!(
+        matches!(console.state.lock().unwrap().key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), Some(InputEvent::Choice { menu_id, .. }) if menu_id == first)
+    );
+    console
+        .show_picker_menu(menu(next), PickerKind::Actions)
+        .unwrap();
+    console.finish_menu_submission(first).unwrap();
+    assert!(
+        matches!(console.state.lock().unwrap().key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)), Some(InputEvent::Cancel { menu_id }) if menu_id == next)
+    );
+}
+
+#[test]
+fn input_dialog_login_updates_keep_callback_editing_and_origin() {
+    let first = Uuid::new_v4();
+    let second = Uuid::new_v4();
+    let login = Uuid::new_v4();
+    let request = Uuid::new_v4();
+    let mut state = State::new(true, 100, 24);
+    state.chat = Some(first);
+    let console = tests::console_with_state(state);
+    let mut page = menu(login);
+    page.title = "Browser login".into();
+    page.context = vec!["https://fixture.test/authorize".into()];
+    page.options = vec!["Submit callback".into(), "Cancel login".into()];
+    console
+        .show_login_menu(page.clone(), "https://fixture.test/authorize", true)
+        .unwrap();
+    {
+        let mut state = console.state.lock().unwrap();
+        state.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        state.paste("fixture callback draft");
+    }
+    page.context.push("Callback validation failed".into());
+    console
+        .show_login_menu(page, "https://fixture.test/authorize", true)
+        .unwrap();
+    {
+        let state = console.state.lock().unwrap();
+        assert!(state.menu_comment_is_editing());
+        assert_eq!(
+            state.selected_menu_comment().as_deref(),
+            Some("fixture callback draft")
+        );
+    }
+    console.set_request_layout(Some(request)).unwrap();
+    console.show_focused_menu(menu(request)).unwrap();
+    let mut hidden_update = menu(login);
+    hidden_update.context = vec!["https://fixture.test/new-authorize".into()];
+    console
+        .show_login_menu(
+            hidden_update.clone(),
+            "https://fixture.test/new-authorize",
+            true,
+        )
+        .unwrap();
+    assert_eq!(console.dialog_menu_id().unwrap(), Some(request));
+    console
+        .complete_login_menu(login, "Login saved", "Fixture account")
+        .unwrap();
+    assert_eq!(console.dialog_menu_id().unwrap(), Some(request));
+    console.clear_menu(request).unwrap();
+    console.select_chat(Some(second)).unwrap();
+    console
+        .show_login_menu(hidden_update, "https://fixture.test/new-authorize", true)
+        .unwrap();
+    console
+        .complete_login_menu(login, "Login failed", "Controlled late result")
+        .unwrap();
+    assert_eq!(console.dialog_menu_id().unwrap(), None);
+    console.select_chat(Some(first)).unwrap();
+    let mut state = console.state.lock().unwrap();
+    assert_eq!(state.menu.as_ref().unwrap().id, login);
+    assert!(
+        state
+            .menu
+            .as_ref()
+            .unwrap()
+            .context
+            .iter()
+            .any(|line| line.contains("Esc leaves editing first"))
+    );
+    assert_eq!(
+        state
+            .menu_link
+            .as_ref()
+            .map(|(_, address)| address.as_str()),
+        Some("https://fixture.test/new-authorize")
+    );
+    assert!(state.menu_comment_is_editing());
+    assert!(
+        state
+            .styled_frame()
+            .0
+            .last()
+            .unwrap()
+            .text()
+            .contains("Enter return")
+    );
+    assert_eq!(
+        state.selected_menu_comment().as_deref(),
+        Some("fixture callback draft")
+    );
+    assert!(
+        state
+            .key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .is_none()
+    );
+    assert!(
+        matches!(state.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)), Some(InputEvent::Cancel { menu_id }) if menu_id == login)
+    );
+}
+
+#[test]
+fn input_dialog_grouped_models_refresh_only_supported_rows() {
+    let mut state = State::new(true, 100, 24);
+    state.prompt_enabled = true;
+    let console = tests::console_with_state(state);
+    let id = Uuid::new_v4();
+    console
+        .show_presented_picker_menu(
+            menu(id),
+            PickerKind::Model,
+            PickerPresentation {
+                refresh: true,
+                refresh_options: Some(vec![1]),
+                row_hints: vec!["p Connection".into(), "p Connection · r Refresh".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let mut state = console.state.lock().unwrap();
+    assert!(
+        state
+            .key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE))
+            .is_none()
+    );
+    state.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+    assert!(matches!(
+        state.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)),
+        Some(InputEvent::PickerAction {
+            index: 1,
+            action: PickerAction::RefreshAccountModels,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn input_dialog_continuing_submission_releases_only_its_fence() {
+    let mut state = State::new(true, 100, 24);
+    state.prompt_enabled = true;
+    let console = tests::console_with_state(state);
+    let login = Uuid::new_v4();
+    let mut page = menu(login);
+    page.context = vec!["https://fixture.test/authorize".into()];
+    console
+        .show_login_menu(page, "https://fixture.test/authorize", true)
+        .unwrap();
+    {
+        let mut state = console.state.lock().unwrap();
+        state.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        state.paste("callback draft");
+        assert!(
+            matches!(state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), Some(InputEvent::Choice { menu_id, .. }) if menu_id == login)
+        );
+    }
+    console.continue_menu_submission(Uuid::new_v4()).unwrap();
+    assert_eq!(
+        console.state.lock().unwrap().menu_submission_pending,
+        Some(login)
+    );
+    console.continue_menu_submission(login).unwrap();
+    let mut state = console.state.lock().unwrap();
+    assert_eq!(state.menu.as_ref().unwrap().id, login);
+    assert!(state.menu_submission_pending.is_none());
+    assert!(state.menu_comment_is_editing());
+    assert_eq!(
+        state.selected_menu_comment().as_deref(),
+        Some("callback draft")
+    );
+    state.release_finished_submissions();
+    assert!(
+        state
+            .key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .is_none()
+    );
+    assert!(
+        matches!(state.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)), Some(InputEvent::Cancel { menu_id }) if menu_id == login)
+    );
+}
+
+#[tokio::test]
+async fn input_dialog_completed_login_keeps_other_agent_composer_enabled() {
+    use crate::terminal::login::{LoginFlow, LoginMethod, complete_provider_login};
+    let first = Uuid::new_v4();
+    let second = Uuid::new_v4();
+    let mut state = State::new(true, 100, 24);
+    state.chat = Some(first);
+    state.prompt_enabled = true;
+    let console = tests::console_with_state(state);
+    let (flow, _) = LoginFlow::start_fixture(&console, LoginMethod::Device).unwrap();
+    let id = flow.id();
+    let mut login = Some(flow);
+    complete_provider_login(
+        login.as_mut().unwrap(),
+        &console,
+        &Ok("Fixture account".into()),
+    )
+    .unwrap();
+    console.select_chat(Some(second)).unwrap();
+    {
+        let mut state = console.state.lock().unwrap();
+        state.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(
+            state.editor.draft(),
+            "x",
+            "A hidden login must not disable B's Composer"
+        );
+    }
+    console.select_chat(Some(first)).unwrap();
+    assert_eq!(console.dialog_menu_id().unwrap(), Some(id));
+}
+
+#[tokio::test]
+async fn input_dialog_background_provider_completion_updates_only_its_origin_page() {
+    use crate::terminal::login::{LoginFlow, LoginMethod, LoginSession};
+    let directory = tempfile::tempdir().unwrap();
+    let agent = crate::terminal::Agent::new_embedded(
+        crate::terminal::test_support::config(),
+        Arc::new(crate::terminal::test_support::ScriptedModel::new(Vec::new())),
+    );
+    let first = agent.create_chat(directory.path().into()).await.unwrap();
+    let second = agent.create_chat(directory.path().into()).await.unwrap();
+    let mut state = State::new(true, 100, 24);
+    state.chat = Some(first);
+    state.prompt_enabled = true;
+    let console = tests::console_with_state(state);
+    for result in [
+        Ok("Fixture source account".into()),
+        Err("Fixture source refusal".into()),
+    ] {
+        console.select_chat(Some(first)).unwrap();
+        let (flow, _) = LoginFlow::start_fixture(&console, LoginMethod::Device).unwrap();
+        let id = flow.id();
+        let mut session = LoginSession {
+            flow,
+            from_provider: true,
+            succeeded: false,
+        };
+        console.select_chat(Some(second)).unwrap();
+        let before = console.state.lock().unwrap().scrollback.line_count();
+        crate::terminal::finish_provider_login(&agent, &console, &mut session, &result)
+            .await
+            .unwrap();
+        assert_eq!(
+            console.state.lock().unwrap().scrollback.line_count(),
+            before,
+            "A's result must not enter B's transcript"
+        );
+        assert_eq!(console.dialog_menu_id().unwrap(), None);
+        console.select_chat(Some(first)).unwrap();
+        assert_eq!(console.dialog_menu_id().unwrap(), Some(id));
+        console.clear_menu(id).unwrap();
+    }
+    agent.shutdown().await;
+}
+
+#[test]
+fn settings_scroll_new_generation_preserves_context_without_reusing_row_identity() {
+    let mut state = State::new(true, 100, 24);
+    state.prompt_enabled = true;
+    let console = tests::console_with_state(state);
+    let mut first = menu(Uuid::new_v4());
+    first.title = "Settings".into();
+    first.context = (0..20)
+        .map(|index| format!("Explanation {index}"))
+        .collect();
+    first.options = vec!["Auto-scroll".into(), "Reduce motion".into()];
+    console
+        .show_picker_menu(first.clone(), PickerKind::Actions)
+        .unwrap();
+    let before = {
+        let mut state = console.state.lock().unwrap();
+        state.key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        state.context_offset
+    };
+    assert!(before > 0);
+    let mut next = first;
+    next.id = Uuid::new_v4();
+    next.selected = 1;
+    console
+        .show_picker_menu(next.clone(), PickerKind::Actions)
+        .unwrap();
+    {
+        let state = console.state.lock().unwrap();
+        assert_eq!(state.context_offset, before);
+        assert_eq!(state.menu.as_ref().unwrap().id, next.id);
+        assert_eq!(state.menu.as_ref().unwrap().selected, 1);
+    }
+    next.id = Uuid::new_v4();
+    next.title = "Thinking".into();
+    console.show_picker_menu(next, PickerKind::Actions).unwrap();
+    assert_eq!(console.state.lock().unwrap().context_offset, 0);
 }

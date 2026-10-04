@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{collections::HashMap, path::PathBuf};
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -110,6 +110,65 @@ pub(super) struct LoginFlow {
     task: tokio::task::JoinHandle<()>,
     updates: mpsc::UnboundedReceiver<LoginUpdate>,
     browser: Option<(String, BrowserCallback)>,
+    completed: bool,
+}
+
+pub(super) struct LoginSession {
+    pub(super) flow: LoginFlow,
+    pub(super) from_provider: bool,
+    pub(super) succeeded: bool,
+}
+
+pub(super) fn active_login_id(
+    sessions: &HashMap<Uuid, LoginSession>,
+    console: &Console,
+) -> Result<Option<Uuid>, String> {
+    if console.is_interactive() {
+        Ok(console
+            .dialog_menu_id()?
+            .filter(|id| sessions.contains_key(id)))
+    } else {
+        let chat = console.dialog_chat()?;
+        Ok(sessions
+            .iter()
+            .find(|(_, session)| session.flow.chat() == chat)
+            .map(|(id, _)| *id))
+    }
+}
+
+pub(super) async fn next_login_update(
+    sessions: &mut HashMap<Uuid, LoginSession>,
+) -> (Uuid, Option<LoginUpdate>) {
+    use futures_util::FutureExt;
+    let updates = sessions
+        .iter_mut()
+        .filter(|(_, session)| session.flow.updates_pending())
+        .map(|(id, session)| {
+            let id = *id;
+            async move { (id, session.flow.next().await) }.boxed()
+        });
+    futures_util::future::select_all(updates).await.0
+}
+
+pub(super) fn complete_provider_login(
+    flow: &mut LoginFlow,
+    console: &Console,
+    result: &Result<String, String>,
+) -> Result<(), String> {
+    flow.completed = true;
+    flow.cancel.cancel();
+    flow.task.abort();
+    let (status, notice) = match result {
+        Ok(account) => (
+            "Login saved",
+            format!("Login saved · {}", safe_text(account)),
+        ),
+        Err(error) => (
+            "Login failed",
+            format!("Cannot log in: {}", safe_text(error)),
+        ),
+    };
+    console.complete_login_menu(flow.id, status, &notice)
 }
 
 impl LoginFlow {
@@ -280,6 +339,7 @@ impl LoginFlow {
             task,
             updates: receiver,
             browser: None,
+            completed: false,
         })
     }
 
@@ -297,6 +357,44 @@ impl LoginFlow {
 
     pub(super) async fn next(&mut self) -> Option<LoginUpdate> {
         self.updates.recv().await
+    }
+
+    pub(super) fn updates_pending(&self) -> bool {
+        !self.completed
+    }
+
+    pub(super) fn completed(&self) -> bool {
+        self.completed
+    }
+
+    #[cfg(test)]
+    pub(super) fn start_fixture(
+        console: &Console,
+        method: LoginMethod,
+    ) -> Result<(Self, mpsc::UnboundedSender<LoginUpdate>), String> {
+        let id = Uuid::new_v4();
+        let chat = console.dialog_chat()?;
+        Self::show(
+            console,
+            id,
+            vec!["Controlled authorization fixture".into()],
+            None,
+            method.label(),
+        )?;
+        let (sender, updates) = mpsc::unbounded_channel();
+        Ok((
+            Self {
+                id,
+                chat,
+                method,
+                cancel: CancellationToken::new(),
+                task: tokio::spawn(std::future::pending()),
+                updates,
+                browser: None,
+                completed: false,
+            },
+            sender,
+        ))
     }
 
     pub(super) fn show_device(
@@ -425,7 +523,6 @@ impl LoginFlow {
         label: &str,
     ) -> Result<(), String> {
         if console.is_interactive() {
-            console.set_prompt_enabled(false)?;
             let menu = Menu {
                 id,
                 title: format!("Log in to {label}"),
@@ -446,8 +543,7 @@ impl LoginFlow {
     pub(super) fn close(self, console: &Console) -> Result<(), String> {
         self.cancel.cancel();
         console.finish_menu_submission(self.id)?;
-        console.clear_menu(self.id)?;
-        console.set_prompt_enabled(true)
+        console.clear_menu(self.id)
     }
 }
 
@@ -595,6 +691,7 @@ async fn launch_browser_result(address: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     mod input_dialog {
         include!(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -638,29 +735,90 @@ mod tests {
             .unwrap();
     }
 
+    #[tokio::test]
+    async fn login_sessions_route_background_updates_without_owning_another_agent_input() {
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let console = Console::test_interactive_for_chat(first);
+        console.set_prompt_enabled(true).unwrap();
+        let (first_flow, first_sender) =
+            LoginFlow::start_fixture(&console, LoginMethod::Device).unwrap();
+        let first_id = first_flow.id();
+        console.select_chat(Some(second)).unwrap();
+        let (second_flow, second_sender) =
+            LoginFlow::start_fixture(&console, LoginMethod::Device).unwrap();
+        let second_id = second_flow.id();
+        let mut sessions = HashMap::from([
+            (
+                first_id,
+                LoginSession {
+                    flow: first_flow,
+                    from_provider: true,
+                    succeeded: false,
+                },
+            ),
+            (
+                second_id,
+                LoginSession {
+                    flow: second_flow,
+                    from_provider: true,
+                    succeeded: false,
+                },
+            ),
+        ]);
+        assert_eq!(
+            active_login_id(&sessions, &console).unwrap(),
+            Some(second_id)
+        );
+        first_sender
+            .send(LoginUpdate::Finished(Ok("First account".into())))
+            .unwrap();
+        let (id, update) = next_login_update(&mut sessions).await;
+        assert_eq!(id, first_id);
+        let Some(LoginUpdate::Finished(result)) = update else {
+            panic!("Expected first login result");
+        };
+        complete_provider_login(&mut sessions.get_mut(&id).unwrap().flow, &console, &result)
+            .unwrap();
+        assert_eq!(console.dialog_menu_id().unwrap(), Some(second_id));
+        second_sender
+            .send(LoginUpdate::Finished(Ok("Second account".into())))
+            .unwrap();
+        let (id, _) = next_login_update(&mut sessions).await;
+        assert_eq!(id, second_id, "Completed sessions must stop polling");
+        console.select_chat(Some(Uuid::new_v4())).unwrap();
+        assert_eq!(active_login_id(&sessions, &console).unwrap(), None);
+        console.select_chat(Some(first)).unwrap();
+        assert_eq!(
+            active_login_id(&sessions, &console).unwrap(),
+            Some(first_id)
+        );
+        assert_eq!(console.dialog_menu_id().unwrap(), Some(first_id));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pty_device_login_then_conversation_uses_saved_subscription() {
-        pty_login_conversation(false, None).await;
+        pty_login_conversation(false, None, false).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pty_browser_login_then_conversation_uses_saved_subscription() {
-        pty_login_conversation(true, None).await;
+        pty_login_conversation(true, None, false).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pty_login_keeps_an_explicit_model_even_before_it_is_authenticated() {
-        pty_login_conversation(true, Some("gpt-5.6-sol")).await;
+        pty_login_conversation(true, Some("gpt-5.6-sol"), false).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pty_login_then_conversation_uses_current_codex_sol() {
-        pty_login_conversation(true, Some("gpt-6.1-sol")).await;
+        pty_login_conversation(true, Some("gpt-6.1-sol"), false).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pty_login_then_conversation_uses_current_codex_luna() {
-        pty_login_conversation(true, Some("gpt-6-luna")).await;
+        pty_login_conversation(true, Some("gpt-6-luna"), false).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -810,6 +968,11 @@ mod tests {
         writer.flush().unwrap();
         wait("Cannot log in:");
         rejected_login.join().unwrap();
+        assert!(
+            screen::visible_screen(&output.lock().unwrap(), 150, 40).contains("Back to Provider")
+        );
+        writer.write_all(b"\x1b").unwrap();
+        writer.flush().unwrap();
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             let text = output.lock().unwrap();
@@ -828,11 +991,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(std::fs::read_to_string(&credentials).unwrap(), original);
-        for title in [
-            "Connection · OpenAI",
-            "Choose Provider",
-            "Selection cancelled",
-        ] {
+        for title in ["Connection · OpenAI", "Choose Provider"] {
             let mark = output.lock().unwrap().len();
             writer.write_all(TERMINAL_ESCAPE_KEY).unwrap();
             writer.flush().unwrap();
@@ -841,6 +1000,23 @@ mod tests {
                 assert!(Instant::now() < deadline, "PTY missing fresh {title}");
                 std::thread::sleep(Duration::from_millis(20));
             }
+        }
+        writer.write_all(TERMINAL_ESCAPE_KEY).unwrap();
+        writer.flush().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let frame = screen::visible_screen(&output.lock().unwrap(), 150, 40);
+            if !frame.contains("Choose Provider")
+                && !frame.contains("Connection · OpenAI")
+                && frame.lines().any(|line| line.trim() == "❯")
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Provider root did not close: {frame}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
         }
         writer.write_all(b"/exit\r").unwrap();
         writer.flush().unwrap();
@@ -858,7 +1034,16 @@ mod tests {
         reading.join().unwrap();
     }
 
-    async fn pty_login_conversation(browser: bool, selected_model: Option<&'static str>) {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pty_browser_callback_submission_keeps_login_and_editor_through_completion() {
+        pty_login_conversation(true, Some("gpt-6.1-sol"), true).await;
+    }
+
+    async fn pty_login_conversation(
+        browser: bool,
+        selected_model: Option<&'static str>,
+        manual_callback: bool,
+    ) {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
         if let Some(model) = selected_model {
@@ -871,7 +1056,13 @@ mod tests {
         }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
+        let (callback_sender, callback_receiver) = tokio::sync::oneshot::channel();
+        let (token_release, token_pending) = tokio::sync::oneshot::channel();
+        let (token_requested, token_request) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
+            let mut callback_sender = Some(callback_sender);
+            let mut token_pending = Some(token_pending);
+            let mut token_requested = Some(token_requested);
             let mut model_seen = false;
             let mut device_page_opened = false;
             while !model_seen {
@@ -913,6 +1104,15 @@ mod tests {
                         .query_pairs_mut()
                         .append_pair("code", "browser-code")
                         .append_pair("state", &params["state"]);
+                    if manual_callback {
+                        callback_sender
+                            .take()
+                            .unwrap()
+                            .send(callback.to_string())
+                            .unwrap();
+                        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                        continue;
+                    }
                     stream.write_all(format!("HTTP/1.1 302 Found\r\nLocation: {callback}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
                     continue;
                 }
@@ -934,6 +1134,10 @@ mod tests {
                         "application/json",
                     )
                 } else if headers.starts_with("POST /oauth/token ") {
+                    if manual_callback {
+                        token_requested.take().unwrap().send(()).unwrap();
+                        token_pending.take().unwrap().await.unwrap();
+                    }
                     (json!({"access_token":"ey.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdC10ZXN0In19.sig","refresh_token":"fake-refresh-never-display","expires_in":3600}).to_string(), "application/json")
                 } else if headers.starts_with("GET /codex/models?") {
                     assert!(headers.contains("chatgpt-account-id: acct-test"));
@@ -1139,8 +1343,89 @@ mod tests {
             input_dialog::assert_frame(&frame, 40, "Log in to Codex");
             input_dialog::record_frame("device-login", &frame);
         }
-        wait_after("login saved", before_login);
+        if manual_callback {
+            let callback = callback_receiver.await.unwrap();
+            wait_after("Submit callback", before_login);
+            let before_empty = output.lock().unwrap().len();
+            writer.write_all(b"\r").unwrap();
+            writer.flush().unwrap();
+            wait_after("Codex browser login", before_empty);
+            std::thread::sleep(Duration::from_millis(100));
+            let frame = screen::visible_screen(&output.lock().unwrap(), 150, 40);
+            assert!(
+                frame.contains("Codex browser login") && frame.contains("Submit callback"),
+                "Empty submission dismissed login: {frame}"
+            );
+            input_dialog::record_frame("callback-empty", &frame);
+
+            let before_invalid = output.lock().unwrap().len();
+            writer.write_all(b"\tinvalid-callback\r").unwrap();
+            writer.flush().unwrap();
+            wait_after("invalid-callback", before_invalid);
+            std::thread::sleep(Duration::from_millis(100));
+            let frame = screen::visible_screen(&output.lock().unwrap(), 150, 40);
+            assert!(
+                frame.contains("Codex browser login") && frame.contains("invalid-callback"),
+                "Invalid submission dismissed editor: {frame}"
+            );
+            input_dialog::record_frame("callback-invalid", &frame);
+
+            let before_accepted = output.lock().unwrap().len();
+            writer
+                .write_all(&vec![0x7f; "invalid-callback".len()])
+                .unwrap();
+            writer.write_all(callback.as_bytes()).unwrap();
+            writer.write_all(b"\r").unwrap();
+            writer.flush().unwrap();
+            tokio::time::timeout(Duration::from_secs(20), token_request)
+                .await
+                .unwrap()
+                .unwrap();
+            wait_after("Codex browser login", before_accepted);
+            std::thread::sleep(Duration::from_millis(100));
+            let frame = screen::visible_screen(&output.lock().unwrap(), 150, 40);
+            assert!(
+                frame.contains("Codex browser login") && frame.contains(&callback),
+                "Accepted submission dismissed editor: {frame}"
+            );
+            input_dialog::record_frame("callback-accepted", &frame);
+            token_release.send(()).unwrap();
+        }
+        wait_after("Back to Provider", before_login);
         wait("Codex subscription");
+        let completed_frame = screen::visible_screen(&output.lock().unwrap(), 150, 40);
+        assert!(
+            completed_frame.contains("Back to Provider")
+                && !completed_frame.contains("Choose model"),
+            "Completed login frame: {completed_frame}"
+        );
+        if manual_callback {
+            assert!(
+                completed_frame.contains("Enter return"),
+                "Completed callback footer: {completed_frame}"
+            );
+            input_dialog::record_frame("callback-completed", &completed_frame);
+            let before_field_escape = output.lock().unwrap().len();
+            writer.write_all(TERMINAL_ESCAPE_KEY).unwrap();
+            writer.flush().unwrap();
+            wait_after("Back to Provider", before_field_escape);
+            let frame = screen::visible_screen(&output.lock().unwrap(), 150, 40);
+            assert!(
+                frame.contains("Back to Provider") && !frame.contains("Sign in · OpenAI"),
+                "First Esc must only close callback editing: {frame}"
+            );
+            input_dialog::record_frame("callback-field-escape", &frame);
+        }
+        let before_login_return = output.lock().unwrap().len();
+        writer.write_all(TERMINAL_ESCAPE_KEY).unwrap();
+        writer.flush().unwrap();
+        wait_after("Sign in · OpenAI", before_login_return);
+        let before_directory_return = output.lock().unwrap().len();
+        writer.write_all(TERMINAL_ESCAPE_KEY).unwrap();
+        writer.flush().unwrap();
+        wait_after("Choose Provider", before_directory_return);
+        writer.write_all(b"\r").unwrap();
+        writer.flush().unwrap();
         {
             let deadline = Instant::now() + Duration::from_secs(5);
             loop {
@@ -1185,8 +1470,15 @@ mod tests {
                 writer.write_all(b"j\r").unwrap();
                 writer.flush().unwrap();
                 wait_after("Codex browser login", before_reauthentication);
-                wait_after("login saved", before_reauthentication);
-                wait_after("Connection · OpenAI", before_reauthentication);
+                wait_after("Back to Provider", before_reauthentication);
+                let before_method_return = output.lock().unwrap().len();
+                writer.write_all(TERMINAL_ESCAPE_KEY).unwrap();
+                writer.flush().unwrap();
+                wait_after("Sign in · OpenAI", before_method_return);
+                let before_connection_return = output.lock().unwrap().len();
+                writer.write_all(TERMINAL_ESCAPE_KEY).unwrap();
+                writer.flush().unwrap();
+                wait_after("Connection · OpenAI", before_connection_return);
                 let before_model_return = output.lock().unwrap().len();
                 writer.write_all(TERMINAL_ESCAPE_KEY).unwrap();
                 writer.flush().unwrap();
@@ -1231,6 +1523,14 @@ mod tests {
                 writer.write_all(b"\r").unwrap();
                 writer.flush().unwrap();
                 wait("Model selection:");
+                let before_model_back = output.lock().unwrap().len();
+                writer.write_all(TERMINAL_ESCAPE_KEY).unwrap();
+                writer.flush().unwrap();
+                wait_after("Choose Provider", before_model_back);
+                let before_model_cancel = output.lock().unwrap().len();
+                writer.write_all(TERMINAL_ESCAPE_KEY).unwrap();
+                writer.flush().unwrap();
+                wait_for_input_after(before_model_cancel);
             } else {
                 let before_model_back = output.lock().unwrap().len();
                 writer.write_all(TERMINAL_ESCAPE_KEY).unwrap();

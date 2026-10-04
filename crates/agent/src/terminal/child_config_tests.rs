@@ -515,15 +515,17 @@ fn child_model_provider_and_settings_entries_use_the_input_dialog() {
             input_dialog::assert_frame(&frame, HEIGHT, "Choose model");
             input_dialog::record_frame("child-settings-model", &frame);
         }
-        if title != "Choose Provider" {
+        if title == "Settings" {
             view.send(b"\x1b");
-            view.wait_for("directory parent", |frame| {
-                frame.contains("Choose Provider")
+            view.wait_for("settings parent", |frame| {
+                frame.lines().any(|line| line == "Settings") && !frame.contains("Choose model")
             });
         }
         view.send(b"\x1b");
         view.wait_for("child composer", |frame| {
-            !frame.contains("Choose Provider") && !frame.contains("Choose model")
+            !frame.contains("Choose Provider")
+                && !frame.contains("Choose model")
+                && !frame.lines().any(|line| line == "Settings")
         });
     }
     view.close();

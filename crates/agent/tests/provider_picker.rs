@@ -217,19 +217,12 @@ impl Terminal {
     }
 
     fn close_model_picker(&mut self) {
-        let frame = screen::visible_screen(&self.output.lock().unwrap(), self.columns, self.rows);
-        if frame.contains("Choose model ·") {
-            let mark = self.mark();
-            self.send(b"\x1b");
-            self.wait_for_frame_after(mark, "model Provider returned", |frame| {
-                frame.contains("Choose Provider")
-            });
-        }
         let mark = self.mark();
         self.send(b"\x1b");
-        self.wait_for_frame_after(mark, "model picker closed", |frame| {
+        self.wait_for_frame_after(mark, "model picker returned one level", |frame| {
             !frame.contains("Choose model")
         });
+        self.close_provider_picker();
     }
 
     fn close_provider_picker(&mut self) {
@@ -237,7 +230,9 @@ impl Terminal {
             let frame =
                 screen::visible_screen(&self.output.lock().unwrap(), self.columns, self.rows);
             if !frame.contains("Choose Provider")
-                && !frame.contains("Choose connection")
+                && !frame.contains("Choose model")
+                && !frame.contains("Connection ·")
+                && !frame.lines().any(|line| line == "Settings")
                 && !frame.contains("Service account · Google")
             {
                 return;
@@ -300,11 +295,11 @@ fn saved_builtin_key_is_reused_and_model_browsing_does_not_save_a_selection() {
     let mark = terminal.mark();
     terminal.send(b"/model\r");
     terminal.wait_for_frame_after(mark, "built-in model uses saved key", |frame| {
-        frame.contains("Choose model · DeepSeek")
+        frame.contains("Choose model · Signed-in Providers")
             && frame.contains("API key saved")
             && frame.contains("DeepSeek-V4.1-Flash")
     });
-    terminal.assert_dialog("slash-model", "Choose model · DeepSeek");
+    terminal.assert_dialog("slash-model", "Choose model · Signed-in Providers");
     terminal.close_model_picker();
     assert!(!root.join("state/settings.json").exists());
     assert_eq!(fs::read(root.join("state/.env")).unwrap(), original);
@@ -366,7 +361,7 @@ fn builtin_key_replacement_cancel_and_commit_are_atomic_and_return_to_details() 
     let mark = terminal.mark();
     terminal.send(b"\x1b");
     terminal.wait_for_frame_after(mark, "replacement field closed", |frame| {
-        frame.contains("API key · DeepSeek") && frame.contains("Esc cancel")
+        frame.contains("API key · DeepSeek") && frame.contains("Esc back")
     });
     let mark = terminal.mark();
     terminal.send(b"\x1b");
@@ -420,7 +415,7 @@ fn model_confirmation_saves_only_builtin_identity_and_thinking() {
     let mut terminal = Terminal::start(&root);
     terminal.wait_for("deepseek-flash");
     terminal.send(b"/model\r");
-    terminal.wait_for("Choose model · DeepSeek");
+    terminal.wait_for("Choose model · Signed-in Providers");
     let mark = terminal.mark();
     terminal.send(b"l\r");
     terminal.wait_for_frame_after(mark, "built-in model and thinking applied", |frame| {
@@ -432,6 +427,7 @@ fn model_confirmation_saves_only_builtin_identity_and_thinking() {
     assert!(saved.get("model").is_none());
     assert!(saved.get("providers").is_none());
     assert!(!root.join("state/providers").exists());
+    terminal.close_model_picker();
     terminal.exit();
 }
 
@@ -444,7 +440,8 @@ fn environment_key_browsing_does_not_create_credentials_or_provider_files() {
     let mark = terminal.mark();
     terminal.send(b"/model\r");
     terminal.wait_for_frame_after(mark, "built-in environment credential reused", |frame| {
-        frame.contains("Choose model · DeepSeek") && frame.contains("API key from environment")
+        frame.contains("Choose model · Signed-in Providers")
+            && frame.contains("API key from environment")
     });
     assert!(!root.join("state/.env").exists());
     assert!(!root.join("state/providers").exists());
@@ -617,12 +614,15 @@ fn first_run_model_directory_and_settings_model_use_the_input_dialog() {
     input_dialog::record_frame("model-status-click", &frame);
     let mark = terminal.mark();
     terminal.send(b"/model\r");
-    terminal.wait_for_frame_after(mark, "empty configured directory", |frame| {
-        frame.contains("Choose Provider · Configured")
+    terminal.wait_for_frame_after(mark, "empty signed-in model list", |frame| {
+        frame.contains("Choose model · Signed-in Providers")
     });
-    terminal.assert_dialog("first-run-model-directory", "Choose Provider · Configured");
+    terminal.assert_dialog(
+        "first-run-model-directory",
+        "Choose model · Signed-in Providers",
+    );
     let mark = terminal.mark();
-    terminal.select_row("Add connection");
+    terminal.select_row("Manage Providers");
     terminal.wait_for_frame_after(mark, "add connection directory", |frame| {
         frame.contains("Choose Provider · All")
     });
@@ -635,9 +635,9 @@ fn first_run_model_directory_and_settings_model_use_the_input_dialog() {
     let mark = terminal.mark();
     terminal.send(b"\r");
     terminal.wait_for_frame_after(mark, "settings model", |frame| {
-        frame.contains("Choose Provider · Configured")
+        frame.contains("Choose model · Signed-in Providers")
     });
-    terminal.assert_dialog("settings-model", "Choose Provider · Configured");
+    terminal.assert_dialog("settings-model", "Choose model · Signed-in Providers");
     terminal.close_provider_picker();
     terminal.exit();
 }
