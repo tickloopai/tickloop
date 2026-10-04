@@ -219,20 +219,8 @@ pub(super) async fn complete(
         };
         let status = response.status().as_u16();
         if status != 101 {
-            let retry_after = response
-                .headers()
-                .get("retry-after")
-                .and_then(|value| value.to_str().ok())
-                .and_then(crate::model::provider_failure::parse_retry_after);
-            let server_retry = response
-                .headers()
-                .get("x-should-retry")
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| match value.trim() {
-                    "true" => Some(true),
-                    "false" => Some(false),
-                    _ => None,
-                });
+            let (retry_after, server_retry) =
+                crate::model::provider_failure::retry_headers(response.headers());
             let error_body =
                 crate::model::provider_failure::read_error_body(&mut response, &cancel)
                     .await

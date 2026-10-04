@@ -1,18 +1,20 @@
 use super::*;
 use crate::{
-    host_tools::HostToolProvider,
-    native_host::NativeHostToolProvider,
     runtime::{Agent, ShellTask, ShellTaskState, TickLinkState},
     tick_stream::{ArtifactTickStream, NativeTickStream, ObservationKind},
 };
 use std::path::PathBuf;
 
 pub struct HerdrAdapter {
-    access: Option<Arc<tick_connect::access::TickAccess>>,
+    stream: Option<Arc<dyn TickStreamPort>>,
 }
 impl HerdrAdapter {
-    pub fn new(access: Option<Arc<tick_connect::access::TickAccess>>) -> Self {
-        Self { access }
+    pub fn new(provider: Option<Arc<crate::native_host::NativeHostToolProvider>>) -> Self {
+        Self {
+            stream: provider.map(|provider| {
+                Arc::new(NativeTickStream::new(provider)) as Arc<dyn TickStreamPort>
+            }),
+        }
     }
 }
 impl TickAdapter for HerdrAdapter {
@@ -45,19 +47,11 @@ impl TickAdapter for HerdrAdapter {
             .collect()
     }
     fn stream(&self) -> Option<Arc<dyn TickStreamPort>> {
-        self.access.as_ref().map(|access| {
-            Arc::new(NativeTickStream::new(access.clone())) as Arc<dyn TickStreamPort>
-        })
-    }
-    fn tools(&self) -> Option<Arc<dyn HostToolProvider>> {
-        self.access.as_ref().map(|access| {
-            Arc::new(NativeHostToolProvider::new(access.clone())) as Arc<dyn HostToolProvider>
-        })
+        self.stream.clone()
     }
 }
 
 pub struct ArtifactAdapter {
-    root: Option<PathBuf>,
     stream: Option<Arc<dyn TickStreamPort>>,
 }
 impl ArtifactAdapter {
@@ -65,7 +59,7 @@ impl ArtifactAdapter {
         let stream = root
             .as_ref()
             .map(|root| Arc::new(ArtifactTickStream::new(root.clone())) as Arc<dyn TickStreamPort>);
-        Self { root, stream }
+        Self { stream }
     }
 }
 impl TickAdapter for ArtifactAdapter {
@@ -166,15 +160,9 @@ impl TickAdapter for ArtifactAdapter {
     fn refresh_action(&self) -> Option<Arc<dyn TickActionExecutor>> {
         Some(crate::terminal::tick_actions::builtin::artifact("", 'r'))
     }
-    fn tools(&self) -> Option<Arc<dyn HostToolProvider>> {
-        self.root.as_ref().map(|root| {
-            Arc::new(super::tools::ArtifactTools::new(root.clone())) as Arc<dyn HostToolProvider>
-        })
-    }
 }
 
 pub struct ShellAdapter {
-    agent: Option<crate::runtime::WeakAgent>,
     stream: Option<Arc<dyn TickStreamPort>>,
 }
 impl ShellAdapter {
@@ -182,10 +170,7 @@ impl ShellAdapter {
         let stream = agent
             .as_ref()
             .map(|agent| Arc::new(ShellTickStream::new(agent.clone())) as Arc<dyn TickStreamPort>);
-        Self {
-            agent: agent.as_ref().map(Agent::downgrade),
-            stream,
-        }
+        Self { stream }
     }
 }
 impl TickAdapter for ShellAdapter {
@@ -239,14 +224,6 @@ impl TickAdapter for ShellAdapter {
     }
     fn stream(&self) -> Option<Arc<dyn TickStreamPort>> {
         self.stream.clone()
-    }
-    fn tools(&self) -> Option<Arc<dyn HostToolProvider>> {
-        self.agent
-            .as_ref()
-            .and_then(|agent| agent.upgrade())
-            .map(|agent| {
-                Arc::new(super::tools::ShellTools::new(agent.clone())) as Arc<dyn HostToolProvider>
-            })
     }
 }
 pub fn shell_status(task: &ShellTask) -> String {

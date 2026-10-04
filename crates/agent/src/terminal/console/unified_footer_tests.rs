@@ -16,12 +16,11 @@ fn fixture() -> Console {
     tests::console_with_state(state)
 }
 
-fn item(id: &str, content: &str) -> StatusItem {
-    StatusItem {
-        id: id.into(),
-        title: content.into(),
-        state: "in progress",
-        role: Role::Warning,
+fn todo(content: &str) -> TodoItem {
+    TodoItem {
+        content: content.into(),
+        status: tickloop_agent::runtime::TodoStatus::InProgress,
+        active_form: "Working".into(),
     }
 }
 
@@ -39,7 +38,7 @@ fn key(console: &Console, code: KeyCode) -> Option<InputEvent> {
         .key(KeyEvent::new(code, KeyModifiers::NONE))
 }
 
-fn update(console: &Console, todos: Vec<StatusItem>) {
+fn update(console: &Console, todos: Vec<TodoItem>) {
     console
         .update_status_area(
             "Auto".into(),
@@ -180,6 +179,50 @@ fn expanded_subagents_start_at_the_entry_without_an_items_or_blank_summary_row()
 }
 
 #[test]
+fn subagents_robot_prefix_preserves_divider_bounds_and_hints_in_both_states_and_glyph_sets() {
+    use tickloop_agent::settings::GlyphSet;
+
+    for (glyph_set, robot) in [(GlyphSet::Unicode, "⏺"), (GlyphSet::NerdFont, "\u{f06a9}")] {
+        let console = fixture();
+        console
+            .set_display_preferences(DisplayPreferences {
+                glyph_set,
+                prefers_reduced_motion: false,
+            })
+            .unwrap();
+        update(&console, vec![]);
+        console
+            .set_agent_family(
+                vec![
+                    agent(1, None, "Main robot probe"),
+                    agent(2, Some(Uuid::from_u128(1)), "child robot probe"),
+                ],
+                Some(Uuid::from_u128(1)),
+            )
+            .unwrap();
+        key(&console, KeyCode::Down);
+        let label = format!("{robot} Subagents 1");
+        for (collapsed, hint) in [(false, "Enter/Space hide"), (true, "Enter/Space expand")] {
+            let rendered = frame(&console);
+            let state = console.state.lock().unwrap();
+            let target = state.footer_bar_target.as_ref().unwrap();
+            let lower = &rendered[target.row];
+            assert!(lower.starts_with(&format!("─ {label} ")), "{lower}");
+            assert!(lower.ends_with("Context 21% used ─"), "{lower}");
+            assert_eq!(display_width(lower), state.width);
+            assert_eq!(target.categories[0].0, 2..15);
+            assert_eq!(
+                rendered.iter().any(|row| row.contains("child robot probe")),
+                !collapsed
+            );
+            assert!(rendered.last().unwrap().contains(hint), "{rendered:?}");
+            drop(state);
+            key(&console, KeyCode::Enter);
+        }
+    }
+}
+
+#[test]
 fn divider_edges_use_short_rules_and_exact_label_targets_with_narrow_fallbacks() {
     let console = fixture();
     update(&console, vec![]);
@@ -206,9 +249,9 @@ fn divider_edges_use_short_rules_and_exact_label_targets_with_narrow_fallbacks()
         }],
     );
     for (width, prefix, suffix) in [
-        (80, "─ ▾ Subagents 1 ", "Context 21% used ─"),
-        (55, "▾ Subagents 1 ", "Context 21% used ─"),
-        (53, "▾ Subagents 1 ", "Context 21% used"),
+        (80, "─ ⏺ Subagents 1 ", "Context 21% used ─"),
+        (55, "⏺ Subagents 1 ", "Context 21% used ─"),
+        (53, "⏺ Subagents 1 ", "Context 21% used"),
     ] {
         console.state.lock().unwrap().resize(width, 24);
         let rendered = frame(&console);
@@ -227,7 +270,7 @@ fn divider_edges_use_short_rules_and_exact_label_targets_with_narrow_fallbacks()
                 .skip(label.start)
                 .take(label.len())
                 .collect::<String>(),
-            "▾ Subagents 1"
+            "⏺ Subagents 1"
         );
         let ticks = state.tick_toggle_target.as_ref().unwrap();
         let upper = &rendered[ticks.row];
@@ -254,9 +297,81 @@ fn divider_edges_use_short_rules_and_exact_label_targets_with_narrow_fallbacks()
 }
 
 #[test]
+fn subagents_and_context_colors_resolve_from_theme_roles() {
+    use tickloop_agent::settings::GlyphSet;
+
+    for glyph_set in [GlyphSet::Unicode, GlyphSet::NerdFont] {
+        for theme_name in ThemeName::ALL {
+            let console = fixture();
+            console
+                .set_agent_family(
+                    vec![
+                        agent(1, None, "Main theme probe"),
+                        agent(2, Some(Uuid::from_u128(1)), "child theme probe"),
+                    ],
+                    Some(Uuid::from_u128(1)),
+                )
+                .unwrap();
+            for (context, text, context_role) in [
+                (Some((0, 200_000)), "Context 0% used", Role::Success),
+                (None, "Context unknown", Role::MutedText),
+            ] {
+                console
+                    .update_status_area("Auto".into(), "fixture".into(), context, vec![])
+                    .unwrap();
+                let mut state = console.state.lock().unwrap();
+                state.display.set_preferences(DisplayPreferences {
+                    glyph_set,
+                    prefers_reduced_motion: false,
+                });
+                state.display.set_theme(theme_name);
+                let label = format!("{} Subagents 1", state.display.glyph(Glyph::Subagents));
+                for (collapsed, focused, entry_role) in [
+                    (false, false, Role::Permission),
+                    (true, false, Role::MutedText),
+                    (false, true, Role::Suggestion),
+                    (true, true, Role::Suggestion),
+                ] {
+                    state.status_area.agents_collapsed = collapsed;
+                    state.footer.apply(FooterAction::Clear);
+                    if focused {
+                        state.footer.select(FooterItemId::Agents);
+                    }
+                    let (styled, _, _) = state.normal_styled_frame();
+                    let lower = styled
+                        .iter()
+                        .find(|line| line.text().contains(&label))
+                        .unwrap();
+                    let resolved = lower.resolve(state.display.theme(), state.width);
+                    for (segment, role) in [(label.as_str(), entry_role), (text, context_role)] {
+                        assert!(
+                            lower
+                                .spans
+                                .iter()
+                                .any(|span| span.text.contains(segment) && span.role == Some(role)),
+                            "{lower:?}"
+                        );
+                        let style = resolved
+                            .spans
+                            .iter()
+                            .find(|span| span.text.contains(segment))
+                            .unwrap()
+                            .style;
+                        assert_eq!(
+                            style.foreground,
+                            state.display.theme().style(role).foreground
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn family_updates_preserve_editor_focus_and_never_expose_todo_or_shell_categories() {
     let console = fixture();
-    update(&console, vec![item("1.", "todo unique")]);
+    update(&console, vec![todo("todo unique")]);
     console
         .set_agent_family(
             vec![
@@ -269,7 +384,7 @@ fn family_updates_preserve_editor_focus_and_never_expose_todo_or_shell_categorie
     for character in "jk".chars() {
         key(&console, KeyCode::Char(character));
     }
-    update(&console, vec![item("1.", "new todo")]);
+    update(&console, vec![todo("new todo")]);
     let rendered = frame(&console);
     assert!(rendered.iter().any(|row| row.contains("child unique")));
     assert!(
@@ -288,9 +403,8 @@ fn family_updates_preserve_editor_focus_and_never_expose_todo_or_shell_categorie
 #[test]
 fn runtime_empty_progress_clears_completed_activity_details_while_working_and_idle() {
     let console = fixture();
-    let mut done = item("1.", "retired runtime task");
-    done.state = "completed";
-    done.role = Role::Success;
+    let mut done = todo("retired runtime task");
+    done.status = tickloop_agent::runtime::TodoStatus::Completed;
     update(&console, vec![done]);
     console
         .set_activity(Some(&[(
@@ -326,13 +440,11 @@ fn runtime_empty_progress_clears_completed_activity_details_while_working_and_id
 #[test]
 fn todos_follow_working_and_remain_when_idle_only_for_the_visible_agent() {
     let console = fixture();
-    let mut pending = item("1.", "pending unique");
-    pending.state = "pending";
-    pending.role = Role::MutedText;
-    let active = item("2.", "active unique");
-    let mut done = item("3.", "completed unique");
-    done.state = "completed";
-    done.role = Role::Success;
+    let mut pending = todo("pending unique");
+    pending.status = tickloop_agent::runtime::TodoStatus::Pending;
+    let active = todo("active unique");
+    let mut done = todo("completed unique");
+    done.status = tickloop_agent::runtime::TodoStatus::Completed;
     update(&console, vec![pending, active, done]);
     assert!(
         frame(&console)
@@ -354,11 +466,14 @@ fn todos_follow_working_and_remain_when_idle_only_for_the_visible_agent() {
         working[activity + 1].contains("pending unique"),
         "{working:?}"
     );
+    assert!(working[activity + 1].starts_with("  ⎿  ◻ "));
+    assert!(working[activity + 2].starts_with("     ◼ "));
+    assert!(working[activity + 3].starts_with("     ✔ "));
     assert!(working[activity + 2].contains("active unique"));
     assert!(working[activity + 3].contains("completed unique"));
     assert!(!working.iter().any(|row| row.contains("Todo 3")));
     console.activate_agent(Uuid::from_u128(99)).unwrap();
-    update(&console, vec![item("1.", "child todo unique")]);
+    update(&console, vec![todo("child todo unique")]);
     console
         .set_activity(Some(&[("Working child".into(), Some(Role::MutedText))]))
         .unwrap();
@@ -749,7 +864,7 @@ fn core_status_is_always_right_aligned_with_styled_content_and_fallback() {
             .unwrap();
         let divider = &rendered[editor + 1];
         assert!(
-            divider.starts_with('─') && divider.ends_with("模型 fixture ─"),
+            divider.starts_with('─') && divider.ends_with("模型 fixture · Context unknown ─"),
             "{rendered:?}"
         );
         assert_eq!(display_width(divider), 79);
@@ -1011,13 +1126,13 @@ fn modified_enter_cannot_focus_or_activate_a_collapsed_agents_list() {
 #[test]
 fn todos_use_claude_status_marks_styles_and_width_ellipsis() {
     let console = fixture();
-    let mut pending = item("1.", "pending mark");
-    pending.state = "pending";
-    let mut done = item("3.", "completed mark");
-    done.state = "completed";
+    let mut pending = todo("pending mark");
+    pending.status = tickloop_agent::runtime::TodoStatus::Pending;
+    let mut done = todo("completed mark");
+    done.status = tickloop_agent::runtime::TodoStatus::Completed;
     update(
         &console,
-        vec![pending, item("2.", &"active mark ".repeat(20)), done],
+        vec![pending, todo(&"active mark ".repeat(20)), done],
     );
     let rows = frame(&console);
     assert!(

@@ -22,8 +22,10 @@ const UNREACHABLE_VARIABLE: &str = "TICKLOOP_OWNER_LOSS_FLAG";
 const WIDTH: usize = 100;
 const HEIGHT: usize = 30;
 const TIMEOUT: Duration = Duration::from_secs(10);
+const OVERVIEW_RESPONSE_DELAY: Duration = Duration::from_millis(250);
 
 /// Fails catalog and Agent observations while the flag file exists, as an unreachable owner does.
+/// Slow catalog replies separate the initial prompt from the initialized cached View.
 struct SwitchableOwner {
     owner: EmbeddedAgentAccess,
     unreachable: std::path::PathBuf,
@@ -32,6 +34,9 @@ struct SwitchableOwner {
 #[async_trait]
 impl AgentAccess for SwitchableOwner {
     async fn observe(&self, query: ObservationRequest) -> Result<Observation, AccessError> {
+        if matches!(query, ObservationRequest::Overview { .. }) {
+            tokio::time::sleep(OVERVIEW_RESPONSE_DELAY).await;
+        }
         if self.unreachable.exists()
             && matches!(
                 query,
@@ -203,7 +208,9 @@ fn an_unreachable_owner_keeps_the_view_drafts_and_feedback_alive() {
         output,
         _master: pair.master,
     };
-    view.wait_for("the session input", |frame| frame.contains("❯"));
+    view.wait_for("the initialized session input", |frame| {
+        frame.contains("❯") && frame.contains("⏵⏵ ")
+    });
     std::fs::write(&flag, "unreachable").unwrap();
     view.send(b"\x1b[D");
     view.wait_for("the cached overview with a stale label", |frame| {

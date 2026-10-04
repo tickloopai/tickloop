@@ -18,7 +18,7 @@ use crate::{
     tools::{CommandSnapshot, SearchConfig},
 };
 
-pub const PROTOCOL_MAJOR: u16 = 3;
+pub const PROTOCOL_MAJOR: u16 = 4;
 pub const PROTOCOL_MINOR: u16 = 2;
 pub const MIN_CHUNKED_RESPONSE_MINOR: u16 = 1;
 pub const MIN_PROVIDER_CREDENTIALS_MINOR: u16 = 2;
@@ -445,6 +445,11 @@ pub enum LoopAction {
         loop_id: Uuid,
         version: u64,
         mode: ExecutionMode,
+    },
+    DeclinePlan {
+        loop_id: Uuid,
+        version: u64,
+        feedback: Option<String>,
     },
     UpdateSubscription {
         subscription_id: Uuid,

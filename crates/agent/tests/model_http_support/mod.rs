@@ -5,6 +5,67 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 
+pub fn raw_reasoning_prefix_reply(
+    added_prefix: bool,
+    completed_text: &str,
+    rotating_ids: bool,
+) -> String {
+    let mut frames = Vec::new();
+    let mut sequence = 0;
+    let mut event = |kind: &str, mut value: Value| {
+        value["type"] = kind.into();
+        value["sequence_number"] = sequence.into();
+        sequence += 1;
+        frames.push(format!("event: {kind}\ndata: {value}\n\n"));
+    };
+    let id = |kind: &str, phase: &str| {
+        if rotating_ids {
+            format!("{kind}-{phase}")
+        } else {
+            kind.to_owned()
+        }
+    };
+    let reasoning = |phase: &str, text: Option<&str>| serde_json::json!({"type":"reasoning","id":id("rs-prefix",phase),"summary":[],"content":text.map(|text|vec![serde_json::json!({"type":"reasoning_text","text":text})]).unwrap_or_default(),"encrypted_content":if rotating_ids {format!("opaque-{phase}")} else {"opaque-fixture".into()}});
+    let message = |phase: &str| serde_json::json!({"type":"message","id":id("msg-prefix",phase),"role":"assistant","status":"completed","content":[{"type":"output_text","text":"Answer","annotations":[]}]});
+    event(
+        "response.created",
+        serde_json::json!({"response":{"id":id("response-prefix","created"),"status":"in_progress"}}),
+    );
+    event(
+        "response.output_item.added",
+        serde_json::json!({"output_index":0,"item":reasoning("added",added_prefix.then_some("Think"))}),
+    );
+    if !added_prefix {
+        event(
+            "response.reasoning_text.delta",
+            serde_json::json!({"output_index":0,"item_id":id("rs-prefix","delta"),"content_index":0,"delta":"Think"}),
+        );
+    }
+    event(
+        "response.output_item.done",
+        serde_json::json!({"output_index":0,"item":reasoning("done",Some(completed_text))}),
+    );
+    let mut initial_message = message("added");
+    initial_message["content"] = serde_json::json!([]);
+    event(
+        "response.output_item.added",
+        serde_json::json!({"output_index":1,"item":initial_message}),
+    );
+    event(
+        "response.output_text.delta",
+        serde_json::json!({"output_index":1,"item_id":id("msg-prefix","delta"),"content_index":0,"delta":"Answer"}),
+    );
+    event(
+        "response.output_item.done",
+        serde_json::json!({"output_index":1,"item":message("done")}),
+    );
+    event(
+        "response.completed",
+        serde_json::json!({"response":{"id":id("response-prefix","completed"),"status":"completed","output":[reasoning("completed",Some(completed_text)),message("completed")],"usage":{"input_tokens":20,"output_tokens":10}}}),
+    );
+    frames.concat()
+}
+
 pub async fn serve_response(
     status: u16,
     body: String,
@@ -103,7 +164,7 @@ fn header_lines(headers: &[(&str, &str)]) -> String {
         .collect()
 }
 
-async fn read_request(socket: &mut TcpStream) -> (String, Value) {
+pub async fn read_request(socket: &mut TcpStream) -> (String, Value) {
     let mut received = Vec::new();
     let mut buffer = [0; 4096];
     let (headers, start, length) = loop {

@@ -9,10 +9,9 @@ mod screen {
     ));
 }
 
-const FIXTURE_DIRECTORY: &str = "TICKLOOP_INPUT_DIALOG_FIXTURE_DIR";
-const TIMEOUT: Duration = Duration::from_secs(8);
+pub(super) const FIXTURE_DIRECTORY: &str = "TICKLOOP_INPUT_DIALOG_FIXTURE_DIR";
+pub(super) const TIMEOUT: Duration = Duration::from_secs(8);
 const REQUEST: Uuid = Uuid::from_u128(7101);
-
 #[test]
 #[ignore]
 fn input_dialog_pty_fixture() {
@@ -118,8 +117,8 @@ fn input_dialog_tick_paste_pty_fixture() {
     });
 }
 
-struct Fixture {
-    child: Box<dyn portable_pty::Child + Send + Sync>,
+pub(super) struct Fixture {
+    pub(super) child: Box<dyn portable_pty::Child + Send + Sync>,
     writer: Box<dyn Write + Send>,
     output: Arc<Mutex<Vec<u8>>>,
     _master: Box<dyn portable_pty::MasterPty + Send>,
@@ -128,7 +127,12 @@ struct Fixture {
 }
 
 impl Fixture {
-    fn start(directory: &std::path::Path, width: u16, height: u16, fixture_name: &str) -> Self {
+    pub(super) fn start(
+        directory: &std::path::Path,
+        width: u16,
+        height: u16,
+        fixture_name: &str,
+    ) -> Self {
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows: height,
@@ -171,12 +175,12 @@ impl Fixture {
         }
     }
 
-    fn send(&mut self, bytes: &[u8]) {
+    pub(super) fn send(&mut self, bytes: &[u8]) {
         self.writer.write_all(bytes).unwrap();
         self.writer.flush().unwrap();
     }
 
-    fn frame(&self) -> String {
+    pub(super) fn frame(&self) -> String {
         screen::visible_screen(
             &String::from_utf8_lossy(&self.output.lock().unwrap()),
             self.width,
@@ -184,7 +188,7 @@ impl Fixture {
         )
     }
 
-    fn wait(&self, predicate: impl Fn(&str) -> bool) -> String {
+    pub(super) fn wait(&self, predicate: impl Fn(&str) -> bool) -> String {
         let deadline = Instant::now() + TIMEOUT;
         loop {
             let frame = self.frame();
@@ -276,7 +280,7 @@ fn input_dialog_pty_preserves_search_and_draft_through_permission_preemption() {
         fixture.wait(|frame| {
             frame
                 .lines()
-                .nth(top)
+                .nth(top + input_dialog::INPUT_DIALOG_RULE_ROWS)
                 .is_some_and(|line| line.starts_with("Resume Chat"))
         });
         fixture.send(b"/Chat 1\x1b[B\x1b[B\x1b[B");
@@ -285,16 +289,20 @@ fn input_dialog_pty_preserves_search_and_draft_through_permission_preemption() {
         let frame = fixture.wait(|frame| {
             frame
                 .lines()
-                .nth(top)
+                .nth(top + input_dialog::INPUT_DIALOG_RULE_ROWS)
                 .is_some_and(|line| line.starts_with("Permission fixture"))
         });
-        assert!(
-            frame
-                .lines()
-                .next()
-                .unwrap()
-                .contains("Pinned fixture prompt")
-        );
+        assert_eq!(frame.matches("Pinned fixture prompt").count(), 1, "{frame}");
+        if top >= 12 {
+            assert!(
+                !frame
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .contains("Pinned fixture prompt"),
+                "{frame}"
+            );
+        }
         assert!(
             frame
                 .lines()
@@ -308,7 +316,13 @@ fn input_dialog_pty_preserves_search_and_draft_through_permission_preemption() {
                 && std::fs::read_to_string(directory.path().join("phase"))
                     .is_ok_and(|phase| phase == "resumed")
         });
-        assert!(frame.lines().nth(top).unwrap().starts_with("Resume Chat"));
+        assert!(
+            frame
+                .lines()
+                .nth(top + input_dialog::INPUT_DIALOG_RULE_ROWS)
+                .unwrap()
+                .starts_with("Resume Chat")
+        );
         fixture.send(b"\r");
         fixture.wait(|frame| frame.contains("Unsent fixture draft"));
         std::fs::write(directory.path().join("trigger"), "finish").unwrap();
@@ -316,6 +330,109 @@ fn input_dialog_pty_preserves_search_and_draft_through_permission_preemption() {
         loop {
             if let Some(status) = fixture.child.try_wait().unwrap() {
                 assert!(status.success());
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "fixture did not exit: {}",
+                fixture.frame()
+            );
+            thread::sleep(Duration::from_millis(15));
+        }
+    }
+}
+
+#[test]
+#[ignore]
+fn plan_approval_pty_fixture() {
+    use crate::terminal::{execution::ConsoleExecution, menus::Menus, test_support};
+    use tickloop_agent::{permissions::ExecutionMode, runtime::EventKind};
+    let directory = PathBuf::from(std::env::var(FIXTURE_DIRECTORY).unwrap());
+    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+        let model = Arc::new(test_support::ScriptedModel::new(vec![
+            test_support::submit_plan("plan", "# Controlled PTY plan\nCreate executed.txt only after approval."),
+            test_support::call("execute", "Write", serde_json::json!({"file_path":"executed.txt","content":"approved implementation"})),
+            test_support::text("Implementation completed."),
+        ]));
+        let agent = ConsoleExecution::new_embedded(test_support::config(), model.clone());
+        let chat = agent.create_chat(directory.clone()).await.unwrap();
+        agent.set_execution_mode(chat, ExecutionMode::Plan).await.unwrap();
+        let (console, mut input) = Console::start(true).unwrap();
+        console.select_chat(Some(chat)).unwrap();
+        console.set_prompt_enabled(true).unwrap();
+        console.state.lock().unwrap().insert("Unsent PTY draft");
+        let mut events = agent.subscribe();
+        agent.submit(chat, None, "Plan the controlled file".into()).await.unwrap();
+        let mut menus = Menus::default();
+        let mut pending = HashMap::new();
+        let mut poll = tokio::time::interval(Duration::from_millis(20));
+        loop {
+            tokio::select! {
+                event = events.recv() => match event.unwrap().kind {
+                    EventKind::PermissionRequested { request } => { pending.insert(request.id, request.run_id); }
+                    EventKind::Failed(error) => panic!("{error}"),
+                    EventKind::Completed { .. } => {
+                        assert_eq!(model.requests.lock().unwrap().len(), 3);
+                        assert_eq!(agent.snapshot(chat).await.unwrap().policy.mode, ExecutionMode::AcceptEdits);
+                        assert_eq!(std::fs::read_to_string(directory.join("executed.txt")).unwrap(), "approved implementation");
+                        assert_eq!(console.state.lock().unwrap().editor.draft(), "Unsent PTY draft");
+                        console.write("Implementation completed after approval\n").unwrap();
+                        std::fs::write(directory.join("phase"), "executed").unwrap();
+                        break;
+                    }
+                    _ => {},
+                },
+                event = input.recv() => match event {
+                    Some(InputEvent::Choice { menu_id, index, comment }) => {
+                        assert_eq!(index, 1);
+                        let outcome = menus.choose(&agent, &console, menu_id, Some(index), comment).await.unwrap();
+                        assert!(outcome.receipt.is_none(), "approval must continue the existing run");
+                        pending.clear();
+                    }
+                    Some(InputEvent::Eof | InputEvent::Error(_)) | None => panic!("PTY input ended early"),
+                    _ => {},
+                },
+                _ = poll.tick() => {
+                    menus.refresh_family_permissions(&agent, &console, &[chat], &pending, &HashMap::new()).await.unwrap();
+                    if !pending.is_empty() && console.dialog_menu_id().unwrap().is_some() {
+                        assert!(!directory.join("executed.txt").exists());
+                        assert_eq!(model.requests.lock().unwrap().len(), 1);
+                        std::fs::write(directory.join("phase"), "approval").unwrap();
+                    }
+                },
+            }
+        }
+        agent.shutdown().await;
+    });
+}
+
+#[test]
+fn plan_approval_pty_opens_without_a_command_and_starts_execution_after_approval() {
+    for (width, height) in [(80, 24), (120, 40)] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut fixture = Fixture::start(
+            directory.path(),
+            width,
+            height,
+            "terminal::console::input_dialog_pty::plan_approval_pty_fixture",
+        );
+        let frame = fixture
+            .wait(|frame| frame.contains("Plan approval") && frame.contains("Approve and start"));
+        assert!(frame.contains("Controlled PTY plan"), "{frame}");
+        assert!(!directory.path().join("executed.txt").exists());
+        fixture.send(b"j\r");
+        fixture.wait(|_| {
+            std::fs::read_to_string(directory.path().join("phase"))
+                .is_ok_and(|phase| phase == "executed")
+        });
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("executed.txt")).unwrap(),
+            "approved implementation"
+        );
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            if let Some(status) = fixture.child.try_wait().unwrap() {
+                assert!(status.success(), "{}", fixture.frame());
                 break;
             }
             assert!(

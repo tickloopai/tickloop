@@ -312,7 +312,7 @@ async fn run_family_navigation(fixture: &PrivateFixture) {
     pty.wait_for("Main completed editor and family summary", |frame| {
         frame.contains(MAIN_REPLY)
             && frame.contains("✓ Done")
-            && frame.contains("Subagents 2")
+            && frame.contains("⏺ Subagents 2")
             && editor_has_focus(&captured)
     })
     .await;
@@ -331,7 +331,12 @@ async fn run_family_navigation(fixture: &PrivateFixture) {
         .iter()
         .position(|line| line.contains("Subagents 2"))
         .unwrap();
-    assert!(rows[entry + 1].contains("Main ·"), "{entry_focused}");
+    assert!(
+        rows[entry + 1].contains("⏵⏵ Auto · deepseek-flash"),
+        "{entry_focused}"
+    );
+    assert!(!rows[entry + 1].contains("Context"), "{entry_focused}");
+    assert!(rows[entry + 2].contains("Main ·"), "{entry_focused}");
     assert!(!entry_focused.contains("items"));
     pty.send(b"\x1b[B");
     let list_focused = pty
@@ -352,7 +357,9 @@ async fn run_family_navigation(fixture: &PrivateFixture) {
     pty.resize(TERMINAL_WIDTH, TERMINAL_HEIGHT).await;
     super::unified_footer::click_category(&mut pty, "Subagents 2");
     pty.wait_for("mouse collapses the completed family", |frame| {
-        frame.contains("Enter/Space expand") && !family_rows_are_visible(frame)
+        frame.contains("Enter/Space expand")
+            && frame.contains("⏺ Subagents 2")
+            && !family_rows_are_visible(frame)
     })
     .await;
     assert!(!pty.frame().contains("reply completed"));
@@ -367,7 +374,9 @@ async fn run_family_navigation(fixture: &PrivateFixture) {
     .await;
     pty.send(b" ");
     pty.wait_for("focused Space collapses the family", |frame| {
-        frame.contains("Enter/Space expand") && !family_rows_are_visible(frame)
+        frame.contains("Enter/Space expand")
+            && frame.contains("⏺ Subagents 2")
+            && !family_rows_are_visible(frame)
     })
     .await;
     super::unified_footer::click_category(&mut pty, "Subagents 2");

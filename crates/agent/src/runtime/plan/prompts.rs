@@ -1,8 +1,6 @@
 //! Plan mode and todo list texts the model reads, adapted from Claude Code's `EnterPlanModeTool`,
 //! `ExitPlanModeTool` and `TodoWriteTool` prompts and results and the plan mode reminders of
-//! `utils/messages.ts`. Tick Loop has no subagents, so the reminder follows Claude Code's iterative
-//! workflow, which explores with Read, Glob and Grep directly, and the `TodoWrite` result has no
-//! verification-agent nudge.
+//! `utils/messages.ts`. The planning reminder uses direct Read, Glob and Grep exploration.
 
 use std::path::Path;
 
@@ -14,9 +12,6 @@ use crate::tools::{
 use super::{ENTER_PLAN_MODE_TOOL_NAME, EXIT_PLAN_MODE_TOOL_NAME};
 
 pub(super) const NOT_IN_PLAN_MODE: &str = "You are not in plan mode. This tool is only for exiting plan mode after writing a plan. If your plan was already approved, continue with implementation.";
-
-const SUBMITTED_PLAN_PREFIX: &str =
-    "Your plan has been submitted to the user for approval as version ";
 
 pub(super) const TODO_WRITE_RESULT: &str = "Todos have been modified successfully. Ensure that you continue to use the todo list to track your progress. Please proceed with the current tasks if applicable";
 
@@ -188,30 +183,19 @@ pub(super) fn empty_plan_file(path: &Path) -> String {
     )
 }
 
-/// The `ExitPlanMode` result, adapted from Claude Code's reply to a teammate whose plan awaits
-/// approval: here the user reviews the plan after the turn ends. It starts with the plan version,
-/// which [`submitted_plan_version`] reads back when the conversation is rebuilt.
-pub(super) fn submitted_plan(version: u64, path: &Path, markdown: &str) -> String {
-    format!(
-        "{SUBMITTED_PLAN_PREFIX}{version}.
-
-Plan file: {}
-
-**What happens next:**
-1. End your turn now and wait for the user to review your plan
-2. If the user approves the plan, you will be asked to implement it
-3. If the user asks for revisions, update the plan file and call {EXIT_PLAN_MODE_TOOL_NAME} again
-
-**Important:** Do NOT start implementing until the user approves the plan.
-
-## Submitted Plan:
-{markdown}",
-        path.display()
-    )
+pub(super) fn declined_plan(feedback: Option<&str>) -> String {
+    match feedback {
+        Some(feedback) => format!(
+            "User has requested changes to your plan. Keep planning, update the plan file, and call ExitPlanMode again when ready.\n\nUser feedback: {feedback}"
+        ),
+        None => {
+            "User cancelled plan approval. Remain in plan mode and wait for further instructions."
+                .into()
+        }
+    }
 }
 
-/// The message that starts implementing an approved plan: Claude Code's `ExitPlanMode` result for
-/// an approved plan, which here arrives after the asynchronous approval.
+/// The approved ExitPlanMode result, also used to continue a saved plan whose original Run ended.
 pub(super) fn approved_plan(path: &Path, markdown: &str) -> String {
     format!(
         "User has approved your plan. You can now start coding. Start with updating your todo list if applicable
@@ -223,12 +207,6 @@ You can refer back to it if needed during implementation.
 {markdown}",
         path.display()
     )
-}
-
-/// The plan version a [`submitted_plan`] result announces, also inside a persisted-output preview.
-pub(super) fn submitted_plan_version(result: &str) -> Option<u64> {
-    let (_, rest) = result.split_once(SUBMITTED_PLAN_PREFIX)?;
-    rest.split_once('.')?.0.parse().ok()
 }
 
 /// The plan mode section of every conversation request while the Chat is in Plan mode.
@@ -486,19 +464,6 @@ When in doubt, use this tool. Being proactive with task management demonstrates 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_submitted_version_is_read_back_from_the_result_and_its_preview() {
-        let result = submitted_plan(
-            12,
-            Path::new("/plans/calm-baking-aurora-loop-x.md"),
-            "Plan.",
-        );
-        assert_eq!(submitted_plan_version(&result), Some(12));
-        let preview = format!("<persisted-output>\nPreview:\n{}", &result[..80]);
-        assert_eq!(submitted_plan_version(&preview), Some(12));
-        assert_eq!(submitted_plan_version("Plan saved."), None);
-    }
 
     #[test]
     fn the_reminder_names_the_plan_file_and_how_to_finish() {

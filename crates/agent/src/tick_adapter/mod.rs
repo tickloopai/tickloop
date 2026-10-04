@@ -1,14 +1,12 @@
 //! Registered Tick adapters own type knowledge; lists and Loops consume their common contract.
 mod builtin;
 mod shell;
-mod tools;
 
 pub use builtin::{ArtifactAdapter, HerdrAdapter, ShellAdapter, shell_status};
 pub use shell::ShellTickStream;
 
 use crate::{
     artifacts::ArtifactMetadata,
-    host_tools::HostToolProvider,
     runtime::{ChatSnapshot, ShellTaskSnapshot, TickSubscriptionStatus},
     tick_stream::{EventPublisher, InstanceRef, TickStreamHandle, TickStreamPort, WatchId},
 };
@@ -102,8 +100,6 @@ pub trait TickAdapter: Send + Sync + 'static {
     fn tick_type(&self) -> &'static str;
     fn list(&self, context: &TickListContext) -> Vec<TickDescriptor>;
     fn stream(&self) -> Option<Arc<dyn TickStreamPort>>;
-    /// ReadTick supplies the instance's catalog; CallTickTool prepares its declared query/action.
-    fn tools(&self) -> Option<Arc<dyn HostToolProvider>>;
     fn refresh_action(&self) -> Option<Arc<dyn TickActionExecutor>> {
         None
     }
@@ -134,7 +130,9 @@ impl TickAdapters {
         Self::new([
             Arc::new(ArtifactAdapter::new(root)) as Arc<dyn TickAdapter>,
             Arc::new(ShellAdapter::new(agent)),
-            Arc::new(HerdrAdapter::new(access)),
+            Arc::new(HerdrAdapter::new(access.map(|access| {
+                Arc::new(crate::native_host::NativeHostToolProvider::new(access))
+            }))),
         ])
         .expect("unique built-in Tick Adapters")
     }
@@ -177,23 +175,11 @@ impl TickAdapters {
         });
         entries
     }
-    fn provider(&self, instance: &InstanceRef) -> Result<Arc<dyn HostToolProvider>, String> {
-        self.adapters
-            .get(instance.tick_type())
-            .and_then(|adapter| adapter.tools())
-            .ok_or_else(|| format!("Tick Adapter {} is unavailable", instance.tick_type()))
-    }
     pub(crate) fn refresh_actions(&self) -> Vec<Arc<dyn TickActionExecutor>> {
         self.adapters
             .values()
             .filter_map(|adapter| adapter.refresh_action())
             .collect()
-    }
-    pub fn host_tools(
-        &self,
-        native: Option<Arc<dyn HostToolProvider>>,
-    ) -> Arc<dyn HostToolProvider> {
-        Arc::new(tools::AdapterTools::new(self.clone(), native))
     }
 }
 
@@ -228,20 +214,40 @@ impl TickStreamPort for TickAdapters {
         &self,
         chat: Uuid,
         instance: &InstanceRef,
+        input: &serde_json::Value,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<Option<crate::tick_stream::PreparedTickWatch>, String> {
-        let provider = self.provider(instance)?;
-        let call = provider
-            .prepare_call(
-                chat,
-                "ReadTick",
-                &serde_json::json!({"tick_instance_id":instance}),
-                cancel,
-            )
-            .await?;
-        Ok(Some(crate::tick_stream::PreparedTickWatch::new(
-            provider, call,
-        )))
+        let stream = self
+            .adapters
+            .get(instance.tick_type())
+            .and_then(|adapter| adapter.stream())
+            .ok_or_else(|| format!("Tick Adapter {} is unavailable", instance.tick_type()))?;
+        stream.prepare_watch(chat, instance, input, cancel).await
+    }
+    fn set_watch_authorities(
+        &self,
+        authorities: BTreeMap<WatchId, crate::host_tools::HostToolAuthority>,
+    ) {
+        for stream in self
+            .adapters
+            .values()
+            .filter_map(|adapter| adapter.stream())
+        {
+            stream.set_watch_authorities(authorities.clone());
+        }
+    }
+    async fn revalidate_watch(
+        &self,
+        chat: Uuid,
+        instance: &InstanceRef,
+        authority: Option<&crate::host_tools::HostToolAuthority>,
+    ) -> Result<(), String> {
+        let stream = self
+            .adapters
+            .get(instance.tick_type())
+            .and_then(|adapter| adapter.stream())
+            .ok_or("Tick stream is unavailable")?;
+        stream.revalidate_watch(chat, instance, authority).await
     }
     fn set_watch_chats(&self, chats: BTreeMap<WatchId, Uuid>) {
         for stream in self

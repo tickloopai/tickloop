@@ -57,6 +57,7 @@ struct TerminalHost {
     gone: Mutex<Option<String>>,
     protocol: Mutex<Option<InstanceRef>>,
     outage: AtomicBool,
+    content_reads: AtomicUsize,
 }
 
 impl TerminalHost {
@@ -69,6 +70,7 @@ impl TerminalHost {
             gone: Mutex::new(None),
             protocol: Mutex::new(None),
             outage: AtomicBool::new(false),
+            content_reads: AtomicUsize::new(0),
         }
     }
 
@@ -136,6 +138,7 @@ impl HerdrPort for TerminalHost {
                 json!({"foreground_process_group_id":1,"foreground_processes":[{"pid":std::process::id()}]}),
             ),
             "pane.read" => {
+                self.content_reads.fetch_add(1, Ordering::SeqCst);
                 let pane = params["pane_id"].as_str().unwrap();
                 let text = self.text.lock().unwrap().get(pane).cloned().unwrap();
                 Ok(
@@ -145,6 +148,31 @@ impl HerdrPort for TerminalHost {
             _ => Err(HostError::before("UnknownMethod", method)),
         }
     }
+}
+
+fn native_provider(
+    access: Arc<TickAccess>,
+) -> Arc<tickloop_agent::native_host::NativeHostToolProvider> {
+    Arc::new(
+        tickloop_agent::native_host::NativeHostToolProvider::with_trusted_adapter_identity(
+            access,
+            Uuid::new_v4(),
+        ),
+    )
+}
+fn bind_watches(
+    stream: &NativeTickStream,
+    provider: &tickloop_agent::native_host::NativeHostToolProvider,
+    watches: impl IntoIterator<Item = Uuid>,
+) {
+    use tickloop_agent::host_tools::HostToolProvider;
+    let authority = provider.tool_authority("ReadTick").unwrap().unwrap();
+    stream.set_watch_authorities(
+        watches
+            .into_iter()
+            .map(|watch| (watch, authority.clone()))
+            .collect(),
+    );
 }
 
 fn instance(pane: &str) -> InstanceRef {
@@ -219,7 +247,7 @@ async fn terminal_text_changes_reach_only_the_owning_loops_after_their_baselines
     ));
     let agent = Agent::new_embedded(config(), model.clone());
     agent
-        .install_tick_stream(Arc::new(NativeTickStream::new(access)))
+        .install_tick_stream(Arc::new(NativeTickStream::new(native_provider(access))))
         .await;
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
@@ -348,7 +376,7 @@ async fn terminal_host_outage_requires_reselection_after_event_continuity_is_los
     ));
     let agent = Agent::new_embedded(config(), model.clone());
     agent
-        .install_tick_stream(Arc::new(NativeTickStream::new(access)))
+        .install_tick_stream(Arc::new(NativeTickStream::new(native_provider(access))))
         .await;
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
@@ -405,9 +433,12 @@ async fn a_new_watch_restarts_a_retired_native_worker_without_rearming_its_old_w
         },
         host.clone(),
     ));
-    let mut stream = NativeTickStream::new(access).open();
+    let provider = native_provider(access);
+    let native = NativeTickStream::new(provider.clone());
+    let mut stream = native.open();
     let target = instance("one");
     let old = Uuid::new_v4();
+    bind_watches(&native, &provider, [old]);
     stream
         .desired
         .send(BTreeMap::from([(old, target.clone())]))
@@ -440,6 +471,7 @@ async fn a_new_watch_restarts_a_retired_native_worker_without_rearming_its_old_w
     assert!(uncertain);
 
     let new = Uuid::new_v4();
+    bind_watches(&native, &provider, [new]);
     stream
         .desired
         .send(BTreeMap::from([(old, target.clone()), (new, target)]))
@@ -469,9 +501,12 @@ async fn a_finished_old_read_cannot_block_a_fresh_watch_that_already_has_its_bas
         },
         host.clone(),
     ));
-    let mut stream = NativeTickStream::new(access).open();
+    let provider = native_provider(access);
+    let native = NativeTickStream::new(provider.clone());
+    let mut stream = native.open();
     let target = instance("one");
     let old = Uuid::new_v4();
+    bind_watches(&native, &provider, [old]);
     stream
         .desired
         .send(BTreeMap::from([(old, target.clone())]))
@@ -494,6 +529,7 @@ async fn a_finished_old_read_cannot_block_a_fresh_watch_that_already_has_its_bas
     stream.desired.send(BTreeMap::new()).unwrap();
     settle().await;
     let fresh = Uuid::new_v4();
+    bind_watches(&native, &provider, [old, fresh]);
     stream
         .desired
         .send(BTreeMap::from([(fresh, target)]))
@@ -543,9 +579,12 @@ async fn a_watch_joining_during_an_old_read_survives_the_old_watch_terminal_stat
         },
         host.clone(),
     ));
-    let mut stream = NativeTickStream::new(access).open();
+    let provider = native_provider(access);
+    let native = NativeTickStream::new(provider.clone());
+    let mut stream = native.open();
     let target = instance("one");
     let old = Uuid::new_v4();
+    bind_watches(&native, &provider, [old]);
     stream
         .desired
         .send(BTreeMap::from([(old, target.clone())]))
@@ -566,6 +605,7 @@ async fn a_watch_joining_during_an_old_read_survives_the_old_watch_terminal_stat
         .await
         .expect("old worker did not start its second read");
     let fresh = Uuid::new_v4();
+    bind_watches(&native, &provider, [old, fresh]);
     stream
         .desired
         .send(BTreeMap::from([(old, target.clone()), (fresh, target)]))
@@ -632,9 +672,12 @@ async fn a_retired_native_worker_keeps_its_final_state_for_a_slow_consumer() {
         },
         host.clone(),
     ));
-    let mut stream = NativeTickStream::new(access).open();
+    let provider = native_provider(access);
+    let native = NativeTickStream::new(provider.clone());
+    let mut stream = native.open();
     let target = instance("one");
     let watches: BTreeMap<_, _> = (0..130).map(|_| (Uuid::new_v4(), target.clone())).collect();
+    bind_watches(&native, &provider, watches.keys().copied());
     stream.desired.send(watches).unwrap();
     settle().await;
 
@@ -708,7 +751,7 @@ async fn protocol_tick_update_after_registration_reaches_its_loop() {
     ]));
     let agent = Agent::new_embedded(config(), model.clone());
     agent
-        .install_tick_stream(Arc::new(NativeTickStream::new(access)))
+        .install_tick_stream(Arc::new(NativeTickStream::new(native_provider(access))))
         .await;
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
@@ -824,7 +867,7 @@ for line in sys.stdin:
     ]));
     let agent = Agent::new_embedded(config(), model.clone());
     agent
-        .install_tick_stream(Arc::new(NativeTickStream::new(access)))
+        .install_tick_stream(Arc::new(NativeTickStream::new(native_provider(access))))
         .await;
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
@@ -869,11 +912,10 @@ for line in sys.stdin:
 }
 
 #[tokio::test]
-async fn herdr_adapter_aliases_keep_native_query_permissions_and_target_admission() {
-    use support::tick_alias_contract::{AliasCase, verify_alias_policy};
+async fn herdr_subscriptions_keep_native_query_permissions_and_target_admission() {
+    use support::tick_admission_contract::{AdmissionCase, verify_admission_policy};
     use tickloop_agent::{
         host_tools::HostToolProvider,
-        native_host::NativeHostToolProvider,
         tick_adapter::{HerdrAdapter, TickAdapter, TickAdapters},
     };
     let directory = tempfile::Builder::new()
@@ -906,10 +948,12 @@ async fn herdr_adapter_aliases_keep_native_query_permissions_and_target_admissio
         )
         .with_runtime_dir(runtime_dir),
     );
-    let native = NativeHostToolProvider::new(access.clone());
+    let native = native_provider(access.clone());
     let adapters = Arc::new(
-        TickAdapters::new([Arc::new(HerdrAdapter::new(Some(access))) as Arc<dyn TickAdapter>])
-            .unwrap(),
+        TickAdapters::new([
+            Arc::new(HerdrAdapter::new(Some(native.clone()))) as Arc<dyn TickAdapter>
+        ])
+        .unwrap(),
     );
     let model = Arc::new(ScriptedModel::new(vec![]));
     let agent = Agent::new_embedded(config(), model.clone());
@@ -945,28 +989,28 @@ async fn herdr_adapter_aliases_keep_native_query_permissions_and_target_admissio
         tickloop_agent::host_tools::HostToolPermission::Reviewable
     );
     let cases = [
-        AliasCase {
+        AdmissionCase {
             plan_denied: true,
             name: "CallTickTool",
             input: mutation_input,
             policy_name: "CallTickTool",
             policy_input: mutation.input().clone(),
         },
-        AliasCase {
+        AdmissionCase {
             plan_denied: false,
             name: "ReadTick",
             input: read_input.clone(),
             policy_name: "ReadTick",
             policy_input: read.input().clone(),
         },
-        AliasCase {
+        AdmissionCase {
             plan_denied: false,
             name: "CallTickTool",
             input: query_input.clone(),
             policy_name: "CallTickTool",
             policy_input: query.input().clone(),
         },
-        AliasCase {
+        AdmissionCase {
             plan_denied: false,
             name: "SubscribeTick",
             input: json!({"tick_instance_id":instance,"every_seconds":5}),
@@ -974,10 +1018,10 @@ async fn herdr_adapter_aliases_keep_native_query_permissions_and_target_admissio
             policy_input: read.input().clone(),
         },
     ];
-    let tools = adapters.host_tools(None);
+    let tools = native.clone();
     agent.install_host_tools(tools.clone()).unwrap();
     agent.install_tick_stream(adapters.clone()).await;
-    verify_alias_policy(&agent, &model, chat, &cases).await;
+    verify_admission_policy(&agent, &model, chat, &cases).await;
     session.shutdown().await.unwrap();
     *host.protocol.lock().unwrap() = None;
     assert!(
@@ -996,9 +1040,284 @@ async fn herdr_adapter_aliases_keep_native_query_permissions_and_target_admissio
     }
     assert!(
         adapters
-            .prepare_watch(chat, &instance, CancellationToken::new())
+            .prepare_watch(
+                chat,
+                &instance,
+                &json!({"tick_instance_id":instance,"every_seconds":5}),
+                CancellationToken::new()
+            )
             .await
             .is_err()
     );
     agent.shutdown().await;
+}
+
+async fn socket_fixture(
+    path: std::path::PathBuf,
+    host: Arc<TerminalHost>,
+) -> tokio::task::JoinHandle<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let listener = tokio::net::UnixListener::bind(path).unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (socket, _) = listener.accept().await.unwrap();
+            let host = host.clone();
+            tokio::spawn(async move {
+                let mut socket = BufReader::new(socket);
+                let mut line = String::new();
+                socket.read_line(&mut line).await.unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                let result = host
+                    .request(
+                        request["method"].as_str().unwrap(),
+                        request["params"].clone(),
+                        CancellationToken::new(),
+                    )
+                    .await
+                    .unwrap();
+                let response = json!({"id":request["id"],"result":result});
+                socket
+                    .get_mut()
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .unwrap();
+            });
+        }
+    })
+}
+
+#[tokio::test]
+async fn restored_native_watch_refuses_a_changed_frozen_endpoint() {
+    use tickloop_agent::{
+        host_tools::{HostCallContext, HostToolProvider},
+        native_host::NativeHostToolProvider,
+        permissions::ExecutionMode,
+    };
+    let directory = tempfile::tempdir_in("/tmp").unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let store = root.join("store");
+    let first = root.join("first.sock");
+    let second = root.join("second.sock");
+    let host_a = Arc::new(TerminalHost::new());
+    let host_b = Arc::new(TerminalHost::new());
+    let server_a = socket_fixture(first.clone(), host_a).await;
+    let server_b = socket_fixture(second.clone(), host_b.clone()).await;
+    let access_a = Arc::new(TickAccess::new(HerdrContext {
+        socket: first,
+        caller_pane: "agent".into(),
+    }));
+    let access_b = Arc::new(TickAccess::new(HerdrContext {
+        socket: second,
+        caller_pane: "agent".into(),
+    }));
+    let instance = instance("one");
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "parent-subscribe",
+            "SubscribeTick",
+            json!({"tick_instance_id":instance,"every_seconds":5}),
+        ),
+        call(
+            "delegate",
+            "DelegateAgent",
+            json!({"task":"Watch the authorized terminal"}),
+        ),
+        call(
+            "child-subscribe",
+            "SubscribeTick",
+            json!({"tick_instance_id":instance,"every_seconds":5}),
+        ),
+        text("Child watching"),
+        text("Parent watching"),
+    ]));
+    let agent = Agent::open_embedded(store.clone(), config(), model).unwrap();
+    agent
+        .install_host_tools(Arc::new(NativeHostToolProvider::new(access_a.clone())))
+        .unwrap();
+    agent
+        .install_tick_stream(Arc::new(NativeTickStream::new(Arc::new(
+            tickloop_agent::native_host::NativeHostToolProvider::new(access_a),
+        ))))
+        .await;
+    let parent = agent.create_chat(root.clone()).await.unwrap();
+    agent
+        .set_execution_mode(parent, ExecutionMode::FullAccess)
+        .await
+        .unwrap();
+    agent
+        .set_host_work_context(
+            parent,
+            HostCallContext {
+                workdir: root.clone(),
+                workspace_id: Some("workspace".into()),
+                interaction: None,
+            },
+        )
+        .await
+        .unwrap();
+    let mut events = agent.subscribe();
+    agent
+        .submit(parent, None, "Watch then delegate".into())
+        .await
+        .unwrap();
+    loop {
+        let event = next_event(&mut events).await;
+        if let EventKind::ToolCompleted { call_id, result } = &event.kind
+            && call_id.ends_with("subscribe")
+        {
+            assert!(!result.is_error, "{}", result.content);
+        }
+        if event.chat_id == parent && matches!(event.kind, EventKind::Completed { .. }) {
+            break;
+        }
+    }
+    let child = agent
+        .list_chats()
+        .await
+        .into_iter()
+        .find(|c| c.id != parent)
+        .unwrap()
+        .id;
+    let snapshot = agent.snapshot(child).await.unwrap();
+    let old_authority =
+        snapshot.delegation.as_ref().unwrap().ceiling.host_tools["ReadTick"].clone();
+    let loop_id = snapshot.loops[0].id;
+    assert_eq!(
+        snapshot.loops[0].trigger.as_ref().unwrap().subscriptions[0].authority,
+        Some(old_authority.clone())
+    );
+    agent.shutdown().await;
+    let provider_b = Arc::new(NativeHostToolProvider::new(access_b.clone()));
+    let new_authority = provider_b.tool_authority("ReadTick").unwrap().unwrap();
+    assert_ne!(old_authority, new_authority);
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "restored-direct-read",
+            "ReadTick",
+            json!({"tick_instance_id":instance}),
+        ),
+        text("Continue watching"),
+        text("Unexpected endpoint data received"),
+    ]));
+    let restored = Agent::open_embedded(store, config(), model.clone()).unwrap();
+    restored.install_host_tools(provider_b.clone()).unwrap();
+    restored
+        .install_tick_stream(Arc::new(NativeTickStream::new(provider_b.clone())))
+        .await;
+    let snapshot = restored.resume_chat(child).await.unwrap();
+    assert_eq!(
+        snapshot.delegation.unwrap().ceiling.host_tools["ReadTick"],
+        old_authority
+    );
+    let mut events = restored.subscribe();
+    restored
+        .submit(child, Some(loop_id), "Continue authorized watch".into())
+        .await
+        .unwrap();
+    loop {
+        let event = next_event(&mut events).await;
+        if let EventKind::ToolCompleted { call_id, result } = &event.kind
+            && call_id == "restored-direct-read"
+        {
+            assert!(
+                result.is_error
+                    && result
+                        .content
+                        .contains("outside the child's inherited authorization"),
+                "{}",
+                result.content
+            );
+        }
+        if matches!(event.kind, EventKind::Completed { .. }) {
+            break;
+        }
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    host_b.set("one", "CHANGED_ENDPOINT_SECRET");
+    let delivery = tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            let event = events.recv().await.unwrap();
+            if event.chat_id == child && matches!(event.kind, EventKind::Completed { .. }) {
+                return last_user_text(&model);
+            }
+        }
+    })
+    .await;
+
+    assert_eq!(
+        host_b.content_reads.load(Ordering::SeqCst),
+        0,
+        "restored watch sampled its changed endpoint before rejection"
+    );
+    restored.shutdown().await;
+    server_a.abort();
+    server_b.abort();
+    assert!(
+        delivery.is_err(),
+        "changed endpoint reached frozen child: {delivery:?}"
+    );
+}
+
+#[tokio::test]
+async fn native_stream_rejects_missing_or_foreign_bindings_before_any_host_read() {
+    use tickloop_agent::host_tools::{HostEndpointIdentity, HostToolAuthority, HostToolProvider};
+    let host = Arc::new(TerminalHost::new());
+    let access = Arc::new(TickAccess::with_host(
+        HerdrContext {
+            socket: "/tmp/controlled-test.sock".into(),
+            caller_pane: "agent".into(),
+        },
+        host.clone(),
+    ));
+    let provider = native_provider(access);
+    for binding in [
+        None,
+        Some(HostToolAuthority::Native {
+            endpoint: HostEndpointIdentity::TrustedAdapter {
+                scope: Uuid::new_v4(),
+            },
+        }),
+    ] {
+        let stream = NativeTickStream::new(provider.clone());
+        let watch = Uuid::new_v4();
+        stream.set_watch_authorities(
+            binding
+                .clone()
+                .map(|authority| BTreeMap::from([(watch, authority)]))
+                .unwrap_or_default(),
+        );
+        let mut handle = stream.open();
+        let target = instance("one");
+        assert!(
+            stream
+                .revalidate_watch(Uuid::new_v4(), &target, binding.as_ref())
+                .await
+                .is_err()
+        );
+        handle
+            .desired
+            .send(BTreeMap::from([(watch, target)]))
+            .unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(2), handle.events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(
+                event,
+                TickStreamEvent::State {
+                    state: TickConnectionState::IdentityUncertain,
+                    ..
+                }
+            ),
+            "a foreign/unbound watch reached baseline or content: {event:?}"
+        );
+        handle.desired.send(BTreeMap::new()).unwrap();
+    }
+    assert_eq!(
+        host.content_reads.load(Ordering::SeqCst),
+        0,
+        "unbound or foreign Native watch read host content"
+    );
+    assert!(provider.tool_authority("ReadTick").unwrap().is_some());
 }

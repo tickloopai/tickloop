@@ -843,11 +843,10 @@ fn passive_todos_allow_tick_list_focus_on_right_and_shift_arrows() {
                 "Auto".into(),
                 "fixture".into(),
                 None,
-                vec![StatusItem {
-                    id: "1".into(),
-                    title: "own passive todo".into(),
-                    state: "pending",
-                    role: Role::MutedText,
+                vec![TodoItem {
+                    content: "own passive todo".into(),
+                    status: tickloop_agent::runtime::TodoStatus::Pending,
+                    active_form: "Working".into(),
                 }],
             )
             .unwrap();
@@ -1379,9 +1378,6 @@ async fn a_new_adapter_remote_action_and_detail_work_through_enter_and_click() {
             }]
         }
         fn stream(&self) -> Option<Arc<dyn crate::tick_stream::TickStreamPort>> {
-            None
-        }
-        fn tools(&self) -> Option<Arc<dyn crate::host_tools::HostToolProvider>> {
             None
         }
     }

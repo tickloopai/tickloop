@@ -4,6 +4,235 @@ use crate::tick_adapter::{
     TickActionOutcome, TickActionUi, TickListAction, TickListOperation,
 };
 
+#[test]
+fn input_dialog_top_rule_matches_claude_code_in_both_themes() {
+    use crate::terminal::style::{Theme, ThemeName};
+    for theme in ThemeName::ALL {
+        for (width, height) in [(80, 24), (120, 40), (32, 10)] {
+            let mut state = State::new(true, width, height);
+            state.display.set_theme(theme);
+            state.menu = Some(menu(Uuid::new_v4()));
+            state.picker_kind = Some(PickerKind::Actions);
+            state.picker_presentation.hint = "Enter open · Esc close".into();
+            let capacity = state.input_dialog_height();
+            let lines = state.styled_frame().0;
+            assert_eq!(lines.len(), capacity);
+            assert_eq!(lines[0].text(), "▔".repeat(state.width));
+            assert_eq!(lines[0].spans[0].role, Some(Role::Permission));
+            assert_eq!(lines[1].spans[0].role, Some(Role::DialogTitle));
+            assert_eq!(lines.last().unwrap().spans[0].role, Some(Role::MutedText));
+            assert_eq!(
+                lines[0].resolve(state.display.theme(), state.width).spans[0].style,
+                Theme::new(theme).style(Role::Permission)
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn input_dialog_top_rule_covers_every_surface_with_semantic_theme_roles() {
+    use crate::terminal::{
+        artifacts_picker::ArtifactsPicker,
+        conversation_picker::{ConversationEntry, ConversationPickerPurpose},
+        execution::ConsoleExecution,
+        style::{Theme, ThemeName},
+        test_support,
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let agent = ConsoleExecution::new_embedded(
+        test_support::config(),
+        Arc::new(test_support::ScriptedModel::new(Vec::new())),
+    );
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let view = agent.permissions_view(chat).await.unwrap();
+    for theme in ThemeName::ALL {
+        for surface in [
+            "settings",
+            "permission",
+            "question",
+            "plan",
+            "plan feedback",
+            "login",
+            "help",
+            "resume",
+            "artifacts",
+            "tasks",
+            "permissions",
+            "subscriptions",
+            "trust",
+            "tick confirmation",
+        ] {
+            let mut state = State::new(true, 80, 24);
+            state.chat = Some(chat);
+            state.display.set_theme(theme);
+            let console = tests::console_with_state(state);
+            let id = Uuid::new_v4();
+            match surface {
+                "settings" => console.show_focused_menu(menu(id)).unwrap(),
+                "permission" => {
+                    console.set_request_layout(Some(id)).unwrap();
+                    let mut page = menu(id);
+                    page.confirmation = true;
+                    console.show_focused_menu(page).unwrap();
+                }
+                "question" => console
+                    .show_question_menu(
+                        menu(id),
+                        QuestionMenu {
+                            entry_option: None,
+                            entry_text: String::new(),
+                            multi_select: false,
+                            navigable: false,
+                        },
+                    )
+                    .unwrap(),
+                "plan" | "plan feedback" => {
+                    let mut page = menu(id);
+                    page.options = ["Auto", "Ask", "Full Access", "No, keep planning"]
+                        .into_iter()
+                        .map(String::from)
+                        .collect();
+                    console
+                        .show_plan_menu(page, surface == "plan feedback")
+                        .unwrap();
+                }
+                "login" => console
+                    .show_login_menu(menu(id), "https://example.test/device", false)
+                    .unwrap(),
+                "help" => console.state.lock().unwrap().help_open = true,
+                "resume" => console
+                    .show_conversation_picker(ConversationPicker::new(
+                        ConversationPickerPurpose::Resume,
+                        vec![ConversationEntry::new("Saved Chat", &[], &[])],
+                    ))
+                    .unwrap(),
+                "artifacts" => console
+                    .show_artifacts_picker(ArtifactsPicker::new(
+                        Some(chat),
+                        "fixture@example.test".into(),
+                        HashSet::new(),
+                    ))
+                    .unwrap(),
+                "tasks" => {
+                    console
+                        .show_tasks_at(tests::task_snapshot(chat, 2), None)
+                        .unwrap();
+                }
+                "permissions" => {
+                    console.state.lock().unwrap().permissions_surface =
+                        Some(PermissionsSurface::open(
+                            view.clone(),
+                            PermissionsReturn::ModePicker { settings: false },
+                        ))
+                }
+                "subscriptions" => console
+                    .show_subscriptions(chat, vec![tests::subscription_row(1)])
+                    .unwrap(),
+                "trust" => {
+                    console.state.lock().unwrap().workspace_trust =
+                        Some(WorkspaceTrust::new(PathBuf::from("/fixture/project")))
+                }
+                "tick confirmation" => {
+                    console.state.lock().unwrap().tick_list.confirmation =
+                        Some(super::super::tick_list::TickConfirmation {
+                            instance: "fixture-tick".into(),
+                            action: Arc::new(FixtureTickAction("fixture-tick".into())),
+                            prompt: "Confirm fixture action?".into(),
+                        });
+                }
+                _ => unreachable!(),
+            }
+            let mut state = console.state.lock().unwrap();
+            let role = match surface {
+                "plan" | "plan feedback" => Role::PlanMode,
+                "trust" => Role::Warning,
+                _ => Role::Permission,
+            };
+            let (lines, row, _) = state.styled_frame();
+            assert_eq!(
+                lines.len(),
+                input_dialog::INPUT_DIALOG_ROWS,
+                "{surface}/{theme:?}"
+            );
+            assert_eq!(lines[0].text(), "▔".repeat(state.width));
+            assert_eq!(lines[0].spans[0].role, Some(role), "{surface}/{theme:?}");
+            assert_eq!(
+                lines[0].resolve(state.display.theme(), state.width).spans[0].style,
+                Theme::new(theme).style(role)
+            );
+            assert!(row < lines.len());
+        }
+    }
+    agent.shutdown().await;
+}
+
+#[test]
+fn input_dialog_plan_rule_restores_after_question_and_agent_switch() {
+    let console = tests::console_with_state(State::new(true, 80, 24));
+    let first = Uuid::new_v4();
+    let second = Uuid::new_v4();
+    let plan = Uuid::new_v4();
+    let question = Uuid::new_v4();
+    console.select_chat(Some(first)).unwrap();
+    console.show_plan_menu(menu(plan), false).unwrap();
+    console.set_request_layout(Some(question)).unwrap();
+    console
+        .show_question_menu(
+            menu(question),
+            QuestionMenu {
+                entry_option: None,
+                entry_text: String::new(),
+                multi_select: false,
+                navigable: false,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        console.state.lock().unwrap().styled_frame().0[0].spans[0].role,
+        Some(Role::Permission)
+    );
+    console.select_chat(Some(second)).unwrap();
+    console.show_focused_menu(menu(Uuid::new_v4())).unwrap();
+    assert_eq!(
+        console.state.lock().unwrap().styled_frame().0[0].spans[0].role,
+        Some(Role::Permission)
+    );
+    console.select_chat(Some(first)).unwrap();
+    console.clear_menu(question).unwrap();
+    assert_eq!(console.dialog_menu_id().unwrap(), Some(plan));
+    assert_eq!(
+        console.state.lock().unwrap().styled_frame().0[0].spans[0].role,
+        Some(Role::PlanMode)
+    );
+}
+
+#[test]
+fn input_dialog_rule_click_never_submits_a_menu_or_trust_choice() {
+    for trust in [false, true] {
+        let mut state = State::new(true, 80, 24);
+        state.chat = Some(Uuid::new_v4());
+        if trust {
+            state.workspace_trust = Some(WorkspaceTrust::new(PathBuf::from("/fixture/project")));
+        } else {
+            state.menu = Some(menu(Uuid::new_v4()));
+        }
+        let mut output = Vec::new();
+        state.draw(&mut output).unwrap();
+        let top = state.height - state.input_dialog_height();
+        assert!(state.pointer(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 0,
+                row: top as u16,
+                modifiers: KeyModifiers::NONE
+            },
+            &mut output
+        ));
+        assert!(state.pointer_input.is_none());
+        assert!(state.menu_submission_pending.is_none());
+    }
+}
+
 struct FixtureTickAction(String);
 impl TickActionExecutor for FixtureTickAction {
     fn prepare(&self, _: &mut TickActionUi<'_>) -> Result<PreparedTickAction, String> {
@@ -855,7 +1084,7 @@ fn input_dialog_request_preempts_and_restores_selection_scroll_and_agent_state()
     request_menu.title = "Question".into();
     console.show_focused_menu(request_menu).unwrap();
     assert!(
-        console.state.lock().unwrap().styled_frame().0[0]
+        console.state.lock().unwrap().styled_frame().0[input_dialog::INPUT_DIALOG_RULE_ROWS]
             .text()
             .contains("(1/3)")
     );
@@ -942,7 +1171,11 @@ fn resume_picker_uses_the_bottom_container_and_keeps_the_conversation_visible() 
             .iter()
             .any(|line| line.contains("conversation remains visible"))
     );
-    assert!(state.rendered_screen[12].starts_with("Resume Chat"));
+    assert!(
+        state.rendered_screen
+            [state.height - state.input_dialog_height() + input_dialog::INPUT_DIALOG_RULE_ROWS]
+            .starts_with("Resume Chat")
+    );
     assert_eq!(state.styled_frame().0.len(), 12);
 }
 
@@ -1036,11 +1269,91 @@ fn workspace_trust_and_subscriptions_use_the_fixed_dialog_height() {
 }
 
 #[test]
+fn sticky_prompt_short_conversation_keeps_the_full_content_height() {
+    let console = tests::console_with_state(State::new(true, 160, 24));
+    console.select_chat(Some(Uuid::new_v4())).unwrap();
+    console.show_focused_menu(menu(Uuid::new_v4())).unwrap();
+    let mut state = console.state.lock().unwrap();
+    state
+        .tick_list
+        .replace(TickGroup::Artifacts, fixture_ticks());
+    state.scrollback.append("Leading boundary");
+    state.record_input("Short user request");
+    for index in 0..9 {
+        state.scrollback.append(&format!("Short reply {index}\n"));
+    }
+    state.scrollback.append("Trailing boundary");
+    state.draw(&mut Vec::new()).unwrap();
+    assert!(state.rendered_screen[0].starts_with("Leading boundary"));
+    assert!(state.rendered_screen[0].contains('│'));
+    assert!(
+        state.rendered_screen[..12]
+            .iter()
+            .any(|row| row.contains("Fixture Tick 0"))
+    );
+    assert!(state.rendered_screen[1].starts_with("❯ Short user request"));
+    assert_eq!(
+        state
+            .rendered_screen
+            .iter()
+            .filter(|row| row.contains("Short user request"))
+            .count(),
+        1
+    );
+    assert_eq!(state.input_dialog_height(), input_dialog::INPUT_DIALOG_ROWS);
+    let dialog_top = state.height - state.input_dialog_height();
+    assert!(state.rendered_screen[dialog_top - 1].starts_with("Trailing boundary"));
+    assert!(state.rendered_screen[dialog_top - 1].contains('│'));
+    assert_eq!(state.rendered_screen[dialog_top], "▔".repeat(state.width));
+    assert!(
+        state.rendered_screen[dialog_top + input_dialog::INPUT_DIALOG_RULE_ROWS]
+            .starts_with("Settings")
+    );
+}
+
+#[test]
+fn sticky_prompt_loaded_history_tracks_the_original_message_row() {
+    let console = tests::console_with_state(State::new(true, 80, 24));
+    let chat = Uuid::new_v4();
+    let agent_message = Uuid::new_v4();
+    console.select_chat(Some(chat)).unwrap();
+    let snapshot: crate::runtime::ChatSnapshot = serde_json::from_value(serde_json::json!({
+        "id": chat,
+        "workdir": "/fixture",
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "Loaded user request"}]},
+            {"role": "user", "content": [{"type": "text", "text": "Legacy Agent message"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": (0..40).map(|index| format!("Loaded reply {index}\n\n")).collect::<String>()}]}
+        ],
+        "message_ids": {"1": agent_message},
+        "agent_message_origins": {(agent_message.to_string()): {}},
+        "loops": []
+    })).unwrap();
+    super::super::workflows::write_public_history(&console, &snapshot).unwrap();
+    let mut state = console.state.lock().unwrap();
+    state.draw(&mut Vec::new()).unwrap();
+    assert!(state.rendered_screen[0].starts_with("❯ Loaded user request"));
+    state.scroll_conversation(ScrollAction::First);
+    state.draw(&mut Vec::new()).unwrap();
+    assert!(!state.rendered_screen[0].contains("Loaded user request"));
+    assert_eq!(
+        state
+            .rendered_screen
+            .iter()
+            .filter(|row| row.contains("Loaded user request"))
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn latest_user_message_stays_at_the_top_left_with_ticks_and_an_input_dialog() {
     let mut state = State::new(true, 160, 24);
     state.chat = Some(Uuid::new_v4());
     state.record_input("Most recent user request\nwith more detail");
-    state.scrollback.append("Agent reply\n");
+    for index in 0..30 {
+        state.scrollback.append(&format!("Agent reply {index}\n"));
+    }
     state.tick_list.replace(
         TickGroup::Shells,
         vec![TickListEntry {
@@ -1063,7 +1376,11 @@ fn latest_user_message_stays_at_the_top_left_with_ticks_and_an_input_dialog() {
     state.draw(&mut Vec::new()).unwrap();
     assert!(state.rendered_screen[0].starts_with("❯ Most recent user request"));
     assert!(state.rendered_screen[0].contains('│'));
-    assert!(state.rendered_screen[12].starts_with("Settings"));
+    assert!(
+        state.rendered_screen
+            [state.height - state.input_dialog_height() + input_dialog::INPUT_DIALOG_RULE_ROWS]
+            .starts_with("Settings")
+    );
 }
 
 #[test]
@@ -1076,13 +1393,19 @@ fn latest_user_message_is_scoped_to_its_agent_and_falls_back_on_short_screens() 
         .record_input(&format!("First user {}\nnext line", "界".repeat(40)))
         .unwrap();
     console.select_chat(Some(second)).unwrap();
-    console
-        .set_latest_user_message(second, Some("Loaded second user message".into()))
-        .unwrap();
+    console.record_input("Second user").unwrap();
     {
         let mut state = console.state.lock().unwrap();
         state.draw(&mut Vec::new()).unwrap();
-        assert!(state.rendered_screen[0].contains("Loaded second"));
+        assert!(!state.rendered_screen[0].contains("Second user"));
+        assert_eq!(
+            state
+                .rendered_screen
+                .iter()
+                .filter(|row| row.contains("Second user"))
+                .count(),
+            1
+        );
     }
     console.select_chat(Some(first)).unwrap();
     let mut state = console.state.lock().unwrap();
@@ -1103,6 +1426,127 @@ fn latest_user_message_is_scoped_to_its_agent_and_falls_back_on_short_screens() 
             );
         }
     }
+}
+
+#[test]
+fn sticky_prompt_first_line_boundary_is_stable_on_scroll_and_resize() {
+    let console = tests::console_with_state(State::new(true, 80, 24));
+    console.select_chat(Some(Uuid::new_v4())).unwrap();
+    console.show_focused_menu(menu(Uuid::new_v4())).unwrap();
+    let mut state = console.state.lock().unwrap();
+    state.record_input("Boundary request\ncontinuation visible");
+    for index in 0..9 {
+        state.scrollback.append(&format!("Reply {index}\n"));
+    }
+    for _ in 0..3 {
+        state.draw(&mut Vec::new()).unwrap();
+        assert!(state.rendered_screen[0].starts_with("❯ Boundary request"));
+        assert_eq!(
+            state
+                .rendered_screen
+                .iter()
+                .filter(|row| row.contains("Boundary request"))
+                .count(),
+            1
+        );
+        assert!(state.rendered_screen[1].contains("continuation visible"));
+    }
+    state.scrollback.append("Reply 9\n");
+    state.draw(&mut Vec::new()).unwrap();
+    assert!(state.rendered_screen[0].starts_with("❯ Boundary request continuation visible"));
+    state.resize(80, 25);
+    for _ in 0..3 {
+        state.draw(&mut Vec::new()).unwrap();
+        assert!(state.rendered_screen[0].starts_with("❯ Boundary request"));
+        assert!(!state.rendered_screen[0].contains("continuation visible"));
+        assert!(state.rendered_screen[1].contains("continuation visible"));
+    }
+    state.resize(80, 24);
+    state.draw(&mut Vec::new()).unwrap();
+    state.scroll_conversation(ScrollAction::First);
+    state.scroll_conversation(ScrollAction::LinesDown(2));
+    state.draw(&mut Vec::new()).unwrap();
+    assert!(state.rendered_screen[0].starts_with("❯ Boundary request continuation visible"));
+    assert!(state.rendered_screen[1].contains("continuation visible"));
+    state.scroll_conversation(ScrollAction::LinesUp(1));
+    state.draw(&mut Vec::new()).unwrap();
+    assert!(state.rendered_screen[0].starts_with("❯ Boundary request"));
+    assert!(!state.rendered_screen[0].contains("continuation visible"));
+    assert!(state.rendered_screen[1].contains("continuation visible"));
+}
+
+#[test]
+fn sticky_prompt_latest_message_below_the_viewport_has_no_header() {
+    let mut state = State::new(true, 80, 24);
+    state.chat = Some(Uuid::new_v4());
+    state.record_input("Earlier request");
+    for index in 0..40 {
+        state.scrollback.append(&format!("Earlier reply {index}\n"));
+    }
+    state.record_input("Latest request");
+    for index in 0..40 {
+        state.scrollback.append(&format!("Latest reply {index}\n"));
+    }
+    state.draw(&mut Vec::new()).unwrap();
+    assert!(state.rendered_screen[0].starts_with("❯ Latest request"));
+    state.scroll_conversation(ScrollAction::First);
+    state.scroll_conversation(ScrollAction::LinesDown(10));
+    state.draw(&mut Vec::new()).unwrap();
+    assert!(state.rendered_screen[0].starts_with("Earlier reply"));
+    assert!(
+        !state
+            .rendered_screen
+            .iter()
+            .any(|row| row.contains("Latest request"))
+    );
+}
+
+#[test]
+fn sticky_prompt_reflows_with_width_and_respects_auto_scroll_switches() {
+    let console = tests::console_with_state(State::new(true, 80, 24));
+    console.select_chat(Some(Uuid::new_v4())).unwrap();
+    console.show_focused_menu(menu(Uuid::new_v4())).unwrap();
+    let mut state = console.state.lock().unwrap();
+    state.record_input("Reflow request");
+    state
+        .scrollback
+        .append(&format!("{}\n", "width ".repeat(80)));
+    state.draw(&mut Vec::new()).unwrap();
+    assert!(!state.rendered_screen[0].contains("Reflow request"));
+    assert_eq!(
+        state
+            .rendered_screen
+            .iter()
+            .filter(|row| row.contains("Reflow request"))
+            .count(),
+        1
+    );
+    state.resize(40, 24);
+    state.draw(&mut Vec::new()).unwrap();
+    assert!(state.rendered_screen[0].starts_with("❯ Reflow request"));
+    state.scrollback.set_auto_scroll(false);
+    state.draw(&mut Vec::new()).unwrap();
+    assert!(state.rendered_screen[0].starts_with("❯ Reflow request"));
+    state.scroll_conversation(ScrollAction::First);
+    state.draw(&mut Vec::new()).unwrap();
+    assert!(!state.rendered_screen[0].contains("Reflow request"));
+    state.scrollback.set_auto_scroll(true);
+    state.draw(&mut Vec::new()).unwrap();
+    assert!(!state.rendered_screen[0].contains("Reflow request"));
+    state.scroll_conversation(ScrollAction::Last);
+    state.draw(&mut Vec::new()).unwrap();
+    assert!(state.rendered_screen[0].starts_with("❯ Reflow request"));
+    state.resize(80, 24);
+    state.draw(&mut Vec::new()).unwrap();
+    assert!(!state.rendered_screen[0].contains("Reflow request"));
+    assert_eq!(
+        state
+            .rendered_screen
+            .iter()
+            .filter(|row| row.contains("Reflow request"))
+            .count(),
+        1
+    );
 }
 
 #[test]
@@ -1274,7 +1718,7 @@ fn provider_model_and_connection_dialogs_have_one_fixed_container_and_isolate_in
             let mut state = console.state.lock().unwrap();
             let lines = state.styled_frame().0;
             assert_eq!(lines.len(), expected, "{kind:?}/{width}x{height}");
-            assert!(lines[0].text().contains("Builtin picker"));
+            assert!(lines[1].text().contains("Builtin picker"));
             assert!(
                 !lines
                     .iter()
@@ -1339,7 +1783,7 @@ fn provider_credential_dialog_hides_ordinals_and_keeps_secret_editing_hints() {
         closed.contains(&format!("API key: {}", "*".repeat("secret-value".len()))),
         "{closed}"
     );
-    assert!(closed.contains("Esc cancel"), "{closed}");
+    assert!(closed.contains("Esc back"), "{closed}");
     state.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
     state.key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
     state.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
@@ -1487,4 +1931,1111 @@ fn provider_vendor_headers_never_submit_and_model_rows_keep_mouse_identity() {
     assert!(
         matches!(state.pointer_input, Some(InputEvent::Choice { menu_id, index: 1, .. }) if menu_id == id)
     );
+}
+
+#[tokio::test]
+async fn exit_plan_mode_automatically_opens_the_agent_dialog_and_preserves_it_across_switches() {
+    use crate::terminal::{execution::ConsoleExecution, menus::Menus, test_support};
+    use tickloop_agent::{permissions::ExecutionMode, runtime::EventKind};
+    let directory = tempfile::tempdir().unwrap();
+    let markdown = (0..30)
+        .map(|index| format!("Plan line {index}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let model = Arc::new(test_support::ScriptedModel::new(vec![
+        test_support::submit_plan("plan", &markdown),
+        test_support::text("Implementation started."),
+    ]));
+    let agent = ConsoleExecution::new_embedded(test_support::config(), model.clone());
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let other = agent.create_chat(directory.path().into()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::Plan)
+        .await
+        .unwrap();
+    let mut events = agent.subscribe();
+    agent
+        .submit(chat, None, "Plan the task".into())
+        .await
+        .unwrap();
+    let request = loop {
+        if let EventKind::PermissionRequested { request } =
+            test_support::next_event(&mut events).await.kind
+        {
+            break request;
+        }
+    };
+    let mut state = State::new(true, 80, 24);
+    state.prompt_enabled = true;
+    let console = tests::console_with_state(state);
+    console.select_chat(Some(chat)).unwrap();
+    console
+        .state
+        .lock()
+        .unwrap()
+        .insert("Unsent planning draft");
+    let user_menu = menu(Uuid::new_v4());
+    let user_id = user_menu.id;
+    console.show_menu(user_menu).unwrap();
+    let mut menus = Menus::default();
+    let pending = HashMap::from([(request.id, request.run_id)]);
+    menus
+        .refresh_family_permissions(&agent, &console, &[chat], &pending, &HashMap::new())
+        .await
+        .unwrap();
+    let approval_id = console.dialog_menu_id().unwrap().unwrap();
+    {
+        let mut state = console.state.lock().unwrap();
+        assert_eq!(state.request_layout, Some(request.id));
+        assert_eq!(
+            state.styled_frame().0[0].spans[0].role,
+            Some(Role::PlanMode)
+        );
+        assert!(state.menu_plan);
+        assert_eq!(
+            state.menu_comment.as_ref().unwrap().options,
+            [super::super::workflows::PlanApprovalChoice::KeepPlanning.option_index()]
+        );
+        assert_eq!(
+            state.input_dialog_frame().0.len(),
+            input_dialog::INPUT_DIALOG_ROWS
+        );
+        let frame = state
+            .input_dialog_frame()
+            .0
+            .iter()
+            .map(RoleLine::text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(frame.contains("Plan approval"), "{frame}");
+        assert!(frame.contains("Plan line 0"), "{frame}");
+        state.key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+        assert!(state.full_review);
+        state.key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        let full = state
+            .full_review_frame()
+            .iter()
+            .map(RoleLine::text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(full.contains("Plan line 29"), "{full}");
+        assert!(
+            state
+                .key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+                .is_none()
+        );
+        assert!(!state.full_review);
+    }
+    console.select_chat(Some(other)).unwrap();
+    menus
+        .refresh_family_permissions(&agent, &console, &[other], &pending, &HashMap::new())
+        .await
+        .unwrap();
+    assert!(console.dialog_menu_id().unwrap().is_none());
+    console.select_chat(Some(chat)).unwrap();
+    menus
+        .refresh_family_permissions(&agent, &console, &[chat], &pending, &HashMap::new())
+        .await
+        .unwrap();
+    assert_eq!(console.dialog_menu_id().unwrap(), Some(approval_id));
+    let choice = {
+        let mut state = console.state.lock().unwrap();
+        assert_eq!(
+            state.styled_frame().0[0].spans[0].role,
+            Some(Role::PlanMode)
+        );
+        assert!(state.menu_plan);
+        assert_eq!(state.menu_comment.as_ref().unwrap().label, "Feedback");
+        state.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        state
+            .key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap()
+    };
+    let InputEvent::Choice {
+        menu_id,
+        index,
+        comment,
+    } = choice
+    else {
+        panic!("expected plan choice");
+    };
+    assert_eq!(index, 1);
+    menus
+        .choose(&agent, &console, menu_id, Some(index), comment)
+        .await
+        .unwrap();
+    loop {
+        if matches!(
+            test_support::next_event(&mut events).await.kind,
+            EventKind::Completed { .. }
+        ) {
+            break;
+        }
+    }
+    {
+        let mut state = console.state.lock().unwrap();
+        state.release_finished_submissions();
+        assert_eq!(state.editor.draft(), "Unsent planning draft");
+        assert_eq!(state.menu.as_ref().unwrap().id, user_id);
+    }
+    assert_eq!(
+        agent.snapshot(chat).await.unwrap().policy.mode,
+        ExecutionMode::AcceptEdits
+    );
+    assert_eq!(model.requests.lock().unwrap().len(), 2);
+    let saved = super::super::workflows::Workflow::plan(&agent, chat, request.loop_id)
+        .await
+        .unwrap();
+    menus.workflow(&console, saved).unwrap();
+    {
+        let mut state = console.state.lock().unwrap();
+        assert_eq!(
+            state.styled_frame().0[0].spans[0].role,
+            Some(Role::PlanMode)
+        );
+        assert!(state.menu_plan);
+        assert!(state.menu_comment.is_none());
+        assert_eq!(state.menu.as_ref().unwrap().options, ["Close"]);
+    }
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn restored_pending_plan_automatically_uses_the_same_approval_dialog() {
+    use crate::terminal::{execution::ConsoleExecution, menus::Menus, test_support};
+    use tickloop_agent::{permissions::ExecutionMode, runtime::EventKind};
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("state");
+    let agent = ConsoleExecution::open_embedded(
+        root.clone(),
+        test_support::persisted_config(),
+        Arc::new(test_support::ScriptedModel::new(vec![
+            test_support::submit_plan("plan", "Saved plan for restored approval."),
+        ])),
+    )
+    .unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::Plan)
+        .await
+        .unwrap();
+    let mut events = agent.subscribe();
+    let receipt = agent.submit(chat, None, "Plan".into()).await.unwrap();
+    loop {
+        if matches!(
+            test_support::next_event(&mut events).await.kind,
+            EventKind::PermissionRequested { .. }
+        ) {
+            break;
+        }
+    }
+    agent.shutdown().await;
+    let model = Arc::new(test_support::ScriptedModel::new(vec![test_support::text(
+        "Restored execution started.",
+    )]));
+    let restored =
+        ConsoleExecution::open_embedded(root, test_support::persisted_config(), model.clone())
+            .unwrap();
+    restored.resume_chat(chat).await.unwrap();
+    let console = tests::console_with_state(State::new(true, 80, 24));
+    console.select_chat(Some(chat)).unwrap();
+    let mut menus = Menus::default();
+    menus
+        .refresh_family_permissions(
+            &restored,
+            &console,
+            &[chat],
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+    let id = console
+        .dialog_menu_id()
+        .unwrap()
+        .expect("restored approval opens automatically");
+    assert!(model.requests.lock().unwrap().is_empty());
+    assert_eq!(
+        console.state.lock().unwrap().menu.as_ref().unwrap().title,
+        "Plan approval"
+    );
+    let mut events = restored.subscribe();
+    let effect = menus
+        .choose(&restored, &console, id, Some(1), None)
+        .await
+        .unwrap();
+    assert_eq!(effect.receipt.unwrap().loop_id, receipt.loop_id);
+    loop {
+        if matches!(
+            test_support::next_event(&mut events).await.kind,
+            EventKind::Completed { .. }
+        ) {
+            break;
+        }
+    }
+    assert_eq!(
+        restored.snapshot(chat).await.unwrap().policy.mode,
+        ExecutionMode::AcceptEdits
+    );
+    assert_eq!(model.requests.lock().unwrap().len(), 1);
+    restored.shutdown().await;
+}
+
+#[test]
+fn plan_feedback_uses_text_editing_and_esc_closes_the_field_before_cancelling() {
+    let console = tests::console_with_state(State::new(true, 80, 24));
+    let mut plan = menu(Uuid::new_v4());
+    plan.options = vec![
+        "Auto".into(),
+        "Ask".into(),
+        "Full Access".into(),
+        "No, keep planning".into(),
+    ];
+    plan.selected = 3;
+    plan.confirmation = true;
+    let id = plan.id;
+    console.show_plan_menu(plan, true).unwrap();
+    let mut state = console.state.lock().unwrap();
+    assert_eq!(
+        state.styled_frame().0[0].spans[0].role,
+        Some(Role::PlanMode)
+    );
+    assert!(
+        state
+            .key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .is_none()
+    );
+    assert!(state.menu_comment_is_editing());
+    state.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+    state.paste(" feedback 中文");
+    assert!(
+        state
+            .key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .is_none()
+    );
+    assert!(!state.menu_comment_is_editing());
+    assert_eq!(
+        state.selected_menu_comment().as_deref(),
+        Some("j feedback 中文")
+    );
+    assert!(
+        matches!(state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), Some(InputEvent::Choice { menu_id, index: 3, comment: Some(feedback) }) if menu_id == id && feedback == "j feedback 中文")
+    );
+}
+
+#[tokio::test]
+async fn copied_loop_ids_keep_distinct_pending_plan_dialogs_for_each_agent() {
+    use crate::terminal::{execution::ConsoleExecution, menus::Menus, test_support};
+    use tickloop_agent::{
+        permissions::ExecutionMode,
+        runtime::{BranchRequest, EventKind},
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let agent = ConsoleExecution::open_embedded(
+        directory.path().join("state"),
+        test_support::persisted_config(),
+        Arc::new(test_support::ScriptedModel::new(vec![
+            test_support::submit_plan("plan", "Shared pending plan."),
+            test_support::text("Copy implementation started."),
+        ])),
+    )
+    .unwrap();
+    let source = agent.create_chat(directory.path().into()).await.unwrap();
+    agent
+        .set_execution_mode(source, ExecutionMode::Plan)
+        .await
+        .unwrap();
+    let mut events = agent.subscribe();
+    let receipt = agent.submit(source, None, "Plan".into()).await.unwrap();
+    loop {
+        if matches!(
+            test_support::next_event(&mut events).await.kind,
+            EventKind::PermissionRequested { .. }
+        ) {
+            break;
+        }
+    }
+    agent
+        .decline_plan(source, receipt.loop_id, 1, None)
+        .await
+        .unwrap();
+    loop {
+        if matches!(
+            test_support::next_event(&mut events).await.kind,
+            EventKind::Interrupted
+        ) {
+            break;
+        }
+    }
+    let branch = agent
+        .branch_chat(BranchRequest {
+            request_id: Uuid::new_v4(),
+            source_chat_id: source,
+            source_loop_id: None,
+            name: None,
+        })
+        .await
+        .unwrap();
+    let copy = branch.child_chat_id;
+    assert_eq!(branch.snapshot.plans[0].loop_id, receipt.loop_id);
+    agent.snapshot(source).await.unwrap();
+    agent.snapshot(copy).await.unwrap();
+    let console = tests::console_with_state(State::new(true, 80, 24));
+    let mut menus = Menus::default();
+    console.select_chat(Some(source)).unwrap();
+    menus
+        .refresh_family_permissions(
+            &agent,
+            &console,
+            &[source],
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+    let source_menu = console.dialog_menu_id().unwrap().unwrap();
+    console.select_chat(Some(copy)).unwrap();
+    menus
+        .refresh_family_permissions(&agent, &console, &[copy], &HashMap::new(), &HashMap::new())
+        .await
+        .unwrap();
+    let copy_menu = console.dialog_menu_id().unwrap().unwrap();
+    assert_ne!(copy_menu, source_menu);
+    menus
+        .choose(&agent, &console, copy_menu, Some(1), None)
+        .await
+        .unwrap();
+    loop {
+        if matches!(
+            test_support::next_event(&mut events).await.kind,
+            EventKind::Completed { .. }
+        ) {
+            break;
+        }
+    }
+    assert!(agent.snapshot(source).await.unwrap().plans[0].approval_pending);
+    assert_eq!(
+        agent.snapshot(source).await.unwrap().policy.mode,
+        ExecutionMode::Plan
+    );
+    console.select_chat(Some(source)).unwrap();
+    menus
+        .refresh_family_permissions(
+            &agent,
+            &console,
+            &[source],
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(console.dialog_menu_id().unwrap(), Some(source_menu));
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn another_view_decision_retires_a_restored_plan_dialog_and_stale_esc_cannot_repend_it() {
+    use crate::terminal::{execution::ConsoleExecution, menus::Menus, test_support};
+    use tickloop_agent::{permissions::ExecutionMode, runtime::EventKind};
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("state");
+    let original = ConsoleExecution::open_embedded(
+        root.clone(),
+        test_support::persisted_config(),
+        Arc::new(test_support::ScriptedModel::new(vec![
+            test_support::submit_plan("plan", "Review this plan."),
+        ])),
+    )
+    .unwrap();
+    let chat = original.create_chat(directory.path().into()).await.unwrap();
+    original
+        .set_execution_mode(chat, ExecutionMode::Plan)
+        .await
+        .unwrap();
+    let mut events = original.subscribe();
+    let run = original.submit(chat, None, "Plan".into()).await.unwrap();
+    loop {
+        if matches!(
+            test_support::next_event(&mut events).await.kind,
+            EventKind::PermissionRequested { .. }
+        ) {
+            break;
+        }
+    }
+    original.shutdown().await;
+    let model = Arc::new(test_support::ScriptedModel::new(vec![test_support::text(
+        "Implementation started.",
+    )]));
+    let agent =
+        ConsoleExecution::open_embedded(root, test_support::persisted_config(), model.clone())
+            .unwrap();
+    agent.resume_chat(chat).await.unwrap();
+    let first = tests::console_with_state(State::new(true, 80, 24));
+    let second = tests::console_with_state(State::new(true, 80, 24));
+    first.select_chat(Some(chat)).unwrap();
+    second.select_chat(Some(chat)).unwrap();
+    {
+        let mut state = second.state.lock().unwrap();
+        state.insert("Keep this second View draft");
+        state.last_input_edit = None;
+    }
+    let mut first_menus = Menus::default();
+    let mut second_menus = Menus::default();
+    first_menus
+        .refresh_family_permissions(&agent, &first, &[chat], &HashMap::new(), &HashMap::new())
+        .await
+        .unwrap();
+    second_menus
+        .refresh_family_permissions(&agent, &second, &[chat], &HashMap::new(), &HashMap::new())
+        .await
+        .unwrap();
+    let first_id = first.dialog_menu_id().unwrap().unwrap();
+    let stale_id = second.dialog_menu_id().unwrap().unwrap();
+    let mut events = agent.subscribe();
+    first_menus
+        .choose(&agent, &first, first_id, Some(1), None)
+        .await
+        .unwrap();
+    loop {
+        if matches!(
+            test_support::next_event(&mut events).await.kind,
+            EventKind::Completed { .. }
+        ) {
+            break;
+        }
+    }
+    agent.snapshot(chat).await.unwrap();
+    second_menus
+        .refresh_family_permissions(&agent, &second, &[chat], &HashMap::new(), &HashMap::new())
+        .await
+        .unwrap();
+    assert!(
+        second.dialog_menu_id().unwrap().is_none(),
+        "the other View still owns a processed request"
+    );
+    assert_eq!(second.state.lock().unwrap().request_queue_count, 0);
+    second_menus
+        .choose(&agent, &second, stale_id, None, None)
+        .await
+        .unwrap();
+    assert!(
+        agent
+            .decline_plan(chat, run.loop_id, 1, None)
+            .await
+            .is_err()
+    );
+    let snapshot = agent.snapshot(chat).await.unwrap();
+    assert!(!snapshot.plans[0].approval_pending);
+    assert_eq!(snapshot.policy.mode, ExecutionMode::AcceptEdits);
+    assert_eq!(
+        second.state.lock().unwrap().editor.draft(),
+        "Keep this second View draft"
+    );
+    assert_eq!(model.requests.lock().unwrap().len(), 1);
+    agent.shutdown().await;
+}
+
+#[test]
+fn a_child_can_request_an_existing_plan_without_unlocking_mode_changes() {
+    use crate::terminal::completion::{CommandScope, unavailable_command};
+    assert!(unavailable_command("/plan", CommandScope::Child).is_none());
+    assert!(
+        unavailable_command(
+            "/plan 00000000-0000-0000-0000-000000000001",
+            CommandScope::Child
+        )
+        .is_none()
+    );
+    for command in ["/mode auto", "/rule allow Bash", "/add-dir /tmp"] {
+        assert!(unavailable_command(command, CommandScope::Child).is_some());
+    }
+}
+
+#[tokio::test]
+async fn a_child_reopens_its_dismissed_approval_but_cannot_enter_plan_mode_without_a_plan() {
+    use crate::terminal::{
+        execution::ConsoleExecution, menus::Menus, open_current_plan, test_support,
+    };
+    use tickloop_agent::{
+        permissions::{ExecutionMode, PermissionScope},
+        runtime::EventKind,
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(test_support::ScriptedModel::new(vec![
+        test_support::call(
+            "delegate",
+            "DelegateAgent",
+            serde_json::json!({"task":"Plan the delegated task."}),
+        ),
+        test_support::call("enter", "EnterPlanMode", serde_json::json!({})),
+        test_support::submit_plan("plan", "Child plan to review."),
+        test_support::text("The parent observed the interrupted child."),
+        test_support::call(
+            "execute",
+            "Write",
+            serde_json::json!({"file_path":"child-executed.txt","content":"approved child implementation"}),
+        ),
+        test_support::text("Approved child implementation started."),
+        test_support::text("The parent observed completion."),
+    ]));
+    let core = tickloop_agent::runtime::Agent::new_embedded(test_support::config(), model.clone());
+    let agent = ConsoleExecution::from_embedded(core.clone(), test_support::config());
+    let parent = agent.create_chat(directory.path().into()).await.unwrap();
+    agent
+        .set_execution_mode(parent, ExecutionMode::FullAccess)
+        .await
+        .unwrap();
+    let mut events = core.subscribe();
+    agent
+        .submit(parent, None, "Delegate a plan".into())
+        .await
+        .unwrap();
+    let (child, enter) = loop {
+        let event = test_support::next_event(&mut events).await;
+        match event.kind {
+            EventKind::PermissionRequested { request } => break (event.chat_id, request),
+            EventKind::ToolCompleted { result, .. } if result.is_error => {
+                panic!("child setup failed: {}", result.content)
+            }
+            EventKind::Completed { .. } => panic!("parent completed before child approval request"),
+            EventKind::Failed(error) => panic!("child setup failed: {error}"),
+            _ => {}
+        }
+    };
+    let console = tests::console_with_state(State::new(true, 80, 24));
+    console.select_chat(Some(child)).unwrap();
+    console.set_visible_delegation(true).unwrap();
+    let mut menus = Menus::default();
+    assert!(
+        open_current_plan(
+            &agent,
+            &console,
+            &mut menus,
+            Some(child),
+            Some(enter.loop_id)
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(
+        agent.snapshot(child).await.unwrap().policy.mode,
+        ExecutionMode::FullAccess
+    );
+    agent
+        .answer_permission_with_comment(child, enter.id, true, PermissionScope::Once, None)
+        .await
+        .unwrap();
+    let approval = loop {
+        if let EventKind::PermissionRequested { request } =
+            test_support::next_event(&mut events).await.kind
+        {
+            break request;
+        }
+    };
+    assert_eq!(approval.name, "ExitPlanMode");
+    agent
+        .decline_plan(child, approval.loop_id, 1, None)
+        .await
+        .unwrap();
+    loop {
+        let event = test_support::next_event(&mut events).await;
+        if event.chat_id == child && matches!(event.kind, EventKind::Interrupted) {
+            break;
+        }
+    }
+    loop {
+        let event = test_support::next_event(&mut events).await;
+        if event.chat_id == parent && matches!(event.kind, EventKind::Completed { .. }) {
+            break;
+        }
+    }
+    assert!(
+        crate::terminal::completion::unavailable_command("/plan", console.command_scope())
+            .is_none()
+    );
+    open_current_plan(
+        &agent,
+        &console,
+        &mut menus,
+        Some(child),
+        Some(approval.loop_id),
+    )
+    .await
+    .unwrap();
+    let id = console
+        .dialog_menu_id()
+        .unwrap()
+        .expect("child pending approval must reopen");
+    assert_eq!(
+        console.state.lock().unwrap().menu.as_ref().unwrap().title,
+        "Plan approval"
+    );
+    assert_eq!(
+        agent.snapshot(child).await.unwrap().policy.mode,
+        ExecutionMode::Plan
+    );
+    assert!(!directory.path().join("child-executed.txt").exists());
+    menus
+        .choose(&agent, &console, id, Some(2), None)
+        .await
+        .unwrap();
+    loop {
+        let event = test_support::next_event(&mut events).await;
+        if event.chat_id == child && matches!(event.kind, EventKind::Completed { .. }) {
+            break;
+        }
+    }
+    assert!(!agent.snapshot(child).await.unwrap().plans[0].approval_pending);
+    assert_eq!(
+        agent.snapshot(child).await.unwrap().policy.mode,
+        ExecutionMode::FullAccess
+    );
+    assert_eq!(
+        agent.snapshot(parent).await.unwrap().policy.mode,
+        ExecutionMode::FullAccess
+    );
+    let child_snapshot = core.snapshot(child).await.unwrap();
+    let parent_snapshot = core.snapshot(parent).await.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(directory.path().join("child-executed.txt")).unwrap_or_else(
+            |error| panic!(
+                "{error}: child operations {:?}; parent operations {:?}; model requests {}",
+                child_snapshot.operations,
+                parent_snapshot.operations,
+                model.requests.lock().unwrap().len()
+            )
+        ),
+        "approved child implementation"
+    );
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_new_plan_version_replaces_a_stale_restored_request_in_another_view() {
+    use crate::terminal::{execution::ConsoleExecution, menus::Menus, test_support};
+    use tickloop_agent::{permissions::ExecutionMode, runtime::EventKind};
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("state");
+    let original = ConsoleExecution::open_embedded(
+        root.clone(),
+        test_support::persisted_config(),
+        Arc::new(test_support::ScriptedModel::new(vec![
+            test_support::submit_plan("plan", "First plan."),
+        ])),
+    )
+    .unwrap();
+    let chat = original.create_chat(directory.path().into()).await.unwrap();
+    original
+        .set_execution_mode(chat, ExecutionMode::Plan)
+        .await
+        .unwrap();
+    let mut events = original.subscribe();
+    let run = original.submit(chat, None, "Plan".into()).await.unwrap();
+    loop {
+        if matches!(
+            test_support::next_event(&mut events).await.kind,
+            EventKind::PermissionRequested { .. }
+        ) {
+            break;
+        }
+    }
+    original.shutdown().await;
+    let agent = ConsoleExecution::open_embedded(
+        root,
+        test_support::persisted_config(),
+        Arc::new(test_support::ScriptedModel::new(vec![
+            test_support::call(
+                "read",
+                "Read",
+                serde_json::json!({"file_path":test_support::PLAN_FILE}),
+            ),
+            test_support::submit_plan("revised", "Revised plan."),
+            test_support::text("Implementation started."),
+        ])),
+    )
+    .unwrap();
+    agent.resume_chat(chat).await.unwrap();
+    let console = tests::console_with_state(State::new(true, 80, 24));
+    console.select_chat(Some(chat)).unwrap();
+    let mut menus = Menus::default();
+    menus
+        .refresh_family_permissions(&agent, &console, &[chat], &HashMap::new(), &HashMap::new())
+        .await
+        .unwrap();
+    let old_id = console.dialog_menu_id().unwrap().unwrap();
+    let mut events = agent.subscribe();
+    agent
+        .submit(chat, Some(run.loop_id), "Revise in another View".into())
+        .await
+        .unwrap();
+    let revised = loop {
+        if let EventKind::PermissionRequested { request } =
+            test_support::next_event(&mut events).await.kind
+        {
+            break request;
+        }
+    };
+    agent.snapshot(chat).await.unwrap();
+    menus.note_request(chat, revised.id);
+    let pending = HashMap::from([(revised.id, revised.run_id)]);
+    menus
+        .refresh_family_permissions(&agent, &console, &[chat], &pending, &HashMap::new())
+        .await
+        .unwrap();
+    let new_id = console.dialog_menu_id().unwrap().unwrap();
+    assert_ne!(old_id, new_id);
+    assert!(
+        console
+            .state
+            .lock()
+            .unwrap()
+            .menu
+            .as_ref()
+            .unwrap()
+            .context
+            .iter()
+            .any(|line| line == "Plan version: 2")
+    );
+    assert_eq!(console.state.lock().unwrap().request_queue_count, 1);
+    menus
+        .choose(&agent, &console, old_id, None, None)
+        .await
+        .unwrap();
+    assert!(
+        agent
+            .decline_plan(chat, run.loop_id, 1, None)
+            .await
+            .is_err()
+    );
+    assert!(agent.snapshot(chat).await.unwrap().plans[0].approval_pending);
+    menus
+        .choose(&agent, &console, new_id, Some(1), None)
+        .await
+        .unwrap();
+    loop {
+        if matches!(
+            test_support::next_event(&mut events).await.kind,
+            EventKind::Completed { .. }
+        ) {
+            break;
+        }
+    }
+    assert_eq!(agent.snapshot(chat).await.unwrap().plans[0].version, 2);
+    agent.shutdown().await;
+}
+
+#[test]
+fn input_dialog_finished_settings_transition_accepts_the_next_key_without_idle() {
+    let mut state = State::new(true, 100, 24);
+    state.prompt_enabled = true;
+    let console = tests::console_with_state(state);
+    let first = Uuid::new_v4();
+    let next = Uuid::new_v4();
+    console
+        .show_picker_menu(menu(first), PickerKind::Actions)
+        .unwrap();
+    assert!(
+        matches!(console.state.lock().unwrap().key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), Some(InputEvent::Choice { menu_id, .. }) if menu_id == first)
+    );
+    console
+        .show_picker_menu(menu(next), PickerKind::Actions)
+        .unwrap();
+    console.finish_menu_submission(first).unwrap();
+    assert!(
+        matches!(console.state.lock().unwrap().key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)), Some(InputEvent::Cancel { menu_id }) if menu_id == next)
+    );
+}
+
+#[test]
+fn input_dialog_login_updates_keep_callback_editing_and_origin() {
+    let first = Uuid::new_v4();
+    let second = Uuid::new_v4();
+    let login = Uuid::new_v4();
+    let request = Uuid::new_v4();
+    let mut state = State::new(true, 100, 24);
+    state.chat = Some(first);
+    let console = tests::console_with_state(state);
+    let mut page = menu(login);
+    page.title = "Browser login".into();
+    page.context = vec!["https://fixture.test/authorize".into()];
+    page.options = vec!["Submit callback".into(), "Cancel login".into()];
+    console
+        .show_login_menu(page.clone(), "https://fixture.test/authorize", true)
+        .unwrap();
+    {
+        let mut state = console.state.lock().unwrap();
+        state.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        state.paste("fixture callback draft");
+    }
+    page.context.push("Callback validation failed".into());
+    console
+        .show_login_menu(page, "https://fixture.test/authorize", true)
+        .unwrap();
+    {
+        let state = console.state.lock().unwrap();
+        assert!(state.menu_comment_is_editing());
+        assert_eq!(
+            state.selected_menu_comment().as_deref(),
+            Some("fixture callback draft")
+        );
+    }
+    console.set_request_layout(Some(request)).unwrap();
+    console.show_focused_menu(menu(request)).unwrap();
+    let mut hidden_update = menu(login);
+    hidden_update.context = vec!["https://fixture.test/new-authorize".into()];
+    console
+        .show_login_menu(
+            hidden_update.clone(),
+            "https://fixture.test/new-authorize",
+            true,
+        )
+        .unwrap();
+    assert_eq!(console.dialog_menu_id().unwrap(), Some(request));
+    console
+        .complete_login_menu(login, "Login saved", "Fixture account")
+        .unwrap();
+    assert_eq!(console.dialog_menu_id().unwrap(), Some(request));
+    console.clear_menu(request).unwrap();
+    console.select_chat(Some(second)).unwrap();
+    console
+        .show_login_menu(hidden_update, "https://fixture.test/new-authorize", true)
+        .unwrap();
+    console
+        .complete_login_menu(login, "Login failed", "Controlled late result")
+        .unwrap();
+    assert_eq!(console.dialog_menu_id().unwrap(), None);
+    console.select_chat(Some(first)).unwrap();
+    let mut state = console.state.lock().unwrap();
+    assert_eq!(state.menu.as_ref().unwrap().id, login);
+    assert!(
+        state
+            .menu
+            .as_ref()
+            .unwrap()
+            .context
+            .iter()
+            .any(|line| line.contains("Esc leaves editing first"))
+    );
+    assert_eq!(
+        state
+            .menu_link
+            .as_ref()
+            .map(|(_, address)| address.as_str()),
+        Some("https://fixture.test/new-authorize")
+    );
+    assert!(state.menu_comment_is_editing());
+    assert!(
+        state
+            .styled_frame()
+            .0
+            .last()
+            .unwrap()
+            .text()
+            .contains("Enter return")
+    );
+    assert_eq!(
+        state.selected_menu_comment().as_deref(),
+        Some("fixture callback draft")
+    );
+    assert!(
+        state
+            .key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .is_none()
+    );
+    assert!(
+        matches!(state.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)), Some(InputEvent::Cancel { menu_id }) if menu_id == login)
+    );
+}
+
+#[test]
+fn input_dialog_grouped_models_refresh_only_supported_rows() {
+    let mut state = State::new(true, 100, 24);
+    state.prompt_enabled = true;
+    let console = tests::console_with_state(state);
+    let id = Uuid::new_v4();
+    console
+        .show_presented_picker_menu(
+            menu(id),
+            PickerKind::Model,
+            PickerPresentation {
+                refresh: true,
+                refresh_options: Some(vec![1]),
+                row_hints: vec!["p Connection".into(), "p Connection · r Refresh".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let mut state = console.state.lock().unwrap();
+    assert!(
+        state
+            .key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE))
+            .is_none()
+    );
+    state.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+    assert!(matches!(
+        state.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)),
+        Some(InputEvent::PickerAction {
+            index: 1,
+            action: PickerAction::RefreshAccountModels,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn input_dialog_continuing_submission_releases_only_its_fence() {
+    let mut state = State::new(true, 100, 24);
+    state.prompt_enabled = true;
+    let console = tests::console_with_state(state);
+    let login = Uuid::new_v4();
+    let mut page = menu(login);
+    page.context = vec!["https://fixture.test/authorize".into()];
+    console
+        .show_login_menu(page, "https://fixture.test/authorize", true)
+        .unwrap();
+    {
+        let mut state = console.state.lock().unwrap();
+        state.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        state.paste("callback draft");
+        assert!(
+            matches!(state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), Some(InputEvent::Choice { menu_id, .. }) if menu_id == login)
+        );
+    }
+    console.continue_menu_submission(Uuid::new_v4()).unwrap();
+    assert_eq!(
+        console.state.lock().unwrap().menu_submission_pending,
+        Some(login)
+    );
+    console.continue_menu_submission(login).unwrap();
+    let mut state = console.state.lock().unwrap();
+    assert_eq!(state.menu.as_ref().unwrap().id, login);
+    assert!(state.menu_submission_pending.is_none());
+    assert!(state.menu_comment_is_editing());
+    assert_eq!(
+        state.selected_menu_comment().as_deref(),
+        Some("callback draft")
+    );
+    state.release_finished_submissions();
+    assert!(
+        state
+            .key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .is_none()
+    );
+    assert!(
+        matches!(state.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)), Some(InputEvent::Cancel { menu_id }) if menu_id == login)
+    );
+}
+
+#[tokio::test]
+async fn input_dialog_completed_login_keeps_other_agent_composer_enabled() {
+    use crate::terminal::login::{LoginFlow, LoginMethod, complete_provider_login};
+    let first = Uuid::new_v4();
+    let second = Uuid::new_v4();
+    let mut state = State::new(true, 100, 24);
+    state.chat = Some(first);
+    state.prompt_enabled = true;
+    let console = tests::console_with_state(state);
+    let (flow, _) = LoginFlow::start_fixture(&console, LoginMethod::Device).unwrap();
+    let id = flow.id();
+    let mut login = Some(flow);
+    complete_provider_login(
+        login.as_mut().unwrap(),
+        &console,
+        &Ok("Fixture account".into()),
+    )
+    .unwrap();
+    console.select_chat(Some(second)).unwrap();
+    {
+        let mut state = console.state.lock().unwrap();
+        state.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(
+            state.editor.draft(),
+            "x",
+            "A hidden login must not disable B's Composer"
+        );
+    }
+    console.select_chat(Some(first)).unwrap();
+    assert_eq!(console.dialog_menu_id().unwrap(), Some(id));
+}
+
+#[tokio::test]
+async fn input_dialog_background_provider_completion_updates_only_its_origin_page() {
+    use crate::terminal::login::{LoginFlow, LoginMethod, LoginSession};
+    let directory = tempfile::tempdir().unwrap();
+    let agent = crate::terminal::Agent::new_embedded(
+        crate::terminal::test_support::config(),
+        Arc::new(crate::terminal::test_support::ScriptedModel::new(Vec::new())),
+    );
+    let first = agent.create_chat(directory.path().into()).await.unwrap();
+    let second = agent.create_chat(directory.path().into()).await.unwrap();
+    let mut state = State::new(true, 100, 24);
+    state.chat = Some(first);
+    state.prompt_enabled = true;
+    let console = tests::console_with_state(state);
+    for result in [
+        Ok("Fixture source account".into()),
+        Err("Fixture source refusal".into()),
+    ] {
+        console.select_chat(Some(first)).unwrap();
+        let (flow, _) = LoginFlow::start_fixture(&console, LoginMethod::Device).unwrap();
+        let id = flow.id();
+        let mut session = LoginSession {
+            flow,
+            from_provider: true,
+            succeeded: false,
+        };
+        console.select_chat(Some(second)).unwrap();
+        let before = console.state.lock().unwrap().scrollback.line_count();
+        crate::terminal::finish_provider_login(&agent, &console, &mut session, &result)
+            .await
+            .unwrap();
+        assert_eq!(
+            console.state.lock().unwrap().scrollback.line_count(),
+            before,
+            "A's result must not enter B's transcript"
+        );
+        assert_eq!(console.dialog_menu_id().unwrap(), None);
+        console.select_chat(Some(first)).unwrap();
+        assert_eq!(console.dialog_menu_id().unwrap(), Some(id));
+        console.clear_menu(id).unwrap();
+    }
+    agent.shutdown().await;
+}
+
+#[test]
+fn settings_scroll_new_generation_preserves_context_without_reusing_row_identity() {
+    let mut state = State::new(true, 100, 24);
+    state.prompt_enabled = true;
+    let console = tests::console_with_state(state);
+    let mut first = menu(Uuid::new_v4());
+    first.title = "Settings".into();
+    first.context = (0..20)
+        .map(|index| format!("Explanation {index}"))
+        .collect();
+    first.options = vec!["Auto-scroll".into(), "Reduce motion".into()];
+    console
+        .show_picker_menu(first.clone(), PickerKind::Actions)
+        .unwrap();
+    let before = {
+        let mut state = console.state.lock().unwrap();
+        state.key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        state.context_offset
+    };
+    assert!(before > 0);
+    let mut next = first;
+    next.id = Uuid::new_v4();
+    next.selected = 1;
+    console
+        .show_picker_menu(next.clone(), PickerKind::Actions)
+        .unwrap();
+    {
+        let state = console.state.lock().unwrap();
+        assert_eq!(state.context_offset, before);
+        assert_eq!(state.menu.as_ref().unwrap().id, next.id);
+        assert_eq!(state.menu.as_ref().unwrap().selected, 1);
+    }
+    next.id = Uuid::new_v4();
+    next.title = "Thinking".into();
+    console.show_picker_menu(next, PickerKind::Actions).unwrap();
+    assert_eq!(console.state.lock().unwrap().context_offset, 0);
 }

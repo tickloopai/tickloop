@@ -69,7 +69,7 @@ fn execution_connection_facts_fit_custom_status_help_and_short_screens() {
                             assert!(
                                 text.contains("⏵⏵ Auto")
                                     && text.contains("loss-model")
-                                    && !text.contains("Context"),
+                                    && text.contains("Context unknown"),
                                 "{text}"
                             );
                         }
@@ -115,7 +115,9 @@ fn connection_recovery_removes_the_short_notice_and_restores_core() {
         "{frame}"
     );
     assert!(
-        frame.contains("⏵⏵ Auto") && frame.contains("loss-model") && !frame.contains("Context"),
+        frame.contains("⏵⏵ Auto")
+            && frame.contains("loss-model")
+            && frame.contains("Context unknown"),
         "{frame}"
     );
 }
@@ -283,8 +285,8 @@ fn a_creation_prefix_history_and_loss_rebuild_in_order_once_and_stay_with_the_ch
         console.reset_chat(chat).unwrap();
         crate::terminal::workflows::write_public_history(&console, &snapshot).unwrap();
         let rendered = console_frame(&console);
-        assert!(rendered.lines().next().unwrap().contains("History user"));
-        let frame = rendered.lines().skip(1).collect::<Vec<_>>().join("\n");
+        assert!(!rendered.lines().next().unwrap().contains("History user"));
+        let frame = rendered;
         let mut previous = None;
         for part in [
             "Tick Loop Agent · owned startup",

@@ -325,11 +325,7 @@ impl Agent {
     }
 
     pub(super) async fn start_next_agent_run(&self, chat_id: ChatId) -> Result<(), AgentError> {
-        let next = {
-            let mut chats = self.inner.chats.lock().await;
-            let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
-            self.next_run(chat)?
-        };
+        let next = self.next_run(chat_id).await?;
         if let Some(next) = next {
             self.inner.tasks.lock().await.push(self.run_task(next));
         }

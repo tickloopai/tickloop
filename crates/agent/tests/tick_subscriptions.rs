@@ -616,6 +616,7 @@ async fn a_trigger_rejects_subscriptions_it_cannot_honour() {
         id: Uuid::new_v4(),
         instance: fixture_instance(instance),
         every_seconds,
+        authority: None,
     };
 
     for rejected in [
@@ -784,6 +785,7 @@ async fn a_cancelled_watch_cannot_deliver_late_events_to_a_new_activation() {
         id: subscription,
         instance: fixture_instance(7),
         every_seconds: 5,
+        authority: None,
     });
     agent
         .configure_trigger(chat, loop_id, Some(trigger))
@@ -1104,7 +1106,7 @@ async fn a_fresh_subscription_can_reobserve_a_stopped_instance_without_rearming_
 }
 
 #[tokio::test(start_paused = true)]
-async fn an_over_sized_delivery_blanks_its_largest_data_and_names_the_tool_that_recovers_it() {
+async fn an_over_sized_delivery_blanks_its_largest_data_and_points_to_native_recovery() {
     let directory = tempfile::tempdir().unwrap();
     let model = Arc::new(ScriptedModel::new(vec![
         call(
@@ -1135,7 +1137,10 @@ async fn an_over_sized_delivery_blanks_its_largest_data_and_names_the_tool_that_
 
     let delivered = last_user_text(&model);
     assert!(delivered.contains("\"truncated\":true"), "{delivered}");
-    assert!(delivered.contains("CallTickTool"), "{delivered}");
+    assert!(
+        delivered.contains("native tools for that instance type"),
+        "{delivered}"
+    );
     assert!(delivered.contains("small enough to keep"), "{delivered}");
     assert!(
         !delivered.contains("candlecandle"),
@@ -1234,6 +1239,7 @@ async fn many_subscribed_instances_still_fit_one_loop_delivery_under_sixteen_kib
                 id: Uuid::new_v4(),
                 instance,
                 every_seconds: 5,
+                authority: None,
             })
             .collect(),
     };
@@ -1280,4 +1286,509 @@ async fn many_subscribed_instances_still_fit_one_loop_delivery_under_sixteen_kib
         delivered.len()
     );
     agent.shutdown().await;
+}
+
+async fn invalidated_queued_watch_preserves_user_input(state: Option<TickConnectionState>) {
+    use tickloop_agent::model::*;
+    use tokio::sync::{Notify, mpsc::UnboundedSender};
+    use tokio_util::sync::CancellationToken;
+
+    struct HeldSiblingModel {
+        gate: Arc<Notify>,
+        entered: Arc<Notify>,
+        calls: std::sync::atomic::AtomicUsize,
+        model: Arc<ScriptedModel>,
+    }
+    #[async_trait::async_trait]
+    impl ModelClient for HeldSiblingModel {
+        fn identity(&self) -> ModelIdentity {
+            self.model.identity()
+        }
+        async fn complete(
+            &self,
+            request: ModelRequest,
+            events: UnboundedSender<ModelDelta>,
+            cancel: CancellationToken,
+        ) -> Result<ModelOutput, ModelError> {
+            if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 2 {
+                self.entered.notify_one();
+                self.gate.notified().await;
+            }
+            self.model.complete(request, events, cancel).await
+        }
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "watch",
+            "SubscribeTick",
+            json!({"tick_instance_id":fixture_instance(7)}),
+        ),
+        text("Watching."),
+        text("Sibling finished."),
+        text("User input handled."),
+        text("Unexpected Tick input."),
+    ]));
+    let gate = Arc::new(Notify::new());
+    let entered = Arc::new(Notify::new());
+    let agent = Agent::new_embedded(
+        config(),
+        Arc::new(HeldSiblingModel {
+            gate: gate.clone(),
+            entered: entered.clone(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            model: model.clone(),
+        }),
+    );
+    let stream = InMemoryTickStream::new();
+    agent.install_tick_stream(Arc::new(stream.clone())).await;
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let mut events = agent.subscribe();
+    let watched = agent
+        .submit(chat, None, "Watch the Tick".into())
+        .await
+        .unwrap();
+    wait_for_completion(&mut events).await;
+    let busy = agent
+        .submit(chat, None, "Hold this sibling Loop".into())
+        .await
+        .unwrap();
+    entered.notified().await;
+    stream.push(update(7, 1, "INVALID_QUEUED_TICK"));
+    settle().await;
+    tokio::time::advance(CADENCE).await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while agent
+            .snapshot(chat)
+            .await
+            .unwrap()
+            .pending_inputs
+            .is_empty()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let user = agent
+        .submit(chat, None, "Keep this queued user input".into())
+        .await
+        .unwrap();
+    if let Some(state) = state {
+        stream.emit(TickStreamEvent::State {
+            instance: fixture_instance(7),
+            state,
+            audience: audience(&stream, 7),
+        });
+    } else {
+        let subscription = agent.tick_subscriptions(chat).await.unwrap()[0].id;
+        agent
+            .update_tick_subscription(chat, subscription, TickSubscriptionChange::Cancel)
+            .await
+            .unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let snapshot = agent.snapshot(chat).await.unwrap();
+            if snapshot.pending_inputs.len() == 1 {
+                assert_eq!(snapshot.pending_inputs[0].receipt.run_id, user.run_id);
+                assert_ne!(
+                    snapshot
+                        .loops
+                        .iter()
+                        .find(|goal| goal.id == watched.loop_id)
+                        .unwrap()
+                        .state,
+                    LoopState::Queued
+                );
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    gate.notify_one();
+    let mut completed = BTreeSet::new();
+    while !completed.contains(&busy.run_id) || !completed.contains(&user.run_id) {
+        let event = next_event(&mut events).await;
+        if matches!(event.kind, EventKind::Completed { .. }) {
+            completed.insert(event.run_id);
+        }
+    }
+    assert!(
+        agent
+            .snapshot(chat)
+            .await
+            .unwrap()
+            .pending_inputs
+            .is_empty()
+    );
+    let request_count = model.requests.lock().unwrap().len();
+    let last_input = last_user_text(&model);
+    agent.shutdown().await;
+    assert_eq!(request_count, 4);
+    assert!(last_input.contains("Keep this queued user input"));
+    assert!(!last_input.contains("INVALID_QUEUED_TICK"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn uncertain_watch_removes_queued_tick_without_removing_user_input() {
+    invalidated_queued_watch_preserves_user_input(Some(TickConnectionState::IdentityUncertain))
+        .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn gone_watch_removes_queued_tick_without_removing_user_input() {
+    invalidated_queued_watch_preserves_user_input(Some(TickConnectionState::Gone)).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancelled_watch_removes_queued_tick_without_removing_user_input() {
+    invalidated_queued_watch_preserves_user_input(None).await;
+}
+
+async fn chat_reading_final_admission(cancel_during_check: bool) {
+    use tickloop_agent::host_tools::HostToolAuthority;
+    use tickloop_agent::tick_stream::{TickStreamHandle, TickStreamPort, WatchId};
+    struct ChatReadingStream {
+        updates: InMemoryTickStream,
+        agent: std::sync::Weak<Agent>,
+        checks: Arc<std::sync::atomic::AtomicUsize>,
+        gate: Option<Arc<tokio::sync::Notify>>,
+        entered: Arc<tokio::sync::Notify>,
+    }
+    #[async_trait::async_trait]
+    impl TickStreamPort for ChatReadingStream {
+        fn set_watch_authorities(
+            &self,
+            authorities: std::collections::BTreeMap<WatchId, HostToolAuthority>,
+        ) {
+            self.updates.set_watch_authorities(authorities);
+        }
+        fn open(&self) -> TickStreamHandle {
+            self.updates.open()
+        }
+        async fn revalidate_watch(
+            &self,
+            chat: Uuid,
+            instance: &InstanceRef,
+            authority: Option<&HostToolAuthority>,
+        ) -> Result<(), String> {
+            self.agent
+                .upgrade()
+                .ok_or("Agent unavailable")?
+                .snapshot(chat)
+                .await
+                .map_err(|error| error.to_string())?;
+            self.updates
+                .revalidate_watch(chat, instance, authority)
+                .await?;
+            let check = self
+                .checks
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if check == 2
+                && let Some(gate) = &self.gate
+            {
+                self.entered.notify_one();
+                gate.notified().await;
+            }
+            Ok(())
+        }
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "s1",
+            "SubscribeTick",
+            json!({"tick_instance_id":fixture_instance(7)}),
+        ),
+        text("Watching."),
+        text("Tick update handled."),
+    ]));
+    let agent = Arc::new(Agent::new_embedded(config(), model.clone()));
+    let updates = InMemoryTickStream::new();
+    let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let entered = Arc::new(tokio::sync::Notify::new());
+    agent
+        .install_tick_stream(Arc::new(ChatReadingStream {
+            updates: updates.clone(),
+            agent: Arc::downgrade(&agent),
+            checks: checks.clone(),
+            gate: cancel_during_check.then(|| gate.clone()),
+            entered: entered.clone(),
+        }))
+        .await;
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let mut events = agent.subscribe();
+    agent
+        .submit(chat, None, "Watch this Tick".into())
+        .await
+        .unwrap();
+    wait_for_completion(&mut events).await;
+    updates.push(update(7, 1, "changed"));
+    settle().await;
+    tokio::time::advance(CADENCE).await;
+    if cancel_during_check {
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+        let subscription = agent.tick_subscriptions(chat).await.unwrap()[0].id;
+        agent
+            .update_tick_subscription(chat, subscription, TickSubscriptionChange::Cancel)
+            .await
+            .unwrap();
+        gate.notify_one();
+        settle().await;
+        assert!(
+            agent
+                .snapshot(chat)
+                .await
+                .unwrap()
+                .pending_inputs
+                .is_empty()
+        );
+    } else {
+        wait_for_completion(&mut events).await;
+    }
+    assert!(
+        checks.load(std::sync::atomic::Ordering::SeqCst) >= 3,
+        "delivery, trigger submission and actual run admission each revalidate the Watch"
+    );
+    assert_eq!(
+        model.requests.lock().unwrap().len(),
+        if cancel_during_check { 2 } else { 3 }
+    );
+    agent.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn final_tick_admission_allows_the_stream_to_read_its_chat() {
+    chat_reading_final_admission(false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancelling_a_watch_during_async_admission_discards_its_tick_input() {
+    chat_reading_final_admission(true).await;
+}
+
+async fn unaffected_watch_queue(cancel_other: bool, include_other: bool) {
+    let expect_retained = !cancel_other || !include_other;
+    use tickloop_agent::model::*;
+    use tokio::sync::{Notify, mpsc::UnboundedSender};
+    use tokio_util::sync::CancellationToken;
+
+    struct HeldSiblingModel {
+        gate: Arc<Notify>,
+        entered: Arc<Notify>,
+        calls: std::sync::atomic::AtomicUsize,
+        model: Arc<ScriptedModel>,
+    }
+    #[async_trait::async_trait]
+    impl ModelClient for HeldSiblingModel {
+        fn identity(&self) -> ModelIdentity {
+            self.model.identity()
+        }
+        async fn complete(
+            &self,
+            request: ModelRequest,
+            events: UnboundedSender<ModelDelta>,
+            cancel: CancellationToken,
+        ) -> Result<ModelOutput, ModelError> {
+            if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 2 {
+                self.entered.notify_one();
+                self.gate.notified().await;
+            }
+            self.model.complete(request, events, cancel).await
+        }
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "watch-a",
+            "SubscribeTick",
+            json!({"tick_instance_id":fixture_instance(7)}),
+        )
+        .into_iter()
+        .chain(call(
+            "watch-b",
+            "SubscribeTick",
+            json!({"tick_instance_id":fixture_instance(8)}),
+        ))
+        .collect(),
+        text("Watching."),
+        text("Sibling finished."),
+        text("User input handled."),
+        text("Valid B input handled."),
+    ]));
+    let gate = Arc::new(Notify::new());
+    let entered = Arc::new(Notify::new());
+    let agent = Agent::new_embedded(
+        config(),
+        Arc::new(HeldSiblingModel {
+            gate: gate.clone(),
+            entered: entered.clone(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            model: model.clone(),
+        }),
+    );
+    let stream = InMemoryTickStream::new();
+    agent.install_tick_stream(Arc::new(stream.clone())).await;
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let mut events = agent.subscribe();
+    let watched = agent
+        .submit(chat, None, "Watch the Tick".into())
+        .await
+        .unwrap();
+    wait_for_completion(&mut events).await;
+    let busy = agent
+        .submit(chat, None, "Hold this sibling Loop".into())
+        .await
+        .unwrap();
+    entered.notified().await;
+    if include_other {
+        stream.push(update(7, 1, "QUEUED_A_TICK"));
+    }
+    stream.push(update(8, 1, "VALID_B_ONLY_QUEUED_TICK"));
+    settle().await;
+    tokio::time::advance(CADENCE).await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while agent
+            .snapshot(chat)
+            .await
+            .unwrap()
+            .pending_inputs
+            .is_empty()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let before = agent.snapshot(chat).await.unwrap();
+    let pending = before
+        .pending_inputs
+        .iter()
+        .find(|pending| pending.receipt.loop_id == watched.loop_id)
+        .unwrap()
+        .clone();
+    assert_eq!(
+        pending.trigger_source.as_ref().unwrap().payload["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        if include_other { 2 } else { 1 }
+    );
+    assert!(
+        pending.trigger_source.as_ref().unwrap().payload["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["instance"] == json!(fixture_instance(8)))
+    );
+    let subscription = agent
+        .tick_subscriptions(chat)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|subscription| subscription.instance == fixture_instance(7))
+        .unwrap()
+        .id;
+    let user = agent
+        .submit(chat, None, "Keep the queued user input".into())
+        .await
+        .unwrap();
+    let change = if cancel_other {
+        TickSubscriptionChange::Cancel
+    } else {
+        TickSubscriptionChange::Cadence(120)
+    };
+    agent
+        .update_tick_subscription(chat, subscription, change)
+        .await
+        .unwrap();
+    let after = agent.snapshot(chat).await.unwrap();
+    let retained = after
+        .pending_inputs
+        .iter()
+        .any(|queued| queued.receipt.run_id == pending.receipt.run_id);
+    let b_still_admitted = agent
+        .tick_subscriptions(chat)
+        .await
+        .unwrap()
+        .iter()
+        .any(|subscription| subscription.instance == fixture_instance(8));
+    assert!(
+        after
+            .pending_inputs
+            .iter()
+            .any(|queued| queued.receipt.run_id == user.run_id)
+    );
+    gate.notify_one();
+    let mut completed = BTreeSet::new();
+    let mut expected = BTreeSet::from([busy.run_id, user.run_id]);
+    if expect_retained {
+        expected.insert(pending.receipt.run_id);
+    }
+    while completed != expected {
+        let event = next_event(&mut events).await;
+        if matches!(event.kind, EventKind::Completed { .. }) && expected.contains(&event.run_id) {
+            completed.insert(event.run_id);
+        }
+    }
+    let finished = agent.snapshot(chat).await.unwrap();
+    let requests = {
+        let requests = model.requests.lock().unwrap();
+        (
+            requests.len(),
+            serde_json::to_string(&requests.last().unwrap().messages).unwrap(),
+        )
+    };
+    agent.shutdown().await;
+    assert!(b_still_admitted);
+    assert_eq!(
+        retained, expect_retained,
+        "queued Tick input retention must depend on its included Watches"
+    );
+    assert!(finished.pending_inputs.is_empty());
+    assert_eq!(
+        finished
+            .loops
+            .iter()
+            .find(|goal| goal.id == watched.loop_id)
+            .unwrap()
+            .state,
+        LoopState::WaitingTrigger
+    );
+    assert_eq!(requests.0, if expect_retained { 5 } else { 4 });
+    assert_eq!(
+        requests.1.contains("VALID_B_ONLY_QUEUED_TICK"),
+        expect_retained
+    );
+    assert_eq!(
+        requests.1.contains("QUEUED_A_TICK"),
+        expect_retained && include_other
+    );
+    assert!(requests.1.contains("Keep the queued user input"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancelling_other_watch_preserves_valid_queued_input() {
+    unaffected_watch_queue(true, false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn changing_other_watch_cadence_preserves_valid_queued_input() {
+    unaffected_watch_queue(false, false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancelling_an_included_watch_discards_the_whole_queued_input() {
+    unaffected_watch_queue(true, true).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn changing_included_watch_cadence_preserves_valid_queued_input() {
+    unaffected_watch_queue(false, true).await;
 }

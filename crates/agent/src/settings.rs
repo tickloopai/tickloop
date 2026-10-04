@@ -47,6 +47,7 @@ const CONTEXT_WINDOW_KEY: &str = "contextWindowTokens";
 const GLYPH_SET_KEY: &str = "glyphSet";
 const PREFERS_REDUCED_MOTION_KEY: &str = "prefersReducedMotion";
 const TICK_LIST_KEY: &str = "tickList";
+const PROMPT_SUGGESTION_ENABLED_KEY: &str = "promptSuggestionEnabled";
 /// Claude Code's `outputStyle` setting.
 const OUTPUT_STYLE_KEY: &str = "outputStyle";
 /// 照 Claude Code `cleanupPeriodDays`：保留对话记录等文件的天数；0 表示不写 Transcript。
@@ -371,6 +372,19 @@ impl LoadedSettings {
             .cloned()
             .and_then(|value| serde_json::from_value(value).ok())
             .unwrap_or_default()
+    }
+
+    pub fn prompt_suggestion_enabled(&mut self) -> bool {
+        match self.settings.get(PROMPT_SUGGESTION_ENABLED_KEY) {
+            Some(Value::Bool(enabled)) => *enabled,
+            None => true,
+            Some(_) => {
+                self.warn(format!(
+                    "`{PROMPT_SUGGESTION_ENABLED_KEY}` is not a boolean and is ignored"
+                ));
+                true
+            }
+        }
     }
 
     pub fn display_preferences(&mut self) -> DisplayPreferences {
@@ -886,6 +900,13 @@ impl UserSettings {
                 TICK_LIST_KEY.into(),
                 serde_json::to_value(preference).expect("tick list preference serializes to JSON"),
             );
+            Ok(())
+        })
+    }
+
+    pub fn save_prompt_suggestion_enabled(&self, enabled: bool) -> Result<(), SettingsError> {
+        self.update(|settings| {
+            settings.insert(PROMPT_SUGGESTION_ENABLED_KEY.into(), enabled.into());
             Ok(())
         })
     }

@@ -14,7 +14,7 @@ const CHOICES: [&str; 2] = ["No, exit", "Yes, I trust this folder"];
 pub(super) const TRUST_CANCEL_CHOICE_INDEX: usize = 0;
 pub(super) const TRUST_ACCEPT_CHOICE_INDEX: usize = 1;
 const MIN_TRUST_COLUMNS: usize = 2;
-const RULE_MIN_HEIGHT: usize = 16;
+const WORKSPACE_TRUST_TITLE: &str = "Accessing workspace:";
 
 pub(super) struct WorkspaceTrustFrame {
     pub(super) lines: Vec<RoleLine>,
@@ -123,12 +123,13 @@ impl WorkspaceTrust {
         display: DisplayProfile,
     ) -> WorkspaceTrustFrame {
         let wrap_width = width.max(1);
-        let mut heading: Vec<_> = wrap_text("Accessing workspace:", wrap_width)
+        let sanitized_path = safe_line(&self.workdir.to_string_lossy());
+        let mut heading: Vec<_> = wrap_text(WORKSPACE_TRUST_TITLE, wrap_width)
             .into_iter()
             .map(|line| RoleLine::role(line, Role::DialogTitle))
             .collect();
         heading.extend(
-            wrap_text(&safe_line(&self.workdir.to_string_lossy()), wrap_width)
+            wrap_text(&sanitized_path, wrap_width)
                 .into_iter()
                 .map(|line| RoleLine::role(line, Role::Strong)),
         );
@@ -185,7 +186,15 @@ impl WorkspaceTrust {
             .flat_map(|error| wrap_text(error, wrap_width))
             .map(|line| RoleLine::role(line, Role::Error))
             .collect();
-        let required_rows = heading.len() + error_lines.len() + actions.len();
+        let mut required_rows = heading.len() + error_lines.len() + actions.len();
+        let compact_heading = format!("{WORKSPACE_TRUST_TITLE} {sanitized_path}");
+        if required_rows > height && wrap_text(&compact_heading, wrap_width).len() == 1 {
+            let mut line = RoleLine::role(WORKSPACE_TRUST_TITLE, Role::DialogTitle);
+            line.push(" ", None);
+            line.push(&sanitized_path, Some(Role::Strong));
+            heading = vec![line];
+            required_rows = heading.len() + error_lines.len() + actions.len();
+        }
         if width < MIN_TRUST_COLUMNS || required_rows > height {
             let mut lines = error_lines;
             lines.extend(
@@ -207,11 +216,7 @@ impl WorkspaceTrust {
             };
         }
         let mut body = Vec::new();
-        let mut remaining_rows = height - required_rows;
-        if height >= RULE_MIN_HEIGHT && remaining_rows > 0 {
-            body.push(RoleLine::role("─".repeat(width), Role::Accent));
-            remaining_rows -= 1;
-        }
+        let remaining_rows = height - required_rows;
         body.extend(heading);
         body.extend(error_lines);
         let mut explanation = Vec::new();

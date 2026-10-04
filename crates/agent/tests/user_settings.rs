@@ -22,6 +22,23 @@ fn selected_model() -> ModelConfig {
 }
 
 #[test]
+fn prompt_suggestions_default_on_and_can_be_disabled_without_losing_settings() {
+    let directory = tempfile::tempdir().unwrap();
+    let settings = UserSettings::in_root(directory.path());
+    assert!(settings.load().prompt_suggestion_enabled());
+    std::fs::write(
+        directory.path().join("settings.json"),
+        r#"{"futureSetting": 42}"#,
+    )
+    .unwrap();
+    settings.save_prompt_suggestion_enabled(false).unwrap();
+    assert!(!settings.load().prompt_suggestion_enabled());
+    assert_eq!(settings_json(directory.path())["futureSetting"], 42);
+    settings.save_prompt_suggestion_enabled(true).unwrap();
+    assert!(settings.load().prompt_suggestion_enabled());
+}
+
+#[test]
 fn display_preferences_round_trip_without_replacing_unrelated_settings() {
     let directory = tempfile::tempdir().unwrap();
     let settings = UserSettings::in_root(directory.path());
@@ -405,11 +422,17 @@ fn settings_json(root: &Path) -> serde_json::Value {
 #[tokio::test]
 async fn builtin_model_and_rules_apply_after_restart_without_context_tuning() {
     let directory = tempfile::tempdir().unwrap();
-    let root = directory.path().join("root");
+    let root = directory.path().canonicalize().unwrap().join("root");
     let workdir = directory.path().join("work");
     let other_project = directory.path().join("other");
     std::fs::create_dir_all(&workdir).unwrap();
     std::fs::create_dir_all(&other_project).unwrap();
+    tickloop_agent::model::credentials::save_api_key(
+        &root,
+        &selected_model().api_key_env,
+        "fixture-settings-key",
+    )
+    .unwrap();
     let shell = json!({"command":"printf persisted"});
     let first = Agent::open_embedded(
         root.clone(),

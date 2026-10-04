@@ -23,6 +23,8 @@ pub mod access;
 pub mod availability;
 pub mod cards;
 mod chat_completions;
+mod generation_budget;
+pub use generation_budget::GenerationBudget;
 mod codex;
 pub mod connection;
 pub mod copilot;
@@ -31,6 +33,7 @@ mod glm;
 mod google;
 pub(crate) mod history;
 mod image_limits;
+mod kimi;
 mod provider_directory;
 mod provider_failure;
 pub use provider_failure::{ProviderFailureClass, ProviderHttpFailure};
@@ -1558,20 +1561,7 @@ impl HttpModelClient {
         )
         .emit();
         let mut response = sent?;
-        let retry_after = response
-            .headers()
-            .get(reqwest::header::RETRY_AFTER)
-            .and_then(|value| value.to_str().ok())
-            .and_then(provider_failure::parse_retry_after);
-        let should_retry = response
-            .headers()
-            .get("x-should-retry")
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| match value.trim() {
-                "true" => Some(true),
-                "false" => Some(false),
-                _ => None,
-            });
+        let (retry_after, should_retry) = provider_failure::retry_headers(response.headers());
         let status = response.status().as_u16();
         if !(200..=299).contains(&status) {
             let error_body = provider_failure::read_error_body(&mut response, &cancel).await?;
@@ -1635,6 +1625,18 @@ impl HttpModelClient {
                 };
                 failure.set_class(class, should_retry);
                 failure.hint.push_str(&format!(" {}", error));
+            }
+            if self.config.adapter() == cards::Adapter::KimiChatCompletions
+                && kimi::http_error(status, body.as_ref()).is_some()
+            {
+                failure.set_class(
+                    if self.config.auth_source == ModelAuthSource::KimiOAuth && status == 403 {
+                        ProviderFailureClass::UsageOrPlan
+                    } else {
+                        ProviderFailureClass::UsageLimit
+                    },
+                    should_retry,
+                );
             }
             failure.require_complete_body(error_body.complete, &secrets);
             return Err(ModelError::ProviderHttp(Box::new(failure)));

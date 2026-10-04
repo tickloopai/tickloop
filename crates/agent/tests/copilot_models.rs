@@ -491,6 +491,55 @@ async fn claude_requests_use_the_copilot_token_and_client_identity() {
 }
 
 #[tokio::test]
+async fn copilot_raw_reasoning_prefix_completion_delivers_normal_answers_and_rejects_conflicts() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    sign_in(&root).await;
+    for added_prefix in [true, false] {
+        for completed in ["Thinking", "Contradictory"] {
+            let (url, mut received) = serve_responses(vec![(
+                200,
+                model_http_support::raw_reasoning_prefix_reply(added_prefix, completed, true),
+            )])
+            .await;
+            let client = model_client(configured("gpt-6-luna", &url), Some(&root)).unwrap();
+            let (events, mut deltas) = mpsc::unbounded_channel();
+            let result = client
+                .complete(
+                    request(vec![user("Hello")], None),
+                    events,
+                    CancellationToken::new(),
+                )
+                .await;
+            received.recv().await.unwrap();
+            if completed == "Contradictory" {
+                assert!(
+                    matches!(result, Err(ModelError::InvalidResponse(_))),
+                    "inconsistent Copilot reasoning must fail"
+                );
+                continue;
+            }
+            let output =
+                result.expect("Copilot reasoning prefixes can complete across rotating item IDs");
+            let mut thinking = String::new();
+            let mut text = String::new();
+            while let Ok(delta) = deltas.try_recv() {
+                match delta {
+                    tickloop_agent::model::ModelDelta::Thinking(value) => thinking.push_str(&value),
+                    tickloop_agent::model::ModelDelta::Text(value) => text.push_str(&value),
+                    _ => {}
+                }
+            }
+            assert_eq!(thinking, "Thinking");
+            assert_eq!(text, "Answer");
+            assert!(
+                matches!(&output.content[0], Content::ProtocolData { value, .. } if value["content"][0]["text"] == "Thinking" && value["encrypted_content"] == "opaque-completed")
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn gpt_requests_use_responses_without_replaying_connection_bound_reasoning() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().canonicalize().unwrap();

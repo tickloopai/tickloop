@@ -871,14 +871,33 @@ impl ChatRecorder {
         );
     }
 
-    /// 恢复后的 Loop 视为已在链上：恢复规则带来的变化（转为已中断、解除武装）不写入文件，
-    /// 之后再次恢复时按同样的规则得到同样的结果，等待手动恢复的 Trigger 也不会因此丢失。
-    fn adopt_restored_loops(&self, snapshot: &ChatSnapshot) {
+    /// Adopt ordinary recovery state without rewriting it. Keep the actual recorded plan state
+    /// as the comparison baseline so plan normalization is checkpointed before the View loads.
+    fn adopt_restored_loops(
+        &self,
+        snapshot: &ChatSnapshot,
+        checkpoints: &[super::plan::PlanCheckpoint],
+    ) {
+        let recorded_plans = checkpoints
+            .iter()
+            .filter_map(|checkpoint| {
+                checkpoint
+                    .plan_version
+                    .map(|version| (checkpoint.loop_id, (version, checkpoint.approval_pending)))
+            })
+            .collect::<HashMap<_, _>>();
         if let Some(log) = self.logs.lock().unwrap().get_mut(&snapshot.id) {
             log.recorded_loops = snapshot
                 .loops
                 .iter()
-                .map(|goal| (goal.id, loop_entry_content(snapshot, goal)))
+                .map(|goal| {
+                    let (mut record, run) = loop_entry_content(snapshot, goal);
+                    record.plan_version = recorded_plans.get(&goal.id).map(|(version, _)| *version);
+                    record.plan_approval_pending = recorded_plans
+                        .get(&goal.id)
+                        .is_some_and(|(_, pending)| *pending);
+                    (goal.id, (record, run))
+                })
                 .collect();
             log.created_loops = snapshot.loops.iter().map(|goal| goal.id).collect();
         }
@@ -1042,7 +1061,11 @@ fn loop_entry_content(snapshot: &ChatSnapshot, goal: &LoopSnapshot) -> LoopEntry
                 .iter()
                 .filter_map(|source| serde_json::to_value(source).ok())
                 .collect(),
-            plan_version: None,
+            plan_version: super::plan::highest_plan_version(snapshot, goal.id),
+            plan_approval_pending: snapshot
+                .plans
+                .iter()
+                .any(|plan| plan.loop_id == goal.id && plan.approval_pending),
             progress: None,
             state_since: goal.state_since.map(serde_json::Value::from),
         },
@@ -1135,7 +1158,7 @@ fn record_loop(
     *parent = Some(entry.uuid);
     log.created_loops.insert(loop_id);
     log.recorded_loops
-        .insert(loop_id, (record.without_plan(), run_id));
+        .insert(loop_id, (record.without_progress(), run_id));
     Line::System(entry)
 }
 
@@ -1649,6 +1672,7 @@ impl RestoredChain {
                 position: *position,
                 loop_id: record.loop_id,
                 plan_version: record.plan_version,
+                approval_pending: record.plan_approval_pending,
                 progress: record
                     .progress
                     .clone()
@@ -1852,6 +1876,24 @@ fn file_history_snapshots(loaded: &LoadedTranscript) -> Vec<FileHistorySnapshot>
 }
 
 impl Agent {
+    pub(super) async fn checkpoint_plan_approval(
+        &self,
+        snapshot: &ChatSnapshot,
+    ) -> Result<(), String> {
+        let Some(recorder) = &self.inner.recorder else {
+            return Ok(());
+        };
+        recorder.enqueue_sync(snapshot);
+        let path = recorder
+            .path_for_chat(snapshot.id)
+            .ok_or("Plan approval has no Transcript path")?;
+        let writer = recorder.writer.clone();
+        tokio::task::spawn_blocking(move || writer.checkpoint_blocking(&path))
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())
+    }
+
     pub(super) async fn checkpoint_connection(
         &self,
         snapshot: &ChatSnapshot,
@@ -2250,9 +2292,10 @@ impl Agent {
             recover_transcript(chat_id, &loaded, &restored, &removed, source_chat_id)?;
         self.require_working_directory_trust(&recovered.snapshot.workdir)?;
         let plans_directory = recorder.plans_directory();
+        let plan_checkpoints = restored.without(&removed).plan_checkpoints();
         let plan_warnings = super::plan::rebuild_plans_and_progress(
             &mut recovered.snapshot,
-            &restored.without(&removed).plan_checkpoints(),
+            &plan_checkpoints,
             Some(&plans_directory),
         )?;
         loaded.warnings.extend(plan_warnings);
@@ -2275,6 +2318,19 @@ impl Agent {
             snapshot.additional_directories = delegation.ceiling.additional_directories.clone();
             snapshot.policy = delegation.ceiling.policy.clone();
         }
+        if snapshot.plans.iter().any(|plan| plan.approval_pending) {
+            snapshot.policy.mode = ExecutionMode::Plan;
+            for goal in &mut snapshot.loops {
+                if !matches!(goal.state, LoopState::Stopped | LoopState::Expired)
+                    && snapshot
+                        .plans
+                        .iter()
+                        .any(|plan| plan.loop_id == goal.id && plan.approval_pending)
+                {
+                    goal.recover_state(LoopState::WaitingPlan);
+                }
+            }
+        }
         let mut file_history = FileHistory::restore(
             self.file_history_directory(source_chat_id, &snapshot.workdir),
             file_history_snapshots(&loaded),
@@ -2292,7 +2348,7 @@ impl Agent {
                     recovered.meta_messages,
                     loaded,
                 );
-                recorder.adopt_restored_loops(&snapshot);
+                recorder.adopt_restored_loops(&snapshot, &plan_checkpoints);
             }
             RestoreTarget::NewChat { .. } => {
                 // 照 Claude Code `copyPlanForFork`：以新 chatId 恢复时使用新的 slug 并复制计划文件。
@@ -2327,6 +2383,9 @@ impl Agent {
                 }
             }
         }
+        self.checkpoint_plan_approval(&snapshot)
+            .await
+            .map_err(AgentError::Storage)?;
         let tools = self.create_chat_tools(chat_id, &snapshot.workdir);
         let skills = crate::skills::SkillRegistry::discover(
             &snapshot.workdir,

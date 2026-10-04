@@ -16,60 +16,128 @@ use tickloop_agent::{
 use uuid::Uuid;
 
 #[tokio::test]
-async fn plans_can_be_revised_and_only_the_current_version_can_be_approved() {
+async fn exit_plan_mode_waits_for_approval_before_the_next_model_request() {
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        submit_plan("approval", "Read notes and write the report."),
+        text("Implementation started."),
+    ]));
+    let agent = Agent::new_embedded(config(), model.clone());
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    enter_plan_mode(&agent, chat).await;
+    let mut events = agent.subscribe();
+    let receipt = agent
+        .submit(chat, None, "Plan the report".into())
+        .await
+        .unwrap();
+    loop {
+        match next_event(&mut events).await.kind {
+            EventKind::PermissionRequested { request }
+                if request.name == EXIT_PLAN_MODE_TOOL_NAME =>
+            {
+                break;
+            }
+            EventKind::ToolCompleted { call_id, .. } if call_id == "approval" => {
+                panic!("ExitPlanMode completed without opening an approval request")
+            }
+            EventKind::Completed { .. } => {
+                panic!("Run completed without opening an approval request")
+            }
+            EventKind::Failed(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    assert_eq!(model.requests.lock().unwrap().len(), 1);
+    agent
+        .approve_plan(chat, receipt.loop_id, 1, ExecutionMode::Auto)
+        .await
+        .unwrap();
+    loop {
+        match next_event(&mut events).await.kind {
+            EventKind::Completed { .. } => break,
+            EventKind::Failed(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    let snapshot = agent.snapshot(chat).await.unwrap();
+    assert_eq!(snapshot.policy.mode, ExecutionMode::Auto);
+    assert_eq!(
+        snapshot.plans[0].approved_execution_mode,
+        Some(ExecutionMode::Auto)
+    );
+    let requests = model.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].messages.iter().flat_map(|message| &message.content).any(|content| matches!(content, Content::ToolResult { tool_use_id, content, is_error: false } if tool_use_id == "approval" && content.text().starts_with("User has approved your plan."))));
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn plans_can_be_revised_and_only_the_current_pending_version_can_be_approved() {
     let directory = tempfile::tempdir().unwrap();
     let model = Arc::new(ScriptedModel::new(vec![
         submit_plan("plan1", "Read notes, then produce a draft."),
-        text("review this plan"),
         submit_plan("plan2", "Read notes, then produce a concise draft."),
-        text("revised plan ready"),
+        text("Approved execution started."),
     ]));
     let agent = Agent::new_embedded(config(), model);
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    agent
-        .set_execution_mode(chat, ExecutionMode::Plan)
-        .await
-        .unwrap();
+    enter_plan_mode(&agent, chat).await;
     let mut events = agent.subscribe();
-    let receipt = agent
+    let run = agent
         .submit(chat, None, "Plan the draft".into())
         .await
         .unwrap();
-    loop {
-        match next_event(&mut events).await.kind {
-            EventKind::Completed { .. } => break,
-            EventKind::Failed(error) => panic!("{error}"),
-            _ => {}
-        }
-    }
-    assert_eq!(agent.snapshot(chat).await.unwrap().plans[0].version, 1);
+    let first = plan_request(&mut events).await;
     agent
-        .submit(chat, Some(receipt.loop_id), "Make the draft concise".into())
+        .decline_plan(
+            chat,
+            run.loop_id,
+            first.input["plan_version"].as_u64().unwrap(),
+            Some("Make the draft concise".into()),
+        )
         .await
         .unwrap();
-    loop {
-        match next_event(&mut events).await.kind {
-            EventKind::Completed { .. } => break,
-            EventKind::Failed(error) => panic!("{error}"),
-            _ => {}
-        }
-    }
+    plan_request(&mut events).await;
     assert!(
         agent
-            .approve_plan(chat, receipt.loop_id, 1, ExecutionMode::AcceptEdits)
+            .approve_plan(chat, run.loop_id, 1, ExecutionMode::AcceptEdits)
             .await
             .is_err()
     );
     agent
-        .approve_plan(chat, receipt.loop_id, 2, ExecutionMode::AcceptEdits)
+        .approve_plan(chat, run.loop_id, 2, ExecutionMode::AcceptEdits)
         .await
         .unwrap();
+    loop {
+        if matches!(
+            next_event(&mut events).await.kind,
+            EventKind::Completed { .. }
+        ) {
+            break;
+        }
+    }
     let snapshot = agent.snapshot(chat).await.unwrap();
     assert_eq!(snapshot.policy.mode, ExecutionMode::AcceptEdits);
     assert_eq!(
         snapshot.plans[0].approved_execution_mode,
         Some(ExecutionMode::AcceptEdits)
     );
+}
+
+async fn plan_request(
+    events: &mut tokio::sync::broadcast::Receiver<tickloop_agent::runtime::Event>,
+) -> tickloop_agent::runtime::PermissionRequest {
+    loop {
+        match next_event(events).await.kind {
+            EventKind::PermissionRequested { request }
+                if request.name == EXIT_PLAN_MODE_TOOL_NAME =>
+            {
+                return request;
+            }
+            EventKind::Failed(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
 }
 
 fn system_prompt(request: &tickloop_agent::model::ModelRequest) -> String {
@@ -223,23 +291,11 @@ async fn exit_plan_mode_submits_the_written_plan_file_for_approval() {
         )
     );
     let submitted = result_of(&results, "submit");
-    assert!(!submitted.is_error, "{}", submitted.content);
+    assert!(submitted.is_error);
     assert!(
         submitted
             .content
-            .starts_with("Your plan has been submitted to the user for approval as version 1."),
-        "{}",
-        submitted.content
-    );
-    assert!(
-        submitted
-            .content
-            .contains(&format!("Plan file: {plan_file}"))
-    );
-    assert!(
-        submitted.content.ends_with(markdown),
-        "{}",
-        submitted.content
+            .contains("User feedback: Continue planning for this fixture.")
     );
 
     let updated = loop {
@@ -250,52 +306,60 @@ async fn exit_plan_mode_submits_the_written_plan_file_for_approval() {
     assert_eq!((updated.version, updated.markdown.as_str()), (1, markdown));
     let snapshot = agent.snapshot(chat).await.unwrap();
     let goal = snapshot.loops[0].id;
-    assert_eq!(snapshot.loops[0].state, LoopState::WaitingPlan);
+    assert_eq!(snapshot.loops[0].state, LoopState::Completed);
     assert_eq!(plan_of(&snapshot, goal), (1, markdown.into()));
     assert_eq!(plan_files(&root, goal), [markdown]);
-    agent
-        .approve_plan(chat, goal, 1, ExecutionMode::AcceptEdits)
-        .await
-        .unwrap();
+    assert!(
+        agent
+            .approve_plan(chat, goal, 1, ExecutionMode::AcceptEdits)
+            .await
+            .is_err()
+    );
     assert_eq!(
         agent.snapshot(chat).await.unwrap().policy.mode,
-        ExecutionMode::AcceptEdits
+        ExecutionMode::Plan
     );
     agent.shutdown().await;
 }
 
 #[tokio::test]
-async fn approving_a_plan_starts_it_with_claude_codes_approval_and_the_plan_file() {
+async fn approving_a_plan_returns_claude_codes_approval_and_the_plan_file_to_the_waiting_tool() {
     let directory = tempfile::tempdir().unwrap();
     let markdown = "1. Read the notes.\n2. Draft the report.";
     let model = Arc::new(ScriptedModel::new(vec![
         submit_plan("plan", markdown),
-        text("The plan is ready for review."),
+        text("Approved execution started."),
     ]));
     let agent =
         Agent::open_embedded(directory.path().join("root"), config(), model.clone()).unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     enter_plan_mode(&agent, chat).await;
-    let goal = run_turn(&agent, chat, None, "Plan the report")
-        .await
-        .loop_id;
-    let plan_file = reminded_plan_file(&model.requests.lock().unwrap()[0]).unwrap();
-
-    let continuation = agent
-        .approve_plan(chat, goal, 1, ExecutionMode::AcceptEdits)
+    let mut events = agent.subscribe();
+    let run = agent
+        .submit(chat, None, "Plan the report".into())
         .await
         .unwrap();
-
+    plan_request(&mut events).await;
+    let plan_file = reminded_plan_file(&model.requests.lock().unwrap()[0]).unwrap();
+    assert!(
+        agent
+            .approve_plan(chat, run.loop_id, 1, ExecutionMode::AcceptEdits)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let result = loop {
+        if let EventKind::ToolCompleted { call_id, result } = next_event(&mut events).await.kind
+            && call_id == "plan"
+        {
+            break result;
+        }
+    };
+    assert!(!result.is_error);
     assert_eq!(
-        continuation,
+        result.content,
         format!(
-            "User has approved your plan. You can now start coding. Start with updating your todo list if applicable
-
-Your plan has been saved to: {plan_file}
-You can refer back to it if needed during implementation.
-
-## Approved Plan:
-{markdown}"
+            "User has approved your plan. You can now start coding. Start with updating your todo list if applicable\n\nYour plan has been saved to: {plan_file}\nYou can refer back to it if needed during implementation.\n\n## Approved Plan:\n{markdown}"
         )
     );
     agent.shutdown().await;
@@ -345,7 +409,7 @@ async fn a_submitted_plan_file_can_be_edited_without_rereading_and_submitted_aga
     let results = run_turn_results(&agent, chat, Some(goal), "Also check the calendar").await;
     let edited = result_of(&results, "plan-edit");
     assert!(!edited.is_error, "{}", edited.content);
-    assert!(!result_of(&results, "plan-2").is_error);
+    assert!(result_of(&results, "plan-2").is_error);
     let revised = "Check the notes and the calendar.";
     assert_eq!(
         plan_of(&agent.snapshot(chat).await.unwrap(), goal),
@@ -358,10 +422,12 @@ async fn a_submitted_plan_file_can_be_edited_without_rereading_and_submitted_aga
             .await
             .is_err()
     );
-    agent
-        .approve_plan(chat, goal, 2, ExecutionMode::AcceptEdits)
-        .await
-        .unwrap();
+    assert!(
+        agent
+            .approve_plan(chat, goal, 2, ExecutionMode::AcceptEdits)
+            .await
+            .is_err()
+    );
     agent.shutdown().await;
 }
 
@@ -1017,6 +1083,18 @@ async fn run_turn(
             EventKind::Completed { .. } => return receipt,
             EventKind::Failed(error) => panic!("turn failed: {error}"),
             EventKind::PermissionRequested { request } => {
+                if request.name == EXIT_PLAN_MODE_TOOL_NAME {
+                    agent
+                        .decline_plan(
+                            chat,
+                            request.loop_id,
+                            request.input["plan_version"].as_u64().unwrap(),
+                            Some("Continue planning for this fixture.".into()),
+                        )
+                        .await
+                        .unwrap();
+                    continue;
+                }
                 panic!("unexpected permission request for {}", request.name)
             }
             _ => {}
@@ -1044,6 +1122,18 @@ async fn run_turn_results(
             EventKind::Completed { .. } => return results,
             EventKind::Failed(error) => panic!("turn failed: {error}"),
             EventKind::PermissionRequested { request } => {
+                if request.name == EXIT_PLAN_MODE_TOOL_NAME {
+                    agent
+                        .decline_plan(
+                            chat,
+                            request.loop_id,
+                            request.input["plan_version"].as_u64().unwrap(),
+                            Some("Continue planning for this fixture.".into()),
+                        )
+                        .await
+                        .unwrap();
+                    continue;
+                }
                 panic!("unexpected permission request for {}", request.name)
             }
             _ => {}
@@ -1170,7 +1260,7 @@ fn plan_of(snapshot: &ChatSnapshot, loop_id: LoopId) -> (u64, String) {
 }
 
 #[tokio::test]
-async fn two_loops_keep_separate_plans_and_progress_and_approve_by_version_after_restart() {
+async fn two_loops_keep_separate_plans_and_progress_and_processed_versions_after_restart() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("root");
     let model = Arc::new(ScriptedModel::new(vec![
@@ -1220,14 +1310,18 @@ async fn two_loops_keep_separate_plans_and_progress_and_approve_by_version_after
             .await
             .is_err()
     );
-    restarted
-        .approve_plan(chat, first.loop_id, 2, ExecutionMode::AcceptEdits)
-        .await
-        .unwrap();
-    restarted
-        .approve_plan(chat, second.loop_id, 2, ExecutionMode::AcceptEdits)
-        .await
-        .unwrap();
+    assert!(
+        restarted
+            .approve_plan(chat, first.loop_id, 2, ExecutionMode::AcceptEdits)
+            .await
+            .is_err()
+    );
+    assert!(
+        restarted
+            .approve_plan(chat, second.loop_id, 2, ExecutionMode::AcceptEdits)
+            .await
+            .is_err()
+    );
     enter_plan_mode(&restarted, chat).await;
     run_turn(&restarted, chat, Some(first.loop_id), "Revise goal A again").await;
     let revised = restarted.snapshot(chat).await.unwrap();
@@ -1252,10 +1346,12 @@ async fn two_loops_keep_separate_plans_and_progress_and_approve_by_version_after
             .await
             .is_err()
     );
-    again
-        .approve_plan(chat, first.loop_id, 3, ExecutionMode::AcceptEdits)
-        .await
-        .unwrap();
+    assert!(
+        again
+            .approve_plan(chat, first.loop_id, 3, ExecutionMode::AcceptEdits)
+            .await
+            .is_err()
+    );
     again.shutdown().await;
 }
 
@@ -1365,14 +1461,18 @@ async fn branched_and_forked_chats_revise_independent_plan_files() {
             before.id
         );
     }
-    restarted
-        .approve_plan(child, goal, 2, ExecutionMode::AcceptEdits)
-        .await
-        .unwrap();
-    restarted
-        .approve_plan(copy.id, goal, 3, ExecutionMode::AcceptEdits)
-        .await
-        .unwrap();
+    assert!(
+        restarted
+            .approve_plan(child, goal, 2, ExecutionMode::AcceptEdits)
+            .await
+            .is_err()
+    );
+    assert!(
+        restarted
+            .approve_plan(copy.id, goal, 3, ExecutionMode::AcceptEdits)
+            .await
+            .is_err()
+    );
     restarted.shutdown().await;
 }
 
@@ -1416,10 +1516,12 @@ async fn rewinding_keeps_the_current_plan_version_and_restart_agrees() {
         Agent::open_embedded(root, config(), Arc::new(ScriptedModel::new(Vec::new()))).unwrap();
     let restored = restarted.resume_chat(chat).await.unwrap();
     assert_eq!(plan_state(&restored), plan_state(&before));
-    restarted
-        .approve_plan(chat, goal, 2, ExecutionMode::AcceptEdits)
-        .await
-        .unwrap();
+    assert!(
+        restarted
+            .approve_plan(chat, goal, 2, ExecutionMode::AcceptEdits)
+            .await
+            .is_err()
+    );
     restarted.shutdown().await;
 }
 
@@ -1465,7 +1567,7 @@ fn plan_slug(path: &Path, loop_id: LoopId) -> String {
 }
 
 #[tokio::test]
-async fn a_plan_written_before_its_result_was_recorded_is_restored_as_a_new_unapproved_version() {
+async fn a_plan_without_its_tool_result_restores_the_durable_pending_version() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("root");
     let (chat, goal) = run_and_shut_down(
@@ -1482,7 +1584,7 @@ async fn a_plan_written_before_its_result_was_recorded_is_restored_as_a_new_unap
         &["Plan it", "Revise it", "Revise it again"],
     )
     .await;
-    // 模拟计划文件已写入第 3 版、进程在结果写入 Transcript 之前崩溃：链上只有第 2 版。
+    // The pending version is durable before ExitPlanMode receives a user decision.
     truncate_transcript_before(&transcript_file(&root, chat), |line| {
         is_tool_result_line(line, "plan-3")
     });
@@ -1496,9 +1598,9 @@ async fn a_plan_written_before_its_result_was_recorded_is_restored_as_a_new_unap
     let restored = restarted.resume_chat(chat).await.unwrap();
     let (version, markdown) = plan_of(&restored, goal);
     assert_eq!(markdown, "Unreviewed plan.");
-    assert!(version > 3, "restored version {version} was already used");
-    assert!(!restarted.transcript_load_warnings(chat).is_empty());
-    for stale in [2, 3] {
+    assert_eq!(version, 3);
+    assert!(restored.plans[0].approval_pending);
+    for stale in [2] {
         assert!(
             restarted
                 .approve_plan(chat, goal, stale, ExecutionMode::AcceptEdits)
@@ -1521,10 +1623,12 @@ async fn a_plan_written_before_its_result_was_recorded_is_restored_as_a_new_unap
         Agent::open_embedded(root, config(), Arc::new(ScriptedModel::new(Vec::new()))).unwrap();
     let restored = again.resume_chat(chat).await.unwrap();
     assert_eq!(plan_state(&restored), plan_state(&revised));
-    again
-        .approve_plan(chat, goal, version + 1, ExecutionMode::AcceptEdits)
-        .await
-        .unwrap();
+    assert!(
+        again
+            .approve_plan(chat, goal, version + 1, ExecutionMode::AcceptEdits)
+            .await
+            .is_err()
+    );
     again.shutdown().await;
 }
 
@@ -1612,10 +1716,12 @@ async fn a_missing_plan_file_keeps_the_version_sequence_after_restart() {
         Agent::open_embedded(root, config(), Arc::new(ScriptedModel::new(Vec::new()))).unwrap();
     let restored = again.resume_chat(chat).await.unwrap();
     assert_eq!(plan_state(&restored), plan_state(&revised));
-    again
-        .approve_plan(chat, goal, 3, ExecutionMode::AcceptEdits)
-        .await
-        .unwrap();
+    assert!(
+        again
+            .approve_plan(chat, goal, 3, ExecutionMode::AcceptEdits)
+            .await
+            .is_err()
+    );
     again.shutdown().await;
 }
 

@@ -59,15 +59,7 @@ fn request_question_descriptions_and_other_use_separate_physical_rows() {
             .iter()
             .position(|line| line.contains("用 DelegateAgent"))
             .unwrap();
-        let other = text.iter().position(|line| line.trim() == "Other").unwrap();
-        let placeholder = text
-            .iter()
-            .position(|line| line.trim() == "Type something.")
-            .unwrap();
-        assert!(
-            selected_row < description && description < other && other < placeholder,
-            "{text:?}"
-        );
+        assert!(selected_row < description, "{text:?}");
         assert!(
             text.iter()
                 .any(|line| line == "Enter select · Esc answer later"),
@@ -75,6 +67,16 @@ fn request_question_descriptions_and_other_use_separate_physical_rows() {
         );
         for code in [KeyCode::Down, KeyCode::Up] {
             state.key(KeyEvent::new(code, KeyModifiers::NONE));
+            if code == KeyCode::Down {
+                let (lines, other_row, _) = state.styled_frame();
+                let text = lines.iter().map(RoleLine::text).collect::<Vec<_>>();
+                assert!(text[other_row].ends_with("Other"), "{text:?}");
+                let placeholder = text
+                    .iter()
+                    .position(|line| line.trim() == "Type something.")
+                    .unwrap();
+                assert!(other_row < placeholder, "{text:?}");
+            }
             let mut output = Vec::new();
             state.draw(&mut output).unwrap();
             assert!(

@@ -55,6 +55,8 @@ pub enum ArtifactError {
     Expired,
     #[error("Artifact Service login cancelled")]
     Cancelled,
+    #[error("Artifact credentials changed while verifying the account")]
+    AccountChanged,
     #[error("Artifact Service credential storage is unavailable or unsafe")]
     Storage,
     #[error("Artifact Service returned HTTP {status}: {code}")]
@@ -313,7 +315,9 @@ impl ArtifactClient {
             return Ok(None);
         };
         if credential.expires_at <= now_seconds() {
-            self.remove_if_same(&credential.access_token).await?;
+            if !self.remove_if_same(&credential.access_token).await? {
+                return Err(ArtifactError::AccountChanged);
+            }
             return Ok(None);
         }
         let response = self
@@ -323,12 +327,20 @@ impl ArtifactClient {
             .await
             .map_err(|_| ArtifactError::Connection)?;
         if response.status() == StatusCode::UNAUTHORIZED {
-            self.remove_if_same(&credential.access_token).await?;
+            if !self.remove_if_same(&credential.access_token).await? {
+                return Err(ArtifactError::AccountChanged);
+            }
             return Ok(None);
         }
         let session: SessionResponse = self.success_json(response).await?;
         if session.user.id != credential.user.id || session.expires_at.is_empty() {
             return Err(ArtifactError::InvalidResponse);
+        }
+        if !self.credential_snapshot()?.is_some_and(|current| {
+            current.account_id == credential.user.id
+                && current.access_token == credential.access_token
+        }) {
+            return Err(ArtifactError::AccountChanged);
         }
         Ok(Some(session.user))
     }

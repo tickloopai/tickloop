@@ -556,7 +556,7 @@ fn run_hidden_view_pty(route: &str) {
         fixture.open_overview_agent(&phase, "other");
         let phase = fixture.wait_for_phase(&phase_path, "other-opened");
         let other_frame = fixture.repaint_after_recovery("other Chat", |frame| {
-            !frame.contains("Context") && !frame.contains("Project:")
+            frame.contains("Context unknown") && !frame.contains("Project:")
         });
         assert!(
             !other_frame.contains(FIRST_LINE)

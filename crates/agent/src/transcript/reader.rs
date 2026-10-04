@@ -35,15 +35,7 @@ struct IndexedEntry {
 pub(crate) const SKIP_PRECOMPACT_THRESHOLD: u64 = 5 * 1024 * 1024;
 const COMPACT_BOUNDARY_MARKER: &[u8] = b"\"compact_boundary\"";
 const SYSTEM_LINE_PREFIX: &[u8] = b"{\"type\":\"system\"";
-/// 照 Claude Code `METADATA_TYPE_MARKERS`：边界之前仍要读取的 Chat 级元数据。Tick Loop 的 Chat 级
-/// 元数据只有标题，另外保留 Branch 来源。
-const PRE_BOUNDARY_METADATA_MARKERS: [&[u8]; 4] = [
-    b"{\"type\":\"custom-title\"",
-    b"{\"type\":\"branch-origin\"",
-    b"{\"type\":\"delegation\"",
-    b"{\"type\":\"artifact-ticks\"",
-];
-
+const DELEGATION_LINE_PREFIX: &[u8] = b"{\"type\":\"delegation\"";
 /// 照 Claude Code `loadTranscriptFile` 与 `buildConversationChain` 加载 Transcript：
 /// 跳过无法解析的行（含截断的末行），重接部分压缩的保留区段，取时间最新的叶子沿父指针
 /// 重建对话链。没有任何 user／assistant 条目时返回 `None`。
@@ -54,6 +46,7 @@ const PRE_BOUNDARY_METADATA_MARKERS: [&[u8]; 4] = [
 pub(crate) fn load(path: &Path) -> io::Result<Option<LoadedTranscript>> {
     let bytes = std::fs::read(path)?;
     let lines = split_lines(&bytes);
+    validate_delegation_records(&lines)?;
     if bytes.len() as u64 > SKIP_PRECOMPACT_THRESHOLD {
         let skip_before = last_unpreserved_boundary_offset(&lines);
         if skip_before > 0 {
@@ -64,6 +57,67 @@ pub(crate) fn load(path: &Path) -> io::Result<Option<LoadedTranscript>> {
         }
     }
     Ok(load_lines(path, &lines, 0).0)
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum MetadataKind {
+    CustomTitle,
+    BranchOrigin,
+    Delegation,
+    ArtifactTicks,
+    #[serde(other)]
+    Other,
+}
+impl MetadataKind {
+    fn is_retained(&self) -> bool {
+        !matches!(self, Self::Other)
+    }
+}
+#[derive(serde::Deserialize)]
+struct MetadataHeader {
+    #[serde(rename = "type")]
+    kind: MetadataKind,
+    #[serde(rename = "agentMessageOrigin")]
+    agent_origin: Option<serde_json::Value>,
+}
+
+fn validate_delegation_records(lines: &[(u64, &[u8])]) -> io::Result<()> {
+    let mut has_delegation_authorization = false;
+    let mut has_parent_origin = false;
+    for (_, raw) in lines {
+        match serde_json::from_slice::<MetadataHeader>(raw) {
+            Ok(header) => {
+                if matches!(header.kind, MetadataKind::Delegation) {
+                    serde_json::from_slice::<Line>(raw).map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "delegated Transcript authorization is invalid or incompatible",
+                        )
+                    })?;
+                    has_delegation_authorization = true;
+                }
+                has_parent_origin |= header
+                    .agent_origin
+                    .is_some_and(|origin| origin["sender_relationship"] == "parent");
+            }
+            Err(_) => {
+                if raw.trim_ascii_start().starts_with(DELEGATION_LINE_PREFIX) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "delegated Transcript authorization is invalid or incompatible",
+                    ));
+                }
+            }
+        }
+    }
+    if has_parent_origin && !has_delegation_authorization {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "delegated Transcript authorization is missing",
+        ));
+    }
+    Ok(())
 }
 
 /// Recovers original prompts from the logical ancestry of an active compact boundary.
@@ -161,9 +215,8 @@ fn load_lines(
             continue;
         }
         if line_offset < skip_before
-            && !PRE_BOUNDARY_METADATA_MARKERS
-                .iter()
-                .any(|marker| raw.starts_with(marker))
+            && !serde_json::from_slice::<MetadataHeader>(raw)
+                .is_ok_and(|header| header.kind.is_retained())
         {
             continue;
         }

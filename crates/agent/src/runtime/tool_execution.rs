@@ -120,11 +120,9 @@ impl ToolRegistry {
                     .definitions()
                     .into_iter()
                     .filter(|definition| {
-                        chat.snapshot.delegation.is_none()
-                            || matches!(
-                                definition.name.as_str(),
-                                "ReadWorkspace" | "ReadTick" | "CallTickTool" | "ModifyTick"
-                            )
+                        chat.snapshot.delegation.as_ref().is_none_or(|delegation| {
+                            delegation.ceiling.host_tools.contains_key(&definition.name)
+                        })
                     })
                     .map(|definition| RegisteredTool {
                         definition,
@@ -408,6 +406,7 @@ impl Agent {
         receipt: &Receipt,
         operation: &OperationRecord,
         registered: &RegisteredTool,
+        authority: Option<crate::host_tools::HostToolAuthority>,
         cancel: CancellationToken,
     ) -> Result<ToolResult, String> {
         match &registered.route {
@@ -427,7 +426,7 @@ impl Agent {
             }
             ToolRoute::Skill => self.skill_tool(receipt, &operation.input).await,
             ToolRoute::TickSubscription => {
-                self.tick_subscription_tool(receipt, &operation.name, &operation.input)
+                self.tick_subscription_tool(receipt, &operation.name, &operation.input, authority)
                     .await
             }
             ToolRoute::Host(provider) => Ok(provider
@@ -449,7 +448,7 @@ impl Agent {
                 .await
                 .expect("registered interaction tool has a handler"),
             ToolRoute::Plan => self
-                .control_tool(receipt, &operation.name, &operation.input)
+                .control_tool(receipt, operation, cancel)
                 .await
                 .expect("registered plan tool has a handler"),
             ToolRoute::BuiltIn => unreachable!("built-in tools execute typed operations"),
@@ -501,39 +500,6 @@ impl Agent {
         self.refresh_project_rules(receipt.chat_id)
             .await
             .map_err(|error| error.to_string())?;
-        let alias = match registration
-            .as_ref()
-            .and_then(RegisteredTool::host_provider)
-        {
-            Some(provider) => match provider.builtin_alias(receipt.chat_id, &name, &input).await {
-                Ok(alias) => alias,
-                Err(error) => return Ok(ToolCallOutcome::not_admitted(error)),
-            },
-            None => None,
-        };
-        let (name, input, registration) = if let Some(alias) = alias {
-            let Some(definition) = crate::tools::Tools::definitions()
-                .into_iter()
-                .find(|definition| definition.name == alias.name)
-            else {
-                return Ok(ToolCallOutcome::not_admitted(
-                    "Host alias does not name a built-in tool".into(),
-                ));
-            };
-            if let Err(error) = validate_tool_input(&definition, &alias.input) {
-                return Ok(ToolCallOutcome::not_admitted(error));
-            }
-            (
-                alias.name,
-                alias.input,
-                Some(RegisteredTool {
-                    definition,
-                    route: ToolRoute::BuiltIn,
-                }),
-            )
-        } else {
-            (name, input, registration)
-        };
         let mut permission_comment = None;
         let mut continue_after_denial = false;
         let mut is_rejected_by_user = false;
@@ -569,7 +535,7 @@ impl Agent {
             });
         let prepared_host_call = if let Some(provider) = host_tools.as_ref() {
             if let Err(error) = self
-                .check_delegated_host_endpoint(receipt, provider.as_ref())
+                .check_delegated_host_tool(receipt, provider.as_ref(), &name)
                 .await
             {
                 return Ok(ToolCallOutcome::not_admitted(error));
@@ -593,7 +559,7 @@ impl Agent {
             match prepared {
                 Ok(prepared) => {
                     if let Err(error) = self
-                        .check_delegated_host_endpoint(receipt, provider.as_ref())
+                        .check_delegated_host_tool(receipt, provider.as_ref(), &name)
                         .await
                     {
                         return Ok(ToolCallOutcome::not_admitted(error));
@@ -636,13 +602,18 @@ impl Agent {
             let port = self.tick_deliveries().port.clone();
             match port {
                 Some(port) => match port
-                    .prepare_watch(receipt.chat_id, &instance, cancel.clone())
+                    .prepare_watch(receipt.chat_id, &instance, &input, cancel.clone())
                     .await
                 {
                     Ok(Some(watch)) => {
-                        if let Err(error) = self
-                            .check_delegated_host_endpoint(receipt, watch.provider())
-                            .await
+                        if let Some(binding) = watch.host_authority()?
+                            && let Err(error) = self
+                                .check_delegated_host_authority(
+                                    receipt,
+                                    &binding.tool_name,
+                                    binding.authority,
+                                )
+                                .await
                         {
                             return Ok(ToolCallOutcome::not_admitted(error));
                         }
@@ -742,6 +713,7 @@ impl Agent {
                 name == ENTER_PLAN_MODE_TOOL_NAME && execution_mode != ExecutionMode::Plan;
             let decision = match decision {
                 Decision::Deny => Decision::Deny,
+                _ if name == EXIT_PLAN_MODE_TOOL_NAME => Decision::Allow,
                 _ if requires_plan_mode_consent => Decision::Ask,
                 Decision::Ask
                     if execution_mode == ExecutionMode::Auto
@@ -886,7 +858,7 @@ impl Agent {
                     (host_tools.as_ref(), prepared_host_call.as_ref())
                 {
                     match self
-                        .check_delegated_host_endpoint(receipt, provider.as_ref())
+                        .check_delegated_host_tool(receipt, provider.as_ref(), &name)
                         .await
                     {
                         Ok(()) => {
@@ -903,10 +875,18 @@ impl Agent {
                             .map(|watch| (prepared, watch))
                     })
                 {
-                    match self
-                        .check_delegated_host_endpoint(receipt, watch.provider())
-                        .await
-                    {
+                    let authority_check = match watch.host_authority()? {
+                        Some(binding) => {
+                            self.check_delegated_host_authority(
+                                receipt,
+                                &binding.tool_name,
+                                binding.authority,
+                            )
+                            .await
+                        }
+                        None => Ok(()),
+                    };
+                    match authority_check {
                         Ok(()) => {
                             crate::tick_stream::PreparedTickWatch::revalidate(
                                 receipt.chat_id,
@@ -1022,6 +1002,14 @@ impl Agent {
                             .finish(receipt.chat_id, &operation);
                             return Err(ToolCallError::denied(error, record));
                         }
+                        let watch_authority = match prepared_host_call.as_ref().and_then(|call| {
+                            call.payload::<crate::tick_stream::PreparedTickWatch>()
+                        }) {
+                            Some(watch) => watch
+                                .host_authority()?
+                                .and_then(|binding| binding.authority),
+                            None => None,
+                        };
                         if let (Some(provider), Some(prepared)) =
                             (host_tools.as_ref(), prepared_host_call)
                         {
@@ -1044,6 +1032,7 @@ impl Agent {
                                 registration
                                     .as_ref()
                                     .expect("registered local or Host tool"),
+                                watch_authority,
                                 cancel.clone(),
                             )
                             .await
@@ -1434,6 +1423,7 @@ impl Agent {
                             &prepared.name,
                             &prepared.input,
                             Some(&prepared),
+                            plan_file.as_deref(),
                         )
                         .map_err(ToolCallError::from)?;
                         let chat = chats.get_mut(&receipt.chat_id).unwrap();

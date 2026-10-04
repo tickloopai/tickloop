@@ -9,6 +9,7 @@ use super::{ModelConfig, ModelFailureKind};
 const MAX_MESSAGE_CHARS: usize = 1024;
 const TRUNCATION_SUFFIX: &str = "...";
 const MAX_RETRY_AFTER_SECONDS: u64 = 86400;
+const ERROR_BODY_TIMEOUT: Duration = Duration::from_secs(15);
 const REDACTED: &str = "***";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -814,6 +815,24 @@ fn html_tags() -> &'static Regex {
     TAGS.get_or_init(|| Regex::new(r"(?is)<[^>]*>").expect("valid HTML tag regex"))
 }
 
+pub(super) fn retry_headers(
+    headers: &reqwest::header::HeaderMap,
+) -> (Option<Duration>, Option<bool>) {
+    let retry_after = headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_retry_after);
+    let server_retry = headers
+        .get("x-should-retry")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| match value.trim() {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        });
+    (retry_after, server_retry)
+}
+
 pub(super) fn parse_retry_after(value: &str) -> Option<Duration> {
     if let Ok(seconds) = value.trim().parse::<u64>() {
         return Some(Duration::from_secs(seconds));
@@ -840,7 +859,7 @@ pub(super) async fn read_error_body(
         bytes: Vec::new(),
         complete: false,
     };
-    let deadline = tokio::time::sleep(Duration::from_secs(15));
+    let deadline = tokio::time::sleep(ERROR_BODY_TIMEOUT);
     tokio::pin!(deadline);
     while body.bytes.len() < super::MAX_ERROR_BODY_BYTES {
         let chunk = tokio::select! {

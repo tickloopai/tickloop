@@ -6,6 +6,11 @@ const STARTUP_MODEL: &str = "deepseek-flash";
 const EXTERNAL_MODEL: &str = "external-fixture";
 
 fn startup_config(model: &str) -> ModelConfig {
+    if model == STARTUP_MODEL {
+        return crate::model::cards::ModelCatalog::defaults()
+            .get("deepseek-api", "deepseek-flash")
+            .unwrap();
+    }
     let mut config = test_support::config();
     config.model = model.into();
     config.protocol = Protocol::ChatCompletions;
@@ -154,7 +159,7 @@ fn assert_clean_startup_status(frame: &str, rows: &str, model: &str) {
             .find(|line| line.contains("⏵⏵ Auto"))
             .unwrap_or_else(|| panic!("missing core status: {frame}"));
         assert_eq!(status.matches(model).count(), 1, "{status}");
-        assert!(!status.contains("Context"), "{status}");
+        assert!(status.contains("Context 0% used"), "{status}");
         assert!(!status.contains("ChatCompletions"), "{status}");
     }
     if matches!(rows, "1" | "3") {
@@ -170,8 +175,9 @@ fn assert_clean_startup_status(frame: &str, rows: &str, model: &str) {
 fn new_agent_startup_has_one_model_and_no_ordinary_ready_status() {
     let (mut fixture, _directory) = start_startup_fixture("default");
     fixture.wait_for("Tick Loop Agent");
-    let frame =
-        fixture.repaint_after_recovery("New Agent startup", |frame| !frame.contains("Context"));
+    let frame = fixture.repaint_after_recovery("New Agent startup", |frame| {
+        frame.contains("Context 0% used")
+    });
     assert_clean_startup_status(&frame, "default", STARTUP_MODEL);
 }
 

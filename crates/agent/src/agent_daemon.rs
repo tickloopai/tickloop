@@ -590,20 +590,19 @@ pub async fn build_runtime_with_client(
         access,
     ));
     agent.install_tick_stream(adapters.clone()).await;
-    let tools = adapters.host_tools(native_host);
     if let Some(root) = launch.config_root.as_ref()
         && let Ok(artifact) = crate::artifacts::ArtifactClient::new(root)
     {
         agent
             .install_host_tools(Arc::new(
-                crate::mcp_tools::McpHostToolProvider::new(artifact, Some(tools))
+                crate::mcp_tools::McpHostToolProvider::new(artifact, native_host.clone())
                     .with_event_bridge(ARTIFACT_EVENT_BRIDGE_URI)
                     .with_event_bridge_fallback(ARTIFACT_EVENT_BRIDGE_FALLBACK_URI),
             ))
             .map_err(|error| format!("cannot install MCP tools: {error}"))?;
-    } else {
+    } else if let Some(native_host) = native_host {
         agent
-            .install_host_tools(tools)
+            .install_host_tools(native_host)
             .map_err(|error| format!("cannot install Tick tools: {error}"))?;
     }
     Ok(agent)
@@ -689,12 +688,19 @@ fn remove_owned_socket(endpoint: &Path, identity: (u64, u64)) -> Result<(), Stri
 }
 
 fn private_listener(endpoint: &Path) -> Result<(UnixListener, (u64, u64)), String> {
+    const TEMPORARY_SOCKET_NAME_LENGTH: usize = 8;
     check_socket_length(endpoint)?;
-    let listener = UnixListener::bind(endpoint).map_err(|error| error.to_string())?;
-    std::fs::set_permissions(endpoint, std::fs::Permissions::from_mode(0o600))
-        .map_err(|error| error.to_string())?;
-    let metadata = std::fs::symlink_metadata(endpoint).map_err(|error| error.to_string())?;
-    Ok((listener, (metadata.dev(), metadata.ino())))
+    let temporary = endpoint
+        .with_file_name(&Uuid::new_v4().simple().to_string()[..TEMPORARY_SOCKET_NAME_LENGTH]);
+    let listener = UnixListener::bind(&temporary).map_err(|error| error.to_string())?;
+    let metadata = std::fs::symlink_metadata(&temporary).map_err(|error| error.to_string())?;
+    let identity = (metadata.dev(), metadata.ino());
+    // Publish only after permissions are private; linking never overwrites a replacement.
+    let published = std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))
+        .and_then(|()| std::fs::hard_link(&temporary, endpoint));
+    remove_owned_socket(&temporary, identity)?;
+    published.map_err(|error| error.to_string())?;
+    Ok((listener, identity))
 }
 
 fn check_socket_length(endpoint: &Path) -> Result<(), String> {
@@ -703,4 +709,37 @@ fn check_socket_length(endpoint: &Path) -> Result<(), String> {
         return Err("Agent runtime directory is too long for a Unix socket path".into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_published_listener_is_private_and_accepts_connections() {
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
+        let endpoint = directory.path().join("owner.sock");
+        let (listener, identity) = private_listener(&endpoint).unwrap();
+        validate_socket(&endpoint).unwrap();
+        let client = tokio::net::UnixStream::connect(&endpoint).await.unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut client = client;
+        client.write_all(b"private").await.unwrap();
+        let mut received = [0; 7];
+        server.read_exact(&mut received).await.unwrap();
+        assert_eq!(&received, b"private");
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+        remove_owned_socket(&endpoint, identity).unwrap();
+    }
+
+    #[tokio::test]
+    async fn publishing_a_listener_preserves_an_existing_endpoint() {
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
+        let endpoint = directory.path().join("owner.sock");
+        std::fs::write(&endpoint, "replacement").unwrap();
+        assert!(private_listener(&endpoint).is_err());
+        assert_eq!(std::fs::read_to_string(&endpoint).unwrap(), "replacement");
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
 }

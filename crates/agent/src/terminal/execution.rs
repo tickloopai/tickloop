@@ -520,6 +520,51 @@ impl ConsoleExecution {
             .is_some_and(|snapshot| snapshot.conversation.delegation.is_some())
     }
 
+    pub(super) fn cached_pending_plan_approvals(
+        &self,
+        chat: Uuid,
+    ) -> Option<(ExecutionRef, Vec<(Uuid, u64)>)> {
+        let snapshots = self.inner.snapshots.read().unwrap();
+        let snapshot = snapshots.get(&chat)?;
+        Some((
+            snapshot.execution,
+            snapshot
+                .conversation
+                .plans
+                .iter()
+                .filter(|plan| {
+                    plan.approval_pending
+                        && snapshot.conversation.loops.iter().any(|goal| {
+                            goal.id == plan.loop_id
+                                && matches!(
+                                    goal.state,
+                                    runtime::LoopState::WaitingPlan
+                                        | runtime::LoopState::Interrupted
+                                )
+                        })
+                        && !snapshot.permissions.iter().any(|request| {
+                            request.name == runtime::EXIT_PLAN_MODE_TOOL_NAME
+                                && request.loop_id == plan.loop_id
+                        })
+                })
+                .map(|plan| (plan.loop_id, plan.version))
+                .collect(),
+        ))
+    }
+
+    pub(super) fn cached_plan_is_pending(
+        &self,
+        chat: Uuid,
+        loop_id: Uuid,
+        version: u64,
+    ) -> Option<bool> {
+        let snapshots = self.inner.snapshots.read().unwrap();
+        let snapshot = snapshots.get(&chat)?;
+        Some(snapshot.conversation.plans.iter().any(|plan| {
+            plan.loop_id == loop_id && plan.version == version && plan.approval_pending
+        }))
+    }
+
     pub(super) async fn reference(&self, chat: Uuid) -> Result<ExecutionRef, AgentError> {
         if let Some(reference) = self.inner.references.read().unwrap().get(&chat).copied() {
             return Ok(reference);
@@ -2580,7 +2625,7 @@ impl ConsoleExecution {
         loop_id: Uuid,
         version: u64,
         mode: ExecutionMode,
-    ) -> Result<String, AgentError> {
+    ) -> Result<Option<String>, AgentError> {
         match self
             .loop_command(
                 chat,
@@ -2592,7 +2637,31 @@ impl ConsoleExecution {
             )
             .await?
         {
-            CommandResult::Text(value) => Ok(value),
+            CommandResult::Text(value) => Ok(Some(value)),
+            CommandResult::Done => Ok(None),
+            _ => Err(unexpected()),
+        }
+    }
+    pub(super) async fn decline_plan(
+        &self,
+        chat: Uuid,
+        loop_id: Uuid,
+        version: u64,
+        feedback: Option<String>,
+    ) -> Result<Option<Receipt>, AgentError> {
+        match self
+            .loop_command(
+                chat,
+                LoopAction::DeclinePlan {
+                    loop_id,
+                    version,
+                    feedback,
+                },
+            )
+            .await?
+        {
+            CommandResult::Submitted(receipt) => Ok(Some(receipt)),
+            CommandResult::Done => Ok(None),
             _ => Err(unexpected()),
         }
     }

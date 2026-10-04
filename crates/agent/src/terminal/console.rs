@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+use tickloop_agent::runtime::TodoItem;
 
 use super::workspace_trust::{TRUST_ACCEPT_CHOICE_INDEX, TrustDecision, WorkspaceTrust};
 use crossterm::cursor::{Hide, MoveTo, Show};
@@ -43,6 +44,14 @@ mod input_dialog_tests;
 #[cfg(test)]
 #[path = "console/layout_tests.rs"]
 mod layout_tests;
+#[cfg(test)]
+#[path = "console/model_dialog_pty.rs"]
+mod model_dialog_pty;
+mod prompt_suggestion;
+#[cfg(test)]
+mod prompt_suggestion_pty;
+#[cfg(test)]
+mod prompt_suggestion_tests;
 #[cfg(test)]
 #[path = "console/request_layout_tests.rs"]
 mod request_layout_tests;
@@ -106,8 +115,8 @@ use super::{
         InputKind, ShellCompletionKey, ShellCompletionKind, ShellEmptyControl, ShellExecution,
         ShellInputAction, ShellInputState, UserShellSubmission,
     },
-    status_area::{BackgroundStatusNotice, StatusArea, StatusItem},
-    style::{ColourDepth, Role, RoleLine, Span, StyledLine, ThemeName},
+    status_area::{BackgroundStatusNotice, StatusArea},
+    style::{ColourDepth, Role, RoleLine, RoleSpan, Span, StyledLine, ThemeName},
     subscription_surface::{
         SubscriptionAction, SubscriptionEffect, SubscriptionFocus, SubscriptionSurface,
         SubscriptionViewport,
@@ -389,16 +398,23 @@ pub(super) struct CompactPickerRow {
 pub(super) struct PickerPresentation {
     pub(super) headers: Vec<(usize, String)>,
     pub(super) hint: String,
+    pub(super) editing_hint: Option<&'static str>,
+    pub(super) restore_context_offset: Option<usize>,
     pub(super) refresh: bool,
+    pub(super) refresh_options: Option<Vec<usize>>,
     pub(super) connection_options: Option<usize>,
     pub(super) row_hints: Vec<String>,
     pub(super) compact_rows: Vec<CompactPickerRow>,
+    pub(super) failure_target: Option<Uuid>,
+    pub(super) failure_connections: Vec<Option<String>>,
+    pub(super) failure_message: bool,
 }
 
 #[derive(Clone)]
 enum MenuFocus {
     WhenInputEmpty,
     Menu,
+    Plan,
     MenuWithLink(String),
     Secret(String),
     Input(String),
@@ -536,12 +552,14 @@ pub(super) struct State {
     display: DisplayProfile,
     colour_depth: ColourDepth,
     prompt_enabled: bool,
+    prompt_suggestion_enabled: bool,
+    prompt_suggestion: Option<String>,
+    prompt_suggestion_request: Option<super::prompt_suggestion::SuggestionRequest>,
     foreground_shell: bool,
     shell_background_chord_started_at: Option<Instant>,
     width: usize,
     height: usize,
     scrollback: Scrollback,
-    latest_user_message: Option<String>,
     /// Startup and local feedback from before this View's draft created its Chat.
     creation_prefixes: HashMap<Option<Uuid>, Vec<CreationPrefixEntry>>,
     echoed_inputs: HashSet<Uuid>,
@@ -598,6 +616,7 @@ pub(super) struct State {
     dialog_option_rows: Vec<(std::ops::Range<usize>, usize)>,
     request_queue_count: usize,
     menu: Option<Menu>,
+    menu_rule_role: Option<Role>,
     picker_kind: Option<PickerKind>,
     picker_presentation: PickerPresentation,
     /// The `/resume` picker owns input while open; the
@@ -607,6 +626,7 @@ pub(super) struct State {
     menu_link: Option<(Uuid, String)>,
     menu_review: Option<MenuReviewState>,
     full_review: bool,
+    menu_plan: bool,
     menu_comment: Option<MenuCommentState>,
     menu_expand_options: Vec<usize>,
     question_menu: Option<QuestionMenu>,
@@ -614,6 +634,7 @@ pub(super) struct State {
     request_menu: Option<Uuid>,
     menu_submission_pending: Option<Uuid>,
     menu_submission_finished: Option<Uuid>,
+    menu_submission_navigation: bool,
     branch_submission: BranchSubmission,
     menu_focused: bool,
     review_focused: bool,
@@ -642,6 +663,7 @@ pub(super) struct State {
     conversation_focused: bool,
     status: String,
     provider_failure: Option<String>,
+    provider_failures: HashMap<Uuid, HashMap<String, crate::model::ProviderHttpFailure>>,
     configured_status_lines: Option<Vec<String>>,
     background_status_notice: Option<BackgroundStatusNotice>,
     connection_notice: Option<String>,
@@ -750,7 +772,6 @@ impl Default for ChatInput {
 struct ViewPresentation {
     pub(super) tick_list: TickList,
     scrollback: Scrollback,
-    latest_user_message: Option<String>,
     echoed_inputs: HashSet<Uuid>,
     awaiting_input_echoes: HashSet<Uuid>,
     footer: FooterState,
@@ -1404,6 +1425,7 @@ impl Console {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         let was_open = state.overview.projection.is_some();
         if !was_open && projection.is_some() {
+            state.clear_prompt_suggestion();
             state.overview.current_draft = state.chat.is_none();
             let dispatch = std::mem::take(&mut state.overview_input);
             let source = state.replace_input(dispatch);
@@ -1730,12 +1752,25 @@ impl Console {
         Ok(())
     }
 
+    pub(super) fn set_provider_failures(
+        &self,
+        chat: Uuid,
+        failures: &HashMap<String, crate::model::ProviderHttpFailure>,
+    ) -> Result<(), String> {
+        self.state
+            .lock()
+            .map_err(|error| error.to_string())?
+            .provider_failures
+            .insert(chat, failures.clone());
+        Ok(())
+    }
+
     pub(super) fn update_status_area(
         &self,
         mode: String,
         model: String,
         context: Option<(u64, usize)>,
-        todos: Vec<StatusItem>,
+        todos: Vec<TodoItem>,
     ) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         state.status_area.update(mode, model, context, todos);
@@ -3013,24 +3048,6 @@ impl Console {
     }
 
     /// Echoes a submitted line in the body; the returned echo names it in this presentation only.
-    pub(super) fn set_latest_user_message(
-        &self,
-        chat: Uuid,
-        text: Option<String>,
-    ) -> Result<(), String> {
-        let mut state = self.state.lock().map_err(|error| error.to_string())?;
-        if state.chat == Some(chat) {
-            state.latest_user_message = text;
-        } else {
-            state
-                .view_cache
-                .entry(Some(chat))
-                .or_default()
-                .latest_user_message = text;
-        }
-        Ok(())
-    }
-
     pub fn record_input(&self, line: &str) -> Result<Option<InputEcho>, String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         if !state.interactive {
@@ -3240,6 +3257,15 @@ impl Console {
         )
     }
 
+    pub(super) fn picker_context_offset(&self, id: Uuid) -> Result<Option<usize>, String> {
+        let state = self.state.lock().map_err(|error| error.to_string())?;
+        Ok(state
+            .menu
+            .as_ref()
+            .filter(|menu| menu.id == id)
+            .map(|_| state.context_offset))
+    }
+
     pub(super) fn picker_selection(&self, id: Uuid) -> Result<Option<usize>, String> {
         let state = self.state.lock().map_err(|error| error.to_string())?;
         Ok(state
@@ -3247,6 +3273,44 @@ impl Console {
             .as_ref()
             .filter(|menu| menu.id == id)
             .map(|menu| menu.selected))
+    }
+
+    pub(super) fn menu_snapshot(&self, id: Uuid) -> Result<Option<Menu>, String> {
+        let state = self.state.lock().map_err(|error| error.to_string())?;
+        Ok(state
+            .menu
+            .as_ref()
+            .filter(|menu| menu.id == id)
+            .map(|menu| {
+                let mut menu = menu.clone();
+                menu.context = state.picker_context(&menu);
+                menu
+            }))
+    }
+
+    pub(super) fn recover_menu(
+        &self,
+        previous: Uuid,
+        restored: Uuid,
+        selected: Option<usize>,
+    ) -> Result<bool, String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        let Some(menu) = state.menu.as_mut().filter(|menu| menu.id == previous) else {
+            return Ok(false);
+        };
+        menu.id = restored;
+        menu.selected = selected
+            .unwrap_or(menu.selected)
+            .min(menu.options.len().saturating_sub(1));
+        if let Some((id, _)) = &mut state.menu_link
+            && *id == previous
+        {
+            *id = restored;
+        }
+        state
+            .draw(&mut io::stdout().lock())
+            .map_err(|error| error.to_string())?;
+        Ok(true)
     }
 
     pub(super) fn show_presented_picker_menu(
@@ -3310,7 +3374,7 @@ impl Console {
     ) -> Result<(), String> {
         {
             let mut state = self.state.lock().map_err(|error| error.to_string())?;
-            if state.update_hidden_login(&menu, address, callback) {
+            if state.update_login(&menu, address, callback) {
                 return state
                     .draw(&mut io::stdout().lock())
                     .map_err(|error| error.to_string());
@@ -3328,6 +3392,21 @@ impl Console {
         )
     }
 
+    pub(super) fn complete_login_menu(
+        &self,
+        id: Uuid,
+        status: &str,
+        notice: &str,
+    ) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        if state.complete_login(id, status, notice) {
+            state
+                .draw(&mut io::stdout().lock())
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
     pub fn show_commentable_menu(
         &self,
         menu: Menu,
@@ -3340,6 +3419,19 @@ impl Console {
             "Comment",
             None,
             MenuFocus::WhenInputEmpty,
+        )
+    }
+
+    pub(super) fn show_plan_menu(&self, menu: Menu, feedback: bool) -> Result<(), String> {
+        self.show_menu_with_comments(
+            menu,
+            feedback.then_some(vec![
+                super::workflows::PlanApprovalChoice::KeepPlanning.option_index(),
+            ]),
+            Vec::new(),
+            "Feedback",
+            None,
+            MenuFocus::Plan,
         )
     }
 
@@ -3453,6 +3545,16 @@ impl Console {
         if !state.interactive {
             return Err("interactive menus require a terminal".into());
         }
+        let restore_context_offset = match &focus {
+            MenuFocus::Picker(_, presentation) => presentation.restore_context_offset,
+            _ => None,
+        };
+        let same_picker_page = match (&focus, &state.menu) {
+            (MenuFocus::Picker(kind, _), Some(current)) => {
+                state.picker_kind == Some(*kind) && current.title == menu.title
+            }
+            _ => false,
+        };
         let picker_refresh = match &focus {
             MenuFocus::Picker(kind, _) => state
                 .menu
@@ -3488,6 +3590,7 @@ impl Console {
                                 state.editor.draft().is_empty()
                             }
                             MenuFocus::Menu
+                            | MenuFocus::Plan
                             | MenuFocus::MenuWithLink(_)
                             | MenuFocus::Secret(_)
                             | MenuFocus::Input(_)
@@ -3497,6 +3600,8 @@ impl Console {
             |(_, focused)| focused,
         );
         state.review_focused = false;
+        state.menu_rule_role = matches!(focus, MenuFocus::Plan).then_some(Role::PlanMode);
+        state.menu_plan = matches!(focus, MenuFocus::Plan);
         state.request_menu = state.request_layout.map(|_| menu.id);
         state.shell_background_chord_started_at = None;
         state.completion.dismiss();
@@ -3554,6 +3659,7 @@ impl Console {
             MenuFocus::MenuWithLink(address) => Some((menu.id, address)),
             MenuFocus::WhenInputEmpty
             | MenuFocus::Menu
+            | MenuFocus::Plan
             | MenuFocus::Secret(_)
             | MenuFocus::Input(_)
             | MenuFocus::Picker(..)
@@ -3561,7 +3667,11 @@ impl Console {
         };
         state.menu = Some(menu);
         state.full_review = false;
-        state.context_offset = 0;
+        if let Some(offset) = restore_context_offset {
+            state.context_offset = offset;
+        } else if picker_refresh.is_none() && !same_picker_page {
+            state.context_offset = 0;
+        }
         state.draw(&mut output).map_err(|error| error.to_string())
     }
 
@@ -3591,7 +3701,24 @@ impl Console {
 
     pub fn finish_menu_submission(&self, id: Uuid) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        let navigation =
+            state.menu_submission_pending == Some(id) && state.menu_submission_navigation;
         state.mark_menu_submission_finished(id);
+        if navigation && state.clear_finished_menu_submission() {
+            state
+                .draw(&mut io::stdout().lock())
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn continue_menu_submission(&self, id: Uuid) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        if state.menu_submission_pending == Some(id) {
+            state.menu_submission_pending = None;
+            state.menu_submission_finished = None;
+            state.menu_submission_navigation = false;
+        }
         Ok(())
     }
 
@@ -3610,6 +3737,7 @@ impl Console {
             let mut output = io::stdout().lock();
             state.prompt_enabled = enabled;
             if !enabled {
+                state.clear_prompt_suggestion();
                 state.shell_background_chord_started_at = None;
             }
             state.draw(&mut output).map_err(|error| error.to_string())?;
@@ -3999,6 +4127,9 @@ pub(super) enum RendererSwitch {
 
 impl Drop for Lifetime {
     fn drop(&mut self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.clear_prompt_suggestion();
+        }
         self.stop.store(true, Ordering::Release);
         if let Ok(reader) = self.reader.get_mut()
             && let Some(reader) = reader.take()
@@ -4053,9 +4184,10 @@ impl Drop for Lifetime {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum ConversationPiece {
     Styled(String, Option<Role>),
-    Linked {
+    Input {
         text: String,
-        link: hyperlink::Hyperlink,
+        spans: Vec<RoleSpan>,
+        is_user_message: bool,
     },
     Markdown {
         text: String,
@@ -4093,7 +4225,19 @@ impl ConversationPiece {
                 }
             }
             Self::Styled(text, role) => scrollback.append_as(text, *role, None),
-            Self::Linked { text, link } => scrollback.append_span(text, None, None, Some(link)),
+            Self::Input {
+                spans,
+                is_user_message,
+                ..
+            } => {
+                let first_line = scrollback.line_count();
+                for span in spans {
+                    scrollback.append_span(&span.text, span.role, None, span.link.as_ref());
+                }
+                if *is_user_message {
+                    scrollback.mark_input(first_line..scrollback.line_count() - 1);
+                }
+            }
             Self::Markdown {
                 text,
                 starts_message,
@@ -4107,7 +4251,7 @@ impl ConversationPiece {
     pub(super) fn text(&self) -> &str {
         match self {
             Self::Styled(text, _)
-            | Self::Linked { text, .. }
+            | Self::Input { text, .. }
             | Self::Markdown { text, .. }
             | Self::ToolCall { text, .. } => text,
         }
@@ -4302,7 +4446,6 @@ impl State {
     fn clear_history(&mut self) {
         let auto_scroll = self.scrollback.auto_scroll();
         self.scrollback = Scrollback::new();
-        self.latest_user_message = None;
         self.echoed_inputs.clear();
         self.awaiting_input_echoes.clear();
         self.rendered_execution_losses.clear();
@@ -4334,6 +4477,7 @@ impl State {
         if self.chat == chat {
             return;
         }
+        self.clear_prompt_suggestion();
         self.visible_delegated = false;
         self.activity_interruptible = false;
         self.back_to_bottom_target = None;
@@ -4375,10 +4519,6 @@ impl State {
         ViewPresentation {
             tick_list: std::mem::replace(&mut self.tick_list, next.tick_list),
             scrollback: std::mem::replace(&mut self.scrollback, next.scrollback),
-            latest_user_message: std::mem::replace(
-                &mut self.latest_user_message,
-                next.latest_user_message,
-            ),
             echoed_inputs: std::mem::replace(&mut self.echoed_inputs, next.echoed_inputs),
             awaiting_input_echoes: std::mem::replace(
                 &mut self.awaiting_input_echoes,
@@ -4519,12 +4659,14 @@ impl State {
                 std::env::var("COLORTERM").ok().as_deref(),
             ),
             prompt_enabled: false,
+            prompt_suggestion_enabled: true,
+            prompt_suggestion: None,
+            prompt_suggestion_request: None,
             foreground_shell: false,
             shell_background_chord_started_at: None,
             width: usize::from(width).saturating_sub(1).max(2),
             height: usize::from(height).max(1),
             scrollback: Scrollback::new(),
-            latest_user_message: None,
             creation_prefixes: HashMap::new(),
             echoed_inputs: HashSet::new(),
             awaiting_input_echoes: HashSet::new(),
@@ -4569,6 +4711,7 @@ impl State {
             dialog_option_rows: Vec::new(),
             request_queue_count: 0,
             menu: None,
+            menu_rule_role: None,
             picker_kind: None,
             picker_presentation: Default::default(),
             artifacts_picker: None,
@@ -4576,6 +4719,7 @@ impl State {
             menu_link: None,
             menu_review: None,
             full_review: false,
+            menu_plan: false,
             menu_comment: None,
             menu_expand_options: Vec::new(),
             question_menu: None,
@@ -4583,6 +4727,7 @@ impl State {
             request_menu: None,
             menu_submission_pending: None,
             menu_submission_finished: None,
+            menu_submission_navigation: false,
             branch_submission: BranchSubmission::Idle,
             menu_focused: false,
             review_focused: false,
@@ -4611,6 +4756,7 @@ impl State {
             conversation_focused: false,
             status: String::new(),
             provider_failure: None,
+            provider_failures: HashMap::new(),
             configured_status_lines: None,
             background_status_notice: None,
             connection_notice: None,
@@ -4631,16 +4777,18 @@ impl State {
     fn pointer(&mut self, event: MouseEvent, output: &mut impl Write) -> bool {
         let height = self.input_dialog_height();
         let start = self.height.saturating_sub(height);
+        let body_height = self.input_dialog_body_height();
+        let rule_rows = height - body_height;
         if let Some(dialog) = &mut self.workspace_trust {
             if event.kind == MouseEventKind::Down(MouseButton::Left)
-                && usize::from(event.row) >= start
+                && usize::from(event.row) >= start + rule_rows
                 && usize::from(event.row) < self.height
             {
                 self.pointer_input = dialog
                     .click(
-                        usize::from(event.row) - start,
+                        usize::from(event.row) - start - rule_rows,
                         self.width,
-                        height,
+                        body_height,
                         self.display,
                     )
                     .map(|decision| match decision {
@@ -4685,6 +4833,11 @@ impl State {
             }
             if at.row >= start {
                 let row = at.row - start;
+                let rule_rows = self.input_dialog_height() - self.input_dialog_body_height();
+                if row < rule_rows {
+                    return true;
+                }
+                let body_row = row - rule_rows;
                 if self.menu.is_none()
                     && (self.artifacts_picker.is_some() || self.conversation_picker.is_some())
                 {
@@ -4699,11 +4852,11 @@ impl State {
                         }
                         MouseEventKind::Down(MouseButton::Left) => {
                             let selected = if let Some(picker) = &mut self.artifacts_picker {
-                                picker.select_at_row(row)
+                                picker.select_at_row(body_row)
                             } else {
                                 self.conversation_picker
                                     .as_mut()
-                                    .is_some_and(|picker| picker.select_at_row(row))
+                                    .is_some_and(|picker| picker.select_at_row(body_row))
                             };
                             if selected {
                                 self.pointer_input =
@@ -4729,9 +4882,9 @@ impl State {
                             self.pointer_input = self.key(KeyEvent::new(code, KeyModifiers::NONE));
                         }
                         MouseEventKind::Down(MouseButton::Left) => {
-                            let capacity = self.input_dialog_height();
+                            let capacity = self.input_dialog_body_height();
                             if let Some(surface) = &mut self.permissions_surface {
-                                let effect = surface.click(row, self.width, capacity);
+                                let effect = surface.click(body_row, self.width, capacity);
                                 if let PermissionsEffect::Close { .. } = effect {
                                     self.permissions_surface = None;
                                 }
@@ -4741,12 +4894,13 @@ impl State {
                             } else {
                                 let viewport =
                                     task_surface_content_viewport(self.width, self.height);
-                                let capacity = self.input_dialog_height();
+                                let capacity = self.input_dialog_body_height();
                                 let selected = if let Some(surface) = &mut self.task_surface {
-                                    row.checked_sub(1)
+                                    body_row
+                                        .checked_sub(1)
                                         .is_some_and(|row| surface.select_at_row(row, viewport))
                                 } else {
-                                    row.checked_sub(1).is_some_and(|row| {
+                                    body_row.checked_sub(1).is_some_and(|row| {
                                         self.subscription_surface.as_mut().unwrap().select_at_row(
                                             row,
                                             capacity.saturating_sub(2).max(1),
@@ -4974,6 +5128,9 @@ impl State {
         if !self.interactive {
             return Ok(());
         }
+        if self.input_dialog_visible() && self.prompt_suggestion_request.is_some() {
+            self.clear_prompt_suggestion();
+        }
         if self.held_frames > 0 {
             self.frame_deferred = true;
             return Ok(());
@@ -4984,7 +5141,6 @@ impl State {
         renderer::write_synchronized(output, |output| self.draw_frame(output))
     }
 
-    /// Draws a list view in the lower half of the screen with the conversation above it.
     fn tick_list_visible(&self) -> bool {
         self.chat.is_some()
             && !self.tick_list.entries().is_empty()
@@ -5144,10 +5300,11 @@ impl State {
         let content_columns = self.content_columns();
         let sticky_prompt = (start >= 2 && self.workspace_trust.is_none())
             .then(|| {
-                let text = self
-                    .scrollback
-                    .latest_input_text(self.display.glyph(Glyph::Prompt))
-                    .or_else(|| self.latest_user_message.clone())?;
+                let text = self.scrollback.sticky_input_text(
+                    self.display.glyph(Glyph::Prompt),
+                    content_columns,
+                    start,
+                )?;
                 let text = format!(
                     "{} {}",
                     self.display.glyph(Glyph::Prompt),
@@ -5161,30 +5318,11 @@ impl State {
             .flatten();
         let sticky_rows = usize::from(sticky_prompt.is_some());
         let body_height = start.saturating_sub(sticky_rows);
-        let mut body = self.scrollback.frame_with_motion(
+        let body = self.scrollback.frame_with_motion(
             content_columns,
             body_height,
             self.display.preferences().prefers_reduced_motion,
         );
-        let reading_prompt = if sticky_prompt.is_none()
-            && !self.input_dialog_visible()
-            && self.footer.selected().is_none()
-            && self.candidate_rows(1).is_empty()
-        {
-            self.scrollback.reading_prompt(content_columns, start)
-        } else {
-            None
-        };
-        if let Some(prompt) = &reading_prompt {
-            body = self.scrollback.frame_with_motion(
-                content_columns,
-                start.saturating_sub(1),
-                self.display.preferences().prefers_reduced_motion,
-            );
-            body.lines.insert(0, prompt.clone());
-            body.styled
-                .insert(0, RoleLine::role(prompt.clone(), Role::MutedText));
-        }
         self.initialize_screen(output)?;
         write!(output, "{RESET_SCROLL_REGION}")?;
         let padding = body_height.saturating_sub(body.lines.len());
@@ -5279,10 +5417,7 @@ impl State {
                 .render(self.colour_depth)
             }))
             .collect();
-        let scroll_rows = if sticky_prompt.is_none()
-            && !self.tick_list_visible()
-            && self.scrollback.reading_prompt(self.width, start).is_none()
-        {
+        let scroll_rows = if sticky_prompt.is_none() && !self.tick_list_visible() {
             start
         } else {
             0
@@ -5497,21 +5632,46 @@ impl State {
             .map(|(_, header)| header.as_str())
     }
 
-    fn request_styled_frame(&mut self) -> (Vec<RoleLine>, usize, usize) {
+    fn picker_context(&self, menu: &Menu) -> Vec<String> {
+        let mut context = menu.context.clone();
+        if let Some(failure) = self
+            .picker_presentation
+            .failure_target
+            .and_then(|chat| self.provider_failures.get(&chat))
+            .and_then(|failures| {
+                self.picker_presentation
+                    .failure_connections
+                    .get(menu.selected)
+                    .and_then(Option::as_ref)
+                    .and_then(|connection| failures.get(connection))
+            })
+        {
+            context.splice(
+                0..0,
+                super::menus::providers::provider_failure_context(failure),
+            );
+            if self.picker_presentation.failure_message {
+                context.push(format!("Provider message: {}", failure.message));
+            }
+        }
+        context
+    }
+
+    fn request_styled_frame(&mut self, capacity: usize) -> (Vec<RoleLine>, usize, usize) {
         if !self.menu_is_visible() {
             let mut lines = vec![RoleLine::role(
                 "Resize terminal to review · Esc cancel",
                 Role::MutedText,
             )];
-            lines.resize(self.input_dialog_height(), RoleLine::default());
+            lines.resize(capacity, RoleLine::default());
             for line in &mut lines {
                 line.truncate(self.width);
             }
             return (lines, 0, 0);
         }
         let menu = self.menu.as_ref().expect("request menu is visible");
-        let capacity = self.input_dialog_height();
         let selected = menu.selected.min(menu.options.len().saturating_sub(1));
+        let picker_context = self.picker_context(menu);
         let title_rows = usize::from(capacity > 1);
         let hint_rows = usize::from(capacity > 2);
         let input_field = self.input_menu_active();
@@ -5585,14 +5745,23 @@ impl State {
         let comment_rows = comment_lines
             .len()
             .min(capacity.saturating_sub(title_rows + hint_rows + 1));
-        let context_reserve = usize::from(!menu.context.is_empty() || self.menu_review.is_some())
+        let picker = self.picker_kind.is_some();
+        let compact = picker && self.width < COMPACT_PICKER_COLUMNS;
+        let minimum_option_rows =
+            1 + usize::from(
+                compact
+                    && self
+                        .picker_presentation
+                        .compact_rows
+                        .get(selected)
+                        .is_some(),
+            ) + usize::from(picker && !self.picker_presentation.headers.is_empty());
+        let context_reserve = usize::from(!picker_context.is_empty() || self.menu_review.is_some())
             * capacity
-                .saturating_sub(title_rows + hint_rows + comment_rows + 1)
+                .saturating_sub(title_rows + hint_rows + comment_rows + minimum_option_rows)
                 .min(2);
         let option_capacity =
             capacity.saturating_sub(title_rows + hint_rows + comment_rows + context_reserve);
-        let picker = self.picker_kind.is_some();
-        let compact = picker && self.width < COMPACT_PICKER_COLUMNS;
         let options = menu
             .options
             .iter()
@@ -5703,8 +5872,7 @@ impl State {
                     }
                 }));
             } else {
-                let context = menu
-                    .context
+                let context = picker_context
                     .iter()
                     .flat_map(|line| {
                         let link = self
@@ -5787,7 +5955,7 @@ impl State {
         if hint_rows > 0 {
             let hint = if input_field && !editing {
                 format!(
-                    "Enter confirm · Esc cancel · Tab edit {}",
+                    "Enter confirm · Esc back · Tab edit {}",
                     self.menu_comment.as_ref().unwrap().label
                 )
             } else if let Some(comment) = comment {
@@ -5796,6 +5964,8 @@ impl State {
                         "{} · Enter save · Ctrl+G external editor · Esc close field",
                         comment.label
                     )
+                } else if let Some(hint) = self.picker_presentation.editing_hint {
+                    hint.into()
                 } else if self.menu_link.is_some() {
                     format!("{} · Enter submit · Esc close field", comment.label)
                 } else if self.question_menu.is_some() {
@@ -5840,7 +6010,15 @@ impl State {
                 };
                 hints.push((scroll.into(), 7));
             }
-            if self.menu_review.is_some() && comment.is_none() {
+            if self.menu_plan {
+                hints.push(("v full plan".into(), 12));
+                if !editing {
+                    hints.push(("PgUp/PgDn plan".into(), 10));
+                    if self.menu_comment.is_some() {
+                        hints.push(("Tab feedback".into(), 10));
+                    }
+                }
+            } else if self.menu_review.is_some() && comment.is_none() {
                 hints.push(("v full Diff".into(), 12));
                 hints.push(("Shift+Tab review".into(), 7));
             } else if menu
@@ -6049,11 +6227,7 @@ impl State {
         .then(|| {
             format!(
                 "{} {}",
-                self.display.glyph(if self.status_area.agents_collapsed {
-                    Glyph::Collapsed
-                } else {
-                    Glyph::Expanded
-                }),
+                self.display.glyph(Glyph::Subagents),
                 self.status_area.header_label(FooterItemId::Agents)
             )
         })
@@ -6315,17 +6489,23 @@ impl State {
         let mut tick_control = None;
         if borders > 0 {
             let can_return = self.ordinary_input_is_visible() && !self.scrollback.is_following();
-            let mut reading = can_return && self.scrollback.has_hidden_tail(self.width, body_rows);
-            if can_return
+            let content_columns = self.content_columns();
+            let sticky_rows = usize::from(
+                can_return
+                    && body_rows >= 2
+                    && self
+                        .scrollback
+                        .sticky_input_text(
+                            self.display.glyph(Glyph::Prompt),
+                            content_columns,
+                            body_rows,
+                        )
+                        .is_some(),
+            );
+            let reading = can_return
                 && self
                     .scrollback
-                    .reading_prompt(self.width, body_rows)
-                    .is_some()
-            {
-                reading = self
-                    .scrollback
-                    .has_hidden_tail(self.width, body_rows.saturating_sub(1));
-            }
+                    .has_hidden_tail(content_columns, body_rows.saturating_sub(sticky_rows));
             let label = reading.then(|| self.back_to_bottom_label()).flatten();
             if let Some(label) = label {
                 let label_width = display_width(&label);
@@ -6758,6 +6938,9 @@ impl State {
     }
 
     fn input_image_marks(&self) -> Vec<(std::ops::Range<usize>, Role)> {
+        if let Some(text) = self.visible_prompt_suggestion() {
+            return vec![(0..text.len(), Role::MutedText)];
+        }
         let offset = usize::from(self.shell_input.kind() == InputKind::Shell);
         self.paste_blocks
             .projection(
@@ -6778,6 +6961,9 @@ impl State {
     }
 
     fn input_display(&self) -> (String, usize) {
+        if let Some(text) = self.visible_prompt_suggestion() {
+            return (text.into(), 0);
+        }
         let projection = self.paste_blocks.projection(
             self.editor.draft(),
             self.editor.cursor(),
@@ -7204,6 +7390,7 @@ impl State {
             .editor
             .apply_keeping_whole(command, &self.paste_blocks.ranges());
         if outcome == EditorOutcome::Changed {
+            self.clear_prompt_suggestion();
             self.retry_of = None;
             self.paste_blocks.reconcile(&before, self.editor.draft());
             self.snap_cursor_out_of_pasted_block(previous_cursor);
@@ -7215,7 +7402,7 @@ impl State {
     fn menu_is_visible(&self) -> bool {
         if self.menu.as_ref().is_some_and(|menu| menu.confirmation)
             && self.request_layout.is_none()
-            && self.input_dialog_height() < 3
+            && self.input_dialog_body_height() < 3
         {
             return false;
         }
@@ -7336,6 +7523,8 @@ impl State {
     fn begin_menu_submission(&mut self, id: Uuid) {
         self.menu_submission_pending = Some(id);
         self.menu_submission_finished = None;
+        self.menu_submission_navigation =
+            self.picker_kind.is_some() && self.request_layout.is_none();
     }
 
     fn mark_menu_submission_finished(&mut self, id: Uuid) {
@@ -7357,6 +7546,7 @@ impl State {
         };
         self.menu_submission_pending = None;
         self.menu_submission_finished = None;
+        self.menu_submission_navigation = false;
         if self.clear_hidden_menu(id) {
             return true;
         }
@@ -7612,6 +7802,18 @@ impl State {
     }
 
     fn navigate_menu_review(&mut self, action: DiffNavigationAction) {
+        if self.menu_plan {
+            let page = self.height.saturating_sub(3).max(1);
+            self.context_offset = match action {
+                DiffNavigationAction::Up => self.context_offset.saturating_sub(1),
+                DiffNavigationAction::Down => self.context_offset.saturating_add(1),
+                DiffNavigationAction::PageUp => self.context_offset.saturating_sub(page),
+                DiffNavigationAction::PageDown => self.context_offset.saturating_add(page),
+                DiffNavigationAction::Home => 0,
+                DiffNavigationAction::End => usize::MAX,
+            };
+            return;
+        }
         let Some(review_state) = &mut self.menu_review else {
             return;
         };
@@ -7967,6 +8169,9 @@ impl State {
     }
 
     fn paste(&mut self, text: &str) {
+        if self.ordinary_input_is_visible() {
+            self.clear_prompt_suggestion();
+        }
         if self.request_layout.is_some() && self.menu.is_none()
             || self.workspace_trust.is_some()
             || self.full_review
@@ -8758,7 +8963,10 @@ impl State {
         if key.kind == KeyEventKind::Release {
             return None;
         }
-        let dialog_height = self.input_dialog_height();
+        if self.ordinary_input_is_visible() && matches!(key.code, KeyCode::Char(_)) {
+            self.clear_prompt_suggestion();
+        }
+        let dialog_height = self.input_dialog_body_height();
         if let Some(dialog) = &mut self.workspace_trust {
             if self.menu_submission_pending.is_some() {
                 return None;
@@ -8786,7 +8994,7 @@ impl State {
         }
         if key.code == KeyCode::Char('v')
             && key.modifiers == KeyModifiers::NONE
-            && self.menu_review.is_some()
+            && (self.menu_review.is_some() || self.menu_plan)
             && !self.menu_comment_is_editing()
         {
             self.full_review = true;
@@ -8842,7 +9050,7 @@ impl State {
             return self.conversation_picker_key(key);
         }
         if self.menu.is_none()
-            && self.input_dialog_height() < 3
+            && self.input_dialog_body_height() < 3
             && key.code == KeyCode::Enter
             && (self.tick_list.confirmation.is_some()
                 || self
@@ -8953,6 +9161,20 @@ impl State {
                 _ => {}
             }
             return None;
+        }
+        if self.visible_prompt_suggestion().is_some()
+            && key.modifiers == KeyModifiers::NONE
+            && matches!(key.code, KeyCode::Tab | KeyCode::Right | KeyCode::Enter)
+        {
+            let text = self
+                .prompt_suggestion
+                .take()
+                .expect("visible suggestion exists");
+            self.clear_prompt_suggestion();
+            self.insert(&text);
+            if key.code != KeyCode::Enter {
+                return None;
+            }
         }
         if self.chat.is_some()
             && !self.tick_list.entries().is_empty()
@@ -9265,7 +9487,12 @@ impl State {
                     Some(PickerAction::ToggleConnections)
                 }
                 (Some(PickerKind::Model), KeyCode::Char('r'), KeyModifiers::NONE)
-                    if self.picker_presentation.refresh =>
+                    if self.picker_presentation.refresh
+                        && self
+                            .picker_presentation
+                            .refresh_options
+                            .as_ref()
+                            .is_none_or(|options| options.contains(&menu.selected)) =>
                 {
                     Some(PickerAction::RefreshAccountModels)
                 }
@@ -9493,6 +9720,17 @@ impl State {
             return None;
         }
         let selected_comment = self.selected_menu_comment();
+        if self.menu_plan
+            && key.code == KeyCode::Enter
+            && self.selected_menu_accepts_comment()
+            && !self.menu_comment_is_editing()
+            && selected_comment.is_none()
+        {
+            if let Some(comment) = &mut self.menu_comment {
+                comment.editing = true;
+            }
+            return None;
+        }
         let direct_number_choices =
             self.picker_kind.is_none() && self.menu.as_ref().is_some_and(|menu| !menu.confirmation);
         let approval_review_available = self
@@ -9638,6 +9876,14 @@ impl State {
                 return None;
             }
             return Some(InputEvent::CycleExecutionMode);
+        }
+        if key.code == KeyCode::Esc
+            && self.ordinary_input_is_visible()
+            && (self.prompt_suggestion.is_some() || self.prompt_suggestion_request.is_some())
+        {
+            self.clear_prompt_suggestion();
+            self.escape_confirmation = None;
+            return None;
         }
         if key.code == KeyCode::Down && self.can_enter_footer() {
             self.apply_footer_action(FooterAction::Down);
@@ -10031,7 +10277,7 @@ fn send_input(sender: &mpsc::Sender<InputEvent>, stop: &AtomicBool, mut input: I
 fn task_surface_content_viewport(width: usize, height: usize) -> TaskViewport {
     TaskViewport {
         width: width.saturating_sub(2).max(1),
-        height: input_dialog::height_for_terminal(height)
+        height: input_dialog::body_height(input_dialog::height_for_terminal(height))
             .saturating_sub(TASK_SURFACE_HEADER_FOOTER_ROWS),
     }
 }
@@ -11059,10 +11305,10 @@ mod tests {
         );
     }
 
-    struct InteractiveConsoleFixture(Console);
+    pub(super) struct InteractiveConsoleFixture(Console);
 
     impl InteractiveConsoleFixture {
-        fn new(state: State) -> Self {
+        pub(super) fn new(state: State) -> Self {
             assert!(state.interactive);
             let mut console = console_with_state(state);
             Arc::get_mut(&mut console._lifetime).unwrap().interactive = true;
@@ -13038,6 +13284,11 @@ mod tests {
                 menu.options,
                 ["Yes, enter plan mode", "No, start implementing now"]
             );
+            assert_eq!(
+                state.styled_frame().0[0].spans[0].role,
+                Some(Role::PlanMode)
+            );
+            assert!(state.menu_comment.is_none());
             let frame = state.frame().0.join("\n");
             assert!(
                 frame.contains(
@@ -14801,7 +15052,7 @@ mod tests {
             core.starts_with('─')
                 && core.contains("⏵⏵ Auto")
                 && core.contains("claude-fable-5-1")
-                && !core.contains("Context"),
+                && core.contains("Context unknown"),
             "{core:?}"
         );
         assert_eq!(
@@ -15169,11 +15420,10 @@ mod tests {
                     "Auto".into(),
                     "loss-model".into(),
                     None,
-                    vec![StatusItem {
-                        id: "todo".into(),
-                        title: "review".into(),
-                        state: "pending",
-                        role: Role::MutedText,
+                    vec![TodoItem {
+                        content: "review".into(),
+                        status: tickloop_agent::runtime::TodoStatus::Pending,
+                        active_form: "Working".into(),
                     }],
                 );
                 super::layout_tests::set_status_family(&mut state.status_area);
@@ -15241,7 +15491,7 @@ mod tests {
                 assert!(
                     returned.contains("Auto")
                         && returned.contains("loss-model")
-                        && !returned.contains("Context"),
+                        && returned.contains("Context unknown"),
                     "{focus}: {returned}"
                 );
                 assert!(
@@ -16470,34 +16720,6 @@ mod tests {
     }
 
     #[test]
-    fn status_area_variant_a_keeps_the_draft_and_switches_exclusive_panels() {
-        let mut state = State::new(true, 80, 24);
-        state.prompt_enabled = true;
-        state.insert("inspect current work");
-        let draft = state.editor.draft().to_owned();
-        state.status_area.update(
-            "Auto".into(),
-            "model".into(),
-            Some((42000, 200000)),
-            vec![StatusItem {
-                id: "1".into(),
-                title: "review results".into(),
-                state: "pending",
-                role: Role::MutedText,
-            }],
-        );
-        super::layout_tests::set_status_family(&mut state.status_area);
-        state.footer.update(state.status_area.available_panels());
-        state.key(key(KeyCode::Down));
-        state.key(key(KeyCode::Right));
-        let frame = state.frame().0;
-        assert!(frame.iter().any(|row| row.contains("task 00")));
-        assert!(!frame.iter().any(|row| row.contains("cargo test")));
-        assert!(state.key(key(KeyCode::Esc)).is_none());
-        assert_eq!(state.editor.draft(), draft);
-    }
-
-    #[test]
     fn footer_escape_and_printable_keys_return_to_the_editor() {
         let mut state = State::new(true, 80, 24);
         state.prompt_enabled = true;
@@ -16870,7 +17092,10 @@ mod tests {
         state.draw(&mut output).unwrap();
         let output = String::from_utf8(output).unwrap();
         assert_eq!(state.frame().0.len(), 12);
-        assert_eq!(state.rendered_screen[6], "Run this command?");
+        assert_eq!(
+            state.rendered_screen[6 + input_dialog::INPUT_DIALOG_RULE_ROWS],
+            "Run this command?"
+        );
         assert!(output.contains("tool log 49"));
         assert!(
             !state
@@ -18064,6 +18289,7 @@ mod tests {
                         "Output style",
                         "Permissions",
                         "Artifact Service",
+                        "Prompt suggestions",
                     ]
                 );
                 settings.id
@@ -18398,6 +18624,62 @@ mod tests {
                 && line.text().contains(&format!("Model {expected:02}"))));
             state.key(key(KeyCode::Char('k')));
         }
+    }
+
+    #[test]
+    fn provider_diagnostics_follow_model_keys_and_live_snapshot_without_moving_focus() {
+        let chat = Uuid::new_v4();
+        let mut state = State::new(true, 120, 25);
+        state.prompt_enabled = true;
+        state.menu_focused = true;
+        state.picker_kind = Some(PickerKind::Model);
+        let mut picker = menu();
+        picker.options = vec!["DeepSeek".into(), "MiniMax".into()];
+        picker.selected = 0;
+        let id = picker.id;
+        state.menu = Some(picker);
+        state.picker_presentation.failure_target = Some(chat);
+        state.picker_presentation.failure_connections =
+            vec![Some("deepseek-api".into()), Some("minimax-api".into())];
+        state.provider_failures.insert(
+            chat,
+            HashMap::from([(
+                "deepseek-api".into(),
+                crate::model::ProviderHttpFailure {
+                    provider_id: "deepseek-api".into(),
+                    provider_name: "DeepSeek".into(),
+                    status: 403,
+                    class: crate::model::ProviderFailureClass::UsageLimit,
+                    message: "Monthly limit".into(),
+                    hint: "Check allowance".into(),
+                    retry_after: None,
+                    retryable: false,
+                },
+            )]),
+        );
+        let context = |state: &State| {
+            state
+                .picker_context(state.menu.as_ref().unwrap())
+                .join("\n")
+        };
+        assert!(context(&state).contains("DeepSeek · HTTP 403"));
+        for down in [
+            key(KeyCode::Char('j')),
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
+        ] {
+            assert!(state.key(down).is_none());
+            assert!(!context(&state).contains("HTTP 403"));
+            assert!(state.key(key(KeyCode::Char('k'))).is_none());
+            assert!(context(&state).contains("HTTP 403"));
+        }
+        state
+            .provider_failures
+            .insert(Uuid::new_v4(), HashMap::new());
+        assert!(context(&state).contains("HTTP 403"));
+        state.provider_failures.insert(chat, HashMap::new());
+        assert!(!context(&state).contains("HTTP 403"));
+        assert_eq!(state.menu.as_ref().unwrap().id, id);
+        assert_eq!(state.menu.as_ref().unwrap().selected, 0);
     }
 
     #[test]

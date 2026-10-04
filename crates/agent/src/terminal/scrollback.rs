@@ -224,8 +224,14 @@ impl Scrollback {
         self.activity.clone()
     }
 
-    pub(super) fn latest_input_text(&self, prompt: &str) -> Option<String> {
-        self.inputs.iter().rev().find_map(|(_, range)| {
+    pub(super) fn sticky_input_text(
+        &mut self,
+        prompt: &str,
+        width: usize,
+        height: usize,
+    ) -> Option<String> {
+        self.prepare_frame(width, height);
+        let (range, text) = self.inputs.iter().rev().find_map(|(_, range)| {
             let text = self
                 .lines
                 .get(range.clone())?
@@ -236,34 +242,15 @@ impl Scrollback {
                 .collect::<Vec<_>>()
                 .join(" ");
             let text = text.strip_prefix(prompt).unwrap_or(&text).trim();
-            (!text.is_empty() && !text.starts_with('/')).then(|| text.to_owned())
-        })
-    }
-
-    pub(super) fn reading_prompt(&self, width: usize, height: usize) -> Option<String> {
-        if self.following || height < 7 || width < 24 {
-            return None;
-        }
-        let first_line = self.rows.get(self.top_row())?.start.line;
-        if self.line_styles.get(first_line)?.fill == Some(Role::UserMessageBg) {
-            return None;
-        }
-        let end = (0..first_line)
-            .rev()
-            .find(|index| self.line_styles[*index].fill == Some(Role::UserMessageBg))?;
-        let mut start = end;
-        while start > 0 && self.line_styles[start - 1].fill == Some(Role::UserMessageBg) {
-            start -= 1;
-        }
-        let summary = self.lines[start..=end]
-            .join(" ")
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
-        let summary = summary.chars().take(512).collect::<String>();
-        let mut line = RoleLine::plain(summary);
-        line.truncate(width);
-        Some(line.text())
+            (!text.is_empty() && !text.starts_with('/')).then(|| (range, text.to_owned()))
+        })?;
+        let first_row = self
+            .rows
+            .partition_point(|row| row.start.line < range.start);
+        self.rows
+            .get(first_row)
+            .filter(|row| range.contains(&row.start.line))?;
+        (first_row < self.top_row()).then_some(text)
     }
 
     pub(super) fn new() -> Self {

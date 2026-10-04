@@ -160,11 +160,16 @@ fn incompatible_service_output(terminal: bool) -> String {
     let commands = command.lines().map(str::trim).collect::<Vec<_>>();
     assert_eq!(commands.len(), 2);
     assert!(commands[0].ends_with(" service stop"));
-    let quoted_executable = shell_words::quote(executable);
-    assert!(commands[0].ends_with(&format!("{quoted_executable} service stop")));
+    let resolved_executable = std::fs::canonicalize(executable).unwrap();
+    let resolved_executable = resolved_executable.to_str().unwrap();
+    let quoted_executable = shell_words::quote(resolved_executable);
+    assert!(
+        commands[0].ends_with(&format!("{quoted_executable} service stop")),
+        "{command}"
+    );
     assert!(commands[1].ends_with(quoted_executable.as_ref()));
     assert!(output.contains(&format!("Runtime: {}", runtime.display())));
-    assert!(output.contains(&format!("Executable: {executable}")));
+    assert!(output.contains(&format!("Executable: {resolved_executable}")));
     assert!(output.contains(&format!(
         "client {}.{}",
         tickloop_agent::agent_access::PROTOCOL_MAJOR,

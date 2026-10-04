@@ -824,9 +824,18 @@ impl EmbeddedAgentAccess {
                 loop_id,
                 version,
                 mode,
-            } => Ok(CommandResult::Text(
-                agent.approve_plan(chat, loop_id, version, mode).await?,
-            )),
+            } => match agent.approve_plan(chat, loop_id, version, mode).await? {
+                Some(continuation) => Ok(CommandResult::Text(continuation)),
+                None => Ok(CommandResult::Done),
+            },
+            LoopAction::DeclinePlan {
+                loop_id,
+                version,
+                feedback,
+            } => match agent.decline_plan(chat, loop_id, version, feedback).await? {
+                Some(receipt) => Ok(CommandResult::Submitted(receipt)),
+                None => Ok(CommandResult::Done),
+            },
             LoopAction::UpdateSubscription {
                 subscription_id,
                 change,

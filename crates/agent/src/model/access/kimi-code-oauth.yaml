@@ -11,6 +11,8 @@ series:
   version: K3
   model: k3
   capability_order: 0
-notice: Kimi Code model listing does not verify plan access. kimi-for-coding is the default
-  for all plans; other models may require a higher plan. A usage-limit refusal may also
-  mean the plan does not include the model. Check the provider's subscription link.
+notice: Kimi Code OAuth uses the registered Kimi Code client. K3 context is conservatively
+  capped at 256K; 1M requires Pro entitlement.
+  Model listing does not verify plan access. kimi-for-coding is the default for all
+  plans; other models may require a higher plan. A usage-limit refusal may also mean
+  the plan does not include the model. Check the provider's subscription link.

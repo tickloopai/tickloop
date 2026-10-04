@@ -4,24 +4,17 @@ DEV_LAUNCHER := $(shell dirname '$(subst ','"'"',$(strip $(MAKEFILE_LIST)))')/sc
 -include .env
 export
 
-# dev starts the Agent in the current directory and keeps its state isolated.
-DEV_CONFIG_DIR ?= /tmp/tickloop-dev/config
 ARGS ?=
 
 CARGO_PACKAGE := -p tickloop-agent
 PACKAGE_TARGET ?= $(shell rustc -vV | sed -n 's/^host: //p')
 PACKAGE_ARCHIVE = dist/tickloop-$(PACKAGE_TARGET).tar.gz
 
-.PHONY: dev dev-reset build install package test check release-docs prototype-glyph-set prototype-glyph-set-terminal prototype-earnings-review
+.PHONY: dev build install package test check release-docs prototype-glyph-set prototype-glyph-set-terminal prototype-earnings-review
 
-## Start in the current directory with isolated state; example: make dev ARGS="-c"
+## Start in the current directory with the global configuration; example: make dev ARGS="-c"
 dev:
-	@mkdir -p "$(DEV_CONFIG_DIR)"
-	TICKLOOP_CONFIG_DIR="$(DEV_CONFIG_DIR)" "$(DEV_LAUNCHER)" $(ARGS)
-
-## Remove only the dev state directory
-dev-reset:
-	rm -rf "$(DEV_CONFIG_DIR)"
+	"$(DEV_LAUNCHER)" $(ARGS)
 
 build:
 	cargo build --locked $(CARGO_PACKAGE) -p tickloop-ticks --bins
