@@ -163,37 +163,29 @@ fn model_menu_cancellation_restores_prompt_and_allows_reopening() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().canonicalize().unwrap();
     let mut terminal = TerminalFixture::start(&root);
+    let model_menu_closed = |frame: &str| {
+        frame.contains("deepseek-flash")
+            && !frame.contains("Choose model")
+            && !frame.contains("Choose Provider")
+            && frame.lines().any(|line| line.trim() == "❯")
+    };
     terminal.wait_for("deepseek-flash");
     let opened_menu = terminal.output_mark();
     terminal.send(b"/model\r");
     terminal.wait_for_frame_after(opened_menu, "model choices opened", |frame| {
-        frame.contains("Choose model ·")
-    });
-    let returned_provider = terminal.output_mark();
-    terminal.send(b"j\x10\x1b");
-    terminal.wait_for_frame_after(returned_provider, "model Provider returned", |frame| {
-        frame.contains("Choose Provider")
+        frame.contains("Choose model · Signed-in Providers")
     });
     let cancelled_menu = terminal.output_mark();
-    terminal.send(b"\x1b");
-    terminal.wait_for_frame_after(cancelled_menu, "model menu closed", |frame| {
-        frame.contains("deepseek-flash") && !frame.contains("Choose model")
-    });
+    terminal.send(b"j\x10\x1b");
+    terminal.wait_for_frame_after(cancelled_menu, "model menu closed", model_menu_closed);
     let reopened_menu = terminal.output_mark();
     terminal.send(b"/model\r");
     terminal.wait_for_frame_after(reopened_menu, "model menu reopened", |frame| {
-        frame.contains("Choose model ·")
-    });
-    let returned_provider = terminal.output_mark();
-    terminal.send(b"\x1b");
-    terminal.wait_for_frame_after(returned_provider, "model Provider returned", |frame| {
-        frame.contains("Choose Provider")
+        frame.contains("Choose model · Signed-in Providers")
     });
     let cancelled_model = terminal.output_mark();
     terminal.send(b"\x1b");
-    terminal.wait_for_frame_after(cancelled_model, "model menu closed", |frame| {
-        frame.contains("deepseek-flash") && !frame.contains("Choose model")
-    });
+    terminal.wait_for_frame_after(cancelled_model, "model menu closed", model_menu_closed);
     terminal.exit();
     assert!(!root.join("state/auth").exists());
 }
@@ -226,18 +218,19 @@ fn logout_can_be_cancelled_while_another_process_holds_the_auth_lock() {
     terminal.wait_for("Connection · OpenAI");
     terminal.select_row("Sign out…");
     terminal.wait_for("Sign out · OpenAI");
+    let signing_out = terminal.output_mark();
     terminal.send(b"j\r");
-    terminal.wait_for("Removing Codex login");
+    terminal.wait_for_frame_after(signing_out, "Connection retained during logout", |frame| {
+        frame.contains("Connection · OpenAI") && !frame.contains("Sign out · OpenAI")
+    });
     let cancelled = terminal.output_mark();
-    terminal.send(b"\x03");
+    terminal.send(b"\x1b");
     terminal.wait_for("Logout cancelled; saved login remains.");
     assert!(credentials.exists());
     drop(lock);
     terminal.wait_for_frame_after(cancelled, "Provider after logout cancellation", |frame| {
-        frame.contains("Connection · OpenAI")
+        frame.contains("Choose Provider · All") && frame.contains("Signed in")
     });
-    terminal.send(b"\x1b");
-    terminal.wait_for("Choose Provider");
     let returned = terminal.output_mark();
     terminal.send(b"\x1b");
     terminal.wait_for_frame_after(returned, "prompt after logout cancellation", |frame| {
@@ -247,7 +240,7 @@ fn logout_can_be_cancelled_while_another_process_holds_the_auth_lock() {
 }
 
 #[tokio::test]
-async fn piped_commands_wait_for_logout_before_model_menu_and_exit() {
+async fn piped_commands_wait_for_logout_before_provider_navigation_and_exit() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().canonicalize().unwrap();
     let state_dir = root.join("state");
@@ -268,22 +261,6 @@ async fn piped_commands_wait_for_logout_before_model_menu_and_exit() {
     )
     .unwrap();
     std::fs::set_permissions(&credential_path, std::fs::Permissions::from_mode(0o600)).unwrap();
-    let mut connection = tickloop_agent::model::cards::ModelCatalog::defaults()
-        .get("openai-codex", "gpt-6.1-sol")
-        .unwrap()
-        .connection()
-        .unwrap()
-        .clone();
-    connection.discovery = tickloop_agent::model::connection::ModelDiscovery::Unsupported;
-    std::fs::create_dir_all(state_dir.join("providers")).unwrap();
-    std::fs::write(
-        state_dir.join("providers/openai-codex.yaml"),
-        serde_yaml_ng::to_string(
-            &serde_json::json!({"id":"openai-codex", "connection":connection}),
-        )
-        .unwrap(),
-    )
-    .unwrap();
     let lock_path = auth_dir.join("openai-codex.lock");
     let lock = OpenOptions::new()
         .read(true)
@@ -413,12 +390,9 @@ async fn piped_commands_wait_for_logout_before_model_menu_and_exit() {
     assert!(!stdout.contains("fake-refresh"));
     assert!(!stdout.contains("Codex browser login"));
     let removed = stdout.find("Codex login removed locally").unwrap();
-    let model_menu = stdout
+    let provider_directory = stdout
         .rfind("Choose Provider")
-        .unwrap_or_else(|| panic!("missing model menu: {stdout}"));
-    let cancelled = stdout
-        .find("Selection cancelled; configuration unchanged.")
-        .unwrap();
-    assert!(removed < model_menu && model_menu < cancelled, "{stdout}");
+        .unwrap_or_else(|| panic!("missing Provider directory: {stdout}"));
+    assert!(removed < provider_directory, "{stdout}");
     assert!(!credential_path.exists());
 }

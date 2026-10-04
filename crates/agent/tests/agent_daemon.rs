@@ -598,18 +598,47 @@ async fn a_real_worker_keeps_shell_execution_after_ui_disconnect_and_exits_on_li
     assert!(!socket.exists());
 }
 
+/// Multi-megabyte IPC transfers in a debug build; on a machine busy with parallel tests they took
+/// over 15 s. Only a failure waits this long.
+const OVERSIZED_TRANSFER_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Stops whatever owner serves a test's private runtime directory when the test ends, also
+/// after a failed assertion. The test's runtime may already be gone by then, so the shutdown
+/// runs on its own thread and runtime and is awaited.
 struct PrivateOwnerGuard {
-    client: Option<LocalAgentClient>,
+    socket: std::path::PathBuf,
+}
+impl PrivateOwnerGuard {
+    fn new(directory: &Path) -> Self {
+        Self {
+            socket: directory.join("owner.sock"),
+        }
+    }
 }
 impl Drop for PrivateOwnerGuard {
     fn drop(&mut self) {
-        if let Some(client) = self.client.take()
-            && let Ok(handle) = tokio::runtime::Handle::try_current()
-        {
-            handle.spawn(async move {
-                let _ = client.shutdown_owner().await;
-            });
+        if !self.socket.exists() {
+            return;
         }
+        let socket = self.socket.clone();
+        let _ = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(async {
+                let _ = tokio::time::timeout(Duration::from_secs(15), async {
+                    if let Ok(client) = LocalAgentClient::connect(&socket).await {
+                        let _ = client.shutdown_owner().await;
+                        while socket.exists() {
+                            tokio::time::sleep(Duration::from_millis(25)).await;
+                        }
+                    }
+                })
+                .await;
+            });
+            Ok::<(), std::io::Error>(())
+        })
+        .join();
     }
 }
 
@@ -640,12 +669,11 @@ async fn an_owner_killed_without_cleanup_never_blocks_the_next_owner() {
         private_directory.join("worker-control.sock").exists(),
         "a killed owner leaves its endpoints behind"
     );
-    let mut guard = PrivateOwnerGuard { client: None };
+    let _guard = PrivateOwnerGuard::new(&private_directory);
     let next = tickloop_agent::agent_daemon::connect_or_start_at(private_directory, executable)
         .await
         .expect("the next owner replaces the stale endpoints");
     assert_ne!(next.owner_epoch(), killed.owner_epoch());
-    guard.client = Some(next);
 }
 
 #[tokio::test]
@@ -656,7 +684,7 @@ async fn a_real_owner_answers_hosted_lifecycle_requests_only_for_live_grants() {
     let private_directory = temporary.path().join("agent-runtime");
     std::fs::create_dir(&private_directory).unwrap();
     std::fs::set_permissions(&private_directory, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let mut guard = PrivateOwnerGuard { client: None };
+    let _guard = PrivateOwnerGuard::new(&private_directory);
     let client = tickloop_agent::agent_daemon::connect_or_start_at(
         private_directory.clone(),
         std::path::PathBuf::from(env!("CARGO_BIN_EXE_tickloop")),
@@ -664,7 +692,6 @@ async fn a_real_owner_answers_hosted_lifecycle_requests_only_for_live_grants() {
     .await
     .unwrap();
     let epoch = client.owner_epoch();
-    guard.client = Some(client);
     let endpoint = private_directory.join("worker-control.sock");
     assert_eq!(
         std::fs::metadata(&endpoint).unwrap().permissions().mode() & 0o777,
@@ -714,7 +741,7 @@ async fn concurrent_cold_start_uses_one_isolated_owner_and_owner_exit_closes_wor
     let private_directory = temporary.path().join("agent-runtime");
     std::fs::create_dir(&private_directory).unwrap();
     std::fs::set_permissions(&private_directory, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let mut guard = PrivateOwnerGuard { client: None };
+    let _guard = PrivateOwnerGuard::new(&private_directory);
     let executable = std::path::PathBuf::from(env!("CARGO_BIN_EXE_tickloop"));
     let mut calls = Vec::new();
     for _ in 0..8 {
@@ -734,7 +761,6 @@ async fn concurrent_cold_start_uses_one_isolated_owner_and_owner_exit_closes_wor
     assert!(clients.iter().all(|client| client.owner_epoch() == epoch));
     let owner_pid = clients[0].server_process_id() as i32;
     assert!(owner_pid > 0 && owner_pid != std::process::id() as i32);
-    guard.client = Some(clients[0].clone());
     assert_eq!(
         std::fs::metadata(private_directory.join("owner.sock"))
             .unwrap()
@@ -883,12 +909,10 @@ async fn concurrent_cold_start_uses_one_isolated_owner_and_owner_exit_closes_wor
     })
     .await
     .unwrap();
-    guard.client = None;
     let new_owner =
         tickloop_agent::agent_daemon::connect_or_start_at(private_directory.clone(), executable)
             .await
             .unwrap();
-    guard.client = Some(new_owner.clone());
     assert_ne!(new_owner.owner_epoch(), epoch);
     assert!(agents(&new_owner).await.is_empty());
     let old = match new_owner
@@ -904,7 +928,6 @@ async fn concurrent_cold_start_uses_one_isolated_owner_and_owner_exit_closes_wor
     };
     assert_eq!(old.code, AccessErrorCode::EpochChanged);
     new_owner.shutdown_owner().await.unwrap();
-    guard.client = None;
 }
 
 async fn controlled_connections(
@@ -2017,7 +2040,7 @@ async fn an_oversized_initial_observation_returns_a_typed_error_and_keeps_ipc_av
     let temporary = tempfile::tempdir_in("/tmp").unwrap();
     let (client, access, target, server) = oversized_response_fixture(temporary.path()).await;
     let error = tokio::time::timeout(
-        Duration::from_secs(15),
+        OVERSIZED_TRANSFER_TIMEOUT,
         client.observe(ObservationRequest::Agent {
             execution: target,
             detail: AgentDetailQuery::Warnings,
@@ -2060,7 +2083,7 @@ async fn an_oversized_accepted_receipt_stays_queryable_without_replaying_the_com
             },
         },
     );
-    let error = tokio::time::timeout(Duration::from_secs(15), client.execute(command.clone()))
+    let error = tokio::time::timeout(OVERSIZED_TRANSFER_TIMEOUT, client.execute(command.clone()))
         .await
         .unwrap()
         .unwrap_err();
@@ -2070,7 +2093,7 @@ async fn an_oversized_accepted_receipt_stays_queryable_without_replaying_the_com
         epoch: command.owner_epoch,
         command_id: command.command_id,
     };
-    let error = tokio::time::timeout(Duration::from_secs(15), client.observe(query.clone()))
+    let error = tokio::time::timeout(OVERSIZED_TRANSFER_TIMEOUT, client.observe(query.clone()))
         .await
         .unwrap()
         .unwrap_err();

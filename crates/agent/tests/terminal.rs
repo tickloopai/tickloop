@@ -1,6 +1,9 @@
+#[path = "support/screen.rs"]
+mod screen;
+
 mod support;
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::process::Command;
 use std::{process::Stdio, thread, time::Duration};
 
@@ -9,7 +12,9 @@ use serde_json::{Value, json};
 use tickloop_agent::settings::UserSettings;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 
-const INTERACTION_TIMEOUT: Duration = Duration::from_secs(10);
+/// Every wait here expects success; a real CLI with its own owner, worker and Shells needed more
+/// than ten seconds on a machine busy with parallel test runs. Only a failure waits this long.
+const INTERACTION_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn trust_working_directory(config_root: &std::path::Path, workdir: &std::path::Path) {
     UserSettings::in_root(config_root)
@@ -117,7 +122,7 @@ fn interactive_pty_trusts_the_directory_and_cycles_all_execution_modes() {
             pixel_height: 0,
         })
         .unwrap();
-    let mut reader = pty.master.try_clone_reader().unwrap();
+    let reader = pty.master.try_clone_reader().unwrap();
     let mut writer = pty.master.take_writer().unwrap();
     let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_tickloop"));
     command.env(
@@ -134,18 +139,8 @@ fn interactive_pty_trusts_the_directory_and_cycles_all_execution_modes() {
     drop(pty.slave);
     let output = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
     let reader_output = output.clone();
-    let output_reader = thread::spawn(move || {
-        let mut buffer = [0_u8; 4096];
-        while let Ok(length) = reader.read(&mut buffer) {
-            if length == 0 {
-                break;
-            }
-            reader_output
-                .lock()
-                .unwrap()
-                .push_str(&String::from_utf8_lossy(&buffer[..length]));
-        }
-    });
+    // Status glyphs are multi-byte; the shared capture keeps a character split across reads.
+    let output_reader = thread::spawn(move || screen::capture_output(reader, reader_output));
     let wait_for_output = |needle: &str, after: usize| {
         let deadline = std::time::Instant::now() + INTERACTION_TIMEOUT;
         let ansi = regex::Regex::new(r"\x1b\[[0-9;?]*[ -/]*[@-~]").unwrap();
@@ -158,7 +153,10 @@ fn interactive_pty_trusts_the_directory_and_cycles_all_execution_modes() {
                 return;
             }
             if std::time::Instant::now() >= deadline {
-                panic!("PTY output did not contain {needle:?}: {captured}");
+                // Release the output lock first, so the reader thread is not poisoned.
+                let text = captured.clone();
+                drop(captured);
+                panic!("PTY output did not contain {needle:?}: {text}");
             }
             drop(captured);
             thread::sleep(Duration::from_millis(20));
@@ -208,18 +206,22 @@ fn interactive_pty_trusts_the_directory_and_cycles_all_execution_modes() {
 
 #[test]
 fn interactive_pty_opens_the_subscription_view_and_closes_it_with_escape() {
+    const TERMINAL_WIDTH: usize = 120;
+    const TERMINAL_HEIGHT: usize = 30;
+    const COMPLETED_FRAME_END: &str = "\x1b[?2026l";
+
     let directory = tempfile::tempdir().unwrap();
     let config_root = directory.path().join("config-root");
     trust_working_directory(&config_root, &directory.path().canonicalize().unwrap());
     let pty = native_pty_system()
         .openpty(PtySize {
-            rows: 30,
-            cols: 120,
+            rows: TERMINAL_HEIGHT as u16,
+            cols: TERMINAL_WIDTH as u16,
             pixel_width: 0,
             pixel_height: 0,
         })
         .unwrap();
-    let mut reader = pty.master.try_clone_reader().unwrap();
+    let reader = pty.master.try_clone_reader().unwrap();
     let mut writer = pty.master.take_writer().unwrap();
     let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_tickloop"));
     command.env(
@@ -234,18 +236,7 @@ fn interactive_pty_opens_the_subscription_view_and_closes_it_with_escape() {
     drop(pty.slave);
     let output = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
     let reader_output = output.clone();
-    let output_reader = thread::spawn(move || {
-        let mut buffer = [0_u8; 4096];
-        while let Ok(length) = reader.read(&mut buffer) {
-            if length == 0 {
-                break;
-            }
-            reader_output
-                .lock()
-                .unwrap()
-                .push_str(&String::from_utf8_lossy(&buffer[..length]));
-        }
-    });
+    let output_reader = thread::spawn(move || screen::capture_output(reader, reader_output));
     let ansi = regex::Regex::new(r"\x1b\[[0-9;?]*[ -/]*[@-~]").unwrap();
     let wait_for_output = |needle: &str, after: usize| {
         let deadline = std::time::Instant::now() + INTERACTION_TIMEOUT;
@@ -253,12 +244,17 @@ fn interactive_pty_opens_the_subscription_view_and_closes_it_with_escape() {
             let captured = output.lock().unwrap();
             if captured
                 .get(after..)
-                .is_some_and(|suffix| ansi.replace_all(suffix, "").contains(needle))
+                .is_some_and(|suffix| suffix.contains(COMPLETED_FRAME_END))
+                && screen::visible_screen(&captured, TERMINAL_WIDTH, TERMINAL_HEIGHT)
+                    .contains(needle)
             {
                 return;
             }
             if std::time::Instant::now() >= deadline {
-                panic!("PTY output did not contain {needle:?}: {captured}");
+                // Release the output lock first, so the reader thread is not poisoned.
+                let text = captured.clone();
+                drop(captured);
+                panic!("PTY output did not contain {needle:?}: {text}");
             }
             drop(captured);
             thread::sleep(Duration::from_millis(20));
@@ -556,7 +552,7 @@ async fn piped_provider_model_and_settings_menus_apply_numbered_choices() {
         .take()
         .unwrap()
         .write_all(
-            b"/model\n2\n/model\ncancel\ncancel\n/settings\n4\n2\n/settings\ncancel\n/exit\n",
+            b"/provider\n1\n2\ncancel\ncancel\n/model\n2\ncancel\n/model\ncancel\n/settings\n4\n2\ncancel\n/settings\ncancel\n/exit\n",
         )
         .await
         .unwrap();
@@ -585,9 +581,13 @@ async fn piped_provider_model_and_settings_menus_apply_numbered_choices() {
         "{transcript}"
     );
     assert!(
-        transcript.contains("Selection cancelled; configuration unchanged."),
+        transcript.contains("Choose Provider · All")
+            && transcript.contains("Choose model · Signed-in Providers")
+            && transcript
+                .contains("Model selection: Applied · DeepSeek-V4.1-Flash · Thinking auto"),
         "{transcript}"
     );
+    assert!(!transcript.contains("Accepted: Goal"), "{transcript}");
     assert!(!transcript.contains("Cannot"), "{transcript}");
     assert!(
         !transcript.contains('\u{1b}'),
@@ -1310,15 +1310,22 @@ async fn a_run_whose_worker_is_lost_is_reported_and_the_cli_exits_at_end_of_inpu
         .expect("the worker socket identifies its peer");
     assert!(worker_pid > 0);
     assert_ne!(Some(worker_pid as u32), child.id());
+    let mut errors = child.stderr.take().unwrap();
+    let errors = tokio::spawn(async move {
+        let mut text = String::new();
+        let _ = errors.read_to_string(&mut text).await;
+        text
+    });
     assert_eq!(unsafe { libc::kill(worker_pid, libc::SIGKILL) }, 0);
     drop(input);
     let status = finish_process(child, output, &mut transcript).await;
-    assert!(!status.success(), "{transcript:?}");
+    let errors = errors.await.unwrap();
+    assert!(!status.success(), "{transcript:?}\n{errors}");
     assert!(
         transcript.iter().any(|line| {
             line.contains("unknown outcome") && line.contains("execution was lost")
         }),
-        "the run's lost execution is reported instead of awaited: {transcript:?}"
+        "the run's lost execution is reported instead of awaited: {transcript:?}\n{errors}"
     );
     assert!(
         transcript

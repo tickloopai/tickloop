@@ -13,11 +13,10 @@ use super::tick_actions::{
     PreparedTickAction, TickActionBackend, TickActionContext, TickActionExecutor,
     TickActionOutcome, TickActionUi, TickDetailKey, TickDetailLine, TickDetailView,
 };
-use crate::tick_adapter::{DiscoveredTick, DiscoveryError, TickDiscovery};
+use crate::tick_adapter::{DiscoveredTick, DiscoveryError, MONITOR_ADD_KEY, TickDiscovery};
 use crate::tick_stream::InstanceRef;
 
 /// The Monitor list key that opens this picker; the picker's own actions report it too.
-pub(super) const ADD_KEY: char = 'a';
 /// The list-level action has no single target instance.
 const NO_INSTANCE: &str = "";
 
@@ -51,7 +50,11 @@ impl TickActionExecutor for OpenPicker {
             None => Arc::new(Nothing),
         };
         ui.open_detail(Box::new(picker));
-        Ok(PreparedTickAction::new(NO_INSTANCE, ADD_KEY, backend))
+        Ok(PreparedTickAction::new(
+            NO_INSTANCE,
+            MONITOR_ADD_KEY,
+            backend,
+        ))
     }
 }
 
@@ -187,7 +190,7 @@ impl MonitorPicker {
         self.workspace = Listing::Loading;
         TickDetailKey::Action(PreparedTickAction::new(
             NO_INSTANCE,
-            ADD_KEY,
+            MONITOR_ADD_KEY,
             Arc::new(LoadPage {
                 discovery,
                 panel: self.id,
@@ -233,7 +236,7 @@ impl MonitorPicker {
         }
         TickDetailKey::Action(PreparedTickAction::new(
             instance.to_string(),
-            ADD_KEY,
+            MONITOR_ADD_KEY,
             Arc::new(AddMember {
                 panel: self.id,
                 title: (self.source == Source::Workspace).then_some(row.title),

@@ -1,6 +1,8 @@
 use super::execution::ConsoleExecution as Agent;
 mod judgment;
 mod providers;
+#[cfg(test)]
+mod settings_ux_pty;
 use providers::{ModelChoice, ProviderModels, ProviderRow};
 
 use std::{
@@ -95,6 +97,7 @@ enum Selection {
     Model {
         target: ConfigTarget,
         choices: Vec<ModelChoice>,
+        actions: Vec<providers::ModelAction>,
     },
 
     ApiKey {
@@ -115,6 +118,7 @@ enum Selection {
     Effort {
         target: ConfigTarget,
         choices: Vec<Option<ReasoningEffort>>,
+        return_to_settings: bool,
     },
     Settings {
         target: ConfigTarget,
@@ -290,6 +294,87 @@ impl RewindPoint {
 }
 
 impl Selection {
+    fn configuration_retry(&self) -> Option<Self> {
+        Some(match self {
+            Self::Settings { target } => Self::Settings { target: *target },
+            Self::SettingsInfo { target } => Self::SettingsInfo { target: *target },
+            Self::Theme { settings_target } => Self::Theme {
+                settings_target: *settings_target,
+            },
+            Self::OutputStyle { target } => Self::OutputStyle { target: *target },
+            Self::GlyphSet {
+                target,
+                font_action,
+            } => Self::GlyphSet {
+                target: *target,
+                font_action: *font_action,
+            },
+            Self::GlyphSetConfirmation { target, glyph_set } => Self::GlyphSetConfirmation {
+                target: *target,
+                glyph_set: *glyph_set,
+            },
+            Self::FontActionConfirmation { target, action } => Self::FontActionConfirmation {
+                target: *target,
+                action: *action,
+            },
+            Self::ArtifactSignOut { target } => Self::ArtifactSignOut { target: *target },
+            Self::Effort {
+                target,
+                choices,
+                return_to_settings,
+            } => Self::Effort {
+                target: *target,
+                choices: choices.clone(),
+                return_to_settings: *return_to_settings,
+            },
+            Self::Mode { target, choices } => Self::Mode {
+                target: *target,
+                choices: choices.clone(),
+            },
+            Self::Model {
+                target,
+                choices,
+                actions,
+            } => Self::Model {
+                target: *target,
+                choices: choices.clone(),
+                actions: actions.clone(),
+            },
+            Self::Provider {
+                target,
+                choices,
+                rows,
+            } => Self::Provider {
+                target: *target,
+                choices: choices.clone(),
+                rows: rows.clone(),
+            },
+            Self::ConnectionDetails {
+                target,
+                provider,
+                actions,
+            } => Self::ConnectionDetails {
+                target: *target,
+                provider: provider.clone(),
+                actions: actions.clone(),
+            },
+            Self::LoginMethods { target, provider } => Self::LoginMethods {
+                target: *target,
+                provider: provider.clone(),
+            },
+            Self::ConnectionConfirm {
+                target,
+                provider,
+                action,
+            } => Self::ConnectionConfirm {
+                target: *target,
+                provider: provider.clone(),
+                action: *action,
+            },
+            _ => return None,
+        })
+    }
+
     fn request_id(&self) -> Option<Uuid> {
         match self {
             Self::Permission { request, .. } | Self::PermissionRule { request, .. } => {
@@ -352,10 +437,17 @@ struct RestoredPlanApproval {
     version: u64,
 }
 
+#[derive(Clone, Copy)]
+struct SettingsPosition {
+    selected: usize,
+    context_offset: usize,
+}
+
 pub(super) struct Menus {
     active: Option<(Uuid, Selection)>,
     dialog_chat: Option<Uuid>,
     active_cache: HashMap<Option<Uuid>, Option<(Uuid, Selection)>>,
+    settings_positions: HashMap<Option<Uuid>, SettingsPosition>,
     provider_chat: Option<Option<Uuid>>,
     provider_sessions: HashMap<Option<Uuid>, providers::ProviderSession>,
     provider_login_results: HashMap<Option<Uuid>, bool>,
@@ -370,7 +462,7 @@ pub(super) struct Menus {
     user_settings: Option<UserSettings>,
     provider: providers::ProviderSession,
     config_root: Option<PathBuf>,
-    refresh_connections: HashSet<(Option<Uuid>, String)>,
+    refresh_connections: HashMap<(Option<Uuid>, String), Uuid>,
     model_discovery: tickloop_agent::model::availability::AccountModelDiscovery,
     font_manager: Option<NerdFontManager<SystemFontAdapter>>,
     /// Where the next New Agent will be created; its saved project rules are shown before the
@@ -390,6 +482,7 @@ impl Menus {
             active: None,
             dialog_chat: None,
             active_cache: HashMap::new(),
+            settings_positions: HashMap::new(),
             provider_chat: None,
             provider_sessions: HashMap::new(),
             provider_login_results: HashMap::new(),
@@ -402,7 +495,7 @@ impl Menus {
             user_settings,
             provider: Default::default(),
             config_root: config_root.clone(),
-            refresh_connections: HashSet::new(),
+            refresh_connections: HashMap::new(),
             model_discovery: Default::default(),
             font_manager: config_root.map(NerdFontManager::production),
             new_agent_directory: None,
@@ -836,7 +929,17 @@ impl Menus {
         let discovery = (self.id() == Some(menu.id))
             .then(|| self.provider.discovery_flow.take())
             .flatten();
-        let presentation = self.prepare_dialog(console, selection.request_id())?;
+        let presentation = if self.active.as_ref().is_some_and(|(id, previous)| {
+            selection.config_target().is_some()
+                && previous.config_target() == selection.config_target()
+                && std::mem::discriminant(previous) == std::mem::discriminant(&selection)
+                && console.dialog_menu_id().ok().flatten() == Some(*id)
+        }) && !console.agent_request_is_open()?
+        {
+            RequestPresentation::Presented
+        } else {
+            self.prepare_dialog(console, selection.request_id())?
+        };
         if let Some(discovery) = discovery {
             self.provider.discovery_flow = Some(discovery);
         }
@@ -866,14 +969,29 @@ impl Menus {
                     | Selection::ConnectionConfirm { .. }
                     | Selection::CredentialDetails { .. }
                     | Selection::LoginMethods { .. }
-                    | Selection::JudgmentSettings {
-                        return_to: JudgmentReturn::Providers { .. },
-                        ..
-                    }
+                    | Selection::JudgmentSettings { .. }
+                    | Selection::PermissionMode { .. }
+                    | Selection::Settings { .. }
+                    | Selection::SettingsInfo { .. }
+                    | Selection::Effort { .. }
+                    | Selection::Mode { .. }
+                    | Selection::Theme { .. }
+                    | Selection::OutputStyle { .. }
+                    | Selection::GlyphSet { .. }
+                    | Selection::GlyphSetConfirmation { .. }
+                    | Selection::FontActionConfirmation { .. }
+                    | Selection::ArtifactSignOut { .. }
             ) {
+                let login_hint =
+                    format!("Enter start · {}", self.provider.provider_nav.escape_hint());
                 let hint = match &selection {
+                    Selection::Settings { .. } => "Enter change · Esc close",
+                    Selection::Effort { .. }
+                    | Selection::Mode { .. }
+                    | Selection::Theme { .. }
+                    | Selection::OutputStyle { .. } => "Enter apply · Esc back",
                     Selection::ConnectionConfirm { .. } => "Enter confirm · Esc Connection",
-                    Selection::LoginMethods { .. } => "Enter start · Esc Connection",
+                    Selection::LoginMethods { .. } => &login_hint,
                     Selection::CredentialDetails { .. } => "Enter back · Esc Connection",
                     _ => "Enter open · Esc back",
                 };
@@ -882,36 +1000,79 @@ impl Menus {
                     PickerKind::Actions,
                     super::console::PickerPresentation {
                         hint: hint.into(),
+                        restore_context_offset: if let Selection::Settings { target } = &selection {
+                            self.settings_positions
+                                .get(&target.agent())
+                                .map(|position| position.context_offset)
+                        } else {
+                            None
+                        },
                         ..Default::default()
                     },
                 )?;
-            } else if matches!(&selection, Selection::Model { .. }) {
-                let refresh = self
-                    .provider
-                    .model_provider
-                    .as_ref()
-                    .and_then(|key| self.connection(key).ok())
-                    .is_some_and(|provider| provider.supports_discovery());
-                console.show_presented_picker_menu(
-                    menu,
-                    PickerKind::Model,
-                    super::console::PickerPresentation {
-                        headers: Vec::new(),
-                        refresh,
-                        hint: if refresh {
+            } else if let Selection::Model {
+                choices, actions, ..
+            } = &selection
+            {
+                let refresh = actions.contains(&providers::ModelAction::RefreshAccountModels);
+                let mut headers = Vec::new();
+                let mut last_connection = None;
+                let mut row_hints = Vec::new();
+                let mut refresh_options = Vec::new();
+                for (index, choice) in choices.iter().enumerate() {
+                    let provider = self
+                        .key_for_model(&choice.config)
+                        .and_then(|key| self.connection(&key).ok());
+                    if self.provider.model_provider.is_none()
+                        && let Some(provider) = &provider
+                        && last_connection.as_ref() != Some(&provider.key())
+                    {
+                        headers.push((
+                            index,
+                            safe_text(&format!(
+                                "{} · {}",
+                                provider.models[0].provider_name,
+                                self.provider_auth_label(provider)
+                            )),
+                        ));
+                        last_connection = Some(provider.key());
+                    }
+                    let supports_discovery = provider
+                        .as_ref()
+                        .is_some_and(|provider| provider.supports_discovery());
+                    if supports_discovery {
+                        refresh_options.push(index);
+                    }
+                    row_hints.push(
+                        if supports_discovery {
                             "p Connection · r Refresh · Enter apply · Esc back"
                         } else {
                             "p Connection · Enter apply · Esc back"
                         }
                         .into(),
+                    );
+                }
+                row_hints.extend(
+                    actions
+                        .iter()
+                        .map(|action| format!("Enter {} · Esc back", action.label())),
+                );
+                console.show_presented_picker_menu(
+                    menu,
+                    PickerKind::Model,
+                    super::console::PickerPresentation {
+                        headers,
+                        refresh,
+                        refresh_options: Some(refresh_options),
+                        row_hints,
+                        connection_options: Some(choices.len()),
+                        hint: "p Connection · Enter apply · Esc back".into(),
                         ..Default::default()
                     },
                 )?;
             } else if matches!(
                 &selection,
-                Selection::Rewind { .. }
-                    | Selection::RewindActions { .. }
-                    | Selection::PermissionMode { .. }
+                Selection::Rewind { .. } | Selection::RewindActions { .. }
             ) {
                 console.show_focused_menu(menu)?;
             } else {
@@ -1132,21 +1293,30 @@ impl Menus {
         console: &Console,
         target: ConfigTarget,
     ) -> Result<(), String> {
+        self.open_models(agent, console, target, false).await
+    }
+
+    async fn open_models(
+        &mut self,
+        agent: &Agent,
+        console: &Console,
+        target: ConfigTarget,
+        return_to_settings: bool,
+    ) -> Result<(), String> {
         self.sync_dialog_chat(console)?;
-        self.provider.model_return = None;
-        self.provider.provider_nav = providers::ProviderNavigator {
-            filter: providers::ConnectionFilter::Configured,
-            ..Default::default()
-        };
+        self.provider.provider_nav = Default::default();
         self.load_providers(agent, target).await?;
-        if self.provider.provider_choices.iter().any(|provider| {
-            Some(&provider.key()) == self.provider.current_connection.as_ref()
-                && self.provider_authenticated(provider) == Ok(true)
-        }) {
+        self.provider.model_return = Some(providers::ModelPickerDraft {
+            provider: None,
+            selected: self.provider.current_model.clone(),
+            action: None,
+            choices: Vec::new(),
+        });
+        if return_to_settings {
             self.provider
                 .provider_nav
                 .back_stack
-                .push(self.directory_parent());
+                .push(providers::ProviderPage::Settings);
         }
         self.configured_models(agent, console, target).await
     }
@@ -1169,6 +1339,16 @@ impl Menus {
         agent: &Agent,
         console: &Console,
         target: ConfigTarget,
+    ) -> Result<(), String> {
+        self.show_efforts(agent, console, target, false).await
+    }
+
+    async fn show_efforts(
+        &mut self,
+        agent: &Agent,
+        console: &Console,
+        target: ConfigTarget,
+        return_to_settings: bool,
     ) -> Result<(), String> {
         let snapshot = agent
             .configuration(target)
@@ -1228,7 +1408,7 @@ impl Menus {
                     .unwrap_or(0),
                 confirmation: false,
             },
-            Selection::Effort { target, choices },
+            Selection::Effort { target, choices, return_to_settings },
         )
     }
 
@@ -1238,6 +1418,11 @@ impl Menus {
         console: &Console,
         target: ConfigTarget,
     ) -> Result<(), String> {
+        self.sync_dialog_chat(console)?;
+        let selected = self
+            .settings_positions
+            .get(&target.agent())
+            .map_or(0, |position| position.selected);
         let snapshot = agent
             .configuration(target)
             .await
@@ -1349,7 +1534,7 @@ impl Menus {
                         }
                     ),
                 ],
-                selected: 0,
+                selected,
                 confirmation: false,
             },
             Selection::Settings { target },
@@ -1399,6 +1584,15 @@ impl Menus {
         &mut self,
         console: &Console,
         target: ConfigTarget,
+    ) -> Result<(), String> {
+        self.glyph_sets_with_focus(console, target, None).await
+    }
+
+    async fn glyph_sets_with_focus(
+        &mut self,
+        console: &Console,
+        target: ConfigTarget,
+        selected: Option<usize>,
     ) -> Result<(), String> {
         let current = console.display_preferences()?.glyph_set;
         let unicode = DisplayProfile::new(DisplayPreferences::default()).preview();
@@ -1453,10 +1647,10 @@ impl Menus {
                     "Choose only after the preview is aligned. Missing glyphs or boxes mean keep Unicode.".into(),
                 ],
                 options,
-                selected: GlyphSet::ALL
+                selected: selected.unwrap_or_else(|| GlyphSet::ALL
                     .into_iter()
                     .position(|glyph_set| glyph_set == current)
-                    .unwrap_or(0),
+                    .unwrap_or(0)),
                 confirmation: false,
             },
             Selection::GlyphSet { target, font_action },
@@ -2160,11 +2354,11 @@ impl Menus {
         comment: Option<String>,
     ) -> Result<MenuOutcome, String> {
         self.sync_dialog_chat(console)?;
-        let menu_id = match self.provider.refreshed_model_cancel {
+        let menu_id = match self.provider.refreshed_picker_cancel {
             Some((previous, current))
                 if index.is_none() && menu_id == previous && self.id() == Some(current) =>
             {
-                self.provider.refreshed_model_cancel = None;
+                self.provider.refreshed_picker_cancel = None;
                 current
             }
             _ => menu_id,
@@ -2173,8 +2367,31 @@ impl Menus {
             console.finish_menu_submission(menu_id)?;
             return Ok(MenuOutcome::default());
         }
-        self.cancel_model_discovery(menu_id);
+        if !matches!(&self.active, Some((_, Selection::Model { choices, .. })) if index.is_some_and(|index| index < choices.len()))
+        {
+            self.cancel_model_discovery(menu_id);
+        }
+        let navigation_before = self.provider.provider_nav.clone();
+        let model_provider_before = self.provider.model_provider.clone();
         let (_, selection) = self.active.take().unwrap();
+        if let Selection::Settings { target } = &selection
+            && let Some(index) = index
+        {
+            self.settings_positions.insert(
+                target.agent(),
+                SettingsPosition {
+                    selected: index,
+                    context_offset: console.picker_context_offset(menu_id)?.unwrap_or_default(),
+                },
+            );
+        }
+        let retry = if let Some(selection) = selection.configuration_retry() {
+            console
+                .menu_snapshot(menu_id)?
+                .map(|menu| (selection, menu))
+        } else {
+            None
+        };
         let outcome: Result<MenuOutcome, String> = async {
             match selection {
                 Selection::Locations { generation, views } => {
@@ -2502,7 +2719,7 @@ impl Menus {
                     let parent = providers::ProviderPage::Details { connection: provider.key(), selected: index };
                     match action {
                         providers::ConnectionAction::Browse => {
-                            if matches!(self.provider.provider_nav.back_stack.last(), Some(providers::ProviderPage::Models { connection, .. }) if *connection == provider.key()) {
+                            if matches!(self.provider.provider_nav.back_stack.last(), Some(providers::ProviderPage::Models { connection, .. }) if connection.as_deref().is_none_or(|key| key == provider.key())) {
                                 self.provider_back(agent, console, target).await?;
                             } else {
                                 self.provider.provider_nav.back_stack.push(parent);
@@ -2542,11 +2759,12 @@ impl Menus {
                             return Err(error.to_string());
                         }
                         self.model_discovery.invalidate(&provider.models[0].provider_id);
-                        self.refresh_connections.insert((target.agent(), provider.key()));
+                        self.refresh_connections.insert((target.agent(), provider.key()), Uuid::new_v4());
                         self.provider_back(agent, console, target).await?;
                     } else {
                         let sign_in = super::login::SignInTarget::from_auth(provider.models[0].auth_source).unwrap_or(super::login::SignInTarget::Codex);
                         self.provider.login_return = Some((target, provider));
+                        self.provider_back(agent, console, target).await?;
                         return Ok(MenuOutcome { provider_logout: true, logout_target: sign_in, ..Default::default() });
                     }
                 }
@@ -2630,19 +2848,29 @@ impl Menus {
                         self.judgment_settings(agent, console, return_to).await?;
                     }
                 }
-                Selection::Model { target, choices } => {
+                Selection::Model { target, choices, actions } => {
                     let Some(index) = index else {
                         self.remember_model_drafts(&choices);
                         self.provider_back(agent, console, target).await?;
                         return Ok(MenuOutcome::default());
                     };
-                    if index == choices.len() {
-                        self.open_model_providers(console, target, choices, index)?;
-                        return Ok(MenuOutcome::default());
-                    }
-                    if index == choices.len() + 1 {
-                        self.remember_model_drafts(&choices);
-                        self.refresh_model_choices(agent, console, target).await?;
+                    if let Some(action) = index.checked_sub(choices.len()).and_then(|index| actions.get(index)) {
+                        match action {
+                            providers::ModelAction::ConnectionDetails => self.open_model_providers(console, target, choices, index)?,
+                            providers::ModelAction::RefreshAccountModels => {
+                                self.remember_model_drafts(&choices);
+                                self.refresh_model_choices(agent, console, target, None, Some(providers::ModelAction::RefreshAccountModels)).await?;
+                            }
+                            providers::ModelAction::Providers => {
+                                self.provider.provider_nav.back_stack.push(providers::ProviderPage::Models {
+                                    connection: self.provider.model_provider.clone(),
+                                    focused: self.provider.focused_model.clone(),
+                                    action: Some(providers::ModelAction::Providers),
+                                });
+                                self.provider.provider_nav.filter = providers::ConnectionFilter::All;
+                                self.back_to_providers(console, target)?;
+                            }
+                        }
                         return Ok(MenuOutcome::default());
                     }
                     let choice = choices.get(index).ok_or("model option does not exist")?;
@@ -2668,6 +2896,11 @@ impl Menus {
                             return Err(error);
                         }
                     }
+                    let snapshot = agent.configuration(target).await.map_err(|error| error.to_string())?;
+                    self.provider.current_connection = self.key_for_model(&snapshot.model);
+                    self.provider.current_model = Some((snapshot.model.provider_id, snapshot.model.model_id));
+                    let updated = Uuid::new_v4();
+                    self.show_model_choices(console, target, choices, index, updated)?;
                 }
                 Selection::PermissionMode {
                     target,
@@ -2675,10 +2908,25 @@ impl Menus {
                     ..
                 } if index.is_none() => self.settings(agent, console, target).await?,
                 Selection::PermissionMode { .. } if index.is_none() => {},
+                Selection::Settings { target } if index.is_none() => {
+                    self.settings_positions.remove(&target.agent());
+                }
+                Selection::Effort { target, return_to_settings: true, .. }
+                | Selection::Mode { target, .. }
+                | Selection::OutputStyle { target }
+                | Selection::GlyphSet { target, .. }
+                | Selection::ArtifactSignOut { target }
+                    if index.is_none() => self.settings(agent, console, target).await?,
+                Selection::GlyphSetConfirmation { target, glyph_set }
+                    if index.is_none() => self.glyph_sets_with_focus(console, target, GlyphSet::ALL.into_iter().position(|candidate| candidate == glyph_set)).await?,
+                Selection::FontActionConfirmation { target, .. }
+                    if index.is_none() => self.glyph_sets_with_focus(console, target, Some(GlyphSet::ALL.len())).await?,
+                Selection::Theme { settings_target: Some(target) }
+                    if index.is_none() => self.settings(agent, console, target).await?,
                 _ if index.is_none() => {
                     console.write("Selection cancelled; configuration unchanged.\n")?
                 }
-                Selection::Effort { target, choices } => {
+                Selection::Effort { target, choices, return_to_settings } => {
                     let effort = *choices
                         .get(index.unwrap())
                         .ok_or("effort option does not exist")?;
@@ -2691,6 +2939,11 @@ impl Menus {
                         effort.map_or("auto", ReasoningEffort::label),
                         change.staged_note()
                     ))?;
+                    if return_to_settings {
+                        self.settings(agent, console, target).await?;
+                    } else {
+                        self.show_efforts(agent, console, target, false).await?;
+                    }
                 }
                 Selection::ArtifactSignOut { target } => {
                     if index == Some(1) {
@@ -2710,7 +2963,7 @@ impl Menus {
                         console.set_prompt_suggestion_enabled(enabled)?;
                         self.settings(agent, console, target).await?;
                     }
-                    Some(0) => self.models(agent, console, target).await?,
+                    Some(0) => self.open_models(agent, console, target, true).await?,
                     Some(1) => {
                         let configuration = agent.configuration(target).await.map_err(|error| error.to_string())?;
                         if matches!(
@@ -2725,7 +2978,7 @@ impl Menus {
                         }
                         self.settings(agent, console, target).await?;
                     }
-                    Some(2) => self.efforts(agent, console, target).await?,
+                    Some(2) => self.show_efforts(agent, console, target, true).await?,
                     Some(3) => self.modes(agent, console, target).await?,
                     Some(4) => self.settings_info(agent, console, target, false).await?,
                     Some(5) => self.settings_info(agent, console, target, true).await?,
@@ -2801,7 +3054,7 @@ impl Menus {
                         self.save_display_preferences(console, preferences)?;
                         self.settings(agent, console, target).await?;
                     }
-                    Some(1) => self.glyph_sets(console, target).await?,
+                    Some(1) => self.glyph_sets_with_focus(console, target, GlyphSet::ALL.into_iter().position(|candidate| candidate == glyph_set)).await?,
                     _ => return Err("glyph confirmation option does not exist".into()),
                 },
                 Selection::FontActionConfirmation { target, action } => match index {
@@ -2823,9 +3076,9 @@ impl Menus {
                             | FontOutcome::Removed { message } => message,
                         };
                         console.write(&format!("{message}\n"))?;
-                        self.glyph_sets(console, target).await?;
+                        self.glyph_sets_with_focus(console, target, Some(GlyphSet::ALL.len())).await?;
                     }
-                    Some(1) => self.glyph_sets(console, target).await?,
+                    Some(1) => self.glyph_sets_with_focus(console, target, Some(GlyphSet::ALL.len())).await?,
                     _ => return Err("font action confirmation does not exist".into()),
                 },
                 Selection::Mode { target, choices } => {
@@ -2840,6 +3093,7 @@ impl Menus {
                         "Execution mode: {mode}. Explicit deny rules remain effective.{}\n",
                         change.staged_note()
                     ))?;
+                    self.settings(agent, console, target).await?;
                 }
                 Selection::PermissionMode {
                     target: ConfigTarget::NewDraft,
@@ -2956,6 +3210,28 @@ impl Menus {
             Ok(MenuOutcome::default())
         }
         .await;
+        if outcome.is_err()
+            && self.active.is_none()
+            && let Some((selection, mut menu)) = retry
+        {
+            menu.id = Uuid::new_v4();
+            if let Some(index) = index {
+                menu.selected = index;
+            }
+            let restored = menu.id;
+            self.provider.provider_nav = navigation_before;
+            self.provider.model_provider = model_provider_before;
+            if console.recover_menu(menu_id, restored, index)? {
+                self.active = Some((restored, selection));
+            } else {
+                self.show(console, menu, selection)?;
+            }
+            if let Some(flow) = &mut self.provider.discovery_flow
+                && flow.id == menu_id
+            {
+                flow.id = restored;
+            }
+        }
         console.finish_menu_submission(menu_id)?;
         outcome
     }
@@ -3687,7 +3963,7 @@ mod tests {
             "deepseek-api"
         );
         menus
-            .show_model_providers(&console, ConfigTarget::Agent(chat), None)
+            .back_to_providers(&console, ConfigTarget::Agent(chat))
             .unwrap();
         menus.provider.provider_choices = menus.provider.model_providers.clone();
         menus
@@ -3703,7 +3979,7 @@ mod tests {
             .unwrap()
             .key();
         menus
-            .show_provider_models(&console, ConfigTarget::Agent(chat), &openai, None)
+            .show_provider_models(&console, ConfigTarget::Agent(chat), &openai, None, None)
             .unwrap();
         let (id, Selection::Model { choices, .. }) = menus.active.as_ref().unwrap() else {
             panic!("expected empty model selection for denied Provider");

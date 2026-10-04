@@ -898,7 +898,7 @@ fn display_width(text: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, time::Instant};
+    use std::{path::PathBuf, time::Duration};
 
     use super::*;
     use crate::file_change::{FileChangeHunk, FileChangeLine, FileVersion};
@@ -1336,7 +1336,19 @@ mod tests {
             height: 3,
         };
 
-        let started = Instant::now();
+        // CPU time of this thread, so parallel tests on a loaded machine never stretch the bound.
+        let thread_cpu_time = || {
+            let mut time = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            assert_eq!(
+                unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut time) },
+                0
+            );
+            Duration::new(time.tv_sec as u64, time.tv_nsec as u32)
+        };
+        let started = thread_cpu_time();
         let end = navigate_diff(
             &review,
             &DiffNavigation::default(),
@@ -1355,7 +1367,7 @@ mod tests {
             },
         );
 
-        assert!(started.elapsed().as_secs() < 10);
+        assert!(thread_cpu_time() - started < Duration::from_secs(10));
         assert_eq!(end_frame.lines.len(), viewport.height);
         assert!(end_frame.total_rows > LONG_LINE_BYTES);
         assert!(!end_frame.can_move_down);

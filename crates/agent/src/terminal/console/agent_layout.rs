@@ -1981,7 +1981,7 @@ pub(super) fn help_lines(
             "Enter open Agent (list)",
             "Space fold descendants (list)",
             "Esc list → entry → input",
-            "→ Monitor (empty input)",
+            "→ Monitor (empty, no suggestion)",
             "Shift+↑/↓ Monitor Shells",
             "Enter open Shell (Monitor)",
             "x remove from Monitor",

@@ -144,9 +144,12 @@ pub enum MemberState {
     IdentityUncertain,
 }
 
-/// Keys the Monitor list itself owns: `a` adds from discovery and `r` refreshes. Row actions
-/// never use them, so the list's hints always match what a key does.
-pub const MONITOR_KEYS: [char; 2] = ['a', 'r'];
+/// Adds a program to Monitor from discovery.
+pub const MONITOR_ADD_KEY: char = 'a';
+pub const MONITOR_REFRESH_KEY: char = 'r';
+/// Keys the Monitor list itself owns. Row actions never use them, so the list's hints always
+/// match what a key does.
+pub const MONITOR_KEYS: [char; 2] = [MONITOR_ADD_KEY, MONITOR_REFRESH_KEY];
 
 pub trait TickAdapter: Send + Sync + 'static {
     fn tick_type(&self) -> &'static str;

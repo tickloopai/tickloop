@@ -55,34 +55,21 @@ pub(super) struct DialogState {
 }
 
 impl DialogState {
+    fn complete_login(&mut self, id: Uuid, status: &str, notice: &str) -> bool {
+        self.menu.as_mut().is_some_and(|menu| {
+            complete_login_menu(menu, &mut self.picker_presentation, id, status, notice)
+        })
+    }
+
     fn update_login(&mut self, menu: &Menu, address: &str, callback: bool) -> bool {
-        if self
-            .menu
-            .as_ref()
-            .is_none_or(|current| current.id != menu.id)
-        {
-            return false;
-        }
-        let selected = self.menu.as_ref().map_or(0, |current| current.selected);
-        self.menu = Some(Menu {
-            selected: selected.min(menu.options.len().saturating_sub(1)),
-            ..menu.clone()
-        });
-        self.menu_link = valid_login_link(address)
-            .filter(|_| menu.context.iter().any(|line| line == address))
-            .map(|address| (menu.id, address));
-        if callback && self.menu_comment.is_none() {
-            self.menu_comment = Some(MenuCommentState {
-                options: vec![0],
-                values: HashMap::new(),
-                label: "Callback URL",
-                editing: false,
-                cursor: 0,
-                secret: false,
-                standalone_input: false,
-            });
-        }
-        true
+        update_login_menu(
+            &mut self.menu,
+            &mut self.menu_link,
+            &mut self.menu_comment,
+            menu,
+            address,
+            callback,
+        )
     }
 
     fn clear_artifact_picker(&mut self, id: Uuid) -> bool {
@@ -130,6 +117,62 @@ impl DialogState {
         self.reset_menu();
         true
     }
+}
+
+fn update_login_menu(
+    current: &mut Option<Menu>,
+    link: &mut Option<(Uuid, String)>,
+    comment: &mut Option<MenuCommentState>,
+    menu: &Menu,
+    address: &str,
+    callback: bool,
+) -> bool {
+    let Some(current) = current.as_mut().filter(|current| current.id == menu.id) else {
+        return false;
+    };
+    *current = Menu {
+        selected: current.selected.min(menu.options.len().saturating_sub(1)),
+        ..menu.clone()
+    };
+    *link = valid_login_link(address)
+        .filter(|_| menu.context.iter().any(|line| line == address))
+        .map(|address| (menu.id, address));
+    if callback && comment.is_none() {
+        *comment = Some(MenuCommentState {
+            options: vec![0],
+            values: HashMap::new(),
+            label: "Callback URL",
+            editing: false,
+            cursor: 0,
+            secret: false,
+            standalone_input: false,
+        });
+    }
+    true
+}
+
+fn complete_login_menu(
+    menu: &mut Menu,
+    presentation: &mut PickerPresentation,
+    id: Uuid,
+    status: &str,
+    notice: &str,
+) -> bool {
+    if menu.id != id {
+        return false;
+    }
+    presentation.hint = "Enter return to Provider · Esc back".into();
+    presentation.row_hints.clear();
+    presentation.editing_hint = Some("Callback URL · Enter return to Provider · Esc close field");
+    menu.title = format!("{} · {status}", menu.title);
+    menu.context = vec![
+        notice.into(),
+        "Enter returns to Provider; Esc leaves editing first, otherwise returns to Provider. Saved credentials remain applied.".into(),
+    ];
+    for option in &mut menu.options {
+        *option = "Back to Provider".into();
+    }
+    true
 }
 
 impl State {
@@ -376,12 +419,17 @@ impl State {
         None
     }
 
-    pub(super) fn update_hidden_login(
-        &mut self,
-        menu: &Menu,
-        address: &str,
-        callback: bool,
-    ) -> bool {
+    pub(super) fn update_login(&mut self, menu: &Menu, address: &str, callback: bool) -> bool {
+        if update_login_menu(
+            &mut self.menu,
+            &mut self.menu_link,
+            &mut self.menu_comment,
+            menu,
+            address,
+            callback,
+        ) {
+            return true;
+        }
         if self
             .suspended_dialog
             .as_mut()
@@ -394,6 +442,24 @@ impl State {
                 || suspended
                     .as_mut()
                     .is_some_and(|dialog| dialog.update_login(menu, address, callback))
+        })
+    }
+
+    pub(super) fn complete_login(&mut self, id: Uuid, status: &str, notice: &str) -> bool {
+        if self.menu.as_mut().is_some_and(|menu| {
+            complete_login_menu(menu, &mut self.picker_presentation, id, status, notice)
+        }) || self
+            .suspended_dialog
+            .as_mut()
+            .is_some_and(|dialog| dialog.complete_login(id, status, notice))
+        {
+            return true;
+        }
+        self.dialog_cache.values_mut().any(|(active, suspended)| {
+            active.complete_login(id, status, notice)
+                || suspended
+                    .as_mut()
+                    .is_some_and(|dialog| dialog.complete_login(id, status, notice))
         })
     }
 

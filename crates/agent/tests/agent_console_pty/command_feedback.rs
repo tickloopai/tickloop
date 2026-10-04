@@ -21,32 +21,47 @@ impl LocalCommand {
 
     fn result_prefix(&self) -> &str {
         match self {
-            Self::Model => MODEL_FEEDBACK,
-            Self::Provider => "Selection cancelled; configuration unchanged.",
+            Self::Model | Self::Provider => MODEL_FEEDBACK,
             Self::Rule => "Rule added:",
         }
     }
 
     async fn apply(&self, view: &mut PtyView) -> String {
         view.send(format!("{}\r", self.input()).as_bytes());
-        match self {
-            Self::Model => {
-                view.wait_for("real model picker opens", |frame| {
-                    frame.contains("Choose model · DeepSeek")
-                        && frame.contains("DeepSeek-V4.1-Flash")
+        let model_title = match self {
+            Self::Model => Some("Choose model · Signed-in Providers"),
+            Self::Provider => {
+                view.wait_for("real Provider picker opens", |frame| {
+                    frame.contains("Choose Provider · All") && frame.contains("API key saved")
                 })
                 .await;
                 view.send(b"\r");
+                Some("Choose model · DeepSeek")
             }
-            Self::Provider => {
-                view.wait_for("real Provider picker opens", |frame| {
-                    frame.contains("Choose Provider")
+            Self::Rule => None,
+        };
+        if let Some(title) = model_title {
+            view.wait_for("real model picker opens", |frame| {
+                frame.contains(title) && frame.contains("DeepSeek-V4.1-Flash")
+            })
+            .await;
+            view.send(b"\r");
+            view.wait_for("model application keeps its picker and feedback", |frame| {
+                frame.contains(title)
+                    && body_shows_once_in_order(frame, &[self.input(), self.result_prefix()])
+            })
+            .await;
+            view.send(b"\x1b");
+            if matches!(self, Self::Provider) {
+                view.wait_for("model Escape returns to the Provider directory", |frame| {
+                    frame.contains("Choose Provider · All")
                 })
                 .await;
                 view.send(b"\x1b");
             }
-            Self::Rule => {}
         }
+        view.wait_for_editor("local command restores the composer", Some(""))
+            .await;
         view.wait_for("local command produces its feedback", |frame| {
             body_shows_once_in_order(frame, &[self.input(), self.result_prefix()])
         })

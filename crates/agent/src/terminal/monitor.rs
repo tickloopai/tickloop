@@ -14,8 +14,8 @@ pub(super) const MONITOR_AUTO_MIN_COLUMNS: usize = 121;
 
 pub(super) use crate::tick_adapter::TickGroup;
 use crate::tick_adapter::{
-    MemberState, MonitorAction, MonitorContext, TickAdapters, TickDescriptor, TickGlyph, TickOwner,
-    TickResources, page_of,
+    MONITOR_ADD_KEY, MemberState, MonitorAction, MonitorContext, TickAdapters, TickDescriptor,
+    TickGlyph, TickOwner, TickResources, page_of,
 };
 use crate::tick_stream::InstanceRef;
 
@@ -415,7 +415,7 @@ impl Monitor {
                 })
                 .unwrap_or_default();
             if can_add {
-                hints.push("a add".into());
+                hints.push(format!("{MONITOR_ADD_KEY} add"));
             }
             hints.push("Esc".into());
             lines.push(RoleLine::role(hints.join(" · "), Role::MutedText));

@@ -78,8 +78,9 @@ async fn run_working_todo_list(fixture: &PrivateFixture) {
                 let rows = frame.lines().collect::<Vec<_>>();
                 rows.iter()
                     .position(|line| {
+                        // The first frames may not show the elapsed time yet.
                         line.contains("Inspecting the source-owned footer behavior")
-                            && line.contains("Esc")
+                            && line.contains("s · Esc to interrupt)")
                     })
                     .is_some_and(|activity| {
                         rows.get(activity + 1)

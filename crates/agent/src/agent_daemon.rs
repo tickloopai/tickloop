@@ -700,6 +700,9 @@ fn validate_file(file: &File, label: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The extension a private endpoint is bound under before it is published.
+const STAGING_EXTENSION: &str = "new";
+
 fn validate_socket(endpoint: &Path) -> Result<(), String> {
     use std::os::unix::fs::FileTypeExt;
     let metadata = std::fs::symlink_metadata(endpoint).map_err(|error| error.to_string())?;
@@ -749,11 +752,28 @@ fn remove_owned_socket(endpoint: &Path, identity: (u64, u64)) -> Result<(), Stri
         .map_err(|error| format!("Cannot remove owned Agent endpoint: {error}"))
 }
 
+/// Binds under a staging name and publishes the endpoint by rename once it is 0600, so a client
+/// polling for a starting service never finds the endpoint with another mode. Each endpoint has
+/// one binder (the owner under its lock, or a worker with a unique name), so a staging socket
+/// left by a killed process is stale.
 fn private_listener(endpoint: &Path) -> Result<(UnixListener, (u64, u64)), String> {
     check_socket_length(endpoint)?;
-    let listener = UnixListener::bind(endpoint).map_err(|error| error.to_string())?;
-    std::fs::set_permissions(endpoint, std::fs::Permissions::from_mode(0o600))
-        .map_err(|error| error.to_string())?;
+    let staging = endpoint.with_extension(STAGING_EXTENSION);
+    check_socket_length(&staging)?;
+    if let Ok(metadata) = std::fs::symlink_metadata(&staging) {
+        use std::os::unix::fs::FileTypeExt;
+        if !metadata.file_type().is_socket() || metadata.uid() != unsafe { libc::geteuid() } {
+            return Err("Agent endpoint staging path is occupied by something else".into());
+        }
+        std::fs::remove_file(&staging).map_err(|error| error.to_string())?;
+    }
+    let listener = UnixListener::bind(&staging).map_err(|error| error.to_string())?;
+    std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o600))
+        .and_then(|()| std::fs::rename(&staging, endpoint))
+        .map_err(|error| {
+            let _ = std::fs::remove_file(&staging);
+            error.to_string()
+        })?;
     let metadata = std::fs::symlink_metadata(endpoint).map_err(|error| error.to_string())?;
     Ok((listener, (metadata.dev(), metadata.ino())))
 }

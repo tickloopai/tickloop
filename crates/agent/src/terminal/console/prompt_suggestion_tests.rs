@@ -72,6 +72,36 @@ fn prompt_suggestion_right_accepts_before_the_monitor_and_empty_enter_submits_on
 }
 
 #[test]
+fn the_footer_hint_names_what_right_does_while_a_suggestion_is_visible() {
+    let console = console();
+    console
+        .state
+        .lock()
+        .unwrap()
+        .monitor
+        .replace(TickGroup::Artifacts, input_dialog_tests::fixture_ticks());
+    let hint = |console: &Console| {
+        let mut state = console.state.lock().unwrap();
+        let (lines, _, _) = state.normal_styled_frame();
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.text.as_str())
+                    .collect::<String>()
+            })
+            .find(|line| line.contains("? help"))
+            .unwrap()
+    };
+    assert!(hint(&console).contains("→ Monitor"));
+    show(&console, "run the tests");
+    let shown = hint(&console);
+    assert!(shown.contains("Tab/→ accept"), "{shown}");
+    assert!(!shown.contains("→ Monitor"), "{shown}");
+}
+
+#[test]
 fn prompt_suggestion_typing_pasting_switching_and_new_turn_cancel_late_results() {
     for action in ["typing", "pasting", "switching", "new turn", "off"] {
         let console = console();

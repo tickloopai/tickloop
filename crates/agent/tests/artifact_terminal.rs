@@ -1,3 +1,5 @@
+#[path = "support/screen.rs"]
+mod screen;
 mod support;
 
 use std::{
@@ -80,19 +82,8 @@ fn post_login_account_failure_preserves_the_view_and_artifacts_can_retry() {
         .unwrap();
     let output = Arc::new(Mutex::new(String::new()));
     let captured = output.clone();
-    let mut stdout = child.stdout.take().unwrap();
-    let reader = thread::spawn(move || {
-        let mut buffer = [0_u8; 2048];
-        while let Ok(count) = stdout.read(&mut buffer) {
-            if count == 0 {
-                break;
-            }
-            captured
-                .lock()
-                .unwrap()
-                .push_str(&String::from_utf8_lossy(&buffer[..count]));
-        }
-    });
+    let stdout = child.stdout.take().unwrap();
+    let reader = thread::spawn(move || screen::capture_output(stdout, captured));
     let mut stdin = child.stdin.take().unwrap();
     stdin.write_all(b"/artifacts\n").unwrap();
     stdin.flush().unwrap();
@@ -167,19 +158,8 @@ fn artifact_commands_are_visible_and_device_login_can_be_cancelled_without_a_mod
         .unwrap();
     let output = Arc::new(Mutex::new(String::new()));
     let captured = output.clone();
-    let mut stdout = child.stdout.take().unwrap();
-    let reader = thread::spawn(move || {
-        let mut buffer = [0_u8; 2048];
-        while let Ok(count) = stdout.read(&mut buffer) {
-            if count == 0 {
-                break;
-            }
-            captured
-                .lock()
-                .unwrap()
-                .push_str(&String::from_utf8_lossy(&buffer[..count]));
-        }
-    });
+    let stdout = child.stdout.take().unwrap();
+    let reader = thread::spawn(move || screen::capture_output(stdout, captured));
     let mut stdin = child.stdin.take().unwrap();
     stdin.write_all(b"/help\n/artifacts\n").unwrap();
     stdin.flush().unwrap();
