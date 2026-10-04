@@ -422,11 +422,17 @@ fn settings_json(root: &Path) -> serde_json::Value {
 #[tokio::test]
 async fn builtin_model_and_rules_apply_after_restart_without_context_tuning() {
     let directory = tempfile::tempdir().unwrap();
-    let root = directory.path().join("root");
+    let root = directory.path().canonicalize().unwrap().join("root");
     let workdir = directory.path().join("work");
     let other_project = directory.path().join("other");
     std::fs::create_dir_all(&workdir).unwrap();
     std::fs::create_dir_all(&other_project).unwrap();
+    tickloop_agent::model::credentials::save_api_key(
+        &root,
+        &selected_model().api_key_env,
+        "fixture-settings-key",
+    )
+    .unwrap();
     let shell = json!({"command":"printf persisted"});
     let first = Agent::open_embedded(
         root.clone(),

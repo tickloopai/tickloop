@@ -105,7 +105,7 @@ use execution::{
     ConsoleExecution as Agent, CreateAcknowledgement, CreationAcceptance, DraftCreationError,
     DraftPermissionsError, InputResolution, RuleSave,
 };
-use login::{LoginFlow, LoginUpdate, LogoutFlow};
+use login::{LoginFlow, LoginSession, LoginUpdate, LogoutFlow};
 use menus::{MenuOutcome, Menus};
 use new_agent_draft::ConfigTarget;
 use permissions_surface::{PermissionsEffect, PermissionsReturn, PermissionsSubject};
@@ -1217,6 +1217,44 @@ async fn open_current_plan(
     Ok(())
 }
 
+fn close_login_session(
+    session: LoginSession,
+    console: &Console,
+    menus: &mut Menus,
+    cancelled: bool,
+) -> Result<(), String> {
+    let chat = session.flow.chat();
+    let completed = session.flow.completed();
+    session.flow.close(console)?;
+    if session.from_provider {
+        menus.note_provider_login_result(chat, session.succeeded);
+    }
+    if cancelled && !completed {
+        console.write("Login cancelled.\n")?;
+    }
+    Ok(())
+}
+
+async fn finish_provider_login(
+    agent: &Agent,
+    console: &Console,
+    session: &mut LoginSession,
+    result: &Result<String, String>,
+) -> Result<(), String> {
+    session.succeeded = result.is_ok();
+    let mut notice = result.clone();
+    if let Ok(account) = result
+        && let Some(chat) = session.flow.chat()
+        && let Err(error) = agent.refresh_configuration(chat).await
+    {
+        notice = Ok(format!(
+            "{account} · Cannot refresh Agent configuration: {}",
+            safe_text(&error.to_string())
+        ));
+    }
+    login::complete_provider_login(&mut session.flow, console, &notice)
+}
+
 async fn interact(
     agent: &Agent,
     workdir: PathBuf,
@@ -1247,10 +1285,8 @@ async fn interact(
         HashMap::new();
     let mut artifact_refresh = tokio::time::interval(std::time::Duration::from_millis(50));
     artifact_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut login: Option<LoginFlow> = None;
-    let mut login_from_provider = false;
-    let mut provider_login_chat = None;
-    let mut provider_login_succeeded = false;
+    let mut logins: HashMap<uuid::Uuid, LoginSession> = HashMap::new();
+    let mut provider_logout_chat = None;
     let mut reauthenticate_after_logout = false;
     let mut logout_target = login::SignInTarget::Codex;
     let mut logout: Option<LogoutFlow> = None;
@@ -1407,23 +1443,26 @@ async fn interact(
             registration.update_chat(selected_chat);
         }
         menus.sync_dialog_chat(console)?;
-        if login.is_none() && logout.is_none() && login_from_provider {
-            login_from_provider = false;
-            menus.note_provider_login_result(provider_login_chat, provider_login_succeeded);
+        if logout.is_none()
+            && let Some(chat) = provider_logout_chat.take()
+        {
+            menus.note_provider_login_result(chat, false);
         }
-        if login.is_none()
-            && logout.is_none()
+        if logout.is_none()
             && let Some(succeeded) = menus.take_provider_login_result(console)?
         {
-            if let Some(chat) = selected_chat {
-                agent
-                    .refresh_configuration(chat)
-                    .await
-                    .map_err(|error| error.to_string())?;
+            if let Some(chat) = selected_chat
+                && let Err(error) = agent.refresh_configuration(chat).await
+            {
+                outln!(
+                    console,
+                    "Cannot refresh Agent configuration: {}",
+                    safe_text(&error.to_string())
+                );
             }
-            menus
-                .resume_provider_login(agent, console, succeeded)
-                .await?;
+            if let Err(error) = menus.resume_provider_login(agent, console, succeeded).await {
+                outln!(console, "Cannot return to Provider: {}", safe_text(&error));
+            }
         }
         if let Some(outcome) = menu_outcome.take() {
             if history_return_overview {
@@ -1453,9 +1492,7 @@ async fn interact(
             }
             if outcome.provider_logout {
                 menus.invalidate_model_discovery();
-                login_from_provider = true;
-                provider_login_chat = selected_chat;
-                provider_login_succeeded = false;
+                provider_logout_chat = Some(selected_chat);
                 if let Some(root) = menus.provider_login_root() {
                     reauthenticate_after_logout = outcome.reauthenticate_after_logout;
                     logout_target = outcome.logout_target;
@@ -1468,12 +1505,18 @@ async fn interact(
                 }
             }
             if let Some(method) = outcome.provider_login {
-                login_from_provider = true;
-                provider_login_chat = selected_chat;
-                provider_login_succeeded = false;
                 if let Some(root) = menus.provider_login_root() {
                     match LoginFlow::start(root, console, method) {
-                        Ok(flow) => login = Some(flow),
+                        Ok(flow) => {
+                            logins.insert(
+                                flow.id(),
+                                LoginSession {
+                                    flow,
+                                    from_provider: true,
+                                    succeeded: false,
+                                },
+                            );
+                        }
                         Err(error) => outln!(console, "Cannot log in: {}", safe_text(&error)),
                     }
                 } else {
@@ -1834,7 +1877,7 @@ async fn interact(
             && directed_summaries.is_empty()
             && deferred_events.is_empty()
             && !reply_lines.values().any(ReplyLines::has_complete_line)
-            && login.is_none()
+            && logins.is_empty()
             && logout.is_none()
             && paused_inputs.is_empty()
             && menu_commands.is_empty()
@@ -1877,7 +1920,11 @@ async fn interact(
             }
         }
         let discovery_active = menus.discovery_active();
-        let login_active = login.is_some();
+        let active_login = login::active_login_id(&logins, console)?;
+        let login_active = active_login.is_some();
+        let login_updates_pending = logins
+            .values()
+            .any(|session| session.flow.updates_pending());
         let logout_active = logout.is_some();
         #[cfg(test)]
         let global_refresh_enabled = agent.recovery_refresh_enabled();
@@ -1917,31 +1964,42 @@ async fn interact(
                 menus.finish_discovery(agent, console, result).await?;
                 status_dirty = true;
             },
-            update = async { login.as_mut().unwrap().next().await }, if login_active => {
+            (login_id, update) = login::next_login_update(&mut logins), if login_updates_pending => {
                 match update {
-                    Some(LoginUpdate::Device { address, code }) => login.as_ref().unwrap().show_device(console, &address, &code)?,
-                    Some(LoginUpdate::Browser { address, callback }) => login.as_mut().unwrap().show_browser(console, address, callback)?,
+                    Some(LoginUpdate::Device { address, code }) => logins[&login_id].flow.show_device(console, &address, &code)?,
+                    Some(LoginUpdate::Browser { address, callback }) => logins.get_mut(&login_id).unwrap().flow.show_browser(console, address, callback)?,
                     Some(LoginUpdate::Finished(result)) => {
-                        let flow = login.take().unwrap();
-                        let provider_label = flow.label();
-                        let login_chat = flow.chat();
-                        flow.close(console)?;
+                        let session = logins.get_mut(&login_id).unwrap();
+                        let provider_label = session.flow.label();
+                        let login_chat = session.flow.chat();
+                        let from_provider = session.from_provider;
+                        session.succeeded = result.is_ok();
+                        if interactive && from_provider {
+                            finish_provider_login(agent, console, session, &result).await?;
+                        } else {
+                            close_login_session(logins.remove(&login_id).unwrap(), console, &mut menus, false)?;
+                        }
                         match result {
                             Ok(account) => {
-                                if provider_label == "Artifact Service" {
-                                    if let Some(root) = config_root.as_deref()
-                                        && let Err(error) = artifact_ui::open(agent, console, root, login_chat, interactive).await {
-                                        outln!(console, "Cannot open artifacts: {} · use /artifacts to retry", safe_text(&error));
-                                    }
-                                } else { provider_login_succeeded = true; }
-                                outln!(console, "{} login saved · {}", provider_label, safe_text(&account));
+                                if provider_label == "Artifact Service"
+                                    && let Some(root) = config_root.as_deref()
+                                    && let Err(error) = artifact_ui::open(agent, console, root, login_chat, interactive).await {
+                                    outln!(console, "Cannot open artifacts: {} · use /artifacts to retry", safe_text(&error));
+                                }
+                                if !interactive || !from_provider { outln!(console, "{} login saved · {}", provider_label, safe_text(&account)); }
                             }
-                            Err(error) => outln!(console, "Cannot log in: {}", safe_text(&error)),
+                            Err(error) if !interactive || !from_provider => outln!(console, "Cannot log in: {}", safe_text(&error)),
+                            Err(_) => {},
                         }
                     }
                     None => {
-                        login.take().unwrap().close(console)?;
-                        outln!(console, "Sign-in ended before completion; use /provider to retry.");
+                        let session = logins.get_mut(&login_id).unwrap();
+                        if interactive && session.from_provider {
+                            login::complete_provider_login(&mut session.flow, console, &Err("Sign-in ended before completion; return to Provider to retry.".into()))?;
+                        } else {
+                            close_login_session(logins.remove(&login_id).unwrap(), console, &mut menus, false)?;
+                            outln!(console, "Sign-in ended before completion; use /provider to retry.");
+                        }
                     }
                 }
                 status_dirty = true;
@@ -1953,7 +2011,10 @@ async fn interact(
                         outln!(console, "{} login removed locally.", logout_target.label());
                         if reauthenticate_after_logout && let Some(root) = config_root.clone() {
                             match LoginFlow::start(root, console, logout_target.login_method()) {
-                                Ok(flow) => login = Some(flow),
+                                Ok(flow) => {
+                                    logins.insert(flow.id(), LoginSession { flow, from_provider: true, succeeded: false });
+                                    provider_logout_chat = None;
+                                },
                                 Err(error) => outln!(console, "Cannot log in: {}", safe_text(&error)),
                             }
                         }
@@ -2075,11 +2136,10 @@ async fn interact(
                     | InputEvent::OpenTranscript { .. } | InputEvent::ExpandChoice { .. }
                     | InputEvent::BackgroundForegroundShell | InputEvent::TaskSurface(_)
                     | InputEvent::Subscription(_) | InputEvent::Permissions(_)
-                    | InputEvent::UserShellSubmitted(_) | InputEvent::CycleExecutionMode) if login.is_some() => {},
+                    | InputEvent::UserShellSubmitted(_) | InputEvent::CycleExecutionMode) if login_active => {},
                 Some(InputEvent::Escape) => {
-                    if let Some(flow) = login.take() {
-                        flow.close(console)?;
-                        outln!(console, "Login cancelled.");
+                    if let Some(id) = active_login {
+                        close_login_session(logins.remove(&id).unwrap(), console, &mut menus, true)?;
                         status_dirty = true;
                         continue;
                     }
@@ -2093,6 +2153,12 @@ async fn interact(
                 },
                 Some(InputEvent::Interrupt) if logout_active => {
                     logout.as_ref().unwrap().cancel();
+                    console.set_status("Cancelling logout…")?;
+                    status_dirty = true;
+                },
+                Some(event @ InputEvent::Cancel { menu_id }) if logout_active && menus.provider_logout_menu_is_active(menu_id) => {
+                    logout.as_ref().unwrap().cancel();
+                    paused_inputs.push_back(event);
                     console.set_status("Cancelling logout…")?;
                     status_dirty = true;
                 },
@@ -2131,9 +2197,8 @@ async fn interact(
                     open_rewind(agent,console,&mut menus,selected_chat,is_busy).await?;
                 },
                 Some(InputEvent::Interrupt) => {
-                    if let Some(flow) = login.take() {
-                        flow.close(console)?;
-                        outln!(console, "Login cancelled.");
+                    if let Some(id) = active_login {
+                        close_login_session(logins.remove(&id).unwrap(), console, &mut menus, true)?;
                         status_dirty = true;
                         continue;
                     }
@@ -2216,7 +2281,7 @@ async fn interact(
                     transcript_dirty=false;
                 },
                 Some(InputEvent::PickerAction { menu_id, index, action }) => {
-                    if login.is_none() && logout.is_none() {
+                    if !login_active && logout.is_none() {
                         match menus.picker_action(agent, console, menu_id, index, action).await {
                             Ok(outcome) => menu_outcome = Some(outcome),
                             Err(error) => outln!(console, "Cannot apply selection: {}", safe_text(&error)),
@@ -2225,14 +2290,13 @@ async fn interact(
                     }
                 },
                 Some(InputEvent::Choice {menu_id,index,comment}) => {
-                    if login.as_ref().is_some_and(|flow| flow.id() == menu_id) {
-                        if index == 0 && login.as_ref().unwrap().is_browser() {
-                            login.as_ref().unwrap().submit_callback(console, comment.as_deref())?;
-                            console.finish_menu_submission(menu_id)?;
+                    if let Some(session) = logins.get(&menu_id) {
+                        if index == 0 && session.flow.is_browser() && !session.flow.completed() {
+                            session.flow.submit_callback(console, comment.as_deref())?;
+                            console.continue_menu_submission(menu_id)?;
                             continue;
                         }
-                        login.take().unwrap().close(console)?;
-                        outln!(console, "Login cancelled.");
+                        close_login_session(logins.remove(&menu_id).unwrap(), console, &mut menus, true)?;
                         status_dirty = true;
                         continue;
                     }
@@ -2255,9 +2319,8 @@ async fn interact(
                     }
                 },
                 Some(InputEvent::Cancel {menu_id}) => {
-                    if login.as_ref().is_some_and(|flow| flow.id() == menu_id) {
-                        login.take().unwrap().close(console)?;
-                        outln!(console, "Login cancelled.");
+                    if let Some(session) = logins.remove(&menu_id) {
+                        close_login_session(session, console, &mut menus, true)?;
                         status_dirty = true;
                         continue;
                     }
@@ -2456,13 +2519,12 @@ async fn interact(
                         }
                         _ => unreachable!(),
                     };
-                    if login.is_some() {
+                    if let Some(id) = active_login {
                         if matches!(line.trim(), "cancel" | "/cancel" | "/exit") {
-                            login.take().unwrap().close(console)?;
-                            outln!(console, "Login cancelled.");
+                            close_login_session(logins.remove(&id).unwrap(), console, &mut menus, true)?;
                             if line.trim() == "/exit" { return Ok(()); }
-                        } else if login.as_ref().unwrap().is_browser() {
-                            login.as_ref().unwrap().submit_callback(console, Some(&line))?;
+                        } else if logins[&id].flow.is_browser() && !logins[&id].flow.completed() {
+                            logins[&id].flow.submit_callback(console, Some(&line))?;
                         } else {
                             outln!(console, "Login is waiting. Complete the official authorization or enter cancel.");
                         }
@@ -2641,7 +2703,7 @@ async fn interact(
                             match tickloop_agent::artifacts::ArtifactClient::new(root).map_err(|error| error.to_string()) {
                                 Ok(client) => match client.status().await {
                                     Ok(Some(_)) => { if let Err(error) = artifact_ui::open(agent, console, root, selected_chat, interactive).await { outln!(console, "Cannot open Artifacts: {}", safe_text(&error)); } }
-                                    Ok(None) => match LoginFlow::start(root.clone(), console, login::LoginMethod::Artifact) { Ok(flow) => login = Some(flow), Err(error) => outln!(console, "Cannot start Artifact Service login: {}", safe_text(&error)) },
+                                    Ok(None) => match LoginFlow::start(root.clone(), console, login::LoginMethod::Artifact) { Ok(flow) => { logins.insert(flow.id(), LoginSession { flow, from_provider: false, succeeded: false }); }, Err(error) => outln!(console, "Cannot start Artifact Service login: {}", safe_text(&error)) },
                                     Err(error) => outln!(console, "Cannot check Artifact Service account: {}", safe_text(&error.to_string())),
                                 },
                                 Err(error) => outln!(console, "Cannot configure Artifact Service: {}", safe_text(&error)),
@@ -3715,7 +3777,7 @@ async fn interact(
                         failed=true;
                     },
                 }
-                if directed_summaries.is_empty() && summary_recovery_required.is_empty() && login.is_none() {
+                if directed_summaries.is_empty() && summary_recovery_required.is_empty() {
                     console.set_prompt_enabled(true)?;
                 }
             },

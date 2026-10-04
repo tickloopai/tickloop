@@ -398,7 +398,10 @@ pub(super) struct CompactPickerRow {
 pub(super) struct PickerPresentation {
     pub(super) headers: Vec<(usize, String)>,
     pub(super) hint: String,
+    pub(super) editing_hint: Option<&'static str>,
+    pub(super) restore_context_offset: Option<usize>,
     pub(super) refresh: bool,
+    pub(super) refresh_options: Option<Vec<usize>>,
     pub(super) connection_options: Option<usize>,
     pub(super) row_hints: Vec<String>,
     pub(super) compact_rows: Vec<CompactPickerRow>,
@@ -628,6 +631,7 @@ pub(super) struct State {
     request_menu: Option<Uuid>,
     menu_submission_pending: Option<Uuid>,
     menu_submission_finished: Option<Uuid>,
+    menu_submission_navigation: bool,
     branch_submission: BranchSubmission,
     menu_focused: bool,
     review_focused: bool,
@@ -3227,6 +3231,15 @@ impl Console {
         )
     }
 
+    pub(super) fn picker_context_offset(&self, id: Uuid) -> Result<Option<usize>, String> {
+        let state = self.state.lock().map_err(|error| error.to_string())?;
+        Ok(state
+            .menu
+            .as_ref()
+            .filter(|menu| menu.id == id)
+            .map(|_| state.context_offset))
+    }
+
     pub(super) fn picker_selection(&self, id: Uuid) -> Result<Option<usize>, String> {
         let state = self.state.lock().map_err(|error| error.to_string())?;
         Ok(state
@@ -3234,6 +3247,36 @@ impl Console {
             .as_ref()
             .filter(|menu| menu.id == id)
             .map(|menu| menu.selected))
+    }
+
+    pub(super) fn menu_snapshot(&self, id: Uuid) -> Result<Option<Menu>, String> {
+        let state = self.state.lock().map_err(|error| error.to_string())?;
+        Ok(state.menu.as_ref().filter(|menu| menu.id == id).cloned())
+    }
+
+    pub(super) fn recover_menu(
+        &self,
+        previous: Uuid,
+        restored: Uuid,
+        selected: Option<usize>,
+    ) -> Result<bool, String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        let Some(menu) = state.menu.as_mut().filter(|menu| menu.id == previous) else {
+            return Ok(false);
+        };
+        menu.id = restored;
+        menu.selected = selected
+            .unwrap_or(menu.selected)
+            .min(menu.options.len().saturating_sub(1));
+        if let Some((id, _)) = &mut state.menu_link
+            && *id == previous
+        {
+            *id = restored;
+        }
+        state
+            .draw(&mut io::stdout().lock())
+            .map_err(|error| error.to_string())?;
+        Ok(true)
     }
 
     pub(super) fn show_presented_picker_menu(
@@ -3297,7 +3340,7 @@ impl Console {
     ) -> Result<(), String> {
         {
             let mut state = self.state.lock().map_err(|error| error.to_string())?;
-            if state.update_hidden_login(&menu, address, callback) {
+            if state.update_login(&menu, address, callback) {
                 return state
                     .draw(&mut io::stdout().lock())
                     .map_err(|error| error.to_string());
@@ -3313,6 +3356,21 @@ impl Console {
             None,
             link.map_or(MenuFocus::Menu, MenuFocus::MenuWithLink),
         )
+    }
+
+    pub(super) fn complete_login_menu(
+        &self,
+        id: Uuid,
+        status: &str,
+        notice: &str,
+    ) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        if state.complete_login(id, status, notice) {
+            state
+                .draw(&mut io::stdout().lock())
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
     }
 
     pub fn show_commentable_menu(
@@ -3453,6 +3511,16 @@ impl Console {
         if !state.interactive {
             return Err("interactive menus require a terminal".into());
         }
+        let restore_context_offset = match &focus {
+            MenuFocus::Picker(_, presentation) => presentation.restore_context_offset,
+            _ => None,
+        };
+        let same_picker_page = match (&focus, &state.menu) {
+            (MenuFocus::Picker(kind, _), Some(current)) => {
+                state.picker_kind == Some(*kind) && current.title == menu.title
+            }
+            _ => false,
+        };
         let picker_refresh = match &focus {
             MenuFocus::Picker(kind, _) => state
                 .menu
@@ -3565,7 +3633,11 @@ impl Console {
         };
         state.menu = Some(menu);
         state.full_review = false;
-        state.context_offset = 0;
+        if let Some(offset) = restore_context_offset {
+            state.context_offset = offset;
+        } else if picker_refresh.is_none() && !same_picker_page {
+            state.context_offset = 0;
+        }
         state.draw(&mut output).map_err(|error| error.to_string())
     }
 
@@ -3595,7 +3667,24 @@ impl Console {
 
     pub fn finish_menu_submission(&self, id: Uuid) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        let navigation =
+            state.menu_submission_pending == Some(id) && state.menu_submission_navigation;
         state.mark_menu_submission_finished(id);
+        if navigation && state.clear_finished_menu_submission() {
+            state
+                .draw(&mut io::stdout().lock())
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn continue_menu_submission(&self, id: Uuid) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        if state.menu_submission_pending == Some(id) {
+            state.menu_submission_pending = None;
+            state.menu_submission_finished = None;
+            state.menu_submission_navigation = false;
+        }
         Ok(())
     }
 
@@ -4598,6 +4687,7 @@ impl State {
             request_menu: None,
             menu_submission_pending: None,
             menu_submission_finished: None,
+            menu_submission_navigation: false,
             branch_submission: BranchSubmission::Idle,
             menu_focused: false,
             review_focused: false,
@@ -5798,7 +5888,7 @@ impl State {
         if hint_rows > 0 {
             let hint = if input_field && !editing {
                 format!(
-                    "Enter confirm · Esc cancel · Tab edit {}",
+                    "Enter confirm · Esc back · Tab edit {}",
                     self.menu_comment.as_ref().unwrap().label
                 )
             } else if let Some(comment) = comment {
@@ -5807,6 +5897,8 @@ impl State {
                         "{} · Enter save · Ctrl+G external editor · Esc close field",
                         comment.label
                     )
+                } else if let Some(hint) = self.picker_presentation.editing_hint {
+                    hint.into()
                 } else if self.menu_link.is_some() {
                     format!("{} · Enter submit · Esc close field", comment.label)
                 } else if self.question_menu.is_some() {
@@ -7363,6 +7455,8 @@ impl State {
     fn begin_menu_submission(&mut self, id: Uuid) {
         self.menu_submission_pending = Some(id);
         self.menu_submission_finished = None;
+        self.menu_submission_navigation =
+            self.picker_kind.is_some() && self.request_layout.is_none();
     }
 
     fn mark_menu_submission_finished(&mut self, id: Uuid) {
@@ -7384,6 +7478,7 @@ impl State {
         };
         self.menu_submission_pending = None;
         self.menu_submission_finished = None;
+        self.menu_submission_navigation = false;
         if self.clear_hidden_menu(id) {
             return true;
         }
@@ -9318,7 +9413,12 @@ impl State {
                     Some(PickerAction::ToggleConnections)
                 }
                 (Some(PickerKind::Model), KeyCode::Char('r'), KeyModifiers::NONE)
-                    if self.picker_presentation.refresh =>
+                    if self.picker_presentation.refresh
+                        && self
+                            .picker_presentation
+                            .refresh_options
+                            .as_ref()
+                            .is_none_or(|options| options.contains(&menu.selected)) =>
                 {
                     Some(PickerAction::RefreshAccountModels)
                 }
