@@ -1,7 +1,7 @@
 use super::*;
 use crate::tick_adapter::{
-    PreparedTickAction, TickActionBackend, TickActionContext, TickActionExecutor,
-    TickActionOutcome, TickActionUi, TickListAction, TickListOperation,
+    MonitorAction, MonitorOperation, PreparedTickAction, TickActionBackend, TickActionContext,
+    TickActionExecutor, TickActionOutcome, TickActionUi,
 };
 
 #[test]
@@ -133,8 +133,8 @@ async fn input_dialog_top_rule_covers_every_surface_with_semantic_theme_roles() 
                         Some(WorkspaceTrust::new(PathBuf::from("/fixture/project")))
                 }
                 "tick confirmation" => {
-                    console.state.lock().unwrap().tick_list.confirmation =
-                        Some(super::super::tick_list::TickConfirmation {
+                    console.state.lock().unwrap().monitor.confirmation =
+                        Some(super::super::monitor::TickConfirmation {
                             instance: "fixture-tick".into(),
                             action: Arc::new(FixtureTickAction("fixture-tick".into())),
                             prompt: "Confirm fixture action?".into(),
@@ -251,20 +251,23 @@ impl TickActionBackend for FixtureTickBackend {
     }
 }
 
-pub(super) fn fixture_ticks() -> Vec<TickListEntry> {
+pub(super) fn fixture_ticks() -> Vec<MonitorEntry> {
     (0..2)
-        .map(|index| TickListEntry {
-            id: format!("fixture-tick-{index}"),
+        .map(|index| MonitorEntry {
+            instance: crate::tick_stream::InstanceRef::new("fixture", &format!("tick-{index}"))
+                .unwrap(),
             group: TickGroup::Artifacts,
             glyph: Glyph::ArtifactTick,
             title: format!("Fixture Tick {index}"),
             kind: "Document".into(),
             status: "read".into(),
+            owner: crate::tick_adapter::TickOwner::Unknown,
             updated_at_ms: None,
-            actions: vec![TickListAction {
+            resources: None,
+            actions: vec![MonitorAction {
                 key: 'o',
                 label: "open",
-                operation: TickListOperation::Execute(Arc::new(FixtureTickAction(format!(
+                operation: MonitorOperation::Execute(Arc::new(FixtureTickAction(format!(
                     "fixture-tick-{index}"
                 )))),
             }],
@@ -278,9 +281,7 @@ fn review_regression_focused_ticks_do_not_swallow_request_field_paste() {
         let mut state = State::new(true, 120, 40);
         state.chat = Some(Uuid::new_v4());
         state.prompt_enabled = true;
-        state
-            .tick_list
-            .replace(TickGroup::Artifacts, fixture_ticks());
+        state.monitor.replace(TickGroup::Artifacts, fixture_ticks());
         assert!(matches!(
             state.key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
             Some(InputEvent::TickAction { action, .. }) if action.key == 'r'
@@ -317,7 +318,7 @@ fn review_regression_focused_ticks_do_not_swallow_request_field_paste() {
                 .unwrap();
         }
         let mut state = console.state.lock().unwrap();
-        assert!(state.tick_list.focused && state.tick_list_visible());
+        assert!(state.monitor.focused && state.monitor_visible());
         state.key(KeyEvent::new(
             if question {
                 KeyCode::Enter
@@ -338,7 +339,7 @@ fn review_regression_focused_ticks_do_not_swallow_request_field_paste() {
         assert!(
             matches!(state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), Some(InputEvent::TickAction { action, .. }) if action.key == 'o' && action.instance == "fixture-tick-0")
         );
-        state.paste("Tick List still owns input");
+        state.paste("Monitor still owns input");
         assert!(state.editor.draft().is_empty());
         state.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
         assert!(
@@ -729,10 +730,10 @@ async fn review_regression_only_the_displayed_request_consumes_input() {
             "permissions",
             "help",
             "foreground shell",
-            "tick list",
+            "monitor",
         ] {
             for cancel in [false, true] {
-                let (width, height) = if surface == "tick list" {
+                let (width, height) = if surface == "monitor" {
                     (120, 40)
                 } else {
                     (80, 24)
@@ -792,13 +793,11 @@ async fn review_regression_only_the_displayed_request_consumes_input() {
                     }
                     "help" => console.state.lock().unwrap().help_open = true,
                     "foreground shell" => console.state.lock().unwrap().foreground_shell = true,
-                    "tick list" => {
+                    "monitor" => {
                         let mut state = console.state.lock().unwrap();
-                        state
-                            .tick_list
-                            .replace(TickGroup::Artifacts, fixture_ticks());
-                        state.tick_list.focus(true, None);
-                        assert!(state.tick_list_visible());
+                        state.monitor.replace(TickGroup::Artifacts, fixture_ticks());
+                        state.monitor.focus(true, None);
+                        assert!(state.monitor_visible());
                     }
                     _ => unreachable!(),
                 }
@@ -864,7 +863,7 @@ async fn review_regression_only_the_displayed_request_consumes_input() {
                     .map(RoleLine::text)
                     .collect::<Vec<_>>();
                 assert_eq!(before, after, "{title}/{surface}");
-                if surface == "tick list" {
+                if surface == "monitor" {
                     let event = state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
                     assert!(
                         matches!(&event, Some(InputEvent::TickAction { action, .. }) if action.key == 'o' && action.instance == "fixture-tick-0"),
@@ -1274,9 +1273,7 @@ fn sticky_prompt_short_conversation_keeps_the_full_content_height() {
     console.select_chat(Some(Uuid::new_v4())).unwrap();
     console.show_focused_menu(menu(Uuid::new_v4())).unwrap();
     let mut state = console.state.lock().unwrap();
-    state
-        .tick_list
-        .replace(TickGroup::Artifacts, fixture_ticks());
+    state.monitor.replace(TickGroup::Artifacts, fixture_ticks());
     state.scrollback.append("Leading boundary");
     state.record_input("Short user request");
     for index in 0..9 {
@@ -1354,16 +1351,18 @@ fn latest_user_message_stays_at_the_top_left_with_ticks_and_an_input_dialog() {
     for index in 0..30 {
         state.scrollback.append(&format!("Agent reply {index}\n"));
     }
-    state.tick_list.replace(
+    state.monitor.replace(
         TickGroup::Shells,
-        vec![TickListEntry {
-            id: "fixture".into(),
+        vec![MonitorEntry {
+            instance: crate::tick_stream::InstanceRef::new("shell", "fixture").unwrap(),
             group: TickGroup::Shells,
             glyph: Glyph::ShellTick,
             title: "Fixture Shell".into(),
             kind: "Shell".into(),
             status: "running".into(),
+            owner: crate::tick_adapter::TickOwner::Unknown,
             updated_at_ms: None,
+            resources: None,
             actions: Vec::new(),
         }],
     );
@@ -1670,7 +1669,11 @@ fn a_completed_artifact_selection_closes_its_original_picker_without_switching_a
     console.select_chat(Some(visible)).unwrap();
     console.show_focused_menu(menu(visible_menu)).unwrap();
     console
-        .select_artifact_tick(picker_id, owner, "fixture-artifact")
+        .select_artifact_tick(
+            picker_id,
+            owner,
+            "artifact:https://docs.example/fixture-artifact",
+        )
         .unwrap();
     assert_eq!(console.dialog_chat().unwrap(), Some(visible));
     assert_eq!(console.dialog_menu_id().unwrap(), Some(visible_menu));
@@ -1688,10 +1691,8 @@ fn provider_model_and_connection_dialogs_have_one_fixed_container_and_isolate_in
             state.insert("unsent Chat draft");
             state.key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
             let cursor = state.editor.cursor();
-            state
-                .tick_list
-                .replace(TickGroup::Artifacts, fixture_ticks());
-            state.tick_list.focus(true, None);
+            state.monitor.replace(TickGroup::Artifacts, fixture_ticks());
+            state.monitor.focus(true, None);
             let console = tests::console_with_state(state);
             let id = Uuid::new_v4();
             console
@@ -1735,7 +1736,7 @@ fn provider_model_and_connection_dialogs_have_one_fixed_container_and_isolate_in
             state.clear_menu(id);
             assert_eq!(state.editor.draft(), "unsent Chat draft");
             assert_eq!(state.editor.cursor(), cursor);
-            assert!(state.tick_list.focused);
+            assert!(state.monitor.focused);
         }
     }
 }

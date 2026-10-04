@@ -1,13 +1,19 @@
-//! Registered Tick adapters own type knowledge; lists and Loops consume their common contract.
+//! Registered Tick adapters own type knowledge; Monitor and Loops consume their common contract.
 mod builtin;
+mod discovery;
 mod shell;
 
+#[cfg(test)]
+pub(crate) use builtin::artifact_actions;
 pub use builtin::{ArtifactAdapter, HerdrAdapter, ShellAdapter, shell_status};
+pub use discovery::{DiscoveredTick, DiscoveryError, HerdrDiscovery, TickDiscovery};
 pub use shell::ShellTickStream;
 
 use crate::{
     artifacts::ArtifactMetadata,
-    runtime::{ChatSnapshot, ShellTaskSnapshot, TickSubscriptionStatus},
+    runtime::{
+        ChatSnapshot, MonitorMember, MonitorMemberSource, ShellTaskSnapshot, TickSubscriptionStatus,
+    },
     tick_stream::{EventPublisher, InstanceRef, TickStreamHandle, TickStreamPort, WatchId},
 };
 use std::{
@@ -55,25 +61,53 @@ pub use crate::terminal::tick_actions::{
     TickDetailView,
 };
 #[derive(Clone)]
-pub enum TickListOperation {
+pub enum MonitorOperation {
     Execute(Arc<dyn TickActionExecutor>),
-    RemoveLocal,
     Notify(String),
 }
-impl std::fmt::Debug for TickListOperation {
+impl std::fmt::Debug for MonitorOperation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Execute(_) => f.write_str("AdapterAction"),
-            Self::RemoveLocal => f.write_str("RemoveLocal"),
             Self::Notify(message) => f.debug_tuple("Notify").field(message).finish(),
         }
     }
 }
+
+/// Who controls an instance's lifecycle, as far as this Chat can verify it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TickOwner {
+    ThisChat,
+    /// A program the user started in Herdr; Herdr owns its Pane and process.
+    Herdr,
+    Service(&'static str),
+    Unknown,
+}
+impl TickOwner {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::ThisChat => "this Chat",
+            Self::Herdr => "Herdr",
+            Self::Service(name) => name,
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// One sample of the business process. Absent values stay absent; nothing is shown as zero.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TickResources {
+    pub pid: u32,
+    pub cpu_time_ms: Option<u64>,
+    pub cpu_percent: Option<f64>,
+    pub rss_bytes: Option<u64>,
+    pub sampled_at_ms: u64,
+}
 #[derive(Clone, Debug)]
-pub struct TickListAction {
+pub struct MonitorAction {
     pub key: char,
     pub label: &'static str,
-    pub operation: TickListOperation,
+    pub operation: MonitorOperation,
 }
 #[derive(Clone, Debug)]
 pub struct TickDescriptor {
@@ -83,25 +117,99 @@ pub struct TickDescriptor {
     pub title: String,
     pub kind: String,
     pub status: String,
+    pub owner: TickOwner,
+    /// The latest business update; resource and screen refreshes never set it.
     pub updated_at_ms: Option<u64>,
     pub running: bool,
-    pub actions: Vec<TickListAction>,
+    pub resources: Option<TickResources>,
+    pub actions: Vec<MonitorAction>,
 }
 #[derive(Default)]
-pub struct TickListContext {
+pub struct MonitorContext {
     pub chat: Option<ChatSnapshot>,
     pub shells: Option<ShellTaskSnapshot>,
     pub subscriptions: Vec<TickSubscriptionStatus>,
     pub metadata: HashMap<String, Option<ArtifactMetadata>>,
     pub metadata_failures: HashMap<String, String>,
+    /// What the latest host probe found for members no subscription reports on.
+    pub member_states: HashMap<InstanceRef, MemberState>,
 }
+
+/// A host probe's finding for one member. Probing reads host state only: it never reads Tick
+/// content, subscribes or calls the model.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MemberState {
+    Live { protocol: bool },
+    Gone,
+    IdentityUncertain,
+}
+
+/// Adds a program to Monitor from discovery.
+pub const MONITOR_ADD_KEY: char = 'a';
+pub const MONITOR_REFRESH_KEY: char = 'r';
+/// Keys the Monitor list itself owns. Row actions never use them, so the list's hints always
+/// match what a key does.
+pub const MONITOR_KEYS: [char; 2] = [MONITOR_ADD_KEY, MONITOR_REFRESH_KEY];
 
 pub trait TickAdapter: Send + Sync + 'static {
     fn tick_type(&self) -> &'static str;
-    fn list(&self, context: &TickListContext) -> Vec<TickDescriptor>;
+    /// Rows this adapter knows from its own sources (subscriptions, services, tasks).
+    fn list(&self, context: &MonitorContext) -> Vec<TickDescriptor>;
+    /// The row for a Chat member the adapter did not list itself. Adapters whose host can be
+    /// probed add the probe's state; the default shows only what the Chat recorded.
+    fn member(&self, member: &MonitorMember, _context: &MonitorContext) -> TickDescriptor {
+        member_descriptor(member)
+    }
     fn stream(&self) -> Option<Arc<dyn TickStreamPort>>;
     fn refresh_action(&self) -> Option<Arc<dyn TickActionExecutor>> {
         None
+    }
+}
+
+/// A member row with only the facts the Chat recorded: no invented status, time or resources.
+pub fn member_descriptor(member: &MonitorMember) -> TickDescriptor {
+    TickDescriptor {
+        title: member
+            .title
+            .clone()
+            .unwrap_or_else(|| member.instance.to_string()),
+        instance: member.instance.clone(),
+        group: TickGroup::Ticks,
+        glyph: TickGlyph::Protocol,
+        kind: "Tick".into(),
+        status: String::new(),
+        owner: member_owner(member),
+        updated_at_ms: None,
+        running: false,
+        resources: None,
+        actions: vec![
+            MonitorAction {
+                key: 'o',
+                label: "details",
+                operation: MonitorOperation::Execute(
+                    crate::terminal::tick_actions::builtin::details(member.instance.clone()),
+                ),
+            },
+            remove_from_monitor(&member.instance),
+        ],
+    }
+}
+
+/// The shared x action: hides the row in this Chat only and keeps every other fact.
+pub fn remove_from_monitor(instance: &InstanceRef) -> MonitorAction {
+    MonitorAction {
+        key: 'x',
+        label: "remove",
+        operation: MonitorOperation::Execute(crate::terminal::tick_actions::builtin::remove(
+            instance.clone(),
+        )),
+    }
+}
+
+fn member_owner(member: &MonitorMember) -> TickOwner {
+    match member.source {
+        MonitorMemberSource::Opened => TickOwner::ThisChat,
+        MonitorMemberSource::Added => TickOwner::Unknown,
     }
 }
 
@@ -139,15 +247,49 @@ impl TickAdapters {
     pub fn presentation() -> Self {
         Self::builtin(None, None, None)
     }
-    pub fn list(&self, context: &TickListContext) -> Vec<TickDescriptor> {
-        let mut entries = merge_descriptors(
+    /// The Chat's complete deduplicated Monitor set: adapter rows plus opened and added members,
+    /// minus the instances the user removed. Listing never subscribes or calls the model.
+    pub fn list(&self, context: &MonitorContext) -> Vec<TickDescriptor> {
+        let mut merged = merge_descriptors(
             self.adapters
                 .values()
                 .flat_map(|adapter| adapter.list(context)),
-        )
-        .into_values()
-        .collect::<Vec<_>>();
+        );
+        if let Some(chat) = &context.chat {
+            for member in &chat.monitor.members {
+                match merged.get_mut(&member.instance) {
+                    Some(entry) => {
+                        if entry.title == entry.instance.as_str()
+                            && let Some(title) = &member.title
+                        {
+                            entry.title = title.clone();
+                        }
+                        if member.source == MonitorMemberSource::Opened {
+                            entry.owner = TickOwner::ThisChat;
+                        }
+                    }
+                    None => {
+                        let row = match self.adapters.get(member.instance.tick_type()) {
+                            Some(adapter) => adapter.member(member, context),
+                            None => member_descriptor(member),
+                        };
+                        merged.insert(member.instance.clone(), row);
+                    }
+                }
+            }
+            merged.retain(|instance, _| !chat.monitor.is_removed(instance));
+        }
+        let mut entries = merged.into_values().collect::<Vec<_>>();
         for entry in &mut entries {
+            entry.actions.retain(|action| {
+                let reserved = MONITOR_KEYS.contains(&action.key);
+                debug_assert!(
+                    !reserved,
+                    "Tick Adapter row action {:?} uses a key the Monitor list owns",
+                    action.key
+                );
+                !reserved
+            });
             let frequencies = context
                 .subscriptions
                 .iter()
@@ -167,13 +309,19 @@ impl TickAdapters {
                 entry.status.push_str(&frequencies.join(" / "));
             }
         }
-        entries.sort_by(|a, b| {
-            a.group
-                .cmp(&b.group)
-                .then_with(|| b.updated_at_ms.cmp(&a.updated_at_ms))
-                .then_with(|| a.instance.cmp(&b.instance))
-        });
+        entries.sort_by(descriptor_order);
         entries
+    }
+    /// One page of [`Self::list`]. Pages partition the set in a stable group-and-identity order,
+    /// so updates never move a row to another page; within a page rows keep the display order.
+    /// A page never stands for the complete set, and a membership change expires older cursors.
+    pub fn page(
+        &self,
+        context: &MonitorContext,
+        cursor: Option<&tick_connect::page::PageCursor>,
+        limit: Option<usize>,
+    ) -> Result<tick_connect::page::Page<TickDescriptor>, tick_connect::page::PageError> {
+        page_of(self.list(context), cursor, limit)
     }
     pub(crate) fn refresh_actions(&self) -> Vec<Arc<dyn TickActionExecutor>> {
         self.adapters
@@ -183,26 +331,88 @@ impl TickAdapters {
     }
 }
 
+/// One page of an already listed Monitor set; see [`TickAdapters::page`].
+pub fn page_of(
+    entries: Vec<TickDescriptor>,
+    cursor: Option<&tick_connect::page::PageCursor>,
+    limit: Option<usize>,
+) -> Result<tick_connect::page::Page<TickDescriptor>, tick_connect::page::PageError> {
+    let mut page = tick_connect::page::paginate(
+        entries,
+        |entry| format!("{:05}:{}", entry.group.order, entry.instance),
+        cursor,
+        limit,
+    )?;
+    page.items.sort_by(descriptor_order);
+    Ok(page)
+}
+
+fn descriptor_order(left: &TickDescriptor, right: &TickDescriptor) -> std::cmp::Ordering {
+    display_order(
+        (left.group, left.updated_at_ms, &left.instance),
+        (right.group, right.updated_at_ms, &right.instance),
+    )
+}
+
+/// Groups in adapter order; within a group the most recently updated first.
+pub(crate) fn display_order(
+    left: (TickGroup, Option<u64>, &InstanceRef),
+    right: (TickGroup, Option<u64>, &InstanceRef),
+) -> std::cmp::Ordering {
+    left.0
+        .cmp(&right.0)
+        .then_with(|| right.1.cmp(&left.1))
+        .then_with(|| left.2.cmp(right.2))
+}
+
+/// Folds every projection of one instance into one row without losing facts: the newest
+/// projection leads, while the latest update time, running state, title, owner, resources and
+/// actions from the others are kept.
 fn merge_descriptors(
     entries: impl IntoIterator<Item = TickDescriptor>,
 ) -> BTreeMap<InstanceRef, TickDescriptor> {
     let mut merged: BTreeMap<InstanceRef, TickDescriptor> = BTreeMap::new();
     for entry in entries {
-        let rank = |entry: &TickDescriptor| {
-            (
-                entry.updated_at_ms,
-                entry.running,
-                entry.title != entry.instance.as_str(),
-            )
-        };
         match merged.entry(entry.instance.clone()) {
             std::collections::btree_map::Entry::Vacant(slot) => {
                 slot.insert(entry);
             }
             std::collections::btree_map::Entry::Occupied(mut slot) => {
-                if rank(&entry) > rank(slot.get()) {
-                    slot.insert(entry);
+                let current = slot.get_mut();
+                let rank = |entry: &TickDescriptor| {
+                    (
+                        entry.updated_at_ms,
+                        entry.running,
+                        entry.title != entry.instance.as_str(),
+                    )
+                };
+                let (mut lead, other) = if rank(&entry) > rank(current) {
+                    (entry, current.clone())
+                } else {
+                    (current.clone(), entry)
+                };
+                lead.updated_at_ms = lead.updated_at_ms.max(other.updated_at_ms);
+                lead.running |= other.running;
+                if lead.title == lead.instance.as_str() {
+                    lead.title = other.title;
                 }
+                if lead.status.is_empty() {
+                    lead.status = other.status;
+                }
+                if lead.owner == TickOwner::Unknown {
+                    lead.owner = other.owner;
+                }
+                if other.resources.as_ref().map(|sample| sample.sampled_at_ms)
+                    > lead.resources.as_ref().map(|sample| sample.sampled_at_ms)
+                {
+                    lead.resources = other.resources;
+                }
+                for action in other.actions {
+                    if !lead.actions.iter().any(|known| known.key == action.key) {
+                        lead.actions.push(action);
+                    }
+                }
+                *current = lead;
             }
         }
     }

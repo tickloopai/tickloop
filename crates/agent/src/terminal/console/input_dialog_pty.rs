@@ -76,7 +76,7 @@ fn input_dialog_tick_paste_pty_fixture() {
     tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
         let (console, mut input) = Console::start(true).unwrap();
         console.select_chat(Some(Uuid::from_u128(7100))).unwrap();
-        console.state.lock().unwrap().tick_list.replace(TickGroup::Artifacts, super::input_dialog_tests::fixture_ticks());
+        console.state.lock().unwrap().monitor.replace(TickGroup::Artifacts, super::input_dialog_tests::fixture_ticks());
         console.set_prompt_enabled(true).unwrap();
         console.record_input("Pinned tick fixture prompt").unwrap();
         std::fs::write(directory.join("phase"), "ticks").unwrap();
@@ -93,7 +93,7 @@ fn input_dialog_tick_paste_pty_fixture() {
                         console.finish_menu_submission(REQUEST).unwrap();
                         console.clear_menu(REQUEST).unwrap();
                         while console.state.lock().unwrap().menu_submission_is_pending() { tokio::time::sleep(Duration::from_millis(10)).await; }
-                        assert!(console.state.lock().unwrap().tick_list.focused);
+                        assert!(console.state.lock().unwrap().monitor.focused);
                         std::fs::write(directory.join("phase"), "answered").unwrap();
                     }
                     Some(InputEvent::TickAction { action, .. }) if action.key == 'o' => {

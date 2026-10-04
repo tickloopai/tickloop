@@ -18,8 +18,11 @@ use crate::{
     tools::{CommandSnapshot, SearchConfig},
 };
 
-pub const PROTOCOL_MAJOR: u16 = 5;
+/// Business 6.0 adds Monitor membership (`AddMonitorMember`, `RemoveMonitorMember`, Chat snapshot
+/// membership) to 5.0's family messaging; peers of another major are refused before dispatch.
+pub const PROTOCOL_MAJOR: u16 = 6;
 pub const PROTOCOL_MINOR: u16 = 0;
+
 pub const MAX_FRAME_BYTES: usize = 128 * 1024 * 1024;
 pub const RESPONSE_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 pub const FEED_CAPACITY: usize = 128;
@@ -247,6 +250,17 @@ pub enum AgentCommand {
     ListArtifactTicks {
         execution: ExecutionRef,
     },
+    /// Adds an existing Tick Instance to the Chat's Monitor without ownership or permission.
+    AddMonitorMember {
+        execution: ExecutionRef,
+        instance: tick_connect::instance::InstanceRef,
+        title: Option<String>,
+    },
+    /// Removes an instance from the Chat's Monitor view only.
+    RemoveMonitorMember {
+        execution: ExecutionRef,
+        instance: tick_connect::instance::InstanceRef,
+    },
     Create {
         launch: LaunchSpec,
         initial: Option<UserInput>,
@@ -335,6 +349,8 @@ impl AgentCommand {
             | Self::AddArtifactTick { execution, .. }
             | Self::RemoveArtifactTick { execution, .. }
             | Self::ListArtifactTicks { execution }
+            | Self::AddMonitorMember { execution, .. }
+            | Self::RemoveMonitorMember { execution, .. }
             | Self::EnqueueAfterTurn { execution, .. }
             | Self::RefreshConfiguration { execution } => Some(*execution),
             Self::DecidePermission { request, .. } | Self::AnswerQuestion { request, .. } => {
@@ -832,6 +848,7 @@ impl CommandReceipt {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum CommandResult {
     ArtifactTicks(Vec<crate::artifacts::ArtifactTick>),
+    MonitorMembership(crate::runtime::MonitorMembership),
     Created {
         execution: ExecutionRef,
         snapshot: Box<LiveChatSnapshot>,
@@ -1170,4 +1187,35 @@ pub(crate) enum ServerMessage {
         request_id: Option<Uuid>,
         error: AccessError,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn monitor_membership_commands_cross_the_wire_unchanged() {
+        let execution = ExecutionRef {
+            owner_epoch: Uuid::new_v4(),
+            agent_id: Uuid::new_v4(),
+            generation: 1,
+        };
+        let instance: tick_connect::instance::InstanceRef = "herdr:counter".parse().unwrap();
+        for command in [
+            AgentCommand::AddMonitorMember {
+                execution,
+                instance: instance.clone(),
+                title: Some("Counter".into()),
+            },
+            AgentCommand::RemoveMonitorMember {
+                execution,
+                instance: instance.clone(),
+            },
+        ] {
+            let wire = serde_json::to_value(&command).unwrap();
+            let decoded: AgentCommand = serde_json::from_value(wire.clone()).unwrap();
+            assert_eq!(serde_json::to_value(&decoded).unwrap(), wire);
+            assert_eq!(decoded.execution(), Some(execution));
+        }
+    }
 }

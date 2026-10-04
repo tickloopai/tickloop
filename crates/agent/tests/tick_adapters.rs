@@ -6,8 +6,8 @@ use support::*;
 use tickloop_agent::{
     runtime::{Agent, EventKind, ShellTaskCenter, TickSubscriptionChange},
     tick_adapter::{
-        ShellAdapter, TickAdapter, TickAdapters, TickDescriptor, TickGlyph, TickGroup,
-        TickListAction, TickListContext, TickListOperation,
+        MonitorAction, MonitorContext, MonitorOperation, ShellAdapter, TickAdapter, TickAdapters,
+        TickDescriptor, TickGlyph, TickGroup,
     },
     tick_stream::{
         InMemoryTickStream, InstanceRef, ObservationKind, TickObservation, TickStreamPort,
@@ -22,7 +22,7 @@ impl TickAdapter for CalendarAdapter {
     fn tick_type(&self) -> &'static str {
         "cal"
     }
-    fn list(&self, _: &TickListContext) -> Vec<TickDescriptor> {
+    fn list(&self, _: &MonitorContext) -> Vec<TickDescriptor> {
         vec![TickDescriptor {
             instance: calendar(),
             group: TickGroup {
@@ -33,12 +33,14 @@ impl TickAdapter for CalendarAdapter {
             title: "Earnings calendar".into(),
             kind: "Calendar".into(),
             status: "live".into(),
+            owner: tickloop_agent::tick_adapter::TickOwner::Unknown,
             updated_at_ms: None,
+            resources: None,
             running: true,
-            actions: vec![TickListAction {
+            actions: vec![MonitorAction {
                 key: 'o',
                 label: "open",
-                operation: TickListOperation::Notify("Calendar opened".into()),
+                operation: MonitorOperation::Notify("Calendar opened".into()),
             }],
         }]
     }
@@ -106,7 +108,7 @@ async fn a_registered_type_lists_subscribes_and_triggers_without_type_branches()
     }
     let subscriptions = agent.tick_subscriptions(chat).await.unwrap();
     assert_eq!(subscriptions.len(), 1);
-    let rows = adapters.list(&TickListContext {
+    let rows = adapters.list(&MonitorContext {
         subscriptions: subscriptions.clone(),
         ..Default::default()
     });
@@ -213,7 +215,7 @@ async fn shell_baseline_output_and_final_exit_use_the_same_subscription_to_loop_
             "{messages}"
         );
     }
-    let rows = adapters.list(&TickListContext {
+    let rows = adapters.list(&MonitorContext {
         shells: Some(center.snapshot(chat).await.unwrap()),
         subscriptions: agent.tick_subscriptions(chat).await.unwrap(),
         ..Default::default()
@@ -353,7 +355,7 @@ fn duplicate_instance_projection_keeps_the_newest_delivery_in_any_subscription_o
         vec![recent.clone(), baseline.clone()],
         vec![baseline.clone(), recent.clone()],
     ] {
-        let rows = TickAdapters::presentation().list(&TickListContext {
+        let rows = TickAdapters::presentation().list(&MonitorContext {
             subscriptions,
             ..Default::default()
         });
@@ -497,7 +499,7 @@ async fn a_titleless_artifact_subscription_preserves_joined_and_cached_titles() 
     };
     agent.add_artifact_tick(chat, tick.clone()).await.unwrap();
     let row:tickloop_agent::runtime::TickSubscriptionStatus=serde_json::from_value(json!({"id":Uuid::new_v4(),"loop_id":Uuid::new_v4(),"loop_state":"WaitingTrigger","instance":tick.instance_id(),"every_seconds":60,"accumulated":0,"last_delivery_ms":null,"last_delivery":null,"kind":"Protocol","title":null,"updated_at_ms":null,"link":"Disconnected"})).unwrap();
-    let mut context = TickListContext {
+    let mut context = MonitorContext {
         chat: Some(agent.snapshot(chat).await.unwrap()),
         subscriptions: vec![row],
         ..Default::default()

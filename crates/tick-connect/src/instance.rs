@@ -5,6 +5,7 @@ use std::fmt;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 const HERDR_SOURCE: &str = "herdr:";
+const HOSTED_TYPE: &str = "hosted";
 
 pub fn artifact_instance_id(origin: &str, id: &str) -> String {
     format!("artifact:{}/{id}", origin.trim_end_matches('/'))
@@ -66,6 +67,21 @@ impl InstanceRef {
         Ok(Self(identity))
     }
 
+    /// A Tick running in the dedicated Tick host. `hosted` names where it runs, not a kind of
+    /// Tick: its protocol and tools are those of the program it runs.
+    pub fn hosted(run: uuid::Uuid) -> Self {
+        Self(format!("{HOSTED_TYPE}:{run}"))
+    }
+
+    /// The run identity of a hosted instance.
+    pub fn hosted_run(&self) -> Option<uuid::Uuid> {
+        self.0
+            .strip_prefix(HOSTED_TYPE)?
+            .strip_prefix(':')?
+            .parse()
+            .ok()
+    }
+
     pub fn artifact(origin: &str, id: &str) -> Result<Self, &'static str> {
         if id.is_empty()
             || id.contains('/')
@@ -99,19 +115,28 @@ impl Serialize for InstanceRef {
     }
 }
 
-impl<'de> Deserialize<'de> for InstanceRef {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let identity = String::deserialize(deserializer)?;
+impl std::str::FromStr for InstanceRef {
+    type Err = &'static str;
+
+    fn from_str(identity: &str) -> Result<Self, Self::Err> {
         if let Some(artifact) = identity.strip_prefix("artifact:") {
             let (origin, id) = artifact
                 .rsplit_once('/')
-                .ok_or_else(|| serde::de::Error::custom("invalid Artifact Tick identity"))?;
-            return Self::artifact(origin, id).map_err(serde::de::Error::custom);
+                .ok_or("invalid Artifact Tick identity")?;
+            return Self::artifact(origin, id);
         }
-        let (tick_type, id) = identity.split_once(':').ok_or_else(|| {
-            serde::de::Error::custom("Tick Instance reference requires a type prefix")
-        })?;
-        Self::new(tick_type, id).map_err(serde::de::Error::custom)
+        let (tick_type, id) = identity
+            .split_once(':')
+            .ok_or("Tick Instance reference requires a type prefix")?;
+        Self::new(tick_type, id)
+    }
+}
+
+impl<'de> Deserialize<'de> for InstanceRef {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
     }
 }
 

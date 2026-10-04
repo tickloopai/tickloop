@@ -34,6 +34,32 @@ impl Session {
         origin: Option<&str>,
         bin: Option<&std::path::Path>,
     ) -> Self {
+        Self::spawn(
+            directory,
+            origin,
+            bin,
+            &["--working-directory-is-trusted", "--no-session-persistence"],
+        )
+    }
+    /// Resumes a saved Chat, so its persisted Monitor membership is what the View shows.
+    fn resume(directory: &std::path::Path, chat: uuid::Uuid) -> Self {
+        Self::spawn(
+            directory,
+            None,
+            None,
+            &[
+                "--working-directory-is-trusted",
+                "--resume",
+                &chat.to_string(),
+            ],
+        )
+    }
+    fn spawn(
+        directory: &std::path::Path,
+        origin: Option<&str>,
+        bin: Option<&std::path::Path>,
+        arguments: &[&str],
+    ) -> Self {
         let pty = native_pty_system()
             .openpty(PtySize {
                 rows: TERMINAL_HEIGHT as u16,
@@ -44,7 +70,7 @@ impl Session {
             .unwrap();
         let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_tickloop"));
         command.cwd(directory);
-        command.args(["--working-directory-is-trusted", "--no-session-persistence"]);
+        command.args(arguments);
         command.env("TICKLOOP_CONFIG_DIR", directory.join("state"));
         command.env(
             "TICKLOOP_AGENT_RUNTIME_DIR",
@@ -86,6 +112,12 @@ impl Session {
         self.writer.flush().unwrap();
     }
     fn wait(&self, needle: &str) {
+        self.wait_until_shown(needle, true);
+    }
+    fn wait_without(&self, needle: &str) {
+        self.wait_until_shown(needle, false);
+    }
+    fn wait_until_shown(&self, needle: &str, shown: bool) {
         let deadline = Instant::now() + TIMEOUT;
         loop {
             let frame = screen::visible_screen(
@@ -93,16 +125,28 @@ impl Session {
                 TERMINAL_WIDTH,
                 TERMINAL_HEIGHT,
             );
-            if frame.contains(needle) {
+            if frame.contains(needle) == shown {
                 return;
             }
             assert!(
                 Instant::now() < deadline,
-                "PTY did not display {needle:?}: {}",
+                "PTY {} {needle:?}: {}",
+                if shown {
+                    "did not display"
+                } else {
+                    "still displays"
+                },
                 frame
             );
             thread::sleep(Duration::from_millis(20));
         }
+    }
+    fn frame(&self) -> String {
+        screen::visible_screen(
+            &self.output.lock().unwrap(),
+            TERMINAL_WIDTH,
+            TERMINAL_HEIGHT,
+        )
     }
     fn wait_for_editor(&self) {
         let deadline = Instant::now() + TIMEOUT;
@@ -160,7 +204,7 @@ fn shell_tick_appears_can_be_focused_and_removed_in_an_isolated_pty() {
     let directory = tempfile::tempdir().unwrap();
     let mut session = Session::start(directory.path(), None, None);
     session.wait_for_editor();
-    assert!(!session.output.lock().unwrap().contains("No Ticks"));
+    assert!(!session.output.lock().unwrap().contains("Monitor 0"));
     session.send(b"!printf shell-tick-pty; while [ ! -f finish ]; do sleep 0.02; done\r");
     session.wait("Shell running · Ctrl+B background");
     session.send(b"\x02");
@@ -168,7 +212,9 @@ fn shell_tick_appears_can_be_focused_and_removed_in_an_isolated_pty() {
     std::fs::write(directory.path().join("finish"), "").unwrap();
     session.wait("exit 0");
     session.send(b"\x1b[Cx");
-    session.send(b"/ticks\r\r");
+    session.wait_without("Shells (1)");
+    session.wait_for_editor();
+    session.send(b"/monitor\r\r");
     let settings_path = directory.path().join("state/settings.json");
     let deadline = Instant::now() + TIMEOUT;
     while !settings_path.exists() {
@@ -184,7 +230,7 @@ fn shell_tick_appears_can_be_focused_and_removed_in_an_isolated_pty() {
         &std::fs::read(directory.path().join("state/settings.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!(saved["tickList"], "auto");
+    assert_eq!(saved["monitor"], "auto");
 }
 
 #[test]
@@ -250,7 +296,7 @@ fn artifact_login_opens_picker_adds_tick_and_uses_a_substitute_browser() {
         session.wait("PTY Research");
         session.send(b"\r");
         session.wait("Artifacts (1)");
-        session.wait("Ticks 1");
+        session.wait("Monitor 1");
         session.send(b"\r");
         let deadline = Instant::now() + TIMEOUT;
         let log = directory.path().join("browser.log");
@@ -270,4 +316,76 @@ fn artifact_login_opens_picker_adds_tick_and_uses_a_substitute_browser() {
     if let Err(panic) = result {
         std::panic::resume_unwind(panic);
     }
+}
+
+#[test]
+fn a_saved_member_is_shown_detailed_removed_and_restored_across_restarts_in_a_real_pty() {
+    let directory = tempfile::tempdir().unwrap();
+    let workdir = directory.path().canonicalize().unwrap();
+    let chat = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let agent = tickloop_agent::runtime::Agent::open_embedded(
+                workdir.join("state"),
+                support::config(),
+                Arc::new(support::ScriptedModel::new(Vec::new())),
+            )
+            .unwrap();
+            let chat = agent.create_chat(workdir.clone()).await.unwrap();
+            agent
+                .add_monitor_member(
+                    chat,
+                    "herdr:pty-member".parse().unwrap(),
+                    Some("PTY member".into()),
+                )
+                .await
+                .unwrap();
+            agent.shutdown().await;
+            chat
+        });
+
+    let mut session = Session::resume(&workdir, chat);
+    session.wait_for_editor();
+    session.wait("Monitor 1");
+    session.wait("PTY member");
+    session.send(b"jk");
+    session.wait("❯\u{a0}jk");
+    assert!(
+        session.frame().contains("PTY member"),
+        "typing j/k edits the input while Monitor is not focused"
+    );
+    session.send(b"\x7f\x7f");
+    session.wait_without("❯\u{a0}jk");
+    session.send(b"\x1b[C");
+    session.wait("Enter details · x remove · Esc");
+    session.send(b"\r");
+    session.wait("Owner     Herdr");
+    session.wait("Resources unavailable");
+    session.send(b"\x1b");
+    session.wait_without("Owner     Herdr");
+    session.send(b"x");
+    session.wait_without("PTY member");
+    session.wait_without("Monitor 1");
+    session.exit();
+    drop(session);
+
+    let mut restarted = Session::resume(&workdir, chat);
+    restarted.wait_for_editor();
+    thread::sleep(Duration::from_millis(500));
+    let frame = restarted.frame();
+    assert!(
+        !frame.contains("Monitor 1") && !frame.contains("PTY member"),
+        "the removal survives a restart: {frame}"
+    );
+    restarted.send(b"/monitor add\r");
+    restarted.wait("Add to Monitor · Removed");
+    restarted.send(b"\r");
+    restarted.wait("Added to Monitor");
+    restarted.send(b"\x1b");
+    restarted.wait("Monitor 1");
+    restarted.wait("Enter details · x remove · Esc");
+    restarted.send(b"\x1b");
+    restarted.exit();
 }

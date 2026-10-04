@@ -59,6 +59,8 @@ mod menus;
 #[cfg(test)]
 #[path = "../tests/model_http_support/mod.rs"]
 pub(crate) mod model_http_support;
+mod monitor;
+mod monitor_discovery;
 #[cfg(test)]
 mod navigation_tests;
 mod new_agent_draft;
@@ -92,7 +94,6 @@ mod task_surface;
 mod test_support;
 mod thinking_preview;
 pub mod tick_actions;
-mod tick_list;
 mod tick_shell;
 mod transcript;
 mod workflows;
@@ -132,6 +133,8 @@ use thinking_preview::ThinkingPreview;
 use workflows::Workflow;
 
 const SUBSCRIPTION_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+/// How often the host state of Monitor members without a subscription is sampled.
+const MEMBER_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
 macro_rules! out {
     ($console:expr, $($argument:tt)*) => { $console.write(&format!($($argument)*))? };
@@ -437,6 +440,9 @@ fn switch_to_saved_branch(console: &Console, child_chat_id: uuid::Uuid) -> Resul
     }
 }
 
+/// Opens Monitor's add picker, like its `a` key.
+const MONITOR_ADD_COMMAND: &str = "/monitor add";
+
 async fn branch_from_terminal(
     console: &Console,
     agent: &Agent,
@@ -639,7 +645,7 @@ The footer contains only Subagents N when there are subagents, expanded by defau
 Down on the last visual input row, after history ends, focuses the Subagents N entry without submitting the draft.
 Click Subagents N or press Enter/Space on its focused entry to hide/show the list; modified Enter is ignored.
 Down from the expanded entry focuses the list; Enter opens an Agent, Space folds descendants, Esc returns to the entry, then Esc returns to the editor.
-Shift+Up/Down focuses the Tick List's Shells group; Enter opens the selected Shell.
+Shift+Up/Down focuses Monitor's Shells group; Enter opens the selected Shell.
 Each Agent's own Todos stay below Working, including while idle, with a five-second grace after all items complete; rewrites do not extend it.
 Mode and model stay right-aligned on the lower divider; Context appears only with confirmed nonzero rounded usage.
 Divider edge titles have a short rule beyond the text; the expanded Subagents list has no items summary row.
@@ -870,9 +876,9 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
     let status_lines = saved_settings
         .as_mut()
         .and_then(LoadedSettings::status_lines);
-    let tick_list_preference = saved_settings
+    let monitor_preference = saved_settings
         .as_ref()
-        .map(LoadedSettings::tick_list_preference)
+        .map(LoadedSettings::monitor_preference)
         .unwrap_or_default();
     if let Some(settings) = saved_settings.as_mut() {
         settings.prompt_suggestion_enabled();
@@ -900,33 +906,38 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
         },
     };
     use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
-    let (host_work_context, view_host) = if let Some(context) = HerdrContext::from_environment()? {
-        let access = TickAccess::new(context.clone());
-        let pane = access
-            .caller()
-            .await
-            .map_err(|error| format!("cannot inspect the calling Herdr Pane: {error}"))?;
-        let metadata = std::fs::metadata(&context.socket)
-            .map_err(|error| format!("cannot inspect Herdr endpoint: {error}"))?;
-        let host_instance = format!("herdr:{}:{}", metadata.dev(), metadata.ino());
-        (
-            Some(crate::agent_access::HostWorkContext {
-                socket: context.socket.clone(),
-                workspace: Some(pane.workspace_id.clone()),
-            }),
-            Some(crate::agent_access::HostLocation {
-                host_instance,
-                socket: context.socket,
-                workspace: Some(pane.workspace_id),
-                tab: Some(pane.tab_id),
-                pane: Some(pane.pane_id),
-                terminal: Some(pane.terminal_id),
-                client: None,
-            }),
-        )
-    } else {
-        (None, None)
-    };
+    let (host_work_context, view_host, tick_discovery) =
+        if let Some(context) = HerdrContext::from_environment()? {
+            let access = std::sync::Arc::new(TickAccess::new(context.clone()));
+            let pane = access
+                .caller()
+                .await
+                .map_err(|error| format!("cannot inspect the calling Herdr Pane: {error}"))?;
+            let metadata = std::fs::metadata(&context.socket)
+                .map_err(|error| format!("cannot inspect Herdr endpoint: {error}"))?;
+            let host_instance = format!("herdr:{}:{}", metadata.dev(), metadata.ino());
+            (
+                Some(crate::agent_access::HostWorkContext {
+                    socket: context.socket.clone(),
+                    workspace: Some(pane.workspace_id.clone()),
+                }),
+                Some(crate::agent_access::HostLocation {
+                    host_instance,
+                    socket: context.socket,
+                    workspace: Some(pane.workspace_id),
+                    tab: Some(pane.tab_id),
+                    pane: Some(pane.pane_id),
+                    terminal: Some(pane.terminal_id),
+                    client: None,
+                }),
+                Some(
+                    std::sync::Arc::new(crate::tick_adapter::HerdrDiscovery::new(access))
+                        as std::sync::Arc<dyn crate::tick_adapter::TickDiscovery>,
+                ),
+            )
+        } else {
+            (None, None, None)
+        };
     let launch = crate::agent_access::LaunchSpec {
         workdir: workdir.clone(),
         config_root: config_root.clone(),
@@ -944,7 +955,7 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
     };
     #[cfg(test)]
     let agent = if std::env::var_os("TICKLOOP_TEST_CODEX_OAUTH").is_some() {
-        let core = crate::agent_daemon::build_runtime(&launch).await?;
+        let core = crate::agent_daemon::build_runtime(&launch, None).await?;
         Agent::from_embedded_launch(core, launch)
     } else {
         let client = crate::agent_daemon::connect_or_start().await?;
@@ -1010,7 +1021,10 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
     };
     let console = &console;
     console.set_status_lines(status_lines)?;
-    console.set_tick_list_preference(tick_list_preference)?;
+    console.set_monitor_preference(monitor_preference)?;
+    if let Some(discovery) = tick_discovery {
+        console.set_tick_discovery(discovery)?;
+    }
     console.configure_input_history(config_root.as_deref(), &workdir)?;
     // The image cache expires with Transcripts, so a session that saves no Chats caches nothing.
     let image_cache_root = config_root
@@ -1295,6 +1309,8 @@ async fn interact(
     let mut message_groups = MessageGroups::default();
     let mut subscription_refresh = tokio::time::interval(SUBSCRIPTION_REFRESH_INTERVAL);
     subscription_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut member_probe = tokio::time::interval(MEMBER_PROBE_INTERVAL);
+    member_probe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut transcript_refresh = tokio::time::interval(std::time::Duration::from_millis(100));
     transcript_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut animation_refresh = tokio::time::interval(ANIMATION_FRAME_DURATION);
@@ -1633,6 +1649,8 @@ async fn interact(
                     snapshot.highest_pasted_image_id(),
                 )?;
                 reconcile_consumed_input_echoes(console, &snapshot)?;
+                // The Chat snapshot carries Monitor membership and removals, so it applies first.
+                console.update_monitor_chat(&snapshot)?;
                 let task_snapshot = task_center
                     .snapshot(chat)
                     .await
@@ -1641,7 +1659,6 @@ async fn interact(
                 if let Ok(rows) = agent.tick_subscriptions(chat).await {
                     console.update_subscribed_ticks(chat, &rows)?;
                 }
-                console.update_artifact_ticks(&snapshot)?;
                 console.set_provider_failures(chat, &snapshot.provider_failures)?;
                 menus.note_provider_failures(chat, &snapshot.provider_failures);
                 console.set_provider_failure(
@@ -2045,6 +2062,22 @@ async fn interact(
                 if !matches!(&line,Some(InputEvent::Line(input)|InputEvent::Prompt {family_target: None, text:input,..}) if !input.trim_start().starts_with('/')) {
                     merged_echoes.next_submission_block();
                 }
+                // `/monitor add` is the `a` key of Monitor: it opens the same prepared action.
+                let line = match line {
+                    Some(InputEvent::Line(command) | InputEvent::Prompt { text: command, .. })
+                        if command.trim() == MONITOR_ADD_COMMAND && !overview_active && !login_active =>
+                    {
+                        if selected_chat.is_none() {
+                            outln!(console, "No Chat is selected. Enter a task first.");
+                            continue;
+                        }
+                        match console.open_monitor_discovery()? {
+                            Some(event) => Some(event),
+                            None => continue,
+                        }
+                    }
+                    other => other,
+                };
                 let line = match line {
                     Some(InputEvent::TickAction { chat, action }) if selected_chat == Some(chat) && !overview_active && !login_active => {
                         let context = tick_actions::TickActionContext { agent, console, root:config_root.as_deref(), chat };
@@ -2180,8 +2213,8 @@ async fn interact(
                     console.suspend()?;
                     status_dirty=true;
                 },
-                Some(InputEvent::ToggleTickList { show }) => {
-                    if let Err(error) = set_tick_list_visible(console, user_settings.as_ref(), show) { console.set_status(&safe_text(&error))?; }
+                Some(InputEvent::ToggleMonitor { show }) => {
+                    if let Err(error) = set_monitor_visible(console, user_settings.as_ref(), show) { console.set_status(&safe_text(&error))?; }
                     else if show && let Some(chat) = selected_chat { artifact_ui::refresh(agent, console, config_root.as_deref(), chat).await?; }
                     status_dirty = true;
                 },
@@ -2809,9 +2842,9 @@ async fn interact(
                             }
                             else {outln!(console,"No Chat is selected. Enter a task first.");}
                         },
-                        "/ticks" => {
-                            let show = !console.tick_list_is_visible()?;
-                            if let Err(error) = set_tick_list_visible(console, user_settings.as_ref(), show) { outln!(console, "{}", safe_text(&error)); }
+                        "/monitor" => {
+                            let show = !console.monitor_is_visible()?;
+                            if let Err(error) = set_monitor_visible(console, user_settings.as_ref(), show) { outln!(console, "{}", safe_text(&error)); }
                             else if show && let Some(chat) = selected_chat { artifact_ui::refresh(agent, console, config_root.as_deref(), chat).await?; }
                         },
                         "/plan" => {
@@ -3933,8 +3966,28 @@ async fn interact(
                     write_next_reply_line(console, reply)?;
                 }
             },
-            _ = subscription_refresh.tick(), if interactive && ((!overview_active && console.tick_list_has_entries()?) || !console.subscription_dialog_chats()?.is_empty()) => {
-                status_dirty |= console.tick_list_has_entries()?;
+            _ = member_probe.tick(), if interactive && !overview_active => {
+                // A slow host never stalls input: the probe runs beside the loop and reports back.
+                if let Some(probe) = console.claim_member_probe()? {
+                    let console = console.clone();
+                    tokio::spawn(async move {
+                        let chat = probe.chat;
+                        // A failed or panicked probe keeps the earlier findings and still releases
+                        // the probe slot, so probing never stops for the session.
+                        let probed = tokio::spawn(async move {
+                            probe.discovery.probe(&probe.targets).await
+                        })
+                        .await;
+                        let states = match probed {
+                            Ok(Ok(states)) => Some(states),
+                            Ok(Err(_)) | Err(_) => None,
+                        };
+                        let _ = console.update_member_states(chat, states);
+                    });
+                }
+            },
+            _ = subscription_refresh.tick(), if interactive && ((!overview_active && console.monitor_has_entries()?) || !console.subscription_dialog_chats()?.is_empty()) => {
+                status_dirty |= console.monitor_has_entries()?;
                 for chat in console.subscription_dialog_chats()? {
                     refresh_subscriptions(agent,console,chat).await?;
                 }
@@ -4044,24 +4097,24 @@ async fn open_rewind(
     menus.rewind(console, &snapshot)
 }
 
-fn set_tick_list_visible(
+fn set_monitor_visible(
     console: &Console,
     settings: Option<&UserSettings>,
     show: bool,
 ) -> Result<(), String> {
-    let settings = settings
-        .ok_or("No Agent state directory is configured; cannot save Tick List preference")?;
+    let settings =
+        settings.ok_or("No Agent state directory is configured; cannot save Monitor preference")?;
     let preference = if show {
-        crate::settings::TickListPreference::Auto
+        crate::settings::MonitorPreference::Auto
     } else {
-        crate::settings::TickListPreference::Hidden
+        crate::settings::MonitorPreference::Hidden
     };
     settings
-        .save_tick_list_preference(preference)
-        .map_err(|error| format!("Cannot save Tick List preference: {error}"))?;
-    console.set_tick_list_preference(preference)?;
+        .save_monitor_preference(preference)
+        .map_err(|error| format!("Cannot save Monitor preference: {error}"))?;
+    console.set_monitor_preference(preference)?;
     if show {
-        console.open_tick_list()?;
+        console.open_monitor()?;
     }
     Ok(())
 }
@@ -8257,7 +8310,7 @@ mod status_agents_help_tests {
         let help = super::help_text();
         assert!(help.contains("Subagents N") && help.contains("expanded by default"));
         assert!(help.contains("Enter/Space") && help.contains("Esc returns to the entry"));
-        assert!(help.contains("Tick List's Shells group"));
+        assert!(help.contains("Monitor's Shells group"));
         assert!(help.contains("including while idle") && help.contains("five-second grace"));
         assert!(!help.contains("Footer Tasks/Todo") && !help.contains("starts folded"));
     }

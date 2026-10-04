@@ -2777,6 +2777,48 @@ impl ConsoleExecution {
             _ => Err(unexpected()),
         }
     }
+    pub(super) async fn add_monitor_member(
+        &self,
+        chat: Uuid,
+        instance: crate::tick_stream::InstanceRef,
+        title: Option<String>,
+    ) -> Result<runtime::MonitorMembership, AgentError> {
+        let execution = self.reference(chat).await?;
+        match self
+            .command(
+                AgentCommand::AddMonitorMember {
+                    execution,
+                    instance,
+                    title,
+                },
+                None,
+            )
+            .await?
+        {
+            CommandResult::MonitorMembership(membership) => Ok(membership),
+            _ => Err(unexpected()),
+        }
+    }
+    pub(super) async fn remove_monitor_member(
+        &self,
+        chat: Uuid,
+        instance: crate::tick_stream::InstanceRef,
+    ) -> Result<runtime::MonitorMembership, AgentError> {
+        let execution = self.reference(chat).await?;
+        match self
+            .command(
+                AgentCommand::RemoveMonitorMember {
+                    execution,
+                    instance,
+                },
+                None,
+            )
+            .await?
+        {
+            CommandResult::MonitorMembership(membership) => Ok(membership),
+            _ => Err(unexpected()),
+        }
+    }
     pub(super) async fn artifact_ticks(
         &self,
         chat: Uuid,

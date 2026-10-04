@@ -21,7 +21,7 @@ impl TickAdapter for HerdrAdapter {
     fn tick_type(&self) -> &'static str {
         "herdr"
     }
-    fn list(&self, context: &TickListContext) -> Vec<TickDescriptor> {
+    fn list(&self, context: &MonitorContext) -> Vec<TickDescriptor> {
         subscriptions(context, self.tick_type())
             .map(|row| {
                 let terminal = matches!(row.kind, Some(ObservationKind::Terminal { .. }));
@@ -39,12 +39,38 @@ impl TickAdapter for HerdrAdapter {
                         .unwrap_or_else(|| row.instance.to_string()),
                     kind: if terminal { "Terminal" } else { "Tick" }.into(),
                     status: link_status(row.link).into(),
+                    owner: TickOwner::Herdr,
                     updated_at_ms: row.last_delivery_ms,
                     running: row.link == TickLinkState::Live,
-                    actions: remote_actions(&row.id.to_string(), false),
+                    resources: None,
+                    actions: subscription_actions(row),
                 }
             })
             .collect()
+    }
+    /// A Herdr member reports the latest probe of its Pane; a program the user started in Herdr
+    /// stays Herdr's even when added here.
+    fn member(&self, member: &MonitorMember, context: &MonitorContext) -> TickDescriptor {
+        let mut row = super::member_descriptor(member);
+        if member.source == MonitorMemberSource::Added {
+            row.owner = TickOwner::Herdr;
+        }
+        match context.member_states.get(&member.instance) {
+            Some(MemberState::Live { protocol }) => {
+                row.running = true;
+                row.status = link_status(TickLinkState::Live).into();
+                if !protocol {
+                    row.kind = "Terminal".into();
+                    row.glyph = TickGlyph::Terminal;
+                }
+            }
+            Some(MemberState::Gone) => row.status = link_status(TickLinkState::InstanceGone).into(),
+            Some(MemberState::IdentityUncertain) => {
+                row.status = link_status(TickLinkState::IdentityUncertain).into()
+            }
+            None => {}
+        }
+        row
     }
     fn stream(&self) -> Option<Arc<dyn TickStreamPort>> {
         self.stream.clone()
@@ -66,7 +92,7 @@ impl TickAdapter for ArtifactAdapter {
     fn tick_type(&self) -> &'static str {
         "artifact"
     }
-    fn list(&self, context: &TickListContext) -> Vec<TickDescriptor> {
+    fn list(&self, context: &MonitorContext) -> Vec<TickDescriptor> {
         let mut rows =
             super::merge_descriptors(subscriptions(context, self.tick_type()).map(|row| {
                 TickDescriptor {
@@ -79,9 +105,11 @@ impl TickAdapter for ArtifactAdapter {
                         .unwrap_or_else(|| row.instance.to_string()),
                     kind: "Artifact".into(),
                     status: link_status(row.link).into(),
+                    owner: ARTIFACT_OWNER,
                     updated_at_ms: row.updated_at_ms,
                     running: false,
-                    actions: remote_actions(row.instance.as_str(), true),
+                    resources: None,
+                    actions: artifact_actions(row.instance.as_str()),
                 }
             }));
         if let Some(chat) = &context.chat {
@@ -145,9 +173,11 @@ impl TickAdapter for ArtifactAdapter {
                         }
                         .into(),
                         status: status.into(),
+                        owner: ARTIFACT_OWNER,
                         updated_at_ms,
                         running: false,
-                        actions: remote_actions(&id, true),
+                        resources: None,
+                        actions: artifact_actions(&id),
                     },
                 );
             }
@@ -177,7 +207,7 @@ impl TickAdapter for ShellAdapter {
     fn tick_type(&self) -> &'static str {
         "shell"
     }
-    fn list(&self, context: &TickListContext) -> Vec<TickDescriptor> {
+    fn list(&self, context: &MonitorContext) -> Vec<TickDescriptor> {
         context
             .shells
             .iter()
@@ -191,23 +221,23 @@ impl TickAdapter for ShellAdapter {
                 let instance = InstanceRef::shell(task.id);
                 TickDescriptor {
                     actions: vec![
-                        TickListAction {
+                        MonitorAction {
                             key: 'o',
                             label: "open",
-                            operation: TickListOperation::Execute(
+                            operation: MonitorOperation::Execute(
                                 crate::terminal::tick_actions::builtin::shell(task.id),
                             ),
                         },
-                        TickListAction {
-                            key: 'x',
-                            label: "remove",
-                            operation: if task.state.is_terminal() {
-                                TickListOperation::RemoveLocal
-                            } else {
-                                TickListOperation::Notify(
+                        if task.state.is_terminal() {
+                            remove_from_monitor(&instance)
+                        } else {
+                            MonitorAction {
+                                key: 'x',
+                                label: "remove",
+                                operation: MonitorOperation::Notify(
                                     "Open this Shell to stop it before removing it".into(),
-                                )
-                            },
+                                ),
+                            }
                         },
                     ],
                     instance,
@@ -216,8 +246,10 @@ impl TickAdapter for ShellAdapter {
                     title: task.command.lines().next().unwrap_or_default().into(),
                     kind: "Shell".into(),
                     status: shell_status(task),
+                    owner: TickOwner::ThisChat,
                     updated_at_ms: task.updated_at_ms,
                     running: !task.state.is_terminal(),
+                    resources: None,
                 }
             })
             .collect()
@@ -242,7 +274,7 @@ pub fn shell_status(task: &ShellTask) -> String {
     }
 }
 fn subscriptions<'a>(
-    context: &'a TickListContext,
+    context: &'a MonitorContext,
     tick_type: &'a str,
 ) -> impl Iterator<Item = &'a TickSubscriptionStatus> {
     context.subscriptions.iter().filter(move |row| {
@@ -262,27 +294,36 @@ fn link_status(link: TickLinkState) -> &'static str {
         TickLinkState::IdentityUncertain => "uncertain",
     }
 }
-fn remote_actions(id: &str, artifact: bool) -> Vec<TickListAction> {
-    let actions = if artifact {
-        vec![
-            ('o', "open"),
-            ('x', "remove"),
-            ('c', "copy"),
-            ('f', "feedback"),
-        ]
-    } else {
-        vec![('o', "open"), ('x', "remove")]
-    };
-    actions
-        .into_iter()
-        .map(|(key, label)| TickListAction {
-            key,
-            label,
-            operation: TickListOperation::Execute(if artifact {
-                crate::terminal::tick_actions::builtin::artifact(id, key)
-            } else {
-                crate::terminal::tick_actions::builtin::subscription(id, key)
-            }),
-        })
-        .collect()
+const ARTIFACT_OWNER: TickOwner = TickOwner::Service("Artifact Service");
+
+pub(crate) fn artifact_actions(id: &str) -> Vec<MonitorAction> {
+    [
+        ('o', "open"),
+        ('x', "remove"),
+        ('c', "copy"),
+        ('f', "feedback"),
+    ]
+    .into_iter()
+    .map(|(key, label)| MonitorAction {
+        key,
+        label,
+        operation: MonitorOperation::Execute(crate::terminal::tick_actions::builtin::artifact(
+            id, key,
+        )),
+    })
+    .collect()
+}
+
+/// Enter opens the subscription; x only removes the row from this Chat's Monitor.
+fn subscription_actions(row: &TickSubscriptionStatus) -> Vec<MonitorAction> {
+    vec![
+        MonitorAction {
+            key: 'o',
+            label: "open",
+            operation: MonitorOperation::Execute(
+                crate::terminal::tick_actions::builtin::subscription(&row.id.to_string()),
+            ),
+        },
+        remove_from_monitor(&row.instance),
+    ]
 }

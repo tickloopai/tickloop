@@ -340,16 +340,18 @@ fn divider_edges_use_short_rules_and_exact_label_targets_with_narrow_fallbacks()
             Some(Uuid::from_u128(1)),
         )
         .unwrap();
-    console.state.lock().unwrap().tick_list.replace(
+    console.state.lock().unwrap().monitor.replace(
         TickGroup::Shells,
-        vec![TickListEntry {
-            id: TASK.to_string(),
+        vec![MonitorEntry {
+            instance: crate::tick_stream::InstanceRef::shell(TASK),
             group: TickGroup::Shells,
             glyph: Glyph::ShellTick,
             title: "edge Shell".into(),
             kind: "Shell".into(),
             status: "running".into(),
+            owner: crate::tick_adapter::TickOwner::Unknown,
             updated_at_ms: None,
+            resources: None,
             actions: Vec::new(),
         }],
     );
@@ -377,27 +379,27 @@ fn divider_edges_use_short_rules_and_exact_label_targets_with_narrow_fallbacks()
                 .collect::<String>(),
             "⏺ Subagents 1"
         );
-        let ticks = state.tick_toggle_target.as_ref().unwrap();
-        let upper = &rendered[ticks.row];
-        assert!(upper.ends_with(" ◉ Ticks 1 ─"), "{upper:?}");
-        assert_eq!(ticks.columns.end, state.width - 2);
+        let toggle = state.monitor_toggle_target.as_ref().unwrap();
+        let upper = &rendered[toggle.row];
+        assert!(upper.ends_with(" ◉ Monitor 1 ─"), "{upper:?}");
+        assert_eq!(toggle.columns.end, state.width - 2);
         assert_eq!(
             upper
                 .chars()
-                .skip(ticks.columns.start)
-                .take(ticks.columns.len())
+                .skip(toggle.columns.start)
+                .take(toggle.columns.len())
                 .collect::<String>(),
-            "◉ Ticks 1"
+            "◉ Monitor 1"
         );
     }
     console.set_agent_family(vec![], None).unwrap();
-    for (width, suffix) in [(14, " ◉ Ticks 1 ─"), (13, " ◉ Ticks 1")] {
+    for (width, suffix) in [(16, " ◉ Monitor 1 ─"), (15, " ◉ Monitor 1")] {
         console.state.lock().unwrap().resize(width, 24);
         let rendered = frame(&console);
         let state = console.state.lock().unwrap();
-        let ticks = state.tick_toggle_target.as_ref().unwrap();
-        assert!(rendered[ticks.row].ends_with(suffix), "{rendered:?}");
-        assert_eq!(ticks.columns.len(), 9);
+        let toggle = state.monitor_toggle_target.as_ref().unwrap();
+        assert!(rendered[toggle.row].ends_with(suffix), "{rendered:?}");
+        assert_eq!(toggle.columns.len(), 11);
     }
 }
 
@@ -654,7 +656,7 @@ fn single_shell_activation_and_detail_updates_keep_the_exact_eligible_task() {
         .state
         .lock()
         .unwrap()
-        .tick_list
+        .monitor
         .detail
         .as_ref()
         .unwrap()
@@ -758,7 +760,7 @@ fn assert_single_shell_shortcut(cached_detail: bool) {
         .state
         .lock()
         .unwrap()
-        .tick_list
+        .monitor
         .detail
         .as_ref()
         .unwrap()
@@ -840,7 +842,7 @@ async fn global_shell_count_and_open_keep_the_peer_task_and_stop_its_actual_owne
         let console = fixture();
         console.state.lock().unwrap().chat = Some(source);
         console.update_shell_ticks(&snapshot).unwrap();
-        assert!(console.state.lock().unwrap().tick_list.entries().is_empty());
+        assert!(console.state.lock().unwrap().monitor.entries().is_empty());
         let mut subscription = None;
         crate::terminal::open_tasks(&center, &console, source, &mut subscription, Some(peer_task)).await.unwrap();
         key(&console, KeyCode::Home);
@@ -1262,7 +1264,7 @@ fn todos_use_claude_status_marks_styles_and_width_ellipsis() {
 }
 
 #[test]
-fn question_mark_help_matches_agents_focus_layers_and_tick_list_shells() {
+fn question_mark_help_matches_agents_focus_layers_and_monitor_shells() {
     let mut state = State::new(true, 160, 40);
     state.prompt_enabled = true;
     state.chat = Some(CHAT);
@@ -1276,7 +1278,7 @@ fn question_mark_help_matches_agents_focus_layers_and_tick_list_shells() {
         "Enter open Agent",
         "Space fold descendants",
         "Esc list → entry → input",
-        "Shift+↑/↓ Tick List Shells",
+        "Shift+↑/↓ Monitor Shells",
     ] {
         assert!(help.contains(hint), "missing {hint}: {help}");
     }

@@ -8,7 +8,8 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use tick_connect::{
     access::TickAccess,
-    herdr::{HerdrContext, HerdrPort, HostError, Pane, process_birth},
+    herdr::{HerdrContext, HerdrPort, Pane, process_birth},
+    host_error::HostError,
     instance::InstanceRef,
     session::{SessionLaunch, TickSession},
 };
@@ -127,9 +128,15 @@ async fn explicit_host_operations_continue_after_the_agent_view_closes() {
         })
         .await
         .unwrap();
-    let Some(CommandResult::Created { execution, .. }) = created.result else {
+    let Some(CommandResult::Created {
+        execution,
+        snapshot: created_snapshot,
+        ..
+    }) = created.result
+    else {
         panic!("Create failed: {created:?}");
     };
+    let chat = created_snapshot.conversation.id;
     let configured = access
         .execute(CommandEnvelope {
             owner_epoch: access.owner_epoch(),
@@ -179,6 +186,8 @@ async fn explicit_host_operations_continue_after_the_agent_view_closes() {
             _ => {}
         }
     }
+    let membership = agent.snapshot(chat).await.unwrap().monitor;
+    let subscriptions = agent.tick_subscriptions(chat).await.unwrap();
     agent.shutdown().await;
     for name in [
         "discover",
@@ -204,6 +213,19 @@ async fn explicit_host_operations_continue_after_the_agent_view_closes() {
     assert_eq!(opened["tab_id"], "tab");
     assert_eq!(opened["workspace_id"], "workspace-a");
     assert!(opened["tick_instance_id"].is_string());
+    assert_eq!(
+        membership
+            .members
+            .iter()
+            .map(|member| (member.instance.as_str(), member.source))
+            .collect::<Vec<_>>(),
+        vec![(
+            opened["tick_instance_id"].as_str().unwrap(),
+            tickloop_agent::runtime::MonitorMemberSource::Opened
+        )],
+        "a verified open joins the opening Chat's Monitor"
+    );
+    assert!(subscriptions.is_empty(), "opening never subscribes");
     assert_eq!(host.0.sent.lock().unwrap().len(), 1);
 }
 
@@ -1168,8 +1190,10 @@ async fn agent_reads_and_changes_the_same_external_protocol_tick() {
     let session = TickSession::spawn(SessionLaunch {
         command: vec!["python3".into(), script.to_string_lossy().into_owned()],
         cwd: directory.path().into(),
-        host_socket: host_socket.clone(),
-        terminal_id: "protocol".into(),
+        backend: tick_connect::session::SessionBackend::Herdr {
+            socket: host_socket.clone(),
+            terminal_id: "protocol".into(),
+        },
         runtime_dir: Some(runtime_dir.clone()),
     })
     .await

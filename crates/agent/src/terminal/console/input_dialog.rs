@@ -610,9 +610,9 @@ impl State {
             || self.artifacts_picker.is_some()
             || self.conversation_picker.is_some()
             || self.help_open && self.overview.projection.is_none()
-            || self.tick_list.confirmation.is_some()
+            || self.monitor.confirmation.is_some()
             || self
-                .tick_list
+                .monitor
                 .detail
                 .as_ref()
                 .is_some_and(|detail| detail.confirmation().is_some())
@@ -711,7 +711,7 @@ impl State {
             lines.push(RoleLine::role("Esc / ? close help", Role::MutedText));
         } else {
             let detail = self
-                .tick_list
+                .monitor
                 .detail
                 .as_ref()
                 .and_then(|detail| detail.confirmation());
@@ -720,7 +720,7 @@ impl State {
                 .unwrap_or_else(|| {
                     (
                         "Tick action".into(),
-                        self.tick_list
+                        self.monitor
                             .confirmation
                             .as_ref()
                             .map(|c| c.prompt.clone())

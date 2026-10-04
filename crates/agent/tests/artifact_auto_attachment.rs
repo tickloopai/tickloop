@@ -108,7 +108,7 @@ async fn confirmed_publication_attaches_to_its_chat_without_creating_a_subscript
         vec![artifact("Published title")]
     );
     let adapters = tickloop_agent::tick_adapter::TickAdapters::presentation();
-    let projected = adapters.list(&tickloop_agent::tick_adapter::TickListContext {
+    let projected = adapters.list(&tickloop_agent::tick_adapter::MonitorContext {
         chat: Some(agent.snapshot(chat).await.unwrap()),
         ..Default::default()
     });
@@ -120,7 +120,7 @@ async fn confirmed_publication_attaches_to_its_chat_without_creating_a_subscript
     );
     assert!(
         adapters
-            .list(&tickloop_agent::tick_adapter::TickListContext {
+            .list(&tickloop_agent::tick_adapter::MonitorContext {
                 chat: Some(agent.snapshot(other).await.unwrap()),
                 ..Default::default()
             })

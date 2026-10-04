@@ -20,6 +20,7 @@ pub(crate) const FLUSH_INTERVAL: Duration = Duration::from_millis(100);
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CachedMetadata {
     pub artifact_ticks: Option<super::entry::ArtifactTicksEntry>,
+    pub monitor_members: Option<super::entry::MonitorMembersEntry>,
     pub custom_title: Option<CustomTitleEntry>,
     pub ai_title: Option<AiTitleEntry>,
     pub subagents: Option<SubagentsEntry>,
@@ -35,6 +36,7 @@ impl CachedMetadata {
     fn remember(&mut self, line: &Line) {
         match line {
             Line::ArtifactTicks(entry) => self.artifact_ticks = Some(entry.clone()),
+            Line::MonitorMembers(entry) => self.monitor_members = Some(entry.clone()),
             Line::CustomTitle(entry) => self.custom_title = Some(entry.clone()),
             Line::AiTitle(entry) => self.ai_title = Some(entry.clone()),
             Line::Subagents(entry) => self.subagents = Some(entry.clone()),
@@ -66,6 +68,7 @@ impl CachedMetadata {
             .chain(self.branch_origin.clone().map(Line::BranchOrigin))
             .chain(self.delegation.clone().map(Line::Delegation))
             .chain(self.artifact_ticks.clone().map(Line::ArtifactTicks))
+            .chain(self.monitor_members.clone().map(Line::MonitorMembers))
             .collect()
     }
 }
@@ -121,6 +124,7 @@ impl TranscriptWriter {
             if !accepted.iter().any(|line| {
                 line.is_conversation_message()
                     || matches!(line, Line::ArtifactTicks(entry) if entry.cwd.is_some() && (!entry.artifact_ticks.is_empty() || !entry.removed_artifact_ticks.is_empty()))
+                    || matches!(line, Line::MonitorMembers(entry) if entry.materializes_chat())
             }) {
                 file.buffered.extend(accepted);
                 return;

@@ -8,7 +8,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::session::{SessionClient, SessionError};
 use crate::{
-    herdr::{HerdrContext, HerdrPort, HostError, Pane, SocketHerdr, process_birth},
+    herdr::{HerdrContext, HerdrPort, Pane, SocketHerdr, process_birth},
+    host_error::HostError,
     instance::InstanceRef,
 };
 
@@ -226,6 +227,21 @@ impl TickAccess {
             pane,
             protocol: false,
         })
+    }
+
+    /// Identifies every running program once, without reading any Tick content. The second
+    /// value counts programs whose identity could not be proven for any reason, so an absent
+    /// instance is only gone when every program was identified.
+    pub async fn locate_all(&self) -> Result<(Vec<TickLocation>, usize), HostError> {
+        let mut located = Vec::new();
+        let mut uncertain = 0;
+        for pane in self.panes(None).await? {
+            match self.identify(pane).await {
+                Ok(location) => located.push(location),
+                Err(_) => uncertain += 1,
+            }
+        }
+        Ok((located, uncertain))
     }
 
     pub async fn discover(&self, workspace: &str) -> Result<Value, HostError> {
@@ -505,8 +521,10 @@ impl TickAccess {
         }
         SessionClient::connect(
             instance.clone(),
-            self.context.socket.clone(),
-            target.pane.terminal_id,
+            crate::session::SessionBackend::Herdr {
+                socket: self.context.socket.clone(),
+                terminal_id: target.pane.terminal_id,
+            },
             self.runtime_dir.clone(),
         )
         .await
@@ -764,7 +782,10 @@ impl TickAccess {
         let mut launch = None;
         let mut placement = PreparedPlacement::NewTab;
         let mut permission = match name {
-            "read_workspace" => AccessPermission::ReadOnly,
+            "read_workspace" => {
+                discovery_page_request(input)?;
+                AccessPermission::ReadOnly
+            }
             "modify_tick" if input["action"] == "open" => {
                 placement = self
                     .prepare_placement(input, &workspace, true, None, context)
@@ -940,6 +961,17 @@ impl TickAccess {
                     None => None,
                 };
                 result["caller"] = caller.map_or(Value::Null, |caller| json!({"pane_id":caller.pane_id,"tab_id":caller.tab_id,"workspace_id":caller.workspace_id}));
+                let (cursor, limit) = discovery_page_request(&prepared.input)?;
+                let ticks = match result["ticks"].take() {
+                    Value::Array(ticks) => ticks,
+                    _ => Vec::new(),
+                };
+                let page = crate::page::paginate(ticks, discovery_key, cursor.as_ref(), limit)
+                    .map_err(|error| HostError::before(error.code(), error.to_string()))?;
+                result["ticks"] = json!(page.items);
+                result["total"] = json!(page.total);
+                result["generation"] = json!(page.generation);
+                result["next_cursor"] = json!(page.next);
                 Ok(result)
             }
             "read_tick" => {
@@ -1463,13 +1495,55 @@ fn matches_destination(pane: &Pane, placement: &PreparedPlacement) -> bool {
     }
 }
 
-fn resolve_executable(program: &str, cwd: &std::path::Path) -> Result<PathBuf, HostError> {
+/// Resolves a program the way an Agent open does: the bundled `tick` beside the Agent first, then
+/// PATH relative to `cwd`.
+pub fn resolve_executable(program: &str, cwd: &std::path::Path) -> Result<PathBuf, HostError> {
     resolve_executable_from(
         program,
         cwd,
         std::env::current_exe().ok().as_deref(),
         &std::env::var_os("PATH").unwrap_or_default(),
     )
+}
+
+/// A discovery page request; an absent limit uses the default page size.
+fn discovery_page_request(
+    input: &Value,
+) -> Result<(Option<crate::page::PageCursor>, Option<usize>), HostError> {
+    let cursor = input
+        .get("cursor")
+        .map(|cursor| serde_json::from_value(cursor.clone()))
+        .transpose()
+        .map_err(|_| {
+            HostError::before(
+                "InvalidArguments",
+                "cursor must be the next_cursor object returned by the previous page",
+            )
+        })?;
+    let limit = match input.get("limit") {
+        None => None,
+        Some(limit) => Some(
+            limit
+                .as_u64()
+                .and_then(|limit| usize::try_from(limit).ok())
+                .filter(|limit| (1..=crate::page::MAX_PAGE_SIZE).contains(limit))
+                .ok_or_else(|| {
+                    HostError::before(
+                        "InvalidArguments",
+                        format!("limit must be between 1 and {}", crate::page::MAX_PAGE_SIZE),
+                    )
+                })?,
+        ),
+    };
+    Ok((cursor, limit))
+}
+
+/// Instances sort by identity; panes whose identity is uncertain sort by Pane.
+fn discovery_key(tick: &Value) -> String {
+    match tick["tick_instance_id"].as_str() {
+        Some(instance) => format!("instance:{instance}"),
+        None => format!("pane:{}", tick["pane_id"].as_str().unwrap_or_default()),
+    }
 }
 
 pub fn bundled_tick_executable() -> Option<PathBuf> {
