@@ -1484,6 +1484,12 @@ async fn interact(
                     console.update_subscribed_ticks(chat, &rows)?;
                 }
                 console.update_artifact_ticks(&snapshot)?;
+                console.set_provider_failure(
+                    snapshot
+                        .provider_failures
+                        .get(&snapshot.model.provider_id)
+                        .map(|failure| failure.summary()),
+                )?;
                 console.update_status_area(
                     snapshot.policy.mode.to_string(),
                     safe_text(&snapshot.model.model),
@@ -1662,6 +1668,7 @@ async fn interact(
                 console.set_activity(None)?;
                 console.set_background_status_notice(None)?;
                 console.set_footer_items(Vec::new())?;
+                console.set_provider_failure(None)?;
                 if let Ok(draft) = agent.configuration(ConfigTarget::NewDraft).await {
                     console.update_status_area(
                         draft.execution_mode.to_string(),

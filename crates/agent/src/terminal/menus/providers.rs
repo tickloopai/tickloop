@@ -557,6 +557,54 @@ mod tests {
     }
 
     #[test]
+    fn kimi_connection_initial_focus_uses_the_recommendation_and_preserves_explicit_focus() {
+        let profiles = crate::model::cards::built_in_model_profiles()
+            .into_iter()
+            .filter(|model| model.provider_id == "kimi-code-oauth")
+            .collect();
+        let provider = ProviderModels::group(profiles).remove(0);
+        assert_eq!(
+            provider.models[0].model_id, "k3",
+            "capability order should remain unchanged"
+        );
+        let key = provider.key();
+        let console = Console::test_interactive_for_chat(Uuid::new_v4());
+        let mut menus = Menus::default();
+        menus.provider.provider_choices = vec![provider.clone()];
+        menus.provider.model_providers = vec![provider.clone()];
+        menus.provider.model_choices = provider
+            .models
+            .iter()
+            .map(|model| ModelChoice {
+                config: model.clone(),
+                thinking: None,
+                availability: ModelAvailability::Unknown {
+                    reason: "Controlled directory fixture".into(),
+                },
+            })
+            .collect();
+        menus
+            .show_provider_models(&console, ConfigTarget::NewDraft, &key, None)
+            .unwrap();
+        assert_eq!(
+            menus.provider.focused_model,
+            Some(("kimi-code-oauth".into(), "kimi-for-coding".into()))
+        );
+        menus
+            .show_provider_models(
+                &console,
+                ConfigTarget::NewDraft,
+                &key,
+                Some(&("kimi-code-oauth".into(), "k3".into())),
+            )
+            .unwrap();
+        assert_eq!(
+            menus.provider.focused_model,
+            Some(("kimi-code-oauth".into(), "k3".into()))
+        );
+    }
+
+    #[test]
     fn capability_order_is_stable_and_separate_from_default_recommendations() {
         let mut profiles = tickloop_agent::model::cards::built_in_model_profiles();
         let forward = ProviderModels::group(profiles.clone());
@@ -962,6 +1010,8 @@ pub(super) enum ConnectionAction {
 
 #[derive(Default)]
 pub(super) struct ProviderSession {
+    pub(super) provider_failures:
+        std::collections::HashMap<String, crate::model::ProviderHttpFailure>,
     pub(super) login_return: Option<(ConfigTarget, ProviderModels)>,
     pub(super) provider_choices: Vec<ProviderModels>,
     pub(super) provider_selected: usize,
@@ -1277,12 +1327,17 @@ impl Menus {
         }
         actions.push(ConnectionAction::CredentialDetails);
         options.push("Credential details…".into());
-        let mut context = vec![
+        let failure = self.provider.provider_failures.get(&config.provider_id);
+        let mut context = failure.map(provider_failure_context).unwrap_or_default();
+        context.extend([
             self.provider_auth_label(&provider).into(),
             format!("Endpoint: {}", endpoint_label(&config.base_url)),
-        ];
+        ]);
         if let Err(error) = authenticated {
             context.push(safe_text(&error));
+        }
+        if let Some(failure) = failure {
+            context.push(format!("Provider message: {}", failure.message));
         }
         self.show(
             console,
@@ -1843,6 +1898,14 @@ impl Menus {
                     choice.config.provider_id == *id && choice.config.model_id == *model
                 })
             })
+            .or_else(|| {
+                let first = choices.first()?;
+                let recommended = crate::model::access::AccessCatalog::defaults()
+                    .recommended_model(&first.config.provider_id)?;
+                choices
+                    .iter()
+                    .position(|choice| choice.config.model_id == recommended)
+            })
             .unwrap_or(0);
         self.provider.model_provider = Some(provider.into());
         self.show_model_choices(console, target, choices, selected, Uuid::new_v4())
@@ -1994,6 +2057,13 @@ impl Menus {
             .and_then(|access| access.notice.as_deref())
         {
             context.push(safe_text(notice));
+        }
+        if let Some(failure) = self
+            .provider
+            .provider_failures
+            .get(&provider.models[0].provider_id)
+        {
+            context.splice(0..0, provider_failure_context(failure));
         }
         let title = format!("Choose model · {}", provider.model_page_name());
         self.show(
@@ -2423,4 +2493,16 @@ fn directory_status(
                 .into()
         }
     }
+}
+
+fn provider_failure_context(failure: &crate::model::ProviderHttpFailure) -> Vec<String> {
+    let next_step = if failure.class == crate::model::ProviderFailureClass::UsageOrPlan {
+        "Other models may require a higher Kimi Code plan; try kimi-for-coding.".into()
+    } else {
+        failure.hint.clone()
+    };
+    vec![
+        format!("Last request failed: {}", failure.summary()),
+        next_step,
+    ]
 }

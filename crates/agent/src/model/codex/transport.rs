@@ -7,13 +7,13 @@ use futures_util::{SinkExt, StreamExt};
 use reqwest::Url;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio::{
-    net::TcpStream,
-    sync::{Mutex, mpsc::UnboundedSender},
-};
+use tokio::sync::{Mutex, mpsc::UnboundedSender};
 use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, connect_async,
-    tungstenite::{Message, client::IntoClientRequest, http::HeaderValue},
+    WebSocketStream,
+    tungstenite::{
+        Message, client::IntoClientRequest, handshake::derive_accept_key, http::HeaderValue,
+        protocol::Role as SocketRole,
+    },
 };
 use tokio_util::sync::CancellationToken;
 
@@ -31,7 +31,7 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const CACHE_IDLE: Duration = Duration::from_secs(5 * 60);
 const CACHE_AGE: Duration = Duration::from_secs(55 * 60);
 
-type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+type Socket = WebSocketStream<reqwest::Upgraded>;
 
 struct Continuation {
     body: Value,
@@ -93,6 +93,8 @@ pub(super) struct WebSocketFailure {
 }
 
 pub(super) struct WebSocketRequest<'a> {
+    pub(super) config: &'a crate::model::ModelConfig,
+    pub(super) client: &'a reqwest::Client,
     pub(super) chat_id: Option<ChatId>,
     pub(super) endpoint: &'a Url,
     pub(super) body: &'a Value,
@@ -145,6 +147,8 @@ pub(super) async fn complete(
     model_context: Option<&ModelRequestContext>,
 ) -> Result<ModelOutput, WebSocketFailure> {
     let WebSocketRequest {
+        config,
+        client,
         chat_id,
         endpoint,
         body: full_body,
@@ -201,28 +205,95 @@ pub(super) async fn complete(
             headers.insert("session-id", session.clone());
             headers.insert("x-client-request-id", session);
         }
-        let connected = tokio::select! {
+        let expected_accept = derive_accept_key(request.headers()["sec-websocket-key"].as_bytes());
+        let outgoing = client
+            .get(endpoint.clone())
+            .version(http::Version::HTTP_11)
+            .headers(request.headers().clone());
+        let mut response = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(failure(ModelError::Cancelled, false)),
-            result = tokio::time::timeout(CONNECT_TIMEOUT, connect_async(request)) => result,
+            result = tokio::time::timeout(CONNECT_TIMEOUT, outgoing.send()) => result
+                .map_err(|_| failure(ModelError::TimedOutAt { stage: ModelRequestStage::Connect }, false))?
+                .map_err(|error| failure(crate::model::request_transport_error(error), false))?,
         };
-        let (socket, _) = connected
-            .map_err(|_| {
-                failure(
-                    ModelError::TimedOutAt {
-                        stage: ModelRequestStage::Connect,
-                    },
-                    false,
-                )
-            })?
-            .map_err(|_| {
-                failure(
-                    ModelError::ConnectionAt {
-                        stage: ModelRequestStage::Connect,
-                    },
-                    false,
-                )
-            })?;
+        let status = response.status().as_u16();
+        if status != 101 {
+            let retry_after = response
+                .headers()
+                .get("retry-after")
+                .and_then(|value| value.to_str().ok())
+                .and_then(crate::model::provider_failure::parse_retry_after);
+            let server_retry = response
+                .headers()
+                .get("x-should-retry")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| match value.trim() {
+                    "true" => Some(true),
+                    "false" => Some(false),
+                    _ => None,
+                });
+            let error_body =
+                crate::model::provider_failure::read_error_body(&mut response, &cancel)
+                    .await
+                    .map_err(|error| failure(error, false))?;
+            let bytes = &error_body.bytes;
+            let mut detail = crate::model::ProviderHttpFailure::from_response(
+                config,
+                status,
+                bytes,
+                retry_after,
+                server_retry,
+                &[access_token, account_id],
+            );
+            let may_fallback = error_body.complete
+                && bytes.is_empty()
+                && matches!(status, 400 | 404 | 405 | 426 | 501);
+            detail.require_complete_body(error_body.complete, &[access_token, account_id]);
+            if may_fallback {
+                detail.retryable = false;
+            }
+            return Err(WebSocketFailure {
+                error: ModelError::ProviderHttp(Box::new(detail)),
+                may_fallback,
+            });
+        }
+        let headers = response.headers();
+        let has_upgrade = headers
+            .get("upgrade")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.eq_ignore_ascii_case("websocket"));
+        let has_connection_upgrade = headers
+            .get("connection")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value
+                    .split(',')
+                    .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
+            });
+        if !has_upgrade
+            || !has_connection_upgrade
+            || headers
+                .get("sec-websocket-accept")
+                .is_none_or(|value| value.as_bytes() != expected_accept.as_bytes())
+            || headers.contains_key("sec-websocket-protocol")
+            || headers.contains_key("sec-websocket-extensions")
+        {
+            return Err(failure(
+                ModelError::ConnectionAt {
+                    stage: ModelRequestStage::Connect,
+                },
+                false,
+            ));
+        }
+        let upgraded = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(failure(ModelError::Cancelled, false)),
+            result = tokio::time::timeout(CONNECT_TIMEOUT, response.upgrade()) => result
+                .map_err(|_| failure(ModelError::TimedOutAt { stage: ModelRequestStage::Connect }, false))?
+                .map_err(|error| failure(crate::model::request_transport_error(error), false))?,
+        };
+        let socket = WebSocketStream::from_raw_socket(upgraded, SocketRole::Client, None).await;
         cached = Some(CachedConnection {
             socket,
             token_fingerprint,

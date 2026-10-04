@@ -1023,6 +1023,12 @@ fn chain_entry(
 fn loop_entry_content(snapshot: &ChatSnapshot, goal: &LoopSnapshot) -> LoopEntryContent {
     (
         LoopRecord {
+            failure_events: snapshot
+                .failure_events
+                .iter()
+                .filter(|event| event.loop_id == goal.id)
+                .filter_map(|event| serde_json::to_value(event).ok())
+                .collect(),
             loop_id: goal.id,
             goal: goal.goal.clone(),
             state: serde_json::to_value(&goal.state).unwrap_or(serde_json::Value::Null),
@@ -1657,6 +1663,7 @@ impl RestoredChain {
         snapshot.loops.clear();
         snapshot.loop_starts.clear();
         snapshot.resume_triggers.clear();
+        snapshot.failure_events.clear();
         for (position, (record, run_id)) in &self.loop_records {
             let Ok(state) = serde_json::from_value::<LoopState>(record.state.clone()) else {
                 continue;
@@ -1669,6 +1676,20 @@ impl RestoredChain {
             else {
                 continue;
             };
+            for value in &record.failure_events {
+                if let Ok(mut event) = serde_json::from_value::<super::Event>(value.clone())
+                    && event.loop_id == record.loop_id
+                    && matches!(event.kind, super::EventKind::Failed(_))
+                    && !snapshot.failure_events.iter().any(|previous| {
+                        previous.run_id == event.run_id && previous.sequence == event.sequence
+                    })
+                {
+                    event.chat_id = snapshot.id;
+                    snapshot.last_sequence = snapshot.last_sequence.max(event.sequence);
+                    snapshot.events.push(event.clone());
+                    snapshot.failure_events.push(event);
+                }
+            }
             let goal = LoopSnapshot {
                 id: record.loop_id,
                 goal: record.goal.clone(),

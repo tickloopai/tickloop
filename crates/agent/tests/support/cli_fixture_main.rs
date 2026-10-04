@@ -190,6 +190,9 @@ struct TransportClient {
 
 #[async_trait]
 impl tickloop_agent::model::ModelClient for TransportClient {
+    fn connection_id(&self) -> Option<String> {
+        self.inner.connection_id()
+    }
     fn identity(&self) -> tickloop_agent::model::ModelIdentity {
         self.inner.identity()
     }

@@ -32,6 +32,8 @@ mod google;
 pub(crate) mod history;
 mod image_limits;
 mod provider_directory;
+mod provider_failure;
+pub use provider_failure::{ProviderFailureClass, ProviderHttpFailure};
 mod responses;
 mod structured_response;
 
@@ -555,6 +557,8 @@ pub enum ModelResponseRejection {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ModelError {
+    #[error("{0}")]
+    ProviderHttp(Box<ProviderHttpFailure>),
     #[error("invalid model configuration: {0}")]
     Configuration(String),
     #[error("model protocol {0:?} is not implemented yet")]
@@ -669,6 +673,7 @@ impl ModelError {
 
     pub fn kind(&self) -> ModelFailureKind {
         match self {
+            Self::ProviderHttp(failure) => failure.kind(),
             Self::AtStage { error, .. } => error.kind(),
             Self::Configuration(_) | Self::UnsupportedProtocol(_) => {
                 ModelFailureKind::Configuration
@@ -708,6 +713,7 @@ impl ModelError {
 
     pub fn stage(&self) -> ModelRequestStage {
         match self {
+            Self::ProviderHttp(_) => ModelRequestStage::ResponseHeaders,
             Self::AtStage { stage, .. } => *stage,
             Self::Configuration(_) | Self::UnsupportedProtocol(_) => {
                 ModelRequestStage::Configuration
@@ -742,6 +748,7 @@ impl ModelError {
 
     pub fn retry_hint(&self) -> (bool, Option<Duration>) {
         match self {
+            Self::ProviderHttp(failure) => (failure.retryable, failure.retry_after),
             Self::AtStage { error, .. } => error.retry_hint(),
             Self::RateLimited
             | Self::Connection
@@ -765,6 +772,7 @@ impl ModelError {
 
     pub fn status(&self) -> Option<u16> {
         match self {
+            Self::ProviderHttp(failure) => Some(failure.status),
             Self::AtStage { error, .. } => error.status(),
             Self::Http { status }
             | Self::HttpResponse { status, .. }
@@ -778,6 +786,14 @@ impl ModelError {
         match self {
             Self::AtStage { error, .. } => error.safe_quota_detail(),
             Self::QuotaExhausted { description, .. } => Some(description),
+            _ => None,
+        }
+    }
+
+    pub fn provider_failure(&self) -> Option<&ProviderHttpFailure> {
+        match self {
+            Self::ProviderHttp(failure) => Some(failure),
+            Self::AtStage { error, .. } => error.provider_failure(),
             _ => None,
         }
     }
@@ -798,6 +814,10 @@ fn request_transport_error(error: reqwest::Error) -> ModelError {
 
 #[async_trait]
 pub trait ModelClient: Send + Sync {
+    fn connection_id(&self) -> Option<String> {
+        None
+    }
+
     fn identity(&self) -> ModelIdentity;
 
     async fn close_chat(&self, _chat_id: crate::runtime::ChatId) {}
@@ -1542,8 +1562,7 @@ impl HttpModelClient {
             .headers()
             .get(reqwest::header::RETRY_AFTER)
             .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.trim().parse::<u64>().ok())
-            .map(Duration::from_secs);
+            .and_then(provider_failure::parse_retry_after);
         let should_retry = response
             .headers()
             .get("x-should-retry")
@@ -1555,88 +1574,70 @@ impl HttpModelClient {
             });
         let status = response.status().as_u16();
         if !(200..=299).contains(&status) {
-            if status == 401 {
-                return Err(if copilot_auth {
-                    ModelError::CopilotAuthentication.at_stage(ModelRequestStage::ResponseHeaders)
-                } else {
-                    ModelError::AuthenticationAt {
-                        stage: ModelRequestStage::ResponseHeaders,
-                    }
-                });
-            }
-            if status == 403 {
-                return Err(if copilot_auth {
-                    copilot::entitlement_denied(status)
-                } else {
-                    ModelError::Http { status }
-                }
-                .at_stage(ModelRequestStage::ResponseHeaders));
-            }
-            if status == 402 {
-                return Err(
-                    ModelError::InsufficientBalance.at_stage(ModelRequestStage::ResponseHeaders)
-                );
-            }
-            let mut error_bytes = Vec::new();
-            while error_bytes.len() < MAX_ERROR_BODY_BYTES {
-                let chunk = tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => return Err(ModelError::Cancelled),
-                    result = response.chunk() => result.ok().flatten(),
-                };
-                let Some(chunk) = chunk else { break };
-                let remaining = MAX_ERROR_BODY_BYTES - error_bytes.len();
-                error_bytes.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
-            }
+            let error_body = provider_failure::read_error_body(&mut response, &cancel).await?;
+            let error_bytes = &error_body.bytes;
             if let Some(rejected_images) = rejected_images
+                && error_body.complete
                 && matches!(status, 400 | 413)
-                && image_limits::rejects_images(&String::from_utf8_lossy(&error_bytes))
+                && image_limits::rejects_images(&String::from_utf8_lossy(error_bytes))
             {
                 *rejected_images = true;
                 return Err(
                     ModelError::Http { status }.at_stage(ModelRequestStage::ResponseHeaders)
                 );
             }
-            let body = serde_json::from_slice::<Value>(&error_bytes).ok();
-            if copilot_auth
-                && body
-                    .as_ref()
-                    .is_some_and(|body| copilot::is_model_not_enabled(status, body))
-            {
-                return Err(copilot::entitlement_denied(status)
-                    .at_stage(ModelRequestStage::ResponseHeaders));
-            }
-            if self.config.adapter() == cards::Adapter::GlmChatCompletions
-                && let Some(error) = glm::http_error(status, body.as_ref())
-            {
-                return Err(error.at_stage(ModelRequestStage::ResponseHeaders));
-            }
-            if body.as_ref().is_some_and(is_context_limit_error)
-                || copilot_auth && body.as_ref().is_some_and(copilot::is_context_limit)
+            let body = serde_json::from_slice::<Value>(error_bytes).ok();
+            if error_body.complete
+                && (body.as_ref().is_some_and(is_context_limit_error)
+                    || copilot_auth && body.as_ref().is_some_and(copilot::is_context_limit))
             {
                 return Err(
                     ModelError::ResponseRejected(ModelResponseRejection::ContextLimit)
                         .at_stage(ModelRequestStage::ResponseHeaders),
                 );
             }
-            let is_spend_limit = body.as_ref().is_some_and(|body| {
-                body["error"]["details"]["error_code"].as_str()
-                    == Some("enforced_spend_limit_reached")
-            });
-            if is_spend_limit {
-                return Err(ModelError::QuotaExhausted {
-                    status,
-                    description: provider_error_description(status, body.as_ref()),
-                }
-                .at_stage(ModelRequestStage::ResponseHeaders));
-            }
-            return Err(ModelError::HttpResponse {
+            let secrets = key
+                .as_ref()
+                .and_then(|key| std::str::from_utf8(key.as_bytes()).ok())
+                .into_iter()
+                .collect::<Vec<_>>();
+            let mut failure = ProviderHttpFailure::from_response(
+                &self.config,
                 status,
-                description: provider_error_description(status, body.as_ref()),
+                error_bytes,
                 retry_after,
                 should_retry,
+                &secrets,
+            );
+            if copilot_auth
+                && body
+                    .as_ref()
+                    .is_some_and(|body| copilot::is_model_not_enabled(status, body))
+            {
+                failure.set_class(ProviderFailureClass::ModelUnavailable, should_retry);
             }
-            .at_stage(ModelRequestStage::ResponseHeaders));
+            if self.config.adapter() == cards::Adapter::GlmChatCompletions
+                && let Some(error) = glm::http_error(status, body.as_ref())
+            {
+                let class = match error.kind() {
+                    ModelFailureKind::QuotaExhausted
+                        if glm::business_code(body.as_ref())
+                            == Some(glm::INSUFFICIENT_BALANCE_CODE) =>
+                    {
+                        ProviderFailureClass::Billing
+                    }
+                    ModelFailureKind::QuotaExhausted => ProviderFailureClass::UsageLimit,
+                    ModelFailureKind::EntitlementDenied => ProviderFailureClass::ModelUnavailable,
+                    _ if error_body.complete => {
+                        return Err(error.at_stage(ModelRequestStage::ResponseHeaders));
+                    }
+                    _ => ProviderFailureClass::Refused,
+                };
+                failure.set_class(class, should_retry);
+                failure.hint.push_str(&format!(" {}", error));
+            }
+            failure.require_complete_body(error_body.complete, &secrets);
+            return Err(ModelError::ProviderHttp(Box::new(failure)));
         }
         let mut output = consume_sse_response(
             response,
@@ -1656,6 +1657,10 @@ impl HttpModelClient {
 
 #[async_trait]
 impl ModelClient for HttpModelClient {
+    fn connection_id(&self) -> Option<String> {
+        Some(self.config.provider_id.clone())
+    }
+
     fn identity(&self) -> ModelIdentity {
         self.config.identity()
     }
@@ -1962,44 +1967,6 @@ fn is_context_limit_error(body: &Value) -> bool {
             || message.contains("maximum context length")
             || message.contains("context window exceeded")
     })
-}
-
-fn provider_error_description(status: u16, body: Option<&Value>) -> String {
-    let error = body.map(|body| {
-        body.get("error")
-            .filter(|error| error.is_object())
-            .unwrap_or(body)
-    });
-    let code = error
-        .and_then(|error| error["code"].as_str().or_else(|| error["type"].as_str()))
-        .filter(|code| {
-            code.len() <= 80
-                && code.chars().all(|character| {
-                    character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
-                })
-        });
-    let label = match status {
-        400 | 422 => "invalid request",
-        408 | 504 => "request timeout",
-        409 => "request conflict",
-        413 => "request too large",
-        429 => "rate limited",
-        529 => "service overloaded",
-        _ => "",
-    };
-    let code = if error.is_some_and(|error| {
-        error["details"]["error_code"].as_str() == Some("enforced_spend_limit_reached")
-    }) {
-        Some("enforced_spend_limit_reached")
-    } else {
-        code
-    };
-    match (label.is_empty(), code) {
-        (true, None) => String::new(),
-        (false, None) => format!(": {label}"),
-        (true, Some(code)) => format!(": {code}"),
-        (false, Some(code)) => format!(": {label} ({code})"),
-    }
 }
 
 fn stream_provider_error(payload: &Value) -> ModelError {

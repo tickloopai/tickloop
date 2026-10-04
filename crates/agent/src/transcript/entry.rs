@@ -148,6 +148,8 @@ pub(crate) const LOOP_ENDED_SUBTYPE: &str = "loop_ended";
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct LoopRecord {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failure_events: Vec<serde_json::Value>,
     pub loop_id: Uuid,
     pub goal: String,
     pub state: serde_json::Value,

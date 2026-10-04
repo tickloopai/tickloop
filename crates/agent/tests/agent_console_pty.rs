@@ -24,6 +24,9 @@ mod unified_footer;
 #[path = "agent_console_pty/auto_review.rs"]
 mod auto_review;
 
+#[path = "agent_console_pty/provider_errors.rs"]
+mod provider_errors;
+
 use std::{
     io::{Read, Write},
     panic::AssertUnwindSafe,

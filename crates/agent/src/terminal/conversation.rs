@@ -285,7 +285,16 @@ pub(super) fn project(snapshot: &ChatSnapshot) -> ConversationProjection {
                 kind: ConversationBlockKind::Plan { plan },
             }),
     );
-    for outcome in snapshot.events.iter().filter_map(|event| {
+    let events = snapshot
+        .events
+        .iter()
+        .chain(snapshot.failure_events.iter().filter(|failure| {
+            !snapshot
+                .events
+                .iter()
+                .any(|event| event.run_id == failure.run_id && event.sequence == failure.sequence)
+        }));
+    for outcome in events.filter_map(|event| {
         matches!(
             event.kind,
             EventKind::Completed { .. }

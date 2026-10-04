@@ -272,6 +272,8 @@ impl Agent {
         };
         let client = source.client.clone();
         let mut snapshot = ChatSnapshot {
+            failure_events: Vec::new(),
+            provider_failures: Default::default(),
             tool_call_recoveries: Vec::new(),
             artifact_ticks: source.snapshot.artifact_ticks.clone(),
             removed_artifact_ticks: source.snapshot.removed_artifact_ticks.clone(),

@@ -641,6 +641,7 @@ pub(super) struct State {
     footer_list_focused: bool,
     conversation_focused: bool,
     status: String,
+    provider_failure: Option<String>,
     configured_status_lines: Option<Vec<String>>,
     background_status_notice: Option<BackgroundStatusNotice>,
     connection_notice: Option<String>,
@@ -1719,6 +1720,14 @@ impl Console {
         state
             .draw(&mut io::stdout().lock())
             .map_err(|error| error.to_string())
+    }
+
+    pub(super) fn set_provider_failure(&self, failure: Option<String>) -> Result<(), String> {
+        self.state
+            .lock()
+            .map_err(|error| error.to_string())?
+            .provider_failure = failure;
+        Ok(())
     }
 
     pub(super) fn update_status_area(
@@ -4077,6 +4086,12 @@ impl ConversationPiece {
                 state,
                 ..
             } => scrollback.set_tool_call(*run_id, call_key, spans, *state),
+            Self::Styled(text, role) if *role == Some(Role::Error) => {
+                let links = hyperlink::web_links(text);
+                for (run, link) in hyperlink::runs(text, &links) {
+                    scrollback.append_span(run, *role, None, link);
+                }
+            }
             Self::Styled(text, role) => scrollback.append_as(text, *role, None),
             Self::Linked { text, link } => scrollback.append_span(text, None, None, Some(link)),
             Self::Markdown {
@@ -4595,6 +4610,7 @@ impl State {
             footer_list_focused: false,
             conversation_focused: false,
             status: String::new(),
+            provider_failure: None,
             configured_status_lines: None,
             background_status_notice: None,
             connection_notice: None,
@@ -6107,6 +6123,7 @@ impl State {
                         > self.width
             });
         let required_status = !self.status.is_empty()
+            || self.provider_failure.is_some()
             || self.confirmation_hint().is_some()
             || short && !overview && !self.queued_inputs.is_empty()
             || !overview
@@ -8511,6 +8528,12 @@ impl State {
     }
 
     fn status_notice(&self, status: &str) -> String {
+        let with_failure = match &self.provider_failure {
+            Some(failure) if status.is_empty() => failure.clone(),
+            Some(failure) => format!("{status} · {failure}"),
+            None => status.to_owned(),
+        };
+        let status = with_failure.as_str();
         let Some(hint) = self.confirmation_hint() else {
             return status.to_owned();
         };

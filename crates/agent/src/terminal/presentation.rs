@@ -119,6 +119,10 @@ pub(super) fn transcript_document(
         } = block;
         let mut text = String::new();
         let mut is_prompt = false;
+        let is_failure = matches!(
+            &kind,
+            ConversationBlockKind::Outcome(ConversationOutcome::Failed { .. })
+        );
         match kind {
             ConversationBlockKind::User { text: content } => {
                 let is_agent_message = match block_id {
@@ -288,6 +292,15 @@ pub(super) fn transcript_document(
         }
         let first_line = document.lines.len();
         document.lines.extend(text.lines().map(str::to_owned));
+        if is_failure {
+            for (line, text) in document.lines.iter().enumerate().skip(first_line) {
+                document.links.extend(
+                    super::hyperlink::web_links(text)
+                        .into_iter()
+                        .map(|(range, link)| LineLink { line, range, link }),
+                );
+            }
+        }
         if is_prompt {
             for (line, text) in document.lines.iter().enumerate().skip(first_line) {
                 let links = image_links.in_text(snapshot.id, text);

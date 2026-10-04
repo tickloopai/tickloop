@@ -1073,6 +1073,16 @@ impl Menus {
             .await
             .map_err(|error| error.to_string())?;
         self.refresh_provider_scope(agent, target).await?;
+        self.provider.provider_failures = match target {
+            ConfigTarget::Agent(chat) => {
+                agent
+                    .snapshot(chat)
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .provider_failures
+            }
+            ConfigTarget::NewDraft => HashMap::new(),
+        };
         let catalog = tickloop_agent::model::cards::ModelCatalog::defaults();
         let defaults = tickloop_agent::model::cards::ModelCatalog::defaults();
         let access = tickloop_agent::model::access::AccessCatalog::defaults();
