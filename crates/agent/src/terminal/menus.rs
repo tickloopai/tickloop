@@ -3644,8 +3644,10 @@ mod tests {
             .push(crate::runtime::PermissionRequest {
                 id: permission,
                 loop_id: receipt.loop_id,
-                run_id: receipt.run_id,
-                call_id: "snapshot-permission".into(),
+                execution: crate::runtime::PermissionExecution::ToolCall {
+                    run_id: receipt.run_id,
+                    call_id: "snapshot-permission".into(),
+                },
                 name: "Bash".into(),
                 input: json!({"command":"printf fixture"}),
                 file_change: None,
