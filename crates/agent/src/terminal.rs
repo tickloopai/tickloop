@@ -629,7 +629,7 @@ Usage: tickloop [--cwd DIRECTORY]
 service stop ends the local Agent service and its running Agents; saved history is kept.
 Run tickloop again to start this build. TICKLOOP_AGENT_RUNTIME_DIR selects the service.
 monitor popup install asks before registering Tick Loop's popup plugin in that Herdr session and sets monitorPopup to enabled; remove asks before unregistering only that plugin and sets it to disabled. Running Ticks continue either way.
-monitor attach is the popup's attach client: it shows the hosted Tick its one-time view grant in TICKLOOP_MONITOR_ATTACH names.
+monitor attach is the popup's attach client: it shows the hosted Tick its one-time view grant in TICKLOOP_MONITOR_ATTACH names until a lone Esc closes it.
 
 The working directory must exist; omitting --cwd uses the current directory.
 Unknown directories require interactive trust. --working-directory-is-trusted is an explicit host assertion for externally controlled automation and does not save trust.
@@ -652,7 +652,7 @@ Down on the last visual input row, after history ends, focuses the Subagents N e
 Click Subagents N or press Enter/Space on its focused entry to hide/show the list; modified Enter is ignored.
 Down from the expanded entry focuses the list; Enter opens an Agent, Space folds descendants, Esc returns to the entry, then Esc returns to the editor.
 Shift+Up/Down focuses Monitor's Shells group; Enter opens the selected Shell.
-Enter on a hosted Tick in Monitor shows its screen as a snapshot and why it is not floated; a attaches the same process full screen in this terminal until Ctrl+B q and r refreshes the snapshot; in the list, c closes the Tick and n reopens one lost with its host.
+Enter or a click on a hosted Tick in Monitor opens it: in a Herdr popup inside Herdr (the popup plugin is offered once for registration), otherwise full screen here; a lone Esc closes it and the Tick keeps running, Ctrl+B Esc sends Esc and Ctrl+B Ctrl+B sends Ctrl+B to the Tick; s shows a text snapshot; c closes the Tick and n reopens one lost with its host.
 Each Agent's own Todos stay below Working, including while idle, with a five-second grace after all items complete; rewrites do not extend it.
 Mode and model stay right-aligned on the lower divider; Context appears only with confirmed nonzero rounded usage.
 Divider edge titles have a short rule beyond the text; the expanded Subagents list has no items summary row.
@@ -949,6 +949,7 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
         } else {
             (None, None, None)
         };
+    let herdr_socket = view_host.as_ref().map(|view| view.socket.clone());
     let launch = crate::agent_access::LaunchSpec {
         workdir: workdir.clone(),
         config_root: config_root.clone(),
@@ -1038,6 +1039,9 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
     // new Ticks run in the Tick host and are probed there.
     if let Some(discovery) = tick_discovery {
         console.set_tick_discovery(discovery)?;
+    }
+    if let Some(socket) = herdr_socket {
+        console.set_herdr_socket(socket)?;
     }
     console.add_member_probe(std::sync::Arc::new(hosted_probe::HostedProbe::new(
         agent.clone(),
@@ -8538,10 +8542,8 @@ mod status_agents_help_tests {
         let help = super::help_text();
         assert!(help.contains("tickloop monitor popup install|remove --herdr-socket SOCKET"));
         assert!(help.contains("tickloop monitor attach"));
-        assert!(
-            help.contains(
-                "a attaches the same process full screen in this terminal until Ctrl+B q"
-            )
-        );
+        assert!(help.contains(
+            "a lone Esc closes it and the Tick keeps running, Ctrl+B Esc sends Esc and Ctrl+B Ctrl+B sends Ctrl+B to the Tick"
+        ));
     }
 }

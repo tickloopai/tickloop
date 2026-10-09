@@ -19,9 +19,10 @@ use tokio::sync::watch;
 use uuid::Uuid;
 
 use super::{
-    EventPublisher, InstanceObserver, InstanceRef, PreparedTickWatch, ProtocolFeed,
-    TickConnectionState, TickObservation, TickStreamHandle, TickStreamPort, WatchAdmission,
-    WatchId, connection_state, current_observation, follow_instances, observe_protocol,
+    ConnectionBudget, EventPublisher, InstanceObserver, InstanceRef, PreparedTickWatch,
+    ProtocolFeed, RECONNECT_PAUSE, TickConnectionState, TickObservation, TickStreamHandle,
+    TickStreamPort, WatchAdmission, WatchId, connection_state, current_observation,
+    follow_instances, observe_protocol,
 };
 use crate::{
     host_tools::{HostToolAuthority, HostToolProvider},
@@ -29,10 +30,6 @@ use crate::{
     tick_tool_router::READ_TICK,
 };
 
-/// A watch connects to its Tick once and reconnects at most this often in a process; then it
-/// stays Disconnected until the Chat subscribes again.
-const RECONNECTS_PER_WATCH: u32 = 3;
-const RECONNECT_PAUSE: Duration = Duration::from_secs(5);
 /// How soon a Watch intent change the owner did not take is offered again.
 const INTENT_RETRY_PAUSE: Duration = Duration::from_secs(5);
 
@@ -43,8 +40,7 @@ pub struct HostedTickStream {
     /// The (Chat, instance) pairs with a live watch registration, whose binding is therefore
     /// current.
     live: Arc<Mutex<HashSet<(Uuid, InstanceRef)>>>,
-    /// Connection attempts per watch in this process.
-    connects: Arc<Mutex<BTreeMap<WatchId, u32>>>,
+    budget: ConnectionBudget,
 }
 
 impl HostedTickStream {
@@ -54,7 +50,7 @@ impl HostedTickStream {
             authorities: watch::channel(BTreeMap::new()).0,
             chats: watch::channel(BTreeMap::new()).0,
             live: Arc::default(),
-            connects: Arc::default(),
+            budget: ConnectionBudget::default(),
         }
     }
 
@@ -64,7 +60,7 @@ impl HostedTickStream {
             authorities: self.authorities.subscribe(),
             chats: self.chats.subscribe(),
             live: self.live.clone(),
-            connects: self.connects.clone(),
+            budget: self.budget.clone(),
         }
     }
 }
@@ -75,7 +71,7 @@ struct HostedScope {
     authorities: watch::Receiver<BTreeMap<WatchId, HostToolAuthority>>,
     chats: watch::Receiver<BTreeMap<WatchId, Uuid>>,
     live: Arc<Mutex<HashSet<(Uuid, InstanceRef)>>>,
-    connects: Arc<Mutex<BTreeMap<WatchId, u32>>>,
+    budget: ConnectionBudget,
 }
 
 impl HostedScope {
@@ -102,29 +98,6 @@ impl HostedScope {
             live.remove(&(chat, instance.clone()));
         }
     }
-
-    /// Forgets the connection counts of watches no longer wanted.
-    fn forget_connects_except(&self, desired: &BTreeMap<WatchId, InstanceRef>) {
-        self.connects
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .retain(|watch, _| desired.contains_key(watch));
-    }
-
-    fn count_connect(&self, watches: &BTreeSet<WatchId>) {
-        let mut connects = self.connects.lock().unwrap_or_else(PoisonError::into_inner);
-        for watch in watches {
-            *connects.entry(*watch).or_default() += 1;
-        }
-    }
-
-    fn may_connect(&self, watch: &WatchId) -> bool {
-        self.connects
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(watch)
-            .is_none_or(|connects| *connects <= RECONNECTS_PER_WATCH)
-    }
 }
 
 impl WatchAdmission for HostedScope {
@@ -150,12 +123,17 @@ impl WatchAdmission for HostedScope {
                     None
                 }
             })
+            .filter(|watch| self.budget.admit_or_disconnect(*watch, instance, publisher))
             .collect()
     }
 }
 
 #[async_trait::async_trait]
 impl InstanceObserver for HostedScope {
+    fn budget(&self) -> &ConnectionBudget {
+        &self.budget
+    }
+
     async fn authorities_changed(&mut self) -> bool {
         tokio::select! {
             changed = self.authorities.changed() => changed.is_ok(),
@@ -189,14 +167,14 @@ async fn observe_hosted_instance(
             scope: &scope,
             chat,
         };
-        let attempted = owned.admitted(&requested, &instance, &publisher);
+        let owned_watches = owned.admitted(&requested, &instance, &publisher);
+        let attempted = scope.budget.take(&owned_watches, &instance, &publisher);
         if attempted.is_empty() {
             if wanted.changed().await.is_err() {
                 return;
             }
             continue;
         }
-        scope.count_connect(&attempted);
         let feed = HostedFeed {
             tools: scope.tools.clone(),
             chat,
@@ -240,9 +218,8 @@ async fn observe_hosted_instance(
     }
 }
 
-/// The admitted watches of the one Chat that owns the observed instance and that may still
-/// connect: only that Chat holds the binding, and a watch that used its reconnects stays
-/// Disconnected.
+/// The admitted watches of the one Chat that owns the observed instance: only that Chat holds
+/// the binding.
 struct OwnedWatches<'a> {
     scope: &'a HostedScope,
     chat: Uuid,
@@ -261,14 +238,6 @@ impl WatchAdmission for OwnedWatches<'_> {
                 publisher.state_to(
                     instance.clone(),
                     TickConnectionState::IdentityUncertain,
-                    [*watch],
-                );
-                return false;
-            }
-            if !self.scope.may_connect(watch) {
-                publisher.state_to(
-                    instance.clone(),
-                    TickConnectionState::Disconnected,
                     [*watch],
                 );
                 return false;
@@ -392,7 +361,6 @@ async fn sync_watch_intents(
             .collect();
         {
             let desired = desired.borrow_and_update();
-            scope.forget_connects_except(&desired);
             let authorities = scope.authorities.borrow();
             for (watch, instance) in desired.iter() {
                 if let Some(chat) = scope.chat_of(watch)
