@@ -82,8 +82,8 @@ impl TickActionExecutor for ArtifactAction {
 }
 #[async_trait]
 impl TickActionBackend for ArtifactAction {
-    async fn execute(&self, ctx: TickActionContext<'_>) -> Result<TickActionOutcome, String> {
-        match artifact_ui::tick_action(
+    async fn execute(&self, ctx: TickActionContext<'_>) -> Result<(), String> {
+        artifact_ui::tick_action(
             ctx.agent,
             ctx.console,
             ctx.root,
@@ -91,11 +91,8 @@ impl TickActionBackend for ArtifactAction {
             self.id.clone(),
             self.key,
         )
-        .await?
-        {
-            Some(InputEvent::Prompt { text, .. }) => Ok(TickActionOutcome::Prompt(text)),
-            _ => Ok(TickActionOutcome::Done),
-        }
+        .await?;
+        Ok(())
     }
 }
 struct SubscriptionAction {
@@ -114,7 +111,7 @@ impl TickActionExecutor for SubscriptionAction {
 }
 #[async_trait]
 impl TickActionBackend for SubscriptionAction {
-    async fn execute(&self, ctx: TickActionContext<'_>) -> Result<TickActionOutcome, String> {
+    async fn execute(&self, ctx: TickActionContext<'_>) -> Result<(), String> {
         let id = Uuid::parse_str(&self.id).map_err(|error| error.to_string())?;
         let rows = ctx
             .agent
@@ -123,7 +120,7 @@ impl TickActionBackend for SubscriptionAction {
             .map_err(|error| error.to_string())?;
         ctx.console
             .show_subscriptions_at(ctx.chat, rows, id, false)?;
-        Ok(TickActionOutcome::Done)
+        Ok(())
     }
 }
 struct DetailsOpen {
@@ -163,7 +160,7 @@ impl TickActionExecutor for OpenHosted {
 }
 #[async_trait]
 impl TickActionBackend for OpenHosted {
-    async fn execute(&self, ctx: TickActionContext<'_>) -> Result<TickActionOutcome, String> {
+    async fn execute(&self, ctx: TickActionContext<'_>) -> Result<(), String> {
         let floated = match HerdrPopup::reach(&ctx).await {
             Ok(None) => return open_full_screen(&ctx, &self.instance, NOT_IN_HERDR.into()).await,
             Ok(Some(popup)) => match popup.check(&ctx).await {
@@ -180,7 +177,7 @@ impl TickActionBackend for OpenHosted {
                         }),
                         reason.registration_prompt(),
                     )?;
-                    return Ok(TickActionOutcome::Done);
+                    return Ok(());
                 }
                 Err(reason) => Err(reason),
             },
@@ -350,7 +347,7 @@ impl TickActionExecutor for RegisterPopup {
 }
 #[async_trait]
 impl TickActionBackend for RegisterPopup {
-    async fn execute(&self, ctx: TickActionContext<'_>) -> Result<TickActionOutcome, String> {
+    async fn execute(&self, ctx: TickActionContext<'_>) -> Result<(), String> {
         let floated = async {
             let popup = HerdrPopup::reach(&ctx)
                 .await?
@@ -369,7 +366,7 @@ async fn settle_float(
     ctx: &TickActionContext<'_>,
     instance: &crate::tick_stream::InstanceRef,
     floated: Result<(), NotFloated>,
-) -> Result<TickActionOutcome, String> {
+) -> Result<(), String> {
     match floated {
         Ok(()) => ctx.console.hold_status(FLOATED)?,
         Err(reason) if reason.opens_full_screen() => {
@@ -377,7 +374,7 @@ async fn settle_float(
         }
         Err(reason) => ctx.console.hold_status(&reason.notice())?,
     }
-    Ok(TickActionOutcome::Done)
+    Ok(())
 }
 
 /// Attaches the hosted Tick full screen in this View's terminal with a one-time view grant;
@@ -386,7 +383,7 @@ async fn open_full_screen(
     ctx: &TickActionContext<'_>,
     instance: &crate::tick_stream::InstanceRef,
     reason: String,
-) -> Result<TickActionOutcome, String> {
+) -> Result<(), String> {
     let grant = ctx
         .agent
         .attach_hosted_tick(ctx.chat, instance.clone())
@@ -394,7 +391,7 @@ async fn open_full_screen(
         .map_err(|error| format!("Cannot open {instance}: {error}"))?;
     ctx.console
         .begin_full_screen_attach(ctx.chat, grant, reason)?;
-    Ok(TickActionOutcome::Done)
+    Ok(())
 }
 
 /// Opens the text snapshot detail of a hosted Tick.
@@ -420,7 +417,7 @@ struct LoadHostedSnapshot {
 }
 #[async_trait]
 impl TickActionBackend for LoadHostedSnapshot {
-    async fn execute(&self, ctx: TickActionContext<'_>) -> Result<TickActionOutcome, String> {
+    async fn execute(&self, ctx: TickActionContext<'_>) -> Result<(), String> {
         let snapshot = ctx
             .agent
             .hosted_tick_snapshot(ctx.chat, self.instance.clone())
@@ -433,14 +430,14 @@ impl TickActionBackend for LoadHostedSnapshot {
                 Some(())
             },
         )?;
-        Ok(TickActionOutcome::Done)
+        Ok(())
     }
 }
 struct NoBackend;
 #[async_trait]
 impl TickActionBackend for NoBackend {
-    async fn execute(&self, _: TickActionContext<'_>) -> Result<TickActionOutcome, String> {
-        Ok(TickActionOutcome::Done)
+    async fn execute(&self, _: TickActionContext<'_>) -> Result<(), String> {
+        Ok(())
     }
 }
 struct RemoveFromMonitor {
@@ -459,7 +456,7 @@ impl TickActionExecutor for RemoveFromMonitor {
 }
 #[async_trait]
 impl TickActionBackend for RemoveFromMonitor {
-    async fn execute(&self, ctx: TickActionContext<'_>) -> Result<TickActionOutcome, String> {
+    async fn execute(&self, ctx: TickActionContext<'_>) -> Result<(), String> {
         let membership = ctx
             .agent
             .remove_monitor_member(ctx.chat, self.instance.clone())
@@ -467,7 +464,7 @@ impl TickActionBackend for RemoveFromMonitor {
             .map_err(|error| format!("Cannot remove from Monitor: {error}"))?;
         ctx.console
             .update_monitor_membership(ctx.chat, membership)?;
-        Ok(TickActionOutcome::Done)
+        Ok(())
     }
 }
 const CLOSE_HOSTED_PROMPT: &str =
@@ -494,7 +491,7 @@ impl TickActionExecutor for CloseHosted {
 }
 #[async_trait]
 impl TickActionBackend for CloseHosted {
-    async fn execute(&self, ctx: TickActionContext<'_>) -> Result<TickActionOutcome, String> {
+    async fn execute(&self, ctx: TickActionContext<'_>) -> Result<(), String> {
         if !self.is_confirmed {
             ctx.console.confirm_tick_action(
                 ctx.chat,
@@ -505,14 +502,14 @@ impl TickActionBackend for CloseHosted {
                 }),
                 CLOSE_HOSTED_PROMPT,
             )?;
-            return Ok(TickActionOutcome::Done);
+            return Ok(());
         }
         ctx.agent
             .close_hosted_tick(ctx.chat, self.instance.clone())
             .await
             .map_err(|error| format!("Cannot close {}: {error}", self.instance))?;
         ctx.notify(&format!("Closed {}", self.instance))?;
-        Ok(TickActionOutcome::Done)
+        Ok(())
     }
 }
 
@@ -536,7 +533,7 @@ impl TickActionExecutor for ReopenHosted {
 }
 #[async_trait]
 impl TickActionBackend for ReopenHosted {
-    async fn execute(&self, ctx: TickActionContext<'_>) -> Result<TickActionOutcome, String> {
+    async fn execute(&self, ctx: TickActionContext<'_>) -> Result<(), String> {
         if !self.is_confirmed {
             ctx.console.confirm_tick_action(
                 ctx.chat,
@@ -547,7 +544,7 @@ impl TickActionBackend for ReopenHosted {
                 }),
                 REOPEN_HOSTED_PROMPT,
             )?;
-            return Ok(TickActionOutcome::Done);
+            return Ok(());
         }
         let (reopened, membership) = ctx
             .agent
@@ -557,7 +554,7 @@ impl TickActionBackend for ReopenHosted {
         ctx.console
             .update_monitor_membership(ctx.chat, membership)?;
         ctx.notify(&format!("Reopened {} as {reopened}", self.instance))?;
-        Ok(TickActionOutcome::Done)
+        Ok(())
     }
 }
 struct Refresh {
@@ -582,11 +579,11 @@ impl TickActionExecutor for Refresh {
 }
 #[async_trait]
 impl TickActionBackend for RefreshBackend {
-    async fn execute(&self, ctx: TickActionContext<'_>) -> Result<TickActionOutcome, String> {
+    async fn execute(&self, ctx: TickActionContext<'_>) -> Result<(), String> {
         for action in &self.actions {
             action.backend.execute(ctx).await?;
         }
-        Ok(TickActionOutcome::Done)
+        Ok(())
     }
 }
 struct ShellOpen {
@@ -614,7 +611,7 @@ impl TickActionExecutor for ShellOpen {
 }
 #[async_trait]
 impl TickActionBackend for ShellRefresh {
-    async fn execute(&self, ctx: TickActionContext<'_>) -> Result<TickActionOutcome, String> {
+    async fn execute(&self, ctx: TickActionContext<'_>) -> Result<(), String> {
         let center = ShellTaskCenter::new(ctx.agent.clone());
         let snapshot = center
             .snapshot(ctx.chat)
@@ -638,7 +635,7 @@ impl TickActionBackend for ShellRefresh {
             effect,
         )
         .await?;
-        Ok(TickActionOutcome::Done)
+        Ok(())
     }
 }
 struct ShellEffect {
@@ -647,7 +644,7 @@ struct ShellEffect {
 }
 #[async_trait]
 impl TickActionBackend for ShellEffect {
-    async fn execute(&self, ctx: TickActionContext<'_>) -> Result<TickActionOutcome, String> {
+    async fn execute(&self, ctx: TickActionContext<'_>) -> Result<(), String> {
         let center = ShellTaskCenter::new(ctx.agent.clone());
         apply_shell_effect(
             &center,
@@ -657,7 +654,7 @@ impl TickActionBackend for ShellEffect {
             self.effect.clone(),
         )
         .await?;
-        Ok(TickActionOutcome::Done)
+        Ok(())
     }
 }
 #[derive(Clone, Copy)]

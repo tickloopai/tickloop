@@ -549,3 +549,50 @@ async fn shell_subscription_preserves_its_policy_including_final_admission() {
     .await;
     agent.shutdown().await;
 }
+
+#[tokio::test]
+async fn artifact_rows_show_where_feedback_is_linked_and_the_newest_request() {
+    let directory = tempfile::tempdir().unwrap();
+    let agent = Agent::new_embedded(config(), Arc::new(ScriptedModel::new(vec![])));
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let tick = tickloop_agent::artifacts::ArtifactTick {
+        artifact_id: "doc".into(),
+        origin: "https://docs.example".into(),
+        title: "Linked".into(),
+        format: "markdown".into(),
+        url: "https://docs.example/a/doc".into(),
+        access_role: "owner".into(),
+        added_at_ms: 1,
+    };
+    agent.add_artifact_tick(chat, tick.clone()).await.unwrap();
+    let here = Uuid::new_v4();
+    let elsewhere = Uuid::new_v4();
+    let base = agent.snapshot(chat).await.unwrap();
+    let row = |paused: Option<bool>, remote: Option<Uuid>| {
+        let mut snapshot = base.clone();
+        if let Some(resume_required) = paused {
+            snapshot.loops.push(serde_json::from_value(json!({"id":Uuid::new_v4(),"goal":"Feedback","state":"WaitingTrigger","run_id":null,"run_started_at":null,"event_sources":[{"origin":"https://docs.example","account_id":"owner","artifact_id":"doc","binding_id":here,"client_instance_id":Uuid::new_v4(),"epoch":2,"resume_required":resume_required,"last_request_at_ms":1_791_453_600_000_u64}]})).unwrap());
+        }
+        let mut context = MonitorContext {
+            chat: Some(snapshot),
+            ..Default::default()
+        };
+        context.metadata.insert(tick.instance_id(), Some(serde_json::from_value(json!({"id":"doc","title":"Linked","format":"markdown","access_role":"owner","human_updated_at":"2026-10-08T09:00:00.000Z","agent_link":remote.map(|binding_id| json!({"binding_id":binding_id,"chat_id":Uuid::new_v4(),"loop_id":Uuid::new_v4(),"epoch":2}))})).unwrap()));
+        TickAdapters::presentation().list(&context).remove(0)
+    };
+    assert_eq!(row(None, None).status, "");
+    assert_eq!(row(None, Some(elsewhere)).status, "feedback elsewhere");
+    assert_eq!(row(Some(false), Some(elsewhere)).status, "feedback here");
+    assert_eq!(row(Some(true), Some(here)).status, "feedback paused");
+    assert_eq!(
+        row(Some(true), Some(elsewhere)).status,
+        "feedback elsewhere"
+    );
+    assert_eq!(
+        row(Some(false), Some(here)).updated_at_ms,
+        Some(1_791_453_600_000),
+        "a delivered request is the newest update"
+    );
+    assert_eq!(row(None, None).updated_at_ms, Some(1_791_450_000_000));
+    agent.shutdown().await;
+}

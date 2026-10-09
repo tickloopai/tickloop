@@ -530,8 +530,12 @@ impl Agent {
             .get(&receipt.chat_id)
             .and_then(|chat| chat.active_event_claims.get(&receipt.run_id))
             .map(|active| crate::host_tools::EventToolContext {
-                source: active.source.clone(),
-                event_id: active.claim.event_id.clone(),
+                origin: active.source.origin.clone(),
+                account_id: active.source.account_id.clone(),
+                artifact_id: active.source.artifact_id.clone(),
+                binding_id: active.source.binding_id,
+                epoch: active.source.epoch,
+                request_id: active.claim.request_id.clone(),
                 claim_id: active.claim.claim_id.clone(),
                 fencing_token: active.claim.fencing_token.clone(),
             });

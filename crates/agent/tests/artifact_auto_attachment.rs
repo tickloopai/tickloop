@@ -8,7 +8,6 @@ use tickloop_agent::{
     artifacts::ArtifactTick,
     host_tools::{
         HostCallResult, HostEffect, HostToolPermission, HostToolProvider, PreparedHostCall,
-        PublishedSourceEffect,
     },
     model::ToolDefinition,
     runtime::{Agent, ChatId, EventKind},
@@ -16,14 +15,14 @@ use tickloop_agent::{
 };
 use tokio_util::sync::CancellationToken;
 
-struct PublishingArtifact;
+struct CreatingArtifact;
 
 #[async_trait]
-impl HostToolProvider for PublishingArtifact {
+impl HostToolProvider for CreatingArtifact {
     fn definitions(&self) -> Vec<ToolDefinition> {
         vec![ToolDefinition {
-            name: "release_custom_document".into(),
-            description: "Publish a document".into(),
+            name: "create_custom_document".into(),
+            description: "Create a document".into(),
             input_schema: json!({"type":"object"}),
         }]
     }
@@ -39,25 +38,13 @@ impl HostToolProvider for PublishingArtifact {
         _: PreparedHostCall,
         _: CancellationToken,
     ) -> HostCallResult {
-        let tick = artifact("Published title");
-        let effect = PublishedSourceEffect {
-            server_id: tick.origin.clone(),
-            owner_account_id: "owner".into(),
-            source_key: tick.artifact_id.clone(),
-            operation_id: "publish-op".into(),
-            version_id: "version-one".into(),
-            credential_generation: [0; 32],
-            directory_fingerprint: [0; 32],
-            bridge_fingerprint: [0; 32],
-            artifact_tick: Some(tick),
-        };
         HostCallResult::CompletedWithEffect(
             ToolResult {
-                content: "Published".into(),
+                content: "Created".into(),
                 is_error: false,
                 output_ref: None,
             },
-            Box::new(HostEffect::PublishedSource(effect)),
+            Box::new(HostEffect::CreatedArtifact(artifact("Created title"))),
         )
     }
 }
@@ -74,10 +61,10 @@ fn artifact(title: &str) -> ArtifactTick {
     }
 }
 
-async fn publish(agent: &Agent, chat: ChatId) {
+async fn create(agent: &Agent, chat: ChatId) {
     let mut events = agent.subscribe();
     agent
-        .submit(chat, None, "Publish the document".into())
+        .submit(chat, None, "Create the document".into())
         .await
         .unwrap();
     loop {
@@ -90,22 +77,22 @@ async fn publish(agent: &Agent, chat: ChatId) {
 }
 
 #[tokio::test]
-async fn confirmed_publication_attaches_to_its_chat_without_creating_a_subscription() {
+async fn a_created_artifact_attaches_to_its_chat_without_creating_a_subscription() {
     let directory = tempfile::tempdir().unwrap();
     let model = Arc::new(support::ScriptedModel::new(vec![
-        support::call("publish", "release_custom_document", json!({})),
+        support::call("create", "create_custom_document", json!({})),
         support::text("done"),
     ]));
     let agent = Agent::new_embedded(support::config(), model);
     agent
-        .install_host_tools(Arc::new(PublishingArtifact))
+        .install_host_tools(Arc::new(CreatingArtifact))
         .unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let other = agent.create_chat(directory.path().into()).await.unwrap();
-    publish(&agent, chat).await;
+    create(&agent, chat).await;
     assert_eq!(
         agent.artifact_ticks(chat).await.unwrap(),
-        vec![artifact("Published title")]
+        vec![artifact("Created title")]
     );
     let adapters = tickloop_agent::tick_adapter::TickAdapters::presentation();
     let projected = adapters.list(&tickloop_agent::tick_adapter::MonitorContext {
@@ -113,7 +100,7 @@ async fn confirmed_publication_attaches_to_its_chat_without_creating_a_subscript
         ..Default::default()
     });
     assert_eq!(projected.len(), 1);
-    assert_eq!(projected[0].title, "Published title");
+    assert_eq!(projected[0].title, "Created title");
     assert_eq!(
         projected[0].instance.as_str(),
         artifact("title").instance_id()
@@ -132,12 +119,12 @@ async fn confirmed_publication_attaches_to_its_chat_without_creating_a_subscript
 }
 
 #[tokio::test]
-async fn manual_removal_prevents_later_publication_after_restart_and_branch() {
+async fn manual_removal_prevents_a_later_creation_effect_after_restart_and_branch() {
     let directory = tempfile::tempdir().unwrap();
     let store = directory.path().join("archive");
     let response = || {
         vec![
-            support::call("publish", "release_custom_document", json!({})),
+            support::call("create", "create_custom_document", json!({})),
             support::text("done"),
         ]
     };
@@ -148,10 +135,10 @@ async fn manual_removal_prevents_later_publication_after_restart_and_branch() {
     )
     .unwrap();
     agent
-        .install_host_tools(Arc::new(PublishingArtifact))
+        .install_host_tools(Arc::new(CreatingArtifact))
         .unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    publish(&agent, chat).await;
+    create(&agent, chat).await;
     agent
         .remove_artifact_tick(chat, &artifact("title").instance_id())
         .await
@@ -167,10 +154,10 @@ async fn manual_removal_prevents_later_publication_after_restart_and_branch() {
     )
     .unwrap();
     restored
-        .install_host_tools(Arc::new(PublishingArtifact))
+        .install_host_tools(Arc::new(CreatingArtifact))
         .unwrap();
     restored.resume_chat(chat).await.unwrap();
-    publish(&restored, chat).await;
+    create(&restored, chat).await;
     assert!(restored.artifact_ticks(chat).await.unwrap().is_empty());
     let branch = restored
         .branch_chat(tickloop_agent::runtime::BranchRequest {
@@ -181,7 +168,7 @@ async fn manual_removal_prevents_later_publication_after_restart_and_branch() {
         })
         .await
         .unwrap();
-    publish(&restored, branch.child_chat_id).await;
+    create(&restored, branch.child_chat_id).await;
     assert!(
         restored
             .artifact_ticks(branch.child_chat_id)
@@ -193,7 +180,7 @@ async fn manual_removal_prevents_later_publication_after_restart_and_branch() {
         .add_artifact_tick(chat, artifact("Explicit re-add"))
         .await
         .unwrap();
-    publish(&restored, chat).await;
+    create(&restored, chat).await;
     assert_eq!(restored.artifact_ticks(chat).await.unwrap().len(), 1);
     restored.shutdown().await;
 }
@@ -202,7 +189,7 @@ struct ArtifactEffects(std::sync::Mutex<std::collections::VecDeque<HostCallResul
 #[async_trait]
 impl HostToolProvider for ArtifactEffects {
     fn definitions(&self) -> Vec<ToolDefinition> {
-        PublishingArtifact.definitions()
+        CreatingArtifact.definitions()
     }
     fn permission(&self, _: ChatId, _: &str, _: &Value) -> HostToolPermission {
         HostToolPermission::Automatic
@@ -229,7 +216,7 @@ async fn repeated_confirmed_effects_refresh_metadata_but_failure_and_unknown_do_
                 vec![
                     support::call(
                         &format!("effect-{index}"),
-                        "release_custom_document",
+                        "create_custom_document",
                         json!({}),
                     ),
                     support::text("done"),
@@ -265,16 +252,16 @@ async fn repeated_confirmed_effects_refresh_metadata_but_failure_and_unknown_do_
         ))))
         .unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    publish(&agent, chat).await;
+    create(&agent, chat).await;
     assert_eq!(agent.artifact_ticks(chat).await.unwrap(), vec![created]);
-    publish(&agent, chat).await;
+    create(&agent, chat).await;
     refreshed.added_at_ms = 17;
     assert_eq!(
         agent.artifact_ticks(chat).await.unwrap(),
         vec![refreshed.clone()]
     );
-    publish(&agent, chat).await;
-    publish(&agent, chat).await;
+    create(&agent, chat).await;
+    create(&agent, chat).await;
     assert_eq!(agent.artifact_ticks(chat).await.unwrap(), vec![refreshed]);
     assert!(
         agent

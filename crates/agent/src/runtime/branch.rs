@@ -418,7 +418,6 @@ impl Agent {
                 user_shell_queue: Arc::new(Notify::new()),
                 trigger_cancellations: Default::default(),
                 event_cancellations: Default::default(),
-                disabled_event_source_runs: Default::default(),
                 active_event_claims: Default::default(),
                 deferred_messages: Vec::new(),
                 user_cancelled_runs: std::collections::HashSet::new(),

@@ -365,20 +365,6 @@ fn read_run_state(
     }
 }
 
-pub(super) fn checkpoint_connection_run_state(
-    directory: &PrivateDirectory,
-    loop_id: LoopId,
-) -> io::Result<()> {
-    let Some(state) = read_run_state(directory, loop_id)? else {
-        return Ok(());
-    };
-    if !state.armed || state.ended {
-        return Err(io::Error::other("Connection Loop is no longer armed"));
-    }
-    File::open(run_state_path(directory, loop_id))?.sync_all()?;
-    File::open(directory.path())?.sync_all()
-}
-
 /// 在状态写锁内读取、递增并原子替换停止状态，返回写入后文件中的状态。已结束的状态不被覆盖。
 fn write_run_state(
     directory: &PrivateDirectory,

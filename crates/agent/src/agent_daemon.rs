@@ -41,9 +41,6 @@ use crate::{
 
 mod service_control;
 
-const ARTIFACT_EVENT_BRIDGE_URI: &str = "tickloop://event-bridge/v2";
-const ARTIFACT_EVENT_BRIDGE_FALLBACK_URI: &str = "tickloop://event-bridge/v1";
-
 const STARTUP_DEADLINE: Duration = Duration::from_secs(5);
 const CONNECT_INTERVAL: Duration = Duration::from_millis(25);
 const SOCKET_NAME: &str = "owner.sock";
@@ -678,11 +675,10 @@ pub async fn build_runtime_with_client(
         && let Ok(artifact) = crate::artifacts::ArtifactClient::new(root)
     {
         agent
-            .install_host_tools(Arc::new(
-                crate::mcp_tools::McpHostToolProvider::new(artifact, native_host.clone())
-                    .with_event_bridge(ARTIFACT_EVENT_BRIDGE_URI)
-                    .with_event_bridge_fallback(ARTIFACT_EVENT_BRIDGE_FALLBACK_URI),
-            ))
+            .install_host_tools(Arc::new(crate::mcp_tools::McpHostToolProvider::new(
+                artifact,
+                native_host.clone(),
+            )))
             .map_err(|error| format!("cannot install MCP tools: {error}"))?;
     } else if let Some(native_host) = native_host {
         agent

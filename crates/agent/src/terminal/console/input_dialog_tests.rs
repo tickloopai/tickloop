@@ -1,7 +1,7 @@
 use super::*;
 use crate::tick_adapter::{
     MonitorAction, MonitorOperation, PreparedTickAction, TickActionBackend, TickActionContext,
-    TickActionExecutor, TickActionOutcome, TickActionUi,
+    TickActionExecutor, TickActionUi,
 };
 
 #[test]
@@ -250,8 +250,8 @@ impl TickActionExecutor for FixtureTickAction {
 struct FixtureTickBackend;
 #[async_trait::async_trait]
 impl TickActionBackend for FixtureTickBackend {
-    async fn execute(&self, _: TickActionContext<'_>) -> Result<TickActionOutcome, String> {
-        Ok(TickActionOutcome::Done)
+    async fn execute(&self, _: TickActionContext<'_>) -> Result<(), String> {
+        Ok(())
     }
 }
 

@@ -59,9 +59,8 @@ pub enum TickGlyph {
 }
 
 pub use crate::terminal::tick_actions::{
-    PreparedTickAction, TickActionBackend, TickActionContext, TickActionExecutor,
-    TickActionOutcome, TickActionUi, TickConfirmationView, TickDetailKey, TickDetailLine,
-    TickDetailView,
+    PreparedTickAction, TickActionBackend, TickActionContext, TickActionExecutor, TickActionUi,
+    TickConfirmationView, TickDetailKey, TickDetailLine, TickDetailView,
 };
 #[derive(Clone)]
 pub enum MonitorOperation {

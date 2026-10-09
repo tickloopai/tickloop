@@ -21,8 +21,14 @@ use crate::{
     },
 };
 
+mod agent_requests;
 mod catalog;
-pub use catalog::{ArtifactMetadata, ArtifactOperation, ArtifactPage, ArtifactTick};
+pub use agent_requests::{
+    AgentLink, AgentLinkRequest, ClaimedRequest, PendingRequest, PendingRequestPage, ReleaseOutcome,
+};
+pub use catalog::{
+    AgentLinkMetadata, ArtifactMetadata, ArtifactOperation, ArtifactPage, ArtifactTick,
+};
 
 pub const DEFAULT_ORIGIN: &str = "https://docs.tickloop.ai";
 const ORIGIN_ENV: &str = "TICKLOOP_ARTIFACT_ORIGIN";
@@ -544,6 +550,17 @@ impl ArtifactClient {
     }
 }
 
+/// One URL path segment naming an artifact or request.
+fn path_segment(value: &str) -> Result<&str, ArtifactError> {
+    if value.is_empty()
+        || value.contains(['/', '?', '#', '%'])
+        || value.chars().any(char::is_control)
+    {
+        return Err(ArtifactError::InvalidResponse);
+    }
+    Ok(value)
+}
+
 fn bearer(token: &str) -> Result<header::HeaderValue, ArtifactError> {
     let mut value = header::HeaderValue::from_str(&format!("Bearer {token}"))
         .map_err(|_| ArtifactError::Storage)?;
@@ -745,6 +762,144 @@ mod tests {
             matches!(client.list("all", "", Some("old")).await, Err(ArtifactError::Service { status:409, code }) if code == "catalog_conflict")
         );
         assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+
+    fn request_body(request: &str) -> serde_json::Value {
+        serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn agent_request_lifecycle_uses_the_contract_endpoints() {
+        let (origin, requests) = server(|request, _, _| {
+            let line = request.lines().next().unwrap();
+            let body = if line.starts_with("PUT /api/v1/agent/links/doc ") {
+                serde_json::json!({"artifact_id":"doc","binding_id":request_body(request)["binding_id"],"epoch":3})
+            } else if line.starts_with("GET /api/v1/agent/requests?") {
+                serde_json::json!({"items":[{"request_id":"request-1","thread_id":"thread-1","created_at":"2026-10-08T10:00:00.000Z"}],"next_cursor":"page-2"})
+            } else if line.starts_with("POST /api/v1/agent/requests/request-1/claim ") {
+                serde_json::json!({"request_id":"request-1","claim_id":"claim-1","fencing_token":"fence-1","lease_expires_at":"2026-10-08T10:01:30.000Z","input":{"artifact_id":"doc","thread_id":"thread-1","text":"@tickloop tighten"}})
+            } else if line.starts_with("POST /api/v1/agent/requests/request-1/renew ") {
+                serde_json::json!({"lease_expires_at":"2026-10-08T10:03:00.000Z"})
+            } else {
+                serde_json::json!({"request_id":"request-1","status":"pending"})
+            };
+            (200, body.to_string())
+        })
+        .await;
+        let (_directory, client) = catalog_client(&origin).await;
+        let binding_id = uuid::Uuid::new_v4();
+        let client_instance_id = uuid::Uuid::new_v4();
+        let (chat_id, loop_id) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let link = client
+            .link_agent(
+                "owner",
+                "doc",
+                &AgentLinkRequest {
+                    binding_id,
+                    client_instance_id,
+                    chat_id,
+                    loop_id,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!((link.binding_id, link.epoch), (binding_id, 3));
+        let page = client
+            .pending_requests("owner", &link, Some("page-1"))
+            .await
+            .unwrap();
+        assert_eq!(page.items[0].request_id, "request-1");
+        assert_eq!(page.next_cursor.as_deref(), Some("page-2"));
+        let claim = client
+            .claim_request("owner", &link, client_instance_id, "request-1")
+            .await
+            .unwrap();
+        assert_eq!(claim.input["text"], "@tickloop tighten");
+        assert_eq!(
+            client.renew_request("owner", "doc", &claim).await.unwrap(),
+            "2026-10-08T10:03:00.000Z"
+        );
+        client
+            .release_request("owner", "doc", &claim, ReleaseOutcome::Retry)
+            .await
+            .unwrap();
+
+        let requests = requests.lock().unwrap();
+        assert!(requests.iter().all(|request| {
+            request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer test-token")
+        }));
+        assert_eq!(
+            request_body(&requests[0]),
+            serde_json::json!({"binding_id":binding_id,"client_instance_id":client_instance_id,"chat_id":chat_id,"loop_id":loop_id})
+        );
+        assert!(requests[1].starts_with(&format!(
+            "GET /api/v1/agent/requests?artifact_id=doc&binding_id={binding_id}&epoch=3&cursor=page-1 "
+        )));
+        assert_eq!(
+            request_body(&requests[2]),
+            serde_json::json!({"artifact_id":"doc","binding_id":binding_id,"epoch":3,"client_instance_id":client_instance_id})
+        );
+        for (request, extra) in [
+            (&requests[3], serde_json::json!({})),
+            (&requests[4], serde_json::json!({"outcome":"retry"})),
+        ] {
+            let mut expected = serde_json::json!({"artifact_id":"doc","claim_id":"claim-1","fencing_token":"fence-1"});
+            expected
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            assert_eq!(request_body(request), expected);
+        }
+        assert!(requests[4].starts_with("POST /api/v1/agent/requests/request-1/release "));
+    }
+
+    #[tokio::test]
+    async fn agent_request_lifecycle_rejects_other_accounts_and_mismatched_replies() {
+        let (origin, requests) = server(|request, _, _| {
+            let body = if request.starts_with("PUT ") {
+                serde_json::json!({"artifact_id":"doc","binding_id":uuid::Uuid::new_v4(),"epoch":1})
+            } else {
+                serde_json::json!({"request_id":"request-1","claim_id":"claim-1","fencing_token":"fence-1","lease_expires_at":"later","input":{"artifact_id":"other"}})
+            };
+            (200, body.to_string())
+        })
+        .await;
+        let (_directory, client) = catalog_client(&origin).await;
+        let request = AgentLinkRequest {
+            binding_id: uuid::Uuid::new_v4(),
+            client_instance_id: uuid::Uuid::new_v4(),
+            chat_id: uuid::Uuid::new_v4(),
+            loop_id: uuid::Uuid::new_v4(),
+        };
+        assert!(matches!(
+            client.link_agent("someone-else", "doc", &request).await,
+            Err(ArtifactError::AccountChanged)
+        ));
+        assert!(requests.lock().unwrap().is_empty());
+        assert!(matches!(
+            client.link_agent("owner", "doc", &request).await,
+            Err(ArtifactError::InvalidResponse)
+        ));
+        let link = AgentLink {
+            artifact_id: "doc".into(),
+            binding_id: request.binding_id,
+            epoch: 1,
+        };
+        assert!(matches!(
+            client
+                .claim_request("owner", &link, request.client_instance_id, "request-1")
+                .await,
+            Err(ArtifactError::InvalidResponse)
+        ));
+        assert!(matches!(
+            client
+                .claim_request("owner", &link, request.client_instance_id, "a/b")
+                .await,
+            Err(ArtifactError::InvalidResponse)
+        ));
+        assert_eq!(requests.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]

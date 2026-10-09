@@ -30,7 +30,7 @@ pub(super) fn can_trigger(goal: &LoopSnapshot) -> bool {
     }) || goal
         .event_sources
         .iter()
-        .any(|source| source.association_epoch.is_some() && !source.resume_required))
+        .any(|source| !source.resume_required))
         && matches!(
             goal.state,
             LoopState::Running
@@ -48,14 +48,6 @@ pub(super) fn recover_loops(snapshot: &mut ChatSnapshot) {
         if !goal.event_sources.is_empty() {
             for source in &mut goal.event_sources {
                 source.resume_required = true;
-                for operation in &mut source.claim_operations {
-                    if matches!(
-                        operation.status,
-                        EventClaimStatus::Pending | EventClaimStatus::Claimed
-                    ) {
-                        operation.status = EventClaimStatus::NeedsAttention;
-                    }
-                }
             }
             if goal.state == LoopState::WaitingTrigger {
                 goal.recover_state(LoopState::Interrupted);
@@ -191,7 +183,7 @@ impl Agent {
             && !goal
                 .event_sources
                 .iter()
-                .any(|source| source.association_epoch.is_some() && !source.resume_required)
+                .any(|source| !source.resume_required)
         {
             goal.set_state(LoopState::Completed);
         }
@@ -237,7 +229,7 @@ impl Agent {
                 || pending.trigger_source.as_ref().is_none_or(|source| {
                     matches!(
                         source.source.as_str(),
-                        "mcp_event" | TICK_SUBSCRIPTION_SOURCE
+                        super::event_sources::ARTIFACT_REQUEST_SOURCE | TICK_SUBSCRIPTION_SOURCE
                     )
                 });
             if !keep {
@@ -267,7 +259,7 @@ impl Agent {
                 && !goal
                     .event_sources
                     .iter()
-                    .any(|source| source.association_epoch.is_some() && !source.resume_required)
+                    .any(|source| !source.resume_required)
             {
                 goal.set_state(LoopState::Completed);
             }
@@ -447,30 +439,17 @@ impl Agent {
         if let Some(trigger) = &mut goal.trigger {
             trigger.armed = false;
         }
-        let event_releases = if state == LoopState::Stopped {
-            chat.active_event_claims
-                .values()
-                .filter(|active| active.source.loop_id == loop_id && !active.lease_completed)
-                .cloned()
-                .map(|active| (active, Uuid::new_v4().to_string()))
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
-        for (active, operation_id) in &event_releases {
-            if let Some(source) = goal
-                .event_sources
-                .iter_mut()
-                .find(|source| source.binding_id == active.source.binding_id)
-                && let Some(record) = source
-                    .claim_operations
-                    .iter_mut()
-                    .find(|record| record.event_id == active.claim.event_id)
-            {
-                record.release_operation_id = Some(operation_id.clone());
-                record.status = EventClaimStatus::NeedsAttention;
-            }
-        }
+        // An ended Loop hands every unfinished request back for another attempt, including one
+        // whose queued run never starts.
+        let event_releases = chat
+            .active_event_claims
+            .values_mut()
+            .filter(|active| active.loop_id == loop_id && !active.settled)
+            .map(|active| {
+                active.settled = true;
+                active.clone()
+            })
+            .collect::<Vec<_>>();
         let mut cancelled_shells = HashSet::new();
         for shell in &mut chat.snapshot.user_shells {
             if shell.loop_id == Some(loop_id)
@@ -544,52 +523,9 @@ impl Agent {
         self.inner.loop_leases.release(chat_id, loop_id);
         self.warn_loop_run_state_failure(chat_id, loop_id, recorded);
         self.sync_tick_subscriptions().await;
-        if !event_releases.is_empty() {
-            let provider = self.inner.host_tools.read().unwrap().clone();
-            if let Some(provider) = provider {
-                for (active, operation_id) in event_releases {
-                    let request = crate::host_tools::EventLeaseRequest {
-                        source: active.source,
-                        event_id: active.claim.event_id,
-                        claim_id: active.claim.claim_id,
-                        fencing_token: active.claim.fencing_token,
-                        operation_id,
-                    };
-                    let completed = matches!(
-                        tokio::time::timeout(
-                            std::time::Duration::from_secs(5),
-                            provider.release_event_claim(request.clone(), CancellationToken::new()),
-                        )
-                        .await,
-                        Ok(crate::host_tools::EventLeaseOutcome::Completed)
-                    );
-                    if completed {
-                        let mut chats = self.inner.chats.lock().await;
-                        if let Some(chat) = chats.get_mut(&chat_id)
-                            && let Some(record) = chat
-                                .snapshot
-                                .loops
-                                .iter_mut()
-                                .find(|goal| goal.id == loop_id)
-                                .and_then(|goal| {
-                                    goal.event_sources.iter_mut().find(|source| {
-                                        source.binding_id == request.source.binding_id
-                                    })
-                                })
-                                .and_then(|source| {
-                                    source.claim_operations.iter_mut().find(|record| {
-                                        record.event_id == request.event_id
-                                            && record.claim_id.as_deref()
-                                                == Some(request.claim_id.as_str())
-                                    })
-                                })
-                        {
-                            record.status = EventClaimStatus::Completed;
-                            self.save(&chat.snapshot);
-                        }
-                    }
-                }
-            }
+        for active in &event_releases {
+            self.release_event_claim(active, crate::artifacts::ReleaseOutcome::Retry)
+                .await;
         }
         for command in tools.stop_loop(loop_id).await {
             self.record_command(chat_id, command).await?;

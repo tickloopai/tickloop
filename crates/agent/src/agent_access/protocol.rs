@@ -22,7 +22,7 @@ use crate::{
 /// sets, and typed model-call versus direct human Shell permission requests.
 /// A 9.0 peer requires the old flat run/call fields and cannot decode the new request shape;
 /// other business majors are refused before dispatch. Frozen management remains independent.
-pub const PROTOCOL_MAJOR: u16 = 10;
+pub const PROTOCOL_MAJOR: u16 = 11;
 pub const PROTOCOL_MINOR: u16 = 0;
 
 pub const MAX_FRAME_BYTES: usize = 128 * 1024 * 1024;
@@ -249,6 +249,11 @@ pub enum AgentCommand {
         execution: ExecutionRef,
         instance_id: String,
     },
+    /// Links the artifact to the Chat for the signed-in account's @tickloop requests.
+    LinkArtifact {
+        execution: ExecutionRef,
+        tick: crate::artifacts::ArtifactTick,
+    },
     ListArtifactTicks {
         execution: ExecutionRef,
     },
@@ -374,6 +379,7 @@ impl AgentCommand {
             | Self::ManageTask { execution, .. }
             | Self::AddArtifactTick { execution, .. }
             | Self::RemoveArtifactTick { execution, .. }
+            | Self::LinkArtifact { execution, .. }
             | Self::ListArtifactTicks { execution }
             | Self::AddMonitorMember { execution, .. }
             | Self::RemoveMonitorMember { execution, .. }
@@ -461,9 +467,6 @@ pub enum LoopAction {
     },
     Interrupt,
     DisableEventSources {
-        loop_id: Uuid,
-    },
-    ResumeEventSources {
         loop_id: Uuid,
     },
     ConfigureTrigger {
@@ -906,9 +909,6 @@ pub enum CommandResult {
     },
     Submitted(Receipt),
     ShellSubmitted(UserShellReceipt),
-    EventSourcesResumed {
-        count: usize,
-    },
     Done,
     ModelChanged(ModelChange),
     Permissions(Box<PermissionsView>),

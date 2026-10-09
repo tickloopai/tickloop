@@ -1371,7 +1371,7 @@ async fn a_new_adapter_remote_action_and_detail_work_through_enter_and_click() {
     }
     #[async_trait::async_trait]
     impl TickActionBackend for ReadCalendar {
-        async fn execute(&self, ctx: TickActionContext<'_>) -> Result<TickActionOutcome, String> {
+        async fn execute(&self, ctx: TickActionContext<'_>) -> Result<(), String> {
             let text = reqwest::get(&self.endpoint)
                 .await
                 .map_err(|error| error.to_string())?
@@ -1382,7 +1382,7 @@ async fn a_new_adapter_remote_action_and_detail_work_through_enter_and_click() {
                 view.text = text;
                 Some(())
             })?;
-            Ok(TickActionOutcome::Done)
+            Ok(())
         }
     }
     impl TickAdapter for Calendar {

@@ -17,17 +17,14 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-const BRIDGE_URI: &str = "tickloop://event-bridge/v1";
-const FIXTURE_ARTIFACT_TITLE: &str = "Fixture published artifact";
+const FIXTURE_ARTIFACT_TITLE: &str = "Fixture created artifact";
 const FIXTURE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Default)]
 struct ObservedRequests {
-    missing_v2_read: AtomicBool,
-    descriptor_read: AtomicBool,
-    artifact_metadata_read: AtomicBool,
+    linked: AtomicBool,
+    listened: AtomicBool,
     attached_to_model: AtomicBool,
-    associated: AtomicBool,
     model_calls: AtomicUsize,
     model_tools: Mutex<Vec<String>>,
 }
@@ -60,23 +57,23 @@ async fn read_request(stream: &mut TcpStream) -> (String, Value) {
     }
 }
 
-fn model_stream(publish: bool) -> String {
-    let block = if publish {
-        json!({"type":"tool_use","id":"publish-call","name":"mcp__artifacts__artifact_publish","input":{"operation_id":"publish-one","source":"# Fixture"}})
+fn model_stream(create: bool) -> String {
+    let block = if create {
+        json!({"type":"tool_use","id":"create-call","name":"ArtifactEdit","input":{"action":"create","title":FIXTURE_ARTIFACT_TITLE,"format":"markdown","content":"# Fixture"}})
     } else {
-        json!({"type":"text","text":"Publication fixture finished."})
+        json!({"type":"text","text":"Creation fixture finished."})
     };
     [
         json!({"type":"message_start","message":{"id":"fixture","type":"message","role":"assistant","content":[],"usage":{"input_tokens":1,"output_tokens":0}}}),
         json!({"type":"content_block_start","index":0,"content_block":block}),
         json!({"type":"content_block_stop","index":0}),
-        json!({"type":"message_delta","delta":{"stop_reason":if publish {"tool_use"} else {"end_turn"}},"usage":{"output_tokens":1}}),
+        json!({"type":"message_delta","delta":{"stop_reason":if create {"tool_use"} else {"end_turn"}},"usage":{"output_tokens":1}}),
         json!({"type":"message_stop"}),
     ].iter().map(|event| format!("data: {event}\n\n")).collect()
 }
 
 #[tokio::test]
-async fn console_publication_enables_feedback_and_keeps_lifecycle_tools_host_only() {
+async fn console_creation_links_the_artifact_and_shows_only_the_artifact_tools() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
     let observed = Arc::new(ObservedRequests::default());
@@ -100,61 +97,38 @@ async fn console_publication_enables_feedback_and_keeps_lifecycle_tools_host_onl
                         json!({"user":user,"expires_at":"2099-01-01T00:00:00Z"}).to_string(),
                     )
                 } else if path.starts_with("GET /api/v1/artifacts/fixture-artifact ") {
-                    observed
-                        .artifact_metadata_read
-                        .store(true, Ordering::SeqCst);
-                    ("application/json", json!({"id":"fixture-artifact","title":FIXTURE_ARTIFACT_TITLE,"format":"markdown","access_role":"owner","url":format!("{origin}/a/fixture-artifact")}).to_string())
+                    ("application/json", json!({"id":"fixture-artifact","title":FIXTURE_ARTIFACT_TITLE,"format":"markdown","access_role":"owner","url":format!("{origin}/a/fixture-artifact"),"agent_link":null}).to_string())
+                } else if path.starts_with("PUT /api/v1/agent/links/fixture-artifact ") {
+                    observed.linked.store(true, Ordering::SeqCst);
+                    ("application/json", json!({"artifact_id":"fixture-artifact","binding_id":request["binding_id"],"epoch":1}).to_string())
+                } else if path.starts_with("GET /api/v1/agent/requests?") {
+                    observed.listened.store(true, Ordering::SeqCst);
+                    (
+                        "application/json",
+                        json!({"items":[],"next_cursor":null}).to_string(),
+                    )
                 } else if path.starts_with("POST /mcp ") {
-                    let response = if request["method"] == "resources/read"
-                        && request["params"]["uri"] == "tickloop://event-bridge/v2"
-                    {
-                        observed.missing_v2_read.store(true, Ordering::SeqCst);
-                        json!({"jsonrpc":"2.0","id":request["id"],"error":{
-                            "code":rmcp::model::ErrorCode::RESOURCE_NOT_FOUND,
-                            "message":"Resource not found", "data":{"uri":request["params"]["uri"]}
-                        }})
-                    } else {
-                        let result = match request["method"].as_str().unwrap_or("") {
-                            "server/discover" => {
-                                json!({"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{},"resources":{}},"ttlMs":0,"cacheScope":"private"})
-                            }
-                            "tools/list" => {
-                                let mut tools = vec![
-                                    json!({"name":"artifact_publish","inputSchema":{"type":"object","properties":{"operation_id":{"type":"string"},"source":{"type":"string"}},"required":["operation_id","source"]}}),
-                                ];
-                                tools.extend(["associate","pending","claim","renew","release","operation"].map(|role| json!({"name":format!("event_{role}"),"inputSchema":{"type":"object"}})));
-                                json!({"tools":tools})
-                            }
-                            "resources/list" => {
-                                json!({"resources":[{"uri":BRIDGE_URI,"name":"legacy-event-bridge"}]})
-                            }
-                            "resources/read" => {
-                                assert_eq!(request["params"]["uri"], BRIDGE_URI);
-                                observed.descriptor_read.store(true, Ordering::SeqCst);
-                                json!({"contents":[{"uri":BRIDGE_URI,"mimeType":"application/json","text":json!({"version":1,"publication_tools":[{"tool":"artifact_publish","operation_id_argument":"operation_id","source_key_result":"artifact_id","version_key_result":"version_id"}],"tools":{"associate":"event_associate","pending":"event_pending","claim":"event_claim","renew":"event_renew","release":"event_release","operation":"event_operation"}}).to_string()}]})
-                            }
-                            "tools/call" => {
-                                let args = &request["params"]["arguments"];
-                                let result = match request["params"]["name"].as_str().unwrap_or("")
-                                {
-                                    "artifact_publish" => {
-                                        json!({"status":"committed","operation_id":args["operation_id"],"artifact_id":"fixture-artifact","version_id":"fixture-version"})
-                                    }
-                                    "event_associate" => {
-                                        assert_eq!(args["source_key"], "fixture-artifact");
-                                        observed.associated.store(true, Ordering::SeqCst);
-                                        json!({"status":"committed","operation_id":args["operation_id"],"source_key":"fixture-artifact","association_epoch":1})
-                                    }
-                                    "event_pending" => json!({"events":[],"next_cursor":null}),
-                                    other => panic!("unexpected fixture tool: {other}"),
-                                };
-                                json!({"content":[],"structuredContent":result})
-                            }
-                            other => panic!("unexpected fixture MCP method: {other}"),
-                        };
-                        json!({"jsonrpc":"2.0","id":request["id"],"result":result})
+                    let result = match request["method"].as_str().unwrap_or("") {
+                        "server/discover" => {
+                            json!({"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{}},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"tickloop-docs","version":"1"}}})
+                        }
+                        "tools/list" => json!({"tools":[
+                            {"name":"ArtifactRead","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":true}},
+                            {"name":"ArtifactEdit","inputSchema":{"type":"object","properties":{"action":{"type":"string"},"title":{"type":"string"},"format":{"type":"string"},"content":{"type":"string"}},"required":["action"]}},
+                            {"name":"ArtifactComment","inputSchema":{"type":"object"}},
+                            {"name":"unrelated_remote_tool","inputSchema":{"type":"object"}}
+                        ]}),
+                        "tools/call" => {
+                            assert_eq!(request["params"]["name"], "ArtifactEdit");
+                            let args = &request["params"]["arguments"];
+                            json!({"content":[],"structuredContent":{"artifact_id":"fixture-artifact","title":args["title"],"format":args["format"],"url":format!("{origin}/a/fixture-artifact"),"revision":1}})
+                        }
+                        other => panic!("unexpected fixture MCP method: {other}"),
                     };
-                    ("application/json", response.to_string())
+                    (
+                        "application/json",
+                        json!({"jsonrpc":"2.0","id":request["id"],"result":result}).to_string(),
+                    )
                 } else {
                     assert!(path.starts_with("POST /v1/messages "), "{path}");
                     *observed.model_tools.lock().unwrap() = request["tools"]
@@ -219,11 +193,13 @@ async fn console_publication_enables_feedback_and_keeps_lifecycle_tools_host_onl
         .unwrap();
     let mut stdin = child.stdin.take().unwrap();
     stdin
-        .write_all(b"Publish the fixture artifact.\n")
+        .write_all(b"Create the fixture artifact.\n")
         .await
         .unwrap();
     let completed = tokio::time::timeout(FIXTURE_TIMEOUT, async {
-        while observed.model_calls.load(Ordering::SeqCst) < 2 {
+        while observed.model_calls.load(Ordering::SeqCst) < 2
+            || !observed.listened.load(Ordering::SeqCst)
+        {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
@@ -238,11 +214,10 @@ async fn console_publication_enables_feedback_and_keeps_lifecycle_tools_host_onl
         .await
         .unwrap();
     server.abort();
-    assert!(observed.artifact_metadata_read.load(Ordering::SeqCst));
     assert!(observed.attached_to_model.load(Ordering::SeqCst));
     assert!(
         completed.is_ok(),
-        "fixture publication did not reach the model's second request: {}",
+        "fixture creation did not reach the model's second request: {}",
         String::from_utf8_lossy(&output.stdout)
     );
     assert!(
@@ -251,27 +226,21 @@ async fn console_publication_enables_feedback_and_keeps_lifecycle_tools_host_onl
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        observed.missing_v2_read.load(Ordering::SeqCst),
-        "Console did not try v2 before falling back on its explicit missing-resource result"
+        observed.linked.load(Ordering::SeqCst),
+        "Console creation did not link the artifact to its Loop"
     );
     assert!(
-        observed.descriptor_read.load(Ordering::SeqCst),
-        "Console did not load the feedback bridge descriptor"
-    );
-    assert!(
-        observed.associated.load(Ordering::SeqCst),
-        "Console publication did not associate the artifact with its Loop"
+        observed.listened.load(Ordering::SeqCst),
+        "the linked Loop did not listen for @tickloop requests"
     );
     let tools = observed.model_tools.lock().unwrap();
-    assert!(
-        tools
-            .iter()
-            .any(|name| name == "mcp__artifacts__artifact_publish")
-    );
+    for name in ["ArtifactRead", "ArtifactEdit", "ArtifactComment"] {
+        assert!(tools.iter().any(|tool| tool == name), "{name}");
+    }
     assert!(
         !tools
             .iter()
-            .any(|name| name.starts_with("mcp__artifacts__event_")),
-        "host-only lifecycle tools leaked to the model"
+            .any(|name| name.starts_with("mcp__") || *name == "unrelated_remote_tool"),
+        "{tools:?}"
     );
 }

@@ -1283,7 +1283,7 @@ impl Agent {
                     || goal
                         .event_sources
                         .iter()
-                        .any(|source| source.association_epoch.is_some() && !source.resume_required)
+                        .any(|source| !source.resume_required)
                 {
                     LoopState::WaitingTrigger
                 } else {
@@ -1387,7 +1387,7 @@ fn delivery_payload(items: &[DeliveryItem], truncated: bool) -> Value {
         } else if let Some(tool) = items.iter().find_map(|item| item.recover_with.as_deref()) {
             if tool.len() <= 128 {
                 format!(
-                    "Tick Update data was left out where `data` is null; recovery guidance from the instance: {tool}. Use Artifact MCP for artifacts, Read on Bash output_file for shells, or CallTickTool for a protocol Tick query."
+                    "Tick Update data was left out where `data` is null; recovery guidance from the instance: {tool}. Use ArtifactRead for artifacts, Read on Bash output_file for shells, or CallTickTool for a protocol Tick query."
                 )
             } else {
                 TRUNCATION_HINT.to_owned()

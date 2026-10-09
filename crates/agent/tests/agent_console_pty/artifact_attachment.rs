@@ -3,7 +3,6 @@ use tickloop_agent::artifacts::ArtifactClient;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const CREATED_TITLE: &str = "LIVE-CREATED-ARTIFACT";
-const ATTACHMENT_URI: &str = "tickloop://artifact-tick-attachments/v1";
 
 async fn artifact_service() -> (String, Arc<Mutex<Vec<Value>>>, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -41,7 +40,10 @@ async fn artifact_service() -> (String, Arc<Mutex<Vec<Value>>>, tokio::task::Joi
                 let path = head.lines().next().unwrap();
                 let body: Value = serde_json::from_slice(&bytes[end + 4..end + 4 + length])
                     .unwrap_or(Value::Null);
-                recorded.lock().unwrap().push(body.clone());
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push(json!({"path":path,"body":body}));
                 let response = if path.starts_with("POST /api/v1/auth/device/token ") {
                     json!({"access_token":"test-artifact-token","token_type":"Bearer","expires_in":3600,"user":{"id":"owner","name":"Owner","email":"owner@example.test"}})
                 } else if path.starts_with("POST /api/v1/auth/device ") {
@@ -50,34 +52,24 @@ async fn artifact_service() -> (String, Arc<Mutex<Vec<Value>>>, tokio::task::Joi
                     json!({"user":{"id":"owner","name":"Owner","email":"owner@example.test"},"expires_at":"2099-01-01T00:00:00Z"})
                 } else if path.starts_with("GET /api/v1/artifacts/document ") {
                     json!({"id":"document","title":CREATED_TITLE,"format":"markdown","access_role":"owner","url":format!("{origin}/a/document")})
+                } else if path.starts_with("PUT /api/v1/agent/links/document ") {
+                    json!({"artifact_id":"document","binding_id":body["binding_id"],"epoch":1})
+                } else if path.starts_with("GET /api/v1/agent/requests?") {
+                    json!({"items":[],"next_cursor":null})
                 } else if path.starts_with("POST /mcp ") {
                     let result = match body["method"].as_str().unwrap() {
                         "server/discover" => {
-                            json!({"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{},"resources":{}},"ttlMs":0,"cacheScope":"private"})
+                            json!({"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{}},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"tickloop-docs","version":"1"}}})
                         }
-                        "tools/list" => {
-                            let mut tools = ["associate","pending","claim","renew","release","operation"].into_iter().map(|role|json!({"name":format!("event_{role}"),"inputSchema":{"type":"object"}})).collect::<Vec<_>>();
-                            tools.push(
-                                json!({"name":"publish_custom","inputSchema":{"type":"object"}}),
-                            );
-                            tools.push(json!({"name":"create_custom","inputSchema":{"type":"object","properties":{"operation_id":{"type":"string"},"title":{"type":"string"},"format":{"type":"string"}},"required":["operation_id","title","format"]}}));
-                            json!({"tools":tools})
-                        }
-                        "resources/list" => {
-                            json!({"resources":[{"uri":ATTACHMENT_URI,"name":"attachment"}]})
-                        }
-                        "resources/read" => {
-                            let uri = body["params"]["uri"].as_str().unwrap();
-                            let descriptor = if uri == ATTACHMENT_URI {
-                                json!({"version":1,"creation_tools":[{"tool":"create_custom","operation_id_argument":"operation_id","artifact_id_result":"artifact_id","title_argument":"title","format_argument":"format","url_result":"url"}]})
-                            } else {
-                                json!({"version":1,"publication_tools":[{"tool":"publish_custom","operation_id_argument":"operation_id","source_key_result":"artifact_id","version_key_result":"version_id"}],"tools":{"associate":"event_associate","pending":"event_pending","claim":"event_claim","renew":"event_renew","release":"event_release","operation":"event_operation"}})
-                            };
-                            json!({"contents":[{"uri":uri,"mimeType":"application/json","text":descriptor.to_string()}]})
-                        }
+                        "tools/list" => json!({"tools":[
+                            {"name":"ArtifactRead","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":true}},
+                            {"name":"ArtifactEdit","inputSchema":{"type":"object","properties":{"action":{"type":"string"},"title":{"type":"string"},"format":{"type":"string"},"content":{"type":"string"}},"required":["action"]}},
+                            {"name":"ArtifactComment","inputSchema":{"type":"object"}}
+                        ]}),
                         "tools/call" => {
-                            assert_eq!(body["params"]["name"], "create_custom");
-                            json!({"content":[],"structuredContent":{"status":"committed","artifact_id":"document","operation_id":body["params"]["arguments"]["operation_id"],"url":format!("{origin}/a/document")}})
+                            assert_eq!(body["params"]["name"], "ArtifactEdit");
+                            let args = &body["params"]["arguments"];
+                            json!({"content":[],"structuredContent":{"artifact_id":"document","title":args["title"],"format":args["format"],"url":format!("{origin}/a/document"),"revision":1}})
                         }
                         other => panic!("unexpected method {other}"),
                     };
@@ -106,7 +98,7 @@ async fn actual_cli_creation_adds_an_artifact_tick_before_the_next_model_reply()
         let device = account.start_device_login().await.unwrap();
         account.finish_device_login(device, &tokio_util::sync::CancellationToken::new()).await.unwrap();
         let (model_url, mut requests, release) = model_http_support::serve_responses_with_gated_response(vec![
-            (200,chat_reply(Some(("mcp__artifacts__create_custom","creation",json!({"operation_id":"creation-one","title":CREATED_TITLE,"format":"markdown"}))),"")),
+            (200,chat_reply(Some(("ArtifactEdit","creation",json!({"action":"create","title":CREATED_TITLE,"format":"markdown","content":"# Created"}))),"")),
             (200,chat_reply(None,"CREATION-REPLY-FINISHED")),
         ],1).await;
         fixture.set_chat_model(&model_url);
@@ -122,7 +114,7 @@ async fn actual_cli_creation_adds_an_artifact_tick_before_the_next_model_reply()
         let frame = pty.wait_for("creation is attached before the reply",|frame|frame.contains("Monitor 1") && frame.contains(CREATED_TITLE) && frame.contains("Artifacts (1)")).await;
         assert!(!frame.contains("CREATION-REPLY-FINISHED"));
         eprintln!("[artifact-created-live]\n{frame}\n[/artifact-created-live]");
-        assert!(!calls.lock().unwrap().iter().any(|body|body["params"]["name"]=="event_associate"));
+        assert!(calls.lock().unwrap().iter().any(|request|request["path"].as_str().unwrap().starts_with("PUT /api/v1/agent/links/document ")));
         release.send(()).unwrap();
         pty.wait_for("creation run finished",|frame|frame.contains("CREATION-REPLY-FINISHED")).await;
         pty.close().await;

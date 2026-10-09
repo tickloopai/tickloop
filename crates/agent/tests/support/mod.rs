@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+pub mod artifact_service;
 pub mod cli_runtime;
 pub mod fixture_cli;
 pub mod herdr;

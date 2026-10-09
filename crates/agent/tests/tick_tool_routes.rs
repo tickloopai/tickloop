@@ -235,10 +235,8 @@ async fn artifact_shell_and_untyped_targets_never_reach_a_backend() {
     let herdr_only = TickToolRouter::new(Some(backends.native.clone()), None);
     let chat = uuid::Uuid::new_v4();
     for router in [&both, &hosted_only, &herdr_only] {
-        for (target, native_tool) in [
-            ("artifact:doc", "mcp__artifacts__artifact_read"),
-            ("shell:task", "TaskStop"),
-        ] {
+        for (target, native_tool) in [("artifact:doc", "ArtifactRead"), ("shell:task", "TaskStop")]
+        {
             for (name, input) in [
                 ("ReadTick", json!({"tick_instance_id":target})),
                 (
@@ -410,11 +408,8 @@ async fn native_tick_tools_redirect_artifact_and_shell_ids_before_identity_or_ho
         tick_connect::herdr::HerdrContext::without_view(directory.path().join("unused.sock")),
     )));
     for (instance, native_tool) in [
-        ("artifact:doc", "mcp__artifacts__artifact_read"),
-        (
-            "artifact:https://docs.example/doc",
-            "mcp__artifacts__artifact_read",
-        ),
+        ("artifact:doc", "ArtifactRead"),
+        ("artifact:https://docs.example/doc", "ArtifactRead"),
         ("shell:task", "TaskStop"),
     ] {
         for name in ["ReadTick", "CallTickTool"] {

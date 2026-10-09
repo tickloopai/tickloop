@@ -1,7 +1,4 @@
-use super::{
-    console::{Console, InputEvent},
-    execution::ConsoleExecution,
-};
+use super::{console::Console, execution::ConsoleExecution};
 use crate::{
     artifacts::{ArtifactClient, ArtifactError},
     runtime::TickSubscriptionChange,
@@ -62,10 +59,10 @@ pub(super) async fn tick_action(
     chat: Uuid,
     id: String,
     action: char,
-) -> Result<Option<InputEvent>, String> {
+) -> Result<(), String> {
     if action == 'r' {
         refresh(agent, console, root, chat).await?;
-        return Ok(None);
+        return Ok(());
     }
     let mut subscribed_tick = None;
     if let Ok(subscription_id) = Uuid::parse_str(&id) {
@@ -80,7 +77,7 @@ pub(super) async fn tick_action(
         let Some((origin, artifact_id)) = artifact.filter(|_| matches!(action, 'o' | 'c' | 'f'))
         else {
             console.show_subscriptions_at(chat, rows, subscription_id, action == 'x')?;
-            return Ok(None);
+            return Ok(());
         };
         let root = root.ok_or("Artifact Service configuration is unavailable")?;
         let client =
@@ -108,7 +105,7 @@ pub(super) async fn tick_action(
             .find(|row| row.instance.as_str() == id)
             .and_then(|row| crate::tick_adapter::artifact_target(&row.instance));
         let Some((origin, artifact_id)) = target else {
-            return Ok(None);
+            return Ok(());
         };
         if matches!(action, 'x' | 'X') {
             if action == 'x' {
@@ -116,7 +113,7 @@ pub(super) async fn tick_action(
             } else {
                 remove_local_artifact(agent, console, chat, &id).await?;
             }
-            return Ok(None);
+            return Ok(());
         }
         let client = ArtifactClient::for_origin(
             root.ok_or("Artifact Service configuration is unavailable")?,
@@ -147,75 +144,20 @@ pub(super) async fn tick_action(
                 .collect();
             if action == 'x' && !subscriptions.is_empty() {
                 console.confirm_tick_removal(chat, id)?;
-                return Ok(None);
+                return Ok(());
             }
             remove_local_artifact(agent, console, chat, &id).await?;
         }
         'f' => {
-            if tick.access_role != "owner" {
-                console.set_status("Only the owner can receive artifact feedback")?;
-                return Ok(None);
-            }
-            let snapshot = agent
-                .snapshot(chat)
+            agent
+                .link_artifact(chat, tick)
                 .await
                 .map_err(|error| error.to_string())?;
-            let paused: Vec<_> = snapshot
-                .loops
-                .iter()
-                .filter(|goal| {
-                    goal.event_sources.iter().any(|source| {
-                        source.source_key == tick.artifact_id && source.resume_required
-                    })
-                })
-                .map(|goal| goal.id)
-                .collect();
-            if !paused.is_empty() {
-                for loop_id in paused {
-                    agent
-                        .resume_event_sources(chat, loop_id)
-                        .await
-                        .map_err(|error| error.to_string())?;
-                }
-                console.set_status("Artifact feedback resumed here")?;
-            } else if snapshot.loops.iter().any(|goal| {
-                goal.event_sources
-                    .iter()
-                    .any(|source| source.source_key == tick.artifact_id)
-            }) {
-                console.set_status("Artifact feedback is already connected here")?;
-            } else {
-                let root = root.ok_or("Artifact Service configuration is unavailable")?;
-                let client = ArtifactClient::for_origin(root, &tick.origin)
-                    .map_err(|error| error.to_string())?;
-                let metadata = client.read(&tick.artifact_id).await.map_err(|error| {
-                    format!("Cannot check artifact feedback association: {error}")
-                })?;
-                if metadata.access_role != "owner" {
-                    return Err("Only the owner can receive artifact feedback".into());
-                }
-                let takeover = metadata.association.is_some();
-                let text = format!(
-                    "Connect artifact {} ({}) to this Chat to receive its feedback here.{}",
-                    tick.artifact_id,
-                    tick.url,
-                    if takeover {
-                        " I explicitly request taking over its existing feedback association."
-                    } else {
-                        ""
-                    }
-                );
-                return Ok(Some(InputEvent::Prompt {
-                    family_target: None,
-                    text,
-                    file_references: Vec::new(),
-                    images: Vec::new(),
-                }));
-            }
+            console.set_status("Artifact feedback linked here")?;
         }
         _ => {}
     }
-    Ok(None)
+    Ok(())
 }
 
 async fn remove_local_artifact(
@@ -363,6 +305,10 @@ async fn apply_choice_with_client(
             let tick = artifact.tick(client.origin(), crate::private_fs::unix_time_milliseconds());
             let id = tick.instance_id();
             agent
+                .link_artifact(chat, tick.clone())
+                .await
+                .map_err(|error| error.to_string())?;
+            agent
                 .add_artifact_tick(chat, tick)
                 .await
                 .map_err(|error| error.to_string())?;
@@ -435,11 +381,8 @@ async fn apply_choice_with_client(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_access::*;
     use crate::terminal::test_support;
-    use crate::{
-        agent_access::*,
-        runtime::{EventSourceBinding, LoopSnapshot, LoopState, Receipt, SourcePublication},
-    };
     use std::sync::{Arc, Mutex};
 
     struct SubscriptionRemote {
@@ -518,8 +461,12 @@ mod tests {
                     let input: serde_json::Value =
                         serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
                     serde_json::json!({"operation_id":input["operation_id"],"status":"committed"})
+                } else if request.starts_with("PUT /api/v1/agent/links/doc ") {
+                    let input: serde_json::Value =
+                        serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+                    serde_json::json!({"artifact_id":"doc","binding_id":input["binding_id"],"epoch":2})
                 } else {
-                    serde_json::json!({"id":"doc","title":"Subscribed document","format":"markdown","access_role":"owner","url":format!("{endpoint}/a/doc"),"association":{"chat_id":Uuid::new_v4()}})
+                    serde_json::json!({"id":"doc","title":"Subscribed document","format":"markdown","access_role":"owner","url":format!("{endpoint}/a/doc"),"agent_link":{"binding_id":Uuid::new_v4(),"chat_id":Uuid::new_v4(),"loop_id":Uuid::new_v4(),"epoch":1}})
                 };
                 let body = body.to_string();
                 socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
@@ -541,6 +488,11 @@ mod tests {
             test_support::config(),
             Arc::new(test_support::ScriptedModel::new(Vec::new())),
         );
+        core.install_host_tools(Arc::new(crate::mcp_tools::McpHostToolProvider::new(
+            ArtifactClient::for_origin(directory.canonicalize().unwrap(), origin).unwrap(),
+            None,
+        )))
+        .unwrap();
         let inner = EmbeddedAgentAccess::new(core.clone());
         let remote = Arc::new(SubscriptionRemote {
             inner,
@@ -563,10 +515,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn subscribed_artifact_open_copy_and_feedback_use_its_actual_type_without_adding_it() {
+    async fn subscribed_artifact_open_copy_and_feedback_link_it_without_adding_it() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
-        let (origin, server, _) = artifact_service().await;
+        let (origin, server, requests) = artifact_service().await;
         let client = ArtifactClient::for_origin(&root, &origin).unwrap();
         let device = client.start_device_login().await.unwrap();
         client
@@ -591,14 +543,20 @@ mod tests {
             console.test_clipboard_contents(),
             vec![format!("{origin}/a/doc")]
         );
-        let Some(InputEvent::Prompt { text, .. }) =
-            tick_action(&agent, &console, Some(&root), chat, id, 'f')
-                .await
+        tick_action(&agent, &console, Some(&root), chat, id, 'f')
+            .await
+            .unwrap();
+        assert!(
+            requests
+                .lock()
                 .unwrap()
-        else {
-            panic!("artifact feedback action did not produce a connection prompt");
-        };
-        assert!(text.contains("taking over its existing feedback association"));
+                .iter()
+                .any(|request| request.starts_with("PUT /api/v1/agent/links/doc "))
+        );
+        assert_eq!(console.test_status_text(), "Artifact feedback linked here");
+        let snapshot = agent.snapshot(chat).await.unwrap();
+        let binding = &snapshot.loops[0].event_sources[0];
+        assert_eq!((binding.artifact_id.as_str(), binding.epoch), ("doc", 2));
         assert!(agent.artifact_ticks(chat).await.unwrap().is_empty());
         server.abort();
         core.shutdown().await;
@@ -684,7 +642,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn feedback_action_requires_a_successful_association_read() {
+    async fn feedback_action_without_the_artifact_service_links_nothing() {
         let directory = tempfile::tempdir().unwrap();
         let core = crate::runtime::Agent::new_embedded(
             test_support::config(),
@@ -713,70 +671,25 @@ mod tests {
         )
         .await;
         assert!(
-            result.is_err(),
-            "failed association read must not produce a feedback prompt"
+            result.is_err_and(|error| error.contains("Artifact Service is unavailable")),
+            "linking needs the Artifact Service"
         );
+        assert!(agent.snapshot(chat).await.unwrap().loops.is_empty());
         core.shutdown().await;
     }
 
     struct FeedbackRemote {
         inner: EmbeddedAgentAccess,
-        loop_id: Uuid,
-        resumed: Mutex<Vec<Uuid>>,
+        linked: Mutex<Vec<crate::artifacts::ArtifactTick>>,
     }
     #[async_trait::async_trait]
     impl AgentAccess for FeedbackRemote {
         async fn observe(&self, request: ObservationRequest) -> Result<Observation, AccessError> {
-            let mut observation = self.inner.observe(request).await?;
-            if let ObservationValue::Agent(snapshot) = &mut observation.initial {
-                let chat = snapshot.conversation.id;
-                snapshot.conversation.loops.push(LoopSnapshot {
-                    id: self.loop_id,
-                    goal: "artifact feedback".into(),
-                    state: LoopState::Interrupted,
-                    run_id: None,
-                    run_started_at: None,
-                    trigger: None,
-                    state_since: None,
-                    event_sources: vec![EventSourceBinding {
-                        server_id: "artifacts".into(),
-                        owner_account_id: "owner".into(),
-                        source_key: "doc".into(),
-                        publication: Some(SourcePublication {
-                            version_id: "version".into(),
-                            operation_id: "publication".into(),
-                            receipt: Receipt {
-                                chat_id: chat,
-                                loop_id: self.loop_id,
-                                run_id: Uuid::new_v4(),
-                            },
-                        }),
-                        publication_history: Vec::new(),
-                        connection: None,
-                        association_operation_id: "association".into(),
-                        binding_id: Uuid::new_v4(),
-                        client_instance_id: Uuid::new_v4(),
-                        credential_generation: [0; 32],
-                        directory_fingerprint: [0; 32],
-                        bridge_fingerprint: [0; 32],
-                        association_epoch: Some(1),
-                        resume_required: true,
-                        association_unknown: false,
-                        association_rejected: None,
-                        pending_cursor: None,
-                        claim_operations: Vec::new(),
-                    }],
-                });
-            }
-            Ok(observation)
+            self.inner.observe(request).await
         }
         async fn execute(&self, envelope: CommandEnvelope) -> Result<CommandReceipt, AccessError> {
-            if let AgentCommand::ManageLoop {
-                action: LoopAction::ResumeEventSources { loop_id },
-                ..
-            } = &envelope.command
-            {
-                self.resumed.lock().unwrap().push(*loop_id);
+            if let AgentCommand::LinkArtifact { tick, .. } = &envelope.command {
+                self.linked.lock().unwrap().push(tick.clone());
                 let mut receipt = self
                     .inner
                     .execute(CommandEnvelope {
@@ -784,7 +697,7 @@ mod tests {
                         ..envelope
                     })
                     .await?;
-                receipt.result = Some(CommandResult::EventSourcesResumed { count: 1 });
+                receipt.result = Some(CommandResult::Done);
                 return Ok(receipt);
             }
             self.inner.execute(envelope).await
@@ -795,15 +708,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn feedback_key_resumes_the_exact_paused_loop_without_submitting_a_new_prompt() {
+    async fn feedback_key_links_the_artifact_through_the_agent_without_a_prompt() {
         let directory = tempfile::tempdir().unwrap();
         let model = Arc::new(test_support::ScriptedModel::new(Vec::new()));
         let runtime = crate::runtime::Agent::new_embedded(test_support::config(), model.clone());
         let inner = EmbeddedAgentAccess::new(runtime.clone());
         let remote = Arc::new(FeedbackRemote {
             inner,
-            loop_id: Uuid::new_v4(),
-            resumed: Mutex::new(Vec::new()),
+            linked: Mutex::new(Vec::new()),
         });
         let agent = ConsoleExecution::from_access_for_test(
             remote.clone(),
@@ -827,11 +739,11 @@ mod tests {
         };
         agent.add_artifact_tick(chat, tick.clone()).await.unwrap();
         let console = Console::test_for_chat(chat);
-        let outcome = tick_action(&agent, &console, None, chat, tick.instance_id(), 'f')
+        tick_action(&agent, &console, None, chat, tick.instance_id(), 'f')
             .await
             .unwrap();
-        assert!(outcome.is_none());
-        assert_eq!(*remote.resumed.lock().unwrap(), vec![remote.loop_id]);
+        assert_eq!(*remote.linked.lock().unwrap(), vec![tick]);
+        assert_eq!(console.test_status_text(), "Artifact feedback linked here");
         assert!(model.requests.lock().unwrap().is_empty());
         runtime.shutdown().await;
     }
