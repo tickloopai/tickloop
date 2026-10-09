@@ -58,6 +58,16 @@ pub struct Workspace {
     pub additional_directories: Vec<PathBuf>,
 }
 
+impl Workspace {
+    /// Whether the canonical `path` lies in the canonical form of a workspace directory.
+    fn contains(&self, path: &Path) -> bool {
+        std::iter::once(&self.workdir)
+            .chain(&self.additional_directories)
+            .filter_map(|directory| directory.canonicalize().ok())
+            .any(|directory| path.starts_with(directory))
+    }
+}
+
 /// A write Claude Code never admits through a fast path, following its
 /// `safetyCheck` permission result.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -168,12 +178,19 @@ pub struct ExecutionContext {
 }
 
 impl PreparedTool {
+    /// Repeats the family-temp admission right before the command runs, on a freshly resolved
+    /// cwd that must still be the prepared one.
     fn revalidate_automatic_shell_paths(&self) -> Result<(), ToolError> {
-        if let (Operation::Shell(input), Some(workspace)) =
+        let (Operation::Shell(input), Some(workspace)) =
             (&self.operation, &self.automatic_shell_workspace)
-            && !input.is_allowed_with_family_temp(&self.resolved_path, workspace)
-        {
-            return Err(ToolError::PathChanged(self.resolved_path.clone()));
+        else {
+            return Ok(());
+        };
+        let cwd = self
+            .operation
+            .resolve_target(&self.original_path, self.is_read_only)?;
+        if cwd != self.resolved_path || !input.is_allowed_with_family_temp(&cwd, workspace) {
+            return Err(ToolError::PathChanged(self.original_path.clone()));
         }
         Ok(())
     }
@@ -828,11 +845,13 @@ fn prepare_with_readable_directories(
         Operation::Shell(input) => {
             input.readable_directories = readable_directories.to_vec();
             input.editable_directory = family_temp.map(Path::to_path_buf);
-            let cwd = resolve_path(&original_path, true).unwrap_or_else(|_| original_path.clone());
-            if input.is_allowed_with_family_temp(&cwd, workspace) {
+            let cwd = resolve_path(&original_path, true).ok();
+            if let Some(cwd) = &cwd
+                && input.is_allowed_with_family_temp(cwd, workspace)
+            {
                 automatic_shell_workspace = Some(workspace.clone());
             }
-            input.is_read_only(&cwd, workspace)
+            input.is_read_only(cwd.as_deref().unwrap_or(&original_path), workspace)
         }
         Operation::TaskStop(_) => false,
         _ => true,
@@ -857,15 +876,9 @@ fn prepare_with_readable_directories(
         )?)),
         other => other,
     };
-    let allowed = |path: &Path| {
-        std::iter::once(&workspace.workdir)
-            .chain(&workspace.additional_directories)
-            .filter_map(|directory| directory.canonicalize().ok())
-            .any(|directory| path.starts_with(directory))
-    };
     let in_workspace = !matches!(operation, Operation::WebFetch(_) | Operation::WebSearch(_))
-        && allowed(&original_scope)
-        && allowed(&resolved_path);
+        && workspace.contains(&original_scope)
+        && workspace.contains(&resolved_path);
     let is_file_operation = matches!(
         operation,
         Operation::Read(_) | Operation::Write(_) | Operation::Search(_)

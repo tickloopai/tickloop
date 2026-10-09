@@ -529,6 +529,183 @@ async fn family_temp_auto_allow_does_not_widen_plan_permission() {
     }
 }
 
+/// Canonical workspace, family temp and unrelated directories for Bash `cwd` scope checks.
+struct ShellCwdFixture {
+    _directories: [tempfile::TempDir; 3],
+    project: PathBuf,
+    family_temp: PathBuf,
+    outside: PathBuf,
+    tools: Tools,
+}
+
+impl ShellCwdFixture {
+    fn new() -> Self {
+        let directories = [(); 3].map(|_| tempfile::tempdir().unwrap());
+        let [project, family_temp, outside] =
+            [0, 1, 2].map(|index| directories[index].path().canonicalize().unwrap());
+        Self {
+            tools: Tools::new(family_temp.clone()),
+            _directories: directories,
+            project,
+            family_temp,
+            outside,
+        }
+    }
+
+    fn touch_family_temp_probe(&self) -> String {
+        format!("touch {}", self.family_temp.join("probe").display())
+    }
+
+    async fn prepare_bash(
+        &self,
+        workspace: &Workspace,
+        command: &str,
+        cwd: &Path,
+    ) -> crate::tools::PreparedTool {
+        self.tools
+            .prepare(workspace, "Bash", &json!({"command":command,"cwd":cwd}))
+            .await
+            .unwrap()
+    }
+}
+
+#[tokio::test]
+async fn family_temp_auto_allow_needs_a_cwd_inside_the_workspace_or_family_temp() {
+    use crate::permissions::{Decision, ExecutionMode, PermissionPolicy};
+    let fixture = ShellCwdFixture::new();
+    std::fs::create_dir(fixture.project.join("src")).unwrap();
+    std::fs::create_dir(fixture.family_temp.join("work")).unwrap();
+    let workspace = workspace(&fixture.project);
+    let policy = PermissionPolicy {
+        mode: ExecutionMode::AcceptEdits,
+        ..PermissionPolicy::default()
+    };
+    let probe = fixture.touch_family_temp_probe();
+    let outside_through_parent = Path::new("..").join(fixture.outside.file_name().unwrap());
+    for cwd in [fixture.outside.as_path(), outside_through_parent.as_path()] {
+        for command in ["git status", "pwd", "git log", probe.as_str()] {
+            let prepared = fixture.prepare_bash(&workspace, command, cwd).await;
+            assert!(
+                prepared.requires_permission,
+                "{command} in {}",
+                cwd.display()
+            );
+            assert_eq!(
+                policy.decide(&prepared, &workspace, uuid::Uuid::new_v4()),
+                Decision::Ask,
+                "{command} in {}",
+                cwd.display()
+            );
+        }
+    }
+    for cwd in [
+        fixture.project.clone(),
+        fixture.project.join("src"),
+        fixture.family_temp.clone(),
+        fixture.family_temp.join("work"),
+    ] {
+        for command in ["git status", "pwd", probe.as_str()] {
+            let prepared = fixture.prepare_bash(&workspace, command, &cwd).await;
+            assert!(
+                !prepared.requires_permission,
+                "{command} in {}",
+                cwd.display()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn family_temp_auto_allow_resolves_cwd_links_before_checking_their_scope() {
+    let fixture = ShellCwdFixture::new();
+    let workspace = workspace(&fixture.project);
+    std::os::unix::fs::symlink(&fixture.outside, fixture.project.join("escape")).unwrap();
+    std::os::unix::fs::symlink(&fixture.outside, fixture.family_temp.join("escape")).unwrap();
+    std::os::unix::fs::symlink(&fixture.project, fixture.family_temp.join("project")).unwrap();
+    for cwd in [
+        fixture.project.join("escape"),
+        PathBuf::from("escape"),
+        fixture.family_temp.join("escape"),
+    ] {
+        for command in ["git status", "pwd"] {
+            let prepared = fixture.prepare_bash(&workspace, command, &cwd).await;
+            assert!(
+                prepared.requires_permission,
+                "{command} in {}",
+                cwd.display()
+            );
+        }
+    }
+    let prepared = fixture
+        .prepare_bash(
+            &workspace,
+            &fixture.touch_family_temp_probe(),
+            &fixture.family_temp.join("project"),
+        )
+        .await;
+    assert!(!prepared.requires_permission);
+}
+
+#[tokio::test]
+async fn prepared_family_temp_bash_rejects_a_cwd_replaced_by_an_outside_link() {
+    let fixture = ShellCwdFixture::new();
+    let workspace = workspace(&fixture.project);
+    let probe = fixture.touch_family_temp_probe();
+    for cwd in [
+        fixture.project.join("work"),
+        fixture.family_temp.join("work"),
+    ] {
+        std::fs::create_dir(&cwd).unwrap();
+        let prepared = fixture.prepare_bash(&workspace, &probe, &cwd).await;
+        assert!(!prepared.requires_permission, "{}", cwd.display());
+        std::fs::remove_dir(&cwd).unwrap();
+        std::os::unix::fs::symlink(&fixture.outside, &cwd).unwrap();
+        assert!(matches!(
+            prepared.revalidate_automatic_shell_paths(),
+            Err(ToolError::PathChanged(_))
+        ));
+        let result = fixture
+            .tools
+            .execute(prepared, CancellationToken::new())
+            .await;
+        assert!(
+            matches!(result, Err(ToolError::PathChanged(_))),
+            "{}: {result:?}",
+            cwd.display()
+        );
+        assert!(!fixture.family_temp.join("probe").exists());
+        std::fs::remove_file(&cwd).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn prepared_family_temp_bash_rechecks_the_cwd_scope_before_running() {
+    let fixture = ShellCwdFixture::new();
+    let links = tempfile::tempdir().unwrap();
+    let workdir = links.path().join("workspace");
+    std::os::unix::fs::symlink(&fixture.project, &workdir).unwrap();
+    let workspace = workspace(&workdir);
+    let prepared = fixture
+        .prepare_bash(
+            &workspace,
+            &fixture.touch_family_temp_probe(),
+            &fixture.project,
+        )
+        .await;
+    assert!(!prepared.requires_permission);
+    std::fs::remove_file(&workdir).unwrap();
+    std::os::unix::fs::symlink(&fixture.outside, &workdir).unwrap();
+    let result = fixture
+        .tools
+        .execute(prepared, CancellationToken::new())
+        .await;
+    assert!(
+        matches!(result, Err(ToolError::PathChanged(_))),
+        "{result:?}"
+    );
+    assert!(!fixture.family_temp.join("probe").exists());
+}
+
 #[tokio::test]
 async fn prepared_internal_bash_rejects_a_later_symlink_escape() {
     let project = tempfile::tempdir().unwrap();

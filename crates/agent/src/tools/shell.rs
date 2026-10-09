@@ -82,17 +82,23 @@ impl ShellInput {
         permission::is_allowed_without_rules(&self.command, &context, false)
     }
 
+    /// Admission through the family temp, which needs the canonical `cwd` inside the family temp
+    /// or the workspace: elsewhere even a path-free read such as `git status` reads outside them.
     pub(super) fn is_allowed_with_family_temp(
         &self,
         cwd: &Path,
         workspace: &super::Workspace,
     ) -> bool {
-        self.editable_directory.is_some()
-            && permission::is_allowed_without_rules(
-                &self.command,
-                &self.permission_context(cwd, workspace),
-                false,
-            )
+        self.editable_directory
+            .as_deref()
+            .is_some_and(|family_temp| {
+                (cwd.starts_with(family_temp) || workspace.contains(cwd))
+                    && permission::is_allowed_without_rules(
+                        &self.command,
+                        &self.permission_context(cwd, workspace),
+                        false,
+                    )
+            })
     }
 
     /// Claude Code's rule-free Accept Edits admission for the same command.
