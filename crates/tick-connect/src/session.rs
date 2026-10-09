@@ -25,6 +25,8 @@ use crate::{
     protocol::{self, TickDescriptor, TickProtocol, TickRead, TickUpdate},
 };
 
+/// Where Tick Sessions put their sockets when the launch names no directory.
+pub const RUNTIME_DIR_ENV: &str = "TICKLOOP_TICK_RUNTIME_DIR";
 const MAX_CONNECTIONS: usize = 8;
 const MAX_IN_FLIGHT: usize = 8;
 const HOST_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -53,9 +55,42 @@ pub enum SessionError {
 pub struct SessionLaunch {
     pub command: Vec<String>,
     pub cwd: PathBuf,
-    pub host_socket: PathBuf,
-    pub terminal_id: String,
+    pub backend: SessionBackend,
     pub runtime_dir: Option<PathBuf>,
+}
+
+/// The terminal backend a Session's launcher proved it runs on. Every hello and request must
+/// name the same backend, so a Session is never mistaken for one on another host or terminal.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SessionBackend {
+    Herdr {
+        socket: PathBuf,
+        terminal_id: String,
+    },
+    Hosted(crate::hosted::HostedTerminal),
+}
+
+impl SessionBackend {
+    fn instance(&self, run: uuid::Uuid) -> InstanceRef {
+        match self {
+            Self::Herdr { .. } => {
+                InstanceRef::native(run.to_string()).expect("a UUID is a valid run identity")
+            }
+            Self::Hosted(_) => InstanceRef::hosted(run),
+        }
+    }
+
+    /// The run identity of `instance` when it belongs to this kind of backend.
+    fn run_of(&self, instance: &InstanceRef) -> Option<uuid::Uuid> {
+        match self {
+            Self::Herdr { .. } => instance
+                .as_str()
+                .strip_prefix("herdr:")
+                .and_then(|run| run.parse().ok()),
+            Self::Hosted(_) => instance.hosted_run(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -86,8 +121,7 @@ struct PendingCall {
 
 struct Core {
     instance: InstanceRef,
-    host_socket: PathBuf,
-    terminal_id: String,
+    backend: SessionBackend,
     stdin: Mutex<tokio::process::ChildStdin>,
     pending: Mutex<HashMap<u64, PendingCall>>,
     next_id: AtomicU64,
@@ -100,6 +134,7 @@ struct Core {
 
 pub struct TickSession {
     instance: InstanceRef,
+    process_id: Option<u32>,
     socket: PathBuf,
     _socket_lease: SocketLease,
     core: Arc<Core>,
@@ -123,8 +158,7 @@ impl Drop for SocketLease {
 pub struct SessionClient {
     instance: InstanceRef,
     socket: PathBuf,
-    host_socket: PathBuf,
-    terminal_id: String,
+    backend: SessionBackend,
 }
 
 impl TickSession {
@@ -133,13 +167,13 @@ impl TickSession {
             .command
             .first()
             .ok_or_else(|| SessionError::Protocol("Tick command is empty".into()))?;
-        let identity = format!("herdr:{}", uuid::Uuid::new_v4());
-        let instance =
-            InstanceRef::native(&identity).map_err(|error| SessionError::Protocol(error.into()))?;
+        let run = uuid::Uuid::new_v4();
+        let instance = launch.backend.instance(run);
+        let identity = instance.to_string();
         let runtime_dir = resolve_runtime_dir(launch.runtime_dir.as_deref())?;
         std::fs::create_dir_all(&runtime_dir)?;
         private_directory(&runtime_dir)?;
-        let socket = runtime_dir.join(format!("{}.sock", &identity[6..]));
+        let socket = runtime_dir.join(format!("{run}.sock"));
         if socket.as_os_str().len() >= 104 {
             return Err(SessionError::Protocol(
                 "Tick session socket path is too long".into(),
@@ -157,11 +191,14 @@ impl TickSession {
             .args(&launch.command[1..])
             .current_dir(&launch.cwd)
             .env(protocol::INSTANCE_ID_ENV, &identity)
+            // The launch token belongs to the launcher alone; the business Tick never sees it.
+            .env_remove(crate::hosted::LAUNCH_ENV)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())
             .kill_on_drop(true);
         let mut child = child.spawn()?;
+        let process_id = child.id();
         let stdin = child
             .stdin
             .take()
@@ -186,8 +223,7 @@ impl TickSession {
         let (observations, _) = watch::channel(observation.clone());
         let core = Arc::new(Core {
             instance: instance.clone(),
-            host_socket: launch.host_socket,
-            terminal_id: launch.terminal_id,
+            backend: launch.backend,
             stdin: Mutex::new(stdin),
             pending: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
@@ -206,6 +242,7 @@ impl TickSession {
         let listener = tokio::spawn(async move { serve(listener, server).await });
         let session = Self {
             instance,
+            process_id,
             socket,
             _socket_lease: socket_lease,
             core,
@@ -236,9 +273,12 @@ impl TickSession {
         SessionClient {
             instance: self.instance.clone(),
             socket: self.socket.clone(),
-            host_socket: self.core.host_socket.clone(),
-            terminal_id: self.core.terminal_id.clone(),
+            backend: self.core.backend.clone(),
         }
+    }
+    /// The business process the Session spawned, while the operating system reported one.
+    pub fn process_id(&self) -> Option<u32> {
+        self.process_id
     }
     pub fn endpoint(&self) -> &Path {
         &self.socket
@@ -577,8 +617,7 @@ async fn serve_connection(mut stream: UnixStream, core: Arc<Core>) -> Result<(),
         let id = frame.get("id").cloned().unwrap_or(Value::Null);
         let binding = frame.get("binding").cloned().unwrap_or(Value::Null);
         if binding["instance_id"] != core.instance.to_string()
-            || binding["host_socket"] != core.host_socket.to_string_lossy().as_ref()
-            || binding["terminal_id"] != core.terminal_id
+            || binding["backend"] != json!(core.backend)
         {
             write_frame(&mut writer, json!({"jsonrpc":"2.0","id":id,"error":{"code":-32014,"message":"Tick Session host, terminal, or identity mismatch"}})).await?;
             continue;
@@ -619,7 +658,7 @@ async fn serve_connection(mut stream: UnixStream, core: Arc<Core>) -> Result<(),
         } else {
             match method {
                 "session/hello" => Ok(
-                    json!({"instance_id":core.instance.to_string(),"protocol":protocol::NATIVE_PROTOCOL_VERSION,"host_socket":core.host_socket,"terminal_id":core.terminal_id}),
+                    json!({"instance_id":core.instance.to_string(),"protocol":protocol::NATIVE_PROTOCOL_VERSION,"backend":core.backend}),
                 ),
                 "tick/describe" => core.request(method, params, HOST_REQUEST_TIMEOUT).await,
                 "tick/read" => core.read().await.and_then(|read| {
@@ -669,30 +708,25 @@ async fn write_frame(
 impl SessionClient {
     pub async fn connect(
         instance: InstanceRef,
-        host_socket: PathBuf,
-        terminal_id: String,
+        backend: SessionBackend,
         runtime_dir: Option<PathBuf>,
     ) -> Result<Self, SessionError> {
-        let uuid = instance
-            .as_str()
-            .strip_prefix("herdr:")
-            .ok_or_else(|| SessionError::Protocol("invalid Native Tick identity".into()))?;
-        uuid::Uuid::parse_str(uuid).map_err(|error| SessionError::Protocol(error.to_string()))?;
+        let run = backend.run_of(&instance).ok_or_else(|| {
+            SessionError::Protocol("the Tick identity does not belong to this backend".into())
+        })?;
         let directory = resolve_runtime_dir(runtime_dir.as_deref())?;
         verify_owner(&directory)?;
-        let socket = directory.join(format!("{uuid}.sock"));
+        let socket = directory.join(format!("{run}.sock"));
         verify_owner(&socket)?;
         let client = Self {
             instance,
             socket,
-            host_socket,
-            terminal_id,
+            backend,
         };
         let hello = client.request("session/hello", json!({}), None).await?;
         if hello["instance_id"] != client.instance.to_string()
             || hello["protocol"] != protocol::NATIVE_PROTOCOL_VERSION
-            || hello["host_socket"] != client.host_socket.to_string_lossy().as_ref()
-            || hello["terminal_id"] != client.terminal_id
+            || hello["backend"] != json!(client.backend)
         {
             return Err(SessionError::Protocol(
                 "Tick Session host, terminal, or identity mismatch".into(),
@@ -860,9 +894,12 @@ fn client_request_bytes(
     method: &str,
     params: Value,
 ) -> Result<Vec<u8>, SessionError> {
-    let mut bytes = serde_json::to_vec(&json!({"jsonrpc":"2.0","id":1,"method":method,"params":params,
-        "binding":{"instance_id":client.instance.to_string(),"host_socket":client.host_socket,"terminal_id":client.terminal_id}
-    })).map_err(|error| SessionError::Protocol(error.to_string()))?;
+    let mut bytes = serde_json::to_vec(
+        &json!({"jsonrpc":"2.0","id":1,"method":method,"params":params,
+            "binding":{"instance_id":client.instance.to_string(),"backend":client.backend}
+        }),
+    )
+    .map_err(|error| SessionError::Protocol(error.to_string()))?;
     bytes.push(b'\n');
     if bytes.len() > protocol::MAX_REQUEST_BYTES {
         return Err(SessionError::Protocol("Session request too large".into()));
@@ -934,7 +971,7 @@ fn response_result(response: Value) -> Result<Value, SessionError> {
 fn resolve_runtime_dir(configured: Option<&Path>) -> Result<PathBuf, SessionError> {
     let directory = configured
         .map(Path::to_path_buf)
-        .or_else(|| std::env::var_os("TICKLOOP_TICK_RUNTIME_DIR").map(PathBuf::from))
+        .or_else(|| std::env::var_os(RUNTIME_DIR_ENV).map(PathBuf::from))
         .unwrap_or_else(|| {
             PathBuf::from(format!("/tmp/tickloop-{}/ticks", unsafe {
                 libc::geteuid()

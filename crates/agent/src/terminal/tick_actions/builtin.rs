@@ -9,8 +9,14 @@ use super::*;
 pub(crate) fn artifact(id: &str, key: char) -> Arc<dyn TickActionExecutor> {
     Arc::new(ArtifactAction { id: id.into(), key })
 }
-pub(crate) fn subscription(id: &str, key: char) -> Arc<dyn TickActionExecutor> {
-    Arc::new(SubscriptionAction { id: id.into(), key })
+pub(crate) fn subscription(id: &str) -> Arc<dyn TickActionExecutor> {
+    Arc::new(SubscriptionAction { id: id.into() })
+}
+pub(crate) fn details(instance: crate::tick_stream::InstanceRef) -> Arc<dyn TickActionExecutor> {
+    Arc::new(DetailsOpen { instance })
+}
+pub(crate) fn remove(instance: crate::tick_stream::InstanceRef) -> Arc<dyn TickActionExecutor> {
+    Arc::new(RemoveFromMonitor { instance })
 }
 pub(crate) fn shell(task: Uuid) -> Arc<dyn TickActionExecutor> {
     Arc::new(ShellOpen { task })
@@ -54,16 +60,14 @@ impl TickActionBackend for ArtifactAction {
 }
 struct SubscriptionAction {
     id: String,
-    key: char,
 }
 impl TickActionExecutor for SubscriptionAction {
     fn prepare(&self, _ui: &mut TickActionUi<'_>) -> Result<PreparedTickAction, String> {
         Ok(PreparedTickAction::new(
             &self.id,
-            self.key,
+            'o',
             Arc::new(SubscriptionAction {
                 id: self.id.clone(),
-                key: self.key,
             }),
         ))
     }
@@ -78,7 +82,60 @@ impl TickActionBackend for SubscriptionAction {
             .await
             .map_err(|error| error.to_string())?;
         ctx.console
-            .show_subscriptions_at(ctx.chat, rows, id, self.key == 'x')?;
+            .show_subscriptions_at(ctx.chat, rows, id, false)?;
+        Ok(TickActionOutcome::Done)
+    }
+}
+struct DetailsOpen {
+    instance: crate::tick_stream::InstanceRef,
+}
+impl TickActionExecutor for DetailsOpen {
+    fn prepare(&self, ui: &mut TickActionUi<'_>) -> Result<PreparedTickAction, String> {
+        let chat = ui.chat().ok_or("No selected Chat")?;
+        let entry = ui
+            .monitor_entry(&self.instance)
+            .ok_or("This Tick is no longer in Monitor")?;
+        ui.open_detail(Box::new(super::super::monitor::MonitorDetail::new(
+            chat, entry,
+        )));
+        Ok(PreparedTickAction::new(
+            self.instance.to_string(),
+            'o',
+            Arc::new(NoBackend),
+        ))
+    }
+}
+struct NoBackend;
+#[async_trait]
+impl TickActionBackend for NoBackend {
+    async fn execute(&self, _: TickActionContext<'_>) -> Result<TickActionOutcome, String> {
+        Ok(TickActionOutcome::Done)
+    }
+}
+struct RemoveFromMonitor {
+    instance: crate::tick_stream::InstanceRef,
+}
+impl TickActionExecutor for RemoveFromMonitor {
+    fn prepare(&self, _ui: &mut TickActionUi<'_>) -> Result<PreparedTickAction, String> {
+        Ok(PreparedTickAction::new(
+            self.instance.to_string(),
+            'x',
+            Arc::new(RemoveFromMonitor {
+                instance: self.instance.clone(),
+            }),
+        ))
+    }
+}
+#[async_trait]
+impl TickActionBackend for RemoveFromMonitor {
+    async fn execute(&self, ctx: TickActionContext<'_>) -> Result<TickActionOutcome, String> {
+        let membership = ctx
+            .agent
+            .remove_monitor_member(ctx.chat, self.instance.clone())
+            .await
+            .map_err(|error| format!("Cannot remove from Monitor: {error}"))?;
+        ctx.console
+            .update_monitor_membership(ctx.chat, membership)?;
         Ok(TickActionOutcome::Done)
     }
 }

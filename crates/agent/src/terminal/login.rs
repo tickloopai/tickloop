@@ -715,6 +715,11 @@ mod tests {
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    /// Each PTY test re-executes this test binary and starts an Agent owner and worker; on a
+    /// machine busy with parallel test runs that has taken more than 20 seconds. Only a failure
+    /// waits this long.
+    const PTY_TIMEOUT: Duration = Duration::from_secs(90);
+
     const TERMINAL_CHILD_STACK_BYTES: usize = 8 * 1024 * 1024;
     const TERMINAL_ESCAPE_KEY: &[u8] = b"\x1b[27u";
     const SYNCHRONIZED_FRAME_END: &str = "\x1b[?2026l";
@@ -859,9 +864,7 @@ mod tests {
         let rejected_login = std::thread::spawn(move || {
             use std::io::Read;
             let (mut stream, _) = rejected_login.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(20)))
-                .unwrap();
+            stream.set_read_timeout(Some(PTY_TIMEOUT)).unwrap();
             let mut headers = Vec::new();
             while !headers.ends_with(b"\r\n\r\n") {
                 let mut byte = [0];
@@ -918,7 +921,7 @@ mod tests {
             screen::capture_output(reader, captured);
         });
         let wait = |needle: &str| {
-            let deadline = Instant::now() + Duration::from_secs(20);
+            let deadline = Instant::now() + PTY_TIMEOUT;
             while !output.lock().unwrap().contains(needle) {
                 assert!(
                     Instant::now() < deadline,
@@ -947,7 +950,7 @@ mod tests {
         writer.write_all(b"\x1b").unwrap();
         writer.flush().unwrap();
         wait("Login cancelled");
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + PTY_TIMEOUT;
         loop {
             let text = output.lock().unwrap();
             if let Some(cancelled) = text.rfind("Login cancelled")
@@ -973,7 +976,7 @@ mod tests {
         );
         writer.write_all(b"\x1b").unwrap();
         writer.flush().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + PTY_TIMEOUT;
         loop {
             let text = output.lock().unwrap();
             if let Some(failed) = text.rfind("Cannot log in:")
@@ -995,7 +998,7 @@ mod tests {
             let mark = output.lock().unwrap().len();
             writer.write_all(TERMINAL_ESCAPE_KEY).unwrap();
             writer.flush().unwrap();
-            let deadline = Instant::now() + Duration::from_secs(20);
+            let deadline = Instant::now() + PTY_TIMEOUT;
             while !output.lock().unwrap()[mark..].contains(title) {
                 assert!(Instant::now() < deadline, "PTY missing fresh {title}");
                 std::thread::sleep(Duration::from_millis(20));
@@ -1003,7 +1006,7 @@ mod tests {
         }
         writer.write_all(TERMINAL_ESCAPE_KEY).unwrap();
         writer.flush().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + PTY_TIMEOUT;
         loop {
             let frame = screen::visible_screen(&output.lock().unwrap(), 150, 40);
             if !frame.contains("Choose Provider")
@@ -1020,7 +1023,7 @@ mod tests {
         }
         writer.write_all(b"/exit\r").unwrap();
         writer.flush().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + PTY_TIMEOUT;
         loop {
             if let Some(status) = child.0.try_wait().unwrap() {
                 assert!(status.success());
@@ -1242,7 +1245,7 @@ mod tests {
         });
         let ansi = regex::Regex::new(r"\x1b\[[0-9;?]*[ -/]*[@-~]").unwrap();
         let wait = |needle: &str| {
-            let deadline = Instant::now() + Duration::from_secs(20);
+            let deadline = Instant::now() + PTY_TIMEOUT;
             loop {
                 let text = output.lock().unwrap().clone();
                 if screen::visible_screen(&text, 150, 40).contains(needle) {
@@ -1264,7 +1267,7 @@ mod tests {
             }
         };
         let wait_after = |needle: &str, offset: usize| {
-            let deadline = Instant::now() + Duration::from_secs(20);
+            let deadline = Instant::now() + PTY_TIMEOUT;
             loop {
                 let text = output.lock().unwrap().clone();
                 let updates = text.get(offset..).unwrap_or("");
@@ -1285,7 +1288,7 @@ mod tests {
             }
         };
         let wait_for_input_after = |offset: usize| {
-            let deadline = Instant::now() + Duration::from_secs(20);
+            let deadline = Instant::now() + PTY_TIMEOUT;
             let frame_end = SYNCHRONIZED_FRAME_END;
             loop {
                 let text = output.lock().unwrap().clone();
@@ -1386,7 +1389,7 @@ mod tests {
             writer.write_all(callback.as_bytes()).unwrap();
             writer.write_all(b"\r").unwrap();
             writer.flush().unwrap();
-            tokio::time::timeout(Duration::from_secs(20), token_request)
+            tokio::time::timeout(PTY_TIMEOUT, token_request)
                 .await
                 .unwrap()
                 .unwrap();
@@ -1556,7 +1559,7 @@ mod tests {
         wait("Subscription terminal connected");
         writer.write_all(b"/exit\r").unwrap();
         writer.flush().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + PTY_TIMEOUT;
         loop {
             if let Some(status) = child.0.try_wait().unwrap() {
                 assert!(status.success());

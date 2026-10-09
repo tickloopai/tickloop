@@ -696,9 +696,9 @@ impl State {
             4
         } else if let Some(surface) = &self.permissions_surface {
             surface.minimum_frame_rows(self.width)
-        } else if self.tick_list.confirmation.is_some()
+        } else if self.monitor.confirmation.is_some()
             || self
-                .tick_list
+                .monitor
                 .detail
                 .as_ref()
                 .is_some_and(|detail| detail.confirmation().is_some())
@@ -738,7 +738,9 @@ impl State {
         }
         lines.resize(capacity.saturating_sub(1), RoleLine::default());
         lines.push(RoleLine::role(
-            if self.menu_comment_is_editing() {
+            if self.user_menu_submission_is_unfinished() {
+                MENU_SUBMISSION_PENDING_HINT
+            } else if self.menu_comment_is_editing() {
                 "Resize · Esc close field"
             } else {
                 "Resize · Esc back"
@@ -776,9 +778,9 @@ impl State {
             2 + surface.content_rows(self.width, maximum)
         } else if self.help_open {
             1 + agent_layout::help_lines(self.width, self.width + 1, None).len()
-        } else if self.tick_list.confirmation.is_some()
+        } else if self.monitor.confirmation.is_some()
             || self
-                .tick_list
+                .monitor
                 .detail
                 .as_ref()
                 .is_some_and(|detail| detail.confirmation().is_some())
@@ -799,9 +801,9 @@ impl State {
             || self.artifacts_picker.is_some()
             || self.conversation_picker.is_some()
             || self.help_open && self.overview.projection.is_none()
-            || self.tick_list.confirmation.is_some()
+            || self.monitor.confirmation.is_some()
             || self
-                .tick_list
+                .monitor
                 .detail
                 .as_ref()
                 .is_some_and(|detail| detail.confirmation().is_some())
@@ -903,7 +905,7 @@ impl State {
             lines.push(RoleLine::role("Esc / ? close help", Role::MutedText));
         } else {
             let detail = self
-                .tick_list
+                .monitor
                 .detail
                 .as_ref()
                 .and_then(|detail| detail.confirmation());
@@ -912,7 +914,7 @@ impl State {
                 .unwrap_or_else(|| {
                     (
                         "Tick action".into(),
-                        self.tick_list
+                        self.monitor
                             .confirmation
                             .as_ref()
                             .map(|c| c.prompt.clone())

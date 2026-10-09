@@ -49,6 +49,8 @@ mod screen {
 const TERMINAL_WIDTH: usize = 100;
 const TERMINAL_HEIGHT: usize = 32;
 const UI_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long the topmost history line must stay unchanged before wheel scrolling counts as done.
+const WHEEL_SETTLE_TIME: Duration = Duration::from_millis(1500);
 const COMPLETED_FRAME_START: &str = "\x1b[?2026h";
 const COMPLETED_FRAME_END: &str = "\x1b[?2026l";
 const CURSOR_VISIBLE: &str = "\x1b[?25h";
@@ -377,6 +379,32 @@ async fn catalog(client: &LocalAgentClient) -> Vec<AgentSummary> {
     rows
 }
 
+async fn wait_for_display_views(
+    client: &LocalAgentClient,
+    execution: ExecutionRef,
+    expected: usize,
+) {
+    let mut latest = None;
+    let ready = tokio::time::timeout(UI_TIMEOUT, async {
+        loop {
+            latest = catalog(client)
+                .await
+                .into_iter()
+                .find(|row| row.execution.agent_id == execution.agent_id)
+                .map(|row| (row.execution, row.views.len()));
+            if latest == Some((execution, expected)) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        ready.is_ok(),
+        "expected {expected} registered Views for {execution:?}; latest: {latest:?}"
+    );
+}
+
 fn family_panel_has_viewing_row(frame: &str) -> bool {
     frame
         .lines()
@@ -515,7 +543,7 @@ async fn run_lifecycle(fixture: &PrivateFixture) {
     reopened
         .wait_for(
             "open live Agent exposes its real background Task",
-            |frame| frame.contains("Ticks 1") && !frame.contains("Agents · local"),
+            |frame| frame.contains("Monitor 1") && !frame.contains("Agents · local"),
         )
         .await;
     let rows = catalog(&client).await;
@@ -525,13 +553,13 @@ async fn run_lifecycle(fixture: &PrivateFixture) {
     reopened.send(b"?");
     reopened
         .wait_for("help replaces the real Task summary", |frame| {
-            frame.contains("Ctrl+J newline") && !frame.contains("Ticks 1")
+            frame.contains("Ctrl+J newline") && !frame.contains("Monitor 1")
         })
         .await;
     reopened.send(b"\x1b");
     reopened
         .wait_for("help restores the real Task summary", |frame| {
-            frame.contains("Ticks 1")
+            frame.contains("Monitor 1")
         })
         .await;
     reopened.send(b"\x1b[C");
@@ -1031,7 +1059,7 @@ async fn run_sustained_owner_loss(
     assert!(busy.user_shells[1].starts_in_background);
     assert!(busy.last_model_run.is_none());
     view.wait_for("actual busy Shell task is cached in the View", |frame| {
-        frame.contains("Ticks 1")
+        frame.contains("Monitor 1")
     })
     .await;
     view.send(b"UNSENT-OWNER-LOSS-DRAFT-jk");
@@ -1165,6 +1193,75 @@ fn request_dialog_visible(frame: &str, question: &str, requester: &str) -> bool 
             .lines()
             .any(|line| line.contains("Goal:") && line.contains(requester))
         && frame.contains("Enter select · Esc answer later")
+}
+
+async fn open_family_request(pty: &mut PtyView, label: &str, task: &str, raw: &str) -> String {
+    let question_visible = |frame: &str| {
+        frame.lines().any(|line| line == "Which bounded cadence?") && frame.contains(label)
+    };
+    for _ in 0..2 {
+        for _ in 0..2 {
+            let frame = pty.frame();
+            if !question_visible(&frame) {
+                break;
+            }
+            pty.send(b"\x1b");
+            pty.wait_for("root question layer closes", |next| next != frame)
+                .await;
+        }
+        pty.send(b"\x1b[1;5F\x1b[B");
+        let entry = pty
+            .wait_for(
+                "family entry receives focus or a request interrupts",
+                |frame| {
+                    frame.contains("Subagents 1") && frame.contains("Esc input")
+                        || question_visible(frame)
+                },
+            )
+            .await;
+        if question_visible(&entry) {
+            continue;
+        }
+        pty.send(b"\x1b[B");
+        let list = pty
+            .wait_for(
+                "family list receives focus or a request interrupts",
+                |frame| frame.lines().any(|line| line.starts_with('›')) || question_visible(frame),
+            )
+            .await;
+        if question_visible(&list) {
+            continue;
+        }
+        if !list
+            .lines()
+            .any(|line| line.starts_with('›') && line.contains("cadence"))
+        {
+            pty.send(b"j");
+            let selected = pty
+                .wait_for("child row is selected or a request interrupts", |frame| {
+                    frame
+                        .lines()
+                        .any(|line| line.starts_with('›') && line.contains("cadence"))
+                        || question_visible(frame)
+                })
+                .await;
+            if question_visible(&selected) {
+                continue;
+            }
+        }
+        pty.send(b"\r");
+        return pty
+            .wait_for(
+                "actual child conversation and request are rendered",
+                |frame| {
+                    request_dialog_visible(frame, "Which bounded cadence?", label)
+                        && frame.contains(raw)
+                        && frame.contains(&format!("Delegated Agent · {task}"))
+                },
+            )
+            .await;
+    }
+    panic!("family navigation remained interrupted: {}", pty.frame());
 }
 
 async fn run_child_views(fixture: &PrivateFixture) {
@@ -1346,15 +1443,16 @@ async fn run_child_views(fixture: &PrivateFixture) {
             frame.contains("Subagents 1") && !frame.contains("Agents · local")
         })
         .await;
-    first.send(b"\x1b[B\x1b[Bj\r");
     let child_label = "Agent cadence".to_owned();
-    let child_frame = first
-        .wait_for("overview enters child requester", |frame| {
-            request_dialog_visible(frame, "Which bounded cadence?", &child_label)
-                && frame.contains(RAW_CHILD_CONTENT)
-                && frame.contains(&format!("Delegated Agent · {CHILD_TASK}"))
-        })
-        .await;
+    let child_frame =
+        open_family_request(&mut first, &child_label, CHILD_TASK, RAW_CHILD_CONTENT).await;
+    wait_for_display_views(&client, child, 1).await;
+    let first_registration = catalog(&client)
+        .await
+        .into_iter()
+        .find(|row| row.execution == child)
+        .unwrap()
+        .views;
     assert!(child_frame.contains(RAW_CHILD_CONTENT), "{child_frame}");
     assert!(
         child_frame.contains(&format!("Delegated Agent · {CHILD_TASK}")),
@@ -1401,27 +1499,24 @@ async fn run_child_views(fixture: &PrivateFixture) {
             frame.contains("Subagents 1") && !frame.contains("Agents · local")
         })
         .await;
-    second.send(b"\x1b[B\x1b[Bj\r");
-    second
-        .wait_for("same real request in second View", |frame| {
-            request_dialog_visible(frame, "Which bounded cadence?", &child_label)
-        })
-        .await;
-    tokio::time::timeout(UI_TIMEOUT, async {
-        loop {
-            let rows = catalog(&client).await;
-            if rows
-                .iter()
-                .find(|row| row.execution == child)
-                .is_some_and(|row| row.views.len() == 2)
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("both rendered child Views must finish owner display registration");
+    open_family_request(&mut second, &child_label, CHILD_TASK, RAW_CHILD_CONTENT).await;
+    if AssertUnwindSafe(wait_for_display_views(&client, child, 2))
+        .catch_unwind()
+        .await
+        .is_err()
+    {
+        let current = catalog(&client)
+            .await
+            .into_iter()
+            .find(|row| row.execution == child)
+            .unwrap()
+            .views;
+        panic!(
+            "child registration changed from {first_registration:?} to {current:?}; first frame:\n{}\nsecond frame:\n{}",
+            first.frame(),
+            second.frame()
+        );
+    }
     let wrong = client
         .execute(CommandEnvelope {
             owner_epoch: client.owner_epoch(),
@@ -1817,12 +1912,35 @@ async fn run_reading_and_draft_return(fixture: &PrivateFixture) {
                 && !frame.contains("A gate active")
         })
         .await;
-    let first_visible_history = reading
-        .lines()
-        .find(|line| line.contains("stable history"))
-        .unwrap()
-        .trim()
-        .to_owned();
+    // The reading anchor is the topmost visible history line. The wheel events can still be
+    // applying when the draft first shows, so the anchor is taken once the topmost line stays
+    // unchanged; later waits compare the topmost line itself.
+    let topmost_history = |frame: &str| {
+        frame
+            .lines()
+            .find(|line| line.contains("stable history"))
+            .map(|line| line.trim().to_owned())
+    };
+    let first_visible_history = {
+        let mut anchor = topmost_history(&reading).unwrap();
+        let mut unchanged_since = std::time::Instant::now();
+        let deadline = std::time::Instant::now() + UI_TIMEOUT;
+        while unchanged_since.elapsed() < WHEEL_SETTLE_TIME {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the reading anchor never settled: {}",
+                view.frame()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if let Some(current) = topmost_history(&view.frame())
+                && current != anchor
+            {
+                anchor = current;
+                unchanged_since = std::time::Instant::now();
+            }
+        }
+        anchor
+    };
     let captured_output = Arc::clone(&view.output);
     view.wait_for(
         "wheel reading keeps editor focus without changing the anchor",
@@ -1886,17 +2004,10 @@ async fn run_reading_and_draft_return(fixture: &PrivateFixture) {
     view.send(b"\r");
     let returned = view
         .wait_for("return restores the original reading anchor", |frame| {
-            !frame.contains("Agents · local") && frame.contains(&first_visible_history)
+            !frame.contains("Agents · local")
+                && topmost_history(frame).as_ref() == Some(&first_visible_history)
         })
         .await;
-    assert_eq!(
-        returned
-            .lines()
-            .find(|line| line.contains("stable history"))
-            .unwrap()
-            .trim(),
-        first_visible_history
-    );
     assert!(!returned.contains("A final output after switching away"));
     view.send(b"\x13");
     view.wait_for(
@@ -1910,17 +2021,12 @@ async fn run_reading_and_draft_return(fixture: &PrivateFixture) {
     let restored = view
         .wait_for(
             "original cursor survives the full root round trip",
-            |frame| frame.contains(&expected),
+            |frame| {
+                frame.contains(&expected)
+                    && topmost_history(frame).as_ref() == Some(&first_visible_history)
+            },
         )
         .await;
-    assert_eq!(
-        restored
-            .lines()
-            .find(|line| line.contains("stable history"))
-            .unwrap()
-            .trim(),
-        first_visible_history
-    );
     assert!(!restored.contains("A final output after switching away"));
     assert!(snapshot(&client, other).await.last_model_run.is_none());
     for _ in 0..2 {
@@ -2998,7 +3104,16 @@ async fn run_filter_hidden_dispatch(fixture: &PrivateFixture) {
     view.send(b"/tasks\r");
     view.wait_for(
         "the created Agent exposes its real completed Shell",
-        |frame| frame.contains("Shell tasks") && frame.contains("pwd"),
+        |frame| {
+            frame.lines().any(|line| line.trim() == "Shell tasks")
+                && frame
+                    .lines()
+                    .last()
+                    .is_some_and(|line| line.contains("Enter open"))
+                && frame.lines().any(|line| {
+                    line.starts_with('❯') && line.contains("pwd") && !line.contains("other Agent")
+                })
+        },
     )
     .await;
     view.send(b"\r");

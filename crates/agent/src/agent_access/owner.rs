@@ -115,6 +115,36 @@ impl OwnerServer {
                 )
             })
     }
+    /// Verifies that `chat` currently runs in `worker` and is not lost, refreshing the directory
+    /// first, and returns its execution. A worker can only act for its own Chats, whatever it
+    /// claims.
+    pub async fn verify_worker_chat(
+        &self,
+        chat: Uuid,
+        worker: &Arc<dyn AgentAccess>,
+    ) -> Result<ExecutionRef, AccessError> {
+        let agents = self.directory().await?;
+        let execution = agents
+            .iter()
+            .find(|entry| {
+                entry.chat_id == chat && entry.availability != ExecutionAvailability::Lost
+            })
+            .map(|entry| entry.execution)
+            .ok_or_else(|| {
+                AccessError::new(
+                    AccessErrorCode::AccessDenied,
+                    "the Chat is not running in this owner",
+                )
+            })?;
+        let routed = self.inner.routes.lock().await.get(&execution).cloned();
+        if !routed.is_some_and(|routed| Arc::ptr_eq(&routed, worker)) {
+            return Err(AccessError::new(
+                AccessErrorCode::AccessDenied,
+                "the Chat belongs to another worker",
+            ));
+        }
+        Ok(execution)
+    }
     fn cursor(&self) -> Cursor {
         Cursor {
             owner_epoch: self.inner.epoch,

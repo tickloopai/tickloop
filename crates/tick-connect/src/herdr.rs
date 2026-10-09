@@ -9,6 +9,8 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+use crate::host_error::HostError;
+
 pub const HOST_TIMEOUT: Duration = Duration::from_secs(10);
 const HOST_RESPONSE_LIMIT: u64 = 8 * 1024 * 1024;
 
@@ -58,24 +60,6 @@ pub struct Pane {
     pub title: Option<String>,
     #[serde(default)]
     pub tokens: BTreeMap<String, String>,
-}
-
-#[derive(Clone, Debug, thiserror::Error)]
-#[error("{code}: {message}")]
-pub struct HostError {
-    pub code: String,
-    pub message: String,
-    pub dispatched: bool,
-}
-
-impl HostError {
-    pub fn before(code: &str, message: impl Into<String>) -> Self {
-        Self {
-            code: code.into(),
-            message: message.into(),
-            dispatched: false,
-        }
-    }
 }
 
 #[async_trait]

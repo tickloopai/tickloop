@@ -615,13 +615,16 @@ fn agent_layout_removed_footer_item_chooses_the_nearest_surviving_task() {
         .state
         .lock()
         .unwrap()
-        .tick_list
-        .select(&selected.to_string());
+        .monitor
+        .select(&crate::tick_stream::InstanceRef::shell(selected));
     snapshot.tasks.retain(|task| task.id != selected);
     console.update_shell_ticks(&snapshot).unwrap();
     let state = console.state.lock().unwrap();
-    assert_eq!(state.tick_list.entries().len(), 19);
-    assert_ne!(state.tick_list.selected().unwrap().id, selected.to_string());
+    assert_eq!(state.monitor.entries().len(), 19);
+    assert_ne!(
+        state.monitor.selected().unwrap().instance,
+        crate::tick_stream::InstanceRef::shell(selected)
+    );
     assert_eq!(state.editor.draft(), "cached draft");
 }
 

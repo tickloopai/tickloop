@@ -9,6 +9,7 @@ pub mod cleanup;
 pub mod file_change;
 mod file_history;
 pub mod host_tools;
+pub mod hosted;
 pub mod housekeeping;
 pub mod image;
 pub mod judgment;

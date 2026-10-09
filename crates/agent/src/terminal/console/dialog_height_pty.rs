@@ -38,7 +38,7 @@ fn dialog_height_pty_fixture() {
         console.set_prompt_enabled(true).unwrap();
         {
             let mut state = console.state.lock().unwrap();
-            state.tick_list.replace(TickGroup::Artifacts, input_dialog_tests::fixture_ticks());
+            state.monitor.replace(TickGroup::Artifacts, input_dialog_tests::fixture_ticks());
             state.record_input("Pinned height prompt");
             for index in 0..40 { state.scrollback.append(&format!("History row {index}\n")); }
         }
@@ -248,8 +248,8 @@ fn dialog_height_pty_grows_shrinks_resizes_and_restores_requests_in_both_rendere
             fixture.wait(|frame| frame.contains("Height picker") && dialog_rows(frame) == 22);
         assert!(grown.contains("Pinned height prompt"));
         assert!(
-            grown.contains("│ Ticks"),
-            "Tick List in the upper two rows: {grown}"
+            grown.contains("│ Monitor"),
+            "Monitor in the upper two rows: {grown}"
         );
         assert!(
             grown

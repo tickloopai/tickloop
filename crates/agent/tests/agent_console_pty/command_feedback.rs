@@ -46,9 +46,11 @@ impl LocalCommand {
             })
             .await;
             view.send(b"\r");
+            // The applied choice finishes after its feedback; Esc counts once the hint is back.
             view.wait_for("model application keeps its picker and feedback", |frame| {
                 frame.contains(title)
                     && body_shows_once_in_order(frame, &[self.input(), self.result_prefix()])
+                    && frame.contains("Enter apply · Esc back")
             })
             .await;
             view.send(b"\x1b");

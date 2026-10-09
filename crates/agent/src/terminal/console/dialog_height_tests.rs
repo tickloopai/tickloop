@@ -14,6 +14,116 @@ fn picker_menu(options: usize) -> Menu {
 }
 
 #[test]
+fn merged_user_menu_commit_hint_survives_content_height_and_resize_only_frames() {
+    for width in [40, 80, 140] {
+        for height in [3, 5, 6, 10, 24, 40] {
+            for (picker_kind, editing) in [
+                (Some(PickerKind::Model), false),
+                (Some(PickerKind::Model), true),
+                (None, false),
+                (None, true),
+            ] {
+                let mut state = State::new(true, width, height);
+                let menu = picker_menu(4);
+                let id = menu.id;
+                state.menu = Some(menu);
+                state.menu_focused = true;
+                state.picker_kind = picker_kind;
+                if picker_kind.is_some() {
+                    state.picker_presentation.headers = vec![(0, "Fixture Provider".into())];
+                }
+                state.picker_presentation.hint = "Enter apply · Esc back".into();
+                if editing {
+                    state.menu_comment = Some(MenuCommentState {
+                        options: vec![0],
+                        values: HashMap::from([(0, "fixture-value".into())]),
+                        label: "Thinking",
+                        editing: true,
+                        cursor: "fixture-value".len(),
+                        secret: false,
+                        standalone_input: true,
+                    });
+                }
+                let settled_height = state.input_dialog_height();
+                state.begin_menu_submission(id);
+                let frame = state.styled_frame().0;
+                assert_eq!(frame.len(), settled_height);
+                assert_eq!(
+                    frame.last().unwrap().text(),
+                    MENU_SUBMISSION_PENDING_HINT,
+                    "{width} columns / {height} rows / kind {picker_kind:?} / editing {editing}: {frame:?}"
+                );
+                for code in [KeyCode::Enter, KeyCode::Esc, KeyCode::Char('j')] {
+                    assert!(state.key(KeyEvent::new(code, KeyModifiers::NONE)).is_none());
+                    assert_eq!(state.menu.as_ref().unwrap().id, id);
+                    assert_eq!(state.menu.as_ref().unwrap().selected, 0);
+                    if editing {
+                        let field = state.menu_comment.as_ref().unwrap();
+                        assert!(field.editing);
+                        assert_eq!(field.values[&0], "fixture-value");
+                    }
+                }
+                state.mark_menu_submission_finished(id);
+                assert_eq!(state.input_dialog_height(), settled_height);
+                let frame = state.styled_frame().0;
+                assert!(
+                    !frame
+                        .last()
+                        .unwrap()
+                        .text()
+                        .contains(MENU_SUBMISSION_PENDING_HINT)
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn merged_generic_menu_completion_repaints_the_next_page_without_an_extra_key() {
+    let mut state = State::new(true, 80, 24);
+    let menu = picker_menu(3);
+    let submitted_id = menu.id;
+    state.menu = Some(menu);
+    state.menu_focused = true;
+    assert!(matches!(
+        state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        Some(InputEvent::Choice { menu_id, .. }) if menu_id == submitted_id
+    ));
+    let console = tests::console_with_state(state);
+    let mut next = picker_menu(3);
+    next.title = "Rewind actions".into();
+    next.selected = 1;
+    let next_id = next.id;
+    console.show_focused_menu(next).unwrap();
+    assert!(
+        console
+            .state
+            .lock()
+            .unwrap()
+            .rendered_screen
+            .last()
+            .unwrap()
+            .contains(MENU_SUBMISSION_PENDING_HINT)
+    );
+    console.finish_menu_submission(submitted_id).unwrap();
+    let mut state = console.state.lock().unwrap();
+    assert!(
+        !state
+            .rendered_screen
+            .last()
+            .unwrap()
+            .contains(MENU_SUBMISSION_PENDING_HINT)
+    );
+    assert!(state.rendered_screen.last().unwrap().contains("Esc back"));
+    assert_eq!(state.menu.as_ref().unwrap().id, next_id);
+    assert_eq!(state.menu.as_ref().unwrap().selected, 1);
+    assert!(state.picker_kind.is_none());
+    state.release_finished_submissions();
+    state.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+    assert_eq!(state.menu.as_ref().unwrap().selected, 2);
+}
+
+#[test]
 fn merged_provider_diagnostics_resize_with_the_selected_connection_and_live_clear() {
     for height in [24, 40] {
         let chat = Uuid::new_v4();
@@ -689,7 +799,7 @@ fn content_height_tiny_picker_requires_resize_and_never_submits_hidden_controls(
 
 #[test]
 fn content_height_help_counts_columns_and_uses_the_full_available_budget() {
-    for (width, height, expected) in [(160, 40, 9), (80, 24, 12), (32, 24, 20), (32, 10, 8)] {
+    for (width, height, expected) in [(160, 40, 10), (80, 24, 13), (32, 24, 22), (32, 10, 8)] {
         let mut state = State::new(true, width, height);
         state.help_open = true;
         let lines = state.styled_frame().0;
@@ -911,13 +1021,13 @@ fn content_height_request_preemption_and_agent_restore_recompute_without_resetti
 }
 
 #[test]
-fn content_height_pinned_message_and_tick_column_share_the_upper_remainder() {
+fn content_height_pinned_message_and_monitor_column_share_the_upper_remainder() {
     for renderer in [Renderer::Inline, Renderer::Fullscreen] {
         let mut state = State::new(true, 140, 24);
         state.renderer = renderer;
         state.chat = Some(Uuid::new_v4());
         state
-            .tick_list
+            .monitor
             .replace(TickGroup::Artifacts, input_dialog_tests::fixture_ticks());
         state.record_input("Height pinned message");
         for index in 0..5 {
@@ -945,7 +1055,7 @@ fn content_height_pinned_message_and_tick_column_share_the_upper_remainder() {
         state.draw(&mut Vec::new()).unwrap();
         assert_eq!(state.input_dialog_height(), 22);
         assert!(state.rendered_screen[0].starts_with("❯ Height pinned message"));
-        assert!(state.rendered_screen[0].contains("│ Ticks"));
+        assert!(state.rendered_screen[0].contains("│ Monitor"));
         assert_eq!(state.rendered_screen[2], "▔".repeat(state.width));
         assert!(
             !state.rendered_screen[2..]
@@ -961,6 +1071,43 @@ fn content_height_pinned_message_and_tick_column_share_the_upper_remainder() {
                 .iter()
                 .any(|line| line.contains("Fixture Tick 0"))
         );
+    }
+}
+
+#[test]
+fn merged_monitor_column_and_overlay_stop_at_the_content_sized_dialog_rule() {
+    for renderer in [Renderer::Inline, Renderer::Fullscreen] {
+        for width in [80, 140] {
+            for height in [6, 10, 24, 40] {
+                let mut state = State::new(true, width, height);
+                state.renderer = renderer;
+                state.chat = Some(Uuid::new_v4());
+                state
+                    .monitor
+                    .replace(TickGroup::Artifacts, input_dialog_tests::fixture_ticks());
+                state.monitor.overlay = width == 80;
+                state.record_input("Monitor height prompt");
+                for index in 0..40 {
+                    state.scrollback.append(&format!("History {index}\n"));
+                }
+                state.picker_kind = Some(PickerKind::Actions);
+                state.menu_focused = true;
+                state.picker_presentation.hint = "Enter · Esc back".into();
+                for count in [2, 80, 2] {
+                    state.menu = Some(picker_menu(count));
+                    state.draw(&mut Vec::new()).unwrap();
+                    let remainder = state.height - state.input_dialog_height();
+                    assert!(remainder >= 2);
+                    assert!(state.rendered_screen[0].contains("│ Monitor"));
+                    assert_eq!(state.rendered_screen[remainder], "▔".repeat(state.width));
+                    assert!(
+                        !state.rendered_screen[remainder..]
+                            .iter()
+                            .any(|line| line.contains('│'))
+                    );
+                }
+            }
+        }
     }
 }
 

@@ -48,6 +48,8 @@ fn settings_ux_pty_fixture() {
             console.select_chat(Some(chat)).unwrap();
             console.set_prompt_enabled(true).unwrap();
             let mut menus = Menus::new(Some(settings), Some(root));
+            // Font installation is outside this controlled picker fixture.
+            menus.font_manager = None;
             std::fs::write(directory.join("ready"), "ready").unwrap();
             let mut login: Option<super::super::login::LoginFlow> = None;
             let mut login_sender = None;
@@ -273,6 +275,8 @@ impl Fixture {
         self.writer.flush().unwrap();
     }
 
+    /// Waits for a settled frame: keys are ignored while a submitted choice is still being
+    /// applied, so a frame showing that state never satisfies a wait.
     fn wait(&self, predicate: impl Fn(&str) -> bool) -> String {
         let deadline = Instant::now() + self.timeout;
         loop {
@@ -286,14 +290,18 @@ impl Fixture {
                 "PTY did not reach expected settings state:\n{frame}\nEvents: {}",
                 std::fs::read_to_string(self.directory.path().join("trace")).unwrap_or_default()
             );
-            if predicate(&frame) {
+            if predicate(&frame)
+                && !frame.contains(super::super::console::MENU_SUBMISSION_PENDING_HINT)
+            {
                 thread::sleep(Duration::from_millis(30));
                 frame = screen::visible_screen(
                     &String::from_utf8_lossy(&self.output.lock().unwrap()),
                     100,
                     self.height,
                 );
-                if !predicate(&frame) {
+                if !predicate(&frame)
+                    || frame.contains(super::super::console::MENU_SUBMISSION_PENDING_HINT)
+                {
                     continue;
                 }
                 if let Some(root) = std::env::var_os("TICKLOOP_SETTINGS_UX_EVIDENCE_DIR") {
@@ -627,8 +635,13 @@ fn settings_ux_pty_failed_subpage_save_keeps_confirmation_open() {
     )
     .unwrap();
     fixture.send(b"\r");
-    let frame = fixture
-        .wait(|frame| frame.contains("Confirm glyph set") && frame.contains("Confirm and save"));
+    // Keys are ignored while a menu submission is pending, so the next key waits until the
+    // failed save has been handled.
+    let frame = fixture.wait(|frame| {
+        frame.contains("Confirm glyph set")
+            && frame.contains("Confirm and save")
+            && fixture.directory.path().join("selection-error").exists()
+    });
     fixture.send(b"j");
     fixture.wait(|next| {
         next != frame

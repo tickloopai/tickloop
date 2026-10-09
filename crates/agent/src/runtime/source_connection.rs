@@ -216,7 +216,7 @@ impl Outcome<'_> {
             )
         } else if binding.resume_required {
             format!(
-                "{status}. Listening is not active; the owner can select the artifact in the Tick List and press f to resume feedback. Association does not mean the Agent is online."
+                "{status}. Listening is not active; the owner can select the artifact in Monitor and press f to resume feedback. Association does not mean the Agent is online."
             )
         } else {
             format!("{status}. Association does not mean the Agent is online.")

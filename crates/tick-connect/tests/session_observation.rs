@@ -39,8 +39,10 @@ for line in sys.stdin:
             script.to_string_lossy().into_owned(),
         ],
         cwd: directory.path().into(),
-        host_socket: PathBuf::from("/tmp/example-herdr.sock"),
-        terminal_id: "counter-pane".into(),
+        backend: tick_connect::session::SessionBackend::Herdr {
+            socket: PathBuf::from("/tmp/example-herdr.sock"),
+            terminal_id: "counter-pane".into(),
+        },
         runtime_dir: Some(directory.path().join("sessions")),
     })
     .await
@@ -53,8 +55,10 @@ async fn later_subscriber_gets_its_own_baseline_and_actual_received_count() {
     let (session, directory) = counter().await;
     let client = SessionClient::connect(
         session.instance().clone(),
-        PathBuf::from("/tmp/example-herdr.sock"),
-        "counter-pane".into(),
+        tick_connect::session::SessionBackend::Herdr {
+            socket: PathBuf::from("/tmp/example-herdr.sock"),
+            terminal_id: "counter-pane".into(),
+        },
         Some(directory.path().join("sessions")),
     )
     .await
@@ -93,7 +97,7 @@ async fn later_subscriber_gets_its_own_baseline_and_actual_received_count() {
 
 #[tokio::test]
 async fn slow_subscriber_sees_latest_content_and_all_received_frames_counted() {
-    let (session, _) = counter().await;
+    let (session, _directory) = counter().await;
     let client = session.client();
     let (_, registration_received, mut observations) = client.watch().await.unwrap();
     assert_eq!(registration_received, 0);
@@ -115,16 +119,20 @@ async fn concurrent_clients_with_identical_calls_receive_their_own_responses() {
     let (session, directory) = counter().await;
     let first = SessionClient::connect(
         session.instance().clone(),
-        PathBuf::from("/tmp/example-herdr.sock"),
-        "counter-pane".into(),
+        tick_connect::session::SessionBackend::Herdr {
+            socket: PathBuf::from("/tmp/example-herdr.sock"),
+            terminal_id: "counter-pane".into(),
+        },
         Some(directory.path().join("sessions")),
     )
     .await
     .unwrap();
     let second = SessionClient::connect(
         session.instance().clone(),
-        PathBuf::from("/tmp/example-herdr.sock"),
-        "counter-pane".into(),
+        tick_connect::session::SessionBackend::Herdr {
+            socket: PathBuf::from("/tmp/example-herdr.sock"),
+            terminal_id: "counter-pane".into(),
+        },
         Some(directory.path().join("sessions")),
     )
     .await
@@ -148,7 +156,7 @@ async fn concurrent_clients_with_identical_calls_receive_their_own_responses() {
 
 #[tokio::test]
 async fn closing_one_in_flight_client_does_not_cancel_a_peers_call() {
-    let (session, _) = counter().await;
+    let (session, _directory) = counter().await;
     let departing = session.client();
     let peer = session.client();
     let (_, _, mut observations) = session.client().watch().await.unwrap();
@@ -175,7 +183,7 @@ async fn closing_one_in_flight_client_does_not_cancel_a_peers_call() {
 
 #[tokio::test]
 async fn sustained_updates_with_an_unread_watcher_do_not_block_peer_reads_or_tools() {
-    let (session, _) = counter().await;
+    let (session, _directory) = counter().await;
     let producer = session.client();
     let peer = session.client();
     let (_, registration_received, mut slow_watcher) = session.client().watch().await.unwrap();
@@ -218,7 +226,7 @@ async fn sustained_updates_with_an_unread_watcher_do_not_block_peer_reads_or_too
 
 #[tokio::test]
 async fn cancellation_after_update_reports_unknown_and_does_not_retry() {
-    let (session, _) = counter().await;
+    let (session, _directory) = counter().await;
     let client = session.client();
     let (_, _, mut observations) = client.watch().await.unwrap();
     let cancellation = CancellationToken::new();
@@ -248,7 +256,7 @@ async fn cancellation_after_update_reports_unknown_and_does_not_retry() {
 
 #[tokio::test]
 async fn oversized_request_is_rejected_before_the_child_receives_it() {
-    let (session, _) = counter().await;
+    let (session, _directory) = counter().await;
     let cancelled = CancellationToken::new();
     cancelled.cancel();
     assert!(matches!(
@@ -278,7 +286,7 @@ async fn oversized_request_is_rejected_before_the_child_receives_it() {
 
 #[tokio::test]
 async fn prepared_call_rechecks_catalog_before_dispatch() {
-    let (session, _) = counter().await;
+    let (session, _directory) = counter().await;
     let client = session.client();
     let descriptor = client.describe().await.unwrap();
     let stale = client
@@ -308,7 +316,7 @@ async fn prepared_call_rechecks_catalog_before_dispatch() {
 
 #[tokio::test]
 async fn shutdown_does_not_remove_a_replacement_at_the_endpoint_path() {
-    let (session, _) = counter().await;
+    let (session, _directory) = counter().await;
     let endpoint = session.endpoint().to_path_buf();
     let original = endpoint.with_extension("old");
     std::fs::rename(&endpoint, &original).unwrap();
@@ -347,8 +355,10 @@ for line in sys.stdin:
             script.to_string_lossy().into_owned(),
         ],
         cwd: directory.path().into(),
-        host_socket: PathBuf::from("/tmp/example-herdr.sock"),
-        terminal_id: "broken-pane".into(),
+        backend: tick_connect::session::SessionBackend::Herdr {
+            socket: PathBuf::from("/tmp/example-herdr.sock"),
+            terminal_id: "broken-pane".into(),
+        },
         runtime_dir: Some(directory.path().join("sessions")),
     })
     .await
@@ -365,7 +375,7 @@ for line in sys.stdin:
 
 #[tokio::test]
 async fn ninth_connection_is_busy_without_dispatching_an_action() {
-    let (session, _) = counter().await;
+    let (session, _directory) = counter().await;
     let client = session.client();
     let mut watchers = Vec::new();
     for _ in 0..8 {
@@ -387,16 +397,20 @@ async fn client_binding_rejects_a_different_host_or_terminal() {
     let (session, directory) = counter().await;
     let wrong_host = SessionClient::connect(
         session.instance().clone(),
-        PathBuf::from("/tmp/wrong-herdr.sock"),
-        "counter-pane".into(),
+        tick_connect::session::SessionBackend::Herdr {
+            socket: PathBuf::from("/tmp/wrong-herdr.sock"),
+            terminal_id: "counter-pane".into(),
+        },
         Some(directory.path().join("sessions")),
     )
     .await;
     assert!(matches!(wrong_host, Err(SessionError::Protocol(_))));
     let wrong_terminal = SessionClient::connect(
         session.instance().clone(),
-        PathBuf::from("/tmp/example-herdr.sock"),
-        "other-pane".into(),
+        tick_connect::session::SessionBackend::Herdr {
+            socket: PathBuf::from("/tmp/example-herdr.sock"),
+            terminal_id: "other-pane".into(),
+        },
         Some(directory.path().join("sessions")),
     )
     .await;
@@ -432,8 +446,10 @@ for line in sys.stdin:
             script.to_string_lossy().into_owned(),
         ],
         cwd: directory.path().into(),
-        host_socket: PathBuf::from("/tmp/example-herdr.sock"),
-        terminal_id: "large-pane".into(),
+        backend: tick_connect::session::SessionBackend::Herdr {
+            socket: PathBuf::from("/tmp/example-herdr.sock"),
+            terminal_id: "large-pane".into(),
+        },
         runtime_dir: Some(directory.path().join("sessions")),
     })
     .await
@@ -472,8 +488,10 @@ for line in sys.stdin:
             script.to_string_lossy().into_owned(),
         ],
         cwd: directory.path().into(),
-        host_socket: PathBuf::from("/tmp/example-herdr.sock"),
-        terminal_id: "nonreader-pane".into(),
+        backend: tick_connect::session::SessionBackend::Herdr {
+            socket: PathBuf::from("/tmp/example-herdr.sock"),
+            terminal_id: "nonreader-pane".into(),
+        },
         runtime_dir: Some(directory.path().join("sessions")),
     })
     .await
@@ -484,7 +502,7 @@ for line in sys.stdin:
         .unwrap();
     let request = json!({
         "jsonrpc":"2.0", "id":1, "method":"tick/describe",
-        "binding":{"instance_id":session.instance().to_string(),"host_socket":"/tmp/example-herdr.sock","terminal_id":"nonreader-pane"},
+        "binding":{"instance_id":session.instance().to_string(),"backend":{"kind":"herdr","socket":"/tmp/example-herdr.sock","terminal_id":"nonreader-pane"}},
         "params":{"padding":"x".repeat(400_000)}
     });
     stream

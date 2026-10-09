@@ -166,9 +166,12 @@ impl TickStream {
     pub fn from_process(tick: TickKind, source: &'static str) -> Result<Self> {
         let native_instance_id = environment_value(protocol::INSTANCE_ID_ENV)?;
         if let Some(native_instance_id) = native_instance_id {
-            if !native_instance_id.starts_with("herdr:") || native_instance_id.len() <= 6 {
+            let launched = native_instance_id
+                .parse::<tick_connect::instance::InstanceRef>()
+                .is_ok_and(|instance| matches!(instance.tick_type(), "herdr" | "hosted"));
+            if !launched {
                 return Err(Error::usage(format!(
-                    "{} needs a complete herdr: instance identity",
+                    "{} needs a complete herdr: or hosted: instance identity",
                     protocol::INSTANCE_ID_ENV
                 )));
             }

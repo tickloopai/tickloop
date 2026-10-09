@@ -1277,9 +1277,11 @@ pub(crate) async fn read_frame<R: AsyncRead + Unpin, T: serde::de::DeserializeOw
 }
 
 fn verify_peer(stream: &UnixStream) -> Result<(), AccessError> {
+    // A peer that disconnected before its credentials could be read is gone, not foreign: the
+    // caller treats the connection as unavailable, as a lost worker.
     let credentials = stream
         .peer_cred()
-        .map_err(|error| AccessError::new(AccessErrorCode::AccessDenied, error.to_string()))?;
+        .map_err(|error| AccessError::unavailable(error.to_string()))?;
     if credentials.uid() != unsafe { libc::geteuid() } {
         return Err(AccessError::new(
             AccessErrorCode::AccessDenied,

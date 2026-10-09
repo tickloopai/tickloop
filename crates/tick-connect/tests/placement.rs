@@ -4,7 +4,8 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use tick_connect::{
     access::TickAccess,
-    herdr::{HerdrContext, HerdrPort, HostError, Pane},
+    herdr::{HerdrContext, HerdrPort, Pane},
+    host_error::HostError,
 };
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;

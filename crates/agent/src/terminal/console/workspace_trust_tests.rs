@@ -89,22 +89,24 @@ fn workspace_trust_modal_owns_input_and_keeps_choices_visible_across_sizes() {
         state.prompt_enabled = true;
         state.insert("hidden jk draft");
         state.chat = Some(Uuid::from_u128(9001));
-        state.tick_list_preference = crate::settings::TickListPreference::Auto;
-        state.tick_list.replace(
+        state.monitor_preference = crate::settings::MonitorPreference::Auto;
+        state.monitor.replace(
             TickGroup::Shells,
-            vec![TickListEntry {
-                id: "hidden-shell".into(),
+            vec![MonitorEntry {
+                instance: crate::tick_stream::InstanceRef::new("shell", "hidden").unwrap(),
                 group: TickGroup::Shells,
                 glyph: Glyph::ShellTick,
                 title: "hidden Shell Tick".into(),
                 kind: "Shell".into(),
                 status: "running".into(),
+                owner: crate::tick_adapter::TickOwner::Unknown,
                 updated_at_ms: None,
+                resources: None,
                 actions: Vec::new(),
             }],
         );
-        state.tick_list.overlay = true;
-        assert!(state.tick_list_visible());
+        state.monitor.overlay = true;
+        assert!(state.monitor_visible());
         state.workspace_trust = Some(WorkspaceTrust::new(PathBuf::from(
             "/workspace/unsafe\x1b[31m-name",
         )));

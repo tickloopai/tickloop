@@ -210,6 +210,10 @@ fn load_lines(
                 metadata.artifact_ticks = Some(entry.clone());
                 continue;
             }
+            Line::MonitorMembers(entry) => {
+                metadata.monitor_members = Some(entry.clone());
+                continue;
+            }
             Line::CustomTitle(entry) => {
                 metadata.custom_title = Some(entry.clone());
                 continue;
@@ -302,11 +306,15 @@ fn load_lines(
                 .then_with(|| right.file_index.cmp(&left.file_index))
         });
     let Some(leaf) = leaf else {
-        let has_artifact_chat = metadata
+        let has_chat_without_messages = metadata
             .artifact_ticks
             .as_ref()
-            .is_some_and(|entry| entry.cwd.is_some());
-        let loaded = has_artifact_chat.then(|| LoadedTranscript {
+            .is_some_and(|entry| entry.cwd.is_some())
+            || metadata
+                .monitor_members
+                .as_ref()
+                .is_some_and(|entry| entry.materializes_chat());
+        let loaded = has_chat_without_messages.then(|| LoadedTranscript {
             uuids,
             chain: Vec::new(),
             metadata,
