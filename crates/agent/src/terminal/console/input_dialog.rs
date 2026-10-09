@@ -1,18 +1,19 @@
 use super::*;
 
-pub(super) const INPUT_DIALOG_ROWS: usize = 12;
+pub(super) const FIXED_INPUT_DIALOG_ROWS: usize = 12;
 pub(super) const INPUT_DIALOG_RULE_ROWS: usize = 1;
 const INPUT_DIALOG_RULE_GLYPH: &str = "▔";
-const MIN_CONTENT_ROWS: usize = 4;
+const FIXED_CONTENT_RESERVE_ROWS: usize = 4;
+const PICKER_CONTENT_RESERVE_ROWS: usize = 2;
 
 pub(super) fn body_height(height: usize) -> usize {
     height.saturating_sub(INPUT_DIALOG_RULE_ROWS).max(1)
 }
 
-pub(super) fn height_for_terminal(height: usize) -> usize {
+pub(super) fn fixed_height_for_terminal(height: usize) -> usize {
     height
-        .saturating_sub(MIN_CONTENT_ROWS)
-        .clamp(1, INPUT_DIALOG_ROWS)
+        .saturating_sub(FIXED_CONTENT_RESERVE_ROWS)
+        .clamp(1, FIXED_INPUT_DIALOG_ROWS)
 }
 
 fn pad_dialog(lines: &mut Vec<RoleLine>, height: usize) {
@@ -594,11 +595,201 @@ impl State {
         lines
     }
 
+    pub(super) fn input_dialog_has_fixed_height(&self) -> bool {
+        self.workspace_trust.is_some()
+            || self.request_layout.is_some()
+            || self.question_menu.is_some()
+            || self.menu_plan
+    }
+
+    pub(super) fn menu_context_rows(&self, menu: &Menu, limit: usize) -> usize {
+        if let Some(review) = &self.menu_review {
+            let viewport = DiffViewport {
+                width: self.width.saturating_sub(2).max(1),
+                height: limit,
+            };
+            match &review.review {
+                Ok(source) => render_diff(source, &review.navigation, viewport).total_rows,
+                Err(error) => {
+                    render_error("Review unavailable", error, &review.navigation, viewport)
+                        .total_rows
+                }
+            }
+        } else {
+            self.picker_context(menu)
+                .iter()
+                .map(|line| {
+                    wrap_text(&display_text(line), self.width.saturating_sub(2).max(1)).len()
+                })
+                .sum()
+        }
+    }
+
+    fn menu_content_rows(&self, menu: &Menu, limit: usize) -> usize {
+        let selected = menu.selected.min(menu.options.len().saturating_sub(1));
+        let context = self.menu_context_rows(menu, limit);
+        let options: usize = if self.picker_kind.is_some() {
+            menu.options.len()
+                + if self.width < COMPACT_PICKER_COLUMNS {
+                    self.picker_presentation
+                        .compact_rows
+                        .len()
+                        .min(menu.options.len())
+                } else {
+                    0
+                }
+        } else {
+            menu.options
+                .iter()
+                .enumerate()
+                .map(|(index, option)| {
+                    let text = format!(
+                        "{} {}. {}",
+                        self.display.glyph(Glyph::Prompt),
+                        index + 1,
+                        display_text(option)
+                    );
+                    wrap_text(&text, self.width).len()
+                })
+                .sum()
+        };
+        let headers = if self.picker_kind.is_some() {
+            self.picker_presentation
+                .headers
+                .iter()
+                .map(|(index, _)| *index)
+                .filter(|index| *index < menu.options.len())
+                .collect::<HashSet<_>>()
+                .len()
+        } else {
+            0
+        };
+        (2 + context + options + headers + self.menu_comment_frame(selected).0.len()).min(limit)
+    }
+
+    pub(super) fn input_dialog_requires_resize(&self) -> bool {
+        if !self.input_dialog_visible()
+            || self.input_dialog_has_fixed_height()
+            || self.full_review
+            || self.transcript.is_some()
+        {
+            return false;
+        }
+        let minimum_body = if let Some(menu) = &self.menu {
+            let selected = menu.selected.min(menu.options.len().saturating_sub(1));
+            if self.menu_comment_is_editing() {
+                3
+            } else {
+                3 + usize::from(!self.picker_presentation.headers.is_empty())
+                    + usize::from(
+                        self.width < COMPACT_PICKER_COLUMNS
+                            && self
+                                .picker_presentation
+                                .compact_rows
+                                .get(selected)
+                                .is_some(),
+                    )
+            }
+        } else if let Some(picker) = &self.artifacts_picker {
+            picker.minimum_frame_rows()
+        } else if self.conversation_picker.is_some() {
+            4
+        } else if let Some(surface) = &self.permissions_surface {
+            surface.minimum_frame_rows(self.width)
+        } else if self.monitor.confirmation.is_some()
+            || self
+                .monitor
+                .detail
+                .as_ref()
+                .is_some_and(|detail| detail.confirmation().is_some())
+        {
+            4
+        } else {
+            3
+        };
+        self.input_dialog_height() < INPUT_DIALOG_RULE_ROWS + minimum_body
+    }
+
+    fn resize_frame(&mut self, capacity: usize) -> (Vec<RoleLine>, usize, usize) {
+        self.dialog_cursor_visible = false;
+        let title = self.menu.as_ref().map_or_else(
+            || {
+                if self.artifacts_picker.is_some() {
+                    "Artifacts"
+                } else if let Some(picker) = &self.conversation_picker {
+                    picker.title()
+                } else if self.permissions_surface.is_some() {
+                    "Permissions"
+                } else if self.subscription_surface.is_some() {
+                    "Tick Subscriptions"
+                } else if self.task_surface.is_some() {
+                    "Shell tasks"
+                } else if self.help_open {
+                    "Help"
+                } else {
+                    "Tick action"
+                }
+            },
+            |menu| menu.title.as_str(),
+        );
+        let mut lines = Vec::new();
+        if capacity >= 2 {
+            lines.push(RoleLine::role(title, Role::DialogTitle));
+        }
+        lines.resize(capacity.saturating_sub(1), RoleLine::default());
+        lines.push(RoleLine::role(
+            if self.user_menu_submission_is_unfinished() {
+                MENU_SUBMISSION_PENDING_HINT
+            } else if self.menu_comment_is_editing() {
+                "Resize · Esc close field"
+            } else {
+                "Resize · Esc back"
+            },
+            Role::MutedText,
+        ));
+        for line in &mut lines {
+            line.truncate(self.width);
+        }
+        (lines, 0, 0)
+    }
+
     pub(super) fn input_dialog_height(&self) -> usize {
         if self.workspace_trust.is_some() && self.chat.is_none() {
-            return self.height.min(INPUT_DIALOG_ROWS);
+            return self.height.min(FIXED_INPUT_DIALOG_ROWS);
         }
-        height_for_terminal(self.height)
+        if self.input_dialog_has_fixed_height() {
+            return fixed_height_for_terminal(self.height);
+        }
+        let maximum = self
+            .height
+            .saturating_sub(PICKER_CONTENT_RESERVE_ROWS)
+            .max(1);
+        let body = if let Some(menu) = &self.menu {
+            self.menu_content_rows(menu, maximum)
+        } else if let Some(picker) = &self.artifacts_picker {
+            picker.content_rows()
+        } else if let Some(picker) = &self.conversation_picker {
+            picker.content_rows()
+        } else if let Some(surface) = &self.permissions_surface {
+            surface.content_rows(self.width, maximum)
+        } else if let Some(surface) = &self.subscription_surface {
+            2 + surface.content_rows()
+        } else if let Some(surface) = &self.task_surface {
+            2 + surface.content_rows(self.width, maximum)
+        } else if self.help_open {
+            1 + agent_layout::help_lines(self.width, self.width + 1, None).len()
+        } else if self.monitor.confirmation.is_some()
+            || self
+                .monitor
+                .detail
+                .as_ref()
+                .is_some_and(|detail| detail.confirmation().is_some())
+        {
+            4
+        } else {
+            return maximum;
+        };
+        (INPUT_DIALOG_RULE_ROWS + body).min(maximum)
     }
 
     pub(super) fn input_dialog_visible(&self) -> bool {
@@ -647,6 +838,9 @@ impl State {
     }
 
     fn input_dialog_body_frame(&mut self, capacity: usize) -> (Vec<RoleLine>, usize, usize) {
+        if self.input_dialog_requires_resize() {
+            return self.resize_frame(capacity);
+        }
         if let Some(dialog) = &self.workspace_trust {
             let frame = dialog.frame(self.width, capacity, self.display);
             self.dialog_cursor_visible = frame.cursor.is_some();
@@ -732,7 +926,8 @@ impl State {
             lines.push(RoleLine::plain(message));
             lines.push(RoleLine::role(format!("› {label}"), Role::Text).filled(Role::Selection));
             self.dialog_option_rows.push((2..3, 0));
-            lines.resize(capacity, RoleLine::default());
+            lines.resize(capacity.saturating_sub(1), RoleLine::default());
+            lines.push(RoleLine::role("Enter confirm · Esc back", Role::MutedText));
         }
         lines.truncate(capacity);
         for line in &mut lines {

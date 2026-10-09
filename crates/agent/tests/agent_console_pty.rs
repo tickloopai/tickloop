@@ -379,6 +379,32 @@ async fn catalog(client: &LocalAgentClient) -> Vec<AgentSummary> {
     rows
 }
 
+async fn wait_for_display_views(
+    client: &LocalAgentClient,
+    execution: ExecutionRef,
+    expected: usize,
+) {
+    let mut latest = None;
+    let ready = tokio::time::timeout(UI_TIMEOUT, async {
+        loop {
+            latest = catalog(client)
+                .await
+                .into_iter()
+                .find(|row| row.execution.agent_id == execution.agent_id)
+                .map(|row| (row.execution, row.views.len()));
+            if latest == Some((execution, expected)) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        ready.is_ok(),
+        "expected {expected} registered Views for {execution:?}; latest: {latest:?}"
+    );
+}
+
 fn family_panel_has_viewing_row(frame: &str) -> bool {
     frame
         .lines()
@@ -1169,6 +1195,42 @@ fn request_dialog_visible(frame: &str, question: &str, requester: &str) -> bool 
         && frame.contains("Enter select · Esc answer later")
 }
 
+async fn open_family_child(pty: &mut PtyView, task: &str) {
+    pty.send(b"\x1b[1;5F\x1b[B");
+    pty.wait_for("family entry receives focus", |frame| {
+        frame.contains("Subagents 1") && frame.contains("Esc input")
+    })
+    .await;
+    pty.send(b"\x1b[B");
+    let list = pty
+        .wait_for("family list receives focus", |frame| {
+            frame.lines().any(|line| line.starts_with('›'))
+        })
+        .await;
+    if !list
+        .lines()
+        .any(|line| line.starts_with('›') && line.contains("cadence"))
+    {
+        pty.send(b"j");
+        pty.wait_for("child row is selected", |frame| {
+            frame
+                .lines()
+                .any(|line| line.starts_with('›') && line.contains("cadence"))
+        })
+        .await;
+    }
+    pty.send(b"\r");
+    pty.wait_for(
+        "child is displayed before releasing its question",
+        |frame| {
+            frame.contains(&format!("Delegated Agent · {task}"))
+                && !frame.contains("Agent family · root")
+                && !frame.contains("Agents · local")
+        },
+    )
+    .await;
+}
+
 async fn run_child_views(fixture: &PrivateFixture) {
     const CHILD_TASK: &str = "Ask bounded cadence.";
     const RAW_CHILD_CONTENT: &str =
@@ -1337,17 +1399,9 @@ async fn run_child_views(fixture: &PrivateFixture) {
             frame.contains("Subagents 1") && !frame.contains("Agents · local")
         })
         .await;
-    first.send(b"\x1b[B\x1b[Bj\r");
     let child_label = "Agent cadence".to_owned();
-    first
-        .wait_for(
-            "first View displays the child before its question response",
-            |frame| {
-                frame.contains(&format!("Delegated Agent · {CHILD_TASK}"))
-                    && !frame.contains("Agent family · root")
-            },
-        )
-        .await;
+    open_family_child(&mut first, CHILD_TASK).await;
+    wait_for_display_views(&client, child, 1).await;
     let mut second = PtyView::start_with_flags(fixture, &["--dangerously-skip-permissions"]);
     second
         .wait_for("independent View ready", new_input_is_visible)
@@ -1373,31 +1427,8 @@ async fn run_child_views(fixture: &PrivateFixture) {
             frame.contains("Subagents 1") && !frame.contains("Agents · local")
         })
         .await;
-    second.send(b"\x1b[B\x1b[Bj\r");
-    second
-        .wait_for(
-            "second View displays the child before its question response",
-            |frame| {
-                frame.contains(&format!("Delegated Agent · {CHILD_TASK}"))
-                    && !frame.contains("Agent family · root")
-            },
-        )
-        .await;
-    tokio::time::timeout(UI_TIMEOUT, async {
-        loop {
-            let rows = catalog(&client).await;
-            if rows
-                .iter()
-                .find(|row| row.execution == child)
-                .is_some_and(|row| row.views.len() == 2)
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("both rendered child Views must finish owner display registration");
+    open_family_child(&mut second, CHILD_TASK).await;
+    wait_for_display_views(&client, child, 2).await;
     show_child_question.send(()).unwrap();
     let child_with_question = wait_snapshot(
         &client,
@@ -3034,7 +3065,16 @@ async fn run_filter_hidden_dispatch(fixture: &PrivateFixture) {
     view.send(b"/tasks\r");
     view.wait_for(
         "the created Agent exposes its real completed Shell",
-        |frame| frame.contains("Shell tasks") && frame.contains("pwd"),
+        |frame| {
+            frame.lines().any(|line| line.trim() == "Shell tasks")
+                && frame
+                    .lines()
+                    .last()
+                    .is_some_and(|line| line.contains("Enter open"))
+                && frame.lines().any(|line| {
+                    line.starts_with('❯') && line.contains("pwd") && !line.contains("other Agent")
+                })
+        },
     )
     .await;
     view.send(b"\r");

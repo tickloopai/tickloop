@@ -208,7 +208,12 @@ fn model_dialog_pty_matches_question_permission_chrome_and_restores_agent_picker
             }
         };
         let original = wait("model", "Choose model");
-        let dialog_top = height as usize - height.saturating_sub(4).min(12) as usize;
+        let dialog_top = original
+            .lines()
+            .collect::<Vec<_>>()
+            .iter()
+            .rposition(|line| !line.is_empty() && line.chars().all(|character| character == '▔'))
+            .unwrap();
         let selected_row = |frame: &str| {
             frame
                 .lines()

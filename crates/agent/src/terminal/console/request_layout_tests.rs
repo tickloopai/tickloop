@@ -98,7 +98,7 @@ fn request_question_wraps_within_the_row_budget_after_resize() {
             state.resize(width, height);
             let (lines, row, column) = state.styled_frame();
             let text = lines.iter().map(RoleLine::text).collect::<Vec<_>>();
-            let capacity = input_dialog::height_for_terminal(state.height);
+            let capacity = input_dialog::fixed_height_for_terminal(state.height);
             assert!(lines.len() <= capacity, "{width}×{height}: {text:?}");
             assert!(
                 text.iter()

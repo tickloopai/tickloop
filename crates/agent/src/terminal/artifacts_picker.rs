@@ -353,6 +353,28 @@ impl ArtifactsPicker {
         })
     }
 
+    pub(super) fn minimum_frame_rows(&self) -> usize {
+        3 + if self.picker.matching_indices().is_empty() {
+            1
+        } else {
+            2
+        } + usize::from(self.rename.is_some())
+    }
+
+    pub(super) fn content_rows(&self) -> usize {
+        let mut previous_group = None;
+        let mut rows = 0;
+        for index in self.picker.matching_indices() {
+            let added = self.added.contains(&self.entries[*index].id);
+            if previous_group != Some(added) {
+                rows += 1;
+                previous_group = Some(added);
+            }
+            rows += 2;
+        }
+        3 + rows.max(1) + usize::from(self.rename.is_some())
+    }
+
     pub(super) fn frame(
         &mut self,
         width: usize,

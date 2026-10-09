@@ -1034,7 +1034,9 @@ fn shift_tab_in_the_overview_changes_no_hidden_agent_and_the_root_keeps_its_key(
     // meaning in the current scope.
     view.send(b"\x15/help advanced\r");
     view.wait_for("the advanced reference over the overview", |frame| {
-        frame.contains("Advanced commands") && frame.contains("PgUp/PgDn")
+        frame.contains("Advanced commands")
+            && frame.contains("/status")
+            && frame.contains("Esc back")
     });
     for _ in 0..30 {
         view.send(b"\x1b[6~");
