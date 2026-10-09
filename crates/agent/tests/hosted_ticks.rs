@@ -2513,30 +2513,31 @@ for line in sys.stdin:
         let business_pid = opened["business_pid"].as_u64().unwrap() as u32;
         let launcher = tick_host::process::sample(business_pid).unwrap().parent;
         let host = tick_host::process::sample(launcher).unwrap().parent;
-        unsafe { libc::kill(host as libc::pid_t, libc::SIGKILL) };
-        assert!(super::gone(business_pid).await);
-        // The subscription's Watch is recorded in the background; a record written while a
-        // listing runs is judged by the next listing, so the loss may show one listing later.
-        let mut members = Vec::new();
-        for _ in 0..200 {
-            let CommandResult::HostedTicks(listed) = owner
-                .command(AgentCommand::ListHostedTicks { execution })
-                .await
-            else {
-                panic!("hosted Ticks expected");
-            };
-            members = listed;
-            if !members.is_empty() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-        assert_eq!(members.len(), 1);
-        assert_eq!(members[0].instance, lost);
-        assert_eq!(members[0].state, HostedMemberState::Lost);
         let host_paths = tick_host::paths::HostPaths {
             runtime: owner.root.join("h"),
         };
+        unsafe { libc::kill(host as libc::pid_t, libc::SIGKILL) };
+        let members = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if !super::alive(business_pid) && !host_paths.host_running().unwrap() {
+                    let CommandResult::HostedTicks(listed) = owner
+                        .command(AgentCommand::ListHostedTicks { execution })
+                        .await
+                    else {
+                        panic!("hosted Ticks expected");
+                    };
+                    if !listed.is_empty() {
+                        break listed;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("the exited host is reflected in the recorded lost Tick listing");
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].instance, lost);
+        assert_eq!(members[0].state, HostedMemberState::Lost);
         assert!(
             !host_paths.host_running().unwrap(),
             "nothing reopened by itself"
@@ -2655,15 +2656,13 @@ for line in sys.stdin:
             "nothing ends while the cleanup holds the Chat"
         );
         drop(cleanup);
-        assert!(super::gone(tick.business_pid).await);
-        // The state goes once the host confirms the end, which can come just after the Tick
-        // itself is gone.
-        for _ in 0..200 {
-            if owner.owner_state(deleted).is_none() {
-                break;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while super::alive(tick.business_pid) || owner.owner_state(deleted).is_some() {
+                tokio::time::sleep(Duration::from_millis(25)).await;
             }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
+        })
+        .await
+        .expect("the finished deletion ends its business process and removes owner state");
         assert_eq!(owner.owner_state(deleted), None);
     }
 

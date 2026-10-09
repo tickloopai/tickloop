@@ -13,6 +13,7 @@ use std::{
 
 #[test]
 fn post_login_account_failure_preserves_the_view_and_artifacts_can_retry() {
+    const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
     use std::sync::atomic::{AtomicBool, Ordering};
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
@@ -27,8 +28,22 @@ fn post_login_account_failure_preserves_the_view_and_artifacts_can_retry() {
                 thread::sleep(Duration::from_millis(10));
                 continue;
             };
+            socket.set_nonblocking(false).unwrap();
+            socket.set_read_timeout(Some(HTTP_REQUEST_TIMEOUT)).unwrap();
             let mut bytes = [0_u8; 8192];
-            let count = socket.read(&mut bytes).unwrap();
+            let mut count = 0;
+            while !bytes[..count].windows(4).any(|end| end == b"\r\n\r\n") {
+                assert!(
+                    count < bytes.len(),
+                    "fixture HTTP headers exceed the request budget"
+                );
+                let received = socket.read(&mut bytes[count..]).unwrap();
+                assert!(
+                    received > 0,
+                    "fixture HTTP request ended before its headers"
+                );
+                count += received;
+            }
             let request = String::from_utf8_lossy(&bytes[..count]);
             let user =
                 serde_json::json!({"id":"owner","name":"Owner","email":"owner@example.test"});

@@ -860,6 +860,31 @@ impl Menus {
         }
     }
 
+    pub(super) fn note_snapshot_requests(&mut self, snapshot: &crate::runtime::ChatSnapshot) {
+        let pending = snapshot
+            .permissions
+            .iter()
+            .map(|request| request.id)
+            .chain(snapshot.questions.iter().map(|request| request.id))
+            .collect::<Vec<_>>();
+        let retained = snapshot
+            .events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                EventKind::PermissionRequested { request } => Some(request.id),
+                EventKind::QuestionAsked { request } => Some(request.id),
+                _ => None,
+            })
+            .filter(|id| pending.contains(id))
+            .collect::<Vec<_>>();
+        for id in pending.iter().filter(|id| !retained.contains(id)) {
+            self.note_request(snapshot.id, *id);
+        }
+        for id in retained {
+            self.note_request(snapshot.id, id);
+        }
+    }
+
     pub(super) fn sync_dialog_chat(&mut self, console: &Console) -> Result<(), String> {
         let chat = console.dialog_chat()?;
         self.sync_provider_chat(chat);
@@ -3583,6 +3608,60 @@ mod tests {
     };
 
     use super::*;
+
+    #[tokio::test]
+    async fn recovery_queues_pending_requests_even_after_their_events_are_evicted() {
+        use crate::terminal::test_support as support;
+        let directory = tempfile::tempdir().unwrap();
+        let core = crate::runtime::Agent::new_embedded(
+            support::config(),
+            std::sync::Arc::new(support::ScriptedModel::new(vec![support::call(
+                "snapshot-question",
+                crate::runtime::ASK_USER_QUESTION_TOOL_NAME,
+                support::single_question("Which fixture?"),
+            )])),
+        );
+        let chat = core.create_chat(directory.path().into()).await.unwrap();
+        let receipt = core
+            .submit(chat, None, "Ask a controlled question".into())
+            .await
+            .unwrap();
+        let mut snapshot = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let snapshot = core.snapshot(chat).await.unwrap();
+                if !snapshot.questions.is_empty() {
+                    break snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let question = snapshot.questions[0].id;
+        let permission = Uuid::new_v4();
+        snapshot
+            .permissions
+            .push(crate::runtime::PermissionRequest {
+                id: permission,
+                loop_id: receipt.loop_id,
+                run_id: receipt.run_id,
+                call_id: "snapshot-permission".into(),
+                name: "Bash".into(),
+                input: json!({"command":"printf fixture"}),
+                file_change: None,
+                approval_reason: None,
+                approval_source: crate::runtime::PermissionApprovalSource::PermissionPolicy,
+            });
+        snapshot.events.clear();
+        let mut menus = Menus::default();
+        menus.note_snapshot_requests(&snapshot);
+        menus.note_snapshot_requests(&snapshot);
+        assert_eq!(
+            menus.request_order,
+            VecDeque::from([(chat, permission), (chat, question)])
+        );
+        core.shutdown().await;
+    }
 
     #[tokio::test]
     async fn connection_management_uses_the_captured_agents_store_from_a_different_view_root() {

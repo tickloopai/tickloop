@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 mod background_request_tests;
 mod cached_navigation_tests;
+mod event_delivery_tests;
 mod hidden_view_recovery_tests;
 mod lost_presentation_tests;
 mod pending_input_tests;
@@ -152,6 +153,7 @@ impl ModelClient for GatedReply {
                 events
                     .send(ModelDelta::Thinking("background".into()))
                     .unwrap();
+                events.send(ModelDelta::Usage(Usage::default())).unwrap();
                 self.flood_acknowledgements
                     .acquire()
                     .await
@@ -290,7 +292,20 @@ async fn run_completed_reply_recovery_fixture() {
     if route == "lagged" {
         agent.hold_recovery_checkpoint(checkpoint.clone());
     }
-    let (probe, mut facts) = mpsc::unbounded_channel();
+    let (probe, mut observed_facts) = mpsc::unbounded_channel();
+    let (forwarded_probe, mut facts) = mpsc::unbounded_channel();
+    let recoveries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed_recoveries = recoveries.clone();
+    tokio::spawn(async move {
+        while let Some(fact) = observed_facts.recv().await {
+            if matches!(fact, RecoveryFact::Lagged) {
+                observed_recoveries.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            if forwarded_probe.send(fact).is_err() {
+                break;
+            }
+        }
+    });
     agent.set_recovery_probe(probe);
     let (console, input) = Console::start(true).unwrap();
     console.set_prompt_enabled(true).unwrap();
@@ -503,7 +518,7 @@ async fn run_completed_reply_recovery_fixture() {
     );
     std::fs::write(
         std::env::var_os(PROOF_VARIABLE).unwrap(),
-        serde_json::to_vec(&serde_json::json!({"route":route,"execution":execution,"view":view,"run":run,"buffered":buffered,"restored":restored,"skipped":skipped,"owner_last_sequence":completed.last_sequence})).unwrap(),
+        serde_json::to_vec(&serde_json::json!({"route":route,"recoveries":recoveries.load(std::sync::atomic::Ordering::Relaxed),"execution":execution,"view":view,"run":run,"buffered":buffered,"restored":restored,"skipped":skipped,"owner_last_sequence":completed.last_sequence})).unwrap(),
     ).unwrap();
     console.write("\nRecovery facts verified\n").unwrap();
     interaction.await.unwrap().unwrap();
@@ -640,7 +655,22 @@ fn run_recovery_pty(route: &str) {
         }
     }
     let frame = fixture.wait_for("Recovery facts verified");
+    if route == "lagged" {
+        assert!(
+            !fixture
+                .raw_output()
+                .contains("The view fell behind; restoring it from saved execution events."),
+            "internal event recovery leaked into the conversation"
+        );
+    }
     let proof = std::fs::read_to_string(directory.path().join("recovery-proof.json")).unwrap();
+    if route == "lagged" {
+        let proof: serde_json::Value = serde_json::from_str(&proof).unwrap();
+        assert_eq!(
+            proof["recoveries"], 1,
+            "one burst triggered consecutive recovery passes"
+        );
+    }
     println!("RECOVERY_PROOF {proof}\nRECOVERY_FRAME_BEGIN\n{frame}\nRECOVERY_FRAME_END");
     assert_eq!(
         frame.matches(REPLY).count(),
@@ -1231,7 +1261,7 @@ fn routine_restore_preserves_raw_user_model_and_read_tool_identifiers() {
 }
 
 #[test]
-fn interactive_reset_keeps_the_retained_history_notice_and_raw_text() {
+fn interactive_reset_preserves_retained_history_without_internal_notices() {
     run_routine_restore_pty(RESET_ROUTE);
 }
 
@@ -1276,6 +1306,7 @@ impl ModelClient for RetainedCompletionModel {
                 events
                     .send(ModelDelta::Thinking("thinking ".into()))
                     .unwrap();
+                events.send(ModelDelta::Usage(Usage::default())).unwrap();
             }
             ("Second retained report.", 117, 29)
         } else {
@@ -1492,7 +1523,9 @@ fn real_event_overflow_restores_known_completion_once_without_inventing_evicted_
         });
     assert!(restored.contains("First retained report."), "{restored}");
     assert!(
-        restored.contains("The saved event range changed"),
+        !fixture
+            .raw_output()
+            .contains("The saved event range changed"),
         "{restored}"
     );
     assert_eq!(restored.matches("✓ Done").count(), 1, "{restored}");
@@ -1557,7 +1590,7 @@ fn real_event_overflow_restores_known_completion_once_without_inventing_evicted_
 }
 
 #[test]
-fn plain_restore_keeps_full_identity_diagnostics_and_unarmed_input_prefixes() {
+fn plain_restore_keeps_public_history_without_internal_identity_notices() {
     let directory = tempfile::tempdir_in("/tmp").unwrap();
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
@@ -1582,9 +1615,7 @@ fn plain_restore_keeps_full_identity_diagnostics_and_unarmed_input_prefixes() {
     let chat: Uuid = serde_json::from_value(proof["chat"].clone()).unwrap();
     let receipt: Receipt = serde_json::from_value(proof["saved"]["receipt"].clone()).unwrap();
     assert!(
-        stdout.contains(&format!(
-            "Chat {chat} restored. Current model: fixture · Messages"
-        )),
+        !stdout.contains(&format!("Chat {chat} restored. Current model:")),
         "{stdout}"
     );
     assert!(
@@ -1681,12 +1712,7 @@ fn run_routine_restore_pty(route: &str) {
         fixture.send(b"\x1b[27u");
         let restored = fixture.wait_for_phase(&phase_path, &format!("restored-{pass}"));
         let frame = fixture.repaint_after_recovery("restored conversation", |frame| {
-            !frame.contains("Agents · local")
-                && if route == RESET_ROUTE {
-                    frame.contains("The saved event range changed")
-                } else {
-                    frame.contains("✓ Done")
-                }
+            !frame.contains("Agents · local") && frame.contains("✓ Done")
         });
         println!(
             "ROUTINE_RESTORE {restored}\nROUTINE_AFTER_{pass}_BEGIN\n{frame}\nROUTINE_AFTER_{pass}_END"
@@ -1718,7 +1744,7 @@ fn run_routine_restore_pty(route: &str) {
         } else if route == RESET_ROUTE {
             assert_eq!(restored["restored"]["Restored"]["reset_required"], true);
             assert!(
-                frame.contains(
+                !fixture.raw_output().contains(
                     "The saved event range changed; displaying the retained conversation."
                 ),
                 "{frame}"

@@ -447,7 +447,7 @@ async fn a_permission_storage_failure_preserves_the_request_for_an_explicit_retr
 }
 
 #[tokio::test]
-async fn oversized_execution_updates_request_resync_without_losing_the_output() {
+async fn large_execution_output_arrives_in_bounded_updates_without_resync() {
     use tickloop_agent::agent_access::{FEED_CAPACITY, FEED_MAX_BYTES, ObservationChange};
     let temporary = tempfile::tempdir().unwrap();
     let output = "result ".repeat(20_000);
@@ -500,17 +500,27 @@ async fn oversized_execution_updates_request_resync_without_losing_the_output() 
         .unwrap()
         .into_result()
         .unwrap();
+    let mut streamed = String::new();
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             let update = observation.recv().await.unwrap();
             assert!(serde_json::to_vec(&update).unwrap().len() <= FEED_MAX_BYTES / FEED_CAPACITY);
-            if matches!(update.change, ObservationChange::Resync { .. }) {
-                break;
+            match update.change {
+                ObservationChange::Event(event) => match event.kind {
+                    tickloop_agent::runtime::EventKind::Text(text) => streamed.push_str(&text),
+                    tickloop_agent::runtime::EventKind::Completed { .. } => break,
+                    _ => {}
+                },
+                ObservationChange::Resync { .. } | ObservationChange::Reset { .. } => {
+                    panic!("large output failed to stream within its per-update budget")
+                }
+                _ => {}
             }
         }
     })
     .await
     .unwrap();
+    assert_eq!(streamed, output);
     tokio::time::timeout(Duration::from_secs(3), async { loop {
         if live(&access, execution).await.conversation.messages.iter().any(|message| message.content.iter().any(|content| matches!(content, tickloop_agent::model::Content::Text { text } if text == &output))) { break; }
         tokio::task::yield_now().await;

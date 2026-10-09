@@ -734,7 +734,8 @@ async fn a_real_owner_answers_hosted_lifecycle_requests_only_for_live_grants() {
 
 #[tokio::test]
 async fn concurrent_cold_start_uses_one_isolated_owner_and_owner_exit_closes_worker_lifelines() {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::{fd::AsRawFd, unix::fs::PermissionsExt};
+    const OWNER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
     let temporary = tempfile::tempdir_in("/tmp").unwrap();
     let private_directory = temporary.path().join("agent-runtime");
     std::fs::create_dir(&private_directory).unwrap();
@@ -900,13 +901,25 @@ async fn concurrent_cold_start_uses_one_isolated_owner_and_owner_exit_closes_wor
         .collect::<Vec<_>>();
     assert_eq!(worker_sockets.len(), 2);
     replacement.shutdown_owner().await.unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while worker_sockets.iter().any(|path| path.exists()) {
+    let owner_lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(private_directory.join("owner.lock"))
+        .unwrap();
+    tokio::time::timeout(OWNER_SHUTDOWN_TIMEOUT, async {
+        loop {
+            if !worker_sockets.iter().any(|path| path.exists())
+                && unsafe { libc::flock(owner_lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }
+                    == 0
+            {
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
     .unwrap();
+    drop(owner_lock);
     let new_owner =
         tickloop_agent::agent_daemon::connect_or_start_at(private_directory.clone(), executable)
             .await

@@ -31,6 +31,258 @@ struct StreamingModel {
     requests: Mutex<Vec<ModelRequest>>,
 }
 
+struct FloodedReply {
+    thinking: bool,
+    paced: bool,
+    fragment: String,
+    deltas: usize,
+}
+
+const FLOOD_DELTAS: usize = 8192;
+
+#[async_trait]
+impl ModelClient for FloodedReply {
+    async fn generate_title(
+        &self,
+        request: ModelRequest,
+        _: UnboundedSender<ModelDelta>,
+        _: CancellationToken,
+    ) -> Result<ModelOutput, ModelError> {
+        Ok(support::title_output(request))
+    }
+
+    fn identity(&self) -> tickloop_agent::model::ModelIdentity {
+        tickloop_agent::model::ModelIdentity {
+            provider: tickloop_agent::model::ModelProvider::Api,
+            profile: "stream-flood-fixture".into(),
+            protocol: tickloop_agent::model::Protocol::Messages,
+            requested_model: "stream-flood-fixture".into(),
+        }
+    }
+
+    async fn complete(
+        &self,
+        _: ModelRequest,
+        events: UnboundedSender<ModelDelta>,
+        _: CancellationToken,
+    ) -> Result<ModelOutput, ModelError> {
+        for _ in 0..self.deltas {
+            events
+                .send(if self.thinking {
+                    ModelDelta::Thinking(self.fragment.clone())
+                } else {
+                    ModelDelta::Text(self.fragment.clone())
+                })
+                .unwrap();
+            if self.paced {
+                tokio::task::yield_now().await;
+            }
+        }
+        let mut content = Vec::new();
+        if self.thinking {
+            content.push(Content::Thinking {
+                thinking: self.fragment.repeat(self.deltas),
+                signature: None,
+            });
+            events.send(ModelDelta::Text("完整答案".into())).unwrap();
+            content.extend(support::text("完整答案"));
+        } else {
+            content.extend(support::text(&self.fragment.repeat(self.deltas)));
+        }
+        Ok(ModelOutput {
+            private_source: None,
+            content,
+            usage: Usage::default(),
+            stop_reason: "end_turn".into(),
+        })
+    }
+}
+
+async fn stream_flood_retains_reply_without_overrunning_live_events(thinking: bool, paced: bool) {
+    let directory = tempfile::tempdir().unwrap();
+    let agent = Agent::new_embedded(
+        support::config(),
+        Arc::new(FloodedReply {
+            thinking,
+            paced,
+            fragment: if thinking { "思" } else { "答" }.into(),
+            deltas: FLOOD_DELTAS,
+        }),
+    );
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let mut events = agent.subscribe();
+    agent
+        .submit(chat, None, "这个项目是做什么的".into())
+        .await
+        .unwrap();
+    let snapshot = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let snapshot = agent.snapshot(chat).await.unwrap();
+            if snapshot
+                .loops
+                .first()
+                .is_some_and(|goal| goal.state == tickloop_agent::runtime::LoopState::Completed)
+            {
+                break snapshot;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let mut streamed_text = String::new();
+    let mut streamed_thinking = String::new();
+    let mut completed = false;
+    loop {
+        match events.try_recv() {
+            Ok(event) => match event.kind {
+                EventKind::Thinking(value) => streamed_thinking.push_str(&value),
+                EventKind::Text(value) => streamed_text.push_str(&value),
+                EventKind::Completed { .. } => completed = true,
+                _ => {}
+            },
+            Err(broadcast::error::TryRecvError::Empty) => break,
+            Err(error) => {
+                panic!("normal first-turn streaming overran the live event receiver: {error:?}")
+            }
+        }
+    }
+    assert!(completed);
+    assert_eq!(
+        streamed_text,
+        if thinking {
+            "完整答案".into()
+        } else {
+            "答".repeat(FLOOD_DELTAS)
+        }
+    );
+    assert_eq!(
+        streamed_thinking,
+        if thinking {
+            "思".repeat(FLOOD_DELTAS)
+        } else {
+            String::new()
+        }
+    );
+    assert!(
+        snapshot
+            .messages
+            .iter()
+            .any(|message| message.role == Role::Assistant)
+    );
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn first_turn_thinking_flood_preserves_output_without_live_event_loss() {
+    stream_flood_retains_reply_without_overrunning_live_events(true, false).await;
+}
+
+#[tokio::test]
+async fn first_turn_text_flood_preserves_output_without_live_event_loss() {
+    stream_flood_retains_reply_without_overrunning_live_events(false, false).await;
+}
+
+#[tokio::test]
+async fn first_turn_paced_thinking_flood_preserves_output_without_live_event_loss() {
+    stream_flood_retains_reply_without_overrunning_live_events(true, true).await;
+}
+
+#[tokio::test]
+async fn batched_and_large_unicode_packets_reach_agent_access_without_resync() {
+    use tickloop_agent::agent_access::*;
+    for thinking in [false, true] {
+        for (fragment, deltas) in [
+            ("a".repeat(64), 256),
+            ("\u{1}".repeat(4096), 1),
+            ("🙂".repeat(4096), 1),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let expected = fragment.repeat(deltas);
+            let agent = Agent::new_embedded(
+                support::config(),
+                Arc::new(FloodedReply {
+                    thinking,
+                    paced: false,
+                    fragment,
+                    deltas,
+                }),
+            );
+            let access = EmbeddedAgentAccess::new(agent.clone());
+            let mut launch = LaunchSpec::embedded(directory.path().into());
+            launch.model = Some(support::config());
+            let created = access
+                .execute(CommandEnvelope {
+                    owner_epoch: access.owner_epoch(),
+                    command_id: uuid::Uuid::new_v4(),
+                    command: AgentCommand::Create {
+                        launch,
+                        initial: None,
+                        origin: None,
+                    },
+                })
+                .await
+                .unwrap();
+            let Some(CommandResult::Created { execution, .. }) = created.result else {
+                panic!("expected created execution: {created:?}");
+            };
+            let initial = access
+                .observe(ObservationRequest::Agent {
+                    execution,
+                    detail: AgentDetailQuery::Snapshot,
+                    after: None,
+                })
+                .await
+                .unwrap();
+            let ObservationValue::Agent(snapshot) = initial.initial else {
+                panic!("expected initial snapshot");
+            };
+            let chat = snapshot.conversation.id;
+            let mut observation = access
+                .observe(ObservationRequest::Agent {
+                    execution,
+                    detail: AgentDetailQuery::Snapshot,
+                    after: None,
+                })
+                .await
+                .unwrap();
+            agent
+                .submit(chat, None, "Stream the controlled packets".into())
+                .await
+                .unwrap();
+            let mut text = String::new();
+            let mut analysis = String::new();
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    match observation.recv().await.unwrap().change {
+                        ObservationChange::Event(event) => match event.kind {
+                            EventKind::Text(value) => text.push_str(&value),
+                            EventKind::Thinking(value) => analysis.push_str(&value),
+                            EventKind::Completed { .. } => break,
+                            _ => {}
+                        },
+                        ObservationChange::Resync { reason }
+                        | ObservationChange::Reset { reason, .. } => {
+                            panic!("valid stream packets exceeded the delivery budget: {reason:?}")
+                        }
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            if thinking {
+                assert_eq!(analysis, expected);
+                assert_eq!(text, "完整答案");
+            } else {
+                assert_eq!(text, expected);
+                assert!(analysis.is_empty());
+            }
+            agent.shutdown().await;
+        }
+    }
+}
+
 #[async_trait]
 impl ModelClient for StreamingModel {
     async fn generate_title(
@@ -138,7 +390,7 @@ async fn snapshots_move_each_streamed_reply_into_history_once_across_a_real_tool
 
     wait_for(
         &mut events,
-        |kind| matches!(kind, EventKind::Text(text) if text == " the read."),
+        |kind| matches!(kind, EventKind::Text(text) if text.ends_with(" the read.")),
     )
     .await;
     let snapshot = agent.snapshot(chat).await.unwrap();
@@ -169,7 +421,7 @@ async fn snapshots_move_each_streamed_reply_into_history_once_across_a_real_tool
     second.begin.cancel();
     wait_for(
         &mut events,
-        |kind| matches!(kind, EventKind::Text(text) if text == " says hello."),
+        |kind| matches!(kind, EventKind::Text(text) if text.ends_with(" says hello.")),
     )
     .await;
     let snapshot = agent.snapshot(chat).await.unwrap();
@@ -241,7 +493,7 @@ async fn failed_partial_text_is_not_committed_before_an_explicit_new_run_starts(
         .unwrap();
     wait_for(
         &mut events,
-        |kind| matches!(kind, EventKind::Text(text) if text == " reply"),
+        |kind| matches!(kind, EventKind::Text(text) if text.ends_with(" reply")),
     )
     .await;
     failed.finish.cancel();
@@ -369,7 +621,7 @@ async fn a_parked_run_does_not_commit_another_runs_failed_reply_when_it_regains_
     resumed.begin.cancel();
     wait_for(
         &mut events,
-        |kind| matches!(kind, EventKind::Text(text) if text == " independently."),
+        |kind| matches!(kind, EventKind::Text(text) if text.ends_with(" independently.")),
     )
     .await;
     let snapshot = agent.snapshot(chat).await.unwrap();

@@ -194,6 +194,24 @@ pub enum Transition {
     Remove,
 }
 
+fn settled_launch_transition(
+    mut observed: LaunchRecord,
+    current: LaunchRecord,
+    transition: Transition,
+) -> Transition {
+    observed.watches.clone_from(&current.watches);
+    if current != observed {
+        return Transition::Keep;
+    }
+    match transition {
+        Transition::Write(mut record) => {
+            record.watches = current.watches;
+            Transition::Write(record)
+        }
+        transition => transition,
+    }
+}
+
 /// The registries of every config root this owner serves, opened on first use.
 #[derive(Default)]
 pub struct Registry {
@@ -740,13 +758,9 @@ impl RootRegistry {
                 },
                 LaunchState::Lost { .. } | LaunchState::Reopened { .. } => continue,
             };
-            // Applied only to the record exactly as it was judged.
+            // Watch intents change independently of the lifecycle being settled.
             self.transition_launch(chat, record.operation, move |current| {
-                if current == record {
-                    transition
-                } else {
-                    Transition::Keep
-                }
+                settled_launch_transition(record, current, transition)
             })
             .await?;
         }
@@ -951,6 +965,107 @@ mod tests {
         .unwrap();
         record.state = state;
         record
+    }
+
+    #[tokio::test]
+    async fn watch_changes_during_settlement_preserve_the_lost_launch_and_latest_intents() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = Registry::default().root(directory.path()).await.unwrap();
+        let chat = Uuid::new_v4();
+        let instance = InstanceRef::hosted(Uuid::new_v4());
+        let host_epoch = Uuid::new_v4();
+        let mut live = record(
+            chat,
+            LaunchState::Live {
+                instance: instance.clone(),
+                host_epoch,
+            },
+        );
+        live.watches.insert(Uuid::new_v4());
+        root.record_launch(&live).await.unwrap();
+        let observed = root.launches(chat).await.unwrap().pop().unwrap();
+        root.transition_launch(chat, observed.operation, |mut current| {
+            current.watches.clear();
+            Transition::Write(Box::new(current))
+        })
+        .await
+        .unwrap();
+        let mut lost = observed.clone();
+        lost.state = LaunchState::Lost {
+            instance: instance.clone(),
+            host_epoch,
+        };
+        let changed = root
+            .transition_launch(chat, observed.operation, move |current| {
+                settled_launch_transition(observed, current, Transition::Write(Box::new(lost)))
+            })
+            .await
+            .unwrap();
+        assert!(
+            changed,
+            "an independent Watch change must not veto host-loss settlement"
+        );
+        let settled = root.launches(chat).await.unwrap().pop().unwrap();
+        assert_eq!(
+            settled.state,
+            LaunchState::Lost {
+                instance,
+                host_epoch
+            }
+        );
+        assert!(
+            settled.watches.is_empty(),
+            "the current Watch intents must remain authoritative"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_settlement_does_not_replace_a_newer_launch_lifecycle() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = Registry::default().root(directory.path()).await.unwrap();
+        let chat = Uuid::new_v4();
+        let instance = InstanceRef::hosted(Uuid::new_v4());
+        let host_epoch = Uuid::new_v4();
+        let live = record(
+            chat,
+            LaunchState::Live {
+                instance: instance.clone(),
+                host_epoch,
+            },
+        );
+        root.record_launch(&live).await.unwrap();
+        let observed = root.launches(chat).await.unwrap().pop().unwrap();
+        let reopened = LaunchState::Reopened {
+            instance: instance.clone(),
+            host_epoch,
+            by: Uuid::new_v4(),
+        };
+        let committed = reopened.clone();
+        root.transition_launch(chat, observed.operation, move |mut current| {
+            current.state = committed;
+            Transition::Write(Box::new(current))
+        })
+        .await
+        .unwrap();
+        let mut lost = observed.clone();
+        lost.state = LaunchState::Lost {
+            instance,
+            host_epoch,
+        };
+        let changed = root
+            .transition_launch(chat, observed.operation, move |current| {
+                settled_launch_transition(observed, current, Transition::Write(Box::new(lost)))
+            })
+            .await
+            .unwrap();
+        assert!(
+            !changed,
+            "an old listing must not undo a new lifecycle transition"
+        );
+        assert_eq!(
+            root.launches(chat).await.unwrap().pop().unwrap().state,
+            reopened
+        );
     }
 
     #[tokio::test]

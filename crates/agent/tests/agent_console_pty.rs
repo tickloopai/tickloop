@@ -1021,11 +1021,16 @@ async fn run_sustained_owner_loss(
         .await;
     let client = fixture.client().await;
     view.send(b"!printf 'cached shell output\\n'\r");
-    view.wait_for("finished Shell output is cached in the View", |frame| {
-        frame
-            .lines()
-            .any(|line| line.trim() == "cached shell output")
-    })
+    view.wait_for(
+        "finished Shell releases the input and retains its output",
+        |frame| {
+            frame
+                .lines()
+                .any(|line| line.trim() == "cached shell output")
+                && frame.lines().any(|line| line.trim() == "❯")
+                && !frame.contains("Shell running · Ctrl+B background · Ctrl+C stop")
+        },
+    )
     .await;
     let rows = catalog(&client).await;
     assert_eq!(rows.len(), 1);
@@ -1203,7 +1208,9 @@ fn request_dialog_visible(frame: &str, question: &str, requester: &str) -> bool 
 async fn open_family_child(pty: &mut PtyView, task: &str) {
     pty.send(b"\x1b[1;5F\x1b[B");
     pty.wait_for("family entry receives focus", |frame| {
-        frame.contains("Subagents 1") && frame.contains("Esc input")
+        frame.contains("Subagents 1")
+            && frame.contains(task)
+            && frame.contains("Enter/Space hide · ↓ list · Esc input")
     })
     .await;
     pty.send(b"\x1b[B");

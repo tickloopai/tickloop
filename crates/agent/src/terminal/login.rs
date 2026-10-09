@@ -922,11 +922,14 @@ mod tests {
         });
         let wait = |needle: &str| {
             let deadline = Instant::now() + PTY_TIMEOUT;
-            while !output.lock().unwrap().contains(needle) {
+            loop {
+                let frame = screen::visible_screen(&output.lock().unwrap(), 150, 40);
+                if frame.contains(needle) {
+                    break frame;
+                }
                 assert!(
                     Instant::now() < deadline,
-                    "PTY missing {needle}; latest frame:\n{}",
-                    screen::visible_screen(&output.lock().unwrap(), 150, 40)
+                    "PTY missing {needle}; latest frame:\n{frame}"
                 );
                 std::thread::sleep(Duration::from_millis(20));
             }
@@ -943,8 +946,7 @@ mod tests {
         wait("Sign in · OpenAI");
         writer.write_all(b"j\r").unwrap();
         writer.flush().unwrap();
-        wait("Codex browser login");
-        let frame = screen::visible_screen(&output.lock().unwrap(), 150, 40);
+        let frame = wait("Codex browser login");
         input_dialog::assert_frame(&frame, 40, "Codex browser login");
         input_dialog::record_frame("browser-login", &frame);
         writer.write_all(b"\x1b").unwrap();
@@ -969,11 +971,9 @@ mod tests {
         }
         writer.write_all(b"k\r").unwrap();
         writer.flush().unwrap();
-        wait("Cannot log in:");
+        let failed = wait("Cannot log in:");
         rejected_login.join().unwrap();
-        assert!(
-            screen::visible_screen(&output.lock().unwrap(), 150, 40).contains("Back to Provider")
-        );
+        assert!(failed.contains("Back to Provider"));
         writer.write_all(b"\x1b").unwrap();
         writer.flush().unwrap();
         let deadline = Instant::now() + PTY_TIMEOUT;
@@ -1248,7 +1248,14 @@ mod tests {
             let deadline = Instant::now() + PTY_TIMEOUT;
             loop {
                 let text = output.lock().unwrap().clone();
-                if screen::visible_screen(&text, 150, 40).contains(needle) {
+                let visible = screen::visible_screen(&text, 150, 40);
+                let model_selection_ready = needle != "Model selection:"
+                    || (visible.contains("Enter apply")
+                        && !visible.contains(super::super::console::MENU_SUBMISSION_PENDING_HINT)
+                        && visible.lines().any(|line| {
+                            line.trim_start().starts_with('❯') && line.contains("Thinking ‹")
+                        }));
+                if visible.contains(needle) && model_selection_ready {
                     break;
                 }
                 assert!(

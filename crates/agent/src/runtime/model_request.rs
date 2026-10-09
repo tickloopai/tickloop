@@ -13,6 +13,15 @@ use crate::model::{
     ModelOutput, ModelRequest, ModelRequestContext, ModelResponseRejection, Role,
 };
 
+const MODEL_DELTA_FLUSH_INTERVAL: Duration = Duration::from_millis(16);
+const MODEL_DELTA_BATCH_COUNT: usize = 256;
+const MODEL_DELTA_ENVELOPE_BYTES: usize = 1024;
+const MAX_JSON_ESCAPE_EXPANSION: usize = 6;
+const MODEL_DELTA_BATCH_BYTES: usize = (crate::agent_access::FEED_MAX_BYTES
+    / crate::agent_access::FEED_CAPACITY
+    - MODEL_DELTA_ENVELOPE_BYTES)
+    / MAX_JSON_ESCAPE_EXPANSION;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct RequestContext {
     owner: RequestOwner,
@@ -132,9 +141,112 @@ struct RequestProgress {
     displayed_text: String,
     output_started: bool,
     regression: Option<UsageCounter>,
+    pending_delta: Option<ModelDelta>,
+    pending_delta_count: usize,
+    delta_deadline: Option<tokio::time::Instant>,
 }
 
 impl Agent {
+    async fn buffer_model_delta(
+        &self,
+        context: &RequestContext,
+        sequence: RequestSequence,
+        delta: ModelDelta,
+        cancel: &CancellationToken,
+        progress: &mut RequestProgress,
+    ) -> Result<(), AgentError> {
+        let (text, thinking) = match delta {
+            ModelDelta::Text(text) => (text, false),
+            ModelDelta::Thinking(text) => (text, true),
+            other => {
+                return self
+                    .buffer_model_delta_part(context, sequence, other, cancel, progress)
+                    .await;
+            }
+        };
+        let mut remaining = text.as_str();
+        loop {
+            let mut end = remaining.len().min(MODEL_DELTA_BATCH_BYTES);
+            while !remaining.is_char_boundary(end) {
+                end -= 1;
+            }
+            let (part, rest) = remaining.split_at(end);
+            let delta = if thinking {
+                ModelDelta::Thinking(part.into())
+            } else {
+                ModelDelta::Text(part.into())
+            };
+            self.buffer_model_delta_part(context, sequence, delta, cancel, progress)
+                .await?;
+            if rest.is_empty() {
+                return Ok(());
+            }
+            remaining = rest;
+        }
+    }
+
+    async fn buffer_model_delta_part(
+        &self,
+        context: &RequestContext,
+        sequence: RequestSequence,
+        delta: ModelDelta,
+        cancel: &CancellationToken,
+        progress: &mut RequestProgress,
+    ) -> Result<(), AgentError> {
+        if !matches!(delta, ModelDelta::Text(_) | ModelDelta::Thinking(_)) {
+            self.flush_model_delta(context, sequence, cancel, progress)
+                .await?;
+            return self
+                .record_model_delta(context, sequence, delta, !cancel.is_cancelled(), progress)
+                .await;
+        }
+        let merged = match (&mut progress.pending_delta, &delta) {
+            (Some(ModelDelta::Text(current)), ModelDelta::Text(next))
+            | (Some(ModelDelta::Thinking(current)), ModelDelta::Thinking(next))
+                if current.len().saturating_add(next.len()) <= MODEL_DELTA_BATCH_BYTES =>
+            {
+                current.push_str(next);
+                true
+            }
+            _ => false,
+        };
+        if !merged {
+            self.flush_model_delta(context, sequence, cancel, progress)
+                .await?;
+            progress.pending_delta = Some(delta);
+            progress.delta_deadline =
+                Some(tokio::time::Instant::now() + MODEL_DELTA_FLUSH_INTERVAL);
+        }
+        progress.pending_delta_count += 1;
+        let bytes = match &progress.pending_delta {
+            Some(ModelDelta::Text(text) | ModelDelta::Thinking(text)) => text.len(),
+            _ => 0,
+        };
+        if progress.pending_delta_count >= MODEL_DELTA_BATCH_COUNT
+            || bytes >= MODEL_DELTA_BATCH_BYTES
+        {
+            self.flush_model_delta(context, sequence, cancel, progress)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn flush_model_delta(
+        &self,
+        context: &RequestContext,
+        sequence: RequestSequence,
+        cancel: &CancellationToken,
+        progress: &mut RequestProgress,
+    ) -> Result<(), AgentError> {
+        progress.delta_deadline = None;
+        progress.pending_delta_count = 0;
+        if let Some(delta) = progress.pending_delta.take() {
+            self.record_model_delta(context, sequence, delta, !cancel.is_cancelled(), progress)
+                .await?;
+        }
+        Ok(())
+    }
+
     pub(super) async fn change_request_usage<T>(
         &self,
         chat_id: ChatId,
@@ -519,14 +631,26 @@ impl Agent {
             };
             tokio::pin!(response, deadline);
             loop {
+                let flush_deadline = progress.delta_deadline;
+                let flush = async {
+                    match flush_deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                };
                 tokio::select! {
                     biased;
                     output = &mut response => break output.map_err(AgentError::from),
                     _ = cancel.cancelled() => break Err(ModelError::Cancelled.into()),
                     _ = &mut deadline => break Err(ModelError::TimedOut.into()),
+                    _ = flush => {
+                        if let Err(error) = self.flush_model_delta(&context, sequence, &cancel, &mut progress).await {
+                            break Err(error);
+                        }
+                    }
                     Some(delta) = receiver.recv() => {
-                        if let Err(error) = self.record_model_delta(&context, sequence, delta,
-                            !cancel.is_cancelled(), &mut progress).await {
+                        if let Err(error) = self.buffer_model_delta(&context, sequence, delta,
+                            &cancel, &mut progress).await {
                             break Err(error);
                         }
                     }
@@ -537,17 +661,17 @@ impl Agent {
         receiver.close();
         while let Ok(delta) = receiver.try_recv() {
             if let Err(error) = self
-                .record_model_delta(
-                    &context,
-                    sequence,
-                    delta,
-                    !cancel.is_cancelled(),
-                    &mut progress,
-                )
+                .buffer_model_delta(&context, sequence, delta, &cancel, &mut progress)
                 .await
             {
                 result = Err(error);
             }
+        }
+        if let Err(error) = self
+            .flush_model_delta(&context, sequence, &cancel, &mut progress)
+            .await
+        {
+            result = Err(error);
         }
         if let Ok(output) = &result
             && let Err(error) = self

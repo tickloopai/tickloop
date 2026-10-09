@@ -29,7 +29,7 @@ struct ResponseStep {
     observations: Vec<Usage>,
     result: Result<ModelOutput, ModelError>,
     wait_for_cancel: Option<Arc<Notify>>,
-    text_chunk_size: Option<usize>,
+    usage_separated_text_chunks: bool,
 }
 
 impl ResponseStep {
@@ -50,7 +50,7 @@ impl ResponseStep {
                 usage,
             }),
             wait_for_cancel: None,
-            text_chunk_size: None,
+            usage_separated_text_chunks: false,
         }
     }
 
@@ -59,7 +59,7 @@ impl ResponseStep {
             observations: vec![usage],
             result: Err(ModelError::Cancelled),
             wait_for_cancel: Some(entered),
-            text_chunk_size: None,
+            usage_separated_text_chunks: false,
         }
     }
 }
@@ -122,11 +122,13 @@ impl ModelClient for UsageModel {
         if let Ok(output) = &step.result {
             for block in &output.content {
                 if let Content::Text { text } = block {
-                    if let Some(size) = step.text_chunk_size {
-                        assert!(text.is_ascii());
-                        for chunk in text.as_bytes().chunks(size) {
+                    if step.usage_separated_text_chunks {
+                        for character in text.chars() {
                             events
-                                .send(ModelDelta::Text(String::from_utf8(chunk.to_vec()).unwrap()))
+                                .send(ModelDelta::Text(character.to_string()))
+                                .unwrap();
+                            events
+                                .send(ModelDelta::Usage(output.usage.clone()))
                                 .unwrap();
                         }
                     } else {
@@ -887,7 +889,7 @@ async fn failed_requests_keep_reported_usage_and_leave_missing_counters_unknown(
                 observations: Vec::new(),
                 result: Err(ModelError::Http { status: 400 }),
                 wait_for_cancel: None,
-                text_chunk_size: None,
+                usage_separated_text_chunks: false,
             },
             ResponseStep {
                 observations: vec![Usage {
@@ -896,7 +898,7 @@ async fn failed_requests_keep_reported_usage_and_leave_missing_counters_unknown(
                 }],
                 result: Err(ModelError::ProviderFailure),
                 wait_for_cancel: None,
-                text_chunk_size: None,
+                usage_separated_text_chunks: false,
             },
         ],
     ));
@@ -936,7 +938,7 @@ async fn evicting_old_completed_events_preserves_all_request_records_and_totals(
     let directory = tempfile::tempdir().unwrap();
     let archive = directory.path().join("archive");
     let mut noisy = ResponseStep::reply(text(&"x".repeat(1_100)), counters(20, 2, 0, 0));
-    noisy.text_chunk_size = Some(1);
+    noisy.usage_separated_text_chunks = true;
     let model = Arc::new(UsageModel::new(
         main_identity(),
         vec![

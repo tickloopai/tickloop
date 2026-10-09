@@ -224,7 +224,7 @@ async fn run_background_event_reset(fixture: &PrivateFixture) {
     const OTHER_OUTPUT: &str = "Other reset Agent output";
     let thinking_frame = format!(
         "data: {}\n\n",
-        json!({"id":"cli-fixture","choices":[{"index":0,"delta":{"reasoning_content":"thinking "},"finish_reason":null}]})
+        json!({"id":"cli-fixture","choices":[{"index":0,"delta":{"reasoning_content":"thinking "},"finish_reason":null}],"usage":{"prompt_tokens":0,"completion_tokens":0}})
     );
     let background_reply = thinking_frame.repeat(THINKING_EVENTS) + &chat_reply(None, SECOND_REPLY);
     let (base_url, mut requests, release) =
