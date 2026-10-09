@@ -429,22 +429,23 @@ mod tests {
     struct NoDiscovery;
     #[async_trait]
     impl TickDiscovery for NoDiscovery {
-        fn tick_type(&self) -> &'static str {
-            "herdr"
-        }
         async fn page(
             &self,
             _: Option<PageCursor>,
         ) -> Result<Page<DiscoveredTick>, DiscoveryError> {
             Err(DiscoveryError::Unavailable("unused".into()))
         }
+    }
+    #[async_trait]
+    impl crate::tick_adapter::TickProbe for NoDiscovery {
+        fn tick_type(&self) -> &'static str {
+            "herdr"
+        }
         async fn probe(
             &self,
+            _: uuid::Uuid,
             _: &[InstanceRef],
-        ) -> Result<
-            std::collections::HashMap<InstanceRef, crate::tick_adapter::MemberState>,
-            DiscoveryError,
-        > {
+        ) -> Result<crate::tick_adapter::MemberFindings, DiscoveryError> {
             Err(DiscoveryError::Unavailable("unused".into()))
         }
     }

@@ -3,7 +3,7 @@
 
 use std::{
     io,
-    os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt},
+    os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
@@ -11,6 +11,8 @@ pub const RUNTIME_DIR_ENV: &str = "TICKLOOP_TICK_HOST_RUNTIME_DIR";
 pub const SOCKET_NAME: &str = "host.sock";
 pub const LOCK_NAME: &str = "host.lock";
 pub const SESSION_DIRECTORY: &str = "s";
+/// One empty file per host epoch that exited because every Tick had ended.
+pub const EMPTIED_DIRECTORY: &str = "emptied";
 /// macOS `sun_path` holds 104 bytes including the terminator.
 pub const MAX_SOCKET_PATH_BYTES: usize = 103;
 /// TickSession keeps paths at most this long so `<uuid>.sock` still fits.
@@ -43,6 +45,46 @@ impl HostPaths {
 
     pub fn sessions(&self) -> PathBuf {
         self.runtime.join(SESSION_DIRECTORY)
+    }
+
+    fn emptied_marker(&self, epoch: uuid::Uuid) -> PathBuf {
+        self.runtime.join(EMPTIED_DIRECTORY).join(epoch.to_string())
+    }
+
+    /// Records that host `epoch` exits because every Tick it ran had ended. A host that crashed
+    /// or was shut down with Ticks leaves no mark, so its Ticks count as lost.
+    pub fn record_emptied(&self, epoch: uuid::Uuid) -> io::Result<()> {
+        private_directory(&self.runtime.join(EMPTIED_DIRECTORY))?;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(self.emptied_marker(epoch))
+            .map(drop)
+    }
+
+    /// Forgets marks older than `retention`; records of those hosts then count as lost, which
+    /// only offers a reopen the user can decline.
+    pub fn prune_emptied(&self, retention: std::time::Duration) {
+        let Ok(entries) = std::fs::read_dir(self.runtime.join(EMPTIED_DIRECTORY)) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let is_old = entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .is_ok_and(|modified| modified.elapsed().is_ok_and(|age| age > retention));
+            if is_old {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+
+    /// Whether host `epoch` exited only after all its Ticks had ended.
+    pub fn was_emptied(&self, epoch: uuid::Uuid) -> bool {
+        std::fs::symlink_metadata(self.emptied_marker(epoch))
+            .is_ok_and(|metadata| metadata.is_file())
     }
 
     /// Whether a host serves this runtime directory: a live host holds the host lock for its

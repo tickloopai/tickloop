@@ -649,6 +649,9 @@ pub(super) struct State {
     monitor_preference: tickloop_agent::settings::MonitorPreference,
     /// Lists the View's Workspace programs for explicit adding; absent outside a Herdr View.
     tick_discovery: Option<Arc<dyn crate::tick_adapter::TickDiscovery>>,
+    /// Reads the host state of Monitor members: the discovery inside Herdr, otherwise the
+    /// hosted Tick probe.
+    member_probe: Option<Arc<dyn crate::tick_adapter::TickProbe>>,
     member_probe_running: bool,
     task_surface: Option<TaskSurface<Uuid>>,
     task_surface_cache: HashMap<Uuid, TaskSurface<Uuid>>,
@@ -882,10 +885,10 @@ struct FooterBarTarget {
     categories: Vec<(std::ops::Range<usize>, FooterItemId)>,
 }
 
-/// One claimed probe of a Chat's members; its result goes back through `update_member_states`.
+/// One claimed probe of a Chat's members; its result goes back through `update_member_findings`.
 pub(super) struct MemberProbe {
     pub(super) chat: Uuid,
-    pub(super) discovery: Arc<dyn crate::tick_adapter::TickDiscovery>,
+    pub(super) prober: Arc<dyn crate::tick_adapter::TickProbe>,
     pub(super) targets: Vec<crate::tick_stream::InstanceRef>,
 }
 
@@ -1166,14 +1169,25 @@ impl Console {
         state.status = message.into();
         Ok(())
     }
+    /// Installs the discovery that lists what can be added; it also probes members.
     pub(super) fn set_tick_discovery(
         &self,
         discovery: Arc<dyn crate::tick_adapter::TickDiscovery>,
     ) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        state.member_probe = Some(discovery.clone());
+        state.tick_discovery = Some(discovery);
+        Ok(())
+    }
+    /// Installs a probe of members where nothing can be added from discovery.
+    pub(super) fn set_member_probe(
+        &self,
+        probe: Arc<dyn crate::tick_adapter::TickProbe>,
+    ) -> Result<(), String> {
         self.state
             .lock()
             .map_err(|error| error.to_string())?
-            .tick_discovery = Some(discovery);
+            .member_probe = Some(probe);
         Ok(())
     }
     /// Opens the add picker in the current Chat's Monitor, even while the Monitor is empty.
@@ -1189,38 +1203,38 @@ impl Console {
     /// Claims the next host probe of the visible Chat's members, if one is due and none runs.
     pub(super) fn claim_member_probe(&self) -> Result<Option<MemberProbe>, String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
-        let (Some(chat), Some(discovery)) = (state.chat, state.tick_discovery.clone()) else {
+        let (Some(chat), Some(prober)) = (state.chat, state.member_probe.clone()) else {
             return Ok(None);
         };
-        let targets = state.monitor.probe_targets(discovery.tick_type());
+        let targets = state.monitor.probe_targets(prober.tick_type());
         if targets.is_empty() || state.member_probe_running {
             return Ok(None);
         }
         state.member_probe_running = true;
         Ok(Some(MemberProbe {
             chat,
-            discovery,
+            prober,
             targets,
         }))
     }
     /// Applies a finished probe. A failed probe (`None`) keeps the earlier findings, and an
     /// unchanged result neither rebuilds nor repaints.
-    pub(super) fn update_member_states(
+    pub(super) fn update_member_findings(
         &self,
         chat: Uuid,
-        states: Option<HashMap<crate::tick_stream::InstanceRef, crate::tick_adapter::MemberState>>,
+        findings: Option<crate::tick_adapter::MemberFindings>,
     ) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         state.member_probe_running = false;
-        let Some(states) = states else {
+        let Some(findings) = findings else {
             return Ok(());
         };
         let visible = state.chat == Some(chat) && state.monitor_visible();
         let monitor = state.monitor_for_chat_mut(chat);
-        if monitor.member_states == states {
+        if monitor.member_findings == findings {
             return Ok(());
         }
-        monitor.member_states = states;
+        monitor.member_findings = findings;
         monitor.rebuild();
         if !visible {
             return Ok(());
@@ -4844,6 +4858,7 @@ impl State {
             monitor: Monitor::default(),
             monitor_preference: tickloop_agent::settings::MonitorPreference::Auto,
             tick_discovery: None,
+            member_probe: None,
             member_probe_running: false,
             task_surface: None,
             task_surface_cache: HashMap::new(),

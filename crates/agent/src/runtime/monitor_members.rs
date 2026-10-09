@@ -119,6 +119,25 @@ impl Agent {
             .await
     }
 
+    /// Joins the instance reopened in place of `lost` to the Chat's Monitor as one it opened,
+    /// under the lost one's title; the lost row stays until it is removed.
+    pub async fn record_reopened_tick(
+        &self,
+        chat_id: ChatId,
+        lost: &InstanceRef,
+        reopened: InstanceRef,
+    ) -> Result<MonitorMembership, AgentError> {
+        self.update_monitor(chat_id, |membership| {
+            let title = membership
+                .members
+                .iter()
+                .find(|member| &member.instance == lost)
+                .and_then(|member| member.title.clone());
+            membership.record_opened(reopened, title);
+        })
+        .await
+    }
+
     /// Removes an instance from the Chat's Monitor view only.
     pub async fn remove_monitor_member(
         &self,

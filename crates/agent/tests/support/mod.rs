@@ -2,6 +2,7 @@
 
 pub mod cli_runtime;
 pub mod fixture_cli;
+pub mod routed;
 pub mod tick_admission_contract;
 
 use async_trait::async_trait;
@@ -89,6 +90,17 @@ impl ModelClient for ScriptedModel {
             stop_reason: "end_turn".into(),
         })
     }
+}
+
+/// An Agent owner that accepts every Transcript deletion, for cleanups whose Chats own no Ticks.
+pub struct AcceptingOwner;
+
+impl tickloop_agent::cleanup::ChatDeletionNotice for AcceptingOwner {
+    fn begin(&self, _chat: uuid::Uuid) -> Result<uuid::Uuid, String> {
+        Ok(uuid::Uuid::new_v4())
+    }
+
+    fn finish(&self, _chat: uuid::Uuid, _operation: uuid::Uuid) {}
 }
 
 pub fn config() -> ModelConfig {

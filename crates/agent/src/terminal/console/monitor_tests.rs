@@ -1640,9 +1640,6 @@ async fn shell_detail_confirmation_runs_the_production_adapter_control_callback(
 struct FixtureDiscovery;
 #[async_trait::async_trait]
 impl crate::tick_adapter::TickDiscovery for FixtureDiscovery {
-    fn tick_type(&self) -> &'static str {
-        "herdr"
-    }
     async fn page(
         &self,
         _: Option<tick_connect::page::PageCursor>,
@@ -1654,17 +1651,24 @@ impl crate::tick_adapter::TickDiscovery for FixtureDiscovery {
             "not listed in this fixture".into(),
         ))
     }
+}
+#[async_trait::async_trait]
+impl crate::tick_adapter::TickProbe for FixtureDiscovery {
+    fn tick_type(&self) -> &'static str {
+        "herdr"
+    }
     async fn probe(
         &self,
+        _chat: Uuid,
         instances: &[crate::tick_stream::InstanceRef],
-    ) -> Result<
-        HashMap<crate::tick_stream::InstanceRef, crate::tick_adapter::MemberState>,
-        crate::tick_adapter::DiscoveryError,
-    > {
-        Ok(instances
-            .iter()
-            .map(|instance| (instance.clone(), crate::tick_adapter::MemberState::Gone))
-            .collect())
+    ) -> Result<crate::tick_adapter::MemberFindings, crate::tick_adapter::DiscoveryError> {
+        Ok(crate::tick_adapter::MemberFindings {
+            states: instances
+                .iter()
+                .map(|instance| (instance.clone(), crate::tick_adapter::MemberState::Gone))
+                .collect(),
+            resources: HashMap::new(),
+        })
     }
 }
 
@@ -1811,10 +1815,10 @@ fn probed_herdr_members_report_their_host_state_and_owner() {
     let states = tokio::runtime::Builder::new_current_thread()
         .build()
         .unwrap()
-        .block_on(probe.discovery.probe(&probe.targets))
+        .block_on(probe.prober.probe(chat, &probe.targets))
         .ok();
-    console.update_member_states(chat, states).unwrap();
-    console.update_member_states(chat, None).unwrap();
+    console.update_member_findings(chat, states).unwrap();
+    console.update_member_findings(chat, None).unwrap();
     let state = console.state.lock().unwrap();
     let added = state
         .monitor
