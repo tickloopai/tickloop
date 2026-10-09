@@ -268,11 +268,7 @@ pub fn bash_output(stdout: &str, stderr: &str) -> Message {
     ))
 }
 
-pub fn background_started(
-    task_id: Uuid,
-    output_file: &std::path::Path,
-    by_user: bool,
-) -> Message {
+pub fn background_started(task_id: Uuid, output_file: &std::path::Path, by_user: bool) -> Message {
     let lead = if by_user {
         "Command was manually backgrounded by user with ID"
     } else {

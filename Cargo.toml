@@ -1,12 +1,11 @@
 [workspace]
 members = [
-    "crates/agent",
     "agent/*",
     "tickhost/host", "tickhost/connect",
     "tick/protocol", "tick/sdk", "tick/provider",
     "tick/providers/builtin", "tick/providers/longbridge", "tick/providers/futu",
     "tick/market", "tick/cli",
-    "crates/ui",
+    "ui",
 ]
 resolver = "3"
 exclude = ["vendor/crossterm", "vendor/longbridge-oauth"]

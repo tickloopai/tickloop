@@ -95,7 +95,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             image::ColorType::Rgb8.into(),
         )?;
         request.messages[0].content = vec![Content::Text { text: "Inspect the image. Call Echo exactly once with text equal to the lowercase English name of its solid color; then report the tool result. Use the actual Echo tool, not a textual representation.".into() }, Content::Image {
-            source: tickloop_agent_protocol::ImageSource::Base64 { media_type: tickloop_agent_base::image::ImageMediaType::Png, data: base64::engine::general_purpose::STANDARD.encode(png) }, width: 32, height: 32,
+            source: tickloop_agent_protocol::ImageSource::Base64 { media_type: tickloop_agent_protocol::ImageMediaType::Png, data: base64::engine::general_purpose::STANDARD.encode(png) }, width: 32, height: 32,
         }];
         "red"
     } else {

@@ -1,3 +1,13 @@
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use crate::{
+    ApprovalAttemptDetails, ApprovalFailureKind, ApprovalFallbackReason, ApprovalOutcome,
+    ApprovalReviewer, ApprovalReviewerKind, AutoBlockKind, AutoReviewerPreference, AutoRuleKind,
+    AutoRuleSource, ChatId, Decision, LoopId, PermissionApprovalSource, RuleApplicability, RunId,
+    SoftDenyClearance, TaskScopeFinding,
+};
+
 pub const MAX_RECENT_DENIALS: usize = 100;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -37,36 +47,36 @@ pub struct DenialRuleSummary {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DenialAutoRuleSummary {
     pub id: String,
-    pub kind: tickloop_agent_protocol::AutoRuleKind,
-    pub source: super::AutoRuleSource,
+    pub kind: AutoRuleKind,
+    pub source: AutoRuleSource,
     pub text: DisplaySummary,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DenialAutoFinding {
-    pub task_scope: super::auto_rules::TaskScopeFinding,
-    pub applicability: Option<super::auto_rules::RuleApplicability>,
-    pub clearance: Option<super::auto_rules::SoftDenyClearance>,
+    pub task_scope: TaskScopeFinding,
+    pub applicability: Option<RuleApplicability>,
+    pub clearance: Option<SoftDenyClearance>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DenialReviewFacts {
-    pub preferred_reviewer: Option<tickloop_agent_protocol::AutoReviewerPreference>,
+    pub preferred_reviewer: Option<AutoReviewerPreference>,
     pub reviewer: Option<ApprovalReviewer>,
     pub auto_settings_revision: Option<String>,
     pub context_version: String,
     pub template_version: String,
-    pub outcome: super::approval_assessment::ApprovalOutcome,
+    pub outcome: ApprovalOutcome,
     #[serde(default)]
-    pub attempts: Vec<super::approval_assessment::ApprovalAttemptDetails>,
+    pub attempts: Vec<ApprovalAttemptDetails>,
     #[serde(default)]
-    pub fallback_from: Option<super::ApprovalReviewerKind>,
+    pub fallback_from: Option<ApprovalReviewerKind>,
     #[serde(default)]
-    pub fallback_failure: Option<super::ApprovalFailureKind>,
+    pub fallback_failure: Option<ApprovalFailureKind>,
     #[serde(default)]
-    pub fallback_reason: Option<super::ApprovalFallbackReason>,
+    pub fallback_reason: Option<ApprovalFallbackReason>,
     #[serde(default)]
-    pub block_kind: Option<super::AutoBlockKind>,
+    pub block_kind: Option<AutoBlockKind>,
     #[serde(default)]
     pub block_rule: Option<DenialAutoRuleSummary>,
     #[serde(default)]
@@ -157,11 +167,11 @@ impl ApprovalRecord {
                 .and_then(|review| review.reviewer.as_ref())
             {
                 Some(ApprovalReviewer {
-                    kind: super::ApprovalReviewerKind::Llm,
+                    kind: ApprovalReviewerKind::Llm,
                     ..
                 }) => ApprovalPath::AutoLlm,
                 Some(ApprovalReviewer {
-                    kind: super::ApprovalReviewerKind::Jev,
+                    kind: ApprovalReviewerKind::Jev,
                     ..
                 }) => ApprovalPath::AutoJev,
                 None => ApprovalPath::Direct,

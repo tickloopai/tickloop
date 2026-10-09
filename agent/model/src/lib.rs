@@ -58,11 +58,16 @@ const CODEX_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/respons
 const MAX_ERROR_BODY_BYTES: usize = 16 * 1024;
 
 /// Model-card and endpoint lookups for a [`ModelConfig`]; the data lives in the protocol crate.
+/// Tokens a request needs beyond its messages and output: system prompt framing and tool schemas.
+pub const REQUEST_OVERHEAD_TOKENS: usize = 2048;
+
 pub trait ModelConfigExt {
     fn connection(&self) -> Option<&ProviderConnection>;
     fn private_history_source(&self) -> Option<PrivateHistorySource>;
     fn thinking_enabled(&self, effort: Option<ReasoningEffort>, enabled: bool) -> Option<bool>;
     fn maximum_context_window_tokens(&self) -> Option<usize>;
+    /// Whether a context window of `tokens` leaves room for the output and request overhead.
+    fn is_usable_context_window(&self, tokens: usize) -> bool;
 }
 
 impl ModelConfigExt for ModelConfig {
@@ -115,6 +120,13 @@ impl ModelConfigExt for ModelConfig {
 
     fn maximum_context_window_tokens(&self) -> Option<usize> {
         cards::model_card(self).and_then(|card| card.context_window_tokens)
+    }
+
+    fn is_usable_context_window(&self, tokens: usize) -> bool {
+        tokens > self.max_output_tokens as usize + REQUEST_OVERHEAD_TOKENS
+            && self
+                .maximum_context_window_tokens()
+                .is_none_or(|maximum| tokens <= maximum)
     }
 }
 

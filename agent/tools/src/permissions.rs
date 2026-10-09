@@ -1,10 +1,13 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 use uuid::Uuid;
 
 use crate::{AUTO_ALLOWLISTED_TOOLS, BASH_TOOL_NAME, PreparedTool, WEB_FETCH_TOOL_NAME, Workspace};
-use tickloop_agent_protocol::{Decision, ExecutionMode, PermissionPolicy, PermissionRule};
+use tickloop_agent_protocol::{
+    Decision, ExecutionMode, PermissionPolicy, PermissionRule, PermissionRuleScope,
+    PermissionRuleSource, PermissionRuleView,
+};
 
 /// Claude Code's rule content prefix for the host a `WebFetch` call fetches.
 const WEB_FETCH_DOMAIN_PREFIX: &str = "domain:";
@@ -295,6 +298,83 @@ pub fn is_supported_rule_content(tool: &str, specifier: &str) -> bool {
             .is_some_and(|host| !host.trim().is_empty()),
         _ => false,
     }
+}
+
+/// Why `rule` cannot be saved or staged, checked before any policy changes.
+pub fn validate_rule(rule: &PermissionRule) -> Result<(), &'static str> {
+    if rule.tool.is_empty() || rule.decision == Decision::Check {
+        return Err("rules require a tool and allow, ask or deny decision");
+    }
+    if rule.persistent && rule.loop_id.is_some() {
+        return Err("project rules cannot name a Loop");
+    }
+    if rule
+        .specifier
+        .as_deref()
+        .is_some_and(|specifier| !is_supported_rule_content(&rule.tool, specifier))
+    {
+        return Err(
+            "rule content is supported only for Bash command patterns and WebFetch domain:{hostname}",
+        );
+    }
+    Ok(())
+}
+
+/// How the Permissions view lists rules, for a visible Agent and for the New Agent screen.
+pub fn rule_views(
+    rules: &[PermissionRule],
+    rule_project: impl Fn(&PermissionRule) -> PathBuf,
+    workdir: &Path,
+    mode: ExecutionMode,
+    project_constraints: &[PermissionRule],
+    managed_constraints: &[PermissionRule],
+) -> Vec<PermissionRuleView> {
+    rules
+        .iter()
+        .map(|rule| PermissionRuleView {
+            rule: rule.clone(),
+            source: if rule.persistent {
+                PermissionRuleSource::ProjectUser
+            } else {
+                PermissionRuleSource::ChatSession
+            },
+            scope: if rule.persistent {
+                PermissionRuleScope::Project(rule_project(rule))
+            } else if let Some(loop_id) = rule.loop_id {
+                PermissionRuleScope::Loop(loop_id)
+            } else {
+                PermissionRuleScope::Chat
+            },
+            editable: true,
+            effective_note: (mode == ExecutionMode::Auto && bypasses_auto_classifier(rule))
+                .then(|| "broad Allow does not bypass Auto review".into()),
+        })
+        .chain(project_constraints.iter().map(|rule| PermissionRuleView {
+            rule: rule.clone(),
+            source: PermissionRuleSource::ProjectConstraint,
+            scope: PermissionRuleScope::Project(workdir.to_path_buf()),
+            editable: false,
+            effective_note: Some("project constraint cannot be edited here".into()),
+        }))
+        .chain(managed_constraints.iter().map(|rule| PermissionRuleView {
+            rule: rule.clone(),
+            source: PermissionRuleSource::ManagedConstraint,
+            scope: PermissionRuleScope::Project(workdir.to_path_buf()),
+            editable: false,
+            effective_note: Some("managed constraint cannot be edited here".into()),
+        }))
+        .collect()
+}
+
+/// An additional directory as permissions record it: canonical, and an existing directory.
+pub fn canonical_directory(path: PathBuf) -> Result<PathBuf, &'static str> {
+    let path = path
+        .canonicalize()
+        .map_err(|_| "directory is unavailable")?;
+    if !path.is_dir() {
+        return Err("path is not a directory");
+    }
+    Ok(path)
 }
 
 pub fn permission_rule_candidates(name: &str, input: &Value) -> Vec<PermissionRuleCandidate> {

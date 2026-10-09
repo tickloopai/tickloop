@@ -1,3 +1,7 @@
+use serde::{Deserialize, Serialize};
+
+use crate::AutoRuleKind;
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AutoRuleSource {

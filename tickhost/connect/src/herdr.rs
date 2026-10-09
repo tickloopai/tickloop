@@ -1,4 +1,9 @@
-use std::{collections::BTreeMap, path::PathBuf, time::Duration};
+use std::{
+    collections::BTreeMap,
+    os::unix::fs::{FileTypeExt, MetadataExt},
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -9,10 +14,11 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::host_error::HostError;
+use crate::{access::TickAccess, host_error::HostError};
 
 pub const HOST_TIMEOUT: Duration = Duration::from_secs(10);
 const HOST_RESPONSE_LIMIT: u64 = 8 * 1024 * 1024;
+const PANE_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug)]
 pub struct HerdrContext {
@@ -60,6 +66,67 @@ pub struct Pane {
     pub title: Option<String>,
     #[serde(default)]
     pub tokens: BTreeMap<String, String>,
+}
+
+/// Why a recorded Herdr Pane can no longer be confirmed as the same Pane.
+#[derive(Debug, thiserror::Error)]
+pub enum PaneIdentityError {
+    /// The endpoint is not this user's socket, or Herdr refused the lookup.
+    #[error("{0}")]
+    Denied(String),
+    /// The Herdr instance or the Pane's terminal is not the one recorded.
+    #[error("{0}")]
+    Replaced(&'static str),
+    #[error("Herdr did not respond")]
+    Unresponsive,
+}
+
+/// The Herdr instance serving a socket: the socket file's device and inode. A restarted Herdr
+/// binds a new socket file, so a recorded instance no longer matches it.
+pub fn endpoint_instance(socket: &std::fs::Metadata) -> String {
+    format!("herdr:{}:{}", socket.dev(), socket.ino())
+}
+
+/// `pane_id` as the Herdr at `socket` reports it now. Before and after the lookup the endpoint
+/// must be a socket owned by this user and still the recorded `instance`; the Pane must still
+/// show `terminal_id`.
+pub async fn confirm_pane(
+    socket: &Path,
+    instance: &str,
+    pane_id: &str,
+    terminal_id: &str,
+) -> Result<Pane, PaneIdentityError> {
+    verify_endpoint(socket, instance)?;
+    let access = TickAccess::new(HerdrContext {
+        socket: socket.to_path_buf(),
+        caller_pane: pane_id.into(),
+    });
+    let pane = tokio::time::timeout(PANE_CONFIRMATION_TIMEOUT, access.caller())
+        .await
+        .map_err(|_| PaneIdentityError::Unresponsive)?
+        .map_err(|error| PaneIdentityError::Denied(error.to_string()))?;
+    verify_endpoint(socket, instance)?;
+    if pane.terminal_id != terminal_id {
+        return Err(PaneIdentityError::Replaced(
+            "Herdr Pane or terminal was replaced",
+        ));
+    }
+    Ok(pane)
+}
+
+fn verify_endpoint(socket: &Path, instance: &str) -> Result<(), PaneIdentityError> {
+    let metadata = std::fs::symlink_metadata(socket).map_err(|error| {
+        PaneIdentityError::Denied(format!("cannot inspect Herdr endpoint: {error}"))
+    })?;
+    if !metadata.file_type().is_socket() || metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(PaneIdentityError::Denied(
+            "Herdr endpoint must be a socket owned by this user".into(),
+        ));
+    }
+    if endpoint_instance(&metadata) != instance {
+        return Err(PaneIdentityError::Replaced("Herdr endpoint was replaced"));
+    }
+    Ok(())
 }
 
 #[async_trait]

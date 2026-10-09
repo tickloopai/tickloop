@@ -31,7 +31,7 @@ tickloop-tick-market = { path = "../market" }
 tickloop-tick-protocol = { path = "../protocol" }
 tickloop-tick-provider = { path = "../provider" }
 tickloop-tick-sdk = { path = "../sdk" }
-tickloop-ui = { path = "../../crates/ui" }
+tickloop-ui = { path = "../../ui" }
 time = { version = "0.3", features = ["formatting", "macros", "parsing", "serde"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal", "sync"] }
 

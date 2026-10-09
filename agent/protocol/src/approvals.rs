@@ -1,3 +1,8 @@
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use crate::{AutoBlockKind, AutoReviewerPreference, AutoRule, Usage, VerdictEvidence};
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalReviewerKind {

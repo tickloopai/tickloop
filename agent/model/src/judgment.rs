@@ -8,9 +8,12 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
-use crate::{ModelError, credentials::load_api_key};
+use crate::{
+    ModelError,
+    credentials::{CredentialError, api_key_status, load_api_key},
+};
 use tickloop_agent_base::network::{HttpPolicy, build_http_client, is_loopback};
-use tickloop_agent_protocol::Usage;
+use tickloop_agent_protocol::{ApiKeyStatus, Usage};
 
 pub const JEV_API_KEY_ENV: &str = "TYPESAFE_API_KEY";
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
@@ -367,6 +370,21 @@ impl JevClient {
         serde_json::from_slice(&bytes)
             .map_err(|_| ModelError::InvalidResponse("invalid Jev response".into()))
     }
+}
+
+/// Jev key status from the credentials under `root`, or from the environment without one.
+pub fn jev_key_status_in(root: Option<&std::path::Path>) -> Result<ApiKeyStatus, CredentialError> {
+    if let Some(root) = root {
+        return api_key_status(root, JEV_API_KEY_ENV);
+    }
+    Ok(std::env::var(JEV_API_KEY_ENV)
+        .ok()
+        .filter(|value| {
+            !value.trim().is_empty()
+                && reqwest::header::HeaderValue::from_str(&format!("Bearer {value}")).is_ok()
+        })
+        .map(|_| ApiKeyStatus::Environment)
+        .unwrap_or(ApiKeyStatus::Missing))
 }
 
 fn authorization_header(

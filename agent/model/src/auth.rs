@@ -35,6 +35,7 @@ use tickloop_agent_base::private_fs::{
     open_without_following_links, replace_file_atomically, unix_time_milliseconds,
     verify_private_directory,
 };
+use tickloop_agent_protocol::ProviderCredentialScope;
 
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const PRODUCTION_ORIGIN: &str = "https://auth.openai.com";
@@ -1231,6 +1232,38 @@ fn decode_base64url(value: &str) -> Option<Vec<u8>> {
         }
     }
     Some(output)
+}
+
+/// The provider credentials visible to this process: the names of usable environment variables,
+/// and under `config_root` the Google service account, so a View can explain which providers
+/// can authenticate.
+pub fn current_provider_credential_scope(config_root: Option<PathBuf>) -> ProviderCredentialScope {
+    let environment_keys = std::env::vars_os()
+        .filter_map(|(name, value)| {
+            let name = name.into_string().ok()?;
+            let value = value.into_string().ok()?;
+            (!value.trim().is_empty() && reqwest::header::HeaderValue::from_str(&value).is_ok())
+                .then_some(name)
+        })
+        .collect();
+    let (service_account_path, service_account_configured) = config_root
+        .as_ref()
+        .map(|root| {
+            let auth = google::GoogleAuth::new(root);
+            (
+                auth.service_account_path()
+                    .map_err(|error| error.to_string()),
+                auth.service_account_configured()
+                    .map_err(|error| error.to_string()),
+            )
+        })
+        .unwrap_or((Ok(None), Ok(false)));
+    ProviderCredentialScope {
+        config_root,
+        environment_keys,
+        service_account_path,
+        service_account_configured,
+    }
 }
 
 #[cfg(test)]

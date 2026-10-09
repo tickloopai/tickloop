@@ -650,7 +650,11 @@ mod tests {
             .unwrap();
         assert_eq!(sequence, RequestSequence(1));
         let directed = ledger
-            .start(manual_owner, ModelRequestKind::CompactionDirected, identity())
+            .start(
+                manual_owner,
+                ModelRequestKind::CompactionDirected,
+                identity(),
+            )
             .unwrap();
         assert_eq!(directed, RequestSequence(2));
         ledger.finish(directed, RequestOutcome::Accepted).unwrap();
@@ -696,7 +700,11 @@ mod tests {
             ..owner()
         };
         let sequence = ledger
-            .start(request_owner, ModelRequestKind::CompactionDirected, identity())
+            .start(
+                request_owner,
+                ModelRequestKind::CompactionDirected,
+                identity(),
+            )
             .unwrap();
         assert_eq!(
             ledger.validate_in_flight(
@@ -819,7 +827,10 @@ mod tests {
         assert_eq!(summary.request_count, 5);
         assert_eq!(summary.groups.len(), 4);
         assert_eq!(summary.kind_counts[&ModelRequestKind::CompactionManual], 2);
-        assert_eq!(summary.kind_counts[&ModelRequestKind::CompactionDirected], 1);
+        assert_eq!(
+            summary.kind_counts[&ModelRequestKind::CompactionDirected],
+            1
+        );
         assert_eq!(summary.outcome_counts[&RequestOutcome::TimedOut], 1);
         let group = summary
             .groups
@@ -882,9 +893,15 @@ mod tests {
                 ModelRequestKind::Conversation,
                 RequestOutcome::HostRejected(ResponseRejection::InvalidToolCall),
             ),
-            (ModelRequestKind::CompactionAutomatic, RequestOutcome::Accepted),
+            (
+                ModelRequestKind::CompactionAutomatic,
+                RequestOutcome::Accepted,
+            ),
             (ModelRequestKind::CompactionManual, RequestOutcome::Accepted),
-            (ModelRequestKind::CompactionDirected, RequestOutcome::Accepted),
+            (
+                ModelRequestKind::CompactionDirected,
+                RequestOutcome::Accepted,
+            ),
             (ModelRequestKind::PermissionCheck, RequestOutcome::Accepted),
         ] {
             request(

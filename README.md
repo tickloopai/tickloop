@@ -6,14 +6,14 @@ Tick Loop 提供完整的终端 Agent 和 example Tick。使用原生 Herdr 的 
 
 | 成员 | 二进制 | 内容 |
 | --- | --- | --- |
-| `crates/agent` | `tickloop` | 完整 Agent Console、工具、权限、Transcript 和 Loop |
+| `agent/tickloop` | `tickloop` | 完整 Agent Console、工具、权限、Transcript 和 Loop（由 `agent/` 下 console、client、daemon、runtime 等 crate 组成） |
 | `tickhost/host` | `tickhost` | Tick 宿主服务（`tickhost run`，由 daemon 按需拉起）、`tickhost open` 外部协议 launcher 与 `tickhost stop` |
 | `tick/cli` | `tick` | `tick <provider> <tick>` 与 Reader |
 | `tick/market` | — | 金融 Tick 本体，只经 provider 接口读取数据 |
 | `tick/provider`、`tick/providers/*` | — | provider 接口，以及 builtin（离线模拟）、longbridge、futu 实现 |
 | `tick/protocol`、`tick/sdk` | — | Tick 标准，以及 Tick 侧的协议实现 |
 | `tickhost/connect` | — | Herdr 接入、每实例 Session 与 launch 契约 |
-| `crates/ui` | — | 共享终端呈现规则 |
+| `ui` | — | 共享终端呈现规则 |
 
 使用当前 Rust stable（edition 2024）。`make build` 构建 Agent 和示例；`make install` 安装 `tickloop`、`tickhost` 和 `tick`；`make package` 打包这三个入口。daemon 只拉起与自己同目录、同版本的 `tickhost`，版本不一致时拒绝启动并报错；`tickhost stop` 结束所有 hosted Tick，下次 Agent 打开 Tick 时自动启动新的 Tickhost，被结束的 Tick 显示为丢失，只在明确要求时重开。
 
@@ -23,7 +23,7 @@ Agent 会确认运行环境，并在 Herdr 接入可用时自动加载 Tick 操�
 
 要并排观察，可以说“在你当前 Tab 右边打开一个 K 线 Tick”；已有 Tick 则说“把刚才那个 Tick 移到你这个 Tab”。移动会保留实例及订阅。支持右侧或下方分屏，操作不抢焦点。
 
-1. 在一个 Herdr Pane 运行 `tickloop`，按 [Agent 说明](crates/agent/README.md) 配置模型。
+1. 在一个 Herdr Pane 运行 `tickloop`，按 [Agent 说明](agent/tickloop/README.md) 配置模型。
 2. 在另一个 Pane 运行 `tick builtin kline 700.HK`。它会自动接入，使用模拟数据，无需金融账户。也可让 Agent 打开这条命令。
 3. 在 Agent 中说：“读取当前 Workspace 的 Kline，并每 5 秒订阅它的变化。”Agent 先读目录，再为当前 Loop 建立订阅。
 4. 在 Kline 按 `5` 切换到 5 分钟周期；订阅收到新内容后，所属 Loop 按 cadence 继续执行。
@@ -186,7 +186,7 @@ Agent 通过一个 `CallTickTool` 调用声明的能力。`SubscribeTick` 属于
 
 # 验证
 
-模型请求失败时，Agent 显示 Provider、HTTP 状态、脱敏后的服务原文与下一步；状态行和连接 Details 保留最近一次失败，直到该连接的模型请求成功。额度／余额错误不会自动重试，也不表示未登录。可通过 `/provider` 切换连接，或打开服务返回的额度／订阅链接。Kimi Code 默认使用 `kimi-for-coding`；模型目录列出 K3 不代表当前套餐可用，403 的 monthly usage limit 也可能表示套餐不含该模型。详见 [Agent 排查说明](crates/agent/README.md#provider-请求失败排查)。
+模型请求失败时，Agent 显示 Provider、HTTP 状态、脱敏后的服务原文与下一步；状态行和连接 Details 保留最近一次失败，直到该连接的模型请求成功。额度／余额错误不会自动重试，也不表示未登录。可通过 `/provider` 切换连接，或打开服务返回的额度／订阅链接。Kimi Code 默认使用 `kimi-for-coding`；模型目录列出 K3 不代表当前套餐可用，403 的 monthly usage limit 也可能表示套餐不含该模型。详见 [Agent 排查说明](agent/tickloop/README.md#provider-请求失败排查)。
 
 ```sh
 cargo fmt --all --check

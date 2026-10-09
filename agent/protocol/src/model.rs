@@ -95,6 +95,26 @@ pub(crate) fn text_only() -> Vec<InputModality> {
 }
 
 impl ModelConfig {
+    /// 从 Transcript 重建或反序列化快照时的占位模型；恢复流程随后换成宿主当前选择的模型。
+    pub fn unselected() -> Self {
+        Self {
+            provider: ModelProvider::Api,
+            auth_source: ModelAuthSource::ApiKeyEnv,
+            name: String::new(),
+            protocol: Protocol::Messages,
+            base_url: String::new(),
+            model: String::new(),
+            api_key_env: String::new(),
+            max_output_tokens: 0,
+            provider_id: String::new(),
+            provider_name: String::new(),
+            model_id: String::new(),
+            connection: None,
+            card: None,
+            input_modalities: vec![InputModality::Text],
+        }
+    }
+
     pub fn adapter(&self) -> Adapter {
         self.card
             .as_ref()

@@ -10,6 +10,8 @@
 //! 不可读或某个值无效时该项不生效，并把问题作为警告返回，不静默丢弃（持久 Deny／Ask 规则
 //! 失效是需要用户知道的）。
 
+mod auto_policy;
+pub mod new_chat;
 pub mod skills;
 
 use std::{

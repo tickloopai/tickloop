@@ -2,7 +2,7 @@
 //! of the host type it mirrors, so a change inside Herdr or the Tickhost reaches the Agent wire
 //! only through an explicit conversion in the runtime.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -41,4 +41,49 @@ pub struct HostedScreenSnapshot {
     pub rows: u16,
     pub columns: u16,
     pub alternate_screen: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct HerdrInteraction {
+    pub socket: PathBuf,
+    pub pane: HerdrPane,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct HostCallContext {
+    pub workdir: PathBuf,
+    pub workspace_id: Option<String>,
+    pub interaction: Option<HerdrInteraction>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HostEndpointIdentity {
+    HerdrSocket {
+        path: PathBuf,
+        owner: u32,
+        device: u64,
+        inode: u64,
+    },
+    TrustedAdapter {
+        scope: uuid::Uuid,
+    },
+    /// The user's Tickhost endpoint. Its process epoch changes across restarts and is checked
+    /// per call through each instance's binding, not here.
+    Tickhost {
+        endpoint: PathBuf,
+        uid: u32,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HostToolAuthority {
+    Native {
+        endpoint: HostEndpointIdentity,
+    },
+    Mcp {
+        server_id: String,
+        account_id: String,
+    },
 }

@@ -1,6 +1,6 @@
 [package]
 name = "tickloop-agent-test-support"
-description = "Test fixtures shared by the Agent crates' tests"
+description = "Test code shared by the Agent crates' tests: a scripted model, PTY screens and model HTTP servers"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
@@ -9,5 +9,13 @@ publish.workspace = true
 doctest = false
 
 [dependencies]
+async-trait = "0.1"
+regex = "1"
 serde_json = "1"
+# The tests of every Agent crate reach the model's test-only seams through this crate.
+tickloop-agent-model = { path = "../model", features = ["test-support"] }
+tickloop-agent-protocol = { path = "../protocol" }
 tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+unicode-width = "0.2"
+uuid = { version = "1", features = ["v4", "serde"] }

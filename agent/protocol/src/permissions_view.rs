@@ -1,3 +1,13 @@
+use std::path::PathBuf;
+
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use crate::{
+    ApiKeyStatus, AutoPolicy, AutoReviewerHealth, AutoReviewerPreference, AutoRuleChange,
+    AutoRuleSettings, AutoSettingsRevision, ChatId, ExecutionMode, PermissionRule,
+};
+
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PermissionsRevision {
     local: u64,

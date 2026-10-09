@@ -8,8 +8,8 @@ use sha2::{Digest, Sha256};
 
 use super::validate_model_config;
 use tickloop_agent_protocol::{
-    Adapter, ModelAuthSource, ModelCard, ModelConfig, ModelDiscovery, ModelProvider, Protocol,
-    ProviderConnection, ProviderPatch, ReasoningEffort, ThinkingControl,
+    Adapter, LaunchSpec, ModelAuthSource, ModelCard, ModelConfig, ModelDiscovery, ModelProvider,
+    Protocol, ProviderConnection, ProviderPatch, ReasoningEffort, ThinkingControl,
 };
 
 /// Anthropic's minimum `budget_tokens`.
@@ -687,6 +687,21 @@ pub fn migrate_legacy_model(mut config: ModelConfig) -> ModelConfig {
         config.card = Some(card);
     }
     config
+}
+
+/// The model a worker for `launch` starts with: the launch's catalog model, or the bundled
+/// default when it names none or one the catalog no longer has.
+pub fn launch_model(launch: &LaunchSpec) -> ModelConfig {
+    let catalog = ModelCatalog::defaults();
+    launch
+        .model
+        .as_ref()
+        .and_then(|model| catalog.get(&model.provider_id, &model.model_id))
+        .unwrap_or_else(|| {
+            catalog
+                .get("deepseek-api", "deepseek-flash")
+                .expect("bundled default model")
+        })
 }
 
 pub fn model_for_persistent_selection(config: ModelConfig) -> ModelConfig {

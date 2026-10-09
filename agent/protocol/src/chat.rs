@@ -1,3 +1,24 @@
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    path::PathBuf,
+    time::SystemTime,
+};
+
+use serde::{Deserialize, Serialize};
+use unicode_width::UnicodeWidthChar;
+use uuid::Uuid;
+
+use crate::{
+    AgentMessageSource, ApprovalAssessmentDetails, ApprovalFailureKind, ArtifactTick, BranchOrigin,
+    ChatId, CommandSnapshot, CompactionMarker, CompactionStatus, Content, Decision,
+    DelegationMetadata, DenialReference, DirectedHumanSource, ExecutionMode, FamilyCompletion,
+    FamilyInputRecord, FileReadRecord, ImageContext, ImageOrigin, InputContext, InvokedSkill,
+    LoopSnapshot, Message, ModelConfig, ModelIdentity, ModelRequestKind, MonitorMembership,
+    PermissionPolicy, Plan, PreparedFileChange, PrivateHistorySource, Progress,
+    ProviderHttpFailure, QuestionRequest, ReasoningEffort, RequestUsageLedger, Role, ToolResult,
+    TriggerSource, Usage,
+};
+
 pub type LoopId = Uuid;
 
 pub type RunId = Uuid;
@@ -231,6 +252,21 @@ impl ChatSnapshot {
         entries.sort_by_key(|entry| entry.queued_sequence);
         entries
     }
+
+    /// 本进程内结果未知的操作，作为宿主状态告知模型。
+    pub fn current_operation_uncertainties(&self) -> Vec<serde_json::Value> {
+        self.operations
+            .iter()
+            .filter(|operation| operation.state == OperationState::Unknown)
+            .map(|operation| {
+                serde_json::json!({
+                    "id": operation.id,
+                    "loop_id": operation.loop_id,
+                    "tool": operation.name,
+                })
+            })
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -269,7 +305,7 @@ pub enum EventKind {
     },
     Failed(String),
     ModelRetry {
-        kind: RequestKind,
+        kind: ModelRequestKind,
         error: String,
         attempt: usize,
         max_retries: usize,
@@ -586,4 +622,60 @@ impl AgentHostOptions {
             prompt_policy: PromptPolicy::Interactive,
         }
     }
+}
+
+/// 一个 Transcript 在项目目录中的摘要，供 Chat 选择器使用。
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct SavedChat {
+    pub id: ChatId,
+    pub title: Option<String>,
+    pub first_prompt: Option<String>,
+    pub last_prompt: Option<String>,
+    pub modified: SystemTime,
+    pub cwd: Option<PathBuf>,
+    pub branch_source: Option<ChatId>,
+    pub git_branch: Option<String>,
+}
+
+const MAX_TITLE_COLUMNS: usize = 64;
+
+/// `text` on one line within the columns a Chat title may take, ending in `…` when cut.
+pub fn short_chat_title(text: &str) -> String {
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut title = String::new();
+    let mut columns = 0;
+    for character in text.chars().filter(|character| !character.is_control()) {
+        let width = character.width().unwrap_or(0);
+        if columns + width > MAX_TITLE_COLUMNS - 1 {
+            title.push('…');
+            return title;
+        }
+        title.push(character);
+        columns += width;
+    }
+    title
+}
+
+const NEW_AGENT_TITLE: &str = "New Agent";
+
+/// Provides a bounded task or Shell label until a generated or explicit Chat title exists.
+fn fallback_title(loops: &[LoopSnapshot], user_shells: &[UserShellRecord]) -> String {
+    loops
+        .first()
+        .map(|goal| short_chat_title(&goal.goal))
+        .or_else(|| {
+            user_shells
+                .first()
+                .map(|shell| short_chat_title(&format!("!{}", shell.command)))
+        })
+        .unwrap_or_else(|| NEW_AGENT_TITLE.into())
+}
+
+pub fn chat_display_title(snapshot: &ChatSnapshot, user_shells: &[UserShellRecord]) -> String {
+    snapshot
+        .branch_origin
+        .as_ref()
+        .map(|origin| origin.name.clone())
+        .or_else(|| snapshot.generated_title.clone())
+        .unwrap_or_else(|| fallback_title(&snapshot.loops, user_shells))
 }

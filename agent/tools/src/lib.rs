@@ -8,10 +8,10 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::file_change::{ARTIFACT_DIRECTORY, FileChangeArtifactError, persist_file_change_review};
-use tickloop_agent_base::image::{Image, ImageError};
+use tickloop_agent_base::image::ImageError;
 use tickloop_agent_base::private_fs::{OpenTarget, PrivateDirectory, open_without_following_links};
 use tickloop_agent_protocol::{
-    CommandSnapshot, CommandState, FileReadRecord, PreparedFileChange, SearchConfig,
+    CommandSnapshot, CommandState, FileReadRecord, Image, PreparedFileChange, SearchConfig,
     ToolDefinition, ToolResult,
 };
 

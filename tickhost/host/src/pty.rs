@@ -9,15 +9,11 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-use tickhost_connect::hosted::TerminalDevice;
+use tickhost_connect::hosted::{MAX_COLUMNS, MAX_ROWS, MIN_COLUMNS, MIN_ROWS, TerminalDevice};
 use tokio::io::unix::AsyncFd;
 
 pub const DEFAULT_ROWS: u16 = 30;
 pub const DEFAULT_COLUMNS: u16 = 120;
-pub const MIN_ROWS: u16 = 2;
-pub const MAX_ROWS: u16 = 300;
-pub const MIN_COLUMNS: u16 = 2;
-pub const MAX_COLUMNS: u16 = 500;
 /// One drain step; the parser yields to other Ticks after each.
 pub const READ_CHUNK_BYTES: usize = 16 * 1024;
 

@@ -20,7 +20,7 @@ build:
 	cargo build --locked $(CARGO_PACKAGE) -p tickloop-tickhost -p tickloop-tick --bins
 
 install:
-	cargo install --locked --path crates/agent --bins
+	cargo install --locked --path agent/tickloop --bins
 	cargo install --locked --path tickhost/host --bin tickhost
 	cargo install --locked --path tick/cli --bin tick
 

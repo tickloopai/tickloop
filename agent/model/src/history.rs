@@ -399,7 +399,7 @@ mod tests {
     fn historical_images_and_tool_images_are_replaced_only_in_the_target_copy() {
         let image = Content::Image {
             source: ImageSource::Base64 {
-                media_type: tickloop_agent_base::image::ImageMediaType::Png,
+                media_type: tickloop_agent_protocol::ImageMediaType::Png,
                 data: "image-data".into(),
             },
             width: 1,

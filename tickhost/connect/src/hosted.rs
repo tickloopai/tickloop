@@ -48,6 +48,11 @@ pub const CALL_RESPONSE_TIMEOUT: Duration =
 pub const ATTACH_INPUT_BYTES: usize = 4 * 1024;
 /// An attached view's request frame: one input chunk, a resize or detach.
 pub const ATTACH_REQUEST_FRAME_BYTES: usize = 64 * 1024;
+/// The terminal sizes a hosted Tick's PTY accepts; an attached view clamps its own size to them.
+pub const MIN_ROWS: u16 = 2;
+pub const MAX_ROWS: u16 = 300;
+pub const MIN_COLUMNS: u16 = 2;
+pub const MAX_COLUMNS: u16 = 500;
 /// The launch binding a hosted launcher reads from its environment.
 pub const LAUNCH_ENV: &str = "TICKLOOP_TICKHOST_LAUNCH";
 
