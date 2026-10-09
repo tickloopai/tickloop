@@ -5,9 +5,8 @@ use std::{
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use tick_connect::{
-    access::{AccessContext, AccessPermission, PreparedOperation, TickAccess, TickLocation},
-    page::MAX_PAGE_SIZE,
+use tick_connect::access::{
+    AccessContext, AccessPermission, PreparedOperation, TickAccess, TickLocation,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -18,9 +17,12 @@ use crate::{
     },
     model::ToolDefinition,
     runtime::ChatId,
+    tick_tool_router::TickBackends,
     tools::ToolResult,
 };
 
+/// The Herdr backend of the native Tick tools: Workspace discovery and the Panes it lists or
+/// opens visibly. A worker installs it behind [`crate::tick_tool_router::TickToolRouter`].
 pub struct NativeHostToolProvider {
     access: Arc<TickAccess>,
     trusted_adapter_scope: Option<uuid::Uuid>,
@@ -29,24 +31,6 @@ pub struct NativeHostToolProvider {
 struct NativePreparedCall {
     operation: PreparedOperation,
     endpoint: Option<HostEndpointIdentity>,
-}
-
-const PLACEMENT_DIRECTIONS: [&str; 4] = ["left", "right", "up", "down"];
-
-#[derive(Debug, thiserror::Error)]
-pub enum TickToolTargetError {
-    #[error(
-        "NativeToolRequired: {operation} cannot operate on an Artifact Tick; use mcp__artifacts__artifact_read and the installed Artifact MCP edit/publish tools with artifact_id"
-    )]
-    Artifact { operation: String },
-    #[error(
-        "NativeToolRequired: {operation} cannot operate on a Shell Tick; use Bash, Read on its output_file, and TaskStop with task_id"
-    )]
-    Shell { operation: String },
-    #[error(
-        "InvalidTickTarget: {operation} requires the complete herdr:<instance id> from ReadWorkspace; use Artifact MCP tools for artifacts and Bash/Read/TaskStop for shells"
-    )]
-    Invalid { operation: String },
 }
 
 impl NativeHostToolProvider {
@@ -79,24 +63,7 @@ impl NativeHostToolProvider {
         if cancel.is_cancelled() {
             return Err("Native host operation was cancelled before preparation".into());
         }
-        if matches!(name, "ReadTick" | "CallTickTool") {
-            let target = input["tick_instance_id"].as_str().unwrap_or_default();
-            let error = match target.split_once(':').map(|(kind, _)| kind) {
-                Some("artifact") => Some(TickToolTargetError::Artifact {
-                    operation: name.into(),
-                }),
-                Some("shell") => Some(TickToolTargetError::Shell {
-                    operation: name.into(),
-                }),
-                Some("herdr") => None,
-                _ => Some(TickToolTargetError::Invalid {
-                    operation: name.into(),
-                }),
-            };
-            if let Some(error) = error {
-                return Err(error.to_string());
-            }
-        }
+        TickBackends::HERDR.route(name, input)?;
         let endpoint = self.host_endpoint()?;
         let operation_name = match name {
             "ReadWorkspace" => "read_workspace",
@@ -182,17 +149,6 @@ fn prepared_binding(call: &PreparedHostCall) -> Result<&NativePreparedCall, Stri
         .ok_or_else(|| "Native host operation has no prepared binding".into())
 }
 
-fn placement_schema(allow_new_tab: bool) -> Value {
-    let mut variants = vec![
-        json!({"type":"object","properties":{"type":{"const":"current_tab"},"direction":{"enum":PLACEMENT_DIRECTIONS}},"required":["type"],"additionalProperties":false}),
-        json!({"type":"object","properties":{"type":{"const":"pane"},"pane_id":{"type":"string","minLength":1},"direction":{"enum":PLACEMENT_DIRECTIONS}},"required":["type","pane_id"],"additionalProperties":false}),
-    ];
-    if allow_new_tab {
-        variants.push(json!({"type":"object","properties":{"type":{"const":"new_tab"}},"required":["type"],"additionalProperties":false}));
-    }
-    json!({"type":"object","oneOf":variants})
-}
-
 #[async_trait]
 impl HostToolProvider for NativeHostToolProvider {
     fn host_endpoint(&self) -> Result<Option<HostEndpointIdentity>, String> {
@@ -225,32 +181,7 @@ impl HostToolProvider for NativeHostToolProvider {
     }
 
     fn definitions(&self) -> Vec<ToolDefinition> {
-        vec![
-            ToolDefinition {
-                name: "ReadWorkspace".into(),
-                description: format!("List running programs in the current Herdr Workspace, or in an explicitly named Workspace. Uses the Agent's Work Context by default; without one, discovers available Workspaces. The optional caller describes the View carrying this input, and may be null while the Agent works in the background. Each program has a stable Tick Instance reference. Results come in pages of at most {MAX_PAGE_SIZE} programs with the complete total; pass next_cursor back as cursor until it is null. CursorExpired means the Workspace changed: list again from the first page. Listing never subscribes."),
-                input_schema: json!({"type":"object","properties":{"workspace_id":{"type":"string","minLength":1},"cursor":{"type":"object","properties":{"generation":{"type":"string"},"after":{"type":"string"}},"required":["generation","after"],"additionalProperties":false},"limit":{"type":"integer","minimum":1,"maximum":MAX_PAGE_SIZE}},"additionalProperties":false}),
-            },
-            ToolDefinition {
-                name: "ReadTick".into(),
-                description: "Read a Herdr Tick using its complete herdr: instance identity. Protocol Ticks return structured content and their declared tool catalog. Ordinary Pane programs return at most 200 recent plain-text lines and 64 KiB. For artifacts use the installed Artifact MCP tools; for Shell tasks use Read on Bash's output_file.".into(),
-                input_schema: json!({"type":"object","properties":{"tick_instance_id":{"type":"string","minLength":1},"workspace_id":{"type":"string","minLength":1}},"required":["tick_instance_id"],"additionalProperties":false}),
-            },
-            ToolDefinition {
-                name: "CallTickTool".into(),
-                description: "Call one tool declared by a Herdr protocol Tick using its complete herdr: instance identity. Read that Tick's catalog first; query tools read content, while modifying tools require permission. Use native Artifact MCP tools for artifacts and Bash/Read/TaskStop for Shell tasks.".into(),
-                input_schema: json!({"type":"object","properties":{"tick_instance_id":{"type":"string","minLength":1},"workspace_id":{"type":"string","minLength":1},"tool":{"type":"string","minLength":1},"args":{"type":"object"}},"required":["tick_instance_id","tool","args"],"additionalProperties":false}),
-            },
-            ToolDefinition {
-                name: "ModifyTick".into(),
-                description: "Open a program, move an existing Tick beside another Pane while preserving its instance and subscriptions, send terminal input, or close a Pane. For open, omitted placement creates a new Tab; placement.type=current_tab places relative to the View captured for this input, which must still be valid, and type=pane places relative to the named Pane in the selected Workspace. Explicit targets and new_tab work without an Agent View; omitted cwd uses the Agent file work directory. Results report the verified host, Workspace, Tab, Pane, Tick Instance and state, with unknown fields left unresolved. Move defaults to current_tab. Direction accepts left, right, up, or down and defaults to right. For an explicit relative direction, invoke move even when the Tick is already in the target Tab. Placement is frozen before approval and never follows UI focus. Right/down do not request focus; moving a focused Pane lets Herdr choose a remaining Pane. Left/up finish focused on the anchor Pane (this Agent for current_tab, the named Pane for pane). For command[0]='tick', prefer the bundled sibling executable, then PATH. Use the tickloop Skill for guidance. Terminal input is checked before sending, without an atomic identity/send guarantee.".into(),
-                input_schema: json!({"type":"object","oneOf":[
-                    {"type":"object","properties":{"action":{"const":"open"},"command":{"type":"array","minItems":1,"items":{"type":"string"}},"cwd":{"type":"string","minLength":1},"workspace_id":{"type":"string","minLength":1},"placement":placement_schema(true)},"required":["action","command"],"additionalProperties":false},
-                    {"type":"object","properties":{"action":{"const":"move"},"tick_instance_id":{"type":"string","minLength":1},"workspace_id":{"type":"string","minLength":1},"placement":placement_schema(false)},"required":["action","tick_instance_id"],"additionalProperties":false},
-                    {"type":"object","properties":{"tick_instance_id":{"type":"string","minLength":1},"workspace_id":{"type":"string","minLength":1},"action":{"type":"string","enum":["send_input","close"]},"text":{"type":"string"},"keys":{"type":"array","minItems":1,"items":{"type":"string"}}},"required":["tick_instance_id","action"],"additionalProperties":false}
-                ]}),
-            },
-        ]
+        TickBackends::HERDR.definitions()
     }
 
     fn permission(&self, _: ChatId, name: &str, _: &Value) -> HostToolPermission {
@@ -339,13 +270,17 @@ impl HostToolProvider for NativeHostToolProvider {
             {
                 HostCallResult::OutcomeUnknown(value.to_string())
             }
-            Ok(value) => {
+            Ok(mut value) => {
+                let is_opened = value["status"] == "opened";
+                if is_opened {
+                    value["visibility"] = json!("visible");
+                }
                 let result = ToolResult {
                     is_error: value["status"] == "created_not_placed",
                     content: value.to_string(),
                     output_ref: None,
                 };
-                if value["status"] != "opened" {
+                if !is_opened {
                     return HostCallResult::Completed(result);
                 }
                 match serde_json::from_value(value["tick_instance_id"].clone()) {
@@ -377,41 +312,6 @@ impl HostToolProvider for NativeHostToolProvider {
             content: "Native host calls require preparation".into(),
             is_error: true,
             output_ref: None,
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn placement_schema_exposes_four_directions_for_both_anchor_types() {
-        for allow_new_tab in [false, true] {
-            let schema = placement_schema(allow_new_tab);
-            let variants = schema["oneOf"].as_array().unwrap();
-            for anchor_type in ["current_tab", "pane"] {
-                let variant = variants
-                    .iter()
-                    .find(|variant| variant["properties"]["type"]["const"] == anchor_type)
-                    .unwrap();
-                assert_eq!(
-                    variant["properties"]["direction"]["enum"],
-                    json!(["left", "right", "up", "down"])
-                );
-                assert!(
-                    !variant["required"]
-                        .as_array()
-                        .unwrap()
-                        .contains(&json!("direction"))
-                );
-            }
-            assert_eq!(
-                variants
-                    .iter()
-                    .any(|variant| variant["properties"]["type"]["const"] == "new_tab"),
-                allow_new_tab
-            );
         }
     }
 }

@@ -1,4 +1,4 @@
-use std::{any::Any, path::PathBuf};
+use std::{any::Any, collections::BTreeSet, path::PathBuf};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -380,11 +380,32 @@ pub enum WorkspaceIntegration {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct WorkspaceHostContext {
     pub name: WorkspaceHostName,
+    /// Whether this Agent can operate the container's Panes.
     pub integration: WorkspaceIntegration,
+    /// Whether this Agent can run Ticks hidden in the Tick host, in any container.
+    pub tick_host: WorkspaceIntegration,
     pub tick_executable: Option<PathBuf>,
 }
 
 impl WorkspaceHostContext {
+    /// The container this process runs in, as its environment says, with no integration.
+    pub fn from_environment() -> Self {
+        Self::detected(
+            std::env::var_os("HERDR_ENV").is_some_and(|value| value == "1"),
+            std::env::var_os("TMUX").is_some_and(|value| !value.is_empty()),
+            std::env::var_os("ZELLIJ").is_some(),
+        )
+    }
+
+    /// The same container, where this Agent can also run hidden Ticks with the bundled `tick`.
+    pub fn with_tick_host(mut self) -> Self {
+        self.tick_host = WorkspaceIntegration::Available;
+        self.tick_executable = self
+            .tick_executable
+            .or_else(tick_connect::access::bundled_tick_executable);
+        self
+    }
+
     fn detected(herdr: bool, tmux: bool, zellij: bool) -> Self {
         let name = if herdr {
             WorkspaceHostName::Herdr
@@ -398,6 +419,7 @@ impl WorkspaceHostContext {
         Self {
             name,
             integration: WorkspaceIntegration::Unavailable,
+            tick_host: WorkspaceIntegration::Unavailable,
             tick_executable: None,
         }
     }
@@ -406,20 +428,22 @@ impl WorkspaceHostContext {
         Self {
             name: WorkspaceHostName::Herdr,
             integration: WorkspaceIntegration::Available,
+            tick_host: WorkspaceIntegration::Unavailable,
             tick_executable,
         }
+    }
+
+    /// Whether this Agent can open or operate any Tick outside Shell and Artifact.
+    pub fn runs_ticks(&self) -> bool {
+        self.integration == WorkspaceIntegration::Available
+            || self.tick_host == WorkspaceIntegration::Available
     }
 }
 
 pub fn current_workspace_host(provider: Option<&dyn HostToolProvider>) -> WorkspaceHostContext {
-    if let Some(context) = provider.and_then(HostToolProvider::workspace_host_context) {
-        return context;
-    }
-    WorkspaceHostContext::detected(
-        std::env::var_os("HERDR_ENV").is_some_and(|value| value == "1"),
-        std::env::var_os("TMUX").is_some_and(|value| !value.is_empty()),
-        std::env::var_os("ZELLIJ").is_some(),
-    )
+    provider
+        .and_then(HostToolProvider::workspace_host_context)
+        .unwrap_or_else(WorkspaceHostContext::from_environment)
 }
 
 impl HostCallResult {
@@ -514,6 +538,8 @@ pub trait HostToolProvider: Send + Sync {
         crate::runtime::validate_host_schema_input(name, schema, input)
     }
 
+    /// The endpoint of a provider that one host serves; a provider routing to several hosts
+    /// reports each call's own through [`Self::call_authority`].
     fn host_endpoint(&self) -> Result<Option<HostEndpointIdentity>, String> {
         Ok(None)
     }
@@ -522,7 +548,23 @@ pub trait HostToolProvider: Send + Sync {
         None
     }
 
-    fn tool_authority(&self, _name: &str) -> Result<Option<HostToolAuthority>, String> {
+    /// Every authority through which this provider can currently serve `name`, one per
+    /// backend. Delegation freezes this set; a backend that appears later is never added.
+    fn tool_authorities(&self, _name: &str) -> Result<BTreeSet<HostToolAuthority>, String> {
+        Ok(self
+            .host_endpoint()?
+            .map(|endpoint| HostToolAuthority::Native { endpoint })
+            .into_iter()
+            .collect())
+    }
+
+    /// The authority of the backend that serves this invocation, chosen from its input alone
+    /// before any host resolves its target; `None` when no backend can serve it.
+    fn call_authority(
+        &self,
+        _name: &str,
+        _input: &Value,
+    ) -> Result<Option<HostToolAuthority>, String> {
         Ok(self
             .host_endpoint()?
             .map(|endpoint| HostToolAuthority::Native { endpoint }))

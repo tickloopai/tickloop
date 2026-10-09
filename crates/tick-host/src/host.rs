@@ -64,6 +64,8 @@ pub const DIAGNOSTIC_CHARACTERS: usize = 256;
 pub const STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 /// The send buffer requested for an attached view; it holds one current frame at a time.
 pub const ATTACH_SEND_BUFFER_BYTES: usize = 64 * 1024;
+/// How long a view grant waits for its view to connect.
+pub const VIEW_GRANT_TIMEOUT: Duration = CONTROL_TIMEOUT;
 /// After the host finished stopping, how long a waiting `shutdown_host` may take to answer.
 pub const SHUTDOWN_REPLY_GRACE: Duration = Duration::from_secs(1);
 /// A failed accept (such as a full descriptor table) is retried after this pause.
@@ -212,10 +214,33 @@ struct HostedTick {
     /// intent; nothing automatic counts.
     last_activity_ms: AtomicU64,
     attached: AtomicBool,
+    /// The one view its owner last allowed to attach, until that view connects or the grant
+    /// expires; a newer grant replaces it.
+    view_grant: std::sync::Mutex<Option<ViewGrant>>,
     /// The approved Watches that keep this Tick, as its owner last reported them.
     intents: std::sync::Mutex<WatchIntents>,
     screen_changes: watch::Sender<()>,
     terminal_closed: CancellationToken,
+}
+
+/// A one-time permission for one view to attach to a Tick's terminal.
+struct ViewGrant {
+    view: Uuid,
+    expires: std::time::Instant,
+}
+
+impl ViewGrant {
+    /// Takes the grant if `view` names it and it has not expired; a grant works once.
+    fn claim(grant: &mut Option<Self>, view: Uuid, now: std::time::Instant) -> bool {
+        match grant.take() {
+            Some(granted) if granted.view == view && now < granted.expires => true,
+            Some(granted) if granted.view != view => {
+                *grant = Some(granted);
+                false
+            }
+            _ => false,
+        }
+    }
 }
 
 /// Watch intents are a lease: each report renews them, and ones not renewed within the idle
@@ -536,6 +561,7 @@ impl Host {
             session: Mutex::new(None),
             last_activity_ms: AtomicU64::new(Self::now_ms()),
             attached: AtomicBool::new(false),
+            view_grant: std::sync::Mutex::new(None),
             intents: std::sync::Mutex::new(WatchIntents::default()),
             screen_changes: watch::channel(()).0,
             terminal_closed: CancellationToken::new(),
@@ -767,6 +793,25 @@ impl Host {
         });
         drop(state);
         tick.terminal_closed.cancel();
+    }
+
+    /// Lets one view attach to `owner`'s Tick `instance`, replacing any earlier grant for it.
+    async fn allow_view(
+        &self,
+        owner: &TickOwner,
+        instance: &InstanceRef,
+    ) -> Result<Value, HostError> {
+        let tick = self
+            .tick_by_instance(instance)
+            .await
+            .filter(|tick| &tick.owner == owner)
+            .ok_or_else(|| HostError::before("TargetGone", "no such Tick of this owner"))?;
+        let view = Uuid::new_v4();
+        *tick.view_grant.lock().unwrap() = Some(ViewGrant {
+            view,
+            expires: std::time::Instant::now() + VIEW_GRANT_TIMEOUT,
+        });
+        Ok(json!({"instance":instance,"view":view,"epoch":self.epoch}))
     }
 
     /// Replaces and renews the approved Watch intents of one of `owner`'s Ticks. Removing the
@@ -1226,6 +1271,8 @@ enum Authority {
         generation: u64,
     },
     Instance(Arc<HostedTick>),
+    /// The one view a grant let in; it can only attach.
+    Viewer(Arc<HostedTick>),
     /// The one connection of a pending launch; `verified` once it proved its foreground.
     Launcher {
         tick: Arc<HostedTick>,
@@ -1264,6 +1311,18 @@ async fn authenticate(host: &Arc<Host>, role: Role) -> Result<Authority, HostErr
             .filter(|tick| same_secret(&data_token, &tick.data_token))
             .map(Authority::Instance)
             .ok_or_else(|| HostError::before("Forbidden", "unknown instance or data token")),
+        Role::Viewer { instance, view } => host
+            .tick_by_instance(&instance)
+            .await
+            .filter(|tick| {
+                ViewGrant::claim(
+                    &mut tick.view_grant.lock().unwrap(),
+                    view,
+                    std::time::Instant::now(),
+                )
+            })
+            .map(Authority::Viewer)
+            .ok_or_else(|| HostError::before("Forbidden", "unknown, expired or used view grant")),
         Role::Launcher {
             operation,
             launch_token,
@@ -1380,9 +1439,9 @@ async fn business(
         let id = request["id"].clone();
         let method = request["method"].as_str().unwrap_or_default().to_owned();
         let params = request.get("params").cloned().unwrap_or(json!({}));
-        if let Authority::Instance(tick) = &authority {
+        if let Authority::Instance(tick) | Authority::Viewer(tick) = &authority {
             match method.as_str() {
-                "watch" => {
+                "watch" if matches!(authority, Authority::Instance(_)) => {
                     return stream_observations(reader, writer, &host, tick.clone(), &id).await;
                 }
                 "attach" => match AttachLease::acquire(tick, params) {
@@ -1405,6 +1464,10 @@ async fn business(
                 controller_request(&host, *generation, &method, params).await
             }
             Authority::Instance(tick) => instance_request(tick, &method, params).await,
+            Authority::Viewer(_) => Err(HostError::before(
+                "MethodNotAllowed",
+                format!("a view can only attach, not {method:?}"),
+            )),
             Authority::Launcher { tick, verified } => {
                 launcher_request(&host, tick, verified, &method, params).await
             }
@@ -1493,6 +1556,16 @@ async fn controller_request(
                 watches,
             } = parameters(params)?;
             host.set_intents(&owner, &instance, watches).await
+        }
+        "allow_view" => {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Allow {
+                owner: TickOwner,
+                instance: InstanceRef,
+            }
+            let Allow { owner, instance } = parameters(params)?;
+            host.allow_view(&owner, &instance).await
         }
         "reconcile_owners" => host.reconcile_owners(parameters(params)?).await,
         "end_owner" => {
@@ -1937,6 +2010,26 @@ pub fn read_config(input: impl std::io::Read) -> std::io::Result<HostConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_view_grant_is_claimed_once_by_its_own_view_before_it_expires() {
+        let now = std::time::Instant::now();
+        let view = Uuid::new_v4();
+        let mut grant = Some(ViewGrant {
+            view,
+            expires: now + VIEW_GRANT_TIMEOUT,
+        });
+        assert!(!ViewGrant::claim(&mut grant, Uuid::new_v4(), now));
+        assert!(grant.is_some(), "another view leaves the grant in place");
+        assert!(ViewGrant::claim(&mut grant, view, now));
+        assert!(
+            !ViewGrant::claim(&mut grant, view, now),
+            "a grant works once"
+        );
+        let mut expired = Some(ViewGrant { view, expires: now });
+        assert!(!ViewGrant::claim(&mut expired, view, now));
+        assert!(expired.is_none(), "an expired grant is gone");
+    }
 
     #[test]
     fn the_start_configuration_needs_a_well_formed_key_and_idle_time() {

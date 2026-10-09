@@ -44,6 +44,18 @@ const CONNECT_INTERVAL: Duration = Duration::from_millis(25);
 /// Only an open starts a host; other requests find that no hosted Tick exists.
 const HOST_NOT_RUNNING: &str = "HostNotRunning";
 
+/// One view's permission to attach to a hosted Tick's terminal: it reaches `endpoint` as a
+/// viewer of `instance` once, and only the host process `host_epoch` honours it. It carries no
+/// data token.
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HostedViewGrant {
+    pub endpoint: PathBuf,
+    pub host_epoch: Uuid,
+    pub instance: tick_connect::instance::InstanceRef,
+    pub view: Uuid,
+}
+
 /// What the host ran for an owner when a listing began.
 pub struct OwnerListing {
     pub started_ms: u64,
@@ -257,6 +269,33 @@ impl HostController {
             Err(error) if error.code == HOST_NOT_RUNNING => Ok(()),
             result => result.map(|_| ()),
         }
+    }
+
+    /// Lets one view attach to `owner`'s Tick `instance` on the running host. The grant works
+    /// once and names the host process it was made by.
+    pub async fn allow_view(
+        &self,
+        owner: &TickOwner,
+        instance: &tick_connect::instance::InstanceRef,
+    ) -> Result<HostedViewGrant, HostError> {
+        let granted = self
+            .request(
+                "allow_view",
+                json!({"owner":owner,"instance":instance}),
+                CONTROL_TIMEOUT,
+                Start::Never,
+            )
+            .await?;
+        let field = |name: &str| {
+            serde_json::from_value(granted[name].clone())
+                .map_err(|error| HostError::after("ProtocolViolation", error.to_string()))
+        };
+        Ok(HostedViewGrant {
+            endpoint: self.endpoint(),
+            host_epoch: field("epoch")?,
+            instance: instance.clone(),
+            view: field("view")?,
+        })
     }
 
     /// What the host runs for `owner`, read across all pages of one host, and the moment the

@@ -141,7 +141,7 @@ impl Agent {
                             .ceiling
                             .host_tools
                             .values()
-                            .any(|allowed| allowed == authority)
+                            .any(|allowed| allowed.contains(authority))
                     })
             {
                 return Err(AgentError::Invalid(

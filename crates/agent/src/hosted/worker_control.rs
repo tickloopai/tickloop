@@ -34,7 +34,6 @@ use super::{
         LaunchIdentity, LaunchRecord, LaunchState, OwnerState, Registry, RootRegistry, TARGET_GONE,
         Transition,
     },
-    tools::MODIFY_TICK,
 };
 use crate::{
     agent_access::{
@@ -43,6 +42,7 @@ use crate::{
     },
     host_tools::{HostEndpointIdentity, HostToolAuthority},
     runtime::LoopState,
+    tick_tool_router::MODIFY_TICK,
 };
 
 pub const ENDPOINT_NAME: &str = "worker-control.sock";
@@ -133,6 +133,11 @@ pub enum WorkerRequest {
         instance: InstanceRef,
         watches: BTreeSet<Uuid>,
     },
+    /// Lets one View of `chat` attach to its hosted `instance` once.
+    AllowHostedView {
+        chat: Uuid,
+        instance: InstanceRef,
+    },
     /// Root Chat `chat` stopped its direct child `child` with StopSubagent.
     EndStoppedChild {
         chat: Uuid,
@@ -179,6 +184,7 @@ impl WorkerRequest {
             | Self::BeginChatDeletion { .. }
             | Self::FinishChatDeletion { .. }
             | Self::SetWatchIntents { .. }
+            | Self::AllowHostedView { .. }
             | Self::EndStoppedChild { .. } => None,
         }
     }
@@ -193,6 +199,7 @@ impl WorkerRequest {
             | Self::BeginChatDeletion { chat, .. }
             | Self::FinishChatDeletion { chat, .. }
             | Self::SetWatchIntents { chat, .. }
+            | Self::AllowHostedView { chat, .. }
             | Self::EndStoppedChild { chat, .. } => *chat,
         }
     }
@@ -647,6 +654,11 @@ impl WorkerControl {
                     .await?;
                 Ok(json!({"instance":instance,"watches":count}))
             }
+            WorkerRequest::AllowHostedView { instance, .. } => self
+                .controller
+                .allow_view(&tick_owner, &instance)
+                .await
+                .map(|grant| json!(grant)),
             WorkerRequest::EndStoppedChild {
                 child, operation, ..
             } => {
@@ -818,7 +830,11 @@ impl WorkerControl {
         }
         let snapshot = chat_snapshot(worker, execution).await?;
         if let Some(delegation) = &snapshot.conversation.delegation
-            && delegation.ceiling.host_tools.get(&admission.tool) != Some(&admission.authority)
+            && !delegation
+                .ceiling
+                .host_tools
+                .get(&admission.tool)
+                .is_some_and(|allowed| allowed.contains(&admission.authority))
         {
             return Err(HostError::before(
                 "Forbidden",

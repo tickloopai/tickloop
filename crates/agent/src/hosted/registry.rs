@@ -139,6 +139,8 @@ pub struct LaunchRecord {
     pub state: LaunchState,
     /// The approved Watches that keep this instance from idling, as the Chat last reported them.
     pub watches: BTreeSet<Uuid>,
+    /// When the record was created or its state last changed. A Watch change keeps it, so a
+    /// listing that began earlier still settles the record.
     pub updated_ms: u64,
 }
 
@@ -361,11 +363,14 @@ impl RegistryFiles {
             return Ok(false);
         };
         let path = self.launch_path(chat, operation);
+        let earlier_state = current.state.clone();
         match change(current) {
             Transition::Keep => Ok(false),
             Transition::Write(record) => {
                 let mut record = *record;
-                record.updated_ms = unix_time_milliseconds();
+                if record.state != earlier_state {
+                    record.updated_ms = unix_time_milliseconds();
+                }
                 self.write(&path, &record).map(|()| true)
             }
             Transition::Remove => match std::fs::remove_file(&path) {

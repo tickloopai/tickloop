@@ -51,6 +51,7 @@ pub(crate) use input_history::{PASTE_CACHE_DIRECTORY, PASTE_FILE_EXTENSION};
 #[cfg(test)]
 mod child_config_tests;
 mod denials_surface;
+mod hosted_detail;
 mod input_view;
 #[cfg(test)]
 mod late_receipt_tests;
@@ -622,9 +623,13 @@ Usage: tickloop [--cwd DIRECTORY]
        [-c | --continue | -r [CHAT] | --resume [CHAT] | --chat-id CHAT] [--fork-session]
        [--no-session-persistence]
        tickloop service stop
+       tickloop monitor popup install|remove --herdr-socket SOCKET
+       tickloop monitor attach
 
 service stop ends the local Agent service and its running Agents; saved history is kept.
 Run tickloop again to start this build. TICKLOOP_AGENT_RUNTIME_DIR selects the service.
+monitor popup install asks before registering Tick Loop's popup plugin in that Herdr session and sets monitorPopup to enabled; remove asks before unregistering only that plugin and sets it to disabled. Running Ticks continue either way.
+monitor attach is the popup's attach client: it shows the hosted Tick its one-time view grant in TICKLOOP_MONITOR_ATTACH names.
 
 The working directory must exist; omitting --cwd uses the current directory.
 Unknown directories require interactive trust. --working-directory-is-trusted is an explicit host assertion for externally controlled automation and does not save trust.
@@ -647,6 +652,7 @@ Down on the last visual input row, after history ends, focuses the Subagents N e
 Click Subagents N or press Enter/Space on its focused entry to hide/show the list; modified Enter is ignored.
 Down from the expanded entry focuses the list; Enter opens an Agent, Space folds descendants, Esc returns to the entry, then Esc returns to the editor.
 Shift+Up/Down focuses Monitor's Shells group; Enter opens the selected Shell.
+Enter on a hosted Tick in Monitor shows its screen as a snapshot and why it is not floated; a attaches the same process full screen in this terminal until Ctrl+B q and r refreshes the snapshot; in the list, c closes the Tick and n reopens one lost with its host.
 Each Agent's own Todos stay below Working, including while idle, with a five-second grace after all items complete; rewrites do not extend it.
 Mode and model stay right-aligned on the lower divider; Context appears only with confirmed nonzero rounded usage.
 Divider edge titles have a short rule beyond the text; the expanded Subagents list has no items summary row.
@@ -881,6 +887,10 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
         .as_ref()
         .map(LoadedSettings::monitor_preference)
         .unwrap_or_default();
+    let monitor_popup = saved_settings
+        .as_ref()
+        .map(LoadedSettings::monitor_popup)
+        .unwrap_or_default();
     if let Some(settings) = saved_settings.as_mut() {
         settings.prompt_suggestion_enabled();
     }
@@ -1023,13 +1033,15 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
     let console = &console;
     console.set_status_lines(status_lines)?;
     console.set_monitor_preference(monitor_preference)?;
-    // A View outside Herdr works with an Agent whose new Ticks run in the Tick host.
-    match tick_discovery {
-        Some(discovery) => console.set_tick_discovery(discovery)?,
-        None => console.set_member_probe(std::sync::Arc::new(hosted_probe::HostedProbe::new(
-            agent.clone(),
-        )))?,
+    console.set_monitor_popup(monitor_popup)?;
+    // Inside Herdr the View also discovers and probes Herdr programs; in every View the Agent's
+    // new Ticks run in the Tick host and are probed there.
+    if let Some(discovery) = tick_discovery {
+        console.set_tick_discovery(discovery)?;
     }
+    console.add_member_probe(std::sync::Arc::new(hosted_probe::HostedProbe::new(
+        agent.clone(),
+    )))?;
     console.configure_input_history(config_root.as_deref(), &workdir)?;
     // The image cache expires with Transcripts, so a session that saves no Chats caches nothing.
     let image_cache_root = config_root
@@ -3983,17 +3995,18 @@ async fn interact(
                     let console = console.clone();
                     tokio::spawn(async move {
                         let chat = probe.chat;
-                        // A failed or panicked probe keeps the earlier findings and still releases
-                        // the probe slot, so probing never stops for the session.
-                        let probed = tokio::spawn(async move {
-                            probe.prober.probe(chat, &probe.targets).await
-                        })
-                        .await;
-                        let findings = match probed {
-                            Ok(Ok(findings)) => Some(findings),
-                            Ok(Err(_)) | Err(_) => None,
-                        };
-                        let _ = console.update_member_findings(chat, findings);
+                        // A failed or panicked probe keeps its type's earlier findings and the probe
+                        // slot is still released, so probing never stops for the session.
+                        let mut results = Vec::new();
+                        for typed in probe.probes {
+                            let tick_type = typed.prober.tick_type();
+                            let probed = tokio::spawn(async move {
+                                typed.prober.probe(chat, &typed.targets).await
+                            })
+                            .await;
+                            results.push((tick_type, probed.ok().and_then(Result::ok)));
+                        }
+                        let _ = console.update_member_findings(chat, results);
                     });
                 }
             },
@@ -8527,5 +8540,17 @@ mod status_agents_help_tests {
         assert!(help.contains("Monitor's Shells group"));
         assert!(help.contains("including while idle") && help.contains("five-second grace"));
         assert!(!help.contains("Footer Tasks/Todo") && !help.contains("starts folded"));
+    }
+
+    #[test]
+    fn help_names_the_monitor_commands_and_hosted_tick_keys() {
+        let help = super::help_text();
+        assert!(help.contains("tickloop monitor popup install|remove --herdr-socket SOCKET"));
+        assert!(help.contains("tickloop monitor attach"));
+        assert!(
+            help.contains(
+                "a attaches the same process full screen in this terminal until Ctrl+B q"
+            )
+        );
     }
 }

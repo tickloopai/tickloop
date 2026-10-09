@@ -25,10 +25,8 @@ use super::{
 };
 use crate::{
     host_tools::{HostToolAuthority, HostToolProvider},
-    hosted::{
-        registry::TARGET_GONE,
-        tools::{HostedTickTools, READ_TICK},
-    },
+    hosted::{registry::TARGET_GONE, tools::HostedTickTools},
+    tick_tool_router::READ_TICK,
 };
 
 /// A watch connects to its Tick once and reconnects at most this often in a process; then it
@@ -86,7 +84,7 @@ impl HostedScope {
         let Some(HostToolAuthority::Native { .. }) = authority else {
             return Err("Hosted watch has no admitted host authority; subscribe explicitly".into());
         };
-        if self.tools.tool_authority(READ_TICK)?.as_ref() != authority {
+        if authority != Some(&self.tools.authority()) {
             return Err("Hosted watch is outside its admitted Tick host".into());
         }
         Ok(())

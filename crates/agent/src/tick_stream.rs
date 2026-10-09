@@ -137,7 +137,7 @@ impl PreparedTickWatch {
         provider: Arc<dyn crate::host_tools::HostToolProvider>,
         query: crate::host_tools::PreparedHostCall,
     ) -> Result<Self, String> {
-        let authority = provider.tool_authority(query.policy_name())?;
+        let authority = provider.call_authority(query.policy_name(), query.source_input())?;
         let admission = crate::host_tools::PreparedHostCall::new(
             query.policy_name().into(),
             query.policy_input().clone(),
@@ -591,12 +591,17 @@ impl NativeWatchScope {
         authority: Option<&crate::host_tools::HostToolAuthority>,
     ) -> Result<(), String> {
         use crate::host_tools::HostToolProvider;
-        let Some(crate::host_tools::HostToolAuthority::Native { .. }) = authority else {
+        let Some(authority @ crate::host_tools::HostToolAuthority::Native { .. }) = authority
+        else {
             return Err(
                 "Native watch has no admitted endpoint authority; subscribe explicitly".into(),
             );
         };
-        if self.provider.tool_authority("ReadTick")?.as_ref() != authority {
+        if !self
+            .provider
+            .tool_authorities(crate::tick_tool_router::READ_TICK)?
+            .contains(authority)
+        {
             return Err("Native watch endpoint is outside its admitted authority".into());
         }
         Ok(())
