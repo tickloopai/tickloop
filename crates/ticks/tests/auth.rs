@@ -147,9 +147,10 @@ async fn approval_is_received_after_a_dropped_connection_without_progress_floodi
         Ok(Err(_)) => "login-error",
         Ok(Ok(())) => "success",
     };
-    eprintln!(
-        "[DEBUG-auth-reconnect] {}",
-        json!({"setup_deadline_ms":SETUP_TIMEOUT.as_millis(), "retry_deadline_ms":RETRY_TIMEOUT.as_millis(),
+    if !matches!(&result, Ok(Ok(()))) {
+        eprintln!(
+            "auth reconnect timing: {}",
+            json!({"setup_deadline_ms":SETUP_TIMEOUT.as_millis(), "retry_deadline_ms":RETRY_TIMEOUT.as_millis(),
         "elapsed_us":finished.duration_since(started).as_micros(),
         "first_drop_us":first_dropped_at.map(|at| at.saturating_duration_since(started).as_micros()),
         "retry_elapsed_us":first_dropped_at.map(|at| finished.saturating_duration_since(at).as_micros()),
@@ -157,7 +158,8 @@ async fn approval_is_received_after_a_dropped_connection_without_progress_floodi
         "outcome":outcome,
         "notices":{"waiting":notices.matches("Waiting for Longbridge").count(), "retry":notices.matches("retrying automatically").count(),
             "remaining":notices.matches("remaining").count(), "logged_in":notices.matches("Logged in").count()}, "events":events})
-    );
+        );
+    }
     result
         .expect("a brief connection failure must not abandon the approved center")
         .unwrap();
@@ -170,6 +172,153 @@ async fn approval_is_received_after_a_dropped_connection_without_progress_floodi
     assert_eq!(output.matches("retrying automatically").count(), 1);
     assert!(!output.contains("remaining"));
     assert!(output.contains("Logged in"));
+}
+
+#[tokio::test]
+async fn approval_survives_transient_http_errors_without_abandoning_its_center() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::time::Duration;
+    const APPROVAL_TIMEOUT: Duration = Duration::from_secs(5);
+
+    for status in [500, 502, 503, 504, 599] {
+        let ap_polls = Arc::new(AtomicUsize::new(0));
+        let observed = ap_polls.clone();
+        let stub = http::Stub::start(move |request| {
+            if request.contains("/register ") {
+                (201, json!({"client_id":"client"}))
+            } else if request.contains("/device/authorize ") {
+                (200, json!({"device_code":"secret","user_code":"CODE","verification_uri":"https://example.com","expires_in":120,"interval":1}))
+            } else if request.contains("x-dc-region: ap") {
+                if observed.fetch_add(1, Ordering::SeqCst) == 0 {
+                    (status, json!({"error":"gateway_unavailable"}))
+                } else {
+                    (200, json!({"access_token":"ap_authorized","expires_in":3600}))
+                }
+            } else {
+                (400, json!({"error":"authorization_pending"}))
+            }
+        }).await;
+        let home = tempfile::tempdir().unwrap();
+        let storage = AuthStorage::in_home(home.path());
+        let endpoints = AuthEndpoints {
+            ap: format!("{}/oauth2", stub.url),
+            us: format!("{}/oauth2", stub.url),
+        };
+        let mut output = Vec::new();
+        tokio::time::timeout(
+            APPROVAL_TIMEOUT,
+            run_login(
+                &Settings::default(),
+                &home.path().join("config.toml"),
+                &storage,
+                Some(endpoints),
+                &mut Cursor::new("cn\n"),
+                &mut output,
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("HTTP {status} must not abandon the approved AP center"))
+        .unwrap();
+        assert_eq!(ap_polls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            storage.token().unwrap().unwrap().access_token,
+            "ap_authorized"
+        );
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(output.matches("Waiting for Longbridge").count(), 1);
+        assert_eq!(output.matches("retrying automatically").count(), 1);
+        assert!(!output.contains("remaining"));
+        assert!(output.contains("Logged in"));
+    }
+}
+
+#[tokio::test]
+async fn simultaneous_endpoint_failures_share_one_continuous_outage_notice() {
+    assert_outage_notices(vec![503, 200], true, 1).await;
+}
+
+#[tokio::test]
+async fn a_new_outage_after_recovery_has_its_own_retry_notice() {
+    assert_outage_notices(vec![503, 400, 503, 200], false, 2).await;
+}
+
+async fn assert_outage_notices(ap_statuses: Vec<u16>, fail_us_once: bool, expected_notices: usize) {
+    use std::{
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::{Duration, Instant},
+    };
+    const HANG_GUARD: Duration = Duration::from_secs(15);
+    const OUTAGE_RETRY_BUDGET: Duration = Duration::from_secs(5);
+    let statuses = Arc::new(ap_statuses);
+    let responses = statuses.clone();
+    let ap_polls = Arc::new(AtomicUsize::new(0));
+    let observed_polls = ap_polls.clone();
+    let us_polls = AtomicUsize::new(0);
+    let timeline = Arc::new(Mutex::new(Vec::new()));
+    let observed_timeline = timeline.clone();
+    let stub = http::Stub::start(move |request| {
+        if request.contains("/register ") {
+            (201, json!({"client_id":"client"}))
+        } else if request.contains("/device/authorize ") {
+            (200, json!({"device_code":"secret","user_code":"CODE","verification_uri":"https://example.com","expires_in":120,"interval":1}))
+        } else if request.contains("x-dc-region: ap") {
+            let poll = observed_polls.fetch_add(1, Ordering::SeqCst);
+            let status = responses[poll];
+            observed_timeline.lock().unwrap().push((status, Instant::now()));
+            (status, match status {
+                200 => json!({"access_token":"ap_authorized","expires_in":3600}),
+                400 => json!({"error":"authorization_pending"}),
+                _ => json!({"error":"gateway_unavailable"}),
+            })
+        } else if fail_us_once && us_polls.fetch_add(1, Ordering::SeqCst) == 0 {
+            (502, json!({"error":"gateway_unavailable"}))
+        } else {
+            (400, json!({"error":"authorization_pending"}))
+        }
+    }).await;
+    let home = tempfile::tempdir().unwrap();
+    let storage = AuthStorage::in_home(home.path());
+    let mut output = Vec::new();
+    tokio::time::timeout(
+        HANG_GUARD,
+        run_login(
+            &Settings::default(),
+            &home.path().join("config.toml"),
+            &storage,
+            Some(AuthEndpoints {
+                ap: format!("{}/oauth2", stub.url),
+                us: format!("{}/oauth2", stub.url),
+            }),
+            &mut Cursor::new("cn\n"),
+            &mut output,
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(ap_polls.load(Ordering::SeqCst), statuses.len());
+    for pair in timeline.lock().unwrap().windows(2) {
+        if pair[0].0 >= 500 {
+            assert!(pair[1].1.duration_since(pair[0].1) < OUTAGE_RETRY_BUDGET);
+        }
+    }
+    assert_eq!(
+        storage.token().unwrap().unwrap().access_token,
+        "ap_authorized"
+    );
+    let output = String::from_utf8(output).unwrap();
+    assert_eq!(
+        output.matches("retrying automatically").count(),
+        expected_notices
+    );
+    assert_eq!(output.matches("Waiting for Longbridge").count(), 1);
+    assert!(!output.contains("remaining"));
 }
 
 #[tokio::test]
