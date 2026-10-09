@@ -306,7 +306,7 @@ async fn a_foreground_command_moves_to_background_without_starting_a_second_proc
     let agent = Agent::new_embedded(
         config(),
         Arc::new(ShellModel {
-            command: "echo started >> starts.txt; printf ready; sleep 30".into(),
+            command: "env sh -c 'echo started >> starts.txt; printf ready; sleep 30'".into(),
         }),
     );
     let chat = agent.create_chat(directory.path().into()).await.unwrap();

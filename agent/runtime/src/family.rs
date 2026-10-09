@@ -303,7 +303,7 @@ impl Agent {
         let Some(goal) = snapshot.loops.iter().find(|goal| goal.id == child.loop_id) else {
             return;
         };
-        let result = snapshot.run_response_text(child.run_id).unwrap_or_default();
+        let result = crate::handback::completion_text(snapshot, child.run_id);
         let error = snapshot.events.iter().rev().find_map(|event| {
             if event.run_id == child.run_id
                 && let EventKind::Failed(error) = &event.kind

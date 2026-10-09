@@ -379,7 +379,7 @@ mod tests {
                 is_meta: false,
                 execution_mode: None,
                 is_inherited_prompt: false,
-                original_user_message_id: None,
+                original_message_id: None,
                 agent_message_origin: None,
                 human_family_origin: None,
                 run_id: None,

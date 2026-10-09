@@ -30,7 +30,24 @@ enum ToolRoute {
     TickSubscription,
     Delegation,
     AgentMessage,
+    Handback,
     Host(Arc<dyn crate::host_tools::HostToolProvider>),
+}
+
+enum PreparedLocalCall {
+    Family(agent_messages::PreparedFamilyCall),
+    Delegation(delegation::PreparedDelegation),
+    Handback(crate::handback::PreparedHandback),
+}
+
+impl PreparedLocalCall {
+    fn policy_input(&self) -> &Value {
+        match self {
+            Self::Family(call) => call.policy_input(),
+            Self::Delegation(call) => &call.input,
+            Self::Handback(call) => &call.input,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -61,6 +78,7 @@ impl ToolRegistry {
         chat: &Chat,
         host_provider: Option<Arc<dyn crate::host_tools::HostToolProvider>>,
         tick_stream_installed: bool,
+        prompt_policy: PromptPolicy,
     ) -> Self {
         let mut tools = tickloop_agent_tools::Tools::definitions()
             .into_iter()
@@ -103,6 +121,12 @@ impl ToolRegistry {
                     route: ToolRoute::AgentMessage,
                 }),
         );
+        if crate::handback::available(chat, prompt_policy) {
+            tools.push(RegisteredTool {
+                definition: crate::handback::definition(),
+                route: ToolRoute::Handback,
+            });
+        }
         if tick_stream_installed {
             tools.extend(
                 tick_subscriptions::definitions()
@@ -414,7 +438,7 @@ impl Agent {
         receipt: &Receipt,
         operation: &OperationRecord,
         registered: &RegisteredTool,
-        family_message: Option<&agent_messages::PreparedFamilyCall>,
+        prepared_local: Option<&PreparedLocalCall>,
         authority: Option<HostToolAuthority>,
         cancel: CancellationToken,
     ) -> Result<ToolResult, String> {
@@ -425,13 +449,26 @@ impl Agent {
                     &operation.call_id,
                     &operation.name,
                     &operation.input,
-                    family_message,
+                    prepared_local.and_then(|call| match call {
+                        PreparedLocalCall::Family(call) => Some(call),
+                        _ => None,
+                    }),
                     cancel,
                 )
                 .await
             }
+            ToolRoute::Handback => {
+                let Some(PreparedLocalCall::Handback(prepared)) = prepared_local else {
+                    return Err("SubagentHandback was not prepared".into());
+                };
+                self.execute_handback(receipt, operation, prepared, cancel)
+                    .await
+            }
             ToolRoute::Delegation => {
-                self.subagent_tool(receipt, &operation.call_id, &operation.input, cancel)
+                let Some(PreparedLocalCall::Delegation(prepared)) = prepared_local else {
+                    return Err("Subagent was not prepared".into());
+                };
+                self.subagent_tool(receipt, &operation.call_id, prepared, cancel)
                     .await
             }
             ToolRoute::Skill => self.skill_tool(receipt, &operation.input).await,
@@ -646,7 +683,7 @@ impl Agent {
         } else {
             None
         };
-        let prepared_family_message = if matches!(
+        let prepared_local = if matches!(
             name.as_str(),
             SEND_AGENT_MESSAGE_TOOL_NAME | agent_messages::STOP_SUBAGENT_TOOL_NAME
         ) && matches!(
@@ -654,7 +691,7 @@ impl Agent {
             Some(ToolRoute::AgentMessage)
         ) {
             match self.prepare_family_call(receipt, &name, &input).await {
-                Ok(prepared) => Some(prepared),
+                Ok(prepared) => Some(PreparedLocalCall::Family(prepared)),
                 Err(rejection) => {
                     return Ok(ToolCallOutcome {
                         result: rejection.result(),
@@ -662,14 +699,41 @@ impl Agent {
                     });
                 }
             }
+        } else if matches!(
+            registration.as_ref().map(|registered| &registered.route),
+            Some(ToolRoute::Delegation)
+        ) {
+            match delegation::PreparedDelegation::parse(&input) {
+                Ok(prepared) => Some(PreparedLocalCall::Delegation(prepared)),
+                Err(error) => return Ok(ToolCallOutcome::not_admitted(error)),
+            }
+        } else if matches!(
+            registration.as_ref().map(|registered| &registered.route),
+            Some(ToolRoute::Handback)
+        ) {
+            match self.prepare_handback(receipt, &input).await {
+                Ok(prepared) => Some(PreparedLocalCall::Handback(prepared)),
+                Err(error) => return Ok(ToolCallOutcome::not_admitted(error)),
+            }
         } else {
             None
         };
-        let host_permission = prepared_host_call.as_ref().map(|call| call.permission());
+        let host_permission = prepared_host_call
+            .as_ref()
+            .map(|call| call.permission())
+            .or_else(|| {
+                let route = &registration.as_ref()?.route;
+                (matches!(route, ToolRoute::Delegation)
+                    || matches!(route, ToolRoute::AgentMessage)
+                        && name == SEND_AGENT_MESSAGE_TOOL_NAME)
+                    .then_some(crate::host_tools::HostToolPermission::Classified {
+                        allow_rule_bypasses_review: name == SEND_AGENT_MESSAGE_TOOL_NAME,
+                    })
+            });
         let normalized_name = prepared_host_call
             .as_ref()
             .map_or(name.as_str(), |call| call.policy_name());
-        let normalized_input = prepared_family_message
+        let normalized_input = prepared_local
             .as_ref()
             .map(|prepared| prepared.policy_input())
             .unwrap_or_else(|| {
@@ -677,7 +741,7 @@ impl Agent {
                     .as_ref()
                     .map_or(&input, |call| call.policy_input())
             });
-        let permission_input = prepared_family_message
+        let permission_input = prepared_local
             .as_ref()
             .map(|prepared| prepared.policy_input())
             .unwrap_or_else(|| {
@@ -747,6 +811,9 @@ impl Agent {
                         explicit_decision.map(Decision::from),
                         host_permission,
                         chat.snapshot.policy.mode,
+                        host_permission
+                            == Some(crate::host_tools::HostToolPermission::PrivateArtifactWrite)
+                            && chat.has_human_input_for_run(receipt.run_id),
                     ),
                     explicit_decision
                         == Some(tickloop_agent_tools::permissions::ExplicitPermissionDecision::Ask),
@@ -1089,7 +1156,7 @@ impl Agent {
                                 registration
                                     .as_ref()
                                     .expect("registered local or Host tool"),
-                                prepared_family_message.as_ref(),
+                                prepared_local.as_ref(),
                                 watch_authority,
                                 cancel.clone(),
                             )

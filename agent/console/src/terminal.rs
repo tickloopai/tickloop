@@ -633,15 +633,8 @@ async fn connect_startup_daemon(
         .await
         .map_err(|reason| format!("{error}\n\n{reason}"))?
         .ok_or("The Agent daemon changed before confirmation; launch tickloop again.")?;
-    if startup_console.is_none() {
-        *startup_console = Some(Console::start_with_display(true, preferences)?);
-    }
-    let (console, input) = startup_console
-        .as_mut()
-        .expect("startup console initialized");
-    console.finish_workspace_trust()?;
     let menu_id = uuid::Uuid::new_v4();
-    console.show_focused_menu(console::Menu {
+    let menu = console::Menu {
         id: menu_id,
         title: "Stop the running daemon and continue?".into(),
         context: vec![
@@ -653,7 +646,17 @@ async fn connect_startup_daemon(
         options: vec!["Stop daemon and open this version".into(), "Cancel — keep running Agents".into()],
         selected: 1,
         confirmation: true,
-    })?;
+    };
+    if let Some((console, _)) = startup_console.as_ref() {
+        console.set_prompt_enabled(false)?;
+        console.finish_workspace_trust()?;
+        console.show_focused_menu(menu)?;
+    } else {
+        *startup_console = Some(Console::start_with_startup_menu(preferences, menu)?);
+    }
+    let (console, input) = startup_console
+        .as_mut()
+        .expect("startup console initialized");
     let confirmed = loop {
         let event = tokio::select! {
             event = input.recv() => event,
@@ -678,6 +681,7 @@ async fn connect_startup_daemon(
     let client = tickloop_agent_client::connect_or_start(executable)
         .await
         .map_err(|error| error.to_string())?;
+    console.finish_menu_submission(menu_id)?;
     console.set_status("")?;
     Ok(Some(client))
 }
@@ -1043,7 +1047,7 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
     } else {
         let Some(client) = connect_startup_daemon(
             interactive_terminal,
-            display_preferences.clone(),
+            display_preferences,
             &mut startup_console,
         )
         .await?
@@ -1056,7 +1060,7 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
     let agent = {
         let Some(client) = connect_startup_daemon(
             interactive_terminal,
-            display_preferences.clone(),
+            display_preferences,
             &mut startup_console,
         )
         .await?
@@ -1467,7 +1471,6 @@ async fn interact(
     let mut transcript_write_error = None;
     let mut loop_trigger_notices: Vec<(uuid::Uuid, String)> = Vec::new();
     let mut displayed_sequences: HashMap<uuid::Uuid, u64> = HashMap::new();
-    let mut displayed_assistant_messages = HashSet::new();
     let mut eof = false;
     let mut failed = false;
     let mut status_dirty = true;
@@ -2227,7 +2230,7 @@ async fn interact(
                         console.set_connection_notice(Some(format!("{VIEW_REGISTRATION_UNAVAILABLE_NOTICE} · {}",safe_line(&error.to_string()))))?;
                     }
                     if let Some(chat)=selected_chat {
-                        match restore_view(console,agent,&mut tools,chat,displayed_sequences.get(&chat).copied().unwrap_or(0),&mut reply_lines).await {
+                        match restore_view(console,agent,&mut tools,chat,displayed_sequences.get(&chat).copied().unwrap_or(0),&mut reply_lines,&mut message_groups).await {
                             Ok(observation)=>{
                                 displayed_sequences.insert(chat,observation.snapshot.last_sequence);
                                 sync_snapshot(&observation.snapshot,&mut pending,&mut permissions,&mut questions);
@@ -3654,14 +3657,14 @@ async fn interact(
                     let starts_assistant_message = matches!(&event.kind, EventKind::Text(_))
                         && message_id
                             .as_ref()
-                            .is_some_and(|id| displayed_assistant_messages.insert(id.clone()));
+                            .is_some_and(|id| message_groups.displayed.insert(id.clone()));
                     let starts_thinking = matches!(&event.kind, EventKind::Thinking(_))
                         && message_id
                             .as_ref()
-                            .is_some_and(|id| displayed_assistant_messages.insert(id.clone()));
+                            .is_some_and(|id| message_groups.displayed.insert(id.clone()));
                     let follows_thinking = starts_assistant_message
                         && message_id.as_ref().is_some_and(|id| {
-                            displayed_assistant_messages
+                            message_groups.displayed
                                 .contains(&id.replace(":assistant:", ":thinking:"))
                         });
                     displayed_sequences.insert(event.chat_id,event.sequence);
@@ -3862,7 +3865,7 @@ async fn interact(
                     status_dirty = true;
                     if !overview_active && let Some(chat)=selected_chat {
                         let frame_hold=console.hold_frames()?;
-                        let observation=restore_view(console, agent,&mut tools,chat,*displayed_sequences.get(&chat).unwrap_or(&0),&mut reply_lines).await?;
+                        let observation=restore_view(console, agent,&mut tools,chat,*displayed_sequences.get(&chat).unwrap_or(&0),&mut reply_lines,&mut message_groups).await?;
                         drop(frame_hold);
                         failed |= observation.snapshot.loops.iter().any(|goal|goal.state==tickloop_agent_protocol::LoopState::Failed);
                         displayed_sequences.insert(chat,observation.snapshot.last_sequence);
@@ -4048,7 +4051,7 @@ async fn interact(
                                         }
                                         if outcome_pending {
                                             if !overview_active && Some(snapshot.id)==selected_chat {
-                                                let restored=restore_view(console,agent,&mut tools,snapshot.id,*displayed_sequences.get(&snapshot.id).unwrap_or(&0),&mut reply_lines).await?;
+                                                let restored=restore_view(console,agent,&mut tools,snapshot.id,*displayed_sequences.get(&snapshot.id).unwrap_or(&0),&mut reply_lines,&mut message_groups).await?;
                                                 failed |= restored.snapshot.loops.iter().any(|goal|goal.state==tickloop_agent_protocol::LoopState::Failed);
                                                 displayed_sequences.insert(snapshot.id,restored.snapshot.last_sequence);
                                                 merged_echoes.close_all();
@@ -4658,29 +4661,38 @@ async fn restore_view(
     chat: uuid::Uuid,
     after: u64,
     buffered_replies: &mut HashMap<uuid::Uuid, ReplyLines>,
+    message_groups: &mut MessageGroups,
 ) -> Result<ExecutionObservation, String> {
     let observation = agent
         .observe(chat, after)
         .await
         .map_err(|error| error.to_string())?;
-    render_restored_observation(
+    let observation = render_restored_observation(
         console,
-        agent,
         tools,
         chat,
         after,
         buffered_replies,
+        message_groups,
         observation,
-    )
+    )?;
+    #[cfg(test)]
+    agent.record_recovery_fact(recovery_tests::RecoveryFact::Restored {
+        chat,
+        after,
+        last_sequence: observation.snapshot.last_sequence,
+        reset_required: observation.reset_required,
+    });
+    Ok(observation)
 }
 
 fn render_restored_observation(
     console: &Console,
-    _agent: &Agent,
     tools: &mut ToolPresentation,
     chat: uuid::Uuid,
     after: u64,
     buffered_replies: &mut HashMap<uuid::Uuid, ReplyLines>,
+    message_groups: &mut MessageGroups,
     observation: ExecutionObservation,
 ) -> Result<ExecutionObservation, String> {
     let conversation_events = observation.snapshot.conversation_events();
@@ -4714,6 +4726,18 @@ fn render_restored_observation(
             .cloned()
             .collect::<Vec<_>>(),
     );
+    *message_groups = MessageGroups::default();
+    for event in conversation_events
+        .iter()
+        .filter(|event| observation.reset_required || event.sequence <= after)
+    {
+        let message_id = message_groups.message_id(event);
+        if matches!(event.kind, EventKind::Thinking(_) | EventKind::Text(_))
+            && let Some(id) = message_id
+        {
+            message_groups.displayed.insert(id);
+        }
+    }
     if observation.reset_required {
         console.reset_chat(chat)?;
         tools.restore(&conversation_events);
@@ -4731,12 +4755,10 @@ fn render_restored_observation(
         }
     } else {
         let mut thinking_runs = HashSet::new();
-        let mut message_groups = MessageGroups::default();
         for event in conversation_events
             .iter()
             .filter(|event| event.sequence <= after)
         {
-            message_groups.message_id(event);
             if matches!(event.kind, EventKind::Thinking(_)) {
                 thinking_runs.insert(event.run_id);
             } else if ends_thinking(&event.kind) {
@@ -4777,6 +4799,20 @@ fn render_restored_observation(
                 buffered_replies.remove(&event.run_id);
             }
             let message_id = message_groups.message_id(event);
+            let starts_thinking = matches!(event.kind, EventKind::Thinking(_))
+                && message_id
+                    .as_ref()
+                    .is_some_and(|id| message_groups.displayed.insert(id.clone()));
+            let starts_assistant_message = matches!(event.kind, EventKind::Text(_))
+                && message_id
+                    .as_ref()
+                    .is_some_and(|id| message_groups.displayed.insert(id.clone()));
+            let follows_thinking = starts_assistant_message
+                && message_id.as_ref().is_some_and(|id| {
+                    message_groups
+                        .displayed
+                        .contains(&id.replace(":assistant:", ":thinking:"))
+                });
             let console = &console.for_message(message_id.clone());
             if matches!(event.kind, EventKind::Thinking(_)) {
                 thinking_runs.insert(event.run_id);
@@ -4804,6 +4840,9 @@ fn render_restored_observation(
                 }
                 EventKind::Thinking(thinking) => {
                     if !console.is_interactive() {
+                        if starts_thinking {
+                            console.write("\nThinking: ")?;
+                        }
                         console.write(&safe_text(thinking))?;
                     }
                 }
@@ -4815,7 +4854,10 @@ fn render_restored_observation(
                         reply.push(&safe_text(text));
                         write_pending_reply_lines(console, reply)?;
                     } else {
-                        console.write_markdown(&safe_text(text), false)?;
+                        if follows_thinking {
+                            console.write("\nAssistant: ")?;
+                        }
+                        console.write_markdown(&safe_text(text), starts_assistant_message)?;
                     }
                 }
                 EventKind::Completed { usage } => {
@@ -4954,13 +4996,6 @@ fn render_restored_observation(
         print_command(console, command)?;
     }
 
-    #[cfg(test)]
-    _agent.record_recovery_fact(recovery_tests::RecoveryFact::Restored {
-        chat,
-        after,
-        last_sequence: observation.snapshot.last_sequence,
-        reset_required: observation.reset_required,
-    });
     Ok(observation)
 }
 
@@ -6989,13 +7024,20 @@ async fn navigate_agent(
                     let mut presentation = ToolPresentation::new(!console.is_interactive());
                     let observation = render_restored_observation(
                         console,
-                        agent,
                         &mut presentation,
                         chat,
                         after,
                         reply_lines,
+                        &mut MessageGroups::default(),
                         observation,
                     )?;
+                    #[cfg(test)]
+                    agent.record_recovery_fact(recovery_tests::RecoveryFact::Restored {
+                        chat,
+                        after,
+                        last_sequence: observation.snapshot.last_sequence,
+                        reset_required: observation.reset_required,
+                    });
                     snapshot = observation.snapshot;
                 }
                 console.set_input_context(
@@ -7324,11 +7366,11 @@ mod tests {
         let mut tools = super::ToolPresentation::new(true);
         super::render_restored_observation(
             &console,
-            &agent,
             &mut tools,
             chat,
             0,
             &mut std::collections::HashMap::new(),
+            &mut super::MessageGroups::default(),
             observation.clone(),
         )
         .unwrap();
@@ -7341,11 +7383,11 @@ mod tests {
         observation.events.retain(|event| event.sequence > 2);
         super::render_restored_observation(
             &console,
-            &agent,
             &mut tools,
             chat,
             2,
             &mut std::collections::HashMap::new(),
+            &mut super::MessageGroups::default(),
             observation,
         )
         .unwrap();
@@ -7425,11 +7467,11 @@ mod tests {
         let mut tools = super::ToolPresentation::new(true);
         super::render_restored_observation(
             &console,
-            &agent,
             &mut tools,
             chat,
             0,
             &mut std::collections::HashMap::new(),
+            &mut super::MessageGroups::default(),
             observation.clone(),
         )
         .unwrap();
@@ -7442,11 +7484,11 @@ mod tests {
         observation.events.retain(|event| event.sequence > 2);
         super::render_restored_observation(
             &console,
-            &agent,
             &mut tools,
             chat,
             2,
             &mut std::collections::HashMap::new(),
+            &mut super::MessageGroups::default(),
             observation,
         )
         .unwrap();
@@ -7531,11 +7573,11 @@ mod tests {
         let mut tools = super::ToolPresentation::new(true);
         super::render_restored_observation(
             &console,
-            &agent,
             &mut tools,
             chat,
             0,
             &mut std::collections::HashMap::new(),
+            &mut super::MessageGroups::default(),
             observation.clone(),
         )
         .unwrap();
@@ -7549,11 +7591,11 @@ mod tests {
         observation.events.retain(|event| event.sequence > 2);
         super::render_restored_observation(
             &console,
-            &agent,
             &mut tools,
             chat,
             2,
             &mut std::collections::HashMap::new(),
+            &mut super::MessageGroups::default(),
             observation,
         )
         .unwrap();

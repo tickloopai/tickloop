@@ -5,6 +5,7 @@ use crate::{AutoBlockKind, AutoReviewerPreference, AutoRule, Usage, VerdictEvide
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct PreparedApprovalFacts {
+    pub artifact_publication: Option<crate::ArtifactPublication>,
     pub normalized_input: serde_json::Value,
     pub canonical_path: Option<std::path::PathBuf>,
     pub in_workspace: Option<bool>,
@@ -109,11 +110,20 @@ pub enum ApprovalAttemptOutcome {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ApprovalAttemptDetails {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage: Option<ApprovalStage>,
     pub reviewer: ApprovalReviewer,
     pub elapsed_ms: u64,
     pub outcome: ApprovalAttemptOutcome,
     pub failure: Option<ApprovalFailureKind>,
     pub usage: Option<Usage>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalStage {
+    RiskScreen,
+    Authorization,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

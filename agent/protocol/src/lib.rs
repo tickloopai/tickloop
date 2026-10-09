@@ -56,9 +56,10 @@ pub use access::{
 pub use approvals::{
     ApprovalAssessmentDetails, ApprovalAttemptDetails, ApprovalAttemptOutcome, ApprovalDiagnostic,
     ApprovalFailureKind, ApprovalFallbackReason, ApprovalOutcome, ApprovalReviewer,
-    ApprovalReviewerKind, AutoReviewerHealth, OriginalUserInput, PreparedApprovalFacts,
+    ApprovalReviewerKind, ApprovalStage, AutoReviewerHealth, OriginalUserInput,
+    PreparedApprovalFacts,
 };
-pub use artifact::ArtifactTick;
+pub use artifact::{ArtifactAudience, ArtifactPublication, ArtifactTick};
 pub use auto_rules::{
     AutoBlockKind, AutoEnvironment, AutoEnvironmentSource, AutoPolicy, AutoRule, AutoRuleSource,
     RuleApplicability, RuleFinding, SoftDenyClearance, TaskScopeFinding, VerdictEvidence,
@@ -85,8 +86,8 @@ pub use denials::{
 pub use family::{
     AgentMessageSource, DelegationCeiling, DelegationMetadata, DirectedHumanSource,
     FamilyCompletion, FamilyInputRecord, FamilyMessageRejection, FamilyMessageRejectionCode,
-    MessageCause, SEND_AGENT_MESSAGE_TOOL_NAME, SUBAGENT_TOOL_NAME, SubagentNotificationDelivery,
-    SubagentRegistration, VerifiedUserRelay,
+    MessageCause, SEND_AGENT_MESSAGE_TOOL_NAME, SUBAGENT_HANDBACK_TOOL_NAME, SUBAGENT_TOOL_NAME,
+    SubagentNotificationDelivery, SubagentRegistration, SubagentReport, VerifiedUserRelay,
 };
 pub use file_change::{
     FileChangeAction, FileChangeArtifactRef, FileChangeReviewSummary, FileIdentity, FileVersion,
@@ -126,7 +127,8 @@ pub use model::{
 };
 pub use model_availability::{AccountModelDirectory, DirectorySemantics, ModelAvailability};
 pub use model_card::{
-    Adapter, ModelCard, ModelPatch, ProviderPatch, ThinkingBudgets, ThinkingControl,
+    Adapter, ModelCard, ModelPatch, ProviderPatch, TemperatureControl, ThinkingBudgets,
+    ThinkingControl, ThinkingOffEncoding,
 };
 pub use monitor::{MonitorMember, MonitorMemberSource, MonitorMembership};
 pub use permissions::{Decision, ExecutionMode, PermissionPolicy, PermissionRule, PermissionScope};

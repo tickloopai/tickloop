@@ -253,15 +253,22 @@ fn incompatible_daemon_guidance(
             "{details}\n\nRun this build with daemon stop, then relaunch.\nThis stops running Agents. Saved history is kept."
         );
     };
-    let stop = format!(
-        "TICKLOOP_DAEMON_RUNTIME_DIR={} {}",
-        shell_words::quote(runtime),
-        shell_words::quote(executable)
-    );
-    let mut launch = format!(
-        "TICKLOOP_DAEMON_RUNTIME_DIR={} ",
-        shell_words::quote(runtime)
-    );
+    let default_directory = PathBuf::from(format!("/tmp/tickloop-daemon-{}", unsafe {
+        libc::geteuid()
+    }));
+    let default_directory = default_directory
+        .canonicalize()
+        .unwrap_or(default_directory);
+    let prefix = if Path::new(runtime) == default_directory {
+        String::new()
+    } else {
+        format!(
+            "TICKLOOP_DAEMON_RUNTIME_DIR={} ",
+            shell_words::quote(runtime)
+        )
+    };
+    let stop = format!("{prefix}{}", shell_words::quote(executable));
+    let mut launch = prefix;
     if let Some(config) = std::env::var_os("TICKLOOP_CONFIG_DIR")
         && let Some(config) = config.to_str()
     {

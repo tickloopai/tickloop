@@ -17,7 +17,35 @@ use tickloop_agent_protocol::{ApiKeyStatus, Usage};
 
 pub const JEV_API_KEY_ENV: &str = "TYPESAFE_API_KEY";
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+const MAX_ERROR_RESPONSE_BYTES: usize = 16 * 1024;
 const PROBABILITY_TOLERANCE: f64 = 0.001;
+const JEV_PROBABILITY_DECIMAL_SCALE: f64 = 100.0;
+const ROUNDING_COMPARISON_EPSILON: f64 = 1e-9;
+
+fn is_feasible_rounded_choice(probabilities: &BTreeMap<String, f64>) -> bool {
+    // Jev 1.13 has returned two-decimal probabilities totaling 0.99. Accept only
+    // vectors whose rounding intervals contain a normalized distribution; retain
+    // the original values and selected answer instead of renormalizing them.
+    let half_step = 0.5 / JEV_PROBABILITY_DECIMAL_SCALE;
+    let mut lower_sum = 0.0;
+    let mut upper_sum = 0.0;
+    let mut has_positive_probability = false;
+    for &probability in probabilities.values() {
+        let scaled = probability * JEV_PROBABILITY_DECIMAL_SCALE;
+        if !probability.is_finite()
+            || !(0.0..=1.0).contains(&probability)
+            || (scaled - scaled.round()).abs() > ROUNDING_COMPARISON_EPSILON
+        {
+            return false;
+        }
+        has_positive_probability |= probability > 0.0;
+        lower_sum += (probability - half_step).max(0.0);
+        upper_sum += (probability + half_step).min(1.0);
+    }
+    has_positive_probability
+        && lower_sum <= 1.0 + ROUNDING_COMPARISON_EPSILON
+        && upper_sum >= 1.0 - ROUNDING_COMPARISON_EPSILON
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -188,7 +216,8 @@ impl Evaluation {
                 ) => {
                     unit_interval(*confidence)
                         && criteria.keys().eq(probabilities.keys())
-                        && valid_distribution(probabilities)
+                        && (valid_distribution(probabilities)
+                            || is_feasible_rounded_choice(probabilities))
                         && probabilities.get(choice).is_some_and(|selected| {
                             probabilities.values().all(|value| value <= selected)
                         })
@@ -341,6 +370,35 @@ impl JevClient {
             .map_err(http_error)?;
         let status = response.status();
         if !status.is_success() {
+            if status.as_u16() == 400 {
+                let mut bytes = Vec::new();
+                let mut complete = false;
+                loop {
+                    match response.chunk().await {
+                        Ok(None) => {
+                            complete = true;
+                            break;
+                        }
+                        Ok(Some(chunk))
+                            if bytes.len().saturating_add(chunk.len())
+                                <= MAX_ERROR_RESPONSE_BYTES =>
+                        {
+                            bytes.extend_from_slice(&chunk);
+                        }
+                        _ => break,
+                    }
+                }
+                if complete
+                    && serde_json::from_slice::<Value>(&bytes)
+                        .ok()
+                        .and_then(|body| body.pointer("/detail/error_type").cloned())
+                        .is_some_and(|kind| kind == "max_tokens_exceeded")
+                {
+                    return Err(ModelError::ResponseRejected(
+                        crate::ModelResponseRejection::ContextLimit,
+                    ));
+                }
+            }
             return Err(match status.as_u16() {
                 401 => ModelError::Authentication,
                 413 => ModelError::ResponseRejected(crate::ModelResponseRejection::ContextLimit),

@@ -18,7 +18,7 @@ async fn auto_rule_groups_and_environment_save_with_revision_and_restore_indepen
     .unwrap();
     let chat = agent.create_chat(temp.path().into()).await.unwrap();
     let initial = agent.permissions_view(chat).await.unwrap();
-    assert_eq!(initial.auto_policy.rules.len(), 9);
+    assert_eq!(initial.auto_policy.rules.len(), 81);
     assert!(
         initial
             .auto_policy
@@ -26,11 +26,11 @@ async fn auto_rule_groups_and_environment_save_with_revision_and_restore_indepen
             .iter()
             .filter(|rule| rule.kind == AutoRuleKind::SoftDeny)
             .count()
-            == 8
+            == 65
     );
     assert!(matches!(
         initial.auto_policy.environment.source,
-        AutoEnvironmentSource::Builtin { version: 2 }
+        AutoEnvironmentSource::Builtin { version: 6 }
     ));
 
     let added = agent
@@ -50,10 +50,10 @@ async fn auto_rule_groups_and_environment_save_with_revision_and_restore_indepen
         .auto_policy
         .rules
         .iter()
-        .find(|rule| rule.kind == AutoRuleKind::HardDeny)
+        .find(|rule| rule.kind == AutoRuleKind::HardDeny && rule.source == AutoRuleSource::User)
         .unwrap();
     assert!(matches!(custom.source, AutoRuleSource::User));
-    assert_eq!(added.auto_policy.rules.len(), 10);
+    assert_eq!(added.auto_policy.rules.len(), 82);
     assert!(matches!(
         agent
             .apply_permission_change(
@@ -82,7 +82,7 @@ async fn auto_rule_groups_and_environment_save_with_revision_and_restore_indepen
         )
         .await
         .unwrap();
-    assert_eq!(replaced.auto_policy.rules.len(), 2);
+    assert_eq!(replaced.auto_policy.rules.len(), 18);
     assert!(!replaced.auto_rule_settings.soft_deny.include_builtins);
     let environment = agent
         .apply_permission_change(
@@ -112,7 +112,7 @@ async fn auto_rule_groups_and_environment_save_with_revision_and_restore_indepen
         )
         .await
         .unwrap();
-    assert_eq!(restored.auto_policy.rules.len(), 10);
+    assert_eq!(restored.auto_policy.rules.len(), 82);
     assert!(matches!(
         restored.auto_policy.environment.source,
         AutoEnvironmentSource::UserReplacement
@@ -129,6 +129,6 @@ async fn auto_rule_groups_and_environment_save_with_revision_and_restore_indepen
         .unwrap();
     assert!(matches!(
         final_view.auto_policy.environment.source,
-        AutoEnvironmentSource::Builtin { version: 2 }
+        AutoEnvironmentSource::Builtin { version: 6 }
     ));
 }

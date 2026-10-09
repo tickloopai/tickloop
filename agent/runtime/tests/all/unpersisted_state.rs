@@ -52,7 +52,11 @@ async fn restart_keeps_the_conversation_but_forgets_session_only_state() {
         config(),
         Arc::new(ScriptedModel::new(vec![
             text("The first answer."),
-            call("run-shell", "Bash", json!({"command":"printf hi"})),
+            call(
+                "run-shell",
+                "Bash",
+                json!({"command":"env sh -c 'printf hi'"}),
+            ),
             call(
                 "clarify",
                 ASK_USER_QUESTION_TOOL_NAME,

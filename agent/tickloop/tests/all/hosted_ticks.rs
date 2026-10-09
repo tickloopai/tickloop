@@ -1036,9 +1036,11 @@ for line in sys.stdin:
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn auto_cleanup_requires_a_successful_creation_receipt_in_the_same_loop() {
+    async fn auto_cleanup_supplies_the_creation_exception_only_for_the_same_loop() {
         use tickloop_agent_protocol::ExecutionMode;
-        use tickloop_agent_test_support::{ScriptedModel, auto_findings, call, next_event, text};
+        use tickloop_agent_test_support::{
+            ScriptedModel, auto_classification, call, next_event, text,
+        };
         for same_loop in [true, false] {
             let model = Arc::new(ScriptedModel::new(Vec::new()));
             let daemon =
@@ -1048,12 +1050,13 @@ for line in sys.stdin:
                 .set_execution_mode(chat, ExecutionMode::Auto)
                 .await
                 .unwrap();
-            let mut cleanup = auto_findings(false);
-            cleanup["rules"][1]["applicability"] = json!("present");
-            cleanup["rules"][1]["clearance"] =
-                json!({"soft_allow":"builtin.soft_allow.loop_tick_cleanup"});
+            let cleanup = if same_loop {
+                auto_classification(false)
+            } else {
+                json!({"decision":"block_soft","rule_id":"builtin.soft_deny.irreversible_local_destruction","reason":"Fixture review requires a same-Loop creation receipt for this cleanup exception"})
+            };
             let reviewer = Arc::new(ScriptedModel::new(vec![
-                text(&auto_findings(false).to_string()),
+                text(&auto_classification(false).to_string()),
                 text(&cleanup.to_string()),
                 text(&cleanup.to_string()),
             ]));
@@ -1111,7 +1114,7 @@ for line in sys.stdin:
                     _ => {}
                 }
             }
-            assert_eq!(prompted, !same_loop);
+            assert!(!prompted);
             {
                 let requests = reviewer.requests.lock().unwrap();
                 let tickloop_agent_protocol::Content::Text { text } =
@@ -1121,6 +1124,13 @@ for line in sys.stdin:
                 };
                 let snapshot: Value = serde_json::from_str(text).unwrap();
                 assert_eq!(snapshot["creation_receipt"].is_object(), same_loop);
+                assert!(
+                    snapshot["auto_policy"]["rules"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|rule| rule["id"] == "builtin.soft_allow.session_created_job_cleanup")
+                );
                 assert_eq!(snapshot["prepared_facts"]["tick_instance"], instance);
                 assert_eq!(snapshot["prepared_facts"]["closes_tick"], true);
             }

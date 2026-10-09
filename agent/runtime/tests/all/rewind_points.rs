@@ -284,7 +284,7 @@ async fn permission_allow_and_deny_comments_reach_history_without_becoming_promp
             call(
                 "commented-shell",
                 "Bash",
-                json!({"command":"printf approved > marker.txt"}),
+                json!({"command":"env sh -c 'printf approved > marker.txt'"}),
             ),
             text("The permission comment was received"),
         ]));

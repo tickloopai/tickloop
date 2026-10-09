@@ -66,6 +66,18 @@ fn validate_delegation_records(lines: &[(u64, &[u8])]) -> io::Result<()> {
     for (_, raw) in lines {
         match serde_json::from_slice::<MetadataHeader>(raw) {
             Ok(header) => {
+                if matches!(header.kind, MetadataKind::System)
+                    && serde_json::from_slice::<serde_json::Value>(raw)
+                        .ok()
+                        .is_some_and(|entry| entry["loop"].get("subagentReport").is_some())
+                {
+                    serde_json::from_slice::<Line>(raw).map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Subagent report checkpoint is invalid or incompatible",
+                        )
+                    })?;
+                }
                 if matches!(header.kind, MetadataKind::Delegation) {
                     serde_json::from_slice::<Line>(raw).map_err(|_| {
                         io::Error::new(
@@ -105,6 +117,51 @@ pub(crate) fn load_original_user_inputs(
     boundary_id: Uuid,
     chat_id: Uuid,
 ) -> io::Result<Option<Vec<OriginalUserInput>>> {
+    let Some(ancestors) = load_compaction_ancestors(path, boundary_id, chat_id)? else {
+        return Ok(None);
+    };
+    let mut originals = Vec::new();
+    for entry in ancestors {
+        if entry.message.role != Role::User
+            || entry.execution_mode.is_none()
+            || entry.is_compact_summary
+            || entry.is_inherited_prompt
+            || entry.agent_message_origin.is_some()
+        {
+            continue;
+        }
+        let (Some(loop_id), Some(run_id)) = (entry.loop_id, entry.run_id) else {
+            return Ok(None);
+        };
+        let text = entry
+            .message
+            .content
+            .iter()
+            .filter_map(|content| match content {
+                Content::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        if text.is_empty() {
+            return Ok(None);
+        }
+        originals.push(OriginalUserInput {
+            chat_id,
+            loop_id,
+            run_id,
+            message_id: entry.original_message_id.unwrap_or(entry.uuid),
+            text,
+        });
+    }
+    Ok(Some(originals))
+}
+
+pub(crate) fn load_compaction_ancestors(
+    path: &Path,
+    boundary_id: Uuid,
+    chat_id: Uuid,
+) -> io::Result<Option<Vec<ChainEntry>>> {
     let bytes = std::fs::read(path)?;
     let mut entries = HashMap::new();
     for (_, raw) in split_lines(&bytes) {
@@ -126,7 +183,7 @@ pub(crate) fn load_original_user_inputs(
     };
     let mut cursor = Some(logical_parent);
     let mut visited = HashSet::new();
-    let mut originals = Vec::new();
+    let mut ancestors = Vec::new();
     while let Some(uuid) = cursor {
         if !visited.insert(uuid) {
             return Ok(None);
@@ -134,36 +191,7 @@ pub(crate) fn load_original_user_inputs(
         let Some(entry) = entries.get(&uuid).filter(|entry| entry.chat_id == chat_id) else {
             return Ok(None);
         };
-        if entry.message.role == Role::User
-            && entry.execution_mode.is_some()
-            && !entry.is_compact_summary
-            && !entry.is_inherited_prompt
-            && entry.agent_message_origin.is_none()
-        {
-            let (Some(loop_id), Some(run_id)) = (entry.loop_id, entry.run_id) else {
-                return Ok(None);
-            };
-            let text = entry
-                .message
-                .content
-                .iter()
-                .filter_map(|content| match content {
-                    Content::Text { text } => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n\n");
-            if text.is_empty() {
-                return Ok(None);
-            }
-            originals.push(OriginalUserInput {
-                chat_id,
-                loop_id,
-                run_id,
-                message_id: entry.original_user_message_id.unwrap_or(entry.uuid),
-                text,
-            });
-        }
+        ancestors.push(entry.clone());
         cursor = if entry.is_compact_boundary() {
             let Some(logical_parent) = entry.logical_parent_uuid else {
                 return Ok(None);
@@ -173,8 +201,8 @@ pub(crate) fn load_original_user_inputs(
             entry.parent_uuid
         };
     }
-    originals.reverse();
-    Ok(Some(originals))
+    ancestors.reverse();
+    Ok(Some(ancestors))
 }
 
 /// 从 `skip_before` 偏移之后的行加载；之前的行只读取 Chat 级元数据。第二个返回值表示对话链
@@ -663,7 +691,7 @@ mod tests {
             is_meta: false,
             execution_mode: None,
             is_inherited_prompt: false,
-            original_user_message_id: None,
+            original_message_id: None,
             agent_message_origin: None,
             human_family_origin: None,
             run_id: None,

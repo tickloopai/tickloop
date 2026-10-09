@@ -26,6 +26,47 @@ pub(super) struct SubagentInvocation {
 pub const MAX_SUBAGENT_HANDLE_CHARACTERS: usize = 32;
 const MAX_LABEL_INPUT_CHARACTERS: usize = 160;
 
+pub(super) struct PreparedDelegation {
+    pub input: Value,
+    task: String,
+    run_in_background: bool,
+    requested_name: Option<String>,
+    description: String,
+}
+
+impl PreparedDelegation {
+    pub(super) fn parse(input: &Value) -> Result<Self, String> {
+        let task = input["task"]
+            .as_str()
+            .map(str::trim)
+            .filter(|task| !task.is_empty())
+            .ok_or("delegation task cannot be empty")?
+            .to_owned();
+        let run_in_background = input
+            .get("run_in_background")
+            .map(|value| value.as_bool().ok_or("run_in_background must be a boolean"))
+            .transpose()?
+            .unwrap_or(false);
+        let requested_name = optional_label(input, "name")?;
+        let description =
+            optional_label(input, "description")?.unwrap_or_else(|| compact_description(&task));
+        let mut input = input.clone();
+        input["task"] = json!(task);
+        input["run_in_background"] = json!(run_in_background);
+        input["description"] = json!(description);
+        if let Some(name) = &requested_name {
+            input["name"] = json!(name);
+        }
+        Ok(Self {
+            input,
+            task,
+            run_in_background,
+            requested_name,
+            description,
+        })
+    }
+}
+
 pub(super) fn definitions() -> Vec<ToolDefinition> {
     vec![ToolDefinition {
         name: SUBAGENT_TOOL_NAME.into(),
@@ -498,24 +539,14 @@ impl Agent {
         &'a self,
         parent: &'a Receipt,
         call_id: &'a str,
-        input: &'a Value,
+        prepared: &'a PreparedDelegation,
         cancel: CancellationToken,
     ) -> Pin<Box<dyn Future<Output = Result<ToolResult, String>> + Send + 'a>> {
         Box::pin(async move {
-            let task = input["task"]
-                .as_str()
-                .map(str::trim)
-                .filter(|task| !task.is_empty())
-                .ok_or("delegation task cannot be empty")?
-                .to_owned();
-            let run_in_background = input
-                .get("run_in_background")
-                .map(|value| value.as_bool().ok_or("run_in_background must be a boolean"))
-                .transpose()?
-                .unwrap_or(false);
-            let requested_name = optional_label(input, "name")?;
-            let description =
-                optional_label(input, "description")?.unwrap_or_else(|| compact_description(&task));
+            let task = prepared.task.clone();
+            let run_in_background = prepared.run_in_background;
+            let requested_name = &prepared.requested_name;
+            let description = prepared.description.clone();
             let fallback_name = description
                 .split_whitespace()
                 .take(3)
@@ -616,6 +647,29 @@ impl Agent {
                         description: description.clone(),
                         created_at: tickloop_agent_base::private_fs::unix_time_milliseconds(),
                     };
+                    let trusted_user_inputs =
+                        approval_context::originals_for_active_chain(&snapshot, &bookkeeping)
+                            .ok()
+                            .map(|inputs| {
+                                inputs
+                                    .into_iter()
+                                    .filter(|input| {
+                                        input.chat_id == parent.chat_id
+                                            && input.loop_id == parent.loop_id
+                                    })
+                                    .collect::<Vec<_>>()
+                            });
+                    let ancestors = self.approval_history_ancestors(&snapshot).await;
+                    let trusted_reply_history = trusted_user_inputs.as_ref().and_then(|inputs| {
+                        serde_json::to_value(approval_context::capture_reply_history(
+                            &snapshot,
+                            &bookkeeping,
+                            Some((parent.run_id, call_id)),
+                            inputs,
+                            ancestors.as_deref(),
+                        ))
+                        .ok()
+                    });
                     let metadata = DelegationMetadata {
                         delegation_id: Uuid::new_v4(),
                         parent_chat_id: parent.chat_id,
@@ -623,21 +677,9 @@ impl Agent {
                         parent_run_id: parent.run_id,
                         parent_call_id: call_id.to_owned(),
                         task: task.clone(),
-                        trusted_user_inputs: approval_context::originals_for_active_chain(
-                            &snapshot,
-                            &bookkeeping,
-                        )
-                        .ok()
-                        .map(|inputs| {
-                            inputs
-                                .into_iter()
-                                .filter(|input| {
-                                    input.chat_id == parent.chat_id
-                                        && input.loop_id == parent.loop_id
-                                })
-                                .collect::<Vec<_>>()
-                        })
-                        .and_then(|inputs| serde_json::to_value(inputs).ok()),
+                        trusted_user_inputs: trusted_user_inputs
+                            .and_then(|inputs| serde_json::to_value(inputs).ok()),
+                        trusted_reply_history,
                         ceiling: DelegationCeiling {
                             workdir: snapshot.workdir.clone(),
                             additional_directories: snapshot.additional_directories.clone(),

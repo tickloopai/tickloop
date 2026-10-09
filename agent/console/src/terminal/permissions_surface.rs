@@ -2293,8 +2293,6 @@ impl PermissionsSurface {
                     environment_source_label(&self.view.auto_policy.environment.source)
                 )));
                 body.push(RoleLine::default());
-                body.push(plain_row(&self.view.auto_policy.environment.text));
-                body.push(RoleLine::default());
                 body.push(selected_row("Replace Environment", *selected == 0));
                 body.push(selected_row("Restore built-in Environment", *selected == 1));
                 body.push(selected_row("Generate Environment draft", *selected == 2));
@@ -2334,6 +2332,15 @@ impl PermissionsSurface {
                         }
                     }
                 }
+                body.push(RoleLine::default());
+                body.extend(
+                    self.view
+                        .auto_policy
+                        .environment
+                        .text
+                        .lines()
+                        .map(plain_row),
+                );
                 "Enter edit · s scope · r descendants · d remove · Esc back"
             }
             Focus::AutoDraft(draft) => {

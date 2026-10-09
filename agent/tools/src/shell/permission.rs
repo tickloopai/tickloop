@@ -34,6 +34,13 @@ pub(super) fn is_allowed_without_rules(
     context: &ShellPermissionContext,
     accept_edits: bool,
 ) -> bool {
+    // A validated standalone printf has no file operands or redirects. Its text-only HOME
+    // expansion is safe even though the general command parser rejects dynamic words.
+    if command.split_whitespace().next() == Some("printf")
+        && is_read_only_subcommand(command, false, context.cwd)
+    {
+        return true;
+    }
     let Some(commands) = parse(command) else {
         return false;
     };

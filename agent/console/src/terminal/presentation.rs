@@ -56,6 +56,7 @@ pub(super) enum OutputDetail {
 #[derive(Default)]
 pub(super) struct MessageGroups {
     replies: HashMap<Uuid, (u64, bool)>,
+    pub(super) displayed: HashSet<String>,
 }
 
 impl MessageGroups {

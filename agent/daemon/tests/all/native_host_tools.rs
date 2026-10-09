@@ -608,15 +608,7 @@ impl JudgmentClient for ControlledJudgment {
                 let Question::Choice { criteria, .. } = question else {
                     panic!("expected typed approval choices")
                 };
-                let selected = if id == "task_scope" {
-                    "within_task"
-                } else if id.starts_with("clear:") {
-                    "missing"
-                } else if self.block && id == "app:builtin.soft_deny.external_code" {
-                    "present"
-                } else {
-                    "absent"
-                };
+                let selected = if self.block { "block_soft" } else { "allow" };
                 (
                     id.clone(),
                     Answer::Choice {
@@ -673,9 +665,9 @@ async fn native_mode_rules_and_human_recovery_apply_to_new_messages_for_both_rev
             agent
                 .set_auto_reviewer(Arc::new(ScriptedModel::new(vec![
                     text(
-                        &tickloop_agent_test_support::auto_findings(true).to_string()
+                        &tickloop_agent_test_support::auto_classification(true).to_string()
                     );
-                    7
+                    14
                 ])))
                 .await;
         }
@@ -806,7 +798,7 @@ async fn assert_native_mode_admits_without_human(mode: ExecutionMode, use_jev: b
         text("Closed."),
     ]));
     let reviewer = Arc::new(ScriptedModel::new(vec![text(
-        &tickloop_agent_test_support::auto_findings(false).to_string(),
+        &tickloop_agent_test_support::auto_classification(false).to_string(),
     )]));
     let agent = Agent::new_embedded(config(), model);
     agent

@@ -20,7 +20,7 @@ pub(super) fn encode_request(
 ) -> Result<Value, ModelError> {
     validate_reasoning_effort(config, request.reasoning_effort)?;
     let reasoning_effort = request.reasoning_effort;
-    let structured_tool = super::uses_structured_response_tool(config, &request);
+    let prompted_output = super::uses_prompted_structured_output(config, &request);
     let mut messages = Vec::new();
     for message in request.messages {
         let has_image = message
@@ -86,7 +86,11 @@ pub(super) fn encode_request(
         }
     }
     let mut body = json!({"model":config.model,"messages":messages,"max_tokens":config.max_output_tokens,"stream":true,"stream_options":{"include_usage":true}});
-    if let Some(temperature) = request.temperature {
+    if let Some(temperature) = super::sampling_temperature(
+        config,
+        request.temperature,
+        super::ModelConfigExt::thinking_enabled(config, reasoning_effort, true).unwrap_or(false),
+    ) {
         body["temperature"] = json!(temperature);
     }
     if !request.tools.is_empty() {
@@ -101,9 +105,6 @@ pub(super) fn encode_request(
             .remove("max_tokens");
         body["max_completion_tokens"] = json!(config.max_output_tokens);
         if config.adapter() == Adapter::KimiChatCompletions {
-            body.as_object_mut()
-                .expect("request object")
-                .remove("temperature");
             if let Some(effort) = reasoning_effort {
                 body["reasoning_effort"] = json!(effort.label());
             }
@@ -134,10 +135,11 @@ pub(super) fn encode_request(
                     "Structured output cannot be combined with executable tools".into(),
                 ));
             }
-            if structured_tool {
-                body["tools"] = json!([{"type":"function","function":{"name":format.name,"description":"Return exactly one structured result using this tool; no other content or tools.","parameters":format.schema}}]);
-                body["tool_choice"] = json!("auto");
-                body["messages"].as_array_mut().expect("messages array").insert(0, json!({"role":"system","content":format!("Call {} exactly once to return the structured result. Emit no ordinary text and no other tool calls.", format.name)}));
+            if prompted_output {
+                body["messages"]
+                    .as_array_mut()
+                    .expect("messages array")
+                    .insert(0, json!({"role":"system","content":format.prompt()}));
             } else {
                 body["response_format"] = json!({"type":"json_schema","json_schema":{"name":format.name,"schema":format.schema,"strict":true}});
             }
@@ -414,19 +416,6 @@ impl ChatStream {
     ) -> Result<ModelOutput, ModelError> {
         if let Some(policy) = policy {
             policy.check_tool_names(self.tools.values().map(|tool| tool.name.as_str()))?;
-            let has_result_tool = !self.tools.is_empty() && policy.expected_tool.is_some();
-            return self.finish().map_err(|error| {
-                if has_result_tool
-                    && matches!(
-                        error,
-                        ModelError::ResponseRejected(ModelResponseRejection::InvalidToolCall)
-                    )
-                {
-                    ModelError::ResponseRejected(ModelResponseRejection::MalformedStructuredOutput)
-                } else {
-                    error
-                }
-            });
         }
         self.finish()
     }

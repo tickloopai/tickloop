@@ -175,24 +175,8 @@ impl ModelClient for ConversationModel {
         _: CancellationToken,
     ) -> Result<ModelOutput, ModelError> {
         let content = if request.structured_output.is_some() {
-            let input = request
-                .messages
-                .iter()
-                .flat_map(|message| &message.content)
-                .find_map(|content| {
-                    if let Content::Text { text } = content {
-                        serde_json::from_str::<serde_json::Value>(text).ok()
-                    } else {
-                        None
-                    }
-                })
-                .expect("review contains a JSON ApprovalSnapshot");
-            let rules = input["auto_policy"]["rules"].as_array().unwrap().iter()
-                .filter(|rule| rule["kind"] != "soft_allow")
-                .map(|rule| json!({"id":rule["id"], "applicability":"absent", "clearance":"missing"}))
-                .collect::<Vec<_>>();
             self.review_requests.lock().unwrap().push(request);
-            text(&json!({"task_scope":"within_task", "rules":rules}).to_string())
+            text(&tickloop_agent_test_support::auto_classification(false).to_string())
         } else {
             let index = self.normal_requests.fetch_add(1, Ordering::SeqCst);
             if index.is_multiple_of(2) {
@@ -216,13 +200,16 @@ impl ModelClient for ConversationModel {
 
 #[derive(Clone, Copy)]
 enum JevBehavior {
+    ContextLimit,
     Authentication,
     AuthThenBlock,
     AuthThenWait,
     Block,
-    Uncertain,
     Invalid,
     TransientThenBlock,
+    BlockThenAuthentication,
+    DelayedScreenThenBlock(u64),
+    TransientInBothStages,
     Wait,
 }
 
@@ -244,23 +231,39 @@ impl JudgmentClient for JevAdapter {
     ) -> Result<Evaluation, JudgmentError> {
         let call_index = self.calls.fetch_add(1, Ordering::SeqCst);
         match self.behavior {
+            JevBehavior::ContextLimit => {
+                return Err(ModelError::ResponseRejected(
+                    tickloop_agent_model::ModelResponseRejection::ContextLimit,
+                )
+                .into());
+            }
             JevBehavior::Authentication => return Err(ModelError::Authentication.into()),
             JevBehavior::AuthThenBlock | JevBehavior::AuthThenWait if call_index == 0 => {
                 return Err(ModelError::Authentication.into());
             }
+            JevBehavior::TransientInBothStages if matches!(call_index, 0 | 2) => {
+                return Err(ModelError::Http { status: 529 }.into());
+            }
             JevBehavior::TransientThenBlock if call_index == 0 => {
                 return Err(ModelError::Http { status: 529 }.into());
             }
+            JevBehavior::BlockThenAuthentication if call_index == 1 => {
+                return Err(ModelError::Authentication.into());
+            }
+            JevBehavior::DelayedScreenThenBlock(seconds) => {
+                tokio::time::sleep(Duration::from_secs(seconds)).await;
+            }
             JevBehavior::Wait | JevBehavior::AuthThenWait => {
                 tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_secs(20)) => {},
+                    _ = tokio::time::sleep(Duration::from_secs(60)) => {},
                     _ = cancel.cancelled() => return Err(ModelError::Cancelled.into()),
                 }
             }
             JevBehavior::AuthThenBlock
             | JevBehavior::Block
-            | JevBehavior::Uncertain
             | JevBehavior::Invalid
+            | JevBehavior::BlockThenAuthentication
+            | JevBehavior::TransientInBothStages
             | JevBehavior::TransientThenBlock => {}
         }
         let answers = request
@@ -270,17 +273,7 @@ impl JudgmentClient for JevAdapter {
                 let Question::Choice { criteria, .. } = question else {
                     panic!("expected Choice")
                 };
-                let selected = if id == "task_scope" {
-                    if matches!(self.behavior, JevBehavior::Uncertain) {
-                        "uncertain"
-                    } else {
-                        "outside_task"
-                    }
-                } else if id.starts_with("app:") {
-                    "absent"
-                } else {
-                    "missing"
-                };
+                let selected = "block_user_boundary";
                 assert!(criteria.contains_key(selected));
                 (
                     id.clone(),
@@ -297,7 +290,7 @@ impl JudgmentClient for JevAdapter {
             .collect::<BTreeMap<_, _>>();
         let mut answers = answers;
         if matches!(self.behavior, JevBehavior::Invalid) {
-            answers.remove("task_scope");
+            answers.remove("decision");
         }
         Ok(Evaluation {
             model: "jev-fixture".into(),
@@ -444,21 +437,21 @@ async fn valid_jev_refusal_does_not_seek_llm_approval() {
     assert_eq!(assessment.block_kind, Some(AutoBlockKind::TaskScope));
     assert!(assessment.fallback_from.is_none());
     assert!(notices.is_empty());
-    assert_eq!(jev.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(jev.calls.load(Ordering::SeqCst), 2);
     assert_eq!(model.review_requests.lock().unwrap().len(), 0);
     assert!(root.path().join("link-0").symlink_metadata().is_err());
     agent.shutdown().await;
 }
 
 #[tokio::test(start_paused = true)]
-async fn jev_wait_uses_one_shared_ten_second_budget_before_llm_fallback() {
+async fn jev_wait_uses_one_shared_twenty_second_budget_before_llm_fallback() {
     let (_root, agent, _, jev, chat) = fixture(JevBehavior::Wait).await;
     let mut events = agent.subscribe();
     let run = agent
         .submit(chat, None, "Create the requested symlink".into())
         .await
         .unwrap();
-    tokio::time::advance(Duration::from_secs(10)).await;
+    tokio::time::advance(Duration::from_secs(20)).await;
     let (assessment, _) = completed(&mut events, run.run_id).await;
     assert_eq!(assessment.reviewer.unwrap().kind, ApprovalReviewerKind::Llm);
     assert_eq!(
@@ -467,7 +460,7 @@ async fn jev_wait_uses_one_shared_ten_second_budget_before_llm_fallback() {
     );
     assert_eq!(jev.calls.load(Ordering::SeqCst), 1);
     assert_eq!(assessment.attempts.len(), 2);
-    assert!(assessment.attempts[0].elapsed_ms <= 10_000);
+    assert!(assessment.attempts[0].elapsed_ms <= 20_000);
     agent.shutdown().await;
 }
 
@@ -483,15 +476,15 @@ async fn transient_jev_failure_retries_once_within_budget_and_keeps_valid_refusa
     let (assessment, notices) = completed(&mut events, run.run_id).await;
     assert_eq!(assessment.outcome, ApprovalOutcome::Block);
     assert_eq!(assessment.reviewer.unwrap().kind, ApprovalReviewerKind::Jev);
-    assert_eq!(assessment.attempts.len(), 2);
-    assert_eq!(jev.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(assessment.attempts.len(), 3);
+    assert_eq!(jev.calls.load(Ordering::SeqCst), 3);
     assert_eq!(model.review_requests.lock().unwrap().len(), 0);
     assert!(notices.is_empty());
     agent.shutdown().await;
 }
 
 #[tokio::test]
-async fn invalid_jev_response_falls_back_but_valid_uncertainty_does_not() {
+async fn invalid_jev_stages_fall_back_but_valid_final_blocks_do_not() {
     let (_root, agent, model, jev, chat) = fixture(JevBehavior::Invalid).await;
     let mut events = agent.subscribe();
     let run = agent
@@ -504,11 +497,11 @@ async fn invalid_jev_response_falls_back_but_valid_uncertainty_does_not() {
         Some(ApprovalFailureKind::InvalidResponse)
     );
     assert_eq!(assessment.reviewer.unwrap().kind, ApprovalReviewerKind::Llm);
-    assert_eq!(jev.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(jev.calls.load(Ordering::SeqCst), 2);
     assert_eq!(model.review_requests.lock().unwrap().len(), 1);
     agent.shutdown().await;
 
-    let (_root, agent, model, jev, chat) = fixture(JevBehavior::Uncertain).await;
+    let (_root, agent, model, jev, chat) = fixture(JevBehavior::Block).await;
     let mut events = agent.subscribe();
     let run = agent
         .submit(chat, None, "Create the requested symlink".into())
@@ -523,10 +516,10 @@ async fn invalid_jev_response_falls_back_but_valid_uncertainty_does_not() {
             break *assessment;
         }
     };
-    assert_eq!(assessment.outcome, ApprovalOutcome::NeedsHuman);
+    assert_eq!(assessment.outcome, ApprovalOutcome::Block);
     assert_eq!(assessment.reviewer.unwrap().kind, ApprovalReviewerKind::Jev);
     assert!(assessment.fallback_from.is_none());
-    assert_eq!(jev.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(jev.calls.load(Ordering::SeqCst), 2);
     assert_eq!(model.review_requests.lock().unwrap().len(), 0);
     agent.interrupt(chat).await.unwrap();
     agent.shutdown().await;
@@ -581,7 +574,7 @@ async fn replacing_connection_while_old_review_waits_ignores_its_late_failure() 
         calls: AtomicUsize::new(0),
     });
     agent.set_judgment_client(replacement.clone()).await;
-    tokio::time::advance(Duration::from_secs(10)).await;
+    tokio::time::advance(Duration::from_secs(20)).await;
     let (assessment, notices) = completed(&mut events, run.run_id).await;
     assert_eq!(assessment.reviewer.unwrap().kind, ApprovalReviewerKind::Llm);
     assert!(notices.is_empty());
@@ -596,94 +589,114 @@ async fn replacing_connection_while_old_review_waits_ignores_its_late_failure() 
         .unwrap();
     let (assessment, _) = completed(&mut events, run.run_id).await;
     assert_eq!(assessment.reviewer.unwrap().kind, ApprovalReviewerKind::Jev);
-    assert_eq!(replacement.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(replacement.calls.load(Ordering::SeqCst), 2);
     assert_eq!(model.review_requests.lock().unwrap().len(), 1);
     agent.shutdown().await;
 }
 
 #[tokio::test]
-async fn jev_capacity_fallback_passes_full_custom_policy_to_chat_llm_without_denial() {
-    let root = tempfile::tempdir().unwrap();
-    let model = Arc::new(ConversationModel {
-        normal_requests: AtomicUsize::new(0),
-        review_requests: Mutex::new(Vec::new()),
-    });
-    let agent = Agent::open_embedded(
-        root.path().canonicalize().unwrap().join("state"),
-        config(),
-        model.clone(),
-    )
-    .unwrap();
-    let jev = Arc::new(JevAdapter {
-        behavior: JevBehavior::Block,
-        calls: AtomicUsize::new(0),
-    });
-    agent.set_judgment_client(jev.clone()).await;
-    let chat = agent.create_chat(root.path().into()).await.unwrap();
-    agent
-        .set_execution_mode(chat, ExecutionMode::Auto)
-        .await
-        .unwrap();
-    let large_rule = "Only use the requested target. ".repeat(850);
-    let view = agent.permissions_view(chat).await.unwrap();
-    agent
-        .apply_permission_change(
-            chat,
-            PermissionChange::ChangeAutoRules {
-                change: AutoRuleChange::Add {
-                    kind: AutoRuleKind::SoftDeny,
-                    text: large_rule.clone(),
-                },
-            },
-            view.revision,
+async fn jev_capacity_routes_complete_policy_without_overriding_valid_denials() {
+    for (repetitions, provider_limit) in [(40_000, false), (3_000, true), (3_000, false)] {
+        let root = tempfile::tempdir().unwrap();
+        let model = Arc::new(ConversationModel {
+            normal_requests: AtomicUsize::new(0),
+            review_requests: Mutex::new(Vec::new()),
+        });
+        let agent = Agent::open_embedded(
+            root.path().canonicalize().unwrap().join("state"),
+            config(),
+            model.clone(),
         )
-        .await
         .unwrap();
-
-    let mut events = agent.subscribe();
-    let run = agent
-        .submit(chat, None, "Create the requested symlink".into())
-        .await
-        .unwrap();
-    let (assessment, notices) = completed(&mut events, run.run_id).await;
-    assert_eq!(assessment.reviewer.unwrap().kind, ApprovalReviewerKind::Llm);
-    assert_eq!(
-        assessment.fallback_failure,
-        Some(ApprovalFailureKind::ContextLimit)
-    );
-    assert_eq!(assessment.fallback_from, Some(ApprovalReviewerKind::Jev));
-    assert_eq!(jev.calls.load(Ordering::SeqCst), 0);
-    assert!(matches!(
-        notices.as_slice(),
-        [AutoReviewerNotice::Fallback {
-            failure: ApprovalFailureKind::ContextLimit
-        }]
-    ));
-    {
-        let requests = model.review_requests.lock().unwrap();
-        assert_eq!(requests.len(), 1);
-        let serialized = requests[0]
-            .messages
-            .iter()
-            .flat_map(|message| &message.content)
-            .find_map(|content| {
-                if let Content::Text { text } = content {
-                    serde_json::from_str::<serde_json::Value>(text).ok()
-                } else {
-                    None
-                }
-            })
+        let jev = Arc::new(JevAdapter {
+            behavior: if provider_limit {
+                JevBehavior::ContextLimit
+            } else {
+                JevBehavior::Block
+            },
+            calls: AtomicUsize::new(0),
+        });
+        agent.set_judgment_client(jev.clone()).await;
+        let chat = agent.create_chat(root.path().into()).await.unwrap();
+        agent
+            .set_execution_mode(chat, ExecutionMode::Auto)
+            .await
             .unwrap();
-        let rules = serialized["auto_policy"]["rules"].as_array().unwrap();
-        assert!(rules.iter().any(|rule| rule["text"] == large_rule));
+        let large_rule = "Only use the requested target. ".repeat(repetitions);
+        let view = agent.permissions_view(chat).await.unwrap();
+        agent
+            .apply_permission_change(
+                chat,
+                PermissionChange::ChangeAutoRules {
+                    change: AutoRuleChange::Add {
+                        kind: AutoRuleKind::SoftDeny,
+                        text: large_rule.clone(),
+                    },
+                },
+                view.revision,
+            )
+            .await
+            .unwrap();
+
+        let mut events = agent.subscribe();
+        let run = agent
+            .submit(chat, None, "Create the requested symlink".into())
+            .await
+            .unwrap();
+        let (assessment, notices) = completed(&mut events, run.run_id).await;
+        if repetitions == 3_000 && !provider_limit {
+            assert_eq!(assessment.outcome, ApprovalOutcome::Block);
+            assert_eq!(assessment.reviewer.unwrap().kind, ApprovalReviewerKind::Jev);
+            assert_eq!(jev.calls.load(Ordering::SeqCst), 2);
+            assert!(notices.is_empty());
+            assert!(model.review_requests.lock().unwrap().is_empty());
+            assert!(root.path().join("link-0").symlink_metadata().is_err());
+            assert_eq!(agent.recent_denials(chat).await.unwrap().records.len(), 1);
+            agent.shutdown().await;
+            continue;
+        }
+        assert_eq!(assessment.reviewer.unwrap().kind, ApprovalReviewerKind::Llm);
         assert_eq!(
-            serialized["original_user_inputs"][0]["text"],
-            "Create the requested symlink"
+            assessment.fallback_failure,
+            Some(ApprovalFailureKind::ContextLimit)
         );
+        assert_eq!(assessment.fallback_from, Some(ApprovalReviewerKind::Jev));
+        assert_eq!(
+            jev.calls.load(Ordering::SeqCst),
+            usize::from(provider_limit)
+        );
+        assert!(matches!(
+            notices.as_slice(),
+            [AutoReviewerNotice::Fallback {
+                failure: ApprovalFailureKind::ContextLimit
+            }]
+        ));
+        {
+            let requests = model.review_requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            let serialized = requests[0]
+                .messages
+                .iter()
+                .flat_map(|message| &message.content)
+                .find_map(|content| {
+                    if let Content::Text { text } = content {
+                        serde_json::from_str::<serde_json::Value>(text).ok()
+                    } else {
+                        None
+                    }
+                })
+                .unwrap();
+            let rules = serialized["auto_policy"]["rules"].as_array().unwrap();
+            assert!(rules.iter().any(|rule| rule["text"] == large_rule));
+            assert_eq!(
+                serialized["original_user_inputs"][0]["text"],
+                "Create the requested symlink"
+            );
+        }
+        assert!(root.path().join("link-0").symlink_metadata().is_ok());
+        assert!(agent.recent_denials(chat).await.unwrap().records.is_empty());
+        agent.shutdown().await;
     }
-    assert!(root.path().join("link-0").symlink_metadata().is_ok());
-    assert!(agent.recent_denials(chat).await.unwrap().records.is_empty());
-    agent.shutdown().await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -755,7 +768,7 @@ async fn only_one_recovery_probe_runs_while_another_chat_uses_llm() {
     assert_eq!(other_model.review_requests.lock().unwrap().len(), 1);
     assert_eq!(jev.calls.load(Ordering::SeqCst), 2);
 
-    tokio::time::advance(Duration::from_secs(10)).await;
+    tokio::time::advance(Duration::from_secs(20)).await;
     let (probe_assessment, notices) = completed(&mut probe_events, probe.run_id).await;
     assert_eq!(
         probe_assessment.fallback_failure,
@@ -806,7 +819,7 @@ async fn valid_refusal_after_cooldown_recovers_jev_once_without_llm_fallback() {
         .unwrap();
     let (_, notices) = completed(&mut events, third.run_id).await;
     assert!(notices.is_empty());
-    assert_eq!(jev.calls.load(Ordering::SeqCst), 3);
+    assert_eq!(jev.calls.load(Ordering::SeqCst), 5);
     assert_eq!(model.review_requests.lock().unwrap().len(), 1);
     agent.shutdown().await;
 }
@@ -1021,4 +1034,116 @@ async fn headless_auto_counts_valid_refusals_but_not_failed_reviews() {
         assert!(root.path().join("reviewed-0").symlink_metadata().is_err());
         agent.shutdown().await;
     }
+}
+
+#[tokio::test]
+async fn authorization_stage_failure_falls_back_without_treating_screening_as_refusal() {
+    use tickloop_agent_protocol::ApprovalStage;
+    let (root, agent, model, jev, chat) = fixture(JevBehavior::BlockThenAuthentication).await;
+    let mut events = agent.subscribe();
+    let run = agent
+        .submit(chat, None, "Create the requested symlink".into())
+        .await
+        .unwrap();
+    let (assessment, _) = completed(&mut events, run.run_id).await;
+    assert_eq!(assessment.outcome, ApprovalOutcome::Allow);
+    assert_eq!(
+        assessment.fallback_failure,
+        Some(ApprovalFailureKind::Authentication)
+    );
+    assert_eq!(assessment.reviewer.unwrap().kind, ApprovalReviewerKind::Llm);
+    assert_eq!(
+        assessment
+            .attempts
+            .iter()
+            .map(|attempt| attempt.stage)
+            .collect::<Vec<_>>(),
+        vec![
+            Some(ApprovalStage::RiskScreen),
+            Some(ApprovalStage::Authorization),
+            Some(ApprovalStage::RiskScreen)
+        ]
+    );
+    assert_eq!(jev.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(model.review_requests.lock().unwrap().len(), 1);
+    assert!(agent.recent_denials(chat).await.unwrap().records.is_empty());
+    assert!(root.path().join("link-0").symlink_metadata().is_ok());
+    agent.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn jev_stages_share_one_twenty_second_budget() {
+    use tickloop_agent_protocol::ApprovalStage;
+    let (_root, agent, _, jev, chat) = fixture(JevBehavior::DelayedScreenThenBlock(12)).await;
+    let mut events = agent.subscribe();
+    let run = agent
+        .submit(chat, None, "Create the requested symlink".into())
+        .await
+        .unwrap();
+    let (assessment, _) = completed(&mut events, run.run_id).await;
+    assert_eq!(
+        assessment.fallback_failure,
+        Some(ApprovalFailureKind::Timeout)
+    );
+    assert_eq!(assessment.outcome, ApprovalOutcome::Allow);
+    assert_eq!(
+        assessment.attempts[0].stage,
+        Some(ApprovalStage::RiskScreen)
+    );
+    assert_eq!(assessment.attempts[0].elapsed_ms, 12000);
+    assert_eq!(
+        assessment.attempts[1].stage,
+        Some(ApprovalStage::Authorization)
+    );
+    assert_eq!(assessment.attempts[1].elapsed_ms, 8000);
+    assert_eq!(jev.calls.load(Ordering::SeqCst), 2);
+    assert!(agent.recent_denials(chat).await.unwrap().records.is_empty());
+    agent.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn jev_can_complete_two_six_second_stages_without_premature_fallback() {
+    let (root, agent, model, jev, chat) = fixture(JevBehavior::DelayedScreenThenBlock(6)).await;
+    let mut events = agent.subscribe();
+    let run = agent
+        .submit(chat, None, "Create the requested symlink".into())
+        .await
+        .unwrap();
+    let (assessment, _) = completed(&mut events, run.run_id).await;
+    assert_eq!(assessment.outcome, ApprovalOutcome::Block);
+    assert_eq!(assessment.reviewer.unwrap().kind, ApprovalReviewerKind::Jev);
+    assert!(assessment.fallback_failure.is_none());
+    assert_eq!(assessment.attempts.len(), 2);
+    assert_eq!(
+        assessment
+            .attempts
+            .iter()
+            .map(|attempt| attempt.elapsed_ms)
+            .sum::<u64>(),
+        12000
+    );
+    assert_eq!(jev.calls.load(Ordering::SeqCst), 2);
+    assert!(model.review_requests.lock().unwrap().is_empty());
+    assert!(root.path().join("link-0").symlink_metadata().is_err());
+    agent.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn both_jev_stages_share_one_retry_allowance() {
+    let (_root, agent, _, jev, chat) = fixture(JevBehavior::TransientInBothStages).await;
+    let mut events = agent.subscribe();
+    let run = agent
+        .submit(chat, None, "Create the requested symlink".into())
+        .await
+        .unwrap();
+    let (assessment, _) = completed(&mut events, run.run_id).await;
+    assert_eq!(assessment.outcome, ApprovalOutcome::Allow);
+    assert_eq!(
+        assessment.fallback_failure,
+        Some(ApprovalFailureKind::Service)
+    );
+    assert_eq!(assessment.reviewer.unwrap().kind, ApprovalReviewerKind::Llm);
+    assert_eq!(jev.calls.load(Ordering::SeqCst), 3);
+    assert_eq!(assessment.attempts.len(), 4);
+    agent.shutdown().await;
 }

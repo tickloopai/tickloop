@@ -1,5 +1,20 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactAudience {
+    Private,
+    Shared,
+    Public,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactPublication {
+    pub audience: ArtifactAudience,
+    pub membership_revision: u64,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ArtifactTick {
     pub artifact_id: String,

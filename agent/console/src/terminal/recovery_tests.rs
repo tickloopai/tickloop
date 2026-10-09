@@ -19,6 +19,78 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 mod background_request_tests;
+
+#[test]
+fn plain_replayed_reply_fixture() {
+    if std::env::var("TICKLOOP_PLAIN_REPLAY_FIXTURE").as_deref() != Ok("1") {
+        return;
+    }
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let directory = tempfile::tempdir().unwrap();
+        let agent = Agent::new_embedded(
+            tickloop_agent_test_support::config(),
+            Arc::new(tickloop_agent_test_support::ScriptedModel::new(vec![])),
+        );
+        let chat = agent.create_chat(directory.path().into()).await.unwrap();
+        let mut observation = agent.observe(chat, 0).await.unwrap();
+        let run = Uuid::new_v4();
+        let loop_id = Uuid::new_v4();
+        observation.events = [
+            EventKind::Thinking("First thought.".into()),
+            EventKind::Thinking(" More thought.".into()),
+            EventKind::Text("Answer.".into()),
+            EventKind::Text(" More answer.".into()),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, kind)| Event {
+            chat_id: chat,
+            loop_id,
+            run_id: run,
+            sequence: index as u64 + 1,
+            kind,
+        })
+        .collect();
+        let (console, _input) = Console::start(false).unwrap();
+        render_restored_observation(
+            &console,
+            &mut ToolPresentation::new(true),
+            chat,
+            0,
+            &mut HashMap::new(),
+            &mut MessageGroups::default(),
+            observation,
+        )
+        .unwrap();
+        agent.shutdown().await;
+    });
+}
+
+#[test]
+fn plain_replayed_thinking_and_answer_have_separate_labels_once() {
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "terminal::recovery_tests::plain_replayed_reply_fixture",
+            "--nocapture",
+        ])
+        .env("TICKLOOP_PLAIN_REPLAY_FIXTURE", "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        text.contains("Thinking: First thought. More thought."),
+        "{text}"
+    );
+    assert!(text.contains("Assistant: Answer. More answer."), "{text}");
+    assert_eq!(text.matches("Thinking: ").count(), 1);
+    assert_eq!(text.matches("Assistant: ").count(), 1);
+}
 mod cached_navigation_tests;
 mod event_delivery_tests;
 mod hidden_view_recovery_tests;
@@ -980,6 +1052,7 @@ async fn recovery_buffers_follow_exact_run_outcomes_and_chat_reset_boundaries() 
             chat,
             after + u64::from(resets),
             &mut buffered,
+            &mut MessageGroups::default(),
         )
         .await
         .unwrap();
@@ -1155,6 +1228,7 @@ fn routine_restore_pty_fixture() {
                         chat,
                         after,
                         &mut HashMap::new(),
+            &mut MessageGroups::default(),
                     )
                     .await
                     .unwrap();
@@ -1216,6 +1290,7 @@ fn routine_restore_pty_fixture() {
                             chat,
                             sequence + 1,
                             &mut HashMap::new(),
+            &mut MessageGroups::default(),
                         )
                         .await
                         .unwrap();
@@ -1445,6 +1520,7 @@ async fn run_retained_completion_lifecycle_fixture() {
         chat,
         snapshots[0].last_sequence,
         &mut HashMap::new(),
+        &mut MessageGroups::default(),
     )
     .await
     .unwrap();

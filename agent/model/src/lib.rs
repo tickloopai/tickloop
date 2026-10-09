@@ -47,6 +47,7 @@ mod kimi;
 mod provider_directory;
 mod provider_failure;
 mod responses;
+mod structured_output;
 mod structured_response;
 
 use crate::provider_failure::ProviderHttpFailureExt;
@@ -130,6 +131,29 @@ impl ModelConfigExt for ModelConfig {
     }
 }
 
+pub(crate) fn sampling_temperature(
+    config: &ModelConfig,
+    requested: Option<f32>,
+    thinking_on: bool,
+) -> Option<f32> {
+    use tickloop_agent_protocol::TemperatureControl;
+    let default = match config.adapter() {
+        Adapter::Messages => TemperatureControl::WithoutThinking,
+        Adapter::Responses | Adapter::CodexResponses | Adapter::KimiChatCompletions => {
+            TemperatureControl::Unsupported
+        }
+        _ => TemperatureControl::Supported,
+    };
+    let control = cards::model_card(config)
+        .and_then(|card| card.temperature_control)
+        .unwrap_or(default);
+    requested.filter(|_| match control {
+        TemperatureControl::Supported => true,
+        TemperatureControl::Unsupported => false,
+        TemperatureControl::WithoutThinking => !thinking_on,
+    })
+}
+
 pub(crate) fn credential_fingerprint(value: &[u8]) -> String {
     Sha256::digest(value)
         .iter()
@@ -156,6 +180,9 @@ pub fn compatible_private_history(current: &ModelConfig, selected: &ModelConfig)
     }
 }
 
+/// A tool-free JSON result contract, shared by all one-shot model consumers.
+/// Adapters use native JSON constraints when supported and a schema prompt otherwise;
+/// both paths validate the completed response locally before returning it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct StructuredOutput {
     pub name: String,
@@ -168,8 +195,7 @@ pub struct ModelRequest {
     pub messages: Vec<Message>,
     pub tools: Vec<ToolDefinition>,
     pub structured_output: Option<StructuredOutput>,
-    /// Sampling temperature. The Responses adapter omits it because the
-    /// reasoning models served there reject sampling parameters.
+    /// Sampling temperature, serialized only when the model card and adapter permit it.
     pub temperature: Option<f32>,
     pub reasoning_effort: Option<ReasoningEffort>,
 }
@@ -277,7 +303,7 @@ pub enum ModelResponseRejection {
     InvalidToolCall,
     #[error("structured response contains unexpected tool operations")]
     UnexpectedToolOperation,
-    #[error("verified structured response contains a malformed result")]
+    #[error("structured response does not match the requested JSON schema")]
     MalformedStructuredOutput,
 }
 
@@ -545,6 +571,10 @@ pub trait ModelClient: Send + Sync {
     }
 
     fn identity(&self) -> ModelIdentity;
+
+    fn supports_reasoning_effort(&self, _effort: ReasoningEffort) -> bool {
+        false
+    }
 
     async fn generate_title(
         &self,
@@ -1172,7 +1202,7 @@ impl HttpModelClient {
             self.ensure_credential_history_compatible(chat_id, &request, key.as_ref())?;
         }
         let structured_response =
-            structured_response::StructuredResponsePolicy::for_request(&self.config, &request);
+            structured_response::StructuredResponsePolicy::for_request(&self.config, &request)?;
         let (endpoint, mut body) = match self.config.adapter() {
             Adapter::Messages | Adapter::DeepseekMessages | Adapter::MinimaxMessages => {
                 ("v1/messages", messages_request(&self.config, request)?)
@@ -1390,6 +1420,10 @@ impl ModelClient for HttpModelClient {
         self.config.identity()
     }
 
+    fn supports_reasoning_effort(&self, effort: ReasoningEffort) -> bool {
+        validate_reasoning_effort(&self.config, Some(effort)).is_ok()
+    }
+
     async fn close_chat(&self, chat_id: tickloop_agent_protocol::ChatId) {
         api_private_provenance()
             .lock()
@@ -1559,10 +1593,6 @@ async fn consume_sse_response(
                     let _ = events.send(ModelDelta::OutputStarted);
                 }
                 if stream.accept(data, &events).map_err(|error| {
-                    let error = match &structured_response {
-                        Some(policy) => policy.decode_error(error),
-                        None => error,
-                    };
                     if error.stage() == ModelRequestStage::Unknown {
                         error.at_stage(ModelRequestStage::ResponseStream)
                     } else {
@@ -1825,57 +1855,39 @@ fn messages_request(config: &ModelConfig, request: ModelRequest) -> Result<Value
     } else if cards::model_card(config).is_some_and(|card| card.adaptive_by_default) {
         body["thinking"] = json!({"type":"adaptive"});
     }
+    if request.reasoning_effort == Some(ReasoningEffort::Off)
+        && let Some(encoding) = cards::model_card(config).and_then(|card| card.thinking_off)
+    {
+        body["thinking"] = json!({"type":encoding.wire_value()});
+    }
     // Anthropic rejects a sampling temperature while thinking is on.
     let thinking_on = matches!(
         body["thinking"]["type"].as_str(),
         Some("enabled" | "adaptive")
     );
-    if let Some(temperature) = request.temperature
-        && !(config.adapter() == Adapter::Messages && thinking_on)
-    {
+    if let Some(temperature) = sampling_temperature(config, request.temperature, thinking_on) {
         body["temperature"] = json!(temperature);
     }
     if !system.is_empty() {
         body["system"] = json!(system);
     }
     if let Some(format) = request.structured_output {
-        if config.adapter() == Adapter::MinimaxMessages {
+        if matches!(
+            config.adapter(),
+            Adapter::MinimaxMessages | Adapter::DeepseekMessages
+        ) {
             if !request.tools.is_empty() {
                 return Err(ModelError::Configuration(
-                    "MiniMax structured output cannot be combined with executable tools".into(),
+                    "structured output cannot be combined with executable tools".into(),
                 ));
             }
-            body["tools"] = json!([{"name":format.name,"description":"Return exactly one structured response using this tool and no other content.","input_schema":format.schema}]);
-            body["tool_choice"] = json!({"type":"auto"});
             if body["system"].is_null() {
                 body["system"] = json!([]);
             }
-            body["system"].as_array_mut().expect("Messages system content is an array").push(json!({"type":"text","text":format!("Call the {} tool exactly once to return the structured response. Emit no ordinary text or other tool calls.", format.name)}));
-        } else if config.adapter() == Adapter::DeepseekMessages {
-            if !request.tools.is_empty() {
-                return Err(ModelError::Configuration(
-                    "DeepSeek Messages cannot combine structured output with tools".into(),
-                ));
-            }
-            if request
-                .reasoning_effort
-                .is_some_and(|effort| effort != ReasoningEffort::Off)
-            {
-                return Err(ModelError::Configuration(
-                    "DeepSeek Messages structured output requires thinking to be disabled".into(),
-                ));
-            }
-            body["thinking"] = json!({"type":"disabled"});
-            body["tools"] = json!([{
-                "name": format.name,
-                "description": "Return the structured response.",
-                "input_schema": format.schema
-            }]);
-            body["tool_choice"] = json!({
-                "type": "tool",
-                "name": format.name,
-                "disable_parallel_tool_use": true
-            });
+            body["system"]
+                .as_array_mut()
+                .expect("Messages system content is an array")
+                .push(json!({"type":"text","text":format.prompt()}));
         } else {
             body["output_config"]["format"] = json!({
                 "type": "json_schema",
@@ -1891,7 +1903,10 @@ fn messages_request(config: &ModelConfig, request: ModelRequest) -> Result<Value
     Ok(body)
 }
 
-pub(crate) fn uses_structured_response_tool(config: &ModelConfig, request: &ModelRequest) -> bool {
+pub(crate) fn uses_prompted_structured_output(
+    config: &ModelConfig,
+    request: &ModelRequest,
+) -> bool {
     matches!(
         config.adapter(),
         Adapter::DeepseekMessages | Adapter::MinimaxMessages
@@ -1920,50 +1935,10 @@ fn finish_structured_response(
     if codex {
         return Ok(output);
     }
-    normalize_structured_tool_output(
-        output,
-        policy.and_then(|policy| policy.expected_tool.as_deref()),
-    )
-    .map_err(structured_response::verified_format_error)
-}
-
-fn normalize_structured_tool_output(
-    mut output: ModelOutput,
-    structured_tool: Option<&str>,
-) -> Result<ModelOutput, ModelError> {
-    let Some(structured_tool) = structured_tool else {
-        return Ok(output);
-    };
-    if output.content.iter().any(|content| {
-        matches!(content, Content::ToolUse { name, .. } if name != structured_tool)
-            || matches!(content, Content::ToolResult { .. })
-    }) {
-        return Err(ModelError::ResponseRejected(
-            ModelResponseRejection::UnexpectedToolOperation,
-        ));
+    match policy {
+        Some(policy) => policy.validate_output(output),
+        None => Ok(output),
     }
-    let mut structured_inputs = output.content.iter().filter_map(|content| match content {
-        Content::ToolUse { name, input, .. } if name == structured_tool => Some(input),
-        _ => None,
-    });
-    let input = structured_inputs
-        .next()
-        .filter(|_| structured_inputs.next().is_none())
-        .ok_or_else(|| invalid_response("structured output tool was not called exactly once"))?;
-    if output
-        .content
-        .iter()
-        .any(|content| matches!(content, Content::Text { text } if !text.trim().is_empty()))
-    {
-        return Err(invalid_response(
-            "structured output contained unexpected content",
-        ));
-    }
-    output.content = vec![Content::Text {
-        text: input.to_string(),
-    }];
-    output.stop_reason = "end_turn".into();
-    Ok(output)
 }
 
 const SCHEMA_COMBINATORS: [&str; 3] = ["oneOf", "anyOf", "allOf"];
@@ -2130,16 +2105,12 @@ impl ProtocolStream {
         self,
         policy: Option<&structured_response::StructuredResponsePolicy>,
     ) -> Result<ModelOutput, ModelError> {
-        let output = match self {
+        match self {
             Self::Messages(stream) => stream.finish(),
             Self::Responses(stream) => stream.finish(),
             Self::Chat(stream) => stream.finish_with_policy(policy),
             Self::Google(stream) => stream.finish(),
-        };
-        output.map_err(|error| match policy {
-            Some(policy) => policy.decode_error(error),
-            None => error,
-        })
+        }
     }
 }
 
@@ -3015,24 +2986,69 @@ mod tests {
     }
 
     #[test]
+    fn model_card_controls_sampling_and_thinking_off_without_model_name_checks() {
+        let mut config = default_model("anthropic-api", "claude-sonnet-5-5");
+        config.model = "custom-future-model".into();
+        config.model_id = config.model.clone();
+        let card = config.card.as_mut().unwrap();
+        card.id = config.model.clone();
+        card.service_model_id = config.model.clone();
+        let mut request = structured_request();
+        request.reasoning_effort = Some(ReasoningEffort::Off);
+        request.temperature = Some(0.0);
+        let body = messages_request(&config, request.clone()).unwrap();
+        assert_eq!(body["thinking"], json!({"type":"between_tools"}));
+        assert!(body.get("temperature").is_none());
+        config.card.as_mut().unwrap().temperature_control =
+            Some(tickloop_agent_protocol::TemperatureControl::Supported);
+        config.card.as_mut().unwrap().thinking_off =
+            Some(tickloop_agent_protocol::ThinkingOffEncoding::Disabled);
+        let body = messages_request(&config, request).unwrap();
+        assert_eq!(body["thinking"], json!({"type":"disabled"}));
+        assert_eq!(body["temperature"], 0.0);
+    }
+
+    #[test]
+    fn model_card_sampling_restrictions_apply_to_every_public_protocol_encoder() {
+        for protocol in [
+            Protocol::Messages,
+            Protocol::ChatCompletions,
+            Protocol::Responses,
+            Protocol::Google,
+        ] {
+            let mut config = cards::model_for_persistent_selection(protocol_config(
+                protocol,
+                "https://example.test",
+            ));
+            config.card.as_mut().unwrap().temperature_control =
+                Some(tickloop_agent_protocol::TemperatureControl::Unsupported);
+            let mut request = structured_request();
+            request.temperature = Some(0.0);
+            let body = match protocol {
+                Protocol::Messages => messages_request(&config, request),
+                Protocol::ChatCompletions => chat_completions::encode_request(&config, request),
+                Protocol::Responses => responses::encode_request(&config, request),
+                Protocol::Google => google::encode_request(&config, request),
+                _ => unreachable!(),
+            }
+            .unwrap();
+            assert!(body.get("temperature").is_none(), "{protocol:?}");
+            assert!(
+                body["generationConfig"].get("temperature").is_none(),
+                "{protocol:?}"
+            );
+        }
+    }
+
+    #[test]
     fn deepseek_compatibility_protocols_use_their_supported_structured_channels() {
         let mut messages_config = default_model("deepseek-api", "deepseek-flash-messages");
         messages_config.base_url = "https://compatible.example/anthropic".into();
         let messages = messages_request(&messages_config, structured_request()).unwrap();
-        assert_eq!(messages["tools"][0]["name"], "verdict");
-        assert_eq!(messages["thinking"], json!({"type":"disabled"}));
-        assert_eq!(
-            messages["tool_choice"],
-            json!({"type":"tool","name":"verdict","disable_parallel_tool_use":true})
-        );
+        assert!(messages.get("tools").is_none());
+        assert!(messages.get("tool_choice").is_none());
+        assert!(messages["system"].to_string().contains("JSON Schema"));
         assert!(messages.get("output_config").is_none());
-
-        let mut thinking_request = structured_request();
-        thinking_request.reasoning_effort = Some(ReasoningEffort::High);
-        assert!(matches!(
-            messages_request(&messages_config, thinking_request,),
-            Err(ModelError::Configuration(_))
-        ));
 
         let mut chat_config = default_model("deepseek-api", "deepseek-flash-chat-completions");
         chat_config.base_url = "https://compatible.example".into();
@@ -3059,31 +3075,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(generic["response_format"]["type"], "json_schema");
-    }
-
-    #[test]
-    fn deepseek_messages_normalizes_the_forced_output_tool_to_json_text() {
-        let output = normalize_structured_tool_output(
-            ModelOutput {
-                private_source: None,
-                content: vec![Content::ToolUse {
-                    id: "tool-1".into(),
-                    name: "verdict".into(),
-                    input: json!({"decision":"allow"}),
-                }],
-                usage: Usage::default(),
-                stop_reason: "tool_use".into(),
-            },
-            Some("verdict"),
-        )
-        .unwrap();
-        assert_eq!(
-            output.content,
-            vec![Content::Text {
-                text: "{\"decision\":\"allow\"}".into()
-            }]
-        );
-        assert_eq!(output.stop_reason, "end_turn");
     }
 
     #[tokio::test]

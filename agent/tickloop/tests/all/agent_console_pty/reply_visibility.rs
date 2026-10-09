@@ -74,22 +74,16 @@ fn batch_reply() -> String {
 }
 
 fn review_allow_reply() -> String {
-    let rules = ["external_code", "destruction", "persistence", "security", "exfiltration", "credentials", "external_scope", "finance"]
-        .into_iter().map(|name| json!({"id": format!("builtin.soft_deny.{name}"), "applicability": "absent", "clearance": "missing"})).collect::<Vec<_>>();
     chat_reply(
         None,
-        &json!({
-            "task_scope": "within_task",
-            "rules": rules,
-        })
-        .to_string(),
+        &tickloop_agent_test_support::auto_classification(false).to_string(),
     )
 }
 
 async fn reply_before_approval(fixture: &PrivateFixture, text: &str) {
     let (url, mut requests, release) = model_http_support::serve_responses_with_gated_response(
         vec![
-            (200, chat_reply(Some(("Bash", "pending-call", json!({"command": "printf admitted > admission-marker", "description": "visibility probe"}))), text)),
+            (200, chat_reply(Some(("Bash", "pending-call", json!({"command": "env sh -c 'printf admitted > admission-marker'", "description": "visibility probe"}))), text)),
             (200, review_allow_reply()),
             (200, chat_reply(None, "PROBE-FINISHED")),
         ], 1,
@@ -302,7 +296,7 @@ async fn multiline_after_interruption(fixture: &PrivateFixture) {
             json!({"role":"assistant","reasoning_content":"Consider all lines before tool admission."}),
             json!({"content":"VISIBLE-LINE-1\nVISIBLE-LI"}),
             json!({"content":"NE-2\nVISIBLE-LINE-3\nVISIBLE-LINE-4\nVISIBLE-LINE-5\nVISIBLE-LINE-6\nVISIBLE-TAIL"}),
-            json!({"tool_calls":[{"index":0,"id":"reused-id","type":"function","function":{"name":"Bash","arguments":json!({"command":"printf admitted > admission-marker","description":"new run with reused call ID"}).to_string()}}]}),
+            json!({"tool_calls":[{"index":0,"id":"reused-id","type":"function","function":{"name":"Bash","arguments":json!({"command":"env sh -c 'printf admitted > admission-marker'","description":"new run with reused call ID"}).to_string()}}]}),
         ],
         "tool_calls",
     );

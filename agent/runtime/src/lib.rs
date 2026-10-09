@@ -2,6 +2,8 @@ mod agent_messages;
 mod approval_assessment;
 pub(crate) mod approval_context;
 mod auto_approval;
+#[cfg(test)]
+mod auto_benchmark_tests;
 mod auto_health;
 mod auto_mode;
 #[cfg(test)]
@@ -12,6 +14,7 @@ mod auto_setup;
 mod branch;
 mod family;
 pub mod file_history;
+mod handback;
 mod host_context;
 pub mod host_tools;
 pub mod hosted;
@@ -474,7 +477,7 @@ enum AutoReview {
         reason: String,
         kind: AutoBlockKind,
         rule_id: Option<String>,
-        evidence: VerdictEvidence,
+        evidence: Option<VerdictEvidence>,
     },
     ContextLimit,
     Unavailable {
@@ -495,7 +498,55 @@ fn host_tool_decision(
     configured: Option<Decision>,
     host_permission: Option<crate::host_tools::HostToolPermission>,
     execution_mode: ExecutionMode,
+    has_human_input: bool,
 ) -> Decision {
+    if let Some(crate::host_tools::HostToolPermission::Classified {
+        allow_rule_bypasses_review,
+    }) = host_permission
+    {
+        return match configured {
+            Some(Decision::Deny) => Decision::Deny,
+            Some(Decision::Ask) => Decision::Ask,
+            Some(Decision::Allow) if allow_rule_bypasses_review => Decision::Allow,
+            _ if matches!(execution_mode, ExecutionMode::Auto | ExecutionMode::Plan) => {
+                Decision::Check
+            }
+            _ => Decision::Allow,
+        };
+    }
+    if matches!(
+        host_permission,
+        Some(
+            crate::host_tools::HostToolPermission::PublicArtifactWrite
+                | crate::host_tools::HostToolPermission::ArtifactContinuation
+        )
+    ) {
+        return match configured {
+            Some(Decision::Deny) => Decision::Deny,
+            Some(Decision::Ask) => Decision::Ask,
+            _ if host_permission
+                == Some(crate::host_tools::HostToolPermission::ArtifactContinuation) =>
+            {
+                Decision::Allow
+            }
+            _ if execution_mode == ExecutionMode::Plan => Decision::Ask,
+            Some(Decision::Allow) => Decision::Allow,
+            _ if execution_mode == ExecutionMode::FullAccess => Decision::Allow,
+            _ if execution_mode == ExecutionMode::Auto => Decision::Check,
+            _ => Decision::Ask,
+        };
+    }
+    if host_permission == Some(crate::host_tools::HostToolPermission::PrivateArtifactWrite) {
+        return match configured {
+            Some(Decision::Deny) => Decision::Deny,
+            Some(Decision::Ask) => Decision::Ask,
+            _ if execution_mode == ExecutionMode::Plan => Decision::Ask,
+            Some(Decision::Allow) => Decision::Allow,
+            _ if has_human_input || execution_mode == ExecutionMode::FullAccess => Decision::Allow,
+            _ if execution_mode == ExecutionMode::Auto => Decision::Check,
+            _ => Decision::Ask,
+        };
+    }
     if execution_mode == ExecutionMode::Plan
         && matches!(
             host_permission,
@@ -529,6 +580,10 @@ fn host_tool_decision(
 }
 
 impl Chat {
+    fn has_human_input_for_run(&self, run: RunId) -> bool {
+        approval_context::originals_for_active_chain(&self.snapshot, &self.bookkeeping)
+            .is_ok_and(|inputs| inputs.iter().any(|input| input.run_id == run))
+    }
     /// 前台 `!` 命令运行或停止中时，Chat 不接受压缩，也不写入其他本地消息。
     fn has_foreground_user_shell(&self) -> bool {
         self.snapshot.user_shells.iter().any(|record| {
@@ -610,6 +665,7 @@ fn answerable_permission_request(
 
 fn empty_snapshot(id: ChatId, workdir: PathBuf, model: ModelConfig) -> ChatSnapshot {
     ChatSnapshot {
+        subagent_reports: BTreeMap::new(),
         failure_events: Vec::new(),
         provider_failures: HashMap::new(),
         tool_call_recoveries: Vec::new(),
@@ -635,7 +691,7 @@ fn empty_snapshot(id: ChatId, workdir: PathBuf, model: ModelConfig) -> ChatSnaps
         message_ids: BTreeMap::new(),
         agent_message_origins: BTreeMap::new(),
         human_family_origins: BTreeMap::new(),
-        original_user_message_ids: BTreeMap::new(),
+        original_message_ids: BTreeMap::new(),
         prompt_execution_modes: BTreeMap::new(),
         inherited_prompts: HashSet::new(),
         message_compactions: BTreeMap::new(),
@@ -681,6 +737,7 @@ impl Agent {
             chat,
             self.inner.host_tools.read().unwrap().clone(),
             self.inner.tick_stream_installed.load(Ordering::SeqCst),
+            self.inner.host_options.prompt_policy,
         )
         .definitions()
     }
@@ -795,6 +852,18 @@ impl Agent {
         prepared_facts: Option<tickloop_agent_protocol::PreparedApprovalFacts>,
         cancel: CancellationToken,
     ) -> Result<approval_assessment::ApprovalAssessment, AgentError> {
+        self.review_operation(receipt, operation, prepared_facts, cancel, true)
+            .await
+    }
+
+    async fn review_operation(
+        &self,
+        receipt: &Receipt,
+        operation: &OperationRecord,
+        prepared_facts: Option<tickloop_agent_protocol::PreparedApprovalFacts>,
+        cancel: CancellationToken,
+        emit_permission: bool,
+    ) -> Result<approval_assessment::ApprovalAssessment, AgentError> {
         let (snapshot, bookkeeping, chat_client, boundary_id, legacy_path) = {
             let chats = self.inner.chats.lock().await;
             let chat = chats.get(&receipt.chat_id).ok_or(AgentError::NotFound)?;
@@ -833,18 +902,21 @@ impl Agent {
             .flatten(),
             _ => None,
         };
+        let ancestors = self.approval_history_ancestors(&snapshot).await;
         let (auto_settings, auto_revision) = match self.auto_settings_snapshot().await {
             Ok(settings) => settings,
             Err(error) => {
                 let reason = format!(
                     "Auto reviewer settings are unavailable ({error}); review this action manually."
                 );
-                self.emit_permission_check(
-                    receipt,
-                    self.apply_prompt_policy(Decision::Ask),
-                    reason.clone(),
-                )
-                .await;
+                if emit_permission {
+                    self.emit_permission_check(
+                        receipt,
+                        self.apply_prompt_policy(Decision::Ask),
+                        reason.clone(),
+                    )
+                    .await;
+                }
                 return Ok(approval_assessment::ApprovalAssessment::missing_context(
                     operation,
                     snapshot.policy.revision,
@@ -866,12 +938,14 @@ impl Agent {
             Ok(context) => context,
             Err(approval_context::ApprovalContextError::MissingOriginalUserInput) => {
                 let reason = "Original user authorization for this Loop is unavailable; review this action manually.".to_owned();
-                self.emit_permission_check(
-                    receipt,
-                    self.apply_prompt_policy(Decision::Ask),
-                    reason.clone(),
-                )
-                .await;
+                if emit_permission {
+                    self.emit_permission_check(
+                        receipt,
+                        self.apply_prompt_policy(Decision::Ask),
+                        reason.clone(),
+                    )
+                    .await;
+                }
                 return Ok(approval_assessment::ApprovalAssessment::missing_context(
                     operation,
                     snapshot.policy.revision,
@@ -880,6 +954,25 @@ impl Agent {
                 ));
             }
         };
+        if let Some(ancestors) = ancestors.as_deref() {
+            context.reply_history = approval_context::capture_reply_history(
+                &snapshot,
+                &bookkeeping,
+                Some((operation.run_id, &operation.call_id)),
+                &context.original_user_inputs,
+                Some(ancestors),
+            );
+            context.tool_history =
+                approval_context::recovered_tool_history(&snapshot, operation, Some(ancestors));
+        }
+        if context.tool_history.capacity_exceeded {
+            return Ok(approval_assessment::ApprovalAssessment::new(
+                &context,
+                AutoReview::ContextLimit,
+                None,
+            )
+            .with_auto_settings(auto_settings.reviewer, &auto_revision));
+        }
         context.creation_receipt = prepared_facts
             .as_ref()
             .filter(|facts| facts.closes_tick)
@@ -898,12 +991,6 @@ impl Agent {
                     .cloned()
             });
         context.prepared_facts = prepared_facts;
-        if context.creation_receipt.is_none() {
-            context
-                .auto_policy
-                .rules
-                .retain(|rule| rule.id != "builtin.soft_allow.loop_tick_cleanup");
-        }
         let preferred = auto_settings.reviewer;
         let configured_reviewer = self.inner.auto_reviewer.lock().await.clone();
         let has_isolated_reviewer = configured_reviewer.is_some();
@@ -924,11 +1011,13 @@ impl Agent {
             let run = self
                 .review_with_llm(receipt, &context, llm_client, cancel)
                 .await?;
-            self.emit_auto_review_check(receipt, &run.review).await;
+            if emit_permission {
+                self.emit_auto_review_check(receipt, &run.review).await;
+            }
             return Ok(assess(run, None, None, None));
         }
 
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = tokio::time::Instant::now() + auto_approval::JEV_REVIEW_BUDGET;
         let generation_before_binding = self.inner.auto_health.lock().await.generation();
         let bound = tokio::select! {
             biased;
@@ -1004,7 +1093,9 @@ impl Agent {
                     self.emit_auto_reviewer_notice(receipt, AutoReviewerNotice::Recovered)
                         .await;
                 }
-                self.emit_auto_review_check(receipt, &run.review).await;
+                if emit_permission {
+                    self.emit_auto_review_check(receipt, &run.review).await;
+                }
                 return Ok(assess(run, None, None, None));
             }
         }
@@ -1016,7 +1107,9 @@ impl Agent {
             .await?;
         jev_attempts.append(&mut run.attempts);
         run.attempts = jev_attempts;
-        self.emit_auto_review_check(receipt, &run.review).await;
+        if emit_permission {
+            self.emit_auto_review_check(receipt, &run.review).await;
+        }
         Ok(assess(
             run,
             Some(ApprovalReviewerKind::Jev),
@@ -2396,6 +2489,9 @@ impl Agent {
             ),
             admission.host_permission,
             chat.snapshot.policy.mode,
+            admission.host_permission
+                == Some(crate::host_tools::HostToolPermission::PrivateArtifactWrite)
+                && chat.has_human_input_for_run(receipt.run_id),
         );
         let permission_is_current = session_context.revalidate(
             &admission.session_evaluation.token,
@@ -2461,6 +2557,7 @@ impl Agent {
                 if let Some(provider) = host_provider {
                     let _ = provider.refresh(cancel.clone()).await;
                 }
+                self.ensure_handback_requirement(&receipt).await?;
                 let registry = {
                     let chats = self.inner.chats.lock().await;
                     let chat = chats.get(&receipt.chat_id).unwrap();
@@ -2468,6 +2565,7 @@ impl Agent {
                         chat,
                         self.inner.host_tools.read().unwrap().clone(),
                         self.inner.tick_stream_installed.load(Ordering::SeqCst),
+                        self.inner.host_options.prompt_policy,
                     )
                 };
                 request.tools = registry.definitions();
@@ -2494,9 +2592,14 @@ impl Agent {
                     self.emit(chat, &receipt, EventKind::AssistantMessageCommitted { message_id: assistant_message_id, tool_calls: calls.clone() });
                 }
                 if calls.is_empty() {
-                    return self.inner.chats.lock().await.get(&receipt.chat_id).unwrap()
-                        .snapshot.request_usage.run_conversation_usage(receipt.run_id)
-                        .map_err(|error| error.to_string());
+                    let mut chats = self.inner.chats.lock().await;
+                    let chat = chats.get_mut(&receipt.chat_id).unwrap();
+                    if handback::remind(chat, &receipt) {
+                        self.save(&chat.snapshot);
+                        request = self.continuation_request(chat)?;
+                        continue;
+                    }
+                    return chat.snapshot.request_usage.run_conversation_usage(receipt.run_id).map_err(|error|error.to_string());
                 }
                 for ProposedToolCall {call_id:id,name,input} in calls {
                     let invocation = ToolInvocation::new(
@@ -2589,6 +2692,9 @@ impl Agent {
                     let mut chats=self.inner.chats.lock().await;
                     let chat=chats.get_mut(&receipt.chat_id).unwrap();
                     self.flush_deferred_messages(chat,MessageBoundary::ToolResults).map_err(|error|error.to_string())?;
+                    if matches!(chat.snapshot.subagent_reports.get(&receipt.run_id), Some(tickloop_agent_protocol::SubagentReport::Delivered { .. })) {
+                        return chat.snapshot.request_usage.run_conversation_usage(receipt.run_id).map_err(|error|error.to_string());
+                    }
                 }
                 self.merge_queued_messages(&receipt)
                     .await
@@ -2596,8 +2702,7 @@ impl Agent {
                 self.complete_file_history_snapshots(receipt.chat_id).await;
                 let chats=self.inner.chats.lock().await;
                 let chat=chats.get(&receipt.chat_id).unwrap();
-                let (messages, history_sources) = context::model_history(chat).map_err(|error|error.to_string())?;
-                request=ModelRequest { history_sources,messages,tools:self.tool_definitions(chat),structured_output:None,temperature:None,reasoning_effort:chat.snapshot.effective_reasoning_effort()};
+                request = self.continuation_request(chat)?;
             }
         }.await;
         let mut chats = self.inner.chats.lock().await;
@@ -2737,6 +2842,19 @@ impl Agent {
                 .await;
         }
         next
+    }
+
+    fn continuation_request(&self, chat: &Chat) -> Result<ModelRequest, String> {
+        let (messages, history_sources) =
+            context::model_history(chat).map_err(|error| error.to_string())?;
+        Ok(ModelRequest {
+            history_sources,
+            messages,
+            tools: self.tool_definitions(chat),
+            structured_output: None,
+            temperature: None,
+            reasoning_effort: chat.snapshot.effective_reasoning_effort(),
+        })
     }
 
     fn run_task(

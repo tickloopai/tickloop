@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
@@ -103,7 +103,7 @@ impl Scenario {
 
     fn expected(self) -> ApprovalOutcome {
         match self {
-            Self::UnverifiedCondition => ApprovalOutcome::NeedsHuman,
+            Self::UnverifiedCondition => ApprovalOutcome::Block,
             Self::RelevantAllow | Self::ExplicitConsent | Self::RoutineBuild => {
                 ApprovalOutcome::Allow
             }
@@ -114,49 +114,23 @@ impl Scenario {
     fn expected_block(self) -> Option<AutoBlockKind> {
         match self {
             Self::Revoked => Some(AutoBlockKind::TaskScope),
-            Self::UnrelatedAllow | Self::ExternalDownload => Some(AutoBlockKind::SoftDeny),
+            Self::UnrelatedAllow | Self::ExternalDownload | Self::UnverifiedCondition => {
+                Some(AutoBlockKind::SoftDeny)
+            }
             Self::HardWithConsent | Self::AdversarialInput => Some(AutoBlockKind::HardDeny),
             _ => None,
         }
     }
 
     fn findings(self, ids: &RuleIds) -> Value {
-        let task_scope = if matches!(self, Self::Revoked) {
-            "outside_task"
-        } else {
-            "within_task"
+        let (decision, rule) = match self {
+            Self::RelevantAllow | Self::ExplicitConsent | Self::RoutineBuild => ("allow", None),
+            Self::Revoked => ("block_user_boundary", None),
+            Self::HardWithConsent | Self::AdversarialInput => ("block_hard", Some(&ids.hard)),
+            Self::UnrelatedAllow => ("block_soft", Some(&ids.second)),
+            Self::ExternalDownload | Self::UnverifiedCondition => ("block_soft", Some(&ids.first)),
         };
-        let mut first = json!({"id":ids.first,"applicability":"absent","clearance":"missing"});
-        let mut second = json!({"id":ids.second,"applicability":"absent","clearance":"missing"});
-        let mut hard = json!({"id":ids.hard,"applicability":"absent","clearance":null});
-        match self {
-            Self::RelevantAllow => {
-                first["applicability"] = json!("present");
-                first["clearance"] = json!({"soft_allow":ids.allow});
-            }
-            Self::ExplicitConsent => {
-                first["applicability"] = json!("present");
-                first["clearance"] = json!("explicit_consent");
-            }
-            Self::UnrelatedAllow => {
-                first["applicability"] = json!("present");
-                first["clearance"] = json!({"soft_allow":ids.allow});
-                second["applicability"] = json!("present");
-            }
-            Self::HardWithConsent => {
-                first["applicability"] = json!("present");
-                first["clearance"] = json!("explicit_consent");
-                hard["applicability"] = json!("present");
-            }
-            Self::UnverifiedCondition => {
-                first["applicability"] = json!("uncertain");
-                first["clearance"] = json!("explicit_consent");
-            }
-            Self::AdversarialInput => hard["applicability"] = json!("present"),
-            Self::ExternalDownload => first["applicability"] = json!("present"),
-            Self::Revoked | Self::RoutineBuild => {}
-        }
-        json!({"task_scope":task_scope,"rules":[first,second,hard]})
+        json!({"decision":decision,"rule_id":rule,"reason":(decision != "allow").then_some("Fixture restriction applies to this proposed operation")})
     }
 }
 
@@ -234,19 +208,13 @@ impl JudgmentClient for CaseJev {
         let serialized = serde_json::to_value(request).unwrap();
         for question in serialized["questions"].as_object().unwrap().values() {
             assert!(
-                question["instructions"]["authority"]
+                question["instructions"]["policy"]
                     .as_str()
                     .unwrap()
                     .contains("original_user_inputs")
             );
         }
         self.requests.lock().unwrap().push(serialized);
-        let rules = self.findings["rules"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|rule| (rule["id"].as_str().unwrap(), rule))
-            .collect::<HashMap<_, _>>();
         let answers = request
             .questions
             .iter()
@@ -254,20 +222,7 @@ impl JudgmentClient for CaseJev {
                 let Question::Choice { criteria, .. } = question else {
                     panic!("expected Choice")
                 };
-                let selected = if id == "task_scope" {
-                    self.findings["task_scope"].as_str().unwrap().to_owned()
-                } else if let Some(rule_id) = id.strip_prefix("app:") {
-                    rules[rule_id]["applicability"].as_str().unwrap().to_owned()
-                } else if let Some(rule_id) = id.strip_prefix("clear:") {
-                    let clearance = &rules[rule_id]["clearance"];
-                    clearance
-                        .get("soft_allow")
-                        .and_then(Value::as_str)
-                        .map(|id| format!("allow:{id}"))
-                        .unwrap_or_else(|| clearance.as_str().unwrap().to_owned())
-                } else {
-                    panic!("unexpected question {id}")
-                };
+                let selected = self.findings["decision"].as_str().unwrap().to_owned();
                 assert!(
                     criteria.contains_key(&selected),
                     "missing Jev choice {selected}"
@@ -398,8 +353,24 @@ async fn run_case(scenario: Scenario, use_jev: bool, ids: &RuleIds) -> CaseResul
         scenario.expected() == ApprovalOutcome::Allow,
         "{scenario:?} reviewer={reviewer}"
     );
-    assert_eq!(model.reviews.lock().unwrap().len(), usize::from(!use_jev));
-    assert_eq!(jev.requests.lock().unwrap().len(), usize::from(use_jev));
+    assert_eq!(
+        model.reviews.lock().unwrap().len(),
+        usize::from(!use_jev)
+            * if scenario.expected() == ApprovalOutcome::Block {
+                2
+            } else {
+                1
+            }
+    );
+    assert_eq!(
+        jev.requests.lock().unwrap().len(),
+        usize::from(use_jev)
+            * if scenario.expected() == ApprovalOutcome::Block {
+                2
+            } else {
+                1
+            }
+    );
     let llm_context = model.reviews.lock().unwrap().first().map(|request| {
         let Content::Text { text } = &request.messages[1].content[0] else {
             panic!("expected context text")
@@ -422,7 +393,7 @@ async fn run_case(scenario: Scenario, use_jev: bool, ids: &RuleIds) -> CaseResul
 }
 
 #[tokio::test]
-async fn llm_and_jev_apply_the_same_scope_rule_clearance_and_hard_deny_semantics() {
+async fn llm_and_jev_preserve_the_same_overall_decisions_and_complete_policy_inputs() {
     for scenario in [
         Scenario::Revoked,
         Scenario::RelevantAllow,

@@ -12,23 +12,24 @@ use tickloop_agent_model::{
 };
 use tickloop_agent_protocol::{
     ApprovalAttemptDetails, ApprovalAttemptOutcome, ApprovalFailureKind, ApprovalReviewer,
-    ApprovalReviewerKind, AutoReviewerHealth, Content, EventKind, ModelIdentity, ModelProvider,
-    ModelRequestKind, Protocol, Receipt, RequestOutcome, ResponseRejection,
+    ApprovalReviewerKind, ApprovalStage, AutoReviewerHealth, Content, EventKind, ModelIdentity,
+    ModelProvider, ModelRequestKind, Protocol, Receipt, RequestOutcome, ResponseRejection,
 };
 
 const MAX_ATTEMPTS: usize = 2;
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(10);
+pub(super) const JEV_REVIEW_BUDGET: Duration = Duration::from_secs(20);
+const LLM_REVIEW_BUDGET: Duration = Duration::from_secs(45);
+
+struct StageRequest {
+    stage: ApprovalStage,
+    max_attempts: usize,
+    deadline: tokio::time::Instant,
+}
 
 pub(super) fn review_from_rule_verdict(verdict: RuleVerdict) -> AutoReview {
     match verdict {
         RuleVerdict::Allow => AutoReview::Allow,
-        RuleVerdict::NeedsHuman {
-            reason,
-            diagnostics,
-        } => AutoReview::Ask {
-            reason,
-            diagnostics,
-        },
         RuleVerdict::Block {
             reason,
             kind,
@@ -98,12 +99,99 @@ impl Agent {
         deadline: tokio::time::Instant,
         cancel: CancellationToken,
     ) -> Result<ReviewerRun, AgentError> {
+        let screen = self
+            .review_jev_stage(
+                receipt,
+                context,
+                client.clone(),
+                cancel.clone(),
+                StageRequest {
+                    stage: ApprovalStage::RiskScreen,
+                    max_attempts: MAX_ATTEMPTS,
+                    deadline,
+                },
+            )
+            .await?;
+        if !matches!(screen.review, AutoReview::Block { .. })
+            && screen.failure != Some(ApprovalFailureKind::InvalidResponse)
+        {
+            return Ok(screen);
+        }
+        let final_review = self
+            .review_jev_stage(
+                receipt,
+                context,
+                client,
+                cancel,
+                StageRequest {
+                    stage: ApprovalStage::Authorization,
+                    max_attempts: MAX_ATTEMPTS + 1 - screen.attempts.len(),
+                    deadline,
+                },
+            )
+            .await?;
+        Ok(final_review.with_prior_attempts(screen.attempts))
+    }
+
+    pub(super) async fn review_with_llm(
+        &self,
+        receipt: &Receipt,
+        context: &ApprovalSnapshot,
+        client: Arc<dyn ModelClient>,
+        cancel: CancellationToken,
+    ) -> Result<ReviewerRun, AgentError> {
+        let deadline = tokio::time::Instant::now() + LLM_REVIEW_BUDGET;
+        let screen = self
+            .review_llm_stage(
+                receipt,
+                context,
+                client.clone(),
+                cancel.clone(),
+                StageRequest {
+                    stage: ApprovalStage::RiskScreen,
+                    max_attempts: auto_mode::MAX_CLASSIFIER_ATTEMPTS,
+                    deadline,
+                },
+            )
+            .await?;
+        if !matches!(screen.review, AutoReview::Block { .. }) && !screen.exhausted_format_retries {
+            return Ok(screen);
+        }
+        let final_review = self
+            .review_llm_stage(
+                receipt,
+                context,
+                client,
+                cancel,
+                StageRequest {
+                    stage: ApprovalStage::Authorization,
+                    max_attempts: auto_mode::MAX_CLASSIFIER_ATTEMPTS + 1 - screen.attempts.len(),
+                    deadline,
+                },
+            )
+            .await?;
+        Ok(final_review.with_prior_attempts(screen.attempts))
+    }
+
+    async fn review_jev_stage(
+        &self,
+        receipt: &Receipt,
+        context: &ApprovalSnapshot,
+        client: Arc<dyn JudgmentClient>,
+        cancel: CancellationToken,
+        stage_request: StageRequest,
+    ) -> Result<ReviewerRun, AgentError> {
+        let StageRequest {
+            stage,
+            max_attempts,
+            deadline,
+        } = stage_request;
         let reviewer = ApprovalReviewer {
             kind: ApprovalReviewerKind::Jev,
             requested_model: client.model().into(),
             reported_model: None,
         };
-        let request = match review_request(context) {
+        let request = match review_request(context, stage) {
             Ok(request) => request,
             Err(AutoReview::ContextLimit) => {
                 return Ok(ReviewerRun::technical(
@@ -116,7 +204,7 @@ impl Agent {
             Err(_) => unreachable!(),
         };
         let mut attempts = Vec::new();
-        for attempt_index in 0..MAX_ATTEMPTS {
+        for attempt_index in 0..max_attempts {
             if cancel.is_cancelled() {
                 return Err(ModelError::Cancelled.into());
             }
@@ -172,6 +260,7 @@ impl Agent {
                             let review = review_from_rule_verdict(verdict);
                             let result = outcome_for_review(&review);
                             attempts.push(ApprovalAttemptDetails {
+                                stage: Some(stage),
                                 reviewer: ApprovalReviewer {
                                     reported_model: Some(evaluation.model.clone()),
                                     ..reviewer.clone()
@@ -182,6 +271,7 @@ impl Agent {
                                 usage: Some(evaluation.usage),
                             });
                             return Ok(ReviewerRun {
+                                exhausted_format_retries: false,
                                 review,
                                 reviewer: Some(ApprovalReviewer {
                                     reported_model: Some(evaluation.model),
@@ -200,6 +290,7 @@ impl Agent {
                             .await?;
                             let failure = ApprovalFailureKind::InvalidResponse;
                             attempts.push(ApprovalAttemptDetails {
+                                stage: Some(stage),
                                 reviewer: reviewer.clone(),
                                 elapsed_ms,
                                 outcome: ApprovalAttemptOutcome::TechnicalFailure,
@@ -208,7 +299,7 @@ impl Agent {
                             });
                             return Ok(ReviewerRun::technical(
                                 AutoReview::Unavailable {
-                                    message: "Jev returned invalid Auto rule findings".into(),
+                                    message: "Jev returned an invalid overall Auto decision".into(),
                                 },
                                 reviewer,
                                 failure,
@@ -236,6 +327,7 @@ impl Agent {
                     }
                     let failure = failure_kind(&model_error);
                     attempts.push(ApprovalAttemptDetails {
+                        stage: Some(stage),
                         reviewer: reviewer.clone(),
                         elapsed_ms,
                         outcome: ApprovalAttemptOutcome::TechnicalFailure,
@@ -246,7 +338,7 @@ impl Agent {
                 }
             };
             let (retryable, retry_after) = error.retry_hint();
-            if retryable && attempt_index + 1 < MAX_ATTEMPTS {
+            if retryable && attempt_index + 1 < max_attempts {
                 let delay = retry_after.unwrap_or(Duration::from_millis(500));
                 let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                 if delay < remaining && delay <= MAX_RETRY_DELAY {
@@ -262,7 +354,7 @@ impl Agent {
                                 kind: ModelRequestKind::PermissionCheck,
                                 error: format!("Jev: {error}"),
                                 attempt: attempt_index + 1,
-                                max_retries: MAX_ATTEMPTS - 1,
+                                max_retries: max_attempts - 1,
                                 delay_ms: delay.as_millis() as u64,
                             },
                         );
@@ -292,22 +384,31 @@ impl Agent {
         unreachable!()
     }
 
-    pub(super) async fn review_with_llm(
+    async fn review_llm_stage(
         &self,
         receipt: &Receipt,
         context: &ApprovalSnapshot,
         client: Arc<dyn ModelClient>,
         cancel: CancellationToken,
+        stage_request: StageRequest,
     ) -> Result<ReviewerRun, AgentError> {
+        let StageRequest {
+            stage,
+            max_attempts,
+            deadline,
+        } = stage_request;
         let reviewer = ApprovalReviewer {
             kind: ApprovalReviewerKind::Llm,
             requested_model: client.identity().requested_model,
             reported_model: None,
         };
-        let mut request = auto_mode::classifier_request(context);
+        let mut request = auto_mode::classifier_request(context, stage);
+        if client.supports_reasoning_effort(tickloop_agent_protocol::ReasoningEffort::Off) {
+            request.reasoning_effort = Some(tickloop_agent_protocol::ReasoningEffort::Off);
+        }
         let mut attempts = Vec::new();
         let mut invalid_reason = "invalid classification";
-        for _ in 0..auto_mode::MAX_CLASSIFIER_ATTEMPTS {
+        for _ in 0..max_attempts {
             let started = tokio::time::Instant::now();
             let response = self
                 .tracked_model_request(
@@ -318,7 +419,7 @@ impl Agent {
                     client.clone(),
                     request.clone(),
                     cancel.clone(),
-                    None,
+                    Some(deadline.saturating_duration_since(tokio::time::Instant::now())),
                 )
                 .await;
             let elapsed_ms = started.elapsed().as_millis() as u64;
@@ -338,6 +439,7 @@ impl Agent {
                         failure_kind(&error)
                     };
                     attempts.push(ApprovalAttemptDetails {
+                        stage: Some(stage),
                         reviewer: reviewer.clone(),
                         elapsed_ms,
                         outcome: ApprovalAttemptOutcome::TechnicalFailure,
@@ -392,6 +494,7 @@ impl Agent {
                 )
                 .await?;
                 attempts.push(ApprovalAttemptDetails {
+                    stage: Some(stage),
                     reviewer: reviewer.clone(),
                     elapsed_ms,
                     outcome: ApprovalAttemptOutcome::TechnicalFailure,
@@ -413,6 +516,7 @@ impl Agent {
                     .await?;
                     let review = review_from_rule_verdict(verdict);
                     attempts.push(ApprovalAttemptDetails {
+                        stage: Some(stage),
                         reviewer: reviewer.clone(),
                         elapsed_ms,
                         outcome: outcome_for_review(&review),
@@ -420,6 +524,7 @@ impl Agent {
                         usage: Some(response.output.usage),
                     });
                     return Ok(ReviewerRun {
+                        exhausted_format_retries: false,
                         review,
                         reviewer: Some(reviewer),
                         attempts,
@@ -436,6 +541,7 @@ impl Agent {
                     )
                     .await?;
                     attempts.push(ApprovalAttemptDetails {
+                        stage: Some(stage),
                         reviewer: reviewer.clone(),
                         elapsed_ms,
                         outcome: ApprovalAttemptOutcome::TechnicalFailure,
@@ -445,7 +551,7 @@ impl Agent {
                 }
             }
         }
-        Ok(ReviewerRun::technical(
+        let mut result = ReviewerRun::technical(
             AutoReview::Unavailable {
                 message: format!(
                     "Invalid Auto reviewer response after {} attempts ({invalid_reason}); review this action manually",
@@ -455,11 +561,14 @@ impl Agent {
             reviewer,
             ApprovalFailureKind::InvalidResponse,
             attempts,
-        ))
+        );
+        result.exhausted_format_retries = true;
+        Ok(result)
     }
 }
 
 pub(super) struct ReviewerRun {
+    exhausted_format_retries: bool,
     pub review: AutoReview,
     pub reviewer: Option<ApprovalReviewer>,
     pub attempts: Vec<ApprovalAttemptDetails>,
@@ -467,8 +576,15 @@ pub(super) struct ReviewerRun {
 }
 
 impl ReviewerRun {
+    fn with_prior_attempts(mut self, mut attempts: Vec<ApprovalAttemptDetails>) -> Self {
+        attempts.append(&mut self.attempts);
+        self.attempts = attempts;
+        self
+    }
+
     pub fn binding_failure(failure: ApprovalFailureKind) -> Self {
         Self {
+            exhausted_format_retries: false,
             review: AutoReview::Unavailable {
                 message: "Jev Auto review is unavailable".into(),
             },
@@ -485,6 +601,7 @@ impl ReviewerRun {
         attempts: Vec<ApprovalAttemptDetails>,
     ) -> Self {
         Self {
+            exhausted_format_retries: false,
             review,
             reviewer: Some(reviewer),
             attempts,

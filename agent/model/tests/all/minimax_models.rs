@@ -165,7 +165,7 @@ async fn regional_api_uses_bearer_messages_images_thinking_and_cache_usage() {
 }
 
 #[tokio::test]
-async fn structured_response_uses_auto_tool_selection_and_rejects_extra_operations() {
+async fn structured_response_uses_prompted_json_and_rejects_extra_operations() {
     for extra in [false, true] {
         let root = tempfile::tempdir().unwrap();
         let root = root.path().canonicalize().unwrap();
@@ -173,16 +173,17 @@ async fn structured_response_uses_auto_tool_selection_and_rejects_extra_operatio
             .get("minimax-cn-api", "minimax-m3-messages")
             .unwrap();
         save_api_key(&root, &config.api_key_env, "test-key").unwrap();
-        let mut blocks = vec![
-            json!({"type":"tool_use","id":"verdict-1","name":"verdict","input":{"allow":false}}),
-        ];
+        let mut blocks = vec![json!({"type":"text","text":"{\"allow\":false}"})];
         if extra {
             blocks.push(
                 json!({"type":"tool_use","id":"other-1","name":"Bash","input":{"command":"false"}}),
             );
         }
-        let (url, captured) =
-            model_http_support::serve_response(200, response(blocks, "tool_use")).await;
+        let (url, captured) = model_http_support::serve_response(
+            200,
+            response(blocks, if extra { "tool_use" } else { "end_turn" }),
+        )
+        .await;
         config.base_url = url;
         let mut input = request(None);
         input.structured_output = Some(StructuredOutput {
@@ -212,9 +213,11 @@ async fn structured_response_uses_auto_tool_selection_and_rejects_extra_operatio
             );
         }
         let (_, body) = captured.await.unwrap();
-        assert_eq!(body["tool_choice"], json!({"type":"auto"}));
+        assert!(body.get("tools").is_none());
+        assert!(body.get("tool_choice").is_none());
         assert!(body["output_config"].get("format").is_none());
-        assert_eq!(body["tools"][0]["name"], "verdict");
+        assert!(body["system"].to_string().contains("JSON Schema"));
+        assert!(body["system"].to_string().contains("additionalProperties"));
     }
 }
 

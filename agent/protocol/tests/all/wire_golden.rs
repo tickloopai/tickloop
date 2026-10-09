@@ -125,6 +125,8 @@ fn model_config() -> ModelConfig {
             adaptive_by_default: false,
             effort_levels: vec![ReasoningEffort::Low, ReasoningEffort::High],
             input_modalities: vec![InputModality::Text, InputModality::Image],
+            temperature_control: None,
+            thinking_off: None,
             thinking_budgets: Some(ThinkingBudgets {
                 low: 2048,
                 medium: 8192,

@@ -1,5 +1,16 @@
 //! Every agent/runtime integration test, compiled as one binary.
 
+#[path = "all/agent_approval_routing.rs"]
+mod agent_approval_routing;
+
+#[path = "all/approval_budget.rs"]
+mod approval_budget;
+#[path = "all/approval_stages.rs"]
+mod approval_stages;
+
+#[path = "all/subagent_handback.rs"]
+mod subagent_handback;
+
 #[path = "all/auto_review_improvements.rs"]
 mod auto_review_improvements;
 

@@ -51,7 +51,7 @@ async fn artifact_service() -> (String, Arc<Mutex<Vec<Value>>>, tokio::task::Joi
                 } else if path.starts_with("GET /api/v1/auth/session ") {
                     json!({"user":{"id":"owner","name":"Owner","email":"owner@example.test"},"expires_at":"2099-01-01T00:00:00Z"})
                 } else if path.starts_with("GET /api/v1/artifacts/document ") {
-                    json!({"id":"document","title":CREATED_TITLE,"format":"markdown","access_role":"owner","url":format!("{origin}/a/document")})
+                    json!({"id":"document","title":CREATED_TITLE,"format":"markdown","access_role":"owner","url":format!("{origin}/a/document"),"publication":{"audience":"private","membership_revision":0}})
                 } else if path.starts_with("PUT /api/v1/agent/links/document ") {
                     json!({"artifact_id":"document","binding_id":body["binding_id"],"epoch":1})
                 } else if path.starts_with("GET /api/v1/agent/requests?") {
@@ -89,8 +89,7 @@ async fn artifact_service() -> (String, Arc<Mutex<Vec<Value>>>, tokio::task::Joi
     (origin, requests, server)
 }
 
-#[tokio::test]
-async fn actual_cli_creation_adds_an_artifact_tick_before_the_next_model_reply() {
+async fn creation_adds_an_artifact_in_mode(flags: &[&str]) {
     let fixture = PrivateFixture::new();
     let (origin, calls, server) = artifact_service().await;
     let result = AssertUnwindSafe(async {
@@ -99,24 +98,42 @@ async fn actual_cli_creation_adds_an_artifact_tick_before_the_next_model_reply()
         account.finish_device_login(device, &tokio_util::sync::CancellationToken::new()).await.unwrap();
         let (model_url, mut requests, release) = model_http_support::serve_responses_with_gated_response(vec![
             (200,chat_reply(Some(("ArtifactEdit","creation",json!({"action":"create","title":CREATED_TITLE,"format":"markdown","content":"# Created"}))),"")),
+            (200,chat_reply(Some(("ArtifactEdit","revision",json!({"action":"replace","artifact_id":"document","expected_revision":1,"content":"# Revised"}))),"")),
             (200,chat_reply(None,"CREATION-REPLY-FINISHED")),
         ],1).await;
         fixture.set_chat_model(&model_url);
-        let mut pty = PtyView::launch(&fixture, &["--dangerously-skip-permissions"], &[("TICKLOOP_ARTIFACT_ORIGIN", std::path::Path::new(&origin))], true);
+        let mut pty = PtyView::launch(&fixture, flags, &[("TICKLOOP_ARTIFACT_ORIGIN", std::path::Path::new(&origin))], true);
         pty.resize(160,32).await;
         pty.wait_for("artifact View ready",new_input_is_visible).await;
-        pty.send(b"Create a document\r");
+        pty.send(b"Create a document and revise it\r");
         let _ = tokio::time::timeout(UI_TIMEOUT,requests.recv()).await.unwrap().unwrap();
+        if flags.contains(&"plan") {
+            pty.wait_for("Plan asks before the first Artifact publication", |frame| frame.contains("Permission required") && frame.contains("ArtifactEdit")).await;
+            pty.send(b"\r");
+        }
         let next = tokio::time::timeout(UI_TIMEOUT, requests.recv()).await;
         assert!(next.is_ok(), "frame: {}\ncalls: {:?}", pty.frame(), calls.lock().unwrap());
-        next.unwrap().unwrap();
+        let (_, followup) = next.unwrap().unwrap();
+        assert!(followup["messages"].as_array().unwrap().iter().any(|message| message["role"] == "tool"), "the next request must be the conversation after creation, not an approval classifier");
 
         let frame = pty.wait_for("creation is attached before the reply",|frame|frame.contains("Monitor 1") && frame.contains(CREATED_TITLE) && frame.contains("Artifacts (1)")).await;
         assert!(!frame.contains("CREATION-REPLY-FINISHED"));
+        assert!(!frame.contains("Auto review: Allow"));
+        assert!(!frame.contains("Permission required"));
         eprintln!("[artifact-created-live]\n{frame}\n[/artifact-created-live]");
         assert!(calls.lock().unwrap().iter().any(|request|request["path"].as_str().unwrap().starts_with("PUT /api/v1/agent/links/document ")));
         release.send(()).unwrap();
+        let (_, updated) = tokio::time::timeout(UI_TIMEOUT, requests.recv()).await.unwrap().unwrap();
+        assert_eq!(updated["messages"].as_array().unwrap().iter().filter(|message| message["role"] == "tool").count(), 2,
+            "both private writes must return to the main conversation without a classifier request");
         pty.wait_for("creation run finished",|frame|frame.contains("CREATION-REPLY-FINISHED")).await;
+        {
+            let calls = calls.lock().unwrap();
+            let edits = calls.iter().filter(|request| request["body"]["method"] == "tools/call").collect::<Vec<_>>();
+            assert_eq!(edits.len(), 2);
+            assert_eq!(edits[1]["body"]["params"]["arguments"]["content"], "# Revised");
+            assert_eq!(edits[1]["body"]["params"]["_meta"]["tickloop.ai/publication"], json!({"audience":"private","membership_revision":0}));
+        }
         pty.close().await;
     }).catch_unwind().await;
     let stopped = std::process::Command::new(env!("CARGO_BIN_EXE_tickloop"))
@@ -137,5 +154,17 @@ async fn actual_cli_creation_adds_an_artifact_tick_before_the_next_model_reply()
     server.abort();
     if let Err(panic) = result {
         std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test]
+async fn actual_cli_creation_adds_an_artifact_tick_before_the_next_model_reply() {
+    for flags in [
+        vec!["--mode", "auto"],
+        vec!["--mode", "ask"],
+        vec!["--mode", "plan"],
+        vec!["--dangerously-skip-permissions"],
+    ] {
+        creation_adds_an_artifact_in_mode(&flags).await;
     }
 }

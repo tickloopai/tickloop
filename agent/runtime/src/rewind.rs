@@ -347,7 +347,7 @@ fn conversation_before(
     candidate.message_contexts.split_off(&index);
     candidate_bookkeeping.denial_references.split_off(&index);
     candidate.message_ids.split_off(&index);
-    candidate.original_user_message_ids.split_off(&index);
+    candidate.original_message_ids.split_off(&index);
     candidate.prompt_execution_modes.split_off(&index);
     candidate
         .inherited_prompts

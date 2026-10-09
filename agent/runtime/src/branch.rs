@@ -117,6 +117,7 @@ impl Agent {
         };
         let client = source.client.clone();
         let mut snapshot = ChatSnapshot {
+            subagent_reports: Default::default(),
             failure_events: Vec::new(),
             provider_failures: Default::default(),
             tool_call_recoveries: Vec::new(),
@@ -142,7 +143,7 @@ impl Agent {
             message_ids: BTreeMap::new(),
             agent_message_origins: source.snapshot.agent_message_origins.clone(),
             human_family_origins: source.snapshot.human_family_origins.clone(),
-            original_user_message_ids: BTreeMap::new(),
+            original_message_ids: BTreeMap::new(),
             prompt_execution_modes: BTreeMap::new(),
             inherited_prompts: HashSet::new(),
             message_compactions: BTreeMap::new(),
@@ -362,6 +363,12 @@ fn carry_rewind_points(
 ) {
     for (child_index, (_, source_index)) in seed.iter().enumerate() {
         if let Some(index) = source_index {
+            if let Some(message_id) = source.message_ids.get(index) {
+                child.message_ids.insert(child_index, *message_id);
+            }
+            if let Some(original_id) = source.original_message_ids.get(index) {
+                child.original_message_ids.insert(child_index, *original_id);
+            }
             if let Some(model) = source.message_models.get(index) {
                 child.message_models.insert(child_index, model.clone());
             }

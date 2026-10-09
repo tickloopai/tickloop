@@ -11,6 +11,8 @@ const MAX_CATALOG_RESPONSE_BYTES: usize = 256 * 1024;
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ArtifactMetadata {
     #[serde(default)]
+    pub publication: Option<tickloop_agent_protocol::ArtifactPublication>,
+    #[serde(default)]
     pub human_body_sequence: Option<u64>,
     #[serde(default)]
     pub human_body_updated_at: Option<String>,

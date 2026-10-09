@@ -48,7 +48,7 @@ fn link_exists(directory: &std::path::Path, name: &str) -> bool {
 }
 
 fn classification(should_block: bool) -> Vec<Content> {
-    text(&tickloop_agent_test_support::auto_findings(should_block).to_string())
+    text(&tickloop_agent_test_support::auto_classification(should_block).to_string())
 }
 
 fn tool_results(model: &ScriptedModel) -> Vec<String> {
@@ -144,10 +144,10 @@ async fn verified_malformed_or_truncated_reviews_retry_but_unverified_operations
         ),
         (
             ReviewerFailure::VerifiedMalformedResponse,
-            2,
-            "malformed verified structured result",
+            3,
+            "response does not match the JSON output contract",
         ),
-        (ReviewerFailure::OutputLimit, 2, "truncated"),
+        (ReviewerFailure::OutputLimit, 3, "truncated"),
         (ReviewerFailure::Refusal, 1, "refused"),
         (
             ReviewerFailure::UnexpectedToolOperation,
@@ -530,7 +530,7 @@ async fn an_overlong_auto_review_context_stops_a_headless_run() {
 }
 
 #[tokio::test]
-async fn invalid_classifications_request_a_human_after_one_retry() {
+async fn invalid_classifications_request_a_human_after_both_stages_fail() {
     let workspace = tempfile::tempdir().unwrap();
     let model = Arc::new(ScriptedModel::new(vec![
         call("link", "Bash", link_command("blocked")),
@@ -540,6 +540,7 @@ async fn invalid_classifications_request_a_human_after_one_retry() {
     let checker = Arc::new(ScriptedModel::new(vec![
         text("not a structured verdict"),
         text(r#"{"decision":"allow","reason":"the retired verdict format"}"#),
+        text("authorization also invalid"),
     ]));
     agent.set_auto_reviewer(checker.clone()).await;
     let chat = agent.create_chat(workspace.path().into()).await.unwrap();
@@ -570,7 +571,7 @@ async fn invalid_classifications_request_a_human_after_one_retry() {
     }
     {
         let requests = checker.requests.lock().unwrap();
-        assert_eq!(requests.len(), 2);
+        assert_eq!(requests.len(), 3);
         assert!(requests.iter().all(|request| {
             request.tools.is_empty()
                 && request.temperature == Some(0.0)
@@ -647,7 +648,10 @@ async fn automatic_allow_and_block_classifications_control_real_side_effects() {
             text("done"),
         ]));
         let agent = Agent::new_embedded(config(), model.clone());
-        let reviewer = Arc::new(ScriptedModel::new(vec![classification(should_block)]));
+        let reviewer = Arc::new(ScriptedModel::new(vec![
+            classification(should_block);
+            if should_block { 2 } else { 1 }
+        ]));
         agent.set_auto_reviewer(reviewer.clone()).await;
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
         agent
@@ -670,10 +674,7 @@ async fn automatic_allow_and_block_classifications_control_real_side_effects() {
                     };
                     assert_eq!(decision, expected);
                     if should_block {
-                        assert!(
-                            reason.contains("builtin.soft_deny.external_code"),
-                            "{reason}"
-                        );
+                        assert!(reason.contains("external-code restriction"), "{reason}");
                     } else {
                         assert!(!reason.is_empty());
                     }
@@ -687,7 +688,10 @@ async fn automatic_allow_and_block_classifications_control_real_side_effects() {
         }
         assert!(saw_check);
         assert_eq!(link_exists(directory.path(), "checked"), !should_block);
-        assert_eq!(reviewer.requests.lock().unwrap().len(), 1);
+        assert_eq!(
+            reviewer.requests.lock().unwrap().len(),
+            if should_block { 2 } else { 1 }
+        );
         agent.shutdown().await;
     }
 }
@@ -774,7 +778,7 @@ async fn an_auto_reviewer_denial_is_a_recoverable_tool_result() {
         call("link", "Bash", link_command("blocked")),
         text("I will use a safer approach."),
     ]));
-    let reviewer = Arc::new(ScriptedModel::new(vec![classification(true)]));
+    let reviewer = Arc::new(ScriptedModel::new(vec![classification(true); 2]));
     let agent = Agent::new_embedded(config(), model.clone());
     agent.set_auto_reviewer(reviewer).await;
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
@@ -801,8 +805,8 @@ async fn an_auto_reviewer_denial_is_a_recoverable_tool_result() {
     }
     assert!(!link_exists(directory.path(), "blocked"));
     assert!(tool_results(&model).iter().any(|result| {
-        result.starts_with("Permission for this action has been denied. Reason: Auto Soft deny")
-            && result.contains("builtin.soft_deny.external_code")
+        result.starts_with("Permission for this action has been denied. Reason:")
+            && result.contains("external-code restriction")
             && result.contains("should not* attempt to work around this denial")
     }));
     agent.shutdown().await;
@@ -817,11 +821,7 @@ async fn three_consecutive_auto_denials_require_user_intervention_before_more_mo
         call("link-3", "Bash", link_command("blocked-3")),
     ]));
     let denial = classification(true);
-    let reviewer = Arc::new(ScriptedModel::new(vec![
-        denial.clone(),
-        denial.clone(),
-        denial,
-    ]));
+    let reviewer = Arc::new(ScriptedModel::new(vec![denial; 6]));
     let agent = Agent::new_embedded(config(), model.clone());
     agent.set_auto_reviewer(reviewer.clone()).await;
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
@@ -842,7 +842,7 @@ async fn three_consecutive_auto_denials_require_user_intervention_before_more_mo
         }
     };
     assert_eq!(model.requests.lock().unwrap().len(), 3);
-    assert_eq!(reviewer.requests.lock().unwrap().len(), 3);
+    assert_eq!(reviewer.requests.lock().unwrap().len(), 6);
     assert_eq!(
         request.approval_source,
         PermissionApprovalSource::AutoReviewer
@@ -850,7 +850,7 @@ async fn three_consecutive_auto_denials_require_user_intervention_before_more_mo
     assert_eq!(
         request.approval_reason.as_deref(),
         Some(
-            "3 consecutive actions were blocked. Please review the transcript before continuing.\n\nLatest blocked action: Auto Soft deny builtin.soft_deny.external_code (Builtin { version: 2 }) applies without clearance"
+            "3 consecutive actions were blocked. Please review the transcript before continuing.\n\nLatest blocked action: The operation matches the external-code restriction without authorization"
         )
     );
     assert_eq!(
@@ -888,7 +888,7 @@ async fn human_approval_resets_consecutive_auto_denials() {
     outputs.push(text("Continue with the remaining work."));
     let agent = Agent::new_embedded(config(), Arc::new(ScriptedModel::new(outputs)));
     agent
-        .set_auto_reviewer(Arc::new(ScriptedModel::new(vec![classification(true); 4])))
+        .set_auto_reviewer(Arc::new(ScriptedModel::new(vec![classification(true); 8])))
         .await;
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     agent
@@ -933,8 +933,8 @@ async fn human_approval_resets_consecutive_auto_denials() {
 }
 
 #[tokio::test]
-async fn headless_uncertainty_and_service_failure_do_not_trigger_the_denial_limit() {
-    for uncertain in [false, true] {
+async fn headless_invalid_classification_and_service_failure_do_not_trigger_the_denial_limit() {
+    for invalid_classification in [false, true] {
         let directory = tempfile::tempdir().unwrap();
         let mut outputs = (1..=3)
             .map(|index| {
@@ -955,9 +955,9 @@ async fn headless_uncertainty_and_service_failure_do_not_trigger_the_denial_limi
                 prompt_policy: PromptPolicy::DenyOnPrompt,
             },
         );
-        if uncertain {
-            let mut findings = tickloop_agent_test_support::auto_findings(false);
-            findings["task_scope"] = json!("uncertain");
+        if invalid_classification {
+            let mut findings = tickloop_agent_test_support::auto_classification(false);
+            findings["decision"] = json!("invalid");
             agent
                 .set_auto_reviewer(Arc::new(ScriptedModel::new(vec![
                     text(
@@ -1067,11 +1067,7 @@ async fn headless_auto_mode_stops_the_run_after_repeated_classifier_denials() {
         call("link-3", "Bash", link_command("blocked-3")),
     ]));
     let denial = classification(true);
-    let reviewer = Arc::new(ScriptedModel::new(vec![
-        denial.clone(),
-        denial.clone(),
-        denial,
-    ]));
+    let reviewer = Arc::new(ScriptedModel::new(vec![denial; 6]));
     let agent = Agent::new_with_options(
         config(),
         model.clone(),
@@ -1097,7 +1093,7 @@ async fn headless_auto_mode_stops_the_run_after_repeated_classifier_denials() {
     };
     assert!(error.contains("Agent aborted: too many classifier denials in headless mode"));
     assert_eq!(model.requests.lock().unwrap().len(), 3);
-    assert_eq!(reviewer.requests.lock().unwrap().len(), 3);
+    assert_eq!(reviewer.requests.lock().unwrap().len(), 6);
     agent.shutdown().await;
 }
 
@@ -1122,7 +1118,7 @@ async fn twenty_total_auto_denials_require_user_intervention_even_when_successes
     }
     let model = Arc::new(ScriptedModel::new(model_outputs));
     let reviewer = Arc::new(ScriptedModel::new(
-        (0..20).map(|_| classification(true)).collect(),
+        (0..40).map(|_| classification(true)).collect(),
     ));
     let agent = Agent::new_embedded(config(), model.clone());
     agent.set_auto_reviewer(reviewer.clone()).await;
@@ -1144,7 +1140,7 @@ async fn twenty_total_auto_denials_require_user_intervention_even_when_successes
         }
     };
     assert_eq!(model.requests.lock().unwrap().len(), 39);
-    assert_eq!(reviewer.requests.lock().unwrap().len(), 20);
+    assert_eq!(reviewer.requests.lock().unwrap().len(), 40);
     assert!(request.approval_reason.as_deref().is_some_and(|reason| reason
         .starts_with("20 actions were blocked this session. Please review the transcript before continuing.")));
     agent
@@ -1181,7 +1177,7 @@ async fn human_escalation_preserves_total_until_twenty_and_then_restarts_countin
     }
     let agent = Agent::new_embedded(config(), Arc::new(ScriptedModel::new(outputs)));
     agent
-        .set_auto_reviewer(Arc::new(ScriptedModel::new(vec![classification(true); 23])))
+        .set_auto_reviewer(Arc::new(ScriptedModel::new(vec![classification(true); 46])))
         .await;
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     agent
@@ -1649,7 +1645,7 @@ async fn auto_sends_sensitive_workspace_writes_to_the_classifier_and_accept_edit
             ),
             text("done"),
         ]));
-        let reviewer = Arc::new(ScriptedModel::new(vec![classification(true)]));
+        let reviewer = Arc::new(ScriptedModel::new(vec![classification(true); 2]));
         let agent = Agent::new_embedded(config(), model);
         agent.set_auto_reviewer(reviewer.clone()).await;
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
@@ -1686,7 +1682,7 @@ async fn auto_sends_sensitive_workspace_writes_to_the_classifier_and_accept_edit
         assert!(!directory.path().join(".git/config").exists());
         assert_eq!(
             reviewer.requests.lock().unwrap().len(),
-            usize::from(mode == ExecutionMode::Auto)
+            2 * usize::from(mode == ExecutionMode::Auto)
         );
         agent.shutdown().await;
     }

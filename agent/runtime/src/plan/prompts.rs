@@ -4,6 +4,8 @@
 
 use std::path::Path;
 
+use crate::mcp_tools::ARTIFACT_EDIT_TOOL;
+
 use tickloop_agent_tools::{
     ASK_USER_QUESTION_TOOL_NAME, EDIT_TOOL_NAME, ENTER_PLAN_MODE_TOOL_NAME,
     EXIT_PLAN_MODE_TOOL_NAME, GLOB_TOOL_NAME, GREP_TOOL_NAME, READ_TOOL_NAME, WRITE_TOOL_NAME,
@@ -147,7 +149,7 @@ In plan mode, you should:
 5. Design a concrete implementation strategy
 6. When ready, use {EXIT_PLAN_MODE_TOOL_NAME} to present your plan for approval
 
-Remember: DO NOT write or edit any files except the plan file. This is a read-only exploration and planning phase."
+Remember: DO NOT write or edit any files except the plan file. {ARTIFACT_EDIT_TOOL} may also create or revise Artifact documents, subject to the host's permission checks. Stay in Plan mode for this; the host handles the first-publication confirmation. This is an exploration and planning phase."
     )
 }
 
@@ -222,11 +224,11 @@ pub(crate) fn plan_mode_reminder(plan_file: &Path, plan_exists: bool) -> String 
     format!(
         "# Plan mode
 
-Plan mode is active. The user indicated that they do not want you to execute yet -- you MUST NOT make any edits (with the exception of the plan file mentioned below), run any non-readonly tools (including changing configs or making commits), or otherwise make any changes to the system. This supercedes any other instructions you have received.
+Plan mode is active. The user indicated that they do not want you to execute yet -- you MUST NOT make any edits (except the plan file mentioned below and Artifact documents through {ARTIFACT_EDIT_TOOL}), run other non-readonly tools (including changing configs or making commits), or otherwise make any changes to the system. {ARTIFACT_EDIT_TOOL} may create or revise an Artifact while staying in Plan mode. The host handles the first-publication confirmation and checks the current audience and permission rules before each write. This supersedes other instructions to implement changes.
 
 ## Plan File Info:
 {plan_file_info}
-You should build your plan incrementally by writing to or editing this file. NOTE that this is the only file you are allowed to edit - other than this you are only allowed to take READ-ONLY actions.
+You should build your plan incrementally by writing to or editing this file. This is the only filesystem file you may edit. You may also present your research or plan in an Artifact through {ARTIFACT_EDIT_TOOL}, subject to the host's permission checks. All other actions must be READ-ONLY.
 
 ## Iterative Planning Workflow
 
@@ -475,7 +477,10 @@ mod tests {
             "A plan file already exists at /root/plans/calm-baking-aurora-loop-x.md. You can read it and make incremental edits using the Edit tool."
         ));
         for reminder in [missing, existing] {
-            assert!(reminder.contains("NOTE that this is the only file you are allowed to edit"));
+            assert!(reminder.contains("This is the only filesystem file you may edit."));
+            assert!(reminder.contains(
+                "ArtifactEdit may create or revise an Artifact while staying in Plan mode."
+            ));
             assert!(
                 reminder.contains("- Calling ExitPlanMode when the plan is ready for approval")
             );

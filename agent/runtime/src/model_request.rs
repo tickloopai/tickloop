@@ -448,7 +448,23 @@ impl Agent {
             MAX_MODEL_ERROR_RETRIES + 1
         };
         let model_context = ModelRequestContext::new(max_attempts);
+        let deadline = tracking
+            .timeout
+            .filter(|_| context.kind == ModelRequestKind::PermissionCheck)
+            .map(|timeout| tokio::time::Instant::now() + timeout);
         loop {
+            if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+                let (error, outcome) = if cancel.is_cancelled() {
+                    (ModelError::Cancelled, RequestOutcome::Cancelled)
+                } else {
+                    (ModelError::TimedOut, RequestOutcome::TimedOut)
+                };
+                if let Some(sequence) = tracking.first_sequence.take() {
+                    self.finish_model_request(context.owner.chat_id, sequence, outcome)
+                        .await?;
+                }
+                return Err(error.into());
+            }
             let sequence = if let Some(sequence) = tracking.first_sequence.take() {
                 sequence
             } else {
@@ -479,7 +495,11 @@ impl Agent {
                     request.clone(),
                     cancel.clone(),
                     RequestTracking {
-                        timeout: tracking.timeout,
+                        timeout: deadline
+                            .map(|deadline| {
+                                deadline.saturating_duration_since(tokio::time::Instant::now())
+                            })
+                            .or(tracking.timeout),
                         captured_text: Some(&mut attempt_text),
                         output_started: Some(&mut output_started),
                         model_context: Some(model_context.clone()),
@@ -499,6 +519,9 @@ impl Agent {
                 _ => None,
             };
             if let Some((delay, max_retries, error)) = retry {
+                let delay = deadline.map_or(delay, |deadline| {
+                    delay.min(deadline.saturating_duration_since(tokio::time::Instant::now()))
+                });
                 if let Some(receipt) = context.retry_receipt() {
                     let mut chats = self.inner.chats.lock().await;
                     let chat = chats

@@ -38,6 +38,17 @@ pub fn herdr_adapter_pane(pane: HerdrPane) -> tickhost_connect::herdr::Pane {
 pub enum HostToolPermission {
     ReadOnly,
     Automatic,
+    /// Agent actions reviewed in Auto and Plan. Claude's delegation review also
+    /// runs after an ordinary Allow; an allowed SendMessage skips review.
+    Classified {
+        allow_rule_bypasses_review: bool,
+    },
+    /// A private document write from the fixed Artifact service, without runtime capabilities.
+    PrivateArtifactWrite,
+    /// The first write to a publicly shared Artifact in this conversation.
+    PublicArtifactWrite,
+    /// A subsequent write to an Artifact with the same admitted audience in this conversation.
+    ArtifactContinuation,
     /// A mutation governed by the Chat execution mode and ordinary approval policy.
     Reviewable,
     /// A host requirement for human confirmation, independent of execution mode.

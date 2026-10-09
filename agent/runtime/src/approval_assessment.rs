@@ -153,7 +153,7 @@ fn verdict_facts(context: &ApprovalSnapshot, verdict: &AutoReview) -> VerdictFac
                     .find(|rule| rule.id == *id)
                     .cloned()
             }),
-            block_evidence: Some(evidence.clone()),
+            block_evidence: evidence.clone(),
         },
         AutoReview::Ask { reason, .. } => VerdictFacts {
             outcome: ApprovalOutcome::NeedsHuman,

@@ -1192,7 +1192,7 @@ fn chain_entry(
             .get(&index)
             .and_then(|mode| serde_json::to_value(mode).ok()),
         is_inherited_prompt: snapshot.inherited_prompts.contains(&index),
-        original_user_message_id: snapshot.original_user_message_ids.get(&index).copied(),
+        original_message_id: snapshot.original_message_ids.get(&index).copied(),
         human_family_origin: snapshot.human_family_origins.get(&uuid).cloned(),
         agent_message_origin: snapshot
             .message_ids
@@ -1243,6 +1243,9 @@ fn loop_entry_content(
 ) -> LoopEntryContent {
     (
         LoopRecord {
+            subagent_report: goal
+                .run_id
+                .and_then(|run| snapshot.subagent_reports.get(&run).cloned()),
             failure_events: snapshot
                 .failure_events
                 .iter()
@@ -1344,7 +1347,7 @@ fn record_loop(
         is_meta: false,
         execution_mode: None,
         is_inherited_prompt: false,
-        original_user_message_id: None,
+        original_message_id: None,
         agent_message_origin: None,
         human_family_origin: None,
         run_id,
@@ -1472,7 +1475,7 @@ struct RestoredChain {
     message_ids: BTreeMap<usize, Uuid>,
     agent_message_origins: BTreeMap<Uuid, serde_json::Value>,
     human_family_origins: BTreeMap<Uuid, DirectedHumanSource>,
-    original_user_message_ids: BTreeMap<usize, Uuid>,
+    original_message_ids: BTreeMap<usize, Uuid>,
     prompt_execution_modes: BTreeMap<usize, ExecutionMode>,
     inherited_prompts: HashSet<usize>,
     message_compactions: BTreeMap<usize, CompactionMarker>,
@@ -1504,7 +1507,7 @@ fn restore_chain(chain: &[ChainEntry]) -> (RestoredChain, Vec<String>) {
         message_ids: BTreeMap::new(),
         agent_message_origins: BTreeMap::new(),
         human_family_origins: BTreeMap::new(),
-        original_user_message_ids: BTreeMap::new(),
+        original_message_ids: BTreeMap::new(),
         prompt_execution_modes: BTreeMap::new(),
         inherited_prompts: HashSet::new(),
         message_compactions: BTreeMap::new(),
@@ -1571,6 +1574,7 @@ fn restore_chain(chain: &[ChainEntry]) -> (RestoredChain, Vec<String>) {
             continue;
         }
         let index = restored.messages.len();
+        restored.message_ids.insert(index, entry.uuid);
         if let Some(model) = entry
             .model
             .clone()
@@ -1592,9 +1596,6 @@ fn restore_chain(chain: &[ChainEntry]) -> (RestoredChain, Vec<String>) {
             restored.meta_messages.insert(index);
         }
         if let Some(marker) = compaction_marker(entry) {
-            if matches!(marker, CompactionMarker::Boundary(_)) {
-                restored.message_ids.insert(index, entry.uuid);
-            }
             restored.message_compactions.insert(index, marker);
         }
         if entry.is_inherited_prompt {
@@ -1606,13 +1607,12 @@ fn restore_chain(chain: &[ChainEntry]) -> (RestoredChain, Vec<String>) {
                 .insert(entry.uuid, origin.clone());
         }
         if let Some(origin) = &entry.agent_message_origin {
-            restored.message_ids.insert(index, entry.uuid);
             restored
                 .agent_message_origins
                 .insert(entry.uuid, origin.clone());
         }
-        if let Some(source_id) = entry.original_user_message_id {
-            restored.original_user_message_ids.insert(index, source_id);
+        if let Some(source_id) = entry.original_message_id {
+            restored.original_message_ids.insert(index, source_id);
         }
         if let Some(usage) = entry
             .usage
@@ -1646,7 +1646,6 @@ fn restore_chain(chain: &[ChainEntry]) -> (RestoredChain, Vec<String>) {
             restored
                 .prompt_execution_modes
                 .insert(index, execution_mode);
-            restored.message_ids.insert(index, entry.uuid);
         }
         restored.links.push(MessageLink {
             uuids: vec![entry.uuid],
@@ -1703,7 +1702,7 @@ impl RestoredChain {
             message_ids: BTreeMap::new(),
             agent_message_origins: self.agent_message_origins.clone(),
             human_family_origins: self.human_family_origins.clone(),
-            original_user_message_ids: BTreeMap::new(),
+            original_message_ids: BTreeMap::new(),
             prompt_execution_modes: BTreeMap::new(),
             inherited_prompts: HashSet::new(),
             message_compactions: BTreeMap::new(),
@@ -1743,8 +1742,8 @@ impl RestoredChain {
             if let Some(id) = self.message_ids.get(&original) {
                 kept.message_ids.insert(index, *id);
             }
-            if let Some(id) = self.original_user_message_ids.get(&original) {
-                kept.original_user_message_ids.insert(index, *id);
+            if let Some(id) = self.original_message_ids.get(&original) {
+                kept.original_message_ids.insert(index, *id);
             }
             if let Some(mode) = self.prompt_execution_modes.get(&original) {
                 kept.prompt_execution_modes.insert(index, *mode);
@@ -1919,7 +1918,7 @@ impl RestoredChain {
         snapshot.message_ids = self.message_ids.clone();
         snapshot.agent_message_origins = self.agent_message_origins.clone();
         snapshot.human_family_origins = self.human_family_origins.clone();
-        snapshot.original_user_message_ids = self.original_user_message_ids.clone();
+        snapshot.original_message_ids = self.original_message_ids.clone();
         snapshot.prompt_execution_modes = self.prompt_execution_modes.clone();
         snapshot.inherited_prompts = self.inherited_prompts.clone();
         snapshot.message_usage = self.message_usage.clone();
@@ -1957,6 +1956,9 @@ impl RestoredChain {
         snapshot.resume_triggers.clear();
         snapshot.failure_events.clear();
         for (position, (record, run_id)) in &self.loop_records {
+            if let (Some(run), Some(report)) = (run_id, &record.subagent_report) {
+                snapshot.subagent_reports.insert(*run, report.clone());
+            }
             let Ok(state) = serde_json::from_value::<LoopState>(record.state.clone()) else {
                 continue;
             };
@@ -2147,7 +2149,7 @@ fn file_history_snapshots(loaded: &LoadedTranscript) -> Vec<FileHistorySnapshot>
 }
 
 impl Agent {
-    pub(super) async fn checkpoint_plan_approval(
+    pub(super) async fn checkpoint_transcript(
         &self,
         snapshot: &ChatSnapshot,
         bookkeeping: &ChatBookkeeping,
@@ -2158,7 +2160,7 @@ impl Agent {
         recorder.enqueue_sync(snapshot, bookkeeping);
         let path = recorder
             .path_for_chat(snapshot.id)
-            .ok_or("Plan approval has no Transcript path")?;
+            .ok_or("Chat checkpoint has no Transcript path")?;
         let writer = recorder.writer.clone();
         tokio::task::spawn_blocking(move || writer.checkpoint_blocking(&path))
             .await
@@ -2689,7 +2691,7 @@ impl Agent {
                 }
             }
         }
-        self.checkpoint_plan_approval(&snapshot, &bookkeeping)
+        self.checkpoint_transcript(&snapshot, &bookkeeping)
             .await
             .map_err(AgentError::Storage)?;
         let tools = self.create_chat_tools(&snapshot);

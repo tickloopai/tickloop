@@ -186,7 +186,9 @@ async fn plan_mode_requests_name_the_current_loop_plan_file_as_the_only_editable
     for expected in [
         "Plan mode is active.",
         "No plan file exists yet. You should create your plan at",
-        "NOTE that this is the only file you are allowed to edit",
+        "This is the only filesystem file you may edit.",
+        "ArtifactEdit may create or revise an Artifact while staying in Plan mode.",
+        "The host handles the first-publication confirmation",
         "Calling ExitPlanMode when the plan is ready for approval",
     ] {
         assert!(planning.contains(expected), "{expected}\n{planning}");

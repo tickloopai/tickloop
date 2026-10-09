@@ -432,7 +432,7 @@ async fn builtin_model_and_rules_apply_after_restart_without_context_tuning() {
         "fixture-settings-key",
     )
     .unwrap();
-    let shell = json!({"command":"printf persisted"});
+    let shell = json!({"command":"env sh -c 'printf persisted'"});
     let first = Agent::open_embedded(
         root.clone(),
         config(),
@@ -529,7 +529,7 @@ async fn a_saved_shell_rule_applies_immediately_to_the_current_session() {
     let root = directory.path().join("root");
     let workdir = directory.path().join("work");
     std::fs::create_dir_all(&workdir).unwrap();
-    let input = json!({"command":"printf allowed >> trace.txt"});
+    let input = json!({"command":"env sh -c 'printf allowed >> trace.txt'"});
     let model = Arc::new(ScriptedModel::new(vec![
         call("first", "Bash", input.clone()),
         text("first done"),
@@ -594,7 +594,7 @@ async fn a_saved_shell_rule_applies_immediately_to_the_current_session() {
     assert_eq!(saved.len(), 1);
     assert_eq!(
         saved[0].specifier.as_deref(),
-        Some("printf allowed >> trace.txt")
+        Some("env sh -c 'printf allowed >> trace.txt'")
     );
     agent.shutdown().await;
 }

@@ -118,7 +118,7 @@ impl ModelClient for HeldReviewer {
                 _ = cancel.cancelled() => return Err(ModelError::Cancelled),
                 _ = self.release.notified() => {}
             }
-            text(&tickloop_agent_test_support::auto_findings(false).to_string())
+            text(&tickloop_agent_test_support::auto_classification(false).to_string())
         } else if self.normal_calls.fetch_add(1, Ordering::SeqCst) == 0 {
             call(
                 "held-write",

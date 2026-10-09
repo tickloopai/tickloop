@@ -97,7 +97,7 @@ impl ModelClient for ChatModel {
                     _ = gate.release.notified() => {}
                 }
             }
-            text(&tickloop_agent_test_support::auto_findings(false).to_string())
+            text(&tickloop_agent_test_support::auto_classification(false).to_string())
         } else {
             let index = self.normal_requests.fetch_add(1, Ordering::SeqCst);
             if index.is_multiple_of(2) {
@@ -432,7 +432,7 @@ async fn read_judgment_request(socket: &mut tokio::net::TcpStream) -> (String, s
 fn approving_judgment(body: &serde_json::Value) -> serde_json::Value {
     let answers = body["questions"].as_object().unwrap().iter().map(|(id, question)| {
         let criteria = question["criteria"].as_object().unwrap();
-        let choice = if id == "task_scope" { "within_task" } else if id == "route" { "help" } else if id.starts_with("clear:") { "missing" } else { "absent" };
+        let choice = if id == "route" { "help" } else { "allow" };
         assert!(criteria.contains_key(choice), "fixture answer must be one of the requested options");
         let probabilities = criteria.keys().map(|key| (key.clone(), json!(f64::from(key == choice)))).collect::<serde_json::Map<_, _>>();
         (id.clone(), json!({"type":"choice","choice":choice,"confidence":1.0,"probabilities":probabilities}))

@@ -521,6 +521,12 @@ fn detail_lines(record: &ApprovalRecord) -> Vec<DetailLine> {
             };
             let outcome = match attempt.outcome {
                 ApprovalAttemptOutcome::Allow => "allowed",
+                ApprovalAttemptOutcome::Block
+                    if attempt.stage
+                        == Some(tickloop_agent_protocol::ApprovalStage::RiskScreen) =>
+                {
+                    "potential risk"
+                }
                 ApprovalAttemptOutcome::Block => "denied",
                 ApprovalAttemptOutcome::NeedsHuman => "requires a human",
                 ApprovalAttemptOutcome::TechnicalFailure => "call failed",

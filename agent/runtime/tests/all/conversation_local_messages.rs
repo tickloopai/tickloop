@@ -271,7 +271,7 @@ async fn interrupting_a_tool_call_answers_it_and_records_the_tool_use_marker() {
         call(
             "shell-call",
             "Bash",
-            json!({"command": "printf a; printf b"}),
+            json!({"command": "env sh -c 'printf a; printf b'"}),
         ),
         text("Understood"),
     ]));

@@ -181,6 +181,55 @@ async fn cancelled_requests_make_no_connection() {
 }
 
 #[test]
+fn accepts_only_normalized_or_feasibly_rounded_choice_probabilities() {
+    let mut question = request();
+    let Question::Choice { criteria, .. } = question.questions.get_mut("route").unwrap() else {
+        panic!()
+    };
+    criteria.insert("review".into(), Value::Null);
+    criteria.insert("other".into(), Value::Null);
+    for (probabilities, accepted) in [
+        (
+            json!({"help":0.93,"sales":0.04,"review":0.01,"other":0.01}),
+            true,
+        ),
+        (
+            json!({"help":0.93,"sales":0.04,"review":0.02,"other":0.02}),
+            true,
+        ),
+        (
+            json!({"help":0.93,"sales":0.01,"review":0.01,"other":0.01}),
+            false,
+        ),
+        (
+            json!({"help":0.93,"sales":0.05,"review":0.05,"other":0.05}),
+            false,
+        ),
+        (
+            json!({"help":0.931,"sales":0.04,"review":0.01,"other":0.01}),
+            false,
+        ),
+        (
+            json!({"help":0.0,"sales":0.0,"review":0.0,"other":0.0}),
+            false,
+        ),
+    ] {
+        let mut value = response();
+        value["answers"]["route"]["probabilities"] = probabilities.clone();
+        let evaluation: Evaluation = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            evaluation.validate(&question).is_ok(),
+            accepted,
+            "{probabilities}"
+        );
+        assert_eq!(
+            serde_json::to_value(&evaluation).unwrap()["answers"]["route"]["probabilities"],
+            probabilities
+        );
+    }
+}
+
+#[test]
 fn rejects_mismatched_missing_and_invalid_answers() {
     let valid: Evaluation = serde_json::from_value(response()).unwrap();
     valid.validate(&request()).unwrap();
@@ -256,4 +305,113 @@ async fn live_mixed_typed_questions() {
         "Mixed Choice/Score/Noul: model={}, usage={:?}",
         result.model, result.usage
     );
+}
+
+#[tokio::test]
+async fn server_context_limit_preserves_large_request_and_redacts_error_body() {
+    for (status, body, context_limit) in [
+        (
+            400,
+            json!({"detail":{"error_type":"max_tokens_exceeded"},"padding":"x".repeat(20 * 1024)}),
+            false,
+        ),
+        (
+            413,
+            json!({"detail":"capacity-test-secret private diagnostic"}),
+            true,
+        ),
+        (
+            400,
+            json!({"detail":{"error_type":"max_tokens_exceeded"}, "private":"capacity-test-secret"}),
+            true,
+        ),
+        (
+            400,
+            json!({"detail":{"error_type":"invalid_question"}, "message":"max_tokens_exceeded capacity-test-secret"}),
+            false,
+        ),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap().join("state");
+        save_api_key(&root, "TYPESAFE_API_KEY", "capacity-test-secret").unwrap();
+        let (endpoint, captured, task) = server(vec![(status, body.to_string())]).await;
+        let client = JevClient::new(
+            JevConfig {
+                endpoint,
+                ..Default::default()
+            },
+            Some(root),
+        )
+        .unwrap();
+        let mut proposed = request();
+        proposed.state = json!({"policy": "Complete policy text. ".repeat(4_000)});
+        let error = client
+            .evaluate(&proposed, CancellationToken::new())
+            .await
+            .unwrap_err();
+        if context_limit {
+            assert!(matches!(
+                error.error,
+                ModelError::ResponseRejected(
+                    tickloop_agent_model::ModelResponseRejection::ContextLimit
+                )
+            ));
+        } else {
+            assert!(matches!(
+                error.error,
+                ModelError::HttpResponse { status: 400, .. }
+            ));
+        }
+        assert!(!format!("{error:?}").contains("capacity-test-secret"));
+        task.await.unwrap();
+        let captured = captured.lock().await;
+        assert_eq!(captured.len(), 1);
+        let body: Value =
+            serde_json::from_str(captured[0].split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(body["state"], proposed.state);
+    }
+}
+
+#[tokio::test]
+async fn waiting_for_a_context_error_body_remains_cancellable() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap().join("state");
+    save_api_key(&root, "TYPESAFE_API_KEY", "cancel-test-secret").unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/v1/systemone", listener.local_addr().unwrap());
+    let (started, ready) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut received = [0; 4096];
+        assert!(stream.read(&mut received).await.unwrap() > 0);
+        stream.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: 128\r\n\r\n{\"detail\":").await.unwrap();
+        started.send(()).unwrap();
+        std::future::pending::<()>().await;
+    });
+    let client = JevClient::new(
+        JevConfig {
+            endpoint,
+            ..Default::default()
+        },
+        Some(root),
+    )
+    .unwrap();
+    let cancel = CancellationToken::new();
+    let request_cancel = cancel.clone();
+    let mut evaluation =
+        tokio::spawn(async move { client.evaluate(&request(), request_cancel).await });
+    ready.await.unwrap();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), &mut evaluation)
+            .await
+            .is_err()
+    );
+    cancel.cancel();
+    let error = tokio::time::timeout(std::time::Duration::from_secs(2), evaluation)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(error.error, ModelError::Cancelled));
+    server.abort();
 }

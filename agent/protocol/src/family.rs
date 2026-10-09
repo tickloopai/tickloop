@@ -13,6 +13,20 @@ use crate::{
 };
 
 pub const SEND_AGENT_MESSAGE_TOOL_NAME: &str = "SendMessage";
+pub const SUBAGENT_HANDBACK_TOOL_NAME: &str = "SubagentHandback";
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum SubagentReport {
+    Pending {
+        reminders: u8,
+    },
+    Delivered {
+        message_id: Uuid,
+        report: String,
+        review: Box<crate::ApprovalAssessmentDetails>,
+    },
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct VerifiedUserRelay {
@@ -166,4 +180,6 @@ pub struct DelegationMetadata {
     pub ceiling: DelegationCeiling,
     #[serde(default)]
     pub trusted_user_inputs: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trusted_reply_history: Option<Value>,
 }

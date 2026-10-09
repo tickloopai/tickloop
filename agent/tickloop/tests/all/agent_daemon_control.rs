@@ -631,13 +631,14 @@ async fn verify_stopped_and_restart(
     fixture.daemon_epoch = None;
 }
 
-/// The command line `ps` shows for `process_id`.
+/// The command line the kernel records for the fixture-owned process.
 fn process_arguments(process_id: u32) -> String {
-    let output = std::process::Command::new("/bin/ps")
-        .args(["-o", "command=", "-p", &process_id.to_string()])
-        .output()
-        .unwrap();
-    String::from_utf8_lossy(&output.stdout).into_owned()
+    tickhost::process::arguments(process_id)
+        .expect("the fixture-owned process arguments must be readable")
+        .iter()
+        .map(|argument| argument.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -675,11 +676,11 @@ async fn explicit_cli_stop_ends_current_daemon_and_active_worker_preserving_save
     assert_eq!(worker.daemon_epoch(), epoch);
     assert!(
         process_arguments(daemon.protocol().process_id).contains(" daemon run "),
-        "ps names the daemon by its role"
+        "the kernel command line names the daemon by its role"
     );
     assert!(
         process_arguments(worker.protocol().process_id).contains(" worker "),
-        "ps names the worker by its role"
+        "the kernel command line names the worker by its role"
     );
     let record = TranscriptRef {
         store_root: fixture.config.clone(),

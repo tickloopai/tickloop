@@ -28,9 +28,10 @@ use crate::{
     },
     mcp_http::McpHttpClient,
 };
-use tickloop_agent_artifacts::{ArtifactClient, CredentialSnapshot};
+use tickloop_agent_artifacts::{ArtifactClient, ArtifactError, CredentialSnapshot};
 use tickloop_agent_protocol::{
-    ChatId, HostCallContext, HostEndpointIdentity, HostToolAuthority, ToolDefinition, ToolResult,
+    ArtifactAudience, ArtifactPublication, ChatId, HostCallContext, HostEndpointIdentity,
+    HostToolAuthority, ToolDefinition, ToolResult,
 };
 
 pub const ARTIFACT_READ_TOOL: &str = "ArtifactRead";
@@ -45,6 +46,7 @@ pub const ARTIFACT_TOOL_NAMES: [&str; 3] = [
 
 const SERVER_NAME: &str = "tickloop-docs";
 const EVENT_CONTEXT_META: &str = "tickloop.ai/event-bridge";
+const PUBLICATION_META: &str = "tickloop.ai/publication";
 const MAX_TOOLS: usize = 128;
 const DIRECTORY_TIMEOUT: Duration = Duration::from_secs(30);
 const CALL_TIMEOUT: Duration = Duration::from_secs(45);
@@ -53,6 +55,7 @@ const MAX_APPROVAL_INPUT_BYTES: usize = 32 * 1024;
 const MAX_APPROVAL_COLLECTION_ITEMS: usize = 64;
 const MAX_APPROVAL_DEPTH: usize = 8;
 const MAX_IDENTIFIER_BYTES: usize = 256;
+const MAX_ARTIFACT_TITLE_UTF16_UNITS: usize = 200;
 
 #[derive(Clone)]
 struct DiscoveredTool {
@@ -71,6 +74,40 @@ struct PreparedMcpCall {
     credential: CredentialSnapshot,
     fingerprint: [u8; 32],
     arguments: Value,
+    publication: Option<ArtifactPublication>,
+    read_owned: Option<bool>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ArtifactPublicationAdmission {
+    chat: ChatId,
+    account: String,
+    origin: String,
+    artifact: String,
+    audience: ArtifactAudience,
+}
+
+fn artifact_update_id<'a>(name: &str, input: &'a Value) -> Option<&'a str> {
+    if name != ARTIFACT_EDIT_TOOL {
+        return None;
+    }
+    let fields = input.as_object()?;
+    let valid_fields = match input["action"].as_str()? {
+        "patch" => fields.len() == 3 && input["patches"].is_array(),
+        "replace" => {
+            fields.len() == 4 && input["expected_revision"].is_u64() && input["content"].is_string()
+        }
+        _ => false,
+    };
+    valid_fields
+        .then(|| bounded_identifier(input.get("artifact_id")))
+        .flatten()
+}
+
+fn artifact_read_id<'a>(name: &str, input: &'a Value) -> Option<&'a str> {
+    (name == ARTIFACT_READ_TOOL && matches!(input["action"].as_str(), Some("read" | "threads")))
+        .then(|| bounded_identifier(input.get("artifact_id")))
+        .flatten()
 }
 
 fn bounded_identifier(value: Option<&Value>) -> Option<&str> {
@@ -115,15 +152,57 @@ pub struct McpHostToolProvider {
     native: Option<Arc<dyn HostToolProvider>>,
     directory: RwLock<Option<Directory>>,
     service_status: RwLock<ArtifactServiceStatus>,
+    publication_admissions: RwLock<HashSet<ArtifactPublicationAdmission>>,
 }
 
 impl McpHostToolProvider {
+    async fn artifact_read_is_owned(
+        &self,
+        id: &str,
+        credential: &CredentialSnapshot,
+        cancel: CancellationToken,
+    ) -> Result<bool, String> {
+        tokio::select! {
+            () = cancel.cancelled() => Err("MCP call cancelled".into()),
+            result = self.artifact.read_with_credential(id, credential) => match result {
+                Ok(metadata) if metadata.id != id => Err("Artifact metadata identity does not match the requested artifact".into()),
+                Ok(metadata) => Ok(metadata.access_role == "owner"),
+                Err(ArtifactError::Connection | ArtifactError::InvalidResponse
+                    | ArtifactError::Service { status: 500..=599, .. }
+                    | ArtifactError::Http(500..=599)) => Ok(false),
+                Err(_) => Err("Artifact access could not be verified for this account".into()),
+            }
+        }
+    }
+
+    fn operation_permission(tool: &DiscoveredTool, input: &Value) -> HostToolPermission {
+        let ordinary_creation = tool.definition.name == ARTIFACT_EDIT_TOOL
+            && has_action(input, "create")
+            && input.as_object().is_some_and(|fields| {
+                fields.len() == 4
+                    && fields.keys().all(|key| {
+                        matches!(key.as_str(), "action" | "title" | "format" | "content")
+                    })
+            })
+            && input["title"].as_str().is_some_and(|title| {
+                !title.trim().is_empty()
+                    && title.encode_utf16().count() <= MAX_ARTIFACT_TITLE_UTF16_UNITS
+            })
+            && matches!(input["format"].as_str(), Some("markdown" | "html"))
+            && input["content"].is_string();
+        if ordinary_creation {
+            HostToolPermission::PrivateArtifactWrite
+        } else {
+            tool.permission
+        }
+    }
     pub fn new(artifact: ArtifactClient, native: Option<Arc<dyn HostToolProvider>>) -> Self {
         Self {
             artifact: Arc::new(artifact),
             native,
             directory: RwLock::new(None),
             service_status: RwLock::new(ArtifactServiceStatus::default()),
+            publication_admissions: RwLock::new(HashSet::new()),
         }
     }
 
@@ -630,7 +709,7 @@ impl HostToolProvider for McpHostToolProvider {
 
     fn permission(&self, chat_id: ChatId, name: &str, input: &Value) -> HostToolPermission {
         if let Some((tool, _, _)) = self.directory_tool(name) {
-            return tool.permission;
+            return Self::operation_permission(&tool, input);
         }
         self.native
             .as_ref()
@@ -684,27 +763,96 @@ impl HostToolProvider for McpHostToolProvider {
         if Self::credential_key(&credential) != expected_key {
             return Err("Artifact account changed before MCP preparation".into());
         }
+        let read_owned = if let Some(id) = artifact_read_id(name, input) {
+            Some(
+                self.artifact_read_is_owned(id, &credential, cancel.clone())
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let publication = if let Some(id) = artifact_update_id(name, input) {
+            tokio::select! {
+                () = cancel.cancelled() => return Err("MCP call cancelled".into()),
+                result = self.artifact.read_with_credential(id, &credential) => {
+                    result.map_err(|error| format!("Artifact publication state unavailable: {error}"))?.publication
+                }
+            }
+        } else {
+            None
+        };
+        let permission = if let Some(owned) = read_owned {
+            if owned {
+                HostToolPermission::ReadOnly
+            } else {
+                HostToolPermission::Confirmation
+            }
+        } else {
+            match publication.as_ref().map(|state| state.audience) {
+                Some(audience @ (ArtifactAudience::Private | ArtifactAudience::Public)) => {
+                    let admission = ArtifactPublicationAdmission {
+                        chat: chat_id,
+                        account: credential.account_id.clone(),
+                        origin: credential.origin.clone(),
+                        artifact: artifact_update_id(name, input)
+                            .expect("publication belongs to an update")
+                            .to_owned(),
+                        audience,
+                    };
+                    if self
+                        .publication_admissions
+                        .read()
+                        .unwrap()
+                        .contains(&admission)
+                    {
+                        HostToolPermission::ArtifactContinuation
+                    } else if audience == ArtifactAudience::Private {
+                        HostToolPermission::PrivateArtifactWrite
+                    } else {
+                        HostToolPermission::PublicArtifactWrite
+                    }
+                }
+                _ => Self::operation_permission(&tool, input),
+            }
+        };
         let summary = if name == ARTIFACT_EDIT_TOOL && has_action(input, "create") {
             format!(
                 "Call {name} at {}; the created artifact joins this Chat's Monitor and is linked to the current Loop for @tickloop requests",
+                credential.origin
+            )
+        } else if read_owned == Some(false) {
+            format!(
+                "Read artifact content at {}; ownership or a trusted organization could not be confirmed",
                 credential.origin
             )
         } else {
             format!("Call {name} at {}", credential.origin)
         };
         let approval_input = Self::approval_input(input)?;
+        let facts = tickloop_agent_protocol::PreparedApprovalFacts {
+            artifact_publication: publication.clone(),
+            normalized_input: approval_input.clone(),
+            external_declaration: Some(
+                serde_json::to_value(&tool.definition)
+                    .map_err(|_| "Artifact tool declaration cannot be serialized")?,
+            ),
+            ..Default::default()
+        };
         Ok(PreparedHostCall::new(
             name.to_owned(),
             input.clone(),
             approval_input,
-            tool.permission,
+            permission,
             summary,
         )
+        .with_approval_facts(facts)
         .with_permission_input(input.clone())
         .with_payload(PreparedMcpCall {
             credential,
             fingerprint,
             arguments: input.clone(),
+            publication,
+            read_owned,
         }))
     }
 
@@ -748,6 +896,33 @@ impl HostToolProvider for McpHostToolProvider {
         }) {
             return Err("MCP feedback claim belongs to another Artifact account".into());
         }
+        if let Some(expected) = prepared.read_owned {
+            let id = artifact_read_id(call.name(), &prepared.arguments)
+                .ok_or("Artifact read identity changed")?;
+            if self
+                .artifact_read_is_owned(id, &current, cancel.clone())
+                .await?
+                != expected
+            {
+                return Err("Artifact read ownership changed before dispatch; prepare and check permission again".into());
+            }
+        }
+        if let Some(expected) = &prepared.publication {
+            let id = artifact_update_id(call.name(), &prepared.arguments)
+                .ok_or("Artifact update identity changed")?;
+            let current = tokio::select! {
+                () = cancel.cancelled() => return Err("MCP call cancelled".into()),
+                result = self.artifact.read_with_credential(id, &current) => {
+                    result.map_err(|error| format!("Artifact publication state unavailable: {error}"))?
+                }
+            };
+            if current.publication.as_ref() != Some(expected) {
+                return Err(
+                    "Artifact audience changed before dispatch; prepare and check permission again"
+                        .into(),
+                );
+            }
+        }
         Ok(())
     }
 
@@ -764,6 +939,7 @@ impl HostToolProvider for McpHostToolProvider {
             };
         }
         let name = call.name().to_owned();
+        let permission = call.permission();
         let event_context = call.event_context().cloned();
         let Ok(prepared) = call.into_payload::<PreparedMcpCall>() else {
             unreachable!()
@@ -785,8 +961,14 @@ impl HostToolProvider for McpHostToolProvider {
             None => return HostCallResult::NotDispatched("MCP arguments must be an object".into()),
         };
         let mut params = CallToolRequestParams::new(name.clone()).with_arguments(arguments);
+        let mut metadata = rmcp::model::RequestMetaObject::new();
+        if let Some(publication) = &prepared.publication {
+            metadata
+                .0
+                .0
+                .insert(PUBLICATION_META.into(), json!(publication));
+        }
         if let Some(context) = &event_context {
-            let mut metadata = rmcp::model::RequestMetaObject::new();
             metadata.0.0.insert(
                 EVENT_CONTEXT_META.into(),
                 json!({
@@ -799,6 +981,8 @@ impl HostToolProvider for McpHostToolProvider {
                     "fencing_token": context.fencing_token,
                 }),
             );
+        }
+        if !metadata.0.0.is_empty() {
             params.meta = Some(metadata);
         }
         if cancel.is_cancelled() {
@@ -846,6 +1030,38 @@ impl HostToolProvider for McpHostToolProvider {
             }),
             _ => None,
         };
+        if result.is_error != Some(true) {
+            let admitted = match &effect {
+                Some(HostEffect::CreatedArtifact(tick))
+                    if permission == HostToolPermission::PrivateArtifactWrite =>
+                {
+                    Some((tick.artifact_id.clone(), ArtifactAudience::Private))
+                }
+                _ => prepared.publication.as_ref().and_then(|publication| {
+                    let id = artifact_update_id(&name, &prepared.arguments)?;
+                    let saved = result.structured_content.as_ref()?;
+                    (saved["artifact_id"] == id
+                        && saved["revision"].is_u64()
+                        && matches!(
+                            publication.audience,
+                            ArtifactAudience::Private | ArtifactAudience::Public
+                        ))
+                    .then(|| (id.to_owned(), publication.audience))
+                }),
+            };
+            if let Some((artifact, audience)) = admitted {
+                self.publication_admissions
+                    .write()
+                    .unwrap()
+                    .insert(ArtifactPublicationAdmission {
+                        chat: chat_id,
+                        account: prepared.credential.account_id.clone(),
+                        origin: prepared.credential.origin.clone(),
+                        artifact,
+                        audience,
+                    });
+            }
+        }
         let mut tool_result = Self::model_result(result, &prepared.credential.access_token);
         if let Some(context) = &event_context {
             tool_result.content = tool_result

@@ -4727,6 +4727,7 @@ dependencies = [
  "icu_normalizer",
  "icu_properties",
  "image",
+ "jsonschema",
  "libc",
  "percent-encoding",
  "regex",

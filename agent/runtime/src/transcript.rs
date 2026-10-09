@@ -26,5 +26,7 @@ pub(crate) use path::{
     locate, private_family_temp_directory, private_project_temp_directory, project_directory,
     transcript_path,
 };
-pub(crate) use reader::{LoadedTranscript, load, load_original_user_inputs};
+pub(crate) use reader::{
+    LoadedTranscript, load, load_compaction_ancestors, load_original_user_inputs,
+};
 pub(crate) use writer::{CachedMetadata, FLUSH_INTERVAL, TranscriptWriter};

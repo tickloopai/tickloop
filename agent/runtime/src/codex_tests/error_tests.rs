@@ -293,7 +293,7 @@ async fn auto_review_refreshes_login_and_denies_after_websocket_output_breaks() 
             .unwrap();
         socket
             .send(WebSocketMessage::Text(
-                json!({"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":{"type":"function_call","id":"fc_review","call_id":"call_review","name":"classify_result","arguments":""}})
+                json!({"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":{"type":"message","id":"msg_review","role":"assistant","status":"in_progress","content":[]}})
                     .to_string()
                     .into(),
             ))

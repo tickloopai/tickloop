@@ -25,6 +25,8 @@ pub type RunId = Uuid;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ChatSnapshot {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub subagent_reports: BTreeMap<RunId, crate::SubagentReport>,
     #[serde(default)]
     pub failure_events: Vec<Event>,
     #[serde(default)]
@@ -68,17 +70,21 @@ pub struct ChatSnapshot {
     pub message_runs: BTreeMap<usize, RunId>,
     #[serde(default)]
     pub message_contexts: BTreeMap<usize, Vec<InputContext>>,
-    /// 消息在 Transcript 中的 uuid，文件回滚快照以此关联消息。用户提示与模型回复写入对话时
-    /// 确定，恢复时只重建用户提示的；其余消息的 uuid 在写入 Transcript 时生成。
+    /// Stable Transcript identities for prompts, replies and host messages, including after
+    /// restoration. Identity alone does not establish user authority; source metadata does.
     #[serde(default)]
     pub message_ids: BTreeMap<usize, Uuid>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub agent_message_origins: BTreeMap<Uuid, serde_json::Value>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub human_family_origins: BTreeMap<Uuid, DirectedHumanSource>,
-    /// Stable source IDs for genuine prompts rewritten across directed summaries.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub original_user_message_ids: BTreeMap<usize, Uuid>,
+    /// Source identities across compaction rewrites; these do not establish user authority.
+    #[serde(
+        default,
+        alias = "original_user_message_ids",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub original_message_ids: BTreeMap<usize, Uuid>,
     /// Execution modes captured for user prompts that can serve as rewind points.
     #[serde(default)]
     pub prompt_execution_modes: BTreeMap<usize, ExecutionMode>,

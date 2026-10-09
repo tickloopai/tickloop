@@ -175,7 +175,7 @@ pub(super) fn current_cause(
         {
             return Ok(MessageCause {
                 chain_id: snapshot
-                    .original_user_message_ids
+                    .original_message_ids
                     .get(&index)
                     .copied()
                     .unwrap_or(*id),

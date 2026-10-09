@@ -2,11 +2,12 @@ use std::sync::Arc;
 
 use serde_json::{Value, json};
 use tickloop_agent_protocol::{
-    ApprovalDiagnostic, AutoRuleChange, AutoSetupOptions, Content, EventKind, ExecutionMode,
-    PermissionChange,
+    AutoRuleChange, AutoSetupOptions, Content, EventKind, ExecutionMode, PermissionChange,
 };
 use tickloop_agent_runtime::{Agent, PermissionChangeError};
-use tickloop_agent_test_support::{ScriptedModel, auto_findings, call, config, next_event, text};
+use tickloop_agent_test_support::{
+    ScriptedModel, auto_classification, call, config, next_event, text,
+};
 
 fn reviewer_state(model: &ScriptedModel, index: usize) -> Value {
     let requests = model.requests.lock().unwrap();
@@ -17,83 +18,364 @@ fn reviewer_state(model: &ScriptedModel, index: usize) -> Value {
 }
 
 #[tokio::test]
-async fn ordinary_workspace_read_skips_the_reviewer_and_explicit_ask_still_prompts() {
-    for explicit_ask in [false, true] {
-        let temp = tempfile::tempdir().unwrap();
-        let directory = temp.path().join(".scratch/approval-parity");
-        std::fs::create_dir_all(&directory).unwrap();
-        let path = directory.join("replay-cases.json");
-        std::fs::write(&path, "WORKSPACE-READ-SENTINEL").unwrap();
-        let reviewer = Arc::new(ScriptedModel::new(Vec::new()));
-        let agent = Agent::new_embedded(
-            config(),
-            Arc::new(ScriptedModel::new(vec![
-                call("read", "Read", json!({"file_path":path})),
-                text("done"),
-            ])),
-        );
-        agent.set_auto_reviewer(reviewer.clone()).await;
-        let chat = agent.create_chat(temp.path().into()).await.unwrap();
-        agent
-            .set_execution_mode(chat, ExecutionMode::Auto)
-            .await
-            .unwrap();
-        if explicit_ask {
-            agent
-                .set_permission_rules(
-                    chat,
-                    vec![tickloop_agent_protocol::PermissionRule {
-                        id: uuid::Uuid::new_v4(),
-                        decision: tickloop_agent_protocol::Decision::Ask,
-                        tool: "Read".into(),
-                        specifier: None,
-                        input: None,
-                        loop_id: None,
-                        persistent: false,
-                    }],
-                )
-                .await
-                .unwrap();
+#[ignore = "uses an explicitly supplied Jev credential root and installs an empty fixture project offline"]
+async fn live_jev_admits_declared_dependency_installation_and_executes_the_prepared_command() {
+    live_jev_installation(false).await;
+}
+
+#[tokio::test]
+#[ignore = "uses an explicitly supplied Jev credential root and confirms only an offline fixture installation"]
+async fn live_jev_installation_honors_uncertainty_before_human_approved_execution() {
+    live_jev_installation(true).await;
+}
+
+async fn live_jev_installation(approve_if_uncertain: bool) {
+    use tickloop_agent_model::judgment::{
+        Evaluation, EvaluationRequest, JevClient, JevConfig, JudgmentClient, JudgmentError,
+    };
+    use tickloop_agent_protocol::{ApprovalOutcome, ApprovalReviewerKind};
+    struct ObservedJev {
+        client: JevClient,
+        answers: std::sync::Mutex<Vec<Value>>,
+    }
+    #[async_trait::async_trait]
+    impl JudgmentClient for ObservedJev {
+        fn model(&self) -> &str {
+            self.client.model()
         }
-        let mut events = agent.subscribe();
-        agent
-            .submit(chat, None, "Read this project's replay cases".into())
+        async fn evaluate(
+            &self,
+            request: &EvaluationRequest,
+            cancel: tokio_util::sync::CancellationToken,
+        ) -> Result<Evaluation, JudgmentError> {
+            let result = self.client.evaluate(request, cancel).await?;
+            self.answers
+                .lock()
+                .unwrap()
+                .push(serde_json::to_value(&result.answers).unwrap());
+            Ok(result)
+        }
+    }
+    let credential_root =
+        std::env::var_os("TICKLOOP_JEV_TEST_ROOT").expect("set TICKLOOP_JEV_TEST_ROOT");
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    let project = project.canonicalize().unwrap();
+    let manifest = r#"{"name":"approval-fixture","version":"1.0.0","private":true}"#;
+    let lockfile = r#"{"name":"approval-fixture","version":"1.0.0","lockfileVersion":3,"requires":true,"packages":{"":{"name":"approval-fixture","version":"1.0.0"}}}"#;
+    std::fs::write(project.join("package.json"), manifest).unwrap();
+    std::fs::write(project.join("package-lock.json"), lockfile).unwrap();
+    let npm_cache = project.join("npm-cache");
+    std::fs::create_dir(&npm_cache).unwrap();
+    let command = format!(
+        "npm ci --offline --ignore-scripts --no-audit --no-fund --cache '{}' && printf verified > install-result.txt",
+        npm_cache.display()
+    );
+    let agent = Agent::new_embedded(
+        config(),
+        Arc::new(ScriptedModel::new(vec![
+            call("install", "Bash", json!({"command":command})),
+            text("done"),
+        ])),
+    );
+    let fallback = Arc::new(ScriptedModel::new(Vec::new()));
+    agent.set_auto_reviewer(fallback.clone()).await;
+    let jev = Arc::new(ObservedJev {
+        client: JevClient::bind(JevConfig::default(), Some(credential_root.into())).unwrap(),
+        answers: std::sync::Mutex::new(Vec::new()),
+    });
+    agent.set_judgment_client(jev.clone()).await;
+    let chat = agent.create_chat(project.clone()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::Auto)
+        .await
+        .unwrap();
+    let mut events = agent.subscribe();
+    agent.submit(chat, None, "Build and verify this existing project using its declared dependencies. Write the installation result to install-result.txt. Do not add dependencies or access the network.".into()).await.unwrap();
+    let mut assessments = Vec::new();
+    let mut prompts = 0;
+    let mut execution_error = None;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let event = tokio::time::timeout_at(deadline, events.recv())
             .await
+            .expect("live Jev run exceeded one minute")
             .unwrap();
-        let mut prompted = false;
-        let mut read = false;
-        loop {
-            match next_event(&mut events).await.kind {
-                EventKind::PermissionRequested { request } => {
-                    prompted = true;
+        match event.kind {
+            EventKind::ApprovalAssessed { assessment } => assessments.push(assessment),
+            EventKind::PermissionRequested { request } => {
+                prompts += 1;
+                assert!(!project.join("install-result.txt").exists());
+                assert_eq!(
+                    std::fs::read_dir(&npm_cache).unwrap().count(),
+                    0,
+                    "npm must not execute before confirmation"
+                );
+                agent
+                    .answer_permission(chat, request.id, approve_if_uncertain)
+                    .await
+                    .unwrap();
+            }
+            EventKind::ToolCompleted { result, .. } if result.is_error => {
+                execution_error = Some(result.content)
+            }
+            EventKind::Completed { .. } | EventKind::Interrupted => break,
+            EventKind::Failed(error) => {
+                execution_error = Some(error);
+                break;
+            }
+            _ => {}
+        }
+    }
+    agent.shutdown().await;
+    println!("LIVE_JEV_INSTALL_PROMPTS {prompts}");
+    for answers in jev.answers.lock().unwrap().iter() {
+        println!(
+            "LIVE_JEV_INSTALL {}",
+            json!({"decision":answers["decision"]})
+        );
+    }
+    if !approve_if_uncertain {
+        assert_eq!(prompts, 0, "Jev required a person: {assessments:?}");
+    }
+    assert!(execution_error.is_none(), "{execution_error:?}");
+    assert!(
+        fallback.requests.lock().unwrap().is_empty(),
+        "a fallback cannot count as a Jev approval"
+    );
+    assert_eq!(assessments.len(), 1);
+    if prompts == 0 {
+        assert_eq!(assessments[0].outcome, ApprovalOutcome::Allow);
+    } else {
+        assert_eq!(prompts, 1);
+        assert_eq!(assessments[0].outcome, ApprovalOutcome::NeedsHuman);
+    }
+    assert_eq!(
+        assessments[0].reviewer.as_ref().unwrap().kind,
+        ApprovalReviewerKind::Jev
+    );
+    assert_eq!(
+        std::fs::read_to_string(project.join("install-result.txt")).unwrap(),
+        "verified"
+    );
+    assert_eq!(
+        std::fs::read_to_string(project.join("package.json")).unwrap(),
+        manifest
+    );
+    assert_eq!(
+        std::fs::read_to_string(project.join("package-lock.json")).unwrap(),
+        lockfile
+    );
+}
+
+#[tokio::test]
+async fn ordinary_workspace_reads_and_searches_skip_review_but_explicit_rules_win() {
+    use tickloop_agent_protocol::Decision;
+    for through_link in [false, true] {
+        for tool in ["Read", "Glob", "Grep"] {
+            for explicit in [None, Some(Decision::Ask), Some(Decision::Deny)] {
+                let temp = tempfile::tempdir().unwrap();
+                let directory = temp.path().join(".scratch/approval-parity");
+                let outside = tempfile::tempdir().unwrap();
+                if through_link {
+                    std::fs::create_dir_all(directory.parent().unwrap()).unwrap();
+                    std::os::unix::fs::symlink(outside.path(), &directory).unwrap();
+                } else {
+                    std::fs::create_dir_all(&directory).unwrap();
+                }
+                let path = directory.join("replay-cases.json");
+                std::fs::write(&path, "WORKSPACE-READ-SENTINEL").unwrap();
+                let (input, expected) = match tool {
+                    "Read" => (json!({"file_path":path}), "WORKSPACE-READ-SENTINEL"),
+                    "Glob" => (
+                        json!({"pattern":"*.json", "path":directory}),
+                        "replay-cases.json",
+                    ),
+                    "Grep" => (
+                        json!({"pattern":"WORKSPACE-READ", "path":path, "output_mode":"content"}),
+                        "WORKSPACE-READ-SENTINEL",
+                    ),
+                    _ => unreachable!(),
+                };
+                let reviewer = Arc::new(ScriptedModel::new(Vec::new()));
+                let agent = Agent::new_embedded(
+                    config(),
+                    Arc::new(ScriptedModel::new(vec![
+                        call("read", tool, input),
+                        text("done"),
+                    ])),
+                );
+                agent.set_auto_reviewer(reviewer.clone()).await;
+                let chat = agent.create_chat(temp.path().into()).await.unwrap();
+                agent
+                    .set_execution_mode(chat, ExecutionMode::Auto)
+                    .await
+                    .unwrap();
+                if let Some(decision) = explicit {
                     agent
-                        .answer_permission(chat, request.id, false)
+                        .set_permission_rules(
+                            chat,
+                            vec![tickloop_agent_protocol::PermissionRule {
+                                id: uuid::Uuid::new_v4(),
+                                decision,
+                                tool: tool.into(),
+                                specifier: None,
+                                input: None,
+                                loop_id: None,
+                                persistent: false,
+                            }],
+                        )
                         .await
                         .unwrap();
                 }
-                EventKind::ApprovalAssessed { .. } | EventKind::PermissionChecked { .. } => {
-                    panic!("a workspace Read must not call the automatic reviewer")
+                let mut events = agent.subscribe();
+                agent
+                    .submit(chat, None, "Read this project's replay cases".into())
+                    .await
+                    .unwrap();
+                let mut prompted = false;
+                let mut read = false;
+                loop {
+                    match next_event(&mut events).await.kind {
+                        EventKind::PermissionRequested { request } => {
+                            prompted = true;
+                            agent
+                                .answer_permission(chat, request.id, false)
+                                .await
+                                .unwrap();
+                        }
+                        EventKind::ApprovalAssessed { .. }
+                        | EventKind::PermissionChecked { .. } => {
+                            panic!("a workspace {tool} must not call the automatic reviewer")
+                        }
+                        EventKind::ToolCompleted { result, .. } => {
+                            read = !result.is_error && result.content.contains(expected);
+                        }
+                        EventKind::Completed { .. } | EventKind::Interrupted => break,
+                        EventKind::Failed(error) => panic!("{error}"),
+                        _ => {}
+                    }
                 }
-                EventKind::ToolCompleted { result, .. } => {
-                    read = result.content.contains("WORKSPACE-READ-SENTINEL");
+                assert_eq!(prompted, explicit == Some(Decision::Ask));
+                assert_eq!(read, explicit.is_none(), "{tool}: {explicit:?}");
+                assert!(reviewer.requests.lock().unwrap().is_empty());
+                let history = agent.approval_history_view(chat).await.unwrap();
+                assert!(history.records[0].review.is_none());
+                if explicit.is_none() {
+                    assert_eq!(
+                        history.records[0].path,
+                        tickloop_agent_protocol::ApprovalPath::Direct
+                    );
                 }
-                EventKind::Completed { .. } | EventKind::Interrupted => break,
-                EventKind::Failed(error) => panic!("{error}"),
-                _ => {}
+                agent.shutdown().await;
             }
         }
-        assert_eq!(prompted, explicit_ask);
-        assert_eq!(read, !explicit_ask);
-        assert!(reviewer.requests.lock().unwrap().is_empty());
-        let history = agent.approval_history_view(chat).await.unwrap();
-        assert!(history.records[0].review.is_none());
-        if !explicit_ask {
-            assert_eq!(
-                history.records[0].path,
-                tickloop_agent_protocol::ApprovalPath::Direct
+    }
+}
+
+#[tokio::test]
+async fn shell_fast_paths_and_wrapped_commands_match_claude_auto_review_routing() {
+    use tickloop_agent_protocol::{ApprovalPath, Decision, PermissionRule};
+    for (command, requires_review, writes_file) in [
+        ("printf PARITY-SHELL | cat", false, false),
+        ("printf PARITY-SHELL > written.txt", false, true),
+        ("env sh -c 'printf PARITY-SHELL'", true, false),
+        ("printf 'PARITY-SHELL:%s' \"$HOME\"", false, false),
+        ("printf 'PARITY-SHELL:%s' \"$UNSET_VAR\"", true, false),
+        ("printf 'PARITY-SHELL:%d' \"$UID\"", true, false),
+    ] {
+        for explicit in [None, Some(Decision::Ask), Some(Decision::Deny)] {
+            let directory = tempfile::tempdir().unwrap();
+            let reviewer = Arc::new(ScriptedModel::new(vec![text(
+                &auto_classification(false).to_string(),
+            )]));
+            let agent = Agent::new_embedded(
+                config(),
+                Arc::new(ScriptedModel::new(vec![
+                    call("shell", "Bash", json!({"command":command})),
+                    text("done"),
+                ])),
             );
+            agent.set_auto_reviewer(reviewer.clone()).await;
+            let chat = agent.create_chat(directory.path().into()).await.unwrap();
+            agent
+                .set_execution_mode(chat, ExecutionMode::Auto)
+                .await
+                .unwrap();
+            if let Some(decision) = explicit {
+                agent
+                    .set_permission_rules(
+                        chat,
+                        vec![PermissionRule {
+                            id: uuid::Uuid::new_v4(),
+                            decision,
+                            tool: "Bash".into(),
+                            specifier: None,
+                            input: None,
+                            loop_id: None,
+                            persistent: false,
+                        }],
+                    )
+                    .await
+                    .unwrap();
+            }
+            let mut events = agent.subscribe();
+            agent
+                .submit(chat, None, "Run the requested local fixture command".into())
+                .await
+                .unwrap();
+            let mut prompted = false;
+            let mut succeeded = false;
+            loop {
+                match next_event(&mut events).await.kind {
+                    EventKind::PermissionRequested { request } => {
+                        prompted = true;
+                        agent
+                            .answer_permission(chat, request.id, false)
+                            .await
+                            .unwrap();
+                    }
+                    EventKind::ToolCompleted { result, .. } => {
+                        succeeded = !result.is_error
+                            && (writes_file || result.content.contains("PARITY-SHELL"));
+                    }
+                    EventKind::Completed { .. } | EventKind::Interrupted => break,
+                    EventKind::Failed(error) => panic!("{error}"),
+                    _ => {}
+                }
+            }
+            assert_eq!(
+                prompted,
+                explicit == Some(Decision::Ask),
+                "{command}: {explicit:?}"
+            );
+            assert_eq!(succeeded, explicit.is_none(), "{command}: {explicit:?}");
+            assert_eq!(
+                reviewer.requests.lock().unwrap().len(),
+                usize::from(requires_review && explicit.is_none()),
+                "{command}: {explicit:?}"
+            );
+            if writes_file {
+                let result = std::fs::read_to_string(directory.path().join("written.txt")).ok();
+                assert_eq!(
+                    result.as_deref(),
+                    explicit.is_none().then_some("PARITY-SHELL")
+                );
+            }
+            if explicit.is_none() {
+                let history = agent.approval_history_view(chat).await.unwrap();
+                assert_eq!(
+                    history.records[0].path,
+                    if requires_review {
+                        ApprovalPath::AutoLlm
+                    } else {
+                        ApprovalPath::Direct
+                    }
+                );
+            }
+            agent.shutdown().await;
         }
-        agent.shutdown().await;
     }
 }
 
@@ -106,8 +388,8 @@ async fn prepared_facts_and_dependency_baseline_reach_review_before_dispatch() {
     )
     .unwrap();
     let reviewer = Arc::new(ScriptedModel::new(vec![
-        text(&auto_findings(false).to_string()),
-        text(&auto_findings(false).to_string()),
+        text(&auto_classification(false).to_string()),
+        text(&auto_classification(false).to_string()),
     ]));
     let model = Arc::new(ScriptedModel::new(vec![
         call("one", "Bash", json!({"command":"ln -s missing first"})),
@@ -174,25 +456,29 @@ async fn prepared_facts_and_dependency_baseline_reach_review_before_dispatch() {
 }
 
 #[tokio::test]
-async fn uncertainty_is_explained_and_persisted_without_running_the_action() {
+async fn overall_block_reason_is_persisted_without_fabricated_rule_findings() {
     let temp = tempfile::tempdir().unwrap();
-    let mut findings = auto_findings(false);
-    findings["rules"][1]["applicability"] = json!("uncertain");
-    findings["rules"][1]["clearance"] = json!("uncertain");
+    let classification = json!({"decision":"block_soft", "rule_id":"builtin.soft_deny.irreversible_local_destruction", "reason":"The requested deletion target is not established"});
     let agent = Agent::open_embedded(
         temp.path().join("state"),
         config(),
-        Arc::new(ScriptedModel::new(vec![call(
-            "blocked",
-            "Bash",
-            json!({"command":"ln -s missing never-created"}),
-        )])),
+        Arc::new(ScriptedModel::new(vec![
+            call(
+                "blocked",
+                "Bash",
+                json!({"command":"ln -s missing never-created"}),
+            ),
+            text("stopped"),
+        ])),
     )
     .unwrap();
     agent
-        .set_auto_reviewer(Arc::new(ScriptedModel::new(vec![text(
-            &findings.to_string(),
-        )])))
+        .set_auto_reviewer(Arc::new(ScriptedModel::new(vec![
+            text(
+                &classification.to_string(),
+            );
+            2
+        ])))
         .await;
     let chat = agent.create_chat(temp.path().into()).await.unwrap();
     agent
@@ -206,47 +492,32 @@ async fn uncertainty_is_explained_and_persisted_without_running_the_action() {
         .unwrap();
     loop {
         match next_event(&mut events).await.kind {
-            EventKind::ApprovalAssessed { assessment } => assert_eq!(
-                assessment.diagnostics,
-                Some(vec![
-                    ApprovalDiagnostic::ClearanceUncertain {
-                        rule_id: "builtin.soft_deny.destruction".into()
-                    },
-                    ApprovalDiagnostic::ApplicabilityUncertain {
-                        rule_id: "builtin.soft_deny.destruction".into()
-                    }
-                ])
-            ),
-            EventKind::PermissionRequested { request } => {
-                assert!(!temp.path().join("never-created").exists());
-                assert!(
-                    request
-                        .approval_reason
-                        .as_deref()
-                        .unwrap()
-                        .contains("destruction")
+            EventKind::ApprovalAssessed { assessment } => {
+                assert_eq!(
+                    assessment.outcome,
+                    tickloop_agent_protocol::ApprovalOutcome::Block
                 );
-                agent
-                    .answer_permission(chat, request.id, false)
-                    .await
-                    .unwrap();
+                assert_eq!(
+                    assessment.reason.as_deref(),
+                    Some("The requested deletion target is not established")
+                );
+                assert!(assessment.block_evidence.is_none());
             }
+            EventKind::PermissionRequested { .. } => panic!("one block must not escalate"),
             EventKind::Completed { .. } => break,
-            EventKind::Failed(_) | EventKind::Interrupted => break,
+            EventKind::Failed(error) => panic!("{error}"),
             _ => {}
         }
     }
     let history = agent.approval_history_view(chat).await.unwrap();
-    assert_eq!(
+    assert_eq!(history.records.len(), 1);
+    assert!(
         history.records[0]
             .review
             .as_ref()
             .unwrap()
-            .diagnostics
-            .as_ref()
-            .unwrap()
-            .len(),
-        2
+            .block_finding
+            .is_none()
     );
     assert!(
         temp.path()
@@ -308,12 +579,12 @@ async fn environment_draft_is_private_scoped_and_revision_checked() {
         )
         .await
         .unwrap();
-    assert!(
-        saved
-            .auto_policy
+    assert_eq!(
+        saved.auto_policy.environment.text,
+        tickloop_agent_config::AutoSettings::default()
+            .policy()
             .environment
             .text
-            .contains("do not grant authority")
     );
     assert_eq!(saved.auto_policy.environment.entries.len(), 1);
     assert!(saved.auto_policy.environment.entries[0].confirmed_at_ms > 0);
@@ -469,12 +740,12 @@ async fn legacy_environment_migration_and_manual_edits_preserve_provenance_and_s
         tickloop_agent_protocol::AutoEnvironmentEntrySource::Unknown
     );
     assert!(entry.directory.is_none());
-    assert!(
-        migrated
-            .auto_policy
+    assert_eq!(
+        migrated.auto_policy.environment.text,
+        tickloop_agent_config::AutoSettings::default()
+            .policy()
             .environment
             .text
-            .contains("do not grant authority")
     );
     let scoped = agent
         .apply_permission_change(

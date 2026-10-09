@@ -234,6 +234,15 @@ impl ModelCatalog {
                         "{location}: unsupported thinking cannot declare effort or adaptive defaults"
                     ));
                 }
+                if model.thinking_off.is_some()
+                    && (model.adapter.protocol() != Protocol::Messages
+                        || model.thinking != ThinkingControl::Toggle
+                        || model.thinking_budgets.is_some())
+                {
+                    return Err(format!(
+                        "{location}.thinking_off: requires a controllable Messages model without manual thinking budgets"
+                    ));
+                }
                 if model.adaptive_by_default
                     && !matches!(model.adapter, Adapter::Messages | Adapter::MinimaxMessages)
                 {
@@ -679,6 +688,8 @@ pub fn migrate_legacy_model(mut config: ModelConfig) -> ModelConfig {
                 effort_levels: Vec::new(),
                 input_modalities: config.input_modalities.clone(),
                 thinking_budgets: None,
+                temperature_control: None,
+                thinking_off: None,
             });
         card.id = config.model_id.clone();
         card.display_name = config.name.clone();
@@ -717,7 +728,24 @@ pub fn model_for_persistent_selection(config: ModelConfig) -> ModelConfig {
             .expect("bundled Codex Provider exists")
             .display_name;
     }
-    if config.card.is_some() || config.provider != ModelProvider::Api {
+    if let Some(card) = config.card.as_mut() {
+        if let Some(current) = ModelCatalog::defaults().get(&config.provider_id, &config.model_id)
+            && current.model == config.model
+            && let Some(current_card) = current.card
+            && current_card.adapter == card.adapter
+        {
+            card.temperature_control = card
+                .temperature_control
+                .or(current_card.temperature_control);
+            if card.thinking == current_card.thinking
+                && card.thinking_budgets == current_card.thinking_budgets
+            {
+                card.thinking_off = card.thinking_off.or(current_card.thinking_off);
+            }
+        }
+        return config;
+    }
+    if config.provider != ModelProvider::Api {
         return config;
     }
     if config.provider_id.is_empty() {
@@ -750,6 +778,8 @@ pub fn model_for_persistent_selection(config: ModelConfig) -> ModelConfig {
         effort_levels: Vec::new(),
         input_modalities: config.input_modalities.clone(),
         thinking_budgets: None,
+        temperature_control: None,
+        thinking_off: None,
     });
     config
 }
@@ -772,6 +802,75 @@ pub fn upgrade_saved_legacy_builtin_model(config: ModelConfig) -> ModelConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saved_builtin_cards_inherit_new_capabilities_without_replacing_explicit_overrides() {
+        let mut saved = ModelCatalog::defaults()
+            .get("anthropic-api", "claude-sonnet-5-5")
+            .unwrap();
+        saved.card.as_mut().unwrap().temperature_control = None;
+        saved.card.as_mut().unwrap().thinking_off = None;
+        let upgraded = model_for_persistent_selection(saved.clone());
+        assert_eq!(
+            upgraded.card.as_ref().unwrap().temperature_control,
+            Some(tickloop_agent_protocol::TemperatureControl::Unsupported)
+        );
+        assert_eq!(
+            upgraded.card.as_ref().unwrap().thinking_off,
+            Some(tickloop_agent_protocol::ThinkingOffEncoding::BetweenTools)
+        );
+        saved.card.as_mut().unwrap().temperature_control =
+            Some(tickloop_agent_protocol::TemperatureControl::Supported);
+        saved.card.as_mut().unwrap().thinking_off =
+            Some(tickloop_agent_protocol::ThinkingOffEncoding::Disabled);
+        let overridden = model_for_persistent_selection(saved);
+        assert_eq!(
+            overridden.card.as_ref().unwrap().temperature_control,
+            Some(tickloop_agent_protocol::TemperatureControl::Supported)
+        );
+        assert_eq!(
+            overridden.card.as_ref().unwrap().thinking_off,
+            Some(tickloop_agent_protocol::ThinkingOffEncoding::Disabled)
+        );
+    }
+
+    #[test]
+    fn model_card_capability_patches_can_override_and_clear_protocol_defaults() {
+        let mut config = ModelCatalog::defaults()
+            .get("anthropic-api", "claude-sonnet-5-5")
+            .unwrap();
+        let card = config.card.as_mut().unwrap();
+        assert_eq!(
+            card.temperature_control,
+            Some(tickloop_agent_protocol::TemperatureControl::Unsupported)
+        );
+        assert_eq!(
+            card.thinking_off,
+            Some(tickloop_agent_protocol::ThinkingOffEncoding::BetweenTools)
+        );
+        let patch: tickloop_agent_protocol::ModelPatch =
+            serde_json::from_value(serde_json::json!({
+                "id":card.id,"temperature_control":null,"thinking_off":null
+            }))
+            .unwrap();
+        patch.apply_to(card);
+        assert_eq!(card.temperature_control, None);
+        assert_eq!(card.thinking_off, None);
+        let patch: tickloop_agent_protocol::ModelPatch =
+            serde_json::from_value(serde_json::json!({
+                "id":card.id,"temperature_control":"supported","thinking_off":"disabled"
+            }))
+            .unwrap();
+        patch.apply_to(card);
+        assert_eq!(
+            card.temperature_control,
+            Some(tickloop_agent_protocol::TemperatureControl::Supported)
+        );
+        assert_eq!(
+            card.thinking_off,
+            Some(tickloop_agent_protocol::ThinkingOffEncoding::Disabled)
+        );
+    }
 
     #[test]
     fn historical_builtin_names_upgrade_to_current_model_cards() {

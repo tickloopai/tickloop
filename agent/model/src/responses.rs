@@ -57,6 +57,13 @@ pub(super) fn encode_request(
         push_user_parts(&mut input, &mut user_parts);
     }
     let mut body = json!({"model":config.model,"input":input,"max_output_tokens":config.max_output_tokens,"stream":true,"store":false});
+    if let Some(temperature) = super::sampling_temperature(
+        config,
+        request.temperature,
+        super::ModelConfigExt::thinking_enabled(config, reasoning_effort, true).unwrap_or(false),
+    ) {
+        body["temperature"] = json!(temperature);
+    }
     if let Some(effort) = reasoning_effort {
         body["reasoning"] = json!({"effort":match effort {
             ReasoningEffort::Off => "none",

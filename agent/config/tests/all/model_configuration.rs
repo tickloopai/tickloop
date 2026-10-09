@@ -34,6 +34,8 @@ fn custom_provider(id: &str) -> ProviderDefinition {
             effort_levels: vec![tickloop_agent_protocol::ReasoningEffort::High],
             input_modalities: vec![tickloop_agent_protocol::InputModality::Text],
             thinking_budgets: None,
+            temperature_control: None,
+            thinking_off: None,
         }],
     }
 }

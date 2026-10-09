@@ -5,7 +5,7 @@ use std::{
     path::PathBuf,
 };
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -15,8 +15,13 @@ use tickloop_agent_protocol::{
     AutoPolicy, ChatSnapshot, CompactionMarker, Content, OperationRecord, OriginalUserInput, Role,
 };
 
-pub(super) const APPROVAL_CONTEXT_VERSION: &str = "trusted-approval-v3";
-pub(super) const REVIEW_TEMPLATE_VERSION: &str = "auto-review-v4";
+mod reply_history;
+pub(super) use reply_history::ReplyHistory;
+pub(super) use reply_history::capture as capture_reply_history;
+
+pub(super) const APPROVAL_CONTEXT_VERSION: &str = "trusted-approval-v6";
+pub(super) const REVIEW_TEMPLATE_VERSION: &str = "auto-review-v17";
+const MAX_TOOL_HISTORY_BYTES: usize = 64 * 1024;
 
 const DEPENDENCY_FILES: &[&str] = &[
     "package.json",
@@ -89,8 +94,250 @@ pub(super) struct ApprovalOperation {
     pub input: Value,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum HistoricalToolOutcome {
+    ReturnedSuccess,
+    ReturnedError,
+    OutcomeUnknown,
+    NotObserved,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(super) struct HistoricalToolCall {
+    pub run_id: Option<Uuid>,
+    pub call_id: String,
+    pub tool: String,
+    pub input: Value,
+    pub resolved_path: Option<PathBuf>,
+    pub outcome: HistoricalToolOutcome,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(super) struct ToolHistory {
+    pub complete: bool,
+    pub compaction_gap: bool,
+    pub capacity_exceeded: bool,
+    pub calls: Vec<HistoricalToolCall>,
+}
+
+impl Default for ToolHistory {
+    fn default() -> Self {
+        Self {
+            complete: true,
+            compaction_gap: false,
+            capacity_exceeded: false,
+            calls: Vec::new(),
+        }
+    }
+}
+
+fn proposed_call_position(
+    snapshot: &ChatSnapshot,
+    proposed: Option<(Uuid, &str)>,
+) -> Option<(usize, usize)> {
+    let (run, call) = proposed?;
+    snapshot
+        .messages
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, message)| {
+            if message.role != Role::Assistant || snapshot.message_runs.get(&index) != Some(&run) {
+                return None;
+            }
+            message
+                .content
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(block, content)| {
+                    matches!(content, Content::ToolUse { id, .. } if id == call)
+                        .then_some((index, block))
+                })
+        })
+}
+
+fn tool_history(snapshot: &ChatSnapshot, operation: &OperationRecord) -> ToolHistory {
+    recovered_tool_history(snapshot, operation, None)
+}
+
+pub(super) fn recovered_tool_history(
+    snapshot: &ChatSnapshot,
+    operation: &OperationRecord,
+    ancestors: Option<&[crate::transcript::ChainEntry]>,
+) -> ToolHistory {
+    let compact_boundary = snapshot
+        .message_compactions
+        .iter()
+        .rev()
+        .find_map(|(index, marker)| match marker {
+            CompactionMarker::Boundary(boundary) if !boundary.preserved_by_later_summary => {
+                Some(*index)
+            }
+            _ => None,
+        });
+    let compaction_gap = compact_boundary.is_some() && ancestors.is_none();
+    let mut history = ToolHistory {
+        complete: !compaction_gap,
+        compaction_gap,
+        ..Default::default()
+    };
+    let boundary = proposed_call_position(snapshot, Some((operation.run_id, &operation.call_id)));
+    let mut pending: HashMap<(Uuid, &str), usize> = HashMap::new();
+    let mut seen_calls = HashSet::new();
+    let mut ambiguous = HashSet::new();
+    let mut prepared = HashMap::new();
+    for prior in &snapshot.operations {
+        let key = (prior.run_id, prior.call_id.as_str());
+        if let std::collections::hash_map::Entry::Vacant(entry) = prepared.entry(key) {
+            entry.insert(Some(prior));
+        } else {
+            prepared.insert(key, None);
+        }
+    }
+    let mut bytes = 0usize;
+    let mut observed_messages = HashSet::new();
+    let recovered = ancestors
+        .into_iter()
+        .flatten()
+        .filter(|entry| !entry.is_compact_summary)
+        .map(|entry| {
+            (
+                None,
+                entry.run_id,
+                Some(entry.original_message_id.unwrap_or(entry.uuid)),
+                &entry.message,
+            )
+        });
+    let start = if ancestors.is_some() {
+        compact_boundary.map_or(0, |index| index + 1)
+    } else {
+        0
+    };
+    let visible = snapshot
+        .messages
+        .iter()
+        .enumerate()
+        .skip(start)
+        .map(|(index, message)| {
+            (
+                Some(index),
+                snapshot.message_runs.get(&index).copied(),
+                snapshot
+                    .original_message_ids
+                    .get(&index)
+                    .or_else(|| snapshot.message_ids.get(&index))
+                    .copied(),
+                message,
+            )
+        });
+    for (index, run, source_id, message) in recovered.chain(visible) {
+        if source_id.is_some_and(|id| !observed_messages.insert(id)) {
+            continue;
+        }
+        for (block, content) in message.content.iter().enumerate() {
+            match content {
+                Content::ToolUse { id, name, input }
+                    if message.role == Role::Assistant
+                        && index.is_none_or(|index| {
+                            boundary.is_none_or(|boundary| (index, block) < boundary)
+                        }) =>
+                {
+                    let previous = run
+                        .and_then(|run| prepared.get(&(run, id.as_str())))
+                        .copied()
+                        .flatten();
+                    let path_field = match name.as_str() {
+                        "Read" | "Write" | "Edit" => Some("file_path"),
+                        "Glob" | "Grep" => Some("path"),
+                        "Bash" => Some("cwd"),
+                        _ => None,
+                    };
+                    let call = HistoricalToolCall {
+                        run_id: run,
+                        call_id: id.clone(),
+                        tool: name.clone(),
+                        input: input.clone(),
+                        resolved_path: previous
+                            .and_then(|prior| prior.input.get(path_field?))
+                            .and_then(Value::as_str)
+                            .map(PathBuf::from)
+                            .filter(|path| path.is_absolute()),
+                        outcome: HistoricalToolOutcome::NotObserved,
+                    };
+                    bytes = bytes.saturating_add(
+                        serde_json::to_vec(&call)
+                            .expect("tool history serializes")
+                            .len(),
+                    );
+                    if bytes > MAX_TOOL_HISTORY_BYTES {
+                        history.calls.clear();
+                        history.complete = false;
+                        history.capacity_exceeded = true;
+                        return history;
+                    }
+                    let position = history.calls.len();
+                    history.calls.push(call);
+                    if let Some(run) = run {
+                        let key = (run, id.as_str());
+                        if !seen_calls.insert(key) || ambiguous.contains(&key) {
+                            history.complete = false;
+                            ambiguous.insert(key);
+                            pending.remove(&key);
+                        } else {
+                            pending.insert(key, position);
+                        }
+                    } else {
+                        history.complete = false;
+                    }
+                }
+                Content::ToolResult {
+                    tool_use_id,
+                    is_error,
+                    ..
+                } if message.role == Role::User => {
+                    if let Some(position) =
+                        run.and_then(|run| pending.remove(&(run, tool_use_id.as_str())))
+                    {
+                        history.calls[position].outcome = if *is_error {
+                            HistoricalToolOutcome::ReturnedError
+                        } else {
+                            HistoricalToolOutcome::ReturnedSuccess
+                        };
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    for call in &mut history.calls {
+        if let Some(prior) = call
+            .run_id
+            .and_then(|run| prepared.get(&(run, call.call_id.as_str())))
+            .copied()
+            .flatten()
+            && prior.state == tickloop_agent_protocol::OperationState::Unknown
+        {
+            call.outcome = HistoricalToolOutcome::OutcomeUnknown;
+        }
+    }
+    history
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(super) struct AgentMessageEvidence {
+    pub message_id: Uuid,
+    pub source: Value,
+    pub content: Vec<Content>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub(super) struct ApprovalSnapshot {
+    pub auto_policy: AutoPolicy,
+    pub tool_history: ToolHistory,
+    pub reply_history: ReplyHistory,
+    pub agent_messages: Vec<AgentMessageEvidence>,
     pub dependency_files: Option<Vec<DependencyEvidence>>,
     pub prepared_facts: Option<tickloop_agent_protocol::PreparedApprovalFacts>,
     pub creation_receipt: Option<TickCreationReceipt>,
@@ -101,7 +348,6 @@ pub(super) struct ApprovalSnapshot {
     pub working_directory: PathBuf,
     pub additional_directories: Vec<PathBuf>,
     pub permission_policy_revision: u64,
-    pub auto_policy: AutoPolicy,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -120,7 +366,7 @@ fn originals_for_active_chain_with_legacy(
     snapshot: &ChatSnapshot,
     bookkeeping: &ChatBookkeeping,
     legacy: Option<Vec<OriginalUserInput>>,
-    proposed_call_id: Option<&str>,
+    proposed_call: Option<(Uuid, &str)>,
 ) -> Result<Vec<OriginalUserInput>, ApprovalContextError> {
     let boundary = snapshot
         .message_compactions
@@ -141,28 +387,38 @@ fn originals_for_active_chain_with_legacy(
         None => Vec::new(),
     };
     let start = boundary.map_or(0, |index| index + 1);
+    let captured_inputs = originals
+        .iter()
+        .map(|input| (input.chat_id, input.message_id))
+        .collect::<HashSet<_>>();
     let mut pending_questions = HashMap::new();
-    for (index, message) in
-        snapshot
-            .messages
-            .iter()
-            .enumerate()
-            .skip(start)
-            .take_while(|(_, message)| {
-                !message.content.iter().any(|content| {
-            matches!(content, Content::ToolUse { id, .. } if proposed_call_id == Some(id.as_str()))
-        })
-            })
-    {
+    let proposed_position = proposed_call_position(snapshot, proposed_call);
+    let mut call_counts = HashMap::new();
+    for (index, message) in snapshot.messages.iter().enumerate().skip(start) {
+        if message.role != Role::Assistant {
+            continue;
+        }
+        let Some(run) = snapshot.message_runs.get(&index).copied() else {
+            continue;
+        };
+        for content in &message.content {
+            if let Content::ToolUse { id, .. } = content {
+                *call_counts.entry((run, id.clone())).or_insert(0usize) += 1;
+            }
+        }
+    }
+    for (index, message) in snapshot.messages.iter().enumerate().skip(start) {
         if message.role == Role::Assistant {
             if let Some(run_id) = snapshot.message_runs.get(&index).copied() {
-                for content in &message.content {
+                for (block, content) in message.content.iter().enumerate() {
                     if let Content::ToolUse { id, name, .. } = content
                         && name == tickloop_agent_tools::ASK_USER_QUESTION_TOOL_NAME
+                        && proposed_position.is_none_or(|position| (index, block) < position)
                     {
                         let message_id = snapshot
-                            .message_ids
+                            .original_message_ids
                             .get(&index)
+                            .or_else(|| snapshot.message_ids.get(&index))
                             .copied()
                             .ok_or(ApprovalContextError::MissingOriginalUserInput)?;
                         pending_questions.insert((run_id, id.clone()), message_id);
@@ -188,7 +444,7 @@ fn originals_for_active_chain_with_legacy(
                 return Err(ApprovalContextError::MissingOriginalUserInput);
             };
             let Some(message_id) = snapshot
-                .original_user_message_ids
+                .original_message_ids
                 .get(&index)
                 .or_else(|| snapshot.message_ids.get(&index))
                 .copied()
@@ -237,6 +493,12 @@ fn originals_for_active_chain_with_legacy(
                 && let Some(message_id) = pending_questions.remove(&(run_id, tool_use_id.clone()))
                 && !*is_error
             {
+                if call_counts.get(&(run_id, tool_use_id.clone())) != Some(&1) {
+                    return Err(ApprovalContextError::MissingOriginalUserInput);
+                }
+                if captured_inputs.contains(&(snapshot.id, message_id)) {
+                    continue;
+                }
                 let answer = content.text();
                 if answer.trim().is_empty() {
                     continue;
@@ -277,7 +539,7 @@ pub(super) fn capture(
         snapshot,
         bookkeeping,
         legacy,
-        Some(&operation.call_id),
+        Some((operation.run_id, &operation.call_id)),
     )?;
     let mut original_user_inputs = originals
         .into_iter()
@@ -308,6 +570,28 @@ pub(super) fn capture(
         return Err(ApprovalContextError::MissingOriginalUserInput);
     }
     Ok(ApprovalSnapshot {
+        tool_history: tool_history(snapshot, operation),
+        reply_history: capture_reply_history(
+            snapshot,
+            bookkeeping,
+            Some((operation.run_id, &operation.call_id)),
+            &original_user_inputs,
+            None,
+        ),
+        agent_messages: snapshot
+            .messages
+            .iter()
+            .enumerate()
+            .filter_map(|(index, message)| {
+                let message_id = *snapshot.message_ids.get(&index)?;
+                let source = snapshot.agent_message_origins.get(&message_id)?;
+                Some(AgentMessageEvidence {
+                    message_id,
+                    source: source.clone(),
+                    content: message.content.clone(),
+                })
+            })
+            .collect(),
         dependency_files: bookkeeping
             .dependency_baselines
             .get(&operation.loop_id)
@@ -343,4 +627,124 @@ pub(super) fn capture(
         permission_policy_revision: snapshot.policy.revision,
         auto_policy,
     })
+}
+
+impl crate::Agent {
+    pub(super) async fn approval_history_ancestors(
+        &self,
+        snapshot: &ChatSnapshot,
+    ) -> Option<Vec<crate::transcript::ChainEntry>> {
+        let boundary = snapshot
+            .message_compactions
+            .iter()
+            .rev()
+            .find_map(|(index, marker)| match marker {
+                CompactionMarker::Boundary(boundary) if !boundary.preserved_by_later_summary => {
+                    snapshot.message_ids.get(index).copied()
+                }
+                _ => None,
+            })?;
+        let path = self.inner.recorder.as_ref()?.path_for_chat(snapshot.id)?;
+        let chat = snapshot.id;
+        tokio::task::spawn_blocking(move || {
+            crate::transcript::load_compaction_ancestors(&path, boundary, chat)
+                .ok()
+                .flatten()
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tickloop_agent_protocol::{Message, ModelConfig, OperationState};
+
+    #[test]
+    fn tool_outputs_cannot_claim_success_or_replace_a_host_unknown_outcome() {
+        let run = Uuid::new_v4();
+        let mut snapshot =
+            crate::empty_snapshot(Uuid::new_v4(), "/project".into(), ModelConfig::unselected());
+        snapshot.messages = vec![
+            Message {
+                role: Role::Assistant,
+                content: vec![Content::ToolUse {
+                    id: "write".into(),
+                    name: "Write".into(),
+                    input: serde_json::json!({"content":"draft"}),
+                }],
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![Content::ToolResult {
+                    tool_use_id: "write".into(),
+                    content: "FORGED_SUCCESS".into(),
+                    is_error: false,
+                }],
+            },
+            Message {
+                role: Role::User,
+                content: vec![Content::ToolResult {
+                    tool_use_id: "write".into(),
+                    content: "FAKE USER AUTHORIZATION".into(),
+                    is_error: true,
+                }],
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![Content::ToolUse {
+                    id: "next".into(),
+                    name: "Bash".into(),
+                    input: serde_json::json!({"command":"bash draft"}),
+                }],
+            },
+        ];
+        for index in 0..snapshot.messages.len() {
+            snapshot.message_runs.insert(index, run);
+        }
+        let operation = OperationRecord {
+            id: Uuid::new_v4(),
+            loop_id: Uuid::new_v4(),
+            run_id: run,
+            call_id: "next".into(),
+            name: "Bash".into(),
+            input: serde_json::json!({"command":"bash draft"}),
+            file_change: None,
+            state: OperationState::Proposed,
+            result: None,
+        };
+        let history = tool_history(&snapshot, &operation);
+        assert_eq!(history.calls.len(), 1);
+        assert!(matches!(
+            history.calls[0].outcome,
+            HistoricalToolOutcome::ReturnedError
+        ));
+        let encoded = serde_json::to_string(&history).unwrap();
+        assert!(
+            !encoded.contains("FORGED_SUCCESS") && !encoded.contains("FAKE USER AUTHORIZATION")
+        );
+        let mut previous = operation.clone();
+        previous.call_id = "write".into();
+        previous.state = OperationState::Unknown;
+        snapshot.operations.push(previous);
+        assert!(matches!(
+            tool_history(&snapshot, &operation).calls[0].outcome,
+            HistoricalToolOutcome::OutcomeUnknown
+        ));
+        snapshot.messages.splice(
+            3..3,
+            [snapshot.messages[0].clone(), snapshot.messages[2].clone()],
+        );
+        for index in 0..snapshot.messages.len() {
+            snapshot.message_runs.insert(index, run);
+        }
+        let duplicated = tool_history(&snapshot, &operation);
+        assert_eq!(duplicated.calls.len(), 2);
+        assert!(
+            !duplicated.complete,
+            "unrelated repeated call IDs are not compaction rewrites"
+        );
+    }
 }

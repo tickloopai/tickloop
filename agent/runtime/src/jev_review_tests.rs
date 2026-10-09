@@ -3,7 +3,7 @@ use crate::{ChatBookkeeping, empty_snapshot};
 use std::time::Duration;
 use tickloop_agent_model::judgment::{JevClient, JevConfig, JudgmentClient};
 use tickloop_agent_protocol::{
-    AutoPolicy, ChatSnapshot, Content, Message, OperationRecord, OperationState, Role, Usage,
+    ChatSnapshot, Content, Message, OperationRecord, OperationState, Role, Usage,
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -59,7 +59,28 @@ fn review_request(
         diagnostics: Vec::new(),
         reason: "Original user authorization is unavailable".into(),
     })?;
-    super::review_request(&context)
+    super::review_request(
+        &context,
+        tickloop_agent_protocol::ApprovalStage::Authorization,
+    )
+}
+
+#[test]
+fn one_overall_decision_replaces_the_per_rule_questionnaire() {
+    let (snapshot, bookkeeping, operation) = scenario("Build this project", "cargo test --locked");
+    let request = review_request(&snapshot, &bookkeeping, &operation).unwrap();
+    assert_eq!(request.questions.len(), 1);
+    assert!(request.questions.contains_key("decision"));
+    assert_eq!(
+        request.state["auto_policy"]["rules"]
+            .as_array()
+            .unwrap()
+            .len(),
+        tickloop_agent_config::AutoSettings::default()
+            .policy()
+            .rules
+            .len()
+    );
 }
 
 fn response(request: &EvaluationRequest) -> Evaluation {
@@ -67,13 +88,7 @@ fn response(request: &EvaluationRequest) -> Evaluation {
         .questions
         .iter()
         .map(|(id, question)| {
-            let selected = if id == "task_scope" {
-                "within_task"
-            } else if id.starts_with("clear:") {
-                "missing"
-            } else {
-                "absent"
-            };
+            let selected = "allow";
             let Question::Choice { criteria, .. } = question else {
                 panic!("choice expected")
             };
@@ -195,159 +210,103 @@ fn user_role_notifications_cannot_supply_authorization() {
 }
 
 #[test]
-fn independent_risks_require_their_own_authorization() {
-    let (snapshot, bookkeeping, operation) = scenario("Run tests", "cargo test");
+fn selected_overall_decision_has_no_per_rule_confidence_gate() {
+    let (snapshot, bookkeeping, operation) = scenario("Build this project", "cargo test --locked");
+    let request = review_request(&snapshot, &bookkeeping, &operation).unwrap();
+    let mut result = response(&request);
+    result.answers.insert(
+        "decision".into(),
+        Answer::Choice {
+            choice: "allow".into(),
+            confidence: 0.4,
+            probabilities: BTreeMap::from([
+                ("allow".into(), 0.55),
+                ("block_soft".into(), 0.15),
+                ("block_hard".into(), 0.15),
+                ("block_user_boundary".into(), 0.15),
+            ]),
+        },
+    );
+    result.validate(&request).unwrap();
+    assert_eq!(
+        verdict(
+            &result,
+            &tickloop_agent_config::AutoSettings::default().policy()
+        ),
+        Ok(RuleVerdict::Allow)
+    );
+}
+
+#[test]
+fn block_categories_preserve_hard_and_user_boundaries_without_fabricated_findings() {
+    let (snapshot, bookkeeping, operation) =
+        scenario("Inspect the project", "env sh -c 'printf ok'");
     let request = review_request(&snapshot, &bookkeeping, &operation).unwrap();
     let policy = tickloop_agent_config::AutoSettings::default().policy();
-    for rule in policy
-        .rules
-        .iter()
-        .filter(|rule| rule.kind != AutoRuleKind::SoftAllow)
-    {
-        let id = &rule.id;
+    for (choice, expected) in [
+        (
+            "block_soft",
+            tickloop_agent_protocol::AutoBlockKind::SoftDeny,
+        ),
+        (
+            "block_hard",
+            tickloop_agent_protocol::AutoBlockKind::HardDeny,
+        ),
+        (
+            "block_user_boundary",
+            tickloop_agent_protocol::AutoBlockKind::TaskScope,
+        ),
+    ] {
         let mut result = response(&request);
-        assert!(matches!(verdict(&result, &policy), Ok(RuleVerdict::Allow)));
-        choose(&mut result, &format!("app:{id}"), "present");
-        assert!(matches!(
-            verdict(&result, &policy),
-            Ok(RuleVerdict::Block { .. })
-        ));
-        choose(&mut result, &format!("clear:{id}"), "explicit_consent");
-        assert!(matches!(verdict(&result, &policy), Ok(RuleVerdict::Allow)));
-        if let Answer::Choice { confidence, .. } =
-            result.answers.get_mut(&format!("clear:{id}")).unwrap()
-        {
-            *confidence = 0.79;
-        }
-        let Ok(RuleVerdict::NeedsHuman { diagnostics, .. }) = verdict(&result, &policy) else {
-            panic!("must ask")
-        };
-        assert_eq!(
-            diagnostics,
-            vec![
-                tickloop_agent_protocol::ApprovalDiagnostic::JevLowConfidence {
-                    question_id: format!("clear:{id}")
-                }
-            ]
+        choose(&mut result, "decision", choice);
+        result.validate(&request).unwrap();
+        assert!(
+            matches!(verdict(&result, &policy), Ok(RuleVerdict::Block { kind, rule_id:None, evidence:None, .. }) if kind == expected)
         );
     }
 }
 
 #[test]
-fn low_confidence_and_unclear_effects_never_grant_permission() {
-    let (snapshot, bookkeeping, operation) = scenario("Run tests", "cargo test");
-    let request = review_request(&snapshot, &bookkeeping, &operation).unwrap();
-    let policy = tickloop_agent_config::AutoSettings::default().policy();
-    for id in [
-        "task_scope",
-        "app:builtin.soft_deny.exfiltration",
-        "app:builtin.soft_deny.finance",
-    ] {
-        let mut result = response(&request);
-        choose(&mut result, id, "uncertain");
-        assert!(matches!(
-            verdict(&result, &policy),
-            Ok(RuleVerdict::NeedsHuman { .. })
-        ));
-        let mut result = response(&request);
-        if let Answer::Choice { confidence, .. } = result.answers.get_mut(id).unwrap() {
-            *confidence = 0.5;
-        }
-        assert!(matches!(
-            verdict(&result, &policy),
-            Ok(RuleVerdict::NeedsHuman { .. })
-        ));
-    }
-    let mut result = response(&request);
-    let Answer::Choice { probabilities, .. } = result
-        .answers
-        .get_mut("app:builtin.soft_deny.finance")
-        .unwrap()
-    else {
-        panic!()
-    };
-    probabilities.insert("absent".into(), 0.89);
-    assert!(matches!(
-        verdict(&result, &policy),
-        Ok(RuleVerdict::NeedsHuman { .. })
-    ));
-}
-
-#[test]
-fn custom_hard_deny_cannot_be_cleared_and_soft_allow_clears_only_its_restriction() {
-    use tickloop_agent_protocol::{
-        AutoEnvironment, AutoEnvironmentSource, AutoRule, AutoRuleSource,
-    };
-    let (snapshot, bookkeeping, operation) = scenario("Analyze this account", "broker buy ABC");
-    let policy = AutoPolicy {
-        version: 1,
-        rules: vec![
-            AutoRule {
-                clears: None,
-                id: "allow-exact".into(),
-                kind: AutoRuleKind::SoftAllow,
-                text: "Allow publishing report.csv to reports.example only".into(),
-                source: AutoRuleSource::User,
-            },
-            AutoRule {
-                clears: None,
-                id: "no-trades".into(),
-                kind: AutoRuleKind::HardDeny,
-                text: "Never place orders in Auto review".into(),
-                source: AutoRuleSource::User,
-            },
-            AutoRule {
-                clears: None,
-                id: "external-share".into(),
-                kind: AutoRuleKind::SoftDeny,
-                text: "Do not transmit private files".into(),
-                source: AutoRuleSource::User,
-            },
-        ],
-        environment: AutoEnvironment {
-            entries: Vec::new(),
-            text: "Research environment".into(),
-            source: AutoEnvironmentSource::UserReplacement,
-        },
-    };
-    let context = super::super::approval_context::capture(
+fn both_reviewers_receive_identical_state_and_policy_guidance() {
+    let (snapshot, bookkeeping, operation) = scenario("Run tests", "cargo test --locked");
+    let context = crate::approval_context::capture(
         &snapshot,
         &bookkeeping,
         &operation,
         None,
-        policy.clone(),
+        tickloop_agent_config::AutoSettings::default().policy(),
     )
     .unwrap();
-    let request = super::review_request(&context).unwrap();
-    assert_eq!(
-        request.state["auto_policy"]["environment"]["text"],
-        "Research environment"
+    let llm = crate::auto_mode::classifier_request(
+        &context,
+        tickloop_agent_protocol::ApprovalStage::Authorization,
     );
-    assert!(request.questions.contains_key("app:no-trades"));
-    assert!(!request.questions.contains_key("clear:no-trades"));
-    let Question::Choice { criteria, .. } = &request.questions["clear:external-share"] else {
+    let jev = super::review_request(
+        &context,
+        tickloop_agent_protocol::ApprovalStage::Authorization,
+    )
+    .unwrap();
+    let Content::Text { text } = &llm.messages[1].content[0] else {
         panic!()
     };
-    assert!(criteria.contains_key("allow:allow-exact"));
-
-    let mut evaluation = response(&request);
-    choose(&mut evaluation, "app:no-trades", "present");
-    choose(&mut evaluation, "app:external-share", "present");
-    choose(&mut evaluation, "clear:external-share", "allow:allow-exact");
-    assert!(
-        matches!(verdict(&evaluation, &policy), Ok(RuleVerdict::Block { kind: tickloop_agent_protocol::AutoBlockKind::HardDeny, rule_id: Some(id), .. }) if id == "no-trades")
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(text).unwrap(),
+        jev.state
     );
-    choose(&mut evaluation, "app:no-trades", "absent");
-    assert_eq!(verdict(&evaluation, &policy), Ok(RuleVerdict::Allow));
-    choose(&mut evaluation, "clear:external-share", "missing");
-    assert!(
-        matches!(verdict(&evaluation, &policy), Ok(RuleVerdict::Block { kind: tickloop_agent_protocol::AutoBlockKind::SoftDeny, rule_id: Some(id), .. }) if id == "external-share")
-    );
+    let Content::Text { text: system } = &llm.messages[0].content[0] else {
+        panic!()
+    };
+    let Question::Choice { instructions, .. } = &jev.questions["decision"] else {
+        panic!()
+    };
+    for key in ["policy", "operation"] {
+        assert!(system.contains(instructions[key].as_str().unwrap()));
+    }
 }
 
 #[test]
 fn oversized_evidence_is_not_truncated_into_an_allow() {
-    for evidence_size in [MAX_REVIEW_CONTEXT_BYTES, MAX_REVIEW_REQUEST_BYTES] {
+    for evidence_size in [MAX_REVIEW_REQUEST_BYTES, MAX_REVIEW_REQUEST_BYTES * 2] {
         let (snapshot, bookkeeping, operation) = scenario(&"x".repeat(evidence_size), "cargo test");
         assert!(matches!(
             review_request(&snapshot, &bookkeeping, &operation),
@@ -499,4 +458,105 @@ async fn live_jev_review_scenarios() {
     }
     assert!(tested > 0, "no matching live scenario");
     assert!(failures.is_empty(), "unexpected decisions: {failures:?}");
+}
+
+#[test]
+fn request_bytes_are_not_treated_as_provider_tokens() {
+    for prompt in [
+        "Run the existing project tests. ".repeat(3000),
+        "运行已有项目测试。".repeat(3000),
+    ] {
+        let (snapshot, bookkeeping, operation) = scenario(&prompt, "cargo test");
+        let request = review_request(&snapshot, &bookkeeping, &operation)
+            .expect("a valid text payload must reach the provider's token-capacity check");
+        assert_eq!(request.state["original_user_inputs"][0]["text"], prompt);
+        assert_eq!(request.questions.len(), 1);
+        assert!(serde_json::to_vec(&request).unwrap().len() > 60 * 1024);
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires explicit Jev credentials and pinned Claude defaults; classifies a synthetic local test command"]
+async fn live_jev_full_policy_capacity_uses_the_production_request_builder() {
+    use tickloop_agent_protocol::{ApprovalStage, AutoRule, AutoRuleKind, AutoRuleSource};
+    let root = std::env::var_os("TICKLOOP_JEV_TEST_ROOT").expect("set TICKLOOP_JEV_TEST_ROOT");
+    let path = std::env::var_os("TICKLOOP_CLAUDE_DEFAULTS_FIXTURE")
+        .expect("set TICKLOOP_CLAUDE_DEFAULTS_FIXTURE");
+    let defaults: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    let (snapshot, bookkeeping, operation) = scenario(
+        "Run the existing local tests in this repository.",
+        "npm test",
+    );
+    let mut context = crate::approval_context::capture(
+        &snapshot,
+        &bookkeeping,
+        &operation,
+        None,
+        tickloop_agent_config::AutoSettings::default().policy(),
+    )
+    .unwrap();
+    context.auto_policy.rules.clear();
+    for (group, kind, count) in [
+        ("allow", AutoRuleKind::SoftAllow, 17),
+        ("soft_deny", AutoRuleKind::SoftDeny, 72),
+        ("hard_deny", AutoRuleKind::HardDeny, 1),
+    ] {
+        let rules = defaults[group].as_array().unwrap();
+        assert_eq!(rules.len(), count);
+        context
+            .auto_policy
+            .rules
+            .extend(rules.iter().enumerate().map(|(index, text)| AutoRule {
+                id: format!("oracle.{group}.{index}"),
+                kind,
+                text: text.as_str().unwrap().into(),
+                clears: None,
+                source: AutoRuleSource::Builtin { version: 296 },
+            }));
+    }
+    context.auto_policy.environment.text = defaults["environment"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|text| text.as_str().unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let client = JevClient::bind(JevConfig::default(), Some(root.into())).unwrap();
+    let mut allowed = false;
+    for stage in [ApprovalStage::RiskScreen, ApprovalStage::Authorization] {
+        let request =
+            super::review_request(&context, stage).expect("complete policy must reach Jev");
+        let request_bytes = serde_json::to_vec(&request).unwrap().len();
+        assert!(request_bytes > 80_000);
+        assert_eq!(request.questions.len(), 1);
+        assert_eq!(
+            request.state["auto_policy"]["rules"]
+                .as_array()
+                .unwrap()
+                .len(),
+            90
+        );
+        let evaluation = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.evaluate(&request, CancellationToken::new()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        evaluation.validate(&request).unwrap();
+        let verdict = super::verdict(&evaluation, &context.auto_policy).unwrap();
+        println!(
+            "FULL_POLICY_CAPACITY {}",
+            json!({"stage":stage,"request_bytes":request_bytes,"usage":evaluation.usage,"answers":evaluation.answers})
+        );
+        if verdict == crate::auto_rules::RuleVerdict::Allow {
+            allowed = true;
+            break;
+        }
+    }
+    assert!(
+        allowed,
+        "the supplied full policy should allow this ordinary local test command"
+    );
 }

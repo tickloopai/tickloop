@@ -63,6 +63,10 @@ enum FamilyDelivery<'a> {
         prepared: &'a PreparedFamilyMessage,
         body: &'a str,
     },
+    Handback {
+        prepared: &'a PreparedFamilyMessage,
+        body: &'a str,
+    },
     Completion {
         parent: &'a Receipt,
         body: &'a str,
@@ -226,7 +230,7 @@ pub(super) fn child_run_result(
                 })
                 .flatten()
         })?;
-    let text = snapshot.run_response_text(child.run_id).unwrap_or_default();
+    let text = crate::handback::completion_text(snapshot, child.run_id);
     let metadata = snapshot.delegation.as_ref()?;
     Some(ToolResult {
         content: json!({"delegation_id":metadata.delegation_id,"child_chat_id":child.chat_id,
@@ -443,9 +447,13 @@ impl Agent {
         delivery: FamilyDelivery<'_>,
         cancel: &CancellationToken,
     ) -> Result<ToolResult, String> {
+        let is_handback = matches!(&delivery, FamilyDelivery::Handback { .. });
         let (target, message, is_result, prepared) = match delivery {
             FamilyDelivery::Message { prepared, body } => {
                 (prepared.target.to_string(), body, false, Some(prepared))
+            }
+            FamilyDelivery::Handback { prepared, body } => {
+                (prepared.target.to_string(), body, true, Some(prepared))
             }
             FamilyDelivery::Completion { parent, body } => {
                 (parent.chat_id.to_string(), body, true, None)
@@ -500,6 +508,11 @@ impl Agent {
                 .snapshot
                 .agent_message_origins
                 .contains_key(&sender.run_id)
+                || chats[&target_id]
+                    .snapshot
+                    .agent_message_origins
+                    .values()
+                    .any(|source| source["message_id"] == sender.run_id.to_string())
                 || chats[&target_id]
                     .snapshot
                     .pending_inputs
@@ -624,7 +637,7 @@ impl Agent {
         };
         receiver.snapshot.last_queue_sequence += 1;
         let queued_sequence = receiver.snapshot.last_queue_sequence;
-        let input = if is_result {
+        let input = if is_result && !is_handback {
             message.to_owned()
         } else {
             local_messages::agent_message(&source, message)
@@ -660,7 +673,12 @@ impl Agent {
                 source: source.clone(),
             },
         );
-        self.save(&receiver.snapshot);
+        if is_handback {
+            self.checkpoint_transcript(&receiver.snapshot, &receiver.bookkeeping)
+                .await?;
+        } else {
+            self.save(&receiver.snapshot);
+        }
         *original = candidate;
         if !is_result {
             mailbox.record_source(&source);
@@ -702,6 +720,29 @@ impl Agent {
             self.inner.tasks.lock().await.push(self.run_task(next));
         }
         Ok(delivered)
+    }
+
+    pub(super) async fn deliver_handback_message(
+        &self,
+        child: &Receipt,
+        call_id: &str,
+        target: &PreparedFamilyCall,
+        report: &str,
+        cancel: &CancellationToken,
+    ) -> Result<ToolResult, String> {
+        let PreparedFamilyCall::Message(prepared) = target else {
+            return Err("Handback target was not prepared".into());
+        };
+        self.deliver_agent_message(
+            child,
+            call_id,
+            FamilyDelivery::Handback {
+                prepared,
+                body: report,
+            },
+            cancel,
+        )
+        .await
     }
 
     pub(super) async fn deliver_subagent_notification(

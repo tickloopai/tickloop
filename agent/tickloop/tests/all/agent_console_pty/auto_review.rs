@@ -1,10 +1,10 @@
 use super::*;
 
 async fn malformed_review_recovery(fixture: &PrivateFixture) {
-    let findings = tickloop_agent_test_support::auto_findings(false).to_string();
+    let findings = tickloop_agent_test_support::auto_classification(false).to_string();
     let (url, mut requests, release) = model_http_support::serve_responses_with_gated_response(
         vec![
-            (200, chat_reply(Some(("Bash", "checked-command", json!({"command":"printf admitted > admission-marker", "description":"controlled approval probe"}))), "Review the requested command.")),
+            (200, chat_reply(Some(("Bash", "checked-command", json!({"command":"env sh -c 'printf admitted > admission-marker'", "description":"controlled approval probe"}))), "Review the requested command.")),
             (200, chat_reply(None, &format!("Here is the assessment: {findings}"))),
             (200, chat_reply(None, &format!("```json\n{findings}\n```"))),
             (200, chat_reply(None, "AUTO-REVIEW-RECOVERED")),
@@ -146,14 +146,37 @@ async fn environment_setup_preview_and_save(fixture: &PrivateFixture) {
         Some(fixture.path("work").canonicalize().unwrap())
     );
     assert!(saved.rules.environment_entries[0].confirmed_at_ms > 0);
-    assert!(
+    assert_eq!(
         saved
             .policy_for_directory(&fixture.path("work").canonicalize().unwrap())
             .environment
+            .text,
+        tickloop_agent_config::AutoSettings::default()
+            .policy()
+            .environment
             .text
-            .contains("do not grant authority")
     );
-    view.send(b"\x1b\x1b\x1b");
+    view.wait_for("saved setup returns to Auto settings", |frame| {
+        frame.contains("Generate Environment draft")
+            && !frame.contains("Confirm Environment additions")
+    })
+    .await;
+    view.send(b"\x1b");
+    view.wait_for("Environment settings return to Auto overview", |frame| {
+        frame.contains("Permissions · [Auto mode]") && frame.contains("Reviewer")
+    })
+    .await;
+    view.send(b"\x1b");
+    view.wait_for("Auto settings return to mode selection", |frame| {
+        frame.contains("Permissions · Choose mode")
+    })
+    .await;
+    view.send(b"\x1b");
+    view.wait_for("mode selection closes before exit", |frame| {
+        !(frame.contains("Permissions · Choose mode")
+            || frame.contains("Generate Environment draft"))
+    })
+    .await;
     view.close().await;
 }
 

@@ -573,7 +573,7 @@ async fn checker_uses_its_actual_identity_and_is_excluded_from_conversation_tota
         let checker = Arc::new(UsageModel::new(
             checker_identity.clone(),
             vec![ResponseStep::reply(
-                text(&tickloop_agent_test_support::auto_findings(false).to_string()),
+                text(&tickloop_agent_test_support::auto_classification(false).to_string()),
                 counters(100, 10, 5, 0),
             )],
         ));
@@ -638,6 +638,7 @@ async fn invalid_checker_verdict_retains_usage_and_blocks_the_call() {
         vec![
             ResponseStep::reply(text("not a verdict"), counters(40, 4, 0, 0)),
             ResponseStep::reply(text("still not a verdict"), counters(40, 4, 0, 0)),
+            ResponseStep::reply(text("authorization also invalid"), counters(40, 4, 0, 0)),
         ],
     ));
     let agent = Agent::new_with_options(
@@ -664,7 +665,7 @@ async fn invalid_checker_verdict_retains_usage_and_blocks_the_call() {
         EventKind::Completed { .. }
     ));
     let snapshot = agent.snapshot(chat).await.unwrap();
-    for entry in &support::model_script_requests(&snapshot)[1..=2] {
+    for entry in &support::model_script_requests(&snapshot)[1..=3] {
         assert_eq!(entry.kind, ModelRequestKind::PermissionCheck);
         assert_eq!(
             entry.outcome,
@@ -673,7 +674,7 @@ async fn invalid_checker_verdict_retains_usage_and_blocks_the_call() {
         assert_eq!(entry.usage, counters(40, 4, 0, 0));
     }
     assert!(!blocked_path.exists());
-    assert_eq!(checker.request_count(), 2);
+    assert_eq!(checker.request_count(), 3);
     agent.shutdown().await;
 }
 

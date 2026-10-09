@@ -60,6 +60,30 @@ impl From<Protocol> for Adapter {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TemperatureControl {
+    Supported,
+    Unsupported,
+    WithoutThinking,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThinkingOffEncoding {
+    Disabled,
+    BetweenTools,
+}
+
+impl ThinkingOffEncoding {
+    pub fn wire_value(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::BetweenTools => "between_tools",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelCard {
@@ -83,6 +107,10 @@ pub struct ModelCard {
     /// Messages models without adaptive thinking take a token budget per effort level instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_budgets: Option<ThinkingBudgets>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature_control: Option<TemperatureControl>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_off: Option<ThinkingOffEncoding>,
 }
 
 /// Manual thinking budgets for the effort levels a budget-only Messages model offers; pi uses
@@ -147,7 +175,7 @@ pub struct ModelPatch {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        deserialize_with = "deserialize_nullable_context_window"
+        deserialize_with = "deserialize_nullable"
     )]
     pub context_window_tokens: Option<Option<usize>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -160,15 +188,26 @@ pub struct ModelPatch {
     pub input_modalities: Option<Vec<InputModality>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking_budgets: Option<ThinkingBudgets>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_nullable"
+    )]
+    pub temperature_control: Option<Option<TemperatureControl>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_nullable"
+    )]
+    pub thinking_off: Option<Option<ThinkingOffEncoding>>,
 }
 
-fn deserialize_nullable_context_window<'de, D>(
-    deserializer: D,
-) -> Result<Option<Option<usize>>, D::Error>
+fn deserialize_nullable<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
 where
     D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
 {
-    Option::<usize>::deserialize(deserializer).map(Some)
+    Option::<T>::deserialize(deserializer).map(Some)
 }
 
 impl ModelPatch {
@@ -203,6 +242,12 @@ impl ModelPatch {
         if let Some(value) = self.thinking_budgets {
             model.thinking_budgets = Some(value);
         }
+        if let Some(value) = self.temperature_control {
+            model.temperature_control = value;
+        }
+        if let Some(value) = self.thinking_off {
+            model.thinking_off = value;
+        }
     }
 
     pub fn into_new(self, provider_location: &str) -> Result<ModelCard, String> {
@@ -227,6 +272,8 @@ impl ModelPatch {
             effort_levels: self.effort_levels.unwrap_or_default(),
             input_modalities: self.input_modalities.unwrap_or_else(text_only),
             thinking_budgets: self.thinking_budgets,
+            temperature_control: self.temperature_control.unwrap_or(None),
+            thinking_off: self.thinking_off.unwrap_or(None),
         })
     }
 }

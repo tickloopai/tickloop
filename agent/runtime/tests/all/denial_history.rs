@@ -969,15 +969,14 @@ async fn automatic_hard_deny_keeps_the_frozen_rule_and_reviewer_path_after_polic
         "hardDeny":{"includeBuiltins":true,"custom":[{"id":hard_id,"text":original_rule}]}
     }}});
     std::fs::write(root.join("settings.json"), settings.to_string()).unwrap();
-    let finding = json!({"task_scope":"within_task","rules":[{
-        "id":hard_id,"applicability":"present","clearance":null
-    }]});
+    let finding = json!({"decision":"block_hard","rule_id":hard_id,"reason":"Never create the protected symlink"});
     let model = Arc::new(ScriptedModel::new(vec![
         call(
             "blocked",
             "Bash",
             json!({"command":"ln -s missing-target protected.txt"}),
         ),
+        text(&finding.to_string()),
         text(&finding.to_string()),
         text("blocked"),
     ]));
@@ -1003,11 +1002,8 @@ async fn automatic_hard_deny_keeps_the_frozen_rule_and_reviewer_path_after_polic
     let rule = review.block_rule.unwrap();
     assert_eq!(rule.id, hard_id);
     assert_eq!(rule.text.text, original_rule);
-    assert_eq!(
-        review.block_finding.unwrap().applicability,
-        Some(tickloop_agent_protocol::RuleApplicability::Present)
-    );
-    assert_eq!(review.attempts.len(), 1);
+    assert!(review.block_finding.is_none());
+    assert_eq!(review.attempts.len(), 2);
     assert!(workdir.join("protected.txt").symlink_metadata().is_err());
     agent.shutdown().await;
     std::fs::write(
@@ -1042,9 +1038,7 @@ async fn stale_auto_allow_is_reviewed_again_against_the_new_hard_deny() {
     }}});
     std::fs::write(&settings_path, initial.to_string()).unwrap();
     let hard_id = Uuid::new_v4().to_string();
-    let blocked = json!({"task_scope":"within_task","rules":[{
-        "id":hard_id,"applicability":"present","clearance":null
-    }]});
+    let blocked = json!({"decision":"block_hard","rule_id":hard_id,"reason":"Never create the protected symlink"});
     let model = Arc::new(HeldReviewerModel {
         scripted: ScriptedModel::new(vec![
             call(
@@ -1052,7 +1046,8 @@ async fn stale_auto_allow_is_reviewed_again_against_the_new_hard_deny() {
                 "Bash",
                 json!({"command":"ln -s missing-target held-auto"}),
             ),
-            text(r#"{"task_scope":"within_task","rules":[]}"#),
+            text(&tickloop_agent_test_support::auto_classification(false).to_string()),
+            text(&blocked.to_string()),
             text(&blocked.to_string()),
             text("blocked"),
         ]),
@@ -1100,6 +1095,6 @@ async fn stale_auto_allow_is_reviewed_again_against_the_new_hard_deny() {
             .id,
         hard_id
     );
-    assert_eq!(model.requests.load(Ordering::SeqCst), 4);
+    assert_eq!(model.requests.load(Ordering::SeqCst), 5);
     agent.shutdown().await;
 }

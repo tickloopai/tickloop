@@ -403,15 +403,10 @@ pub(super) async fn complete(
                 }
                 data["type"] = json!(format!("response.{status}"));
             }
-            if stream.accept(data, &events).map_err(|error| {
-                failure(
-                    match &structured_response {
-                        Some(policy) => policy.decode_error(error),
-                        None => error,
-                    },
-                    true,
-                )
-            })? {
+            if stream
+                .accept(data, &events)
+                .map_err(|error| failure(error, true))?
+            {
                 let response_id = stream.response_id().unwrap_or_default().to_owned();
                 let output = stream.finish().map_err(|error| failure(error, true))?;
                 if let Some(chat) = chat_id {

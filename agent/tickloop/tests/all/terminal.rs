@@ -1906,7 +1906,7 @@ async fn terminal_auto_mode_reviews_with_the_current_chat_model_by_default() {
                 "Write",
                 json!({"file_path":requested_path,"content":"checked output"}),
             ),
-            messages_stream(&tickloop_agent_test_support::auto_findings(false).to_string()),
+            messages_stream(&tickloop_agent_test_support::auto_classification(false).to_string()),
             messages_stream("Checked output saved."),
         ] {
             let (mut socket, _) = listener.accept().await.unwrap();
@@ -1949,7 +1949,7 @@ async fn terminal_auto_mode_reviews_with_the_current_chat_model_by_default() {
     assert!(
         requests[1]["system"]
             .to_string()
-            .contains("complete Auto policy")
+            .contains("Decide whether the proposed operation should be blocked")
     );
 }
 

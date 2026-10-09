@@ -130,15 +130,44 @@ async fn run_child_config_fixture() {
     } else {
         vec![
             tickloop_agent_test_support::call("delegate", "Subagent", json!({"task":TASK})),
-            tickloop_agent_test_support::text("child reviewed"),
+            if auto_permissions {
+                let mut reply = tickloop_agent_test_support::text("child reviewed");
+                reply.extend(tickloop_agent_test_support::call(
+                    "child-report",
+                    "SubagentHandback",
+                    json!({"message":"child reviewed"}),
+                ));
+                reply
+            } else {
+                tickloop_agent_test_support::text("child reviewed")
+            },
             tickloop_agent_test_support::text("parent done"),
-            tickloop_agent_test_support::text("child follow-up done"),
+            if auto_permissions {
+                let mut reply = tickloop_agent_test_support::text("child follow-up done");
+                reply.extend(tickloop_agent_test_support::call(
+                    "follow-up-report",
+                    "SubagentHandback",
+                    json!({"message":"child follow-up done"}),
+                ));
+                reply
+            } else {
+                tickloop_agent_test_support::text("child follow-up done")
+            },
         ]
     };
     let core = tickloop_agent_runtime::Agent::new_embedded(
         model.clone(),
         Arc::new(tickloop_agent_test_support::ScriptedModel::new(replies)),
     );
+    core.set_auto_reviewer(Arc::new(tickloop_agent_test_support::ScriptedModel::new(
+        vec![
+            tickloop_agent_test_support::text(
+                &tickloop_agent_test_support::auto_classification(false).to_string(),
+            );
+            3
+        ],
+    )))
+    .await;
     let workdir = std::env::current_dir().unwrap();
     let adapter = Arc::new(RecordingDaemon {
         daemon: EmbeddedAgentAccess::new(core.clone()),

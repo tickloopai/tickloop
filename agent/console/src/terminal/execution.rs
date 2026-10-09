@@ -398,8 +398,6 @@ fn rule_project(directory: &Path) -> Result<PathBuf, AccessError> {
         .map_err(|_| AccessError::invalid("directory is unavailable"))
 }
 
-/// Connects to the local daemon, starting it from this executable when none serves this user.
-
 impl ConsoleExecution {
     pub(super) fn connected(
         client: LocalAgentClient,

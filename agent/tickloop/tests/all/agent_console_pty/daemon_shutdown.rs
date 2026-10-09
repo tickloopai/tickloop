@@ -90,7 +90,7 @@ async fn incompatible_startup_confirmation_opens_the_new_daemon_with_original_op
             fixture.path("work").canonicalize().unwrap()
         );
         assert_eq!(
-            opened.conversation.policy.mode,
+            opened.policy.mode,
             tickloop_agent_protocol::ExecutionMode::AcceptEdits
         );
         view.close().await;

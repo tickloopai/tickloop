@@ -128,7 +128,12 @@ pub(super) fn encode_request(
     if !system.is_empty() {
         body["systemInstruction"] = json!({"parts": system});
     }
-    if let Some(temperature) = request.temperature {
+    if let Some(temperature) = super::sampling_temperature(
+        config,
+        request.temperature,
+        super::ModelConfigExt::thinking_enabled(config, request.reasoning_effort, true)
+            .unwrap_or(false),
+    ) {
         body["generationConfig"]["temperature"] = json!(temperature);
     }
     if let Some(effort) = request.reasoning_effort {

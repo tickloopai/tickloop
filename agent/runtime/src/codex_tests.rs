@@ -722,27 +722,7 @@ async fn agent_reads_two_real_files_and_continues_with_paired_codex_tool_history
 }
 
 fn approval_findings(block: bool) -> Value {
-    let rules = [
-        "external_code",
-        "destruction",
-        "persistence",
-        "security",
-        "exfiltration",
-        "credentials",
-        "external_scope",
-        "finance",
-    ]
-    .into_iter()
-    .enumerate()
-    .map(|(index, id)| {
-        json!({
-            "id": format!("builtin.soft_deny.{id}"),
-            "applicability": if block && index == 0 { "present" } else { "absent" },
-            "clearance": "missing"
-        })
-    })
-    .collect::<Vec<_>>();
-    json!({"task_scope":"within_task", "rules":rules})
+    tickloop_agent_test_support::auto_classification(block)
 }
 
 #[tokio::test]
@@ -756,7 +736,7 @@ async fn codex_auto_review_allows_or_blocks_a_real_protected_operation() {
                 profile.model == "gpt-5.5" && profile.provider == ModelProvider::OpenAiCodex
             })
             .unwrap();
-        let (endpoint, captured) = serve_scripted_responses(vec![
+        let mut responses = vec![
             (
                 200,
                 function_call_stream(
@@ -768,16 +748,24 @@ async fn codex_auto_review_allows_or_blocks_a_real_protected_operation() {
             ),
             (
                 200,
-                function_call_stream(
-                    "review",
-                    "classify_result",
-                    approval_findings(should_block),
-                    7,
-                ),
+                reply_stream("review", &approval_findings(should_block).to_string(), 7),
             ),
             (200, reply_stream("after-review", "reviewed", 30)),
-        ])
-        .await;
+        ];
+        if should_block {
+            responses.insert(
+                2,
+                (
+                    200,
+                    reply_stream(
+                        "authorization-review",
+                        &approval_findings(true).to_string(),
+                        7,
+                    ),
+                ),
+            );
+        }
+        let (endpoint, captured) = serve_scripted_responses(responses).await;
         let client = LoopbackCodexClient::new(config.clone(), &state_dir, endpoint.as_str());
         let client = client.into_fixture_client();
         let agent = Agent::new_embedded(config, client.clone());
@@ -831,13 +819,16 @@ async fn codex_auto_review_allows_or_blocks_a_real_protected_operation() {
             !should_block
         );
         let requests = captured.await.unwrap();
-        assert_eq!(requests.len(), 3);
-        assert_eq!(requests[1]["tool_choice"], "required");
+        assert_eq!(requests.len(), if should_block { 4 } else { 3 });
+        assert_eq!(requests[1]["tool_choice"], "auto");
         assert_eq!(requests[1]["parallel_tool_calls"], false);
-        assert_eq!(requests[1]["tools"].as_array().unwrap().len(), 1);
-        assert_eq!(requests[1]["tools"][0]["name"], "classify_result");
-        assert_eq!(requests[1]["tools"][0]["strict"], true);
-        assert!(!requests[1]["tools"].to_string().contains("Bash"));
+        assert!(requests[1].get("tools").is_none());
+        assert!(
+            requests[1]["instructions"]
+                .as_str()
+                .unwrap()
+                .contains("JSON Schema")
+        );
         let snapshot = agent.snapshot(chat).await.unwrap();
         let usage = snapshot
             .request_usage
@@ -845,7 +836,7 @@ async fn codex_auto_review_allows_or_blocks_a_real_protected_operation() {
             .iter()
             .filter(|entry| entry.kind != ModelRequestKind::Title)
             .collect::<Vec<_>>();
-        assert_eq!(usage.len(), 3);
+        assert_eq!(usage.len(), if should_block { 4 } else { 3 });
         assert_eq!(usage[1].kind, ModelRequestKind::PermissionCheck);
         assert_eq!(usage[1].usage.input_tokens, Some(7));
         agent.shutdown().await;
@@ -885,7 +876,7 @@ async fn explicit_codex_reviewer_uses_its_own_model_and_usage_identity() {
     .await;
     let (reviewer_endpoint, reviewer_requests) = serve_scripted_responses(vec![(
         200,
-        function_call_stream("review", "classify_result", approval_findings(false), 7),
+        reply_stream("review", &approval_findings(false).to_string(), 7),
     )])
     .await;
     let main_client =
@@ -932,7 +923,8 @@ async fn explicit_codex_reviewer_uses_its_own_model_and_usage_identity() {
     assert_eq!(reviewer_requests.len(), 1);
     assert_eq!(main_requests[0]["model"], "gpt-5.5");
     assert_eq!(reviewer_requests[0]["model"], "gpt-5.6-sol");
-    assert_eq!(reviewer_requests[0]["tool_choice"], "required");
+    assert_eq!(reviewer_requests[0]["tool_choice"], "auto");
+    assert!(reviewer_requests[0].get("tools").is_none());
     let snapshot = agent.snapshot(chat).await.unwrap();
     let usage = snapshot
         .request_usage
@@ -1038,22 +1030,25 @@ async fn blocked_auto_review_case(
 #[tokio::test]
 async fn malformed_codex_review_is_retried_then_blocks_without_running_the_tool() {
     let malformed = || {
-        function_call_stream(
+        reply_stream(
             "bad-review",
-            "classify_result",
-            json!({"thinking":"fixture","shouldBlock":"false","reason":"wrong type"}),
+            &json!({"thinking":"fixture","shouldBlock":"false","reason":"wrong type"}).to_string(),
             7,
         )
     };
-    let (requests, kinds, reason) =
-        blocked_auto_review_case(vec![(200, malformed()), (200, malformed())]).await;
-    assert_eq!(requests.len(), 4);
+    let (requests, kinds, reason) = blocked_auto_review_case(vec![
+        (200, malformed()),
+        (200, malformed()),
+        (200, malformed()),
+    ])
+    .await;
+    assert_eq!(requests.len(), 5);
     assert_eq!(
         kinds
             .iter()
             .filter(|kind| **kind == ModelRequestKind::PermissionCheck)
             .count(),
-        2
+        3
     );
     assert!(reason.to_ascii_lowercase().contains("invalid"), "{reason}");
 }
@@ -1143,8 +1138,7 @@ async fn orphan_tool_event_requires_manual_review(malformed_result: bool) {
                     );
                 }
             }
-            let repair =
-                function_call_stream("repair", "classify_result", approval_findings(false), 7);
+            let repair = reply_stream("repair", &approval_findings(false).to_string(), 7);
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let endpoint = format!("http://{}/codex/responses", listener.local_addr().unwrap());
             let calls = Arc::new(AtomicUsize::new(0));

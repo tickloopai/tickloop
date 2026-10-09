@@ -23,7 +23,7 @@ use tokio_util::sync::CancellationToken;
 #[derive(Clone, Copy)]
 enum Outcome {
     Allow,
-    Uncertain,
+    LowConfidence,
     MissingAnswer,
     RetryThenAllow,
     Authentication,
@@ -63,32 +63,36 @@ impl JudgmentClient for Reviewer {
             let Question::Choice { criteria, .. } = question else {
                 panic!()
             };
-            let choice = if id == "task_scope" {
-                "within_task"
-            } else if id.starts_with("clear:") {
-                "missing"
-            } else {
-                "absent"
-            };
+            let choice = "allow";
             answers.insert(
                 id.clone(),
                 Answer::Choice {
                     choice: choice.into(),
-                    confidence: if id == "task_scope" && matches!(self.outcome, Outcome::Uncertain)
+                    confidence: if id == "decision"
+                        && matches!(self.outcome, Outcome::LowConfidence)
                     {
-                        0.3
+                        0.4
                     } else {
                         1.0
                     },
                     probabilities: criteria
                         .keys()
-                        .map(|option| (option.clone(), f64::from(option == choice)))
+                        .map(|option| {
+                            (
+                                option.clone(),
+                                if matches!(self.outcome, Outcome::LowConfidence) {
+                                    if option == choice { 0.55 } else { 0.15 }
+                                } else {
+                                    f64::from(option == choice)
+                                },
+                            )
+                        })
                         .collect(),
                 },
             );
         }
         if matches!(self.outcome, Outcome::MissingAnswer) {
-            answers.remove("task_scope");
+            answers.remove("decision");
         }
         Ok(Evaluation {
             model: "jev-test-1".into(),
@@ -113,7 +117,7 @@ async fn fixture(
             "Bash",
             json!({"command":"ln -s missing-target reviewed"}),
         ),
-        text(&tickloop_agent_test_support::auto_findings(false).to_string()),
+        text(&tickloop_agent_test_support::auto_classification(false).to_string()),
         text("done"),
     ]));
     let agent = Agent::new_with_options(
@@ -161,7 +165,7 @@ async fn selected_jev_configuration_failure_falls_back_to_the_conversation_model
             "Bash",
             json!({"command":"ln -s missing-target reviewed"}),
         ),
-        text(&tickloop_agent_test_support::auto_findings(false).to_string()),
+        text(&tickloop_agent_test_support::auto_classification(false).to_string()),
         text("done"),
     ]));
     let agent = Agent::new_with_user_settings_embedded(
@@ -267,36 +271,24 @@ async fn typed_allow_executes_and_records_separate_judgment_usage() {
 }
 
 #[tokio::test]
-async fn uncertainty_requires_real_user_approval_and_headless_denies() {
+async fn overall_allow_is_not_overridden_by_an_extra_confidence_gate() {
     for prompt_policy in [PromptPolicy::Interactive, PromptPolicy::DenyOnPrompt] {
-        let (root, agent, _, chat) = fixture(Outcome::Uncertain, prompt_policy).await;
+        let (root, agent, reviewer, chat) = fixture(Outcome::LowConfidence, prompt_policy).await;
         let mut events = agent.subscribe();
         agent
             .submit(chat, None, "Create a symlink named reviewed".into())
             .await
             .unwrap();
-        let mut prompted = false;
         loop {
             match next_event(&mut events).await.kind {
-                EventKind::PermissionRequested { request } => {
-                    assert_eq!(prompt_policy, PromptPolicy::Interactive);
-                    assert!(root.path().join("reviewed").symlink_metadata().is_err());
-                    prompted = true;
-                    agent
-                        .answer_permission(chat, request.id, true)
-                        .await
-                        .unwrap();
-                }
+                EventKind::PermissionRequested { .. } => panic!("unexpected confidence gate"),
                 EventKind::Completed { .. } => break,
                 EventKind::Failed(error) => panic!("{error}"),
                 _ => {}
             }
         }
-        assert_eq!(prompted, prompt_policy == PromptPolicy::Interactive);
-        assert_eq!(
-            root.path().join("reviewed").symlink_metadata().is_ok(),
-            prompted
-        );
+        assert!(root.path().join("reviewed").symlink_metadata().is_ok());
+        assert_eq!(reviewer.requests.lock().unwrap()[0].questions.len(), 1);
         agent.shutdown().await;
     }
 }
@@ -319,7 +311,14 @@ async fn invalid_answers_and_auth_failures_fall_back_to_the_chat_model() {
             }
         }
         assert!(root.path().join("reviewed").symlink_metadata().is_ok());
-        assert_eq!(reviewer.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            reviewer.calls.load(Ordering::SeqCst),
+            if matches!(outcome, Outcome::MissingAnswer) {
+                2
+            } else {
+                1
+            }
+        );
         agent.shutdown().await;
     }
 }

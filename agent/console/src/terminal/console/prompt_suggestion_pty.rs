@@ -30,10 +30,16 @@ fn prompt_suggestion_pty_fixture() {
                     let replies = if user_case {
                         vec![
                             tickloop_agent_test_support::call("delegate", "Subagent", serde_json::json!({"task":"Complete the fixture child"})),
-                            tickloop_agent_test_support::text("Child completed."),
+                            tickloop_agent_test_support::call("child-report", "SubagentHandback", serde_json::json!({"message":"Child completed."})),
                             tickloop_agent_test_support::text("Parent completed."),
                             tickloop_agent_test_support::call("ls", "Bash", serde_json::json!({"command":"ls", "description":"List files in current directory"})),
-                            tickloop_agent_test_support::text("当前目录包含 settings.json 和 model-url。"),
+                            if directory.join("delegated-view").exists() {
+                                let mut reply = tickloop_agent_test_support::text("当前目录包含 settings.json 和 model-url。");
+                                reply.extend(tickloop_agent_test_support::call("follow-up-report", "SubagentHandback", serde_json::json!({"message":"当前目录包含 settings.json 和 model-url。"})));
+                                reply
+                            } else {
+                                tickloop_agent_test_support::text("当前目录包含 settings.json 和 model-url。")
+                            },
                             tickloop_agent_test_support::text("Accepted fixture prompt."),
                         ]
                     } else if directory.join("fail-turn").exists() {
@@ -50,6 +56,9 @@ fn prompt_suggestion_pty_fixture() {
                         model.clone(),
                         scripted.clone(),
                     );
+                    core.set_auto_reviewer(Arc::new(tickloop_agent_test_support::ScriptedModel::new(vec![
+                        tickloop_agent_test_support::text(&tickloop_agent_test_support::auto_classification(false).to_string()); 3
+                    ]))).await;
                     let agent = crate::terminal::execution::ConsoleExecution::from_embedded(
                         core.clone(),
                         model.clone(),

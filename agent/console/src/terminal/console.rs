@@ -2902,20 +2902,28 @@ impl Console {
         interactive: bool,
         preferences: DisplayPreferences,
     ) -> Result<(Self, mpsc::Receiver<InputEvent>), String> {
-        Self::start_with_startup(interactive, preferences, None)
+        Self::start_with_startup(interactive, preferences, None, None)
     }
 
     pub(super) fn start_with_workspace_trust(
         preferences: DisplayPreferences,
         workdir: PathBuf,
     ) -> Result<(Self, mpsc::Receiver<InputEvent>), String> {
-        Self::start_with_startup(true, preferences, Some(WorkspaceTrust::new(workdir)))
+        Self::start_with_startup(true, preferences, Some(WorkspaceTrust::new(workdir)), None)
+    }
+
+    pub(super) fn start_with_startup_menu(
+        preferences: DisplayPreferences,
+        menu: Menu,
+    ) -> Result<(Self, mpsc::Receiver<InputEvent>), String> {
+        Self::start_with_startup(true, preferences, None, Some(menu))
     }
 
     fn start_with_startup(
         interactive: bool,
         preferences: DisplayPreferences,
         workspace_trust: Option<WorkspaceTrust>,
+        startup_menu: Option<Menu>,
     ) -> Result<(Self, mpsc::Receiver<InputEvent>), String> {
         let (width, height) = terminal::size().unwrap_or((80, 24));
         let choice =
@@ -2929,6 +2937,11 @@ impl Console {
         };
         let mut initial = State::new_with_display(interactive, width, height, preferences);
         initial.workspace_trust = workspace_trust;
+        if let Some(menu) = startup_menu {
+            initial.menu = Some(menu);
+            initial.menu_focused = true;
+            initial.prompt_enabled = false;
+        }
         if interactive {
             initial.renderer = startup_renderer;
             initial.surface = TerminalSurface::new(renderer::captures_mouse());
@@ -2953,13 +2966,11 @@ impl Console {
             }
         }
         let reader_state = Arc::clone(&state);
-        if interactive
-            && state
-                .lock()
-                .map_err(|error| error.to_string())?
-                .workspace_trust
-                .is_some()
-        {
+        let has_startup_dialog = {
+            let state = state.lock().map_err(|error| error.to_string())?;
+            state.workspace_trust.is_some() || state.menu.is_some()
+        };
+        if interactive && has_startup_dialog {
             let initial_draw = state
                 .lock()
                 .map_err(|error| error.to_string())?

@@ -38,13 +38,7 @@ impl JudgmentClient for AllowingJudgment {
                 let Question::Choice { criteria, .. } = question else {
                     panic!("the reviewer asked for a non-choice answer")
                 };
-                let selected = if id == "task_scope" {
-                    "within_task"
-                } else if id.starts_with("clear:") {
-                    "missing"
-                } else {
-                    "absent"
-                };
+                let selected = "allow";
                 (
                     id.clone(),
                     Answer::Choice {
@@ -79,7 +73,7 @@ async fn agent_reports_typed_assessment_for_each_actual_reviewer() {
             text("done"),
         ]));
         let llm = Arc::new(ScriptedModel::new(vec![text(
-            &tickloop_agent_test_support::auto_findings(false).to_string(),
+            &tickloop_agent_test_support::auto_classification(false).to_string(),
         )]));
         let jev = Arc::new(AllowingJudgment {
             requests: Mutex::new(Vec::new()),
@@ -123,8 +117,8 @@ async fn agent_reports_typed_assessment_for_each_actual_reviewer() {
             snapshot.policy.revision
         );
         assert_eq!(assessment.outcome, ApprovalOutcome::Allow);
-        assert_eq!(assessment.context_version, "trusted-approval-v3");
-        assert_eq!(assessment.review_template_version, "auto-review-v4");
+        assert_eq!(assessment.context_version, "trusted-approval-v6");
+        assert_eq!(assessment.review_template_version, "auto-review-v17");
         let reviewer = assessment.reviewer.as_ref().unwrap();
         assert_eq!(
             reviewer.kind,

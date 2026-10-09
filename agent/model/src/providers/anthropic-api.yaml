@@ -24,6 +24,7 @@ models:
     service_model_id: "claude-opus-5"
     display_name: "Claude Opus 5"
     adapter: "messages"
+    temperature_control: "unsupported"
     max_output_tokens: 64000
     context_window_tokens: null
     thinking: "toggle"
@@ -41,6 +42,7 @@ models:
     service_model_id: "claude-opus-4-8"
     display_name: "Claude Opus 4.8"
     adapter: "messages"
+    temperature_control: "unsupported"
     max_output_tokens: 64000
     context_window_tokens: null
     thinking: "toggle"
@@ -58,6 +60,7 @@ models:
     service_model_id: "claude-opus-4-7"
     display_name: "Claude Opus 4.7"
     adapter: "messages"
+    temperature_control: "unsupported"
     max_output_tokens: 64000
     context_window_tokens: null
     thinking: "toggle"
@@ -75,6 +78,7 @@ models:
     service_model_id: "claude-opus-4-6"
     display_name: "Claude Opus 4.6"
     adapter: "messages"
+    temperature_control: "without_thinking"
     max_output_tokens: 64000
     context_window_tokens: null
     thinking: "toggle"
@@ -91,6 +95,7 @@ models:
     service_model_id: "claude-sonnet-5"
     display_name: "Claude Sonnet 5"
     adapter: "messages"
+    temperature_control: "unsupported"
     max_output_tokens: 64000
     context_window_tokens: null
     thinking: "toggle"
@@ -108,6 +113,7 @@ models:
     service_model_id: "claude-sonnet-4-6"
     display_name: "Claude Sonnet 4.6"
     adapter: "messages"
+    temperature_control: "without_thinking"
     max_output_tokens: 64000
     context_window_tokens: null
     thinking: "toggle"
@@ -124,6 +130,7 @@ models:
     service_model_id: "claude-fable-5-1"
     display_name: "Claude Fable 5.1"
     adapter: "messages"
+    temperature_control: "unsupported"
     max_output_tokens: 128000
     context_window_tokens: 1000000
     thinking: "always_on"
@@ -141,6 +148,7 @@ models:
     service_model_id: "claude-fable-5"
     display_name: "Claude Fable 5"
     adapter: "messages"
+    temperature_control: "unsupported"
     max_output_tokens: 64000
     context_window_tokens: null
     thinking: "always_on"
@@ -158,6 +166,7 @@ models:
     service_model_id: "claude-opus-5-5"
     display_name: "Claude Opus 5.5"
     adapter: "messages"
+    temperature_control: "unsupported"
     max_output_tokens: 128000
     context_window_tokens: 1000000
     thinking: "always_on"
@@ -168,6 +177,8 @@ models:
     service_model_id: "claude-sonnet-5-5"
     display_name: "Claude Sonnet 5.5"
     adapter: "messages"
+    temperature_control: "unsupported"
+    thinking_off: "between_tools"
     max_output_tokens: 128000
     context_window_tokens: 1000000
     thinking: "toggle"
@@ -178,6 +189,7 @@ models:
     service_model_id: "claude-haiku-4-5-20251001"
     display_name: "Claude Haiku 4.5"
     adapter: "messages"
+    temperature_control: "without_thinking"
     max_output_tokens: 64000
     context_window_tokens: 200000
     thinking: "toggle"

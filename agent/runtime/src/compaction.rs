@@ -74,7 +74,7 @@ impl CompactionLayout {
         compacted.message_contexts = BTreeMap::new();
         compacted_bookkeeping.denial_references = BTreeMap::new();
         compacted.message_ids = BTreeMap::new();
-        compacted.original_user_message_ids = BTreeMap::new();
+        compacted.original_message_ids = BTreeMap::new();
         compacted.prompt_execution_modes = BTreeMap::new();
         compacted.inherited_prompts.clear();
         compacted.message_compactions = BTreeMap::new();
@@ -96,23 +96,26 @@ impl CompactionLayout {
                             .denial_references
                             .insert(index, reference.clone());
                     }
-                    if let Some(id) = snapshot.message_ids.get(&original) {
+                    if let Some(original_id) = snapshot.message_ids.get(&original) {
                         let id = if rewrites_existing {
                             Uuid::new_v4()
                         } else {
-                            *id
+                            *original_id
                         };
                         compacted.message_ids.insert(index, id);
+                        if let Some(origin) = snapshot.agent_message_origins.get(original_id) {
+                            compacted.agent_message_origins.insert(id, origin.clone());
+                        }
+                        if let Some(origin) = snapshot.human_family_origins.get(original_id) {
+                            compacted.human_family_origins.insert(id, origin.clone());
+                        }
                     }
-                    if snapshot.prompt_execution_modes.contains_key(&original)
-                        && let Some(source_id) = snapshot
-                            .original_user_message_ids
-                            .get(&original)
-                            .or_else(|| snapshot.message_ids.get(&original))
+                    if let Some(source_id) = snapshot
+                        .original_message_ids
+                        .get(&original)
+                        .or_else(|| snapshot.message_ids.get(&original))
                     {
-                        compacted
-                            .original_user_message_ids
-                            .insert(index, *source_id);
+                        compacted.original_message_ids.insert(index, *source_id);
                     }
                     if let Some(mode) = snapshot.prompt_execution_modes.get(&original) {
                         compacted.prompt_execution_modes.insert(index, *mode);

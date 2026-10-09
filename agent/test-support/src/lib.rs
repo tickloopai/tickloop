@@ -157,28 +157,12 @@ pub fn text(value: &str) -> Vec<Content> {
     vec![Content::Text { text: value.into() }]
 }
 
-pub fn auto_findings(block: bool) -> serde_json::Value {
-    let rules = [
-        "external_code",
-        "destruction",
-        "persistence",
-        "security",
-        "exfiltration",
-        "credentials",
-        "external_scope",
-        "finance",
-    ]
-    .into_iter()
-    .enumerate()
-    .map(|(index, id)| {
-        serde_json::json!({
-            "id": format!("builtin.soft_deny.{id}"),
-            "applicability": if block && index == 0 { "present" } else { "absent" },
-            "clearance": "missing"
-        })
-    })
-    .collect::<Vec<_>>();
-    serde_json::json!({"task_scope":"within_task", "rules":rules})
+pub fn auto_classification(block: bool) -> serde_json::Value {
+    if block {
+        serde_json::json!({"decision":"block_soft", "reason":"The operation matches the external-code restriction without authorization", "rule_id":"builtin.soft_deny.code_from_external"})
+    } else {
+        serde_json::json!({"decision":"allow", "reason":null, "rule_id":null})
+    }
 }
 /// `AskUserQuestion` input with one single-select question offering "Weekly" and "Monthly".
 pub fn single_question(question: &str) -> serde_json::Value {

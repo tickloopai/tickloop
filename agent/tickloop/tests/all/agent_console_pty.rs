@@ -1244,8 +1244,8 @@ async fn run_child_views(fixture: &PrivateFixture) {
     const RAW_CHILD_CONTENT: &str =
         "123e4567-e89b-12d3-a456-426614174000 deadbeef /tmp/a --id deadbeef";
     const FOLLOW_UP: &str = "Continue the same bounded cadence task.";
-    const FIRST_CHILD_RESPONSE_INDEX: usize = 1;
-    const PARENT_RESULT_RESPONSE_INDEX: usize = 4;
+    const FIRST_CHILD_RESPONSE_INDEX: usize = 2;
+    const PARENT_RESULT_RESPONSE_INDEX: usize = 6;
     let replies = vec![
         chat_reply(
             Some((
@@ -1254,6 +1254,10 @@ async fn run_child_views(fixture: &PrivateFixture) {
                 json!({"task":CHILD_TASK,"name":"cadence","description":CHILD_TASK}),
             )),
             "",
+        ),
+        chat_reply(
+            None,
+            &tickloop_agent_test_support::auto_classification(false).to_string(),
         ),
         chat_reply(
             Some((
@@ -1271,9 +1275,32 @@ async fn run_child_views(fixture: &PrivateFixture) {
             )),
             "",
         ),
-        chat_reply(None, "child weekly result"),
+        chat_reply(
+            Some((
+                "SubagentHandback",
+                "child-report",
+                json!({"message":"child weekly result"}),
+            )),
+            "child weekly result",
+        ),
+        chat_reply(
+            None,
+            &tickloop_agent_test_support::auto_classification(false).to_string(),
+        ),
         chat_reply(None, "parent delegated result received"),
-        chat_reply(None, "child follow-up acknowledged"),
+        chat_reply(
+            Some((
+                "SubagentHandback",
+                "follow-up-report",
+                json!({"message":"child follow-up acknowledged"}),
+            )),
+            "child follow-up acknowledged",
+        ),
+        chat_reply(
+            None,
+            &tickloop_agent_test_support::auto_classification(false).to_string(),
+        ),
+        chat_reply(None, "parent processed the follow-up report"),
     ];
     let (base_url, mut requests, mut releases) =
         model_http_support::serve_responses_with_gated_responses(
@@ -1691,14 +1718,16 @@ async fn run_child_views(fixture: &PrivateFixture) {
     let parent_done = wait_snapshot(
         &client,
         parent,
-        "parent completes its original run after the child follow-up",
+        "parent processes the delivered follow-up report",
         |snapshot| {
             snapshot.conversation.loops[0].state == tickloop_agent_protocol::LoopState::Completed
+                && snapshot.events.iter().any(|event| matches!(&event.kind,
+                    tickloop_agent_protocol::EventKind::Text(text) if text.contains("parent processed the follow-up report")))
         },
     )
     .await;
     assert_eq!(parent_done.conversation.loops[0].id, parent_loop);
-    assert_eq!(parent_done.conversation.loops[0].run_id, parent_run);
+    assert_ne!(parent_done.conversation.loops[0].run_id, parent_run);
     assert!(parent_done.events.iter().any(|event| matches!(&event.kind, tickloop_agent_protocol::EventKind::Text(text) if text.contains("parent delegated result received"))));
     let shared_fact = second
         .wait_for("shared child fact keeps the second View draft", |frame| {
@@ -1775,12 +1804,14 @@ async fn run_child_views(fixture: &PrivateFixture) {
         .await
         .unwrap();
     assert!(forbidden.error.unwrap().message.contains("Unsupported"));
-    seen.push(
-        tokio::time::timeout(UI_TIMEOUT, requests.recv())
-            .await
-            .unwrap()
-            .unwrap(),
-    );
+    for _ in 0..3 {
+        seen.push(
+            tokio::time::timeout(UI_TIMEOUT, requests.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+    }
     assert!(requests.try_recv().is_err());
     assert!(
         seen.iter()
@@ -1794,13 +1825,13 @@ async fn run_child_views(fixture: &PrivateFixture) {
             .any(|tool| tool["function"]["name"] == "Subagent")
     );
     assert!(
-        !seen[1].1["tools"]
+        !seen[2].1["tools"]
             .as_array()
             .unwrap()
             .iter()
             .any(|tool| tool["function"]["name"] == "Subagent")
     );
-    let follow_up_input = seen[5].1["messages"]
+    let follow_up_input = seen[7].1["messages"]
         .as_array()
         .unwrap()
         .iter()

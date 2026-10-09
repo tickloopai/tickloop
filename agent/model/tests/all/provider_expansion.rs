@@ -168,18 +168,17 @@ async fn qwen_thinking_parameters_and_text_schema_follow_its_contract() {
 }
 
 #[tokio::test]
-async fn qwen_image_schema_uses_one_inert_tool_and_rejects_extra_calls() {
+async fn qwen_image_schema_uses_prompted_json_and_rejects_tool_calls() {
     for extra in [false, true] {
         let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
-        let mut calls = vec![
-            json!({"index":0,"id":"verdict-1","type":"function","function":{"name":"verdict","arguments":"{\"allow\":false}"}}),
-        ];
-        if extra {
-            calls.push(json!({"index":1,"id":"unsafe-2","type":"function","function":{"name":"Bash","arguments":"{}"}}));
-        }
+        let delta = if extra {
+            json!({"content":"{\"allow\":false}","tool_calls":[{"index":0,"id":"unsafe","type":"function","function":{"name":"Bash","arguments":"{}"}}]})
+        } else {
+            json!({"content":"{\"allow\":false}"})
+        };
         let (endpoint, captured) = model_http_support::serve_response(
             200,
-            chat_reply(json!({"tool_calls":calls}), "tool_calls"),
+            chat_reply(delta, if extra { "tool_calls" } else { "stop" }),
         )
         .await;
         let mut config = ModelCatalog::defaults()
@@ -208,7 +207,9 @@ async fn qwen_image_schema_uses_one_inert_tool_and_rejects_extra_calls() {
         assert_eq!(result.is_err(), extra);
         let body = captured.await.unwrap().1;
         assert!(body.get("response_format").is_none());
-        assert_eq!(body["tools"].as_array().unwrap().len(), 1);
+        assert!(body.get("tools").is_none());
+        assert!(body.get("tool_choice").is_none());
+        assert!(body["messages"].to_string().contains("JSON Schema"));
         if !extra {
             assert_eq!(
                 result.unwrap().content,
@@ -252,10 +253,14 @@ fn registered_oauth_providers_cannot_be_overridden_to_api_key_auth() {
 }
 
 #[tokio::test]
-async fn kimi_code_oauth_schema_is_a_single_inert_auto_tool_on_its_own_route() {
+async fn kimi_code_oauth_schema_uses_prompted_json_on_its_own_route() {
     let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
     saved_subscription(root.path(), "kimi-code-oauth", "kimi");
-    let (endpoint,captured)=model_http_support::serve_response(200,chat_reply(json!({"tool_calls":[{"index":0,"id":"verdict","type":"function","function":{"name":"fixture","arguments":"{\"allow\":false}"}}]}),"tool_calls")).await;
+    let (endpoint, captured) = model_http_support::serve_response(
+        200,
+        chat_reply(json!({"content":"{\"allow\":false}"}), "stop"),
+    )
+    .await;
     let mut config = ModelCatalog::defaults()
         .get("kimi-code-oauth", "k3")
         .unwrap();
@@ -284,9 +289,10 @@ async fn kimi_code_oauth_schema_is_a_single_inert_auto_tool_on_its_own_route() {
             .contains("authorization: bearer fxm72vq84ep61aw9k")
     );
     assert!(headers.starts_with("POST /anthropic/chat/completions "));
-    assert_eq!(body["tool_choice"], "auto");
+    assert!(body.get("tool_choice").is_none());
     assert!(body.get("response_format").is_none());
-    assert_eq!(body["tools"].as_array().unwrap().len(), 1);
+    assert!(body.get("tools").is_none());
+    assert!(body["messages"].to_string().contains("JSON Schema"));
 }
 
 #[tokio::test]

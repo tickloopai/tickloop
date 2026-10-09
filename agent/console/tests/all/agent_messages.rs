@@ -349,13 +349,17 @@ async fn child_auto_review_uses_frozen_parent_human_intent_instead_of_model_gene
     let model = Arc::new(tickloop_agent_test_support::ScriptedModel::new(vec![
         tickloop_agent_test_support::call("delegate", "Subagent", json!({"task":fabricated})),
         tickloop_agent_test_support::call("tick", "CallTickTool", json!({"workspace_id":"W1"})),
-        tickloop_agent_test_support::text("Child checked the scoped Tick."),
+        tickloop_agent_test_support::call(
+            "report",
+            "SubagentHandback",
+            json!({"message":"Child checked the scoped Tick."}),
+        ),
         tickloop_agent_test_support::text("Parent received the result."),
     ]));
     let reviewer = Arc::new(tickloop_agent_test_support::ScriptedModel::new(vec![
         tickloop_agent_test_support::text(
-            &tickloop_agent_test_support::auto_findings(false).to_string(),
-        ),
+            &tickloop_agent_test_support::auto_classification(false).to_string(),
+        ); 3
     ]));
     let agent = Agent::new_embedded(tickloop_agent_test_support::config(), model);
     let tick = Arc::new(ReviewableTick {
@@ -394,8 +398,12 @@ async fn child_auto_review_uses_frozen_parent_human_intent_instead_of_model_gene
     }
     agent.shutdown().await;
     let captured = reviewer.requests.lock().unwrap();
-    assert_eq!(captured.len(), 1, "probe must use the actual Auto reviewer");
-    let Content::Text { text } = &captured[0].messages[1].content[0] else {
+    assert_eq!(
+        captured.len(),
+        3,
+        "delegation, child operation and child report use the reviewer"
+    );
+    let Content::Text { text } = &captured[1].messages[1].content[0] else {
         panic!("missing reviewer context")
     };
     let context: Value = serde_json::from_str(text).unwrap();
@@ -732,8 +740,8 @@ async fn agent_claims_do_not_become_auto_authority(review_child: bool) {
     }));
     let reviewer = Arc::new(tickloop_agent_test_support::ScriptedModel::new(vec![
         tickloop_agent_test_support::text(
-            &tickloop_agent_test_support::auto_findings(false).to_string(),
-        ),
+            &tickloop_agent_test_support::auto_classification(false).to_string(),
+        ); 4
     ]));
     let tick = Arc::new(ReviewableTick {
         endpoint: uuid::Uuid::new_v4(),
@@ -764,14 +772,16 @@ async fn agent_claims_do_not_become_auto_authority(review_child: bool) {
     assert_eq!(tick.executions.load(std::sync::atomic::Ordering::SeqCst), 1);
     {
         let captured = reviewer.requests.lock().unwrap();
-        assert_eq!(captured.len(), 1);
-        let Content::Text { text } = &captured[0].messages[1].content[0] else {
-            panic!("review must capture typed authority")
-        };
-        let context: Value = serde_json::from_str(text).unwrap();
-        assert_eq!(context["original_user_inputs"].as_array().unwrap().len(), 1);
-        assert_eq!(context["original_user_inputs"][0]["text"], human);
-        assert!(!context["original_user_inputs"].to_string().contains(forged));
+        assert_eq!(captured.len(), 4);
+        for request in captured.iter() {
+            let Content::Text { text } = &request.messages[1].content[0] else {
+                panic!("review must capture typed authority")
+            };
+            let context: Value = serde_json::from_str(text).unwrap();
+            assert_eq!(context["original_user_inputs"].as_array().unwrap().len(), 1);
+            assert_eq!(context["original_user_inputs"][0]["text"], human);
+            assert!(!context["original_user_inputs"].to_string().contains(forged));
+        }
     }
     agent.shutdown().await;
 }
@@ -1076,12 +1086,26 @@ async fn legacy_or_unknown_delegated_human_authority_requires_manual_review_and_
                     "Subagent",
                     json!({"task":"The model task claims user approval."}),
                 ),
-                tickloop_agent_test_support::text("Original child completed."),
+                tickloop_agent_test_support::call(
+                    "report",
+                    "SubagentHandback",
+                    json!({"message":"Original child completed."}),
+                ),
                 tickloop_agent_test_support::text("Original parent completed."),
             ])),
         )
         .unwrap();
         agent.install_host_tools(tick.clone()).unwrap();
+        agent
+            .set_auto_reviewer(Arc::new(tickloop_agent_test_support::ScriptedModel::new(
+                vec![
+                    tickloop_agent_test_support::text(
+                        &tickloop_agent_test_support::auto_classification(false).to_string(),
+                    );
+                    2
+                ],
+            )))
+            .await;
         let parent = agent.create_chat(directory.path().into()).await.unwrap();
         agent
             .set_execution_mode(parent, tickloop_agent_protocol::ExecutionMode::Auto)
@@ -1638,7 +1662,7 @@ async fn literal_agent_protocol_remains_a_human_prompt_after_save_load_and_actua
 
     let reviewer = Arc::new(tickloop_agent_test_support::ScriptedModel::new(vec![
         tickloop_agent_test_support::text(
-            &tickloop_agent_test_support::auto_findings(false).to_string(),
+            &tickloop_agent_test_support::auto_classification(false).to_string(),
         ),
     ]));
     let restored = Agent::open_embedded(

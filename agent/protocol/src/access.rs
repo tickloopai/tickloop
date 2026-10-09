@@ -28,10 +28,10 @@ use crate::{
     UserShellReceipt, UserShellRecord,
 };
 
-/// Business 13.0 adds structured Auto Environment entries, setup generation and review diagnostics.
+/// Business 14.0 adds model-card sampling and thinking-off capabilities.
 /// Older business majors are refused before dispatch;
 /// the frozen daemon management protocol remains independent.
-pub const PROTOCOL_MAJOR: u16 = 13;
+pub const PROTOCOL_MAJOR: u16 = 14;
 pub const PROTOCOL_MINOR: u16 = 0;
 
 pub const REPLAY_CAPACITY: usize = 4096;

@@ -1006,8 +1006,7 @@ impl Agent {
                 chat.bookkeeping.clone(),
             )
         };
-        self.checkpoint_plan_approval(&snapshot, &bookkeeping)
-            .await?;
+        self.checkpoint_transcript(&snapshot, &bookkeeping).await?;
         let mut request_operation = operation.clone();
         request_operation.input = json!({"plan_version": plan.version});
         let session_operation = SessionPermissionOperation::from_normalized(

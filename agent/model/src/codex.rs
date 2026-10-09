@@ -158,10 +158,10 @@ impl CodexModelClient {
         cancel: CancellationToken,
         model_context: Option<&ModelRequestContext>,
     ) -> Result<ModelOutput, ModelError> {
-        let structured_tool = request
-            .structured_output
-            .as_ref()
-            .map(|format| format.name.clone());
+        let structured_output = request.structured_output.clone();
+        if let Some(format) = &structured_output {
+            format.validator()?;
+        }
         let credentials = self
             .auth
             .resolve_credentials_with_refresh_gate(&cancel, || {
@@ -230,9 +230,8 @@ impl CodexModelClient {
         };
         output.private_source = source;
         tag_private_output(&mut output, &origin);
-        match structured_tool {
-            Some(name) => normalize_structured_output(output, &name)
-                .map_err(super::structured_response::verified_format_error),
+        match structured_output {
+            Some(format) => format.validate_output(output),
             None => Ok(output),
         }
     }
@@ -541,6 +540,14 @@ fn encode_request(
         "tool_choice": "auto",
         "parallel_tool_calls": true,
     });
+    if let Some(temperature) = super::sampling_temperature(
+        config,
+        request.temperature,
+        super::ModelConfigExt::thinking_enabled(config, request.reasoning_effort, true)
+            .unwrap_or(false),
+    ) {
+        body["temperature"] = json!(temperature);
+    }
     if let Some(format) = request.structured_output {
         if !request.tools.is_empty()
             || format.name.trim().is_empty()
@@ -551,14 +558,8 @@ fn encode_request(
                     .into(),
             ));
         }
-        body["tools"] = json!([{
-            "type": "function",
-            "name": format.name,
-            "description": "Return the structured result.",
-            "parameters": format.schema,
-            "strict": true,
-        }]);
-        body["tool_choice"] = json!("required");
+        let instructions = body["instructions"].as_str().unwrap().to_owned();
+        body["instructions"] = json!(format!("{instructions}\n\n{}", format.prompt()));
         body["parallel_tool_calls"] = json!(false);
     } else if !request.tools.is_empty() {
         body["tools"] = json!(
@@ -634,67 +635,6 @@ fn tag_private_output(output: &mut ModelOutput, origin: &str) {
     }
 }
 
-fn normalize_structured_output(
-    mut output: ModelOutput,
-    tool_name: &str,
-) -> Result<ModelOutput, ModelError> {
-    let tool_calls = output
-        .content
-        .iter()
-        .filter_map(|content| match content {
-            Content::ToolUse { name, .. } => Some(name.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    if tool_calls.iter().any(|name| *name != tool_name)
-        || tool_calls.len() > 1
-        || output
-            .content
-            .iter()
-            .any(|content| matches!(content, Content::ToolResult { .. }))
-    {
-        return Err(ModelError::ResponseRejected(
-            ModelResponseRejection::UnexpectedToolOperation,
-        ));
-    }
-    if output.stop_reason != "tool_use" {
-        return Err(ModelError::InvalidResponse(
-            "structured output did not finish with the required tool".into(),
-        ));
-    }
-    let mut result = None;
-    for content in &output.content {
-        match content {
-            Content::ToolUse { name, input, .. } if name == tool_name && result.is_none() => {
-                result = Some(input);
-            }
-            Content::ProtocolData {
-                protocol: Protocol::Responses,
-                value,
-            } if value["type"] == "reasoning" => {}
-            Content::Thinking { .. } => {}
-            Content::ToolUse { .. } | Content::ToolResult { .. } => {
-                return Err(ModelError::ResponseRejected(
-                    ModelResponseRejection::UnexpectedToolOperation,
-                ));
-            }
-            _ => {
-                return Err(ModelError::InvalidResponse(
-                    "structured output contained extra content or tool operations".into(),
-                ));
-            }
-        }
-    }
-    let result = result.ok_or_else(|| {
-        ModelError::InvalidResponse("structured output tool was not called exactly once".into())
-    })?;
-    output.content = vec![Content::Text {
-        text: result.to_string(),
-    }];
-    output.stop_reason = "end_turn".into();
-    Ok(output)
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -720,7 +660,7 @@ mod tests {
     use tickloop_agent_protocol::Usage;
 
     #[test]
-    fn auto_review_request_requires_one_strict_schema_tool() {
+    fn structured_request_uses_prompted_json_without_result_tools() {
         let config = ModelCatalog::defaults()
             .profiles()
             .into_iter()
@@ -750,11 +690,14 @@ mod tests {
             "test-origin",
         )
         .unwrap();
-        assert_eq!(body["tool_choice"], "required");
+        assert_eq!(body["tool_choice"], "auto");
         assert_eq!(body["parallel_tool_calls"], false);
-        assert_eq!(
-            body["tools"],
-            json!([{"type":"function","name":"classify_result","description":"Return the structured result.","parameters":schema,"strict":true}])
+        assert!(body.get("tools").is_none());
+        assert!(
+            body["instructions"]
+                .as_str()
+                .unwrap()
+                .contains(&schema.to_string())
         );
         assert!(body["text"]["format"].is_null());
     }
@@ -1761,7 +1704,11 @@ mod tests {
                     stop_reason: stop_reason.into(),
                 };
                 assert!(matches!(
-                    normalize_structured_output(output, "classify_result"),
+                    crate::StructuredOutput {
+                        name: "classify_result".into(),
+                        schema: json!({"type":"object"})
+                    }
+                    .validate_output(output),
                     Err(ModelError::ResponseRejected(
                         ModelResponseRejection::UnexpectedToolOperation
                     ))

@@ -124,8 +124,12 @@ pub(crate) struct ChainEntry {
     pub execution_mode: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_inherited_prompt: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub original_user_message_id: Option<Uuid>,
+    #[serde(
+        default,
+        alias = "originalUserMessageId",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub original_message_id: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_message_origin: Option<serde_json::Value>,
     pub human_family_origin: Option<DirectedHumanSource>,
@@ -196,6 +200,8 @@ pub(crate) const LOOP_ENDED_SUBTYPE: &str = "loop_ended";
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct LoopRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_report: Option<tickloop_agent_protocol::SubagentReport>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub failure_events: Vec<serde_json::Value>,
     pub loop_id: Uuid,

@@ -118,10 +118,14 @@ pub(super) fn is_command_read_only(command: &str) -> bool {
     if let Some(stripped) = command.strip_suffix(STDERR_TO_STDOUT_SUFFIX) {
         command = stripped.trim();
     }
-    if contains_unquoted_expansion(command)
-        || has_unproven_symlink_traversal(command)
-        || has_input_derived_file_targets(command)
-    {
+    let printf = printf_arguments(command);
+    if contains_unquoted_expansion(command, printf == Some(PrintfArguments::TextWithHome)) {
+        return false;
+    }
+    if printf.is_some() {
+        return true;
+    }
+    if has_unproven_symlink_traversal(command) || has_input_derived_file_targets(command) {
         return false;
     }
     if is_command_safe_via_flag_parsing(command) {
@@ -134,6 +138,86 @@ pub(super) fn is_command_read_only(command: &str) -> bool {
         && (GIT_INLINE_CONFIG.is_match(command)
             || GIT_EXEC_PATH.is_match(command)
             || GIT_CONFIG_ENV.is_match(command)))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PrintfArguments {
+    Literal,
+    TextWithHome,
+}
+
+fn printf_arguments(command: &str) -> Option<PrintfArguments> {
+    let tokens = quote_tokens(command)?;
+    let arguments = tokens
+        .iter()
+        .map(|token| match token {
+            QuoteToken::Word(word) => Some(word.as_str()),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    if arguments.first() != Some(&"printf") {
+        return None;
+    }
+    let format_index = if arguments.get(1) == Some(&"--") {
+        2
+    } else {
+        1
+    };
+    let format = arguments
+        .get(format_index)
+        .filter(|format| format_index == 2 || !format.starts_with('-'))?;
+    let static_format = !format.contains('$');
+    let mut argument_is_numeric = Vec::new();
+    let mut format = format.chars();
+    while let Some(character) = format.next() {
+        if character != '%' {
+            continue;
+        }
+        let mut conversion = format.next()?;
+        if conversion == '%' {
+            continue;
+        }
+        while conversion.is_ascii_digit()
+            || matches!(conversion, '#' | '-' | '+' | ' ' | '.' | '\'' | '*')
+        {
+            if conversion == '*' {
+                argument_is_numeric.push(true);
+            }
+            conversion = format.next()?;
+        }
+        match conversion {
+            'b' | 's' | 'c' | 'q' => argument_is_numeric.push(false),
+            'd' | 'i' | 'o' | 'u' | 'x' | 'X' | 'a' | 'A' | 'e' | 'E' | 'f' | 'F' | 'g' | 'G' => {
+                argument_is_numeric.push(true)
+            }
+            _ => return None,
+        }
+    }
+    if !argument_is_numeric.iter().any(|numeric| *numeric) {
+        return Some(if static_format {
+            PrintfArguments::TextWithHome
+        } else {
+            PrintfArguments::Literal
+        });
+    }
+    // zsh evaluates numeric operands as arithmetic, including variable references.
+    arguments[format_index + 1..]
+        .iter()
+        .enumerate()
+        .all(|(index, value)| {
+            let unsigned = value.strip_prefix(['+', '-']).unwrap_or(value);
+            let literal_hex = unsigned
+                .strip_prefix("0x")
+                .or_else(|| unsigned.strip_prefix("0X"))
+                .is_some_and(|digits| {
+                    !digits.is_empty() && digits.chars().all(|digit| digit.is_ascii_hexdigit())
+                });
+            !argument_is_numeric[index % argument_is_numeric.len()]
+                || value.parse::<f64>().is_ok_and(f64::is_finite)
+                || literal_hex
+                || value.starts_with(['\'', '"']) && value.len() > 1
+        })
+        .then_some(PrintfArguments::Literal)
 }
 
 const SYMLINK_FOLLOWING_LONG_FLAGS: &[&str] = &[
@@ -203,7 +287,7 @@ fn matches_readonly_regex(command: &str) -> bool {
 }
 
 /// Port of `containsUnquotedExpansion`.
-fn contains_unquoted_expansion(command: &str) -> bool {
+fn contains_unquoted_expansion(command: &str, allow_home: bool) -> bool {
     let chars = command.chars().collect::<Vec<_>>();
     let mut in_single_quote = false;
     let mut in_double_quote = false;
@@ -231,8 +315,19 @@ fn contains_unquoted_expansion(command: &str) -> bool {
         if character == '$'
             && chars
                 .get(index + 1)
-                .is_some_and(|next| next.is_ascii_alphanumeric() || "_@*#?!$-".contains(*next))
+                .is_some_and(|next| next.is_ascii_alphanumeric() || "_@*#?!$-({".contains(*next))
         {
+            let is_home_expansion = allow_home
+                && in_double_quote
+                && chars[index + 1..].starts_with(&['H', 'O', 'M', 'E'])
+                && chars
+                    .get(index + 5)
+                    .is_none_or(|next| !next.is_ascii_alphanumeric() && *next != '_');
+            if !is_home_expansion {
+                return true;
+            }
+        }
+        if character == '`' {
             return true;
         }
         if !in_double_quote && matches!(character, '?' | '*' | '[' | ']') {
@@ -415,6 +510,47 @@ fn validate_flags(tokens: &[String], start: usize, config: &CommandConfig) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn printf_outputs_are_distinct_from_assignments_and_numeric_expression_evaluation() {
+        for command in [
+            "printf hello",
+            "printf '%s\\n' plain",
+            "printf '%%n'",
+            "printf -- '-%s' plain",
+            "printf '%s %04d' label 42",
+            "printf '%*.*f' 8 2 1.5",
+            "printf '%x' 0xff",
+            "printf '%s' '$(touch marker)'",
+            "printf '%s %d' one 1 two 2",
+            "printf '%s' \"$HOME\"",
+            "printf '%s' \"$HOME/test\"",
+            "printf '$HOME'",
+            "printf '%s' --follow -v",
+        ] {
+            assert!(is_command_read_only(command), "{command}");
+        }
+        for command in [
+            "printf -v value '%s' plain",
+            "printf '%n' value",
+            "printf '%%%n' value",
+            "printf '%2n' value",
+            "printf '%d' 'array[$(touch marker)]'",
+            "printf '%*s' 'array[$(touch marker)]' plain",
+            "printf '%d' numeric_variable",
+            "printf '%d' '1+2'",
+            "printf '%s' \"$(touch marker)\"",
+            "printf hello > marker",
+            "printf \"$HOME\"",
+            "printf '%s' \"${HOME}\"",
+            "printf '%s' \"$HOME_KEY\"",
+            "printf '%s' \"$PWD\"",
+            "printf '%s' \"$ANTHROPIC_API_KEY\"",
+            "printf '%d' \"$HOME\"",
+        ] {
+            assert!(!is_command_read_only(command), "{command}");
+        }
+    }
 
     #[test]
     fn allowlisted_command_forms_are_read_only() {

@@ -86,11 +86,12 @@ impl Service {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_service_shows_as_tickhost_run_and_reports_its_build_version() {
     let mut service = Service::start().await;
-    let shown = Command::new("ps")
-        .args(["-o", "args=", "-p", &service.process.id().to_string()])
-        .output()
-        .unwrap();
-    let shown = String::from_utf8_lossy(&shown.stdout);
+    let shown = tickhost::process::arguments(service.process.id())
+        .expect("the fixture-owned Tickhost arguments must be readable")
+        .iter()
+        .map(|argument| argument.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(" ");
     assert!(shown.trim().ends_with("tickhost run"), "{shown}");
     let version = tickhost().arg("--version").output().unwrap();
     assert_eq!(

@@ -1488,20 +1488,6 @@ async fn a_created_artifact_joins_monitor_and_links_to_the_creating_loop() {
         .submit(chat, None, "Write a brief".into())
         .await
         .unwrap();
-    let permission = next_permission(&mut events).await;
-    assert!(
-        permission
-            .approval_reason
-            .as_deref()
-            .unwrap_or_default()
-            .contains("linked to the current Loop for @tickloop requests"),
-        "{:?}",
-        permission.approval_reason
-    );
-    agent
-        .answer_permission(chat, permission.id, true)
-        .await
-        .unwrap();
     eventually(async || {
         agent
             .snapshot(chat)
@@ -1512,6 +1498,20 @@ async fn a_created_artifact_joins_monitor_and_links_to_the_creating_loop() {
             .is_some_and(|goal| goal.state == LoopState::WaitingTrigger)
     })
     .await;
+    while let Ok(event) = events.try_recv() {
+        assert!(
+            !matches!(
+                event.kind,
+                EventKind::PermissionRequested { .. } | EventKind::ApprovalAssessed { .. }
+            ),
+            "ordinary first-party creation must not ask or invoke a reviewer"
+        );
+    }
+    assert!(
+        agent.approval_history_view(chat).await.unwrap().records[0]
+            .review
+            .is_none()
+    );
     let snapshot = agent.snapshot(chat).await.unwrap();
     assert_eq!(snapshot.artifact_ticks.len(), 1);
     assert_eq!(snapshot.artifact_ticks[0].artifact_id, CREATED_ARTIFACT);
