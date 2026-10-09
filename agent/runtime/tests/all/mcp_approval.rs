@@ -97,10 +97,14 @@ async fn service() -> (String, Arc<ServiceControl>) {
                 } else if path.starts_with("POST /mcp ") {
                     let result = match body["method"].as_str().unwrap_or("") {
                         "server/discover" => {
-                            json!({"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{}},"ttlMs":0,"cacheScope":"private"})
+                            json!({"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{}},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"tickloop-docs","version":"1"}}})
                         }
                         "tools/list" => {
-                            json!({"tools":[{"name":"mutate","inputSchema":{"type":"object","additionalProperties":true}}]})
+                            json!({"tools":[
+                                {"name":"ArtifactRead","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":true}},
+                                {"name":"ArtifactEdit","inputSchema":{"type":"object","additionalProperties":true}},
+                                {"name":"ArtifactComment","inputSchema":{"type":"object"}}
+                            ]})
                         }
                         "tools/call" => {
                             json!({"content":[],"structuredContent":{"status":"committed"}})
@@ -182,7 +186,7 @@ async fn prepared_approval_shows_every_short_argument_and_bounds_private_content
     let prepared = provider
         .prepare_call(
             ChatId::new_v4(),
-            "mcp__artifacts__mutate",
+            "ArtifactEdit",
             &input,
             CancellationToken::new(),
         )
@@ -214,7 +218,7 @@ async fn account_change_during_mcp_handshake_prevents_old_account_mutation() {
     let prepared = provider
         .prepare_call(
             ChatId::new_v4(),
-            "mcp__artifacts__mutate",
+            "ArtifactEdit",
             &json!({"mode":"fixed"}),
             CancellationToken::new(),
         )
@@ -264,7 +268,7 @@ async fn agent_approval_and_operation_record_keep_bounded_review_arguments() {
     let source = "private body ".repeat(400);
     let model = Arc::new(ScriptedModel::new(vec![call(
         "mutation",
-        "mcp__artifacts__mutate",
+        "ArtifactEdit",
         json!({"mode":"fixed","version_id":"version-7","comment_text":"Short reply","share_token":"capability-private-value","source":source}),
     )]));
     let agent = Agent::new_embedded(config(), model);
@@ -318,7 +322,7 @@ async fn account_change_after_tool_reaches_server_is_outcome_unknown() {
     let prepared = provider
         .prepare_call(
             ChatId::new_v4(),
-            "mcp__artifacts__mutate",
+            "ArtifactEdit",
             &json!({"mode":"fixed"}),
             CancellationToken::new(),
         )
@@ -367,7 +371,7 @@ async fn exact_deny_rule_matches_frozen_arguments_even_when_review_redacts_them(
     login(&account).await;
     let input = json!({"mode":"fixed","share_token":"secret-capability","source":"private body ".repeat(400)});
     let model = Arc::new(ScriptedModel::new(vec![
-        call("mutation", "mcp__artifacts__mutate", input.clone()),
+        call("mutation", "ArtifactEdit", input.clone()),
         text("Denied"),
     ]));
     let agent = Agent::new_embedded(config(), model);
@@ -382,7 +386,7 @@ async fn exact_deny_rule_matches_frozen_arguments_even_when_review_redacts_them(
             vec![PermissionRule {
                 id: rule_id,
                 decision: Decision::Deny,
-                tool: "mcp__artifacts__mutate".into(),
+                tool: "ArtifactEdit".into(),
                 specifier: None,
                 input: Some(input),
                 loop_id: None,
@@ -437,7 +441,7 @@ async fn exact_allow_rule_survives_final_admission_with_bounded_operation_record
     login(&account).await;
     let input = json!({"mode":"fixed","share_token":"secret-capability","source":"private body ".repeat(400)});
     let model = Arc::new(ScriptedModel::new(vec![
-        call("mutation", "mcp__artifacts__mutate", input.clone()),
+        call("mutation", "ArtifactEdit", input.clone()),
         text("Done"),
     ]));
     let agent = Agent::new_embedded(config(), model);
@@ -452,7 +456,7 @@ async fn exact_allow_rule_survives_final_admission_with_bounded_operation_record
             vec![PermissionRule {
                 id: rule_id,
                 decision: Decision::Allow,
-                tool: "mcp__artifacts__mutate".into(),
+                tool: "ArtifactEdit".into(),
                 specifier: None,
                 input: Some(input),
                 loop_id: None,
@@ -532,7 +536,7 @@ async fn deeply_structured_private_input_cannot_fill_the_operation_record() {
         provider
             .prepare_call(
                 ChatId::new_v4(),
-                "mcp__artifacts__mutate",
+                "ArtifactEdit",
                 &input,
                 CancellationToken::new()
             )

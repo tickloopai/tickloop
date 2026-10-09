@@ -10,8 +10,8 @@ use tickhost_connect::page::{MAX_PAGE_SIZE, Page, PageCursor};
 use uuid::Uuid;
 
 use super::tick_actions::{
-    PreparedTickAction, TickActionBackend, TickActionContext, TickActionExecutor,
-    TickActionOutcome, TickActionUi, TickDetailKey, TickDetailLine, TickDetailView,
+    PreparedTickAction, TickActionBackend, TickActionContext, TickActionExecutor, TickActionUi,
+    TickDetailKey, TickDetailLine, TickDetailView,
 };
 use crate::monitor_rows::{DiscoveredTick, DiscoveryError, MONITOR_ADD_KEY, TickDiscovery};
 use tick_protocol::InstanceRef;
@@ -370,8 +370,8 @@ struct Nothing;
 
 #[async_trait]
 impl TickActionBackend for Nothing {
-    async fn execute(&self, _: TickActionContext<'_>) -> Result<TickActionOutcome, String> {
-        Ok(TickActionOutcome::Done)
+    async fn execute(&self, _: TickActionContext<'_>) -> Result<(), String> {
+        Ok(())
     }
 }
 
@@ -383,7 +383,7 @@ struct LoadPage {
 
 #[async_trait]
 impl TickActionBackend for LoadPage {
-    async fn execute(&self, ctx: TickActionContext<'_>) -> Result<TickActionOutcome, String> {
+    async fn execute(&self, ctx: TickActionContext<'_>) -> Result<(), String> {
         let loaded = match self.discovery.page(self.cursor.clone()).await {
             Err(DiscoveryError::CursorExpired) => {
                 ctx.notify("The Workspace changed; showing its first page again")?;
@@ -395,7 +395,7 @@ impl TickActionBackend for LoadPage {
             Ok((page, restarted)) => picker.load(page, restarted),
             Err(error) => picker.fail(format!("Cannot list Workspace programs: {error}")),
         })?;
-        Ok(TickActionOutcome::Done)
+        Ok(())
     }
 }
 
@@ -407,7 +407,7 @@ struct AddMember {
 
 #[async_trait]
 impl TickActionBackend for AddMember {
-    async fn execute(&self, ctx: TickActionContext<'_>) -> Result<TickActionOutcome, String> {
+    async fn execute(&self, ctx: TickActionContext<'_>) -> Result<(), String> {
         let membership = ctx
             .agent
             .add_monitor_member(ctx.chat(), self.instance.clone(), self.title.clone())
@@ -418,7 +418,7 @@ impl TickActionBackend for AddMember {
         })?;
         ctx.console
             .update_monitor_membership(ctx.chat(), membership)?;
-        Ok(TickActionOutcome::Done)
+        Ok(())
     }
 }
 

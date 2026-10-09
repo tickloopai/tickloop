@@ -50,7 +50,6 @@ mod request_race_tests;
 mod rewind;
 mod session_permissions;
 mod shell_task_center;
-mod source_connection;
 mod system_prompt;
 mod tool_execution;
 mod tool_results;
@@ -367,7 +366,6 @@ struct Chat {
     user_shell_queue: Arc<Notify>,
     trigger_cancellations: HashMap<LoopId, CancellationToken>,
     event_cancellations: HashMap<LoopId, CancellationToken>,
-    disabled_event_source_runs: HashSet<RunId>,
     active_event_claims: HashMap<RunId, ActiveEventClaim>,
     /// 等待写入对话的本地消息；Chat 正在执行、等待或运行前台 `!` 命令时暂存，空闲或到达工具边界时写入。
     deferred_messages: Vec<Message>,
@@ -402,9 +400,11 @@ struct ParkedRun {
 
 #[derive(Clone)]
 struct ActiveEventClaim {
-    source: crate::host_tools::EventSourceLocator,
-    claim: crate::host_tools::ClaimedEvent,
-    lease_completed: bool,
+    loop_id: LoopId,
+    source: EventSourceBinding,
+    claim: tickloop_agent_artifacts::ClaimedRequest,
+    /// The service finished the request or already took the claim back; nothing to release.
+    settled: bool,
 }
 
 #[derive(Default)]
@@ -689,10 +689,13 @@ impl Agent {
         provider: Arc<dyn crate::host_tools::HostToolProvider>,
     ) -> Result<(), AgentError> {
         let reserved = reserved_host_tool_names();
+        let serves_artifacts = provider.artifact_client().is_some();
         let mut names = HashSet::new();
         for definition in provider.definitions() {
+            let is_artifact_tool =
+                crate::mcp_tools::ARTIFACT_TOOL_NAMES.contains(&definition.name.as_str());
             if definition.name.trim().is_empty()
-                || reserved.contains(&definition.name)
+                || (reserved.contains(&definition.name) && !(serves_artifacts && is_artifact_tool))
                 || !names.insert(definition.name.clone())
             {
                 return Err(AgentError::Invalid(format!(
@@ -1448,7 +1451,6 @@ impl Agent {
                 user_shell_queue: Arc::new(Notify::new()),
                 trigger_cancellations: HashMap::new(),
                 event_cancellations: HashMap::new(),
-                disabled_event_source_runs: HashSet::new(),
                 active_event_claims: HashMap::new(),
                 deferred_messages: Vec::new(),
                 user_cancelled_runs: HashSet::new(),
@@ -1873,6 +1875,10 @@ impl Agent {
                 })
                 .map(|pending| pending.receipt.clone());
             if let Some(pending_receipt) = pending_receipt {
+                // A claimed feedback request is never merged into another queued Trigger input.
+                if event_claim.is_some() {
+                    return Err(AgentError::Busy);
+                }
                 *original = candidate;
                 drop(chats);
                 let next = self.next_run(chat_id).await?;
@@ -1920,6 +1926,7 @@ impl Agent {
                 attached_file_reads,
             },
         );
+        let carries_event_claim = event_claim.is_some();
         if let Some(event_claim) = event_claim {
             chat.active_event_claims.insert(receipt.run_id, event_claim);
         }
@@ -1948,7 +1955,15 @@ impl Agent {
             *context = candidate;
         }
         drop(chats);
-        let next = self.next_run(chat_id).await?;
+        let next = match self.next_run(chat_id).await {
+            Ok(next) => next,
+            Err(error) => {
+                if carries_event_claim {
+                    self.withdraw_feedback_input(&receipt).await;
+                }
+                return Err(error);
+            }
+        };
         if let Some((trigger, cancel)) = resume_watcher {
             // 先写出重新武装再启动 Trigger 任务：任务第一次读取停止状态时已知道这次武装。
             let recorded = self
@@ -2463,41 +2478,17 @@ impl Agent {
                         self.record_final_denial(record).await;
                     }
                     let command_state=if name==tickloop_agent_tools::BASH_TOOL_NAME {self.command_state_for_call(&receipt,&id).await} else {None};
-                    let (host_effect, connection_effect) = match host_effect {
-                        Some(crate::host_tools::HostEffect::ConnectSource(effect)) => (None, Some(effect)),
-                        other => (other, None),
-                    };
-                    // A connection's raw service result is replaced below before anything is persisted.
-                    let result = if connection_effect.is_some() { result } else {
-                        self.persist_large_tool_result(&receipt,&name,&id,result).await.map_err(|error|error.to_string())?
-                    };
-                    let mut association_request = None;
-                    let mut connection_dispatch = None;
-                    let mut connection_previously_unknown = false;
-                    let mut connection_watcher = None;
+                    let mut result = result;
+                    if let Some(crate::host_tools::HostEffect::CreatedArtifact(tick)) = &host_effect
+                        && !result.is_error
+                        && host_call_status == Some(crate::host_tools::HostCallStatus::Completed)
+                        && let Err(error) = self.link_created_artifact(&receipt, tick).await
+                    {
+                        result.content.push_str(&format!("\n\nThe artifact was created, but linking it for @tickloop requests failed: {error}. The user can press f on it in Monitor to link it."));
+                    }
+                    let result = self.persist_large_tool_result(&receipt,&name,&id,result).await.map_err(|error|error.to_string())?;
                     let mut chats=self.inner.chats.lock().await;
                     let chat=chats.get_mut(&receipt.chat_id).unwrap();
-                    let result = match connection_effect {
-                        Some(effect) => {
-                            let identity = effect.result_identity.clone();
-                            let activation_blocked = cancel.is_cancelled()
-                                || chat.disabled_event_source_runs.contains(&receipt.run_id)
-                                || chat.snapshot.policy.mode == ExecutionMode::Plan;
-                            let mut decision = source_connection::apply(&mut chat.snapshot, chat.active_run, &receipt, effect, activation_blocked);
-                            if let Some(request) = &decision.dispatch
-                                && let Err(error) = self.checkpoint_connection(&chat.snapshot, &chat.bookkeeping, chat.tools.chat_directory().clone(), request.loop_id).await
-                            {
-                                source_connection::record_outcome(&mut chat.snapshot, request, crate::host_tools::EventAssociationOutcome::NotDispatched(error.clone()), decision.previously_unknown);
-                                decision.result = crate::host_tools::connection_result(&identity, "not_dispatched", serde_json::json!({"reason":"persistence_unavailable"}), true, "This attempt dispatched no association because the exact recovery request could not be saved. Any earlier unresolved attempt remains unknown.");
-                                decision.dispatch = None;
-                            }
-                            connection_dispatch = decision.dispatch;
-                            connection_previously_unknown = decision.previously_unknown;
-                            connection_watcher = decision.start_watcher;
-                            decision.result
-                        }
-                        None => result,
-                    };
                     let model_result=if !continue_after_denial {
                         permission_comment.as_deref().map_or_else(||result.content.clone(),|comment|format!("{}\n\nThe user approved this action with this comment: {comment}",result.content))
                     } else {result.content.clone()};
@@ -2524,140 +2515,28 @@ impl Agent {
                         operation.result=Some(result.clone());
                     }
                     if !result.is_error && host_call_status == Some(crate::host_tools::HostCallStatus::Completed) {
-                        let tick = match &host_effect {
-                            Some(crate::host_tools::HostEffect::CreatedArtifact(tick)) => Some(tick),
-                            Some(crate::host_tools::HostEffect::PublishedSource(effect)) => effect.artifact_tick.as_ref(),
-                            _ => None,
-                        };
-                        if let Some(tick) = tick { self.auto_attach_artifact_tick(chat, tick.clone()); }
-                        if let Some(crate::host_tools::HostEffect::OpenedTick { instance, title }) = &host_effect {
-                            self.record_opened_tick(chat, instance.clone(), title.clone());
-                        }
-                    }
-                    if let Some(crate::host_tools::HostEffect::PublishedSource(effect)) = host_effect
-                        && !source_connection::has_recorded_publication(&chat.snapshot, &effect)
-                        && !source_connection::record_connected_publication(&mut chat.snapshot, &effect, &receipt)
-                        && let Some(goal) = chat.snapshot.loops.iter_mut().find(|goal| goal.id == receipt.loop_id)
-                    {
-                        let source_index = goal.event_sources.iter().position(|source| source.server_id == effect.server_id
-                            && source.owner_account_id == effect.owner_account_id && source.source_key == effect.source_key);
-                        let source_index = source_index.unwrap_or_else(|| {
-                            goal.event_sources.push(EventSourceBinding {
-                                server_id: effect.server_id.clone(),
-                                owner_account_id: effect.owner_account_id.clone(),
-                                source_key: effect.source_key.clone(),
-                                publication: None,
-                                publication_history: Vec::new(),
-                                connection: None,
-                                association_operation_id: Uuid::new_v4().to_string(),
-                                binding_id: Uuid::new_v4(),
-                                client_instance_id: Uuid::new_v4(),
-                                credential_generation: effect.credential_generation,
-                                directory_fingerprint: effect.directory_fingerprint,
-                                bridge_fingerprint: effect.bridge_fingerprint,
-                                association_epoch: None,
-                                resume_required: true,
-                                association_unknown: false,
-                                association_rejected: None,
-                                pending_cursor: None,
-                                claim_operations: Vec::new(),
-                            });
-                            goal.event_sources.len() - 1
-                        });
-                        let source = &mut goal.event_sources[source_index];
-                        source_connection::record_publication(source, &effect, &receipt);
-                        source.credential_generation = effect.credential_generation;
-                        source.directory_fingerprint = effect.directory_fingerprint;
-                        source.bridge_fingerprint = effect.bridge_fingerprint;
-                        // A connected source already has its own request; publication never re-associates it.
-                        if source.connection.is_none() && source.association_epoch.is_none() && !source.association_unknown {
-                            source.association_unknown = true;
-                            association_request = Some(crate::host_tools::EventAssociationRequest {
-                                server_id: source.server_id.clone(),
-                                owner_account_id: source.owner_account_id.clone(),
-                                source_key: source.source_key.clone(),
-                                binding_id: source.binding_id,
-                                client_instance_id: source.client_instance_id,
-                                chat_id: receipt.chat_id,
-                                loop_id: receipt.loop_id,
-                                operation_id: source.association_operation_id.clone(),
-                                expected_epoch: None,
-                                credential_generation: source.credential_generation,
-                                directory_fingerprint: source.directory_fingerprint,
-                                bridge_fingerprint: source.bridge_fingerprint,
-                            });
+                        match &host_effect {
+                            Some(crate::host_tools::HostEffect::CreatedArtifact(tick)) => self.auto_attach_artifact_tick(chat, tick.clone()),
+                            Some(crate::host_tools::HostEffect::OpenedTick { instance, title }) => self.record_opened_tick(chat, instance.clone(), title.clone()),
+                            Some(crate::host_tools::HostEffect::FinishedFeedbackRequest { request_id }) => {
+                                if let Some(active) = chat.active_event_claims.get_mut(&receipt.run_id)
+                                    && active.claim.request_id == *request_id
+                                {
+                                    active.settled = true;
+                                }
+                            }
+                            None => {}
                         }
                     }
                     self.save(&chat.snapshot);
-                    if let Some(request) = &connection_dispatch
-                        && let Err(error) = self.checkpoint_connection(&chat.snapshot, &chat.bookkeeping, chat.tools.chat_directory().clone(), request.loop_id).await
-                    {
-                        source_connection::record_outcome(&mut chat.snapshot, request, crate::host_tools::EventAssociationOutcome::NotDispatched(error), connection_previously_unknown);
-                        connection_dispatch = None;
-                        self.save(&chat.snapshot);
-                    }
                     self.emit(chat,&receipt,EventKind::ToolCompleted {call_id:id.clone(),result:result.clone()});
                     // Tool errors go back to the model; a bare user denial or stopped foreground command ends the run.
                     if is_rejected_by_user && !continue_after_denial {
                         chat.user_cancelled_runs.insert(receipt.run_id);
                     }
                     if chat.user_cancelled_runs.contains(&receipt.run_id) {
-                        if let Some(request) = &connection_dispatch
-                            && source_connection::record_outcome(&mut chat.snapshot, request, crate::host_tools::EventAssociationOutcome::NotDispatched("run cancelled".into()), connection_previously_unknown)
-                        {
-                            self.save(&chat.snapshot);
-                        }
                         cancel.cancel();
                         return Err(result.content);
-                    }
-                    drop(chats);
-                    let association_provider = self.inner.host_tools.read().unwrap().clone();
-                    if let Some(request) = association_request
-                        && let Some(provider) = association_provider
-                    {
-                        let outcome = provider.associate_event_source(request.clone(), cancel.clone()).await;
-                        let mut start_watcher = false;
-                        let mut chats = self.inner.chats.lock().await;
-                        if let Some(chat) = chats.get_mut(&receipt.chat_id)
-                            && let Some(goal) = chat.snapshot.loops.iter_mut().find(|goal| goal.id == receipt.loop_id)
-                            && let Some(source) = goal.event_sources.iter_mut().find(|source| source.association_operation_id == request.operation_id)
-                        {
-                            match outcome {
-                                crate::host_tools::EventAssociationOutcome::Committed(epoch) => {
-                                    source.association_epoch = Some(epoch);
-                                    source.association_unknown = false;
-                                    source.association_rejected = None;
-                                    source.resume_required = matches!(goal.state, LoopState::Stopped | LoopState::Expired) || cancel.is_cancelled();
-                                    start_watcher = !source.resume_required;
-                                }
-                                crate::host_tools::EventAssociationOutcome::OutcomeUnknown(_) => source.association_unknown = true,
-                                crate::host_tools::EventAssociationOutcome::NotDispatched(_) => source.association_unknown = false,
-                                crate::host_tools::EventAssociationOutcome::Rejected(code) => {
-                                    source.association_unknown = false;
-                                    source.association_rejected = Some(code);
-                                }
-                            }
-                            self.save(&chat.snapshot);
-                        }
-                        drop(chats);
-                        if start_watcher {
-                            self.start_event_source_watcher(receipt.chat_id, receipt.loop_id).await;
-                        }
-                    }
-                    let connection_provider = self.inner.host_tools.read().unwrap().clone();
-                    if let Some(request) = connection_dispatch
-                        && let Some(provider) = connection_provider
-                    {
-                        let outcome = provider.associate_event_source(request.clone(), cancel.clone()).await;
-                        let mut chats = self.inner.chats.lock().await;
-                        if let Some(chat) = chats.get_mut(&receipt.chat_id)
-                            && source_connection::record_outcome(&mut chat.snapshot, &request, outcome, connection_previously_unknown)
-                        {
-                            self.save(&chat.snapshot);
-                        }
-                    }
-                    if let Some(loop_id) = connection_watcher {
-                        self.start_event_source_watcher(receipt.chat_id, loop_id).await;
                     }
                 }
                 {
@@ -2677,7 +2556,7 @@ impl Agent {
         }.await;
         let mut chats = self.inner.chats.lock().await;
         let chat = chats.get_mut(&receipt.chat_id)?;
-        chat.active_event_claims.remove(&receipt.run_id);
+        let finished_claim = chat.active_event_claims.remove(&receipt.run_id);
         chat.snapshot.pending_thinking.remove(&receipt.run_id);
         if chat.active_run == Some(receipt.run_id) {
             chat.active = None;
@@ -2719,9 +2598,10 @@ impl Agent {
                         {
                             LoopState::WaitingPlan
                         } else if goal.trigger.as_ref().is_some_and(|trigger| trigger.armed)
-                            || goal.event_sources.iter().any(|source| {
-                                source.association_epoch.is_some() && !source.resume_required
-                            })
+                            || goal
+                                .event_sources
+                                .iter()
+                                .any(|source| !source.resume_required)
                         {
                             LoopState::WaitingTrigger
                         } else {
@@ -2740,6 +2620,30 @@ impl Agent {
                 }
                 Ok(_) => unreachable!(),
             };
+        // An interrupted or failed Loop stops listening until an explicit Continue links it again.
+        let pauses_feedback = matches!(goal.state, LoopState::Interrupted | LoopState::Failed)
+            && goal
+                .event_sources
+                .iter()
+                .any(|source| !source.resume_required);
+        if pauses_feedback {
+            for source in &mut goal.event_sources {
+                source.resume_required = true;
+            }
+        }
+        let disarms_feedback =
+            pauses_feedback && Self::settle_without_listening(goal, LoopState::Interrupted);
+        // A run that ended without `done` hands its request back: an interrupted run for another
+        // attempt, a finished or failed one as failed.
+        if let Some(claim) = finished_claim.filter(|claim| !claim.settled) {
+            let outcome = if cancel.is_cancelled() {
+                tickloop_agent_artifacts::ReleaseOutcome::Retry
+            } else {
+                tickloop_agent_artifacts::ReleaseOutcome::Failed
+            };
+            let agent = self.clone();
+            tokio::spawn(async move { agent.release_event_claim(&claim, outcome).await });
+        }
         let is_deliverable = chat
             .snapshot
             .loops
@@ -2765,6 +2669,10 @@ impl Agent {
         }
         let finished_snapshot = chat.snapshot.clone();
         drop(chats);
+        if disarms_feedback {
+            self.disarm_feedback_lease(receipt.chat_id, receipt.loop_id)
+                .await;
+        }
         let next = match self.next_run(receipt.chat_id).await {
             Ok(next) => next,
             Err(error) => {
@@ -4081,6 +3989,7 @@ pub(crate) fn reserved_host_tool_names() -> HashSet<String> {
         .chain(std::iter::once(
             tickloop_agent_config::skills::SKILL_TOOL_NAME.into(),
         ))
+        .chain(crate::mcp_tools::ARTIFACT_TOOL_NAMES.map(String::from))
         .collect()
 }
 

@@ -28,11 +28,10 @@ use crate::{
     UserShellReceipt, UserShellRecord,
 };
 
-/// Business 11.0 names the per-user background process the daemon on the wire: `daemon_epoch`
-/// in hellos and references, and `ShutdownDaemon`/`DaemonStopped`. A 10.0 peer cannot decode
-/// these fields; other business majors are refused before dispatch. Frozen management on
-/// daemon.sock remains independent.
-pub const PROTOCOL_MAJOR: u16 = 11;
+/// Business 12.0 adds Artifact linking and replaces the saved feedback source with an
+/// account-scoped live-document binding. Older business majors are refused before dispatch;
+/// the frozen daemon management protocol remains independent.
+pub const PROTOCOL_MAJOR: u16 = 12;
 pub const PROTOCOL_MINOR: u16 = 0;
 
 pub const REPLAY_CAPACITY: usize = 4096;
@@ -224,6 +223,11 @@ pub enum AgentCommand {
         execution: ExecutionRef,
         instance_id: String,
     },
+    /// Links the artifact to the Chat for the signed-in account's @tickloop requests.
+    LinkArtifact {
+        execution: ExecutionRef,
+        tick: ArtifactTick,
+    },
     ListArtifactTicks {
         execution: ExecutionRef,
     },
@@ -349,6 +353,7 @@ impl AgentCommand {
             | Self::ManageTask { execution, .. }
             | Self::AddArtifactTick { execution, .. }
             | Self::RemoveArtifactTick { execution, .. }
+            | Self::LinkArtifact { execution, .. }
             | Self::ListArtifactTicks { execution }
             | Self::AddMonitorMember { execution, .. }
             | Self::RemoveMonitorMember { execution, .. }
@@ -436,9 +441,6 @@ pub enum LoopAction {
     },
     Interrupt,
     DisableEventSources {
-        loop_id: Uuid,
-    },
-    ResumeEventSources {
         loop_id: Uuid,
     },
     ConfigureTrigger {
@@ -881,9 +883,6 @@ pub enum CommandResult {
     },
     Submitted(Receipt),
     ShellSubmitted(UserShellReceipt),
-    EventSourcesResumed {
-        count: usize,
-    },
     Done,
     ModelChanged(ModelChange),
     Permissions(Box<PermissionsView>),

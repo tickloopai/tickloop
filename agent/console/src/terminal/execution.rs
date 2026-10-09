@@ -2713,20 +2713,6 @@ impl ConsoleExecution {
         Ok(())
     }
 
-    pub(super) async fn resume_event_sources(
-        &self,
-        chat: Uuid,
-        loop_id: Uuid,
-    ) -> Result<usize, AccessError> {
-        match self
-            .loop_command(chat, LoopAction::ResumeEventSources { loop_id })
-            .await?
-        {
-            CommandResult::EventSourcesResumed { count } => Ok(count),
-            _ => Err(unexpected()),
-        }
-    }
-
     pub(super) async fn configure_trigger(
         &self,
         chat: Uuid,
@@ -2826,6 +2812,16 @@ impl ConsoleExecution {
             CommandResult::ArtifactTicks(ticks) => Ok(ticks),
             _ => Err(unexpected()),
         }
+    }
+    pub(super) async fn link_artifact(
+        &self,
+        chat: Uuid,
+        tick: tickloop_agent_protocol::ArtifactTick,
+    ) -> Result<(), AccessError> {
+        let execution = self.reference(chat).await?;
+        self.command(AgentCommand::LinkArtifact { execution, tick }, None)
+            .await
+            .map(|_| ())
     }
     pub(super) async fn remove_artifact_tick(
         &self,

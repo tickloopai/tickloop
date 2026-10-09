@@ -56,3 +56,10 @@ __pycache__/
 
 # Provider/model redesign acceptance output
 /.scratch/provider-model-picker/evidence/
+
+# design-sync (claude.ai/design) staging, build output and machine state
+.ds-sync/
+ds-bundle/
+.design-sync/.cache/
+.design-sync/learnings/
+.design-sync/node_modules

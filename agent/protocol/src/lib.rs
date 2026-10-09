@@ -112,9 +112,8 @@ pub use local_messages::{
     TaskNotification, TaskNotificationStatus, TickDeliveryLine,
 };
 pub use loops::{
-    EventClaimOperation, EventClaimStatus, EventSourceBinding, EventSourceRecord,
-    FrozenAssociationRequest, LoopSnapshot, LoopState, LoopTriggerNotice, LoopTriggerNoticeKind,
-    SourceConnection, SourcePublication, Trigger, TriggerSource,
+    EventSourceBinding, LoopSnapshot, LoopState, LoopTriggerNotice, LoopTriggerNoticeKind, Trigger,
+    TriggerSource,
 };
 pub use model::{
     ApiKeyStatus, Content, ImageSource, InputModality, Message, ModelAuthSource, ModelConfig,

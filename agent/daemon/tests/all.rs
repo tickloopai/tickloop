@@ -12,8 +12,6 @@ mod agent_titles;
 mod builtin_catalog;
 #[path = "all/busy_inputs.rs"]
 mod busy_inputs;
-#[path = "all/mcp_tools.rs"]
-mod mcp_tools;
 #[path = "all/native_host_tools.rs"]
 mod native_host_tools;
 #[path = "all/permission_claims.rs"]

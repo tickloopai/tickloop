@@ -391,6 +391,11 @@ impl EmbeddedAgentAccess {
                         .await?,
                 ))
             }
+            AgentCommand::LinkArtifact { execution, tick } => {
+                let chat = self.chat(execution).await?;
+                self.inner.agent.link_artifact(chat, &tick).await?;
+                Ok(CommandResult::Done)
+            }
             AgentCommand::ListArtifactTicks { execution } => {
                 let chat = self.chat(execution).await?;
                 Ok(CommandResult::ArtifactTicks(
@@ -1034,10 +1039,6 @@ impl EmbeddedAgentAccess {
             LoopAction::DisableEventSources { loop_id } => {
                 agent.disable_event_sources_for_loop(chat, loop_id).await;
                 Ok(CommandResult::Done)
-            }
-            LoopAction::ResumeEventSources { loop_id } => {
-                let count = agent.resume_event_sources(chat, loop_id).await?;
-                Ok(CommandResult::EventSourcesResumed { count })
             }
             LoopAction::ConfigureTrigger { loop_id, trigger } => {
                 agent.configure_trigger(chat, loop_id, trigger).await?;

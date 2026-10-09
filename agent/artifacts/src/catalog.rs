@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use tickloop_agent_protocol::ArtifactTick;
 
-use super::{ArtifactClient, ArtifactError, MAX_RESPONSE_BYTES, bearer};
+use super::{ArtifactClient, ArtifactError, MAX_RESPONSE_BYTES, bearer, path_segment};
 const MAX_CATALOG_RESPONSE_BYTES: usize = 256 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -17,15 +17,11 @@ pub struct ArtifactMetadata {
     #[serde(default)]
     pub human_body_change: Option<String>,
     #[serde(default)]
-    pub human_body_version_id: Option<String>,
-    #[serde(default)]
     pub human_sequence: Option<u64>,
     #[serde(default)]
     pub human_updated_at: Option<String>,
     #[serde(default)]
     pub human_change: Option<String>,
-    #[serde(default)]
-    pub human_version_id: Option<String>,
     pub id: String,
     pub title: String,
     pub format: String,
@@ -38,8 +34,17 @@ pub struct ArtifactMetadata {
     pub status: String,
     #[serde(default)]
     pub metadata_revision: u64,
+    /// This account's Agent link to the artifact, whichever Chat holds it.
     #[serde(default)]
-    pub association: Option<Value>,
+    pub agent_link: Option<AgentLinkMetadata>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AgentLinkMetadata {
+    pub binding_id: Uuid,
+    pub chat_id: Uuid,
+    pub loop_id: Uuid,
+    pub epoch: u64,
 }
 impl ArtifactMetadata {
     pub fn tick(&self, origin: &str, added_at_ms: u64) -> ArtifactTick {
@@ -86,7 +91,7 @@ impl ArtifactClient {
             .await
     }
 
-    async fn catalog_request_with_credential<T: for<'de> Deserialize<'de>>(
+    pub(super) async fn catalog_request_with_credential<T: for<'de> Deserialize<'de>>(
         &self,
         method: Method,
         path: &str,
@@ -169,10 +174,7 @@ impl ArtifactClient {
         .await
     }
     fn artifact_path(&self, id: &str) -> Result<String, ArtifactError> {
-        if id.is_empty() || id.contains(['/', '?', '#', '%']) || id.chars().any(char::is_control) {
-            return Err(ArtifactError::InvalidResponse);
-        }
-        Ok(format!("/api/v1/artifacts/{id}"))
+        Ok(format!("/api/v1/artifacts/{}", path_segment(id)?))
     }
     pub async fn read(&self, id: &str) -> Result<ArtifactMetadata, ArtifactError> {
         let credential = self

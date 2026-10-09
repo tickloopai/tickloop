@@ -250,8 +250,23 @@ fn artifact_login_opens_picker_adds_tick_and_uses_a_substitute_browser() {
             socket
                 .set_read_timeout(Some(Duration::from_secs(3)))
                 .unwrap();
+            let mut reader = BufReader::new(&mut socket);
             let mut request = String::new();
-            BufReader::new(&mut socket).read_line(&mut request).unwrap();
+            reader.read_line(&mut request).unwrap();
+            let mut content_length = 0;
+            loop {
+                let mut header = String::new();
+                reader.read_line(&mut header).unwrap();
+                if header.trim().is_empty() {
+                    break;
+                }
+                if let Some(length) = header.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = length.trim().parse().unwrap();
+                }
+            }
+            let mut request_body = vec![0; content_length];
+            std::io::Read::read_exact(&mut reader, &mut request_body).unwrap();
+            drop(reader);
             let user = json!({"id":"owner","name":"Owner","email":"owner@example.test"});
             let artifact = json!({"id":id,"title":"PTY Research","format":"markdown","access_role":"owner","url":"https://docs.example/a/test","updated_at":"2026-10-06T00:00:00Z","metadata_revision":1});
             let body = if request.starts_with("POST /api/v1/auth/device ") {
@@ -264,6 +279,11 @@ fn artifact_login_opens_picker_adds_tick_and_uses_a_substitute_browser() {
                 json!({"artifacts":[],"next_cursor":null})
             } else if request.starts_with("GET /api/v1/artifacts?") {
                 json!({"artifacts":[artifact],"next_cursor":null})
+            } else if request.starts_with(&format!("PUT /api/v1/agent/links/{id} ")) {
+                let link: serde_json::Value = serde_json::from_slice(&request_body).unwrap();
+                json!({"artifact_id":id,"binding_id":link["binding_id"],"epoch":1})
+            } else if request.starts_with("GET /api/v1/agent/requests?") {
+                json!({"items":[],"next_cursor":null})
             } else {
                 artifact
             };

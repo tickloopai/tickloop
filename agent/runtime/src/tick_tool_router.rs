@@ -36,7 +36,7 @@ const PLACEMENT_DIRECTIONS: [&str; 4] = ["left", "right", "up", "down"];
 #[derive(Debug, thiserror::Error)]
 pub enum TickToolTargetError {
     #[error(
-        "NativeToolRequired: {operation} cannot operate on an Artifact Tick; use mcp__artifacts__artifact_read and the installed Artifact MCP edit/publish tools with artifact_id"
+        "NativeToolRequired: {operation} cannot operate on an Artifact Tick; use ArtifactRead, ArtifactEdit and ArtifactComment with artifact_id"
     )]
     Artifact { operation: String },
     #[error(
@@ -44,7 +44,7 @@ pub enum TickToolTargetError {
     )]
     Shell { operation: String },
     #[error(
-        "InvalidTickTarget: {operation} requires the complete {supported}; use Artifact MCP tools for artifacts and Bash/Read/TaskStop for shells"
+        "InvalidTickTarget: {operation} requires the complete {supported}; use ArtifactRead/ArtifactEdit/ArtifactComment for artifacts and Bash/Read/TaskStop for shells"
     )]
     Invalid {
         operation: String,
@@ -193,7 +193,7 @@ impl TickBackends {
         definitions.push(ToolDefinition {
             name: READ_TICK.into(),
             description: format!(
-                "Read a Tick using {identity}. Protocol Ticks return structured content and their declared tool catalog.{} Reading never subscribes. For artifacts use the installed Artifact MCP tools; for Shell tasks use Read on Bash's output_file.",
+                "Read a Tick using {identity}. Protocol Ticks return structured content and their declared tool catalog.{} Reading never subscribes. For artifacts use ArtifactRead; for Shell tasks use Read on Bash's output_file.",
                 if self.herdr {
                     " Ordinary Herdr Pane programs return at most 200 recent plain-text lines and 64 KiB; workspace_id applies to herdr: instances."
                 } else {
@@ -204,7 +204,7 @@ impl TickBackends {
         });
         definitions.push(ToolDefinition {
             name: CALL_TICK_TOOL.into(),
-            description: format!("Call one tool declared by a protocol Tick using {identity}. Read that Tick's catalog first; query tools read content, while modifying tools require permission. Use native Artifact MCP tools for artifacts and Bash/Read/TaskStop for Shell tasks."),
+            description: format!("Call one tool declared by a protocol Tick using {identity}. Read that Tick's catalog first; query tools read content, while modifying tools require permission. Use ArtifactRead/ArtifactEdit/ArtifactComment for artifacts and Bash/Read/TaskStop for Shell tasks."),
             input_schema: json!({"type":"object","properties":target_properties(json!({"tool":{"type":"string","minLength":1},"args":{"type":"object"}})),"required":["tick_instance_id","tool","args"],"additionalProperties":false}),
         });
         definitions.push(ToolDefinition {

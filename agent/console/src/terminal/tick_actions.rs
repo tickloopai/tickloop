@@ -2,7 +2,7 @@
 pub(crate) mod builtin;
 
 use super::{
-    console::{Console, InputEvent, State},
+    console::{Console, State},
     execution::ConsoleExecution,
     style::{Role, RoleLine},
 };
@@ -90,7 +90,7 @@ pub trait TickActionExecutor: Send + Sync {
 }
 #[async_trait]
 pub trait TickActionBackend: Send + Sync {
-    async fn execute(&self, context: TickActionContext<'_>) -> Result<TickActionOutcome, String>;
+    async fn execute(&self, context: TickActionContext<'_>) -> Result<(), String>;
 }
 pub struct PreparedTickAction {
     pub instance: String,
@@ -118,10 +118,6 @@ impl PreparedTickAction {
         }
     }
 }
-pub enum TickActionOutcome {
-    Done,
-    Prompt(String),
-}
 #[derive(Clone, Copy)]
 pub struct TickActionContext<'a> {
     pub(super) agent: &'a ConsoleExecution,
@@ -148,14 +144,6 @@ impl TickActionContext<'_> {
 pub(super) async fn execute(
     action: PreparedTickAction,
     context: TickActionContext<'_>,
-) -> Result<Option<InputEvent>, String> {
-    match action.backend.execute(context).await? {
-        TickActionOutcome::Done => Ok(None),
-        TickActionOutcome::Prompt(text) => Ok(Some(InputEvent::Prompt {
-            family_target: None,
-            text,
-            file_references: Vec::new(),
-            images: Vec::new(),
-        })),
-    }
+) -> Result<(), String> {
+    action.backend.execute(context).await
 }

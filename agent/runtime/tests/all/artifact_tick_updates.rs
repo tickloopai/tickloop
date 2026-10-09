@@ -79,17 +79,16 @@ async fn service() -> (String, Arc<AtomicU64>, Arc<AtomicU64>, Arc<AtomicU64>) {
                 }
                 let result = match rpc["method"].as_str().unwrap_or_default() {
                     "server/discover" => {
-                        json!({"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{}},"ttlMs":0,"cacheScope":"private"})
-                    }
-                    "initialize" => {
-                        json!({"protocolVersion":"2026-07-28","capabilities":{"tools":{}},"serverInfo":{"name":"mock-artifacts","version":"1"}})
+                        json!({"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{}},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"tickloop-docs","version":"1"}}})
                     }
                     "tools/list" => json!({"tools":[
-                        {"name":"artifact_read","description":"Read artifact","inputSchema":{"type":"object","properties":{"artifact_id":{"type":"string"},"version_id":{"type":"string"}},"required":["artifact_id"],"additionalProperties":false},"annotations":{"readOnlyHint":true}},
-                        {"name":"artifact_publish","description":"Publish artifact","inputSchema":{"type":"object","properties":{"artifact_id":{"type":"string"}},"required":["artifact_id"]},"annotations":{"readOnlyHint":false}}
+                        {"name":"ArtifactRead","description":"Read artifact","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","read","threads"]},"artifact_id":{"type":"string"}},"required":["action"],"additionalProperties":false},"annotations":{"readOnlyHint":true}},
+                        {"name":"ArtifactEdit","description":"Edit artifact","inputSchema":{"type":"object","properties":{"action":{"type":"string"},"artifact_id":{"type":"string"}},"required":["action"]},"annotations":{"readOnlyHint":false}},
+                        {"name":"ArtifactComment","description":"Comment on artifact","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":false}}
                     ]}),
                     "tools/call" => {
-                        assert_eq!(rpc["params"]["name"], "artifact_read");
+                        assert_eq!(rpc["params"]["name"], "ArtifactRead");
+                        assert_eq!(rpc["params"]["arguments"]["action"], "read");
                         assert_eq!(rpc["params"]["arguments"]["artifact_id"], "doc");
                         json!({"content":[{"type":"text","text":"# Recovered artifact body"}],"isError":false})
                     }
@@ -101,7 +100,7 @@ async fn service() -> (String, Arc<AtomicU64>, Arc<AtomicU64>, Arc<AtomicU64>) {
                 let sequence = changes.load(Ordering::SeqCst);
                 let change = kind.load(Ordering::SeqCst);
                 let body_sequence = sequence - u64::from(change == 1);
-                json!({"id":"doc","title":"Artifact updates","format":"markdown","access_role":"owner","human_sequence":sequence,"human_updated_at":format!("2026-10-06T04:00:{sequence:02}.000Z"),"human_change":if change == 1 {"feedback"} else if change == 2 {"publish"} else {"edit"},"human_version_id":null,"human_body_sequence":body_sequence,"human_body_updated_at":format!("2026-10-06T04:00:{body_sequence:02}.000Z"),"human_body_change":if change == 2 {"publish"} else {"edit"},"human_body_version_id":if change == 2 {Some("version-15")} else {None}})
+                json!({"id":"doc","title":"Artifact updates","format":"markdown","access_role":"owner","human_sequence":sequence,"human_updated_at":format!("2026-10-06T04:00:{sequence:02}.000Z"),"human_change":if change == 1 {"feedback"} else {"edit"},"human_body_sequence":body_sequence,"human_body_updated_at":format!("2026-10-06T04:00:{body_sequence:02}.000Z"),"human_body_change":"edit"})
             };
             let body = body.to_string();
             socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
@@ -169,7 +168,7 @@ async fn feedback_between_polls_does_not_swallow_the_latest_undelivered_body_cha
     assert_eq!(value.sequence, 13);
     assert_eq!(value.data["change"], "edit");
     assert_eq!(value.observed_at, "2026-10-06T04:00:13.000Z");
-    feedback.store(2, Ordering::SeqCst);
+    feedback.store(0, Ordering::SeqCst);
     sequence.store(15, Ordering::SeqCst);
     let value = tokio::time::timeout(Duration::from_secs(7), async {
         loop {
@@ -182,8 +181,7 @@ async fn feedback_between_polls_does_not_swallow_the_latest_undelivered_body_cha
     .await
     .unwrap();
     assert_eq!(value.sequence, 15);
-    assert_eq!(value.data["change"], "publish");
-    assert_eq!(value.data["version_id"], "version-15");
+    assert_eq!(value.data["change"], "edit");
 }
 #[tokio::test]
 async fn subscribed_artifact_baselines_each_watch_polls_at_cadence_and_preserves_feedback_path() {
@@ -351,8 +349,8 @@ async fn artifact_subscription_preserves_native_mcp_read_policy() {
         let model = Arc::new(tickloop_agent_test_support::ScriptedModel::new(vec![
             tickloop_agent_test_support::call(
                 "direct",
-                "mcp__artifacts__artifact_read",
-                json!({"artifact_id":"doc"}),
+                "ArtifactRead",
+                json!({"action":"read","artifact_id":"doc"}),
             ),
             tickloop_agent_test_support::call(
                 "subscribe",
@@ -386,7 +384,7 @@ async fn artifact_subscription_preserves_native_mcp_read_policy() {
                 vec![PermissionRule {
                     id: Uuid::new_v4(),
                     decision,
-                    tool: "mcp__artifacts__artifact_read".into(),
+                    tool: "ArtifactRead".into(),
                     specifier: None,
                     input: None,
                     loop_id: None,
@@ -408,7 +406,7 @@ async fn artifact_subscription_preserves_native_mcp_read_policy() {
                 .kind
             {
                 EventKind::PermissionRequested { request } => {
-                    assert_eq!(request.name, "mcp__artifacts__artifact_read");
+                    assert_eq!(request.name, "ArtifactRead");
                     asked += 1;
                     agent
                         .answer_permission(chat, request.id, true)
@@ -464,10 +462,7 @@ async fn artifact_subscription_preserves_plan_and_final_admission_as_the_native_
     agent.install_tick_stream(adapters).await;
     let chat = agent.create_chat(root).await.unwrap();
     let queries = [
-        (
-            "mcp__artifacts__artifact_read",
-            json!({"artifact_id":"doc"}),
-        ),
+        ("ArtifactRead", json!({"action":"read","artifact_id":"doc"})),
         (
             "SubscribeTick",
             json!({"tick_instance_id":instance,"every_seconds":5}),
@@ -479,8 +474,8 @@ async fn artifact_subscription_preserves_plan_and_final_admission_as_the_native_
             plan_denied: false,
             name,
             input,
-            policy_name: "mcp__artifacts__artifact_read",
-            policy_input: json!({"artifact_id":"doc"}),
+            policy_name: "ArtifactRead",
+            policy_input: json!({"action":"read","artifact_id":"doc"}),
         })
         .collect::<Vec<_>>();
     verify_admission_policy(&agent, &model, chat, &cases).await;
@@ -584,7 +579,7 @@ async fn verify_delegated_watch_account(restore: bool) {
             .delegation
             .unwrap()
             .ceiling
-            .host_tools["mcp__artifacts__artifact_read"],
+            .host_tools["ArtifactRead"],
         std::collections::BTreeSet::from([tickloop_agent_protocol::HostToolAuthority::Mcp {
             server_id: origin.clone(),
             account_id: "owner".into()

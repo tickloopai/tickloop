@@ -62,9 +62,6 @@ pub use daemon_server::{DaemonServer, WorkerFactory};
 pub use embedded::{EmbeddedAgentAccess, ModelClientFactory};
 pub use ipc::{serve_connection, serve_daemon_listener, serve_listener, serve_worker_listener};
 
-const ARTIFACT_EVENT_BRIDGE_URI: &str = "tickloop://event-bridge/v2";
-const ARTIFACT_EVENT_BRIDGE_FALLBACK_URI: &str = "tickloop://event-bridge/v1";
-
 /// How often a daemon checks that clients can still reach it through its runtime directory.
 const RUNTIME_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -531,9 +528,7 @@ pub async fn build_runtime_with_client(
                 tickloop_agent_runtime::mcp_tools::McpHostToolProvider::new(
                     artifact,
                     native_host.clone(),
-                )
-                .with_event_bridge(ARTIFACT_EVENT_BRIDGE_URI)
-                .with_event_bridge_fallback(ARTIFACT_EVENT_BRIDGE_FALLBACK_URI),
+                ),
             ))
             .map_err(|error| format!("cannot install MCP tools: {error}"))?;
     } else if let Some(native_host) = native_host {

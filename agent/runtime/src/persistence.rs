@@ -2166,30 +2166,6 @@ impl Agent {
             .map_err(|error| error.to_string())
     }
 
-    pub(super) async fn checkpoint_connection(
-        &self,
-        snapshot: &ChatSnapshot,
-        bookkeeping: &ChatBookkeeping,
-        directory: tickloop_agent_base::private_fs::PrivateDirectory,
-        loop_id: LoopId,
-    ) -> Result<(), String> {
-        let Some(recorder) = &self.inner.recorder else {
-            return Err("Connection requires a persistent Chat".into());
-        };
-        recorder.enqueue_sync(snapshot, bookkeeping);
-        let path = recorder
-            .path_for_chat(snapshot.id)
-            .ok_or("Connection Chat has no Transcript path")?;
-        let writer = recorder.writer.clone();
-        tokio::task::spawn_blocking(move || {
-            super::loop_lease::checkpoint_connection_run_state(&directory.join("loops"), loop_id)?;
-            writer.checkpoint_blocking(&path)
-        })
-        .await
-        .map_err(|error| error.to_string())?
-        .map_err(|error| error.to_string())
-    }
-
     pub(super) fn record_artifact_ticks(
         &self,
         chat_id: ChatId,
@@ -2745,7 +2721,6 @@ impl Agent {
                 user_shell_queue: Arc::new(Notify::new()),
                 trigger_cancellations: HashMap::new(),
                 event_cancellations: HashMap::new(),
-                disabled_event_source_runs: Default::default(),
                 active_event_claims: HashMap::new(),
                 deferred_messages: Vec::new(),
                 user_cancelled_runs: HashSet::new(),

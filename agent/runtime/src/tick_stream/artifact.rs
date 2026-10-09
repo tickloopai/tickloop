@@ -46,8 +46,8 @@ impl TickStreamPort for ArtifactTickStream {
         let query = provider
             .prepare_call(
                 chat,
-                "mcp__artifacts__artifact_read",
-                &serde_json::json!({"artifact_id":id}),
+                crate::mcp_tools::ARTIFACT_READ_TOOL,
+                &serde_json::json!({"action":"read","artifact_id":id}),
                 cancel,
             )
             .await?;
@@ -250,10 +250,7 @@ fn observation(instance: &InstanceRef, metadata: &ArtifactMetadata) -> Option<Ti
     let sequence = update.sequence;
     let updated_at = update.updated_at.to_owned();
     let change = update.change;
-    let mut data = serde_json::json!({"artifact_id":metadata.id,"title":metadata.title,"change":change,"human_updated_at":updated_at,"human_sequence":sequence});
-    if let Some(version) = update.version_id {
-        data["version_id"] = serde_json::json!(version);
-    }
+    let data = serde_json::json!({"artifact_id":metadata.id,"title":metadata.title,"change":change,"human_updated_at":updated_at,"human_sequence":sequence});
     Some(TickObservation {
         instance: instance.clone(),
         sequence,
@@ -261,7 +258,7 @@ fn observation(instance: &InstanceRef, metadata: &ArtifactMetadata) -> Option<Ti
         dropped: 0,
         data,
         kind: ObservationKind::Protocol,
-        recover_with: Some("Read the artifact with its MCP tools".into()),
+        recover_with: Some("Read the artifact with ArtifactRead".into()),
         gap: false,
     })
 }
@@ -270,26 +267,15 @@ struct BodyUpdate<'a> {
     sequence: u64,
     updated_at: &'a str,
     change: &'a str,
-    version_id: Option<&'a str>,
 }
 
 fn body_update(metadata: &ArtifactMetadata) -> Option<BodyUpdate<'_>> {
-    let update = if let Some(sequence) = metadata.human_body_sequence {
-        BodyUpdate {
-            sequence,
-            updated_at: metadata.human_body_updated_at.as_deref()?,
-            change: metadata.human_body_change.as_deref()?,
-            version_id: metadata.human_body_version_id.as_deref(),
-        }
-    } else {
-        BodyUpdate {
-            sequence: metadata.human_sequence?,
-            updated_at: metadata.human_updated_at.as_deref()?,
-            change: metadata.human_change.as_deref()?,
-            version_id: metadata.human_version_id.as_deref(),
-        }
+    let update = BodyUpdate {
+        sequence: metadata.human_body_sequence?,
+        updated_at: metadata.human_body_updated_at.as_deref()?,
+        change: metadata.human_body_change.as_deref()?,
     };
-    if !["edit", "publish"].contains(&update.change) {
+    if update.change != "edit" {
         return None;
     }
     Some(update)

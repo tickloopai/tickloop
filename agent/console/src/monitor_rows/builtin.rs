@@ -178,21 +178,26 @@ impl MonitorRows for ArtifactRows {
                 let binding = chat
                     .loops
                     .iter()
+                    .filter(|goal| !matches!(goal.state, LoopState::Stopped | LoopState::Expired))
                     .flat_map(|goal| &goal.event_sources)
-                    .find(|binding| binding.source_key == tick.artifact_id);
+                    .find(|binding| {
+                        binding.origin == tick.origin && binding.artifact_id == tick.artifact_id
+                    });
+                let remote_link = metadata
+                    .and_then(Option::as_ref)
+                    .and_then(|metadata| metadata.agent_link.as_ref());
                 let status = if metadata.is_some_and(Option::is_none) {
                     "unavailable"
                 } else if context.metadata_failures.contains_key(&id) {
                     "refresh failed"
-                } else if binding.is_some_and(|binding| binding.resume_required) {
-                    "feedback paused"
-                } else if binding.is_some() {
+                } else if binding.is_some_and(|binding| !binding.resume_required) {
                     "feedback here"
-                } else if metadata
-                    .and_then(Option::as_ref)
-                    .is_some_and(|metadata| metadata.association.is_some())
-                {
+                } else if remote_link.is_some_and(|link| {
+                    binding.is_none_or(|binding| binding.binding_id != link.binding_id)
+                }) {
                     "feedback elsewhere"
+                } else if binding.is_some() {
+                    "feedback paused"
                 } else {
                     ""
                 };
@@ -210,6 +215,7 @@ impl MonitorRows for ArtifactRows {
                     .map(|value| value.max(0) as u64)
                     .into_iter()
                     .chain(subscribed.and_then(|row| row.updated_at_ms))
+                    .chain(binding.and_then(|binding| binding.last_request_at_ms))
                     .max();
                 rows.insert(
                     instance.clone(),

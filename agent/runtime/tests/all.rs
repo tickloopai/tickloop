@@ -2,8 +2,8 @@
 
 #[path = "all/approval_assessment.rs"]
 mod approval_assessment;
-#[path = "all/artifact_live_model.rs"]
-mod artifact_live_model;
+#[path = "all/artifact_real_service.rs"]
+mod artifact_real_service;
 #[path = "all/artifact_tick_updates.rs"]
 mod artifact_tick_updates;
 #[path = "all/auto_configuration.rs"]
@@ -72,6 +72,8 @@ mod loop_chain;
 mod loop_trigger_safety;
 #[path = "all/mcp_approval.rs"]
 mod mcp_approval;
+#[path = "all/mcp_tools.rs"]
+mod mcp_tools;
 #[path = "all/model_error_retry.rs"]
 mod model_error_retry;
 #[path = "all/model_image_capability.rs"]

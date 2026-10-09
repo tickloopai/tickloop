@@ -1,0 +1,241 @@
+{
+  "tools": [
+    {
+      "name": "ArtifactRead",
+      "description": "Read Tick Loop Docs you can access. list: your documents and those shared with you; query matches titles. read: a Markdown document as blocks, each with id and hash, paged by cursor; an HTML document as its whole source. Both include revision. threads: comment threads (open by default) with their latest messages and any @tickloop request. access_role is owner, edit or view; view can comment but not edit.",
+      "inputSchema": {
+        "type": "object",
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": [
+              "list",
+              "read",
+              "threads"
+            ]
+          },
+          "query": {
+            "type": "string",
+            "maxLength": 200,
+            "description": "Part of a title"
+          },
+          "cursor": {
+            "type": "string",
+            "description": "next_cursor from the previous page"
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 50
+          },
+          "artifact_id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "open",
+              "resolved",
+              "all"
+            ]
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true
+      }
+    },
+    {
+      "name": "ArtifactEdit",
+      "description": "Saves are live for all readers. create: title, format (markdown or html), content. patch (Markdown): copy target and expected_hash from read; replace, delete or insert before/after a block. replace (HTML): the whole source plus expected_revision from read. On content_conflict, re-read and merge; never overwrite. On unsupported_markdown, rewrite that part as plain GFM. HTML may use inline scripts/styles and https://cdn.jsdelivr.net/npm/chart.js@4.5.1/dist/chart.umd.min.js; make it fit phone widths (wrap wide tables in overflow-x:auto). Rename, delete, sharing, members, versions: web only.",
+      "inputSchema": {
+        "type": "object",
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": [
+              "create",
+              "patch",
+              "replace"
+            ]
+          },
+          "title": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "format": {
+            "type": "string",
+            "enum": [
+              "markdown",
+              "html"
+            ]
+          },
+          "content": {
+            "type": "string"
+          },
+          "artifact_id": {
+            "type": "string"
+          },
+          "patches": {
+            "minItems": 1,
+            "maxItems": 200,
+            "type": "array",
+            "items": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "replace"
+                    },
+                    "target": {
+                      "type": "string",
+                      "description": "A block id from read"
+                    },
+                    "expected_hash": {
+                      "type": "string",
+                      "description": "That block's hash from read"
+                    },
+                    "markdown": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "target",
+                    "expected_hash",
+                    "markdown"
+                  ],
+                  "additionalProperties": false
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "delete"
+                    },
+                    "target": {
+                      "type": "string",
+                      "description": "A block id from read"
+                    },
+                    "expected_hash": {
+                      "type": "string",
+                      "description": "That block's hash from read"
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "target",
+                    "expected_hash"
+                  ],
+                  "additionalProperties": false
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "const": "insert"
+                    },
+                    "target": {
+                      "type": "string",
+                      "description": "A block id from read"
+                    },
+                    "expected_hash": {
+                      "type": "string",
+                      "description": "That block's hash from read"
+                    },
+                    "side": {
+                      "type": "string",
+                      "enum": [
+                        "before",
+                        "after"
+                      ]
+                    },
+                    "markdown": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "target",
+                    "expected_hash",
+                    "side",
+                    "markdown"
+                  ],
+                  "additionalProperties": false
+                }
+              ]
+            }
+          },
+          "expected_revision": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false
+      }
+    },
+    {
+      "name": "ArtifactComment",
+      "description": "Write in a document's comment threads as the user's Agent. reply: answer in a thread, with thread_id from ArtifactRead threads; a reply does not finish a request. done: call only once you have finished the @tickloop request you are handling, or cannot; outcome done or failed, and a non-empty summary is added to its thread. done needs the request context Tick Loop sends while you handle that request.",
+      "inputSchema": {
+        "type": "object",
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": [
+              "reply",
+              "done"
+            ]
+          },
+          "artifact_id": {
+            "type": "string"
+          },
+          "thread_id": {
+            "type": "string"
+          },
+          "text": {
+            "type": "string",
+            "minLength": 1
+          },
+          "outcome": {
+            "type": "string",
+            "enum": [
+              "done",
+              "failed"
+            ]
+          },
+          "summary": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "action",
+          "artifact_id"
+        ],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false
+      }
+    }
+  ]
+}

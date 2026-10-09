@@ -2095,11 +2095,9 @@ async fn interact(
                 let line = match line {
                     Some(InputEvent::TickAction { chat, action }) if selected_chat == Some(chat) && !overview_active && !login_active => {
                         let context = tick_actions::TickActionContext { agent, console, root:config_root.as_deref(), chat };
-                        match tick_actions::execute(action,context).await {
-                            Ok(Some(prompt)) => Some(prompt),
-                            Ok(None) => { status_dirty=true; continue; },
-                            Err(error) => { console.set_status(&safe_text(&error))?; status_dirty=true; continue; }
-                        }
+                        if let Err(error) = tick_actions::execute(action,context).await { console.set_status(&safe_text(&error))?; }
+                        status_dirty=true;
+                        continue;
                     }
                     Some(InputEvent::TickAction { .. }) => continue,
                     other => other,
