@@ -293,7 +293,7 @@ async fn reading_runs_without_approval_while_edits_ask_under_their_own_name() {
         call(
             "patch",
             "ArtifactEdit",
-            json!({"action":"patch","artifact_id":"doc","patches":[{"type":"replace","target":"b1","expected_hash":"h1","markdown":"# Tighter"}]}),
+            json!({"action":"patch","artifact_id":"doc","patches":[{"type":"replace","target":"b1","expected_hash":"h1","text":"# Tighter"}]}),
         ),
         text("Edited."),
     ]));
@@ -743,6 +743,11 @@ async fn model_tool_inventory_keeps_artifact_shell_and_herdr_names() {
     assert!(
         prompt.contains("Operate artifacts with ArtifactRead, ArtifactEdit and ArtifactComment")
     );
+    assert!(prompt.contains("authentication is signed_out, call ArtifactLogin"));
+    assert!(
+        prompt.contains("a doc, for writing") && prompt.contains("a design, for visual design")
+    );
+    assert!(!tool_names(&requests[0]).contains(&"ArtifactLogin"));
     for name in ["CallTickTool", "ReadTick"] {
         let definition = requests[0]
             .tools
@@ -991,7 +996,7 @@ async fn native_tools_and_workspace_metadata_survive_mcp_composition() {
             .iter()
             .map(|tool| tool.name.as_str())
             .collect::<Vec<_>>(),
-        ["native_fixture"]
+        ["native_fixture", "ArtifactLogin"]
     );
     let context = provider.workspace_host_context().unwrap();
     assert_eq!(context.name, WorkspaceHostName::Herdr);
@@ -1032,7 +1037,14 @@ async fn remote_unauthorized_hides_tools_and_invalidates_local_login() {
     assert!(!provider.definitions().is_empty());
     service.control.reject_mcp.store(true, Ordering::SeqCst);
     provider.refresh(CancellationToken::new()).await.unwrap();
-    assert!(provider.definitions().is_empty());
+    assert_eq!(
+        provider
+            .definitions()
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>(),
+        ["ArtifactLogin"]
+    );
     assert!(
         service
             .client(directory.path())
@@ -1477,7 +1489,7 @@ async fn a_created_artifact_joins_monitor_and_links_to_the_creating_loop() {
         call(
             "create",
             "ArtifactEdit",
-            json!({"action":"create","title":"Brief","format":"markdown","content":"# Brief"}),
+            json!({"action":"create","title":"Brief","format":"doc","content":"# Brief"}),
         ),
         text("Created."),
     ]));
@@ -1516,6 +1528,10 @@ async fn a_created_artifact_joins_monitor_and_links_to_the_creating_loop() {
     assert_eq!(snapshot.artifact_ticks.len(), 1);
     assert_eq!(snapshot.artifact_ticks[0].artifact_id, CREATED_ARTIFACT);
     assert_eq!(snapshot.artifact_ticks[0].title, "Brief");
+    assert_eq!(
+        snapshot.artifact_ticks[0].format, "markdown",
+        "a doc is catalogued under its stored format"
+    );
     let goal = snapshot.loops.last().unwrap();
     assert_eq!(goal.event_sources[0].artifact_id, CREATED_ARTIFACT);
     let link = service.link(CREATED_ARTIFACT).unwrap();
@@ -1534,7 +1550,7 @@ async fn a_failed_creation_link_is_reported_to_the_model_and_monitor_still_shows
         call(
             "create",
             "ArtifactEdit",
-            json!({"action":"create","title":"Brief","format":"html","content":"<p>Brief</p>"}),
+            json!({"action":"create","title":"Brief","format":"design","content":"<p>Brief</p>"}),
         ),
         text("Created."),
     ]));
@@ -1551,6 +1567,7 @@ async fn a_failed_creation_link_is_reported_to_the_model_and_monitor_still_shows
     wait_for_completion(&agent, chat).await;
     let snapshot = agent.snapshot(chat).await.unwrap();
     assert_eq!(snapshot.artifact_ticks.len(), 1);
+    assert_eq!(snapshot.artifact_ticks[0].format, "html");
     assert!(snapshot.loops[0].event_sources.is_empty());
     let result = serde_json::to_string(&model.requests.lock().unwrap()[1].messages).unwrap();
     assert!(
@@ -1596,4 +1613,499 @@ async fn continuing_after_an_account_switch_links_the_artifact_for_the_new_accou
     assert!(!sources[0].resume_required);
     assert_eq!(snapshot.loops[0].state, LoopState::WaitingTrigger);
     agent.shutdown().await;
+}
+
+const HOST_NOTICE: &str = "Host notice:";
+
+fn host_notices(request: &ModelRequest) -> Vec<String> {
+    request
+        .messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .filter_map(|block| match block {
+            Content::Text { text } if text.starts_with(HOST_NOTICE) => Some(text.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn tool_result_text(request: &ModelRequest, call_id: &str) -> String {
+    request
+        .messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .find_map(|block| match block {
+            Content::ToolResult {
+                tool_use_id,
+                content,
+                ..
+            } if tool_use_id == call_id => Some(content.text().into_owned()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no tool result for {call_id}"))
+}
+
+async fn submit_and_wait(agent: &Agent, chat: ChatId, prompt: &str) {
+    agent.submit(chat, None, prompt.into()).await.unwrap();
+    wait_for_completion(agent, chat).await;
+}
+
+#[tokio::test]
+async fn a_resumed_chat_is_told_once_which_host_tools_became_available() {
+    let service = ArtifactService::start().await;
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("root");
+    let earlier = Agent::open_embedded(
+        root.clone(),
+        config(),
+        Arc::new(ScriptedModel::new(vec![text(
+            "I do not have ArtifactEdit in this conversation.",
+        )])),
+    )
+    .unwrap();
+    let chat = earlier.create_chat(directory.path().into()).await.unwrap();
+    submit_and_wait(&earlier, chat, "Make a doc").await;
+    earlier.shutdown().await;
+
+    let account = service.login(directory.path()).await;
+    let model = Arc::new(ScriptedModel::new(vec![
+        text("Now I can."),
+        text("Still can."),
+    ]));
+    let resumed = Agent::open_embedded(root.clone(), config(), model.clone()).unwrap();
+    resumed
+        .install_host_tools(Arc::new(McpHostToolProvider::new(account, None)))
+        .unwrap();
+    resumed.resume_chat(chat).await.unwrap();
+    submit_and_wait(&resumed, chat, "Try again").await;
+    submit_and_wait(&resumed, chat, "And once more").await;
+    let snapshot = resumed.snapshot(chat).await.unwrap();
+    resumed.shutdown().await;
+    {
+        let requests = model.requests.lock().unwrap();
+        let notices = host_notices(&requests[0]);
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(
+            notices[0].contains(
+                "host tools available in this conversation now: ArtifactComment, ArtifactEdit, ArtifactRead."
+            ),
+            "{}",
+            notices[0]
+        );
+        assert!(!notices[0].contains("changed"), "{}", notices[0]);
+        assert!(notices[0].contains("may be outdated"));
+        assert!(tool_names(&requests[0]).contains(&"ArtifactEdit"));
+        assert_eq!(
+            host_notices(&requests[1]).len(),
+            1,
+            "an unchanged tool set is not announced again"
+        );
+    }
+    assert_eq!(snapshot.host_notes.len(), 1);
+    let (index, announced) = snapshot.host_notes.iter().next().unwrap();
+    assert!(announced.contains("ArtifactRead"));
+    assert!(
+        !snapshot.prompt_execution_modes.contains_key(index),
+        "a host note is never a user prompt"
+    );
+    let public = serde_json::to_string(&snapshot.public_conversation_items().unwrap()).unwrap();
+    assert!(!public.contains(HOST_NOTICE), "{public}");
+
+    let account = service.client(directory.path());
+    let model = Arc::new(ScriptedModel::new(vec![text("Same tools.")]));
+    let reopened = Agent::open_embedded(root, config(), model.clone()).unwrap();
+    reopened
+        .install_host_tools(Arc::new(McpHostToolProvider::new(account, None)))
+        .unwrap();
+    let restored = reopened.resume_chat(chat).await.unwrap();
+    assert_eq!(restored.host_notes, snapshot.host_notes);
+    submit_and_wait(&reopened, chat, "Continue").await;
+    reopened.shutdown().await;
+    assert_eq!(
+        host_notices(&model.requests.lock().unwrap()[0]).len(),
+        1,
+        "the announced set survives resume"
+    );
+}
+
+#[tokio::test]
+async fn a_new_chat_is_not_told_about_tools_its_first_request_lists() {
+    let service = ArtifactService::start().await;
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![text("Ready."), text("Again.")]));
+    let agent = signed_in_agent(&service, directory.path(), model.clone()).await;
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    submit_and_wait(&agent, chat, "Hello").await;
+    submit_and_wait(&agent, chat, "Hello again").await;
+    agent.shutdown().await;
+    let requests = model.requests.lock().unwrap();
+    assert!(tool_names(&requests[0]).contains(&"ArtifactRead"));
+    for request in requests.iter() {
+        assert!(host_notices(request).is_empty());
+    }
+}
+
+#[tokio::test]
+async fn signing_out_announces_the_removed_tools_and_offers_sign_in() {
+    let service = ArtifactService::start().await;
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        text("Ready."),
+        text("Signed out."),
+    ]));
+    let agent = signed_in_agent(&service, directory.path(), model.clone()).await;
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    submit_and_wait(&agent, chat, "Hello").await;
+    service.client(directory.path()).logout().await.unwrap();
+    submit_and_wait(&agent, chat, "Make a design").await;
+    agent.shutdown().await;
+    let requests = model.requests.lock().unwrap();
+    let notices = host_notices(&requests[1]);
+    assert_eq!(notices.len(), 1);
+    assert!(
+        notices[0].contains("Now available: ArtifactLogin.")
+            && notices[0]
+                .contains("No longer available: ArtifactComment, ArtifactEdit, ArtifactRead."),
+        "{}",
+        notices[0]
+    );
+    let names = tool_names(&requests[1]);
+    assert!(names.contains(&"ArtifactLogin"));
+    assert!(!names.contains(&"ArtifactEdit"));
+}
+
+#[tokio::test]
+async fn signed_out_offers_only_artifact_login() {
+    let service = ArtifactService::start().await;
+    let directory = tempfile::tempdir().unwrap();
+    let provider = McpHostToolProvider::new(service.client(directory.path()), None);
+    assert!(
+        provider.definitions().is_empty(),
+        "an unverified account offers nothing"
+    );
+    provider.refresh(CancellationToken::new()).await.unwrap();
+    let definitions = provider.definitions();
+    assert_eq!(
+        definitions
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>(),
+        ["ArtifactLogin"]
+    );
+    assert_eq!(
+        definitions[0].input_schema,
+        json!({"type":"object","properties":{},"additionalProperties":false})
+    );
+    assert_eq!(
+        provider.permission(ChatId::new_v4(), "ArtifactLogin", &json!({})),
+        HostToolPermission::Automatic
+    );
+    assert!(
+        provider
+            .validate_input(
+                "ArtifactLogin",
+                &definitions[0].input_schema,
+                &json!({"x":1})
+            )
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn artifact_login_returns_the_link_and_code_and_approval_brings_the_tools() {
+    let service = ArtifactService::start().await;
+    let directory = tempfile::tempdir().unwrap();
+    service
+        .control
+        .hold_device_approval
+        .store(true, Ordering::SeqCst);
+    let model = Arc::new(ScriptedModel::new(vec![
+        call("login", "ArtifactLogin", json!({})),
+        call("login-again", "ArtifactLogin", json!({})),
+        text("Open the link and confirm the code."),
+        text("Signed in."),
+    ]));
+    let agent = Agent::new_embedded(config(), model.clone());
+    agent
+        .install_host_tools(Arc::new(McpHostToolProvider::new(
+            service.client(directory.path()),
+            None,
+        )))
+        .unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    submit_and_wait(&agent, chat, "Make me a design").await;
+    {
+        let requests = model.requests.lock().unwrap();
+        let names = tool_names(&requests[0]);
+        assert!(names.contains(&"ArtifactLogin"));
+        assert!(!names.contains(&"ArtifactEdit"));
+        let started = tool_result_text(&requests[1], "login");
+        assert!(started.starts_with("Sign-in started."), "{started}");
+        assert!(
+            started.contains(&format!("{}/artifact/device?code=TEST", service.origin))
+                && started.contains("confirm the code TEST"),
+            "{started}"
+        );
+        let repeated = tool_result_text(&requests[2], "login-again");
+        assert!(
+            repeated.starts_with("Sign-in is already pending."),
+            "{repeated}"
+        );
+    }
+    assert_eq!(
+        service.device_logins_started(),
+        1,
+        "sign-in is single-flight"
+    );
+
+    service
+        .control
+        .hold_device_approval
+        .store(false, Ordering::SeqCst);
+    let account = service.client(directory.path());
+    eventually(async || matches!(account.credential_snapshot(), Ok(Some(_)))).await;
+    submit_and_wait(&agent, chat, "Now make it").await;
+    agent.shutdown().await;
+    let requests = model.requests.lock().unwrap();
+    let names = tool_names(&requests[3]);
+    for name in ["ArtifactRead", "ArtifactEdit", "ArtifactComment"] {
+        assert!(names.contains(&name), "{name}");
+    }
+    assert!(!names.contains(&"ArtifactLogin"));
+    let notices = host_notices(&requests[3]);
+    assert_eq!(notices.len(), 1);
+    assert!(
+        notices[0].contains("Now available: ArtifactComment, ArtifactEdit, ArtifactRead.")
+            && notices[0].contains("No longer available: ArtifactLogin."),
+        "{}",
+        notices[0]
+    );
+}
+
+#[tokio::test]
+async fn a_sign_in_during_a_turn_reaches_the_next_request_of_that_turn() {
+    let service = ArtifactService::start().await;
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "ask",
+            tickloop_agent_tools::ASK_USER_QUESTION_TOOL_NAME,
+            json!({"questions":[{"question":"Signed in yet?","header":"Sign-in","options":[
+                {"label":"Yes","description":"Signed in with /artifacts"},
+                {"label":"No","description":"Not yet"}
+            ]}]}),
+        ),
+        text("The Artifact tools are available now."),
+    ]));
+    let agent = Agent::new_embedded(config(), model.clone());
+    agent
+        .install_host_tools(Arc::new(McpHostToolProvider::new(
+            service.client(directory.path()),
+            None,
+        )))
+        .unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let mut events = agent.subscribe();
+    agent
+        .submit(chat, None, "Write a doc".into())
+        .await
+        .unwrap();
+    let question = loop {
+        if let EventKind::QuestionAsked { request } =
+            tickloop_agent_test_support::next_event(&mut events)
+                .await
+                .kind
+        {
+            break request;
+        }
+    };
+    service.login(directory.path()).await;
+    agent
+        .answer_question(
+            chat,
+            question.id,
+            vec![tickloop_agent_protocol::QuestionAnswer::option("Yes")],
+        )
+        .await
+        .unwrap();
+    wait_for_completion(&agent, chat).await;
+    agent.shutdown().await;
+    let requests = model.requests.lock().unwrap();
+    assert!(!tool_names(&requests[0]).contains(&"ArtifactEdit"));
+    assert!(tool_names(&requests[1]).contains(&"ArtifactEdit"));
+    assert_eq!(host_notices(&requests[1]).len(), 1);
+}
+
+#[tokio::test]
+async fn a_child_delegated_before_sign_in_takes_up_the_artifact_tools() {
+    let service = ArtifactService::start().await;
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "delegate",
+            "Subagent",
+            json!({"task":"Prepare an Artifact draft"}),
+        ),
+        call(
+            "wait",
+            tickloop_agent_tools::ASK_USER_QUESTION_TOOL_NAME,
+            json!({"questions":[{"question":"Signed in yet?","header":"Sign-in","options":[
+                {"label":"Yes","description":"Signed in with /artifacts"},
+                {"label":"No","description":"Not yet"}
+            ]}]}),
+        ),
+        call(
+            "read",
+            "ArtifactRead",
+            json!({"action":"read","artifact_id":"doc"}),
+        ),
+        text("Child read the doc."),
+        text("Done."),
+    ]));
+    let agent = Agent::new_embedded(config(), model.clone());
+    agent
+        .install_host_tools(Arc::new(McpHostToolProvider::new(
+            service.client(directory.path()),
+            None,
+        )))
+        .unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let mut events = agent.subscribe();
+    agent
+        .submit(chat, None, "Delegate the draft".into())
+        .await
+        .unwrap();
+    let (child, question) = loop {
+        let event = tickloop_agent_test_support::next_event(&mut events).await;
+        if let EventKind::QuestionAsked { request } = event.kind {
+            break (event.chat_id, request);
+        }
+    };
+    assert_ne!(child, chat, "the child asks the question");
+    service.login(directory.path()).await;
+    agent
+        .answer_question(
+            child,
+            question.id,
+            vec![tickloop_agent_protocol::QuestionAnswer::option("Yes")],
+        )
+        .await
+        .unwrap();
+    wait_for_completion(&agent, chat).await;
+    let pinned = agent
+        .snapshot(child)
+        .await
+        .unwrap()
+        .delegation
+        .unwrap()
+        .ceiling
+        .host_tools;
+    agent.shutdown().await;
+    let requests = model.requests.lock().unwrap();
+    assert_eq!(requests.len(), 5);
+    assert!(tool_names(&requests[0]).contains(&"ArtifactLogin"));
+    let child_before = tool_names(&requests[1]);
+    assert!(!child_before.contains(&"ArtifactEdit"));
+    assert!(
+        !child_before.contains(&"ArtifactLogin"),
+        "a child never starts a sign-in"
+    );
+    assert!(tool_names(&requests[2]).contains(&"ArtifactEdit"));
+    assert_eq!(host_notices(&requests[2]).len(), 1);
+    for name in ["ArtifactRead", "ArtifactEdit", "ArtifactComment"] {
+        assert!(
+            pinned[name].iter().any(|authority| matches!(
+                authority,
+                tickloop_agent_protocol::HostToolAuthority::Mcp { account_id, .. } if account_id == "user-one"
+            )),
+            "{name} is pinned to the first account signed in"
+        );
+    }
+    let read = tool_result_text(&requests[3], "read");
+    assert!(read.contains("# Fixture body"), "{read}");
+    assert_eq!(service.tool_calls().len(), 1);
+}
+
+#[tokio::test]
+async fn a_passing_outage_writes_no_tool_notices() {
+    let service = ArtifactService::start().await;
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        text("Ready."),
+        text("Session down."),
+        text("Directory down."),
+        text("Back."),
+    ]));
+    let agent = signed_in_agent(&service, directory.path(), model.clone()).await;
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    submit_and_wait(&agent, chat, "Hello").await;
+    service
+        .control
+        .session_unavailable
+        .store(true, Ordering::SeqCst);
+    submit_and_wait(&agent, chat, "Still there?").await;
+    service
+        .control
+        .session_unavailable
+        .store(false, Ordering::SeqCst);
+    service
+        .control
+        .directory_unavailable
+        .store(true, Ordering::SeqCst);
+    submit_and_wait(&agent, chat, "And now?").await;
+    service
+        .control
+        .directory_unavailable
+        .store(false, Ordering::SeqCst);
+    submit_and_wait(&agent, chat, "Back?").await;
+    agent.shutdown().await;
+    let requests = model.requests.lock().unwrap();
+    assert!(!tool_names(&requests[1]).contains(&"ArtifactEdit"));
+    assert!(!tool_names(&requests[2]).contains(&"ArtifactEdit"));
+    assert!(tool_names(&requests[3]).contains(&"ArtifactEdit"));
+    for request in requests.iter() {
+        assert!(
+            host_notices(request).is_empty(),
+            "{:?}",
+            host_notices(request)
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_request_after_compaction_still_carries_the_tool_notice() {
+    let service = ArtifactService::start().await;
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        text(&"older material ".repeat(2000)),
+        text("Compact summary"),
+        text("The Artifact tools are here."),
+    ]));
+    let agent = Agent::new_embedded(config(), model.clone());
+    agent
+        .install_host_tools(Arc::new(McpHostToolProvider::new(
+            service.client(directory.path()),
+            None,
+        )))
+        .unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    submit_and_wait(&agent, chat, "Collect the material").await;
+    service.login(directory.path()).await;
+    agent.set_context_window(chat, 20_000).await.unwrap();
+    submit_and_wait(&agent, chat, "Now write the doc").await;
+    agent.shutdown().await;
+    let requests = model.requests.lock().unwrap();
+    assert!(
+        requests[1].tools.is_empty(),
+        "the second request is the summary"
+    );
+    let notices = host_notices(&requests[2]);
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert!(
+        notices[0].contains(
+            "host tools available in this conversation now: ArtifactComment, ArtifactEdit, ArtifactRead."
+        ),
+        "{}",
+        notices[0]
+    );
 }

@@ -5783,6 +5783,7 @@ fn consumed_input_text(snapshot: &ChatSnapshot, input: uuid::Uuid) -> Option<&st
         .find_map(|(index, message)| {
             if snapshot.message_runs.get(&index) != Some(&input)
                 || message.role != tickloop_agent_protocol::Role::User
+                || snapshot.host_notes.contains_key(&index)
             {
                 return None;
             }

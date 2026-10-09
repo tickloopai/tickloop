@@ -352,6 +352,8 @@ fn conversation_before(
     candidate
         .inherited_prompts
         .retain(|message_index| *message_index < index);
+    candidate.host_notes.split_off(&index);
+    candidate.announced_host_tools = candidate.visible_announced_host_tools();
     candidate.message_usage.split_off(&index);
     candidate.message_sources.split_off(&index);
     candidate.message_models.split_off(&index);

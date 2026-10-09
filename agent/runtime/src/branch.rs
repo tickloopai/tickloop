@@ -146,6 +146,8 @@ impl Agent {
             original_message_ids: BTreeMap::new(),
             prompt_execution_modes: BTreeMap::new(),
             inherited_prompts: HashSet::new(),
+            host_notes: BTreeMap::new(),
+            announced_host_tools: None,
             message_compactions: BTreeMap::new(),
             message_usage: BTreeMap::new(),
             message_sources: BTreeMap::new(),
@@ -178,6 +180,7 @@ impl Agent {
         let output_style = self.apply_new_chat_settings(&mut snapshot, &mut bookkeeping);
         carry_rewind_points(&mut snapshot, &source.snapshot, &seed);
         carry_compaction_summaries(&mut snapshot, &source.snapshot, &seed);
+        snapshot.announced_host_tools = snapshot.visible_announced_host_tools();
         carry_loops(&mut snapshot, &mut bookkeeping, source, &seed);
         carry_plans_and_progress(&mut snapshot, &mut bookkeeping, source);
         // 照 Claude Code `copyPlanForFork`：Branch 使用新的 slug 并复制计划文件，之后双方各自修改。
@@ -374,6 +377,9 @@ fn carry_rewind_points(
             }
             if let Some(origin) = source.message_sources.get(index) {
                 child.message_sources.insert(child_index, origin.clone());
+            }
+            if let Some(announced) = source.host_notes.get(index) {
+                child.host_notes.insert(child_index, announced.clone());
             }
         }
         let Some(point) = source_index.and_then(|index| source.rewind_point_at(index)) else {

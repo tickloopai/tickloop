@@ -41,6 +41,7 @@ pub struct ServiceControl {
     pub other_account: AtomicBool,
     pub credential_revision: AtomicUsize,
     pub signed_out: AtomicBool,
+    pub hold_device_approval: AtomicBool,
     pub reject_mcp: AtomicBool,
     pub directory_unavailable: AtomicBool,
     pub session_unavailable: AtomicBool,
@@ -105,7 +106,7 @@ fn tools(control: &ServiceControl) -> Value {
     tools
 }
 
-/// A Markdown text anchor as the service stores and returns it.
+/// A doc text anchor as the service stores and returns it.
 fn thread_anchor() -> Value {
     json!({"schema":1,"kind":"text","working_id":"working-1","generation":"generation-1","representation":"rich","quote":"Fixture body","start":{"relative":"AQ==","block_id":"b1"},"end":{"relative":"Ag==","block_id":"b1"}})
 }
@@ -124,7 +125,7 @@ fn call_tool(control: &ServiceControl, origin: &str, params: &Value) -> Value {
         arguments["action"].as_str().unwrap_or(""),
     ) {
         ("ArtifactRead", "read") => {
-            json!({"artifact_id":artifact_id,"title":"Fixture","format":"markdown","url":artifact_url(origin, artifact_id),"access_role":"owner","revision":3,"blocks":[{"id":"b1","hash":"h1","markdown":"# Fixture body"}],"next_cursor":null})
+            json!({"artifact_id":artifact_id,"title":"Fixture","format":"doc","url":artifact_url(origin, artifact_id),"access_role":"owner","revision":3,"blocks":[{"id":"b1","hash":"h1","text":"# Fixture body"}],"next_cursor":null})
         }
         ("ArtifactRead", "threads") => {
             json!({"threads":[{"thread_id":"thread-1","status":"open","anchor":thread_anchor(),"anchor_description":ANCHOR_DESCRIPTION,"messages":[{"message_id":"m1","author":{"name":"One","kind":"human"},"text":"@tickloop tighten this","created_at":REQUEST_CREATED_AT}],"request":{"request_id":"request-1","status":"pending","requested_by":"One"}}],"next_cursor":null})
@@ -424,7 +425,12 @@ impl ArtifactService {
                             200,
                             json!({"device_code":"test-device","user_code":"TEST","verification_uri":format!("{origin}/artifact/device?code=TEST"),"expires_in":30,"interval":1}),
                         )
+                    } else if target == "/api/v1/auth/device/token"
+                        && control.hold_device_approval.load(Ordering::SeqCst)
+                    {
+                        (400, json!({"error":{"code":"authorization_pending"}}))
                     } else if target == "/api/v1/auth/device/token" {
+                        control.signed_out.store(false, Ordering::SeqCst);
                         let revision = control.credential_revision.load(Ordering::SeqCst);
                         (
                             200,
@@ -483,6 +489,12 @@ impl ArtifactService {
             }
         });
         Self { origin, control }
+    }
+
+    /// Device authorizations the service has started.
+    pub fn device_logins_started(&self) -> usize {
+        self.lifecycle_requests("POST /artifact/api/v1/auth/device ")
+            .len()
     }
 
     pub fn client(&self, root: &Path) -> ArtifactClient {

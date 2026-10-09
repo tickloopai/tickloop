@@ -162,9 +162,9 @@ async fn first_party_private_artifact_writes_skip_classifier_but_plan_and_rules_
         (ExecutionMode::Auto, Some(Decision::Deny), false, false),
     ] {
         for input in [
-            json!({"action":"create","title":"Branch report","format":"markdown","content":"# Branch report\n\nRequested summary."}),
+            json!({"action":"create","title":"Branch report","format":"doc","content":"# Branch report\n\nRequested summary."}),
             json!({"action":"replace","artifact_id":"doc","expected_revision":0,"content":"<p>Updated report</p>"}),
-            json!({"action":"patch","artifact_id":"doc","patches":[{"type":"replace","target":"block","expected_hash":"before","markdown":"Updated report"}]}),
+            json!({"action":"patch","artifact_id":"doc","patches":[{"type":"replace","target":"block","expected_hash":"before","text":"Updated report"}]}),
         ] {
             let (origin, control) = service().await;
             *control.publication.lock().unwrap() =
@@ -207,11 +207,7 @@ async fn first_party_private_artifact_writes_skip_classifier_but_plan_and_rules_
             }
             let mut events = agent.subscribe();
             agent
-                .submit(
-                    chat,
-                    None,
-                    "Write a new Markdown artifact summarizing this branch".into(),
-                )
+                .submit(chat, None, "Write a new doc summarizing this branch".into())
                 .await
                 .unwrap();
             let mut prompted = false;
@@ -369,7 +365,7 @@ async fn artifact_creation_from_an_automated_turn_does_not_inherit_the_human_fas
                     "event-artifact",
                     "ArtifactEdit",
                     json!({
-                        "action":"create","title":"Event report","format":"markdown","content":"Local event summary"
+                        "action":"create","title":"Event report","format":"doc","content":"Local event summary"
                     }),
                 ),
                 text("done"),
@@ -492,7 +488,7 @@ async fn extra_artifact_creation_arguments_cannot_borrow_the_private_write_fast_
         let provider = Arc::new(McpHostToolProvider::new(account, None));
         provider.refresh(CancellationToken::new()).await.unwrap();
         let mut input = json!({
-            "action":"create","title":"Report","format":"markdown","content":"Draft"
+            "action":"create","title":"Report","format":"doc","content":"Draft"
         });
         input[field] = value;
         let agent = Agent::new_embedded(

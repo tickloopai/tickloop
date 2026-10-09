@@ -77,6 +77,7 @@ impl CompactionLayout {
         compacted.original_message_ids = BTreeMap::new();
         compacted.prompt_execution_modes = BTreeMap::new();
         compacted.inherited_prompts.clear();
+        compacted.host_notes = BTreeMap::new();
         compacted.message_compactions = BTreeMap::new();
         compacted.message_usage = BTreeMap::new();
         compacted.message_sources = BTreeMap::new();
@@ -122,6 +123,9 @@ impl CompactionLayout {
                     }
                     if snapshot.inherited_prompts.contains(&original) {
                         compacted.inherited_prompts.insert(index);
+                    }
+                    if let Some(announced) = snapshot.host_notes.get(&original) {
+                        compacted.host_notes.insert(index, announced.clone());
                     }
                     if let Some(source) = snapshot.message_sources.get(&original) {
                         compacted.message_sources.insert(index, source.clone());
@@ -191,6 +195,7 @@ impl CompactionLayout {
                 None => origin.clear_seed(),
             }
         }
+        compacted.announced_host_tools = compacted.visible_announced_host_tools();
         if rewrites_existing {
             for start in compacted_bookkeeping.loop_starts.values_mut() {
                 *start = self.moved_loop_start(*start, snapshot.messages.len());

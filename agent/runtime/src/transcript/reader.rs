@@ -689,6 +689,7 @@ mod tests {
             message,
             invoked_skills: Vec::new(),
             is_meta: false,
+            host_tools: None,
             execution_mode: None,
             is_inherited_prompt: false,
             original_message_id: None,

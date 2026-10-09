@@ -388,7 +388,8 @@ pub trait HostToolProvider: Send + Sync {
     }
 
     /// Every authority through which this provider can currently serve `name`, one per
-    /// backend. Delegation freezes this set; a backend that appears later is never added.
+    /// backend. Delegation freezes this set; a backend that appears later is never added, apart
+    /// from the first Artifact account a child delegated before any sign-in takes up.
     fn tool_authorities(&self, _name: &str) -> Result<BTreeSet<HostToolAuthority>, String> {
         Ok(self
             .host_endpoint()?
@@ -411,6 +412,12 @@ pub trait HostToolProvider: Send + Sync {
 
     fn service_connections(&self) -> Value {
         serde_json::json!({})
+    }
+
+    /// Whether [`Self::definitions`] reflects confirmed service state. While a transient failure
+    /// leaves it unconfirmed, the host keeps the tool set it last announced to the model.
+    fn tool_set_is_confirmed(&self) -> bool {
+        true
     }
 
     fn permission(&self, chat_id: ChatId, name: &str, input: &Value) -> HostToolPermission;

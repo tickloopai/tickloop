@@ -114,6 +114,10 @@ pub(crate) struct ChainEntry {
     pub invoked_skills: Vec<tickloop_agent_protocol::InvokedSkill>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_meta: bool,
+    /// Tick Loop extension: marks a host note, the host tool names announced as available once
+    /// it was written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_tools: Option<std::collections::BTreeSet<String>>,
     /// The execution mode at a user checkpoint stays raw so an unknown legacy value cannot
     /// invalidate the entire Transcript entry.
     #[serde(

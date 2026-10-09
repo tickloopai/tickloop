@@ -3,7 +3,7 @@
 
 use std::{
     collections::{BTreeSet, HashSet},
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, RwLock},
     time::Duration,
 };
 
@@ -37,6 +37,8 @@ use tickloop_agent_protocol::{
 pub const ARTIFACT_READ_TOOL: &str = "ArtifactRead";
 pub const ARTIFACT_EDIT_TOOL: &str = "ArtifactEdit";
 pub const ARTIFACT_COMMENT_TOOL: &str = "ArtifactComment";
+/// Offered instead of the Artifact tools while no account is signed in.
+pub const ARTIFACT_LOGIN_TOOL: &str = "ArtifactLogin";
 /// The only tools taken from the service directory; the host reserves these names.
 pub const ARTIFACT_TOOL_NAMES: [&str; 3] = [
     ARTIFACT_READ_TOOL,
@@ -56,6 +58,7 @@ const MAX_APPROVAL_COLLECTION_ITEMS: usize = 64;
 const MAX_APPROVAL_DEPTH: usize = 8;
 const MAX_IDENTIFIER_BYTES: usize = 256;
 const MAX_ARTIFACT_TITLE_UTF16_UNITS: usize = 200;
+const ARTIFACT_LOGIN_DESCRIPTION: &str = "Tick Loop Docs is not signed in. Call this when the user wants a doc or design; it starts sign-in and returns a link and code for the user. After the user approves, ArtifactRead, ArtifactEdit and ArtifactComment become available automatically.";
 
 #[derive(Clone)]
 struct DiscoveredTool {
@@ -68,6 +71,46 @@ struct Directory {
     fingerprint: [u8; 32],
     protocol_version: ProtocolVersion,
     tools: Vec<DiscoveredTool>,
+}
+
+struct PreparedArtifactLogin;
+
+/// Why the tool directory did not load: the service could not be reached, or it answered with a
+/// directory the host does not accept.
+enum DirectoryFailure {
+    Unavailable(String),
+    Rejected(String),
+}
+
+impl From<DirectoryFailure> for String {
+    fn from(failure: DirectoryFailure) -> Self {
+        match failure {
+            DirectoryFailure::Unavailable(reason) | DirectoryFailure::Rejected(reason) => reason,
+        }
+    }
+}
+
+/// The one device sign-in the provider polls for; a repeated `ArtifactLogin` returns it.
+struct PendingLogin {
+    id: u64,
+    verification_uri: String,
+    user_code: String,
+    expires_at: tokio::time::Instant,
+    cancel: CancellationToken,
+}
+
+impl PendingLogin {
+    fn instructions(&self, heading: &str) -> String {
+        let minutes = self
+            .expires_at
+            .saturating_duration_since(tokio::time::Instant::now())
+            .as_secs()
+            .div_ceil(60);
+        format!(
+            "{heading} Give the user this link and code: open {} and confirm the code {}. The code expires in about {minutes} minutes. Once the user approves, ArtifactRead, ArtifactEdit and ArtifactComment become available automatically on a later request; the user can also sign in by running /artifacts.",
+            self.verification_uri, self.user_code
+        )
+    }
 }
 
 struct PreparedMcpCall {
@@ -120,7 +163,7 @@ fn has_action(arguments: &Value, action: &str) -> bool {
     arguments.get("action").and_then(Value::as_str) == Some(action)
 }
 
-#[derive(Clone, Copy, Default, Serialize)]
+#[derive(Clone, Copy, Default, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum ArtifactAuthentication {
     SignedIn,
@@ -139,6 +182,8 @@ enum McpToolDirectory {
 struct ArtifactServiceStatus {
     #[serde(skip)]
     credential_generation: Option<[u8; 32]>,
+    #[serde(skip)]
+    directory_rejected: bool,
     authentication: ArtifactAuthentication,
     tool_directory: McpToolDirectory,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -153,6 +198,14 @@ pub struct McpHostToolProvider {
     directory: RwLock<Option<Directory>>,
     service_status: RwLock<ArtifactServiceStatus>,
     publication_admissions: RwLock<HashSet<ArtifactPublicationAdmission>>,
+    pending_login: Arc<Mutex<Option<PendingLogin>>>,
+    next_login_id: std::sync::atomic::AtomicU64,
+}
+
+impl Drop for McpHostToolProvider {
+    fn drop(&mut self) {
+        self.cancel_pending_login();
+    }
 }
 
 impl McpHostToolProvider {
@@ -188,7 +241,7 @@ impl McpHostToolProvider {
                 !title.trim().is_empty()
                     && title.encode_utf16().count() <= MAX_ARTIFACT_TITLE_UTF16_UNITS
             })
-            && matches!(input["format"].as_str(), Some("markdown" | "html"))
+            && matches!(input["format"].as_str(), Some("doc" | "design"))
             && input["content"].is_string();
         if ordinary_creation {
             HostToolPermission::PrivateArtifactWrite
@@ -203,7 +256,95 @@ impl McpHostToolProvider {
             directory: RwLock::new(None),
             service_status: RwLock::new(ArtifactServiceStatus::default()),
             publication_admissions: RwLock::new(HashSet::new()),
+            pending_login: Arc::new(Mutex::new(None)),
+            next_login_id: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Sign-in is offered only while the last refresh confirmed that no account is signed in.
+    fn offers_login(&self) -> bool {
+        self.service_status.read().unwrap().authentication == ArtifactAuthentication::SignedOut
+            && matches!(self.artifact.credential_snapshot(), Ok(None))
+    }
+
+    fn cancel_pending_login(&self) {
+        if let Some(pending) = self.pending_login.lock().unwrap().take() {
+            pending.cancel.cancel();
+        }
+    }
+
+    fn current_pending_login(&self) -> Option<String> {
+        self.pending_login
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|pending| pending.expires_at > tokio::time::Instant::now())
+            .map(|pending| pending.instructions("Sign-in is already pending."))
+    }
+
+    /// Starts a device sign-in and polls for its approval in the background; the credential it
+    /// saves is the one `/artifacts` writes, so the next refresh offers the Artifact tools.
+    async fn start_login(&self, cancel: CancellationToken) -> ToolResult {
+        let result = |content: String, is_error: bool| ToolResult {
+            content,
+            is_error,
+            output_ref: None,
+        };
+        if let Some(instructions) = self.current_pending_login() {
+            return result(instructions, false);
+        }
+        let device = tokio::select! {
+            () = cancel.cancelled() => return result("Sign-in was cancelled before it started".into(), true),
+            device = self.artifact.start_device_login() => device,
+        };
+        let device = match device {
+            Ok(device) => device,
+            Err(error) => {
+                return result(
+                    format!(
+                        "Tick Loop Docs sign-in could not start: {error}. The user can run /artifacts to sign in."
+                    ),
+                    true,
+                );
+            }
+        };
+        let mut pending_login = self.pending_login.lock().unwrap();
+        if let Some(pending) = pending_login
+            .as_ref()
+            .filter(|pending| pending.expires_at > tokio::time::Instant::now())
+        {
+            return result(pending.instructions("Sign-in is already pending."), false);
+        }
+        let pending = PendingLogin {
+            id: self
+                .next_login_id
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            verification_uri: device.verification_uri.clone(),
+            user_code: device.user_code.clone(),
+            expires_at: tokio::time::Instant::now() + device.expires_in(),
+            cancel: CancellationToken::new(),
+        };
+        let instructions = pending.instructions("Sign-in started.");
+        let (id, poll_cancel) = (pending.id, pending.cancel.clone());
+        if let Some(replaced) = pending_login.replace(pending) {
+            replaced.cancel.cancel();
+        }
+        drop(pending_login);
+        let artifact = self.artifact.clone();
+        let pending_login = self.pending_login.clone();
+        tokio::spawn(async move {
+            let _ = artifact
+                .finish_background_device_login(device, &poll_cancel)
+                .await;
+            let mut pending_login = pending_login.lock().unwrap();
+            if pending_login
+                .as_ref()
+                .is_some_and(|pending| pending.id == id)
+            {
+                *pending_login = None;
+            }
+        });
+        result(instructions, false)
     }
 
     pub fn negotiated_version(&self) -> Option<String> {
@@ -298,14 +439,23 @@ impl McpHostToolProvider {
         }
     }
 
-    async fn load_directory(&self, credential: &CredentialSnapshot) -> Result<Directory, String> {
-        let (service, http) = self.open_session(credential).await?;
-        let peer = service
-            .peer()
-            .peer_info()
-            .ok_or("MCP discovery did not negotiate a protocol version")?;
+    async fn load_directory(
+        &self,
+        credential: &CredentialSnapshot,
+    ) -> Result<Directory, DirectoryFailure> {
+        let (service, http) = self
+            .open_session(credential)
+            .await
+            .map_err(DirectoryFailure::Unavailable)?;
+        let peer = service.peer().peer_info().ok_or_else(|| {
+            DirectoryFailure::Unavailable(
+                "MCP discovery did not negotiate a protocol version".into(),
+            )
+        })?;
         if peer.server_info.as_ref().map(|info| info.name.as_str()) != Some(SERVER_NAME) {
-            return Err(format!("MCP server is not {SERVER_NAME}"));
+            return Err(DirectoryFailure::Rejected(format!(
+                "MCP server is not {SERVER_NAME}"
+            )));
         }
         let protocol_version = peer.protocol_version.clone();
         let tools =
@@ -315,10 +465,13 @@ impl McpHostToolProvider {
                     if http.unauthorized() {
                         self.invalidate(&credential.access_token).await;
                     }
-                    return Err("MCP tool directory unavailable".into());
+                    return Err(DirectoryFailure::Unavailable(
+                        "MCP tool directory unavailable".into(),
+                    ));
                 }
             };
         self.validate_directory(tools, credential, protocol_version)
+            .map_err(DirectoryFailure::Rejected)
     }
 
     async fn invalidate(&self, token: &str) {
@@ -396,10 +549,12 @@ impl McpHostToolProvider {
             return None;
         }
         let title = structured.get("title")?.as_str()?;
-        let format = structured.get("format")?.as_str()?;
-        if !["markdown", "html"].contains(&format) {
-            return None;
-        }
+        // The tool contract names types by intent; the catalog keeps its stored format names.
+        let format = match structured.get("format")?.as_str()? {
+            "doc" => "markdown",
+            "design" => "html",
+            _ => return None,
+        };
         let url = structured.get("url")?.as_str()?;
         let parsed_url = reqwest::Url::parse(url).ok()?;
         let origin = reqwest::Url::parse(&prepared.credential.origin).ok()?;
@@ -511,7 +666,7 @@ impl McpHostToolProvider {
     fn is_body_argument(name: &str) -> bool {
         matches!(
             name.to_ascii_lowercase().as_str(),
-            "source" | "body" | "content" | "markdown" | "html"
+            "source" | "body" | "content" | "text"
         )
     }
 
@@ -538,16 +693,26 @@ impl McpHostToolProvider {
 
 #[async_trait]
 impl HostToolProvider for McpHostToolProvider {
-    /// Native tools never take the Artifact names; only the service directory provides them.
+    /// Native tools never take the Artifact names; only the service directory provides them, and
+    /// the provider itself offers sign-in while signed out.
     fn definitions(&self) -> Vec<ToolDefinition> {
         let mut definitions = self
             .native
             .as_ref()
             .map(|provider| provider.definitions())
             .unwrap_or_default();
-        definitions.retain(|definition| !ARTIFACT_TOOL_NAMES.contains(&definition.name.as_str()));
+        definitions.retain(|definition| {
+            !ARTIFACT_TOOL_NAMES.contains(&definition.name.as_str())
+                && definition.name != ARTIFACT_LOGIN_TOOL
+        });
         if let Some(directory) = self.directory.read().unwrap().as_ref() {
             definitions.extend(directory.tools.iter().map(|tool| tool.definition.clone()));
+        } else if self.offers_login() {
+            definitions.push(ToolDefinition {
+                name: ARTIFACT_LOGIN_TOOL.into(),
+                description: ARTIFACT_LOGIN_DESCRIPTION.into(),
+                input_schema: json!({"type":"object","properties":{},"additionalProperties":false}),
+            });
         }
         definitions
     }
@@ -564,9 +729,13 @@ impl HostToolProvider for McpHostToolProvider {
             .and_then(|native| native.workspace_host_context())
     }
 
+    /// The Artifact names belong to the signed-in account even while its directory is unavailable.
     fn tool_authorities(&self, name: &str) -> Result<BTreeSet<HostToolAuthority>, String> {
-        if self.is_mcp_name(name) {
+        if self.is_mcp_name(name) || ARTIFACT_TOOL_NAMES.contains(&name) {
             return Ok(self.mcp_authority()?.into_iter().collect());
+        }
+        if name == ARTIFACT_LOGIN_TOOL {
+            return Ok(BTreeSet::new());
         }
         self.native
             .as_ref()
@@ -580,6 +749,9 @@ impl HostToolProvider for McpHostToolProvider {
     ) -> Result<Option<HostToolAuthority>, String> {
         if self.is_mcp_name(name) {
             return self.mcp_authority();
+        }
+        if name == ARTIFACT_LOGIN_TOOL {
+            return Ok(None);
         }
         self.native
             .as_ref()
@@ -604,6 +776,19 @@ impl HostToolProvider for McpHostToolProvider {
                 json!(ArtifactServiceStatus::default())
             };
         connections
+    }
+
+    /// Confirmed when signed out or when the signed-in account's directory loaded or was rejected;
+    /// an unknown account or an unreachable directory may be a passing outage.
+    fn tool_set_is_confirmed(&self) -> bool {
+        let is_native_confirmed = self
+            .native
+            .as_ref()
+            .is_none_or(|native| native.tool_set_is_confirmed());
+        is_native_confirmed
+            && (self.offers_login()
+                || self.directory.read().unwrap().is_some()
+                || self.service_status.read().unwrap().directory_rejected)
     }
 
     fn artifact_client(&self) -> Option<Arc<ArtifactClient>> {
@@ -662,7 +847,11 @@ impl HostToolProvider for McpHostToolProvider {
                             status.tool_directory = McpToolDirectory::Available;
                             *self.directory.write().unwrap() = Some(directory);
                         }
-                        Err(_) => self.clear_directory(),
+                        Err(failure) => {
+                            status.directory_rejected =
+                                matches!(failure, DirectoryFailure::Rejected(_));
+                            self.clear_directory();
+                        }
                     }
                 }
                 Ok(None) => {
@@ -688,11 +877,21 @@ impl HostToolProvider for McpHostToolProvider {
             self.clear_directory();
             status = ArtifactServiceStatus::default();
         }
+        if status.authentication == ArtifactAuthentication::SignedIn {
+            self.cancel_pending_login();
+        }
         *self.service_status.write().unwrap() = status;
         Ok(())
     }
 
     fn validate_input(&self, name: &str, schema: &Value, input: &Value) -> Result<(), String> {
+        if name == ARTIFACT_LOGIN_TOOL {
+            return input
+                .as_object()
+                .is_some_and(serde_json::Map::is_empty)
+                .then_some(())
+                .ok_or_else(|| format!("{ARTIFACT_LOGIN_TOOL} takes no input"));
+        }
         if !self.is_mcp_name(name) {
             return self
                 .native
@@ -711,6 +910,9 @@ impl HostToolProvider for McpHostToolProvider {
         if let Some((tool, _, _)) = self.directory_tool(name) {
             return Self::operation_permission(&tool, input);
         }
+        if name == ARTIFACT_LOGIN_TOOL {
+            return HostToolPermission::Automatic;
+        }
         self.native
             .as_ref()
             .map_or(HostToolPermission::Reviewable, |native| {
@@ -726,7 +928,7 @@ impl HostToolProvider for McpHostToolProvider {
         input: &Value,
         cancel: CancellationToken,
     ) -> Result<PreparedHostCall, String> {
-        if self.is_mcp_name(name) {
+        if self.is_mcp_name(name) || name == ARTIFACT_LOGIN_TOOL {
             self.prepare_call(chat_id, name, input, cancel).await
         } else {
             self.native
@@ -744,6 +946,22 @@ impl HostToolProvider for McpHostToolProvider {
         input: &Value,
         cancel: CancellationToken,
     ) -> Result<PreparedHostCall, String> {
+        if name == ARTIFACT_LOGIN_TOOL {
+            if cancel.is_cancelled() {
+                return Err("Sign-in was cancelled".into());
+            }
+            if !self.offers_login() {
+                return Err("Tick Loop Docs is not signed out; sign-in is unavailable".into());
+            }
+            return Ok(PreparedHostCall::new(
+                name.to_owned(),
+                input.clone(),
+                input.clone(),
+                HostToolPermission::Automatic,
+                format!("Start Tick Loop Docs sign-in at {}", self.artifact.origin()),
+            )
+            .with_payload(PreparedArtifactLogin));
+        }
         let Some((tool, fingerprint, expected_key)) = self.directory_tool(name) else {
             return self
                 .native
@@ -862,6 +1080,13 @@ impl HostToolProvider for McpHostToolProvider {
         call: &PreparedHostCall,
         cancel: CancellationToken,
     ) -> Result<(), String> {
+        if call.payload::<PreparedArtifactLogin>().is_some() {
+            return if cancel.is_cancelled() {
+                Err("Sign-in was cancelled".into())
+            } else {
+                Ok(())
+            };
+        }
         let Some(prepared) = call.payload::<PreparedMcpCall>() else {
             return self
                 .native
@@ -932,6 +1157,12 @@ impl HostToolProvider for McpHostToolProvider {
         call: PreparedHostCall,
         cancel: CancellationToken,
     ) -> HostCallResult {
+        if call.payload::<PreparedArtifactLogin>().is_some() {
+            if cancel.is_cancelled() {
+                return HostCallResult::NotDispatched("Sign-in was cancelled".into());
+            }
+            return HostCallResult::Completed(self.start_login(cancel).await);
+        }
         if call.payload::<PreparedMcpCall>().is_none() {
             return match &self.native {
                 Some(native) => native.execute_prepared(chat_id, call, cancel).await,
@@ -1082,7 +1313,7 @@ impl HostToolProvider for McpHostToolProvider {
         cancel: CancellationToken,
     ) -> ToolResult {
         match &self.native {
-            Some(native) if !self.is_mcp_name(name) => {
+            Some(native) if !self.is_mcp_name(name) && name != ARTIFACT_LOGIN_TOOL => {
                 native.execute(chat_id, name, input, cancel).await
             }
             _ => ToolResult {

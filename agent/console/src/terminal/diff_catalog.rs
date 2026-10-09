@@ -185,7 +185,9 @@ fn user_prompt(snapshot: &ChatSnapshot, run_id: RunId) -> Option<String> {
         .iter()
         .enumerate()
         .find(|(index, message)| {
-            message.role == Role::User && snapshot.message_runs.get(index) == Some(&run_id)
+            message.role == Role::User
+                && snapshot.message_runs.get(index) == Some(&run_id)
+                && !snapshot.host_notes.contains_key(index)
         })
         .map(|(_, message)| {
             message

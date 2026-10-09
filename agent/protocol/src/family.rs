@@ -163,7 +163,9 @@ pub struct DelegationCeiling {
     pub session_denials: Option<Vec<SessionPermissionDenial>>,
     pub host_context: Option<HostCallContext>,
     /// Per host tool, the authorities of every backend that could serve it when the child was
-    /// delegated. Each call must run under one of them; a backend found later never joins.
+    /// delegated. Each call must run under one of them; a backend found later never joins. The
+    /// Artifact tools record the signed-in Artifact account even while its tools are unavailable;
+    /// a child delegated with no account signed in records the first account signed in afterwards.
     pub host_tools: BTreeMap<String, BTreeSet<HostToolAuthority>>,
     #[serde(default)]
     pub tick_instances: Vec<tick_protocol::InstanceRef>,

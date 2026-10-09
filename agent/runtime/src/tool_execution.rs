@@ -172,6 +172,14 @@ impl ToolRegistry {
             .collect()
     }
 
+    pub(super) fn host_tool_names(&self) -> std::collections::BTreeSet<String> {
+        self.tools
+            .iter()
+            .filter(|tool| matches!(tool.route, ToolRoute::Host(_)))
+            .map(|tool| tool.definition.name.clone())
+            .collect()
+    }
+
     pub(super) fn resolve(&self, name: &str) -> Option<RegisteredTool> {
         self.tools
             .iter()

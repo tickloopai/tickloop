@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     path::PathBuf,
     time::SystemTime,
 };
@@ -91,6 +91,14 @@ pub struct ChatSnapshot {
     /// Copied prompts in a Branch remain rewind points, but are not fresh child-Chat authorization.
     #[serde(default, skip_serializing_if = "HashSet::is_empty")]
     pub inherited_prompts: HashSet<usize>,
+    /// User-role messages the host wrote for the model, each with the host tool names announced
+    /// as available once it was written. History views skip them; they are never human input.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub host_notes: BTreeMap<usize, BTreeSet<String>>,
+    /// Host tool names the model was last told about; `None` when this history has never been
+    /// told, as in an older Transcript or after compaction dropped the notes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub announced_host_tools: Option<BTreeSet<String>>,
     /// 压缩边界与压缩摘要消息（链上字段）。
     #[serde(default)]
     pub message_compactions: BTreeMap<usize, CompactionMarker>,

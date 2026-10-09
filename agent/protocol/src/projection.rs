@@ -61,6 +61,14 @@ impl ChatSnapshot {
         self.boundary_indexes().last().copied().unwrap_or(0)
     }
 
+    /// The host tool names the latest host note the model can still see announced.
+    pub fn visible_announced_host_tools(&self) -> Option<std::collections::BTreeSet<String>> {
+        self.host_notes
+            .range(self.active_start()..)
+            .next_back()
+            .map(|(_, announced)| announced.clone())
+    }
+
     fn boundary_indexes(&self) -> Vec<usize> {
         self.message_compactions
             .iter()
@@ -287,7 +295,8 @@ fn materialize_active_items(
                         "active conversation projection exceeds the raw archive".into(),
                     )
                 })?;
-                if message.role == Role::System {
+                if message.role == Role::System || snapshot.host_notes.contains_key(&message_index)
+                {
                     continue;
                 }
                 let has_thinking = message.role == Role::Assistant

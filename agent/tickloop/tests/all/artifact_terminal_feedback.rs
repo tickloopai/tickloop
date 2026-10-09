@@ -59,7 +59,7 @@ async fn read_request(stream: &mut TcpStream) -> (String, Value) {
 
 fn model_stream(create: bool) -> String {
     let block = if create {
-        json!({"type":"tool_use","id":"create-call","name":"ArtifactEdit","input":{"action":"create","title":FIXTURE_ARTIFACT_TITLE,"format":"markdown","content":"# Fixture"}})
+        json!({"type":"tool_use","id":"create-call","name":"ArtifactEdit","input":{"action":"create","title":FIXTURE_ARTIFACT_TITLE,"format":"doc","content":"# Fixture"}})
     } else {
         json!({"type":"text","text":"Creation fixture finished."})
     };

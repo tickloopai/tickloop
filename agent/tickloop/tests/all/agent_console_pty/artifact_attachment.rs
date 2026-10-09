@@ -97,7 +97,7 @@ async fn creation_adds_an_artifact_in_mode(flags: &[&str]) {
         let device = account.start_device_login().await.unwrap();
         account.finish_device_login(device, &tokio_util::sync::CancellationToken::new()).await.unwrap();
         let (model_url, mut requests, release) = model_http_support::serve_responses_with_gated_response(vec![
-            (200,chat_reply(Some(("ArtifactEdit","creation",json!({"action":"create","title":CREATED_TITLE,"format":"markdown","content":"# Created"}))),"")),
+            (200,chat_reply(Some(("ArtifactEdit","creation",json!({"action":"create","title":CREATED_TITLE,"format":"doc","content":"# Created"}))),"")),
             (200,chat_reply(Some(("ArtifactEdit","revision",json!({"action":"replace","artifact_id":"document","expected_revision":1,"content":"# Revised"}))),"")),
             (200,chat_reply(None,"CREATION-REPLY-FINISHED")),
         ],1).await;

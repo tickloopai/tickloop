@@ -207,7 +207,7 @@ pub(super) fn project(snapshot: &ChatSnapshot) -> ConversationProjection {
             });
             continue;
         }
-        if message.role == Role::System {
+        if message.role == Role::System || snapshot.host_notes.contains_key(&message_index) {
             continue;
         }
         let run_id = snapshot.message_runs.get(&message_index).copied();
@@ -790,6 +790,38 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(texts, vec!["interrupted prompt".to_owned()]);
+    }
+
+    #[test]
+    fn projection_hides_host_notes() {
+        let mut snapshot = snapshot(Uuid::new_v4());
+        snapshot.messages = vec![
+            Message {
+                role: Role::User,
+                content: vec![Content::Text {
+                    text: "Make a doc".into(),
+                }],
+            },
+            Message {
+                role: Role::User,
+                content: vec![Content::Text {
+                    text: "Host notice: the host tool set changed.".into(),
+                }],
+            },
+        ];
+        snapshot
+            .host_notes
+            .insert(1, ["ArtifactRead".to_owned()].into());
+
+        let texts = project(&snapshot)
+            .blocks
+            .into_iter()
+            .filter_map(|block| match block.kind {
+                ConversationBlockKind::User { text } => Some(text),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(texts, vec!["Make a doc".to_owned()]);
     }
 
     #[test]

@@ -694,7 +694,7 @@ impl ChatRecorder {
                     .and_then(|link| link.uuids.last().copied());
             }
             entry.git_branch = git_branch.clone();
-            entry.is_meta = matches!(source, MessageSource::Existing(original)
+            entry.is_meta |= matches!(source, MessageSource::Existing(original)
                 if log.meta_messages.contains(original));
             parent = Some(uuid);
             log.links.push(MessageLink {
@@ -927,7 +927,7 @@ impl ChatRecorder {
                 entry.contexts = None;
                 entry.execution_mode = None;
                 entry.continues_message = true;
-                entry.is_meta = log.meta_messages.contains(&index);
+                entry.is_meta |= log.meta_messages.contains(&index);
                 parent = Some(entry.uuid);
                 let link = &mut log.links[index];
                 link.uuids.push(entry.uuid);
@@ -952,7 +952,8 @@ impl ChatRecorder {
             }
             let message = snapshot.messages[index].clone();
             let role = message.role;
-            let is_meta = log.meta_messages.contains(&index);
+            let is_meta =
+                log.meta_messages.contains(&index) || snapshot.host_notes.contains_key(&index);
             let uuid = snapshot
                 .message_ids
                 .get(&index)
@@ -1186,7 +1187,8 @@ fn chain_entry(
         git_branch: None,
         message,
         invoked_skills: snapshot.invoked_skills.clone(),
-        is_meta: false,
+        is_meta: snapshot.host_notes.contains_key(&index),
+        host_tools: snapshot.host_notes.get(&index).cloned(),
         execution_mode: snapshot
             .prompt_execution_modes
             .get(&index)
@@ -1345,6 +1347,7 @@ fn record_loop(
         },
         invoked_skills: snapshot.invoked_skills.clone(),
         is_meta: false,
+        host_tools: None,
         execution_mode: None,
         is_inherited_prompt: false,
         original_message_id: None,
@@ -1478,6 +1481,7 @@ struct RestoredChain {
     original_message_ids: BTreeMap<usize, Uuid>,
     prompt_execution_modes: BTreeMap<usize, ExecutionMode>,
     inherited_prompts: HashSet<usize>,
+    host_notes: BTreeMap<usize, BTreeSet<String>>,
     message_compactions: BTreeMap<usize, CompactionMarker>,
     message_usage: BTreeMap<usize, Usage>,
     message_sources: BTreeMap<usize, PrivateHistorySource>,
@@ -1510,6 +1514,7 @@ fn restore_chain(chain: &[ChainEntry]) -> (RestoredChain, Vec<String>) {
         original_message_ids: BTreeMap::new(),
         prompt_execution_modes: BTreeMap::new(),
         inherited_prompts: HashSet::new(),
+        host_notes: BTreeMap::new(),
         message_compactions: BTreeMap::new(),
         message_usage: BTreeMap::new(),
         message_sources: BTreeMap::new(),
@@ -1600,6 +1605,9 @@ fn restore_chain(chain: &[ChainEntry]) -> (RestoredChain, Vec<String>) {
         }
         if entry.is_inherited_prompt {
             restored.inherited_prompts.insert(index);
+        }
+        if let Some(announced) = &entry.host_tools {
+            restored.host_notes.insert(index, announced.clone());
         }
         if let Some(origin) = &entry.human_family_origin {
             restored
@@ -1705,6 +1713,7 @@ impl RestoredChain {
             original_message_ids: BTreeMap::new(),
             prompt_execution_modes: BTreeMap::new(),
             inherited_prompts: HashSet::new(),
+            host_notes: BTreeMap::new(),
             message_compactions: BTreeMap::new(),
             message_usage: BTreeMap::new(),
             message_sources: BTreeMap::new(),
@@ -1753,6 +1762,9 @@ impl RestoredChain {
             }
             if self.meta_messages.contains(&original) {
                 kept.meta_messages.insert(index);
+            }
+            if let Some(announced) = self.host_notes.get(&original) {
+                kept.host_notes.insert(index, announced.clone());
             }
             if let Some(marker) = self.message_compactions.get(&original) {
                 kept.message_compactions.insert(index, marker.clone());
@@ -1925,6 +1937,8 @@ impl RestoredChain {
         snapshot.message_sources = self.message_sources.clone();
         snapshot.message_models = self.message_models.clone();
         snapshot.message_compactions = self.message_compactions.clone();
+        snapshot.host_notes = self.host_notes.clone();
+        snapshot.announced_host_tools = snapshot.visible_announced_host_tools();
         bookkeeping.run_loops = self.run_loops.clone();
         bookkeeping.plan_slug = self.plan_slug.clone();
         self.replay_loops(snapshot, bookkeeping);

@@ -81,7 +81,7 @@ Protocol Tick Updates carry business content. Read the catalog's recovery query 
 
 A subscription keeps a hidden Tick from idling out. A subscription whose link stays `Disconnected` has used its three reconnects; retry it only when the user wants to, by `UnsubscribeTick` and then `SubscribeTick` again, which checks the target anew. Moving a live Pane instance preserves its reference and subscriptions; new operations need its explicit current Workspace scope. A replaced, restarted or reopened program has a new identity: retain the old subscription's state and select the new target explicitly. Detaching a view preserves the live process. Closing an Agent Pane closes its View while the daemon-owned Agent continues; closing an ordinary Tick Pane exits that Tick. Stop a Loop explicitly when requested.
 
-Current host state `artifact_ticks` lists artifacts joined to this Chat. An artifact the user picks in `/artifacts`, or one created with `ArtifactEdit`, joins Monitor and is linked to a Loop for the user's own @tickloop requests; that grants no extra permissions and creates no Tick Subscription.
+Current host state `artifact_ticks` lists artifacts joined to this Chat. An artifact the user picks in `/artifacts`, or one created with `ArtifactEdit`, joins Monitor and is linked to a Loop for the user's own @tickloop requests; that grants no extra permissions and creates no Tick Subscription. While Tick Loop Docs is signed out, `ArtifactLogin` replaces the Artifact tools: call it when the user wants a doc or design and give the user the returned link and code; after approval the Artifact tools appear on a later request.
 
 ## 5. Coordinate a bounded Agent family
 

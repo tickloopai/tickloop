@@ -16,6 +16,7 @@ mod family;
 pub mod file_history;
 mod handback;
 mod host_context;
+mod host_notes;
 pub mod host_tools;
 pub mod hosted;
 mod jev_review;
@@ -605,6 +606,16 @@ impl Chat {
     }
 }
 
+fn host_provider_is_confirmed(
+    host_tools: &std::sync::RwLock<Option<Arc<dyn crate::host_tools::HostToolProvider>>>,
+) -> bool {
+    host_tools
+        .read()
+        .unwrap()
+        .as_ref()
+        .is_none_or(|provider| provider.tool_set_is_confirmed())
+}
+
 fn configured_workspace_for_chat(chat: &Chat) -> tickloop_agent_tools::Workspace {
     tickloop_agent_tools::Workspace {
         workdir: chat.snapshot.workdir.clone(),
@@ -694,6 +705,8 @@ fn empty_snapshot(id: ChatId, workdir: PathBuf, model: ModelConfig) -> ChatSnaps
         original_message_ids: BTreeMap::new(),
         prompt_execution_modes: BTreeMap::new(),
         inherited_prompts: HashSet::new(),
+        host_notes: BTreeMap::new(),
+        announced_host_tools: None,
         message_compactions: BTreeMap::new(),
         message_usage: BTreeMap::new(),
         message_sources: BTreeMap::new(),
@@ -2156,6 +2169,7 @@ impl Agent {
         &self,
         receipt: &Receipt,
         mut request: ModelRequest,
+        host_tools: Option<std::collections::BTreeSet<String>>,
         cancel: CancellationToken,
         used_calls: &mut HashSet<String>,
     ) -> Result<tickloop_agent_model::ModelOutput, AgentError> {
@@ -2170,6 +2184,8 @@ impl Agent {
             }
         }
         self.maybe_compact(receipt, cancel.clone()).await?;
+        // After compaction, which may drop earlier notes; boxed to keep the run future small.
+        Box::pin(self.announce_host_tool_changes(receipt, host_tools)).await?;
         let workspace_host = crate::host_tools::current_workspace_host(
             self.inner.host_tools.read().unwrap().as_deref(),
         );
@@ -2558,6 +2574,7 @@ impl Agent {
                     let _ = provider.refresh(cancel.clone()).await;
                 }
                 self.ensure_handback_requirement(&receipt).await?;
+                self.pin_delegated_artifact_account(receipt.chat_id).await?;
                 let registry = {
                     let chats = self.inner.chats.lock().await;
                     let chat = chats.get(&receipt.chat_id).unwrap();
@@ -2569,7 +2586,8 @@ impl Agent {
                     )
                 };
                 request.tools = registry.definitions();
-                let output = self.model_request(&receipt,request,cancel.clone(),&mut used_calls).await.map_err(|error|error.to_string())?;
+                let host_tools = host_provider_is_confirmed(&self.inner.host_tools).then(|| registry.host_tool_names());
+                let output = self.model_request(&receipt,request,host_tools,cancel.clone(),&mut used_calls).await.map_err(|error|error.to_string())?;
                 is_awaiting_model = false;
                 let assistant_message_id = Uuid::new_v4();
                 let calls = output.content.iter().filter_map(|content| {
@@ -2862,12 +2880,13 @@ impl Agent {
         first: (Receipt, ModelRequest, CancellationToken),
     ) -> tokio::task::JoinHandle<()> {
         let agent = self.clone();
-        tokio::spawn(async move {
+        // Boxed so spawning does not stage the large run future on the caller's stack.
+        tokio::spawn(Box::pin(async move {
             let mut next = Some(first);
             while let Some((receipt, request, cancel)) = next {
                 next = agent.run(receipt, request, cancel).await;
             }
-        })
+        }))
     }
 
     fn park_run(

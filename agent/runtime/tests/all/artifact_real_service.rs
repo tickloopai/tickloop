@@ -426,7 +426,7 @@ impl RequestModel {
                 .and_then(|quote| {
                     blocks
                         .iter()
-                        .find(|block| block["markdown"].as_str().unwrap().contains(quote))
+                        .find(|block| block["text"].as_str().unwrap().contains(quote))
                 })
                 .unwrap_or_else(|| blocks.last().unwrap())
                 .clone()
@@ -445,7 +445,7 @@ impl RequestModel {
                     "patch",
                     "ArtifactEdit",
                     json!({"action": "patch", "artifact_id": artifact_id, "patches": [
-                        {"type": "replace", "target": block["id"], "expected_hash": block["hash"], "markdown": "A tighter first paragraph."}
+                        {"type": "replace", "target": block["id"], "expected_hash": block["hash"], "text": "A tighter first paragraph."}
                     ]}),
                 )
             }
@@ -580,7 +580,7 @@ async fn host_runs_the_artifact_v2_contract_against_the_real_service() {
         call(
             "create",
             "ArtifactEdit",
-            json!({"action": "create", "title": "Real brief", "format": "markdown", "content": "# Real brief\n\nFirst paragraph that is far too long.\n"}),
+            json!({"action": "create", "title": "Real brief", "format": "doc", "content": "# Real brief\n\nFirst paragraph that is far too long.\n"}),
         ),
         text("Created."),
     ]));

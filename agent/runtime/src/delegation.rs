@@ -1,4 +1,4 @@
-use std::{future::Future, pin::Pin};
+use std::{collections::BTreeSet, future::Future, pin::Pin};
 
 use serde_json::{Value, json};
 
@@ -16,6 +16,26 @@ use tickloop_agent_protocol::{
     SubagentRegistration, ToolDefinition, ToolResult,
 };
 use tickloop_agent_tools::{PreparedTool, Workspace, permissions::PermissionPolicyExt};
+
+/// Records the Artifact account the host holds for every Artifact tool a ceiling lacks, so a child
+/// keeps to that account even while the tool directory is unavailable.
+fn record_artifact_account(
+    host_tools: &mut BTreeMap<String, BTreeSet<HostToolAuthority>>,
+    provider: &dyn HostToolProvider,
+) -> Result<bool, String> {
+    let names = crate::mcp_tools::ARTIFACT_TOOL_NAMES;
+    if names.iter().any(|name| host_tools.contains_key(*name)) {
+        return Ok(false);
+    }
+    let authorities = provider.tool_authorities(names[0])?;
+    if authorities.is_empty() {
+        return Ok(false);
+    }
+    for name in names {
+        host_tools.insert(name.to_owned(), authorities.clone());
+    }
+    Ok(true)
+}
 
 #[derive(Clone)]
 pub(super) struct SubagentInvocation {
@@ -471,6 +491,32 @@ impl Agent {
             .await
     }
 
+    /// A child delegated while no Artifact account was signed in takes up the first account the
+    /// host signs in to afterwards; the ceiling records it, so a later account switch stays out.
+    pub(super) async fn pin_delegated_artifact_account(
+        &self,
+        chat_id: ChatId,
+    ) -> Result<(), String> {
+        let Some(provider) = self.inner.host_tools.read().unwrap().clone() else {
+            return Ok(());
+        };
+        let delegation = {
+            let mut chats = self.inner.chats.lock().await;
+            let Some(delegation) = chats
+                .get_mut(&chat_id)
+                .and_then(|chat| chat.snapshot.delegation.as_mut())
+            else {
+                return Ok(());
+            };
+            if !record_artifact_account(&mut delegation.ceiling.host_tools, provider.as_ref())? {
+                return Ok(());
+            }
+            delegation.clone()
+        };
+        self.record_delegation(chat_id, delegation);
+        Ok(())
+    }
+
     pub(super) async fn check_delegated_host_authority(
         &self,
         receipt: &Receipt,
@@ -616,7 +662,7 @@ impl Agent {
                         }
                     }
                     let mut host_context = self.host_call_context(parent, &snapshot.workdir);
-                    let host_tools = self
+                    let mut host_tools: BTreeMap<_, _> = self
                         .inner
                         .host_tools
                         .read()
@@ -638,6 +684,9 @@ impl Agent {
                         .into_iter()
                         .flatten()
                         .collect();
+                    if let Some(provider) = self.inner.host_tools.read().unwrap().as_ref() {
+                        record_artifact_account(&mut host_tools, provider.as_ref())?;
+                    }
                     if let Some(context) = &mut host_context {
                         context.interaction = None;
                     }
