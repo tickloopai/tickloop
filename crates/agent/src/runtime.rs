@@ -2699,8 +2699,7 @@ impl Agent {
         {
             let mut chats = self.inner.chats.lock().await;
             let chat = chats.get_mut(&receipt.chat_id).unwrap();
-            if workspace_host.name == crate::host_tools::WorkspaceHostName::Herdr
-                && workspace_host.integration == crate::host_tools::WorkspaceIntegration::Available
+            if workspace_host.runs_ticks()
                 && !chat
                     .snapshot
                     .invoked_skills

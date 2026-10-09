@@ -1,4 +1,4 @@
-use std::{future::Future, pin::Pin};
+use std::{collections::BTreeSet, future::Future, pin::Pin};
 
 use serde_json::{Value, json};
 
@@ -6,6 +6,9 @@ use super::*;
 use crate::{
     host_tools::{HostCallContext, HostToolAuthority, HostToolProvider},
     model::ToolDefinition,
+    tick_tool_router::{
+        CALL_TICK_TOOL, MODIFY_TICK, READ_TICK, READ_WORKSPACE, TickBackend, TickBackends,
+    },
     tools::{PreparedTool, ToolResult, Workspace},
 };
 
@@ -36,7 +39,9 @@ pub struct DelegationCeiling {
     #[serde(default)]
     pub session_denials: Option<Vec<SessionPermissionDenial>>,
     pub host_context: Option<HostCallContext>,
-    pub host_tools: BTreeMap<String, HostToolAuthority>,
+    /// Per host tool, the authorities of every backend that could serve it when the child was
+    /// delegated. Each call must run under one of them; a backend found later never joins.
+    pub host_tools: BTreeMap<String, BTreeSet<HostToolAuthority>>,
     #[serde(default)]
     pub tick_instances: Vec<tick_connect::instance::InstanceRef>,
 }
@@ -223,23 +228,35 @@ pub(super) fn check_call(
     }
     if matches!(
         name,
-        "ReadWorkspace" | "ReadTick" | "CallTickTool" | "ModifyTick" | "SendTickInput"
+        READ_WORKSPACE | READ_TICK | CALL_TICK_TOOL | MODIFY_TICK
     ) {
-        let workspace = ceiling
-            .host_context
-            .as_ref()
-            .and_then(|context| context.workspace_id.as_deref());
-        if workspace.is_none() || input.get("workspace_id").and_then(Value::as_str) != workspace {
-            return Err("delegated host operation is outside the inherited Workspace scope".into());
-        }
-        if name == "SendTickInput"
-            || name == "ModifyTick"
-                && matches!(input["action"].as_str(), Some("open" | "send_input"))
+        if name == MODIFY_TICK
+            && matches!(
+                input["action"].as_str(),
+                Some("open" | "reopen" | "send_input")
+            )
         {
-            return Err("Unsupported: delegated Agents cannot launch an unrestricted terminal program or submit terminal input".into());
+            return Err(
+                "Unsupported: delegated Agents cannot launch a program or submit terminal input"
+                    .into(),
+            );
+        }
+        // A hosted Tick belongs to the Chat that opened it, which the owner enforces on every
+        // call; every other target stays scoped by the inherited Workspace.
+        if TickBackends::ALL.route(name, input) != Ok(TickBackend::Hosted) {
+            let workspace = ceiling
+                .host_context
+                .as_ref()
+                .and_then(|context| context.workspace_id.as_deref());
+            if workspace.is_none() || input.get("workspace_id").and_then(Value::as_str) != workspace
+            {
+                return Err(
+                    "delegated host operation is outside the inherited Workspace scope".into(),
+                );
+            }
         }
         if ceiling.policy.mode == ExecutionMode::Plan
-            && matches!(name, "CallTickTool" | "ModifyTick" | "SendTickInput")
+            && matches!(name, CALL_TICK_TOOL | MODIFY_TICK)
         {
             return Err("delegated Plan authorization does not admit host mutations".into());
         }
@@ -289,11 +306,14 @@ impl Agent {
             })
     }
 
-    pub(super) async fn check_delegated_host_tool(
+    /// Checks that a delegated call runs under an authority its child inherited for `name`: that
+    /// of the backend this very input routes to, as that backend currently is.
+    pub(super) async fn check_delegated_host_call(
         &self,
         receipt: &Receipt,
         provider: &dyn HostToolProvider,
         name: &str,
+        input: &Value,
     ) -> Result<(), String> {
         if self
             .inner
@@ -308,7 +328,7 @@ impl Agent {
         {
             return Ok(());
         }
-        self.check_delegated_host_authority(receipt, name, provider.tool_authority(name)?)
+        self.check_delegated_host_authority(receipt, name, provider.call_authority(name, input)?)
             .await
     }
 
@@ -323,12 +343,12 @@ impl Agent {
         let Some(delegation) = &chat.snapshot.delegation else {
             return Ok(());
         };
-        let expected = delegation
+        let allowed = delegation
             .ceiling
             .host_tools
             .get(name)
             .ok_or("Unsupported: this tool is outside the child's inherited authorization")?;
-        if authority.as_ref() != Some(expected) {
+        if !authority.is_some_and(|authority| allowed.contains(&authority)) {
             return Err("Unsupported: this tool endpoint or account is outside the child's inherited authorization".into());
         }
         Ok(())
@@ -545,9 +565,9 @@ impl Agent {
                                 .definitions()
                                 .into_iter()
                                 .map(|tool| {
-                                    Ok(provider
-                                        .tool_authority(&tool.name)?
-                                        .map(|authority| (tool.name, authority)))
+                                    let authorities = provider.tool_authorities(&tool.name)?;
+                                    Ok((!authorities.is_empty())
+                                        .then_some((tool.name, authorities)))
                                 })
                                 .collect::<Result<Vec<_>, String>>()
                         })

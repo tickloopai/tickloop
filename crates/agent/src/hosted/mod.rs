@@ -2,6 +2,7 @@
 //! authenticated channel through which workers ask the owner to open, close and list them, and
 //! tell it when a Chat ends.
 
+pub mod attach;
 pub mod controller;
 pub mod lifecycle;
 pub mod registry;

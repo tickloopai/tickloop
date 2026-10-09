@@ -77,7 +77,7 @@ async fn explicit_host_operations_continue_after_the_agent_view_closes() {
         call(
             "open",
             "ModifyTick",
-            json!({"action":"open","command":["/bin/echo","fixture"]}),
+            json!({"action":"open","command":["/bin/echo","fixture"],"placement":{"type":"new_tab"}}),
         ),
         call(
             "delegate-host",
@@ -415,7 +415,7 @@ async fn opening_failure_reports_known_creation_without_repeating_or_rolling_bac
             .prepare_call(
                 chat,
                 "ModifyTick",
-                &json!({"action":"open","command":["/bin/echo","fixture"],"cwd":directory.path()}),
+                &json!({"action":"open","command":["/bin/echo","fixture"],"cwd":directory.path(),"placement":{"type":"new_tab"}}),
                 cancel.clone(),
             )
             .await
@@ -1283,7 +1283,7 @@ async fn agent_opens_a_program_in_a_new_herdr_tab_after_approval() {
         call(
             "open",
             "ModifyTick",
-            json!({"action":"open","command":["/bin/echo","hello; $HOME"],"cwd":"/private/tmp"}),
+            json!({"action":"open","command":["/bin/echo","hello; $HOME"],"cwd":"/private/tmp","placement":{"type":"new_tab"}}),
         ),
         text("Opened the program."),
     ]));
@@ -1495,7 +1495,7 @@ async fn isolated_herdr_keeps_background_host_access_and_places_beside_the_input
         call(
             "open",
             "ModifyTick",
-            json!({"action":"open","command":["/bin/cat"]}),
+            json!({"action":"open","command":["/bin/cat"],"placement":{"type":"new_tab"}}),
         ),
         call(
             "no_anchor",

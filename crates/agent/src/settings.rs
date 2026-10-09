@@ -47,6 +47,7 @@ const CONTEXT_WINDOW_KEY: &str = "contextWindowTokens";
 const GLYPH_SET_KEY: &str = "glyphSet";
 const PREFERS_REDUCED_MOTION_KEY: &str = "prefersReducedMotion";
 const MONITOR_KEY: &str = "monitor";
+const MONITOR_POPUP_KEY: &str = "monitorPopup";
 const PROMPT_SUGGESTION_ENABLED_KEY: &str = "promptSuggestionEnabled";
 /// Claude Code's `outputStyle` setting.
 const OUTPUT_STYLE_KEY: &str = "outputStyle";
@@ -214,6 +215,16 @@ pub enum MonitorPreference {
     Hidden,
 }
 
+/// Whether Monitor may float a hosted Tick in a Herdr popup. Only `tickloop monitor popup
+/// install` enables it, after installing the popup plugin; the setting never installs anything.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MonitorPopup {
+    #[default]
+    Disabled,
+    Enabled,
+}
+
 impl LoadedSettings {
     pub fn status_lines(&mut self) -> Option<Vec<String>> {
         let value = self.settings.get("statusLines")?.clone();
@@ -369,6 +380,14 @@ impl LoadedSettings {
     pub fn monitor_preference(&self) -> MonitorPreference {
         self.settings
             .get(MONITOR_KEY)
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn monitor_popup(&self) -> MonitorPopup {
+        self.settings
+            .get(MONITOR_POPUP_KEY)
             .cloned()
             .and_then(|value| serde_json::from_value(value).ok())
             .unwrap_or_default()
@@ -899,6 +918,16 @@ impl UserSettings {
             settings.insert(
                 MONITOR_KEY.into(),
                 serde_json::to_value(preference).expect("Monitor preference serializes to JSON"),
+            );
+            Ok(())
+        })
+    }
+
+    pub fn save_monitor_popup(&self, popup: MonitorPopup) -> Result<(), SettingsError> {
+        self.update(|settings| {
+            settings.insert(
+                MONITOR_POPUP_KEY.into(),
+                serde_json::to_value(popup).expect("Monitor popup setting serializes to JSON"),
             );
             Ok(())
         })

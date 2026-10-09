@@ -1,7 +1,8 @@
-//! The tools of a worker without a Herdr View: hosted Ticks only. Opening and closing go through
-//! the owner, which alone controls the Tick host; reading and calling use the instance's data
-//! binding directly. Each call is prepared once — target, catalog, executable, working
-//! directory and operation id frozen — and the same preparation is approved and dispatched.
+//! The Tick host backend of the native Tick tools: the hidden Ticks a Chat opened. Opening,
+//! reopening and closing go through the owner, which alone controls the Tick host; reading and
+//! calling use the instance's data binding directly. Each call is prepared once — target,
+//! catalog, executable, working directory and operation id frozen — and the same preparation is
+//! approved and dispatched.
 
 use std::{
     collections::{BTreeSet, HashMap},
@@ -22,6 +23,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{
+    controller::HostedViewGrant,
     registry::{FileIdentity, TARGET_GONE},
     worker_control::{HostedAdmission, HostedTickPage, OwnerControl, WorkerRequest},
 };
@@ -32,14 +34,12 @@ use crate::{
     },
     model::ToolDefinition,
     runtime::ChatId,
+    tick_tool_router::{CALL_TICK_TOOL, MODIFY_TICK, READ_TICK, TickBackends},
     tools::ToolResult,
 };
 
-/// The open placement that runs a Tick hidden in the Tick host.
-pub const HIDDEN_PLACEMENT: &str = "hidden";
-pub const MODIFY_TICK: &str = "ModifyTick";
-pub(crate) const READ_TICK: &str = "ReadTick";
-const CALL_TICK_TOOL: &str = "CallTickTool";
+/// How results name the Tick host that runs a hidden Tick.
+const HOSTED_HOST: &str = "tick-host";
 
 #[derive(Clone)]
 struct DataBinding {
@@ -54,6 +54,14 @@ pub struct HostedMember {
     pub title: Option<String>,
     pub state: HostedMemberState,
     pub resources: Option<tick_host::host::Resources>,
+}
+
+/// A hosted Tick's screen as text when it was taken: the newest lines within the snapshot
+/// limits, saying whether older ones were cut.
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+pub struct HostedSnapshot {
+    pub screen: tick_host::screen::ScreenSnapshot,
+    pub taken_at_ms: u64,
 }
 
 #[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
@@ -76,6 +84,11 @@ enum Operation {
     Close {
         operation: Uuid,
         instance: InstanceRef,
+    },
+    Reopen {
+        operation: Uuid,
+        lost: InstanceRef,
+        title: Option<String>,
     },
     Read {
         instance: InstanceRef,
@@ -119,6 +132,7 @@ impl HostedTickTools {
         input: &Value,
         workdir: Option<&Path>,
     ) -> Result<PreparedHostCall, String> {
+        TickBackends::HOSTED.route(name, input)?;
         let (operation, permission, summary) = match (name, input["action"].as_str()) {
             (MODIFY_TICK, Some("open")) => {
                 let words = input["command"]
@@ -171,10 +185,35 @@ impl HostedTickTools {
                     format!("Close hosted Tick {instance}"),
                 )
             }
+            (MODIFY_TICK, Some("reopen")) => {
+                let lost = hosted_target(input)?;
+                // The owner alone judges whether the instance can be reopened; the listing only
+                // names it for the approval.
+                let title = self
+                    .list_page(chat, None)
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .lost
+                    .into_iter()
+                    .find(|listed| listed.instance == lost)
+                    .and_then(|listed| listed.title);
+                let summary = format!(
+                    "Reopen {} as a new hidden instance from its recorded program, if it was lost with its Tick host; its earlier subscriptions do not follow",
+                    title.as_deref().unwrap_or(lost.as_str())
+                );
+                (
+                    Operation::Reopen {
+                        operation: Uuid::new_v4(),
+                        lost,
+                        title,
+                    },
+                    HostToolPermission::Reviewable,
+                    summary,
+                )
+            }
             (MODIFY_TICK, _) => {
                 return Err(
-                    "UnsupportedCapability: hosted Ticks support open (placement hidden) and close"
-                        .into(),
+                    "UnsupportedCapability: hosted Ticks support open, close and reopen".into(),
                 );
             }
             (READ_TICK, _) => {
@@ -249,7 +288,7 @@ impl HostedTickTools {
                 }
                 Ok(())
             }
-            Operation::Close { .. } | Operation::Read { .. } => Ok(()),
+            Operation::Close { .. } | Operation::Reopen { .. } | Operation::Read { .. } => Ok(()),
             Operation::Call {
                 instance, catalog, ..
             } => {
@@ -286,7 +325,24 @@ impl HostedTickTools {
                     admission: self.admission(),
                 };
                 match self.lifecycle(chat, operation, request).await {
-                    Ok(opened) => self.opened(chat, opened, title).await,
+                    Ok(opened) => self.opened(chat, opened, Some(title), None).await,
+                    Err(unresolved) => unresolved,
+                }
+            }
+            Operation::Reopen {
+                operation,
+                lost,
+                title,
+            } => {
+                let request = WorkerRequest::ReopenHostedTick {
+                    chat,
+                    operation,
+                    instance: lost.clone(),
+                    environment: self.environment.clone(),
+                    admission: self.admission(),
+                };
+                match self.lifecycle(chat, operation, request).await {
+                    Ok(opened) => self.opened(chat, opened, title, Some(&lost)).await,
                     Err(unresolved) => unresolved,
                 }
             }
@@ -303,7 +359,9 @@ impl HostedTickTools {
                 match self.lifecycle(chat, operation, request).await {
                     Ok(_) => {
                         self.bindings.lock().await.remove(&(chat, instance.clone()));
-                        completed(json!({"status":"closed","tick_instance_id":instance}))
+                        completed(
+                            json!({"status":"closed","host":HOSTED_HOST,"tick_instance_id":instance}),
+                        )
                     }
                     Err(unresolved) => unresolved,
                 }
@@ -342,12 +400,17 @@ impl HostedTickTools {
         }
     }
 
+    /// The authority every hosted Tick call runs under: this worker's own Tick host.
+    pub(crate) fn authority(&self) -> HostToolAuthority {
+        HostToolAuthority::Native {
+            endpoint: self.endpoint.clone(),
+        }
+    }
+
     fn admission(&self) -> HostedAdmission {
         HostedAdmission {
             tool: MODIFY_TICK.into(),
-            authority: HostToolAuthority::Native {
-                endpoint: self.endpoint.clone(),
-            },
+            authority: self.authority(),
         }
     }
 
@@ -392,7 +455,14 @@ impl HostedTickTools {
         }
     }
 
-    async fn opened(&self, chat: ChatId, opened: Value, title: String) -> HostCallResult {
+    /// The verified facts of an open, or of a reopen in place of `replaces`.
+    async fn opened(
+        &self,
+        chat: ChatId,
+        opened: Value,
+        title: Option<String>,
+        replaces: Option<&InstanceRef>,
+    ) -> HostCallResult {
         let instance: InstanceRef = match serde_json::from_value(opened["instance"].clone()) {
             Ok(instance) => instance,
             Err(error) => {
@@ -413,16 +483,20 @@ impl HostedTickTools {
                 },
             );
         }
+        let mut result = json!({"status":"opened","host":HOSTED_HOST,"visibility":"hidden","tick_instance_id":instance});
+        if opened["business_pid"].is_u64() {
+            result["business_pid"] = opened["business_pid"].clone();
+        }
+        if let Some(lost) = replaces {
+            result["replaces"] = json!(lost);
+        }
         HostCallResult::CompletedWithEffect(
             ToolResult {
-                content: json!({"status":"opened","host":"tick-host","tick_instance_id":instance,"business_pid":opened["business_pid"]}).to_string(),
+                content: result.to_string(),
                 is_error: false,
                 output_ref: None,
             },
-            Box::new(HostEffect::OpenedTick {
-                instance,
-                title: Some(title),
-            }),
+            Box::new(HostEffect::OpenedTick { instance, title }),
         )
     }
 
@@ -550,38 +624,26 @@ impl HostedTickTools {
             .map_err(|error| HostError::after("ProtocolViolation", error.to_string()))
     }
 
-    /// Starts a new instance in place of a lost one because its user asked to. The owner
-    /// prepares the recorded launch again under the Chat's current authority; the lost instance
-    /// and its Watches stay gone, and nothing reopens on its own. Returns the new instance.
+    /// Starts a new instance in place of a lost one because its user asked to, through the same
+    /// prepared reopen a model's approved ModifyTick runs. The owner checks the recorded launch
+    /// again under the Chat's current authority; the lost instance and its Watches stay gone, and
+    /// nothing reopens on its own. Returns the new instance.
     pub async fn reopen_for_user(
         &self,
         chat: ChatId,
         lost: &InstanceRef,
     ) -> Result<InstanceRef, HostError> {
-        let operation = Uuid::new_v4();
-        let request = WorkerRequest::ReopenHostedTick {
-            chat,
-            operation,
-            instance: lost.clone(),
-            environment: self.environment.clone(),
-            admission: self.admission(),
-        };
-        let opened = match self.lifecycle(chat, operation, request).await {
-            Ok(opened) => opened,
-            Err(HostCallResult::NotDispatched(message)) => {
-                return Err(HostError::before("Refused", message));
-            }
-            Err(HostCallResult::OutcomeUnknown(message)) => {
-                return Err(HostError::after("OutcomeUnknown", message));
-            }
-            Err(_) => {
-                return Err(HostError::after(
-                    "OutcomeUnknown",
-                    "the reopen ended without an answer",
-                ));
-            }
-        };
-        match self.opened(chat, opened, lost.to_string()).await {
+        let cancel = CancellationToken::new();
+        let prepared = self
+            .prepare_call(
+                chat,
+                MODIFY_TICK,
+                &json!({"action":"reopen","tick_instance_id":lost}),
+                cancel.clone(),
+            )
+            .await
+            .map_err(|error| HostError::before("Refused", error))?;
+        match self.execute_prepared(chat, prepared, cancel).await {
             HostCallResult::CompletedWithEffect(_, effect) => match *effect {
                 HostEffect::OpenedTick { instance, .. } => Ok(instance),
                 _ => Err(HostError::after(
@@ -589,13 +651,13 @@ impl HostedTickTools {
                     "unexpected reopen effect",
                 )),
             },
+            HostCallResult::NotDispatched(message) => Err(HostError::before("Refused", message)),
             HostCallResult::OutcomeUnknown(message) => {
                 Err(HostError::after("OutcomeUnknown", message))
             }
-            _ => Err(HostError::after(
-                "OutcomeUnknown",
-                "unexpected reopen result",
-            )),
+            HostCallResult::Completed(result) => {
+                Err(HostError::after("OutcomeUnknown", result.content))
+            }
         }
     }
 
@@ -635,6 +697,42 @@ impl HostedTickTools {
     /// How often Watch intents must be reported again to keep protecting their Ticks.
     pub(crate) fn intent_renewal(&self) -> std::time::Duration {
         self.owner.intent_renewal()
+    }
+
+    /// The current screen of one of the Chat's hosted Ticks as text. Taking it reads host state
+    /// only: it never counts as using the Tick, subscribes or calls the model.
+    pub async fn snapshot(
+        &self,
+        chat: ChatId,
+        instance: &InstanceRef,
+    ) -> Result<HostedSnapshot, HostError> {
+        let screen = self
+            .data(chat, instance)
+            .await?
+            .request("snapshot", json!({}), CONTROL_TIMEOUT)
+            .await?;
+        Ok(HostedSnapshot {
+            screen: serde_json::from_value(screen)
+                .map_err(|error| HostError::after("ProtocolViolation", error.to_string()))?,
+            taken_at_ms: crate::private_fs::unix_time_milliseconds(),
+        })
+    }
+
+    /// Lets one View of the Chat attach to its hosted Tick once, without its data token.
+    pub async fn allow_view(
+        &self,
+        chat: ChatId,
+        instance: &InstanceRef,
+    ) -> Result<HostedViewGrant, HostError> {
+        let granted = self
+            .owner
+            .request(WorkerRequest::AllowHostedView {
+                chat,
+                instance: instance.clone(),
+            })
+            .await?;
+        serde_json::from_value(granted)
+            .map_err(|error| HostError::after("ProtocolViolation", error.to_string()))
     }
 
     /// Tells the owner which approved Watches of `chat` keep `instance` from idling.
@@ -714,7 +812,9 @@ fn hosted_target(input: &Value) -> Result<InstanceRef, String> {
         .parse()
         .map_err(|error: &str| error.to_owned())?;
     if instance.hosted_run().is_none() {
-        return Err("InvalidTickTarget: expected a hosted: instance".into());
+        return Err(format!(
+            "InvalidTickTarget: {instance} is not a valid hosted: instance"
+        ));
     }
     Ok(instance)
 }
@@ -727,33 +827,10 @@ fn completed(value: Value) -> HostCallResult {
     })
 }
 
-fn hosted_definitions() -> Vec<ToolDefinition> {
-    vec![
-        ToolDefinition {
-            name: READ_TICK.into(),
-            description: "Read a hosted Tick using its complete hosted: instance identity. Returns its structured content and declared tool catalog. For artifacts use the installed Artifact MCP tools; for Shell tasks use Read on Bash's output_file.".into(),
-            input_schema: json!({"type":"object","properties":{"tick_instance_id":{"type":"string","minLength":1}},"required":["tick_instance_id"],"additionalProperties":false}),
-        },
-        ToolDefinition {
-            name: CALL_TICK_TOOL.into(),
-            description: "Call one tool declared by a hosted Tick using its complete hosted: instance identity. Read that Tick's catalog first; query tools read content, while modifying tools require permission.".into(),
-            input_schema: json!({"type":"object","properties":{"tick_instance_id":{"type":"string","minLength":1},"tool":{"type":"string","minLength":1},"args":{"type":"object"}},"required":["tick_instance_id","tool","args"],"additionalProperties":false}),
-        },
-        ToolDefinition {
-            name: MODIFY_TICK.into(),
-            description: "Open a protocol Tick hidden in the Tick host, or close a hosted Tick. Opening runs the program in a private terminal that keeps running without any View; it joins this Chat's Monitor and is never subscribed. For command[0]='tick', prefer the bundled sibling executable, then PATH; omitted cwd uses the Agent file work directory. Closing ends that Tick's process.".into(),
-            input_schema: json!({"type":"object","oneOf":[
-                {"type":"object","properties":{"action":{"const":"open"},"command":{"type":"array","minItems":1,"items":{"type":"string"}},"cwd":{"type":"string","minLength":1},"placement":{"type":"object","properties":{"type":{"const":HIDDEN_PLACEMENT}},"required":["type"],"additionalProperties":false}},"required":["action","command","placement"],"additionalProperties":false},
-                {"type":"object","properties":{"action":{"const":"close"},"tick_instance_id":{"type":"string","minLength":1}},"required":["action","tick_instance_id"],"additionalProperties":false}
-            ]}),
-        },
-    ]
-}
-
 #[async_trait]
 impl HostToolProvider for HostedTickTools {
     fn definitions(&self) -> Vec<ToolDefinition> {
-        hosted_definitions()
+        TickBackends::HOSTED.definitions()
     }
 
     fn host_endpoint(&self) -> Result<Option<HostEndpointIdentity>, String> {

@@ -125,6 +125,19 @@ impl TickAdapter for HostedAdapter {
     /// one lost with its host can be reopened as a new instance.
     fn member(&self, member: &MonitorMember, context: &MonitorContext) -> TickDescriptor {
         let mut row = super::member_descriptor(member);
+        if let Some(enter) = row
+            .actions
+            .iter_mut()
+            .find(|action| action.key == MONITOR_ENTER_KEY)
+        {
+            *enter = MonitorAction {
+                key: MONITOR_ENTER_KEY,
+                label: "show",
+                operation: MonitorOperation::Execute(
+                    crate::terminal::tick_actions::builtin::present_hosted(member.instance.clone()),
+                ),
+            };
+        }
         row.resources = context.member_resources.get(&member.instance).cloned();
         row.actions.push(MonitorAction {
             key: HOSTED_CLOSE_KEY,
@@ -308,7 +321,7 @@ impl TickAdapter for ShellAdapter {
                 TickDescriptor {
                     actions: vec![
                         MonitorAction {
-                            key: 'o',
+                            key: MONITOR_ENTER_KEY,
                             label: "open",
                             operation: MonitorOperation::Execute(
                                 crate::terminal::tick_actions::builtin::shell(task.id),
@@ -384,7 +397,7 @@ const ARTIFACT_OWNER: TickOwner = TickOwner::Service("Artifact Service");
 
 pub(crate) fn artifact_actions(id: &str) -> Vec<MonitorAction> {
     [
-        ('o', "open"),
+        (MONITOR_ENTER_KEY, "open"),
         ('x', "remove"),
         ('c', "copy"),
         ('f', "feedback"),
@@ -404,7 +417,7 @@ pub(crate) fn artifact_actions(id: &str) -> Vec<MonitorAction> {
 fn subscription_actions(row: &TickSubscriptionStatus) -> Vec<MonitorAction> {
     vec![
         MonitorAction {
-            key: 'o',
+            key: MONITOR_ENTER_KEY,
             label: "open",
             operation: MonitorOperation::Execute(
                 crate::terminal::tick_actions::builtin::subscription(&row.id.to_string()),

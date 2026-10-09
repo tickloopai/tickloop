@@ -26,9 +26,10 @@ use crate::instance::InstanceRef;
 pub const MANAGEMENT_MAJOR: u16 = 1;
 pub const MANAGEMENT_MINOR: u16 = 0;
 pub const MANAGEMENT_FRAME_BYTES: usize = 64 * 1024;
-/// 2.0: owner revisions on open, listings that name their host epoch, owner reconcile/end and
-/// Watch-intent leases, and explicit or automatic reads; a 1.0 host is refused at hello.
-pub const BUSINESS_MAJOR: u16 = 2;
+/// 3.0: owner revisions on open, listings that name their host epoch, owner reconcile/end,
+/// Watch-intent leases, explicit or automatic reads, and one-time view grants; a host of any
+/// other major is refused at hello.
+pub const BUSINESS_MAJOR: u16 = 3;
 pub const BUSINESS_MINOR: u16 = 0;
 /// A complete business frame, large enough for one legal 8 MiB Tick Tool response.
 pub const BUSINESS_FRAME_BYTES: usize = 8 * 1024 * 1024 + 64 * 1024;
@@ -81,6 +82,12 @@ pub enum Role {
     Instance {
         instance: InstanceRef,
         data_token: String,
+    },
+    /// A view of one instance's terminal, holding the one-time grant its owner asked the host
+    /// for; it can only attach, so no data token leaves the Agent.
+    Viewer {
+        instance: InstanceRef,
+        view: uuid::Uuid,
     },
     /// The launcher of one pending open, holding that open's one-time launch token.
     Launcher {
