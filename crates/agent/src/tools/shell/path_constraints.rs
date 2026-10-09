@@ -54,6 +54,7 @@ pub(super) struct PathPolicy<'a> {
     pub(super) cwd: &'a Path,
     pub(super) working_directories: &'a [PathBuf],
     pub(super) readable_directories: &'a [PathBuf],
+    pub(super) editable_directory: Option<&'a Path>,
     pub(super) accept_edits: bool,
 }
 
@@ -69,6 +70,51 @@ impl PathPolicy<'_> {
         let Some(default_operation) = operation_type(base_command) else {
             return true;
         };
+        let file_flags: &[&str] = match base_command.as_str() {
+            "file" => &["-m", "--magic-file"],
+            "base64" => &["-i", "--input"],
+            "sort" => &["--random-source"],
+            "rg" => &["--ignore-file"],
+            _ => &[],
+        };
+        for (index, argument) in arguments.iter().enumerate() {
+            let (flag, inline) = argument
+                .split_once('=')
+                .map_or((argument.as_str(), None), |(name, value)| {
+                    (name, Some(value))
+                });
+            if file_flags.contains(&flag) {
+                let value = inline.or_else(|| arguments.get(index + 1).map(String::as_str));
+                if value.is_none_or(|path| !self.validate_path(path, FileOperation::Read)) {
+                    return false;
+                }
+            }
+        }
+        if base_command == "diff" {
+            let operands = extract_paths(base_command, arguments);
+            if operands.iter().any(|operand| {
+                self.cwd
+                    .join(expand_tilde(strip_surrounding_quote(operand)))
+                    .is_dir()
+            }) {
+                return false;
+            }
+            for flag in arguments
+                .iter()
+                .filter(|argument| argument.starts_with('-'))
+            {
+                if let Some((name, path)) = flag.split_once('=')
+                    && matches!(name, "--from-file" | "--to-file" | "--exclude-from")
+                    && (!self.validate_path(path, FileOperation::Read)
+                        || self
+                            .cwd
+                            .join(expand_tilde(strip_surrounding_quote(path)))
+                            .is_dir())
+                {
+                    return false;
+                }
+            }
+        }
         let operation = if base_command == "sed" && sed_command_is_allowed(&stripped, false) {
             FileOperation::Read
         } else {
@@ -154,6 +200,15 @@ impl PathPolicy<'_> {
     /// Port of `isPathAllowed` without permission rules.
     fn is_path_allowed(&self, resolved: &Path, operation: FileOperation) -> bool {
         let paths_to_check = paths_for_permission_check(resolved);
+        if self.editable_directory.is_some_and(|directory| {
+            paths_to_check.iter().all(|path| {
+                resolve_deepest_existing_ancestor(path)
+                    .unwrap_or_else(|| path.clone())
+                    .starts_with(directory)
+            })
+        }) {
+            return true;
+        }
         if operation != FileOperation::Read
             && paths_to_check.iter().any(|path| {
                 has_suspicious_path_pattern(path) || is_dangerous_file_to_auto_edit(path)
@@ -454,9 +509,31 @@ fn pattern_command_paths(arguments: &[String], flags_with_arguments: &[&str]) ->
             continue;
         }
         if !after_double_dash && argument.starts_with('-') {
+            if let Some(value) = argument
+                .strip_prefix("-f")
+                .filter(|value| !value.is_empty())
+            {
+                pattern_found = true;
+                paths.push(value.to_owned());
+                continue;
+            }
+            if argument
+                .strip_prefix("-e")
+                .is_some_and(|value| !value.is_empty())
+            {
+                pattern_found = true;
+                continue;
+            }
             let flag = argument.split('=').next().unwrap_or_default();
             if matches!(flag, "-e" | "--regexp" | "-f" | "--file") {
                 pattern_found = true;
+            }
+            if matches!(flag, "-f" | "--file" | "--exclude-from") {
+                if let Some((_, value)) = argument.split_once('=') {
+                    paths.push(value.to_owned());
+                } else if let Some(value) = arguments.get(index) {
+                    paths.push(value.clone());
+                }
             }
             if flags_with_arguments.contains(&flag) && !argument.contains('=') {
                 index += 1;
@@ -512,6 +589,7 @@ fn extract_paths(command: &str, arguments: &[String]) -> Vec<String> {
                     "--regexp",
                     "-f",
                     "--file",
+                    "--exclude-from",
                     "--exclude",
                     "--include",
                     "--exclude-dir",
@@ -757,6 +835,7 @@ mod tests {
                 cwd: &self.root,
                 working_directories: &self.roots,
                 readable_directories: &[],
+                editable_directory: None,
                 accept_edits,
             }
         }

@@ -1991,7 +1991,10 @@ async fn exit_plan_mode_automatically_opens_the_agent_dialog_and_preserves_it_ac
     let user_id = user_menu.id;
     console.show_menu(user_menu).unwrap();
     let mut menus = Menus::default();
-    let pending = HashMap::from([(request.id, request.run_id)]);
+    let pending = HashMap::from([(
+        request.id,
+        crate::terminal::WaitingPermission::new(chat, &request),
+    )]);
     menus
         .refresh_family_permissions(&agent, &console, &[chat], &pending, &HashMap::new())
         .await
@@ -2690,7 +2693,10 @@ async fn a_new_plan_version_replaces_a_stale_restored_request_in_another_view() 
     };
     agent.snapshot(chat).await.unwrap();
     menus.note_request(chat, revised.id);
-    let pending = HashMap::from([(revised.id, revised.run_id)]);
+    let pending = HashMap::from([(
+        revised.id,
+        crate::terminal::WaitingPermission::new(chat, &revised),
+    )]);
     menus
         .refresh_family_permissions(&agent, &console, &[chat], &pending, &HashMap::new())
         .await

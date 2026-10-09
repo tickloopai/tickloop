@@ -1145,6 +1145,7 @@ fn empty_frame(
 fn task_line_kind(status: TaskStatus) -> TaskFrameLineKind {
     match status {
         TaskStatus::Queued
+        | TaskStatus::WaitingPermission
         | TaskStatus::Running
         | TaskStatus::Background
         | TaskStatus::Cancelling => TaskFrameLineKind::ActiveTask,
@@ -1185,6 +1186,7 @@ const OTHER_AGENT: &str = "other Agent";
 fn status_label(status: TaskStatus) -> &'static str {
     match status {
         TaskStatus::Queued => "queued",
+        TaskStatus::WaitingPermission => "needs approval",
         TaskStatus::Running => "running",
         TaskStatus::Background => "background",
         TaskStatus::Cancelling => "stopping",

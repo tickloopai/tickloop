@@ -120,6 +120,26 @@ pub struct PermissionPolicy {
 }
 
 impl PermissionPolicy {
+    pub(crate) fn for_delegation(&self, parent_loop: Uuid) -> Self {
+        let inherited_rules = |rules: &[PermissionRule]| {
+            rules
+                .iter()
+                .filter(|rule| rule.loop_id.is_none_or(|loop_id| loop_id == parent_loop))
+                .cloned()
+                .map(|mut rule| {
+                    rule.loop_id = None;
+                    rule
+                })
+                .collect()
+        };
+        Self {
+            rules: inherited_rules(&self.rules),
+            project_constraints: inherited_rules(&self.project_constraints),
+            managed_constraints: inherited_rules(&self.managed_constraints),
+            ..self.clone()
+        }
+    }
+
     pub(crate) fn explicit_decision_with_session(
         &self,
         name: &str,

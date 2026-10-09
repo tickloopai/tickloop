@@ -1668,7 +1668,10 @@ async fn a_parent_message_cannot_resolve_the_childs_real_permission_request() {
         &tickloop_agent::runtime::Receipt {
             chat_id: child,
             loop_id: request.loop_id,
-            run_id: request.run_id,
+            run_id: request
+                .execution
+                .run_id()
+                .expect("model permission has its Run"),
         },
     )
     .await;

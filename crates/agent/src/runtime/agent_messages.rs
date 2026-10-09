@@ -828,6 +828,7 @@ impl Agent {
                         UserShellState::Running
                             | UserShellState::Background
                             | UserShellState::Queued
+                            | UserShellState::WaitingPermission
                             | UserShellState::Cancelling
                     )
                 })

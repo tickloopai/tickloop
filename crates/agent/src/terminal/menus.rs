@@ -1985,7 +1985,7 @@ impl Menus {
         agent: &Agent,
         console: &Console,
         family: &[Uuid],
-        pending: &HashMap<Uuid, Uuid>,
+        pending: &HashMap<Uuid, super::WaitingPermission>,
         questions: &HashMap<Uuid, QuestionRequest>,
     ) -> Result<(), String> {
         if !console.is_interactive() {
@@ -2123,7 +2123,7 @@ impl Menus {
         agent: &Agent,
         console: &Console,
         chat: Option<Uuid>,
-        pending: &HashMap<Uuid, Uuid>,
+        pending: &HashMap<Uuid, super::WaitingPermission>,
         questions: &HashMap<Uuid, QuestionRequest>,
     ) -> Result<(), String> {
         self.deferred_questions

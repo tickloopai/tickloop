@@ -1303,7 +1303,7 @@ const TPUT_DANGEROUS_CAPABILITIES: &[&str] = &[
     "rmcup",
 ];
 
-pub(super) const SAFE_XARGS_TARGETS: &[&str] = &["echo", "printf", "wc", "grep", "head", "tail"];
+pub(super) const ARGUMENT_ONLY_XARGS_TARGETS: &[&str] = &["echo", "printf"];
 
 pub(super) static COMMAND_ALLOWLIST: LazyLock<Vec<CommandConfig>> = LazyLock::new(|| {
     let mut hostname = CommandConfig::new("hostname", &[HOSTNAME]);

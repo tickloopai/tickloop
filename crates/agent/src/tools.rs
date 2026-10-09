@@ -50,6 +50,7 @@ mod write_tests;
 const DEFAULT_OUTPUT_BYTES: usize = 16 * 1024;
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 pub(crate) const TASK_OUTPUT_SUBDIRECTORY: &str = "tasks";
+pub(crate) const SCRATCHPAD_SUBDIRECTORY: &str = "scratchpad";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Workspace {
@@ -89,6 +90,8 @@ pub struct PreparedTool {
     pub is_read_only: bool,
     pub in_workspace: bool,
     pub file_change: Option<PreparedFileChange>,
+    in_session_temp: bool,
+    automatic_shell_workspace: Option<Workspace>,
     original_path: PathBuf,
     resolved_path: PathBuf,
     operation: Operation,
@@ -165,15 +168,25 @@ pub struct ExecutionContext {
 }
 
 impl PreparedTool {
-    pub(crate) fn is_supported_in_delegated_scope(&self, workspace: &Workspace) -> bool {
+    fn revalidate_automatic_shell_paths(&self) -> Result<(), ToolError> {
+        if let (Operation::Shell(input), Some(workspace)) =
+            (&self.operation, &self.automatic_shell_workspace)
+            && !input.is_allowed_with_session_temp(&self.resolved_path, workspace)
+        {
+            return Err(ToolError::PathChanged(self.resolved_path.clone()));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn is_supported_in_delegated_scope(&self) -> bool {
         match &self.operation {
             Operation::WebFetch(_) | Operation::WebSearch(_) | Operation::TaskStop(_) => true,
-            Operation::Shell(input) => {
+            Operation::Shell(_) => true,
+            _ => {
                 self.in_workspace
-                    && (input.is_read_only(&self.resolved_path, workspace)
-                        || input.is_allowed_in_accept_edits(&self.resolved_path, workspace))
+                    || self.in_session_temp
+                    || self.is_read_only && !self.requires_permission
             }
-            _ => self.in_workspace,
         }
     }
 
@@ -190,10 +203,16 @@ impl PreparedTool {
 
     /// Whether Plan mode refuses this call: it changes something and ordinarily needs approval.
     pub fn is_plan_mode_side_effect(&self) -> bool {
-        !self.is_read_only && self.requires_permission
+        match self.operation {
+            Operation::Write(_) | Operation::Shell(_) => !self.is_read_only,
+            _ => !self.is_read_only && self.requires_permission,
+        }
     }
 
     pub fn safety_check(&self) -> Option<SafetyCheck> {
+        if self.in_session_temp {
+            return None;
+        }
         match self.operation {
             Operation::Write(_) => shell::auto_edit_safety_check(&self.original_path)
                 .or_else(|| shell::auto_edit_safety_check(&self.resolved_path)),
@@ -302,10 +321,8 @@ pub struct Tools {
     output_dir: PrivateDirectory,
     /// 后台任务输出目录，照 Claude Code 位于系统临时目录下的 `<chatId>/tasks`。
     task_output_dir: PrivateDirectory,
-    /// 只读访问无需授权的内部目录，照 Claude Code `checkReadableInternalPath`
-    /// 放行项目目录（含外存的工具结果）与项目临时目录（含任务输出）。均为构造时确定的
-    /// 规范前缀，判断时不再解析它们的符号链接。
-    readable_directories: Vec<PathBuf>,
+    /// Canonical private family root, shared only with this session's children.
+    session_temp: PrivateDirectory,
     commands: shell::Registry,
     search: std::sync::Arc<tokio::sync::RwLock<Option<SearchConfig>>>,
     fetched_pages: web::FetchCache,
@@ -317,18 +334,18 @@ impl Tools {
     pub fn new(output_dir: PathBuf) -> Self {
         let output_dir = PrivateDirectory::trusted(output_dir);
         let task_output_dir = output_dir.join(TASK_OUTPUT_SUBDIRECTORY);
-        Self::for_chat(output_dir, task_output_dir, Vec::new())
+        Self::for_chat(output_dir.clone(), task_output_dir, output_dir)
     }
 
     pub(crate) fn for_chat(
         chat_directory: PrivateDirectory,
         task_output_dir: PrivateDirectory,
-        readable_directories: Vec<PathBuf>,
+        session_temp: PrivateDirectory,
     ) -> Self {
         Self {
             output_dir: chat_directory,
             task_output_dir,
-            readable_directories,
+            session_temp,
             commands: shell::Registry::new(),
             search: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
             fetched_pages: web::FetchCache::default(),
@@ -346,7 +363,18 @@ impl Tools {
         let owned_name = name.to_owned();
         let owned_input = input.clone();
         let output_dir = self.output_dir.clone();
-        let readable_directories = self.readable_directories.clone();
+        let session_temp = self.session_temp.clone();
+        session_temp
+            .create()
+            .map_err(|error| io_error(session_temp.path(), error))?;
+        session_temp
+            .join(SCRATCHPAD_SUBDIRECTORY)
+            .create()
+            .map_err(|error| io_error(session_temp.path(), error))?;
+        let readable_directories = vec![
+            self.output_dir.path().to_path_buf(),
+            session_temp.path().to_path_buf(),
+        ];
         let file_reads = self.file_reads.clone();
         let join_error_path = output_dir.path().to_path_buf();
         let mut prepared = tokio::task::spawn_blocking(move || {
@@ -355,6 +383,7 @@ impl Tools {
                 &owned_name,
                 &owned_input,
                 &readable_directories,
+                Some(session_temp.path()),
                 &file_reads,
             )?;
             if let Operation::Write(operation) = &mut prepared.operation {
@@ -376,9 +405,6 @@ impl Tools {
             path: join_error_path,
             reason: format!("tool preparation did not finish: {error}"),
         })??;
-        if prepared.requires_permission && prepared.is_read_only && self.is_readable(&prepared) {
-            prepared.requires_permission = false;
-        }
         if let Operation::TaskStop(input) = &prepared.operation {
             self.commands.stoppable_task(&input.task_id).await?;
         }
@@ -393,16 +419,6 @@ impl Tools {
             search.config = Some(config);
         }
         Ok(prepared)
-    }
-
-    fn is_readable(&self, prepared: &PreparedTool) -> bool {
-        !matches!(
-            prepared.operation,
-            Operation::WebFetch(_) | Operation::WebSearch(_) | Operation::TaskStop(_)
-        ) && self
-            .readable_directories
-            .iter()
-            .any(|directory| prepared.resolved_path.starts_with(directory))
     }
 
     pub async fn set_search(&self, config: Option<SearchConfig>) -> Result<(), ToolError> {
@@ -455,6 +471,10 @@ impl Tools {
     ) -> Result<ToolResult, ToolError> {
         shell::command_output(command, offset, limit)
     }
+    pub(crate) fn session_temp_directory(&self) -> &Path {
+        self.session_temp.path()
+    }
+
     pub(crate) fn chat_directory(&self) -> &PrivateDirectory {
         &self.output_dir
     }
@@ -470,23 +490,30 @@ impl Tools {
 
     pub(crate) async fn execute_user_shell(
         &self,
-        cwd: &Path,
-        command: String,
+        prepared: PreparedTool,
         operation_id: uuid::Uuid,
         chat_id: uuid::Uuid,
-        background: bool,
         cancel: CancellationToken,
     ) -> Result<ToolResult, ToolError> {
+        let current = prepared
+            .operation
+            .resolve_target(&prepared.original_path, prepared.is_read_only)?;
+        if current != prepared.resolved_path {
+            return Err(ToolError::PathChanged(prepared.original_path));
+        }
+        prepared.revalidate_automatic_shell_paths()?;
+        let Operation::Shell(input) = prepared.operation else {
+            return Err(ToolError::InvalidInput(
+                "user Shell needs a prepared Bash operation".into(),
+            ));
+        };
         self.commands
             .execute_user(
-                cwd,
+                &prepared.resolved_path,
+                input,
                 &self.task_output_dir,
-                shell::UserShellExecution {
-                    command,
-                    operation_id,
-                    chat_id,
-                    background,
-                },
+                operation_id,
+                chat_id,
                 cancel,
             )
             .await
@@ -573,6 +600,7 @@ impl Tools {
         }
         if let Operation::Shell(input) = &prepared.operation {
             return async {
+                prepared.revalidate_automatic_shell_paths()?;
                 if cancel.is_cancelled() {
                     return Err(ToolError::Cancelled);
                 }
@@ -727,7 +755,7 @@ pub fn prepare(
     name: &str,
     input: &Value,
 ) -> Result<PreparedTool, ToolError> {
-    prepare_with_readable_directories(workspace, name, input, &[], &FileReadState::default())
+    prepare_with_readable_directories(workspace, name, input, &[], None, &FileReadState::default())
 }
 
 type PrepareBuiltin = fn(&str, &Value) -> Result<(String, Operation, Value), ToolError>;
@@ -777,6 +805,7 @@ fn prepare_with_readable_directories(
     name: &str,
     input: &Value,
     readable_directories: &[PathBuf],
+    session_temp: Option<&Path>,
     file_reads: &FileReadState,
 ) -> Result<PreparedTool, ToolError> {
     let registration = builtin_registrations()
@@ -793,11 +822,16 @@ fn prepare_with_readable_directories(
     if let Operation::Search(request) = &mut operation {
         request.bind(&original_path, &path, &workspace.workdir)?;
     }
+    let mut automatic_shell_workspace = None;
     let is_read_only = match &mut operation {
         Operation::Write(_) => false,
         Operation::Shell(input) => {
             input.readable_directories = readable_directories.to_vec();
+            input.editable_directory = session_temp.map(Path::to_path_buf);
             let cwd = resolve_path(&original_path, true).unwrap_or_else(|_| original_path.clone());
+            if input.is_allowed_with_session_temp(&cwd, workspace) {
+                automatic_shell_workspace = Some(workspace.clone());
+            }
             input.is_read_only(&cwd, workspace)
         }
         Operation::TaskStop(_) => false,
@@ -832,7 +866,24 @@ fn prepare_with_readable_directories(
     let in_workspace = !matches!(operation, Operation::WebFetch(_) | Operation::WebSearch(_))
         && allowed(&original_scope)
         && allowed(&resolved_path);
-    let requires_permission = operation.has_permission_check() && (!in_workspace || !is_read_only);
+    let is_file_operation = matches!(
+        operation,
+        Operation::Read(_) | Operation::Write(_) | Operation::Search(_)
+    );
+    let in_session_temp = is_file_operation
+        && session_temp.is_some_and(|root| {
+            original_scope.starts_with(root) && resolved_path.starts_with(root)
+        });
+    let is_internal_read = is_read_only
+        && is_file_operation
+        && readable_directories
+            .iter()
+            .any(|root| original_scope.starts_with(root) && resolved_path.starts_with(root));
+    let requires_permission = operation.has_permission_check()
+        && !in_session_temp
+        && automatic_shell_workspace.is_none()
+        && !is_internal_read
+        && (!in_workspace || !is_read_only);
     if let Some(path_field) = operation.path_field() {
         normalized_input[path_field] = json!(resolved_path);
     }
@@ -843,6 +894,8 @@ fn prepare_with_readable_directories(
         is_read_only,
         in_workspace,
         file_change: None,
+        in_session_temp,
+        automatic_shell_workspace,
         original_path,
         resolved_path,
         operation,

@@ -18,9 +18,9 @@ use crate::{
     tools::{CommandSnapshot, SearchConfig},
 };
 
-/// Business 7.0 combines Monitor membership with required push-completion delivery and usage.
-/// Pre-push 6.0 peers are refused before dispatch; there are no minor feature gates.
-pub const PROTOCOL_MAJOR: u16 = 7;
+/// Business 8.0 identifies model-call and direct human Shell permission requests separately.
+/// Older business peers are refused before dispatch; there are no minor feature gates.
+pub const PROTOCOL_MAJOR: u16 = 8;
 pub const PROTOCOL_MINOR: u16 = 0;
 
 pub const MAX_FRAME_BYTES: usize = 128 * 1024 * 1024;

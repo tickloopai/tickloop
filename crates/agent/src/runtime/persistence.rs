@@ -2454,6 +2454,35 @@ impl Agent {
         }
         let retention = self.retain_chat(chat_id)?;
         let (path, loaded) = self.load_saved_transcript(chat_id).await?;
+        if let Some(delegation) = loaded
+            .metadata
+            .delegation
+            .as_ref()
+            .map(|entry| &entry.delegation)
+        {
+            let parent_id = delegation.parent_chat_id;
+            if parent_id == chat_id {
+                return Err(AgentError::Invalid(
+                    "delegated parent identity is invalid".into(),
+                ));
+            }
+            if !self.inner.chats.lock().await.contains_key(&parent_id) {
+                let parent_retention = self.retain_chat(parent_id)?;
+                let (parent_path, parent_loaded) = self.load_saved_transcript(parent_id).await?;
+                if parent_loaded.metadata.delegation.is_some() {
+                    return Err(AgentError::Invalid(
+                        "current parent permission authority is unavailable".into(),
+                    ));
+                }
+                self.insert_restored_chat(
+                    parent_id,
+                    parent_loaded,
+                    RestoreTarget::Resume(parent_path),
+                    parent_retention,
+                )
+                .await?;
+            }
+        }
         self.insert_restored_chat(chat_id, loaded, RestoreTarget::Resume(path), retention)
             .await
     }
@@ -2554,7 +2583,10 @@ impl Agent {
         if let Some(delegation) = &snapshot.delegation {
             snapshot.workdir = delegation.ceiling.workdir.clone();
             snapshot.additional_directories = delegation.ceiling.additional_directories.clone();
-            snapshot.policy = delegation.ceiling.policy.clone();
+            snapshot.policy = delegation
+                .ceiling
+                .policy
+                .for_delegation(delegation.parent_loop_id);
         }
         if snapshot.plans.iter().any(|plan| plan.approval_pending) {
             snapshot.policy.mode = ExecutionMode::Plan;
@@ -2624,7 +2656,7 @@ impl Agent {
         self.checkpoint_plan_approval(&snapshot)
             .await
             .map_err(AgentError::Storage)?;
-        let tools = self.create_chat_tools(chat_id, &snapshot.workdir);
+        let tools = self.create_chat_tools(&snapshot);
         let skills = crate::skills::SkillRegistry::discover(
             &snapshot.workdir,
             self.inner.user_skills_directory.as_deref(),

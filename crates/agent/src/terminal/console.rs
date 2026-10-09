@@ -13504,7 +13504,10 @@ mod tests {
                 &agent,
                 &console,
                 Some(chat),
-                &HashMap::from([(request.id, request.run_id)]),
+                &HashMap::from([(
+                    request.id,
+                    crate::terminal::WaitingPermission::new(chat, &request),
+                )]),
                 &HashMap::new(),
             )
             .await
@@ -13566,7 +13569,10 @@ mod tests {
                 &agent,
                 &console,
                 Some(chat),
-                &HashMap::from([(request.id, request.run_id)]),
+                &HashMap::from([(
+                    request.id,
+                    crate::terminal::WaitingPermission::new(chat, &request),
+                )]),
                 &HashMap::new(),
             )
             .await
@@ -13627,7 +13633,10 @@ mod tests {
                     agent,
                     console,
                     Some(chat),
-                    &HashMap::from([(request.id, request.run_id)]),
+                    &HashMap::from([(
+                        request.id,
+                        crate::terminal::WaitingPermission::new(chat, &request),
+                    )]),
                     &HashMap::new(),
                 )
                 .await

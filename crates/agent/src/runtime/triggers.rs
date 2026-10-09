@@ -471,6 +471,36 @@ impl Agent {
                 record.status = EventClaimStatus::NeedsAttention;
             }
         }
+        let mut cancelled_shells = HashSet::new();
+        for shell in &mut chat.snapshot.user_shells {
+            if shell.loop_id == Some(loop_id)
+                && (matches!(
+                    shell.state,
+                    UserShellState::Queued | UserShellState::WaitingPermission
+                ) || shell.state == UserShellState::Running && shell.pid.is_none())
+            {
+                cancelled_shells.insert(shell.id);
+                shell.armed = false;
+                shell.set_state(UserShellState::Failed);
+                shell.reason = Some("the owning Loop ended before Shell admission".into());
+                if let Some(cancel) = self
+                    .inner
+                    .user_shell_cancellations
+                    .lock()
+                    .unwrap()
+                    .remove(&(chat_id, shell.id))
+                {
+                    cancel.cancel();
+                }
+                let _ = self.inner.user_shell_events.send(shell.clone());
+            }
+        }
+        let cancelled_requests = chat.snapshot.permissions.iter().filter(|request| matches!(request.execution, PermissionExecution::UserShell { command_id } if cancelled_shells.contains(&command_id))).map(|request|request.id).collect::<Vec<_>>();
+        let mut approvals = self.inner.approvals.lock().await;
+        for request in cancelled_requests {
+            approvals.remove(&request);
+        }
+        drop(approvals);
         chat.snapshot
             .pending_inputs
             .retain(|pending| pending.receipt.loop_id != loop_id);

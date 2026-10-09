@@ -1131,6 +1131,7 @@ impl Agent {
                         execution_mode,
                         mut policy,
                         plan_file,
+                        delegated_revision,
                     ) = {
                         let chats = self.inner.chats.lock().await;
                         let chat = chats.get(&receipt.chat_id).unwrap();
@@ -1145,25 +1146,42 @@ impl Agent {
                             self.plans_directory(&chat.snapshot.workdir).path(),
                             receipt.loop_id,
                         );
-                        (
-                            chat.snapshot.policy.decide_with_plan_file(
-                                &prepared,
-                                &workspace,
-                                receipt.loop_id,
-                                session_evaluation.decision,
-                                plan_file.as_deref(),
-                            ),
+                        let decision = chat.snapshot.policy.decide_with_plan_file(
+                            &prepared,
+                            &workspace,
+                            receipt.loop_id,
+                            session_evaluation.decision,
+                            plan_file.as_deref(),
+                        );
+                        let explicit_ask =
                             chat.snapshot.policy.explicit_match_with_session(
                                 &prepared.name,
                                 &prepared.input,
                                 receipt.loop_id,
                                 session_evaluation.decision,
-                            ) == Some(crate::permissions::ExplicitPermissionDecision::Ask),
+                            ) == Some(crate::permissions::ExplicitPermissionDecision::Ask);
+                        let (decision, explicit_ask, delegated_revision) =
+                            delegation::shell_authority_decision(
+                                &chats,
+                                &*self.inner.session_permissions.lock().await,
+                                receipt,
+                                &prepared,
+                                delegation::ShellPermissionDecision {
+                                    decision,
+                                    explicit_ask,
+                                    session: session_evaluation.decision,
+                                },
+                                plan_file.as_deref(),
+                            );
+                        (
+                            decision,
+                            explicit_ask,
                             chat.snapshot.policy.revision,
                             session_evaluation,
                             chat.snapshot.policy.mode,
                             chat.snapshot.policy.clone(),
                             plan_file,
+                            delegated_revision,
                         )
                     };
                     let is_plan_mode_side_effect = execution_mode == ExecutionMode::Plan
@@ -1458,7 +1476,7 @@ impl Agent {
                             plan_file.as_deref(),
                         )
                         .map_err(ToolCallError::from)?;
-                        let chat = chats.get_mut(&receipt.chat_id).unwrap();
+                        let chat = chats.get(&receipt.chat_id).unwrap();
                         if let Err(error) =
                             self.require_working_directory_trust(&chat.snapshot.workdir)
                         {
@@ -1494,18 +1512,33 @@ impl Agent {
                             .finish(receipt.chat_id, &operation);
                             ToolCallError::denied(reason, record)
                         })?;
-                        let current_decision = chat.snapshot.policy.decide_with_plan_file(
+                        let child_decision = chat.snapshot.policy.decide_with_plan_file(
                             &prepared,
                             &workspace,
                             receipt.loop_id,
                             session_evaluation.decision,
                             plan_file.as_deref(),
                         );
+                        let (current_decision, _, current_parent_revision) =
+                            delegation::shell_authority_decision(
+                                &chats,
+                                &session_context,
+                                receipt,
+                                &prepared,
+                                delegation::ShellPermissionDecision {
+                                    decision: child_decision,
+                                    explicit_ask,
+                                    session: session_evaluation.decision,
+                                },
+                                plan_file.as_deref(),
+                            );
                         if !session_context.revalidate(
                             &session_evaluation.token,
                             permission_owner,
                             &current_session_operation,
                         ) || current_decision == Decision::Deny
+                            || (current_parent_revision != delegated_revision
+                                && current_decision != Decision::Allow)
                             || (chat.snapshot.policy.revision != policy_revision
                                 && current_decision != Decision::Allow)
                         {
@@ -1524,6 +1557,7 @@ impl Agent {
                             return Err(ToolCallError::denied(reason, record));
                         }
                         drop(session_context);
+                        let chat = chats.get_mut(&receipt.chat_id).unwrap();
                         self.admit_operation(chat, operation.id)
                             .map_err(|error| error.to_string())?;
                         let approval_path = if was_approved_by_human {

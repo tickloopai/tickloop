@@ -16,6 +16,16 @@ struct UserShellOutput {
     is_truncated: bool,
 }
 
+struct UserShellAuthorization {
+    receipt: super::Receipt,
+    owner: super::session_permissions::PermissionOwner,
+    operation: super::session_permissions::SessionPermissionOperation,
+    evaluation: super::session_permissions::SessionPermissionEvaluation,
+    parent_revision: Option<u64>,
+    policy_revision: u64,
+    explicit_ask: bool,
+}
+
 impl Agent {
     pub fn subscribe_user_shells(&self) -> broadcast::Receiver<UserShellRecord> {
         self.inner.user_shell_events.subscribe()
@@ -36,8 +46,6 @@ impl Agent {
                 "shell command cannot be empty or contain NUL".into(),
             ));
         }
-        self.check_delegated_user_shell(chat_id, loop_id, &command)
-            .await?;
         let command_id = Uuid::new_v4();
         let (tools, should_watch, record) = {
             let mut chats = self.inner.chats.lock().await;
@@ -47,6 +55,11 @@ impl Agent {
             {
                 return Err(AgentError::NotFound);
             }
+            let loop_id = if chat.snapshot.delegation.is_some() {
+                loop_id.or_else(|| chat.snapshot.loops.first().map(|goal| goal.id))
+            } else {
+                loop_id
+            };
             let mut snapshot = chat.snapshot.clone();
             snapshot.last_queue_sequence += 1;
             let record = UserShellRecord {
@@ -121,6 +134,60 @@ impl Agent {
         chat_id: ChatId,
         command_id: Uuid,
     ) -> Result<UserShellRecord, AgentError> {
+        if let Some(record) = self
+            .inner
+            .chats
+            .lock()
+            .await
+            .get(&chat_id)
+            .and_then(|chat| {
+                chat.snapshot.user_shells.iter().find(|record| {
+                    record.id == command_id && user_shell_state_is_terminal(&record.state)
+                })
+            })
+            .cloned()
+        {
+            return Ok(record);
+        }
+        if let Some(cancel) = self
+            .inner
+            .user_shell_cancellations
+            .lock()
+            .unwrap()
+            .remove(&(chat_id, command_id))
+        {
+            cancel.cancel();
+        }
+        let waiting = {
+            let mut chats = self.inner.chats.lock().await;
+            let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
+            if let Some(record) = chat.snapshot.user_shells.iter_mut().find(|record| {
+                record.id == command_id
+                    && (record.state == UserShellState::WaitingPermission
+                        || record.state == UserShellState::Running && record.pid.is_none())
+            }) {
+                record.set_state(UserShellState::Failed);
+                record.reason = Some("cancelled before Shell permission admission".into());
+                let record = record.clone();
+                let requests = chat.snapshot.permissions.iter().filter(|request| matches!(request.execution, super::PermissionExecution::UserShell { command_id: id } if id == command_id)).map(|request| request.id).collect::<Vec<_>>();
+                chat.snapshot
+                    .permissions
+                    .retain(|request| !requests.contains(&request.id));
+                let mut approvals = self.inner.approvals.lock().await;
+                for request in requests {
+                    approvals.remove(&request);
+                }
+                self.save(&chat.snapshot);
+                Some(record)
+            } else {
+                None
+            }
+        };
+        if let Some(record) = waiting {
+            let _ = self.inner.user_shell_events.send(record.clone());
+            self.start_user_shell_queue(chat_id).await?;
+            return Ok(record);
+        }
         if let Some(record) = self
             .update_queued_user_shell(chat_id, command_id, |record| {
                 record.set_state(UserShellState::Failed);
@@ -251,8 +318,12 @@ impl Agent {
         }
     }
 
-    pub(super) async fn start_user_shell_queue(&self, chat_id: ChatId) -> Result<(), AgentError> {
-        loop {
+    pub(super) fn start_user_shell_queue(
+        &self,
+        chat_id: ChatId,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AgentError>> + Send + '_>>
+    {
+        Box::pin(async move {
             let next = {
                 let mut chats = self.inner.chats.lock().await;
                 let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
@@ -286,42 +357,248 @@ impl Agent {
                         // 命令输入在结束或转入后台时与结果一起写入；此前暂存的消息先写出，保持先后顺序。
                         self.flush_deferred_messages(chat, MessageBoundary::Idle)?;
                         let record = &mut chat.snapshot.user_shells[index];
-                        record.set_state(UserShellState::Running);
-                        Some((chat.tools.clone(), record.clone()))
+                        record.set_state(UserShellState::WaitingPermission);
+                        let cancel = self.inner.shutdown.child_token();
+                        self.inner
+                            .user_shell_cancellations
+                            .lock()
+                            .unwrap()
+                            .insert((chat_id, record.id), cancel.clone());
+                        Some((chat.tools.clone(), record.clone(), cancel))
                     }
                 } else {
                     None
                 }
             };
-            let Some((tools, record)) = next else {
+            let Some((tools, record, cancel)) = next else {
                 return self.start_next_agent_run(chat_id).await;
             };
             let _ = self.inner.user_shell_events.send(record.clone());
-            if let Err(error) = self
-                .check_delegated_user_shell(chat_id, record.loop_id, &record.command)
+            let agent = self.clone();
+            self.inner.tasks.lock().await.push(tokio::spawn(async move {
+                if let Err(error) = agent
+                    .admit_user_shell(chat_id, tools, &record, cancel)
+                    .await
+                {
+                    agent
+                        .inner
+                        .user_shell_cancellations
+                        .lock()
+                        .unwrap()
+                        .remove(&(chat_id, record.id));
+                    let _ = agent
+                        .fail_user_shell(chat_id, record.id, error.to_string())
+                        .await;
+                    let _ = agent.start_user_shell_queue(chat_id).await;
+                }
+            }));
+            Ok(())
+        })
+    }
+
+    async fn admit_user_shell(
+        &self,
+        chat_id: ChatId,
+        tools: std::sync::Arc<Tools>,
+        record: &UserShellRecord,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<(), AgentError> {
+        use super::{
+            PermissionApprovalSource, PermissionExecution, PermissionRequest, Receipt,
+            session_permissions::{PermissionOwner, SessionPermissionOperation},
+        };
+        use crate::permissions::{Decision, ExplicitPermissionDecision};
+        let snapshot = self.snapshot(chat_id).await?;
+        let workspace = crate::tools::Workspace {
+            workdir: snapshot.workdir.clone(),
+            additional_directories: snapshot.additional_directories.clone(),
+        };
+        let prepared = tools.prepare(&workspace, crate::tools::BASH_TOOL_NAME, &serde_json::json!({"command":record.command,"cwd":record.cwd,"run_in_background":record.starts_in_background})).await.map_err(|error| AgentError::Invalid(error.to_string()))?;
+        let mut authorization = None;
+        if snapshot.delegation.is_some() {
+            self.refresh_project_rules(chat_id).await?;
+            let loop_id = record
+                .loop_id
+                .ok_or_else(|| AgentError::Invalid("delegated Shell requires its Loop".into()))?;
+            let receipt = Receipt {
+                chat_id,
+                loop_id,
+                run_id: Uuid::nil(),
+            };
+            self.check_delegated_call(&receipt, &prepared.name, &prepared.input, Some(&prepared))
                 .await
-            {
-                self.fail_user_shell(chat_id, record.id, error.to_string())
-                    .await?;
-                continue;
-            }
-            let result = tools
-                .execute_user_shell(
-                    &record.cwd,
-                    record.command.clone(),
-                    record.id,
-                    chat_id,
-                    record.starts_in_background,
-                    self.inner.shutdown.child_token(),
+                .map_err(AgentError::Invalid)?;
+            let owner = PermissionOwner::new(chat_id, loop_id)
+                .map_err(|error| AgentError::Invalid(error.to_string()))?;
+            let operation = SessionPermissionOperation::from_prepared(&prepared, &workspace)
+                .map_err(|error| AgentError::Invalid(error.to_string()))?;
+            let (decision, explicit_ask, parent_revision, mut policy_revision, mut evaluation) = {
+                let chats = self.inner.chats.lock().await;
+                let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
+                let sessions = self.inner.session_permissions.lock().await;
+                let evaluation = sessions.evaluate(owner, &operation);
+                let decision = chat.snapshot.policy.decide_with_session(
+                    &prepared,
+                    &workspace,
+                    loop_id,
+                    evaluation.decision,
+                );
+                let explicit = chat.snapshot.policy.explicit_match_with_session(
+                    &prepared.name,
+                    &prepared.input,
+                    loop_id,
+                    evaluation.decision,
+                ) == Some(ExplicitPermissionDecision::Ask);
+                let (decision, explicit, revision) = super::delegation::shell_authority_decision(
+                    &chats,
+                    &sessions,
+                    &receipt,
+                    &prepared,
+                    super::delegation::ShellPermissionDecision {
+                        decision,
+                        explicit_ask: explicit,
+                        session: evaluation.decision,
+                    },
+                    None,
+                );
+                (
+                    decision,
+                    explicit,
+                    revision,
+                    chat.snapshot.policy.revision,
+                    evaluation,
                 )
-                .await;
-            if let Err(error) = result {
-                self.fail_user_shell(chat_id, record.id, error.to_string())
-                    .await?;
-                continue;
+            };
+            let decision = if explicit_ask
+                && decision == Decision::Ask
+                && self.inner.host_options.prompt_policy == super::PromptPolicy::Unrestricted
+            {
+                Decision::Ask
+            } else {
+                self.apply_prompt_policy(decision)
+            };
+            if decision == Decision::Deny {
+                return Err(AgentError::Invalid(
+                    "delegated permission authority denies this Shell".into(),
+                ));
             }
-            return Ok(());
+            if decision != Decision::Allow {
+                let request = PermissionRequest {
+                    id: Uuid::new_v4(),
+                    loop_id,
+                    execution: PermissionExecution::UserShell {
+                        command_id: record.id,
+                    },
+                    name: prepared.name.clone(),
+                    input: prepared.input.clone(),
+                    file_change: None,
+                    approval_source: if explicit_ask {
+                        PermissionApprovalSource::ExplicitAsk
+                    } else {
+                        PermissionApprovalSource::PermissionPolicy
+                    },
+                    approval_reason: Some(
+                        "the inherited Shell permission authority requires approval".into(),
+                    ),
+                };
+                let answer = self
+                    .wait_for_permission(chat_id, request, operation.clone(), cancel.clone())
+                    .await
+                    .map_err(AgentError::Invalid)?;
+                if !answer.allow {
+                    return Err(AgentError::Invalid(
+                        "permission denied; user Shell was not executed".into(),
+                    ));
+                }
+                policy_revision = answer.revision;
+                evaluation = self
+                    .inner
+                    .session_permissions
+                    .lock()
+                    .await
+                    .evaluate(owner, &operation);
+            }
+            authorization = Some(UserShellAuthorization {
+                receipt,
+                owner,
+                operation,
+                evaluation,
+                parent_revision,
+                policy_revision,
+                explicit_ask,
+            });
+            self.refresh_project_rules(chat_id).await?;
         }
+        {
+            let mut chats = self.inner.chats.lock().await;
+            let sessions = self.inner.session_permissions.lock().await;
+            if let Some(authority) = &authorization {
+                let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
+                super::delegation::check_call(
+                    &chats,
+                    &sessions,
+                    &authority.receipt,
+                    &prepared.name,
+                    &prepared.input,
+                    Some(&prepared),
+                    None,
+                )
+                .map_err(AgentError::Invalid)?;
+                let own = chat.snapshot.policy.decide_with_session(
+                    &prepared,
+                    &workspace,
+                    authority.receipt.loop_id,
+                    authority.evaluation.decision,
+                );
+                let (current, _, revision) = super::delegation::shell_authority_decision(
+                    &chats,
+                    &sessions,
+                    &authority.receipt,
+                    &prepared,
+                    super::delegation::ShellPermissionDecision {
+                        decision: own,
+                        explicit_ask: authority.explicit_ask,
+                        session: authority.evaluation.decision,
+                    },
+                    None,
+                );
+                if current == Decision::Deny
+                    || !sessions.revalidate(
+                        &authority.evaluation.token,
+                        authority.owner,
+                        &authority.operation,
+                    )
+                    || ((revision != authority.parent_revision
+                        || chat.snapshot.policy.revision != authority.policy_revision)
+                        && current != Decision::Allow)
+                {
+                    return Err(AgentError::Invalid(
+                        "Shell permission authority changed before dispatch".into(),
+                    ));
+                }
+            }
+            let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
+            let current = chat
+                .snapshot
+                .user_shells
+                .iter_mut()
+                .find(|shell| shell.id == record.id)
+                .ok_or(AgentError::NotFound)?;
+            if cancel.is_cancelled() || current.state != UserShellState::WaitingPermission {
+                return Err(AgentError::Invalid(
+                    "user Shell was cancelled before dispatch".into(),
+                ));
+            }
+            current.set_state(UserShellState::Running);
+            let update = current.clone();
+            self.save(&chat.snapshot);
+            let _ = self.inner.user_shell_events.send(update);
+        }
+        tools
+            .execute_user_shell(prepared, record.id, chat_id, cancel)
+            .await
+            .map_err(|error| AgentError::Invalid(error.to_string()))?;
+        Ok(())
     }
 
     pub(super) async fn start_next_agent_run(&self, chat_id: ChatId) -> Result<(), AgentError> {
@@ -437,6 +714,11 @@ impl Agent {
         if !user_shell_state_is_terminal(&current.state) {
             return Ok(false);
         }
+        self.inner
+            .user_shell_cancellations
+            .lock()
+            .unwrap()
+            .remove(&(current.chat_id, current.id));
         if was_announced_as_background || command.was_background {
             if !was_announced_as_background {
                 self.append_foreground_shell_messages(chat, [input, announcement])?;
@@ -490,6 +772,9 @@ impl Agent {
             .iter_mut()
             .find(|record| record.id == command_id)
             .ok_or(AgentError::NotFound)?;
+        if user_shell_state_is_terminal(&record.state) {
+            return Ok(());
+        }
         record.set_state(UserShellState::Failed);
         record.reason = Some(reason.clone());
         let record = record.clone();
@@ -571,7 +856,9 @@ fn record_to_command_snapshot(record: &UserShellRecord) -> Option<UserCommandSna
         cwd: record.cwd.clone(),
         pid: record.pid,
         state: match record.state {
-            UserShellState::Queued | UserShellState::Running => CommandState::Running,
+            UserShellState::Queued
+            | UserShellState::WaitingPermission
+            | UserShellState::Running => CommandState::Running,
             UserShellState::Background => CommandState::Background,
             UserShellState::Cancelling => CommandState::Cancelling,
             UserShellState::Completed => CommandState::Completed,

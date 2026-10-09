@@ -78,7 +78,9 @@ impl MessageGroups {
                 self.replies.entry(run).or_default().1 = true;
                 format!("tool:{call_id}")
             }
-            EventKind::PermissionRequested { request } => format!("tool:{}", request.call_id),
+            EventKind::PermissionRequested { request } => {
+                format!("tool:{}", request.execution.call_key())
+            }
             EventKind::QuestionAsked { request } => format!("question:{}", request.id),
             EventKind::PlanUpdated { plan } => format!("plan:{}:{}", plan.loop_id, plan.version),
             EventKind::ProgressUpdated { progress } => format!("progress:{}", progress.loop_id),
@@ -1533,8 +1535,10 @@ mod tests {
                 request: PermissionRequest {
                     id: Uuid::new_v4(),
                     loop_id: Uuid::nil(),
-                    run_id: run,
-                    call_id: "read-one".into(),
+                    execution: crate::runtime::PermissionExecution::ToolCall {
+                        run_id: run,
+                        call_id: "read-one".into(),
+                    },
                     name: "Read".into(),
                     input: json!({"file_path":"notes"}),
                     file_change: None,
@@ -2056,8 +2060,10 @@ mod tests {
         snapshot.permissions.push(PermissionRequest {
             id: Uuid::new_v4(),
             loop_id,
-            run_id,
-            call_id: "call-2".into(),
+            execution: crate::runtime::PermissionExecution::ToolCall {
+                run_id,
+                call_id: "call-2".into(),
+            },
             name: "Bash".into(),
             input: json!({"command":"ls"}),
             file_change: None,
@@ -2141,8 +2147,10 @@ mod tests {
         let request = PermissionRequest {
             id: Uuid::new_v4(),
             loop_id: Uuid::new_v4(),
-            run_id: Uuid::new_v4(),
-            call_id: "write".into(),
+            execution: crate::runtime::PermissionExecution::ToolCall {
+                run_id: Uuid::new_v4(),
+                call_id: "write".into(),
+            },
             name: "Write".into(),
             input: json!({"file_path":path,"content":"new content"}),
             approval_reason: None,
@@ -2661,8 +2669,10 @@ mod tests {
         let request = PermissionRequest {
             id: Uuid::new_v4(),
             loop_id: Uuid::new_v4(),
-            run_id: Uuid::new_v4(),
-            call_id: "read".into(),
+            execution: crate::runtime::PermissionExecution::ToolCall {
+                run_id: Uuid::new_v4(),
+                call_id: "read".into(),
+            },
             name: "Read".into(),
             input: json!({"file_path":"/outside/notes.md","offset":3}),
             file_change: None,
@@ -2680,8 +2690,10 @@ mod tests {
         let mut request = PermissionRequest {
             id: Uuid::new_v4(),
             loop_id: Uuid::new_v4(),
-            run_id: Uuid::new_v4(),
-            call_id: "call".into(),
+            execution: crate::runtime::PermissionExecution::ToolCall {
+                run_id: Uuid::new_v4(),
+                call_id: "call".into(),
+            },
             name: "Bash".into(),
             input: json!({"command":command,"cwd":"/work\u{1b}[2J"}),
             file_change: None,
@@ -2701,16 +2713,15 @@ mod tests {
     }
 
     #[test]
-    fn permission_context_names_safety_checks_including_legacy_host_policy_requests() {
+    fn permission_context_names_the_current_safety_check_source() {
         let request: PermissionRequest = serde_json::from_value(json!({
             "id": Uuid::new_v4(),
             "loop_id": Uuid::new_v4(),
-            "run_id": Uuid::new_v4(),
-            "call_id": "call",
+            "execution": {"ToolCall":{"run_id":Uuid::new_v4(),"call_id":"call"}},
             "name": "Bash",
             "input": {"command":"cat ~/.ssh/id_pub"},
             "approval_reason": "credential access requires human approval",
-            "approval_source": "host_policy"
+            "approval_source": "safety_check"
         }))
         .unwrap();
 
