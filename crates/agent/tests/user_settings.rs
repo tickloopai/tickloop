@@ -9,7 +9,8 @@ use tickloop_agent::{
     model::ModelConfig,
     output_style::OutputStyle,
     permissions::{Decision, PermissionRule, PermissionScope, permission_rule_candidates},
-    runtime::{Agent, ChatId, EventKind, ModelChange},
+    protocol::ChatId,
+    runtime::{Agent, EventKind, ModelChange},
     settings::{DisplayPreferences, GlyphSet, UserSettings},
 };
 use tokio::sync::Barrier;

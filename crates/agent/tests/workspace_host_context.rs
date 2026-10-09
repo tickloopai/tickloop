@@ -20,9 +20,10 @@ use tickloop_agent::{
     },
     model::{
         Content, ModelClient, ModelDelta, ModelError, ModelIdentity, ModelOutput, ModelRequest,
-        Role, ToolDefinition,
+        Role,
     },
     native_host::NativeHostToolProvider,
+    protocol::ToolDefinition,
     runtime::{Agent, EventKind},
     skills::SkillSource,
     tools::ToolResult,

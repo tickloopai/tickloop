@@ -7,8 +7,8 @@ use std::path::PathBuf;
 
 use uuid::Uuid;
 
-use super::ChatId;
 use crate::model::{Content, Message, Role};
+use crate::protocol::ChatId;
 
 pub const INTERRUPT_MESSAGE: &str = "[Request interrupted by user]";
 pub const INTERRUPT_MESSAGE_FOR_TOOL_USE: &str = "[Request interrupted by user for tool use]";

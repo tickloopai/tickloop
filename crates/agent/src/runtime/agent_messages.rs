@@ -1,7 +1,7 @@
 use serde_json::{Value, json};
 
 use super::*;
-use crate::{model::ToolDefinition, tools::ToolResult};
+use crate::{protocol::ToolDefinition, tools::ToolResult};
 
 pub const SEND_AGENT_MESSAGE_TOOL_NAME: &str = "SendMessage";
 pub const LIST_SUBAGENTS_TOOL_NAME: &str = "ListSubagents";

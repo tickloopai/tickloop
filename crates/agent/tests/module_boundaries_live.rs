@@ -3,7 +3,8 @@ use std::{path::Path, time::Duration};
 use tickloop_agent::{
     model::{ModelConfig, cards::ModelCatalog, model_client},
     permissions::{Decision, ExecutionMode, PermissionRule},
-    runtime::{Agent, ChatId, EventKind, RequestKind, RequestOutcome},
+    protocol::ChatId,
+    runtime::{Agent, EventKind, RequestKind, RequestOutcome},
 };
 
 const LIVE_TIMEOUT: Duration = Duration::from_secs(240);

@@ -58,23 +58,34 @@ pub enum TickGlyph {
     Terminal,
 }
 
-pub use crate::terminal::tick_actions::{
-    PreparedTickAction, TickActionBackend, TickActionContext, TickActionExecutor,
-    TickActionOutcome, TickActionUi, TickConfirmationView, TickDetailKey, TickDetailLine,
-    TickDetailView,
-};
-#[derive(Clone)]
-pub enum MonitorOperation {
-    Execute(Arc<dyn TickActionExecutor>),
+/// What a Monitor row action means, as plain data. Adapters only describe it; the Console carries
+/// it out with its own state, such as the selected Chat, the row and any panel it opens.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TickIntent {
+    /// Shows a notice instead of acting.
     Notify(String),
-}
-impl std::fmt::Debug for MonitorOperation {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Execute(_) => f.write_str("AdapterAction"),
-            Self::Notify(message) => f.debug_tuple("Notify").field(message).finish(),
-        }
-    }
+    ShowDetails(InstanceRef),
+    /// Hides the row in this Chat only and keeps every other fact.
+    RemoveFromMonitor(InstanceRef),
+    OpenHosted(InstanceRef),
+    ShowHostedSnapshot(InstanceRef),
+    /// Ends a hosted Tick; the Console asks for confirmation first.
+    CloseHosted(InstanceRef),
+    /// Starts a new instance in place of a lost hosted Tick; the Console asks for confirmation
+    /// first.
+    ReopenHosted(InstanceRef),
+    OpenShell {
+        task: Uuid,
+    },
+    /// An Artifact row action on instance `id`: open, remove, copy or feedback by its key.
+    Artifact {
+        id: String,
+        key: char,
+    },
+    RefreshArtifacts,
+    OpenSubscription {
+        id: Uuid,
+    },
 }
 
 /// Who controls an instance's lifecycle, as far as this Chat can verify it.
@@ -106,11 +117,11 @@ pub struct TickResources {
     pub rss_bytes: Option<u64>,
     pub sampled_at_ms: u64,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MonitorAction {
     pub key: char,
     pub label: &'static str,
-    pub operation: MonitorOperation,
+    pub intent: TickIntent,
 }
 #[derive(Clone, Debug)]
 pub struct TickDescriptor {
@@ -171,7 +182,8 @@ pub trait TickAdapter: Send + Sync + 'static {
         member_descriptor(member)
     }
     fn stream(&self) -> Option<Arc<dyn TickStreamPort>>;
-    fn refresh_action(&self) -> Option<Arc<dyn TickActionExecutor>> {
+    /// What the Monitor refresh key also reloads for this adapter's rows.
+    fn refresh_intent(&self) -> Option<TickIntent> {
         None
     }
 }
@@ -196,9 +208,7 @@ pub fn member_descriptor(member: &MonitorMember) -> TickDescriptor {
             MonitorAction {
                 key: MONITOR_ENTER_KEY,
                 label: "details",
-                operation: MonitorOperation::Execute(
-                    crate::terminal::tick_actions::builtin::details(member.instance.clone()),
-                ),
+                intent: TickIntent::ShowDetails(member.instance.clone()),
             },
             remove_from_monitor(&member.instance),
         ],
@@ -210,9 +220,7 @@ pub fn remove_from_monitor(instance: &InstanceRef) -> MonitorAction {
     MonitorAction {
         key: 'x',
         label: "remove",
-        operation: MonitorOperation::Execute(crate::terminal::tick_actions::builtin::remove(
-            instance.clone(),
-        )),
+        intent: TickIntent::RemoveFromMonitor(instance.clone()),
     }
 }
 
@@ -335,10 +343,10 @@ impl TickAdapters {
     ) -> Result<tick_connect::page::Page<TickDescriptor>, tick_connect::page::PageError> {
         page_of(self.list(context), cursor, limit)
     }
-    pub(crate) fn refresh_actions(&self) -> Vec<Arc<dyn TickActionExecutor>> {
+    pub fn refresh_intents(&self) -> Vec<TickIntent> {
         self.adapters
             .values()
-            .filter_map(|adapter| adapter.refresh_action())
+            .filter_map(|adapter| adapter.refresh_intent())
             .collect()
     }
 }

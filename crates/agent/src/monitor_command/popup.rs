@@ -7,7 +7,7 @@ use std::{
 };
 
 use crate::hosted::popup::{HerdrSession, PLUGIN_ID, PopupPlugin};
-use crate::settings::UserSettings;
+use crate::settings::{UserSettings, config_root_directory};
 
 const INSTALL_PROMPT: &str = "This registers Tick Loop's popup plugin in the given Herdr session; no Herdr or Tick service is started, stopped or replaced. Install? [y/N]";
 const REMOVE_PROMPT: &str = "This removes Tick Loop's popup plugin tickloop.monitor from the given Herdr session and sets monitorPopup to disabled; Enter in Monitor then opens Ticks full screen in the current terminal, and running Ticks keep running. Remove? [y/N]";
@@ -20,7 +20,7 @@ pub(super) enum PopupChange {
 }
 
 pub(super) async fn run(change: PopupChange, herdr_socket: &Path) -> Result<(), String> {
-    let root = crate::terminal::config_root_directory()
+    let root = config_root_directory()
         .ok_or("cannot find the Tick Loop state directory; set TICKLOOP_CONFIG_DIR")?;
     let plugin = PopupPlugin::for_this_executable(&root)?;
     let herdr = HerdrSession::verify(herdr_socket).await?;

@@ -3,9 +3,9 @@ use std::sync::Arc;
 use support::*;
 use tickloop_agent::permissions::{Decision, PermissionRule};
 use tickloop_agent::runtime::{
-    ASK_USER_QUESTION_TOOL_NAME, Agent, EventKind, LoopState, QuestionAnswer, Trigger,
-    TriggerSource,
+    Agent, EventKind, LoopState, QuestionAnswer, Trigger, TriggerSource,
 };
+use tickloop_agent::tools::ASK_USER_QUESTION_TOOL_NAME;
 use uuid::Uuid;
 
 #[tokio::test]

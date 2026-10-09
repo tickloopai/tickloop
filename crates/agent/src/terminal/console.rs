@@ -1177,7 +1177,7 @@ impl Console {
         &self,
         chat: Uuid,
         instance: String,
-        action: Arc<dyn crate::tick_adapter::TickActionExecutor>,
+        action: Arc<dyn super::tick_actions::TickActionExecutor>,
         message: &str,
     ) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
@@ -9667,25 +9667,24 @@ impl State {
                             KeyCode::Char(key) => key,
                             _ => unreachable!(),
                         };
-                        let action = entry
+                        let intent = &entry
                             .actions
                             .iter()
-                            .find(|action| action.key == action_key)?;
-                        match &action.operation {
-                            crate::tick_adapter::MonitorOperation::Execute(executor) => {
-                                let chat = self.chat?;
-                                match executor
-                                    .prepare(&mut super::tick_actions::TickActionUi { state: self })
-                                {
-                                    Ok(action) => {
-                                        return Some(InputEvent::TickAction { chat, action });
-                                    }
-                                    Err(error) => self.hold_status(&error),
-                                }
+                            .find(|action| action.key == action_key)?
+                            .intent;
+                        if let crate::tick_adapter::TickIntent::Notify(message) = intent {
+                            self.hold_status(message);
+                            return None;
+                        }
+                        let chat = self.chat?;
+                        let executor = super::tick_actions::builtin::executor(intent)?;
+                        match executor
+                            .prepare(&mut super::tick_actions::TickActionUi { state: self })
+                        {
+                            Ok(action) => {
+                                return Some(InputEvent::TickAction { chat, action });
                             }
-                            crate::tick_adapter::MonitorOperation::Notify(message) => {
-                                self.hold_status(message)
-                            }
+                            Err(error) => self.hold_status(&error),
                         }
                     }
                 }
@@ -13504,7 +13503,7 @@ mod tests {
     #[tokio::test]
     async fn the_question_dialog_answers_every_question_through_menu_keys() {
         use crate::terminal::menus::Menus;
-        use tickloop_agent::{model::Content, runtime::ASK_USER_QUESTION_TOOL_NAME};
+        use tickloop_agent::{model::Content, tools::ASK_USER_QUESTION_TOOL_NAME};
 
         let directory = tempfile::tempdir().unwrap();
         let model = Arc::new(support::ScriptedModel::new(vec![
@@ -13836,7 +13835,7 @@ mod tests {
     #[tokio::test]
     async fn the_enter_plan_mode_dialog_declines_on_escape_and_enters_on_confirmation() {
         use crate::terminal::menus::Menus;
-        use tickloop_agent::runtime::ENTER_PLAN_MODE_TOOL_NAME;
+        use tickloop_agent::tools::ENTER_PLAN_MODE_TOOL_NAME;
 
         let directory = tempfile::tempdir().unwrap();
         let enter = |id| support::call(id, ENTER_PLAN_MODE_TOOL_NAME, serde_json::json!({}));

@@ -181,7 +181,7 @@ async fn selected_jev_configuration_failure_falls_back_to_the_conversation_model
         .apply_permission_change(
             chat,
             PermissionChange::SelectReviewer {
-                reviewer: tickloop_agent::runtime::AutoReviewerPreference::Jev,
+                reviewer: tickloop_agent::settings::AutoReviewerPreference::Jev,
             },
             view.revision,
         )

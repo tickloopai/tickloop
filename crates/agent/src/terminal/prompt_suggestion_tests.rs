@@ -9,7 +9,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use super::model_http_support as http;
+use crate::model::model_http_support as http;
 
 fn request() -> SuggestionRequest {
     SuggestionRequest {

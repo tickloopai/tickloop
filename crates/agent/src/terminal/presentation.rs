@@ -4,12 +4,13 @@ use uuid::Uuid;
 use serde_json::Value;
 use tickloop_agent::{
     runtime::{
-        ASK_USER_QUESTION_TOOL_NAME, ChatSnapshot, Event, EventKind, LocalMessage,
-        PermissionApprovalSource, PermissionRequest, TODO_WRITE_TOOL_NAME, TickDeliveryLine,
+        ChatSnapshot, Event, EventKind, LocalMessage, PermissionApprovalSource, PermissionRequest,
+        TickDeliveryLine,
     },
     tools::{
-        BASH_TOOL_NAME, CommandState, EDIT_TOOL_NAME, TASK_STOP_TOOL_NAME, ToolResult,
-        WEB_FETCH_TOOL_NAME, WEB_SEARCH_TOOL_NAME, WRITE_TOOL_NAME,
+        ASK_USER_QUESTION_TOOL_NAME, BASH_TOOL_NAME, CommandState, EDIT_TOOL_NAME,
+        TASK_STOP_TOOL_NAME, TODO_WRITE_TOOL_NAME, ToolResult, WEB_FETCH_TOOL_NAME,
+        WEB_SEARCH_TOOL_NAME, WRITE_TOOL_NAME,
     },
 };
 use tickloop_ui::markdown;
@@ -872,7 +873,7 @@ fn tool_summary(name: &str, input: &Value) -> String {
                 .join(" · ");
             Some(asked_questions.as_str())
         }
-        crate::runtime::START_GOAL_TOOL_NAME => input["goal"].as_str(),
+        crate::tools::START_GOAL_TOOL_NAME => input["goal"].as_str(),
         "Read" | "Write" | "Edit" => input["file_path"].as_str(),
         _ => input["path"].as_str(),
     };

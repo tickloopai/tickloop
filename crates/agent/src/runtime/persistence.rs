@@ -17,8 +17,8 @@ use uuid::Uuid;
 
 use super::denials::{ApprovalRecord, DenialRecord, DenialWindow, MAX_RECENT_DENIALS};
 use super::{
-    Agent, AgentError, BranchOrigin, Chat, ChatId, ChatSnapshot, InputContext, LocalMessage,
-    LoopId, LoopSnapshot, LoopState, RunId, SummaryDirection, TodoItem, ToolCallRecovery, Trigger,
+    Agent, AgentError, BranchOrigin, Chat, ChatSnapshot, InputContext, LocalMessage, LoopId,
+    LoopSnapshot, LoopState, RunId, SummaryDirection, TodoItem, ToolCallRecovery, Trigger,
     compaction::{
         CompactBoundary, CompactTrigger, CompactionLayout, CompactionMarker, MessageSource,
         SummarizeMetadata,
@@ -28,6 +28,7 @@ use crate::file_history::{FileHistory, FileHistorySnapshot};
 use crate::model::{Content, Message, PrivateHistorySource, Role, Usage};
 use crate::permissions::ExecutionMode;
 use crate::private_fs::unix_time_milliseconds;
+use crate::protocol::ChatId;
 use crate::transcript::{
     ArtifactTicksEntry, BranchOriginEntry, COMPACT_BOUNDARY_SUBTYPE, CachedMetadata, ChainEntry,
     CompactMetadata, CompactTriggerEntry, ContentReplacementEntry, ContentReplacementRecord,
@@ -2103,7 +2104,7 @@ impl Agent {
     pub(super) async fn checkpoint_connection(
         &self,
         snapshot: &ChatSnapshot,
-        directory: crate::transcript::PrivateDirectory,
+        directory: crate::private_fs::PrivateDirectory,
         loop_id: LoopId,
     ) -> Result<(), String> {
         let Some(recorder) = &self.inner.recorder else {

@@ -12,14 +12,12 @@ use support::{ScriptedModel, call, config, next_event, text, transcript_file};
 use tickloop_agent::{
     cleanup::cleanup_old_message_files_in_background,
     host_tools::{HostToolPermission, HostToolProvider},
-    model::{
-        ModelClient, ModelDelta, ModelError, ModelIdentity, ModelOutput, ModelRequest,
-        ToolDefinition,
-    },
+    model::{ModelClient, ModelDelta, ModelError, ModelIdentity, ModelOutput, ModelRequest},
     permissions::{Decision, ExecutionMode, PermissionRule, PermissionScope},
+    protocol::{ChatId, ToolDefinition},
     runtime::{
         Agent, AgentHostOptions, ApprovalPath, ApprovalResult, AutoBlockKind, BranchRequest,
-        ChatId, DenialCategory, DenialPersistence, EventKind, LoopState, PermissionApprovalSource,
+        DenialCategory, DenialPersistence, EventKind, LoopState, PermissionApprovalSource,
         PromptPolicy, RewindMode,
     },
     tools::ToolResult,

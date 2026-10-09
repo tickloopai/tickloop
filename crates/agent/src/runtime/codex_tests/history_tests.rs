@@ -9,15 +9,15 @@ use tokio::{
 use tokio_tungstenite::accept_async;
 use uuid::Uuid;
 
-use super::{
-    CodexModelClient,
-    tests::{
-        function_call_stream, reply_stream, send_ws_stream, serve_scripted_responses,
-        state_with_credentials, text_stream,
-    },
-};
 use crate::{
-    model::{Content, HttpModelClient, ModelClient, ModelConfig, cards::ModelCatalog},
+    model::{
+        Content, HttpModelClient, ModelClient, ModelConfig,
+        cards::ModelCatalog,
+        codex_test_support::{
+            LoopbackCodexClient, function_call_stream, reply_stream, send_ws_stream,
+            serve_scripted_responses, state_with_credentials, text_stream,
+        },
+    },
     permissions::ExecutionMode,
     runtime::{
         Agent, BranchRequest, Event, EventKind, LoopState, RequestKind, RewindMode, Trigger,
@@ -32,12 +32,7 @@ fn config() -> ModelConfig {
 }
 
 fn client(state: &Path, endpoint: &reqwest::Url) -> Arc<dyn ModelClient> {
-    crate::model::fixture_client(Arc::new(
-        CodexModelClient::new(config(), state)
-            .unwrap()
-            .with_loopback_test_endpoint(endpoint.as_str())
-            .unwrap(),
-    ))
+    LoopbackCodexClient::new(config(), state, endpoint.as_str()).into_fixture_client()
 }
 
 async fn completed(events: &mut broadcast::Receiver<Event>) {
@@ -396,7 +391,7 @@ async fn new_process_restores_transcript_with_full_history_and_no_previous_conne
     let output = tokio::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
-            "model::codex::history_tests::recovery_child",
+            "runtime::codex_tests::history_tests::recovery_child",
             "--nocapture",
         ])
         .env("TICKLOOP_TEST_CODEX_HISTORY_ROOT", &state)
@@ -530,13 +525,9 @@ async fn websocket_history_survives_compaction_branch_and_compatible_rewind() {
             ))
             .unwrap();
     });
-    let client = crate::model::fixture_client(Arc::new(
-        CodexModelClient::new(config(), &state)
-            .unwrap()
-            .with_loopback_test_endpoint(endpoint.as_str())
-            .unwrap()
-            .with_loopback_test_websocket(),
-    ));
+    let client = LoopbackCodexClient::new(config(), &state, endpoint.as_str())
+        .with_websocket()
+        .into_fixture_client();
     let agent = Agent::open_embedded(state.clone(), config(), client).unwrap();
     let source = agent.create_chat(state.clone()).await.unwrap();
     agent

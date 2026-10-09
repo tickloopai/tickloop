@@ -2,12 +2,16 @@ use std::path::PathBuf;
 
 use uuid::Uuid;
 
-use super::auto_rules::{AutoPolicy, AutoRuleChange, AutoRuleSettings};
+use super::auto_rules::AutoPolicy;
 use crate::model::credentials::ApiKeyStatus;
 use crate::permissions::{Decision, ExecutionMode, PermissionRule, is_supported_rule_content};
-use crate::settings::{AutoReviewerPreference, AutoSettings, AutoSettingsRevision, SettingsError};
+use crate::settings::{
+    AutoReviewerPreference, AutoRuleChange, AutoRuleSettings, AutoSettings, AutoSettingsRevision,
+    SettingsError,
+};
 
-use super::{Agent, AgentError, AutoReviewerHealth, ChatId, ChatSnapshot};
+use super::{Agent, AgentError, AutoReviewerHealth, ChatSnapshot};
+use crate::protocol::ChatId;
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PermissionsRevision {

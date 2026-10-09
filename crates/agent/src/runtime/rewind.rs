@@ -14,15 +14,17 @@ use uuid::Uuid;
 
 use super::loop_lease::RunStateChange;
 use super::{
-    Agent, AgentError, Chat, ChatId, ChatSnapshot, Event, EventKind, InputContext, LoopId,
-    LoopSnapshot, LoopState, RunId, UserShellState,
+    Agent, AgentError, Chat, ChatSnapshot, Event, EventKind, InputContext, LoopId, LoopSnapshot,
+    LoopState, RunId, UserShellState,
 };
 use crate::file_history::{
     FileHistoryError, FileHistorySnapshot, FileRestoreReport, create_first_backup,
 };
 use crate::model::{Content, Message};
 use crate::permissions::ExecutionMode;
-use crate::transcript::{PrivateDirectory, private_project_temp_directory};
+use crate::private_fs::PrivateDirectory;
+use crate::protocol::ChatId;
+use crate::transcript::private_project_temp_directory;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum RewindMode {

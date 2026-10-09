@@ -5,48 +5,34 @@ use super::super::{
     tick_shell::{TickShell, TickShellKey},
 };
 use super::*;
-use crate::tick_adapter::{HOSTED_CLOSE_KEY, HOSTED_REOPEN_KEY};
+use crate::tick_adapter::{HOSTED_CLOSE_KEY, HOSTED_REOPEN_KEY, TickIntent};
 
-pub(crate) fn artifact(id: &str, key: char) -> Arc<dyn TickActionExecutor> {
+/// The Console executor that carries out an adapter's intent. A notice has none: the Console only
+/// shows it.
+pub(in crate::terminal) fn executor(intent: &TickIntent) -> Option<Arc<dyn TickActionExecutor>> {
+    let executor: Arc<dyn TickActionExecutor> = match intent.clone() {
+        TickIntent::Notify(_) => return None,
+        TickIntent::ShowDetails(instance) => Arc::new(DetailsOpen { instance }),
+        TickIntent::RemoveFromMonitor(instance) => Arc::new(RemoveFromMonitor { instance }),
+        TickIntent::OpenHosted(instance) => Arc::new(OpenHosted { instance }),
+        TickIntent::ShowHostedSnapshot(instance) => Arc::new(SnapshotHosted { instance }),
+        TickIntent::CloseHosted(instance) => Arc::new(CloseHosted {
+            instance,
+            is_confirmed: false,
+        }),
+        TickIntent::ReopenHosted(instance) => Arc::new(ReopenHosted {
+            instance,
+            is_confirmed: false,
+        }),
+        TickIntent::OpenShell { task } => Arc::new(ShellOpen { task }),
+        TickIntent::Artifact { id, key } => artifact(&id, key),
+        TickIntent::RefreshArtifacts => artifact("", 'r'),
+        TickIntent::OpenSubscription { id } => Arc::new(SubscriptionAction { id }),
+    };
+    Some(executor)
+}
+pub(in crate::terminal) fn artifact(id: &str, key: char) -> Arc<dyn TickActionExecutor> {
     Arc::new(ArtifactAction { id: id.into(), key })
-}
-pub(crate) fn subscription(id: &str) -> Arc<dyn TickActionExecutor> {
-    Arc::new(SubscriptionAction { id: id.into() })
-}
-pub(crate) fn details(instance: crate::tick_stream::InstanceRef) -> Arc<dyn TickActionExecutor> {
-    Arc::new(DetailsOpen { instance })
-}
-pub(crate) fn remove(instance: crate::tick_stream::InstanceRef) -> Arc<dyn TickActionExecutor> {
-    Arc::new(RemoveFromMonitor { instance })
-}
-pub(crate) fn close_hosted(
-    instance: crate::tick_stream::InstanceRef,
-) -> Arc<dyn TickActionExecutor> {
-    Arc::new(CloseHosted {
-        instance,
-        is_confirmed: false,
-    })
-}
-pub(crate) fn reopen_hosted(
-    instance: crate::tick_stream::InstanceRef,
-) -> Arc<dyn TickActionExecutor> {
-    Arc::new(ReopenHosted {
-        instance,
-        is_confirmed: false,
-    })
-}
-/// Enter on a hosted Tick opens it at once: inside Herdr in Tick Loop's Herdr popup, otherwise
-/// full screen in this View's terminal. Either view shows the same process and Esc closes it.
-pub(crate) fn open_hosted(
-    instance: crate::tick_stream::InstanceRef,
-) -> Arc<dyn TickActionExecutor> {
-    Arc::new(OpenHosted { instance })
-}
-/// The text snapshot detail of a hosted Tick.
-pub(crate) fn snapshot_hosted(
-    instance: crate::tick_stream::InstanceRef,
-) -> Arc<dyn TickActionExecutor> {
-    Arc::new(SnapshotHosted { instance })
 }
 pub(in super::super) fn load_hosted_snapshot(
     instance: crate::tick_stream::InstanceRef,
@@ -58,11 +44,11 @@ pub(in super::super) fn load_hosted_snapshot(
         Arc::new(LoadHostedSnapshot { instance, panel }),
     )
 }
-pub(crate) fn shell(task: Uuid) -> Arc<dyn TickActionExecutor> {
-    Arc::new(ShellOpen { task })
-}
-pub(crate) fn refresh(actions: Vec<Arc<dyn TickActionExecutor>>) -> Arc<dyn TickActionExecutor> {
-    Arc::new(Refresh { actions })
+/// Reloads everything the adapters' refresh intents name, in one action.
+pub(in crate::terminal) fn refresh(intents: &[TickIntent]) -> Arc<dyn TickActionExecutor> {
+    Arc::new(Refresh {
+        actions: intents.iter().filter_map(executor).collect(),
+    })
 }
 struct ArtifactAction {
     id: String,
@@ -99,30 +85,27 @@ impl TickActionBackend for ArtifactAction {
     }
 }
 struct SubscriptionAction {
-    id: String,
+    id: Uuid,
 }
 impl TickActionExecutor for SubscriptionAction {
     fn prepare(&self, _ui: &mut TickActionUi<'_>) -> Result<PreparedTickAction, String> {
         Ok(PreparedTickAction::new(
-            &self.id,
+            self.id.to_string(),
             'o',
-            Arc::new(SubscriptionAction {
-                id: self.id.clone(),
-            }),
+            Arc::new(SubscriptionAction { id: self.id }),
         ))
     }
 }
 #[async_trait]
 impl TickActionBackend for SubscriptionAction {
     async fn execute(&self, ctx: TickActionContext<'_>) -> Result<TickActionOutcome, String> {
-        let id = Uuid::parse_str(&self.id).map_err(|error| error.to_string())?;
         let rows = ctx
             .agent
             .tick_subscriptions(ctx.chat)
             .await
             .map_err(|error| error.to_string())?;
         ctx.console
-            .show_subscriptions_at(ctx.chat, rows, id, false)?;
+            .show_subscriptions_at(ctx.chat, rows, self.id, false)?;
         Ok(TickActionOutcome::Done)
     }
 }
@@ -145,6 +128,8 @@ impl TickActionExecutor for DetailsOpen {
         ))
     }
 }
+/// Enter on a hosted Tick opens it at once: inside Herdr in Tick Loop's Herdr popup, otherwise
+/// full screen in this View's terminal. Either view shows the same process and Esc closes it.
 struct OpenHosted {
     instance: crate::tick_stream::InstanceRef,
 }

@@ -25,15 +25,13 @@ use sha2::{Digest, Sha256};
 
 use super::{Agent, AgentError, ChatSnapshot, Receipt};
 use crate::model::{Content, Message, Role, ToolResultContent};
-use crate::private_fs::PRIVATE_FILE_MODE;
+use crate::private_fs::{PRIVATE_FILE_MODE, PrivateDirectory};
 use crate::tools::{
     BASH_TOOL_NAME, GREP_TOOL_NAME, PERSISTED_OUTPUT_TAG, PREVIEW_LABEL, READ_TOOL_NAME,
     SAVED_TO_LABEL, TASK_OUTPUT_SUBDIRECTORY, ToolResult, Tools, large_output_message,
     utf16_length,
 };
-use crate::transcript::{
-    ContentReplacementRecord, PrivateDirectory, private_family_temp_directory,
-};
+use crate::transcript::{ContentReplacementRecord, private_family_temp_directory};
 
 /// Chat 目录中大工具结果的子目录；过期清理按同一布局查找。
 pub(crate) const TOOL_RESULTS_SUBDIRECTORY: &str = "tool-results";

@@ -9,7 +9,8 @@ use async_trait::async_trait;
 use serde_json::json;
 use tickloop_agent::{
     model::{Content, ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest, Role, Usage},
-    runtime::{ASK_USER_QUESTION_TOOL_NAME, Agent, Event, EventKind, QuestionAnswer},
+    runtime::{Agent, Event, EventKind, QuestionAnswer},
+    tools::ASK_USER_QUESTION_TOOL_NAME,
 };
 use tokio::sync::{broadcast, mpsc::UnboundedSender};
 use tokio_util::sync::CancellationToken;

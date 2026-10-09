@@ -11,9 +11,9 @@ use tokio::sync::{Mutex, broadcast};
 use uuid::Uuid;
 
 use super::{
-    Agent, AgentError, ChatId, ChatSnapshot, Event, EventKind, LoopId, UserShellRecord,
-    UserShellState,
+    Agent, AgentError, ChatSnapshot, Event, EventKind, LoopId, UserShellRecord, UserShellState,
 };
+use crate::protocol::ChatId;
 use crate::tools::{CommandSnapshot, CommandState, ToolResult};
 
 pub const SHELL_TASK_OUTPUT_MAX_BYTES: usize = 65_536;

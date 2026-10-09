@@ -6,7 +6,8 @@ use support::*;
 use tickloop_agent::{
     model::Content,
     permissions::{Decision, PermissionRule},
-    runtime::{ASK_USER_QUESTION_TOOL_NAME, Agent, EventKind, LoopState, QuestionAnswer},
+    runtime::{Agent, EventKind, LoopState, QuestionAnswer},
+    tools::ASK_USER_QUESTION_TOOL_NAME,
 };
 use uuid::Uuid;
 

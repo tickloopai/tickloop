@@ -5,9 +5,9 @@ use support::*;
 use tickloop_agent::{
     model::Content,
     permissions::{ExecutionMode, PermissionScope},
-    runtime::{
-        Agent, ChatId, EXIT_PLAN_MODE_TOOL_NAME, Event, EventKind, PermissionRequest, Receipt,
-    },
+    protocol::ChatId,
+    runtime::{Agent, Event, EventKind, PermissionRequest, Receipt},
+    tools::EXIT_PLAN_MODE_TOOL_NAME,
 };
 use tokio::sync::broadcast::Receiver;
 

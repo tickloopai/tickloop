@@ -19,9 +19,10 @@ use tickloop_agent::{
     runtime::{
         Agent, AgentHostOptions, ApprovalAssessmentDetails, ApprovalFailureKind,
         ApprovalFallbackReason, ApprovalOutcome, ApprovalReviewerKind, AutoBlockKind,
-        AutoReviewerHealth, AutoReviewerNotice, AutoRuleChange, AutoRuleKind, DirectoryTrustPolicy,
-        Event, EventKind, PermissionChange, PromptPolicy,
+        AutoReviewerHealth, AutoReviewerNotice, DirectoryTrustPolicy, Event, EventKind,
+        PermissionChange, PromptPolicy,
     },
+    settings::{AutoRuleChange, AutoRuleKind},
 };
 use tokio::sync::{broadcast, mpsc::UnboundedSender};
 use tokio_util::sync::CancellationToken;

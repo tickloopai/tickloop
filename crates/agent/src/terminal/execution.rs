@@ -636,7 +636,7 @@ impl ConsoleExecution {
                                 )
                         })
                         && !snapshot.permissions.iter().any(|request| {
-                            request.name == runtime::EXIT_PLAN_MODE_TOOL_NAME
+                            request.name == crate::tools::EXIT_PLAN_MODE_TOOL_NAME
                                 && request.loop_id == plan.loop_id
                         })
                 })
@@ -3668,8 +3668,8 @@ mod tests {
     use super::*;
     use crate::{
         host_tools::{HostCallContext, HostToolPermission, HostToolProvider, PreparedHostCall},
-        model::ToolDefinition,
         protocol::TRANSPORT_LIMITS,
+        protocol::ToolDefinition,
         terminal::test_support as support,
     };
     use async_trait::async_trait;

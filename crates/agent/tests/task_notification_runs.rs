@@ -14,7 +14,8 @@ use tickloop_agent::{
         Content, ModelClient, ModelDelta, ModelError, ModelIdentity, ModelOutput, ModelRequest,
         Protocol, Role, Usage,
     },
-    runtime::{Agent, ChatId, ChatSnapshot, Event, EventKind, LoopState},
+    protocol::ChatId,
+    runtime::{Agent, ChatSnapshot, Event, EventKind, LoopState},
 };
 use tokio::sync::{broadcast, mpsc::UnboundedSender};
 use tokio_util::sync::CancellationToken;

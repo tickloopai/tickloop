@@ -19,8 +19,9 @@ use tickloop_agent::{
     },
     permissions::ExecutionMode,
     permissions::PermissionScope,
+    protocol::ChatId,
     runtime::{
-        Agent, ChatId, Event, EventKind, InputContext, RewindPoint, RunId, TextContext, Trigger,
+        Agent, Event, EventKind, InputContext, RewindPoint, RunId, TextContext, Trigger,
         TriggerSource, UserShellState,
     },
 };

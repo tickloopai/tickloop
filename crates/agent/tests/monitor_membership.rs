@@ -8,11 +8,11 @@ use tickloop_agent::{
     host_tools::{
         HostCallResult, HostEffect, HostToolPermission, HostToolProvider, PreparedHostCall,
     },
-    model::ToolDefinition,
-    runtime::{Agent, ChatId, EventKind, MonitorMemberSource},
+    protocol::{ChatId, ToolDefinition},
+    runtime::{Agent, EventKind, MonitorMemberSource},
     tick_adapter::{
-        MonitorAction, MonitorContext, MonitorOperation, TickAdapter, TickAdapters, TickDescriptor,
-        TickGlyph, TickGroup, TickOwner,
+        MonitorAction, MonitorContext, TickAdapter, TickAdapters, TickDescriptor, TickGlyph,
+        TickGroup, TickIntent, TickOwner,
     },
     tick_stream::{InMemoryTickStream, InstanceRef, TickStreamPort},
     tools::ToolResult,
@@ -90,7 +90,7 @@ impl TickAdapter for CalendarAdapter {
                 actions: vec![MonitorAction {
                     key: 'o',
                     label: "open",
-                    operation: MonitorOperation::Notify("opened".into()),
+                    intent: TickIntent::Notify("opened".into()),
                 }],
             })
             .collect()
@@ -515,21 +515,43 @@ async fn hosted_members_show_their_probed_state_and_sample_and_offer_close() {
     assert!(!ended.running);
     assert_eq!(ended.status, "gone");
     assert_eq!(ended.resources, None);
-    for row in [live, ended] {
-        let keys = row
-            .actions
-            .iter()
-            .map(|action| action.key)
-            .collect::<String>();
-        assert_eq!(keys, "osxc", "open, snapshot, remove and close");
-    }
+    let hosted_actions = |instance: &InstanceRef| {
+        vec![
+            MonitorAction {
+                key: 'o',
+                label: "open",
+                intent: TickIntent::OpenHosted(instance.clone()),
+            },
+            MonitorAction {
+                key: 's',
+                label: "snapshot",
+                intent: TickIntent::ShowHostedSnapshot(instance.clone()),
+            },
+            MonitorAction {
+                key: 'x',
+                label: "remove",
+                intent: TickIntent::RemoveFromMonitor(instance.clone()),
+            },
+            MonitorAction {
+                key: 'c',
+                label: "close",
+                intent: TickIntent::CloseHosted(instance.clone()),
+            },
+        ]
+    };
+    assert_eq!(live.actions, hosted_actions(&running));
+    assert_eq!(ended.actions, hosted_actions(&gone));
     let recoverable = row(&lost);
     assert_eq!(recoverable.status, "lost");
-    let keys = recoverable
-        .actions
-        .iter()
-        .map(|action| action.key)
-        .collect::<String>();
-    assert_eq!(keys, "osxcn", "a lost Tick can also be reopened as new");
+    let mut reopenable = hosted_actions(&lost);
+    reopenable.push(MonitorAction {
+        key: 'n',
+        label: "reopen as new",
+        intent: TickIntent::ReopenHosted(lost.clone()),
+    });
+    assert_eq!(
+        recoverable.actions, reopenable,
+        "a lost Tick can also be reopened as new"
+    );
     agent.shutdown().await;
 }

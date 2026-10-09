@@ -16,9 +16,10 @@ use tickloop_agent::{
         Content, Message, ModelClient, ModelDelta, ModelError, ModelIdentity, ModelOutput,
         ModelRequest, Protocol, Role, Usage,
     },
+    protocol::ChatId,
     runtime::{
-        Agent, BranchRequest, ChatId, ChatSnapshot, DirectedSummaryRequest, EventKind, LoopId,
-        LoopState, Receipt, RewindMode, SummaryDirection, Trigger,
+        Agent, BranchRequest, ChatSnapshot, DirectedSummaryRequest, EventKind, LoopId, LoopState,
+        Receipt, RewindMode, SummaryDirection, Trigger,
     },
 };
 use tokio::sync::mpsc::UnboundedSender;

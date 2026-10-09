@@ -4,14 +4,15 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    Agent, AgentError, ChatId, ChatSnapshot, Event, EventKind, LedgerError, ProtocolFailure,
-    Receipt, RequestFailure, RequestKind, RequestOutcome, RequestOwner, RequestSequence,
-    RequestUsageLedger, ResponseRejection, UsageCounter,
+    Agent, AgentError, ChatSnapshot, Event, EventKind, LedgerError, ProtocolFailure, Receipt,
+    RequestFailure, RequestKind, RequestOutcome, RequestOwner, RequestSequence, RequestUsageLedger,
+    ResponseRejection, UsageCounter,
 };
 use crate::model::{
     Content, Message, ModelClient, ModelDelta, ModelError, ModelFailureKind, ModelIdentity,
     ModelOutput, ModelRequest, ModelRequestContext, ModelResponseRejection, Role,
 };
+use crate::protocol::ChatId;
 
 const MODEL_DELTA_FLUSH_INTERVAL: Duration = Duration::from_millis(16);
 const MODEL_DELTA_BATCH_COUNT: usize = 256;

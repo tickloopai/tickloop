@@ -2,9 +2,10 @@ use super::style::{Role, RoleLine};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tickloop_agent::runtime::{
     ApprovalAttemptOutcome, ApprovalFailureKind, ApprovalFallbackReason, ApprovalHistoryView,
-    ApprovalPath, ApprovalRecord, ApprovalResult, ApprovalReviewerKind, AutoReviewerPreference,
-    DenialCategory, DenialPersistence, PermissionApprovalSource,
+    ApprovalPath, ApprovalRecord, ApprovalResult, ApprovalReviewerKind, DenialCategory,
+    DenialPersistence, PermissionApprovalSource,
 };
+use tickloop_agent::settings::AutoReviewerPreference;
 use unicode_width::UnicodeWidthChar;
 use uuid::Uuid;
 

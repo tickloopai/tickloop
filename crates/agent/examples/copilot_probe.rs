@@ -10,12 +10,13 @@ use serde_json::{Value, json};
 use tickloop_agent::{
     auth::copilot::CopilotAuth,
     model::{
-        Content, Message, ModelRequest, Role, StructuredOutput, ToolDefinition,
+        Content, Message, ModelRequest, Role, StructuredOutput,
         access::AccessCatalog,
         cards::ModelCatalog,
         copilot::{CLIENT_HEADERS, COPILOT_API_URL, GITHUB_API_VERSION},
         model_client,
     },
+    protocol::ToolDefinition,
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;

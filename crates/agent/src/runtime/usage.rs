@@ -2,8 +2,9 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use super::{ChatId, LoopId, RunId};
+use super::{LoopId, RunId};
 use crate::model::{ModelIdentity, Protocol, Usage};
+use crate::protocol::ChatId;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]

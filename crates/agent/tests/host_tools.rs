@@ -7,11 +7,11 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use tickloop_agent::{
     host_tools::{HostCallResult, HostToolPermission, HostToolProvider, PreparedHostCall},
-    model::ToolDefinition,
     permissions::{Decision, ExecutionMode, PermissionRule},
+    protocol::{ChatId, ToolDefinition},
     runtime::{
-        Agent, AgentHostOptions, ChatId, EventKind, LoopState, OperationState,
-        PermissionApprovalSource, PromptPolicy,
+        Agent, AgentHostOptions, EventKind, LoopState, OperationState, PermissionApprovalSource,
+        PromptPolicy,
     },
     tools::ToolResult,
 };

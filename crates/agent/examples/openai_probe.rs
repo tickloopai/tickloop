@@ -5,9 +5,10 @@ use std::{error::Error, os::unix::fs::PermissionsExt, path::PathBuf};
 
 use serde_json::json;
 use tickloop_agent::model::{
-    Content, Message, ModelRequest, ReasoningEffort, Role, StructuredOutput, ToolDefinition,
-    cards::ModelCatalog, model_client,
+    Content, Message, ModelRequest, ReasoningEffort, Role, StructuredOutput, cards::ModelCatalog,
+    model_client,
 };
+use tickloop_agent::protocol::ToolDefinition;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 

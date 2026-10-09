@@ -7,11 +7,12 @@ use support::*;
 use tickloop_agent::{
     model::Content,
     permissions::{Decision, ExecutionMode, PermissionRule},
+    protocol::ChatId,
     runtime::{
-        Agent, BranchRequest, ChatId, ChatSnapshot, EXIT_PLAN_MODE_TOOL_NAME, EventKind, LoopId,
-        LoopState, RewindMode, TODO_WRITE_TOOL_NAME, TodoItem, TodoStatus,
+        Agent, BranchRequest, ChatSnapshot, EventKind, LoopId, LoopState, RewindMode, TodoItem,
+        TodoStatus,
     },
-    tools::ToolResult,
+    tools::{EXIT_PLAN_MODE_TOOL_NAME, TODO_WRITE_TOOL_NAME, ToolResult},
 };
 use uuid::Uuid;
 

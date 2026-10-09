@@ -5,11 +5,12 @@ use tickloop_agent::{
     image::ImageMediaType,
     model::{
         Content, ImageSource, Message, ModelConfig, ModelDelta, ModelError, ModelRequest,
-        ReasoningEffort, Role, StructuredOutput, ToolDefinition, Usage,
+        ReasoningEffort, Role, StructuredOutput, Usage,
         cards::{ModelCatalog, built_in_model_profiles},
         credentials::save_api_key,
         model_client,
     },
+    protocol::ToolDefinition,
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;

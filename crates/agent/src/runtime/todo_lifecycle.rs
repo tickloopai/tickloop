@@ -2,7 +2,8 @@ use std::{collections::hash_map::Entry, sync::Arc, time::Duration};
 
 use tokio::time::Instant;
 
-use super::{Agent, Chat, ChatId, EventKind, LoopId, Progress, Receipt, TodoItem, TodoStatus};
+use super::{Agent, Chat, EventKind, LoopId, Progress, Receipt, TodoItem, TodoStatus};
+use crate::protocol::ChatId;
 
 const TODO_COMPLETION_GRACE: Duration = Duration::from_secs(5);
 

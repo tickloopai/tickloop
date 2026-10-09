@@ -11,12 +11,11 @@ use tickloop_agent::{
     host_tools::{HostToolPermission, HostToolProvider},
     model::{
         ModelClient, ModelDelta, ModelError, ModelIdentity, ModelOutput, ModelProvider,
-        ModelRequest, Protocol, ToolDefinition, Usage,
+        ModelRequest, Protocol, Usage,
     },
     permissions::{Decision, ExecutionMode, PermissionRule},
-    runtime::{
-        Agent, ChatId, DenialCategory, EventKind, PermissionApprovalSource, PermissionChange,
-    },
+    protocol::{ChatId, ToolDefinition},
+    runtime::{Agent, DenialCategory, EventKind, PermissionApprovalSource, PermissionChange},
     tools::ToolResult,
 };
 use tokio::sync::{Notify, mpsc::UnboundedSender};

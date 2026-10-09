@@ -5,11 +5,10 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use super::approval_assessment::{ApprovalAssessmentDetails, ApprovalReviewer};
-use super::{
-    Agent, AgentError, ChatId, LoopId, OperationRecord, PermissionApprovalSource, Receipt, RunId,
-};
+use super::{Agent, AgentError, LoopId, OperationRecord, PermissionApprovalSource, Receipt, RunId};
 use crate::permissions::{Decision, PermissionPolicy, PermissionRule, permission_rule_content};
 use crate::private_fs::unix_time_milliseconds;
+use crate::protocol::ChatId;
 use crate::tools::{BASH_TOOL_NAME, WEB_FETCH_TOOL_NAME};
 
 pub const MAX_RECENT_DENIALS: usize = 100;
@@ -57,7 +56,7 @@ pub struct DenialRuleSummary {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DenialAutoRuleSummary {
     pub id: String,
-    pub kind: super::AutoRuleKind,
+    pub kind: crate::settings::AutoRuleKind,
     pub source: super::AutoRuleSource,
     pub text: DisplaySummary,
 }
@@ -71,7 +70,7 @@ pub struct DenialAutoFinding {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DenialReviewFacts {
-    pub preferred_reviewer: Option<super::AutoReviewerPreference>,
+    pub preferred_reviewer: Option<crate::settings::AutoReviewerPreference>,
     pub reviewer: Option<ApprovalReviewer>,
     pub auto_settings_revision: Option<String>,
     pub context_version: String,

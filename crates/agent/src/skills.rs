@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::ToolDefinition;
+use crate::protocol::ToolDefinition;
 
 pub const TICKLOOP_SKILL: &str = include_str!("../skills/tickloop/SKILL.md");
 pub const ARTIFACT_SERVICE_SKILL: &str = include_str!("../skills/artifact-service/SKILL.md");

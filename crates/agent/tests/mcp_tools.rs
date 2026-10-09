@@ -19,9 +19,9 @@ use tickloop_agent::{
     mcp_tools::McpHostToolProvider,
     model::{
         Content, ModelClient, ModelDelta, ModelError, ModelIdentity, ModelOutput, ModelRequest,
-        ToolDefinition,
     },
     permissions::ExecutionMode,
+    protocol::ToolDefinition,
     runtime::{Agent, EventKind, LoopState, OperationState},
     tools::ToolResult,
 };
@@ -3861,7 +3861,7 @@ async fn model_tool_inventory_keeps_native_artifact_shell_and_herdr_names() {
     }
 }
 
-async fn wait_for_completion(agent: &Agent, chat: tickloop_agent::runtime::ChatId) {
+async fn wait_for_completion(agent: &Agent, chat: tickloop_agent::protocol::ChatId) {
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         while !agent
             .snapshot(chat)
@@ -4090,7 +4090,7 @@ async fn changed_complete_directory_rejects_prepared_write() {
     let provider = McpHostToolProvider::new(artifact, None);
     provider.refresh(CancellationToken::new()).await.unwrap();
     let name = "mcp__artifacts__artifact_publish";
-    let chat_id = tickloop_agent::runtime::ChatId::new_v4();
+    let chat_id = tickloop_agent::protocol::ChatId::new_v4();
     let prepared = provider
         .prepare_call(
             chat_id,
@@ -4189,7 +4189,7 @@ impl HostToolProvider for NativeFixture {
 
     async fn prepare_call_in_context(
         &self,
-        chat_id: tickloop_agent::runtime::ChatId,
+        chat_id: tickloop_agent::protocol::ChatId,
         context: &HostCallContext,
         name: &str,
         input: &Value,
@@ -4215,7 +4215,7 @@ impl HostToolProvider for NativeFixture {
 
     fn permission(
         &self,
-        _: tickloop_agent::runtime::ChatId,
+        _: tickloop_agent::protocol::ChatId,
         _: &str,
         _: &Value,
     ) -> HostToolPermission {
@@ -4224,7 +4224,7 @@ impl HostToolProvider for NativeFixture {
 
     async fn execute(
         &self,
-        _: tickloop_agent::runtime::ChatId,
+        _: tickloop_agent::protocol::ChatId,
         _: &str,
         _: Value,
         _: CancellationToken,
@@ -5324,7 +5324,7 @@ async fn connection36_check_does_not_adopt_a_publication_only_association() {
 
 async fn connection36_permission(
     agent: &Agent,
-    chat: tickloop_agent::runtime::ChatId,
+    chat: tickloop_agent::protocol::ChatId,
     events: &mut tokio::sync::broadcast::Receiver<tickloop_agent::runtime::Event>,
 ) {
     let permission = tokio::time::timeout(std::time::Duration::from_secs(10), async {
@@ -6058,7 +6058,7 @@ impl HostToolProvider for AssociationRefusal {
     }
     fn permission(
         &self,
-        chat: tickloop_agent::runtime::ChatId,
+        chat: tickloop_agent::protocol::ChatId,
         name: &str,
         input: &Value,
     ) -> HostToolPermission {
@@ -6069,7 +6069,7 @@ impl HostToolProvider for AssociationRefusal {
     }
     async fn prepare_call(
         &self,
-        chat: tickloop_agent::runtime::ChatId,
+        chat: tickloop_agent::protocol::ChatId,
         name: &str,
         input: &Value,
         cancel: CancellationToken,
@@ -6078,7 +6078,7 @@ impl HostToolProvider for AssociationRefusal {
     }
     async fn revalidate_call(
         &self,
-        chat: tickloop_agent::runtime::ChatId,
+        chat: tickloop_agent::protocol::ChatId,
         call: &tickloop_agent::host_tools::PreparedHostCall,
         cancel: CancellationToken,
     ) -> Result<(), String> {
@@ -6086,7 +6086,7 @@ impl HostToolProvider for AssociationRefusal {
     }
     async fn execute_prepared(
         &self,
-        chat: tickloop_agent::runtime::ChatId,
+        chat: tickloop_agent::protocol::ChatId,
         call: tickloop_agent::host_tools::PreparedHostCall,
         cancel: CancellationToken,
     ) -> tickloop_agent::host_tools::HostCallResult {
@@ -6094,7 +6094,7 @@ impl HostToolProvider for AssociationRefusal {
     }
     async fn execute(
         &self,
-        chat: tickloop_agent::runtime::ChatId,
+        chat: tickloop_agent::protocol::ChatId,
         name: &str,
         input: Value,
         cancel: CancellationToken,
@@ -6660,7 +6660,7 @@ async fn changed_attachment_mapping_is_rejected_before_dispatch() {
     login(&account).await;
     let provider = McpHostToolProvider::new(account, None);
     provider.refresh(CancellationToken::new()).await.unwrap();
-    let chat = tickloop_agent::runtime::ChatId::new_v4();
+    let chat = tickloop_agent::protocol::ChatId::new_v4();
     let prepared = provider
         .prepare_call(
             chat,

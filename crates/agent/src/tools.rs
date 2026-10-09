@@ -11,9 +11,8 @@ use crate::file_change::{
     ARTIFACT_DIRECTORY, FileChangeArtifactError, PreparedFileChange, persist_file_change_review,
 };
 use crate::image::{Image, ImageError};
-use crate::model::ToolDefinition;
-use crate::private_fs::{OpenTarget, open_without_following_links};
-use crate::transcript::PrivateDirectory;
+use crate::private_fs::{OpenTarget, PrivateDirectory, open_without_following_links};
+use crate::protocol::ToolDefinition;
 
 mod persisted_output;
 #[cfg(test)]
@@ -78,18 +77,26 @@ pub struct SafetyCheck {
     pub classifier_approvable: bool,
 }
 
+// The runtime implements these tools itself; their names live here so that Auto's allowlist
+// names them without depending on the runtime.
+pub const ENTER_PLAN_MODE_TOOL_NAME: &str = "EnterPlanMode";
+pub const EXIT_PLAN_MODE_TOOL_NAME: &str = "ExitPlanMode";
+pub const TODO_WRITE_TOOL_NAME: &str = "TodoWrite";
+pub const START_GOAL_TOOL_NAME: &str = "StartGoal";
+pub const ASK_USER_QUESTION_TOOL_NAME: &str = "AskUserQuestion";
+
 /// Tools Auto admits without the classifier, mapped from Claude Code's
 /// `SAFE_YOLO_ALLOWLISTED_TOOLS`.
 pub const AUTO_ALLOWLISTED_TOOLS: [&str; 9] = [
     READ_TOOL_NAME,
     GLOB_TOOL_NAME,
     GREP_TOOL_NAME,
-    crate::runtime::ENTER_PLAN_MODE_TOOL_NAME,
-    crate::runtime::EXIT_PLAN_MODE_TOOL_NAME,
-    crate::runtime::TODO_WRITE_TOOL_NAME,
-    crate::runtime::START_GOAL_TOOL_NAME,
+    ENTER_PLAN_MODE_TOOL_NAME,
+    EXIT_PLAN_MODE_TOOL_NAME,
+    TODO_WRITE_TOOL_NAME,
+    START_GOAL_TOOL_NAME,
     TASK_STOP_TOOL_NAME,
-    crate::runtime::ASK_USER_QUESTION_TOOL_NAME,
+    ASK_USER_QUESTION_TOOL_NAME,
 ];
 
 #[derive(Clone, Debug)]

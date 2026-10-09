@@ -8,9 +8,10 @@ use tickloop_agent::{
     image::{ImageMediaType, prepare},
     model::{Content, ImageSource, InputModality, Message, ModelConfig, ModelRequest},
     permissions::{Decision, PermissionRule},
+    protocol::ChatId,
     runtime::{
-        Agent, AgentError, BranchRequest, ChatId, EventKind, ImageContext, ImageOrigin,
-        InputContext, ModelChange, RewindMode,
+        Agent, AgentError, BranchRequest, EventKind, ImageContext, ImageOrigin, InputContext,
+        ModelChange, RewindMode,
     },
 };
 use uuid::Uuid;

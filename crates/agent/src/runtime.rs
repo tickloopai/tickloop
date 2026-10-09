@@ -5,8 +5,7 @@ mod auto_health;
 mod auto_mode;
 pub(crate) mod auto_rules;
 pub use auto_rules::{
-    AutoEnvironment, AutoEnvironmentSource, AutoPolicy, AutoRule, AutoRuleChange,
-    AutoRuleGroupSettings, AutoRuleKind, AutoRuleSettings, AutoRuleSource,
+    AutoEnvironment, AutoEnvironmentSource, AutoPolicy, AutoRule, AutoRuleSource,
 };
 mod auto_settings;
 mod branch;
@@ -70,6 +69,8 @@ pub use local_messages::{
 mod chat_settings;
 pub(crate) use chat_settings::new_chat_settings;
 #[cfg(test)]
+mod codex_tests;
+#[cfg(test)]
 mod file_read_tests;
 mod recovery;
 #[cfg(test)]
@@ -89,10 +90,7 @@ pub(crate) use tool_results::TOOL_RESULTS_SUBDIRECTORY;
 mod user_shell;
 #[cfg(test)]
 mod user_shell_tests;
-pub use interaction::{
-    ASK_USER_QUESTION_TOOL_NAME, Question, QuestionAnswer, QuestionOption, QuestionRequest,
-    START_GOAL_TOOL_NAME,
-};
+pub use interaction::{Question, QuestionAnswer, QuestionOption, QuestionRequest};
 mod commands;
 mod tick_content;
 mod tick_subscriptions;
@@ -106,7 +104,6 @@ pub use triggers::{Trigger, TriggerSource};
 mod permission_management;
 mod plan;
 mod todo_lifecycle;
-pub use crate::settings::{AutoReviewerPreference, AutoSettingsRevision};
 pub(crate) use auto_settings::jev_key_status_in;
 pub use branch::{
     BranchCreation, BranchOrigin, BranchOutcome, BranchPublicItem, BranchPublicSource,
@@ -126,13 +123,10 @@ pub use permission_management::{
     PermissionRuleView, PermissionsRevision, PermissionsView,
 };
 pub(crate) use permission_management::{canonical_directory, rule_views, validate_rule};
-pub use plan::{
-    ENTER_PLAN_MODE_TOOL_NAME, EXIT_PLAN_MODE_TOOL_NAME, Plan, Progress, TODO_WRITE_TOOL_NAME,
-    TodoItem, TodoStatus,
-};
 pub(crate) use plan::{
     MAX_PLAN_SLUG_BYTES, PLAN_FILE_EXTENSION, PLANS_DIRECTORY, is_valid_plan_slug, plan_file_slug,
 };
+pub use plan::{Plan, Progress, TodoItem, TodoStatus};
 pub use rewind::{CodeRewind, RewindDraft, RewindMode, RewindOutcome, RewindPoint};
 pub(crate) use shell_task_center::recover_shell_update_time;
 pub use shell_task_center::{
@@ -167,6 +161,7 @@ use crate::permissions::{
     Decision, ExecutionMode, PermissionPolicy, PermissionRule, PermissionScope,
     SessionPermissionDecision,
 };
+use crate::protocol::ChatId;
 pub use session_permissions::SessionPermissionDenial;
 use session_permissions::{PermissionOwner, SessionPermissionOperation, WorkspaceScope};
 
@@ -175,7 +170,6 @@ const MAX_OUTPUT_LIMIT_CONTINUATIONS: usize = 3;
 const OUTPUT_LIMIT_CONTINUATION_PROMPT: &str = "Output token limit hit. Continue directly from the unfinished response without repeating or summarizing it. Break the remaining work into smaller pieces.";
 const SHELL_STATE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 
-pub type ChatId = Uuid;
 pub type LoopId = Uuid;
 pub type RunId = Uuid;
 pub use agent_messages::{
@@ -1423,7 +1417,7 @@ impl Drop for Inner {
 }
 
 impl Agent {
-    fn tool_definitions(&self, chat: &Chat) -> Vec<crate::model::ToolDefinition> {
+    fn tool_definitions(&self, chat: &Chat) -> Vec<crate::protocol::ToolDefinition> {
         ToolRegistry::for_chat(
             chat,
             self.inner.host_tools.read().unwrap().clone(),
@@ -1615,7 +1609,7 @@ impl Agent {
         let has_isolated_reviewer = configured_reviewer.is_some();
         let has_judgment_adapter = self.inner.judgment.lock().await.is_some();
         let llm_client = configured_reviewer.unwrap_or(chat_client);
-        let use_jev = preferred == AutoReviewerPreference::Jev
+        let use_jev = preferred == crate::settings::AutoReviewerPreference::Jev
             || (has_judgment_adapter && !has_isolated_reviewer);
         let assess = |run: auto_approval::ReviewerRun,
                       fallback_from: Option<ApprovalReviewerKind>,
@@ -4285,7 +4279,8 @@ impl Agent {
             let chats = self.inner.chats.lock().await;
             if chats.get(&chat_id).is_some_and(|chat| {
                 chat.snapshot.permissions.iter().any(|request| {
-                    request.id == request_id && request.name == EXIT_PLAN_MODE_TOOL_NAME
+                    request.id == request_id
+                        && request.name == crate::tools::EXIT_PLAN_MODE_TOOL_NAME
                 })
             }) {
                 return Err(AgentError::Invalid(

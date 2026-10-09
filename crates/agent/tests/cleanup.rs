@@ -984,7 +984,7 @@ fn file_with(path: &Path, content: &str, age: Duration) -> PathBuf {
     path.to_path_buf()
 }
 
-async fn complete(agent: &Agent, chat: tickloop_agent::runtime::ChatId, prompt: &str) {
+async fn complete(agent: &Agent, chat: tickloop_agent::protocol::ChatId, prompt: &str) {
     let mut events = agent.subscribe();
     let receipt = agent.submit(chat, None, prompt.into()).await.unwrap();
     loop {

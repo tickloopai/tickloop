@@ -11,7 +11,8 @@ use tickloop_agent::{
         Content, ImageSource, InputModality, ModelConfig, ModelRequest, ToolResultBlock,
         ToolResultContent,
     },
-    runtime::{Agent, ChatId, EventKind},
+    protocol::ChatId,
+    runtime::{Agent, EventKind},
     tools::ToolResult,
 };
 

@@ -25,7 +25,7 @@ use super::{
     DEFAULT_OUTPUT_BYTES, Operation, ToolDefinition, ToolError, ToolResult, io_error,
     open_existing, read::semantic_integer, write::semantic_boolean,
 };
-use crate::transcript::PrivateDirectory;
+use crate::private_fs::PrivateDirectory;
 
 mod command_tables;
 mod interpreter;

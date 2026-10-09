@@ -6,13 +6,14 @@ use tickloop_agent::{
     image::ImageMediaType,
     model::{
         Content, ImageSource, Message, ModelConfig, ModelRequest, ReasoningEffort, Role,
-        StructuredOutput, ToolDefinition,
+        StructuredOutput,
         access::AccessCatalog,
         availability::{AccountModelDiscovery, ModelAvailability},
         cards::{Adapter, ModelCatalog, ProviderPatch, ThinkingControl, built_in_model_profiles},
         credentials::{load_api_key, save_api_key},
         model_client, validate_reasoning_effort,
     },
+    protocol::ToolDefinition,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},

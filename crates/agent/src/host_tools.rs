@@ -5,7 +5,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::{model::ToolDefinition, runtime::ChatId, tools::ToolResult};
+use crate::{
+    protocol::{ChatId, ToolDefinition},
+    tools::ToolResult,
+};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct HostCallContext {

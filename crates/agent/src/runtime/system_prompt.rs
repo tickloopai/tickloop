@@ -122,10 +122,10 @@ mod tests {
             assert!(!prompt.contains(retired), "{retired}");
         }
         for tool in [
-            crate::runtime::ASK_USER_QUESTION_TOOL_NAME,
-            crate::runtime::EXIT_PLAN_MODE_TOOL_NAME,
-            crate::runtime::TODO_WRITE_TOOL_NAME,
-            crate::runtime::START_GOAL_TOOL_NAME,
+            crate::tools::ASK_USER_QUESTION_TOOL_NAME,
+            crate::tools::EXIT_PLAN_MODE_TOOL_NAME,
+            crate::tools::TODO_WRITE_TOOL_NAME,
+            crate::tools::START_GOAL_TOOL_NAME,
         ] {
             assert!(prompt.contains(tool), "{tool}");
         }
@@ -135,13 +135,13 @@ mod tests {
     fn the_intro_asks_for_todo_write_on_multi_step_work() {
         assert!(INTRO.contains(&format!(
             "Use {} to track progress on multi-step work.",
-            crate::runtime::TODO_WRITE_TOOL_NAME
+            crate::tools::TODO_WRITE_TOOL_NAME
         )));
     }
 
     #[test]
     fn the_plan_mode_reminder_precedes_host_state_and_the_intro_names_exit_plan_mode() {
-        assert!(INTRO.contains(crate::runtime::EXIT_PLAN_MODE_TOOL_NAME));
+        assert!(INTRO.contains(crate::tools::EXIT_PLAN_MODE_TOOL_NAME));
         let prompt = conversation_system_prompt(
             &serde_json::json!({"execution_mode": "plan"}),
             OutputStyle::Standard,

@@ -5,7 +5,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{
-    ActiveEventClaim, Agent, ChatId, EventClaimOperation, EventClaimStatus, EventSourceBinding,
+    ActiveEventClaim, Agent, EventClaimOperation, EventClaimStatus, EventSourceBinding,
     FrozenAssociationRequest, LoopId, LoopState, Receipt, SourceConnection, SourcePublication,
     SubmissionOptions, TriggerSource, loop_lease::RunStateChange, loop_lease::TriggerPermit,
 };
@@ -13,6 +13,7 @@ use crate::host_tools::{
     EventAssociationOutcome, EventAssociationRequest, EventClaimOutcome, EventClaimRequest,
     EventLeaseOutcome, EventLeaseRequest, EventPendingOutcome, EventSourceLocator,
 };
+use crate::protocol::ChatId;
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const IDLE_EVENT_POLL_INTERVAL: Duration = Duration::from_secs(15);

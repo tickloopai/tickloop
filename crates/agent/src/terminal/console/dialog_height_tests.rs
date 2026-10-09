@@ -697,7 +697,7 @@ async fn content_height_permission_management_history_fits_loaded_and_empty_reco
         view.auto_policy.rules = (0..count)
             .map(|index| crate::runtime::AutoRule {
                 id: format!("controlled-{index}"),
-                kind: crate::runtime::AutoRuleKind::SoftAllow,
+                kind: crate::settings::AutoRuleKind::SoftAllow,
                 text: format!("Controlled rule {index}"),
                 source: crate::runtime::AutoRuleSource::User,
             })

@@ -8,13 +8,13 @@ use serde_json::json;
 use support::*;
 use tick_connect::instance::InstanceRef;
 use tickloop_agent::runtime::{
-    ASK_USER_QUESTION_TOOL_NAME, Agent, Event, EventKind, LocalMessage, LoopState,
-    MAX_DELIVERY_PAYLOAD_BYTES, QuestionAnswer, TickLinkState, TickSubscription,
-    TickSubscriptionChange, Trigger,
+    Agent, Event, EventKind, LocalMessage, LoopState, MAX_DELIVERY_PAYLOAD_BYTES, QuestionAnswer,
+    TickLinkState, TickSubscription, TickSubscriptionChange, Trigger,
 };
 use tickloop_agent::tick_stream::{
     InMemoryTickStream, ObservationKind, TickConnectionState, TickObservation, TickStreamEvent,
 };
+use tickloop_agent::tools::ASK_USER_QUESTION_TOOL_NAME;
 use uuid::Uuid;
 
 const CADENCE: Duration = Duration::from_secs(60);

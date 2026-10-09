@@ -6,7 +6,9 @@ use serde_json::json;
 use support::{ScriptedModel, call, config, next_event, single_question, text};
 use tickloop_agent::{
     permissions::ExecutionMode,
-    runtime::{ASK_USER_QUESTION_TOOL_NAME, Agent, ChatId, EventKind, Receipt},
+    protocol::ChatId,
+    runtime::{Agent, EventKind, Receipt},
+    tools::ASK_USER_QUESTION_TOOL_NAME,
 };
 
 async fn wait_for(

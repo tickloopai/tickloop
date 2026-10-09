@@ -12,24 +12,29 @@ use tickloop_agent::{
     permissions::{Decision, ExecutionMode, PermissionRule, PermissionScope},
     runtime::{
         AgentError, AgentHostOptions, BranchOutcome, BranchRequest, ChatSnapshot,
-        DirectoryTrustPolicy, ENTER_PLAN_MODE_TOOL_NAME, EXIT_PLAN_MODE_TOOL_NAME, EventKind,
-        InputContext, LoopId, PermissionChange, PromptPolicy, QuestionRequest, Receipt,
-        RequestKind, RequestOutcome, ShellTaskNotice, ShellTaskPromptWatchdog, ShellTaskState,
-        ShellTaskSubscriptionEvent, TaskNotification, TaskNotificationStatus, TodoItem, Trigger,
-        TriggerSource, UserShellRecord, UserShellState,
+        DirectoryTrustPolicy, EventKind, InputContext, LoopId, PermissionChange, PromptPolicy,
+        QuestionRequest, Receipt, RequestKind, RequestOutcome, ShellTaskNotice,
+        ShellTaskPromptWatchdog, ShellTaskState, ShellTaskSubscriptionEvent, TaskNotification,
+        TaskNotificationStatus, TodoItem, Trigger, TriggerSource, UserShellRecord, UserShellState,
     },
-    settings::{LoadedSettings, UserSettings},
+    settings::{LoadedSettings, UserSettings, config_root_directory},
+    tools::{ENTER_PLAN_MODE_TOOL_NAME, EXIT_PLAN_MODE_TOOL_NAME},
 };
 use tokio::sync::{broadcast, mpsc};
 
 mod artifact_ui;
 mod artifacts_picker;
+#[cfg(test)]
+mod child_config_tests;
 mod clipboard;
 mod clipboard_hint;
 mod completion;
 mod console;
 mod conversation;
 mod conversation_picker;
+#[cfg(test)]
+mod daemon_loss_tests;
+mod denials_surface;
 pub mod diff_catalog;
 pub mod diff_dialog;
 pub mod diff_view;
@@ -41,28 +46,17 @@ mod external_editor;
 mod file_mentions;
 mod font_manager;
 mod footer;
+mod hosted_detail;
 mod hosted_probe;
 mod hyperlink;
 mod image_cache;
-mod subagent_panel;
-pub(crate) use image_cache::IMAGE_CACHE_DIRECTORY;
 mod input_history;
-pub(crate) use input_history::{PASTE_CACHE_DIRECTORY, PASTE_FILE_EXTENSION};
-#[cfg(test)]
-mod child_config_tests;
-#[cfg(test)]
-mod daemon_loss_tests;
-mod denials_surface;
-mod hosted_detail;
 mod input_view;
 #[cfg(test)]
 mod late_receipt_tests;
 mod login;
 mod loops;
 mod menus;
-#[cfg(test)]
-#[path = "../tests/model_http_support/mod.rs"]
-pub(crate) mod model_http_support;
 mod monitor;
 mod monitor_discovery;
 #[cfg(test)]
@@ -88,6 +82,7 @@ mod settings;
 mod shell_input;
 mod status_area;
 mod style;
+mod subagent_panel;
 mod subscription_surface;
 mod task_access;
 mod task_surface;
@@ -5309,20 +5304,6 @@ fn normalize_state_root(root: PathBuf) -> PathBuf {
     }
 }
 
-/// Tick Loop 状态根目录：`TICKLOOP_CONFIG_DIR` 非空时使用它，否则为用户主目录下的 `.tickloop`。
-/// 主目录取自 `std::env::home_dir()`：`$HOME` 缺失或为空时回退到账户数据库。
-/// 两者都不可用时返回 `None`，调用方不写盘。
-pub(crate) fn config_root_directory() -> Option<PathBuf> {
-    std::env::var_os("TICKLOOP_CONFIG_DIR")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::home_dir()
-                .filter(|home| !home.as_os_str().is_empty())
-                .map(|home| home.join(".tickloop"))
-        })
-}
-
 async fn ensure_chat(
     console: &Console,
     agent: &Agent,
@@ -7494,7 +7475,7 @@ mod tests {
         let model = Arc::new(support::ScriptedModel::new(vec![
             support::call(
                 "todos",
-                tickloop_agent::runtime::TODO_WRITE_TOOL_NAME,
+                tickloop_agent::tools::TODO_WRITE_TOOL_NAME,
                 serde_json::json!({"todos": [
                     {"content": "Read the notes", "status": "completed", "activeForm": "Reading the notes"},
                     {"content": "Draft the\nreport", "status": "in_progress", "activeForm": "Drafting\tthe\nreport"},
@@ -7608,7 +7589,7 @@ mod tests {
         let model = Arc::new(support::ScriptedModel::new(vec![
             support::call(
                 "first-todos",
-                tickloop_agent::runtime::TODO_WRITE_TOOL_NAME,
+                tickloop_agent::tools::TODO_WRITE_TOOL_NAME,
                 serde_json::json!({"todos":[
                     {"content":"Draft the first report","status":"in_progress","activeForm":"Drafting the first report"},
                     {"content":"Review the first report","status":"pending","activeForm":"Reviewing the first report"},
@@ -7617,7 +7598,7 @@ mod tests {
             support::text("First goal recorded."),
             support::call(
                 "second-todos",
-                tickloop_agent::runtime::TODO_WRITE_TOOL_NAME,
+                tickloop_agent::tools::TODO_WRITE_TOOL_NAME,
                 serde_json::json!({"todos":[
                     {"content":"Check the second dataset","status":"completed","activeForm":"Checking the second dataset"},
                     {"content":"Summarize the second dataset","status":"in_progress","activeForm":"Summarizing the second dataset"},

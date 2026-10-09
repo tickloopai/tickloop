@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::settings::AutoSettings;
+use crate::settings::{AutoRuleKind, AutoSettings};
 
 pub(crate) const AUTO_POLICY_VERSION: u64 = 1;
 pub(crate) const BUILTIN_GROUP_VERSION: u64 = 1;
@@ -44,14 +44,6 @@ const BUILTIN_SOFT_DENIES: [(&str, &str); 8] = [
     ),
 ];
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AutoRuleKind {
-    SoftAllow,
-    SoftDeny,
-    HardDeny,
-}
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AutoRuleSource {
@@ -65,183 +57,6 @@ pub struct AutoRule {
     pub kind: AutoRuleKind,
     pub text: String,
     pub source: AutoRuleSource,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct CustomAutoRule {
-    pub id: String,
-    pub text: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct AutoRuleGroupSettings {
-    pub include_builtins: bool,
-    pub custom: Vec<CustomAutoRule>,
-}
-
-impl Default for AutoRuleGroupSettings {
-    fn default() -> Self {
-        Self {
-            include_builtins: true,
-            custom: Vec::new(),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
-pub struct AutoRuleSettings {
-    pub soft_allow: AutoRuleGroupSettings,
-    pub soft_deny: AutoRuleGroupSettings,
-    pub hard_deny: AutoRuleGroupSettings,
-    pub environment_replacement: Option<String>,
-}
-
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub enum AutoRuleChange {
-    Add {
-        kind: AutoRuleKind,
-        text: String,
-    },
-    Update {
-        id: String,
-        text: String,
-    },
-    Remove {
-        id: String,
-    },
-    ReplaceGroup {
-        kind: AutoRuleKind,
-        texts: Vec<String>,
-    },
-    RestoreGroup {
-        kind: AutoRuleKind,
-    },
-    ReplaceEnvironment {
-        text: String,
-    },
-    RestoreEnvironment,
-}
-
-impl AutoRuleSettings {
-    pub fn apply(&mut self, change: AutoRuleChange) -> Result<(), String> {
-        let before = self.clone();
-        match change {
-            AutoRuleChange::Add { kind, text } => {
-                self.group_mut(kind).custom.push(CustomAutoRule {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    text,
-                })
-            }
-            AutoRuleChange::Update { id, text } => {
-                let kind = [
-                    AutoRuleKind::SoftAllow,
-                    AutoRuleKind::SoftDeny,
-                    AutoRuleKind::HardDeny,
-                ]
-                .into_iter()
-                .find(|kind| self.group(*kind).custom.iter().any(|rule| rule.id == id))
-                .ok_or("Auto rule is read-only or does not exist")?;
-                let Some(rule) = self
-                    .group_mut(kind)
-                    .custom
-                    .iter_mut()
-                    .find(|rule| rule.id == id)
-                else {
-                    return Err("Auto rule is read-only or does not exist".into());
-                };
-                rule.text = text;
-            }
-            AutoRuleChange::Remove { id } => {
-                let mut removed = false;
-                for kind in [
-                    AutoRuleKind::SoftAllow,
-                    AutoRuleKind::SoftDeny,
-                    AutoRuleKind::HardDeny,
-                ] {
-                    let group = self.group_mut(kind);
-                    let old_len = group.custom.len();
-                    group.custom.retain(|rule| rule.id != id);
-                    removed |= old_len != group.custom.len();
-                }
-                if !removed {
-                    return Err("Auto rule is read-only or does not exist".into());
-                }
-            }
-            AutoRuleChange::ReplaceGroup { kind, texts } => {
-                let group = self.group_mut(kind);
-                group.include_builtins = false;
-                group.custom = texts
-                    .into_iter()
-                    .map(|text| CustomAutoRule {
-                        id: uuid::Uuid::new_v4().to_string(),
-                        text,
-                    })
-                    .collect();
-            }
-            AutoRuleChange::RestoreGroup { kind } => {
-                *self.group_mut(kind) = AutoRuleGroupSettings::default()
-            }
-            AutoRuleChange::ReplaceEnvironment { text } => {
-                self.environment_replacement = Some(text)
-            }
-            AutoRuleChange::RestoreEnvironment => self.environment_replacement = None,
-        }
-        self.validate()?;
-        if *self == before {
-            return Err("Auto settings are unchanged".into());
-        }
-        Ok(())
-    }
-
-    pub fn group(&self, kind: AutoRuleKind) -> &AutoRuleGroupSettings {
-        match kind {
-            AutoRuleKind::SoftAllow => &self.soft_allow,
-            AutoRuleKind::SoftDeny => &self.soft_deny,
-            AutoRuleKind::HardDeny => &self.hard_deny,
-        }
-    }
-
-    pub fn group_mut(&mut self, kind: AutoRuleKind) -> &mut AutoRuleGroupSettings {
-        match kind {
-            AutoRuleKind::SoftAllow => &mut self.soft_allow,
-            AutoRuleKind::SoftDeny => &mut self.soft_deny,
-            AutoRuleKind::HardDeny => &mut self.hard_deny,
-        }
-    }
-
-    pub fn validate(&self) -> Result<(), String> {
-        let mut ids = HashSet::new();
-        for kind in [
-            AutoRuleKind::SoftAllow,
-            AutoRuleKind::SoftDeny,
-            AutoRuleKind::HardDeny,
-        ] {
-            for rule in &self.group(kind).custom {
-                if !uuid::Uuid::parse_str(&rule.id)
-                    .is_ok_and(|parsed| parsed.to_string() == rule.id)
-                {
-                    return Err(format!("invalid custom Auto rule ID: {}", rule.id));
-                }
-                if !ids.insert(&rule.id) {
-                    return Err(format!("duplicate custom Auto rule ID: {}", rule.id));
-                }
-                if rule.text.trim().is_empty() {
-                    return Err(format!("Auto rule {} has empty text", rule.id));
-                }
-            }
-        }
-        if self
-            .environment_replacement
-            .as_ref()
-            .is_some_and(|text| text.trim().is_empty())
-        {
-            return Err("Auto Environment replacement is empty".into());
-        }
-        Ok(())
-    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -608,19 +423,5 @@ mod tests {
         assert_eq!(reduce(&policy, &findings), Ok(RuleVerdict::Allow));
         findings.rules[0].clearance = Some(SoftDenyClearance::SoftAllow("unknown".into()));
         assert!(reduce(&policy, &findings).is_err());
-    }
-
-    #[test]
-    fn malformed_saved_rules_cannot_silently_erase_defaults() {
-        let mut settings = AutoRuleSettings::default();
-        settings.soft_deny.include_builtins = false;
-        settings.soft_deny.custom.push(CustomAutoRule {
-            id: "not-a-stable-id".into(),
-            text: "Some restriction".into(),
-        });
-        assert!(settings.validate().is_err());
-        settings.soft_deny.custom[0].id = uuid::Uuid::new_v4().to_string();
-        settings.soft_deny.custom[0].text = "   ".into();
-        assert!(settings.validate().is_err());
     }
 }

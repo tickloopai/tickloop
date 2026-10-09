@@ -19,13 +19,14 @@ use tickloop_agent::{
         ExecutionMode, PermissionRuleCandidate, PermissionScope, permission_rule_candidates,
     },
     runtime::{
-        AutoReviewerPreference, ChatSnapshot, CounterSummary, CounterTotal, DirectedSummaryRequest,
-        ENTER_PLAN_MODE_TOOL_NAME, EventKind, PermissionApprovalSource, PermissionChange,
-        PermissionChangeError, PermissionRequest, ProtocolFailure, QuestionRequest, Receipt,
-        RequestFailure, RequestKind, RequestOutcome, ResponseRejection, RewindMode, RewindOutcome,
-        SummaryDirection, UsageCounter, UsageCoverage, UsageSummary,
+        ChatSnapshot, CounterSummary, CounterTotal, DirectedSummaryRequest, EventKind,
+        PermissionApprovalSource, PermissionChange, PermissionChangeError, PermissionRequest,
+        ProtocolFailure, QuestionRequest, Receipt, RequestFailure, RequestKind, RequestOutcome,
+        ResponseRejection, RewindMode, RewindOutcome, SummaryDirection, UsageCounter,
+        UsageCoverage, UsageSummary,
     },
-    settings::{DisplayPreferences, GlyphSet, UserSettings},
+    settings::{AutoReviewerPreference, DisplayPreferences, GlyphSet, UserSettings},
+    tools::ENTER_PLAN_MODE_TOOL_NAME,
 };
 use uuid::Uuid;
 
@@ -2210,7 +2211,7 @@ impl Menus {
             if let Some(request) = snapshot.permissions.iter().find(|request| {
                 pending.contains_key(&request.id) && next_request.is_none_or(|id| id == request.id)
             }) {
-                if request.name == tickloop_agent::runtime::EXIT_PLAN_MODE_TOOL_NAME {
+                if request.name == tickloop_agent::tools::EXIT_PLAN_MODE_TOOL_NAME {
                     let (mut menu, workflow) = Workflow::plan(agent, chat, request.loop_id).await?;
                     if console.dialog_chat()? != Some(chat) {
                         menu.title = format!("Plan approval · {requester}");
@@ -3617,7 +3618,7 @@ mod tests {
             support::config(),
             std::sync::Arc::new(support::ScriptedModel::new(vec![support::call(
                 "snapshot-question",
-                crate::runtime::ASK_USER_QUESTION_TOOL_NAME,
+                crate::tools::ASK_USER_QUESTION_TOOL_NAME,
                 support::single_question("Which fixture?"),
             )])),
         );

@@ -13,7 +13,8 @@ use tickloop_agent::{
         Content, HttpModelClient, ImageSource, InputModality, Message, ModelClient, ModelConfig,
         ModelRequest, Protocol, Role, ToolResultBlock, ToolResultContent,
     },
-    runtime::{Agent, ChatId, EventKind, InputContext},
+    protocol::ChatId,
+    runtime::{Agent, EventKind, InputContext},
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;

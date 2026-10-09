@@ -7,7 +7,8 @@ use tickloop_agent::{
     mcp_tools::McpHostToolProvider,
     model::{ModelAuthSource, model_client},
     permissions::ExecutionMode,
-    runtime::{Agent, ChatId, EventKind, LoopState},
+    protocol::ChatId,
+    runtime::{Agent, EventKind, LoopState},
     settings::UserSettings,
 };
 use tokio::sync::broadcast;

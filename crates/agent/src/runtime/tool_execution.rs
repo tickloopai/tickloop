@@ -4,8 +4,10 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use super::*;
-use crate::model::ToolDefinition;
-use crate::tools::ToolResult;
+use crate::protocol::ToolDefinition;
+use crate::tools::{
+    ASK_USER_QUESTION_TOOL_NAME, ENTER_PLAN_MODE_TOOL_NAME, EXIT_PLAN_MODE_TOOL_NAME, ToolResult,
+};
 
 struct AutoPermissionDecision {
     decision: Decision,

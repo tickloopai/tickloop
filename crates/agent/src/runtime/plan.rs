@@ -14,21 +14,22 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use super::*;
-use crate::model::ToolDefinition;
 use crate::private_fs::{
-    PRIVATE_FILE_MODE, create_private_directory, replace_file_atomically, verify_private_directory,
+    PRIVATE_FILE_MODE, PrivateDirectory, create_private_directory, replace_file_atomically,
+    verify_private_directory,
 };
-use crate::tools::{FileReadRecord, ToolResult};
-use crate::transcript::{PrivateDirectory, private_project_temp_directory};
+use crate::protocol::ToolDefinition;
+use crate::tools::{
+    ENTER_PLAN_MODE_TOOL_NAME, EXIT_PLAN_MODE_TOOL_NAME, FileReadRecord, TODO_WRITE_TOOL_NAME,
+    ToolResult,
+};
+use crate::transcript::private_project_temp_directory;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 mod prompts;
 pub(super) use prompts::{enter_plan_mode_declined, plan_mode_reminder};
 
-pub const ENTER_PLAN_MODE_TOOL_NAME: &str = "EnterPlanMode";
-pub const EXIT_PLAN_MODE_TOOL_NAME: &str = "ExitPlanMode";
-pub const TODO_WRITE_TOOL_NAME: &str = "TodoWrite";
 /// 计划文件的目录与文件名 `<slug>-loop-<loopId>.md` 的组成部分；过期清理按同一格式识别。
 pub(crate) const PLANS_DIRECTORY: &str = "plans";
 pub(crate) const PLAN_LOOP_SEPARATOR: &str = "-loop-";

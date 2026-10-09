@@ -3,7 +3,7 @@ use super::*;
 
 const SUGGESTION_FIXTURE_STACK_BYTES: usize = 16 * 1024 * 1024;
 
-use crate::terminal::model_http_support as suggestion_http;
+use crate::model::model_http_support as suggestion_http;
 
 #[test]
 #[ignore]

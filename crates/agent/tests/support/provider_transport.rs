@@ -34,13 +34,13 @@ impl ModelClient for ProviderTransport {
         Err(ModelError::Cancelled)
     }
 
-    async fn close_chat(&self, chat_id: tickloop_agent::runtime::ChatId) {
+    async fn close_chat(&self, chat_id: tickloop_agent::protocol::ChatId) {
         self.0.close_chat(chat_id).await;
     }
 
     async fn complete_for_chat_with_context(
         &self,
-        chat_id: tickloop_agent::runtime::ChatId,
+        chat_id: tickloop_agent::protocol::ChatId,
         request: ModelRequest,
         events: UnboundedSender<ModelDelta>,
         cancel: CancellationToken,
@@ -53,7 +53,7 @@ impl ModelClient for ProviderTransport {
 
     async fn complete_for_chat(
         &self,
-        chat_id: tickloop_agent::runtime::ChatId,
+        chat_id: tickloop_agent::protocol::ChatId,
         request: ModelRequest,
         events: UnboundedSender<ModelDelta>,
         cancel: CancellationToken,

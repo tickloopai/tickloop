@@ -34,8 +34,7 @@ use crate::{
         RemoteAssociationOperation, WorkspaceHostContext, connection_result,
     },
     mcp_http::McpHttpClient,
-    model::ToolDefinition,
-    runtime::ChatId,
+    protocol::{ChatId, ToolDefinition},
     tools::ToolResult,
 };
 

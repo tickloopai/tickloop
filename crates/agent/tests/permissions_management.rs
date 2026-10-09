@@ -10,11 +10,11 @@ use serde_json::json;
 use support::{ScriptedModel, call, config, next_event, text};
 use tickloop_agent::{
     host_tools::{HostToolPermission, HostToolProvider},
-    model::ToolDefinition,
     permissions::{Decision, ExecutionMode, PermissionRule},
+    protocol::{ChatId, ToolDefinition},
     runtime::{
-        Agent, ChatId, EventKind, PermissionApprovalSource, PermissionChange,
-        PermissionChangeError, PermissionRuleScope, PermissionRuleSource, RunId,
+        Agent, EventKind, PermissionApprovalSource, PermissionChange, PermissionChangeError,
+        PermissionRuleScope, PermissionRuleSource, RunId,
     },
     tools::ToolResult,
 };

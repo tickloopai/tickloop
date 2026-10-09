@@ -1,8 +1,5 @@
 use super::*;
-use crate::tick_adapter::{
-    MonitorAction, MonitorOperation, PreparedTickAction, TickActionBackend, TickActionContext,
-    TickActionExecutor, TickActionOutcome, TickActionUi,
-};
+use crate::tick_adapter::{MonitorAction, TickIntent};
 
 #[test]
 fn input_dialog_top_rule_matches_claude_code_in_both_themes() {
@@ -136,7 +133,10 @@ async fn input_dialog_top_rule_covers_every_surface_with_semantic_theme_roles() 
                     console.state.lock().unwrap().monitor.confirmation =
                         Some(super::super::monitor::TickConfirmation {
                             instance: "fixture-tick".into(),
-                            action: Arc::new(FixtureTickAction("fixture-tick".into())),
+                            action: crate::terminal::tick_actions::builtin::artifact(
+                                "fixture-tick",
+                                'o',
+                            ),
                             prompt: "Confirm fixture action?".into(),
                         });
                 }
@@ -237,24 +237,6 @@ fn input_dialog_rule_click_never_submits_a_menu_or_trust_choice() {
     }
 }
 
-struct FixtureTickAction(String);
-impl TickActionExecutor for FixtureTickAction {
-    fn prepare(&self, _: &mut TickActionUi<'_>) -> Result<PreparedTickAction, String> {
-        Ok(PreparedTickAction::new(
-            &self.0,
-            'o',
-            Arc::new(FixtureTickBackend),
-        ))
-    }
-}
-struct FixtureTickBackend;
-#[async_trait::async_trait]
-impl TickActionBackend for FixtureTickBackend {
-    async fn execute(&self, _: TickActionContext<'_>) -> Result<TickActionOutcome, String> {
-        Ok(TickActionOutcome::Done)
-    }
-}
-
 pub(super) fn fixture_ticks() -> Vec<MonitorEntry> {
     (0..2)
         .map(|index| MonitorEntry {
@@ -271,9 +253,10 @@ pub(super) fn fixture_ticks() -> Vec<MonitorEntry> {
             actions: vec![MonitorAction {
                 key: 'o',
                 label: "open",
-                operation: MonitorOperation::Execute(Arc::new(FixtureTickAction(format!(
-                    "fixture-tick-{index}"
-                )))),
+                intent: TickIntent::Artifact {
+                    id: format!("fixture-tick-{index}"),
+                    key: 'o',
+                },
             }],
         })
         .collect()

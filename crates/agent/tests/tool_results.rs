@@ -11,9 +11,9 @@ use support::{ScriptedModel, call, config, next_event, text, transcript_file};
 use tickloop_agent::{
     model::{Content, Message, ModelRequest, Role},
     permissions::{Decision, ExecutionMode, PermissionRule},
+    protocol::ChatId,
     runtime::{
-        Agent, BranchRequest, ChatId, DirectedSummaryRequest, EventKind, LoopId, Receipt,
-        SummaryDirection,
+        Agent, BranchRequest, DirectedSummaryRequest, EventKind, LoopId, Receipt, SummaryDirection,
     },
 };
 use uuid::Uuid;

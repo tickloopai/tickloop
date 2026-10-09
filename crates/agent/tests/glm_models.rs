@@ -7,7 +7,7 @@ use tickloop_agent::{
     image::ImageMediaType,
     model::{
         Content, ImageSource, Message, ModelConfig, ModelError, ModelFailureKind, ModelRequest,
-        ModelResponseRejection, Protocol, ReasoningEffort, Role, StructuredOutput, ToolDefinition,
+        ModelResponseRejection, Protocol, ReasoningEffort, Role, StructuredOutput,
         access::AccessCatalog,
         cards::{
             Adapter, ModelCatalog, ProviderPatch, ThinkingControl, built_in_model_profiles,
@@ -16,6 +16,7 @@ use tickloop_agent::{
         credentials::save_api_key,
         model_client, validate_reasoning_effort,
     },
+    protocol::ToolDefinition,
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;

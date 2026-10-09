@@ -8,8 +8,9 @@ use tickloop_agent::{
     model::{
         Content, HttpModelClient, ImageSource, InputModality, Message, ModelClient, ModelConfig,
         ModelDelta, ModelError, ModelFailureKind, ModelRequest, ModelRequestStage,
-        ModelResponseRejection, Protocol, Role, ToolDefinition, ToolResultBlock, ToolResultContent,
+        ModelResponseRejection, Protocol, Role, ToolResultBlock, ToolResultContent,
     },
+    protocol::ToolDefinition,
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;

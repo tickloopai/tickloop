@@ -13,9 +13,9 @@ use tickloop_agent::{
     model::{
         Content, Message, ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest, Role,
     },
+    protocol::ChatId,
     runtime::{
-        Agent, AgentError, ChatId, ChatSnapshot, Event, EventKind, LoopState, Trigger,
-        UserShellState,
+        Agent, AgentError, ChatSnapshot, Event, EventKind, LoopState, Trigger, UserShellState,
     },
     tools::CommandState,
 };

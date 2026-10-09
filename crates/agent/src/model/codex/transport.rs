@@ -23,7 +23,7 @@ use super::{
 };
 use crate::{
     model::{MAX_RESPONSE_STREAM_BYTES, MAX_SSE_EVENT_BYTES, responses::ResponsesStream},
-    runtime::ChatId,
+    protocol::ChatId,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);

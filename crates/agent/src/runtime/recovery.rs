@@ -1,6 +1,6 @@
 use super::{AgentError, ChatSnapshot, LoopId, OperationState};
 use crate::model::{Content, Message, Role, validate_model_for_resume_in_root};
-use crate::tools::ToolResult;
+use crate::tools::{ASK_USER_QUESTION_TOOL_NAME, ToolResult};
 
 pub(super) fn before_resume(
     snapshot: &mut ChatSnapshot,
@@ -40,7 +40,7 @@ pub(super) fn close_dangling_tool_calls(
 ) -> Result<(), AgentError> {
     for operation in &mut snapshot.operations {
         if only_run.is_none_or(|run| operation.run_id == run)
-            && operation.name == super::ASK_USER_QUESTION_TOOL_NAME
+            && operation.name == ASK_USER_QUESTION_TOOL_NAME
             && matches!(
                 operation.state,
                 OperationState::Admitted | OperationState::Unknown

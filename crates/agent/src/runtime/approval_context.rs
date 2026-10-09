@@ -97,7 +97,7 @@ fn originals_for_active_chain_with_legacy(
             if let Some(run_id) = snapshot.message_runs.get(&index).copied() {
                 for content in &message.content {
                     if let Content::ToolUse { id, name, .. } = content
-                        && name == crate::runtime::ASK_USER_QUESTION_TOOL_NAME
+                        && name == crate::tools::ASK_USER_QUESTION_TOOL_NAME
                     {
                         let message_id = snapshot
                             .message_ids

@@ -36,7 +36,7 @@ pub(super) struct MonitorEntry {
 #[derive(Clone)]
 pub(super) struct TickConfirmation {
     pub(super) instance: String,
-    pub(super) action: std::sync::Arc<dyn crate::tick_adapter::TickActionExecutor>,
+    pub(super) action: std::sync::Arc<dyn super::tick_actions::TickActionExecutor>,
     pub(super) prompt: String,
 }
 #[derive(Default)]
@@ -70,12 +70,12 @@ pub(super) struct MonitorFrame {
 impl Monitor {
     pub(super) fn refresh_action(
         &mut self,
-    ) -> std::sync::Arc<dyn crate::tick_adapter::TickActionExecutor> {
-        let actions = self
+    ) -> std::sync::Arc<dyn super::tick_actions::TickActionExecutor> {
+        let intents = self
             .adapters
             .get_or_insert_with(TickAdapters::presentation)
-            .refresh_actions();
-        super::tick_actions::builtin::refresh(actions)
+            .refresh_intents();
+        super::tick_actions::builtin::refresh(&intents)
     }
     /// The rows of the visible page.
     pub(super) fn entries(&self) -> &[MonitorEntry] {
@@ -636,7 +636,7 @@ impl From<TickDescriptor> for MonitorEntry {
 #[cfg(test)]
 mod adapter_tests {
     use super::*;
-    use crate::tick_adapter::{MonitorOperation, TickAdapter};
+    use crate::tick_adapter::{TickAdapter, TickIntent};
     use std::sync::Arc;
 
     struct Calendar;
@@ -664,7 +664,7 @@ mod adapter_tests {
                     .map(|(key, label)| MonitorAction {
                         key,
                         label,
-                        operation: MonitorOperation::Notify("opened".into()),
+                        intent: TickIntent::Notify("opened".into()),
                     })
                     .collect(),
             }]

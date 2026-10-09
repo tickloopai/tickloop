@@ -7,7 +7,8 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 use tick_connect::instance::InstanceRef;
 
-use super::{Agent, AgentError, ChatId};
+use super::{Agent, AgentError};
+use crate::protocol::ChatId;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

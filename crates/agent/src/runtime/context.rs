@@ -1,14 +1,16 @@
 use super::{
-    Agent, AgentError, Chat, ChatId, ChatSnapshot, EventKind, PendingModelThinking, Receipt,
-    RequestKind, RequestOutcome, ResponseRejection, RunId,
+    Agent, AgentError, Chat, ChatSnapshot, EventKind, PendingModelThinking, Receipt, RequestKind,
+    RequestOutcome, ResponseRejection, RunId,
     compaction::{self, CompactBoundary, CompactTrigger, CompactionLayout, MessageSource},
     model_request::RequestContext,
 };
 use crate::model::{
     Content, ImageSource, Message, ModelClient, ModelConfig, ModelRequest, ReasoningEffort, Role,
-    ToolDefinition, ToolResultBlock, ToolResultContent, strip_images, validate_model_config,
+    ToolResultBlock, ToolResultContent, strip_images, validate_model_config,
     validate_reasoning_effort,
 };
+use crate::protocol::ChatId;
+use crate::protocol::ToolDefinition;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},

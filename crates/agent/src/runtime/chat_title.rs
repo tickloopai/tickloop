@@ -1,5 +1,6 @@
-use super::{Agent, ChatId, approval_context};
+use super::{Agent, approval_context};
 use crate::model::{Content, Message, ModelRequest, Role};
+use crate::protocol::ChatId;
 use std::{sync::atomic::Ordering, time::Duration};
 use unicode_width::UnicodeWidthChar;
 

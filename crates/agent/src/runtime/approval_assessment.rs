@@ -2,12 +2,13 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::model::Usage;
+use crate::settings::AutoReviewerPreference;
 
 use super::approval_context::{
     APPROVAL_CONTEXT_VERSION, ApprovalSnapshot, REVIEW_TEMPLATE_VERSION,
 };
 use super::auto_rules::{AutoBlockKind, AutoRule, VerdictEvidence};
-use super::{AutoReview, AutoReviewerPreference, OperationRecord};
+use super::{AutoReview, OperationRecord};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]

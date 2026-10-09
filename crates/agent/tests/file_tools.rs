@@ -7,9 +7,10 @@ use serde_json::json;
 use tickloop_agent::{
     model::{
         Content, InputModality, ModelClient, ModelConfig, ModelDelta, ModelError, ModelOutput,
-        ModelRequest, Protocol, ToolDefinition, Usage,
+        ModelRequest, Protocol, Usage,
     },
     permissions::{Decision, PermissionRule},
+    protocol::ToolDefinition,
     runtime::{Agent, DirectedSummaryRequest, Event, EventKind, SummaryDirection},
     tools::ToolResult,
 };

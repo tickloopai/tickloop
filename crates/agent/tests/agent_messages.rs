@@ -294,8 +294,8 @@ struct ReviewableTick {
 
 #[async_trait]
 impl tickloop_agent::host_tools::HostToolProvider for ReviewableTick {
-    fn definitions(&self) -> Vec<tickloop_agent::model::ToolDefinition> {
-        vec![tickloop_agent::model::ToolDefinition {
+    fn definitions(&self) -> Vec<tickloop_agent::protocol::ToolDefinition> {
+        vec![tickloop_agent::protocol::ToolDefinition {
             name: "CallTickTool".into(),
             description: "Controlled scoped Tick operation".into(),
             input_schema: json!({"type":"object"}),

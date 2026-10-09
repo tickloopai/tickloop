@@ -5,11 +5,9 @@ use std::sync::Arc;
 use support::{ScriptedModel, call, config, next_event, text, transcript_file};
 use tickloop_agent::{
     permissions::{Decision, ExecutionMode, PermissionRule},
-    runtime::{
-        Agent, AgentError, AgentHostOptions, BranchRequest, ChatId, ENTER_PLAN_MODE_TOOL_NAME,
-        EventKind, LoopId, Receipt,
-    },
-    tools::ToolResult,
+    protocol::ChatId,
+    runtime::{Agent, AgentError, AgentHostOptions, BranchRequest, EventKind, LoopId, Receipt},
+    tools::{ENTER_PLAN_MODE_TOOL_NAME, ToolResult},
 };
 use uuid::Uuid;
 

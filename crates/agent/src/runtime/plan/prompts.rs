@@ -4,12 +4,10 @@
 
 use std::path::Path;
 
-use crate::runtime::ASK_USER_QUESTION_TOOL_NAME;
 use crate::tools::{
-    EDIT_TOOL_NAME, GLOB_TOOL_NAME, GREP_TOOL_NAME, READ_TOOL_NAME, WRITE_TOOL_NAME,
+    ASK_USER_QUESTION_TOOL_NAME, EDIT_TOOL_NAME, ENTER_PLAN_MODE_TOOL_NAME,
+    EXIT_PLAN_MODE_TOOL_NAME, GLOB_TOOL_NAME, GREP_TOOL_NAME, READ_TOOL_NAME, WRITE_TOOL_NAME,
 };
-
-use super::{ENTER_PLAN_MODE_TOOL_NAME, EXIT_PLAN_MODE_TOOL_NAME};
 
 pub(super) const NOT_IN_PLAN_MODE: &str = "You are not in plan mode. This tool is only for exiting plan mode after writing a plan. If your plan was already approved, continue with implementation.";
 

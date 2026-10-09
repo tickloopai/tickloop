@@ -354,7 +354,7 @@ impl Workflow {
             .permissions
             .iter()
             .find(|request| {
-                request.name == tickloop_agent::runtime::EXIT_PLAN_MODE_TOOL_NAME
+                request.name == tickloop_agent::tools::EXIT_PLAN_MODE_TOOL_NAME
                     && request.loop_id == goal
             })
             .map(|request| request.id);
@@ -2250,7 +2250,7 @@ mod tests {
             loop {
                 match support::next_event(events).await.kind {
                     EventKind::PermissionRequested { request }
-                        if request.name == tickloop_agent::runtime::EXIT_PLAN_MODE_TOOL_NAME =>
+                        if request.name == tickloop_agent::tools::EXIT_PLAN_MODE_TOOL_NAME =>
                     {
                         return;
                     }

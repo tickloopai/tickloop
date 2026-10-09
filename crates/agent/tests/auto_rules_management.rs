@@ -4,9 +4,9 @@ use std::sync::Arc;
 use support::ScriptedModel;
 
 use tickloop_agent::runtime::{
-    Agent, AutoEnvironmentSource, AutoRuleChange, AutoRuleKind, AutoRuleSource, PermissionChange,
-    PermissionChangeError,
+    Agent, AutoEnvironmentSource, AutoRuleSource, PermissionChange, PermissionChangeError,
 };
+use tickloop_agent::settings::{AutoRuleChange, AutoRuleKind};
 
 #[tokio::test]
 async fn auto_rule_groups_and_environment_save_with_revision_and_restore_independently() {

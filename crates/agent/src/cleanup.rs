@@ -31,8 +31,9 @@ use crate::runtime::{
     MAX_PLAN_SLUG_BYTES, PLAN_FILE_EXTENSION, PLANS_DIRECTORY, TOOL_RESULTS_SUBDIRECTORY,
     WATERMARK_DIRECTORY, is_valid_plan_slug, plan_file_slug,
 };
-use crate::settings::{CleanupPeriod, UserSettings};
-use crate::terminal::{IMAGE_CACHE_DIRECTORY, PASTE_CACHE_DIRECTORY, PASTE_FILE_EXTENSION};
+use crate::settings::{
+    CleanupPeriod, IMAGE_CACHE_DIRECTORY, PASTE_CACHE_DIRECTORY, PASTE_FILE_EXTENSION, UserSettings,
+};
 use crate::transcript::retention::{RetentionGuard, prepare_directory};
 use crate::transcript::{LITE_READ_BUF_SIZE, PROJECTS_DIRECTORY, TRANSCRIPT_FILE_SUFFIX};
 

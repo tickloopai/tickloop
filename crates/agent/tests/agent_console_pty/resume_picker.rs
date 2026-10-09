@@ -1,6 +1,7 @@
 use super::*;
 
-use tickloop_agent::runtime::{Agent, ChatId, EventKind};
+use tickloop_agent::protocol::ChatId;
+use tickloop_agent::runtime::{Agent, EventKind};
 use unicode_width::UnicodeWidthStr;
 
 const LONG_PROMPT: &str = "请分析腾讯控股最近三个季度的财报，\n比较营收增长与利润率变化，并整理一份包含风险提示、估值区间和后续跟踪指标的长篇研究备忘录";

@@ -1,8 +1,9 @@
 use super::{
-    Agent, AgentError, Chat, ChatId, MessageBoundary, TaskNotification, UserShellReceipt,
-    UserShellRecord, UserShellState, commands::notification_status, local_messages,
+    Agent, AgentError, Chat, MessageBoundary, TaskNotification, UserShellReceipt, UserShellRecord,
+    UserShellState, commands::notification_status, local_messages,
 };
 use crate::model::Message;
+use crate::protocol::ChatId;
 use crate::tools::{
     CANCELLED_COMMAND_REASON, CommandState, ToolResult, Tools, UserCommandSnapshot,
 };

@@ -1,10 +1,13 @@
 use super::*;
-use crate::{model::ToolDefinition, tools::ToolResult};
+use crate::{
+    protocol::ToolDefinition,
+    tools::{
+        ASK_USER_QUESTION_TOOL_NAME, EXIT_PLAN_MODE_TOOL_NAME, START_GOAL_TOOL_NAME, ToolResult,
+    },
+};
 use serde_json::{Value, json};
 use std::collections::HashSet;
 
-pub const ASK_USER_QUESTION_TOOL_NAME: &str = "AskUserQuestion";
-pub const START_GOAL_TOOL_NAME: &str = "StartGoal";
 const QUESTION_HEADER_MAX_CHARACTERS: usize = 12;
 const MIN_QUESTIONS: usize = 1;
 const MAX_QUESTIONS: usize = 4;
@@ -169,7 +172,7 @@ fn answered_questions_result(questions: &[Question], answers: &[QuestionAnswer])
 }
 
 fn ask_user_question_definition() -> ToolDefinition {
-    let plan_tool = super::plan::EXIT_PLAN_MODE_TOOL_NAME;
+    let plan_tool = EXIT_PLAN_MODE_TOOL_NAME;
     ToolDefinition {
         name: ASK_USER_QUESTION_TOOL_NAME.into(),
         description: format!(

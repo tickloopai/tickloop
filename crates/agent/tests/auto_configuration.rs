@@ -15,9 +15,10 @@ use tickloop_agent::{
     },
     permissions::ExecutionMode,
     runtime::{
-        Agent, ApprovalAssessmentDetails, ApprovalReviewerKind, AutoReviewerPreference, EventKind,
-        PermissionChange, PermissionChangeError,
+        Agent, ApprovalAssessmentDetails, ApprovalReviewerKind, EventKind, PermissionChange,
+        PermissionChangeError,
     },
+    settings::AutoReviewerPreference,
 };
 use tokio::sync::{Notify, mpsc::UnboundedSender};
 use tokio_util::sync::CancellationToken;

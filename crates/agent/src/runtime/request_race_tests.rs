@@ -10,13 +10,14 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    Agent, AgentError, ChatId, ProtocolFailure, RequestFailure, RequestOutcome, UsageCounter,
+    Agent, AgentError, ProtocolFailure, RequestFailure, RequestOutcome, UsageCounter,
     model_request::RequestContext,
 };
 use crate::model::{
     Content, InputModality, ModelClient, ModelConfig, ModelDelta, ModelError, ModelIdentity,
     ModelOutput, ModelRequest, Protocol, Usage,
 };
+use crate::protocol::ChatId;
 
 #[derive(Default)]
 struct RaceModel {

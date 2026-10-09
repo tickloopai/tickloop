@@ -19,7 +19,7 @@ use super::tick_content::{
     write_watermark,
 };
 use super::*;
-use crate::model::ToolDefinition;
+use crate::protocol::ToolDefinition;
 use crate::tick_stream::{
     ObservationKind, TickConnectionState, TickObservation, TickStreamEvent, TickStreamPort, WatchId,
 };

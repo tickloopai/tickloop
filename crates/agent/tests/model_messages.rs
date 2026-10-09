@@ -3,9 +3,10 @@ use tickloop_agent::{
     image::ImageMediaType,
     model::{
         Content, HttpModelClient, ImageSource, InputModality, Message, ModelClient, ModelConfig,
-        ModelDelta, ModelError, ModelRequest, Protocol, Role, ToolDefinition, ToolResultBlock,
-        ToolResultContent, Usage,
+        ModelDelta, ModelError, ModelRequest, Protocol, Role, ToolResultBlock, ToolResultContent,
+        Usage,
     },
+    protocol::ToolDefinition,
 };
 mod model_http_support;
 use model_http_support::serve_response;

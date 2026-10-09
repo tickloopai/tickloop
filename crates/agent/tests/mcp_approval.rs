@@ -9,7 +9,8 @@ use tickloop_agent::{
     host_tools::{HostCallResult, HostToolProvider},
     mcp_tools::McpHostToolProvider,
     permissions::{Decision, PermissionRule},
-    runtime::{Agent, ChatId, DenialRuleSource, EventKind, LoopState},
+    protocol::ChatId,
+    runtime::{Agent, DenialRuleSource, EventKind, LoopState},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},

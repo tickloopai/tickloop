@@ -18,6 +18,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::image::{Image, ImageMediaType};
 use crate::network::{HttpPolicy, NetworkDiagnostic, NetworkRoute, build_http_client, is_loopback};
+use crate::protocol::ToolDefinition;
 
 pub mod access;
 pub mod availability;
@@ -26,6 +27,8 @@ mod chat_completions;
 mod generation_budget;
 pub use generation_budget::GenerationBudget;
 mod codex;
+#[cfg(test)]
+pub(crate) mod codex_test_support;
 pub mod connection;
 pub mod copilot;
 pub mod credentials;
@@ -34,6 +37,9 @@ mod google;
 pub(crate) mod history;
 mod image_limits;
 mod kimi;
+#[cfg(test)]
+#[path = "../tests/model_http_support/mod.rs"]
+pub(crate) mod model_http_support;
 mod provider_directory;
 mod provider_failure;
 pub use provider_failure::{ProviderFailureClass, ProviderHttpFailure};
@@ -396,13 +402,6 @@ impl From<&str> for ToolResultContent {
 pub struct Message {
     pub role: Role,
     pub content: Vec<Content>,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-pub struct ToolDefinition {
-    pub name: String,
-    pub description: String,
-    pub input_schema: Value,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -832,11 +831,11 @@ pub trait ModelClient: Send + Sync {
         self.complete(request, events, cancel).await
     }
 
-    async fn close_chat(&self, _chat_id: crate::runtime::ChatId) {}
+    async fn close_chat(&self, _chat_id: crate::protocol::ChatId) {}
 
     async fn complete_for_chat_with_context(
         &self,
-        chat_id: crate::runtime::ChatId,
+        chat_id: crate::protocol::ChatId,
         request: ModelRequest,
         events: UnboundedSender<ModelDelta>,
         cancel: CancellationToken,
@@ -848,7 +847,7 @@ pub trait ModelClient: Send + Sync {
 
     async fn complete_for_chat(
         &self,
-        _chat_id: crate::runtime::ChatId,
+        _chat_id: crate::protocol::ChatId,
         request: ModelRequest,
         events: UnboundedSender<ModelDelta>,
         cancel: CancellationToken,
@@ -1013,7 +1012,7 @@ pub struct HttpModelClient {
     cache_id: uuid::Uuid,
 }
 
-type PrivateBlockKey = (crate::runtime::ChatId, [u8; 32], [u8; 32]);
+type PrivateBlockKey = (crate::protocol::ChatId, [u8; 32], [u8; 32]);
 
 fn api_private_provenance() -> &'static Mutex<HashMap<PrivateBlockKey, Option<[u8; 32]>>> {
     static PROVENANCE: OnceLock<Mutex<HashMap<PrivateBlockKey, Option<[u8; 32]>>>> =
@@ -1046,7 +1045,7 @@ impl HttpModelClient {
 
     fn ensure_credential_history_compatible(
         &self,
-        chat_id: Option<crate::runtime::ChatId>,
+        chat_id: Option<crate::protocol::ChatId>,
         request: &ModelRequest,
         key: Option<&reqwest::header::HeaderValue>,
     ) -> Result<(), ModelError> {
@@ -1094,7 +1093,7 @@ impl HttpModelClient {
 
     fn record_private_output(
         &self,
-        chat_id: Option<crate::runtime::ChatId>,
+        chat_id: Option<crate::protocol::ChatId>,
         key: Option<&reqwest::header::HeaderValue>,
         output: &ModelOutput,
     ) {
@@ -1282,7 +1281,7 @@ impl HttpModelClient {
     /// them for their size or count (Claude Code `isMediaSizeError`).
     async fn complete_inner(
         &self,
-        chat_id: Option<crate::runtime::ChatId>,
+        chat_id: Option<crate::protocol::ChatId>,
         request: ModelRequest,
         events: UnboundedSender<ModelDelta>,
         cancel: CancellationToken,
@@ -1319,7 +1318,7 @@ impl HttpModelClient {
     /// `rejected_images` is set when the service refused the request because of its images.
     async fn complete_once(
         &self,
-        chat_id: Option<crate::runtime::ChatId>,
+        chat_id: Option<crate::protocol::ChatId>,
         request: ModelRequest,
         events: UnboundedSender<ModelDelta>,
         cancel: CancellationToken,
@@ -1676,7 +1675,7 @@ impl ModelClient for HttpModelClient {
         self.config.identity()
     }
 
-    async fn close_chat(&self, chat_id: crate::runtime::ChatId) {
+    async fn close_chat(&self, chat_id: crate::protocol::ChatId) {
         api_private_provenance()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1685,7 +1684,7 @@ impl ModelClient for HttpModelClient {
 
     async fn complete_for_chat_with_context(
         &self,
-        chat_id: crate::runtime::ChatId,
+        chat_id: crate::protocol::ChatId,
         request: ModelRequest,
         events: UnboundedSender<ModelDelta>,
         cancel: CancellationToken,
@@ -1697,7 +1696,7 @@ impl ModelClient for HttpModelClient {
 
     async fn complete_for_chat(
         &self,
-        chat_id: crate::runtime::ChatId,
+        chat_id: crate::protocol::ChatId,
         request: ModelRequest,
         events: UnboundedSender<ModelDelta>,
         cancel: CancellationToken,
@@ -2871,7 +2870,7 @@ pub(crate) fn fixture_client(client: Arc<dyn ModelClient>) -> Arc<dyn ModelClien
         ) -> Result<ModelOutput, ModelError> {
             Ok(fixture_title(request))
         }
-        async fn close_chat(&self, chat: crate::runtime::ChatId) {
+        async fn close_chat(&self, chat: crate::protocol::ChatId) {
             self.0.close_chat(chat).await;
         }
         async fn complete(
@@ -2884,7 +2883,7 @@ pub(crate) fn fixture_client(client: Arc<dyn ModelClient>) -> Arc<dyn ModelClien
         }
         async fn complete_for_chat(
             &self,
-            chat: crate::runtime::ChatId,
+            chat: crate::protocol::ChatId,
             request: ModelRequest,
             events: UnboundedSender<ModelDelta>,
             cancel: CancellationToken,
@@ -2895,7 +2894,7 @@ pub(crate) fn fixture_client(client: Arc<dyn ModelClient>) -> Arc<dyn ModelClien
         }
         async fn complete_for_chat_with_context(
             &self,
-            chat: crate::runtime::ChatId,
+            chat: crate::protocol::ChatId,
             request: ModelRequest,
             events: UnboundedSender<ModelDelta>,
             cancel: CancellationToken,

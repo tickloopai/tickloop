@@ -5,10 +5,13 @@ use tickloop_agent::{
     model::credentials::ApiKeyStatus,
     permissions::{Decision, ExecutionMode, PermissionRule, is_supported_rule_content},
     runtime::{
-        AutoEnvironmentSource, AutoPolicy, AutoReviewerHealth, AutoReviewerPreference,
-        AutoRuleChange, AutoRuleKind, AutoRuleSettings, AutoRuleSource, AutoSettingsRevision,
-        PermissionChange, PermissionRuleScope, PermissionRuleSource, PermissionRuleView,
-        PermissionsRevision, PermissionsView,
+        AutoEnvironmentSource, AutoPolicy, AutoReviewerHealth, AutoRuleSource, PermissionChange,
+        PermissionRuleScope, PermissionRuleSource, PermissionRuleView, PermissionsRevision,
+        PermissionsView,
+    },
+    settings::{
+        AutoReviewerPreference, AutoRuleChange, AutoRuleKind, AutoRuleSettings,
+        AutoSettingsRevision,
     },
     tools::WEB_FETCH_TOOL_NAME,
 };

@@ -5,10 +5,8 @@ use std::sync::Arc;
 use support::*;
 use tickloop_agent::{
     model::{Content, ModelRequest},
-    runtime::{
-        ASK_USER_QUESTION_TOOL_NAME, Agent, EventKind, LoopState, QuestionAnswer, Trigger,
-        TriggerSource,
-    },
+    runtime::{Agent, EventKind, LoopState, QuestionAnswer, Trigger, TriggerSource},
+    tools::ASK_USER_QUESTION_TOOL_NAME,
 };
 use uuid::Uuid;
 

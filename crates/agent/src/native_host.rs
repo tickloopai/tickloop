@@ -15,8 +15,7 @@ use crate::{
         HostCallContext, HostCallResult, HostEffect, HostEndpointIdentity, HostToolPermission,
         HostToolProvider, PreparedHostCall, WorkspaceHostContext,
     },
-    model::ToolDefinition,
-    runtime::ChatId,
+    protocol::{ChatId, ToolDefinition},
     tick_tool_router::TickBackends,
     tools::ToolResult,
 };

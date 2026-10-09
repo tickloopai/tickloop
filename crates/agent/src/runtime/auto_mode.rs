@@ -4,11 +4,12 @@
 use serde_json::json;
 
 use super::approval_context::ApprovalSnapshot;
-use super::auto_rules::{AutoPolicy, AutoRuleKind, RuleVerdict, SemanticFindings, reduce};
+use super::auto_rules::{AutoPolicy, RuleVerdict, SemanticFindings, reduce};
 use crate::model::{
     Content, Message, ModelError, ModelFailureKind, ModelOutput, ModelRequest,
     ModelResponseRejection, Role, StructuredOutput,
 };
+use crate::settings::AutoRuleKind;
 
 pub(super) const CLASSIFIER_TOOL_NAME: &str = "classify_result";
 /// Invalid classifier output gets one further classification attempt.
@@ -450,8 +451,7 @@ mod tests {
     #[test]
     fn structured_findings_apply_custom_hard_deny_before_uncertainty() {
         use super::super::auto_rules::{
-            AutoBlockKind, AutoEnvironment, AutoEnvironmentSource, AutoRule, AutoRuleKind,
-            AutoRuleSource,
+            AutoBlockKind, AutoEnvironment, AutoEnvironmentSource, AutoRule, AutoRuleSource,
         };
         let policy = AutoPolicy {
             version: 1,

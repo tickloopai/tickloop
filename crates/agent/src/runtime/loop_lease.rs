@@ -37,9 +37,9 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::{Agent, ChatId, LoopId};
-use crate::private_fs::{PRIVATE_FILE_MODE, replace_file_atomically};
-use crate::transcript::PrivateDirectory;
+use super::{Agent, LoopId};
+use crate::private_fs::{PRIVATE_FILE_MODE, PrivateDirectory, replace_file_atomically};
+use crate::protocol::ChatId;
 
 /// 照 Claude Code `LOCK_PROBE_INTERVAL_MS`：拿不到租约的进程重试获取的间隔。
 pub(super) const LEASE_RETRY_INTERVAL: Duration = Duration::from_secs(5);

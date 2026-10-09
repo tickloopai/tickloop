@@ -16,10 +16,11 @@ use std::{
 
 use uuid::Uuid;
 
-use super::{Agent, AgentError, Chat, ChatId, ChatSnapshot};
+use super::{Agent, AgentError, Chat, ChatSnapshot};
 use crate::model::{ModelClient, ModelConfig, ReasoningEffort, validate_reasoning_effort};
 use crate::output_style::OutputStyle;
 use crate::permissions::{Decision, PermissionRule};
+use crate::protocol::ChatId;
 use crate::settings::{LoadedSettings, ProjectRuleChanges, SettingsError, UserSettings};
 
 /// Persistent rule changes partitioned by canonical project working directory.

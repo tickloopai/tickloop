@@ -134,20 +134,12 @@ impl TickAdapter for HostedAdapter {
                 MonitorAction {
                     key: MONITOR_ENTER_KEY,
                     label: "open",
-                    operation: MonitorOperation::Execute(
-                        crate::terminal::tick_actions::builtin::open_hosted(
-                            member.instance.clone(),
-                        ),
-                    ),
+                    intent: TickIntent::OpenHosted(member.instance.clone()),
                 },
                 MonitorAction {
                     key: HOSTED_SNAPSHOT_KEY,
                     label: "snapshot",
-                    operation: MonitorOperation::Execute(
-                        crate::terminal::tick_actions::builtin::snapshot_hosted(
-                            member.instance.clone(),
-                        ),
-                    ),
+                    intent: TickIntent::ShowHostedSnapshot(member.instance.clone()),
                 },
             ],
         );
@@ -155,9 +147,7 @@ impl TickAdapter for HostedAdapter {
         row.actions.push(MonitorAction {
             key: HOSTED_CLOSE_KEY,
             label: "close",
-            operation: MonitorOperation::Execute(
-                crate::terminal::tick_actions::builtin::close_hosted(member.instance.clone()),
-            ),
+            intent: TickIntent::CloseHosted(member.instance.clone()),
         });
         match context.member_states.get(&member.instance) {
             Some(MemberState::Live { .. }) => {
@@ -169,11 +159,7 @@ impl TickAdapter for HostedAdapter {
                 row.actions.push(MonitorAction {
                     key: HOSTED_REOPEN_KEY,
                     label: "reopen as new",
-                    operation: MonitorOperation::Execute(
-                        crate::terminal::tick_actions::builtin::reopen_hosted(
-                            member.instance.clone(),
-                        ),
-                    ),
+                    intent: TickIntent::ReopenHosted(member.instance.clone()),
                 });
             }
             Some(MemberState::Gone) => row.status = link_status(TickLinkState::InstanceGone).into(),
@@ -299,8 +285,8 @@ impl TickAdapter for ArtifactAdapter {
     fn stream(&self) -> Option<Arc<dyn TickStreamPort>> {
         self.stream.clone()
     }
-    fn refresh_action(&self) -> Option<Arc<dyn TickActionExecutor>> {
-        Some(crate::terminal::tick_actions::builtin::artifact("", 'r'))
+    fn refresh_intent(&self) -> Option<TickIntent> {
+        Some(TickIntent::RefreshArtifacts)
     }
 }
 
@@ -336,9 +322,7 @@ impl TickAdapter for ShellAdapter {
                         MonitorAction {
                             key: MONITOR_ENTER_KEY,
                             label: "open",
-                            operation: MonitorOperation::Execute(
-                                crate::terminal::tick_actions::builtin::shell(task.id),
-                            ),
+                            intent: TickIntent::OpenShell { task: task.id },
                         },
                         if task.state.is_terminal() {
                             remove_from_monitor(&instance)
@@ -346,7 +330,7 @@ impl TickAdapter for ShellAdapter {
                             MonitorAction {
                                 key: 'x',
                                 label: "remove",
-                                operation: MonitorOperation::Notify(
+                                intent: TickIntent::Notify(
                                     "Open this Shell to stop it before removing it".into(),
                                 ),
                             }
@@ -419,9 +403,7 @@ pub(crate) fn artifact_actions(id: &str) -> Vec<MonitorAction> {
     .map(|(key, label)| MonitorAction {
         key,
         label,
-        operation: MonitorOperation::Execute(crate::terminal::tick_actions::builtin::artifact(
-            id, key,
-        )),
+        intent: TickIntent::Artifact { id: id.into(), key },
     })
     .collect()
 }
@@ -432,9 +414,7 @@ fn subscription_actions(row: &TickSubscriptionStatus) -> Vec<MonitorAction> {
         MonitorAction {
             key: MONITOR_ENTER_KEY,
             label: "open",
-            operation: MonitorOperation::Execute(
-                crate::terminal::tick_actions::builtin::subscription(&row.id.to_string()),
-            ),
+            intent: TickIntent::OpenSubscription { id: row.id },
         },
         remove_from_monitor(&row.instance),
     ]

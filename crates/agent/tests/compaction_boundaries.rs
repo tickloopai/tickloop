@@ -13,8 +13,9 @@ use tickloop_agent::{
         Content, Message, ModelClient, ModelDelta, ModelError, ModelIdentity, ModelOutput,
         ModelRequest, Protocol, Role, Usage,
     },
+    protocol::ChatId,
     runtime::{
-        Agent, BranchRequest, ChatId, ChatSnapshot, DirectedSummaryRequest, EventKind, RewindMode,
+        Agent, BranchRequest, ChatSnapshot, DirectedSummaryRequest, EventKind, RewindMode,
         SummaryDirection,
     },
 };

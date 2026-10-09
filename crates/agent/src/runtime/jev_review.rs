@@ -5,10 +5,11 @@ use serde_json::json;
 use super::AutoReview;
 use super::approval_context::ApprovalSnapshot;
 use super::auto_rules::{
-    AutoPolicy, AutoRuleKind, RuleApplicability, RuleFinding, RuleVerdict, SemanticFindings,
-    SoftDenyClearance, TaskScopeFinding, reduce,
+    AutoPolicy, RuleApplicability, RuleFinding, RuleVerdict, SemanticFindings, SoftDenyClearance,
+    TaskScopeFinding, reduce,
 };
 use crate::judgment::{Answer, Evaluation, EvaluationRequest, Question};
+use crate::settings::AutoRuleKind;
 
 // Conservative byte budgets below Jev 1.13's 64k request / 32k state-plus-question token limits.
 const MAX_REVIEW_REQUEST_BYTES: usize = 60 * 1024;

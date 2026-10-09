@@ -10,13 +10,14 @@ use tokio::sync::Notify;
 use uuid::Uuid;
 
 use super::{
-    ActiveConversationItem, Agent, AgentError, Chat, ChatId, ChatSnapshot, InputContext, LoopId,
-    LoopState, OperationState, RequestUsageLedger, RunId, SummaryDirection, UserShellState,
+    ActiveConversationItem, Agent, AgentError, Chat, ChatSnapshot, InputContext, LoopId, LoopState,
+    OperationState, RequestUsageLedger, RunId, SummaryDirection, UserShellState,
     tool_results::ContentReplacementState,
 };
 use crate::{
     model::{Content, Message, Protocol, Role},
     permissions::PermissionPolicy,
+    protocol::ChatId,
     tools::CommandState,
 };
 

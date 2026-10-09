@@ -25,9 +25,10 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::private_fs::{
-    OpenTarget, PRIVATE_DIRECTORY_MODE, PRIVATE_FILE_MODE, open_without_following_links,
+    OpenTarget, PRIVATE_DIRECTORY_MODE, PRIVATE_FILE_MODE, PrivateDirectory,
+    open_without_following_links,
 };
-use crate::transcript::{PrivateDirectory, now_timestamp};
+use crate::transcript::now_timestamp;
 
 /// 状态根目录（或不持久化时的项目临时目录）下存放各 Chat 备份的目录。
 pub(crate) const FILE_HISTORY_DIRECTORY: &str = "file-history";

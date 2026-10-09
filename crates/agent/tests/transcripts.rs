@@ -19,8 +19,9 @@ use tickloop_agent::{
         ModelRequest, Protocol, Role, ToolResultBlock, ToolResultContent, Usage,
     },
     permissions::{Decision, ExecutionMode, PermissionRule},
+    protocol::ChatId,
     runtime::{
-        Agent, AgentHostOptions, BranchRequest, ChatId, EventKind, LoopId, LoopState, PromptPolicy,
+        Agent, AgentHostOptions, BranchRequest, EventKind, LoopId, LoopState, PromptPolicy,
         Receipt, RewindMode, Trigger,
     },
 };

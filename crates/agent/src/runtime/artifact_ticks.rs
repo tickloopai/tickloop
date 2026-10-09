@@ -1,5 +1,6 @@
-use super::{Agent, AgentError, ChatId};
+use super::{Agent, AgentError};
 use crate::artifacts::ArtifactTick;
+use crate::protocol::ChatId;
 
 impl Agent {
     pub(super) fn auto_attach_artifact_tick(&self, chat: &mut super::Chat, tick: ArtifactTick) {

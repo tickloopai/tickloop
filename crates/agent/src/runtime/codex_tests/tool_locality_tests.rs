@@ -1,17 +1,20 @@
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicUsize, Ordering},
+use std::{
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
 };
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-use super::{CodexModelClient, tests::*, *};
 use crate::{
     host_tools::{HostToolPermission, HostToolProvider},
-    model::{HttpModelClient, ToolDefinition, cards::ModelCatalog},
-    runtime::{Agent, ChatId, EventKind},
+    model::{HttpModelClient, cards::ModelCatalog, codex_test_support::*},
+    protocol::{ChatId, ToolDefinition},
+    runtime::{Agent, EventKind},
     tools::ToolResult,
 };
 
@@ -179,11 +182,8 @@ async fn the_same_new_host_tool_round_trips_through_the_real_codex_adapter() {
     let config = ModelCatalog::defaults()
         .get("openai-codex", "gpt-5.5-responses")
         .unwrap();
-    let client = CodexModelClient::new(config.clone(), &state_dir)
-        .unwrap()
-        .with_loopback_test_endpoint(endpoint.as_str())
-        .unwrap();
-    let agent = Agent::new_embedded(config, crate::model::fixture_client(Arc::new(client)));
+    let client = LoopbackCodexClient::new(config.clone(), &state_dir, endpoint.as_str());
+    let agent = Agent::new_embedded(config, client.into_fixture_client());
     run_agent_round_trip(agent, &state_dir).await;
     assert_wire_round_trip(&requests.await.unwrap(), true);
 }

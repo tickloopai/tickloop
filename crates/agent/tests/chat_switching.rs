@@ -5,8 +5,9 @@ use std::{sync::Arc, time::Duration};
 use support::{ScriptedModel, config, next_event, text, transcript_file};
 use tickloop_agent::{
     model::ModelRequest,
+    protocol::ChatId,
     runtime::{
-        Agent, AgentError, BranchRequest, ChatId, EventKind, LoopId, Receipt, ShellTaskCenter,
+        Agent, AgentError, BranchRequest, EventKind, LoopId, Receipt, ShellTaskCenter,
         ShellTaskState, Trigger,
     },
 };

@@ -1,18 +1,14 @@
 use std::io;
-use std::os::unix::fs::DirBuilderExt;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use icu_normalizer::ComposingNormalizerBorrowed;
 use uuid::Uuid;
 
-use crate::private_fs::{
-    PRIVATE_DIRECTORY_MODE, create_private_directory, current_uid, verify_private_directory,
-};
+use crate::private_fs::{PrivateDirectory, current_uid};
 
 /// Transcript 的项目目录与文件名后缀；过期清理与列表按同一布局查找。
 pub(crate) const PROJECTS_DIRECTORY: &str = "projects";
 pub(crate) const TRANSCRIPT_FILE_SUFFIX: &str = ".jsonl";
-const TEMPORARY_DIRECTORY_DESCRIPTION: &str = "temporary directory";
 /// 多数文件系统单个路径段上限 255 字节；照 Claude Code 保留 200，给哈希后缀留出空间。
 const MAX_SANITIZED_LENGTH: usize = 200;
 const TEMP_DIRECTORY_ENV: &str = "TICKLOOP_TMPDIR";
@@ -47,76 +43,10 @@ fn private_temp_root() -> PrivateDirectory {
         .filter(|value| !value.is_empty())
         .map_or_else(|| PathBuf::from(DEFAULT_TEMP_DIRECTORY), PathBuf::from);
     let base = base.canonicalize().unwrap_or(base);
-    let path = base.join(format!("{PRIVATE_TEMP_DIRECTORY_PREFIX}{}", current_uid()));
-    PrivateDirectory {
-        anchor: Some(base),
-        path,
-    }
-}
-
-/// Tick Loop 自己写入的目录。位于用户配置目录下时照常创建；位于系统临时目录下时，
-/// 其他用户可以在共享的 `/tmp` 中抢先布置目录或符号链接，因此锚点以下
-/// 每一层都必须是当前用户拥有、没有 group/other 权限位的真实目录。
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct PrivateDirectory {
-    /// 可信的基础目录；`None` 表示整条路径可信。
-    anchor: Option<PathBuf>,
-    path: PathBuf,
-}
-
-impl PrivateDirectory {
-    pub(crate) fn trusted(path: PathBuf) -> Self {
-        Self { anchor: None, path }
-    }
-
-    pub(crate) fn path(&self) -> &Path {
-        &self.path
-    }
-
-    pub(crate) fn join(&self, name: impl AsRef<Path>) -> Self {
-        Self {
-            anchor: self.anchor.clone(),
-            path: self.path.join(name),
-        }
-    }
-
-    /// 创建目录（已存在时沿用），失败或校验不通过时返回说明原因的错误。
-    pub(crate) fn create(&self) -> io::Result<()> {
-        let Some(anchor) = &self.anchor else {
-            return create_private_directory(&self.path);
-        };
-        let relative = self.path.strip_prefix(anchor).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "{} is outside the temporary directory {}",
-                    self.path.display(),
-                    anchor.display()
-                ),
-            )
-        })?;
-        create_private_directory(anchor)?;
-        let mut current = anchor.clone();
-        for component in relative.components() {
-            let Component::Normal(name) = component else {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("{} is not a normalized path", self.path.display()),
-                ));
-            };
-            current.push(name);
-            match std::fs::DirBuilder::new()
-                .mode(PRIVATE_DIRECTORY_MODE)
-                .create(&current)
-            {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(error),
-            }
-            verify_private_directory(&current, TEMPORARY_DIRECTORY_DESCRIPTION)?;
-        }
-        Ok(())
-    }
+    PrivateDirectory::anchored(
+        base,
+        format!("{PRIVATE_TEMP_DIRECTORY_PREFIX}{}", current_uid()),
+    )
 }
 
 fn project_directory_name(workdir: &Path) -> String {
@@ -189,7 +119,6 @@ fn djb2_base36(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::MetadataExt;
 
     #[test]
     fn sanitize_matches_claude_code_for_short_and_long_paths() {
@@ -203,66 +132,6 @@ mod tests {
         let sanitized = sanitize_path(&long);
         assert!(sanitized.starts_with(&format!("-{}", "a".repeat(199))));
         assert_eq!(sanitized.len(), 201 + djb2_base36(&long).len());
-    }
-
-    fn anchored(anchor: &Path, relative: &str) -> PrivateDirectory {
-        PrivateDirectory {
-            anchor: Some(anchor.to_path_buf()),
-            path: anchor.join(relative),
-        }
-    }
-
-    #[test]
-    fn private_temp_directories_are_created_owner_only_and_reused() {
-        let anchor = tempfile::tempdir().unwrap();
-        let directory = anchored(anchor.path(), "tickloop-1/project/chat/tasks");
-        directory.create().unwrap();
-        directory.create().unwrap();
-        for layer in [
-            "tickloop-1",
-            "tickloop-1/project",
-            "tickloop-1/project/chat/tasks",
-        ] {
-            let metadata = std::fs::symlink_metadata(anchor.path().join(layer)).unwrap();
-            assert!(metadata.is_dir());
-            assert_eq!(metadata.mode() & 0o777, 0o700, "{layer}");
-        }
-    }
-
-    #[test]
-    fn private_temp_directories_reject_symbolic_links_and_shared_layers() {
-        use std::os::unix::fs::PermissionsExt;
-        let anchor = tempfile::tempdir().unwrap();
-        let elsewhere = tempfile::tempdir().unwrap();
-        std::fs::create_dir(anchor.path().join("tickloop-1")).unwrap();
-        std::fs::set_permissions(
-            anchor.path().join("tickloop-1"),
-            std::fs::Permissions::from_mode(0o700),
-        )
-        .unwrap();
-        std::os::unix::fs::symlink(elsewhere.path(), anchor.path().join("tickloop-1/linked"))
-            .unwrap();
-        let error = anchored(anchor.path(), "tickloop-1/linked/chat")
-            .create()
-            .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
-        assert!(error.to_string().contains("symbolic link"), "{error}");
-        assert!(!elsewhere.path().join("chat").exists());
-
-        let shared = anchor.path().join("tickloop-1/shared");
-        std::fs::create_dir(&shared).unwrap();
-        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o750)).unwrap();
-        let error = anchored(anchor.path(), "tickloop-1/shared/chat")
-            .create()
-            .unwrap_err();
-        assert!(error.to_string().contains("mode 0750"), "{error}");
-        assert!(!shared.join("chat").exists());
-
-        std::fs::write(anchor.path().join("tickloop-1/file"), "").unwrap();
-        let error = anchored(anchor.path(), "tickloop-1/file/chat")
-            .create()
-            .unwrap_err();
-        assert!(error.to_string().contains("not a directory"), "{error}");
     }
 
     #[test]

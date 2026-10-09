@@ -22,11 +22,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::private_fs::{PRIVATE_FILE_MODE, unix_time_milliseconds};
+use crate::settings::{PASTE_CACHE_DIRECTORY, PASTE_FILE_EXTENSION};
 
 const HISTORY_FILE_NAME: &str = "history.jsonl";
-/// 粘贴缓存目录与文件扩展名；过期清理按同一布局查找。
-pub(crate) const PASTE_CACHE_DIRECTORY: &str = "paste-cache";
-pub(crate) const PASTE_FILE_EXTENSION: &str = ".txt";
 const MAX_HISTORY_ITEMS: usize = 100;
 const MAX_SHELL_HISTORY_COMMANDS: usize = 50;
 const SHELL_PROMPT_PREFIX: char = '!';

@@ -16,9 +16,7 @@ fn shell(id: Uuid, title: &str) -> MonitorEntry {
             crate::tick_adapter::MonitorAction {
                 key: 'o',
                 label: "open",
-                operation: crate::tick_adapter::MonitorOperation::Execute(
-                    crate::terminal::tick_actions::builtin::shell(id),
-                ),
+                intent: crate::tick_adapter::TickIntent::OpenShell { task: id },
             },
             crate::tick_adapter::remove_from_monitor(&crate::tick_stream::InstanceRef::shell(id)),
         ],
@@ -1290,108 +1288,24 @@ fn fixture_actions(
         crate::tick_adapter::MonitorAction {
             key: 'o',
             label: "open",
-            operation: crate::tick_adapter::MonitorOperation::Execute(
-                crate::terminal::tick_actions::builtin::subscription(&Uuid::new_v4().to_string()),
-            ),
+            intent: crate::tick_adapter::TickIntent::OpenSubscription { id: Uuid::new_v4() },
         },
         crate::tick_adapter::remove_from_monitor(instance),
     ]
 }
 
-#[tokio::test]
-async fn a_new_adapter_remote_action_and_detail_work_through_enter_and_click() {
+#[test]
+fn a_new_adapter_row_intent_runs_through_enter_and_click() {
     use crate::tick_adapter::*;
-    use std::{
-        any::Any,
-        sync::atomic::{AtomicUsize, Ordering},
-    };
-    use tokio::{
-        io::{AsyncReadExt, AsyncWriteExt},
-        net::TcpListener,
-    };
-    struct Calendar {
-        endpoint: String,
-    }
-    struct OpenCalendar {
-        endpoint: String,
-    }
-    struct ReadCalendar {
-        endpoint: String,
-        panel: Uuid,
-    }
-    struct CalendarDetail {
-        id: Uuid,
-        chat: Uuid,
-        text: String,
-    }
-    impl TickDetailView for CalendarDetail {
-        fn id(&self) -> Uuid {
-            self.id
-        }
-        fn chat(&self) -> Uuid {
-            self.chat
-        }
-        fn lines(&mut self, _width: usize, _height: usize, _now: u64) -> Vec<TickDetailLine> {
-            vec![
-                TickDetailLine::new("Calendar detail"),
-                TickDetailLine::new(&self.text),
-            ]
-        }
-        fn hint(&self) -> String {
-            "Esc back".into()
-        }
-        fn key(&mut self, key: KeyEvent, _width: usize, _height: usize) -> TickDetailKey {
-            if matches!(key.code, KeyCode::Esc | KeyCode::Left) {
-                TickDetailKey::Back
-            } else {
-                TickDetailKey::None
-            }
-        }
-        fn as_any_mut(&mut self) -> &mut dyn Any {
-            self
-        }
-    }
-    impl TickActionExecutor for OpenCalendar {
-        fn prepare(&self, ui: &mut TickActionUi<'_>) -> Result<PreparedTickAction, String> {
-            let panel = Uuid::new_v4();
-            ui.open_detail(Box::new(CalendarDetail {
-                id: panel,
-                chat: ui.chat().unwrap(),
-                text: "loading".into(),
-            }));
-            Ok(PreparedTickAction::new(
-                "cal:remote",
-                'o',
-                Arc::new(ReadCalendar {
-                    endpoint: self.endpoint.clone(),
-                    panel,
-                }),
-            ))
-        }
-    }
-    #[async_trait::async_trait]
-    impl TickActionBackend for ReadCalendar {
-        async fn execute(&self, ctx: TickActionContext<'_>) -> Result<TickActionOutcome, String> {
-            let text = reqwest::get(&self.endpoint)
-                .await
-                .map_err(|error| error.to_string())?
-                .text()
-                .await
-                .map_err(|error| error.to_string())?;
-            ctx.update_detail::<CalendarDetail, _>(self.panel, |view| {
-                view.text = text;
-                Some(())
-            })?;
-            Ok(TickActionOutcome::Done)
-        }
-    }
+    struct Calendar;
     impl TickAdapter for Calendar {
         fn tick_type(&self) -> &'static str {
             "cal"
         }
         fn list(&self, _: &MonitorContext) -> Vec<TickDescriptor> {
+            let instance = crate::tick_stream::InstanceRef::new("cal", "remote").unwrap();
             vec![TickDescriptor {
-                instance: crate::tick_stream::InstanceRef::new("cal", "remote").unwrap(),
+                instance: instance.clone(),
                 group: TickGroup {
                     order: 4,
                     name: "Calendars",
@@ -1400,16 +1314,14 @@ async fn a_new_adapter_remote_action_and_detail_work_through_enter_and_click() {
                 title: "Remote calendar".into(),
                 kind: "Calendar".into(),
                 status: "live".into(),
-                owner: crate::tick_adapter::TickOwner::Unknown,
+                owner: TickOwner::Unknown,
                 updated_at_ms: None,
                 resources: None,
                 running: true,
                 actions: vec![MonitorAction {
-                    key: 'o',
-                    label: "open",
-                    operation: MonitorOperation::Execute(Arc::new(OpenCalendar {
-                        endpoint: self.endpoint.clone(),
-                    })),
+                    key: MONITOR_ENTER_KEY,
+                    label: "details",
+                    intent: TickIntent::ShowDetails(instance),
                 }],
             }]
         }
@@ -1417,44 +1329,11 @@ async fn a_new_adapter_remote_action_and_detail_work_through_enter_and_click() {
             None
         }
     }
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let endpoint = format!("http://{}/calendar", listener.local_addr().unwrap());
-    let calls = Arc::new(AtomicUsize::new(0));
-    let observed = calls.clone();
-    let server = tokio::spawn(async move {
-        loop {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = [0u8; 4096];
-            let count = socket.read(&mut request).await.unwrap();
-            assert!(String::from_utf8_lossy(&request[..count]).starts_with("GET /calendar "));
-            observed.fetch_add(1, Ordering::SeqCst);
-            let body = "remote earnings detail";
-            socket
-                .write_all(
-                    format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    )
-                    .as_bytes(),
-                )
-                .await
-                .unwrap();
-        }
-    });
-    let directory = tempfile::tempdir().unwrap();
-    let core = crate::runtime::Agent::new_embedded(
-        crate::terminal::test_support::config(),
-        Arc::new(crate::terminal::test_support::ScriptedModel::new(vec![])),
-    );
-    let agent = crate::terminal::execution::ConsoleExecution::from_embedded(
-        core.clone(),
-        crate::terminal::test_support::config(),
-    );
-    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let chat = Uuid::new_v4();
     let mut state = State::new(true, 140, 25);
     state.switch_view_chat(Some(chat));
     state.prompt_enabled = true;
-    let rows = TickAdapters::new([Arc::new(Calendar { endpoint }) as Arc<dyn TickAdapter>])
+    let rows = TickAdapters::new([Arc::new(Calendar) as Arc<dyn TickAdapter>])
         .unwrap()
         .list(&MonitorContext::default());
     state.monitor.replace(
@@ -1464,58 +1343,39 @@ async fn a_new_adapter_remote_action_and_detail_work_through_enter_and_click() {
         },
         rows.into_iter().map(MonitorEntry::from).collect(),
     );
-    let console = tests::console_with_state(state);
     for click in [false, true] {
-        let action = {
-            let mut state = console.state.lock().unwrap();
-            state.monitor.focus(false, None);
-            state.draw_frame(&mut Vec::new()).unwrap();
-            let event = if click {
-                let target = &state.monitor_row_targets[0];
-                let (row, column) = (target.row, target.columns.start);
-                state.pointer(
-                    MouseEvent {
-                        kind: MouseEventKind::Down(MouseButton::Left),
-                        row: row as u16,
-                        column: column as u16,
-                        modifiers: KeyModifiers::NONE,
-                    },
-                    &mut Vec::new(),
-                );
-                state.pointer_input.take()
-            } else {
-                state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-            };
-            let Some(InputEvent::TickAction { action, .. }) = event else {
-                panic!("adapter action was not dispatched")
-            };
-            action
+        state.monitor.focus(false, None);
+        state.draw_frame(&mut Vec::new()).unwrap();
+        let event = if click {
+            let target = &state.monitor_row_targets[0];
+            let (row, column) = (target.row, target.columns.start);
+            state.pointer(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    row: row as u16,
+                    column: column as u16,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &mut Vec::new(),
+            );
+            state.pointer_input.take()
+        } else {
+            state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
         };
-        crate::terminal::tick_actions::execute(
-            action,
-            TickActionContext {
-                agent: &agent,
-                console: &console,
-                root: None,
-                chat,
-            },
-        )
-        .await
-        .unwrap();
-        let mut state = console.state.lock().unwrap();
+        assert_eq!(
+            tick_action_signature(event),
+            format!("{chat}/cal:remote/{MONITOR_ENTER_KEY}")
+        );
         state.draw_frame(&mut Vec::new()).unwrap();
         assert!(
             state
                 .rendered_screen
                 .iter()
-                .any(|line| line.contains("remote earnings detail"))
+                .any(|line| line.contains("Instance  cal:remote"))
         );
         state.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(state.monitor.detail.is_none());
     }
-    assert_eq!(calls.load(Ordering::SeqCst), 2);
-    server.abort();
-    core.shutdown().await;
 }
 
 #[tokio::test]

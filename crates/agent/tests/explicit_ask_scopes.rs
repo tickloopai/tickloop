@@ -10,9 +10,9 @@ use serde_json::json;
 use support::{ScriptedModel, call, config, next_event, text};
 use tickloop_agent::{
     host_tools::{HostToolPermission, HostToolProvider},
-    model::ToolDefinition,
     permissions::{Decision, ExecutionMode, PermissionRule, PermissionScope},
-    runtime::{Agent, AgentHostOptions, ChatId, EventKind, PermissionApprovalSource, PromptPolicy},
+    protocol::{ChatId, ToolDefinition},
+    runtime::{Agent, AgentHostOptions, EventKind, PermissionApprovalSource, PromptPolicy},
     tools::ToolResult,
 };
 use tokio_util::sync::CancellationToken;

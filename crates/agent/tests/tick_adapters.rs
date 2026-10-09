@@ -6,8 +6,8 @@ use support::*;
 use tickloop_agent::{
     runtime::{Agent, EventKind, ShellTaskCenter, TickSubscriptionChange},
     tick_adapter::{
-        MonitorAction, MonitorContext, MonitorOperation, ShellAdapter, TickAdapter, TickAdapters,
-        TickDescriptor, TickGlyph, TickGroup,
+        MonitorAction, MonitorContext, ShellAdapter, TickAdapter, TickAdapters, TickDescriptor,
+        TickGlyph, TickGroup, TickIntent,
     },
     tick_stream::{
         InMemoryTickStream, InstanceRef, ObservationKind, TickObservation, TickStreamPort,
@@ -40,7 +40,7 @@ impl TickAdapter for CalendarAdapter {
             actions: vec![MonitorAction {
                 key: 'o',
                 label: "open",
-                operation: MonitorOperation::Notify("Calendar opened".into()),
+                intent: TickIntent::Notify("Calendar opened".into()),
             }],
         }]
     }
@@ -337,6 +337,131 @@ async fn shell_output_changes_before_exit_and_a_late_watch_uses_a_new_baseline()
         .is_err()
     );
     agent.shutdown().await;
+}
+
+/// Built-in rows only describe what each key means; the Console decides how to carry it out.
+#[test]
+fn built_in_rows_describe_their_actions_as_intents() {
+    use tickloop_agent::runtime::{
+        MonitorMember, MonitorMemberSource, ShellTask, ShellTaskCapabilities, ShellTaskOrigin,
+        ShellTaskOwner, ShellTaskSnapshot, ShellTaskState, TickSubscriptionStatus,
+    };
+    let chat = Uuid::new_v4();
+    let shell = |state| ShellTask {
+        id: Uuid::new_v4(),
+        chat_id: chat,
+        origin: ShellTaskOrigin::User,
+        owner: ShellTaskOwner::User { chat_id: chat },
+        command: "sleep 30".into(),
+        cwd: "/fixture".into(),
+        state,
+        was_background: true,
+        pid: None,
+        exit_code: None,
+        signal: None,
+        reason: None,
+        output_bytes: 0,
+        updated_at_ms: None,
+        capabilities: ShellTaskCapabilities::default(),
+    };
+    let (running, finished) = (
+        shell(ShellTaskState::Background),
+        shell(ShellTaskState::Completed),
+    );
+    let subscription = |instance: &str| -> TickSubscriptionStatus {
+        serde_json::from_value(json!({"id":Uuid::new_v4(),"loop_id":Uuid::new_v4(),"loop_state":"WaitingTrigger","instance":instance,"every_seconds":60,"accumulated":0,"last_delivery_ms":null,"last_delivery":null,"link":"Live"})).unwrap()
+    };
+    let (pane, artifact) = (
+        subscription("herdr:pane"),
+        subscription("artifact:https://docs.example/a"),
+    );
+    let rows = TickAdapters::presentation().list(&MonitorContext {
+        shells: Some(ShellTaskSnapshot {
+            chat_id: chat,
+            live_revision: 0,
+            tasks: vec![running.clone(), finished.clone()],
+        }),
+        subscriptions: vec![pane.clone(), artifact.clone()],
+        ..Default::default()
+    });
+    let actions = |instance: &InstanceRef| {
+        rows.iter()
+            .find(|row| &row.instance == instance)
+            .unwrap()
+            .actions
+            .clone()
+    };
+    let action = |key, label, intent| MonitorAction { key, label, intent };
+    assert_eq!(
+        actions(&InstanceRef::shell(running.id)),
+        [
+            action('o', "open", TickIntent::OpenShell { task: running.id }),
+            action(
+                'x',
+                "remove",
+                TickIntent::Notify("Open this Shell to stop it before removing it".into())
+            ),
+        ]
+    );
+    let finished_instance = InstanceRef::shell(finished.id);
+    assert_eq!(
+        actions(&finished_instance),
+        [
+            action('o', "open", TickIntent::OpenShell { task: finished.id }),
+            action(
+                'x',
+                "remove",
+                TickIntent::RemoveFromMonitor(finished_instance.clone())
+            ),
+        ]
+    );
+    assert_eq!(
+        actions(&pane.instance),
+        [
+            action('o', "open", TickIntent::OpenSubscription { id: pane.id }),
+            action(
+                'x',
+                "remove",
+                TickIntent::RemoveFromMonitor(pane.instance.clone())
+            ),
+        ]
+    );
+    assert_eq!(
+        actions(&artifact.instance),
+        [
+            ('o', "open"),
+            ('x', "remove"),
+            ('c', "copy"),
+            ('f', "feedback")
+        ]
+        .map(|(key, label)| {
+            action(
+                key,
+                label,
+                TickIntent::Artifact {
+                    id: artifact.instance.to_string(),
+                    key,
+                },
+            )
+        })
+    );
+    let member = InstanceRef::new("cal", "member").unwrap();
+    let member_row = tickloop_agent::tick_adapter::member_descriptor(&MonitorMember {
+        instance: member.clone(),
+        source: MonitorMemberSource::Added,
+        title: None,
+    });
+    assert_eq!(
+        member_row.actions,
+        [
+            action('o', "details", TickIntent::ShowDetails(member.clone())),
+            action('x', "remove", TickIntent::RemoveFromMonitor(member)),
+        ]
+    );
+    assert_eq!(
+        TickAdapters::presentation().refresh_intents(),
+        [TickIntent::RefreshArtifacts]
+    );
 }
 
 #[test]

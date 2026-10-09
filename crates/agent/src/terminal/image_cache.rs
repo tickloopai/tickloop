@@ -19,9 +19,8 @@ use uuid::Uuid;
 
 use super::hyperlink::Hyperlink;
 use crate::private_fs::{PRIVATE_FILE_MODE, create_private_directory, replace_file_atomically};
+use crate::settings::IMAGE_CACHE_DIRECTORY;
 
-/// Cache directory under the Tick Loop root; expiry cleanup looks for the same layout.
-pub(crate) const IMAGE_CACHE_DIRECTORY: &str = "image-cache";
 const PLACEHOLDER_PREFIX: &str = "[Image #";
 const PLACEHOLDER_SUFFIX: char = ']';
 const CACHED_MEDIA_TYPES: [ImageMediaType; 3] = [

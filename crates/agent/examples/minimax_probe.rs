@@ -4,9 +4,10 @@ use serde_json::json;
 use tickloop_agent::{
     auth::minimax::{MiniMaxAuth, MiniMaxRegion},
     model::{
-        Content, Message, ModelRequest, ReasoningEffort, Role, StructuredOutput, ToolDefinition,
+        Content, Message, ModelRequest, ReasoningEffort, Role, StructuredOutput,
         cards::ModelCatalog, model_client,
     },
+    protocol::ToolDefinition,
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;

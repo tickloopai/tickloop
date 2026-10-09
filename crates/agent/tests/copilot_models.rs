@@ -12,7 +12,7 @@ use tickloop_agent::{
     model::{
         Content, ImageSource, InputModality, Message, ModelAuthSource, ModelConfig, ModelError,
         ModelFailureKind, ModelOutput, ModelRequest, ModelResponseRejection, Protocol,
-        ReasoningEffort, Role, ToolDefinition,
+        ReasoningEffort, Role,
         access::AccessCatalog,
         availability::{AccountModelDiscovery, ModelAvailability},
         cards::{
@@ -22,6 +22,7 @@ use tickloop_agent::{
         connection::{ModelDiscovery, ProductKind},
         model_client, validate_reasoning_effort,
     },
+    protocol::ToolDefinition,
     runtime::{Agent, EventKind},
 };
 use tokio::{

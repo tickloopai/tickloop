@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{
-    Agent, AgentError, Chat, ChatId, ChatSnapshot, InputContext, RequestOutcome, RequestSequence,
+    Agent, AgentError, Chat, ChatSnapshot, InputContext, RequestOutcome, RequestSequence,
     ResponseRejection, UserShellState,
     compaction::{
         self, CompactBoundary, CompactTrigger, CompactionLayout, CompactionMarker, MessageSource,
@@ -23,6 +23,7 @@ use super::{
     model_request::{self, RequestContext},
 };
 use crate::model::{Content, Message, ModelClient, ModelConfig, ModelRequest, Role, strip_images};
+use crate::protocol::ChatId;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]

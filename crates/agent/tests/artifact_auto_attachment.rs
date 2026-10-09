@@ -10,8 +10,8 @@ use tickloop_agent::{
         HostCallResult, HostEffect, HostToolPermission, HostToolProvider, PreparedHostCall,
         PublishedSourceEffect,
     },
-    model::ToolDefinition,
-    runtime::{Agent, ChatId, EventKind},
+    protocol::{ChatId, ToolDefinition},
+    runtime::{Agent, EventKind},
     tools::ToolResult,
 };
 use tokio_util::sync::CancellationToken;

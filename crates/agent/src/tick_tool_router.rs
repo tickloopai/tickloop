@@ -17,9 +17,8 @@ use crate::{
         PreparedHostCall, WorkspaceHostContext,
     },
     hosted::tools::HostedTickTools,
-    model::ToolDefinition,
     native_host::NativeHostToolProvider,
-    runtime::ChatId,
+    protocol::{ChatId, ToolDefinition},
     tools::ToolResult,
 };
 

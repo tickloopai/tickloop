@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use super::*;
 use crate::{
     host_tools::{HostCallContext, HostToolAuthority, HostToolProvider},
-    model::ToolDefinition,
+    protocol::ToolDefinition,
     tick_tool_router::{
         CALL_TICK_TOOL, MODIFY_TICK, READ_TICK, READ_WORKSPACE, TickBackend, TickBackends,
     },

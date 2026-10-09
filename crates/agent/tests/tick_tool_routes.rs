@@ -298,7 +298,7 @@ async fn artifact_shell_and_untyped_targets_never_reach_a_backend() {
     assert_eq!(backends.herdr.requests.load(Ordering::SeqCst), 0);
 }
 
-fn tool<'a>(definitions: &'a [tickloop_agent::model::ToolDefinition], name: &str) -> &'a Value {
+fn tool<'a>(definitions: &'a [tickloop_agent::protocol::ToolDefinition], name: &str) -> &'a Value {
     &definitions
         .iter()
         .find(|definition| definition.name == name)
