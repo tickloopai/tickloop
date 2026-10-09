@@ -18,12 +18,14 @@ use crate::file_history::{
 };
 use crate::transcript::private_project_temp_directory;
 use tickloop_agent_base::private_fs::PrivateDirectory;
+use tickloop_agent_protocol::local_messages::LocalMessage;
 use tickloop_agent_protocol::projection;
 use tickloop_agent_protocol::{
-    ChatId, ChatSnapshot, CodeRewind, Event, EventKind, HostNote, LoopId, LoopSnapshot, LoopState,
-    RewindDraft, RewindMode, RewindOutcome, RewindPoint, Role, RunId, UserShellRecord,
-    UserShellState,
+    ChatId, ChatSnapshot, CodeRewind, Content, Event, EventKind, HostNote, LoopId, LoopSnapshot,
+    LoopState, Message, RewindDraft, RewindMode, RewindOutcome, RewindPoint, Role, RunId,
+    TakenBackPrompt, UserShellRecord, UserShellState,
 };
+use tickloop_agent_tools::Tools;
 
 impl Agent {
     /// 照 Claude Code 的 Rewind 选择器：按模式恢复代码、对话或两者。先恢复代码，再截断对话；
@@ -80,18 +82,7 @@ impl Agent {
                 };
                 chat.active = None;
                 let result = agent.finish_rewind(chat, point, mode, restored, &loops_at_start);
-                let removed_loops = loops_at_start
-                    .into_iter()
-                    .filter(|loop_id| !chat.snapshot.loops.iter().any(|goal| goal.id == *loop_id))
-                    .collect::<Vec<_>>();
-                for loop_id in &removed_loops {
-                    if let Some(cancel) = chat.trigger_cancellations.remove(loop_id) {
-                        cancel.cancel();
-                    }
-                    if let Some(cancel) = chat.event_cancellations.remove(loop_id) {
-                        cancel.cancel();
-                    }
-                }
+                let removed_loops = stop_listening_to_removed_loops(chat, loops_at_start);
                 (result, (removed_loops, chat.tools.clone()))
             };
             let next = agent.next_run(chat_id).await;
@@ -109,19 +100,10 @@ impl Agent {
                 (Ok(_), Err(error)) => (Err(error), None),
                 (Err(error), next) => (Err(error), next.ok().flatten()),
             };
-            // 被截断移除的 Loop 若仍有 Trigger 或后台命令在运行，随之停止。移除视为结束：先写结束
-            // 状态再归还租约，同一 Loop 在其他进程中的 Trigger 下一次到点时随之停止。
             let (removed_loops, tools) = removed_loops;
-            for loop_id in removed_loops {
-                let recorded = agent
-                    .record_loop_run_state(chat_id, loop_id, RunStateChange::Ended)
-                    .await;
-                agent.inner.loop_leases.release(chat_id, loop_id);
-                agent.warn_loop_run_state_failure(chat_id, loop_id, recorded);
-                for command in tools.stop_loop(loop_id).await {
-                    let _ = agent.record_command(chat_id, command).await;
-                }
-            }
+            agent
+                .retire_removed_loops(chat_id, removed_loops, &tools)
+                .await;
             let _ = sender.send(result);
             while let Some((receipt, request, cancel)) = next {
                 next = agent.run(receipt, request, cancel).await;
@@ -131,6 +113,74 @@ impl Agent {
         receiver
             .await
             .map_err(|_| AgentError::Invalid("rewind task ended unexpectedly".into()))?
+    }
+
+    /// 照 Claude Code 中断后的自动恢复（`REPL.tsx` 在 `onQuery` 收尾处以
+    /// `messagesAfterAreOnlySynthetic` 判断后调用 `restoreMessageSync`）：用户中断的 `run_id` 还没有
+    /// 助手文字或工具调用时，对话截断到它的提示之前，模型此后看不到这条提示，Transcript 中留作
+    /// 被放弃的分支。与 rewind 不同，不建新的草稿 Loop：提示建立的 Loop 随提示移除，再次发送时
+    /// 新建；提示发给的已有 Loop 保留，再次发送仍发给它。条件不满足时不改动任何东西并返回
+    /// `None`，中断照常留在对话中。
+    pub async fn take_back_interrupted_prompt(
+        &self,
+        chat_id: ChatId,
+        run_id: RunId,
+    ) -> Result<Option<TakenBackPrompt>, AgentError> {
+        let (taken_back, removed_loops, tools) = {
+            let mut chats = self.inner.chats.lock().await;
+            if self.inner.closed.load(Ordering::SeqCst) {
+                return Err(AgentError::Invalid("agent host has shut down".into()));
+            }
+            let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
+            let Some((point, prompt_loop)) = interrupted_prompt(chat, run_id) else {
+                return Ok(None);
+            };
+            let loops_at_start = chat
+                .snapshot
+                .loops
+                .iter()
+                .map(|goal| goal.id)
+                .collect::<HashSet<_>>();
+            let (candidate, candidate_bookkeeping) =
+                conversation_before(&chat.snapshot, &chat.bookkeeping, &point, &loops_at_start)?;
+            let loop_id = candidate
+                .loops
+                .iter()
+                .any(|goal| goal.id == prompt_loop)
+                .then_some(prompt_loop);
+            self.replace_conversation(chat, &point, candidate, candidate_bookkeeping, prompt_loop);
+            self.save(&chat.snapshot);
+            let removed_loops = stop_listening_to_removed_loops(chat, loops_at_start);
+            let taken_back = TakenBackPrompt {
+                loop_id,
+                prompt: point.prompt,
+                contexts: point.contexts,
+            };
+            (taken_back, removed_loops, chat.tools.clone())
+        };
+        self.retire_removed_loops(chat_id, removed_loops, &tools)
+            .await;
+        Ok(Some(taken_back))
+    }
+
+    /// 被截断移除的 Loop 若仍有后台命令在运行，随之停止。移除视为结束：先写结束状态再归还租约，
+    /// 同一 Loop 在其他进程中的 Trigger 下一次到点时随之停止。
+    async fn retire_removed_loops(
+        &self,
+        chat_id: ChatId,
+        removed_loops: Vec<LoopId>,
+        tools: &Tools,
+    ) {
+        for loop_id in removed_loops {
+            let recorded = self
+                .record_loop_run_state(chat_id, loop_id, RunStateChange::Ended)
+                .await;
+            self.inner.loop_leases.release(chat_id, loop_id);
+            self.warn_loop_run_state_failure(chat_id, loop_id, recorded);
+            for command in tools.stop_loop(loop_id).await {
+                let _ = self.record_command(chat_id, command).await;
+            }
+        }
     }
 
     /// rewind 的第三段：按文件恢复结果与模式截断对话。对话以占用结束时的快照重新计算，
@@ -162,25 +212,25 @@ impl Agent {
             }),
         };
         let draft = if mode.restores_conversation() {
-            let (candidate, candidate_bookkeeping, loop_id) =
+            let (mut candidate, mut candidate_bookkeeping) =
                 conversation_before(&chat.snapshot, &chat.bookkeeping, &point, loops_at_start)?;
-            if let Some(recorder) = &self.inner.recorder {
-                recorder.truncate(&chat.snapshot, &chat.bookkeeping, point.message_index);
-            }
-            // The kept history ends where the prompt was submitted, in the mode it restores. Only
-            // an exited-plan-mode notice the prompt's first request carried is owed again.
-            let first_reply = (point.message_index..chat.snapshot.messages.len())
-                .find(|index| chat.snapshot.messages[*index].role == Role::Assistant)
-                .unwrap_or(chat.snapshot.messages.len());
-            chat.needs_plan_mode_exit_notice = chat
-                .snapshot
-                .host_notes
-                .range(point.message_index..first_reply)
-                .any(|(_, note)| *note == HostNote::PlanModeExit);
-            chat.snapshot = candidate;
-            chat.bookkeeping = candidate_bookkeeping;
-            self.reset_restored_todo_graces(chat);
-            self.emit_conversation_rewound(chat, loop_id, point.message_id);
+            let goal = prompt_loop_goal(&chat.snapshot, point.message_index)
+                .unwrap_or_else(|| point.prompt.clone());
+            let loop_id = Uuid::new_v4();
+            candidate_bookkeeping.add_loop(
+                &mut candidate,
+                LoopSnapshot {
+                    id: loop_id,
+                    goal,
+                    state: LoopState::Idle,
+                    run_id: None,
+                    run_started_at: None,
+                    trigger: None,
+                    event_sources: Vec::new(),
+                    state_since: None,
+                },
+            );
+            self.replace_conversation(chat, &point, candidate, candidate_bookkeeping, loop_id);
             Some(RewindDraft {
                 loop_id,
                 prompt: point.prompt,
@@ -218,6 +268,35 @@ impl Agent {
         tokio::task::spawn_blocking(move || history.files_changed_by_rewind(message_id))
             .await
             .map_err(|error| AgentError::Invalid(format!("file comparison ended: {error}")))
+    }
+
+    /// 换上截断到 `point` 之前的对话：Transcript 中下一条消息接在保留的最后一条之后，各 View
+    /// 收到 `ConversationRewound` 后重画对话。
+    fn replace_conversation(
+        &self,
+        chat: &mut Chat,
+        point: &RewindPoint,
+        candidate: ChatSnapshot,
+        candidate_bookkeeping: ChatBookkeeping,
+        loop_id: LoopId,
+    ) {
+        if let Some(recorder) = &self.inner.recorder {
+            recorder.truncate(&chat.snapshot, &chat.bookkeeping, point.message_index);
+        }
+        // The kept history ends where the prompt was submitted, in the mode it restores. Only
+        // an exited-plan-mode notice the prompt's first request carried is owed again.
+        let first_reply = (point.message_index..chat.snapshot.messages.len())
+            .find(|index| chat.snapshot.messages[*index].role == Role::Assistant)
+            .unwrap_or(chat.snapshot.messages.len());
+        chat.needs_plan_mode_exit_notice = chat
+            .snapshot
+            .host_notes
+            .range(point.message_index..first_reply)
+            .any(|(_, note)| *note == HostNote::PlanModeExit);
+        chat.snapshot = candidate;
+        chat.bookkeeping = candidate_bookkeeping;
+        self.reset_restored_todo_graces(chat);
+        self.emit_conversation_rewound(chat, loop_id, point.message_id);
     }
 
     fn emit_conversation_rewound(&self, chat: &mut Chat, loop_id: LoopId, message_id: Uuid) {
@@ -328,7 +407,7 @@ impl Agent {
     }
 }
 
-/// Rewinds before the target prompt, restores its execution mode, and creates an idle draft Loop.
+/// The conversation before the target prompt, in the execution mode the prompt was sent in.
 ///
 /// `loops_at_start` 是 rewind 占用开始时存在的 Loop：只有它们会因创建位置在截断点之后而移除，
 /// 连同其排队输入、权限请求与提问；占用期间新建的 Loop 保留，创建位置移到截断点。
@@ -337,11 +416,10 @@ fn conversation_before(
     bookkeeping: &ChatBookkeeping,
     point: &RewindPoint,
     loops_at_start: &HashSet<LoopId>,
-) -> Result<(ChatSnapshot, ChatBookkeeping, LoopId), AgentError> {
+) -> Result<(ChatSnapshot, ChatBookkeeping), AgentError> {
     let index = point.message_index;
     let mut candidate = snapshot.clone();
     let mut candidate_bookkeeping = bookkeeping.clone();
-    let goal = prompt_loop_goal(snapshot, index).unwrap_or_else(|| point.prompt.clone());
     let kept_runs = candidate
         .message_runs
         .range(..index)
@@ -424,21 +502,7 @@ fn conversation_before(
         candidate.policy.revision += 1;
     }
     projection::projected_messages(&candidate, &candidate_bookkeeping.denial_references)?;
-    let loop_id = Uuid::new_v4();
-    candidate_bookkeeping.add_loop(
-        &mut candidate,
-        LoopSnapshot {
-            id: loop_id,
-            goal,
-            state: LoopState::Idle,
-            run_id: None,
-            run_started_at: None,
-            trigger: None,
-            event_sources: Vec::new(),
-            state_since: None,
-        },
-    );
-    Ok((candidate, candidate_bookkeeping, loop_id))
+    Ok((candidate, candidate_bookkeeping))
 }
 
 /// 目标提示所属 Loop 的目标文字。提示的 run 仍是 Loop 当前 run、有用量或操作记录时直接对应；
@@ -476,6 +540,73 @@ fn prompt_loop_goal(snapshot: &ChatSnapshot, message_index: usize) -> Option<Str
         .iter()
         .find(|goal| goal.id == loop_id)
         .map(|goal| goal.goal.clone())
+}
+
+/// 截断后不在对话中的 Loop：停止它们的 Trigger 与事件来源，返回这些 Loop 供
+/// [`Agent::retire_removed_loops`] 结束。
+fn stop_listening_to_removed_loops(
+    chat: &mut Chat,
+    loops_at_start: HashSet<LoopId>,
+) -> Vec<LoopId> {
+    let removed_loops = loops_at_start
+        .into_iter()
+        .filter(|loop_id| !chat.snapshot.loops.iter().any(|goal| goal.id == *loop_id))
+        .collect::<Vec<_>>();
+    for loop_id in &removed_loops {
+        if let Some(cancel) = chat.trigger_cancellations.remove(loop_id) {
+            cancel.cancel();
+        }
+        if let Some(cancel) = chat.event_cancellations.remove(loop_id) {
+            cancel.cancel();
+        }
+    }
+    removed_loops
+}
+
+/// 用户中断的 `run_id` 可以撤回的提示及其 Loop。照 Claude Code 的守卫：Chat 已空闲且没有排队的
+/// 输入（中断后排队的输入已开始就是用户已经往下走了），查看的不是委派的子 Agent；对话中最后
+/// 一条提示属于这一轮且其 Loop 已中断，提示之后只有不算回应的消息。
+fn interrupted_prompt(chat: &Chat, run_id: RunId) -> Option<(RewindPoint, LoopId)> {
+    let snapshot = &chat.snapshot;
+    if snapshot.delegation.is_some() || ensure_idle(chat).is_err() {
+        return None;
+    }
+    let (&index, _) = snapshot.prompt_execution_modes.last_key_value()?;
+    let loop_id = *chat.bookkeeping.run_loops.get(&run_id)?;
+    let is_interrupted = snapshot
+        .loops
+        .iter()
+        .any(|goal| goal.id == loop_id && goal.state == LoopState::Interrupted);
+    if !is_interrupted || snapshot.message_runs.get(&index) != Some(&run_id) {
+        return None;
+    }
+    if !snapshot
+        .messages
+        .get(index + 1..)?
+        .iter()
+        .all(is_not_a_response)
+    {
+        return None;
+    }
+    Some((snapshot.rewind_point_at(index)?, loop_id))
+}
+
+/// 照 Claude Code `messagesAfterAreOnlySynthetic`：中断标记和没有文字、工具调用的助手消息
+/// （例如只有思考）不算回应，其他消息都算。
+fn is_not_a_response(message: &Message) -> bool {
+    match message.role {
+        Role::Assistant => message.content.iter().all(|content| match content {
+            Content::Text { text } => text.trim().is_empty(),
+            Content::ToolUse { .. } => false,
+            _ => true,
+        }),
+        Role::User => matches!(
+            message.content.as_slice(),
+            [Content::Text { text }]
+                if matches!(LocalMessage::parse(text), Some(LocalMessage::Interrupted { .. }))
+        ),
+        Role::System => false,
+    }
 }
 
 fn ensure_idle(chat: &Chat) -> Result<(), AgentError> {

@@ -5,11 +5,13 @@ use tickloop_agent_test_support::model_http_support;
 
 mod artifact_attachment;
 mod auto_review;
+mod bash_background;
 mod command_feedback;
 mod daemon_shutdown;
 mod family_messaging;
 mod family_navigation;
 mod hosted_monitor;
+mod interrupted_prompt;
 mod monitor_width;
 mod provider_errors;
 mod reply_visibility;
@@ -423,7 +425,7 @@ fn family_panel_has_viewing_row(frame: &str) -> bool {
 }
 
 fn new_input_is_visible(frame: &str) -> bool {
-    frame.contains("Tick Loop Agent")
+    frame.contains("Tickloop")
         && frame.contains("⏵⏵ ")
         && frame.lines().any(|line| line.starts_with('❯'))
 }
@@ -472,7 +474,7 @@ async fn run_lifecycle(fixture: &PrivateFixture) {
         first.send(return_key);
         first
             .wait_for("current draft returns without creating an Agent", |frame| {
-                frame.contains("Tick Loop Agent v0.1.0") && !frame.contains("Agents · local")
+                frame.contains("Tickloop v0.2.0") && !frame.contains("Agents · local")
             })
             .await;
         assert!(catalog(&client).await.is_empty());
@@ -579,17 +581,18 @@ async fn run_lifecycle(fixture: &PrivateFixture) {
         .await;
     reopened.send(b"\r");
     reopened
-        .wait_for("Tick Shell detail retrieves real worker output", |frame| {
-            frame.lines().any(|line| {
-                line.split('│')
-                    .nth(1)
-                    .is_some_and(|right| right.trim() == "Shell")
-            }) && frame.lines().any(|line| {
-                line.split('│')
-                    .nth(1)
-                    .is_some_and(|right| right.trim() == "shell began")
-            })
-        })
+        .wait_for(
+            "Tick Shell detail covers the screen with real worker output",
+            |frame| {
+                frame
+                    .lines()
+                    .next()
+                    .is_some_and(|line| line.starts_with("$ while [ ! -f finish ]"))
+                    && frame.lines().any(|line| line.trim() == "shell began")
+                    && frame.lines().any(|line| line.trim() == "s stop · esc back")
+                    && !frame.contains('│')
+            },
+        )
         .await;
     std::fs::write(fixture.path("work/finish"), b"finish").unwrap();
     tokio::time::timeout(UI_TIMEOUT, async {
@@ -631,11 +634,13 @@ async fn run_lifecycle(fixture: &PrivateFixture) {
         .wait_for(
             "Task detail follows completion after View detach",
             |frame| {
-                frame.lines().any(|line| {
-                    line.split('│')
-                        .nth(1)
-                        .is_some_and(|right| right.trim() == "shell beganshell ended")
-                })
+                frame
+                    .lines()
+                    .next()
+                    .is_some_and(|line| line.contains("exit 0"))
+                    && frame
+                        .lines()
+                        .any(|line| line.trim() == "shell beganshell ended")
             },
         )
         .await;
@@ -657,11 +662,7 @@ async fn run_lifecycle(fixture: &PrivateFixture) {
         .wait_for("Task Esc returns to ordinary input", |frame| {
             let captured = captured_output.lock().unwrap();
             let terminal = String::from_utf8_lossy(&captured);
-            !frame.lines().any(|line| {
-                line.split('│')
-                    .nth(1)
-                    .is_some_and(|right| right.trim() == "Shell")
-            }) && frame.lines().any(|line| line.trim() == "❯")
+            frame.lines().any(|line| line.trim() == "❯")
                 && terminal.rfind("\x1b[?25h") > terminal.rfind("\x1b[?25l")
         })
         .await;
@@ -3653,7 +3654,7 @@ async fn run_sent_message_echo(fixture: &PrivateFixture, prompts: [&str; 2], gat
     let banner_model = format!("{} · {:?}", model.model, model.protocol);
     let banner_directory = fixture.path("work").to_string_lossy().into_owned();
     let assert_startup_banner = |frame: &str| {
-        assert!(frame.contains("Tick Loop Agent v0.1.0"), "{frame}");
+        assert!(frame.contains("Tickloop v0.2.0"), "{frame}");
         assert!(frame.contains(&banner_model), "{frame}");
         assert!(frame.contains(&banner_directory), "{frame}");
     };
@@ -3718,7 +3719,7 @@ async fn run_sent_message_echo(fixture: &PrivateFixture, prompts: [&str; 2], gat
     view.send(b"/clear\r");
     let frame = view
         .wait_for("a fresh New Agent draft", |frame| {
-            frame.contains("Tick Loop Agent v") && !frame.contains(REPLIES[0])
+            frame.contains("Tickloop v") && !frame.contains(REPLIES[0])
         })
         .await;
     eprintln!("[echo-frame new draft after /clear]\n{frame}\n[/echo-frame]");

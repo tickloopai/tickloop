@@ -30,7 +30,7 @@ const DANGEROUS_FILES: &[&str] = &[
     ".ripgreprc",
     ".mcp.json",
 ];
-/// Claude Code protects its own `.claude` directory; Tick Loop's counterpart
+/// Claude Code protects its own `.claude` directory; Tickloop's counterpart
 /// is `.tickloop`, which holds the Agent's settings and permission rules.
 const DANGEROUS_DIRECTORIES: &[&str] = &[".git", ".vscode", ".idea", ".tickloop"];
 const MAX_SYMLINK_DEPTH: usize = 40;
@@ -439,7 +439,7 @@ pub(crate) fn auto_edit_safety_check(path: &Path) -> Option<crate::SafetyCheck> 
     if paths.iter().any(|path| has_suspicious_path_pattern(path)) {
         return Some(crate::SafetyCheck {
             reason: format!(
-                "Tick Loop requested permissions to write to {}, which contains a suspicious path pattern that requires manual approval.",
+                "Tickloop requested permissions to write to {}, which contains a suspicious path pattern that requires manual approval.",
                 path.display()
             ),
             classifier_approvable: false,
@@ -450,7 +450,7 @@ pub(crate) fn auto_edit_safety_check(path: &Path) -> Option<crate::SafetyCheck> 
         .any(|path| is_dangerous_file_to_auto_edit(path))
         .then(|| crate::SafetyCheck {
             reason: format!(
-                "Tick Loop requested permissions to edit {} which is a sensitive file.",
+                "Tickloop requested permissions to edit {} which is a sensitive file.",
                 path.display()
             ),
             classifier_approvable: true,

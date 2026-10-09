@@ -26,8 +26,8 @@ Tick 清理必须匹配同一 Loop 和实例的可信创建凭据。自动触发
 
 ## 当前不适用的原生条目
 
-- Memory Directory: No managed memory directory is provided by Tick Loop.
-- Claude Code Scheduling: CronCreate/CronDelete/CronList/RemoteTrigger are not Tick Loop tools; native Loop triggers require their own mapping.
+- Memory Directory: No managed memory directory is provided by Tickloop.
+- Claude Code Scheduling: CronCreate/CronDelete/CronList/RemoteTrigger are not Tickloop tools; native Loop triggers require their own mapping.
 - Browser Trusted Navigation: The authenticated Chrome-MCP browser surface is not exposed.
 - Sandbox Network Callback: There is no SandboxNetworkAccess callback in this runtime.
 - Command Network Lists: Bash does not grant network access through allowed_domains.

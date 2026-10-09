@@ -409,7 +409,7 @@ async fn concurrent_first_triggers_leave_exactly_one_holder_and_keep_its_lock() 
             match attempt.await.unwrap() {
                 Ok(_) => delivered += 1,
                 Err(AgentError::Invalid(message)) => {
-                    assert!(message.contains("another Tick Loop process"), "{message}")
+                    assert!(message.contains("another Tickloop process"), "{message}")
                 }
                 Err(error) => panic!("unexpected trigger failure: {error}"),
             }
@@ -594,7 +594,7 @@ async fn stale_lock_files_are_taken_over_whatever_pid_they_name_but_not_from_ano
     let mut exited = std::process::Command::new("true").spawn().unwrap();
     let exited_pid = exited.id();
     exited.wait().unwrap();
-    // 仍在运行但与 Tick Loop 无关的进程：模拟锁文件中的 PID 已被复用。
+    // 仍在运行但与 Tickloop 无关的进程：模拟锁文件中的 PID 已被复用。
     let mut unrelated = std::process::Command::new("sleep")
         .arg("30")
         .spawn()

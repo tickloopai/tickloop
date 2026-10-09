@@ -9,8 +9,8 @@ use std::{
 use crate::terminal::popup::{HerdrSession, PLUGIN_ID, PopupPlugin};
 use tickloop_agent_config::{UserSettings, config_root_directory};
 
-const INSTALL_PROMPT: &str = "This registers Tick Loop's popup plugin in the given Herdr session; no Herdr or Tick service is started, stopped or replaced. Install? [y/N]";
-const REMOVE_PROMPT: &str = "This removes Tick Loop's popup plugin tickloop.monitor from the given Herdr session and sets monitorPopup to disabled; enter in Monitor then opens Ticks full screen in the current terminal, and running Ticks keep running. Remove? [y/N]";
+const INSTALL_PROMPT: &str = "This registers Tickloop's popup plugin in the given Herdr session; no Herdr or Tick service is started, stopped or replaced. Install? [y/N]";
+const REMOVE_PROMPT: &str = "This removes Tickloop's popup plugin tickloop.monitor from the given Herdr session and sets monitorPopup to disabled; enter in Monitor then opens Ticks full screen in the current terminal, and running Ticks keep running. Remove? [y/N]";
 const NOTHING_CHANGED: &str = "nothing was changed";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -21,7 +21,7 @@ pub(super) enum PopupChange {
 
 pub(super) async fn run(change: PopupChange, herdr_socket: &Path) -> Result<(), String> {
     let root = config_root_directory()
-        .ok_or("cannot find the Tick Loop state directory; set TICKLOOP_CONFIG_DIR")?;
+        .ok_or("cannot find the Tickloop state directory; set TICKLOOP_CONFIG_DIR")?;
     let plugin = PopupPlugin::for_this_executable(&root)?;
     let herdr = HerdrSession::verify(herdr_socket).await?;
     let settings = UserSettings::in_root(&root);
@@ -31,7 +31,7 @@ pub(super) async fn run(change: PopupChange, herdr_socket: &Path) -> Result<(), 
             confirm(INSTALL_PROMPT)?;
             herdr.install(&plugin, &settings).await?;
             println!(
-                "Registered Tick Loop's popup plugin {PLUGIN_ID} in {}; monitorPopup is enabled.",
+                "Registered Tickloop's popup plugin {PLUGIN_ID} in {}; monitorPopup is enabled.",
                 herdr.socket().display()
             );
         }
@@ -40,7 +40,7 @@ pub(super) async fn run(change: PopupChange, herdr_socket: &Path) -> Result<(), 
             confirm(REMOVE_PROMPT)?;
             herdr.remove(&plugin, &settings).await?;
             println!(
-                "Removed Tick Loop's popup plugin {PLUGIN_ID} from {}; monitorPopup is disabled and running Ticks keep running.",
+                "Removed Tickloop's popup plugin {PLUGIN_ID} from {}; monitorPopup is disabled and running Ticks keep running.",
                 herdr.socket().display()
             );
         }

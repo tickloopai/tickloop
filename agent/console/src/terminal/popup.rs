@@ -1,4 +1,4 @@
-//! Tick Loop's Herdr popup plugin: installing it into or removing it from one Herdr session,
+//! Tickloop's Herdr popup plugin: installing it into or removing it from one Herdr session,
 //! whether it is ready there, and floating a hosted Tick in it.
 //!
 //! The plugin is static: its only pane runs this executable's `monitor attach`, which reads the
@@ -32,9 +32,9 @@ use tickloop_agent_config::{MonitorPopup, UserSettings};
 use tickloop_agent_protocol::HostedViewGrant;
 
 pub(crate) const PLUGIN_ID: &str = "tickloop.monitor";
-const PLUGIN_NAME: &str = "Tick Loop Monitor";
+const PLUGIN_NAME: &str = "Tickloop Monitor";
 const PANE_ID: &str = "attach";
-const PANE_TITLE: &str = "Tick Loop";
+const PANE_TITLE: &str = "Tickloop";
 const POPUP_PLACEMENT: &str = "popup";
 const POPUP_SIZE: &str = "85%";
 /// Arguments Herdr passes to this executable to open the Monitor popup pane.
@@ -47,7 +47,7 @@ const PLUGIN_PANE_OPEN: &str = "plugin.pane.open";
 /// Herdr's refusal to open a popup outside its normal workspace view.
 const HERDR_UI_BUSY: &str = "ui_busy";
 
-/// Whether this Herdr session can float a hosted Tick in Tick Loop's popup.
+/// Whether this Herdr session can float a hosted Tick in Tickloop's popup.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PopupReadiness {
     Ready,
@@ -134,7 +134,7 @@ struct RegisteredPlugin {
     panes: Vec<RegisteredPane>,
 }
 
-/// Tick Loop's popup plugin: a private directory under the state root whose manifest runs this
+/// Tickloop's popup plugin: a private directory under the state root whose manifest runs this
 /// executable's attach client and nothing else.
 pub(crate) struct PopupPlugin {
     state_root: PathBuf,
@@ -209,7 +209,7 @@ command = [{command}]
         let directory = self.state_root.join(PLUGIN_DIRECTORY);
         create_private_directory(&directory)
             .and_then(|()| {
-                verify_private_directory(&directory, "the Tick Loop popup plugin directory")
+                verify_private_directory(&directory, "the Tickloop popup plugin directory")
             })
             .and_then(|()| {
                 replace_file_atomically(
@@ -218,7 +218,7 @@ command = [{command}]
                     PRIVATE_FILE_MODE,
                 )
             })
-            .map_err(|error| format!("cannot write the Tick Loop popup plugin: {error}"))?;
+            .map_err(|error| format!("cannot write the Tickloop popup plugin: {error}"))?;
         Ok(self.directory())
     }
 
@@ -277,7 +277,7 @@ impl HerdrSession {
             .ok_or_else(|| format!("{} did not answer a Herdr ping", socket.display()))?;
         if !is_supported_herdr(version) {
             return Err(format!(
-                "Herdr {version} cannot run the Tick Loop popup plugin; it needs {MIN_HERDR_VERSION} or later"
+                "Herdr {version} cannot run the Tickloop popup plugin; it needs {MIN_HERDR_VERSION} or later"
             ));
         }
         Ok(session)
@@ -316,7 +316,7 @@ impl HerdrSession {
         match self.readiness(plugin).await? {
             PopupReadiness::Ready | PopupReadiness::Disabled | PopupReadiness::Outdated => Ok(()),
             PopupReadiness::NotInstalled => Err(format!(
-                "{} has no Tick Loop popup plugin {PLUGIN_ID}",
+                "{} has no Tickloop popup plugin {PLUGIN_ID}",
                 self.socket.display()
             )),
             PopupReadiness::Foreign { root } => Err(foreign_plugin(&root)),
@@ -347,7 +347,7 @@ impl HerdrSession {
                 .save_monitor_popup(MonitorPopup::Disabled)
                 .map_err(|error| format!("undid a mismatched registration but cannot set monitorPopup to disabled: {error}"))?;
             return Err(format!(
-                "Herdr registered {PLUGIN_ID} differently from what Tick Loop wrote; the registration was undone and monitorPopup set to disabled"
+                "Herdr registered {PLUGIN_ID} differently from what Tickloop wrote; the registration was undone and monitorPopup set to disabled"
             ));
         }
         settings
@@ -421,7 +421,7 @@ impl From<HostError> for FloatError {
 
 fn foreign_plugin(root: &Path) -> String {
     format!(
-        "{PLUGIN_ID} in this Herdr session comes from {}, not from Tick Loop; it is never replaced or removed",
+        "{PLUGIN_ID} in this Herdr session comes from {}, not from Tickloop; it is never replaced or removed",
         root.display()
     )
 }

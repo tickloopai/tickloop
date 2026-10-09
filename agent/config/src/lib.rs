@@ -60,7 +60,7 @@ const SHIFT_TAB_MODES_KEY: &str = "shiftTabModes";
 pub const DEFAULT_SHIFT_TAB_MODES: [ExecutionMode; 2] = [ExecutionMode::Auto, ExecutionMode::Plan];
 /// Claude Code's `outputStyle` setting.
 const OUTPUT_STYLE_KEY: &str = "outputStyle";
-/// 照 Claude Code `cleanupPeriodDays` 的名称与取值，但只有 0 有含义：不写 Transcript。Tick Loop 不按
+/// 照 Claude Code `cleanupPeriodDays` 的名称与取值，但只有 0 有含义：不写 Transcript。Tickloop 不按
 /// 天数自动删除任何文件，正数与未设置一样保存 Chat。
 const CLEANUP_PERIOD_DAYS_KEY: &str = "cleanupPeriodDays";
 /// 按项目目录分区的设置，参照 Claude Code 全局配置中的 `projects[<目录>]`。
@@ -157,13 +157,13 @@ pub struct ProjectRuleChanges {
     pub added: Vec<PermissionRule>,
 }
 
-/// Console caches under the Tick Loop root: pasted images at `<chatId>/<N>.<ext>` and large
+/// Console caches under the Tickloop root: pasted images at `<chatId>/<N>.<ext>` and large
 /// pastes at `<hash>.txt`.
 pub const IMAGE_CACHE_DIRECTORY: &str = "image-cache";
 pub const PASTE_CACHE_DIRECTORY: &str = "paste-cache";
 pub const PASTE_FILE_EXTENSION: &str = ".txt";
 
-/// Tick Loop 状态根目录：`TICKLOOP_CONFIG_DIR` 非空时使用它，否则为用户主目录下的 `.tickloop`。
+/// Tickloop 状态根目录：`TICKLOOP_CONFIG_DIR` 非空时使用它，否则为用户主目录下的 `.tickloop`。
 /// 主目录取自 `std::env::home_dir()`：`$HOME` 缺失或为空时回退到账户数据库。
 /// 两者都不可用时返回 `None`，调用方不写盘。
 pub fn config_root_directory() -> Option<PathBuf> {
@@ -630,7 +630,7 @@ impl UserSettings {
         Self { path }
     }
 
-    /// Tick Loop 状态根目录下的设置文件。
+    /// Tickloop 状态根目录下的设置文件。
     pub fn in_root(root: &Path) -> Self {
         Self::new(root.join(SETTINGS_FILE_NAME))
     }

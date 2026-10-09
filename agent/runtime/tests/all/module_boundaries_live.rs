@@ -79,7 +79,7 @@ fn open_agent(archive: &Path, auth_root: &Path, config: &ModelConfig) -> Agent {
 async fn verify_live_lifecycle(provider: &str, model: &str) {
     let auth_root = std::env::var_os("TICKLOOP_LIVE_AUTH_ROOT")
         .map(std::path::PathBuf::from)
-        .expect("set TICKLOOP_LIVE_AUTH_ROOT to the existing Tick Loop state directory")
+        .expect("set TICKLOOP_LIVE_AUTH_ROOT to the existing Tickloop state directory")
         .canonicalize()
         .unwrap();
     let config = ModelCatalog::defaults().get(provider, model).unwrap();
@@ -223,7 +223,7 @@ async fn deepseek_model_module_lifecycle() {
 }
 
 #[tokio::test]
-#[ignore = "uses existing Tick Loop Codex credentials and reviews an authorized temporary file command"]
+#[ignore = "uses existing Tickloop Codex credentials and reviews an authorized temporary file command"]
 async fn codex_model_module_lifecycle() {
     verify_live_lifecycle("openai-codex", "gpt-5.6-sol-responses").await;
 }

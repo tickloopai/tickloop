@@ -920,7 +920,7 @@ mod tests {
             directory,
             &[
                 "-c",
-                "user.name=Tick Loop",
+                "user.name=Tickloop",
                 "-c",
                 "user.email=tickloop@example.invalid",
                 "-c",

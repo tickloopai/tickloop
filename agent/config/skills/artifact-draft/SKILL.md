@@ -1,9 +1,9 @@
 ---
 name: artifact-draft
-description: Draft, write, build or edit one Tick Loop Artifacts artifact the user names by link (/artifact/<id>) or artifact_id, e.g. a pasted "用 Tick Loop Artifacts 打开 … 起草这篇 Doc / 做这个 Design 页面" or "Open … with Tick Loop Artifacts and draft …" prompt.
+description: Draft, write, build or edit one Tickloop Artifacts artifact the user names by link (/artifact/<id>) or artifact_id, e.g. a pasted "用 Tickloop Artifacts 打开 … 起草这篇 Doc / 做这个 Design 页面" or "Open … with Tickloop Artifacts and draft …" prompt.
 ---
 
-# Draft into a Tick Loop Artifacts artifact
+# Draft into a Tickloop Artifacts artifact
 
 The user created a doc or a design on the web page and wants you to write it. A doc is writing: reports, notes, plans. A design is a visual page: visual design, UI, prototypes, interactive pages. Work only on that artifact, with `ArtifactRead`, `ArtifactEdit` and `ArtifactComment`; this Skill grants no extra permissions, and each edit still goes through its normal approval.
 

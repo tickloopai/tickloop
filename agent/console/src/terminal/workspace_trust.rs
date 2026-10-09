@@ -223,7 +223,7 @@ impl WorkspaceTrust {
         explanation.push(RoleLine::default());
         for text in [
             "Quick safety check: Is this a project you created or a folder you trust? If you're unsure, review its contents before continuing.",
-            "Tick Loop Agent can read and edit files and run commands here, subject to your execution permissions.",
+            "Tickloop can read and edit files and run commands here, subject to your execution permissions.",
         ] {
             explanation.extend(
                 wrap_text(text, width)

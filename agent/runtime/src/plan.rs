@@ -745,6 +745,8 @@ impl Agent {
         }
         let mut chats = self.inner.chats.lock().await;
         let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
+        // Subagents never reach plan approval, but an approval request can name any Chat, so the
+        // delegated ceiling is enforced here rather than trusted to the tools a child lacks.
         if chat
             .snapshot
             .delegation

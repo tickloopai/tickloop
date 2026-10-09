@@ -1,4 +1,4 @@
-//! The Tick Loop Artifacts MCP connection `tickloop-docs`, whose three tools the host presents as
+//! The Tickloop Artifacts MCP connection `tickloop-docs`, whose three tools the host presents as
 //! first-party built-ins, backed by service-scoped credentials.
 
 use std::{
@@ -58,7 +58,7 @@ const MAX_APPROVAL_COLLECTION_ITEMS: usize = 64;
 const MAX_APPROVAL_DEPTH: usize = 8;
 const MAX_IDENTIFIER_BYTES: usize = 256;
 const MAX_ARTIFACT_TITLE_UTF16_UNITS: usize = 200;
-const ARTIFACT_LOGIN_DESCRIPTION: &str = "Tick Loop Artifacts is not signed in. Call this when the user wants a doc or design; it starts sign-in and returns a link and code for the user. After the user approves, ArtifactRead, ArtifactEdit and ArtifactComment become available automatically.";
+const ARTIFACT_LOGIN_DESCRIPTION: &str = "Tickloop Artifacts is not signed in. Call this when the user wants a doc or design; it starts sign-in and returns a link and code for the user. After the user approves, ArtifactRead, ArtifactEdit and ArtifactComment become available automatically.";
 
 #[derive(Clone)]
 struct DiscoveredTool {
@@ -302,7 +302,7 @@ impl McpHostToolProvider {
             Err(error) => {
                 return result(
                     format!(
-                        "Tick Loop Artifacts sign-in could not start: {error}. The user can run /artifacts to sign in."
+                        "Tickloop Artifacts sign-in could not start: {error}. The user can run /artifacts to sign in."
                     ),
                     true,
                 );
@@ -952,7 +952,7 @@ impl HostToolProvider for McpHostToolProvider {
                 return Err("Sign-in was cancelled".into());
             }
             if !self.offers_login() {
-                return Err("Tick Loop Artifacts is not signed out; sign-in is unavailable".into());
+                return Err("Tickloop Artifacts is not signed out; sign-in is unavailable".into());
             }
             return Ok(PreparedHostCall::new(
                 name.to_owned(),
@@ -960,7 +960,7 @@ impl HostToolProvider for McpHostToolProvider {
                 input.clone(),
                 HostToolPermission::Automatic,
                 format!(
-                    "Start Tick Loop Artifacts sign-in at {}",
+                    "Start Tickloop Artifacts sign-in at {}",
                     self.artifact.origin()
                 ),
             )

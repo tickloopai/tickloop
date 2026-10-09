@@ -173,7 +173,7 @@ impl TickActionExecutor for DetailsOpen {
         ))
     }
 }
-/// Enter on a hosted Tick opens it at once: inside Herdr in Tick Loop's Herdr popup, otherwise
+/// Enter on a hosted Tick opens it at once: inside Herdr in Tickloop's Herdr popup, otherwise
 /// full screen in this View's terminal. Either view shows the same process and Esc closes it.
 struct OpenHosted {
     instance: tick_protocol::InstanceRef,
@@ -221,10 +221,10 @@ impl TickActionBackend for OpenHosted {
 }
 
 const REGISTER_POPUP_PROMPT: &str =
-    "Register Tick Loop's Herdr popup plugin? No other plugin is touched.";
-const TURN_ON_POPUP_PROMPT: &str = "Turn Tick Loop's Herdr popup on? No other plugin is touched.";
+    "Register Tickloop's Herdr popup plugin? No other plugin is touched.";
+const TURN_ON_POPUP_PROMPT: &str = "Turn Tickloop's Herdr popup on? No other plugin is touched.";
 const REGISTER_THIS_TICKLOOP_PROMPT: &str =
-    "Tick Loop's Herdr popup runs another tickloop. Register this one instead?";
+    "Tickloop's Herdr popup runs another tickloop. Register this one instead?";
 const HERDR_BUSY: &str = "Herdr is showing another view; close it and press enter again";
 
 /// Why a hosted Tick did not float in the Herdr popup.
@@ -269,7 +269,7 @@ impl NotFloated {
     }
 }
 
-/// This View's Herdr session together with Tick Loop's popup plugin for it.
+/// This View's Herdr session together with Tickloop's popup plugin for it.
 struct HerdrPopup {
     herdr: crate::terminal::popup::HerdrSession,
     plugin: crate::terminal::popup::PopupPlugin,
@@ -349,7 +349,7 @@ impl HerdrPopup {
     }
 }
 
-/// Registers, or turns on, Tick Loop's popup plugin in this View's Herdr session once the user
+/// Registers, or turns on, Tickloop's popup plugin in this View's Herdr session once the user
 /// confirmed, then floats the Tick.
 struct RegisterPopup {
     instance: tick_protocol::InstanceRef,
@@ -393,9 +393,9 @@ async fn settle_float(
         Err(NotFloated::Unknown(reason)) => ctx.console.hold_status(&format!(
             "The Herdr popup may have opened ({reason}); look in Herdr before opening again"
         ))?,
-        Err(NotFloated::RegistrationFailed(reason)) => ctx.console.hold_status(&format!(
-            "Cannot register Tick Loop's Herdr popup: {reason}"
-        ))?,
+        Err(NotFloated::RegistrationFailed(reason)) => ctx
+            .console
+            .hold_status(&format!("Cannot register Tickloop's Herdr popup: {reason}"))?,
         Err(_) => return open_full_screen(ctx, instance).await,
     }
     Ok(())
@@ -535,8 +535,32 @@ impl TickActionBackend for RemoveFromMonitor {
 }
 fn remove_subscribed_prompt(subscriptions: usize) -> String {
     format!(
-        "Remove from Monitor and cancel its {subscriptions} Tick {}? enter confirm · esc cancel",
-        if subscriptions == 1 {
+        "Remove from Monitor and cancel its {}? enter confirm · esc cancel",
+        tick_subscriptions(subscriptions)
+    )
+}
+/// An artifact linked here also stops its @tickloop requests; one subscribed only by Tick
+/// Subscriptions asks as any subscribed row does.
+pub(in crate::terminal) fn artifact_unlink_prompt(
+    is_linked_here: bool,
+    subscriptions: usize,
+) -> String {
+    match (is_linked_here, subscriptions) {
+        (false, subscriptions) => remove_subscribed_prompt(subscriptions),
+        (true, 0) => {
+            "Unlink this artifact and stop its @tickloop requests here? enter confirm · esc cancel"
+                .into()
+        }
+        (true, subscriptions) => format!(
+            "Unlink this artifact, stop its @tickloop requests here and cancel its {}? enter confirm · esc cancel",
+            tick_subscriptions(subscriptions)
+        ),
+    }
+}
+fn tick_subscriptions(count: usize) -> String {
+    format!(
+        "{count} Tick {}",
+        if count == 1 {
             "Subscription"
         } else {
             "Subscriptions"
@@ -672,7 +696,7 @@ struct ShellRefresh {
 impl TickActionExecutor for ShellOpen {
     fn prepare(&self, ui: &mut TickActionUi<'_>) -> Result<PreparedTickAction, String> {
         let chat = ui.chat().ok_or("No selected Chat")?;
-        let detail = TickShell::loading(chat, self.task);
+        let detail = TickShell::loading(chat, self.task, ui.state.display);
         let panel = detail.id;
         ui.open_detail(Box::new(detail));
         Ok(PreparedTickAction::new(
@@ -815,6 +839,23 @@ async fn apply_shell_effect(
         }
     }
 }
+/// What a Shell detail's key or scroll asks of the Console: an effect becomes an action that
+/// carries it out against that detail.
+fn shell_detail_key(detail: &TickShell, result: TickShellKey) -> TickDetailKey {
+    match result {
+        TickShellKey::None => TickDetailKey::None,
+        TickShellKey::Back => TickDetailKey::Back,
+        TickShellKey::Effect(effect) => TickDetailKey::Action(PreparedTickAction::new(
+            tick_protocol::InstanceRef::shell(detail.task_id).to_string(),
+            's',
+            Arc::new(ShellEffect {
+                panel: detail.id,
+                effect,
+            }),
+        )),
+    }
+}
+
 impl TickDetailView for TickShell {
     fn confirmation(&self) -> Option<TickConfirmationView> {
         self.is_confirming_stop().then(|| TickConfirmationView {
@@ -833,6 +874,9 @@ impl TickDetailView for TickShell {
     fn instance(&self) -> Option<tick_protocol::InstanceRef> {
         Some(tick_protocol::InstanceRef::shell(self.task_id))
     }
+    fn full_screen(&self) -> bool {
+        true
+    }
     fn lines(&mut self, width: usize, height: usize, now: u64) -> Vec<TickDetailLine> {
         TickShell::lines(self, width, height, now)
             .into_iter()
@@ -843,18 +887,12 @@ impl TickDetailView for TickShell {
         TickShell::hint(self)
     }
     fn key(&mut self, key: KeyEvent, width: usize, height: usize) -> TickDetailKey {
-        match TickShell::key(self, key, width, height) {
-            TickShellKey::None => TickDetailKey::None,
-            TickShellKey::Back => TickDetailKey::Back,
-            TickShellKey::Effect(effect) => TickDetailKey::Action(PreparedTickAction::new(
-                tick_protocol::InstanceRef::shell(self.task_id).to_string(),
-                's',
-                Arc::new(ShellEffect {
-                    panel: self.id,
-                    effect,
-                }),
-            )),
-        }
+        let result = TickShell::key(self, key, width, height);
+        shell_detail_key(self, result)
+    }
+    fn scroll(&mut self, lines: i32, width: usize, height: usize) -> TickDetailKey {
+        let result = TickShell::scroll(self, lines, width, height);
+        shell_detail_key(self, result)
     }
     fn poll(&mut self, now: u64) -> Option<PreparedTickAction> {
         if !self.should_refresh(now) {
@@ -875,16 +913,20 @@ impl TickDetailView for TickShell {
 }
 
 impl Console {
-    pub(in crate::terminal) fn confirm_tick_removal(
+    /// Asks before `x` takes out an artifact that still delivers here, through this Chat's
+    /// association or `subscriptions` Tick Subscriptions; confirming unlinks it.
+    pub(in crate::terminal) fn confirm_artifact_unlink(
         &self,
         chat: Uuid,
         id: String,
+        is_linked_here: bool,
+        subscriptions: usize,
     ) -> Result<(), String> {
         self.confirm_tick_action(
             chat,
             id.clone(),
             artifact(&id, 'X'),
-            "Remove artifact and cancel its Tick subscriptions? enter confirm · esc cancel",
+            &artifact_unlink_prompt(is_linked_here, subscriptions),
         )
     }
 }

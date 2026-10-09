@@ -1,5 +1,5 @@
-//! Artifact feedback for a Loop: linking an account's artifacts and the per-Loop watcher that
-//! claims their @tickloop requests through the service's HTTP lifecycle.
+//! Artifact feedback for a Loop: linking and unlinking an account's artifacts and the per-Loop
+//! watcher that claims their @tickloop requests through the service's HTTP lifecycle.
 
 use std::{sync::Arc, time::Duration};
 
@@ -70,7 +70,7 @@ fn artifact_client(agent: &Agent) -> Result<Arc<ArtifactClient>, AgentError> {
         .unwrap()
         .as_ref()
         .and_then(|provider| provider.artifact_client())
-        .ok_or_else(|| AgentError::Invalid("Tick Loop Artifacts is unavailable".into()))
+        .ok_or_else(|| AgentError::Invalid("Tickloop Artifacts is unavailable".into()))
 }
 
 trait EventSourceBindingExt {
@@ -180,10 +180,10 @@ impl Agent {
         let credential = client
             .credential_snapshot()
             .map_err(|error| AgentError::Invalid(error.to_string()))?
-            .ok_or_else(|| AgentError::Invalid("Not signed in to Tick Loop Artifacts".into()))?;
+            .ok_or_else(|| AgentError::Invalid("Not signed in to Tickloop Artifacts".into()))?;
         if credential.origin != tick.origin.trim_end_matches('/') {
             return Err(AgentError::Invalid(
-                "the artifact belongs to another Tick Loop Artifacts origin".into(),
+                "the artifact belongs to another Tickloop Artifacts origin".into(),
             ));
         }
         let (loop_id, creates_loop) = {
@@ -280,10 +280,10 @@ impl Agent {
         let credential = client
             .credential_snapshot()
             .map_err(|error| AgentError::Invalid(error.to_string()))?
-            .ok_or_else(|| AgentError::Invalid("Not signed in to Tick Loop Artifacts".into()))?;
+            .ok_or_else(|| AgentError::Invalid("Not signed in to Tickloop Artifacts".into()))?;
         if credential.origin != tick.origin {
             return Err(AgentError::Invalid(
-                "the artifact belongs to another Tick Loop Artifacts origin".into(),
+                "the artifact belongs to another Tickloop Artifacts origin".into(),
             ));
         }
         let binding = self
@@ -314,6 +314,47 @@ impl Agent {
         self.start_event_source_watcher(receipt.chat_id, receipt.loop_id)
             .await;
         Ok(())
+    }
+
+    /// Ends the Chat's association with the artifact, whichever account linked it: its Loops stop
+    /// listening for the artifact's @tickloop requests, and one left with nothing to wait for
+    /// completes. A request already claimed finishes in its run; the service keeps the account's
+    /// link until it is linked again. Returns the Loops whose run lease to disarm.
+    pub(super) fn unlink_artifact(
+        &self,
+        chat: &mut super::Chat,
+        origin: &str,
+        artifact_id: &str,
+    ) -> Vec<LoopId> {
+        let mut is_unlinked = false;
+        let mut released_loops = Vec::new();
+        for goal in &mut chat.snapshot.loops {
+            let linked = goal.event_sources.len();
+            goal.event_sources
+                .retain(|source| !source.is_for(origin, artifact_id));
+            if goal.event_sources.len() == linked {
+                continue;
+            }
+            is_unlinked = true;
+            if matches!(goal.state, LoopState::Stopped | LoopState::Expired) {
+                continue;
+            }
+            if goal
+                .event_sources
+                .iter()
+                .all(|source| source.resume_required)
+                && let Some(cancel) = chat.event_cancellations.remove(&goal.id)
+            {
+                cancel.cancel();
+            }
+            if Self::settle_without_listening(goal, LoopState::Completed) {
+                released_loops.push(goal.id);
+            }
+        }
+        if is_unlinked {
+            self.save(&chat.snapshot);
+        }
+        released_loops
     }
 
     /// One link request with fresh identities; the service replaces any earlier link of this

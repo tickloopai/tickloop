@@ -62,6 +62,122 @@ fn shell_tick_enter_opens_inside_the_tick_panel() {
     assert!(state.monitor.detail.is_some());
 }
 
+/// Opens the selected Shell row's detail and loads it with a running `make test` and 100 output
+/// lines, the last `output-99`.
+fn open_loaded_shell_detail(state: &mut State) {
+    let chat = state.chat.unwrap();
+    let selected = state.monitor.selected().unwrap().instance.clone();
+    state.monitor.focus(state.monitor.overlay, None);
+    assert!(matches!(
+        state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        Some(InputEvent::TickAction { .. })
+    ));
+    let output = (0..100)
+        .map(|row| format!("output-{row}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut snapshot = tests::task_snapshot(chat, 1);
+    snapshot.tasks[0].id = Uuid::parse_str(selected.id()).unwrap();
+    snapshot.tasks[0].command = "cd /tmp && make test 2>&1 | tail -5".into();
+    snapshot.tasks[0].description = Some("Run the full suite".into());
+    snapshot.tasks[0].output_bytes = output.len() as u64;
+    snapshot.tasks[0].capabilities.can_read_output = true;
+    let detail = state
+        .monitor
+        .detail
+        .as_mut()
+        .unwrap()
+        .as_any_mut()
+        .downcast_mut::<crate::terminal::tick_shell::TickShell>()
+        .unwrap();
+    let Some(TaskSurfaceEffect::ReadOutput {
+        generation,
+        task_id,
+        ..
+    }) = detail.load(snapshot, None)
+    else {
+        panic!("missing detail output request");
+    };
+    detail.output(TaskOutputUpdate::Chunk {
+        generation,
+        chunk: ShellTaskOutputChunk {
+            task_id,
+            offset: 0,
+            confirmed_offset: output.len() as u64,
+            total_bytes: output.len() as u64,
+            next_offset: None,
+            truncated: false,
+            encoding: "utf-8".into(),
+            output,
+        },
+    });
+}
+
+#[test]
+fn a_shell_detail_covers_the_screen_and_esc_returns_to_its_selected_row() {
+    for (width, overlay) in [(140, false), (60, true)] {
+        let mut state = click_fixture(width, overlay, TickGroup::Shells);
+        let selected = state.monitor.selected().unwrap().instance.clone();
+        open_loaded_shell_detail(&mut state);
+        state.draw_frame(&mut Vec::new()).unwrap();
+        let screen = state.rendered_screen.clone();
+        assert_eq!(screen.len(), 25);
+        assert!(screen[0].starts_with("$ make test"), "{screen:#?}");
+        assert_eq!(screen[1], "Run the full suite");
+        assert!(
+            screen.iter().all(|row| !row.contains('│')),
+            "no Monitor column: {screen:#?}"
+        );
+        assert!(
+            screen
+                .iter()
+                .all(|row| display_width(row) <= width as usize)
+        );
+        assert!(screen.contains(&"output-99".to_owned()), "{screen:#?}");
+        assert!(screen[24].ends_with("esc back"), "{screen:#?}");
+
+        state.pointer(
+            MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                row: 10,
+                column: 3,
+                modifiers: KeyModifiers::NONE,
+            },
+            &mut Vec::new(),
+        );
+        state.draw_frame(&mut Vec::new()).unwrap();
+        assert_eq!(
+            state.rendered_screen[..5],
+            screen[..5],
+            "the header stays while the output scrolls"
+        );
+        assert!(!state.rendered_screen.contains(&"output-99".to_owned()));
+        assert!(state.rendered_screen.contains(&"output-96".to_owned()));
+
+        state.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        state.draw_frame(&mut Vec::new()).unwrap();
+        let confirming = state.rendered_screen.join("\n");
+        assert!(
+            state.rendered_screen[0].starts_with("$ make test")
+                && confirming.contains("Stop this Shell?"),
+            "{confirming}"
+        );
+        state.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(state.monitor.detail.is_some(), "esc first cancels the stop");
+
+        state.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        state.draw_frame(&mut Vec::new()).unwrap();
+        assert!(state.monitor.detail.is_none());
+        assert!(state.monitor.focused, "Monitor keeps the focus");
+        assert_eq!(state.monitor.selected().unwrap().instance, selected);
+        let list = state.rendered_screen.join("\n");
+        assert!(
+            list.contains("Shells (1)") && !list.contains("$ make test"),
+            "{list}"
+        );
+    }
+}
+
 #[test]
 fn shell_ticks_only_list_background_executions_and_x_removes_a_finished_one() {
     use tickloop_agent_protocol::{ShellTaskOrigin, ShellTaskOwner, ShellTaskState};
@@ -232,7 +348,7 @@ fn tick_shell_detail_and_selection_restore_per_agent_and_ignore_obsolete_mouse_t
             updated_at_ms: None,
             update: None,
             resources: None,
-            actions: crate::monitor_rows::artifact_actions("artifact:https://docs.example/b"),
+            actions: crate::monitor_rows::artifact_actions("artifact:https://docs.example/b", true),
         }],
     );
     state.pointer(
@@ -249,7 +365,7 @@ fn tick_shell_detail_and_selection_restore_per_agent_and_ignore_obsolete_mouse_t
 }
 
 #[tokio::test]
-async fn shell_panel_live_updates_tail_without_covering_the_input() {
+async fn shell_detail_live_updates_its_tail_over_the_whole_screen() {
     use crate::terminal::{execution::ConsoleExecution, task_access::ShellTaskCenter};
     let directory = tempfile::tempdir().unwrap();
     let core = tickloop_agent_runtime::Agent::new_embedded(
@@ -350,23 +466,15 @@ async fn shell_panel_live_updates_tail_without_covering_the_input() {
     {
         let mut state = console.state.lock().unwrap();
         state.draw_frame(&mut Vec::new()).unwrap();
+        let screen = &state.rendered_screen;
         assert!(
-            state
-                .rendered_screen
-                .iter()
-                .any(|row| row.contains("live-tail"))
+            screen[0].starts_with("$ printf 'first"),
+            "the first line's key command heads the screen: {screen:#?}"
         );
-        let (input, _, _) = state.styled_frame();
-        let start = state.height - input.len();
+        assert!(screen.iter().any(|row| row == "live-tail"), "{screen:#?}");
         assert!(
-            state.rendered_screen[..start]
-                .iter()
-                .all(|row| row.contains('│'))
-        );
-        assert!(
-            state.rendered_screen[start..]
-                .iter()
-                .all(|row| !row.contains('│'))
+            screen.iter().all(|row| !row.contains('│')),
+            "the detail covers the whole screen: {screen:#?}"
         );
     }
     core.shutdown().await;
@@ -1365,7 +1473,7 @@ fn fixture_actions(
     instance: &tick_protocol::InstanceRef,
 ) -> Vec<crate::monitor_rows::MonitorAction> {
     if instance.tick_type() == "artifact" {
-        return crate::monitor_rows::artifact_actions(instance.as_str());
+        return crate::monitor_rows::artifact_actions(instance.as_str(), false);
     }
     vec![
         crate::monitor_rows::MonitorAction {
@@ -1401,6 +1509,7 @@ fn a_newly_registered_row_intent_runs_through_enter_and_click() {
                 kind: "Calendar".into(),
                 status: "live".into(),
                 notes: Vec::new(),
+                inherent_subscription: false,
                 owner: TickOwner::Unknown,
                 tone: crate::monitor_rows::StatusTone::Neutral,
                 updated_at_ms: None,
@@ -2085,12 +2194,13 @@ fn the_row_clock_redraws_while_a_visible_row_blinks_and_stops_when_none_runs() {
 }
 
 #[test]
-fn running_background_shells_are_named_by_description_and_count_from_their_start() {
+fn running_background_shells_are_named_by_key_command_and_count_from_their_start() {
     let chat = Uuid::new_v4();
     let console = Console::test_for_chat(chat);
     let now = tickloop_agent_base::private_fs::unix_time_milliseconds();
     let mut snapshot = tests::task_snapshot(chat, 1);
     snapshot.tasks[0].state = tickloop_agent_protocol::ShellTaskState::Background;
+    snapshot.tasks[0].command = "cd /tmp && cargo test -p console 2>&1 | tail -20".into();
     snapshot.tasks[0].description = Some("Run the console tests".into());
     console
         .set_shell_starts(
@@ -2107,9 +2217,12 @@ fn running_background_shells_are_named_by_description_and_count_from_their_start
         .map(RoleLine::text)
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(text.contains("Run the console tests"), "{text}");
+    assert!(text.contains("$ cargo test -p console"), "{text}");
     assert!(text.contains(" 2m 3s"), "{text}");
-    assert!(!text.contains("printf"), "{text}");
+    assert!(
+        !text.contains("Run the console tests") && !text.contains("tail"),
+        "{text}"
+    );
 }
 
 #[test]
@@ -2160,6 +2273,7 @@ fn a_finished_background_shell_leaves_once_handled_unless_its_detail_is_open() {
     state.monitor.detail = Some(Box::new(crate::terminal::tick_shell::TickShell::loading(
         chat,
         snapshot.tasks[0].id,
+        DisplayProfile::default(),
     )));
     assert!(state.monitor.refresh_due(leaves));
     assert_eq!(
@@ -2768,4 +2882,94 @@ fn a_character_the_focused_row_does_not_bind_is_typed_into_the_input() {
     }
     assert!(!state.monitor.focused, "typing leaves the list");
     assert_eq!(state.editor.draft(), "Hi");
+}
+
+/// A Chat whose one Loop holds the association with its artifact `doc`, live or paused.
+fn linked_artifact_fixture(resume_required: bool) -> (State, tick_protocol::InstanceRef) {
+    let mut state = State::new(true, 140, 30);
+    let chat = Uuid::from_u128(78);
+    state.switch_view_chat(Some(chat));
+    state.prompt_enabled = true;
+    let snapshot: ChatSnapshot = serde_json::from_value(serde_json::json!({
+        "id": chat,
+        "workdir": "/fixture",
+        "messages": [],
+        "artifact_ticks": [{"artifact_id":"doc","origin":"https://docs.example","title":"Brief","format":"markdown","url":"https://docs.example/a/doc","access_role":"owner","added_at_ms":1}],
+        "loops": [{"id":Uuid::from_u128(900),"goal":"Write a brief","state":"WaitingTrigger","run_id":null,"run_started_at":null,"event_sources":[{"origin":"https://docs.example","account_id":"owner","artifact_id":"doc","binding_id":Uuid::from_u128(5),"client_instance_id":Uuid::from_u128(6),"epoch":1,"resume_required":resume_required,"last_request_at_ms":null}]}]
+    }))
+    .unwrap();
+    state.monitor.chat_snapshot = Some(snapshot);
+    state.monitor.rebuild();
+    state.monitor.focus(false, None);
+    (
+        state,
+        tick_protocol::InstanceRef::artifact("https://docs.example", "doc").unwrap(),
+    )
+}
+
+fn action_labels(state: &State) -> Vec<(char, &'static str)> {
+    state
+        .monitor
+        .selected()
+        .unwrap()
+        .actions
+        .iter()
+        .map(|action| (action.key, action.label))
+        .collect()
+}
+
+#[test]
+fn an_artifact_linked_here_shows_the_subscription_marker_and_x_unlinks_it() {
+    let (mut state, artifact) = linked_artifact_fixture(false);
+    let text = monitor_text(&mut state);
+    let row = text.lines().find(|line| line.contains("Brief")).unwrap();
+    assert!(
+        row.trim_end().ends_with('⟳') && !row.contains("feedback"),
+        "{row}"
+    );
+    assert_eq!(
+        action_labels(&state),
+        [
+            ('o', "open"),
+            ('x', "unlink"),
+            ('c', "copy"),
+            ('f', "feedback")
+        ]
+    );
+    assert_eq!(requested_key(press(&mut state, KeyCode::Char('x'))), 'x');
+
+    let mut subscription = tests::subscription_row(3);
+    subscription.instance = artifact;
+    subscription.accumulated = 3;
+    subscription.updated_at_ms = Some(1000);
+    state.monitor.subscriptions = vec![subscription];
+    state.monitor.rebuild();
+    let text = monitor_text(&mut state);
+    assert!(
+        text.contains("⟳ 2 · ● 3"),
+        "the association counts with the Tick Subscription: {text}"
+    );
+    assert_eq!(
+        action_labels(&state),
+        [
+            ('o', "open"),
+            ('x', "unlink"),
+            ('c', "copy"),
+            ('f', "feedback"),
+            ('e', "cadence"),
+            ('u', "unsubscribe")
+        ]
+    );
+}
+
+#[test]
+fn a_paused_association_stays_in_words_without_the_subscription_marker() {
+    let (mut state, _) = linked_artifact_fixture(true);
+    let text = monitor_text(&mut state);
+    let row = text.lines().find(|line| line.contains("Brief")).unwrap();
+    assert!(
+        row.contains("feedback paused") && !row.contains('⟳'),
+        "{row}"
+    );
+    assert_eq!(action_labels(&state)[1], ('x', "unlink"));
 }

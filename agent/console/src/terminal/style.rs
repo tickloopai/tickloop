@@ -1532,13 +1532,13 @@ mod tests {
 
     #[test]
     fn a_plain_line_renders_to_exactly_its_text_at_every_depth() {
-        let line = StyledLine::plain("Tick Loop Agent");
+        let line = StyledLine::plain("Tickloop");
         for depth in [
             ColourDepth::None,
             ColourDepth::Indexed256,
             ColourDepth::TrueColour,
         ] {
-            assert_eq!(line.render(depth), "Tick Loop Agent");
+            assert_eq!(line.render(depth), "Tickloop");
         }
     }
 

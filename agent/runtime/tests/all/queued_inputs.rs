@@ -474,3 +474,224 @@ async fn a_queued_shell_is_not_restored_after_restart() {
     );
     reopened.shutdown().await;
 }
+
+/// Calls `tool` first, then waits in every later request until it is cancelled.
+struct ToolThenWaitingModel {
+    tool: Mutex<Option<Vec<Content>>>,
+    requests: Mutex<Vec<ModelRequest>>,
+}
+
+#[async_trait]
+impl ModelClient for ToolThenWaitingModel {
+    async fn generate_title(
+        &self,
+        request: ModelRequest,
+        _: UnboundedSender<ModelDelta>,
+        _: CancellationToken,
+    ) -> Result<ModelOutput, ModelError> {
+        Ok(tickloop_agent_test_support::title_output(request))
+    }
+
+    fn identity(&self) -> tickloop_agent_protocol::ModelIdentity {
+        PendingModel.identity()
+    }
+
+    async fn complete(
+        &self,
+        request: ModelRequest,
+        _: UnboundedSender<ModelDelta>,
+        cancel: CancellationToken,
+    ) -> Result<ModelOutput, ModelError> {
+        self.requests.lock().unwrap().push(request);
+        let tool = self.tool.lock().unwrap().take();
+        if let Some(content) = tool {
+            return Ok(ModelOutput {
+                private_source: None,
+                content,
+                usage: Default::default(),
+                stop_reason: "tool_use".into(),
+            });
+        }
+        cancel.cancelled().await;
+        Err(ModelError::Cancelled)
+    }
+}
+
+fn bash(id: &str, command: &str) -> Vec<Content> {
+    vec![Content::ToolUse {
+        id: id.into(),
+        name: "Bash".into(),
+        input: serde_json::json!({ "command": command }),
+    }]
+}
+
+async fn allow_bash(agent: &Agent, chat: uuid::Uuid) {
+    agent
+        .set_execution_mode(chat, ExecutionMode::AcceptEdits)
+        .await
+        .unwrap();
+    agent
+        .set_permission_rules(
+            chat,
+            vec![PermissionRule {
+                id: uuid::Uuid::new_v4(),
+                decision: Decision::Allow,
+                tool: "Bash".into(),
+                specifier: None,
+                input: None,
+                loop_id: None,
+                persistent: false,
+            }],
+        )
+        .await
+        .unwrap();
+}
+
+async fn wait_for_tool_start(
+    agent: &Agent,
+    chat: uuid::Uuid,
+    events: &mut tokio::sync::broadcast::Receiver<tickloop_agent_protocol::Event>,
+) {
+    loop {
+        match next_event(events).await.kind {
+            EventKind::PermissionRequested { request } => agent
+                .answer_permission(chat, request.id, true)
+                .await
+                .unwrap(),
+            EventKind::ToolStarted { .. } => break,
+            EventKind::Failed(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test]
+async fn send_now_interrupts_the_running_tool_so_the_next_model_call_answers_the_message() {
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        bash("long-shell", "sleep 30"),
+        text("answered now"),
+    ]));
+    let agent = Agent::new_embedded(config(), model.clone());
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    allow_bash(&agent, chat).await;
+    let mut events = agent.subscribe();
+    let active = agent
+        .submit(chat, None, "start the long work".into())
+        .await
+        .unwrap();
+    wait_for_tool_start(&agent, chat, &mut events).await;
+    let queued = agent
+        .submit(chat, Some(active.loop_id), "how is it going".into())
+        .await
+        .unwrap();
+    assert_eq!(
+        agent
+            .snapshot(chat)
+            .await
+            .unwrap()
+            .queued_inputs()
+            .iter()
+            .map(|entry| entry.id)
+            .collect::<Vec<_>>(),
+        [queued.run_id],
+        "a message alone waits for the tool boundary"
+    );
+
+    let sent_at = std::time::Instant::now();
+    agent.send_now(chat, queued.run_id).await.unwrap();
+    let mut interrupted = false;
+    loop {
+        let event = next_event(&mut events).await;
+        match event.kind {
+            EventKind::Interrupted if event.run_id == active.run_id => interrupted = true,
+            EventKind::InputMerged { into_run_id } if into_run_id == active.run_id => {
+                panic!("a message sent now never joins the interrupted run")
+            }
+            EventKind::Completed { .. } if event.run_id == queued.run_id => break,
+            EventKind::Failed(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    assert!(interrupted, "the run ahead of the message is interrupted");
+    assert!(
+        sent_at.elapsed() < std::time::Duration::from_secs(10),
+        "the message does not wait for the running tool"
+    );
+    let requests = model.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 2);
+    let newest = requests[1].messages.last().unwrap();
+    assert!(
+        newest
+            .content
+            .iter()
+            .any(|block| matches!(block, Content::Text { text } if text == "how is it going")),
+        "the next model call ends with the message sent now: {newest:?}"
+    );
+    assert!(
+        agent
+            .snapshot(chat)
+            .await
+            .unwrap()
+            .queued_inputs()
+            .is_empty()
+    );
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn send_now_leaves_the_run_that_already_answers_the_message() {
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ToolThenWaitingModel {
+        tool: Mutex::new(Some(bash("short-shell", "sleep 0.2"))),
+        requests: Mutex::new(Vec::new()),
+    });
+    let agent = Agent::new_embedded(config(), model.clone());
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    allow_bash(&agent, chat).await;
+    let mut events = agent.subscribe();
+    let active = agent
+        .submit(chat, None, "start the short work".into())
+        .await
+        .unwrap();
+    assert!(
+        agent
+            .send_now(chat, active.run_id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    wait_for_tool_start(&agent, chat, &mut events).await;
+    let joined = agent
+        .submit(chat, Some(active.loop_id), "fold this in".into())
+        .await
+        .unwrap();
+    loop {
+        let event = next_event(&mut events).await;
+        match event.kind {
+            EventKind::InputMerged { into_run_id } if event.run_id == joined.run_id => {
+                assert_eq!(into_run_id, active.run_id);
+                break;
+            }
+            EventKind::Interrupted | EventKind::Failed(_) => panic!("{event:?}"),
+            _ => {}
+        }
+    }
+
+    for run_id in [joined.run_id, uuid::Uuid::new_v4()] {
+        assert!(agent.send_now(chat, run_id).await.unwrap().is_empty());
+    }
+    let snapshot = agent.snapshot(chat).await.unwrap();
+    assert!(
+        !snapshot
+            .events
+            .iter()
+            .any(|event| matches!(event.kind, EventKind::Interrupted)),
+        "the run answering a started or joined message keeps going"
+    );
+    assert!(snapshot.loops.iter().any(|goal| {
+        goal.run_id == Some(active.run_id)
+            && goal.state == tickloop_agent_protocol::LoopState::Running
+    }));
+    agent.shutdown().await;
+}

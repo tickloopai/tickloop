@@ -57,7 +57,7 @@ impl CompactionLayout {
     /// 按布局生成压缩后的快照：保留消息的附属记录随消息移动，边界与摘要获得新的消息 id。
     ///
     /// 定向摘要偏离 Claude Code：Claude Code 让保留的消息沿用原条目，加载时按边界上的保留区段
-    /// 重接，但定向摘要叠加、rewind 到区段的头之后继续对话时，重接会丢掉或复活消息。Tick Loop
+    /// 重接，但定向摘要叠加、rewind 到区段的头之后继续对话时，重接会丢掉或复活消息。Tickloop
     /// 把保留的消息作为新条目直线重写在新边界之后，因此它们换上新的消息 id（关联提示 id 的文件
     /// 回滚快照由调用方按 [`Self::renamed_message_ids`] 重记）；其中 assistant 消息的用量照
     /// Claude Code 重接时的做法清零，被带到新边界之后的旧边界标记为 `preserved_by_later_summary`。

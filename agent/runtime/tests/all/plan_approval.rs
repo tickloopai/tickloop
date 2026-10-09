@@ -568,6 +568,14 @@ async fn a_delegated_child_gets_no_plan_mode_tools() {
     let child = agent.snapshot(children[0].child_chat_id).await.unwrap();
     assert_eq!(child.policy.mode, ExecutionMode::FullAccess);
     assert!(child.plans.is_empty());
+    let error = agent
+        .approve_plan(child.id, child.loops[0].id, 1, ExecutionMode::AcceptEdits)
+        .await
+        .expect_err("an approval naming the child cannot replace its delegated mode");
+    assert!(
+        error.to_string().contains("delegated execution mode"),
+        "{error}"
+    );
     agent.shutdown().await;
 }
 

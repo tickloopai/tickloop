@@ -1,5 +1,5 @@
 provider: "zai-global-coding"
-notice: "GLM Coding Plan terms limit plan quota to officially listed tools; Tick Loop is not listed, so use may be rate limited or suspended. FlashX is not part of the plan."
+notice: "GLM Coding Plan terms limit plan quota to officially listed tools; Tickloop is not listed, so use may be rate limited or suspended. FlashX is not part of the plan."
 series:
   - id: "glm"
     name: "GLM"

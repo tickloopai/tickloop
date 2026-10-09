@@ -2,6 +2,7 @@
 //! result under its own call, reads and searches collapsed, and the same rows whether a View
 //! follows a run's events or reopens its saved history.
 use super::*;
+use agent_messaging::AgentColors;
 use async_trait::async_trait;
 use std::{
     collections::VecDeque,
@@ -137,7 +138,17 @@ async fn finish_run(
 
 /// The conversation of `snapshot` as a View following its events draws it.
 fn followed(chat: Uuid, workdir: &std::path::Path, snapshot: &ChatSnapshot) -> String {
+    followed_view(chat, workdir, snapshot, AgentColors::default()).test_conversation_text()
+}
+
+fn followed_view(
+    chat: Uuid,
+    workdir: &std::path::Path,
+    snapshot: &ChatSnapshot,
+    colors: AgentColors,
+) -> Console {
     let console = Console::test_interactive_for_chat(chat);
+    console.remember_agent_colors(colors).unwrap();
     console.set_input_context(Some(chat), workdir, &[]).unwrap();
     let mut tools = ToolPresentation::new(false);
     render_restored_observation(
@@ -159,14 +170,19 @@ fn followed(chat: Uuid, workdir: &std::path::Path, snapshot: &ChatSnapshot) -> S
         },
     )
     .unwrap();
-    console.test_conversation_text()
+    console
 }
 
 /// The conversation of `snapshot` as a View reopening its history draws it.
 fn reopened(chat: Uuid, snapshot: &ChatSnapshot) -> String {
+    reopened_view(chat, snapshot, AgentColors::default()).test_conversation_text()
+}
+
+fn reopened_view(chat: Uuid, snapshot: &ChatSnapshot, colors: AgentColors) -> Console {
     let console = Console::test_interactive_for_chat(chat);
+    console.remember_agent_colors(colors).unwrap();
     workflows::write_public_history(&console, snapshot).unwrap();
-    console.test_conversation_text()
+    console
 }
 
 #[tokio::test]
@@ -316,6 +332,7 @@ async fn followed_and_reopened_conversations_share_one_claude_code_layout() {
         &snapshot,
         DisplayProfile::default(),
         &Default::default(),
+        &Default::default(),
     )
     .plain_text(120);
     for expanded in [
@@ -329,6 +346,397 @@ async fn followed_and_reopened_conversations_share_one_claude_code_layout() {
         );
     }
     agent.shutdown().await;
+}
+
+/// A family run in steps: the child that the call `background_call` delegated waits at each of
+/// its turns until the test lets it go on.
+struct FamilyScript {
+    routed: tickloop_agent_test_support::routed::RoutedModel,
+    background_call: &'static str,
+    background_turns: tokio::sync::Semaphore,
+}
+
+const FOREGROUND_REPORT: &str = "Config is valid.\nTwo keys are unused.\nOne key is deprecated.";
+const BACKGROUND_NOTE: &str = "Found 3 errors so far.\nStill scanning the archive.";
+const BACKGROUND_REPORT: &str = "Scan complete: 3 errors.";
+
+impl FamilyScript {
+    fn new(
+        background_call: &'static str,
+        respond: impl Fn(&ModelRequest) -> Vec<Content> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            routed: tickloop_agent_test_support::routed::RoutedModel::new(respond),
+            background_call,
+            background_turns: tokio::sync::Semaphore::new(0),
+        }
+    }
+
+    /// The root delegates a foreground child that reports and a background one that writes to
+    /// it before it reports.
+    fn reporting() -> Self {
+        use tickloop_agent_test_support::routed::{has_tool_result, history_text, state};
+        let call = tickloop_agent_test_support::call;
+        let text = tickloop_agent_test_support::text;
+        Self::new("logs", move |request| {
+            let delegation = &state(request)["delegation"];
+            let history = history_text(request);
+            if delegation["parent_call_id"] == "config" {
+                call(
+                    "config-report",
+                    "SubagentHandback",
+                    serde_json::json!({ "message": FOREGROUND_REPORT }),
+                )
+            } else if !delegation.is_null() && !has_tool_result(request, "logs-note") {
+                call(
+                    "logs-note",
+                    "SendMessage",
+                    serde_json::json!({ "to": "parent", "message": BACKGROUND_NOTE }),
+                )
+            } else if !delegation.is_null() {
+                call(
+                    "logs-report",
+                    "SubagentHandback",
+                    serde_json::json!({ "message": BACKGROUND_REPORT }),
+                )
+            } else if !has_tool_result(request, "todos") {
+                call(
+                    "todos",
+                    "TodoWrite",
+                    serde_json::json!({"todos": [{
+                        "content": "Check the config",
+                        "status": "in_progress",
+                        "activeForm": "Checking the config"
+                    }]}),
+                )
+            } else if !has_tool_result(request, "config") {
+                call(
+                    "config",
+                    "Subagent",
+                    serde_json::json!({
+                        "task": "Check the config files",
+                        "name": "config",
+                        "description": "Check the config"
+                    }),
+                )
+            } else if !has_tool_result(request, "logs") {
+                call(
+                    "logs",
+                    "Subagent",
+                    serde_json::json!({
+                        "task": "Scan the logs for errors",
+                        "name": "logs",
+                        "description": "Scan the logs",
+                        "run_in_background": true
+                    }),
+                )
+            } else if history.contains(BACKGROUND_REPORT) {
+                text("The scan is done.")
+            } else if history.contains("Found 3 errors so far.") {
+                text("Noted.")
+            } else {
+                text("Waiting for the logs.")
+            }
+        })
+    }
+}
+
+#[async_trait]
+impl ModelClient for FamilyScript {
+    async fn generate_title(
+        &self,
+        request: ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<ModelDelta>,
+        _: CancellationToken,
+    ) -> Result<ModelOutput, ModelError> {
+        Ok(tickloop_agent_model::fixture_title(request))
+    }
+
+    fn identity(&self) -> ModelIdentity {
+        self.routed.identity()
+    }
+
+    async fn complete(
+        &self,
+        request: ModelRequest,
+        events: tokio::sync::mpsc::UnboundedSender<ModelDelta>,
+        cancel: CancellationToken,
+    ) -> Result<ModelOutput, ModelError> {
+        let delegation = &tickloop_agent_test_support::routed::state(&request)["delegation"];
+        if delegation["parent_call_id"] == self.background_call {
+            self.background_turns.acquire().await.unwrap().forget();
+        }
+        self.routed.complete(request, events, cancel).await
+    }
+}
+
+/// Waits until `chat` has no run left and `ready` holds for its conversation.
+async fn settle(agent: &Agent, chat: Uuid, ready: impl Fn(&ChatSnapshot) -> bool) -> ChatSnapshot {
+    let latest = Mutex::new(None);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let snapshot = agent.snapshot(chat).await.unwrap();
+            *latest.lock().unwrap() = Some(format!(
+                "{:?}\n{:?}\n{:?}",
+                snapshot.loops,
+                snapshot.messages,
+                snapshot
+                    .events
+                    .iter()
+                    .map(|event| &event.kind)
+                    .collect::<Vec<_>>()
+            ));
+            let idle = snapshot.pending_inputs.is_empty()
+                && snapshot.loops.iter().all(|goal| {
+                    !matches!(
+                        goal.state,
+                        tickloop_agent_protocol::LoopState::Running
+                            | tickloop_agent_protocol::LoopState::Queued
+                    )
+                });
+            if idle && ready(&snapshot) {
+                return snapshot;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "the family settles: {}",
+            latest.lock().unwrap().as_ref().unwrap()
+        )
+    })
+}
+
+fn says(snapshot: &ChatSnapshot, reply: &str) -> bool {
+    snapshot.messages.iter().any(|message| {
+        message.role == tickloop_agent_protocol::Role::Assistant
+            && message
+                .content
+                .iter()
+                .any(|content| matches!(content, Content::Text { text } if text == reply))
+    })
+}
+
+/// A root Chat in `mode` whose family `model` answers; every automatic review allows.
+async fn family(
+    model: Arc<FamilyScript>,
+    mode: ExecutionMode,
+    workdir: &std::path::Path,
+) -> (tickloop_agent_runtime::Agent, Agent, Uuid) {
+    let core =
+        tickloop_agent_runtime::Agent::new_embedded(tickloop_agent_test_support::config(), model);
+    core.set_auto_reviewer(Arc::new(tickloop_agent_test_support::ScriptedModel::new(
+        vec![
+            tickloop_agent_test_support::text(
+                &tickloop_agent_test_support::auto_classification(false).to_string(),
+            );
+            20
+        ],
+    )))
+    .await;
+    let agent = Agent::from_embedded(core.clone(), tickloop_agent_test_support::config());
+    let chat = agent.create_chat(workdir.into()).await.unwrap();
+    agent.set_execution_mode(chat, mode).await.unwrap();
+    (core, agent, chat)
+}
+
+fn elapsed(snapshot: &ChatSnapshot, handle: &str) -> String {
+    let completion = snapshot
+        .family_completions
+        .iter()
+        .find(|completion| completion.handle == handle)
+        .unwrap();
+    presentation::compact_duration(completion.finished_at - completion.started_at.unwrap())
+}
+
+#[tokio::test]
+async fn followed_and_reopened_family_conversations_show_agent_communication_alike() {
+    let directory = tempfile::tempdir().unwrap();
+    let workdir = directory.path().canonicalize().unwrap();
+    let model = Arc::new(FamilyScript::reporting());
+    let (core, agent, chat) = family(model.clone(), ExecutionMode::Auto, &workdir).await;
+    agent
+        .submit(chat, None, "Check the config, then scan the logs".into())
+        .await
+        .unwrap();
+    settle(&agent, chat, |snapshot| {
+        says(snapshot, "Waiting for the logs.")
+    })
+    .await;
+    model.background_turns.add_permits(1);
+    settle(&agent, chat, |snapshot| says(snapshot, "Noted.")).await;
+    model.background_turns.add_permits(1);
+    let snapshot = settle(&agent, chat, |snapshot| {
+        says(snapshot, "The scan is done.") && snapshot.family_completions.len() == 2
+    })
+    .await;
+    assert!(
+        snapshot
+            .events
+            .iter()
+            .any(|event| matches!(event.kind, EventKind::ProgressUpdated { .. })),
+        "the run updated its Todo progress"
+    );
+    let colors = agent_messaging::catalog_colors(&agent.catalog().await.unwrap());
+
+    let followed = followed_view(chat, &workdir, &snapshot, colors.clone());
+    let reopened = reopened_view(chat, &snapshot, colors.clone());
+    let text = followed.test_conversation_text();
+    assert_eq!(
+        text,
+        reopened.test_conversation_text(),
+        "a followed family run and its reopened history draw the same rows"
+    );
+    assert_eq!(
+        text,
+        [
+            "",
+            "❯ Check the config, then scan the logs",
+            "",
+            "⏺ Subagent(@config · Check the config)",
+            "  ⎿  Config is valid.",
+            "     Two keys are unused. (ctrl+o to expand)",
+            "",
+            "⏺ Subagent(@logs · Scan the logs)",
+            "  ⎿  Started in background",
+            "",
+            "⏺ Waiting for the logs.",
+            "",
+            "✉ @logs  Found 3 errors so far.  (ctrl+o to expand)",
+            "",
+            "⏺ Noted.",
+            "",
+            &format!("⏺ @logs finished · {}", elapsed(&snapshot, "logs")),
+            "  ⎿  Scan complete: 3 errors.",
+            "",
+            "⏺ The scan is done.",
+            "",
+            "✻ Done",
+            "",
+        ]
+        .join("\n")
+    );
+    for hidden in [
+        "delivered its report",
+        "Subagent hand-back",
+        "Message from",
+        "Progress",
+    ] {
+        assert!(!text.contains(hidden), "{hidden}: {text}");
+    }
+    let logs_color = snapshot
+        .family_completions
+        .iter()
+        .find(|completion| completion.handle == "logs")
+        .and_then(|completion| colors[&completion.child_chat_id])
+        .expect("the runtime gave the child an Agent Color");
+    for view in [&followed, &reopened] {
+        let rows = view.test_conversation_rows();
+        let handles = rows
+            .iter()
+            .flat_map(|row| &row.spans)
+            .filter(|span| span.text == "@logs")
+            .collect::<Vec<_>>();
+        assert_eq!(handles.len(), 3, "call, message and completion name @logs");
+        assert!(
+            handles
+                .iter()
+                .all(|span| span.role == Some(Role::agent(logs_color))),
+            "the handle takes the child's Agent Color"
+        );
+        let completion_dot = rows
+            .iter()
+            .find(|row| row.spans.iter().any(|span| span.text.contains(" finished")))
+            .and_then(|row| row.spans.first())
+            .unwrap();
+        assert_eq!(completion_dot.role, Some(Role::Success));
+    }
+    let transcript = presentation::transcript_document(
+        &snapshot,
+        DisplayProfile::default(),
+        &Default::default(),
+        &colors,
+    )
+    .plain_text(120);
+    for expanded in [
+        "⏺ Subagent(@config · Check the config)",
+        "One key is deprecated.",
+        "✉ @logs",
+        "Still scanning the archive.",
+        "⏺ @logs finished",
+        BACKGROUND_REPORT,
+    ] {
+        assert!(
+            transcript.contains(expanded),
+            "Ctrl+O shows {expanded:?}: {transcript}"
+        );
+    }
+    assert!(!transcript.contains("delivered its report"), "{transcript}");
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_background_child_asked_for_no_report_finishes_as_one_block_alike() {
+    use tickloop_agent_test_support::routed::{has_tool_result, history_text, state};
+    let directory = tempfile::tempdir().unwrap();
+    let workdir = directory.path().canonicalize().unwrap();
+    let model = Arc::new(FamilyScript::new("scan", |request| {
+        if !state(request)["delegation"].is_null() {
+            tickloop_agent_test_support::text("Background done.\nAll clear.\nNothing else.")
+        } else if !has_tool_result(request, "scan") {
+            tickloop_agent_test_support::call(
+                "scan",
+                "Subagent",
+                serde_json::json!({
+                    "task": "Scan quietly in the background",
+                    "name": "scan",
+                    "run_in_background": true
+                }),
+            )
+        } else if history_text(request).contains("Background done.") {
+            tickloop_agent_test_support::text("Thanks.")
+        } else {
+            tickloop_agent_test_support::text("Started.")
+        }
+    }));
+    let (core, agent, chat) = family(model.clone(), ExecutionMode::FullAccess, &workdir).await;
+    agent
+        .submit(chat, None, "Scan in the background".into())
+        .await
+        .unwrap();
+    settle(&agent, chat, |snapshot| says(snapshot, "Started.")).await;
+    model.background_turns.add_permits(1);
+    let snapshot = settle(&agent, chat, |snapshot| {
+        says(snapshot, "Thanks.") && snapshot.family_completions.len() == 1
+    })
+    .await;
+    let text = followed(chat, &workdir, &snapshot);
+    assert_eq!(text, reopened(chat, &snapshot));
+    assert_eq!(
+        text,
+        [
+            "",
+            "❯ Scan in the background",
+            "",
+            "⏺ Subagent(@scan · Scan quietly in the background)",
+            "  ⎿  Started in background",
+            "",
+            "⏺ Started.",
+            "",
+            &format!("⏺ @scan finished · {}", elapsed(&snapshot, "scan")),
+            "  ⎿  Background done.",
+            "     All clear. (ctrl+o to expand)",
+            "",
+            "⏺ Thanks.",
+            "",
+            "✻ Done",
+            "",
+        ]
+        .join("\n")
+    );
+    core.shutdown().await;
 }
 
 #[tokio::test]

@@ -17,10 +17,10 @@ impl std::fmt::Display for LocaleError {
         match self {
             Self::NotUtf8 { variable, value } => write!(
                 formatter,
-                "terminal locale is not UTF-8: {variable}={value}. Tick Loop draws charts with Unicode glyphs; set LANG to a UTF-8 locale such as en_US.UTF-8 and retry."
+                "terminal locale is not UTF-8: {variable}={value}. Tickloop draws charts with Unicode glyphs; set LANG to a UTF-8 locale such as en_US.UTF-8 and retry."
             ),
             Self::Unknown => formatter.write_str(
-                "terminal locale is unknown: none of LC_ALL, LC_CTYPE or LANG is set. Tick Loop draws charts with Unicode glyphs; set LANG to a UTF-8 locale such as en_US.UTF-8 and retry.",
+                "terminal locale is unknown: none of LC_ALL, LC_CTYPE or LANG is set. Tickloop draws charts with Unicode glyphs; set LANG to a UTF-8 locale such as en_US.UTF-8 and retry.",
             ),
         }
     }

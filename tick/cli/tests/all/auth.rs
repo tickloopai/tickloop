@@ -440,7 +440,7 @@ async fn prepared_region_allows_device_login_without_reading_stdin() {
 async fn device_login_registers_once_polls_both_centers_and_saves_private_token() {
     let stub = http::Stub::start(|request| {
         if request.starts_with("POST /oauth2/register ") {
-            assert!(request.contains("Tick Loop"));
+            assert!(request.contains("Tickloop"));
             (201, json!({"client_id":"test-client"}))
         } else if request.starts_with("POST /oauth2/device/authorize ") {
             assert!(request.contains("client_id=test-client"));

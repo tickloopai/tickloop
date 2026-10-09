@@ -24,7 +24,7 @@ use tickloop_agent_base::network::{HttpPolicy, build_http_client};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_JSON_BYTES: usize = 8 * 1024 * 1024;
-const USER_AGENT: &str = concat!("TickLoop-Agent/", env!("CARGO_PKG_VERSION"), " MCP/1");
+const USER_AGENT: &str = concat!("Tickloop-Agent/", env!("CARGO_PKG_VERSION"), " MCP/1");
 
 #[derive(Clone)]
 pub(crate) struct McpHttpClient {

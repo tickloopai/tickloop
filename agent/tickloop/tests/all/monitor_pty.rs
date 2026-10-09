@@ -354,7 +354,12 @@ fn artifact_login_opens_picker_adds_tick_and_uses_a_substitute_browser() {
             std::fs::read_to_string(log).unwrap().trim(),
             "https://docs.example/a/test"
         );
+        session.wait("⟳");
+        session.wait("x unlink");
         session.send(b"x");
+        session.wait("Unlink this artifact and stop its @tickloop requests here?");
+        session.send(b"\r");
+        session.wait("Nothing to monitor");
         session.exit();
     });
     stop.store(true, std::sync::atomic::Ordering::Relaxed);

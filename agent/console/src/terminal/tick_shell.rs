@@ -1,20 +1,50 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use tickhost_connect::naming::short_directory;
+use unicode_width::UnicodeWidthStr;
 use uuid::Uuid;
 
 use super::{
-    monitor::relative_time,
+    console::{truncate_width, wrap_text},
+    conversation_picker::ellipsize,
+    display::{DisplayProfile, Glyph},
+    list_row::{format_elapsed, state_mark},
+    monitor::{relative_time, wrap_words},
+    safe_line,
     style::{Role, RoleLine},
     task_surface::{
         TaskFrameLineKind, TaskOutputUpdate, TaskSurface, TaskSurfaceAction, TaskSurfaceEffect,
         TaskViewport,
     },
 };
+use crate::monitor_rows::{key_command, shell_tone, signal_name};
 use tickloop_agent_protocol::{ShellTask, ShellTaskAction, ShellTaskSnapshot};
 
+/// The key hint row under the output.
+const HINT_ROWS: usize = 1;
+/// The full command's rows at most; the last ends in an ellipsis when more does not fit.
+const COMMAND_ROWS: usize = 3;
+/// The narrowest view whose first row holds the state beside the key command; a narrower one
+/// gives the state its own row.
+const STATE_BESIDE_COMMAND_MIN_COLUMNS: usize = 40;
+const STATE_GAP_COLUMNS: usize = 2;
+const MILLISECONDS_PER_SECOND: u64 = 1000;
+const COMMAND_PROMPT: &str = "$ ";
+const ELLIPSIS: &str = "…";
+const RULE: &str = "─";
+const LOADING_TEXT: &str = "Loading…";
+const STOP_HINT: &str = "s stop";
+const SCROLL_HINT: &str = "↑↓ scroll · home/end top/bottom";
+const BACK_HINT: &str = "esc back";
+const HINT_SEPARATOR: &str = " · ";
+const STATE_SEPARATOR: &str = " · ";
+
+/// A background Shell's full-screen detail: a fixed header about the command over its output,
+/// which follows the tail and scrolls.
 pub(super) struct TickShell {
     pub(super) id: Uuid,
     pub(super) chat: Uuid,
     pub(super) task_id: Uuid,
+    display: DisplayProfile,
     task: Option<ShellTask>,
     started_at_ms: Option<u64>,
     surface: Option<TaskSurface>,
@@ -30,11 +60,12 @@ pub(super) enum TickShellKey {
 }
 
 impl TickShell {
-    pub(super) fn loading(chat: Uuid, task_id: Uuid) -> Self {
+    pub(super) fn loading(chat: Uuid, task_id: Uuid, display: DisplayProfile) -> Self {
         Self {
             id: Uuid::new_v4(),
             chat,
             task_id,
+            display,
             task: None,
             started_at_ms: None,
             surface: None,
@@ -73,6 +104,8 @@ impl TickShell {
             return self.update(snapshot);
         }
         let mut surface = TaskSurface::open(snapshot);
+        // The header tells the task's facts, so the surface shows only its output.
+        surface.set_detail_metadata(self.task_id, Vec::new());
         let effect = surface.initial_effect();
         self.surface = Some(surface);
         Some(effect)
@@ -174,12 +207,22 @@ impl TickShell {
             (KeyCode::End, _) => TaskSurfaceAction::End,
             _ => return TickShellKey::None,
         };
+        self.navigate(action, width, height)
+    }
+
+    /// Scrolls the output by `lines`, up when negative, unless the stop awaits confirmation.
+    pub(super) fn scroll(&mut self, lines: i32, width: usize, height: usize) -> TickShellKey {
+        if self.confirm_stop {
+            return TickShellKey::None;
+        }
+        self.navigate(TaskSurfaceAction::ScrollLines(lines), width, height)
+    }
+
+    /// Moves the output; moving down past its end follows the tail again.
+    fn navigate(&mut self, action: TaskSurfaceAction, width: usize, height: usize) -> TickShellKey {
+        let viewport = self.output_viewport(width, height);
         let Some(surface) = self.surface.as_mut() else {
             return TickShellKey::None;
-        };
-        let viewport = TaskViewport {
-            width,
-            height: height.saturating_sub(2),
         };
         let effect = surface.apply(action, viewport);
         let moving_down = matches!(action, TaskSurfaceAction::ScrollLines(lines) | TaskSurfaceAction::Page(lines) if lines > 0);
@@ -193,49 +236,40 @@ impl TickShell {
         }
         TickShellKey::Effect(effect)
     }
+    /// The view over `width` × `height`: the header, the output in the rows between, and the
+    /// key hints in the last row.
     pub(super) fn lines(&mut self, width: usize, height: usize, now: u64) -> Vec<RoleLine> {
-        let mut lines = vec![RoleLine::role("Shell", Role::Text)];
-        if let (Some(task), Some(surface)) = (&self.task, &mut self.surface) {
-            let mut metadata = vec!["Command".into()];
-            metadata.extend(task.command.lines().map(str::to_owned));
-            metadata.extend([
-                format!("State: {}", task.status_label()),
-                format!(
-                    "Started {} · updated {}",
-                    relative_time(self.started_at_ms, now),
-                    relative_time(task.updated_at_ms, now)
-                ),
-                "Working directory".into(),
-                task.cwd.to_string_lossy().into(),
-            ]);
-            surface.set_detail_metadata(self.task_id, metadata);
-            let frame = surface.frame(TaskViewport {
-                width,
-                height: height.saturating_sub(2),
-            });
-            lines.extend(frame.lines.into_iter().map(|line| {
-                RoleLine::role(
-                    line.text,
-                    if line.kind == TaskFrameLineKind::Unavailable {
-                        Role::Warning
-                    } else {
-                        Role::MutedText
-                    },
-                )
-            }));
+        let Some(content_rows) = height.checked_sub(HINT_ROWS) else {
+            return Vec::new();
+        };
+        let viewport = self.output_viewport(width, height);
+        let mut scrollable = false;
+        let mut lines = match (&self.task, &mut self.surface) {
+            (Some(task), Some(surface)) => {
+                let mut lines = header(task, self.started_at_ms, self.display, width, now);
+                let frame = surface.frame(viewport);
+                scrollable = frame.can_move_up || frame.can_move_down;
+                lines.extend(frame.lines.into_iter().map(|line| {
+                    let role = match line.kind {
+                        TaskFrameLineKind::Output => Role::Text,
+                        TaskFrameLineKind::Unavailable => Role::Warning,
+                        _ => Role::MutedText,
+                    };
+                    RoleLine::role(line.text, role)
+                }));
+                lines
+            }
+            _ => vec![RoleLine::role(LOADING_TEXT, Role::MutedText)],
+        };
+        lines.truncate(content_rows);
+        lines.resize_with(content_rows, RoleLine::default);
+        let hint = if self.confirm_stop {
+            // The input dialog below asks to confirm the stop.
+            String::new()
         } else {
-            lines.push(RoleLine::role("Loading…", Role::MutedText));
-        }
-        lines.truncate(height.saturating_sub(1));
-        lines.resize_with(height.saturating_sub(1), RoleLine::default);
-        if height > 0 {
-            let hint = if self.confirm_stop {
-                String::new()
-            } else {
-                self.hint()
-            };
-            lines.push(RoleLine::role(hint, Role::MutedText));
-        }
+            self.hints(scrollable.then(|| self.display.navigation_hint(SCROLL_HINT)))
+        };
+        lines.push(RoleLine::role(hint, Role::MutedText));
         for line in &mut lines {
             line.truncate(width);
         }
@@ -243,20 +277,163 @@ impl TickShell {
     }
 
     pub(super) fn hint(&self) -> String {
+        self.hints(None)
+    }
+
+    /// The keys this view takes, `scroll` among them while the output scrolls. A failure takes
+    /// the stop key's place.
+    fn hints(&self, scroll: Option<String>) -> String {
         if self.confirm_stop {
-            "Stop this Shell? enter confirm · esc cancel".into()
-        } else if let Some(error) = self
+            return "Stop this Shell? enter confirm · esc cancel".into();
+        }
+        let lead = self
             .error
             .as_deref()
             .or_else(|| self.surface.as_ref().and_then(TaskSurface::visible_error))
-        {
-            format!("{} · esc back", super::safe_line(error))
-        } else if self.can_stop() {
-            "s stop · esc back".into()
-        } else {
-            "esc back".into()
+            .map(safe_line)
+            .or_else(|| self.can_stop().then(|| STOP_HINT.to_owned()));
+        lead.into_iter()
+            .chain(scroll)
+            .chain([BACK_HINT.to_owned()])
+            .collect::<Vec<_>>()
+            .join(HINT_SEPARATOR)
+    }
+
+    /// Where the output shows: the full width, in the rows the header and the hint row leave.
+    fn output_viewport(&self, width: usize, height: usize) -> TaskViewport {
+        let header_rows = self.task.as_ref().map_or(0, |task| {
+            header(task, self.started_at_ms, self.display, width, 0).len()
+        });
+        TaskViewport {
+            width,
+            height: height.saturating_sub(header_rows + HINT_ROWS),
         }
     }
+}
+
+/// The rows that stay above the output wherever it scrolls: the key command with the state at its
+/// right, the description, the full command when it says more, the working directory and a rule.
+/// How many there are depends on `width` alone.
+fn header(
+    task: &ShellTask,
+    started_at_ms: Option<u64>,
+    display: DisplayProfile,
+    width: usize,
+    now: u64,
+) -> Vec<RoleLine> {
+    let key_command = key_command(&task.command);
+    let title = format!("{COMMAND_PROMPT}{}", safe_line(&key_command));
+    let mut state = RoleLine::role(
+        display.glyph(Glyph::ToolCall),
+        state_mark(shell_tone(task, started_at_ms), display, now),
+    );
+    state.push(" ", None);
+    state.push(state_text(task, started_at_ms, now), Some(Role::MutedText));
+    let mut lines = Vec::new();
+    if width >= STATE_BESIDE_COMMAND_MIN_COLUMNS {
+        let state_columns = state.text().width();
+        let mut first = RoleLine::role(
+            ellipsize(
+                &title,
+                width.saturating_sub(state_columns + STATE_GAP_COLUMNS),
+            ),
+            Role::Text,
+        );
+        first.push(
+            " ".repeat(width.saturating_sub(first.text().width() + state_columns)),
+            None,
+        );
+        for span in state.spans {
+            first.push(span.text, span.role);
+        }
+        lines.push(first);
+    } else {
+        lines.push(RoleLine::role(ellipsize(&title, width), Role::Text));
+        lines.push(state);
+    }
+    if let Some(description) = task.description.as_deref().and_then(|description| {
+        description
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+    }) {
+        lines.push(RoleLine::role(
+            ellipsize(&safe_line(description), width),
+            Role::MutedText,
+        ));
+    }
+    let command = task.command.trim();
+    if command != key_command {
+        lines.extend(
+            command_rows(command, width)
+                .into_iter()
+                .map(|row| RoleLine::role(row, Role::MutedText)),
+        );
+    }
+    lines.push(RoleLine::role(
+        ellipsize(
+            &safe_line(&short_directory(&task.cwd.to_string_lossy())),
+            width,
+        ),
+        Role::MutedText,
+    ));
+    lines.push(RoleLine::role(RULE.repeat(width), Role::MutedText));
+    lines
+}
+
+/// The state in words beside its glyph, as a Monitor row tells it: how long a running Shell has
+/// run, or how it ended and how long ago, such as `running 2m 3s` or `SIGTERM · 3m ago`.
+fn state_text(task: &ShellTask, started_at_ms: Option<u64>, now: u64) -> String {
+    if !task.state.is_terminal() {
+        return started_at_ms.map_or_else(
+            || task.status_label(),
+            |since| {
+                format!(
+                    "{} {}",
+                    task.status_label(),
+                    format_elapsed(now.saturating_sub(since))
+                )
+            },
+        );
+    }
+    let outcome = task
+        .signal
+        .and_then(signal_name)
+        .map_or_else(|| task.status_label(), str::to_owned);
+    let Some(ended) = task.ended_at_ms.or(task.updated_at_ms) else {
+        return outcome;
+    };
+    let age = relative_time(Some(ended), now);
+    if now.saturating_sub(ended) < MILLISECONDS_PER_SECOND {
+        format!("{outcome}{STATE_SEPARATOR}{age}")
+    } else {
+        format!("{outcome}{STATE_SEPARATOR}{age} ago")
+    }
+}
+
+/// `command` broken between words into at most [`COMMAND_ROWS`] rows of `width` columns, a word
+/// wider than a row cut across rows.
+fn command_rows(command: &str, width: usize) -> Vec<String> {
+    let mut rows = command
+        .lines()
+        .flat_map(|line| wrap_words(&safe_line(line), width))
+        .flat_map(|row| {
+            if row.width() > width {
+                wrap_text(&row, width)
+            } else {
+                vec![row]
+            }
+        });
+    let mut kept = rows.by_ref().take(COMMAND_ROWS).collect::<Vec<_>>();
+    if rows.next().is_some()
+        && let Some(last) = kept.last_mut()
+    {
+        *last = format!(
+            "{}{ELLIPSIS}",
+            truncate_width(last, width.saturating_sub(ELLIPSIS.width())).trim_end()
+        );
+    }
+    kept
 }
 
 #[cfg(test)]
@@ -295,40 +472,163 @@ mod tests {
             },
         });
     }
-    #[test]
-    fn panel_wraps_metadata_output_and_cjk_without_basic_navigation_hints() {
+    const NOW: u64 = 10_000_000;
+    const LOGGED_TEST_RUN: &str = "cd /srv/work/tickloop/feat && (make test > target/x.log 2>&1; echo \"EXIT $?\" >> target/x.log)";
+
+    /// A detail of a running `command`, started 2m 3s before [`NOW`], showing `output`.
+    fn detail_showing(command: &str, description: Option<&str>, output: &str) -> TickShell {
         let chat = Uuid::new_v4();
         let task = Uuid::new_v4();
-        let output = format!("{}\nfinal", "界".repeat(30));
-        let mut detail = TickShell::loading(chat, task);
-        let effect = detail
-            .load(snapshot(chat, task, 1, output.len(), true), Some(500))
-            .unwrap();
-        deliver(&mut detail, effect, &output);
-        let lines = detail.lines(40, 30, 2000);
-        let text = lines
-            .iter()
-            .map(RoleLine::text)
+        let mut shell = snapshot(chat, task, 1, output.len(), true);
+        shell.tasks[0].command = command.into();
+        shell.tasks[0].description = description.map(Into::into);
+        shell.tasks[0].cwd = "/srv/work/tickloop/feat".into();
+        let mut detail = TickShell::loading(chat, task, DisplayProfile::default());
+        let effect = detail.load(shell, Some(NOW - 123_000)).unwrap();
+        deliver(&mut detail, effect, output);
+        detail
+    }
+
+    fn texts(lines: &[RoleLine]) -> Vec<String> {
+        lines.iter().map(RoleLine::text).collect()
+    }
+
+    #[test]
+    fn the_header_names_the_key_command_and_stays_while_the_output_scrolls() {
+        let output = (0..40)
+            .map(|row| format!("line-{row}"))
             .collect::<Vec<_>>()
             .join("\n");
-        for expected in [
-            "Command",
-            "State: running",
-            "Started 1s",
-            "updated 1s",
-            "Working directory",
-            "/tmp/测试目录",
-            "final",
-            "s stop · esc back",
-        ] {
-            assert!(text.contains(expected), "{text}");
-        }
-        assert!(
-            lines
-                .iter()
-                .all(|line| unicode_width::UnicodeWidthStr::width(line.text().as_str()) <= 40)
+        let mut detail = detail_showing(
+            LOGGED_TEST_RUN,
+            Some("Rerun full test suite in background to verify flakiness"),
+            &output,
         );
-        assert!(!text.contains("j/k") && !text.contains("background, stop"));
+        let rows = texts(&detail.lines(60, 12, NOW));
+        let state = "⏺ running 2m 3s";
+        assert_eq!(
+            rows,
+            [
+                format!("$ make test{}{state}", " ".repeat(60 - 11 - state.width())),
+                "Rerun full test suite in background to verify flakiness".into(),
+                "cd /srv/work/tickloop/feat && (make test > target/x.log".into(),
+                "2>&1; echo \"EXIT $?\" >> target/x.log)".into(),
+                "/…/tickloop/feat".into(),
+                "─".repeat(60),
+                "line-35".into(),
+                "line-36".into(),
+                "line-37".into(),
+                "line-38".into(),
+                "line-39".into(),
+                "s stop · ↑↓ scroll · home/end top/bottom · esc back".into(),
+            ]
+        );
+        let header = rows[..6].to_vec();
+        for _ in 0..3 {
+            detail.key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE), 60, 12);
+        }
+        let scrolled = texts(&detail.lines(60, 12, NOW));
+        assert_eq!(scrolled[..6], header, "the header does not scroll");
+        assert_eq!(scrolled[6], "line-20");
+        detail.key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE), 60, 12);
+        assert_eq!(texts(&detail.lines(60, 12, NOW))[6], "line-0");
+    }
+
+    #[test]
+    fn output_wraps_at_the_full_width_without_cutting_wide_characters() {
+        let long = "word ".repeat(30);
+        let wide = "界".repeat(45);
+        let mut detail = detail_showing("make test", None, &format!("{long}\n{wide}\nfinal"));
+        let rows = texts(&detail.lines(100, 20, NOW));
+        assert_eq!(rows[0].width(), 100, "{rows:#?}");
+        let output = &rows[3..rows.len() - 1];
+        assert_eq!(output[0], "word ".repeat(20));
+        assert_eq!(output[1], "word ".repeat(10));
+        assert_eq!(output[2], "界".repeat(45));
+        assert_eq!(output[3], "final");
+        let narrow = texts(&detail.lines(60, 20, NOW));
+        let output = &narrow[3..narrow.len() - 1];
+        assert_eq!(
+            output[..3],
+            ["word ".repeat(12), "word ".repeat(12), "word ".repeat(6)]
+        );
+        assert_eq!(output[3], "界".repeat(30));
+        assert_eq!(output[4], "界".repeat(15));
+        assert!(narrow.iter().all(|row| row.width() <= 60), "{narrow:#?}");
+    }
+
+    #[test]
+    fn a_narrow_view_gives_the_state_its_own_row_and_hides_nothing_else() {
+        let mut detail = detail_showing("make test", None, "done");
+        let rows = texts(&detail.lines(24, 8, NOW));
+        assert_eq!(
+            rows,
+            [
+                "$ make test",
+                "⏺ running 2m 3s",
+                "/…/tickloop/feat",
+                "─".repeat(24).as_str(),
+                "done",
+                "",
+                "",
+                "s stop · esc back",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_full_command_shows_when_it_says_more_in_at_most_three_rows() {
+        let mut same = detail_showing("make test", None, "");
+        assert!(
+            !texts(&same.lines(60, 10, NOW)).contains(&"make test".to_owned()),
+            "a command that is its own key command shows once"
+        );
+        assert_eq!(
+            command_rows(
+                "cargo nextest run -p console --no-fail-fast 2>&1 | tail -20",
+                20
+            ),
+            ["cargo nextest run -p", "console", "--no-fail-fast 2>&1…"]
+        );
+        assert_eq!(
+            command_rows("python3 - <<'EOF'\nprint(1)\nEOF", 40),
+            ["python3 - <<'EOF'", "print(1)", "EOF"]
+        );
+        assert_eq!(
+            command_rows(&format!("ls {}", "x".repeat(50)), 20),
+            [
+                "ls".to_owned(),
+                "x".repeat(20),
+                format!("{}…", "x".repeat(19))
+            ]
+        );
+    }
+
+    #[test]
+    fn the_state_reads_as_the_monitor_row_tells_it() {
+        let (chat, id) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut shell = snapshot(chat, id, 1, 0, true).tasks.remove(0);
+        assert_eq!(state_text(&shell, None, NOW), "running");
+        assert_eq!(
+            state_text(&shell, Some(NOW - 3_723_000), NOW),
+            "running 1h 2m 3s"
+        );
+        shell.state = tickloop_agent_protocol::ShellTaskState::Completed;
+        shell.ended_at_ms = Some(NOW - 180_000);
+        for (exit_code, signal, reason, expected) in [
+            (Some(0), None, None, "exit 0 · 3m ago"),
+            (Some(2), None, None, "exit 2 · 3m ago"),
+            (Some(143), Some(libc::SIGTERM), None, "SIGTERM · 3m ago"),
+            (None, Some(64), None, "signal 64 · 3m ago"),
+            (None, None, Some("stopped"), "stopped · 3m ago"),
+        ] {
+            shell.exit_code = exit_code;
+            shell.signal = signal;
+            shell.reason = reason.map(Into::into);
+            assert_eq!(state_text(&shell, None, NOW), expected);
+        }
+        shell.ended_at_ms = Some(NOW - 400);
+        assert_eq!(state_text(&shell, None, NOW), "stopped · now");
     }
     #[test]
     fn panel_follows_tail_until_scrolled_and_pages_back_to_newest_output() {
@@ -337,7 +637,7 @@ mod tests {
         let first = (0..30)
             .map(|row| format!("line-{row}\n"))
             .collect::<String>();
-        let mut detail = TickShell::loading(chat, task);
+        let mut detail = TickShell::loading(chat, task, DisplayProfile::default());
         let effect = detail
             .load(snapshot(chat, task, 1, first.len(), true), Some(500))
             .unwrap();
@@ -396,7 +696,7 @@ mod tests {
         for can_stop in [false, true] {
             let chat = Uuid::new_v4();
             let task = Uuid::new_v4();
-            let mut detail = TickShell::loading(chat, task);
+            let mut detail = TickShell::loading(chat, task, DisplayProfile::default());
             detail.load(snapshot(chat, task, 1, 0, can_stop), None);
             assert!(matches!(
                 detail.key(
@@ -439,7 +739,7 @@ mod tests {
     fn shell_panel_success_clears_stale_load_snapshot_and_output_errors() {
         let chat = Uuid::new_v4();
         let task = Uuid::new_v4();
-        let mut detail = TickShell::loading(chat, task);
+        let mut detail = TickShell::loading(chat, task, DisplayProfile::default());
         detail.report("failed load".into());
         let effect = detail.load(snapshot(chat, task, 1, 4, true), None).unwrap();
         assert!(!detail.hint().contains("failed load"));
@@ -463,7 +763,7 @@ mod tests {
     fn reopening_a_panel_retries_failed_output_without_new_bytes() {
         let chat = Uuid::new_v4();
         let task = Uuid::new_v4();
-        let mut detail = TickShell::loading(chat, task);
+        let mut detail = TickShell::loading(chat, task, DisplayProfile::default());
         let initial = snapshot(chat, task, 1, 4, true);
         let Some(TaskSurfaceEffect::ReadOutput { generation, .. }) =
             detail.load(initial.clone(), None)
@@ -497,16 +797,13 @@ mod tests {
             let output = (0..40)
                 .map(|row| format!("line-{row}\n"))
                 .collect::<String>();
-            let mut detail = TickShell::loading(chat, task);
+            let mut detail = TickShell::loading(chat, task, DisplayProfile::default());
             let effect = detail
                 .load(snapshot(chat, task, 1, output.len(), true), None)
                 .unwrap();
             deliver(&mut detail, effect, &output);
             detail.lines(40, 10, 2000);
-            let viewport = TaskViewport {
-                width: 40,
-                height: 8,
-            };
+            let viewport = detail.output_viewport(40, 10);
             let before = detail.surface.as_mut().unwrap().frame(viewport).top_row;
             detail.key(key, 40, 10);
             assert_eq!(
@@ -534,7 +831,7 @@ mod tests {
     fn panel_leaves_detail_when_the_task_disappears_or_changes_chat() {
         let chat = Uuid::new_v4();
         let task = Uuid::new_v4();
-        let mut detail = TickShell::loading(chat, task);
+        let mut detail = TickShell::loading(chat, task, DisplayProfile::default());
         detail.load(snapshot(chat, task, 1, 0, true), None);
         assert!(
             detail

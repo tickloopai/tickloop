@@ -86,7 +86,7 @@ pub struct TriggerSource {
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum LoopTriggerNoticeKind {
-    /// 另一个 Tick Loop 进程持有该 Loop 的 Trigger，本进程等待接手。
+    /// 另一个 Tickloop 进程持有该 Loop 的 Trigger，本进程等待接手。
     HeldByAnotherProcess,
     /// 租约或停止状态无法读写，或锁由另一台主机持有；需要用户处理。
     Warning,

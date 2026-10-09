@@ -133,6 +133,16 @@ pub struct RewindDraft {
     pub contexts: Vec<InputContext>,
 }
 
+/// A prompt an interrupt took back from the conversation, to edit and send again.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TakenBackPrompt {
+    /// The Loop the prompt was sent to, while it is still in the conversation; without one, the
+    /// prompt sent again starts a new Loop.
+    pub loop_id: Option<LoopId>,
+    pub prompt: String,
+    pub contexts: Vec<InputContext>,
+}
+
 /// 恢复代码的结果。照 Claude Code，单个文件失败时跳过该文件继续；找不到目标提示的快照时
 /// 不改动任何文件，`error` 说明原因。
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -161,7 +171,7 @@ pub enum CompactTrigger {
     Auto,
 }
 
-/// 照 Claude Code `compactMetadata`。Tick Loop 不写 `preservedSegment`。
+/// 照 Claude Code `compactMetadata`。Tickloop 不写 `preservedSegment`。
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct CompactBoundary {
     pub trigger: CompactTrigger,

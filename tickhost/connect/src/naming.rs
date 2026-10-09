@@ -174,8 +174,9 @@ fn is_program_title(title: &str, command: &str) -> bool {
         && title != program
 }
 
-/// `directory` with the home directory as `~` and only its last [`KEPT_DIRECTORIES`] names.
-fn short_directory(directory: &str) -> String {
+/// `directory` with the home directory as `~` and only its last [`KEPT_DIRECTORIES`] names,
+/// such as `~/…/tickloop/feat-uipolish`.
+pub fn short_directory(directory: &str) -> String {
     let home = std::env::var("HOME").ok().filter(|home| !home.is_empty());
     let (root, rest) = match home
         .as_deref()

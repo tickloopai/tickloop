@@ -42,6 +42,7 @@ impl MonitorRows for CalendarRows {
             kind: "Calendar".into(),
             status: "live".into(),
             notes: Vec::new(),
+            inherent_subscription: false,
             owner: tickloop_agent_console::monitor_rows::TickOwner::Unknown,
             tone: tickloop_agent_console::monitor_rows::StatusTone::Neutral,
             updated_at_ms: None,
@@ -771,7 +772,30 @@ async fn artifact_rows_show_where_feedback_is_linked_and_the_newest_request() {
         "where feedback goes stays on the row"
     );
     assert_eq!(row(Some(false), Some(elsewhere)).status, "feedback here");
+    assert_eq!(
+        row(Some(false), Some(here)).notes,
+        ["⟳"],
+        "an association here is the row's subscription and shows as its marker"
+    );
+    assert!(row(Some(false), Some(here)).inherent_subscription);
     assert_eq!(row(Some(true), Some(here)).status, "feedback paused");
+    assert_eq!(row(Some(true), Some(here)).notes, ["feedback paused"]);
+    assert!(!row(Some(true), Some(here)).inherent_subscription);
+    let x_label = |paused, remote| {
+        row(paused, remote)
+            .actions
+            .into_iter()
+            .find(|action| action.key == 'x')
+            .unwrap()
+            .label
+    };
+    assert_eq!(x_label(Some(false), Some(here)), "unlink");
+    assert_eq!(x_label(Some(true), Some(here)), "unlink");
+    assert_eq!(
+        x_label(None, Some(elsewhere)),
+        "remove",
+        "x leaves another Chat's association alone"
+    );
     assert_eq!(
         row(Some(true), Some(elsewhere)).status,
         "feedback elsewhere"

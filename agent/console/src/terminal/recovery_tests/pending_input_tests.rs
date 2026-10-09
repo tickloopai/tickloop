@@ -278,7 +278,7 @@ fn wait_queue_proof(
 }
 
 fn submit_two_pending(fixture: &mut RecoveryPty, directory: &std::path::Path) -> String {
-    fixture.wait_for("Tick Loop Agent");
+    fixture.wait_for("Tickloop");
     fixture.send(format!("{INITIAL_MESSAGE}\r").as_bytes());
     wait_queue_proof(fixture, directory, 1, 0);
     fixture.wait_for(INITIAL_MESSAGE);
@@ -463,7 +463,7 @@ fn up_takes_back_pending_messages_without_creating_sent_body_echoes() {
 #[test]
 fn messages_submitted_by_another_view_echo_once_when_the_daemon_consumes_them() {
     let (mut fixture, directory) = start_queue_fixture("external");
-    fixture.wait_for("Tick Loop Agent");
+    fixture.wait_for("Tickloop");
     fixture.send(format!("{INITIAL_MESSAGE}\r").as_bytes());
     wait_queue_proof(&fixture, directory.path(), 1, 0);
     std::fs::write(directory.path().join(OTHER_VIEW_SUBMIT), "").unwrap();

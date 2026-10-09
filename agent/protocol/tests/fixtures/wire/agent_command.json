@@ -279,6 +279,18 @@
     }
   },
   {
+    "kind": "manage_loop",
+    "execution": {
+      "daemon_epoch": "00000000-0000-0000-0000-0000000000e0",
+      "agent_id": "00000000-0000-0000-0000-0000000000a1",
+      "generation": 3
+    },
+    "action": {
+      "kind": "send_now",
+      "run_id": "00000000-0000-0000-0000-000000000022"
+    }
+  },
+  {
     "kind": "add_monitor_member",
     "execution": {
       "daemon_epoch": "00000000-0000-0000-0000-0000000000e0",
@@ -308,5 +320,17 @@
   },
   {
     "kind": "flush_transcripts"
+  },
+  {
+    "kind": "edit_history",
+    "execution": {
+      "daemon_epoch": "00000000-0000-0000-0000-0000000000e0",
+      "agent_id": "00000000-0000-0000-0000-0000000000a1",
+      "generation": 3
+    },
+    "action": {
+      "kind": "take_back_interrupted_prompt",
+      "run_id": "00000000-0000-0000-0000-000000000020"
+    }
   }
 ]

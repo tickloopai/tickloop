@@ -87,7 +87,8 @@ pub use denials::{
 pub use family::{
     AgentColor, AgentMessageSource, DelegationCeiling, DelegationMetadata, DirectedHumanSource,
     FamilyCompletion, FamilyInputRecord, FamilyMessageRejection, FamilyMessageRejectionCode,
-    MessageCause, SEND_AGENT_MESSAGE_TOOL_NAME, SUBAGENT_HANDBACK_TOOL_NAME, SUBAGENT_TOOL_NAME,
+    MessageCause, SEND_AGENT_MESSAGE_TOOL_NAME, SUBAGENT_HANDBACK_TOOL_NAME,
+    SUBAGENT_MISSING_REPORT, SUBAGENT_REPORT_RECEIPT, SUBAGENT_TOOL_NAME,
     SubagentNotificationDelivery, SubagentRegistration, SubagentReport, VerifiedUserRelay,
 };
 pub use file_change::{
@@ -101,7 +102,7 @@ pub use history::{
     CodeRewind, CompactBoundary, CompactTrigger, CompactionMarker, CompactionOutcome,
     CompactionStatus, DirectedSummaryDraft, DirectedSummaryOutcome, DirectedSummaryRequest,
     ModelChange, RewindDraft, RewindMode, RewindOutcome, RewindPoint, SummarizeMetadata,
-    SummaryDirection,
+    SummaryDirection, TakenBackPrompt,
 };
 pub use host::{
     HerdrInteraction, HerdrPane, HostCallContext, HostEndpointIdentity, HostToolAuthority,
@@ -115,7 +116,7 @@ pub use interaction::{Question, QuestionAnswer, QuestionOption, QuestionRequest}
 pub use limits::*;
 pub use local_messages::{
     FOLDED_TICK_REPLY_CHARACTERS, INTERRUPT_MESSAGE, INTERRUPT_MESSAGE_FOR_TOOL_USE, LocalMessage,
-    TaskNotification, TaskNotificationStatus, TickDeliveryLine,
+    SubagentReportMessage, TaskNotification, TaskNotificationStatus, TickDeliveryLine,
 };
 pub use loops::{
     EventSourceBinding, LoopSnapshot, LoopState, LoopTriggerNotice, LoopTriggerNoticeKind, Trigger,

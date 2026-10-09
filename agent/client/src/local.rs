@@ -363,7 +363,7 @@ pub async fn negotiate(
         return Err(AccessError::new(
             AccessErrorCode::VersionMismatch,
             format!(
-                "AgentAccess peer protocol {}.{} is incompatible with client {}.{}; use the same Tick Loop version",
+                "AgentAccess peer protocol {}.{} is incompatible with client {}.{}; use the same Tickloop version",
                 peer.major, peer.minor, PROTOCOL_MAJOR, PROTOCOL_MINOR,
             ),
         ));
@@ -385,7 +385,7 @@ pub async fn negotiate(
             AccessError::new(
                 AccessErrorCode::VersionMismatch,
                 format!(
-                    "AgentAccess peer announced unusable transport limits ({error}); use the same Tick Loop version"
+                    "AgentAccess peer announced unusable transport limits ({error}); use the same Tickloop version"
                 ),
             )
         },

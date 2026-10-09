@@ -1,6 +1,6 @@
 //! Plan mode and todo list texts the model reads, adapted from Claude Code's `EnterPlanModeTool`,
 //! `ExitPlanModeTool` and `TodoWriteTool` prompts and results and the plan mode reminders and
-//! `plan_mode_exit` attachment of `utils/messages.ts`. Tick Loop has no Explore or Plan agent
+//! `plan_mode_exit` attachment of `utils/messages.ts`. Tickloop has no Explore or Plan agent
 //! types: the planning reminder explores with Read, Glob and Grep, and delegates read-only
 //! research or design to Subagent children, which report in their final reply.
 
@@ -17,7 +17,7 @@ use tickloop_agent_tools::{
 pub(super) const NOT_IN_PLAN_MODE: &str = "You are not in plan mode. This tool is only for exiting plan mode after writing a plan. If your plan was already approved, continue with implementation.";
 
 /// Claude Code's subagent plan mode reminder (`getPlanModeV2SubAgentInstructions`) for a child
-/// frozen in Plan. Tick Loop gives the child no plan file: its final reply carries the findings or
+/// frozen in Plan. Tickloop gives the child no plan file: its final reply carries the findings or
 /// plan to the parent, which submits the plan.
 pub(super) const DELEGATED_PLAN_MODE_REMINDER: &str = "# Plan mode
 

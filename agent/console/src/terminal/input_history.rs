@@ -192,6 +192,10 @@ pub(super) struct InputHistory {
     shared: Arc<WriterShared>,
     writer: Option<JoinHandle<()>>,
     last_recorded: Option<StoredEntry>,
+    /// The entry the last [`Self::record`] queued, until [`Self::withdraw_last`] takes it.
+    last_added: Option<StoredEntry>,
+    /// Written entries this process withdrew; reads skip them.
+    withdrawn: Vec<StoredEntry>,
     parsed_file: Mutex<ParsedHistoryFile>,
 }
 
@@ -212,6 +216,8 @@ impl InputHistory {
             shared,
             writer,
             last_recorded: None,
+            last_added: None,
+            withdrawn: Vec::new(),
             parsed_file: Mutex::default(),
         }
     }
@@ -223,6 +229,8 @@ impl InputHistory {
             shared: Arc::new(WriterShared::default()),
             writer: None,
             last_recorded: None,
+            last_added: None,
+            withdrawn: Vec::new(),
             parsed_file: Mutex::default(),
         }
     }
@@ -263,6 +271,7 @@ impl InputHistory {
         }
         self.last_recorded = Some(entry.clone());
         entry.timestamp = unix_time_milliseconds();
+        self.last_added = Some(entry.clone());
 
         let mut pending = self.shared.lock();
         pending.entries.push(entry);
@@ -270,6 +279,30 @@ impl InputHistory {
         drop(pending);
         self.shared.wake.notify_all();
         Ok(true)
+    }
+
+    /// 照 Claude Code `removeLastFromHistory`：提交后又被撤回、放回输入框的提示不再留在历史里，
+    /// 上箭头不会把它和输入框中的文字重复列出。只撤回最近一次记录且内容就是 `prompt` 的条目，
+    /// 最多一次；仍在缓冲中的直接移除，已写入文件的在本进程读取时跳过。
+    pub(super) fn withdraw_last(&mut self, prompt: &str) {
+        let Some(entry) = self.last_added.take() else {
+            return;
+        };
+        if self.resolve_pasted_text(&entry.display, &entry.pasted_contents) != safe_prompt(prompt) {
+            return;
+        }
+        self.last_recorded = None;
+        let mut pending = self.shared.lock();
+        if let Some(index) = pending
+            .entries
+            .iter()
+            .rposition(|candidate| *candidate == entry)
+        {
+            pending.entries.remove(index);
+        } else {
+            drop(pending);
+            self.withdrawn.push(entry);
+        }
     }
 
     /// 上箭头历史：只看当前项目，当前 Chat 的条目在前，各组内由新到旧。
@@ -413,6 +446,13 @@ impl InputHistory {
                     .map_err(InputHistoryError::new)?;
             }
             pending.entries.clone()
+        };
+        let mut visit = |entry: &StoredEntry| {
+            if self.withdrawn.contains(entry) {
+                ControlFlow::Continue(())
+            } else {
+                visit(entry)
+            }
         };
         for entry in pending.iter().rev() {
             if visit(entry).is_break() {
@@ -1154,6 +1194,50 @@ mod tests {
             .search("chat-a", project.path(), HistoryScope::ThisProject, "", 10)
             .unwrap();
         assert_eq!(displays(&matches), ["first", "second"]);
+    }
+
+    #[test]
+    fn withdrawing_the_last_prompt_hides_it_whether_or_not_it_was_written() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let mut history = InputHistory::in_memory();
+        assert!(record(&mut history, "chat-a", project.path(), "kept"));
+        assert!(record(&mut history, "chat-a", project.path(), "sent"));
+        history.withdraw_last("another prompt");
+        history.withdraw_last("sent");
+        assert_eq!(
+            history.recent_prompts("chat-a", project.path()).unwrap(),
+            ["sent", "kept"],
+            "only a matching last prompt is withdrawn, once"
+        );
+        assert!(record(&mut history, "chat-a", project.path(), "taken back"));
+        history.withdraw_last("taken back");
+        history.withdraw_last("sent");
+        assert_eq!(
+            history.recent_prompts("chat-a", project.path()).unwrap(),
+            ["sent", "kept"],
+            "earlier entries stay"
+        );
+
+        let root = history_root(&directory);
+        let mut written = InputHistory::open(&root);
+        assert!(record(&mut written, "chat-a", project.path(), "kept"));
+        assert!(record(&mut written, "chat-a", project.path(), "taken back"));
+        written.flush();
+        assert_eq!(history_lines(&root).len(), 2);
+        written.withdraw_last("taken back");
+        assert_eq!(
+            written.recent_prompts("chat-a", project.path()).unwrap(),
+            ["kept"]
+        );
+        // A new entry differs from the withdrawn one by its millisecond timestamp.
+        thread::sleep(Duration::from_millis(2));
+        assert!(record(&mut written, "chat-a", project.path(), "taken back"));
+        assert_eq!(
+            written.recent_prompts("chat-a", project.path()).unwrap(),
+            ["taken back", "kept"],
+            "sending the prompt again records it again"
+        );
     }
 
     #[test]

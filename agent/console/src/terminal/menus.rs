@@ -974,7 +974,7 @@ impl Menus {
             console,
             Menu {
                 id: Uuid::new_v4(),
-                title: "Sign out of Tick Loop Artifacts?".into(),
+                title: "Sign out of Tickloop Artifacts?".into(),
                 context: vec!["Stops feedback listening before revoking the credential.".into()],
                 options: vec!["Cancel".into(), "Sign out".into()],
                 selected: 0,
@@ -1785,7 +1785,7 @@ impl Menus {
         if let Some(action) = font_action {
             options.push(match action {
                 FontAction::Install => "Install Symbols-only Nerd Font…".into(),
-                FontAction::Uninstall => "Uninstall Tick Loop-owned Symbols-only Nerd Font…".into(),
+                FontAction::Uninstall => "Uninstall Tickloop-owned Symbols-only Nerd Font…".into(),
             });
         }
         self.show(
@@ -1822,7 +1822,7 @@ impl Menus {
                 id: Uuid::new_v4(),
                 title: "Confirm glyph set".into(),
                 context: vec![format!(
-                    "Save {} for future Tick Loop sessions?",
+                    "Save {} for future Tickloop sessions?",
                     glyph_set.label()
                 )],
                 options: vec!["Confirm and save".into(), "Back to preview".into()],
@@ -1842,11 +1842,11 @@ impl Menus {
         let (title, context) = match action {
             FontAction::Install => (
                 "Confirm Nerd Font installation",
-                "Tick Loop will use Homebrew when available; otherwise it downloads the fixed official v3.5.1 Symbols-only asset and verifies SHA-256. This does not enable Nerd Font.",
+                "Tickloop will use Homebrew when available; otherwise it downloads the fixed official v3.5.1 Symbols-only asset and verifies SHA-256. This does not enable Nerd Font.",
             ),
             FontAction::Uninstall => (
                 "Confirm Nerd Font uninstall",
-                "Tick Loop will switch to Unicode first and remove only the installation recorded in its ownership receipt.",
+                "Tickloop will switch to Unicode first and remove only the installation recorded in its ownership receipt.",
             ),
         };
         self.show(
@@ -3070,11 +3070,11 @@ impl Menus {
                 }
                 Selection::ArtifactSignOut { target, return_to_settings } => {
                     if index == Some(1) {
-                        let root = self.config_root.as_ref().ok_or("Tick Loop Artifacts needs a state directory")?;
+                        let root = self.config_root.as_ref().ok_or("Tickloop Artifacts needs a state directory")?;
                         agent.disable_event_sources().await.map_err(|error| error.to_string())?;
                         let client = tickloop_agent_artifacts::ArtifactClient::new(root).map_err(|error| error.to_string())?;
                         client.logout().await.map_err(|error| error.to_string())?;
-                        console.write("Signed out of Tick Loop Artifacts.\n")?;
+                        console.write("Signed out of Tickloop Artifacts.\n")?;
                     } else if return_to_settings {
                         self.settings(agent, console, target).await?;
                     }

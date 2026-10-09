@@ -219,7 +219,6 @@ mod tests {
                         goal: request,
                         version: 1,
                         request: None,
-                        choices: Vec::new(),
                     },
                 ),
             )

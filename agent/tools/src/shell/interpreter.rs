@@ -16,7 +16,7 @@ const ZSH: &str = "zsh";
 /// Where Claude Code looks for each shell after the `which` results.
 const SHELL_DIRECTORIES: [&str; 4] = ["/bin", "/usr/bin", "/usr/local/bin", "/opt/homebrew/bin"];
 const EXECUTABLE_MODE_BITS: u32 = 0o111;
-pub(super) const NO_SUITABLE_SHELL: &str = "No suitable shell found. Tick Loop runs commands with bash or zsh. Please ensure one of them is installed and the SHELL environment variable is set, or set TICKLOOP_SHELL to its path.";
+pub(super) const NO_SUITABLE_SHELL: &str = "No suitable shell found. Tickloop runs commands with bash or zsh. Please ensure one of them is installed and the SHELL environment variable is set, or set TICKLOOP_SHELL to its path.";
 
 /// The shell this process runs commands with, resolved once from its environment.
 pub(super) fn selected_shell() -> Result<PathBuf, String> {

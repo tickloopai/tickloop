@@ -1106,7 +1106,7 @@ fn agent_layout_created_chat_keeps_its_draft_history_and_keeps_other_views_isola
         .unwrap();
     console.clear_visible_agent().unwrap();
     let created_banner = vec![
-        ("Tick Loop Agent v0.1.0\n".into(), Some(Role::Title)),
+        ("Tickloop v0.2.0\n".into(), Some(Role::Title)),
         (
             "current-model · current-protocol\n".into(),
             Some(Role::MutedText),
@@ -1132,7 +1132,7 @@ fn agent_layout_created_chat_keeps_its_draft_history_and_keeps_other_views_isola
         );
     }
     for absent in [
-        "Tick Loop Agent v0.1.0",
+        "Tickloop v0.2.0",
         "current-model · current-protocol",
         "/fixture/current-directory",
         "existing Agent body",
@@ -1165,10 +1165,10 @@ fn agent_layout_created_chat_keeps_its_draft_history_and_keeps_other_views_isola
         .unwrap();
     let frame = frame_lines(&console);
     assert!(line_with(&frame, "existing Agent body").is_some());
-    assert!(line_with(&frame, "Tick Loop Agent v0.1.0").is_none());
+    assert!(line_with(&frame, "Tickloop v0.2.0").is_none());
     console.clear_visible_agent().unwrap();
     let frame = frame_lines(&console);
-    assert!(line_with(&frame, "Tick Loop Agent v0.1.0").is_some());
+    assert!(line_with(&frame, "Tickloop v0.2.0").is_some());
     assert!(line_with(&frame, "current-model").is_some());
     for absent in [
         "original draft banner",

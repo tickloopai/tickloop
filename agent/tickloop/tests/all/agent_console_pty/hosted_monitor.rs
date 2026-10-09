@@ -102,7 +102,7 @@ async fn back_in_monitor_quietly(view: &PtyView) -> String {
     frame
 }
 
-/// A plugin of someone else's, linked before Tick Loop registers its own.
+/// A plugin of someone else's, linked before Tickloop registers its own.
 const OTHER_PLUGIN_ID: &str = "test.other";
 
 /// Closes a Herdr popup or full-screen view with a lone Esc.
@@ -291,7 +291,7 @@ async fn actual_cli_monitor_shows_a_hosted_tick_snapshot_and_attaches_it_full_sc
     }
 }
 
-/// Inside Herdr, Enter on a hosted Tick opens it in Tick Loop's Herdr popup, attached to the same
+/// Inside Herdr, Enter on a hosted Tick opens it in Tickloop's Herdr popup, attached to the same
 /// process. The first time, the plugin is offered once for registration (Enter confirms; another
 /// plugin already linked is left alone) and the popup opens at once; a lone Esc in the popup
 /// closes it while the Tick keeps running. A click on the row is Enter, and while Herdr already
@@ -322,7 +322,7 @@ async fn actual_cli_enter_opens_a_hosted_tick_in_a_herdr_popup_after_a_one_key_r
             .await;
         view.send(b"\r");
         view.wait_for("the one-key registration offer", |frame| {
-            frame.contains("Register Tick Loop") && frame.contains("enter confirm")
+            frame.contains("Register Tickloop") && frame.contains("enter confirm")
         })
         .await;
         assert!(
@@ -333,13 +333,9 @@ async fn actual_cli_enter_opens_a_hosted_tick_in_a_herdr_popup_after_a_one_key_r
         view.send(b"\r");
         wait_until("the popup shows the Tick", || {
             Some(client.screen())
-                .filter(|screen| screen.contains("┌Tick Loop") && screen.contains("keys"))
+                .filter(|screen| screen.contains("┌Tickloop") && screen.contains("keys"))
         });
-        assert_eq!(
-            herdr.plugins().len(),
-            1,
-            "only Tick Loop's plugin is linked"
-        );
+        assert_eq!(herdr.plugins().len(), 1, "only Tickloop's plugin is linked");
         let others = herdr.plugins_with_id(OTHER_PLUGIN_ID);
         assert_eq!(
             (
@@ -364,11 +360,11 @@ async fn actual_cli_enter_opens_a_hosted_tick_in_a_herdr_popup_after_a_one_key_r
         );
         client.send(CLOSE);
         wait_until("the popup to close", || {
-            Some(()).filter(|()| !client.screen().contains("┌Tick Loop"))
+            Some(()).filter(|()| !client.screen().contains("┌Tickloop"))
         });
 
         view.send(b"\r");
-        client.shows("┌Tick Loop");
+        client.shows("┌Tickloop");
         view.send(b"\r");
         view.wait_for("a busy Herdr is explained", |frame| {
             frame.contains("Herdr is showing another view")
@@ -380,7 +376,7 @@ async fn actual_cli_enter_opens_a_hosted_tick_in_a_herdr_popup_after_a_one_key_r
         );
         client.send(CLOSE);
         wait_until("the popup to close", || {
-            Some(()).filter(|()| !client.screen().contains("┌Tick Loop"))
+            Some(()).filter(|()| !client.screen().contains("┌Tickloop"))
         });
 
         let frame = view.frame();
@@ -395,10 +391,10 @@ async fn actual_cli_enter_opens_a_hosted_tick_in_a_herdr_popup_after_a_one_key_r
             })
             .unwrap_or_else(|| panic!("the hosted row is on screen: {frame}"));
         view.send(format!("\x1b[<0;{column};{row}M\x1b[<0;{column};{row}m").as_bytes());
-        client.shows("┌Tick Loop");
+        client.shows("┌Tickloop");
         client.send(CLOSE);
         wait_until("the popup to close", || {
-            Some(()).filter(|()| !client.screen().contains("┌Tick Loop"))
+            Some(()).filter(|()| !client.screen().contains("┌Tickloop"))
         });
         view.send(b"\x1b");
         view.wait_for("input focused again", new_input_is_visible)
@@ -415,7 +411,7 @@ async fn actual_cli_enter_opens_a_hosted_tick_in_a_herdr_popup_after_a_one_key_r
     }
 }
 
-/// Tick Loop's own popup plugin linked by another tickloop build runs that build's attach client,
+/// Tickloop's own popup plugin linked by another tickloop build runs that build's attach client,
 /// which may not speak this Tickhost's protocol and would close the popup at once. Enter offers to
 /// register the plugin for this tickloop instead of floating the Tick into the other one, and once
 /// confirmed the popup shows the Tick.
@@ -448,7 +444,7 @@ async fn actual_cli_enter_re_registers_a_popup_plugin_another_tickloop_linked() 
         std::fs::write(
             plugin.join("herdr-plugin.toml"),
             format!(
-                "id = \"{PLUGIN_ID}\"\nname = \"Tick Loop Monitor\"\nversion = \"0.1.0\"\nmin_herdr_version = \"0.9.0\"\nplatforms = [\"macos\", \"linux\"]\n\n[[panes]]\nid = \"attach\"\ntitle = \"Tick Loop\"\nplacement = \"popup\"\nwidth = \"85%\"\nheight = \"85%\"\ncommand = [{:?}, \"monitor\", \"attach\"]\n",
+                "id = \"{PLUGIN_ID}\"\nname = \"Tickloop Monitor\"\nversion = \"0.1.0\"\nmin_herdr_version = \"0.9.0\"\nplatforms = [\"macos\", \"linux\"]\n\n[[panes]]\nid = \"attach\"\ntitle = \"Tickloop\"\nplacement = \"popup\"\nwidth = \"85%\"\nheight = \"85%\"\ncommand = [{:?}, \"monitor\", \"attach\"]\n",
                 other_tickloop.to_str().unwrap()
             ),
         )
@@ -490,7 +486,7 @@ async fn actual_cli_enter_re_registers_a_popup_plugin_another_tickloop_linked() 
         view.send(b"\r");
         wait_until("the popup shows the Tick", || {
             Some(client.screen())
-                .filter(|screen| screen.contains("┌Tick Loop") && screen.contains("keys"))
+                .filter(|screen| screen.contains("┌Tickloop") && screen.contains("keys"))
         });
         let plugins = herdr.plugins();
         assert_eq!(plugins.len(), 1, "{plugins:?}");
@@ -502,7 +498,7 @@ async fn actual_cli_enter_re_registers_a_popup_plugin_another_tickloop_linked() 
         );
         client.send(CLOSE);
         wait_until("the popup to close", || {
-            Some(()).filter(|()| !client.screen().contains("┌Tick Loop"))
+            Some(()).filter(|()| !client.screen().contains("┌Tickloop"))
         });
         view.send(b"\x1b");
         view.wait_for("input focused again", new_input_is_visible)
@@ -546,12 +542,12 @@ async fn actual_cli_enter_without_a_usable_popup_opens_full_screen() {
             .await;
         view.send(b"\r");
         view.wait_for("the one-key registration offer", |frame| {
-            frame.contains("Register Tick Loop")
+            frame.contains("Register Tickloop")
         })
         .await;
         view.send(b"\x1b");
         view.wait_for("the offer declined", |frame| {
-            !frame.contains("Register Tick Loop") && frame.contains("enter open")
+            !frame.contains("Register Tickloop") && frame.contains("enter open")
         })
         .await;
         assert!(herdr.plugins().is_empty(), "declining links nothing");
@@ -561,7 +557,7 @@ async fn actual_cli_enter_without_a_usable_popup_opens_full_screen() {
         view.send(CLOSE);
         let back = back_in_monitor_quietly(&view).await;
         assert!(
-            !back.contains("Register Tick Loop"),
+            !back.contains("Register Tickloop"),
             "the offer is made once: {back}"
         );
         assert!(

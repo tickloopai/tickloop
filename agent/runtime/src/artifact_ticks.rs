@@ -47,26 +47,43 @@ impl Agent {
         );
         Ok(ticks)
     }
+    /// Unlinks the artifact from the Chat: it leaves Monitor for good and its association with
+    /// the Chat's Loops ends, so its @tickloop requests no longer reach them. Tick Subscriptions
+    /// on it are cancelled on their own.
     pub async fn remove_artifact_tick(
         &self,
         chat_id: ChatId,
         instance_id: &str,
     ) -> Result<Vec<ArtifactTick>, AgentError> {
-        let mut chats = self.inner.chats.lock().await;
-        let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
-        chat.snapshot
-            .removed_artifact_ticks
-            .insert(instance_id.to_owned());
-        chat.snapshot
-            .artifact_ticks
-            .retain(|tick| tick.instance_id() != instance_id);
-        let ticks = chat.snapshot.artifact_ticks.clone();
-        self.record_artifact_ticks(
-            chat_id,
-            &chat.snapshot.workdir,
-            ticks.clone(),
-            chat.snapshot.removed_artifact_ticks.clone(),
-        );
+        let (ticks, released_loops) = {
+            let mut chats = self.inner.chats.lock().await;
+            let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
+            chat.snapshot
+                .removed_artifact_ticks
+                .insert(instance_id.to_owned());
+            chat.snapshot
+                .artifact_ticks
+                .retain(|tick| tick.instance_id() != instance_id);
+            let released_loops = instance_id
+                .parse::<tick_protocol::InstanceRef>()
+                .ok()
+                .and_then(|instance| {
+                    let (origin, artifact_id) = instance.artifact_parts()?;
+                    Some(self.unlink_artifact(chat, origin, artifact_id))
+                })
+                .unwrap_or_default();
+            let ticks = chat.snapshot.artifact_ticks.clone();
+            self.record_artifact_ticks(
+                chat_id,
+                &chat.snapshot.workdir,
+                ticks.clone(),
+                chat.snapshot.removed_artifact_ticks.clone(),
+            );
+            (ticks, released_loops)
+        };
+        for released in released_loops {
+            self.disarm_feedback_lease(chat_id, released).await;
+        }
         Ok(ticks)
     }
     pub async fn artifact_ticks(&self, chat_id: ChatId) -> Result<Vec<ArtifactTick>, AgentError> {

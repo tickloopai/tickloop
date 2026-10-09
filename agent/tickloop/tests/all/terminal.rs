@@ -1082,7 +1082,7 @@ async fn assert_piped_creation_refused(piped_input: &str) {
         .unwrap()
         .unwrap()
         .unwrap();
-    assert!(banner.starts_with("Tick Loop Agent"), "{banner}");
+    assert!(banner.starts_with("Tickloop"), "{banner}");
     // The daemon cannot start a worker in a directory that no longer exists, so it refuses Create.
     std::fs::remove_dir(&workdir).unwrap();
     input.write_all(piped_input.as_bytes()).await.unwrap();

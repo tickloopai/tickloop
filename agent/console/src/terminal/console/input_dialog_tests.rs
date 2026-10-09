@@ -141,7 +141,7 @@ async fn input_dialog_top_rule_covers_every_surface_with_semantic_theme_roles() 
             let (lines, row, _) = state.styled_frame();
             let expected = match surface {
                 "permission" | "question" | "plan" | "plan feedback" | "trust" => 12,
-                "help" => 13,
+                "help" => 14,
                 "settings" | "login" | "resume" => 6,
                 "artifacts" | "tick confirmation" => 5,
                 "permissions" => 4,
@@ -2193,16 +2193,15 @@ async fn another_view_decision_retires_a_restored_plan_dialog_and_stale_esc_cann
 }
 
 #[test]
-fn a_child_can_request_an_existing_plan_without_unlocking_mode_changes() {
-    use crate::terminal::completion::{CommandScope, unavailable_command};
-    assert!(unavailable_command("/plan", CommandScope::Child).is_none());
-    assert!(
-        unavailable_command(
-            "/plan 00000000-0000-0000-0000-000000000001",
-            CommandScope::Child
-        )
-        .is_none()
-    );
+fn a_child_cannot_use_plan_or_change_its_mode() {
+    use crate::terminal::completion::{CHILD_PLAN_REPORTED, CommandScope, unavailable_command};
+    for command in ["/plan", "/plan 00000000-0000-0000-0000-000000000001"] {
+        assert_eq!(
+            unavailable_command(command, CommandScope::Child),
+            Some(("/plan", CHILD_PLAN_REPORTED))
+        );
+    }
+    assert!(unavailable_command("/plan", CommandScope::Root).is_none());
     for command in ["/mode auto", "/rule allow Bash", "/add-dir /tmp"] {
         assert!(unavailable_command(command, CommandScope::Child).is_some());
     }

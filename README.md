@@ -1,6 +1,6 @@
-# Tick Loop
+# Tickloop
 
-Tick Loop 提供完整的终端 Agent 和 example Tick。使用原生 Herdr 的 Workspace → Tab → Pane 组织程序；Agent 可以读取 Tick、调用它的工具，并通过明确订阅让内容变化推动 Loop 继续执行。
+Tickloop 提供完整的终端 Agent 和 example Tick。使用原生 Herdr 的 Workspace → Tab → Pane 组织程序；Agent 可以读取 Tick、调用它的工具，并通过明确订阅让内容变化推动 Loop 继续执行。
 
 主命令是 `tickloop`。Herdr 外仍可使用普通 Agent 功能；跨 Tick 发现、操作和订阅要求受支持的宿主，目前支持 Herdr。
 
@@ -35,7 +35,7 @@ Agent 会确认运行环境，并在 Herdr 接入可用时自动加载 Tick 操�
 
 # Tick Command `tick`
 
-`tick` 是 Tick Loop 的 Tick Command，提供报价、自选、K 线、持仓、资讯和财报视图。命令形式为 `tick <provider> <tick>`：provider 决定数据来源，同一个 Tick 在各 provider 上界面一致。
+`tick` 是 Tickloop 的 Tick Command，提供报价、自选、K 线、持仓、资讯和财报视图。命令形式为 `tick <provider> <tick>`：provider 决定数据来源，同一个 Tick 在各 provider 上界面一致。
 
 | provider | 实现的接口 | 可运行的 Tick |
 | --- | --- | --- |

@@ -14,6 +14,10 @@ use crate::{
 
 pub const SEND_AGENT_MESSAGE_TOOL_NAME: &str = "SendMessage";
 pub const SUBAGENT_HANDBACK_TOOL_NAME: &str = "SubagentHandback";
+/// A finished child's result when its report already reached the caller as an Agent message.
+pub const SUBAGENT_REPORT_RECEIPT: &str = "The subagent delivered its report as an Agent message. Read it there; it is not repeated in this receipt.";
+/// A finished child's result when it ended without delivering the report it was asked for.
+pub const SUBAGENT_MISSING_REPORT: &str = "The subagent ended without delivering a report through SubagentHandback. Its unsent text is not shown. Use SendMessage to ask it to deliver its report.";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]

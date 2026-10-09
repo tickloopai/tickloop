@@ -272,7 +272,7 @@ async fn the_host_reserves_the_artifact_tool_names() {
     assert!(
         reads[0]
             .description
-            .starts_with("Read Tick Loop Artifacts you can access."),
+            .starts_with("Read Tickloop Artifacts you can access."),
         "only the service directory provides an Artifact name"
     );
     agent
@@ -1480,6 +1480,144 @@ async fn relinking_an_artifact_keeps_it_in_the_loop_that_holds_it() {
         "a new link goes to the newest open Loop"
     );
     assert_eq!(snapshot.loops[1].state, LoopState::WaitingTrigger);
+    agent.shutdown().await;
+}
+
+/// Holds its first turn until released, then answers every turn at once.
+#[derive(Default)]
+struct GatedModel {
+    started: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    requests: std::sync::Mutex<Vec<ModelRequest>>,
+}
+
+#[async_trait]
+impl ModelClient for GatedModel {
+    async fn generate_title(
+        &self,
+        request: ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<ModelDelta>,
+        _: CancellationToken,
+    ) -> Result<ModelOutput, ModelError> {
+        Ok(tickloop_agent_test_support::title_output(request))
+    }
+
+    fn identity(&self) -> ModelIdentity {
+        ScriptedModel::new(vec![]).identity()
+    }
+
+    async fn complete(
+        &self,
+        request: ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<ModelDelta>,
+        _: CancellationToken,
+    ) -> Result<ModelOutput, ModelError> {
+        let is_first = {
+            let mut requests = self.requests.lock().unwrap();
+            requests.push(request);
+            requests.len() == 1
+        };
+        if is_first {
+            self.started.notify_one();
+            self.release.notified().await;
+        }
+        Ok(ModelOutput {
+            private_source: None,
+            content: text("Done."),
+            usage: Default::default(),
+            stop_reason: "end_turn".into(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn an_unlinked_artifact_no_longer_brings_its_requests_into_the_loop() {
+    let service = ArtifactService::start().await;
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(GatedModel::default());
+    let agent = signed_in_agent(&service, directory.path(), model.clone()).await;
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::FullAccess)
+        .await
+        .unwrap();
+    // The running Loop takes both artifacts and holds their requests back until it waits.
+    agent
+        .submit(chat, None, "Write two briefs".into())
+        .await
+        .unwrap();
+    tokio::time::timeout(WAIT, model.started.notified())
+        .await
+        .unwrap();
+    let loop_id = agent.snapshot(chat).await.unwrap().loops[0].id;
+    service.request_feedback("doc", "request-1");
+    service.request_feedback("other", "request-2");
+    let doc = artifact_tick(&service, "doc");
+    let other = artifact_tick(&service, "other");
+    for tick in [&doc, &other] {
+        agent.add_artifact_tick(chat, tick.clone()).await.unwrap();
+        agent.link_artifact(chat, tick).await.unwrap();
+    }
+    agent
+        .remove_artifact_tick(chat, &doc.instance_id())
+        .await
+        .unwrap();
+    let snapshot = agent.snapshot(chat).await.unwrap();
+    assert_eq!(snapshot.artifact_ticks, std::slice::from_ref(&other));
+    assert_eq!(
+        snapshot.loops[0]
+            .event_sources
+            .iter()
+            .map(|source| source.artifact_id.as_str())
+            .collect::<Vec<_>>(),
+        ["other"]
+    );
+
+    model.release.notify_one();
+    eventually(async || {
+        service
+            .releases()
+            .contains(&("request-2".into(), "failed".into()))
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(service.is_pending("request-1"));
+    assert!(
+        service
+            .lifecycle_requests("POST /artifact/api/v1/agent/requests/request-1/")
+            .is_empty()
+    );
+    let conversations = model
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|request| serde_json::to_string(&request.messages).unwrap())
+        .collect::<Vec<_>>();
+    assert!(
+        conversations
+            .iter()
+            .any(|conversation| conversation.contains("@tickloop request request-2"))
+    );
+    assert!(
+        conversations
+            .iter()
+            .all(|conversation| !conversation.contains("request-1")),
+        "an unlinked artifact's request never reaches the Loop"
+    );
+
+    wait_for_loop_state(&agent, chat, loop_id, LoopState::WaitingTrigger).await;
+    agent
+        .remove_artifact_tick(chat, &other.instance_id())
+        .await
+        .unwrap();
+    let goal = agent.snapshot(chat).await.unwrap().loops[0].clone();
+    assert!(goal.event_sources.is_empty());
+    assert_eq!(
+        goal.state,
+        LoopState::Completed,
+        "a Loop left with nothing to wait for completes"
+    );
     agent.shutdown().await;
 }
 

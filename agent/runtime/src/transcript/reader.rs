@@ -473,7 +473,7 @@ struct PrecompactPrune {
     preserved: HashSet<Uuid>,
 }
 
-/// 照 Claude Code `applyPreservedSegmentRelinks` 读取带保留区段的文件（Tick Loop 自己不再写区段）：
+/// 照 Claude Code `applyPreservedSegmentRelinks` 读取带保留区段的文件（Tickloop 自己不再写区段）：
 /// 只采用文件中最后一个带保留区段的边界。先从尾到头校验区段链，再把头接到锚点、把锚点的其他
 /// 子节点接到尾，清零保留 assistant 消息的用量。返回删除最后一个边界之前、不在保留区段中的
 /// 条目所需的信息，由调用方在选出叶子后决定是否删除。区段校验失败时不做任何修改，返回说明，
@@ -561,7 +561,7 @@ fn apply_preserved_segment_relinks(
 
 /// 照 Claude Code `recoverOrphanedParallelToolResults`：并行工具结果若写成了兄弟分支，
 /// 沿父链重建时只会带上其中一支，这里把其余结果补回同一条结果消息。
-/// Tick Loop 目前的写入拓扑是线性的，正常不会触发。
+/// Tickloop 目前的写入拓扑是线性的，正常不会触发。
 fn recover_orphaned_parallel_tool_results(
     chain: &mut Vec<ChainEntry>,
     entries: &HashMap<Uuid, IndexedEntry>,

@@ -451,7 +451,7 @@ fn settings_ux_pty_settings_escape_returns_one_page_and_omits_numbers() {
         ("Theme:", "Choose theme"),
         ("Glyph Set:", "Choose Glyph Set"),
         ("Output style:", "Preferred output style"),
-        ("Artifacts:", "Sign out of Tick Loop Artifacts?"),
+        ("Artifacts:", "Sign out of Tickloop Artifacts?"),
     ] {
         fixture.send(b"/settings\r");
         let frame = fixture.wait(|frame| frame.lines().any(|line| line == "Settings"));

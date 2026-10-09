@@ -292,7 +292,7 @@ async fn summarize_models(
         .filter_map(|entry| entry["id"].as_str())
         .filter(|id| bound.iter().all(|(_, service_id, _)| service_id != id))
         .collect::<Vec<_>>();
-    println!("Other listed ids (not offered by Tick Loop): {unbound:?}");
+    println!("Other listed ids (not offered by Tickloop): {unbound:?}");
     Ok(())
 }
 

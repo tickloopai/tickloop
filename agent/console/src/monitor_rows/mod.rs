@@ -9,7 +9,9 @@ pub(crate) use builtin::artifact_actions;
 pub use builtin::{
     ArtifactRows, FINISHED_SHELL_DISPLAY_MS, HerdrRows, HostedRows, ShellRows, finished_shell_until,
 };
-pub(crate) use builtin::{HOSTED_CLOSE_KEY, HOSTED_REOPEN_KEY, signal_name};
+pub(crate) use builtin::{
+    HOSTED_CLOSE_KEY, HOSTED_REOPEN_KEY, feedback_binding, key_command, shell_tone, signal_name,
+};
 pub use discovery::{
     DiscoveredTick, DiscoveryError, HerdrDiscovery, MemberFindings, TickDiscovery, TickProbe,
 };
@@ -197,6 +199,10 @@ pub struct TickDescriptor {
     /// What the row shows at its right before its latest update: facts its glyph's colour
     /// cannot tell, such as a non-zero exit code, a signal or the subscription marker.
     pub notes: Vec<String>,
+    /// Whether a Loop of this Chat subscribes to the instance through its type rather than a Tick
+    /// Subscription, as an artifact's association does with its @tickloop requests. It shows in
+    /// the subscription marker without a cadence, and the row's own `x` ends it.
+    pub inherent_subscription: bool,
     pub owner: TickOwner,
     pub tone: StatusTone,
     /// The latest business update; resource and screen refreshes never set it.
@@ -327,6 +333,7 @@ fn subscription_descriptor(row: &TickSubscriptionStatus) -> TickDescriptor {
         kind: if terminal { "Terminal" } else { "Tick" }.into(),
         status: builtin::link_status(row.link).into(),
         notes: Vec::new(),
+        inherent_subscription: false,
         tone: builtin::link_tone(row.link),
         owner: TickOwner::Unknown,
         updated_at_ms: row.updated_at_ms,
@@ -337,13 +344,18 @@ fn subscription_descriptor(row: &TickSubscriptionStatus) -> TickDescriptor {
     }
 }
 
-/// Shows the row's subscriptions as a marker, `⟳ 60s` or `⟳ 2` for several, and adds the keys
-/// that manage them. Enter shows them unless the type opens the instance itself.
+/// Shows the row's subscriptions as a marker, `⟳ 60s` for one Tick Subscription, `⟳` for the
+/// type's inherent one, which has no cadence, or `⟳ 2` for several, and adds the keys that manage
+/// Tick Subscriptions. Enter shows them unless the type opens the instance itself.
 fn mark_subscribed(entry: &mut TickDescriptor, rows: &[&TickSubscriptionStatus]) {
-    entry.notes.push(match rows {
-        [row] => format!("⟳ {}s", row.every_seconds),
-        rows => format!("⟳ {}", rows.len()),
+    entry.notes.push(match (entry.inherent_subscription, rows) {
+        (false, [row]) => format!("⟳ {}s", row.every_seconds),
+        (true, []) => "⟳".into(),
+        (inherent, rows) => format!("⟳ {}", rows.len() + usize::from(inherent)),
     });
+    if rows.is_empty() {
+        return;
+    }
     let instance = entry.instance.clone();
     let manage = |operation| TickIntent::ManageSubscriptions {
         instance: instance.clone(),
@@ -435,6 +447,7 @@ pub fn member_descriptor(member: &MonitorMember) -> TickDescriptor {
         kind: "Tick".into(),
         status: String::new(),
         notes: Vec::new(),
+        inherent_subscription: false,
         owner: member_owner(member),
         tone: StatusTone::Neutral,
         updated_at_ms: None,
@@ -555,7 +568,10 @@ impl MonitorRowsRegistry {
                 );
                 !reserved
             });
-            if let Some(rows) = subscribed.get(&entry.instance) {
+            let rows = subscribed
+                .get(&entry.instance)
+                .map_or(&[][..], Vec::as_slice);
+            if entry.inherent_subscription || !rows.is_empty() {
                 mark_subscribed(entry, rows);
             }
             let handled_at = context
@@ -660,6 +676,7 @@ fn merge_descriptors(
                     lead.update = other.update.clone();
                 }
                 lead.running |= other.running;
+                lead.inherent_subscription |= other.inherent_subscription;
                 if lead.title == lead.instance.as_str() {
                     lead.title = other.title;
                 }

@@ -76,7 +76,7 @@ impl DeviceSubscription {
     pub fn consent_notice(self) -> &'static str {
         match self {
             Self::Kimi => {
-                "The consent page names the registered Kimi Code client. Tick Loop is an independent client; subscription model access remains subject to your account."
+                "The consent page names the registered Kimi Code client. Tickloop is an independent client; subscription model access remains subject to your account."
             }
             Self::Xai => {
                 "The consent page uses the registered Grok client. This connection uses cli-chat-proxy.grok.com with its required token-auth headers; api.x.ai API keys are a separate route."

@@ -221,7 +221,7 @@ impl ChatSnapshot {
 }
 
 /// 照 Claude Code `getCompactUserSummaryMessage`：自动压缩要求模型不再提问、直接继续，手动
-/// `/compact` 不带继续指令。Tick Loop 在摘要之后附带宿主保存的目标与计划；Claude Code 附加的
+/// `/compact` 不带继续指令。Tickloop 在摘要之后附带宿主保存的目标与计划；Claude Code 附加的
 /// Transcript 路径没有照搬（不持久化的 Agent 没有文件）。
 pub fn full_summary_message(
     summary: &str,

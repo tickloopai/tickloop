@@ -31,6 +31,18 @@ pub async fn read_frame<R: AsyncRead + Unpin, T: serde::de::DeserializeOwned>(
     reader: &mut R,
     frame_bytes: usize,
 ) -> Result<Option<T>, AccessError> {
+    match read_frame_body(reader, frame_bytes).await? {
+        Some(bytes) => decode_frame(&bytes).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// One frame's undecoded body, for a reader that answers a body it cannot decode instead of
+/// dropping the connection.
+pub async fn read_frame_body<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    frame_bytes: usize,
+) -> Result<Option<Vec<u8>>, AccessError> {
     let length = match reader.read_u32().await {
         Ok(length) => length as usize,
         Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
@@ -42,7 +54,7 @@ pub async fn read_frame<R: AsyncRead + Unpin, T: serde::de::DeserializeOwned>(
         .read_exact(&mut bytes)
         .await
         .map_err(|error| AccessError::unavailable(error.to_string()))?;
-    decode_frame(&bytes).map(Some)
+    Ok(Some(bytes))
 }
 
 pub fn verify_peer(stream: &UnixStream) -> Result<(), AccessError> {

@@ -95,6 +95,7 @@ impl MonitorRows for CalendarRows {
                 kind: "Calendar".into(),
                 status: "live".into(),
                 notes: Vec::new(),
+                inherent_subscription: false,
                 owner: TickOwner::Unknown,
                 tone: tickloop_agent_console::monitor_rows::StatusTone::Neutral,
                 updated_at_ms: row.last_delivery_ms,

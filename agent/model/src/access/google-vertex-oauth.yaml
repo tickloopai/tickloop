@@ -11,5 +11,5 @@ series:
   version: '3.5'
   model: gemini-3.5-flash-lite
   capability_order: 1
-notice: Uses dedicated Tick Loop Google OAuth credentials and their quota project;
+notice: Uses dedicated Tickloop Google OAuth credentials and their quota project;
   does not read other tools login files.

@@ -1,6 +1,6 @@
 use super::*;
 use tickloop_agent_protocol::{
-    LoopState, ObservationKind, ShellTask, ShellTaskState, TickLinkState,
+    EventSourceBinding, LoopState, ObservationKind, ShellTask, ShellTaskState, TickLinkState,
 };
 
 /// How long a finished background Shell keeps its row once the Chat handled its end.
@@ -30,6 +30,7 @@ impl MonitorRows for HerdrRows {
                     kind: if terminal { "Terminal" } else { "Tick" }.into(),
                     status: link_status(row.link).into(),
                     notes: Vec::new(),
+                    inherent_subscription: false,
                     owner: TickOwner::Herdr,
                     tone: link_tone(row.link),
                     updated_at_ms: row.updated_at_ms,
@@ -99,6 +100,7 @@ impl MonitorRows for HostedRows {
                 kind: "Tick".into(),
                 status: link_status(row.link).into(),
                 notes: Vec::new(),
+                inherent_subscription: false,
                 owner: TickOwner::ThisChat,
                 tone: link_tone(row.link),
                 updated_at_ms: row.updated_at_ms,
@@ -184,13 +186,14 @@ impl MonitorRows for ArtifactRows {
                     kind: "Artifact".into(),
                     status: link_status(row.link).into(),
                     notes: Vec::new(),
+                    inherent_subscription: false,
                     owner: ARTIFACT_OWNER,
                     tone: link_tone(row.link),
                     updated_at_ms: row.updated_at_ms,
                     update: row.updated_at_ms.map(RowUpdate::new),
                     running: false,
                     resources: None,
-                    actions: artifact_actions(row.instance.as_str()),
+                    actions: artifact_actions(row.instance.as_str(), false),
                 }
             }));
         if let Some(chat) = &context.chat {
@@ -200,20 +203,14 @@ impl MonitorRows for ArtifactRows {
                     continue;
                 };
                 let metadata = context.metadata.get(&id);
-                let binding = chat
-                    .loops
-                    .iter()
-                    .filter(|goal| !matches!(goal.state, LoopState::Stopped | LoopState::Expired))
-                    .flat_map(|goal| &goal.event_sources)
-                    .find(|binding| {
-                        binding.origin == tick.origin && binding.artifact_id == tick.artifact_id
-                    });
+                let binding = feedback_binding(chat, &tick.origin, &tick.artifact_id);
+                let is_linked_here = binding.is_some_and(|binding| !binding.resume_required);
                 let remote_link = metadata
                     .and_then(Option::as_ref)
                     .and_then(|metadata| metadata.agent_link.as_ref());
                 let unavailable = metadata.is_some_and(Option::is_none);
                 let refresh_failed = context.metadata_failures.contains_key(&id);
-                let feedback = if binding.is_some_and(|binding| !binding.resume_required) {
+                let feedback = if is_linked_here {
                     Some("feedback here")
                 } else if remote_link.is_some_and(|link| {
                     binding.is_none_or(|binding| binding.binding_id != link.binding_id)
@@ -267,8 +264,15 @@ impl MonitorRows for ArtifactRows {
                         }
                         .into(),
                         status: status.into(),
-                        // Where feedback goes is not a state the glyph's colour tells.
-                        notes: feedback.map(str::to_owned).into_iter().collect(),
+                        // An association here is the row's subscription and shows as its marker;
+                        // feedback paused or going elsewhere is not a state the glyph's colour
+                        // tells, so it stays in words.
+                        notes: feedback
+                            .filter(|_| !is_linked_here)
+                            .map(str::to_owned)
+                            .into_iter()
+                            .collect(),
+                        inherent_subscription: is_linked_here,
                         owner: ARTIFACT_OWNER,
                         tone: if unavailable {
                             StatusTone::Gone
@@ -281,7 +285,7 @@ impl MonitorRows for ArtifactRows {
                         update,
                         running: false,
                         resources: None,
-                        actions: artifact_actions(&id),
+                        actions: artifact_actions(&id, binding.is_some()),
                     },
                 );
             }
@@ -346,8 +350,9 @@ impl MonitorRows for ShellRows {
                         String::new()
                     },
                     notes: shell_notes(task),
+                    inherent_subscription: false,
                     owner: TickOwner::ThisChat,
-                    tone: shell_tone(task, context),
+                    tone: shell_tone(task, context.shell_starts.get(&task.id).copied()),
                     updated_at_ms: task.updated_at_ms,
                     update: ended_at(task).map(RowUpdate::new),
                     running: !task.state.is_terminal(),
@@ -434,19 +439,214 @@ pub(crate) fn signal_name(signal: i32) -> Option<&'static str> {
     })
 }
 
-/// A Shell is named by its description; without one, by its first command line less a leading
-/// `cd <directory> &&`, which would otherwise start every row with the same path.
+/// A Shell row is named by its key command, so the row says what runs; its description stays in
+/// the detail.
 fn shell_title(task: &ShellTask) -> String {
-    if let Some(description) = task
-        .description
-        .as_deref()
-        .map(str::trim)
-        .filter(|description| !description.is_empty())
-    {
-        return description.lines().next().unwrap_or_default().to_owned();
+    key_command(&task.command)
+}
+
+/// Commands that prepare for or report on the work rather than do it.
+const SETUP_COMMANDS: [&str; 11] = [
+    "cd", "export", "set", "source", ".", "echo", "printf", "sleep", "mkdir", "true", ":",
+];
+/// Commands that run the next word as the program.
+const WRAPPER_COMMANDS: [&str; 5] = ["env", "time", "nohup", "timeout", "caffeinate"];
+/// The wrapper whose first operand is a duration rather than the program.
+const TIMEOUT_COMMAND: &str = "timeout";
+/// Redirection operators, longer before their prefixes, after an optional descriptor number.
+const REDIRECTION_OPERATORS: [&str; 11] = [
+    "&>>", "&>", ">>", ">&", ">|", ">", "<<<", "<<", "<&", "<>", "<",
+];
+
+/// The command a person recognises in `command`, such as `make test`: its first line's first
+/// command that does the work, without the setup around it, the variables, wrappers and
+/// redirections in front of or after it, or the directory of an absolute program path. A line
+/// with nothing else falls back to itself less a leading `cd <directory> &&`.
+pub(crate) fn key_command(command: &str) -> String {
+    let first_line = command.trim_start().lines().next().unwrap_or_default();
+    let line = first_line.trim_end();
+    let line = line.strip_suffix('\\').unwrap_or(line);
+    work_command(without_leading_cd(line))
+        .unwrap_or_else(|| without_leading_cd(first_line).to_owned())
+}
+
+/// The first top-level command of `command` that does the work, opening groups around it.
+fn work_command(command: &str) -> Option<String> {
+    let command = command.trim();
+    let command = group_body(command).unwrap_or(command);
+    top_level_commands(command).into_iter().find_map(|segment| {
+        let words = program_words(segment);
+        let program = *words.first()?;
+        let program = if program.starts_with('/') {
+            std::path::Path::new(program)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(program)
+        } else {
+            program
+        };
+        if SETUP_COMMANDS.contains(&program) {
+            return None;
+        }
+        let joined = std::iter::once(program)
+            .chain(words[1..].iter().copied())
+            .collect::<Vec<_>>()
+            .join(" ");
+        match group_body(&joined) {
+            Some(body) => work_command(body),
+            None => Some(joined),
+        }
+    })
+}
+
+/// A segment's words from its program on: redirections and their targets dropped, then the
+/// variable assignments and wrapper commands in front of the program.
+fn program_words(segment: &str) -> Vec<&str> {
+    let mut words = Vec::new();
+    let mut skips_target = false;
+    for word in top_level_words(segment) {
+        if std::mem::take(&mut skips_target) {
+            continue;
+        }
+        match redirection_needs_target(word) {
+            Some(needs_target) => skips_target = needs_target,
+            None => words.push(word),
+        }
     }
-    let first_line = task.command.trim_start().lines().next().unwrap_or_default();
-    without_leading_cd(first_line).to_owned()
+    let mut start = 0;
+    while let Some(word) = words.get(start).copied() {
+        if is_assignment(word) {
+            start += 1;
+        } else if WRAPPER_COMMANDS.contains(&word) {
+            start += 1;
+            while words.get(start).is_some_and(|word| word.starts_with('-')) {
+                start += 1;
+            }
+            if word == TIMEOUT_COMMAND {
+                start += 1;
+            }
+        } else {
+            break;
+        }
+    }
+    words.split_off(start.min(words.len()))
+}
+
+/// Whether `word` is a redirection, such as `2>&1`, and whether its target is the next word, as
+/// in `> log`.
+fn redirection_needs_target(word: &str) -> Option<bool> {
+    let operator = word.trim_start_matches(|character: char| character.is_ascii_digit());
+    REDIRECTION_OPERATORS
+        .iter()
+        .find_map(|redirection| operator.strip_prefix(redirection))
+        .map(str::is_empty)
+}
+
+/// Whether `word` assigns a variable for the command, as `NAME=value` does.
+fn is_assignment(word: &str) -> bool {
+    word.split_once('=').is_some_and(|(name, _)| {
+        name.starts_with(|character: char| character.is_ascii_alphabetic() || character == '_')
+            && name
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '_')
+    })
+}
+
+/// The commands inside a `( … )` or `{ …; }` group that spans all of `command`.
+fn group_body(command: &str) -> Option<&str> {
+    let close = match command.chars().next()? {
+        '(' => ')',
+        '{' => '}',
+        _ => return None,
+    };
+    let spans_command = command.ends_with(close)
+        && top_level_characters(command)
+            .into_iter()
+            .skip(1)
+            .all(|(_, _, top_level)| !top_level);
+    spans_command.then(|| {
+        command[1..command.len() - 1]
+            .trim()
+            .trim_end_matches(';')
+            .trim_end()
+    })
+}
+
+/// `command` cut at its top-level `;`, `&&`, `||` and `|`.
+fn top_level_commands(command: &str) -> Vec<&str> {
+    let characters = top_level_characters(command);
+    let mut segments = Vec::new();
+    let mut start = 0;
+    let mut index = 0;
+    while let Some(&(offset, character, top_level)) = characters.get(index) {
+        let next = characters.get(index + 1).map(|&(_, next, _)| next);
+        let separator_length = match (top_level, character, next) {
+            (true, ';', _) => 1,
+            (true, '&', Some('&')) | (true, '|', Some('|')) => 2,
+            (true, '|', _) => 1,
+            _ => 0,
+        };
+        if separator_length == 0 {
+            index += 1;
+            continue;
+        }
+        segments.push(command[start..offset].trim());
+        start = offset + separator_length;
+        index += separator_length;
+    }
+    segments.push(command[start..].trim());
+    segments
+}
+
+/// `segment` cut at its top-level whitespace, each word kept as written.
+fn top_level_words(segment: &str) -> Vec<&str> {
+    let mut words = Vec::new();
+    let mut start = None;
+    for (offset, character, top_level) in top_level_characters(segment) {
+        if top_level && character.is_whitespace() {
+            if let Some(word_start) = start.take() {
+                words.push(&segment[word_start..offset]);
+            }
+        } else if start.is_none() {
+            start = Some(offset);
+        }
+    }
+    if let Some(word_start) = start {
+        words.push(&segment[word_start..]);
+    }
+    words
+}
+
+/// Each character of `text` with its byte offset and whether it stands outside quotes, escapes
+/// and groups, where shell syntax separates commands and words. An opening quote or bracket is
+/// itself at the top level; what follows up to its close is not.
+fn top_level_characters(text: &str) -> Vec<(usize, char, bool)> {
+    let mut quote = None;
+    let mut escaped = false;
+    let mut depth = 0usize;
+    text.char_indices()
+        .map(|(offset, character)| {
+            let top_level = quote.is_none() && !escaped && depth == 0;
+            if escaped {
+                escaped = false;
+            } else if let Some(open) = quote {
+                if character == open {
+                    quote = None;
+                } else if character == '\\' && open != '\'' {
+                    escaped = true;
+                }
+            } else {
+                match character {
+                    '\\' => escaped = true,
+                    '\'' | '"' | '`' => quote = Some(character),
+                    '(' | '{' => depth += 1,
+                    ')' | '}' => depth = depth.saturating_sub(1),
+                    _ => {}
+                }
+            }
+            (offset, character, top_level)
+        })
+        .collect()
 }
 
 fn without_leading_cd(command: &str) -> &str {
@@ -470,10 +670,11 @@ fn without_leading_cd(command: &str) -> &str {
     }
 }
 
-fn shell_tone(task: &ShellTask, context: &MonitorContext) -> StatusTone {
+/// The tone a Shell's glyph takes: running since `started_at_ms`, or how it ended.
+pub(crate) fn shell_tone(task: &ShellTask, started_at_ms: Option<u64>) -> StatusTone {
     if !task.state.is_terminal() {
         StatusTone::Running {
-            since_ms: context.shell_starts.get(&task.id).copied(),
+            since_ms: started_at_ms,
         }
     } else if task.signal.is_some() {
         StatusTone::Stopped
@@ -517,10 +718,33 @@ pub(super) fn link_status(link: TickLinkState) -> &'static str {
 }
 const ARTIFACT_OWNER: TickOwner = TickOwner::Service("Artifacts");
 
-pub(crate) fn artifact_actions(id: &str) -> Vec<MonitorAction> {
+/// This Chat's association with the artifact: the binding a Loop that has not ended holds, live
+/// or paused.
+pub(crate) fn feedback_binding<'a>(
+    chat: &'a ChatSnapshot,
+    origin: &str,
+    artifact_id: &str,
+) -> Option<&'a EventSourceBinding> {
+    chat.loops
+        .iter()
+        .filter(|goal| !matches!(goal.state, LoopState::Stopped | LoopState::Expired))
+        .flat_map(|goal| &goal.event_sources)
+        .find(|binding| binding.origin == origin && binding.artifact_id == artifact_id)
+}
+
+/// An artifact row's actions. Its `x` reads `unlink` while this Chat holds the artifact's
+/// association, which `x` ends along with the row; otherwise it only removes the row.
+pub(crate) fn artifact_actions(id: &str, holds_association: bool) -> Vec<MonitorAction> {
     [
         (MONITOR_ENTER_KEY, "open"),
-        ('x', "remove"),
+        (
+            'x',
+            if holds_association {
+                "unlink"
+            } else {
+                "remove"
+            },
+        ),
         ('c', "copy"),
         ('f', "feedback"),
     ]
@@ -568,41 +792,83 @@ mod tests {
     }
 
     #[test]
-    fn shells_are_named_by_description_or_by_command_without_a_leading_cd() {
-        for (command, description, expected) in [
-            (
+    fn shells_are_named_by_their_key_command_whatever_their_description() {
+        assert_eq!(
+            shell_title(&task(
                 "cargo test",
-                Some("Run the console tests"),
-                "Run the console tests",
+                Some("Rerun full test suite in background to verify flakiness")
+            )),
+            "cargo test"
+        );
+        for (command, expected) in [
+            (
+                "cd /a/b && (make test > target/x.log 2>&1; echo \"EXIT $?\" >> target/x.log)",
+                "make test",
             ),
-            ("cargo test", Some("  \n"), "cargo test"),
+            (
+                "FOO=1 timeout 60 cargo nextest run -p x 2>&1 | tail -20",
+                "cargo nextest run -p x",
+            ),
             (
                 "cd /Users/me/worktrees/feature && cargo test -p console",
-                None,
                 "cargo test -p console",
             ),
-            ("cd '/a dir/with space' && make", None, "make"),
-            ("cd \"/quoted\"; ls -la", None, "ls -la"),
-            ("  cd /x &&   echo a\necho b", None, "echo a"),
-            ("cd /tmp", None, "cd /tmp"),
-            ("cd /tmp &&", None, "cd /tmp &&"),
-            ("cdx /tmp && ls", None, "cdx /tmp && ls"),
+            ("cd '/a dir/with space' && make", "make"),
+            ("cd \"/quoted\"; ls -la", "ls -la"),
+            ("{ make lint; make test; }", "make lint"),
+            (
+                "export RUST_LOG=debug; mkdir -p out && cargo run",
+                "cargo run",
+            ),
+            ("source .env && . ./setup.sh && pytest -q", "pytest -q"),
+            ("sleep 5; true || : ; ./run.sh", "./run.sh"),
+            ("/bin/sleep 1 && /usr/bin/make -j8", "make -j8"),
+            ("set -e; printf 'go' | npm test", "npm test"),
+            (
+                "env -i PATH=/bin nohup time make dev &> dev.log",
+                "make dev",
+            ),
+            (
+                "caffeinate -dims cargo build --release < /dev/null",
+                "cargo build --release",
+            ),
+            (
+                "timeout --preserve-status 300 make test > out.log",
+                "make test",
+            ),
+            (
+                "/usr/local/bin/python3 -m http.server 8000",
+                "python3 -m http.server 8000",
+            ),
+            ("make test 2> errors.log >>all.log", "make test"),
+            (
+                "grep 'a;b|c&&d' file.txt | wc -l",
+                "grep 'a;b|c&&d' file.txt",
+            ),
+            ("echo \"x && y | z\"; git status", "git status"),
+            ("rg \"a|b\" src || echo none", "rg \"a|b\" src"),
+            ("cargo test \\\n  -p console", "cargo test"),
+            ("  cd /x &&   echo a\necho b", "echo a"),
+            ("cd /tmp", "cd /tmp"),
+            ("cd /tmp &&", "cd /tmp &&"),
+            ("cdx /tmp && ls", "cdx /tmp"),
+            (
+                "echo \"EXIT $?\" > target/x.log",
+                "echo \"EXIT $?\" > target/x.log",
+            ),
         ] {
-            assert_eq!(
-                shell_title(&task(command, description)),
-                expected,
-                "{command:?}"
-            );
+            assert_eq!(key_command(command), expected, "{command:?}");
         }
     }
 
     #[test]
     fn finished_shells_take_the_tone_of_how_they_ended_and_leave_once_their_end_was_handled() {
-        let context = MonitorContext::default();
         let mut shell = task("make", None);
         assert_eq!(
-            shell_tone(&shell, &context),
-            StatusTone::Running { since_ms: None }
+            shell_tone(&shell, Some(1_000)),
+            StatusTone::Running {
+                since_ms: Some(1_000)
+            }
         );
         assert_eq!(finished_shell_until(&shell, Some(5_000)), None);
         for (exit_code, signal, reason, state, tone) in [
@@ -646,7 +912,7 @@ mod tests {
             shell.signal = signal;
             shell.reason = reason.map(Into::into);
             shell.state = state;
-            assert_eq!(shell_tone(&shell, &context), tone);
+            assert_eq!(shell_tone(&shell, None), tone);
         }
         assert_eq!(
             finished_shell_until(&shell, None),

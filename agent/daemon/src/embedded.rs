@@ -1039,6 +1039,15 @@ impl EmbeddedAgentAccess {
                     draft: result.draft,
                 })
             }
+            HistoryAction::TakeBackInterruptedPrompt { run_id } => {
+                match agent.take_back_interrupted_prompt(chat, run_id).await? {
+                    Some(draft) => Ok(CommandResult::PromptTakenBack {
+                        snapshot: Box::new(self.snapshot(execution).await?),
+                        draft,
+                    }),
+                    None => Ok(CommandResult::Done),
+                }
+            }
         }
     }
 
@@ -1054,6 +1063,9 @@ impl EmbeddedAgentAccess {
                 Ok(CommandResult::Operations(agent.stop(chat, loop_id).await?))
             }
             LoopAction::Interrupt => Ok(CommandResult::Operations(agent.interrupt(chat).await?)),
+            LoopAction::SendNow { run_id } => Ok(CommandResult::Operations(
+                agent.send_now(chat, run_id).await?,
+            )),
             LoopAction::DisableEventSources { loop_id } => {
                 agent.disable_event_sources_for_loop(chat, loop_id).await;
                 Ok(CommandResult::Done)

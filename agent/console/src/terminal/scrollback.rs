@@ -203,6 +203,8 @@ pub(super) struct Scrollback {
     activity_details: Vec<RoleLine>,
     /// The latest output of a running `!` command, drawn under its echo until it ends.
     shell_preview: Vec<RoleLine>,
+    /// What moves the model's running Bash call to the background, drawn under it.
+    foreground_command_hint: Option<RoleLine>,
     /// Header lines of tool calls still executing, by call id.
     running_tool_calls: HashMap<String, usize>,
     tool_call_headers: HashMap<String, ToolCallHeader>,
@@ -235,6 +237,7 @@ impl Default for Scrollback {
             activity: None,
             activity_details: Vec::new(),
             shell_preview: Vec::new(),
+            foreground_command_hint: None,
             running_tool_calls: HashMap::new(),
             tool_call_headers: HashMap::new(),
             running_shimmer: RunningShimmer::default(),
@@ -847,6 +850,19 @@ impl Scrollback {
         true
     }
 
+    /// Returns whether the hint changed.
+    pub(super) fn set_foreground_command_hint(&mut self, hint: Option<RoleLine>) -> bool {
+        if self.foreground_command_hint == hint {
+            return false;
+        }
+        self.foreground_command_hint = hint;
+        true
+    }
+
+    pub(super) fn shows_foreground_command_hint(&self) -> bool {
+        self.foreground_command_hint.is_some()
+    }
+
     pub(super) fn remap_display(&mut self, previous: DisplayProfile, next: DisplayProfile) {
         if previous.preferences().glyph_set == next.preferences().glyph_set {
             return;
@@ -918,6 +934,11 @@ impl Scrollback {
                 (Glyph::Failure, Role::Error),
                 (Glyph::Warning, Role::Warning),
                 (Glyph::Prompt, Role::Subtle),
+                // A finished background task or child: its `⏺` in its outcome's colour.
+                (Glyph::ToolCall, Role::Success),
+                (Glyph::ToolCall, Role::Error),
+                (Glyph::ToolCall, Role::Warning),
+                (Glyph::AgentMessage, Role::MutedText),
             ] {
                 remap_prefix(
                     line,
@@ -1058,13 +1079,14 @@ impl Scrollback {
             .map_or(0, |last| last + 1)
     }
 
-    /// The rows below the conversation: a running command's output under its echo, the live
-    /// activity and its details as a block of their own, then the blank row that keeps everything
-    /// above clear of the input.
+    /// The rows below the conversation: a running command's output under its echo and the hint
+    /// for a running Bash call, the live activity and its details as a block of their own, then
+    /// the blank row that keeps everything above clear of the input.
     fn tail_rows(&self) -> Vec<RoleLine> {
         let mut rows: Vec<RoleLine> = self
             .shell_preview
             .iter()
+            .chain(&self.foreground_command_hint)
             .map(|row| {
                 let mut row = row.clone();
                 row.truncate(self.width);

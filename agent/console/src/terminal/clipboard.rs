@@ -26,7 +26,7 @@ const OSC52_LIMIT_BYTES: usize = 74_994;
 /// Over SSH that command would fill the remote machine's pasteboard instead, so
 /// it is skipped there. This mirrors Claude Code's `setClipboard`.
 ///
-/// Images are read from the clipboard of the machine Tick Loop runs on, which
+/// Images are read from the clipboard of the machine Tickloop runs on, which
 /// over SSH is the remote host rather than the user's own machine.
 #[derive(Clone)]
 pub(super) enum Clipboard {

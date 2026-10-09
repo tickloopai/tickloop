@@ -15,7 +15,7 @@ use tick_provider::{
 };
 use tickloop_ui::settings::{AmbiguousWidth, ColorMode, IconTheme};
 
-const ABOUT: &str = "Tick Loop Ticks: market, account and news views as standalone terminal commands, \
+const ABOUT: &str = "Tickloop Ticks: market, account and news views as standalone terminal commands, \
      run as `tick <provider> <tick>`";
 
 const AFTER_HELP: &str = "Providers:

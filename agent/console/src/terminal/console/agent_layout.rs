@@ -1731,6 +1731,7 @@ pub(super) fn help_lines(
         [
             "← Agents (empty input)",
             "enter send",
+            "ctrl+enter send now (working)",
             "ctrl+j newline",
             "ctrl+g editor",
             "A/Q approval/question",

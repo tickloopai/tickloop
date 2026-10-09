@@ -175,6 +175,11 @@ impl Fixture {
         self.writer.flush().unwrap();
     }
 
+    /// Everything the child wrote, terminal mode switches included.
+    pub(super) fn raw_output(&self) -> String {
+        String::from_utf8_lossy(&self.output.lock().unwrap()).into_owned()
+    }
+
     pub(super) fn frame(&self) -> String {
         // Copies the output first: the reader keeps draining the PTY while the screen is replayed,
         // so a long replay cannot block the child's writes.

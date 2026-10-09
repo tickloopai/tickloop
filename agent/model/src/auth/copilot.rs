@@ -1,6 +1,6 @@
 //! GitHub Copilot sign-in as pi does it: GitHub's device flow for the GitHub Copilot app that
 //! VS Code uses, then an exchange of that GitHub token for a short-lived Copilot token whose
-//! `proxy-ep` names the account's API host. Tick Loop has no partner client of its own, so GitHub
+//! `proxy-ep` names the account's API host. Tickloop has no partner client of its own, so GitHub
 //! shows its Copilot app on the consent page.
 
 use std::{
@@ -30,7 +30,7 @@ use tickloop_agent_base::{
 /// The GitHub Copilot app used by VS Code, pi and OpenClaw.
 const CLIENT_ID: &str = "Iv1.b507a08c87ecfe98";
 const SCOPE: &str = "read:user";
-pub const CONSENT_NOTICE: &str = "GitHub shows its own GitHub Copilot app (the client VS Code uses); Tick Loop signs in through it like pi, which GitHub may treat as an unsupported client.";
+pub const CONSENT_NOTICE: &str = "GitHub shows its own GitHub Copilot app (the client VS Code uses); Tickloop signs in through it like pi, which GitHub may treat as an unsupported client.";
 const GITHUB_ORIGIN: &str = "https://github.com";
 const GITHUB_API_ORIGIN: &str = "https://api.github.com";
 const COPILOT_TOKEN_PATH: &str = "/copilot_internal/v2/token";

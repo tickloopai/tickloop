@@ -1,10 +1,11 @@
 use super::execution::ConsoleExecution as Agent;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::SystemTime;
 
 use uuid::Uuid;
 
 use super::{
+    agent_messaging::{self, AgentColors, AgentInput, AgentMessage},
     console::{Console, ConversationPiece, Menu},
     conversation,
     conversation_picker::{
@@ -18,7 +19,7 @@ use super::{
 use tickloop_agent_protocol::{
     BranchPublicItem, BranchPublicSource, ChatSnapshot, CommandSnapshot, CommandState, Content,
     EventKind, ExecutionMode, FOLDED_TICK_REPLY_CHARACTERS, InputContext, LocalMessage, LoopState,
-    Receipt, Role, SavedChat, ToolResult, UserShellRecord, UserShellState,
+    Receipt, Role, SUBAGENT_TOOL_NAME, SavedChat, ToolResult, UserShellRecord, UserShellState,
 };
 
 const COMMAND_OUTPUT_PAGE_BYTES: usize = 16 * 1024;
@@ -89,7 +90,6 @@ pub(super) enum Workflow {
         goal: Uuid,
         version: u64,
         request: Option<Uuid>,
-        choices: Vec<PlanApprovalChoice>,
     },
     PlanView {
         chat: Uuid,
@@ -356,23 +356,13 @@ impl Workflow {
                     && request.loop_id == goal
             })
             .map(|request| request.id);
-        // A delegated child keeps its parent's frozen mode; approval cannot choose another.
-        let delegated_mode = snapshot
-            .delegation
-            .as_ref()
-            .map(|delegation| delegation.ceiling.policy.mode);
-        let choices = PLAN_APPROVAL_CHOICES
-            .into_iter()
-            .filter(|choice| {
-                choice
-                    .mode()
-                    .is_none_or(|mode| delegated_mode.is_none_or(|fixed| fixed == mode))
-            })
-            .collect::<Vec<_>>();
         let mut menu = menu(
             "Plan approval",
             context,
-            choices.iter().map(|choice| choice.label().into()).collect(),
+            PLAN_APPROVAL_CHOICES
+                .iter()
+                .map(|choice| choice.label().into())
+                .collect(),
         );
         menu.confirmation = true;
         Ok((
@@ -382,7 +372,6 @@ impl Workflow {
                 goal,
                 version: plan.version,
                 request,
-                choices,
             },
         ))
     }
@@ -660,10 +649,11 @@ impl Workflow {
                 chat,
                 goal,
                 version,
-                choices,
                 ..
             } => {
-                let choice = choices.get(index).ok_or("Invalid plan selection.")?;
+                let choice = PLAN_APPROVAL_CHOICES
+                    .get(index)
+                    .ok_or("Invalid plan selection.")?;
                 let Some(mode) = choice.mode() else {
                     effect.receipt = agent
                         .decline_plan(chat, goal, version, feedback)
@@ -930,11 +920,19 @@ struct PublicHistoryBuilder<'a> {
     chat: &'a ChatSnapshot,
     pieces: Vec<ConversationPiece>,
     image_links: ImageLinks,
+    colors: &'a AgentColors,
     tool_states: HashMap<(Uuid, String), super::scrollback::ToolCallState>,
+    /// The result of each Subagent call, which names the child its row shows.
+    subagent_launches: HashMap<ToolCallKey, serde_json::Value>,
+    /// Children whose completion block already stands at their report or completion notice.
+    shown_completions: HashSet<Uuid>,
     /// Set while the latest piece is a declined call's result, which already stands for the
     /// interruption that follows it.
     after_rejection: bool,
 }
+
+/// A call as its Chat, Run and id name it.
+type ToolCallKey = (Uuid, Option<Uuid>, String);
 
 impl PublicHistoryBuilder<'_> {
     fn push_str(&mut self, text: &str) {
@@ -1010,19 +1008,23 @@ fn public_history_pieces(
     chat: &ChatSnapshot,
     display: DisplayProfile,
     image_links: ImageLinks,
+    colors: &AgentColors,
 ) -> Vec<ConversationPiece> {
-    let mut history = PublicHistoryBuilder {
-        chat,
-        pieces: Vec::new(),
-        image_links,
-        tool_states: presentation::tool_call_states(chat),
-        after_rejection: false,
-    };
     let Ok(projection) = chat.public_conversation_items() else {
         return vec![ConversationPiece::Styled(
             "\nConversation view unavailable. ctrl+o opens the detailed transcript.\n".into(),
             None,
         )];
+    };
+    let mut history = PublicHistoryBuilder {
+        chat,
+        pieces: Vec::new(),
+        image_links,
+        colors,
+        tool_states: presentation::tool_call_states(chat),
+        subagent_launches: subagent_launches(&projection),
+        shown_completions: HashSet::new(),
+        after_rejection: false,
     };
     let mut tool_calls = HashMap::new();
     let mut answers_tick_delivery = false;
@@ -1077,13 +1079,53 @@ fn public_history_pieces(
             super::style::Role::MutedText,
         );
     }
-    for completion in &chat.family_completions {
-        history.push_role(
-            presentation::family_completion_text(completion, presentation::OutputDetail::Preview),
-            super::style::Role::MutedText,
+    // A background child whose report or completion notice has not reached the conversation.
+    let shown_completions = std::mem::take(&mut history.shown_completions);
+    for completion in chat.family_completions.iter().filter(|completion| {
+        completion.notification.is_background()
+            && !shown_completions.contains(&completion.child_run_id)
+    }) {
+        let (heading, response) = agent_messaging::completion_runs(
+            completion,
+            chat,
+            colors,
+            presentation::OutputDetail::Preview,
+            display,
         );
+        history.push_runs(&heading);
+        history.push_response(response);
     }
     history.pieces
+}
+
+/// The result of every Subagent call in `projection`, by the call it answers.
+fn subagent_launches(projection: &[BranchPublicItem]) -> HashMap<ToolCallKey, serde_json::Value> {
+    projection
+        .iter()
+        .filter_map(|item| match item {
+            BranchPublicItem::Message {
+                source, message, ..
+            } => Some((source, message)),
+            BranchPublicItem::Summary { .. } => None,
+        })
+        .flat_map(|(source, message)| {
+            message.content.iter().filter_map(|content| match content {
+                Content::ToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } => {
+                    let text = content.text();
+                    agent_messaging::launched_child(&text)?;
+                    Some((
+                        (source.chat_id, source.run_id, tool_use_id.clone()),
+                        serde_json::from_str(&text).ok()?,
+                    ))
+                }
+                _ => None,
+            })
+        })
+        .collect()
 }
 
 /// The history as plain text, with each reply's Markdown source behind the
@@ -1091,13 +1133,18 @@ fn public_history_pieces(
 #[cfg(test)]
 pub(super) fn public_history(chat: &ChatSnapshot, display: DisplayProfile) -> String {
     let assistant_lead = format!("{} ", display.glyph(super::display::Glyph::Assistant));
-    public_history_pieces(chat, display, ImageLinks::default())
-        .iter()
-        .map(|piece| match piece {
-            ConversationPiece::Markdown { text, .. } => format!("{assistant_lead}{text}"),
-            piece => piece.text().into_owned(),
-        })
-        .collect()
+    public_history_pieces(
+        chat,
+        display,
+        ImageLinks::default(),
+        &AgentColors::default(),
+    )
+    .iter()
+    .map(|piece| match piece {
+        ConversationPiece::Markdown { text, .. } => format!("{assistant_lead}{text}"),
+        piece => piece.text().into_owned(),
+    })
+    .collect()
 }
 
 pub(super) fn write_public_history(console: &Console, chat: &ChatSnapshot) -> Result<(), String> {
@@ -1112,7 +1159,12 @@ pub(super) fn write_public_history(console: &Console, chat: &ChatSnapshot) -> Re
             ))?;
         }
     }
-    let pieces = public_history_pieces(chat, console.display_profile()?, console.image_links()?);
+    let pieces = public_history_pieces(
+        chat,
+        console.display_profile()?,
+        console.image_links()?,
+        &console.agent_colors()?,
+    );
     console.write_pieces(&pieces)?;
     console.mark_input_echoes(
         chat.id,
@@ -1120,7 +1172,7 @@ pub(super) fn write_public_history(console: &Console, chat: &ChatSnapshot) -> Re
             .values()
             .copied()
             .filter(|input| super::consumed_input_text(chat, *input).is_some())
-            .chain(chat.agent_message_origins.keys().copied()),
+            .chain(agent_messaging::shown_agent_inputs(chat)),
     )?;
     if console.is_interactive()
         && let Some(event) = chat.conversation_events().into_iter().rev().find(|event| {
@@ -1159,6 +1211,42 @@ fn is_folded_tick_reply(message: &tickloop_agent_protocol::Message) -> bool {
         })
 }
 
+/// An Agent message in saved history: a background child's report or completion notice as the
+/// child's completion block, any other message as its line. `None` when it shows elsewhere: a
+/// foreground child's report under its call, or a report whose run has not ended yet.
+fn agent_input_runs(
+    history: &mut PublicHistoryBuilder,
+    source: &BranchPublicSource,
+    local: &LocalMessage,
+    display: DisplayProfile,
+) -> Option<(presentation::RoleRuns, presentation::RoleRuns)> {
+    let preview = presentation::OutputDetail::Preview;
+    match agent_messaging::agent_input(history.chat, source.message_id, local) {
+        AgentInput::Result(completion) => {
+            if !completion.notification.is_background() {
+                return None;
+            }
+            history.shown_completions.insert(completion.child_run_id);
+            Some(agent_messaging::completion_runs(
+                completion,
+                history.chat,
+                history.colors,
+                preview,
+                display,
+            ))
+        }
+        AgentInput::PendingResult => None,
+        AgentInput::Message => Some(
+            match AgentMessage::of(local, history.chat, source.message_id) {
+                Some(message) => {
+                    agent_messaging::message_runs(&message, history.colors, preview, display)
+                }
+                None => presentation::local_message_runs(local, preview, display),
+            },
+        ),
+    }
+}
+
 fn append_public_message(
     history: &mut PublicHistoryBuilder,
     tool_calls: &mut HashMap<(Uuid, Option<Uuid>, String), (String, serde_json::Value)>,
@@ -1192,11 +1280,18 @@ fn append_public_message(
                 if matches!(local_message, LocalMessage::Interrupted { .. }) && follows_rejection {
                     continue;
                 }
-                let (heading, response) = presentation::local_message_runs(
-                    &local_message,
-                    presentation::OutputDetail::Preview,
-                    display,
-                );
+                let (heading, response) = if source.is_agent_message {
+                    match agent_input_runs(history, source, &local_message, display) {
+                        Some(runs) => runs,
+                        None => continue,
+                    }
+                } else {
+                    presentation::local_message_runs(
+                        &local_message,
+                        presentation::OutputDetail::Preview,
+                        display,
+                    )
+                };
                 history.push_runs(&heading);
                 history.push_response(response);
             }
@@ -1232,8 +1327,18 @@ fn append_public_message(
                         .get(&(run, id.clone()))
                         .copied()
                         .unwrap_or(super::scrollback::ToolCallState::Finished);
-                    let spans =
-                        presentation::tool_call_roles(name, input, &history.chat.workdir, display);
+                    let spans = if name == SUBAGENT_TOOL_NAME {
+                        agent_messaging::subagent_call_runs(
+                            input,
+                            history
+                                .subagent_launches
+                                .get(&(source_chat_id, run_id, id.clone())),
+                            history.colors,
+                            display,
+                        )
+                    } else {
+                        presentation::tool_call_roles(name, input, &history.chat.workdir, display)
+                    };
                     let mut text = spans
                         .iter()
                         .map(|(text, _)| text.as_str())
@@ -1297,18 +1402,25 @@ fn append_public_message(
                     is_error: *is_error,
                     output_ref: None,
                 };
-                let review = run_id
-                    .filter(|_| name == tickloop_agent_tools::EDIT_TOOL_NAME && !*is_error)
-                    .and_then(|run| {
-                        presentation::file_change_review(history.chat, run, tool_use_id)
-                    });
+                let facts = presentation::CallFacts {
+                    review: run_id
+                        .filter(|_| name == tickloop_agent_tools::EDIT_TOOL_NAME && !*is_error)
+                        .and_then(|run| {
+                            presentation::file_change_review(history.chat, run, tool_use_id)
+                        }),
+                    report: history
+                        .subagent_launches
+                        .get(&(source_chat_id, run_id, tool_use_id.clone()))
+                        .filter(|_| name == SUBAGENT_TOOL_NAME)
+                        .and_then(|launch| agent_messaging::subagent_report(history.chat, launch)),
+                };
                 let runs = presentation::archived_tool_result(
                     name,
                     input,
                     &result,
                     &history.chat.workdir,
                     display,
-                    review.as_ref(),
+                    &facts,
                 );
                 match run_id {
                     Some(run) => history.pieces.push(ConversationPiece::ToolResult {
@@ -1708,6 +1820,7 @@ mod tests {
                 &snapshot,
                 DisplayProfile::default(),
                 ImageLinks::new(Some(cache.clone()), true),
+                &AgentColors::default(),
             )
             .into_iter()
             .flat_map(|piece| match piece {
@@ -1836,6 +1949,7 @@ mod tests {
                 &snapshot,
                 DisplayProfile::default(),
                 &ImageLinks::default(),
+                &AgentColors::default(),
             )
             .plain_text(200),
         );

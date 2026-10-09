@@ -89,8 +89,14 @@ async fn run_family_messaging(fixture: &PrivateFixture) {
         })
         .unwrap()
         .execution;
+    let delegated = pty.frame();
     assert!(
-        !String::from_utf8_lossy(&pty.output.lock().unwrap()).contains("Subagent @audit finished"),
+        delegated.contains("⏺ Subagent(@audit · Audit bounded evidence)")
+            && delegated.contains("Audit child ready"),
+        "a foreground call names its child and shows its result under the call: {delegated}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&pty.output.lock().unwrap()).contains("@audit finished"),
         "foreground audit must not print a separate live completion card"
     );
     let before = snapshot(&client, root).await;
@@ -125,6 +131,15 @@ async fn run_family_messaging(fixture: &PrivateFixture) {
     .await;
     assert!(target.conversation.messages.iter().any(|message| message.role == tickloop_agent_protocol::Role::User && message.content.iter().any(|content| matches!(content, tickloop_agent_protocol::Content::Text { text } if text == "DIRECT-HELLO"))));
     let sibling = wait_snapshot(&client, echo, "model sibling delivery completes", |current| !current.conversation.agent_message_origins.is_empty() && current.conversation.messages.iter().any(|message| message.content.iter().any(|content| matches!(content, tickloop_agent_protocol::Content::Text { text } if text == "Sibling context received")))).await;
+    pty.wait_for(
+        "the sibling's background completion as one block",
+        |frame| {
+            frame.contains("⏺ @echo finished · ")
+                && frame.contains("⎿  Sibling context received")
+                && !frame.contains("Subagent @echo")
+        },
+    )
+    .await;
     assert!(
         sibling
             .conversation
@@ -348,10 +363,24 @@ async fn run_handback_warning(fixture: &PrivateFixture) {
     pty.wait_for("report input", new_input_is_visible).await;
     let client = fixture.client().await;
     pty.send(b"Delegate the bounded report\r");
-    pty.wait_for("report completes without manual approval", |frame| {
-        frame.contains("REPORT-FLOW-FINISHED")
-    })
-    .await;
+    let finished = pty
+        .wait_for("report completes without manual approval", |frame| {
+            frame.contains("REPORT-FLOW-FINISHED")
+        })
+        .await;
+    for shown in [
+        "⏺ Subagent(@peer · Return the fixture report)",
+        "⎿  SECURITY WARNING: auto review flagged this subagent's report.",
+        "PTY-HANDBACK-REPORT",
+    ] {
+        assert!(
+            finished.contains(shown),
+            "the report sits under its call: {finished}"
+        );
+    }
+    for hidden in ["delivered its report", "Subagent hand-back", "Message from"] {
+        assert!(!finished.contains(hidden), "{hidden}: {finished}");
+    }
     let rows = catalog(&client).await;
     let parent = rows
         .iter()

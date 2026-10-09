@@ -9,6 +9,10 @@ const ACTIVITY_PHASE: &str = "activity-phase.json";
 const ACTIVITY_EXECUTIONS: &str = "activity-executions.json";
 const ACTIVITY_CREATED: &str = "activity-created.json";
 const ACTIVITY_OBSERVED_START: &str = "activity-observed-start.json";
+const ACTIVITY_LOST_END: &str = "activity-lost-end.json";
+/// A route whose Agent feeds lose every Completed event to a lagged Reset, while an armed
+/// trigger keeps the Loop waiting after its run ends.
+const LOST_END_ROUTE: &str = "lost-end";
 
 struct ActivityModel(AtomicUsize);
 
@@ -82,6 +86,14 @@ impl AgentAccess for ActivityAccess {
             let count = self.queries.fetch_add(1, Ordering::Relaxed) + 1;
             std::fs::write(ACTIVITY_QUERIES, count.to_string()).unwrap();
         }
+        let lossy_feed = match &query {
+            ObservationRequest::Agent {
+                execution,
+                detail: AgentDetailQuery::Snapshot,
+                ..
+            } if std::env::var(ACTIVITY_ROUTE).as_deref() == Ok(LOST_END_ROUTE) => Some(*execution),
+            _ => None,
+        };
         let mut observation = self.daemon.observe(query).await?;
         if std::env::var(ACTIVITY_ROUTE).as_deref() == Ok("observe-only")
             && let ObservationValue::Overview(rows) = &mut observation.initial
@@ -90,10 +102,40 @@ impl AgentAccess for ActivityAccess {
                 row.capabilities.retain(|capability| capability != "loop");
             }
         }
+        if let Some(execution) = lossy_feed
+            && observation.has_feed()
+        {
+            return Ok(lose_completed_events(
+                self.daemon.clone(),
+                execution,
+                observation,
+            ));
+        }
         Ok(observation)
     }
     async fn execute(&self, command: CommandEnvelope) -> Result<CommandReceipt, AccessError> {
         let receipt = self.daemon.execute(command).await?;
+        if std::env::var(ACTIVITY_ROUTE).as_deref() == Ok(LOST_END_ROUTE)
+            && let Some(CommandResult::Submitted(submitted)) = &receipt.result
+        {
+            self.daemon
+                .runtime()
+                .configure_trigger(
+                    submitted.chat_id,
+                    submitted.loop_id,
+                    Some(Trigger {
+                        id: Uuid::new_v4(),
+                        prompt: "Check for updates".into(),
+                        interval_seconds: None,
+                        expires_at_ms: None,
+                        accepts_events: true,
+                        armed: true,
+                        subscriptions: Vec::new(),
+                    }),
+                )
+                .await
+                .unwrap();
+        }
         if let Some(CommandResult::Created {
             execution,
             snapshot,
@@ -467,4 +509,76 @@ fn working_activity_without_loop_control_omits_the_action_and_esc_keeps_it_runni
 fn working_seconds(frame: &str) -> Option<u64> {
     let (_, elapsed) = frame.split_once("Working (")?;
     elapsed.split_once('s')?.0.parse().ok()
+}
+
+/// Forwards `observation`'s feed, but answers each Completed event the way the worker's feed
+/// answers a receiver that lagged past it: a Reset carrying only the current snapshot.
+fn lose_completed_events(
+    daemon: EmbeddedAgentAccess,
+    execution: ExecutionRef,
+    observation: Observation,
+) -> Observation {
+    let (initial, cursor, reset, changes, failure) = observation.into_parts();
+    let mut changes = changes.expect("an Agent observation feed");
+    let (sender, receiver) = mpsc::channel(FEED_CAPACITY);
+    tokio::spawn(async move {
+        while let Some(mut update) = changes.recv().await {
+            if matches!(&update.change, ObservationChange::Event(event) if matches!(event.kind, EventKind::Completed { .. }))
+            {
+                let observation = daemon
+                    .observe(ObservationRequest::Agent {
+                        execution,
+                        detail: AgentDetailQuery::Snapshot,
+                        after: None,
+                    })
+                    .await
+                    .unwrap();
+                let ObservationValue::Agent(snapshot) = observation.initial else {
+                    panic!("the Agent snapshot");
+                };
+                let loops = snapshot
+                    .conversation
+                    .loops
+                    .iter()
+                    .map(|goal| format!("{:?}", goal.state))
+                    .collect::<Vec<_>>();
+                std::fs::write(
+                    ACTIVITY_LOST_END,
+                    serde_json::json!({"phase":"lost-end","loops":loops}).to_string(),
+                )
+                .unwrap();
+                update.change = ObservationChange::Reset {
+                    reason: tickloop_agent_protocol::ResetReason::Lagged,
+                    snapshot,
+                };
+            }
+            if sender.send(update).await.is_err() {
+                break;
+            }
+        }
+    });
+    Observation::new(initial, cursor, reset, Some(receiver), failure)
+}
+
+#[test]
+fn a_run_whose_end_event_was_lost_stops_working_once_the_snapshot_shows_it_ended() {
+    let (mut fixture, directory) = start_activity_fixture(LOST_END_ROUTE);
+    fixture.wait_for("Enter a message to");
+    fixture.send(b"Watch for updates\r");
+    fixture.wait_for_phase(&directory.path().join(ACTIVITY_PHASE), "running-1");
+    fixture.wait_until_shown("the live run", |frame| frame.contains("Working ("));
+    std::fs::write(directory.path().join(ACTIVITY_STAGE), "finish-1").unwrap();
+    fixture.wait_for("Activity reply 1");
+    let lost = fixture.wait_for_phase(&directory.path().join(ACTIVITY_LOST_END), "lost-end");
+    assert_eq!(
+        lost["loops"],
+        serde_json::json!(["WaitingTrigger"]),
+        "the ended run leaves its Loop waiting rather than finished"
+    );
+    fixture.wait_until_shown("the ended run without Working", |frame| {
+        frame.contains("Activity reply 1") && !frame.contains("Working")
+    });
+    let frame = screen::visible_screen(&fixture.raw_output(), 80, 24);
+    assert_eq!(frame.matches("Activity reply 1").count(), 1, "{frame}");
+    fixture.send(b"\x04\x04");
 }

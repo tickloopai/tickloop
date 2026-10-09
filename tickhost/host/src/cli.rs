@@ -23,7 +23,7 @@ const STOP_POLL: Duration = Duration::from_millis(50);
 #[command(
     name = "tickhost",
     version = BUILD_VERSION,
-    about = "Tick Loop's Tick host: connects protocol programs to Agents and runs the Ticks Agents open hidden"
+    about = "Tickloop's Tick host: connects protocol programs to Agents and runs the Ticks Agents open hidden"
 )]
 struct Cli {
     #[command(subcommand)]

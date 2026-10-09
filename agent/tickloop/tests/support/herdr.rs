@@ -134,13 +134,13 @@ impl PrivateHerdr {
         let created = self
             .request(
                 "workspace.create",
-                json!({"cwd": self.root.path(), "label": "tick-loop-test", "focus": true}),
+                json!({"cwd": self.root.path(), "label": "tickloop-test", "focus": true}),
             )
             .unwrap();
         created["root_pane"]["pane_id"].as_str().unwrap().to_owned()
     }
 
-    /// The plugins this server lists under Tick Loop's plugin id.
+    /// The plugins this server lists under Tickloop's plugin id.
     pub fn plugins(&self) -> Vec<Value> {
         self.plugins_with_id(PLUGIN_ID)
     }
@@ -153,12 +153,12 @@ impl PrivateHerdr {
             .clone()
     }
 
-    /// Links a plugin Tick Loop did not write under Tick Loop's plugin id.
+    /// Links a plugin Tickloop did not write under Tickloop's plugin id.
     pub fn link_foreign_plugin(&self) -> PathBuf {
         self.link_other_plugin(PLUGIN_ID)
     }
 
-    /// Links a minimal plugin Tick Loop did not write under `id` and returns its root.
+    /// Links a minimal plugin Tickloop did not write under `id` and returns its root.
     pub fn link_other_plugin(&self, id: &str) -> PathBuf {
         let directory = self.root.path().join(format!("plugin-{id}"));
         std::fs::create_dir_all(&directory).unwrap();

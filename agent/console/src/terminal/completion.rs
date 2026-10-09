@@ -50,13 +50,15 @@ const OVERVIEW_COMMANDS: &[(&str, &str)] = &[
     ("/exit", "Leaves this View; Agents keep running."),
     ("/help", "Shows overview keys and commands."),
     ("/resume", "Opens saved Agent history."),
-    ("/tickloop", "Starts a new Agent with the Tick Loop Skill."),
+    ("/tickloop", "Starts a new Agent with the Tickloop Skill."),
 ];
 
 const OVERVIEW_AGENT_COMMAND: &str =
     "acts on an open Agent; enter opens the selected Agent, /clear starts a new draft";
 pub(super) const CHILD_HISTORY_FIXED: &str = "its history belongs to the delegation";
 pub(super) const CHILD_AUTHORIZATION_FIXED: &str = "its authorization is set by the parent";
+pub(super) const CHILD_PLAN_REPORTED: &str =
+    "its mode is set by the parent and it reports any plan in its final reply";
 
 pub(super) fn command_refusal(scope: CommandScope, command: &str, reason: &str) -> String {
     let location = if scope == CommandScope::Child {
@@ -81,15 +83,13 @@ impl CommandSpec {
                 "/mode" | "/rule" | "/add-dir" | "/auto-mode-setup" => {
                     Some(CHILD_AUTHORIZATION_FIXED)
                 }
+                "/plan" => Some(CHILD_PLAN_REPORTED),
                 _ => None,
             },
         }
     }
 
     pub(super) fn description_in(&self, scope: CommandScope) -> String {
-        if scope == CommandScope::Child && self.command == "/plan" {
-            return "Reopens a pending approval or views a saved plan; entering Plan mode is fixed by parent.".into();
-        }
         if scope == CommandScope::Child && self.command == "/permissions" {
             return "Shows current mode and recent activity; child permissions are read-only."
                 .into();
@@ -137,7 +137,7 @@ const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         command: "/tickloop",
         arguments: "[REQUEST]",
-        description: "Loads the Tick Loop Skill.",
+        description: "Loads the Tickloop Skill.",
         menu_group: Some(CommandGroup::Skills),
     },
     CommandSpec {

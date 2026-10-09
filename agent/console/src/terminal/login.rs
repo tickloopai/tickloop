@@ -405,7 +405,7 @@ impl LoginFlow {
     ) -> Result<(), String> {
         let mut context = vec![
             if matches!(self.method, LoginMethod::Artifact) {
-                "Open this Tick Loop Artifacts link in your own browser:".into()
+                "Open this Tickloop Artifacts link in your own browser:".into()
             } else {
                 "Opening your browser. If no page appears, open this link on your own device:"
                     .into()
@@ -415,7 +415,7 @@ impl LoginFlow {
             format!("Enter code: {}", safe_text(code)),
         ];
         if let LoginMethod::Artifact = self.method {
-            context.push("In your browser, sign in with Google and approve this device for your Tick Loop Artifacts account.".into());
+            context.push("In your browser, sign in with Google and approve this device for your Tickloop Artifacts account.".into());
         } else if let LoginMethod::MiniMax(_) = self.method {
             context.push("Approve access on the MiniMax Portal. The consent page identifies the registered Portal client.".into());
         } else if let LoginMethod::Subscription(provider) = self.method {
@@ -1292,7 +1292,7 @@ mod tests {
                     .map(|end| &text[..offset + end + frame_end.len()]);
                 let visible = screen::visible_screen(completed.unwrap_or(&text), 150, 40);
                 let input_restored = completed.is_some()
-                    && visible.contains("Tick Loop Agent v")
+                    && visible.contains("Tickloop v")
                     && visible.contains("Context 0% used")
                     && visible.lines().any(|line| line.trim() == "❯")
                     && [

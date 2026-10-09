@@ -22,7 +22,7 @@
 //! 已结束，或已解除武装且 generation 新于本进程所知，就同步本地 Loop（停止或解除武装、取消
 //! Trigger 任务、归还租约）且不触发。仅删除锁文件的旧做法会让另一实例接手后继续触发。
 //!
-//! 与 Claude Code 不同：Claude Code 恢复时只要 sessionId 相同就改写为自己；Tick Loop 的两个进程
+//! 与 Claude Code 不同：Claude Code 恢复时只要 sessionId 相同就改写为自己；Tickloop 的两个进程
 //! 可以同时继续同一个 Chat，所以以 flock 判断持有者。不持久化的 Agent 的 Chat 不会被其他进程
 //! 恢复，不使用租约与停止状态。
 
@@ -50,7 +50,7 @@ const STATE_WRITE_LOCK_FILE: &str = ".state.lock";
 /// 打开的锁文件恰好被持有者删除或替换时重新打开的次数；超过时视为被其他进程持有。
 const LOCK_OPEN_ATTEMPTS: usize = 3;
 const HELD_ELSEWHERE_MESSAGE: &str =
-    "another Tick Loop process holds this goal's trigger; the event was not delivered";
+    "another Tickloop process holds this goal's trigger; the event was not delivered";
 
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -433,7 +433,7 @@ impl Agent {
                     chat_id,
                     loop_id,
                     LoopTriggerNoticeKind::HeldByAnotherProcess,
-                    "another Tick Loop process holds this goal's trigger".into(),
+                    "another Tickloop process holds this goal's trigger".into(),
                 );
                 TriggerPermit::Wait(HELD_ELSEWHERE_MESSAGE.into())
             }
@@ -441,7 +441,7 @@ impl Agent {
                 let message = format!(
                     "this goal's trigger lock was written on host {host}; the loops directory may \
                      be shared between machines, so this process will not take it over. Remove \
-                     the lock file if that host no longer runs Tick Loop"
+                     the lock file if that host no longer runs Tickloop"
                 );
                 leases.set_notice(
                     chat_id,
@@ -537,7 +537,7 @@ impl Agent {
                 loop_id,
                 LoopTriggerNoticeKind::Warning,
                 format!(
-                    "could not record this goal's trigger state ({error}); other Tick Loop \
+                    "could not record this goal's trigger state ({error}); other Tickloop \
                      processes may not see the change"
                 ),
             );

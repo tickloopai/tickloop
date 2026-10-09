@@ -52,7 +52,7 @@ pub(crate) struct FileHistoryBackup {
 }
 
 /// 一条用户提示对应的快照。路径是绝对路径（与 Claude Code 缩短为相对工作目录的路径不同，
-/// Tick Loop 的工作目录可以用 `/cwd` 改变，绝对路径才能稳定地找回文件）。
+/// Tickloop 的工作目录可以用 `/cwd` 改变，绝对路径才能稳定地找回文件）。
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct FileHistorySnapshot {

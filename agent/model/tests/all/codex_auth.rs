@@ -685,7 +685,7 @@ async fn browser_callback_reports_code_received_when_exchange_fails() {
     let browser_response = String::from_utf8(browser_response).unwrap();
     assert!(browser_response.starts_with("HTTP/1.1 200"));
     assert!(browser_response.contains("Authorization code received"));
-    assert!(browser_response.contains("Return to Tick Loop"));
+    assert!(browser_response.contains("Return to Tickloop"));
     assert!(!browser_response.contains("authentication completed"));
     assert!(!browser_response.contains("fake-browser-code"));
     assert!(!browser_response.contains(&state));

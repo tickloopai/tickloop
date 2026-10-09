@@ -618,6 +618,42 @@ impl Chat {
             self.parked.get(&run_id).map(|run| &run.cancel)
         }
     }
+
+    /// Cancels the running run, or else the latest waiting one, as the user's interruption.
+    /// Queued user messages stay armed and start right after it; Agent messages queued for the
+    /// interrupted Loop wait for explicit continuation. Returns the operations whose outcome the
+    /// interruption may leave admitted or unknown.
+    fn interrupt(&mut self) -> Vec<OperationRecord> {
+        let mut interrupted_loop = None;
+        if let Some(cancel) = &self.active {
+            cancel.cancel();
+            if let Some(run_id) = self.active_run {
+                self.user_cancelled_runs.insert(run_id);
+                interrupted_loop = self.bookkeeping.run_loops.get(&run_id).copied();
+            }
+        } else if let Some(waiting) = self.parked.values().max_by_key(|run| run.sequence) {
+            waiting.cancel.cancel();
+            self.user_cancelled_runs.insert(waiting.receipt.run_id);
+            interrupted_loop = Some(waiting.receipt.loop_id);
+        }
+        for pending in &mut self.snapshot.pending_inputs {
+            if pending.agent_message.is_some() && Some(pending.receipt.loop_id) == interrupted_loop
+            {
+                pending.armed = false;
+            }
+        }
+        self.snapshot
+            .operations
+            .iter()
+            .filter(|operation| {
+                matches!(
+                    operation.state,
+                    OperationState::Admitted | OperationState::Unknown
+                )
+            })
+            .cloned()
+            .collect()
+    }
 }
 
 fn host_provider_is_confirmed(
@@ -1174,36 +1210,28 @@ impl Agent {
     pub async fn interrupt(&self, chat_id: ChatId) -> Result<Vec<OperationRecord>, AgentError> {
         let mut chats = self.inner.chats.lock().await;
         let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
-        let mut interrupted_loop = None;
-        if let Some(cancel) = &chat.active {
-            cancel.cancel();
-            if let Some(run_id) = chat.active_run {
-                chat.user_cancelled_runs.insert(run_id);
-                interrupted_loop = chat.bookkeeping.run_loops.get(&run_id).copied();
-            }
-        } else if let Some(waiting) = chat.parked.values().max_by_key(|run| run.sequence) {
-            waiting.cancel.cancel();
-            chat.user_cancelled_runs.insert(waiting.receipt.run_id);
-            interrupted_loop = Some(waiting.receipt.loop_id);
+        Ok(chat.interrupt())
+    }
+
+    /// Sends the queued user message `run_id` now: interrupts the work ahead of it, after which
+    /// it starts at once instead of at the next tool boundary. The check and the interruption
+    /// share one lock, so the run answering a message that has already joined or started it is
+    /// never interrupted. Such a message, an unknown one, or one with no work ahead is left as is.
+    pub async fn send_now(
+        &self,
+        chat_id: ChatId,
+        run_id: RunId,
+    ) -> Result<Vec<OperationRecord>, AgentError> {
+        let mut chats = self.inner.chats.lock().await;
+        let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
+        let is_queued_message = chat.snapshot.queued_inputs().iter().any(|queued| {
+            queued.id == run_id && queued.armed && queued.kind == QueuedInputKind::Message
+        });
+        let has_work_ahead = chat.active.is_some() || !chat.parked.is_empty();
+        if !is_queued_message || !has_work_ahead {
+            return Ok(Vec::new());
         }
-        for pending in &mut chat.snapshot.pending_inputs {
-            if pending.agent_message.is_some() && Some(pending.receipt.loop_id) == interrupted_loop
-            {
-                pending.armed = false;
-            }
-        }
-        Ok(chat
-            .snapshot
-            .operations
-            .iter()
-            .filter(|operation| {
-                matches!(
-                    operation.state,
-                    OperationState::Admitted | OperationState::Unknown
-                )
-            })
-            .cloned()
-            .collect())
+        Ok(chat.interrupt())
     }
 
     /// 打开以 `root` 为根目录的持久化 Agent。打开时不加载任何 Chat；
@@ -2375,7 +2403,10 @@ impl Agent {
         let events = {
             let mut chats = self.inner.chats.lock().await;
             let original = chats.get_mut(&active.chat_id).ok_or(AgentError::NotFound)?;
-            if original.active_run != Some(active.run_id) {
+            // Input queued before an interruption is answered by the run that follows it.
+            if original.active_run != Some(active.run_id)
+                || original.user_cancelled_runs.contains(&active.run_id)
+            {
                 return Ok(());
             }
             let mut candidate = original.clone();

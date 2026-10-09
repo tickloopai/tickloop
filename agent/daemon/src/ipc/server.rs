@@ -11,14 +11,15 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{chunked::EncodedResponse, views::command_origin};
-use tickloop_agent_client::frame::{read_frame, verify_peer, write_frame};
+use tickloop_agent_client::frame::{read_frame_body, verify_peer, write_frame};
 use tickloop_agent_protocol::{
     AccessCapability, AccessError, AccessErrorCode, AccessLimits, AgentAccess, ChunkedResponseKind,
     ClientMessage, DisplayUpdate, HANDSHAKE_FRAME_BYTES, PROTOCOL_MAJOR, PROTOCOL_MINOR,
-    ServerHello, ServerMessage, bounded_update,
+    ServerHello, ServerMessage, bounded_update, decode_frame,
 };
 
 const OBSERVATION_CANCELLED_BEFORE_OPENING: &str = "observation cancelled before opening";
+const UNKNOWN_REQUEST_MESSAGE: &str = "this request is unknown to the running daemon, which is another Tickloop build; relaunch tickloop to choose a build";
 
 /// An observation feed a connection is writing. Cancelling an observation on a live connection
 /// stops its task between frames; aborting is reserved for connections that are closing, because
@@ -34,6 +35,18 @@ struct ConnectionCleanup {
     access: Arc<dyn AgentAccess>,
     cancel: CancellationToken,
     session_id: Uuid,
+}
+
+/// The id of a request whose kind this build does not know: the single externally tagged
+/// variant's `request_id`, when the body is otherwise a well-formed request.
+fn unknown_request_id(body: &[u8]) -> Option<Uuid> {
+    let value = serde_json::from_slice::<serde_json::Value>(body).ok()?;
+    let mut variants = value.as_object()?.values();
+    let fields = variants.next()?.as_object()?;
+    if variants.next().is_some() {
+        return None;
+    }
+    fields.get("request_id")?.as_str()?.parse().ok()
 }
 
 #[cfg(test)]
@@ -200,7 +213,7 @@ pub(super) async fn serve_connection_mode(
                     error: AccessError::new(
                         AccessErrorCode::VersionMismatch,
                         format!(
-                            "AgentAccess client protocol {major}.{minor} is incompatible with server {PROTOCOL_MAJOR}.{PROTOCOL_MINOR}; use the same Tick Loop version",
+                            "AgentAccess client protocol {major}.{minor} is incompatible with server {PROTOCOL_MAJOR}.{PROTOCOL_MINOR}; use the same Tickloop version",
                         ),
                     ),
                 },
@@ -281,11 +294,34 @@ pub(super) async fn serve_connection_mode(
         session_id,
     };
     let result = loop {
-        let incoming = tokio::select! { _ = cancel.cancelled() => break Ok(()), incoming = read_frame::<_, ClientMessage>(&mut reader, frame_bytes) => incoming };
-        let message = match incoming {
-            Ok(Some(message)) => message,
+        let incoming = tokio::select! { _ = cancel.cancelled() => break Ok(()), incoming = read_frame_body(&mut reader, frame_bytes) => incoming };
+        let body = match incoming {
+            Ok(Some(body)) => body,
             Ok(None) => break Ok(()),
             Err(error) => break Err(error),
+        };
+        let message = match decode_frame::<ClientMessage>(&body) {
+            Ok(message) => message,
+            // A request of another build is refused alone, so its View keeps the connection and
+            // shows why instead of reconnecting into the same refusal.
+            Err(error) => match unknown_request_id(&body) {
+                Some(request_id) => {
+                    write_frame(
+                        &mut *writer.lock().await,
+                        &ServerMessage::Error {
+                            request_id: Some(request_id),
+                            error: AccessError::new(
+                                AccessErrorCode::Unsupported,
+                                UNKNOWN_REQUEST_MESSAGE,
+                            ),
+                        },
+                        frame_bytes,
+                    )
+                    .await?;
+                    continue;
+                }
+                None => break Err(error),
+            },
         };
         if let ClientMessage::ShutdownDaemon {
             request_id,

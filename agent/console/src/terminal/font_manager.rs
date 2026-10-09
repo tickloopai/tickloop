@@ -44,9 +44,9 @@ impl FontStatus {
         match self {
             Self::BuiltIn => "Built into Ghostty; preview before enabling",
             Self::External => "Available and externally managed; preview before enabling",
-            Self::OwnedHomebrew => "Installed by Tick Loop through Homebrew",
-            Self::OwnedDirect => "Installed and owned by Tick Loop",
-            Self::InstallAvailable => "Not installed by Tick Loop",
+            Self::OwnedHomebrew => "Installed by Tickloop through Homebrew",
+            Self::OwnedDirect => "Installed and owned by Tickloop",
+            Self::InstallAvailable => "Not installed by Tickloop",
             Self::Unsupported => "Automatic installation is available on macOS only",
         }
     }
@@ -71,7 +71,7 @@ pub(super) enum FontManagerError {
         operation: &'static str,
         message: String,
     },
-    #[error("cannot uninstall a font without a Tick Loop ownership receipt")]
+    #[error("cannot uninstall a font without a Tickloop ownership receipt")]
     MissingOwnership,
     #[error("cannot read the Nerd Font ownership receipt: {0}")]
     InvalidReceipt(String),
@@ -183,12 +183,12 @@ impl<A: FontAdapter> NerdFontManager<A> {
         let homebrew = self.adapter.homebrew_state().await?;
         if homebrew.cask_installed {
             return Ok(FontOutcome::ReadyForPreview {
-                message: "Symbols Nerd Font is already managed outside Tick Loop. Reload and confirm the preview.".into(),
+                message: "Symbols Nerd Font is already managed outside Tickloop. Reload and confirm the preview.".into(),
             });
         }
         if self.adapter.external_symbols_present().await? {
             return Ok(FontOutcome::ReadyForPreview {
-                message: "Symbols Nerd Font is already installed outside Tick Loop. Reload and confirm the preview; no font was installed.".into(),
+                message: "Symbols Nerd Font is already installed outside Tickloop. Reload and confirm the preview; no font was installed.".into(),
             });
         }
         let receipt = if homebrew.available {
@@ -239,8 +239,7 @@ impl<A: FontAdapter> NerdFontManager<A> {
             message: error.to_string(),
         })?;
         Ok(FontOutcome::Removed {
-            message: "Tick Loop-owned Symbols Nerd Font was removed. Unicode remains active."
-                .into(),
+            message: "Tickloop-owned Symbols Nerd Font was removed. Unicode remains active.".into(),
         })
     }
 
@@ -973,7 +972,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn uninstall_without_a_tick_loop_receipt_refuses_external_fonts() {
+    async fn uninstall_without_a_tickloop_receipt_refuses_external_fonts() {
         let directory = tempfile::tempdir().unwrap();
         let manager = NerdFontManager::new(
             directory.path().to_path_buf(),

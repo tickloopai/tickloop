@@ -3,7 +3,7 @@ name: tickloop
 description: Show stock prices, quotes or K-line charts in Ticks, operate a Tick, or subscribe to updates. Use for 看看特斯拉股价 and 打开K线, even without the word Tick, and for Shell or Artifact Tick updates. New Ticks run hidden in the Tickhost and appear in this Chat's Monitor; Herdr Panes are opened only when the user asks for a place.
 ---
 
-# Tick Loop Ticks
+# Tickloop Ticks
 
 ## 1. Select the Tick and where it runs
 
@@ -16,7 +16,7 @@ Use the installed host tools as the authority for targets and capabilities. Star
 | `tickhost` `available` | Open, read, operate and subscribe to hidden Ticks (section 2). This works in every terminal, inside Herdr or not. |
 | `herdr`, integration `available` | Programs in Herdr Panes can also be discovered and operated, and a visible Pane can be opened where the user asks (section 3). Confirm live access with `ReadWorkspace({})`. |
 | `herdr`, integration `unavailable`, or a failed host connection | Explain that Pane programs cannot be operated and report the connection diagnostic; hidden Ticks still work when `tickhost` is available. |
-| `tmux` or `zellij` | Say that the multiplexer was detected but Tick Loop's Pane integration for it is not implemented yet; hidden Ticks still work when `tickhost` is available. |
+| `tmux` or `zellij` | Say that the multiplexer was detected but Tickloop's Pane integration for it is not implemented yet; hidden Ticks still work when `tickhost` is available. |
 | `standalone` | No workspace host is connected; hidden Ticks still work when `tickhost` is available. |
 | `tickhost` `unavailable` and no Herdr integration | No Tick can be opened here. Explain why and end this Tick workflow. |
 
@@ -42,7 +42,7 @@ The host checks local prerequisites before launching a bundled Tick. If authoriz
 
 ### Show it to the user
 
-A hidden Tick is shown by the user, not by the Agent: Enter or a click on its Monitor row opens the same running process, inside Herdr in Tick Loop's popup and otherwise full screen in their terminal; a lone Esc closes it and the Tick keeps running, Ctrl+B Esc sends Esc and Ctrl+B Ctrl+B sends Ctrl+B to the Tick. The first time inside Herdr, Monitor offers once to register the popup plugin. `s` on the row shows a text snapshot. Say where to find it rather than promising a window.
+A hidden Tick is shown by the user, not by the Agent: Enter or a click on its Monitor row opens the same running process, inside Herdr in Tickloop's popup and otherwise full screen in their terminal; a lone Esc closes it and the Tick keeps running, Ctrl+B Esc sends Esc and Ctrl+B Ctrl+B sends Ctrl+B to the Tick. The first time inside Herdr, Monitor offers once to register the popup plugin. `s` on the row shows a text snapshot. Say where to find it rather than promising a window.
 
 ### Read, operate, close or reopen
 
@@ -81,7 +81,7 @@ Protocol Tick Updates carry business content. Read the catalog's recovery query 
 
 A subscription keeps a hidden Tick from idling out. A subscription whose link stays `Disconnected` has used its three reconnects; retry it only when the user wants to, by `UnsubscribeTick` and then `SubscribeTick` again, which checks the target anew. Moving a live Pane instance preserves its reference and subscriptions; new operations need its explicit current Workspace scope. A replaced, restarted or reopened program has a new identity: retain the old subscription's state and select the new target explicitly. Detaching a view preserves the live process. Closing an Agent Pane closes its View while the daemon-owned Agent continues; closing an ordinary Tick Pane exits that Tick. Stop a Loop explicitly when requested.
 
-Current host state `artifact_ticks` lists artifacts joined to this Chat. An artifact the user picks in `/artifacts`, or one created with `ArtifactEdit`, joins Monitor and is linked to a Loop for the user's own @tickloop requests; that grants no extra permissions and creates no Tick Subscription. While Tick Loop Artifacts is signed out, `ArtifactLogin` replaces the Artifact tools: call it when the user wants a doc or design and give the user the returned link and code; after approval the Artifact tools appear on a later request.
+Current host state `artifact_ticks` lists artifacts joined to this Chat. An artifact the user picks in `/artifacts`, or one created with `ArtifactEdit`, joins Monitor and is linked to a Loop for the user's own @tickloop requests; that grants no extra permissions and creates no Tick Subscription. While Tickloop Artifacts is signed out, `ArtifactLogin` replaces the Artifact tools: call it when the user wants a doc or design and give the user the returned link and code; after approval the Artifact tools appear on a later request.
 
 ## 5. Coordinate a bounded Agent family
 

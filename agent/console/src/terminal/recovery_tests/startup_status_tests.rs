@@ -175,7 +175,7 @@ fn assert_clean_startup_status(frame: &str, rows: &str, model: &str) {
 #[test]
 fn new_agent_startup_has_one_model_and_no_ordinary_ready_status() {
     let (mut fixture, _directory) = start_startup_fixture("default");
-    fixture.wait_for("Tick Loop Agent");
+    fixture.wait_for("Tickloop");
     let frame = fixture.repaint_after_recovery("New Agent startup", |frame| {
         frame.contains("Context 0% used")
     });
@@ -186,10 +186,9 @@ fn new_agent_startup_has_one_model_and_no_ordinary_ready_status() {
 fn startup_status_configuration_help_and_removed_model_file_notice_survive_refresh() {
     for rows in ["default", "0", "1", "3"] {
         let (mut fixture, _directory) = start_startup_fixture(rows);
-        fixture.wait_for("Tick Loop Agent");
-        let frame = fixture.repaint_after_recovery("configured startup", |frame| {
-            frame.contains("Tick Loop Agent")
-        });
+        fixture.wait_for("Tickloop");
+        let frame = fixture
+            .repaint_after_recovery("configured startup", |frame| frame.contains("Tickloop"));
         assert_clean_startup_status(&frame, rows, STARTUP_MODEL);
         fixture.send(b"?");
         fixture.wait_for("esc / ? close help");

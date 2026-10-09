@@ -445,17 +445,16 @@ async fn run_shell_panel(fixture: &PrivateFixture) {
     pty.wait_for("Shift Down focuses the newest Shell", |frame| {
         frame
             .lines()
-            .any(|line| line.contains("›") && line.contains("shell-first"))
+            .any(|line| line.contains("›") && line.contains("while [ ! -f first-finish ]"))
     })
     .await;
     pty.send(b"\r");
     pty.wait_for("Enter opens the exact first task detail", |frame| {
-        frame.contains("shell-first-0123456789abcdef")
-            && frame.lines().any(|line| {
-                line.split('│')
-                    .nth(1)
-                    .is_some_and(|right| right.trim() == "Shell")
-            })
+        frame
+            .lines()
+            .next()
+            .is_some_and(|line| line.starts_with("$ while [ ! -f first-finish ]"))
+            && frame.contains("shell-first-0123456789abcdef")
     })
     .await;
     pty.send(b"\x1b");
@@ -513,17 +512,18 @@ async fn run_shell_panel(fixture: &PrivateFixture) {
     pty.wait_for("newest exact Shell selected", |frame| {
         frame
             .lines()
-            .any(|line| line.contains("›") && line.contains("shell-second"))
+            .any(|line| line.contains("›") && line.contains("while [ ! -f second-finish ]"))
     })
     .await;
     pty.send(b"\r");
     pty.wait_for("second exact detail", |frame| {
-        frame.contains("shell-second")
-            && frame.lines().any(|line| {
-                line.split('│')
-                    .nth(1)
-                    .is_some_and(|right| right.trim() == "Shell")
-            })
+        frame
+            .lines()
+            .next()
+            .is_some_and(|line| line.starts_with("$ while [ ! -f second-finish ]"))
+            && frame.contains("shell-second")
+            // `s` stops only once the loaded task offers it; a key sent earlier is ignored.
+            && frame.contains("s stop")
     })
     .await;
     pty.send(b"s");

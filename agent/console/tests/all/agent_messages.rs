@@ -3674,14 +3674,15 @@ async fn background_completion_obeys_the_same_pending_inbox_limit() {
     )
     .await
     .unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    // Creating 129 subagents is setup; under a full parallel run it outlasts a few seconds.
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
         while model.entered_count.load(Ordering::SeqCst) != 129 {
             tokio::task::yield_now().await;
         }
     })
     .await
     .unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
         while !core
             .snapshot(root)
             .await

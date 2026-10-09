@@ -1,4 +1,4 @@
-//! Tick Loop 自己写入的文件共用的底层原语：私有权限位、私有目录的创建与校验、同目录临时文件
+//! Tickloop 自己写入的文件共用的底层原语：私有权限位、私有目录的创建与校验、同目录临时文件
 //! 原子替换、从根目录逐段不跟随符号链接地打开路径，以及写入记录用的毫秒时间戳。
 
 use std::ffi::CString;
@@ -60,7 +60,7 @@ pub fn verify_private_directory(path: &Path, description: &str) -> io::Result<()
     ))
 }
 
-/// Tick Loop 自己写入的目录。位于用户配置目录下时照常创建；位于系统临时目录下时，
+/// Tickloop 自己写入的目录。位于用户配置目录下时照常创建；位于系统临时目录下时，
 /// 其他用户可以在共享的 `/tmp` 中抢先布置目录或符号链接，因此锚点以下
 /// 每一层都必须是当前用户拥有、没有 group/other 权限位的真实目录。
 #[derive(Clone, Debug, PartialEq, Eq)]

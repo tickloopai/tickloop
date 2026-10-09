@@ -14,6 +14,7 @@ use tickloop_agent_tools::{
 use tickloop_ui::markdown;
 
 use super::{
+    agent_messaging::{self, AgentColors, AgentInput, AgentMessage},
     console::Console,
     conversation::{
         AssistantState, ConversationBlock, ConversationBlockId, ConversationBlockKind,
@@ -29,10 +30,10 @@ use super::{
     transcript::{TranscriptDocument, TranscriptPiece},
 };
 use tickloop_agent_protocol::{
-    ChatSnapshot, CommandState, Event, EventKind, FamilyCompletion, FamilyInputRecord,
-    LocalMessage, LoopState, PermissionApprovalSource, PermissionRequest,
-    SEND_AGENT_MESSAGE_TOOL_NAME, SUBAGENT_TOOL_NAME, SubagentNotificationDelivery,
-    TaskNotificationStatus, TickDeliveryLine, ToolResult, UserShellRecord, UserShellState,
+    ChatSnapshot, CommandState, Event, EventKind, FamilyInputRecord, LocalMessage, LoopState,
+    PermissionApprovalSource, PermissionRequest, SEND_AGENT_MESSAGE_TOOL_NAME, SUBAGENT_TOOL_NAME,
+    SubagentReportMessage, TaskNotificationStatus, TickDeliveryLine, ToolResult, UserShellRecord,
+    UserShellState,
 };
 
 const RETAINED_TOOL_EVENTS: usize = 128;
@@ -144,6 +145,7 @@ pub(super) fn transcript_document(
     snapshot: &ChatSnapshot,
     display: DisplayProfile,
     image_links: &ImageLinks,
+    colors: &AgentColors,
 ) -> TranscriptDocument {
     let blocks = project_conversation(snapshot).blocks;
     let shown_thinking = current_turn_thinking(&blocks, snapshot);
@@ -166,6 +168,36 @@ pub(super) fn transcript_document(
                 let is_agent_message = is_agent_message(&block.id, snapshot);
                 match typed_local_message(text, is_agent_message) {
                     Some(LocalMessage::BashInput { command }) => writer.shell_input(&command),
+                    Some(local) if is_agent_message => {
+                        let message_id = block_message_id(&block.id, snapshot);
+                        match agent_messaging::agent_input(snapshot, message_id, &local) {
+                            AgentInput::Result(completion) => {
+                                if completion.notification.is_background() {
+                                    writer.runs(agent_messaging::completion_runs(
+                                        completion,
+                                        snapshot,
+                                        colors,
+                                        OutputDetail::Full,
+                                        display,
+                                    ));
+                                }
+                            }
+                            AgentInput::PendingResult | AgentInput::Message => {
+                                match AgentMessage::of(&local, snapshot, message_id) {
+                                    Some(message) => writer.runs(agent_messaging::message_runs(
+                                        &message,
+                                        colors,
+                                        OutputDetail::Full,
+                                        display,
+                                    )),
+                                    None => writer.block_text(
+                                        local_message_text(&local, OutputDetail::Full, display),
+                                        Some(Role::MutedText),
+                                    ),
+                                }
+                            }
+                        }
+                    }
                     Some(message) => writer.block_text(
                         local_message_text(&message, OutputDetail::Full, display),
                         Some(Role::MutedText),
@@ -236,23 +268,36 @@ pub(super) fn transcript_document(
                     Some(_) if failed => Role::Error,
                     Some(_) => Role::Success,
                 };
-                writer.tool_call(dot, name, &transcript_arguments(name, input));
-                if let Some(result) = result
-                    && let ConversationBlockKind::ToolResult {
+                let content = result.and_then(|result| match &result.kind {
+                    ConversationBlockKind::ToolResult {
                         content, is_error, ..
-                    } = &result.kind
-                {
+                    } => Some((content, *is_error)),
+                    _ => None,
+                });
+                let launch = content
+                    .filter(|_| name == SUBAGENT_TOOL_NAME)
+                    .and_then(|(content, _)| serde_json::from_str::<Value>(content).ok());
+                let arguments = match &launch {
+                    Some(launch) => agent_messaging::subagent_call_label(input, Some(launch)),
+                    None => transcript_arguments(name, input),
+                };
+                writer.tool_call(dot, name, &arguments);
+                if let (Some(result), Some((content, is_error))) = (result, content) {
                     let elapsed = block
                         .metadata
                         .timestamp_ms
                         .zip(result.metadata.timestamp_ms)
                         .map(|(started, finished)| finished.saturating_sub(started));
+                    let report = launch
+                        .as_ref()
+                        .and_then(|launch| agent_messaging::subagent_report(snapshot, launch));
                     writer.result(transcript_result_lines(
                         name,
                         Some(input),
                         content,
-                        *is_error,
+                        is_error,
                         elapsed,
+                        report.as_ref(),
                     ));
                 }
             }
@@ -272,7 +317,7 @@ pub(super) fn transcript_document(
                     "",
                 );
                 writer.result(transcript_result_lines(
-                    "tool", None, content, *is_error, None,
+                    "tool", None, content, *is_error, None, None,
                 ));
             }
             ConversationBlockKind::ToolResult { .. } | ConversationBlockKind::Plan => {}
@@ -289,10 +334,15 @@ pub(super) fn transcript_document(
                 family_input_text(record, OutputDetail::Full),
                 Some(Role::MutedText),
             ),
-            ConversationBlockKind::FamilyCompletion { completion } => writer.block_text(
-                family_completion_text(completion, OutputDetail::Full),
-                Some(Role::MutedText),
-            ),
+            ConversationBlockKind::FamilyCompletion { completion } => {
+                writer.runs(agent_messaging::completion_runs(
+                    completion,
+                    snapshot,
+                    colors,
+                    OutputDetail::Full,
+                    display,
+                ))
+            }
             ConversationBlockKind::Outcome(ConversationOutcome::Failed { error }) => {
                 writer.block();
                 writer.hanging(
@@ -366,12 +416,16 @@ fn current_turn_thinking(blocks: &[ConversationBlock], snapshot: &ChatSnapshot) 
 }
 
 fn is_agent_message(id: &ConversationBlockId, snapshot: &ChatSnapshot) -> bool {
+    block_message_id(id, snapshot)
+        .is_some_and(|id| snapshot.agent_message_origins.contains_key(&id))
+}
+
+fn block_message_id(id: &ConversationBlockId, snapshot: &ChatSnapshot) -> Option<Uuid> {
     match id {
-        ConversationBlockId::MessageContent { message_index, .. } => snapshot
-            .message_ids
-            .get(message_index)
-            .is_some_and(|id| snapshot.agent_message_origins.contains_key(id)),
-        _ => false,
+        ConversationBlockId::MessageContent { message_index, .. } => {
+            snapshot.message_ids.get(message_index).copied()
+        }
+        _ => None,
     }
 }
 
@@ -425,6 +479,20 @@ impl TranscriptWriter {
             self.block();
         }
         self.text(rest, role);
+    }
+
+    /// A block of styled runs: its heading under the `⏺ ` gutter, then its `⎿` rows.
+    fn runs(&mut self, (heading, response): (RoleRuns, RoleRuns)) {
+        self.block();
+        for (text, role) in heading {
+            let text = text.trim_start_matches('\n');
+            if !text.is_empty() {
+                self.hanging(text, role, BLOCK_INDENT);
+            }
+        }
+        for (text, role) in response {
+            self.hanging(text, role, RESULT_INDENT);
+        }
     }
 
     fn hanging(&mut self, text: impl Into<String>, role: Option<Role>, hang: usize) {
@@ -630,12 +698,13 @@ fn transcript_result_lines(
     content: &str,
     is_error: bool,
     elapsed_ms: Option<u64>,
+    report: Option<&SubagentReportMessage>,
 ) -> Vec<ResultLine> {
     let value = serde_json::from_str::<Value>(content).ok();
     if name == SUBAGENT_TOOL_NAME
         && let Some(value) = &value
     {
-        return subagent_result_lines(input, value, elapsed_ms);
+        return subagent_result_lines(input, value, elapsed_ms, report);
     }
     if is_error {
         let text = safe_text(content);
@@ -737,11 +806,13 @@ fn written_lines(input: &Value, key: &str) -> Vec<ResultLine> {
     lines
 }
 
-/// Claude Code's expanded Agent result: the prompt, the response and how the run ended.
+/// Claude Code's expanded Agent result: the prompt, the response and how the run ended. The
+/// response is the report the child delivered.
 fn subagent_result_lines(
     input: Option<&Value>,
     value: &Value,
     elapsed_ms: Option<u64>,
+    report: Option<&SubagentReportMessage>,
 ) -> Vec<ResultLine> {
     let status = value["status"].as_str();
     if status == Some("async_launched") {
@@ -761,12 +832,12 @@ fn subagent_result_lines(
         lines.push(ResultLine::new("Prompt:", Some(Role::AgentSection)));
         lines.extend(indented(prompt));
     }
-    if let Some(response) = value["result"]
-        .as_str()
-        .filter(|response| !response.is_empty())
-    {
+    if let Some(report) = report {
         lines.push(ResultLine::new("Response:", Some(Role::AgentSection)));
-        lines.extend(indented(response));
+        if let Some(note) = &report.note {
+            lines.extend(text_lines(&safe_text(note), Some(Role::Warning)));
+        }
+        lines.extend(indented(&report.report));
     }
     if status == Some("completed") {
         let tokens = ["input_tokens", "output_tokens"]
@@ -821,7 +892,7 @@ pub(super) fn compact_count(count: u64) -> String {
 }
 
 /// Claude Code's `formatDuration`: `45s`, `1m 3s`, `2h 5m 0s`.
-fn compact_duration(milliseconds: u64) -> String {
+pub(super) fn compact_duration(milliseconds: u64) -> String {
     let seconds = milliseconds / 1_000;
     let (hours, minutes, seconds) = (seconds / 3_600, seconds % 3_600 / 60, seconds % 60);
     if hours > 0 {
@@ -863,14 +934,24 @@ pub(super) struct ToolPresentation {
     events: VecDeque<Event>,
 }
 
+/// What a call's result shows from elsewhere in the conversation.
+#[derive(Default)]
+pub(super) struct CallFacts {
+    /// The change an edit made, as its review recorded it.
+    pub(super) review: Option<FileChangeReview>,
+    /// The report a Subagent's child delivered apart from the call's result.
+    pub(super) report: Option<SubagentReportMessage>,
+}
+
 impl ToolPresentation {
     /// Shows `event` in the conversation: a call's row as it is queued, runs and ends, and its
-    /// result under the row. `review` is the recorded change of an edit the event completes.
+    /// result under the row. `facts` are what the result shows from elsewhere in the
+    /// conversation; a Subagent's result also names its child in the call's row.
     pub(super) fn present_event(
         &mut self,
         console: &Console,
         event: &Event,
-        review: Option<&FileChangeReview>,
+        facts: &CallFacts,
     ) -> Result<bool, String> {
         self.record(event);
         let display = console.display_profile()?;
@@ -901,7 +982,7 @@ impl ToolPresentation {
             }
             _ => {}
         }
-        let Some(rendered) = self.render_event_roles(event, display, &cwd, review) else {
+        let Some(rendered) = self.render_event_roles(event, display, &cwd, facts) else {
             return Ok(false);
         };
         match &event.kind {
@@ -929,19 +1010,42 @@ impl ToolPresentation {
             }
             EventKind::ToolCompleted { call_id, result } if !self.detailed => {
                 let key = tool_call_key(event.run_id, call_id);
-                // A model-only call shows no row of its own until it fails.
-                if let (name, Some(input)) = self.started_call(event, call_id)
-                    && result.is_error
-                    && is_model_only_tool(name)
-                    && console.is_interactive()
-                {
-                    console.write_tool_call(
-                        event.run_id,
-                        &key,
-                        &tool_call_roles(name, input, &cwd, display),
-                        ToolCallState::Failed,
-                        None,
-                    )?;
+                let state = if result.is_error {
+                    ToolCallState::Failed
+                } else {
+                    ToolCallState::Finished
+                };
+                match self.started_call(event, call_id) {
+                    // A model-only call shows no row of its own until it fails.
+                    (name, Some(input))
+                        if result.is_error
+                            && is_model_only_tool(name)
+                            && console.is_interactive() =>
+                    {
+                        console.write_tool_call(
+                            event.run_id,
+                            &key,
+                            &tool_call_roles(name, input, &cwd, display),
+                            state,
+                            None,
+                        )?;
+                    }
+                    (SUBAGENT_TOOL_NAME, Some(input)) if console.is_interactive() => {
+                        let launch = serde_json::from_str::<Value>(&result.content).ok();
+                        console.write_tool_call(
+                            event.run_id,
+                            &key,
+                            &agent_messaging::subagent_call_runs(
+                                input,
+                                launch.as_ref(),
+                                &console.agent_colors()?,
+                                display,
+                            ),
+                            state,
+                            None,
+                        )?;
+                    }
+                    _ => {}
                 }
                 console.write_tool_result(&key, &rendered)?
             }
@@ -972,15 +1076,38 @@ impl ToolPresentation {
             .unwrap_or(false)
     }
 
-    /// The call an edit result of `event` completes, whose recorded change its diff shows.
-    pub(super) fn completed_edit<'a>(&self, event: &'a Event) -> Option<&'a str> {
+    /// Whether the result `event` brings shows something from elsewhere in the conversation: an
+    /// edit's recorded change or the report a Subagent's child delivered.
+    pub(super) fn result_reads_conversation(&self, event: &Event) -> bool {
         match &event.kind {
-            EventKind::ToolCompleted { call_id, result }
-                if !result.is_error && self.started_call(event, call_id).0 == EDIT_TOOL_NAME =>
-            {
-                Some(call_id)
+            EventKind::ToolCompleted { call_id, result } => {
+                match self.started_call(event, call_id).0 {
+                    EDIT_TOOL_NAME => !result.is_error,
+                    SUBAGENT_TOOL_NAME => true,
+                    _ => false,
+                }
             }
-            _ => None,
+            _ => false,
+        }
+    }
+
+    /// What the result `event` brings shows from `snapshot`, its conversation.
+    pub(super) fn call_facts(&self, event: &Event, snapshot: &ChatSnapshot) -> CallFacts {
+        let EventKind::ToolCompleted { call_id, result } = &event.kind else {
+            return CallFacts::default();
+        };
+        match self.started_call(event, call_id).0 {
+            EDIT_TOOL_NAME if !result.is_error => CallFacts {
+                review: file_change_review(snapshot, event.run_id, call_id),
+                report: None,
+            },
+            SUBAGENT_TOOL_NAME => CallFacts {
+                review: None,
+                report: serde_json::from_str::<Value>(&result.content)
+                    .ok()
+                    .and_then(|launch| agent_messaging::subagent_report(snapshot, &launch)),
+            },
+            _ => CallFacts::default(),
         }
     }
 
@@ -1050,7 +1177,7 @@ impl ToolPresentation {
                     result,
                     "↳",
                     Path::new(""),
-                    None,
+                    &CallFacts::default(),
                 )))
             }
             _ => None,
@@ -1065,7 +1192,7 @@ impl ToolPresentation {
         event: &Event,
         display: DisplayProfile,
         cwd: &Path,
-        review: Option<&FileChangeReview>,
+        facts: &CallFacts,
     ) -> Option<Vec<(String, Option<Role>)>> {
         if matches!(&event.kind, EventKind::ToolStarted { name, .. } if is_model_only_tool(name))
             || matches!(&event.kind, EventKind::ToolCompleted { call_id, result } if !result.is_error && is_model_only_tool(self.started_call(event, call_id).0))
@@ -1089,7 +1216,7 @@ impl ToolPresentation {
                     result,
                     display.glyph(Glyph::ToolResult),
                     cwd,
-                    review,
+                    facts,
                 )
             }
             _ => vec![(self.render_event(event)?, Some(Role::MutedText))],
@@ -1152,6 +1279,9 @@ pub(super) fn tool_call_roles(
     cwd: &Path,
     display: DisplayProfile,
 ) -> Vec<(String, Option<Role>)> {
+    if name == SUBAGENT_TOOL_NAME {
+        return agent_messaging::subagent_call_runs(input, None, &AgentColors::default(), display);
+    }
     vec![
         ("\n".into(), None),
         (
@@ -1522,7 +1652,7 @@ pub(super) fn archived_tool_result(
     result: &ToolResult,
     cwd: &Path,
     display: DisplayProfile,
-    review: Option<&FileChangeReview>,
+    facts: &CallFacts,
 ) -> RoleRuns {
     compact_result_runs(
         name,
@@ -1530,7 +1660,7 @@ pub(super) fn archived_tool_result(
         result,
         display.glyph(Glyph::ToolResult),
         cwd,
-        review,
+        facts,
     )
 }
 
@@ -1567,52 +1697,20 @@ pub(super) fn local_message_runs(
             sender_label,
             relay,
             message,
-            is_result,
+            ..
         } => {
-            if matches!(detail, OutputDetail::Preview) {
-                runs.push((
-                    format!(
-                        "\nMessage from @{} · ctrl+o to expand\n",
-                        safe_text(sender_handle)
-                    ),
-                    Some(Role::MutedText),
-                ));
-                return (runs, response);
-            }
-            let body = if *is_result {
-                serde_json::from_str::<Value>(message)
-                    .ok()
-                    .map(|value| {
-                        format!(
-                            "{}\n{}\n{}",
-                            value["status"].as_str().unwrap_or("Result"),
-                            value["result"].as_str().unwrap_or_default(),
-                            value["error"].as_str().unwrap_or_default()
-                        )
-                    })
-                    .unwrap_or_else(|| message.clone())
-            } else {
-                message.clone()
-            };
-            let label = if sender_label.is_empty() {
-                String::new()
-            } else {
-                format!(" · {}", safe_text(sender_label))
-            };
-            let mut heading = format!("\nMessage from @{}{label}:\n", safe_text(sender_handle));
-            if let Some(relay) = relay {
-                heading.push_str(&format!(
-                    "Verified user relay · {}\n{}\n",
-                    if relay.forwarded_verbatim {
-                        "verbatim"
-                    } else {
-                        "paraphrased"
-                    },
-                    safe_text(&relay.original_text)
-                ));
-            }
-            runs.push((heading, Some(Role::MutedText)));
-            push_response_block(&mut response, &body, detail, display, None);
+            return agent_messaging::message_runs(
+                &AgentMessage {
+                    sender_handle,
+                    sender_label,
+                    sender_chat: None,
+                    relay: relay.as_ref(),
+                    text: message,
+                },
+                &AgentColors::default(),
+                detail,
+                display,
+            );
         }
         LocalMessage::BashInput { command } => {
             runs.push(("\n".into(), None));
@@ -1860,7 +1958,7 @@ fn compact_result(name: &str, input: Option<&Value>, result: &ToolResult) -> Str
         result,
         "↳",
         Path::new(""),
-        None,
+        &CallFacts::default(),
     ))
 }
 
@@ -1873,7 +1971,7 @@ fn compact_result_runs(
     result: &ToolResult,
     glyph: &str,
     cwd: &Path,
-    review: Option<&FileChangeReview>,
+    facts: &CallFacts,
 ) -> RoleRuns {
     let mut rows = ResponseRows::new(glyph);
     let failure = |failed: bool| if failed { Role::Error } else { Role::MutedText };
@@ -1893,7 +1991,7 @@ fn compact_result_runs(
     }
     if !result.is_error
         && let Some(input) = input
-        && let Some(change) = file_change_runs(name, input, glyph, cwd, review)
+        && let Some(change) = file_change_runs(name, input, glyph, cwd, facts.review.as_ref())
     {
         return change;
     }
@@ -1908,24 +2006,28 @@ fn compact_result_runs(
         return rows.runs;
     }
     let value = serde_json::from_str::<Value>(&result.content).ok();
-    if matches!(name, SUBAGENT_TOOL_NAME | SEND_AGENT_MESSAGE_TOOL_NAME)
+    if name == SUBAGENT_TOOL_NAME
+        && let Some(value) = &value
+    {
+        return agent_messaging::subagent_result_runs(
+            value,
+            result.is_error,
+            facts.report.as_ref(),
+            glyph,
+        );
+    }
+    if name == SEND_AGENT_MESSAGE_TOOL_NAME
         && let Some(value) = &value
     {
         let status = match value["status"].as_str() {
-            Some("async_launched") => "Child started in background",
             Some("accepted") => "Message sent",
-            Some("completed") => "Child completed",
-            Some("failed") => "Child failed",
-            Some("interrupted") => "Child interrupted",
             other => other.unwrap_or("Completed"),
         };
         rows.row([(
             safe_text(status),
             Some(failure(result.is_error || value["status"] == "failed")),
         )]);
-        if name == SEND_AGENT_MESSAGE_TOOL_NAME
-            && let Some(label) = value["target_label"].as_str()
-        {
+        if let Some(label) = value["target_label"].as_str() {
             let relationship = if value["target_relationship"] == "parent" {
                 "Main Agent"
             } else {
@@ -2384,7 +2486,7 @@ fn clipped_runs(runs: RoleRuns, maximum: usize) -> RoleRuns {
     clipped
 }
 
-fn clipped(text: &str, maximum: usize) -> (String, bool) {
+pub(super) fn clipped(text: &str, maximum: usize) -> (String, bool) {
     let sanitized = safe_text(text);
     let mut characters = sanitized.chars();
     let mut preview = characters.by_ref().take(maximum).collect::<String>();
@@ -2400,49 +2502,6 @@ fn display_value(value: &Value) -> String {
         Value::String(text) => text.clone(),
         other => serde_json::to_string_pretty(other).unwrap_or_else(|_| other.to_string()),
     })
-}
-
-pub(super) fn family_completion_text(
-    completion: &FamilyCompletion,
-    detail: OutputDetail,
-) -> String {
-    if !completion.notification.is_background() {
-        return String::new();
-    }
-
-    let delivery = match &completion.notification {
-        SubagentNotificationDelivery::Rejected(rejection) => format!(
-            "\n  Notification not delivered: {}\n",
-            super::safe_line(&rejection.message)
-        ),
-        _ => String::new(),
-    };
-    let status = match completion.state {
-        LoopState::Failed => "failed",
-        LoopState::Stopped | LoopState::Expired => "stopped",
-        LoopState::Interrupted => "interrupted",
-        _ => "finished",
-    };
-    let result = if matches!(detail, OutputDetail::Full) {
-        safe_text(&completion.result)
-    } else {
-        super::console::truncate_width(&super::safe_line(&completion.result), 120)
-    };
-    let error = completion
-        .error
-        .as_deref()
-        .map(safe_text)
-        .unwrap_or_default();
-    format!(
-        "\nSubagent @{} {status}\n  {}{}{delivery}\n",
-        completion.handle,
-        result,
-        if error.is_empty() {
-            String::new()
-        } else {
-            format!("\n  {error}")
-        }
-    )
 }
 
 pub(super) fn family_input_text(record: &FamilyInputRecord, detail: OutputDetail) -> String {
@@ -2495,8 +2554,13 @@ mod tests {
     const TRANSCRIPT_WIDTH: usize = 1000;
 
     fn transcript_text(snapshot: &ChatSnapshot) -> String {
-        transcript_document(snapshot, DisplayProfile::default(), &ImageLinks::default())
-            .plain_text(TRANSCRIPT_WIDTH)
+        transcript_document(
+            snapshot,
+            DisplayProfile::default(),
+            &ImageLinks::default(),
+            &AgentColors::default(),
+        )
+        .plain_text(TRANSCRIPT_WIDTH)
     }
 
     fn stream_pending_reply(snapshot: &mut ChatSnapshot, text: &str) {
@@ -2735,7 +2799,12 @@ mod tests {
         .unwrap();
         let links = ImageLinks::new(Some(cache), true);
 
-        let document = transcript_document(&snapshot, DisplayProfile::default(), &links);
+        let document = transcript_document(
+            &snapshot,
+            DisplayProfile::default(),
+            &links,
+            &AgentColors::default(),
+        );
         assert_eq!(
             document.links(TRANSCRIPT_WIDTH),
             [(
@@ -2745,7 +2814,12 @@ mod tests {
         );
 
         std::fs::remove_dir_all(root.path().join("image-cache")).unwrap();
-        let expired = transcript_document(&snapshot, DisplayProfile::default(), &links);
+        let expired = transcript_document(
+            &snapshot,
+            DisplayProfile::default(),
+            &links,
+            &AgentColors::default(),
+        );
         assert!(expired.links(TRANSCRIPT_WIDTH).is_empty());
         assert_eq!(
             expired.plain_text(TRANSCRIPT_WIDTH),
@@ -2907,10 +2981,10 @@ mod tests {
     }
 
     #[test]
-    fn family_message_preview_is_collapsed_and_full_detail_labels_verified_relay() {
+    fn an_agent_message_previews_its_first_line_and_full_detail_labels_verified_relay() {
         let text = format!(
             "<agent-message>{}</agent-message>",
-            json!({"source":{"sender_relationship":"sibling","sender_label":"Audit report","sender_handle":"audit","relay":{"original_chat_id":Uuid::new_v4(),"original_message_id":Uuid::new_v4(),"original_text":"Human instruction","forwarded_verbatim":true},"is_result":false},"message":"Agent body secret"})
+            json!({"source":{"sender_relationship":"sibling","sender_label":"Audit report","sender_handle":"audit","relay":{"original_chat_id":Uuid::new_v4(),"original_message_id":Uuid::new_v4(),"original_text":"Human instruction","forwarded_verbatim":true},"is_result":false},"message":"Agent body first line\nAgent body detail"})
         );
         let local = LocalMessage::parse(&text).unwrap();
         for glyphs in [
@@ -2922,11 +2996,17 @@ mod tests {
                 ..Default::default()
             });
             let preview = local_message_text(&local, OutputDetail::Preview, display);
-            assert!(preview.contains("Message from @audit"));
-            assert!(!preview.contains("Agent body secret"));
+            assert_eq!(
+                preview,
+                format!(
+                    "\n{} @audit  Agent body first line  (ctrl+o to expand)\n",
+                    display.glyph(Glyph::AgentMessage)
+                )
+            );
             let full = local_message_text(&local, OutputDetail::Full, display);
-            assert!(full.contains("Agent body secret"));
-            assert!(full.contains("Verified user relay"));
+            assert!(full.contains("@audit · Audit report"));
+            assert!(full.contains("Agent body first line\n     Agent body detail"));
+            assert!(full.contains("Verified user relay · verbatim"));
             assert!(full.contains("Human instruction"));
         }
     }
@@ -2949,9 +3029,8 @@ mod tests {
             ],"loops":[],"message_ids":{"1":first,"2":second},"agent_message_origins":{first.to_string():{},second.to_string():{}}
         })).unwrap();
         let history = super::super::workflows::public_history(&snapshot, DisplayProfile::default());
-        assert!(history.contains("Message from @Annual report"));
-        assert!(history.contains("Message from @Quarterly report"));
-        assert!(history.contains("revision abcdef12"));
+        assert!(history.contains("✉ @Annual report  Which revision abcdef12 should I read?\n"));
+        assert!(history.contains("✉ @Quarterly report  Which filing should I read?\n"));
         assert!(!history.contains("<agent-message>"));
         assert!(!history.contains(&first.to_string()));
         assert!(!history.contains(&second.to_string()));
@@ -3021,11 +3100,11 @@ mod tests {
     }
 
     #[test]
-    fn a_typed_parent_message_is_collapsed_with_its_handle_and_expands_actual_text() {
+    fn a_typed_parent_message_previews_its_first_line_and_expands_actual_text() {
         let id = Uuid::new_v4();
         let message = format!(
             "<agent-message>{}</agent-message>",
-            json!({"source":{"message_id":id,"sender_chat_id":Uuid::new_v4(),"sender_relationship":"parent","sender_handle":"main","sender_label":"Parent task wording","is_result":false},"message":"Keep user revision abcdef12."})
+            json!({"source":{"message_id":id,"sender_chat_id":Uuid::new_v4(),"sender_relationship":"parent","sender_handle":"main","sender_label":"Parent task wording","is_result":false},"message":"Keep user revision abcdef12.\nThen report back."})
         );
         let snapshot: ChatSnapshot = serde_json::from_value(json!({
             "id":Uuid::new_v4(),"workdir":"/work","messages":[
@@ -3034,9 +3113,16 @@ mod tests {
         }))
         .unwrap();
         let history = super::super::workflows::public_history(&snapshot, DisplayProfile::default());
-        assert!(history.contains("Message from @main"));
-        assert!(!history.contains("revision abcdef12"));
-        assert!(transcript_text(&snapshot).contains("revision abcdef12"));
+        assert_eq!(
+            history,
+            "\n✉ @main  Keep user revision abcdef12.  (ctrl+o to expand)\n"
+        );
+        let transcript = transcript_text(&snapshot);
+        assert!(
+            transcript.contains("✉ @main · Parent task wording"),
+            "{transcript}"
+        );
+        assert!(transcript.contains("Then report back."), "{transcript}");
         assert!(!history.contains("Parent Agent"));
         assert!(!history.contains(&id.to_string()));
     }
@@ -3355,7 +3441,7 @@ mod tests {
             },
             Path::new(""),
             DisplayProfile::default(),
-            None,
+            &CallFacts::default(),
         ));
         assert!(
             archived.contains("Running in background")
@@ -3603,7 +3689,7 @@ mod tests {
                     },
                     Path::new("/work"),
                     DisplayProfile::default(),
-                    None,
+                    &CallFacts::default(),
                 )),
                 expected.replace('↳', DisplayProfile::default().glyph(Glyph::ToolResult)),
                 "the path is relative to the working directory: {call_id}"
@@ -3627,7 +3713,7 @@ mod tests {
             },
             Path::new(""),
             DisplayProfile::default(),
-            None,
+            &CallFacts::default(),
         );
         let role_of = |text: &str| {
             runs.iter()
@@ -3676,7 +3762,7 @@ mod tests {
             },
             Path::new(""),
             DisplayProfile::default(),
-            None,
+            &CallFacts::default(),
         );
         let text = joined(&runs);
         assert!(
@@ -3707,7 +3793,7 @@ mod tests {
             },
             Path::new(""),
             DisplayProfile::default(),
-            None,
+            &CallFacts::default(),
         );
         assert_eq!(joined(&bash), "  ⎿  a.txt\n     b.txt\n", "{bash:?}");
         assert!(bash.contains(&("a.txt".into(), None)), "{bash:?}");
@@ -3721,7 +3807,7 @@ mod tests {
             },
             Path::new(""),
             DisplayProfile::default(),
-            None,
+            &CallFacts::default(),
         );
         assert_eq!(joined(&failed), "  ⎿  Exit code 1\n     boom\n");
         assert!(
@@ -3747,7 +3833,7 @@ mod tests {
                 },
                 Path::new(""),
                 DisplayProfile::default(),
-                None,
+                &CallFacts::default(),
             );
             assert_eq!(
                 joined(&declined),
@@ -3765,7 +3851,7 @@ mod tests {
                 },
                 Path::new("/work"),
                 DisplayProfile::default(),
-                None,
+                &CallFacts::default(),
             );
             assert_eq!(
                 joined(&declined_write),
@@ -3819,7 +3905,12 @@ mod tests {
         let view = ToolPresentation::new(true);
 
         let rendered = view
-            .render_event_roles(&completed, DisplayProfile::default(), Path::new(""), None)
+            .render_event_roles(
+                &completed,
+                DisplayProfile::default(),
+                Path::new(""),
+                &CallFacts::default(),
+            )
             .unwrap()
             .into_iter()
             .map(|(text, _)| text)
@@ -4015,7 +4106,10 @@ mod tests {
             },
             Path::new("/work"),
             DisplayProfile::default(),
-            Some(&review),
+            &CallFacts {
+                review: Some(review),
+                report: None,
+            },
         );
         assert_eq!(
             joined(&runs),

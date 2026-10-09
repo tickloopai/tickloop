@@ -18,11 +18,11 @@ use tickloop_agent_runtime::hosted::controller::HostController;
 use uuid::Uuid;
 
 const PLUGIN_DIRECTORY: &str = "herdr-popup-plugin";
-const INSTALL_PROMPT: &str = "This registers Tick Loop's popup plugin in the given Herdr session; no Herdr or Tick service is started, stopped or replaced. Install? [y/N]";
+const INSTALL_PROMPT: &str = "This registers Tickloop's popup plugin in the given Herdr session; no Herdr or Tick service is started, stopped or replaced. Install? [y/N]";
 const PRESERVED_SETTINGS: &str = r#"{"prefersReducedMotion":true}"#;
 const KEYS_TICK: &str = include_str!("../support/keys_tick.py");
 
-/// The Tick Loop state one test's commands use: settings, the generated plugin, and a home.
+/// The Tickloop state one test's commands use: settings, the generated plugin, and a home.
 struct State {
     directory: tempfile::TempDir,
 }
@@ -151,7 +151,7 @@ fn assert_our_plugin(herdr: &PrivateHerdr, state: &State) {
         plugin["panes"],
         json!([{
             "id": "attach",
-            "title": "Tick Loop",
+            "title": "Tickloop",
             "placement": "popup",
             "width": "85%",
             "height": "85%",
@@ -161,12 +161,12 @@ fn assert_our_plugin(herdr: &PrivateHerdr, state: &State) {
     );
 }
 
-/// Only an explicit yes in a terminal links Tick Loop's own plugin and turns `monitorPopup` on;
-/// No, Enter, EOF and a non-interactive run change nothing. A same-id plugin Tick Loop did not
-/// write is never replaced or removed. Removing unlinks only Tick Loop's plugin and turns the
+/// Only an explicit yes in a terminal links Tickloop's own plugin and turns `monitorPopup` on;
+/// No, Enter, EOF and a non-interactive run change nothing. A same-id plugin Tickloop did not
+/// write is never replaced or removed. Removing unlinks only Tickloop's plugin and turns the
 /// setting off; other settings stay.
 #[test]
-fn popup_install_and_remove_change_only_tick_loops_plugin_after_an_explicit_yes() {
+fn popup_install_and_remove_change_only_tickloops_plugin_after_an_explicit_yes() {
     let herdr = PrivateHerdr::start();
     let state = State::new();
 
@@ -406,7 +406,7 @@ async fn the_installed_popup_shows_the_same_hosted_tick_until_esc_closes_it() {
         .unwrap();
     assert_eq!(popup(&grant).unwrap()["type"], "ok");
     let shown = client.shows("keys");
-    assert!(shown.contains("┌Tick Loop"), "{shown}");
+    assert!(shown.contains("┌Tickloop"), "{shown}");
     let listed = row(&controller.list(&owner, None).await.unwrap(), &opened);
     assert_eq!(listed["attached"], true, "{listed}");
     assert_eq!(listed["business_pid"], opened.business_pid);
@@ -525,7 +525,7 @@ fn a_popup_that_cannot_attach_shows_why_until_a_key_closes_it() {
     );
     assert_eq!(opened.unwrap()["type"], "ok");
     let shown = client.shows("Press any key to close");
-    assert!(shown.contains("┌Tick Loop"), "{shown}");
+    assert!(shown.contains("┌Tickloop"), "{shown}");
     assert!(
         shown.contains("HostUnavailable"),
         "the reason is shown: {shown}"
@@ -538,7 +538,7 @@ fn a_popup_that_cannot_attach_shows_why_until_a_key_closes_it() {
 
     client.send(b"x");
     wait_until("the popup closes", || {
-        Some(()).filter(|()| !client.screen().contains("┌Tick Loop"))
+        Some(()).filter(|()| !client.screen().contains("┌Tickloop"))
     });
     wait_until("the attach process exits", || {
         popup_attach_processes(&herdr).is_empty().then_some(())

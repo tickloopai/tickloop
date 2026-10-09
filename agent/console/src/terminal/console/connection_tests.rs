@@ -257,7 +257,7 @@ fn a_creation_prefix_history_and_loss_rebuild_in_order_once_and_stay_with_the_ch
     let mut state = State::new(true, 180, 40);
     state.prompt_enabled = true;
     let console = super::tests::console_with_state(state);
-    console.write("Tick Loop Agent · owned startup\n").unwrap();
+    console.write("Tickloop · owned startup\n").unwrap();
     console.record_input("/model").unwrap();
     console
         .write("Model selection: Applied · owned model\n")
@@ -289,7 +289,7 @@ fn a_creation_prefix_history_and_loss_rebuild_in_order_once_and_stay_with_the_ch
         let frame = rendered;
         let mut previous = None;
         for part in [
-            "Tick Loop Agent · owned startup",
+            "Tickloop · owned startup",
             "❯ /model",
             "Model selection: Applied · owned model",
             "History user",

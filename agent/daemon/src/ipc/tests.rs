@@ -238,6 +238,63 @@ async fn frames_beyond_the_negotiated_limit_are_refused_on_both_sides() {
     server.abort();
 }
 
+#[tokio::test]
+async fn a_request_of_another_build_is_refused_alone_and_the_connection_stays() {
+    let temporary = tempfile::tempdir_in("/tmp").unwrap();
+    let socket = temporary.path().join("unknown.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let epoch = Uuid::new_v4();
+    let source = Arc::new(CompletingLookup {
+        epoch,
+        started: tokio::sync::Notify::new(),
+        release: std::sync::atomic::AtomicBool::new(true),
+    });
+    let server = tokio::spawn(serve_listener(listener, source, epoch, TRANSPORT_LIMITS));
+    let mut stream = UnixStream::connect(&socket).await.unwrap();
+    negotiate(&mut stream).await.unwrap();
+    let unknown = Uuid::new_v4();
+    write_frame(
+        &mut stream,
+        &serde_json::json!({"RequestFromANewerBuild": {"request_id": unknown, "detail": 1}}),
+        FRAME_BYTES,
+    )
+    .await
+    .unwrap();
+    let Some(ServerMessage::Error { request_id, error }) =
+        read_frame::<_, ServerMessage>(&mut stream, FRAME_BYTES)
+            .await
+            .unwrap()
+    else {
+        panic!("the unknown request gets its own error");
+    };
+    assert_eq!(request_id, Some(unknown));
+    assert_eq!(error.code, AccessErrorCode::Unsupported);
+    assert!(
+        error.message.contains("another Tickloop build"),
+        "{error:?}"
+    );
+    let known = Uuid::new_v4();
+    write_frame(
+        &mut stream,
+        &ClientMessage::ShutdownDaemon {
+            request_id: known,
+            daemon_epoch: Uuid::new_v4(),
+        },
+        FRAME_BYTES,
+    )
+    .await
+    .unwrap();
+    let Some(ServerMessage::Error { request_id, .. }) =
+        read_frame::<_, ServerMessage>(&mut stream, FRAME_BYTES)
+            .await
+            .unwrap()
+    else {
+        panic!("the same connection still answers known requests");
+    };
+    assert_eq!(request_id, Some(known));
+    server.abort();
+}
+
 struct CompletingLookup {
     epoch: Uuid,
     started: tokio::sync::Notify,

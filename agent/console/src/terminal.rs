@@ -14,6 +14,7 @@ use tickloop_agent_config::{LoadedSettings, UserSettings, config_root_directory}
 use tickloop_agent_tools::{ENTER_PLAN_MODE_TOOL_NAME, EXIT_PLAN_MODE_TOOL_NAME};
 use tokio::sync::{broadcast, mpsc};
 
+mod agent_messaging;
 mod artifact_ui;
 mod artifacts_picker;
 pub mod attach;
@@ -94,6 +95,7 @@ mod transcript;
 mod workflows;
 mod workspace_trust;
 
+use agent_messaging::{AgentInput, AgentMessage};
 use console::{Console, InputEvent, RendererSwitch};
 use diff_catalog::ChangeCatalog;
 use directed_summary::{DirectedSummaryTasks, SummaryTaskCompletion};
@@ -129,9 +131,9 @@ use tickloop_agent_protocol::{
     ExecutionMode, ExecutionRef, HostLocation, HostWorkContext, InputContext, LaunchSpec,
     ModelConfig, ModelRequestKind, ObservationRequest, ObservationValue, PermissionChange,
     PermissionRule, PermissionScope, PromptPolicy, QuestionRequest, ReasoningEffort, Receipt,
-    RequestOutcome, ShellTaskNotice, ShellTaskPromptWatchdog, ShellTaskState, TaskNotification,
-    TaskNotificationStatus, TodoItem, Trigger, TriggerSource, Usage, UserInput, UserShellRecord,
-    UserShellState, ViewRef,
+    RequestOutcome, ShellTaskNotice, ShellTaskOrigin, ShellTaskPromptWatchdog, ShellTaskState,
+    TakenBackPrompt, TaskNotification, TaskNotificationStatus, TodoItem, Trigger, TriggerSource,
+    Usage, UserInput, UserShellRecord, UserShellState, ViewRef,
 };
 use workflows::Workflow;
 
@@ -646,7 +648,7 @@ async fn connect_startup_daemon(
         .ok_or("The Agent daemon changed before confirmation; launch tickloop again.")?;
     let running_executable = mismatch.running_executable.clone();
     let mut context = vec![
-        "A different Tick Loop version is running.".into(),
+        "A different Tickloop version is running.".into(),
         safe_text(&mismatch.description),
         "Stopping it stops all running Agents. Saved history is kept. Ticks keep running.".into(),
         "After stopping, this version opens automatically with your current startup options."
@@ -729,7 +731,7 @@ pub fn print_help() {
 }
 
 fn help_text() -> String {
-    let guidance = r#"Tick Loop Agent
+    let guidance = r#"Tickloop
 Usage: tickloop [--cwd DIRECTORY]
        [--mode acceptEdits|auto|plan] [--deny-on-prompt | --dangerously-skip-permissions]
        [--working-directory-is-trusted]
@@ -741,7 +743,7 @@ Usage: tickloop [--cwd DIRECTORY]
 
 daemon stop ends the local Agent daemon and all of its workers, which is every running Agent; saved history is kept and Ticks in the Tickhost keep running.
 Run tickloop again to start this build. TICKLOOP_DAEMON_RUNTIME_DIR selects the daemon.
-monitor popup install asks before registering Tick Loop's popup plugin in that Herdr session and sets monitorPopup to enabled; remove asks before unregistering only that plugin and sets it to disabled. Running Ticks continue either way.
+monitor popup install asks before registering Tickloop's popup plugin in that Herdr session and sets monitorPopup to enabled; remove asks before unregistering only that plugin and sets it to disabled. Running Ticks continue either way.
 monitor attach is the popup's attach client: it shows the hosted Tick its one-time view grant in TICKLOOP_MONITOR_ATTACH names until a lone esc closes it; when it cannot, it shows why until a key is pressed.
 
 The working directory must exist; omitting --cwd uses the current directory.
@@ -760,6 +762,8 @@ Built-in /model choices and persistent rules are saved in settings.json there; m
 
 Enter a task; follow-up inputs are accepted while the current run continues.
 Queued messages, commands and Shell input appear above the editor; up on the first visual row restores editable queued input.
+While the Agent works, enter queues a message for its next tool boundary; ctrl+enter send now interrupts the turn and sends it at once, or with empty input the oldest queued message. Idle, ctrl+enter is enter.
+ctrl+enter needs a terminal that reports it (kitty keyboard protocol: Ghostty, kitty, WezTerm, iTerm2 with CSI u, or Herdr inside one); elsewhere enter then esc does the same, since esc interrupts and queued messages start right away.
 The footer contains only Subagents N when there are subagents, expanded by default.
 down on the last visual input row, after history ends, enters the Subagents list at the row selected last, without submitting the draft; a folded list unfolds.
 Click Subagents N to hide/show the list. In the list enter opens an Agent (modified enter is ignored), space folds descendants, x dismisses a finished subagent, and esc or up on the first row returns to the editor.
@@ -800,7 +804,7 @@ ctrl+g edits the draft in $VISUAL or $EDITOR (which may be Vim); saving and quit
 ctrl+v attaches the clipboard image as [Image #N], moved and deleted as one block; the model must accept image input.
 ctrl+r opens history search.
 History search uses ctrl+s for session/project/all scopes; enter/tab fills the draft.
-ctrl+j or modified enter inserts a real newline; ctrl+c clears a draft before interrupting.
+ctrl+j or alt/shift+enter inserts a real newline; ctrl+c clears a draft before interrupting.
 With an empty prompt, ctrl+c or ctrl+d must be pressed twice within 800ms to exit.
 With a draft, ctrl+d deletes forward instead of exiting.
 On Unix, ctrl+z suspends this Agent process; run fg in the shell to resume it.
@@ -1286,7 +1290,7 @@ fn write_banner(
     if !console.is_interactive() {
         outln!(
             console,
-            "Tick Loop Agent · {} · {} · {:?}",
+            "Tickloop · {} · {} · {:?}",
             safe_text(&config.name),
             safe_text(&config.model),
             config.protocol
@@ -1313,7 +1317,7 @@ fn startup_banner_spans(
         _ => directory,
     };
     vec![
-        ("Tick Loop Agent".into(), Some(Role::Title)),
+        ("Tickloop".into(), Some(Role::Title)),
         (
             format!(" v{}\n", env!("CARGO_PKG_VERSION")),
             Some(Role::MutedText),
@@ -1341,6 +1345,14 @@ async fn open_current_plan(
             .snapshot(chat)
             .await
             .map_err(|error| error.to_string())?;
+        // Plain input reaches here without the editor's scope check.
+        if snapshot.delegation.is_some() {
+            return Err(completion::command_refusal(
+                completion::CommandScope::Child,
+                "/plan",
+                completion::CHILD_PLAN_REPORTED,
+            ));
+        }
         if let Some(plan) = snapshot
             .plans
             .iter()
@@ -1358,13 +1370,6 @@ async fn open_current_plan(
                 safe_text(&plan.markdown)
             );
             return Ok(());
-        }
-        if snapshot.delegation.is_some() {
-            return Err(completion::command_refusal(
-                completion::CommandScope::Child,
-                "/plan",
-                "only an existing plan can be reopened; entering Plan mode requires the Agent's consent request",
-            ));
         }
         agent
             .set_execution_mode(chat, ExecutionMode::Plan)
@@ -1452,6 +1457,8 @@ async fn interact(
         prompt_suggestion::SuggestionResult,
     )> = tokio::task::JoinSet::new();
     let mut suggestible_runs = HashSet::new();
+    // Runs this View interrupted by esc or ctrl+c; their prompt may come back to the editor.
+    let mut user_interrupted_runs: HashSet<uuid::Uuid> = HashSet::new();
     let mut suggestion_diagnostics: HashMap<uuid::Uuid, (uuid::Uuid, &'static str)> =
         HashMap::new();
     let mut artifact_refresh = tokio::time::interval(std::time::Duration::from_millis(50));
@@ -1532,6 +1539,7 @@ async fn interact(
     match startup.chat {
         StartupChat::New => {}
         StartupChat::Resumed(snapshot, has_history) => {
+            learn_agent_colors(console, agent, &snapshot).await?;
             goal = show_opened_chat(console, agent, &snapshot, has_history)?;
             selected_chat = Some(snapshot.id);
             displayed_sequences.insert(snapshot.id, snapshot.last_sequence);
@@ -1804,6 +1812,18 @@ async fn interact(
                 console
                     .set_shell_starts(chat, task_access::shell_starts(&snapshot, &task_snapshot))?;
                 console.update_shell_ticks(&task_snapshot)?;
+                console.set_foreground_commands(
+                    &task_snapshot
+                        .tasks
+                        .iter()
+                        .filter(|task| {
+                            task.chat_id == chat
+                                && task.origin == ShellTaskOrigin::Agent
+                                && task.capabilities.can_background
+                        })
+                        .map(|task| task.id)
+                        .collect::<Vec<_>>(),
+                )?;
                 if let Ok(rows) = agent.tick_subscriptions(chat).await {
                     console.update_subscribed_ticks(chat, &rows)?;
                 }
@@ -2427,6 +2447,7 @@ async fn interact(
                         && pending.values().any(|receipt| receipt.chat_id == chat)
                     {
                         agent.interrupt(chat).await.map_err(|error|error.to_string())?;
+                        user_interrupted_runs.extend(pending.values().filter(|receipt| receipt.chat_id == chat).map(|receipt| receipt.run_id));
                         stop_visual_pacing(console,chat,&pending,&mut thinking_previews,&mut reply_lines,&mut unpaced_runs)?;
                         status_dirty=true;
                     }
@@ -2436,6 +2457,7 @@ async fn interact(
                     if pending.values().any(|receipt| receipt.chat_id == chat) || directed_summaries.contains(chat) {
                         match agent.interrupt(chat).await {
                             Ok(_) => {
+                                user_interrupted_runs.extend(pending.values().filter(|receipt| receipt.chat_id == chat).map(|receipt| receipt.run_id));
                                 stop_visual_pacing(console,chat,&pending,&mut thinking_previews,&mut reply_lines,&mut unpaced_runs)?;
                                 if directed_summaries.contains(chat) { outln!(console,"\nCancelling conversation summary…"); }
                             },
@@ -2443,6 +2465,13 @@ async fn interact(
                         }
                         status_dirty=true;
                     }
+                },
+                Some(InputEvent::SendQueuedNow { run_id }) => {
+                    let Some(chat) = selected_chat else { continue; };
+                    if let Err(error) = agent.send_now(chat, run_id).await {
+                        console.set_status(&format!("Cannot send now: {}", safe_line(&error.to_string())))?;
+                    }
+                    status_dirty = true;
                 },
                 Some(InputEvent::TakeBackQueued { draft_empty }) => {
                     let Some(chat) = selected_chat else {
@@ -2471,7 +2500,7 @@ async fn interact(
                 Some(InputEvent::OpenTranscript { id }) => {
                     if let Some(chat)=selected_chat {
                         let snapshot=agent.snapshot(chat).await.map_err(|error|error.to_string())?;
-                        console.update_transcript(id,presentation::transcript_document(&snapshot, console.display_profile()?, &console.image_links()?))?;
+                        console.update_transcript(id,presentation::transcript_document(&snapshot, console.display_profile()?, &console.image_links()?, &console.agent_colors()?))?;
                     } else {console.update_transcript(id,vec!["No conversation yet. Return to enter a task.".into()].into())?;}
                 },
                 Some(InputEvent::PickerAction { menu_id, index, action }) => {
@@ -2525,9 +2554,9 @@ async fn interact(
                     }
                 },
                 Some(InputEvent::BackgroundForegroundShell) => {
-                    if let Some(chat)=selected_chat
-                        && let Some(command_id)=foreground_shells.get(&chat).copied()
-                    {
+                    let Some(chat)=selected_chat else { continue; };
+                    // Like Claude Code's `backgroundAll`, one press moves every foreground Shell.
+                    if let Some(command_id)=foreground_shells.get(&chat).copied() {
                         match agent.background_user_shell(chat,command_id).await {
                             Ok(_) => {
                                 foreground_shells.remove(&chat);
@@ -2538,8 +2567,14 @@ async fn interact(
                             },
                             Err(error)=>outln!(console,"Cannot background user shell: {}",safe_text(&error.to_string())),
                         }
-                        status_dirty=true;
                     }
+                    // The Bash call returns to the model on its own once its command leaves the foreground.
+                    for command_id in console.backgroundable_commands()? {
+                        if let Err(error)=agent.background_command(chat,command_id).await {
+                            outln!(console,"Cannot background command: {}",safe_text(&error.to_string()));
+                        }
+                    }
+                    status_dirty=true;
                 },
                 Some(InputEvent::Permissions(effect)) => {
                     match effect {
@@ -2704,15 +2739,15 @@ async fn interact(
                 Some(input @ (InputEvent::Line(_) | InputEvent::Prompt { .. })) => {
                     console.clear_prompt_suggestion()?;
                     let retry_of = console.take_submitted_retry()?;
-                    let (line, file_references, pasted_images, restored_contexts, is_user_prompt, family_target) = match input {
-                        InputEvent::Line(line) => (line, Vec::new(), Vec::new(), Vec::new(), false, None),
-                        InputEvent::Prompt { text, file_references, images, family_target } => {
+                    let (line, file_references, pasted_images, restored_contexts, is_user_prompt, family_target, send_now) = match input {
+                        InputEvent::Line(line) => (line, Vec::new(), Vec::new(), Vec::new(), false, None, false),
+                        InputEvent::Prompt { text, file_references, images, family_target, send_now } => {
                             let restored_contexts = if is_branch_command(text.trim()) {
                                 Vec::new()
                             } else {
                                 console.take_restored_contexts(&text)?
                             };
-                            (text, file_references, images, restored_contexts, true, family_target)
+                            (text, file_references, images, restored_contexts, true, family_target, send_now)
                         }
                         _ => unreachable!(),
                     };
@@ -2779,7 +2814,7 @@ async fn interact(
                             match open_chat(agent,line.trim(),None).await {
                                 Ok(snapshot)=>{
                                     console.set_global_overview(None)?;global.interpret(crate::agent_console::Intent::Back).map_err(|error|error.to_string())?;
-                                    overview_active=false;goal=show_opened_chat(console,agent,&snapshot,true)?;selected_chat=Some(snapshot.id);
+                                    overview_active=false;learn_agent_colors(console,agent,&snapshot).await?;goal=show_opened_chat(console,agent,&snapshot,true)?;selected_chat=Some(snapshot.id);
                                     sync_snapshot(&snapshot,&mut pending,&mut permissions,&mut questions);
                                 },
                                 Err(error)=>{console.restore_rejected_prompt(restored_contexts,&error)?;report_refused_input(console,&error,&mut failed);},
@@ -2948,14 +2983,14 @@ async fn interact(
                         "/help advanced" => outln!(console, "{}",completion::command_help(true)),
                         command if command == "/artifacts" || command.starts_with("/artifacts ") => {
                             if command.trim() != "/artifacts" { outln!(console, "Use /artifacts"); continue; }
-                            let Some(root) = config_root.as_ref() else { outln!(console, "Tick Loop Artifacts needs a state directory; set TICKLOOP_CONFIG_DIR."); continue; };
+                            let Some(root) = config_root.as_ref() else { outln!(console, "Tickloop Artifacts needs a state directory; set TICKLOOP_CONFIG_DIR."); continue; };
                             match tickloop_agent_artifacts::ArtifactClient::new(root).map_err(|error| error.to_string()) {
                                 Ok(client) => match client.status().await {
-                                    Ok(Some(_)) => { if let Err(error) = artifact_ui::open(agent, console, root, selected_chat, interactive).await { outln!(console, "Cannot open Tick Loop Artifacts: {}", safe_text(&error)); } }
-                                    Ok(None) => match LoginFlow::start(root.clone(), console, login::LoginMethod::Artifact) { Ok(flow) => { logins.insert(flow.id(), LoginSession { flow, from_provider: false, succeeded: false }); }, Err(error) => outln!(console, "Cannot start the Tick Loop Artifacts login: {}", safe_text(&error)) },
-                                    Err(error) => outln!(console, "Cannot check the Tick Loop Artifacts account: {}", safe_text(&error.to_string())),
+                                    Ok(Some(_)) => { if let Err(error) = artifact_ui::open(agent, console, root, selected_chat, interactive).await { outln!(console, "Cannot open Tickloop Artifacts: {}", safe_text(&error)); } }
+                                    Ok(None) => match LoginFlow::start(root.clone(), console, login::LoginMethod::Artifact) { Ok(flow) => { logins.insert(flow.id(), LoginSession { flow, from_provider: false, succeeded: false }); }, Err(error) => outln!(console, "Cannot start the Tickloop Artifacts login: {}", safe_text(&error)) },
+                                    Err(error) => outln!(console, "Cannot check the Tickloop Artifacts account: {}", safe_text(&error.to_string())),
                                 },
-                                Err(error) => outln!(console, "Cannot configure Tick Loop Artifacts: {}", safe_text(&error)),
+                                Err(error) => outln!(console, "Cannot configure Tickloop Artifacts: {}", safe_text(&error)),
                             }
                         },
                         command if is_rewind_command(command) => {
@@ -3030,7 +3065,7 @@ async fn interact(
                             let id = console.start_transcript()?;
                             if let Some(chat)=selected_chat {
                                 let snapshot=agent.snapshot(chat).await.map_err(|error|error.to_string())?;
-                                console.update_transcript(id,presentation::transcript_document(&snapshot, console.display_profile()?, &console.image_links()?))?;
+                                console.update_transcript(id,presentation::transcript_document(&snapshot, console.display_profile()?, &console.image_links()?, &console.agent_colors()?))?;
                             } else {console.update_transcript(id,vec!["No conversation yet. Return to enter a task.".into()].into())?;}
                         },
                         "/details" => out!(console, "{}",tools.toggle()),
@@ -3401,6 +3436,7 @@ async fn interact(
                         _ if line.starts_with("/resume ") => {
                             match open_chat(agent, &line, selected_chat).await {
                                 Ok(snapshot) => {
+                                    learn_agent_colors(console,agent,&snapshot).await?;
                                     goal=show_opened_chat(console,agent,&snapshot,true)?;
                                     selected_chat=Some(snapshot.id);
                                     draft_question=None;
@@ -3499,7 +3535,11 @@ async fn interact(
                                     merged_echoes.accepted(receipt.run_id,echo);
                                     goal = Some(receipt.loop_id);
                                     if !interactive {outln!(console, "Accepted: Goal {} · Run {}", receipt.loop_id, receipt.run_id);}
+                                    let run_id=receipt.run_id;
                                     track_accepted_input(console,agent,receipt,adopted,&mut pending,&mut permissions,&mut questions).await?;
+                                    if send_now && let Err(error)=agent.send_now(chat_id,run_id).await {
+                                        console.set_status(&format!("Cannot send now: {}",safe_line(&error.to_string())))?;
+                                    }
                                 },
                                 InputSend::Unknown(id, error) => {
                                     if let Some(echo)=echo {console.withdraw_echo(Some(chat_id),echo)?;}
@@ -3601,6 +3641,7 @@ async fn interact(
                 Ok(event) if !overview_active && (pending.contains_key(&event.run_id) || Some(event.chat_id)==selected_chat) => {
                     if Some(event.chat_id)==selected_chat && matches!(event.kind,EventKind::Started|EventKind::InputMerged {..})
                         && let Ok(snapshot)=agent.snapshot(event.chat_id).await {
+                        learn_agent_colors(console,agent,&snapshot).await?;
                         show_consumed_family_input(console,&snapshot,event.run_id)?;
                     }
                     if event.sequence<=*displayed_sequences.get(&event.chat_id).unwrap_or(&0) {
@@ -3671,6 +3712,7 @@ async fn interact(
                             &mut questions,
                         );
                         console.reset_chat(event.chat_id)?;
+                        learn_agent_colors(console, agent, &snapshot).await?;
                         workflows::write_public_history(console, &snapshot)?;
                         outln!(
                             console,
@@ -3716,18 +3758,30 @@ async fn interact(
                     if interactive && stopped_thinking {
                         console.write_pieces(&[presentation::thinking_label()])?;
                     }
+                    let interrupted_by_user = matches!(&event.kind,EventKind::Completed {..} | EventKind::Failed(_) | EventKind::Interrupted)
+                        && user_interrupted_runs.remove(&event.run_id)
+                        && matches!(&event.kind,EventKind::Interrupted);
                     if matches!(&event.kind,EventKind::Completed {..} | EventKind::Failed(_) | EventKind::Interrupted) {
                         unpaced_runs.remove(&event.run_id);
                     }
-                    let review = match tools.completed_edit(&event) {
-                        Some(call_id) => agent.snapshot(event.chat_id).await.ok().and_then(|snapshot| presentation::file_change_review(&snapshot, event.run_id, call_id)),
-                        None => None,
+                    let conversation = if tools.result_reads_conversation(&event) || matches!(&event.kind, EventKind::FamilyRunCompleted { .. }) {
+                        agent.snapshot(event.chat_id).await.ok()
+                    } else {
+                        None
                     };
+                    if let Some(snapshot) = &conversation {
+                        learn_agent_colors(console, agent, snapshot).await?;
+                    }
+                    let facts = conversation.as_ref().map(|snapshot| tools.call_facts(&event, snapshot)).unwrap_or_default();
                     let interrupted_by_rejection = tools.ended_with_rejection(event.run_id);
-                    if tools.present_event(console,&event,review.as_ref())? { continue; }
+                    if tools.present_event(console,&event,&facts)? { continue; }
                     match event.kind {
                         EventKind::FamilyInputUpdated { record } => console.write(&presentation::family_input_text(&record, presentation::OutputDetail::Preview))?,
-                        EventKind::FamilyRunCompleted { completion } => console.write(&presentation::family_completion_text(&completion, presentation::OutputDetail::Preview))?,
+                        EventKind::FamilyRunCompleted { completion } => {
+                            if let Some(snapshot) = &conversation {
+                                show_family_completion(console, &completion, snapshot)?;
+                            }
+                        },
                         EventKind::Thinking(thinking) => {
                             if !interactive {
                                 if starts_thinking {
@@ -3828,6 +3882,14 @@ async fn interact(
                                 // A declined call's result already says the run stopped there.
                                 if !interrupted_by_rejection {
                                     console.write_response(&[(format!("{}\n", presentation::interrupted_notice(console.display_profile()?)), Some(Role::MutedText))])?;
+                                }
+                                if interrupted_by_user
+                                    && let Some((restored,draft))=take_back_interrupted_prompt(agent,console,event.chat_id,event.run_id).await?
+                                {
+                                    displayed_sequences.insert(restored.id,restored.last_sequence);
+                                    tools.restore(&restored.conversation_events());
+                                    sync_snapshot(&restored,&mut pending,&mut permissions,&mut questions);
+                                    goal=draft.loop_id;
                                 }
                             } else {
                                 outln!(console, "\n{} goal {} · run {}",if stopped {"Stopped"} else {"Interrupted"},event.loop_id,event.run_id);
@@ -4042,6 +4104,7 @@ async fn interact(
                             }
                         }
                         let projection=global.projection();
+                        console.remember_agent_colors(agent_messaging::catalog_colors(&projection.rows))?;
                         // A run whose execution the daemon has lost can no longer report its end.
                         for notice in end_runs_of_lost_executions(&projection.rows,&mut pending,&mut permissions,&mut questions) {
                             failed=true;
@@ -4067,9 +4130,13 @@ async fn interact(
                                 console.set_agent_family(if family.len()>1 {agent_rows(&family,false)}else{Vec::new()},Some(row.execution.agent_id))?;
                                 console.set_task_title((row.parent.is_none() && row.has_work==Some(true)).then(|| safe_line(&row.title)))?;
                                 for row in family.into_iter().filter(|row|row.availability==ExecutionAvailability::Live) {
-                                    if let Ok(snapshot)=agent.snapshot(row.chat_id).await {
-                                        let awaiting_events=pending.values().filter(|receipt|receipt.chat_id==snapshot.id).cloned().collect::<Vec<_>>();
-                                        let outcome_pending=awaiting_events.iter().any(|receipt|snapshot.loops.iter().any(|goal|goal.id==receipt.loop_id && matches!(goal.state,tickloop_agent_protocol::LoopState::Completed|tickloop_agent_protocol::LoopState::Failed|tickloop_agent_protocol::LoopState::Interrupted|tickloop_agent_protocol::LoopState::Stopped)));
+                                    // Only the daemon's current answer can prove a run ended; a cached copy predates it.
+                                    if let Ok(snapshot)=agent.current_snapshot(row.chat_id).await {
+                                        let in_progress=receipts_in_progress(&snapshot).map(|receipt|receipt.run_id).collect::<HashSet<_>>();
+                                        // A receipt the snapshot no longer has in progress belongs to a run that ended,
+                                        // including one whose end event never reached this View, such as one lost to a
+                                        // lagged feed; its Loop may since wait for a trigger or run another input.
+                                        let outcome_pending=pending.values().any(|receipt|receipt.chat_id==snapshot.id && !in_progress.contains(&receipt.run_id));
                                         // Events already queued for this View finish the run themselves; restoring
                                         // from the snapshot now would print the reply a second way.
                                         if outcome_pending && !events.is_empty() && Some(snapshot.id)==selected_chat {
@@ -4096,7 +4163,6 @@ async fn interact(
                                             continue;
                                         }
                                         sync_snapshot(&snapshot,&mut pending,&mut permissions,&mut questions);
-                                        for receipt in awaiting_events {pending.entry(receipt.run_id).or_insert(receipt);}
                                     }
                                 }
                                 if row.availability==ExecutionAvailability::Live {
@@ -4130,6 +4196,9 @@ async fn interact(
                         } else {None};
                         if notice.is_some() || selected_chat.is_none() || overview_active {
                             console.set_connection_notice(notice.or_else(||agent.disconnected()))?;
+                        } else {
+                            // A selected Agent shows its own loss as its execution notice.
+                            console.set_connection_notice(None)?;
                         }
                         status_dirty=true;
                     }
@@ -4215,6 +4284,35 @@ async fn interact(
             }
         }
     }
+}
+
+/// Claude Code's auto-restore on interrupt: with nothing typed, asks the Agent to take back the
+/// prompt of the interrupted run; when it did, the conversation is drawn again without that turn
+/// and the prompt returns to the editor.
+async fn take_back_interrupted_prompt(
+    agent: &Agent,
+    console: &Console,
+    chat: uuid::Uuid,
+    run: uuid::Uuid,
+) -> Result<Option<(ChatSnapshot, TakenBackPrompt)>, String> {
+    if !console.input_is_empty()? {
+        return Ok(None);
+    }
+    let (snapshot, draft) = match agent.take_back_interrupted_prompt(chat, run).await {
+        Ok(Some(taken_back)) => taken_back,
+        Ok(None) => return Ok(None),
+        Err(error) => {
+            console.set_status(&format!(
+                "Cannot restore the interrupted prompt: {}",
+                safe_line(&error.to_string())
+            ))?;
+            return Ok(None);
+        }
+    };
+    console.reset_chat(chat)?;
+    workflows::write_public_history(console, &snapshot)?;
+    console.restore_interrupted_prompt(&draft.prompt, &draft.contexts)?;
+    Ok(Some((snapshot, draft)))
 }
 
 async fn open_rewind(
@@ -4516,28 +4614,38 @@ fn sync_snapshot(
     permissions: &mut HashMap<uuid::Uuid, PermissionRequestOwner>,
     questions: &mut HashMap<uuid::Uuid, QuestionRequest>,
 ) {
-    use tickloop_agent_protocol::LoopState;
     sync_snapshot_requests(snapshot, permissions, questions);
     pending.retain(|_, receipt| receipt.chat_id != snapshot.id);
-    for input in snapshot.pending_inputs.iter().filter(|input| input.armed) {
-        pending.insert(input.receipt.run_id, input.receipt.clone());
+    for receipt in receipts_in_progress(snapshot) {
+        pending.insert(receipt.run_id, receipt);
     }
-    for goal in &snapshot.loops {
-        if matches!(
-            goal.state,
-            LoopState::Running | LoopState::WaitingPermission | LoopState::WaitingQuestion
-        ) && let Some(run_id) = goal.run_id
-        {
-            pending.insert(
-                run_id,
-                Receipt {
-                    chat_id: snapshot.id,
-                    loop_id: goal.id,
-                    run_id,
-                },
-            );
-        }
-    }
+}
+
+/// The runs `snapshot` still has in progress: each armed queued input and each Loop running or
+/// waiting on the user. A run outside them has ended, whether or not its end event arrived.
+fn receipts_in_progress(
+    snapshot: &tickloop_agent_protocol::ChatSnapshot,
+) -> impl Iterator<Item = Receipt> + '_ {
+    use tickloop_agent_protocol::LoopState;
+    let queued = snapshot
+        .pending_inputs
+        .iter()
+        .filter(|input| input.armed)
+        .map(|input| input.receipt.clone());
+    let running = snapshot.loops.iter().filter_map(|goal| {
+        let run_id = goal.run_id.filter(|_| {
+            matches!(
+                goal.state,
+                LoopState::Running | LoopState::WaitingPermission | LoopState::WaitingQuestion
+            )
+        })?;
+        Some(Receipt {
+            chat_id: snapshot.id,
+            loop_id: goal.id,
+            run_id,
+        })
+    });
+    queued.chain(running)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -4588,6 +4696,7 @@ async fn restore_view(
         .observe(chat, after)
         .await
         .map_err(|error| error.to_string())?;
+    learn_agent_colors(console, agent, &observation.snapshot).await?;
     let observation = render_restored_observation(
         console,
         tools,
@@ -4743,11 +4852,9 @@ fn render_restored_observation(
             {
                 console.write_pieces(&[presentation::thinking_label()])?;
             }
-            let review = tools.completed_edit(event).and_then(|call_id| {
-                presentation::file_change_review(&observation.snapshot, event.run_id, call_id)
-            });
+            let facts = tools.call_facts(event, &observation.snapshot);
             let interrupted_by_rejection = tools.ended_with_rejection(event.run_id);
-            if tools.present_event(console, event, review.as_ref())? {
+            if tools.present_event(console, event, &facts)? {
                 continue;
             }
             match &event.kind {
@@ -4755,10 +4862,7 @@ fn render_restored_observation(
                     &presentation::family_input_text(record, presentation::OutputDetail::Preview),
                 )?,
                 EventKind::FamilyRunCompleted { completion } => {
-                    console.write(&presentation::family_completion_text(
-                        completion,
-                        presentation::OutputDetail::Preview,
-                    ))?
+                    show_family_completion(console, completion, &observation.snapshot)?
                 }
                 EventKind::Thinking(thinking) => {
                     if !console.is_interactive() {
@@ -4838,14 +4942,11 @@ fn render_restored_observation(
                     plan.loop_id,
                     safe_text(&plan.markdown)
                 ),
-                EventKind::ProgressUpdated { progress } => {
+                // The Todo list shows progress; only plain output writes it out.
+                EventKind::ProgressUpdated { progress } if !console.is_interactive() => {
+                    outln!(console, "\nProgress for goal {}:", progress.loop_id);
                     for todo in &progress.todos {
-                        outln!(
-                            console,
-                            "\nProgress {:?}: {}",
-                            todo.status,
-                            safe_text(&todo.content)
-                        );
+                        outln!(console, "  {:?}: {}", todo.status, safe_text(&todo.content));
                     }
                 }
                 EventKind::PermissionChecked { decision, reason }
@@ -5760,25 +5861,122 @@ fn show_consumed_family_input(
                 }
             }
         }
-        for content in &message.content {
-            if let tickloop_agent_protocol::Content::Text { text } = content
-                && let Some(
-                    local @ tickloop_agent_protocol::LocalMessage::AgentCommunication { .. },
-                ) = tickloop_agent_protocol::LocalMessage::parse(text)
-            {
-                console.write_roles(&[(
-                    presentation::local_message_text(
-                        &local,
-                        presentation::OutputDetail::Preview,
-                        console.display_profile()?,
-                    ),
-                    Some(Role::MutedText),
-                )])?;
+        let mut awaits_completion = false;
+        let agent_texts = message
+            .content
+            .iter()
+            .filter(|_| snapshot.agent_message_origins.contains_key(id))
+            .filter_map(|content| match content {
+                tickloop_agent_protocol::Content::Text { text } => Some(text),
+                _ => None,
+            });
+        for text in agent_texts {
+            let Some(local) = presentation::typed_local_message(text, true) else {
+                continue;
+            };
+            match agent_messaging::agent_input(snapshot, Some(*id), &local) {
+                AgentInput::Result(completion) => {
+                    show_family_completion(console, completion, snapshot)?;
+                }
+                AgentInput::PendingResult => awaits_completion = true,
+                AgentInput::Message => {
+                    if let Some(message) = AgentMessage::of(&local, snapshot, Some(*id)) {
+                        write_block(
+                            console,
+                            agent_messaging::message_runs(
+                                &message,
+                                &console.agent_colors()?,
+                                presentation::OutputDetail::Preview,
+                                console.display_profile()?,
+                            ),
+                        )?;
+                    }
+                }
             }
         }
-        console.mark_input_echoes(snapshot.id, [*id])?;
+        // A report whose run has not ended shows with the child's completion.
+        if !awaits_completion {
+            console.mark_input_echoes(snapshot.id, [*id])?;
+        }
     }
     Ok(())
+}
+
+/// Shows a background child's completion once, as one block with the report it delivered;
+/// whichever of the two reaches this View first draws it. A foreground child's report is under
+/// its call. A notice that later failed to reach the parent adds that line on its own.
+fn show_family_completion(
+    console: &Console,
+    completion: &tickloop_agent_protocol::FamilyCompletion,
+    snapshot: &ChatSnapshot,
+) -> Result<(), String> {
+    if !completion.notification.is_background() {
+        console.mark_input_echoes(snapshot.id, [completion.child_run_id])?;
+        return Ok(());
+    }
+    if console.input_is_echoed(snapshot.id, completion.child_run_id)? {
+        if let tickloop_agent_protocol::SubagentNotificationDelivery::Rejected(rejection) =
+            &completion.notification
+        {
+            console.write_roles(&[(
+                format!(
+                    "\nNotification for @{} not delivered: {}\n",
+                    safe_line(&completion.handle),
+                    safe_line(&rejection.message)
+                ),
+                Some(Role::MutedText),
+            )])?;
+        }
+        return Ok(());
+    }
+    write_block(
+        console,
+        agent_messaging::completion_runs(
+            completion,
+            snapshot,
+            &console.agent_colors()?,
+            presentation::OutputDetail::Preview,
+            console.display_profile()?,
+        ),
+    )?;
+    console.mark_input_echoes(snapshot.id, [completion.child_run_id])
+}
+
+/// A heading and the `⎿` rows under it.
+fn write_block(
+    console: &Console,
+    (heading, response): (presentation::RoleRuns, presentation::RoleRuns),
+) -> Result<(), String> {
+    let mut pieces = console::ConversationPiece::block_runs(&heading);
+    if !response.is_empty() {
+        pieces.push(console::ConversationPiece::Response(response));
+    }
+    console.write_pieces(&pieces)
+}
+
+/// Learns the Agent Colors of the Agents `snapshot`'s conversation names that this View has not
+/// seen yet, from the Agent catalog.
+async fn learn_agent_colors(
+    console: &Console,
+    agent: &Agent,
+    snapshot: &ChatSnapshot,
+) -> Result<(), String> {
+    let known = console.agent_colors()?;
+    let unknown = agent_messaging::named_agents(snapshot)
+        .into_iter()
+        .filter(|chat| !known.contains_key(chat))
+        .collect::<Vec<_>>();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    let Ok(rows) = agent.catalog().await else {
+        return Ok(());
+    };
+    let mut colors = agent_messaging::catalog_colors(&rows);
+    for chat in unknown {
+        colors.entry(chat).or_insert(None);
+    }
+    console.remember_agent_colors(colors)
 }
 
 async fn track_accepted_echo(
@@ -6947,6 +7145,7 @@ async fn navigate_agent(
                 console.set_global_overview(None)?;
                 let restored = console.activate_agent(chat)?;
                 if !restored {
+                    learn_agent_colors(console, agent, &snapshot).await?;
                     workflows::write_public_history(console, &snapshot)?;
                 } else if let Some(observation) = observation {
                     let mut presentation = ToolPresentation::new(!console.is_interactive());
@@ -7538,6 +7737,66 @@ mod tests {
     }
 
     #[test]
+    fn a_child_report_and_its_completion_draw_one_block_whichever_arrives_first() {
+        use super::{ChatSnapshot, Console, show_consumed_family_input, show_family_completion};
+        let child_run = uuid::Uuid::new_v4();
+        let report = tickloop_agent_protocol::SubagentReportMessage {
+            note: None,
+            report: "Report line".into(),
+        };
+        let text = format!(
+            "<agent-message>{}</agent-message>",
+            serde_json::json!({"source":{"message_id":child_run,"sender_handle":"audit","sender_label":"audit","is_result":true},"message":report.text()})
+        );
+        let completion = tickloop_agent_protocol::FamilyCompletion {
+            child_chat_id: uuid::Uuid::new_v4(),
+            child_loop_id: uuid::Uuid::new_v4(),
+            child_run_id: child_run,
+            handle: "audit".into(),
+            state: tickloop_agent_protocol::LoopState::Completed,
+            result: tickloop_agent_protocol::SUBAGENT_REPORT_RECEIPT.into(),
+            error: None,
+            started_at: Some(1_000),
+            finished_at: 3_000,
+            triggering_message_ids: Vec::new(),
+            notification: tickloop_agent_protocol::SubagentNotificationDelivery::Queued,
+            usage: Default::default(),
+        };
+        for report_first in [true, false] {
+            let chat = uuid::Uuid::new_v4();
+            let run = uuid::Uuid::new_v4();
+            let mut snapshot: ChatSnapshot = serde_json::from_value(serde_json::json!({
+                "id":chat,"workdir":"/work","loops":[],
+                "messages":[{"role":"user","content":[{"type":"text","text":text}]}]
+            }))
+            .unwrap();
+            snapshot.message_ids.insert(0, child_run);
+            snapshot.message_runs.insert(0, run);
+            snapshot
+                .agent_message_origins
+                .insert(child_run, serde_json::json!({"is_result":true}));
+            let console = Console::test_interactive_for_chat(chat);
+            if report_first {
+                show_consumed_family_input(&console, &snapshot, run).unwrap();
+                assert!(
+                    !console.test_conversation_text().contains("Report line"),
+                    "a report whose run has not ended waits for its completion"
+                );
+                assert!(!console.input_is_echoed(chat, child_run).unwrap());
+            }
+            snapshot.family_completions.push(completion.clone());
+            show_family_completion(&console, &completion, &snapshot).unwrap();
+            show_consumed_family_input(&console, &snapshot, run).unwrap();
+            show_family_completion(&console, &completion, &snapshot).unwrap();
+            assert_eq!(
+                console.test_conversation_text(),
+                "\n⏺ @audit finished · 2s\n  ⎿  Report line\n",
+                "report first: {report_first}"
+            );
+        }
+    }
+
+    #[test]
     fn consumed_agent_message_stays_deferred_until_the_selected_view_can_render_it() {
         use super::{
             ChatSnapshot, Console, consume_input_echo_from_snapshot,
@@ -8043,6 +8302,7 @@ mod tests {
             text: "/branch summary-busy".into(),
             file_references: Vec::new(),
             images: Vec::new(),
+            send_now: false,
         }));
         assert!(!should_pause_input_for_summary(&InputEvent::Line(
             "/branch".into()
@@ -8052,6 +8312,7 @@ mod tests {
             text: "continue after summary".into(),
             file_references: Vec::new(),
             images: Vec::new(),
+            send_now: false,
         }));
     }
 
@@ -8355,6 +8616,118 @@ mod tests {
         );
         assert_eq!(model.requests.lock().unwrap().len(), 2);
         assert!(!target.exists());
+        agent.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn an_interrupt_before_any_reply_puts_the_prompt_back_only_into_an_empty_editor() {
+        use tickloop_agent_model::{ModelClient, ModelDelta, ModelError, ModelOutput};
+        use tickloop_agent_protocol::{ImageContext, ImageOrigin, InputContext};
+
+        struct UntilInterrupted(tokio::sync::Notify);
+
+        #[async_trait::async_trait]
+        impl ModelClient for UntilInterrupted {
+            async fn generate_title(
+                &self,
+                request: tickloop_agent_model::ModelRequest,
+                _: tokio::sync::mpsc::UnboundedSender<ModelDelta>,
+                _: tokio_util::sync::CancellationToken,
+            ) -> Result<ModelOutput, ModelError> {
+                Ok(tickloop_agent_test_support::title_output(request))
+            }
+
+            fn identity(&self) -> tickloop_agent_protocol::ModelIdentity {
+                tickloop_agent_protocol::ModelIdentity {
+                    provider: tickloop_agent_protocol::ModelProvider::Api,
+                    profile: "fixture".into(),
+                    protocol: tickloop_agent_protocol::Protocol::Messages,
+                    requested_model: "fixture".into(),
+                }
+            }
+
+            async fn complete(
+                &self,
+                _: tickloop_agent_model::ModelRequest,
+                _: tokio::sync::mpsc::UnboundedSender<ModelDelta>,
+                cancel: tokio_util::sync::CancellationToken,
+            ) -> Result<ModelOutput, ModelError> {
+                self.0.notify_one();
+                cancel.cancelled().await;
+                Err(ModelError::Cancelled)
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let model = Arc::new(UntilInterrupted(tokio::sync::Notify::new()));
+        let agent = Agent::new_embedded(tickloop_agent_test_support::config(), model.clone());
+        let chat = agent.create_chat(directory.path().into()).await.unwrap();
+        let mut png = Vec::new();
+        ::image::DynamicImage::ImageRgba8(::image::RgbaImage::new(4, 3))
+            .write_to(
+                &mut std::io::Cursor::new(&mut png),
+                ::image::ImageFormat::Png,
+            )
+            .unwrap();
+        let image = ImageContext {
+            origin: ImageOrigin::Pasted { id: 1 },
+            image: tickloop_agent_base::image::prepare(&png).unwrap(),
+        };
+        let prompt = "Explain [Image #1]";
+        let mut events = agent.subscribe();
+        let receipt = agent
+            .submit_with_input_contexts(
+                chat,
+                None,
+                prompt.into(),
+                vec![InputContext::Image(image.clone())],
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        model.0.notified().await;
+        agent.interrupt(chat).await.unwrap();
+        loop {
+            let event = tickloop_agent_test_support::next_event(&mut events).await;
+            if event.run_id == receipt.run_id && matches!(event.kind, EventKind::Interrupted) {
+                break;
+            }
+        }
+        let console = Console::test_interactive_for_chat(chat);
+        super::workflows::write_public_history(&console, &agent.snapshot(chat).await.unwrap())
+            .unwrap();
+        assert!(console.test_conversation_text().contains(prompt));
+
+        console
+            .restore_rewind_draft("typed after the interrupt", &[])
+            .unwrap();
+        assert!(
+            super::take_back_interrupted_prompt(&agent, &console, chat, receipt.run_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "a draft typed after the interrupt keeps the prompt in the conversation"
+        );
+        assert!(console.test_conversation_text().contains(prompt));
+        assert_eq!(agent.snapshot(chat).await.unwrap().rewind_points().len(), 1);
+
+        let console = Console::test_interactive_for_chat(chat);
+        super::workflows::write_public_history(&console, &agent.snapshot(chat).await.unwrap())
+            .unwrap();
+        let (snapshot, draft) =
+            super::take_back_interrupted_prompt(&agent, &console, chat, receipt.run_id)
+                .await
+                .unwrap()
+                .expect("an empty editor gets the prompt back");
+        assert!(snapshot.messages.is_empty());
+        assert_eq!(draft.loop_id, None);
+        assert!(!console.test_conversation_text().contains(prompt));
+        assert_eq!(console.test_draft(), prompt);
+        assert_eq!(console.test_draft_images(), [image]);
+        assert_eq!(
+            console.test_status_text(),
+            "Interrupted prompt restored for editing"
+        );
         agent.shutdown().await;
     }
 

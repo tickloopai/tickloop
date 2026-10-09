@@ -15,17 +15,17 @@ use tickloop_agent_protocol::{
     AgentFilter, AgentHostOptions, AgentSummary, ArtifactTick, ChatSnapshot, ChunkedResponseKind,
     ClientMessage, CommandEnvelope, CommandReceipt, CommandResult, ConfigurationChange,
     ConnectionRegion, Content, Cursor, Decision, DisplayReceipt, DisplayUpdate, DisplayedView,
-    EnvironmentValue, ExecutionAvailability, ExecutionMode, ExecutionRef, HostLocation,
-    HostWorkContext, HostedMember, HostedMemberState, HostedResources, HostedScreenSnapshot,
-    HostedSnapshot, HostedViewGrant, ImageMediaType, ImageSource, InputModality, InteractionSource,
-    LaunchSpec, LiveChatSnapshot, LoopAction, Message, ModelAuthSource, ModelCard, ModelConfig,
-    ModelDiscovery, ModelProvider, MonitorMember, MonitorMemberSource, MonitorMembership,
-    ObservationChange, ObservationRequest, ObservationUpdate, ObservationValue, PROTOCOL_MAJOR,
-    PROTOCOL_MINOR, Page, PendingRequestKind, PermissionPolicy, PermissionRule, PermissionScope,
-    PersistenceState, ProductKind, Protocol, ProtocolLimits, ProviderConnection,
-    ProviderCredentialScope, ReasoningEffort, ReceiptState, RequestRef, ResetReason, Role,
-    ServerHello, ServerMessage, ThinkingBudgets, ThinkingControl, ToolResultBlock,
-    ToolResultContent, TranscriptRef, UserInput, ViewRef,
+    EnvironmentValue, ExecutionAvailability, ExecutionMode, ExecutionRef, HistoryAction,
+    HostLocation, HostWorkContext, HostedMember, HostedMemberState, HostedResources,
+    HostedScreenSnapshot, HostedSnapshot, HostedViewGrant, ImageMediaType, ImageSource,
+    InputModality, InteractionSource, LaunchSpec, LiveChatSnapshot, LoopAction, Message,
+    ModelAuthSource, ModelCard, ModelConfig, ModelDiscovery, ModelProvider, MonitorMember,
+    MonitorMemberSource, MonitorMembership, ObservationChange, ObservationRequest,
+    ObservationUpdate, ObservationValue, PROTOCOL_MAJOR, PROTOCOL_MINOR, Page, PendingRequestKind,
+    PermissionPolicy, PermissionRule, PermissionScope, PersistenceState, ProductKind, Protocol,
+    ProtocolLimits, ProviderConnection, ProviderCredentialScope, ReasoningEffort, ReceiptState,
+    RequestRef, ResetReason, Role, ServerHello, ServerMessage, TakenBackPrompt, ThinkingBudgets,
+    ThinkingControl, ToolResultBlock, ToolResultContent, TranscriptRef, UserInput, ViewRef,
 };
 
 const BLESS_VARIABLE: &str = "TICKLOOP_BLESS_WIRE_FIXTURES";
@@ -194,7 +194,7 @@ fn messages() -> Vec<Message> {
         Message {
             role: Role::System,
             content: vec![Content::Text {
-                text: "You are Tick Loop.".into(),
+                text: "You are Tickloop.".into(),
             }],
         },
         Message {
@@ -519,6 +519,10 @@ fn agent_commands_keep_their_recorded_wire() {
                     ),
                 },
             },
+            AgentCommand::ManageLoop {
+                execution: execution(),
+                action: LoopAction::SendNow { run_id: id(0x22) },
+            },
             AgentCommand::AddMonitorMember {
                 execution: execution(),
                 instance: herdr_instance(),
@@ -537,6 +541,10 @@ fn agent_commands_keep_their_recorded_wire() {
                 launch: None,
             },
             AgentCommand::FlushTranscripts,
+            AgentCommand::EditHistory {
+                execution: execution(),
+                action: HistoryAction::TakeBackInterruptedPrompt { run_id: id(0x20) },
+            },
         ],
     );
 }
@@ -738,6 +746,17 @@ fn command_results_keep_their_recorded_wire() {
             },
             CommandResult::Text("ok".into()),
             CommandResult::Done,
+            CommandResult::PromptTakenBack {
+                snapshot: Box::new(live_chat_snapshot()),
+                draft: TakenBackPrompt {
+                    loop_id: Some(id(0x10)),
+                    prompt: "Compare [Image #1]".into(),
+                    contexts: serde_json::from_value(json!([
+                        {"kind": "image", "origin": {"type": "pasted", "id": 1}, "image": {"media_type": "image/png", "data": "iVBORw0KGgo=", "width": 1, "height": 1}},
+                    ]))
+                    .unwrap(),
+                },
+            },
         ],
     );
 }

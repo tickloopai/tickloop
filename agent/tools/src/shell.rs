@@ -48,7 +48,7 @@ const MAX_TIMEOUT_MS: u64 = 600_000;
 const TERMINATION_GRACE: Duration = Duration::from_millis(200);
 const PROCESS_CHECK_INTERVAL: Duration = Duration::from_millis(10);
 const OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(40);
-/// 单个任务输出文件上限。Claude Code 为 5GB；Tick Loop 按工单 34 的决定保留 64 MiB。
+/// 单个任务输出文件上限。Claude Code 为 5GB；Tickloop 按工单 34 的决定保留 64 MiB。
 pub(crate) const MAX_COMMAND_OUTPUT_BYTES: u64 = 64 * 1024 * 1024;
 /// 命令被停止或随 Agent 关闭而终止时记录的原因。
 pub const CANCELLED_COMMAND_REASON: &str = "cancelled";

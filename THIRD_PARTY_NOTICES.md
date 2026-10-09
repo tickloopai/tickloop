@@ -1,6 +1,6 @@
 # Third-party notices
 
-This file records the source and applicable license of third-party code adapted into Tick Loop. It does not select a license for Tick Loop as a whole.
+This file records the source and applicable license of third-party code adapted into Tickloop. It does not select a license for Tickloop as a whole.
 
 ## Former Herdr layout adaptation
 
@@ -10,9 +10,9 @@ This file records the source and applicable license of third-party code adapted 
 - Former adapted source: `crates/tickloop/src/layout/tree.rs` and its regression tests, removed with the in-development workspace under [ADR 0012](./docs/adr/0012-remove-in-development-workspace-compatibility.md).
 - Applicable upstream license: Apache License, Version 2.0, as declared in Herdr's package metadata and [LICENSE at the reference revision](https://github.com/herdrdev/herdr/blob/120c682008a85dc17d7a13cc619a2fd5d25f3924/LICENSE). An unmodified copy is included in [licenses/Herdr-Apache-2.0.txt](./licenses/Herdr-Apache-2.0.txt).
 
-The former adaptation changed Herdr's Pane terminology to Tick Loop's Panel terminology and adjusted its layout types. This attribution and the license copy remain for historical source versions. The referenced upstream layout file contains no separate copyright attribution, and the reference checkout has no top-level NOTICE file.
+The former adaptation changed Herdr's Pane terminology to Tickloop's Panel terminology and adjusted its layout types. This attribution and the license copy remain for historical source versions. The referenced upstream layout file contains no separate copyright attribution, and the reference checkout has no top-level NOTICE file.
 
-Current Tick Loop connects to an independently running Herdr through its API; it does not build or distribute that former layout implementation. Herdr's repository is not a Tick Loop build dependency. This notice covers the former adapted source, not unrelated components or dependencies in Herdr.
+Current Tickloop connects to an independently running Herdr through its API; it does not build or distribute that former layout implementation. Herdr's repository is not a Tickloop build dependency. This notice covers the former adapted source, not unrelated components or dependencies in Herdr.
 
 ## Longbridge Terminal pure functions
 

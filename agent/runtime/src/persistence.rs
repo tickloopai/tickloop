@@ -1382,7 +1382,7 @@ fn record_loop(
     Line::System(entry)
 }
 
-/// Tick Loop 不写 `preservedSegment`（见 `ChatRecorder::compact`）；读取时仍兼容带区段的文件。
+/// Tickloop 不写 `preservedSegment`（见 `ChatRecorder::compact`）；读取时仍兼容带区段的文件。
 fn compact_metadata_entry(boundary: &CompactBoundary) -> CompactMetadata {
     CompactMetadata {
         trigger: match boundary.trigger {
@@ -1411,7 +1411,7 @@ fn compaction_marker(entry: &ChainEntry) -> Option<CompactionMarker> {
             pre_tokens: metadata.pre_tokens,
             user_context: metadata.user_context.clone(),
             messages_summarized: metadata.messages_summarized,
-            // 链上有父条目的边界不是对话链的起点：Tick Loop 重写的保留边界，或 Claude Code
+            // 链上有父条目的边界不是对话链的起点：Tickloop 重写的保留边界，或 Claude Code
             // 保留区段重接后的边界。
             preserved_by_later_summary: entry.parent_uuid.is_some(),
             original_user_inputs: metadata.original_user_inputs.clone(),
@@ -2457,7 +2457,7 @@ impl Agent {
     /// 末尾，让只读尾部的列表仍能取到。
     ///
     /// Claude Code 同时清空按 sessionId 缓存的 uuid 集合（`clearSessionMessagesCache`），下次写入时从
-    /// 文件重新读取；Tick Loop 的去重集合由写入器随写入增量维护，与文件内容一致，无需重建。
+    /// 文件重新读取；Tickloop 的去重集合由写入器随写入增量维护，与文件内容一致，无需重建。
     pub(super) async fn reappend_transcript_metadata(&self, chat_id: ChatId) {
         let Some(recorder) = &self.inner.recorder else {
             return;

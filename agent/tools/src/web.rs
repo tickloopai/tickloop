@@ -721,9 +721,10 @@ async fn request(
     let (client, route) = build_http_client(&url, policy)
         .map_err(|_| ToolError::Network("cannot initialize HTTP client".into()))?;
     for redirects in 0..=MAX_REDIRECTS {
-        let mut request = client
-            .get(url.clone())
-            .header(reqwest::header::USER_AGENT, "TickLoop-Agent/0.1");
+        let mut request = client.get(url.clone()).header(
+            reqwest::header::USER_AGENT,
+            concat!("Tickloop-Agent/", env!("CARGO_PKG_VERSION")),
+        );
         if let Some(key) = key {
             request = request.header("X-API-Key", key);
         }

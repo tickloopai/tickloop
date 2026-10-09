@@ -8,8 +8,8 @@ use async_trait::async_trait;
 use serde_json::json;
 use tickloop_agent_model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
 use tickloop_agent_protocol::{
-    ChatId, ChatSnapshot, Content, Event, EventKind, LoopState, ModelIdentity, Protocol, Role,
-    Usage,
+    ChatId, ChatSnapshot, CommandState, Content, Event, EventKind, LoopState, ModelIdentity,
+    Protocol, Role, Usage,
 };
 use tickloop_agent_runtime::Agent;
 use tickloop_agent_test_support::{ScriptedModel, call, config, next_event, text};
@@ -220,6 +220,94 @@ async fn a_foreground_command_past_its_timeout_moves_to_the_background_and_notif
     ] {
         assert!(notification.contains(&expected), "{notification}");
     }
+}
+
+#[tokio::test]
+async fn a_foreground_command_the_user_backgrounds_returns_at_once_and_notifies_on_completion() {
+    let directory = tempfile::tempdir().unwrap();
+    let gate = directory.path().join("release");
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "long-shell",
+            "Bash",
+            json!({
+                "command": format!("printf began; {}; printf finished", gated_command(&gate)),
+                "description": "Wait for the release gate"
+            }),
+        ),
+        text("the user moved the command to the background"),
+        text("the background command finished"),
+    ]));
+    let agent = Agent::new_embedded(config(), model.clone());
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let mut events = agent.subscribe();
+    agent.submit(chat, None, "run it".into()).await.unwrap();
+    let running = loop {
+        match next_event(&mut events).await.kind {
+            EventKind::PermissionRequested { request } => {
+                agent
+                    .answer_permission(chat, request.id, true)
+                    .await
+                    .unwrap();
+            }
+            EventKind::CommandUpdated { command } if command.state == CommandState::Running => {
+                break command;
+            }
+            EventKind::Failed(error) => panic!("run failed: {error}"),
+            _ => {}
+        }
+    };
+
+    let backgrounded = agent
+        .background_command(chat, running.operation_id)
+        .await
+        .unwrap();
+    assert_eq!(backgrounded.state, CommandState::Background);
+    assert_eq!(backgrounded.pid, running.pid);
+    finish_run(&agent, chat, &mut events).await;
+    let moved = agent.snapshot(chat).await.unwrap();
+    assert_eq!(
+        tool_result_text(&moved, "long-shell"),
+        format!(
+            "Command was manually backgrounded by user with ID: {}. Output is being written to: {}",
+            running.operation_id,
+            running.output_ref.display()
+        )
+    );
+    assert_eq!(model.requests.lock().unwrap().len(), 2);
+    assert_eq!(
+        agent.commands(chat).await.unwrap()[0].state,
+        CommandState::Background,
+        "the tool returned while its command keeps running"
+    );
+
+    std::fs::write(&gate, b"release").unwrap();
+
+    let snapshot = wait_for_snapshot(&agent, chat, |snapshot| {
+        conversation_texts(snapshot)
+            .last()
+            .is_some_and(|text| text == "the background command finished")
+    })
+    .await;
+    let notification = conversation_texts(&snapshot)
+        .into_iter()
+        .find(|text| text.starts_with("<task-notification>"))
+        .expect("task notification message");
+    for expected in [
+        format!("<task-id>{}</task-id>", running.operation_id),
+        "<tool-use-id>long-shell</tool-use-id>".into(),
+        "<status>completed</status>".into(),
+        "<summary>Background command \"Wait for the release gate\" completed (exit code 0)</summary>"
+            .into(),
+    ] {
+        assert!(notification.contains(&expected), "{notification}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(&running.output_ref).unwrap(),
+        "beganfinished",
+        "output written after backgrounding lands in the same file"
+    );
+    assert_eq!(model.requests.lock().unwrap().len(), 3);
 }
 
 #[tokio::test]

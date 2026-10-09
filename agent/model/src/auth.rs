@@ -1045,7 +1045,7 @@ async fn handle_browser_callback(
                     }
                     Ok(code) => (
                         200,
-                        "Authorization code received. Return to Tick Loop to finish login; the terminal will confirm whether it succeeded.",
+                        "Authorization code received. Return to Tickloop to finish login; the terminal will confirm whether it succeeded.",
                         Some(Ok(code)),
                     ),
                     Err(AuthError::StateMismatch) => (400, CALLBACK_STATE_MISMATCH, None),

@@ -23,7 +23,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const DEFAULT_POLL_SECONDS: u64 = 5;
 const DEFAULT_TOKEN_LIFETIME_SECONDS: u64 = 3600;
 const SLOW_DOWN_SECONDS: u64 = 5;
-const CLIENT_NAME: &str = "Tick Loop";
+const CLIENT_NAME: &str = "Tickloop";
 const REDIRECT_URI: &str = "http://localhost:60355/callback";
 
 #[derive(Clone)]
@@ -263,7 +263,7 @@ pub async fn run_login(
     let login = begin_login(region, storage, endpoints.clone()).await?;
     writeln!(
         output,
-        "\nTick Loop · Longbridge\n\n1. Open this link in your browser:\n   {}\n\n2. Confirm this device code and approve access:\n   {}\n\nWaiting for Longbridge to confirm (up to {}s). Ctrl+C cancels.",
+        "\nTickloop · Longbridge\n\n1. Open this link in your browser:\n   {}\n\n2. Confirm this device code and approve access:\n   {}\n\nWaiting for Longbridge to confirm (up to {}s). Ctrl+C cancels.",
         login.verification_uri(),
         login.user_code(),
         login.expires_in()

@@ -23,17 +23,18 @@ use crate::{
     PermissionRequest, PermissionRule, PermissionScope, PermissionsRevision, PermissionsView,
     ProviderPatch, QuestionAnswer, QuestionRequest, QueuedInput, ReasoningEffort, Receipt,
     RequestUsageLedger, RewindDraft, RewindMode, RewindPoint, RunId, SavedChat, SearchConfig,
-    ShellTask, ShellTaskOutputChunk, SubagentRegistration, SummaryDirection, TaskNotification,
-    TickSubscriptionChange, TickSubscriptionStatus, ToolCallRecovery, Trigger, TriggerSource,
-    UserShellReceipt, UserShellRecord,
+    ShellTask, ShellTaskOutputChunk, SubagentRegistration, SummaryDirection, TakenBackPrompt,
+    TaskNotification, TickSubscriptionChange, TickSubscriptionStatus, ToolCallRecovery, Trigger,
+    TriggerSource, UserShellReceipt, UserShellRecord,
 };
 
 /// Business 16.0 adds the Shell description request kind to the usage ledger; 16.1 adds the
-/// daemon's build identity and executable to its Hello.
+/// daemon's build identity and executable to its Hello; 16.2 adds the Loop action that sends a
+/// queued message now; 16.3 adds taking back an interrupted prompt to the history actions.
 /// Older business majors are refused before dispatch;
 /// the frozen daemon management protocol remains independent.
 pub const PROTOCOL_MAJOR: u16 = 16;
-pub const PROTOCOL_MINOR: u16 = 1;
+pub const PROTOCOL_MINOR: u16 = 3;
 
 static BUILD_IDENTITY: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
 
@@ -234,6 +235,8 @@ pub enum AgentCommand {
         execution: ExecutionRef,
         tick: ArtifactTick,
     },
+    /// Unlinks the artifact from the Chat: it leaves Monitor and its association with the
+    /// Chat's Loops ends.
     RemoveArtifactTick {
         execution: ExecutionRef,
         instance_id: String,
@@ -455,6 +458,11 @@ pub enum HistoryAction {
         message_id: Uuid,
         mode: RewindMode,
     },
+    /// Takes back the prompt of the user-interrupted run `run_id` for editing when the run has no
+    /// assistant text or tool call yet; answers `PromptTakenBack` when it did, `Done` when not.
+    TakeBackInterruptedPrompt {
+        run_id: Uuid,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -464,6 +472,11 @@ pub enum LoopAction {
         loop_id: Uuid,
     },
     Interrupt,
+    /// Interrupts the current work so the queued user message `run_id` starts now; does nothing
+    /// once the message has joined a run or when no work runs ahead of it.
+    SendNow {
+        run_id: Uuid,
+    },
     DisableEventSources {
         loop_id: Uuid,
     },
@@ -946,6 +959,10 @@ pub enum CommandResult {
         conversation_restored: bool,
         draft: Option<RewindDraft>,
     },
+    PromptTakenBack {
+        snapshot: Box<LiveChatSnapshot>,
+        draft: TakenBackPrompt,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1331,6 +1348,7 @@ fn receipt_carries_history(receipt: &CommandReceipt) -> bool {
                 | CommandResult::Compact { .. }
                 | CommandResult::DirectedSummary { .. }
                 | CommandResult::Rewind { .. }
+                | CommandResult::PromptTakenBack { .. }
                 | CommandResult::QueueTaken(_)
         )
     )

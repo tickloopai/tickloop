@@ -11,7 +11,8 @@ use super::workspace_trust::{TRUST_ACCEPT_CHOICE_INDEX, TrustDecision, Workspace
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{
     self, DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange,
-    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseButton,
+    MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::terminal::{self, Clear, ClearType, ScrollUp};
 use crossterm::{execute, queue};
@@ -32,6 +33,9 @@ mod conversation_picker_tests;
 mod dialog_height_pty;
 #[cfg(test)]
 mod dialog_height_tests;
+#[cfg(test)]
+#[path = "console/foreground_command_tests.rs"]
+mod foreground_command_tests;
 mod input_dialog;
 #[cfg(test)]
 mod input_dialog_pty;
@@ -57,6 +61,8 @@ mod prompt_suggestion_tests;
 #[path = "console/request_layout_tests.rs"]
 mod request_layout_tests;
 #[cfg(test)]
+mod send_now_pty;
+#[cfg(test)]
 #[path = "console/unified_footer_tests.rs"]
 mod unified_footer_tests;
 #[cfg(test)]
@@ -69,6 +75,7 @@ pub(super) use agent_layout::{
 };
 
 use super::{
+    agent_messaging::AgentColors,
     clipboard::Clipboard,
     clipboard_hint::{CLIPBOARD_IMAGE_HINT, ClipboardImageHint},
     completion::{
@@ -130,6 +137,7 @@ const DIVIDER_EDGE_RULE_COLUMNS: usize = 1;
 const DIVIDER_ENTRY_GAP_COLUMNS: usize = 1;
 const CREATION_ATTACH_UNAVAILABLE_PREFIX: &str = "New Agent created; local connection unavailable";
 const EXECUTION_CONNECTION_DETAILS_HINT: &str = "ctrl+o details";
+const SEND_NOW_HINT: &str = "ctrl+enter send now";
 const HINT_SEGMENT_SEPARATOR: &str = " · ";
 /// Blank columns between the key hints and the right-aligned notice.
 const HINT_NOTICE_GAP_COLUMNS: usize = 2;
@@ -208,6 +216,11 @@ const MIN_MENU_TERMINAL_ROWS: usize = FOOTER_ROWS + MIN_SCROLL_ROWS + MIN_MENU_B
 const EXIT_CONFIRMATION_WINDOW: Duration = Duration::from_millis(800);
 const ESCAPE_CONFIRMATION_WINDOW: Duration = Duration::from_millis(800);
 const SHELL_BACKGROUND_CHORD_WINDOW: Duration = Duration::from_millis(800);
+/// Claude Code `PROGRESS_THRESHOLD_MS`: how long the model's foreground Bash runs before ctrl+b
+/// can move it to the background.
+const FOREGROUND_COMMAND_HINT_DELAY: Duration = Duration::from_secs(2);
+/// Claude Code `BackgroundHint`, under the running Bash call at its response column.
+const FOREGROUND_COMMAND_HINT: &str = "     (ctrl+b to run in background)";
 const SECRET_PASTE_ERROR: &str = "API key paste must contain one line of text";
 pub(super) const REFRESH_ACCOUNT_MODELS_LABEL: &str = "Refresh account models";
 const COMPACT_PICKER_COLUMNS: usize = 100;
@@ -216,6 +229,7 @@ const SHELL_HISTORY_CACHE_TTL: Duration = Duration::from_secs(60);
 const NO_CLIPBOARD_IMAGE: &str = "No image found in clipboard";
 const NO_CLIPBOARD_IMAGE_OVER_SSH: &str = "No image found in clipboard · over SSH this reads the remote host's clipboard; attach the image with @path instead";
 const IMAGE_INPUT_UNSUPPORTED: &str = "Current model does not support image input · switch to a model that accepts images with /model";
+const INTERRUPTED_PROMPT_RESTORED: &str = "Interrupted prompt restored for editing";
 
 pub(super) enum InputEvent {
     Line(String),
@@ -225,6 +239,13 @@ pub(super) enum InputEvent {
         file_references: Vec<PathBuf>,
         /// Pasted images in the order of their `[Image #N]` placeholders.
         images: Vec<ImageContext>,
+        /// ctrl+enter: a message accepted while the Agent works is sent now instead of joining
+        /// at the next tool boundary.
+        send_now: bool,
+    },
+    /// ctrl+enter with an empty draft sends the oldest queued message now.
+    SendQueuedNow {
+        run_id: Uuid,
     },
     UserShellSubmitted(UserShellSubmission),
     BackgroundForegroundShell,
@@ -313,12 +334,18 @@ impl fmt::Debug for InputEvent {
                 text,
                 file_references,
                 images,
+                send_now,
             } => formatter
                 .debug_struct("Prompt")
                 .field("family_target", family_target)
                 .field("text", text)
                 .field("file_references", file_references)
                 .field("images", &images.len())
+                .field("send_now", send_now)
+                .finish(),
+            Self::SendQueuedNow { run_id } => formatter
+                .debug_struct("SendQueuedNow")
+                .field("run_id", run_id)
                 .finish(),
             Self::UserShellSubmitted(value) => formatter
                 .debug_tuple("UserShellSubmitted")
@@ -569,6 +596,9 @@ pub(super) struct State {
     prompt_suggestion: Option<String>,
     prompt_suggestion_request: Option<super::prompt_suggestion::SuggestionRequest>,
     foreground_shell: bool,
+    /// The model's foreground Bash commands in the shown Chat, each with when this View first saw
+    /// it running.
+    foreground_commands: Vec<(Uuid, Instant)>,
     shell_background_chord_started_at: Option<Instant>,
     width: usize,
     height: usize,
@@ -577,6 +607,8 @@ pub(super) struct State {
     creation_prefixes: HashMap<Option<Uuid>, Vec<CreationPrefixEntry>>,
     echoed_inputs: HashSet<Uuid>,
     awaiting_input_echoes: HashSet<Uuid>,
+    /// Agent Colors of every Agent this View has learned of, shared by all its conversations.
+    agent_colors: AgentColors,
     pub(super) chat: Option<Uuid>,
     activity_interruptible: bool,
     back_to_bottom_target: Option<BackToBottomTarget>,
@@ -747,6 +779,8 @@ enum RenderedView {
     Overview,
     Transcript,
     DiffScreen,
+    /// A full-screen Monitor detail, an input dialog below it while one is open.
+    TickDetail,
 }
 
 #[derive(Clone, Copy)]
@@ -1080,6 +1114,16 @@ fn hints_beside_notice(hints: &str, notice: RoleLine, width: usize) -> RoleLine 
     line.filled(Role::StatusBar)
 }
 
+/// With the kitty keyboard protocol on, ctrl+[ arrives as itself rather than as the escape it
+/// always meant in a terminal; it keeps meaning escape.
+fn legacy_escape(key: KeyEvent) -> KeyEvent {
+    if key.code == KeyCode::Char('[') && key.modifiers == KeyModifiers::CONTROL {
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)
+    } else {
+        key
+    }
+}
+
 /// Keeps frames off the terminal until dropped. Writes made meanwhile reach
 /// the terminal as one frame, so a burst of them cannot repaint the screen
 /// once per write.
@@ -1131,9 +1175,31 @@ impl Console {
             .join("\n")
     }
 
+    /// The rows [`Self::test_conversation_text`] reads, with the role of each span.
+    #[cfg(test)]
+    pub(super) fn test_conversation_rows(&self) -> Vec<RoleLine> {
+        self.state
+            .lock()
+            .unwrap()
+            .scrollback
+            .frame(120, 1000)
+            .styled
+    }
+
     #[cfg(test)]
     pub(super) fn test_status_text(&self) -> String {
         self.state.lock().unwrap().status.clone()
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_draft(&self) -> String {
+        self.state.lock().unwrap().editor.draft().to_owned()
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_draft_images(&self) -> Vec<ImageContext> {
+        let state = self.state.lock().unwrap();
+        state.paste_blocks.images(state.editor.draft())
     }
 
     #[cfg(test)]
@@ -1634,11 +1700,10 @@ impl Console {
     pub(super) fn set_connection_notice(&self, notice: Option<String>) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         let notice = notice.map(|notice| display_single_line(&notice));
-        if state.connection_notice == notice && state.execution_connection_notice.is_none() {
+        if state.connection_notice == notice {
             return Ok(());
         }
         state.connection_notice = notice;
-        state.execution_connection_notice = None;
         state
             .draw(&mut io::stdout().lock())
             .map_err(|error| error.to_string())
@@ -1658,11 +1723,12 @@ impl Console {
                 .last_connection_diagnostics
                 .insert(chat, display_text(&cause));
         }
-        if state.execution_connection_notice == notice && state.connection_notice.is_none() {
+        // The View's own connection notice is a separate fact that only the daemon refresh that set
+        // it clears; clearing it here made the two notices take turns every refresh.
+        if state.execution_connection_notice == notice {
             return Ok(());
         }
         state.execution_connection_notice = notice;
-        state.connection_notice = None;
         state
             .draw(&mut io::stdout().lock())
             .map_err(|error| error.to_string())
@@ -2198,6 +2264,24 @@ impl Console {
             .lock()
             .map_err(|error| error.to_string())?
             .image_links())
+    }
+
+    pub(super) fn agent_colors(&self) -> Result<AgentColors, String> {
+        Ok(self
+            .state
+            .lock()
+            .map_err(|error| error.to_string())?
+            .agent_colors
+            .clone())
+    }
+
+    pub(super) fn remember_agent_colors(&self, colors: AgentColors) -> Result<(), String> {
+        self.state
+            .lock()
+            .map_err(|error| error.to_string())?
+            .agent_colors
+            .extend(colors);
+        Ok(())
     }
 
     pub fn set_input_context(
@@ -3955,6 +4039,27 @@ impl Console {
         Ok(())
     }
 
+    /// Records the model's foreground Bash commands in the shown Chat.
+    pub(super) fn set_foreground_commands(&self, commands: &[Uuid]) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        if state.set_foreground_commands(commands, Instant::now()) {
+            state
+                .draw(&mut io::stdout().lock())
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// The foreground Bash commands ctrl+b moves to the background now.
+    pub(super) fn backgroundable_commands(&self) -> Result<Vec<Uuid>, String> {
+        Ok(self
+            .state
+            .lock()
+            .map_err(|error| error.to_string())?
+            .backgroundable_commands(Instant::now())
+            .collect())
+    }
+
     pub fn set_queued_inputs(&self, queued_inputs: Vec<QueuedInput>) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         if state.queued_inputs != queued_inputs {
@@ -4054,6 +4159,32 @@ impl Console {
                 if contexts.len() == 1 { "" } else { "s" }
             )
         };
+        state
+            .draw(&mut io::stdout().lock())
+            .map_err(|error| error.to_string())
+    }
+
+    /// Whether the editor holds nothing typed: no text and not in Shell mode.
+    pub(super) fn input_is_empty(&self) -> Result<bool, String> {
+        let state = self.state.lock().map_err(|error| error.to_string())?;
+        Ok(state.editor.draft().is_empty() && state.shell_input.kind() == InputKind::Prompt)
+    }
+
+    /// Claude Code `restoreMessageSync` after an interrupt took the prompt back: the prompt text
+    /// returns to the editor with its saved pasted images on their `[Image #N]` placeholders and
+    /// the other attachments for the next send, and, as `removeLastFromHistory`, leaves the input
+    /// history. Text typed while the prompt was being taken back stays after it.
+    pub(super) fn restore_interrupted_prompt(
+        &self,
+        prompt: &str,
+        contexts: &[InputContext],
+    ) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        if let Some(history) = &mut state.input_history {
+            history.withdraw_last(prompt);
+        }
+        state.restore_interrupted_prompt(prompt, contexts);
+        state.hold_status(INTERRUPTED_PROMPT_RESTORED);
         state
             .draw(&mut io::stdout().lock())
             .map_err(|error| error.to_string())
@@ -4246,7 +4377,7 @@ impl Console {
             .and_then(|()| {
                 write!(
                     output,
-                    "{RESET_SCROLL_REGION}\r\nTick Loop Agent suspended. Run `fg` to resume.\r\n"
+                    "{RESET_SCROLL_REGION}\r\nTickloop suspended. Run `fg` to resume.\r\n"
                 )
             })
             .and_then(|()| disable_input_reporting(&mut output))
@@ -4307,14 +4438,26 @@ fn restore_terminal(output: &mut impl Write, surface: &TerminalSurface) -> io::R
     paste.and(screen).and(cursor).and(mode)
 }
 
-/// Bracketed paste and focus reporting go on and off together wherever the
-/// console takes the terminal or hands it back.
+/// Bracketed paste, focus reporting and disambiguated keys go on and off together wherever the
+/// console takes the terminal or hands it back. Disambiguated keys (the kitty keyboard protocol,
+/// also passed through by Herdr) tell ctrl+enter from enter; terminals without the protocol
+/// ignore the request and keep sending legacy keys.
 fn enable_input_reporting(output: &mut impl Write) -> io::Result<()> {
-    execute!(output, EnableBracketedPaste, EnableFocusChange)
+    execute!(
+        output,
+        EnableBracketedPaste,
+        EnableFocusChange,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    )
 }
 
 fn disable_input_reporting(output: &mut impl Write) -> io::Result<()> {
-    execute!(output, DisableBracketedPaste, DisableFocusChange)
+    execute!(
+        output,
+        PopKeyboardEnhancementFlags,
+        DisableBracketedPaste,
+        DisableFocusChange
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4663,6 +4806,49 @@ impl State {
         }
     }
 
+    /// Keeps when each still-running command was first seen; returns whether the hint changed.
+    fn set_foreground_commands(&mut self, commands: &[Uuid], now: Instant) -> bool {
+        self.foreground_commands
+            .retain(|(command, _)| commands.contains(command));
+        for command in commands {
+            if !self
+                .foreground_commands
+                .iter()
+                .any(|(seen, _)| seen == command)
+            {
+                self.foreground_commands.push((*command, now));
+            }
+        }
+        self.refresh_foreground_command_hint(now)
+    }
+
+    /// Like Claude Code, a foreground command is offered to the background once it has run past
+    /// the progress threshold.
+    fn backgroundable_commands(&self, now: Instant) -> impl Iterator<Item = Uuid> + '_ {
+        self.foreground_commands
+            .iter()
+            .filter(move |(_, seen)| {
+                now.saturating_duration_since(*seen) >= FOREGROUND_COMMAND_HINT_DELAY
+            })
+            .map(|(command, _)| *command)
+    }
+
+    /// Shows the hint once a command can move to the background and hides it when none can;
+    /// returns whether it changed.
+    fn refresh_foreground_command_hint(&mut self, now: Instant) -> bool {
+        let offers_background = self.backgroundable_commands(now).next().is_some();
+        if offers_background == self.scrollback.shows_foreground_command_hint() {
+            return false;
+        }
+        self.scrollback.set_foreground_command_hint(
+            offers_background.then(|| RoleLine::role(FOREGROUND_COMMAND_HINT, Role::MutedText)),
+        )
+    }
+
+    fn can_background_foreground_work(&self) -> bool {
+        self.foreground_shell || self.scrollback.shows_foreground_command_hint()
+    }
+
     fn focus_lost(&mut self) {
         self.back_to_bottom_pressed = false;
         self.shell_background_chord_started_at = None;
@@ -4797,6 +4983,9 @@ impl State {
             self.replace_dialog(dialog);
             self.suspended_dialog = suspended;
         }
+        // The next status refresh reports the new Chat's foreground commands.
+        self.foreground_commands.clear();
+        self.scrollback.set_foreground_command_hint(None);
         self.shell_background_chord_started_at = None;
         self.rendered_region = None;
     }
@@ -4946,6 +5135,7 @@ impl State {
             prompt_suggestion: None,
             prompt_suggestion_request: None,
             foreground_shell: false,
+            foreground_commands: Vec::new(),
             shell_background_chord_started_at: None,
             width: usize::from(width).saturating_sub(1).max(2),
             height: usize::from(height).max(1),
@@ -4953,6 +5143,7 @@ impl State {
             creation_prefixes: HashMap::new(),
             echoed_inputs: HashSet::new(),
             awaiting_input_echoes: HashSet::new(),
+            agent_colors: AgentColors::default(),
             chat: None,
             activity_interruptible: false,
             back_to_bottom_target: None,
@@ -5155,6 +5346,16 @@ impl State {
             row: usize::from(event.row),
             column: usize::from(event.column),
         };
+        if self.full_screen_detail_shown()
+            && (!self.input_dialog_visible()
+                || at.row < self.height.saturating_sub(self.input_dialog_height()))
+        {
+            if let MouseEventKind::ScrollUp | MouseEventKind::ScrollDown = event.kind {
+                self.pointer_input =
+                    self.scroll_full_screen_detail(event.kind == MouseEventKind::ScrollDown);
+            }
+            return true;
+        }
         if self.full_review {
             match event.kind {
                 MouseEventKind::ScrollUp => self.navigate_menu_review(DiffNavigationAction::Up),
@@ -5376,6 +5577,21 @@ impl State {
         }
     }
 
+    /// Scrolls the full-screen detail by one wheel step and returns the action that needs, such as
+    /// reading earlier output.
+    fn scroll_full_screen_detail(&mut self, down: bool) -> Option<InputEvent> {
+        let (width, height) = self.detail_area();
+        let detail = self.monitor.detail.as_mut()?;
+        let lines = renderer::WHEEL_SCROLL_LINES as i32;
+        match detail.scroll(if down { lines } else { -lines }, width, height) {
+            super::tick_actions::TickDetailKey::Action(action) => Some(InputEvent::TickAction {
+                chat: detail.chat(),
+                action,
+            }),
+            _ => None,
+        }
+    }
+
     fn scroll_conversation(&mut self, action: ScrollAction) -> bool {
         if self.transcript.is_some() || self.diff_screen.is_some() {
             return false;
@@ -5494,8 +5710,43 @@ impl State {
             && self.diff_screen.is_none()
             && !self.full_review
             && (self.monitor.overlay
+                || self.full_screen_detail_open()
                 || self.monitor_side_columns().is_some()
                     && self.monitor_preference == tickloop_agent_config::MonitorPreference::Auto)
+    }
+
+    /// Whether the focused Monitor has a detail open that covers the whole screen, which needs no
+    /// room for Monitor's column.
+    fn full_screen_detail_open(&self) -> bool {
+        self.monitor.focused
+            && self
+                .monitor
+                .detail
+                .as_ref()
+                .is_some_and(|detail| detail.full_screen())
+    }
+
+    /// Whether this frame draws a full-screen Monitor detail in place of the conversation.
+    fn full_screen_detail_shown(&self) -> bool {
+        self.full_screen_detail_open() && self.monitor_visible()
+    }
+
+    /// The columns and rows the open Monitor detail draws in: the whole screen above any input
+    /// dialog for a full-screen detail, else Monitor's column above the input area.
+    fn detail_area(&mut self) -> (usize, usize) {
+        if self.full_screen_detail_shown() {
+            let dialog_rows = if self.input_dialog_visible() {
+                self.styled_frame().0.len()
+            } else {
+                0
+            };
+            (self.width, self.height.saturating_sub(dialog_rows))
+        } else {
+            (
+                self.monitor_columns().saturating_sub(2),
+                self.height.saturating_sub(self.styled_frame().0.len()),
+            )
+        }
     }
 
     #[cfg(test)]
@@ -5641,6 +5892,9 @@ impl State {
             queue!(output, Hide)?;
             self.rendered_screen = lines;
             return output.flush();
+        }
+        if self.full_screen_detail_shown() {
+            return self.draw_full_screen_detail(output);
         }
         let (lines, cursor_row, cursor_column) = self.styled_frame();
         let start = self.height - lines.len();
@@ -5812,24 +6066,72 @@ impl State {
             output,
             MoveTo(cursor_column as u16, (start + cursor_row) as u16)
         )?;
+        if self.shows_cursor() {
+            queue!(output, Show)?;
+        } else {
+            queue!(output, Hide)?;
+        }
+        output.flush()
+    }
+
+    /// Whether the frame shows the terminal cursor at the input's or the input dialog's cursor.
+    fn shows_cursor(&self) -> bool {
         if self.workspace_trust.is_some() {
-            if self.dialog_cursor_visible {
-                queue!(output, Show)?;
-            } else {
-                queue!(output, Hide)?;
-            }
-        } else if ((self.menu_focused || self.review_focused) && !self.menu_comment_is_editing())
+            return self.dialog_cursor_visible;
+        }
+        !(((self.menu_focused || self.review_focused) && !self.menu_comment_is_editing())
             || self.footer.selected().is_some()
             || self.help_open
             || self.permissions_surface.is_some()
             || (self.artifacts_picker.is_some() || self.conversation_picker.is_some())
                 && !self.dialog_cursor_visible
             || self.conversation_focused
-            || self.monitor.focused && self.monitor_visible() && !self.input_dialog_visible()
-        {
-            queue!(output, Hide)?;
+            || self.monitor.focused && self.monitor_visible() && !self.input_dialog_visible())
+    }
+
+    /// Draws the open full-screen Monitor detail over the whole screen, as the detailed
+    /// transcript is drawn, with an input dialog below it while one is open.
+    fn draw_full_screen_detail(&mut self, output: &mut impl Write) -> io::Result<()> {
+        let (dialog, cursor_row, cursor_column) = if self.input_dialog_visible() {
+            self.styled_frame()
         } else {
-            queue!(output, Show)?;
+            (Vec::new(), 0, 0)
+        };
+        let detail_height = self.height.saturating_sub(dialog.len());
+        let now = tickloop_agent_base::private_fs::unix_time_milliseconds();
+        let mut lines = self
+            .monitor
+            .detail
+            .as_mut()
+            .map(|detail| {
+                detail
+                    .lines(self.width, detail_height, now)
+                    .into_iter()
+                    .map(|line| line.line)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        lines.resize_with(detail_height, RoleLine::default);
+        lines.extend(dialog);
+        let rows = lines
+            .iter()
+            .map(|line| {
+                line.resolve(self.display.theme(), self.width)
+                    .render(self.colour_depth)
+            })
+            .collect();
+        self.initialize_screen(output)?;
+        write!(output, "{RESET_SCROLL_REGION}")?;
+        self.paint_rows(output, RenderedView::TickDetail, rows, 0)?;
+        self.rendered_screen = lines.iter().map(RoleLine::text).collect();
+        if detail_height < self.height && self.shows_cursor() {
+            queue!(
+                output,
+                MoveTo(cursor_column as u16, (detail_height + cursor_row) as u16),
+                Show
+            )?;
+        } else {
+            queue!(output, Hide)?;
         }
         output.flush()
     }
@@ -6208,17 +6510,11 @@ impl State {
                 } else {
                     " "
                 };
-                let ordinal =
-                    if !picker && self.request_layout.is_none() && self.question_menu.is_none() {
-                        format!("{}. ", index + 1)
-                    } else {
-                        String::new()
-                    };
                 let row = compact
                     .then(|| self.picker_presentation.compact_rows.get(index))
                     .flatten();
                 let text = format!(
-                    "{marker} {ordinal}{}",
+                    "{marker} {}",
                     display_text(row.map_or(option.as_str(), |row| row.label.as_str()))
                 );
                 if picker {
@@ -7232,6 +7528,7 @@ impl State {
                 let overview_list_hint;
                 let return_hint;
                 let monitor_hint;
+                let send_now_hint;
                 let hints = if self.confirmation_hint().is_some() || self.help_open {
                     // Help is focused and draws its own close hint; only facts remain.
                     ""
@@ -7275,13 +7572,23 @@ impl State {
                     return_hint.as_str()
                 } else if self.editor.draft().is_empty() {
                     // A visible suggestion takes Tab and →, so → no longer opens Monitor.
-                    if self.visible_prompt_suggestion().is_some() {
+                    let empty_input_hint = if self.visible_prompt_suggestion().is_some() {
                         "← Agents · tab/→ accept · ? help · ctrl+o details · ctrl+g editor · ctrl+c interrupt"
                     } else if self.monitor.total() == 0 {
                         "← Agents · ? help · ctrl+o details · ctrl+g editor · ctrl+c interrupt"
                     } else {
                         "← Agents · → Monitor · ? help · ctrl+o details · ctrl+g editor · ctrl+c interrupt"
+                    };
+                    if self.can_send_now() && self.oldest_queued_message().is_some() {
+                        send_now_hint =
+                            format!("{SEND_NOW_HINT}{HINT_SEGMENT_SEPARATOR}{empty_input_hint}");
+                        send_now_hint.as_str()
+                    } else {
+                        empty_input_hint
                     }
+                } else if self.can_send_now() && !self.editor.draft().trim_start().starts_with('/')
+                {
+                    "enter queue · ctrl+enter send now · ctrl+g editor · ctrl+c clear"
                 } else {
                     "enter send · ctrl+g editor · ctrl+c clear"
                 };
@@ -7720,10 +8027,28 @@ impl State {
         }
     }
 
+    fn restore_interrupted_prompt(&mut self, prompt: &str, contexts: &[InputContext]) {
+        let typed = self.editor.draft();
+        let draft = if typed.is_empty() {
+            prompt.to_owned()
+        } else {
+            format!("{prompt}\n{typed}")
+        };
+        self.replace_draft(draft, prompt.len());
+        self.add_saved_contexts(contexts);
+        self.file_mentions.dismiss();
+        self.completion.dismiss();
+        self.escape_confirmation = None;
+    }
+
     /// Saved pasted images go back onto their `[Image #N]` placeholders as image blocks;
     /// the other attachments wait in `restored_contexts` until the prompt is sent.
     fn restore_saved_contexts(&mut self, contexts: &[InputContext]) {
         self.restored_contexts.clear();
+        self.add_saved_contexts(contexts);
+    }
+
+    fn add_saved_contexts(&mut self, contexts: &[InputContext]) {
         for context in contexts {
             match context {
                 InputContext::Image(ImageContext {
@@ -7733,6 +8058,7 @@ impl State {
                     self.paste_blocks
                         .restore_image(self.editor.draft(), *id, image.clone());
                 }
+                _ if self.restored_contexts.contains(context) => {}
                 _ => self.restored_contexts.push(context.clone()),
             }
         }
@@ -8562,6 +8888,7 @@ impl State {
     }
 
     fn paste(&mut self, text: &str) {
+        self.shell_background_chord_started_at = None;
         if let Some((_, transcript)) = &mut self.transcript {
             transcript.paste(text);
             return;
@@ -8614,7 +8941,6 @@ impl State {
             return;
         }
         if self.menu.is_none() && self.foreground_shell {
-            self.shell_background_chord_started_at = None;
             return;
         }
         if self.menu.is_none()
@@ -9275,6 +9601,56 @@ impl State {
         self.status = "Draft cleared · up restores it".into();
     }
 
+    /// A turn of the shown Agent is working and this View can interrupt it.
+    fn can_interrupt_activity(&self) -> bool {
+        self.activity_interruptible && self.scrollback.activity_line().is_some()
+    }
+
+    /// ctrl+enter sends a prompt now, instead of acting as enter, only while a turn of the shown
+    /// Agent works.
+    fn can_send_now(&self) -> bool {
+        self.ordinary_input_is_visible()
+            && self.shell_input.kind() == InputKind::Prompt
+            && self.can_interrupt_activity()
+    }
+
+    fn oldest_queued_message(&self) -> Option<Uuid> {
+        self.queued_inputs
+            .iter()
+            .find(|entry| entry.kind == QueuedInputKind::Message)
+            .map(|entry| entry.id)
+    }
+
+    /// ctrl+enter is enter, except while a turn works: a draft is submitted to be sent now, and
+    /// an empty draft sends the oldest queued message now.
+    fn send_now_key(&mut self) -> Option<InputEvent> {
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        if !self.can_send_now() {
+            return self.key(enter);
+        }
+        if self.editor.draft().is_empty()
+            && let Some(run_id) = self.oldest_queued_message()
+        {
+            return Some(InputEvent::SendQueuedNow { run_id });
+        }
+        match self.key(enter) {
+            Some(InputEvent::Prompt {
+                family_target,
+                text,
+                file_references,
+                images,
+                ..
+            }) => Some(InputEvent::Prompt {
+                family_target,
+                text,
+                file_references,
+                images,
+                send_now: true,
+            }),
+            other => other,
+        }
+    }
+
     fn main_escape(&mut self) -> Option<InputEvent> {
         if self.ordinary_input_is_visible() {
             if !self.scrollback.is_at_bottom() {
@@ -9282,7 +9658,7 @@ impl State {
                 self.escape_confirmation = None;
                 return None;
             }
-            if self.activity_interruptible && self.scrollback.activity_line().is_some() {
+            if self.can_interrupt_activity() {
                 self.escape_confirmation = None;
                 return Some(InputEvent::InterruptActivity);
             }
@@ -9526,8 +9902,7 @@ impl State {
             && self.monitor_visible()
             && self.monitor.focused
         {
-            let width = self.monitor_columns().saturating_sub(2);
-            let height = self.height.saturating_sub(self.styled_frame().0.len());
+            let (width, height) = self.detail_area();
             if let Some(detail) = self.monitor.detail.as_mut() {
                 let chat = detail.chat();
                 let result = detail.key(key, width, height);
@@ -9742,7 +10117,7 @@ impl State {
         }
         self.expire_shell_background_chord();
         if self.shell_background_chord_started_at.is_some()
-            && (!self.foreground_shell
+            && (!self.can_background_foreground_work()
                 || self.menu.is_some()
                 || self.diff_screen.is_some()
                 || self.permissions_surface.is_some()
@@ -9886,6 +10261,20 @@ impl State {
                 _ => None,
             };
         }
+        // The model's foreground Bash keeps the editor; only the keys its hint offers act on it.
+        if self.scrollback.shows_foreground_command_hint()
+            && self.overview.projection.is_none()
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            match key.code {
+                KeyCode::Char('b') => return Some(InputEvent::BackgroundForegroundShell),
+                KeyCode::Char('x') => {
+                    self.shell_background_chord_started_at = Some(Instant::now());
+                    return None;
+                }
+                _ => {}
+            }
+        }
         if self.footer.selected().is_some()
             && let Some(event) = self.footer_key(key)
         {
@@ -9994,6 +10383,13 @@ impl State {
             }
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) {
+            if key.code == KeyCode::Enter {
+                return if self.menu_focused {
+                    None
+                } else {
+                    self.send_now_key()
+                };
+            }
             if matches!(key.code, KeyCode::Char('n' | 'p'))
                 && self.apply_shell_completion(if key.code == KeyCode::Char('n') {
                     ShellCompletionKey::Next
@@ -10041,7 +10437,7 @@ impl State {
                     None
                 }
                 KeyCode::Char('c') => Some(InputEvent::Interrupt),
-                // Ctrl+B backgrounds only a running foreground Shell; otherwise it moves the cursor back.
+                // Ctrl+B backgrounds only a foreground Shell or offered Bash command; otherwise it moves the cursor back.
                 KeyCode::Char('b') if self.prompt_enabled && !self.menu_focused => {
                     if !self.move_across_pasted_block(false) {
                         self.edit(EditorCommand::MoveLeft);
@@ -10216,8 +10612,6 @@ impl State {
             }
             return None;
         }
-        let direct_number_choices =
-            self.picker_kind.is_none() && self.menu.as_ref().is_some_and(|menu| !menu.confirmation);
         let approval_review_available = self
             .menu_review
             .as_ref()
@@ -10249,27 +10643,6 @@ impl State {
                     KeyCode::Down if menu_is_visible => {
                         menu.selected = (menu.selected + 1).min(menu.options.len() - 1);
                         None
-                    }
-                    KeyCode::Char(digit)
-                        if direct_number_choices
-                            && menu_is_visible
-                            && key.modifiers == KeyModifiers::NONE
-                            && digit
-                                .to_digit(10)
-                                .and_then(|number| usize::try_from(number).ok())
-                                .and_then(|number| number.checked_sub(1))
-                                .is_some_and(|index| index < menu.options.len()) =>
-                    {
-                        let index = digit
-                            .to_digit(10)
-                            .and_then(|number| usize::try_from(number).ok())
-                            .and_then(|number| number.checked_sub(1))
-                            .expect("validated menu number");
-                        Some(InputEvent::Choice {
-                            menu_id: menu.id,
-                            index,
-                            comment: None,
-                        })
                     }
                     KeyCode::Enter
                         if menu_is_visible
@@ -10419,6 +10792,7 @@ impl State {
                         text: source_text,
                         file_references: Vec::new(),
                         images: Vec::new(),
+                        send_now: false,
                     });
                 }
                 let file_references = match self
@@ -10471,6 +10845,7 @@ impl State {
                         text: line,
                         file_references,
                         images,
+                        send_now: false,
                     })
                 }
             }
@@ -10651,7 +11026,12 @@ fn read_keys(
             let confirmation_expired = state.expire_key_confirmations();
             let rows_changed =
                 state.refresh_row_clocks(tickloop_agent_base::private_fs::unix_time_milliseconds());
-            if state.poll_clipboard_hint(Instant::now()) || confirmation_expired || rows_changed {
+            let hint_changed = state.refresh_foreground_command_hint(Instant::now());
+            if state.poll_clipboard_hint(Instant::now())
+                || confirmation_expired
+                || rows_changed
+                || hint_changed
+            {
                 state.draw(&mut io::stdout().lock())?;
             }
             continue;
@@ -10675,7 +11055,7 @@ fn read_keys(
         let input = match event {
             Event::Key(key) => {
                 state.clear_selection();
-                state.key(key)
+                state.key(legacy_escape(key))
             }
             Event::Paste(text) => {
                 state.paste(&text);
@@ -13974,7 +14354,7 @@ mod tests {
     }
 
     #[test]
-    fn summary_guidance_uses_its_own_label_and_numbers_submit_without_guidance() {
+    fn summary_guidance_uses_its_own_label() {
         let mut state = State::new(true, 80, 24);
         state.prompt_enabled = true;
         let mut summary = menu();
@@ -14006,15 +14386,6 @@ mod tests {
         let frame = state.frame().0.join("\n");
         assert!(frame.contains("Guidance: focus on API boundaries"));
         assert!(frame.contains("add context (optional)"));
-        assert!(state.key(key(KeyCode::Tab)).is_none());
-        assert!(matches!(
-            state.key(key(KeyCode::Char('2'))),
-            Some(InputEvent::Choice {
-                index: 1,
-                comment: None,
-                ..
-            })
-        ));
     }
 
     #[test]
@@ -14058,7 +14429,7 @@ mod tests {
     }
 
     #[test]
-    fn non_confirmation_menu_numbers_choose_the_displayed_option() {
+    fn menu_options_show_no_numbers_and_digits_choose_nothing() {
         let mut state = State::new(true, 80, 24);
         state.prompt_enabled = true;
         let mut rewind = menu();
@@ -14069,18 +14440,14 @@ mod tests {
             "Current point".into(),
         ];
         rewind.confirmation = false;
-        let menu_id = rewind.id;
         state.menu = Some(rewind);
         state.menu_focused = true;
 
-        assert!(matches!(
-            state.key(key(KeyCode::Char('2'))),
-            Some(InputEvent::Choice {
-                menu_id: selected_menu,
-                index: 1,
-                comment: None,
-            }) if selected_menu == menu_id
-        ));
+        let frame = state.frame().0.join("\n");
+        assert!(frame.contains("Before · second prompt"), "{frame}");
+        assert!(!frame.contains("1. ") && !frame.contains("2. "), "{frame}");
+        assert!(state.key(key(KeyCode::Char('2'))).is_none());
+        assert_eq!(state.menu.as_ref().unwrap().selected, 0);
     }
 
     #[test]
@@ -15173,6 +15540,76 @@ mod tests {
     }
 
     #[test]
+    fn an_interrupted_prompt_returns_with_its_attachments_and_leaves_the_input_history() {
+        let project = tempfile::tempdir().unwrap();
+        let mut state = state_with_clipboard(Some(clipboard_image()), false);
+        state.input_history = Some(InputHistory::in_memory());
+        state.history_project = project.path().into();
+        state.history_session = "interrupt-session".into();
+        let console = console_with_state(state);
+        let prompt = "Compare [Image #2] with the saved notes";
+        console.record_prompt_history("earlier prompt").unwrap();
+        console.record_prompt_history(prompt).unwrap();
+        assert!(console.input_is_empty().unwrap());
+        let notes = saved_file_context("notes.md", "saved notes");
+
+        console
+            .restore_interrupted_prompt(
+                prompt,
+                &[InputContext::Image(pasted_image(2)), notes.clone()],
+            )
+            .unwrap();
+
+        let mut state = console.state.lock().unwrap();
+        assert_eq!(state.editor.draft(), prompt);
+        assert_eq!(state.editor.cursor(), prompt.len());
+        assert_eq!(state.restored_contexts, [notes]);
+        assert_eq!(state.status, INTERRUPTED_PROMPT_RESTORED);
+        let history = state
+            .input_history
+            .as_ref()
+            .unwrap()
+            .recent_prompts(&state.history_session, &state.history_project)
+            .unwrap();
+        assert_eq!(
+            history,
+            ["earlier prompt"],
+            "up does not list the prompt twice"
+        );
+        state.key(control(KeyCode::Char('v')));
+        let draft = format!("{prompt}[Image #3]");
+        assert_eq!(state.editor.draft(), draft);
+        assert_eq!(
+            submitted_images(&mut state),
+            (draft, vec![pasted_image(2), pasted_image(3)]),
+            "the restored image is a block again and new pastes number after it"
+        );
+    }
+
+    #[test]
+    fn text_typed_while_the_prompt_was_taken_back_stays_after_it() {
+        let mut state = state_with_clipboard(Some(clipboard_image()), false);
+        state.insert("typed meanwhile ");
+        state.key(control(KeyCode::Char('v')));
+        let console = console_with_state(state);
+        assert!(!console.input_is_empty().unwrap());
+        let prompt = "first ask [Image #4]";
+
+        console
+            .restore_interrupted_prompt(prompt, &[InputContext::Image(pasted_image(4))])
+            .unwrap();
+
+        let mut state = console.state.lock().unwrap();
+        let merged = format!("{prompt}\ntyped meanwhile [Image #1]");
+        assert_eq!(state.editor.draft(), merged);
+        assert_eq!(state.editor.cursor(), prompt.len());
+        assert_eq!(
+            submitted_images(&mut state),
+            (merged, vec![pasted_image(4), pasted_image(1)])
+        );
+    }
+
+    #[test]
     fn control_v_attaches_clipboard_images_numbered_with_folded_pastes_in_placeholder_order() {
         let mut state = state_with_clipboard(Some(clipboard_image()), false);
         let paste = "first\nsecond\nthird\nfourth";
@@ -15281,6 +15718,7 @@ mod tests {
                     .unwrap(),
                     state.display,
                     &state.image_links(),
+                    &state.agent_colors,
                 );
                 state.transcript.as_mut().unwrap().1.update(document);
             }
@@ -15936,6 +16374,43 @@ mod tests {
     }
 
     #[test]
+    fn control_bracket_still_means_escape_under_the_kitty_protocol() {
+        let escape = legacy_escape(KeyEvent::new(KeyCode::Char('['), KeyModifiers::CONTROL));
+        assert_eq!(escape.code, KeyCode::Esc);
+        assert_eq!(escape.modifiers, KeyModifiers::NONE);
+        let bracket = legacy_escape(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE));
+        assert_eq!(bracket.code, KeyCode::Char('['));
+    }
+
+    #[test]
+    fn view_and_execution_connection_notices_never_clear_each_other() {
+        let mut state = State::new(true, 80, 24);
+        state.interactive = false;
+        let console = console_with_state(state);
+        let view_notice = "View registration unavailable · daemon connection is closed";
+        console
+            .set_connection_notice(Some(view_notice.into()))
+            .unwrap();
+        console
+            .set_execution_connection_notice(Some(ExecutionConnectionNotice::CachedExecution), None)
+            .unwrap();
+        {
+            let state = console.state.lock().unwrap();
+            assert_eq!(state.connection_notice.as_deref(), Some(view_notice));
+            assert_eq!(
+                state.execution_connection_notice,
+                Some(ExecutionConnectionNotice::CachedExecution)
+            );
+        }
+        console.set_connection_notice(None).unwrap();
+        assert_eq!(
+            console.state.lock().unwrap().execution_connection_notice,
+            Some(ExecutionConnectionNotice::CachedExecution),
+            "only the refresh that owns a notice clears it"
+        );
+    }
+
+    #[test]
     fn a_changed_connection_notice_rewrites_only_the_status_row() {
         let mut state = State::new(true, 80, 24);
         state.prompt_enabled = true;
@@ -16131,16 +16606,24 @@ mod tests {
     }
 
     #[test]
-    fn focus_reporting_is_switched_with_bracketed_paste_and_off_when_the_terminal_is_restored() {
+    fn focus_reporting_and_disambiguated_keys_switch_with_bracketed_paste_and_off_on_restore() {
         let mut enabled = Vec::new();
         enable_input_reporting(&mut enabled).unwrap();
         let enabled = String::from_utf8(enabled).unwrap();
         assert!(enabled.contains("\x1b[?2004h") && enabled.contains("\x1b[?1004h"));
+        assert!(
+            enabled.contains("\x1b[>1u"),
+            "the kitty keyboard protocol is pushed so ctrl+enter is told from enter: {enabled:?}"
+        );
 
         let mut restored = Vec::new();
         let _ = restore_terminal(&mut restored, &TerminalSurface::new(false));
         let restored = String::from_utf8(restored).unwrap();
         assert!(restored.contains("\x1b[?2004l") && restored.contains("\x1b[?1004l"));
+        assert!(
+            restored.contains("\x1b[<1u"),
+            "the pushed keyboard flags are popped: {restored:?}"
+        );
     }
 
     #[test]
@@ -18021,6 +18504,110 @@ mod tests {
             .find(|line| line.contains("start fresh"))
             .unwrap();
         assert!(!row.contains(&chat), "{row}");
+    }
+
+    const CTRL_ENTER: KeyEvent = KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL);
+
+    fn working_state() -> State {
+        let mut state = State::new(true, 120, 24);
+        state.prompt_enabled = true;
+        state
+            .scrollback
+            .set_activity(Some(RoleLine::role("• Working", Role::MutedText)));
+        state.activity_interruptible = true;
+        state
+    }
+
+    fn hint_row(state: &mut State) -> String {
+        state.frame().0.last().cloned().unwrap_or_default()
+    }
+
+    #[test]
+    fn ctrl_enter_sends_a_draft_or_the_oldest_queued_message_now_while_a_turn_works() {
+        let mut state = working_state();
+        state.insert("how is it going");
+        assert!(matches!(
+            state.key(CTRL_ENTER),
+            Some(InputEvent::Prompt { text, send_now: true, .. }) if text == "how is it going"
+        ));
+        assert!(state.editor.draft().is_empty());
+
+        let command = queued_input(QueuedInputKind::Command, "/compact", 1);
+        let oldest = queued_input(QueuedInputKind::Message, "first queued", 2);
+        let newer = queued_input(QueuedInputKind::Message, "second queued", 3);
+        state.queued_inputs = vec![command, oldest.clone(), newer];
+        assert!(matches!(
+            state.key(CTRL_ENTER),
+            Some(InputEvent::SendQueuedNow { run_id }) if run_id == oldest.id
+        ));
+
+        state.insert("plain enter still queues");
+        assert!(matches!(
+            state.key(key(KeyCode::Enter)),
+            Some(InputEvent::Prompt {
+                send_now: false,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn ctrl_enter_is_enter_without_a_working_turn_or_for_shell_input() {
+        let mut idle = State::new(true, 120, 24);
+        idle.prompt_enabled = true;
+        idle.queued_inputs = vec![queued_input(QueuedInputKind::Message, "behind a Shell", 1)];
+        idle.insert("hello");
+        assert!(matches!(
+            idle.key(CTRL_ENTER),
+            Some(InputEvent::Prompt { text, send_now: false, .. }) if text == "hello"
+        ));
+        assert!(!matches!(
+            idle.key(CTRL_ENTER),
+            Some(InputEvent::SendQueuedNow { .. })
+        ));
+
+        let mut shell = working_state();
+        shell.key(key(KeyCode::Char('!')));
+        assert_eq!(shell.shell_input.kind(), InputKind::Shell);
+        for character in "ls".chars() {
+            shell.key(key(KeyCode::Char(character)));
+        }
+        assert!(matches!(
+            shell.key(CTRL_ENTER),
+            Some(InputEvent::UserShellSubmitted(_))
+        ));
+    }
+
+    #[test]
+    fn hints_offer_ctrl_enter_send_now_only_while_a_turn_works() {
+        let mut state = working_state();
+        state.insert("check progress");
+        assert!(
+            hint_row(&mut state).starts_with("enter queue · ctrl+enter send now · "),
+            "{}",
+            hint_row(&mut state)
+        );
+        state.edit(EditorCommand::Clear);
+        state.insert("/compact");
+        assert!(!hint_row(&mut state).contains(SEND_NOW_HINT));
+
+        state.edit(EditorCommand::Clear);
+        assert!(!hint_row(&mut state).contains(SEND_NOW_HINT));
+        state.queued_inputs = vec![queued_input(QueuedInputKind::Message, "queued", 1)];
+        assert!(
+            hint_row(&mut state).starts_with(SEND_NOW_HINT),
+            "{}",
+            hint_row(&mut state)
+        );
+
+        state.activity_interruptible = false;
+        assert!(!hint_row(&mut state).contains(SEND_NOW_HINT));
+        state.insert("idle draft");
+        assert!(
+            hint_row(&mut state).starts_with("enter send · "),
+            "{}",
+            hint_row(&mut state)
+        );
     }
 
     #[test]

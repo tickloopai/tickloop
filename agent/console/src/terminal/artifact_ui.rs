@@ -62,12 +62,16 @@ pub(super) async fn tick_action(
         refresh(agent, console, root, chat).await?;
         return Ok(());
     }
+    if matches!(action, 'x' | 'X') {
+        return unlink(agent, console, chat, &id, action == 'X').await;
+    }
     let ticks = agent
         .artifact_ticks(chat)
         .await
         .map_err(|error| error.to_string())?;
-    let tick = ticks.into_iter().find(|tick| tick.instance_id() == id);
-    let tick = if let Some(tick) = tick {
+    let listed = ticks.into_iter().find(|tick| tick.instance_id() == id);
+    let is_listed = listed.is_some();
+    let tick = if let Some(tick) = listed {
         tick
     } else {
         let rows = agent
@@ -81,16 +85,8 @@ pub(super) async fn tick_action(
         let Some((origin, artifact_id)) = target else {
             return Ok(());
         };
-        if matches!(action, 'x' | 'X') {
-            if action == 'x' {
-                console.confirm_tick_removal(chat, id)?;
-            } else {
-                remove_local_artifact(agent, console, chat, &id).await?;
-            }
-            return Ok(());
-        }
         let client = ArtifactClient::for_origin(
-            root.ok_or("Tick Loop Artifacts configuration is unavailable")?,
+            root.ok_or("Tickloop Artifacts configuration is unavailable")?,
             &origin,
         )
         .map_err(|error| error.to_string())?;
@@ -98,7 +94,10 @@ pub(super) async fn tick_action(
             .read(&artifact_id)
             .await
             .map_err(|error| error.to_string())?
-            .tick(&origin, 0)
+            .tick(
+                &origin,
+                tickloop_agent_base::private_fs::unix_time_milliseconds(),
+            )
     };
     match action {
         'o' => {
@@ -107,31 +106,71 @@ pub(super) async fn tick_action(
             }
         }
         'c' => console.copy_artifact_link(&tick.url)?,
-        'x' | 'X' => {
-            let rows = agent
-                .tick_subscriptions(chat)
-                .await
-                .map_err(|error| error.to_string())?;
-            let subscriptions: Vec<_> = rows
-                .into_iter()
-                .filter(|row| row.instance.as_str() == id)
-                .collect();
-            if action == 'x' && !subscriptions.is_empty() {
-                console.confirm_tick_removal(chat, id)?;
-                return Ok(());
-            }
-            remove_local_artifact(agent, console, chat, &id).await?;
-        }
         'f' => {
             agent
-                .link_artifact(chat, tick)
+                .link_artifact(chat, tick.clone())
                 .await
                 .map_err(|error| error.to_string())?;
+            // The association subscribes this Chat, so the artifact stays in Monitor until it is
+            // unlinked, also after a Tick Subscription that showed it ends.
+            if !is_listed {
+                agent
+                    .add_artifact_tick(chat, tick)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                console.update_monitor_chat(
+                    &agent
+                        .snapshot(chat)
+                        .await
+                        .map_err(|error| error.to_string())?,
+                )?;
+            }
             console.set_status("Artifact feedback linked here")?;
         }
         _ => {}
     }
     Ok(())
+}
+
+/// Takes the artifact out of this Chat. While it still delivers here, through this Chat's
+/// association or a Tick Subscription, the user confirms first; unlinking ends both.
+async fn unlink(
+    agent: &ConsoleExecution,
+    console: &Console,
+    chat: Uuid,
+    id: &str,
+    is_confirmed: bool,
+) -> Result<(), String> {
+    if !is_confirmed {
+        let instance = id.parse::<tick_protocol::InstanceRef>()?;
+        let subscriptions = crate::monitor_rows::subscriptions_on(
+            &agent
+                .tick_subscriptions(chat)
+                .await
+                .map_err(|error| error.to_string())?,
+            &instance,
+        )
+        .len();
+        let snapshot = agent
+            .snapshot(chat)
+            .await
+            .map_err(|error| error.to_string())?;
+        let is_linked_here = instance
+            .artifact_parts()
+            .and_then(|(origin, artifact_id)| {
+                crate::monitor_rows::feedback_binding(&snapshot, origin, artifact_id)
+            })
+            .is_some_and(|binding| !binding.resume_required);
+        if is_linked_here || subscriptions > 0 {
+            return console.confirm_artifact_unlink(
+                chat,
+                id.to_owned(),
+                is_linked_here,
+                subscriptions,
+            );
+        }
+    }
+    remove_local_artifact(agent, console, chat, id).await
 }
 
 async fn remove_local_artifact(
@@ -183,7 +222,7 @@ pub(super) async fn open(
         .status()
         .await
         .map_err(|error| error.to_string())?
-        .ok_or("Not signed in to Tick Loop Artifacts")?;
+        .ok_or("Not signed in to Tickloop Artifacts")?;
     if !interactive {
         let page = client
             .list("all", "", None)
@@ -497,7 +536,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn subscribed_artifact_open_copy_and_feedback_link_it_without_adding_it() {
+    async fn subscribed_artifact_open_copy_and_feedback_which_keeps_it_in_monitor() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
         let (origin, server, requests) = artifact_service().await;
@@ -525,7 +564,7 @@ mod tests {
             console.test_clipboard_contents(),
             vec![format!("{origin}/a/doc")]
         );
-        tick_action(&agent, &console, Some(&root), chat, id, 'f')
+        tick_action(&agent, &console, Some(&root), chat, id.clone(), 'f')
             .await
             .unwrap();
         assert!(
@@ -539,7 +578,15 @@ mod tests {
         let snapshot = agent.snapshot(chat).await.unwrap();
         let binding = &snapshot.loops[0].event_sources[0];
         assert_eq!((binding.artifact_id.as_str(), binding.epoch), ("doc", 2));
-        assert!(agent.artifact_ticks(chat).await.unwrap().is_empty());
+        let ticks = agent.artifact_ticks(chat).await.unwrap();
+        assert_eq!(
+            ticks
+                .iter()
+                .map(|tick| tick.instance_id())
+                .collect::<Vec<_>>(),
+            [id],
+            "the association keeps the artifact in Monitor after its Tick Subscription ends"
+        );
         server.abort();
         core.shutdown().await;
     }
@@ -654,8 +701,8 @@ mod tests {
         )
         .await;
         assert!(
-            result.is_err_and(|error| error.contains("Tick Loop Artifacts is unavailable")),
-            "linking needs Tick Loop Artifacts"
+            result.is_err_and(|error| error.contains("Tickloop Artifacts is unavailable")),
+            "linking needs Tickloop Artifacts"
         );
         assert!(agent.snapshot(chat).await.unwrap().loops.is_empty());
         core.shutdown().await;
@@ -732,5 +779,86 @@ mod tests {
         assert_eq!(console.test_status_text(), "Artifact feedback linked here");
         assert!(model.requests.lock().unwrap().is_empty());
         runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn x_asks_before_unlinking_an_artifact_linked_here_then_ends_its_feedback_and_row() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let (origin, server, _requests) = artifact_service().await;
+        let client = ArtifactClient::for_origin(&root, &origin).unwrap();
+        let device = client.start_device_login().await.unwrap();
+        client
+            .finish_device_login(device, &tokio_util::sync::CancellationToken::new())
+            .await
+            .unwrap();
+        let (agent, core, remote, chat) = subscribed_fixture(directory.path(), &origin).await;
+        remote.rows.lock().unwrap().clear();
+        let tick = client.read("doc").await.unwrap().tick(&origin, 1);
+        let id = tick.instance_id();
+        agent.add_artifact_tick(chat, tick).await.unwrap();
+        let console = Console::test_for_chat(chat);
+        tick_action(&agent, &console, Some(&root), chat, id.clone(), 'f')
+            .await
+            .unwrap();
+
+        tick_action(&agent, &console, Some(&root), chat, id.clone(), 'x')
+            .await
+            .unwrap();
+        assert_eq!(
+            console.test_status_text(),
+            "Unlink this artifact and stop its @tickloop requests here? enter confirm · esc cancel"
+        );
+        let snapshot = agent.snapshot(chat).await.unwrap();
+        assert_eq!(
+            snapshot.loops[0].event_sources.len(),
+            1,
+            "asking unlinks nothing"
+        );
+        assert_eq!(snapshot.artifact_ticks.len(), 1);
+
+        tick_action(&agent, &console, Some(&root), chat, id, 'X')
+            .await
+            .unwrap();
+        let snapshot = agent.snapshot(chat).await.unwrap();
+        assert!(snapshot.loops[0].event_sources.is_empty());
+        assert!(snapshot.artifact_ticks.is_empty());
+        assert!(!console.monitor_has_entries().unwrap());
+        refresh(&agent, &console, Some(&root), chat).await.unwrap();
+        assert!(
+            !console.monitor_has_entries().unwrap(),
+            "an unlinked artifact stays out of Monitor"
+        );
+        server.abort();
+        core.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn x_removes_an_artifact_that_delivers_nothing_here_without_asking() {
+        let directory = tempfile::tempdir().unwrap();
+        let core = tickloop_agent_runtime::Agent::new_embedded(
+            tickloop_agent_test_support::config(),
+            Arc::new(tickloop_agent_test_support::ScriptedModel::new(Vec::new())),
+        );
+        let agent =
+            ConsoleExecution::from_embedded(core.clone(), tickloop_agent_test_support::config());
+        let chat = agent.create_chat(directory.path().into()).await.unwrap();
+        let tick = tickloop_agent_protocol::ArtifactTick {
+            artifact_id: "doc".into(),
+            origin: "https://docs.example".into(),
+            title: "Elsewhere".into(),
+            format: "markdown".into(),
+            url: "https://docs.example/a/doc".into(),
+            access_role: "owner".into(),
+            added_at_ms: 1,
+        };
+        agent.add_artifact_tick(chat, tick.clone()).await.unwrap();
+        let console = Console::test_for_chat(chat);
+        tick_action(&agent, &console, None, chat, tick.instance_id(), 'x')
+            .await
+            .unwrap();
+        assert!(console.test_status_text().is_empty());
+        assert!(agent.artifact_ticks(chat).await.unwrap().is_empty());
+        core.shutdown().await;
     }
 }

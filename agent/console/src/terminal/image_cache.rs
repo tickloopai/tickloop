@@ -2,7 +2,7 @@
 //! `utils/imageStore.ts` and `components/ClickableImageRef.tsx`.
 //!
 //! Files live at `<root>/image-cache/<chatId>/<N>.<ext>`, private to the user. Claude Code
-//! keys the directory by process; Tick Loop keys it by Chat because one process hosts many
+//! keys the directory by process; Tickloop keys it by Chat because one process hosts many
 //! Chats and several processes may run at once. The cache only serves links: nothing reads it
 //! back as model context.
 

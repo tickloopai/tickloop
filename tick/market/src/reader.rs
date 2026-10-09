@@ -386,7 +386,11 @@ pub async fn load_document(origin: &str) -> Result<Document> {
             let client = reqwest::Client::builder()
                 .timeout(FETCH_TIMEOUT)
                 .redirect(reqwest::redirect::Policy::limited(5))
-                .user_agent("TickLoop/0.1 document reader")
+                .user_agent(concat!(
+                    "Tickloop/",
+                    env!("CARGO_PKG_VERSION"),
+                    " document reader"
+                ))
                 .build()
                 .map_err(|error| Error::network(error.to_string()))?;
             let mut response = client

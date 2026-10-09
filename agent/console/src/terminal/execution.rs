@@ -32,10 +32,10 @@ use tickloop_agent_protocol::{
     Page, PendingRequestKind, PermissionChange, PermissionRule, PermissionScope,
     PermissionsRevision, PermissionsView, ProviderCredentialScope, QuestionAnswer, QueuedInput,
     REPLAY_CAPACITY, ReasoningEffort, Receipt, ReceiptState, RequestRef, RewindMode, RewindOutcome,
-    SavedChat, ShellTask, ShellTaskOrigin, ShellTaskOutputChunk, TaskAction, TaskNotification,
-    TaskOrigin, TaskRef, TickSubscriptionChange, TickSubscriptionStatus, ToolResult, TranscriptRef,
-    Trigger, TriggerSource, UserInput, UserShellReceipt, UserShellRecord, ViewRef,
-    chat_display_title, recover_shell_update_time,
+    SavedChat, ShellTask, ShellTaskOrigin, ShellTaskOutputChunk, TakenBackPrompt, TaskAction,
+    TaskNotification, TaskOrigin, TaskRef, TickSubscriptionChange, TickSubscriptionStatus,
+    ToolResult, TranscriptRef, Trigger, TriggerSource, UserInput, UserShellReceipt,
+    UserShellRecord, ViewRef, chat_display_title, recover_shell_update_time,
 };
 use tickloop_agent_tools::permissions::{canonical_directory, rule_views, validate_rule};
 
@@ -1313,18 +1313,26 @@ impl ConsoleExecution {
             .map(|snapshot| snapshot.into_snapshot())
     }
 
+    /// The snapshot the daemon reports now. Unlike `snapshot`, an unreachable daemon is an error
+    /// rather than the cached copy, so the answer can prove that a run has ended.
+    pub(super) async fn current_snapshot(&self, chat: Uuid) -> Result<ChatSnapshot, AccessError> {
+        let (execution, value) = self
+            .observed_value(chat, AgentDetailQuery::Snapshot)
+            .await
+            .inspect_err(|error| {
+                *self.inner.disconnected.lock().unwrap() = Some(error.to_string());
+            })?;
+        self.adopt_snapshot(execution, value)
+            .await
+            .map(|snapshot| snapshot.into_snapshot())
+    }
+
     pub(super) async fn live_snapshot(
         &self,
         chat: Uuid,
     ) -> Result<Box<LiveChatSnapshot>, AccessError> {
         match self.observed_value(chat, AgentDetailQuery::Snapshot).await {
-            Ok((execution, ObservationValue::Agent(snapshot))) => {
-                *self.inner.disconnected.lock().unwrap() = None;
-                let snapshot = self.inner.cache_snapshot(snapshot, Some(execution));
-                self.watch(snapshot.execution).await?;
-                Ok(snapshot)
-            }
-            Ok(_) => Err(unexpected()),
+            Ok((execution, value)) => self.adopt_snapshot(execution, value).await,
             Err(error) => {
                 *self.inner.disconnected.lock().unwrap() = Some(error.to_string());
                 self.inner
@@ -1337,6 +1345,21 @@ impl ConsoleExecution {
                     .ok_or(error)
             }
         }
+    }
+
+    /// Caches an Agent snapshot the daemon just reported and keeps following its execution.
+    async fn adopt_snapshot(
+        &self,
+        execution: ExecutionRef,
+        value: ObservationValue,
+    ) -> Result<Box<LiveChatSnapshot>, AccessError> {
+        let ObservationValue::Agent(snapshot) = value else {
+            return Err(unexpected());
+        };
+        *self.inner.disconnected.lock().unwrap() = None;
+        let snapshot = self.inner.cache_snapshot(snapshot, Some(execution));
+        self.watch(snapshot.execution).await?;
+        Ok(snapshot)
     }
     pub(super) async fn observe(
         &self,
@@ -2739,6 +2762,19 @@ impl ConsoleExecution {
             _ => Err(unexpected()),
         }
     }
+    pub(super) async fn send_now(
+        &self,
+        chat: Uuid,
+        run_id: Uuid,
+    ) -> Result<Vec<OperationRecord>, AccessError> {
+        match self
+            .loop_command(chat, LoopAction::SendNow { run_id })
+            .await?
+        {
+            CommandResult::Operations(value) => Ok(value),
+            _ => Err(unexpected()),
+        }
+    }
     pub(super) async fn disable_event_sources(&self) -> Result<(), AccessError> {
         let root = self.inner.launch.config_root.as_ref();
         for row in self.catalog().await? {
@@ -3221,6 +3257,30 @@ impl ConsoleExecution {
                     draft,
                 })
             }
+            _ => Err(unexpected()),
+        }
+    }
+    /// The conversation without the interrupted run's prompt and that prompt, when the Agent
+    /// took it back.
+    pub(super) async fn take_back_interrupted_prompt(
+        &self,
+        chat: Uuid,
+        run_id: Uuid,
+    ) -> Result<Option<(ChatSnapshot, TakenBackPrompt)>, AccessError> {
+        match self
+            .history(
+                chat,
+                HistoryAction::TakeBackInterruptedPrompt { run_id },
+                None,
+            )
+            .await?
+        {
+            CommandResult::PromptTakenBack { snapshot, draft } => {
+                self.inner
+                    .cache_snapshot(snapshot.clone(), Some(snapshot.execution));
+                Ok(Some((snapshot.into_snapshot(), draft)))
+            }
+            CommandResult::Done => Ok(None),
             _ => Err(unexpected()),
         }
     }

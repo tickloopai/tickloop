@@ -114,11 +114,11 @@ pub(crate) struct ChainEntry {
     pub invoked_skills: Vec<tickloop_agent_protocol::InvokedSkill>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_meta: bool,
-    /// Tick Loop extension: marks a host note, the host tool names announced as available once
+    /// Tickloop extension: marks a host note, the host tool names announced as available once
     /// it was written.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_tools: Option<std::collections::BTreeSet<String>>,
-    /// Tick Loop extension: marks the host note telling the model that Plan mode ended, Claude
+    /// Tickloop extension: marks the host note telling the model that Plan mode ended, Claude
     /// Code's `plan_mode_exit` attachment.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub plan_mode_exit: bool,
@@ -147,9 +147,9 @@ pub(crate) struct ChainEntry {
     pub tool_call_recoveries: Vec<ToolCallRecovery>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contexts: Option<serde_json::Value>,
-    /// Tick Loop 扩展：同一条内存消息拆成多个条目时（向结果消息追加的并行工具结果），后续条目
+    /// Tickloop 扩展：同一条内存消息拆成多个条目时（向结果消息追加的并行工具结果），后续条目
     /// 标记为接续父条目所在的消息，加载时合并回同一条消息。Claude Code 的每个工具结果本来就是
-    /// 独立的 user 消息，Tick Loop 在内存中把并行结果合在一条消息里，所以保留这个字段。
+    /// 独立的 user 消息，Tickloop 在内存中把并行结果合在一条消息里，所以保留这个字段。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub continues_message: bool,
     /// 照 Claude Code system 条目的 `subtype`；压缩边界为 [`COMPACT_BOUNDARY_SUBTYPE`]。
@@ -164,10 +164,10 @@ pub(crate) struct ChainEntry {
     pub summarize_metadata: Option<SummarizeMetadata>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_visible_in_transcript_only: bool,
-    /// assistant 条目的用量（Claude Code 记在 `message.usage`，Tick Loop 的消息结构没有该字段）。
+    /// assistant 条目的用量（Claude Code 记在 `message.usage`，Tickloop 的消息结构没有该字段）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
-    /// assistant 条目生成该消息的模型（Claude Code 记在 `message.model`，Tick Loop 的消息结构
+    /// assistant 条目生成该消息的模型（Claude Code 记在 `message.model`，Tickloop 的消息结构
     /// 没有该字段）。恢复时据此判断历史中的私有推理是否来自当前模型。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<ModelIdentity>,

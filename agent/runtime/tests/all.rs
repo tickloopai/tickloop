@@ -78,6 +78,8 @@ mod input_context;
 mod interaction;
 #[path = "all/interleaved_context.rs"]
 mod interleaved_context;
+#[path = "all/interrupted_prompt.rs"]
+mod interrupted_prompt;
 #[path = "all/jev_auto.rs"]
 mod jev_auto;
 #[path = "all/loop_chain.rs"]

@@ -804,6 +804,7 @@ mod registered_rows_tests {
                 kind: "Calendar".into(),
                 status: "waiting".into(),
                 notes: vec!["3 events".into()],
+                inherent_subscription: false,
                 owner: crate::monitor_rows::TickOwner::Unknown,
                 tone: crate::monitor_rows::StatusTone::Neutral,
                 updated_at_ms: None,

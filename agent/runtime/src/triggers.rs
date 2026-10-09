@@ -367,7 +367,7 @@ impl Agent {
             loop_id,
             LoopState::Stopped,
             None,
-            "stopped in another Tick Loop process",
+            "stopped in another Tickloop process",
             false,
         )
         .await
@@ -560,7 +560,7 @@ impl Agent {
                 TriggerPermit::Wait(reason) => return Err(AgentError::Invalid(reason)),
                 TriggerPermit::Withdrawn => {
                     return Err(AgentError::Invalid(
-                        "this goal was stopped or its trigger disarmed in another Tick Loop \
+                        "this goal was stopped or its trigger disarmed in another Tickloop \
                          process; the event was not delivered"
                             .into(),
                     ));

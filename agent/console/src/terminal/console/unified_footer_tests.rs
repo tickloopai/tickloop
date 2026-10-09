@@ -740,10 +740,12 @@ fn single_shell_activation_and_detail_updates_keep_the_exact_eligible_task() {
         effect,
         TaskSurfaceEffect::None | TaskSurfaceEffect::ReadOutput { .. }
     ));
+    let detail = frame(&console);
     assert!(
-        frame(&console)
+        detail
             .iter()
-            .any(|row| row.contains("State: exit 0"))
+            .any(|row| row.starts_with("$ selected shell") && row.ends_with("⏺ exit 0")),
+        "{detail:?}"
     );
     key(&console, KeyCode::Esc);
     assert_eq!(
@@ -830,7 +832,9 @@ fn single_shell_shortcut_opens_its_exact_detail() {
         "{detail:?}"
     );
     assert!(
-        detail.iter().any(|row| row.contains("State: running")),
+        detail
+            .iter()
+            .any(|row| row.starts_with("$ sole eligible task") && row.ends_with("⏺ running")),
         "{detail:?}"
     );
     key(&console, KeyCode::Esc);
