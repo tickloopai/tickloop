@@ -433,3 +433,373 @@ fn recorded_reads_keep_the_most_recently_used_hundred_files() {
     assert!(state.get(Path::new("/work/1.txt")).is_none());
     assert!(state.get(Path::new("/work/100.txt")).is_some());
 }
+
+#[tokio::test]
+async fn family_temp_writes_edits_and_bash_are_allowed_but_other_families_and_links_are_not() {
+    use tickloop_agent::tools::{Tools, Workspace};
+    let directory = tempfile::tempdir().unwrap();
+    let internal = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let tools = Tools::new(internal.path().canonicalize().unwrap());
+    let workspace = Workspace {
+        workdir: directory.path().canonicalize().unwrap(),
+        additional_directories: vec![],
+    };
+    let path = internal.path().join("scratch.txt");
+    for (name, input) in [
+        ("Write", json!({"file_path":path,"content":"owned result"})),
+        (
+            "Bash",
+            json!({"command":format!("touch {}", path.display())}),
+        ),
+        (
+            "Bash",
+            json!({"command":format!("echo owned > {}", path.display())}),
+        ),
+    ] {
+        let prepared = tools.prepare(&workspace, name, &input).await.unwrap();
+        assert!(!prepared.requires_permission, "{name}: {input}");
+    }
+    std::fs::write(&path, "owned result").unwrap();
+    let read = tools
+        .prepare(&workspace, "Read", &json!({"file_path":path}))
+        .await
+        .unwrap();
+    assert!(!read.requires_permission);
+    tools.execute(read, CancellationToken::new()).await.unwrap();
+    let edit = tools
+        .prepare(
+            &workspace,
+            "Edit",
+            &json!({"file_path":path,"old_string":"owned","new_string":"shared"}),
+        )
+        .await
+        .unwrap();
+    assert!(!edit.requires_permission);
+    let outside = other.path().join("other.txt");
+    std::fs::write(&outside, "other-session").unwrap();
+    let link = internal.path().join("escape");
+    std::os::unix::fs::symlink(&outside, &link).unwrap();
+    for candidate in [&outside, &link] {
+        let prepared = tools
+            .prepare(&workspace, "Read", &json!({"file_path":candidate}))
+            .await
+            .unwrap();
+        assert!(prepared.requires_permission, "{}", candidate.display());
+        let prepared = tools
+            .prepare(
+                &workspace,
+                "Bash",
+                &json!({"command":format!("cat {}",candidate.display())}),
+            )
+            .await
+            .unwrap();
+        assert!(prepared.requires_permission, "{}", candidate.display());
+    }
+}
+
+#[tokio::test]
+async fn family_temp_auto_allow_does_not_widen_plan_permission() {
+    use crate::permissions::{Decision, ExecutionMode, PermissionPolicy};
+    let project = tempfile::tempdir().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let tools = Tools::new(root.clone());
+    let workspace = workspace(&project.path().canonicalize().unwrap());
+    let policy = PermissionPolicy {
+        mode: ExecutionMode::Plan,
+        ..PermissionPolicy::default()
+    };
+    for (name, input) in [
+        (
+            "Write",
+            json!({"file_path":root.join("probe"),"content":"Plan must refuse"}),
+        ),
+        (
+            "Bash",
+            json!({"command":format!("touch {}",root.join("probe").display())}),
+        ),
+    ] {
+        let prepared = tools.prepare(&workspace, name, &input).await.unwrap();
+        assert_eq!(
+            policy.decide(&prepared, &workspace, uuid::Uuid::new_v4()),
+            Decision::Deny,
+            "{name}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn prepared_internal_bash_rejects_a_later_symlink_escape() {
+    let project = tempfile::tempdir().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let path = temp.path().canonicalize().unwrap().join("result");
+    std::fs::write(&path, "owned").unwrap();
+    let target = outside.path().join("secret");
+    std::fs::write(&target, "outside").unwrap();
+    let tools = Tools::new(temp.path().canonicalize().unwrap());
+    let prepared = tools
+        .prepare(
+            &workspace(&project.path().canonicalize().unwrap()),
+            "Bash",
+            &json!({"command":format!("cat {}",path.display())}),
+        )
+        .await
+        .unwrap();
+    assert!(!prepared.requires_permission);
+    std::fs::remove_file(&path).unwrap();
+    std::os::unix::fs::symlink(&target, &path).unwrap();
+    let result = tools.execute(prepared, CancellationToken::new()).await;
+    assert!(
+        matches!(result, Err(ToolError::PathChanged(_))),
+        "{result:?}"
+    );
+}
+
+#[tokio::test]
+async fn recursive_symlink_following_requires_normal_shell_authorization() {
+    let project = tempfile::tempdir().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let target = outside.path().join("outside");
+    std::fs::write(&target, "OUTSIDE-RESULT").unwrap();
+    std::os::unix::fs::symlink(&target, root.join("escape")).unwrap();
+    let tools = Tools::new(root.clone());
+    let workspace = workspace(&project.path().canonicalize().unwrap());
+    for command in [
+        format!("rg --follow OUTSIDE {}", root.display()),
+        format!("rg -nL OUTSIDE {}", root.display()),
+        format!("grep -R OUTSIDE {}", root.display()),
+        format!("find -L {}", root.display()),
+    ] {
+        let prepared = tools
+            .prepare(&workspace, "Bash", &json!({"command":command}))
+            .await
+            .unwrap();
+        assert!(prepared.requires_permission, "{command}");
+    }
+    let prepared = tools
+        .prepare(
+            &workspace,
+            "Bash",
+            &json!({"command":format!("rg OUTSIDE {}",root.display())}),
+        )
+        .await
+        .unwrap();
+    assert!(!prepared.requires_permission);
+}
+
+#[tokio::test]
+async fn implicit_directory_diff_and_input_derived_file_paths_need_permission() {
+    let project = tempfile::tempdir().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let a = root.join("a");
+    let b = root.join("b");
+    std::fs::create_dir(&a).unwrap();
+    std::fs::create_dir(&b).unwrap();
+    let secret = outside.path().join("secret");
+    std::fs::write(&secret, "OUTSIDE").unwrap();
+    std::os::unix::fs::symlink(&secret, a.join("leak")).unwrap();
+    let list = root.join("file-list");
+    std::fs::write(&list, secret.to_string_lossy().as_bytes()).unwrap();
+    let tools = Tools::new(root.clone());
+    let workspace = workspace(&project.path().canonicalize().unwrap());
+    for command in [
+        format!("diff -rN {} {}", a.display(), b.display()),
+        format!("diff {} {}", a.display(), b.display()),
+        format!("cat {} | xargs grep .", list.display()),
+        format!("diff --from-file={} {}", secret.display(), list.display()),
+    ] {
+        let prepared = tools
+            .prepare(&workspace, "Bash", &json!({"command":command}))
+            .await
+            .unwrap();
+        assert!(prepared.requires_permission, "{command}");
+    }
+    let file_a = root.join("one");
+    let file_b = root.join("two");
+    std::fs::write(&file_a, "one").unwrap();
+    std::fs::write(&file_b, "two").unwrap();
+    let prepared = tools
+        .prepare(
+            &workspace,
+            "Bash",
+            &json!({"command":format!("diff -u {} {}",file_a.display(),file_b.display())}),
+        )
+        .await
+        .unwrap();
+    assert!(!prepared.requires_permission);
+}
+
+#[tokio::test]
+async fn pattern_file_arguments_require_the_same_read_permission_as_search_inputs() {
+    let project = tempfile::tempdir().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let input = root.join("input");
+    std::fs::write(&input, "example").unwrap();
+    let patterns = outside.path().join("patterns");
+    std::fs::write(&patterns, "example").unwrap();
+    let tools = Tools::new(root.clone());
+    let workspace = workspace(&project.path().canonicalize().unwrap());
+    for command in [
+        format!("rg -f {} {}", patterns.display(), input.display()),
+        format!("rg --file={} {}", patterns.display(), input.display()),
+        format!("grep -f {} {}", patterns.display(), input.display()),
+        format!("grep --file={} {}", patterns.display(), input.display()),
+    ] {
+        let prepared = tools
+            .prepare(&workspace, "Bash", &json!({"command":command}))
+            .await
+            .unwrap();
+        assert!(prepared.requires_permission, "{command}");
+    }
+    std::os::unix::fs::symlink(&patterns, project.path().join("123")).unwrap();
+    for command in [
+        format!("rg -f123 {}", input.display()),
+        format!("grep -f123 {}", input.display()),
+        format!("rg -e123 {}", patterns.display()),
+    ] {
+        let prepared = tools
+            .prepare(&workspace, "Bash", &json!({"command":command}))
+            .await
+            .unwrap();
+        assert!(prepared.requires_permission, "{command}");
+    }
+    let own = root.join("patterns");
+    std::fs::write(&own, "example").unwrap();
+    let prepared = tools
+        .prepare(
+            &workspace,
+            "Bash",
+            &json!({"command":format!("rg -f {} {}",own.display(),input.display())}),
+        )
+        .await
+        .unwrap();
+    assert!(!prepared.requires_permission);
+}
+
+#[tokio::test]
+async fn tilde_directory_operands_use_the_same_normalized_path_checks() {
+    let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+    let project = directory.path().canonicalize().unwrap();
+    let home = std::env::home_dir().unwrap();
+    let a = project.join("a");
+    let b = project.join("b");
+    std::fs::create_dir(&a).unwrap();
+    std::fs::create_dir(&b).unwrap();
+    let output = tempfile::tempdir().unwrap();
+    let tools = Tools::new(output.path().canonicalize().unwrap());
+    let command = format!(
+        "diff -rN ~/{} ~/{}",
+        a.strip_prefix(&home).unwrap().display(),
+        b.strip_prefix(&home).unwrap().display()
+    );
+    let prepared = tools
+        .prepare(&workspace(&project), "Bash", &json!({"command":command}))
+        .await
+        .unwrap();
+    assert!(prepared.requires_permission);
+}
+
+#[tokio::test]
+async fn filename_lists_and_ambiguous_short_values_require_ordinary_permission() {
+    let project = tempfile::tempdir().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let input = root.join("input");
+    let list = root.join("list");
+    let other = outside.path().join("other");
+    std::fs::write(&input, "input").unwrap();
+    std::fs::write(&other, "other").unwrap();
+    std::fs::write(&list, other.to_string_lossy().as_bytes()).unwrap();
+    let tools = Tools::new(root.clone());
+    let workspace = workspace(&project.path().canonicalize().unwrap());
+    for command in [
+        format!("file -f {}", list.display()),
+        format!("sha256sum -c {}", list.display()),
+        format!("sha1sum -bc {}", list.display()),
+        format!("md5sum --check {}", list.display()),
+        format!("wc --files0-from={}", list.display()),
+        format!("du --files0-from {}", list.display()),
+        format!("file --magic-file={} {}", other.display(), input.display()),
+        format!("base64 -i=123 {}", input.display()),
+        format!("grep -f=123 {}", input.display()),
+    ] {
+        let prepared = tools
+            .prepare(&workspace, "Bash", &json!({"command":command}))
+            .await
+            .unwrap();
+        assert!(prepared.requires_permission, "{command}");
+    }
+    let prepared = tools
+        .prepare(
+            &workspace,
+            "Bash",
+            &json!({"command":format!("rg -H input {}",input.display())}),
+        )
+        .await
+        .unwrap();
+    assert!(!prepared.requires_permission);
+}
+
+#[tokio::test]
+async fn quoted_literal_glob_symlink_does_not_get_family_temp_allowance() {
+    let project = tempfile::tempdir().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let path = root.join("*");
+    let target = outside.path().join("target");
+    std::fs::write(&target, "outside fixture").unwrap();
+    std::fs::write(&path, "owned fixture").unwrap();
+    let tools = Tools::new(root);
+    let workspace = workspace(&project.path().canonicalize().unwrap());
+    let command = format!("cat '{}'", path.display());
+    let prepared = tools
+        .prepare(&workspace, "Bash", &json!({"command":command}))
+        .await
+        .unwrap();
+    assert!(!prepared.requires_permission);
+    std::fs::remove_file(&path).unwrap();
+    std::os::unix::fs::symlink(&target, &path).unwrap();
+    let prepared = tools
+        .prepare(&workspace, "Bash", &json!({"command":command}))
+        .await
+        .unwrap();
+    assert!(prepared.requires_permission);
+}
+
+#[tokio::test]
+async fn prepared_quoted_literal_glob_rechecks_replaced_symlink() {
+    let project = tempfile::tempdir().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let path = root.join("*");
+    std::fs::write(&path, "owned fixture").unwrap();
+    let target = outside.path().join("target");
+    std::fs::write(&target, "outside fixture").unwrap();
+    let tools = Tools::new(root);
+    let prepared = tools
+        .prepare(
+            &workspace(&project.path().canonicalize().unwrap()),
+            "Bash",
+            &json!({"command":format!("cat '{}'",path.display())}),
+        )
+        .await
+        .unwrap();
+    assert!(!prepared.requires_permission);
+    std::fs::remove_file(&path).unwrap();
+    std::os::unix::fs::symlink(&target, &path).unwrap();
+    assert!(matches!(
+        tools.execute(prepared, CancellationToken::new()).await,
+        Err(ToolError::PathChanged(_))
+    ));
+}

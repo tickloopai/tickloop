@@ -372,7 +372,7 @@ impl Agent {
         {
             recorder.register_branch(&mut source.snapshot, child_chat_id, &name);
         }
-        let tools = self.create_chat_tools(child_chat_id, &snapshot.workdir);
+        let tools = self.create_chat_tools(&snapshot);
         let skills = crate::skills::SkillRegistry::discover(
             &snapshot.workdir,
             self.inner.user_skills_directory.as_deref(),
@@ -1169,8 +1169,10 @@ mod tests {
                         .push(super::super::PermissionRequest {
                             id: Uuid::new_v4(),
                             loop_id,
-                            run_id,
-                            call_id: "busy-permission".into(),
+                            execution: crate::runtime::PermissionExecution::ToolCall {
+                                run_id,
+                                call_id: "busy-permission".into(),
+                            },
                             name: "Bash".into(),
                             input: serde_json::json!({"command": "true"}),
                             file_change: None,

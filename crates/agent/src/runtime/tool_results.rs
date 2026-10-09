@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 
-use super::{Agent, AgentError, ChatId, ChatSnapshot, Receipt};
+use super::{Agent, AgentError, ChatSnapshot, Receipt};
 use crate::model::{Content, Message, Role, ToolResultContent};
 use crate::private_fs::PRIVATE_FILE_MODE;
 use crate::tools::{
@@ -32,7 +32,7 @@ use crate::tools::{
     utf16_length,
 };
 use crate::transcript::{
-    ContentReplacementRecord, PrivateDirectory, private_project_temp_directory,
+    ContentReplacementRecord, PrivateDirectory, private_family_temp_directory,
 };
 
 /// Chat 目录中大工具结果的子目录；过期清理按同一布局查找。
@@ -51,35 +51,34 @@ const FALLBACK_NAME_ATTEMPTS: usize = 8;
 const FALLBACK_STEM: &str = "tool-result";
 
 impl Agent {
-    /// 创建 Chat 的工具。持久化时 Chat 目录为 Transcript 同级的 `<chatId>/`
-    /// （须先登记 Transcript 路径），否则位于系统临时目录的项目目录下；后台任务输出照
-    /// `<系统临时目录>/tickloop-private-<uid>/<项目目录名>/<chatId>/tasks`。
-    pub(super) fn create_chat_tools(&self, chat_id: ChatId, workdir: &Path) -> Arc<Tools> {
-        let project_temp = private_project_temp_directory(workdir);
+    /// Each family owns one private temporary root; children share it without widening
+    /// access to other families in the same project.
+    pub(super) fn create_chat_tools(&self, snapshot: &ChatSnapshot) -> Arc<Tools> {
+        let chat_id = snapshot.id;
+        let family_id = snapshot
+            .delegation
+            .as_ref()
+            .map_or(chat_id, |delegation| delegation.parent_chat_id);
+        let family_temp = private_family_temp_directory(family_id);
         let persistent_project = self
             .inner
             .recorder
             .as_ref()
             .and_then(|recorder| recorder.project_directory_of(chat_id));
-        let mut readable_directories = Vec::new();
-        if let Some(project) = &persistent_project {
-            readable_directories.push(project.clone());
-        }
-        // 项目临时目录在这里由本用户创建并校验；其他用户预先布置（符号链接、属主或权限不符）时
-        // 不放行读取，之后写入任务输出与外存结果时会以同样的校验报错。
-        if project_temp.create().is_ok() {
-            readable_directories.push(project_temp.path().to_path_buf());
-        }
-        let project =
-            persistent_project.map_or_else(|| project_temp.clone(), PrivateDirectory::trusted);
-        let chat_directory = project.join(chat_id.to_string());
-        let task_output_directory = project_temp
-            .join(chat_id.to_string())
-            .join(TASK_OUTPUT_SUBDIRECTORY);
+        let temporary_chat = if family_id == chat_id {
+            family_temp.clone()
+        } else {
+            family_temp.join(chat_id.to_string())
+        };
+        let chat_directory = persistent_project.map_or_else(
+            || temporary_chat.clone(),
+            |project| PrivateDirectory::trusted(project).join(chat_id.to_string()),
+        );
+        let task_output_directory = temporary_chat.join(TASK_OUTPUT_SUBDIRECTORY);
         Arc::new(Tools::for_chat(
             chat_directory,
             task_output_directory,
-            readable_directories,
+            family_temp,
         ))
     }
 

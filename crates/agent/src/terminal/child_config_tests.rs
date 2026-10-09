@@ -267,6 +267,15 @@ struct ChildPty {
     _master: Box<dyn portable_pty::MasterPty + Send>,
 }
 
+/// The output up to the end of the last completed synchronized frame, so a half-drawn frame is
+/// never sampled.
+fn completed_frames(output: &str) -> &str {
+    let end = output
+        .rfind(COMPLETED_FRAME_END)
+        .map_or(0, |end| end + COMPLETED_FRAME_END.len());
+    &output[..end]
+}
+
 impl ChildPty {
     fn start(directory: &Path, route: &str) -> Self {
         let pair = native_pty_system()
@@ -332,8 +341,9 @@ impl ChildPty {
     }
 
     fn frame(&self) -> String {
+        let output = self.output.lock().unwrap();
         screen::visible_screen(
-            &String::from_utf8_lossy(&self.output.lock().unwrap()),
+            completed_frames(&String::from_utf8_lossy(&output)),
             WIDTH,
             HEIGHT,
         )
@@ -372,10 +382,7 @@ impl ChildPty {
         self.wait_for("the child editor owns input", |frame| {
             let bytes = captured.lock().unwrap();
             let output = String::from_utf8_lossy(&bytes);
-            let end = output
-                .rfind(COMPLETED_FRAME_END)
-                .map_or(output.len(), |end| end + COMPLETED_FRAME_END.len());
-            let completed = &output[..end];
+            let completed = completed_frames(&output);
             frame.contains(CHILD_VIEW_HEADING)
                 && completed.rfind(CURSOR_VISIBLE).is_some_and(|shown| {
                     completed

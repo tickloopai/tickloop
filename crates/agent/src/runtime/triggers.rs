@@ -471,6 +471,25 @@ impl Agent {
                 record.status = EventClaimStatus::NeedsAttention;
             }
         }
+        let mut cancelled_shells = HashSet::new();
+        for shell in &mut chat.snapshot.user_shells {
+            if shell.loop_id == Some(loop_id)
+                && (shell.state == UserShellState::Queued || shell.awaits_admission())
+            {
+                cancelled_shells.insert(shell.id);
+                shell.armed = false;
+                shell.set_state(UserShellState::Failed);
+                shell.reason = Some("the owning Loop ended before Shell admission".into());
+                if let Some(cancel) = self.take_user_shell_cancellation(chat_id, shell.id) {
+                    cancel.cancel();
+                }
+                let _ = self.inner.user_shell_events.send(shell.clone());
+            }
+        }
+        self.withdraw_user_shell_requests(&mut chat.snapshot, |command_id| {
+            cancelled_shells.contains(&command_id)
+        })
+        .await;
         chat.snapshot
             .pending_inputs
             .retain(|pending| pending.receipt.loop_id != loop_id);

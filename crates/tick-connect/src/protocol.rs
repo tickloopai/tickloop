@@ -115,6 +115,7 @@ impl TickProtocol {
     pub fn descriptor(&self, result: Value) -> Result<TickDescriptor, String> {
         let descriptor: TickDescriptor =
             serde_json::from_value(result).map_err(|error| error.to_string())?;
+        check_encoded_size(&descriptor, MAX_DESCRIPTION_BYTES, "Tick description")?;
         descriptor.validate()?;
         Ok(descriptor)
     }
@@ -142,6 +143,7 @@ impl TickProtocol {
         let update: TickUpdate =
             serde_json::from_value(params).map_err(|error| error.to_string())?;
         self.validate_identity(update.version, &update.tick_instance_id)?;
+        check_encoded_size(&update, MAX_UPDATE_BYTES, "Tick update")?;
         if update.sequence == 0
             || self
                 .sequence
@@ -166,6 +168,17 @@ impl TickProtocol {
         }
         Ok(())
     }
+}
+
+/// Refuses `value` when its encoding exceeds `limit` bytes. What a Tick sends is parsed and
+/// forwarded re-encoded, and number formatting can make it several times larger than the Tick's
+/// own line (`1e15` becomes `1000000000000000.0`), so limits apply to the encoding.
+pub fn check_encoded_size(value: &impl Serialize, limit: usize, what: &str) -> Result<(), String> {
+    let encoded = serde_json::to_vec(value).map_err(|error| error.to_string())?;
+    if encoded.len() > limit {
+        return Err(format!("{what} exceeds {limit} bytes once encoded"));
+    }
+    Ok(())
 }
 
 pub fn parse_request(line: &[u8]) -> Result<Value, String> {
@@ -196,6 +209,35 @@ mod tests {
         assert!(protocol.update(json!({"version":3,"tick_instance_id":"herdr:other","source":"demo","sequence":5,"observed_at":"2026-09-24T00:00:00Z","data":{}})).is_err());
         assert!(protocol.update(json!({"version":2,"tick_instance_id":"herdr:one","source":"demo","sequence":5,"observed_at":"2026-09-24T00:00:00Z","data":{}})).is_err());
         assert_eq!(protocol.sequence(), Some(4));
+    }
+
+    #[test]
+    fn an_update_is_limited_by_its_encoded_size_not_its_line() {
+        let mut protocol = TickProtocol::new("herdr:one");
+        let values = vec!["1e15"; 100_000].join(",");
+        let line = format!(
+            r#"{{"version":3,"tick_instance_id":"herdr:one","source":"demo","sequence":1,"observed_at":"2026-09-24T00:00:00Z","data":[{values}]}}"#
+        );
+        assert!(line.len() < MAX_UPDATE_BYTES);
+        let params: Value = serde_json::from_str(&line).unwrap();
+        assert!(serde_json::to_vec(&params).unwrap().len() > MAX_UPDATE_BYTES);
+        assert_eq!(
+            protocol.update(params).unwrap_err(),
+            format!("Tick update exceeds {MAX_UPDATE_BYTES} bytes once encoded")
+        );
+        assert_eq!(protocol.sequence(), None);
+    }
+
+    #[test]
+    fn a_description_is_limited_by_its_encoded_size() {
+        let protocol = TickProtocol::new("herdr:one");
+        let description = "d".repeat(MAX_DESCRIPTION_BYTES);
+        assert_eq!(
+            protocol
+                .descriptor(json!({"protocol":2,"tick_type":"external.weather","title":"Weather","description":description,"recover_with":null,"tools":[]}))
+                .unwrap_err(),
+            format!("Tick description exceeds {MAX_DESCRIPTION_BYTES} bytes once encoded")
+        );
     }
 
     #[test]

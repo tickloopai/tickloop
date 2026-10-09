@@ -1292,7 +1292,7 @@ async fn run_child_views(fixture: &PrivateFixture) {
     model.base_url = base_url.trim_end_matches("/anthropic").into();
     model.api_key_env = "TICKLOOP_FIXTURE_API_KEY".into();
     fixture.set_model(&model);
-    let mut first = PtyView::start_with_flags(fixture, &["--dangerously-skip-permissions"]);
+    let mut first = PtyView::start(fixture);
     first
         .wait_for("delegation View ready", new_input_is_visible)
         .await;
@@ -1414,7 +1414,7 @@ async fn run_child_views(fixture: &PrivateFixture) {
     let child_label = "Agent cadence".to_owned();
     open_family_child(&mut first, CHILD_TASK).await;
     wait_for_display_views(&client, child, 1).await;
-    let mut second = PtyView::start_with_flags(fixture, &["--dangerously-skip-permissions"]);
+    let mut second = PtyView::start(fixture);
     second
         .wait_for("independent View ready", new_input_is_visible)
         .await;
@@ -1715,19 +1715,57 @@ async fn run_child_views(fixture: &PrivateFixture) {
             frame.contains("child follow-up acknowledged")
         })
         .await;
+    let configured = client
+        .execute(CommandEnvelope {
+            owner_epoch: client.owner_epoch(),
+            command_id: uuid::Uuid::new_v4(),
+            command: AgentCommand::Configure {
+                provider: None,
+                execution: parent,
+                change: ConfigurationChange::ExecutionMode {
+                    mode: tickloop_agent::permissions::ExecutionMode::AcceptEdits,
+                },
+            },
+        })
+        .await
+        .unwrap();
+    assert!(configured.error.is_none());
     first.send(b"!python3 -c 'print(123)'\r");
     first
-        .wait_for(
-            "child Shell ceiling refusal restores original Shell input",
-            |frame| {
-                frame.contains("Unsupported")
-                    && frame
-                        .lines()
-                        .any(|line| line.contains("❯") && line.contains("python3 -c 'print(123)'"))
-            },
-        )
+        .wait_for("child Shell permission is visible", |frame| {
+            frame.contains("python3") && frame.contains("Permission required")
+        })
         .await;
-    assert!(snapshot(&client, child).await.user_shells.is_empty());
+    let waiting = wait_snapshot(
+        &client,
+        child,
+        "direct child Shell awaits normal approval",
+        |snapshot| !snapshot.permissions.is_empty(),
+    )
+    .await;
+    assert!(matches!(
+        waiting.permissions[0].execution,
+        tickloop_agent::runtime::PermissionExecution::UserShell { .. }
+    ));
+    assert!(waiting.user_shells.iter().all(|shell| shell.pid.is_none()));
+    first.send(b"\r");
+    wait_snapshot(
+        &client,
+        child,
+        "approved direct child Shell completed",
+        |snapshot| {
+            snapshot
+                .user_shells
+                .iter()
+                .any(|shell| shell.state == tickloop_agent::runtime::UserShellState::Completed)
+        },
+    )
+    .await;
+    first
+        .wait_for("approved child Shell output is visible", |frame| {
+            frame.contains("123")
+        })
+        .await;
     let forbidden = client
         .execute(CommandEnvelope {
             owner_epoch: client.owner_epoch(),

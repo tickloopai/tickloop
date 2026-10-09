@@ -1358,7 +1358,7 @@ mod tests {
 
     #[tokio::test]
     async fn older_business_peers_are_fenced_before_a_query_can_dispatch() {
-        for (major, minor) in [(3, 2), (5, 0), (6, 0)] {
+        for (major, minor) in [(3, 2), (5, 0), (6, 0), (8, 0), (9, 0)] {
             let epoch = Uuid::new_v4();
             let source = Arc::new(CompletingLookup {
                 epoch,

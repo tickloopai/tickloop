@@ -19,7 +19,7 @@ use tick_host::host::{Receipt, TickOwner};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use super::controller::{HostController, LIFECYCLE_TIMEOUT, OwnerListing};
+use super::controller::{HostController, LIFECYCLE_TIMEOUT, OwnerListing, WatchIntents};
 
 use crate::{
     private_fs::{
@@ -40,6 +40,10 @@ const RECORD_EXTENSION: &str = ".json";
 const DELETION_SETTLE_POLL: std::time::Duration = std::time::Duration::from_secs(1);
 /// The host's answer for an instance or owner it no longer runs.
 pub const TARGET_GONE: &str = "TargetGone";
+/// The most one registry record, or one owner or Watch message to the host, may serialize to.
+/// Records are kept per Chat and per launch, so this never caps how many there are.
+pub const SHARD_BYTES: usize = 1024 * 1024;
+const RECORD_TOO_LARGE: &str = "RecordTooLarge";
 
 /// Whether a Chat may own hosted Ticks. Retention deletion of its Transcript and an explicit
 /// StopSubagent end it; nothing else does. A deleted Chat leaves no state behind once its Ticks end.
@@ -237,7 +241,7 @@ impl Registry {
         let root = Arc::new(RootRegistry {
             files: Arc::new(files),
             intents: Mutex::new(()),
-            lifecycles: std::sync::Mutex::new(HashMap::new()),
+            lifecycles: LifecycleLocks::default(),
         });
         roots.insert(canonical, root.clone());
         Ok(root)
@@ -252,7 +256,42 @@ pub struct RootRegistry {
     intents: Mutex<()>,
     /// Per Chat: opens, reopens and ends take turns, so an end can never fall between an
     /// open's revision and its launch.
-    lifecycles: std::sync::Mutex<HashMap<Uuid, Arc<Mutex<()>>>>,
+    lifecycles: LifecycleLocks,
+}
+
+/// Per Chat, its lifecycle lock. A Chat's entry lasts only while its claims are above zero.
+type LifecycleLocks = std::sync::Mutex<HashMap<Uuid, ChatLifecycle>>;
+
+/// The lock a Chat's lifecycle turns take, and how many callers hold or await it.
+#[derive(Default)]
+struct ChatLifecycle {
+    lock: Arc<Mutex<()>>,
+    claims: usize,
+}
+
+/// One caller's turn at a Chat's lifecycle, counted from when it starts waiting until it drops.
+pub struct LifecycleTurn<'a> {
+    locks: &'a LifecycleLocks,
+    chat: Uuid,
+    held: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl Drop for LifecycleTurn<'_> {
+    fn drop(&mut self) {
+        // The lock is released before the count drops, so an entry removed at zero is never
+        // replaced by a new lock while someone still holds the old one.
+        self.held.take();
+        let mut locks = self
+            .locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(lifecycle) = locks.get_mut(&self.chat) {
+            lifecycle.claims -= 1;
+            if lifecycle.claims == 0 {
+                locks.remove(&self.chat);
+            }
+        }
+    }
 }
 
 struct RegistryFiles {
@@ -306,16 +345,17 @@ impl RegistryFiles {
     }
 
     fn write(&self, path: &Path, value: &impl Serialize) -> Result<(), HostError> {
+        let bytes = serde_json::to_vec(value).map_err(|error| failed(&error))?;
+        within_shard("the hosted Tick registry record", bytes.len())?;
         let parent = path.parent().expect("registry files live in a directory");
         create_private_directory(parent).map_err(|error| failed(&error))?;
         verify_private_directory(parent, "hosted Tick registry directory")
             .map_err(|error| failed(&error))?;
-        let bytes = serde_json::to_vec(value).map_err(|error| failed(&error))?;
         replace_file_atomically(path, &bytes, PRIVATE_FILE_MODE).map_err(|error| failed(&error))
     }
 
     fn revision(&self) -> Result<u64, HostError> {
-        match read_unlinked(&self.directory.join(MANIFEST_FILE)).map_err(|error| failed(&error))? {
+        match read_unlinked(&self.directory.join(MANIFEST_FILE))? {
             Some(bytes) => serde_json::from_slice::<Manifest>(&bytes)
                 .map(|manifest| manifest.revision)
                 .map_err(|error| failed(&error)),
@@ -334,7 +374,7 @@ impl RegistryFiles {
         let Some(directory) = self.existing_chat_directory(chat)? else {
             return Ok(OwnerState::Active);
         };
-        match read_unlinked(&directory.join(OWNER_FILE)).map_err(|error| failed(&error))? {
+        match read_unlinked(&directory.join(OWNER_FILE))? {
             Some(bytes) => serde_json::from_slice(&bytes).map_err(|error| failed(&error)),
             None => Ok(OwnerState::Active),
         }
@@ -438,7 +478,7 @@ impl RegistryFiles {
                 continue;
             };
             // A record removed since the directory was listed is simply gone.
-            let Some(bytes) = read_unlinked(&entry.path()).map_err(|error| failed(&error))? else {
+            let Some(bytes) = read_unlinked(&entry.path())? else {
                 continue;
             };
             let record: LaunchRecord =
@@ -491,16 +531,25 @@ impl RegistryFiles {
 }
 
 impl RootRegistry {
-    /// Holds `chat`'s lifecycle until the guard drops.
-    pub async fn lifecycle(&self, chat: Uuid) -> tokio::sync::OwnedMutexGuard<()> {
-        let lock = self
-            .lifecycles
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry(chat)
-            .or_default()
-            .clone();
-        lock.lock_owned().await
+    /// Holds `chat`'s lifecycle until the turn drops.
+    pub async fn lifecycle(&self, chat: Uuid) -> LifecycleTurn<'_> {
+        let lock = {
+            let mut locks = self
+                .lifecycles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let lifecycle = locks.entry(chat).or_default();
+            lifecycle.claims += 1;
+            lifecycle.lock.clone()
+        };
+        // Counted before it waits, so a caller that gives up waiting still releases its claim.
+        let mut turn = LifecycleTurn {
+            locks: &self.lifecycles,
+            chat,
+            held: None,
+        };
+        turn.held = Some(lock.lock_owned().await);
+        turn
     }
 
     async fn on_files<T: Send + 'static>(
@@ -611,10 +660,8 @@ impl RootRegistry {
                 } = &record.state
                     && *epoch == host_epoch
                 {
-                    match controller
-                        .set_intents(&owner, instance, &record.watches)
-                        .await
-                    {
+                    let intents = WatchIntents::new(&owner, instance, &record.watches)?;
+                    match controller.set_intents(&intents).await {
                         // It ended since it was listed; the next listing settles its record.
                         Err(error) if error.code == TARGET_GONE => {}
                         result => result?,
@@ -728,7 +775,8 @@ impl RootRegistry {
         instance: &InstanceRef,
         watches: BTreeSet<Uuid>,
     ) -> Result<(), HostError> {
-        let _intents = self.intents.lock().await;
+        let intents = WatchIntents::new(owner, instance, &watches)?;
+        let _in_order = self.intents.lock().await;
         let is_live = |record: &LaunchRecord| matches!(&record.state, LaunchState::Live { instance: live, .. } if live == instance);
         let gone = || HostError::before(TARGET_GONE, "this Chat has no such live hosted Tick");
         let record = self
@@ -756,7 +804,7 @@ impl RootRegistry {
                 return Err(gone());
             }
         }
-        controller.set_intents(owner, instance, &watches).await
+        controller.set_intents(&intents).await
     }
 
     /// Records that a cleanup holding `chat`'s retention lock is about to remove its Transcript.
@@ -859,21 +907,39 @@ impl RootRegistry {
     }
 }
 
-/// A registry file's bytes, refusing a symbolic link in its place; `None` when it is missing.
-fn read_unlinked(path: &Path) -> io::Result<Option<Vec<u8>>> {
+/// A registry file's bytes, refusing a symbolic link in its place and a file over one record,
+/// which is never read whole; `None` when it is missing.
+fn read_unlinked(path: &Path) -> Result<Option<Vec<u8>>, HostError> {
     use std::io::Read;
-    let mut file = match std::fs::OpenOptions::new()
+    let file = match std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)
     {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
+        Err(error) => return Err(failed(&error)),
     };
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
+    file.take(SHARD_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| failed(&error))?;
+    within_shard(
+        format_args!("registry file {}", path.display()),
+        bytes.len(),
+    )?;
     Ok(Some(bytes))
+}
+
+/// Refuses `what` when it takes `size` bytes, more than one record may.
+pub(crate) fn within_shard(what: impl std::fmt::Display, size: usize) -> Result<(), HostError> {
+    if size > SHARD_BYTES {
+        return Err(HostError::before(
+            RECORD_TOO_LARGE,
+            format!("{what} takes more than the {SHARD_BYTES} bytes one record may hold"),
+        ));
+    }
+    Ok(())
 }
 
 fn unavailable(message: String) -> HostError {
@@ -1149,6 +1215,46 @@ mod tests {
             .unwrap();
         assert!(!changed, "a removed record is not brought back");
         assert!(root.launches(chat).await.unwrap().is_empty());
+    }
+
+    /// A Chat's lifecycle lock is kept only while someone holds or awaits it, whether a waiter
+    /// gets its turn or gives up, and turns stay exclusive throughout.
+    #[tokio::test]
+    async fn a_chats_lifecycle_lock_lasts_only_while_it_is_held_or_awaited() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = Registry::default().root(directory.path()).await.unwrap();
+        let chat = Uuid::new_v4();
+        let locked = |root: &RootRegistry| root.lifecycles.lock().unwrap().len();
+
+        let first = root.lifecycle(chat).await;
+        assert_eq!(locked(&root), 1);
+        let gave_up =
+            tokio::time::timeout(std::time::Duration::from_millis(50), root.lifecycle(chat)).await;
+        assert!(gave_up.is_err(), "a held turn is exclusive");
+        let (acquired, is_acquired) = tokio::sync::oneshot::channel();
+        let (release, is_released) = tokio::sync::oneshot::channel::<()>();
+        let waiter = tokio::spawn({
+            let root = root.clone();
+            async move {
+                let _turn = root.lifecycle(chat).await;
+                acquired.send(()).unwrap();
+                is_released.await.unwrap();
+            }
+        });
+        tokio::task::yield_now().await;
+        drop(first);
+        is_acquired.await.unwrap();
+        assert_eq!(locked(&root), 1, "the waiter holds its turn");
+        release.send(()).unwrap();
+        waiter.await.unwrap();
+        assert_eq!(locked(&root), 0, "nobody holds or awaits it");
+
+        let held = root.lifecycle(chat).await;
+        let gave_up =
+            tokio::time::timeout(std::time::Duration::from_millis(50), root.lifecycle(chat)).await;
+        assert!(gave_up.is_err());
+        drop(held);
+        assert_eq!(locked(&root), 0, "a waiter that gave up leaves nothing");
     }
 
     #[tokio::test]

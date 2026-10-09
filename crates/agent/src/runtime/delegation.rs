@@ -62,7 +62,7 @@ pub struct DelegationMetadata {
 pub(super) fn definitions() -> Vec<ToolDefinition> {
     vec![ToolDefinition {
         name: SUBAGENT_TOOL_NAME.into(),
-        description: "Create one bounded independent child under your frozen resource and permission ceiling. Foreground waits for its final report. Set run_in_background=true to return immediately; completion arrives automatically as a task notification. Messages arrive automatically, so finish a turn after asking for clarification. Name and description identify the child separately from its task. The child has its own identity, Loop and approval/question requests. Interrupting foreground observation does not stop the child. Nested delegation, history rewrites and unrestricted Shell are unavailable.".into(),
+        description: "Create one bounded independent child under your frozen resource and permission ceiling. Foreground waits for its final report. Set run_in_background=true to return immediately; completion arrives automatically as a task notification. Messages arrive automatically, so finish a turn after asking for clarification. Name and description identify the child separately from its task. The child has its own identity, Loop and approval/question requests. Interrupting foreground observation does not stop the child. Bash follows the parent's frozen permission authority and normal approval checks; the working directory is not an OS sandbox. Nested delegation and history rewrites are unavailable.".into(),
         input_schema: json!({"type":"object","properties":{
             "task":{"type":"string","minLength":1},
             "run_in_background":{"type":"boolean","default":false,"description":"Return immediately and receive the final report as an automatic task notification."},
@@ -189,7 +189,8 @@ pub(super) fn check_call(
                 "the parent's current denial still applies to this delegated operation".into(),
             );
         }
-        if current_parent_decision == Some(Decision::Ask)
+        if name != crate::tools::BASH_TOOL_NAME
+            && current_parent_decision == Some(Decision::Ask)
             && chat.snapshot.policy.explicit_decision_with_session(
                 name,
                 input,
@@ -205,7 +206,7 @@ pub(super) fn check_call(
     }
     if ceiling
         .policy
-        .explicit_decision_with_session(name, input, receipt.loop_id, None)
+        .explicit_decision_with_session(name, input, delegation.parent_loop_id, None)
         == Some(Decision::Deny)
     {
         return Err("delegated authorization ceiling denies this operation".into());
@@ -217,11 +218,16 @@ pub(super) fn check_call(
         };
         let is_plan_file_access = plan_file.is_some_and(|path| prepared.accesses_file(path))
             && (prepared.is_read_only || chat.snapshot.policy.mode == ExecutionMode::Plan);
-        if !is_plan_file_access && !prepared.is_supported_in_delegated_scope(&workspace) {
-            return Err("Unsupported: the operation cannot be proven to stay within the delegated resource scope; unrestricted Shell is unavailable".into());
+        if !is_plan_file_access && !prepared.is_supported_in_delegated_scope() {
+            return Err(
+                "Unsupported: the operation is outside the delegated resource scope".into(),
+            );
         }
         if !is_plan_file_access
-            && ceiling.policy.decide(prepared, &workspace, receipt.loop_id) == Decision::Deny
+            && ceiling
+                .policy
+                .decide(prepared, &workspace, delegation.parent_loop_id)
+                == Decision::Deny
         {
             return Err("delegated authorization ceiling denies this operation".into());
         }
@@ -262,6 +268,130 @@ pub(super) fn check_call(
         }
     }
     Ok(())
+}
+
+/// A call's permission decision and the policy revisions it was made under.
+pub(super) struct PermissionAuthority {
+    pub decision: Decision,
+    pub explicit_ask: bool,
+    /// The Chat's own policy revision.
+    pub policy_revision: u64,
+    /// The parent policy revision a delegated child's Bash was decided under; `None` for other
+    /// calls, and when the parent is gone, which decides Deny.
+    pub parent_revision: Option<u64>,
+}
+
+impl PermissionAuthority {
+    /// Whether this re-evaluated authority still admits a call approved under the given
+    /// revisions: nothing denies it, and once either policy changed it must allow outright.
+    pub(super) fn still_admits(
+        &self,
+        approved_policy_revision: u64,
+        approved_parent_revision: Option<u64>,
+    ) -> bool {
+        self.decision != Decision::Deny
+            && (self.decision == Decision::Allow
+                || self.policy_revision == approved_policy_revision
+                    && self.parent_revision == approved_parent_revision)
+    }
+}
+
+/// The permission decision for `prepared` in the receipt's Chat and Loop, or `None` when the
+/// Chat is gone. A delegated child's Bash is further narrowed by its frozen ceiling and by its
+/// parent's current policy.
+pub(super) fn permission_authority(
+    chats: &HashMap<ChatId, Chat>,
+    sessions: &session_permissions::SessionPermissionContext,
+    receipt: &Receipt,
+    prepared: &PreparedTool,
+    session: Option<crate::permissions::SessionPermissionDecision>,
+    plan_file: Option<&std::path::Path>,
+) -> Option<PermissionAuthority> {
+    let chat = chats.get(&receipt.chat_id)?;
+    let policy = &chat.snapshot.policy;
+    let own = PermissionAuthority {
+        decision: policy.decide_with_plan_file(
+            prepared,
+            &configured_workspace_for_chat(chat),
+            receipt.loop_id,
+            session,
+            plan_file,
+        ),
+        explicit_ask: policy.explicit_match_with_session(
+            &prepared.name,
+            &prepared.input,
+            receipt.loop_id,
+            session,
+        ) == Some(crate::permissions::ExplicitPermissionDecision::Ask),
+        policy_revision: policy.revision,
+        parent_revision: None,
+    };
+    let Some(delegation) = chat
+        .snapshot
+        .delegation
+        .as_ref()
+        .filter(|_| prepared.name == crate::tools::BASH_TOOL_NAME)
+    else {
+        return Some(own);
+    };
+    let workspace = Workspace {
+        workdir: delegation.ceiling.workdir.clone(),
+        additional_directories: delegation.ceiling.additional_directories.clone(),
+    };
+    let frozen = delegation.ceiling.policy.decide_with_plan_file(
+        prepared,
+        &workspace,
+        delegation.parent_loop_id,
+        session,
+        plan_file,
+    );
+    let frozen_ask = delegation.ceiling.policy.explicit_decision_with_session(
+        &prepared.name,
+        &prepared.input,
+        delegation.parent_loop_id,
+        session,
+    ) == Some(Decision::Ask);
+    let parent = chats.get(&delegation.parent_chat_id);
+    let (current, parent_ask, revision) = parent.map_or((Decision::Deny, false, None), |parent| {
+        let Ok(owner) = PermissionOwner::new(delegation.parent_chat_id, delegation.parent_loop_id)
+        else {
+            return (Decision::Deny, false, Some(parent.snapshot.policy.revision));
+        };
+        let parent_workspace = configured_workspace_for_chat(parent);
+        let Ok(operation) = SessionPermissionOperation::from_prepared(prepared, &parent_workspace)
+        else {
+            return (Decision::Deny, false, Some(parent.snapshot.policy.revision));
+        };
+        let parent_session = sessions.evaluate(owner, &operation).decision;
+        let effective_session =
+            if parent_session == Some(crate::permissions::SessionPermissionDecision::Deny) {
+                parent_session
+            } else {
+                session
+            };
+        (
+            parent.snapshot.policy.decide_with_plan_file(
+                prepared,
+                &parent_workspace,
+                delegation.parent_loop_id,
+                effective_session,
+                plan_file,
+            ),
+            parent.snapshot.policy.explicit_decision_with_session(
+                &prepared.name,
+                &prepared.input,
+                delegation.parent_loop_id,
+                effective_session,
+            ) == Some(Decision::Ask),
+            Some(parent.snapshot.policy.revision),
+        )
+    });
+    Some(PermissionAuthority {
+        decision: own.decision.stricter(frozen).stricter(current),
+        explicit_ask: own.explicit_ask || frozen_ask || parent_ask,
+        parent_revision: revision,
+        ..own
+    })
 }
 
 impl Agent {
@@ -394,74 +524,6 @@ impl Agent {
             prepared,
             plan_file.as_deref(),
         )
-    }
-
-    pub(super) async fn check_delegated_user_shell(
-        &self,
-        chat_id: ChatId,
-        loop_id: Option<LoopId>,
-        command: &str,
-    ) -> Result<(), AgentError> {
-        if self
-            .inner
-            .chats
-            .lock()
-            .await
-            .get(&chat_id)
-            .ok_or(AgentError::NotFound)?
-            .snapshot
-            .delegation
-            .is_none()
-        {
-            return Ok(());
-        }
-        self.refresh_project_rules(chat_id).await?;
-        let chats = self.inner.chats.lock().await;
-        let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
-        let delegation = chat
-            .snapshot
-            .delegation
-            .as_ref()
-            .ok_or(AgentError::NotFound)?;
-        let workspace = Workspace {
-            workdir: delegation.ceiling.workdir.clone(),
-            additional_directories: delegation.ceiling.additional_directories.clone(),
-        };
-        let prepared = crate::tools::prepare(
-            &workspace,
-            crate::tools::BASH_TOOL_NAME,
-            &json!({"command":command,"cwd":workspace.workdir}),
-        )
-        .map_err(|error| AgentError::Invalid(error.to_string()))?;
-        let loop_id = loop_id
-            .or_else(|| chat.snapshot.loops.first().map(|goal| goal.id))
-            .ok_or(AgentError::NotFound)?;
-        let receipt = Receipt {
-            chat_id,
-            loop_id,
-            run_id: Uuid::nil(),
-        };
-        let sessions = self.inner.session_permissions.lock().await;
-        check_call(
-            &chats,
-            &sessions,
-            &receipt,
-            &prepared.name,
-            &prepared.input,
-            Some(&prepared),
-            None,
-        )
-        .map_err(AgentError::Invalid)?;
-        if delegation
-            .ceiling
-            .policy
-            .decide(&prepared, &workspace, loop_id)
-            != Decision::Allow
-            || chat.snapshot.policy.decide(&prepared, &workspace, loop_id) != Decision::Allow
-        {
-            return Err(AgentError::Invalid("Unsupported: direct Shell cannot bypass delegated action approval; use an admitted scoped operation".into()));
-        }
-        Ok(())
     }
 
     pub(super) fn subagent_tool<'a>(

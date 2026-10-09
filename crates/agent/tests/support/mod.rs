@@ -2,6 +2,8 @@
 
 pub mod cli_runtime;
 pub mod fixture_cli;
+pub mod herdr;
+pub mod hosted;
 pub mod routed;
 pub mod tick_admission_contract;
 
@@ -229,10 +231,25 @@ pub fn reminded_plan_file(request: &ModelRequest) -> Option<String> {
     })
 }
 
+/// How long [`next_event`] waits for the next runtime event.
+const EVENT_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A watch connects to its Tick once and then reconnects at most
+/// [`RECONNECTS_PER_WATCH`](tickloop_agent::tick_stream::RECONNECTS_PER_WATCH) times.
+pub const CONNECTS_PER_WATCH: usize =
+    1 + tickloop_agent::tick_stream::RECONNECTS_PER_WATCH as usize;
+
 pub async fn next_event(
     receiver: &mut tokio::sync::broadcast::Receiver<tickloop_agent::runtime::Event>,
 ) -> tickloop_agent::runtime::Event {
-    tokio::time::timeout(std::time::Duration::from_secs(5), receiver.recv())
+    next_event_within(receiver, EVENT_WAIT).await
+}
+
+pub async fn next_event_within(
+    receiver: &mut tokio::sync::broadcast::Receiver<tickloop_agent::runtime::Event>,
+    wait: std::time::Duration,
+) -> tickloop_agent::runtime::Event {
+    tokio::time::timeout(wait, receiver.recv())
         .await
         .expect("event timed out")
         .expect("event channel closed")

@@ -15,7 +15,8 @@ use uuid::Uuid;
 
 const TIMEOUT: Duration = Duration::from_secs(15);
 
-/// A protocol Tick whose terminal is raw and shows its size and the last bytes it received.
+/// A protocol Tick whose terminal is raw and shows its size and the last bytes it received; it
+/// logs every byte it receives to `received`.
 const KEYS_TICK: &str = include_str!("support/keys_tick.py");
 
 struct Host {
@@ -184,12 +185,13 @@ impl View {
     }
 }
 
-/// Every key the user types reaches the same Tick process, Esc, wide characters and mouse
-/// reports included; Ctrl+B Ctrl+B sends one Ctrl+B, Ctrl+B with another key sends both, pasted
-/// text never detaches, and a resize reaches the Tick. Ctrl+B q, even across writes, leaves the Tick running, restores the
-/// terminal and releases the view, so a second client is refused only while one is attached.
+/// Every key the user types reaches the same Tick process, wide characters and mouse reports
+/// included; Ctrl+B Esc sends Esc, Ctrl+B Ctrl+B sends one Ctrl+B, Ctrl+B with another key sends
+/// both, pasted text never closes the view, and a resize reaches the Tick. A lone Esc closes the
+/// view, leaves the Tick running, restores the terminal and releases the view, so a second
+/// client is refused only while one is attached.
 #[tokio::test(flavor = "multi_thread")]
-async fn an_attached_view_reaches_the_same_process_until_it_detaches() {
+async fn an_attached_view_reaches_the_same_process_until_esc_closes_it() {
     let host = Host::start().await;
     let opened = host.open_keys().await;
     let home = host.directory.path().join("home");
@@ -197,7 +199,7 @@ async fn an_attached_view_reaches_the_same_process_until_it_detaches() {
     let mut view = View::start(&host.grant(&opened).await, &home);
     view.shows(24, 80, "size 80x24");
 
-    view.send(b"\x1b");
+    view.send(b"\x02\x1b");
     view.shows(24, 80, "keys 1b");
     view.send(b"\x02\x02");
     view.shows(24, 80, "keys 1b 02");
@@ -207,8 +209,8 @@ async fn an_attached_view_reaches_the_same_process_until_it_detaches() {
     view.shows(24, 80, "keys 1b 02 02 78");
     view.send("腾".as_bytes());
     view.shows(24, 80, "02 78 e8 85 be");
-    view.send(b"\x1b[200~\x02q\x1b[201~");
-    view.shows(24, 80, "e8 85 be 1b 5b 32 30 30 7e 02 71 1b 5b 32 30 31 7e");
+    view.send(b"\x1b[200~\x02\x1b\x1b[201~");
+    view.shows(24, 80, "e8 85 be 1b 5b 32 30 30 7e 02 1b 1b 5b 32 30 31 7e");
 
     view.send(b"\x1b[<0;5;5M");
     view.shows(24, 80, "7e 1b 5b 3c 30 3b 35 3b 35 4d");
@@ -231,10 +233,8 @@ async fn an_attached_view_reaches_the_same_process_until_it_detaches() {
         .unwrap();
     view.shows(30, 100, "size 100x30");
 
-    view.send(b"\x02");
-    std::thread::sleep(Duration::from_millis(200));
-    view.send(b"q");
-    assert_eq!(view.exit_code(), 0, "detaching ends the view");
+    view.send(b"\x1b");
+    assert_eq!(view.exit_code(), 0, "a lone Esc closes the view");
     let output = view.output_text();
     let restored = &output[output.len().saturating_sub(160)..];
     for reset in [
@@ -260,6 +260,50 @@ async fn an_attached_view_reaches_the_same_process_until_it_detaches() {
     );
     let mut again = View::start(&host.grant(&opened).await, &home);
     again.shows(24, 80, "size 80x24");
-    again.send(b"\x02q");
+    again.send(b"\x1b");
     assert_eq!(again.exit_code(), 0, "the lease was released");
+}
+
+/// A paste far larger than the attach client's input queue of 16 reads of 4 KiB reaches the
+/// same Tick process whole and in order: a full queue holds further keys back in the terminal
+/// instead of dropping them, and the Esc and Ctrl+B keys inside the paste are passed through.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_paste_larger_than_the_input_queue_reaches_the_tick_whole_and_in_order() {
+    const PASTED_BYTES: usize = 256 * 1024;
+    const PRINTABLE_ASCII: std::ops::RangeInclusive<u8> = b' '..=b'~';
+    let host = Host::start().await;
+    let opened = host.open_keys().await;
+    let home = host.directory.path().join("home");
+    std::fs::create_dir(&home).unwrap();
+    let mut view = View::start(&host.grant(&opened).await, &home);
+    view.shows(24, 80, "size 80x24");
+
+    let mut paste = b"\x1b[200~".to_vec();
+    paste.extend(PRINTABLE_ASCII.cycle().take(PASTED_BYTES));
+    paste.extend(b"\x1b\x02\x1b\x1b[201~");
+    let mut writer = std::mem::replace(&mut view.writer, Box::new(std::io::sink()));
+    let pasted = paste.clone();
+    let writing = std::thread::spawn(move || {
+        writer.write_all(&pasted).unwrap();
+        writer.flush().unwrap();
+        writer
+    });
+    view.shows(24, 80, &format!("count {}", paste.len()));
+    view.writer = writing.join().unwrap();
+    assert!(
+        std::fs::read(host.directory.path().join("received")).unwrap() == paste,
+        "every pasted byte arrives once and in order"
+    );
+    assert_eq!(
+        unsafe { libc::kill(opened.business_pid as i32, 0) },
+        0,
+        "the same Tick process received it"
+    );
+
+    view.send(b"\x1b");
+    assert_eq!(
+        view.exit_code(),
+        0,
+        "the view stayed open until a lone Esc closed it"
+    );
 }

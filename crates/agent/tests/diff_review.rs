@@ -119,7 +119,7 @@ async fn permission_and_operation_share_the_immutable_prepared_review() {
         .unwrap()
         .operations
         .into_iter()
-        .find(|operation| operation.call_id == permission.call_id)
+        .find(|operation| operation.call_id == permission.execution.call_key())
         .unwrap();
     assert_eq!(
         permission.file_change.as_deref(),
@@ -214,13 +214,13 @@ async fn change_journal_contains_only_successful_file_operations() {
         .unwrap();
 
     let first_permission = next_permission(&mut events).await;
-    assert_eq!(first_permission.call_id, "successful-edit");
+    assert_eq!(first_permission.execution.call_key(), "successful-edit");
     agent
         .answer_permission(chat, first_permission.id, true)
         .await
         .unwrap();
     let second_permission = next_permission(&mut events).await;
-    assert_eq!(second_permission.call_id, "conflicting-edit");
+    assert_eq!(second_permission.execution.call_key(), "conflicting-edit");
     std::fs::write(&second_path, "external replacement\n").unwrap();
     agent
         .answer_permission(chat, second_permission.id, true)

@@ -10,6 +10,7 @@ use std::{
 pub const RUNTIME_DIR_ENV: &str = "TICKLOOP_TICK_HOST_RUNTIME_DIR";
 pub const SOCKET_NAME: &str = "host.sock";
 pub const LOCK_NAME: &str = "host.lock";
+/// Holds one private directory per Tick, where its launcher binds the Tick Session socket.
 pub const SESSION_DIRECTORY: &str = "s";
 /// One empty file per host epoch that exited because every Tick had ended.
 pub const EMPTIED_DIRECTORY: &str = "emptied";
@@ -45,6 +46,27 @@ impl HostPaths {
 
     pub fn sessions(&self) -> PathBuf {
         self.runtime.join(SESSION_DIRECTORY)
+    }
+
+    /// The session directory of the host's `serial`th Tick, removed with that Tick, so even a
+    /// launcher killed before it could clean up leaves no socket behind.
+    pub fn tick_session_directory(&self, serial: u64) -> PathBuf {
+        self.sessions().join(format!("{serial:x}"))
+    }
+
+    /// Removes whatever the Ticks of an earlier host left in the session directory; the host
+    /// lock proves no host serves them any more.
+    pub fn clear_sessions(&self) {
+        let Ok(entries) = std::fs::read_dir(self.sessions()) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let _ = if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                std::fs::remove_dir_all(entry.path())
+            } else {
+                std::fs::remove_file(entry.path())
+            };
+        }
     }
 
     fn emptied_marker(&self, epoch: uuid::Uuid) -> PathBuf {
@@ -118,7 +140,9 @@ impl HostPaths {
                 "Tick host runtime directory is too long for a Unix socket path",
             ));
         }
-        if self.sessions().as_os_str().as_bytes().len() > MAX_SESSION_DIRECTORY_BYTES {
+        let longest_tick_session_directory = self.tick_session_directory(u64::MAX);
+        if longest_tick_session_directory.as_os_str().as_bytes().len() > MAX_SESSION_DIRECTORY_BYTES
+        {
             return Err(io::Error::other(
                 "Tick host session directory is too long for Tick Session sockets",
             ));
@@ -164,5 +188,28 @@ pub fn file_identity(path: &Path) -> io::Result<(u64, u64)> {
 pub fn remove_if_identity(path: &Path, identity: (u64, u64)) {
     if file_identity(path).is_ok_and(|current| current == identity) {
         let _ = std::fs::remove_file(path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_runtime_fits_only_while_its_longest_tick_session_directory_fits() {
+        let directory = tempfile::Builder::new()
+            .prefix("thp")
+            .tempdir_in("/private/tmp")
+            .unwrap();
+        let longest_tick_suffix = format!("/{SESSION_DIRECTORY}/{:x}", u64::MAX);
+        let fitting_bytes = MAX_SESSION_DIRECTORY_BYTES - longest_tick_suffix.len();
+        let runtime_of = |bytes: usize| {
+            let parent_bytes = directory.path().as_os_str().len() + "/".len();
+            HostPaths {
+                runtime: directory.path().join("r".repeat(bytes - parent_bytes)),
+            }
+        };
+        assert!(runtime_of(fitting_bytes).prepare().is_ok());
+        assert!(runtime_of(fitting_bytes + 1).prepare().is_err());
     }
 }

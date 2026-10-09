@@ -32,6 +32,9 @@ const MAX_IN_FLIGHT: usize = 8;
 const HOST_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const TOOL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 const RESPONSE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+/// A frame between a Session and its host: one Tick response, read or update within its own
+/// limit, plus the frame's envelope.
+const SESSION_FRAME_BYTES: usize = protocol::MAX_TOOL_RESPONSE_BYTES + 64 * 1024;
 
 #[derive(Debug, Error)]
 pub enum SessionError {
@@ -490,7 +493,15 @@ async fn read_child(stdout: tokio::process::ChildStdout, core: Arc<Core>) {
         }
         if let Some(id) = frame.get("id").and_then(Value::as_u64) {
             let result = match (frame.get("result"), frame.get("error")) {
-                (Some(result), None) => Ok(result.clone()),
+                // The Tick has already acted on the request, so an answer too large to forward
+                // leaves its outcome unknown rather than undone.
+                (Some(result), None) => protocol::check_encoded_size(
+                    result,
+                    protocol::MAX_TOOL_RESPONSE_BYTES,
+                    "Tick response",
+                )
+                .map(|()| result.clone())
+                .map_err(|_| SessionError::OutcomeUnknown),
                 (None, Some(error)) => Err(SessionError::ChildError(error.to_string())),
                 _ => Err(SessionError::Protocol("invalid Tick response".into())),
             };
@@ -696,7 +707,7 @@ async fn write_frame(
     let mut bytes =
         serde_json::to_vec(&frame).map_err(|error| SessionError::Protocol(error.to_string()))?;
     bytes.push(b'\n');
-    if bytes.len() > protocol::MAX_TOOL_RESPONSE_BYTES {
+    if bytes.len() > SESSION_FRAME_BYTES {
         return Err(SessionError::Protocol("Session response too large".into()));
     }
     tokio::time::timeout(HOST_REQUEST_TIMEOUT, writer.write_all(&bytes))
@@ -908,7 +919,7 @@ fn client_request_bytes(
 }
 
 async fn read_client_frame<R: AsyncBufRead + Unpin>(reader: &mut R) -> Result<Value, SessionError> {
-    let line = read_line_bounded(reader, protocol::MAX_TOOL_RESPONSE_BYTES)
+    let line = read_line_bounded(reader, SESSION_FRAME_BYTES)
         .await?
         .ok_or(SessionError::Gone)?;
     serde_json::from_slice(&line).map_err(|error| SessionError::Protocol(error.to_string()))
@@ -1032,5 +1043,56 @@ fn remove_owned_socket(path: &Path, expected: (u64, u64)) {
         && file_identity(path).ok() == Some(expected)
     {
         let _ = std::fs::remove_file(path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Answers already in flight that leave less than one largest answer of the 64 MiB response
+    /// budget make the next call Busy before it reaches the Tick, though connections and
+    /// in-flight slots are free.
+    #[tokio::test]
+    async fn a_call_beyond_the_response_budget_is_busy_before_dispatch() {
+        let directory = tempfile::tempdir().unwrap();
+        let counter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/ticks/counter.py");
+        let session = TickSession::spawn(SessionLaunch {
+            command: vec![
+                "python3".into(),
+                "-u".into(),
+                counter.to_string_lossy().into_owned(),
+            ],
+            cwd: directory.path().into(),
+            backend: SessionBackend::Herdr {
+                socket: PathBuf::from("/tmp/example-herdr.sock"),
+                terminal_id: "counter-pane".into(),
+            },
+            runtime_dir: Some(directory.path().join("sessions")),
+        })
+        .await
+        .unwrap();
+        let in_flight = RESPONSE_BUDGET_BYTES - protocol::MAX_TOOL_RESPONSE_BYTES + 1;
+        let answers = Arc::clone(&session.core.response_budget)
+            .try_acquire_many_owned(in_flight as u32)
+            .unwrap();
+        let refused = session
+            .client()
+            .call("increment", json!({"amount": 1}), CancellationToken::new())
+            .await;
+        assert!(matches!(refused, Err(SessionError::Busy)), "{refused:?}");
+        assert_eq!(
+            session.client().read().await.unwrap().data,
+            Some(json!({"value":0})),
+            "the Tick never received the call"
+        );
+        drop(answers);
+        let called = session
+            .client()
+            .call("increment", json!({"amount": 1}), CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(called["value"], 1);
+        session.shutdown().await.unwrap();
     }
 }

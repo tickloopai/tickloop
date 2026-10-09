@@ -5,7 +5,7 @@
 //! approved and dispatched.
 
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet},
     path::{Path, PathBuf},
 };
 
@@ -110,6 +110,7 @@ pub struct HostedTickTools {
     environment: Vec<(String, String)>,
     endpoint: HostEndpointIdentity,
     /// Data bindings of the Ticks each Chat owns; another Chat of this worker never shares one.
+    /// A binding goes when its Tick is closed, replaced, or missing from a complete listing.
     bindings: Mutex<HashMap<(ChatId, InstanceRef), DataBinding>>,
 }
 
@@ -157,7 +158,7 @@ impl HostedTickTools {
                     .map_err(|error| error.to_string())?;
                 let mut command = words.clone();
                 command[0] = executable.to_string_lossy().into_owned();
-                let title = words.join(" ");
+                let command_line = words.join(" ");
                 (
                     Operation::Open {
                         operation: Uuid::new_v4(),
@@ -165,11 +166,11 @@ impl HostedTickTools {
                         directory: FileIdentity::directory(&cwd)?,
                         command,
                         cwd: cwd.clone(),
-                        title: title.clone(),
+                        title: tick_host::host::display_title(&command_line),
                     },
                     HostToolPermission::Reviewable,
                     format!(
-                        "Open `{title}` hidden in the Tick host (cwd {})",
+                        "Open `{command_line}` hidden in the Tick host (cwd {})",
                         cwd.display()
                     ),
                 )
@@ -471,17 +472,23 @@ impl HostedTickTools {
                 ));
             }
         };
-        if let (Some(endpoint), Some(token)) = (
-            opened["terminal"]["endpoint"].as_str(),
-            opened["data_token"].as_str(),
-        ) {
-            self.bindings.lock().await.insert(
-                (chat, instance.clone()),
-                DataBinding {
-                    endpoint: endpoint.into(),
-                    data_token: token.into(),
-                },
-            );
+        {
+            let mut bindings = self.bindings.lock().await;
+            if let Some(lost) = replaces {
+                bindings.remove(&(chat, lost.clone()));
+            }
+            if let (Some(endpoint), Some(token)) = (
+                opened["terminal"]["endpoint"].as_str(),
+                opened["data_token"].as_str(),
+            ) {
+                bindings.insert(
+                    (chat, instance.clone()),
+                    DataBinding {
+                        endpoint: endpoint.into(),
+                        data_token: token.into(),
+                    },
+                );
+            }
         }
         let mut result = json!({"status":"opened","host":HOSTED_HOST,"visibility":"hidden","tick_instance_id":instance});
         if opened["business_pid"].is_u64() {
@@ -606,9 +613,25 @@ impl HostedTickTools {
             }));
             match page.page.next {
                 Some(next) => cursor = Some(next),
-                None => return Ok(members),
+                None => {
+                    let running = members
+                        .iter()
+                        .filter(|member| member.state == HostedMemberState::Running)
+                        .map(|member| member.instance.clone())
+                        .collect();
+                    self.forget_unlisted(chat, &running).await;
+                    return Ok(members);
+                }
             }
         }
+    }
+
+    /// Forgets `chat`'s bindings of every instance a complete listing did not show running.
+    async fn forget_unlisted(&self, chat: ChatId, running: &HashSet<InstanceRef>) {
+        self.bindings
+            .lock()
+            .await
+            .retain(|(bound, instance), _| *bound != chat || running.contains(instance));
     }
 
     async fn list_page(
@@ -757,30 +780,33 @@ impl HostedTickTools {
         chat: ChatId,
         instance: &InstanceRef,
     ) -> Result<DataBinding, HostError> {
+        let mut running = HashSet::new();
         let mut cursor = None;
         loop {
             let page = self.list_page(chat, cursor).await?;
-            if let Some(row) = page
-                .page
-                .items
-                .into_iter()
-                .find(|row| row.instance.as_ref() == Some(instance))
-            {
-                let binding = DataBinding {
-                    endpoint: page.endpoint,
-                    data_token: row.data_token.ok_or_else(|| {
-                        HostError::before(TARGET_GONE, "the hosted Tick is not running")
-                    })?,
+            for row in page.page.items {
+                let Some(listed) = row.instance else {
+                    continue;
                 };
-                self.bindings
-                    .lock()
-                    .await
-                    .insert((chat, instance.clone()), binding.clone());
-                return Ok(binding);
+                if listed == *instance {
+                    let binding = DataBinding {
+                        endpoint: page.endpoint,
+                        data_token: row.data_token.ok_or_else(|| {
+                            HostError::before(TARGET_GONE, "the hosted Tick is not running")
+                        })?,
+                    };
+                    self.bindings
+                        .lock()
+                        .await
+                        .insert((chat, instance.clone()), binding.clone());
+                    return Ok(binding);
+                }
+                running.insert(listed);
             }
             match page.page.next {
                 Some(next) => cursor = Some(next),
                 None => {
+                    self.forget_unlisted(chat, &running).await;
                     return Err(HostError::before(
                         TARGET_GONE,
                         format!("{instance} is not a running hosted Tick of this Chat"),
@@ -913,5 +939,159 @@ impl HostToolProvider for HostedTickTools {
             is_error: true,
             output_ref: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use tick_connect::{
+        hosted::{BUSINESS_FRAME_BYTES, read_frame, write_frame},
+        page::Page,
+    };
+    use tick_host::host::{TickOwner, TickRow, TickState};
+
+    use super::*;
+    use crate::hosted::worker_control::WorkerControlGrant;
+
+    /// An owner that answers every request with one complete listing of `chat`'s `running`
+    /// Ticks.
+    fn listing_owner(directory: &Path, chat: ChatId, running: &[InstanceRef]) -> OwnerControl {
+        let endpoint = directory.join("owner.sock");
+        let listener = tokio::net::UnixListener::bind(&endpoint).unwrap();
+        let rows = running
+            .iter()
+            .map(|instance| TickRow {
+                instance: Some(instance.clone()),
+                terminal: Uuid::new_v4(),
+                data_token: Some("token".into()),
+                owner: TickOwner {
+                    root: "fixture-root".into(),
+                    chat,
+                },
+                title: None,
+                state: TickState::Running,
+                business_pid: None,
+                attached: false,
+            })
+            .collect::<Vec<_>>();
+        let page = HostedTickPage {
+            page: Page {
+                generation: "listing".into(),
+                total: rows.len(),
+                items: rows,
+                next: None,
+            },
+            endpoint: directory.join("host.sock"),
+            lost: Vec::new(),
+        };
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let (reader, mut writer) = stream.into_split();
+                let mut reader = tokio::io::BufReader::new(reader);
+                if let Ok(Some(request)) = read_frame(&mut reader, BUSINESS_FRAME_BYTES).await {
+                    let answer = json!({"id":request["id"],"result":page});
+                    let _ = write_frame(&mut writer, &answer, BUSINESS_FRAME_BYTES).await;
+                }
+            }
+        });
+        OwnerControl::new(WorkerControlGrant {
+            endpoint,
+            owner_epoch: Uuid::new_v4(),
+            binding: Uuid::new_v4(),
+            capability: "capability".into(),
+            host_endpoint: directory.join("host.sock"),
+            intent_renewal: std::time::Duration::from_secs(100),
+        })
+    }
+
+    async fn bound(tools: &HostedTickTools) -> HashSet<(ChatId, InstanceRef)> {
+        tools.bindings.lock().await.keys().cloned().collect()
+    }
+
+    async fn bind(tools: &HostedTickTools, chat: ChatId, instance: &InstanceRef) {
+        tools.bindings.lock().await.insert(
+            (chat, instance.clone()),
+            DataBinding {
+                endpoint: "/nonexistent/host.sock".into(),
+                data_token: "token".into(),
+            },
+        );
+    }
+
+    /// The approval names the whole command and the launch keeps it, while the title the Chat
+    /// keeps for its Monitor is bounded like the host's listing.
+    #[tokio::test]
+    async fn an_open_keeps_its_whole_command_under_a_bounded_title() {
+        let directory = tempfile::Builder::new()
+            .prefix("hto")
+            .tempdir_in("/private/tmp")
+            .unwrap();
+        let chat = Uuid::new_v4();
+        let tools = HostedTickTools::new(listing_owner(directory.path(), chat, &[]), Vec::new());
+        let argument = "x".repeat(tick_host::host::TITLE_CHARACTERS * 4);
+        let prepared = tools
+            .prepare(
+                chat,
+                MODIFY_TICK,
+                &json!({"action":"open","command":["/bin/echo", argument],"cwd":directory.path()}),
+                None,
+            )
+            .await
+            .unwrap();
+        let whole = format!("/bin/echo {argument}");
+        assert!(prepared.approval_summary().contains(&whole));
+        let Some(HostedPrepared {
+            operation: Operation::Open { command, title, .. },
+        }) = prepared.payload::<HostedPrepared>()
+        else {
+            panic!("an open prepares an open");
+        };
+        assert_eq!(command, &["/bin/echo".to_owned(), argument]);
+        assert_eq!(title, &tick_host::host::display_title(&whole));
+    }
+
+    /// A binding goes once its Tick is no longer listed running, is looked up as gone, or was
+    /// lost and reopened as a new instance; another Chat's bindings are never touched.
+    #[tokio::test]
+    async fn bindings_of_ticks_that_ended_or_were_replaced_are_forgotten() {
+        let directory = tempfile::Builder::new()
+            .prefix("htb")
+            .tempdir_in("/private/tmp")
+            .unwrap();
+        let (chat, other) = (Uuid::new_v4(), Uuid::new_v4());
+        let hosted = || InstanceRef::hosted(Uuid::new_v4());
+        let (running, ended, elsewhere) = (hosted(), hosted(), hosted());
+        let tools = HostedTickTools::new(
+            listing_owner(directory.path(), chat, std::slice::from_ref(&running)),
+            Vec::new(),
+        );
+
+        bind(&tools, chat, &ended).await;
+        bind(&tools, other, &elsewhere).await;
+        tools.members(chat).await.unwrap();
+        assert_eq!(
+            bound(&tools).await,
+            HashSet::from([(chat, running.clone()), (other, elsewhere.clone())])
+        );
+
+        bind(&tools, chat, &ended).await;
+        let gone = tools.data(chat, &hosted()).await.err().unwrap();
+        assert_eq!(gone.code, TARGET_GONE);
+        assert_eq!(
+            bound(&tools).await,
+            HashSet::from([(chat, running.clone()), (other, elsewhere.clone())]),
+            "looking up a gone Tick forgets every unlisted one of the Chat"
+        );
+
+        let (lost, reopened) = (hosted(), hosted());
+        bind(&tools, chat, &lost).await;
+        let opened = json!({"instance":reopened,"terminal":{"endpoint":"/nonexistent/host.sock"},"data_token":"token"});
+        tools.opened(chat, opened, None, Some(&lost)).await;
+        assert_eq!(
+            bound(&tools).await,
+            HashSet::from([(chat, running), (chat, reopened), (other, elsewhere)])
+        );
     }
 }

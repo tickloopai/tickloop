@@ -18,14 +18,25 @@ struct Fixture {
     server: tokio::task::JoinHandle<std::io::Result<()>>,
 }
 
-async fn start() -> Fixture {
-    let directory = tempfile::Builder::new()
+fn private_directory() -> tempfile::TempDir {
+    tempfile::Builder::new()
         .prefix("th")
         .tempdir_in("/private/tmp")
-        .unwrap();
-    let paths = HostPaths {
+        .unwrap()
+}
+
+fn host_paths(directory: &tempfile::TempDir) -> HostPaths {
+    HostPaths {
         runtime: directory.path().join("h"),
-    };
+    }
+}
+
+async fn start() -> Fixture {
+    start_in(private_directory()).await
+}
+
+async fn start_in(directory: tempfile::TempDir) -> Fixture {
+    let paths = host_paths(&directory);
     let key = host::random_token();
     let server = tokio::spawn(host::serve(
         paths.clone(),
@@ -294,6 +305,80 @@ async fn an_unused_host_exits_after_its_initial_grace() {
         !fixture.paths.socket().exists(),
         "the host removes its own socket"
     );
+}
+
+/// Management answers left unread are given up after the 10-second control bound: the host
+/// closes that connection instead of waiting on its reader forever.
+#[tokio::test]
+async fn a_management_reader_that_stops_reading_loses_its_connection() {
+    const REQUESTS: u64 = 4000;
+    let fixture = start().await;
+    let (mut reader, mut writer, hello) = raw(
+        &fixture.paths.socket(),
+        json!({"channel":"management","major":1,"minor":0,"controller_key":fixture.key}),
+    )
+    .await;
+    let epoch = hello["result"]["epoch"].clone();
+    // Far more answers than the socket buffers hold, and none of them read for a while.
+    let flooding = tokio::spawn(async move {
+        for id in 0..REQUESTS {
+            let request = json!({"id":id,"method":"shutdown_status","params":{"epoch":epoch,"operation":uuid::Uuid::new_v4()}});
+            if write_frame(&mut writer, &request, MANAGEMENT_FRAME_BYTES)
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+        writer
+    });
+    tokio::time::sleep(tick_connect::hosted::CONTROL_TIMEOUT + Duration::from_secs(3)).await;
+    let mut answered = 0;
+    let closed = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Ok(Some(_)) = read_frame(&mut reader, MANAGEMENT_FRAME_BYTES).await {
+            answered += 1;
+        }
+    })
+    .await;
+    assert!(closed.is_ok(), "the host closed the stalled connection");
+    assert!(
+        answered < REQUESTS,
+        "every one of {answered} answers waited"
+    );
+    drop(flooding);
+    tokio::time::timeout(Duration::from_secs(10), fixture.server)
+        .await
+        .expect("the unused host exits")
+        .unwrap()
+        .unwrap();
+}
+
+/// The session directory a host gives its launchers starts empty: what the Ticks of an earlier
+/// host left there goes once the new host holds the lock.
+#[tokio::test]
+async fn a_new_host_clears_what_the_ticks_of_an_earlier_host_left() {
+    let directory = private_directory();
+    let paths = host_paths(&directory);
+    paths.prepare().unwrap();
+    let left = paths.sessions().join("7");
+    std::fs::create_dir(&left).unwrap();
+    for socket in [
+        left.join(format!("{}.sock", uuid::Uuid::new_v4())),
+        paths
+            .sessions()
+            .join(format!("{}.sock", uuid::Uuid::new_v4())),
+    ] {
+        drop(std::os::unix::net::UnixListener::bind(socket).unwrap());
+    }
+    let fixture = start_in(directory).await;
+    assert_eq!(
+        std::fs::read_dir(fixture.paths.sessions())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>(),
+        Vec::<PathBuf>::new()
+    );
+    shutdown(fixture).await;
 }
 
 async fn shutdown(fixture: Fixture) {

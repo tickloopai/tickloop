@@ -11,7 +11,7 @@ use std::{
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use support::{ScriptedModel, call, config, next_event, text};
+use support::{CONNECTS_PER_WATCH, ScriptedModel, call, config, next_event, text};
 use tick_connect::{
     access::TickAccess,
     herdr::{HerdrContext, HerdrPort, Pane, process_birth},
@@ -21,7 +21,10 @@ use tick_connect::{
 };
 use tickloop_agent::{
     runtime::{Agent, Event, EventKind, LoopState, TickLinkState},
-    tick_stream::{NativeTickStream, TickConnectionState, TickStreamEvent, TickStreamPort},
+    tick_stream::{
+        NativeTickStream, RECONNECT_PAUSE, RECONNECTS_PER_WATCH, TickConnectionState,
+        TickStreamEvent, TickStreamPort,
+    },
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -58,6 +61,8 @@ struct TerminalHost {
     gone: Mutex<Option<String>>,
     protocol: Mutex<Option<InstanceRef>>,
     outage: AtomicBool,
+    /// Requests refused while the controlled connection was down.
+    refused: AtomicUsize,
     content_reads: AtomicUsize,
 }
 
@@ -71,6 +76,7 @@ impl TerminalHost {
             gone: Mutex::new(None),
             protocol: Mutex::new(None),
             outage: AtomicBool::new(false),
+            refused: AtomicUsize::new(0),
             content_reads: AtomicUsize::new(0),
         }
     }
@@ -116,6 +122,7 @@ impl HerdrPort for TerminalHost {
         _: CancellationToken,
     ) -> Result<Value, HostError> {
         if self.outage.load(Ordering::SeqCst) {
+            self.refused.fetch_add(1, Ordering::SeqCst);
             return Err(HostError::before(
                 "HostUnavailable",
                 "controlled Herdr connection is down",
@@ -1340,4 +1347,90 @@ async fn native_stream_rejects_missing_or_foreign_bindings_before_any_host_read(
         "unbound or foreign Native watch read host content"
     );
     assert!(!provider.tool_authorities("ReadTick").unwrap().is_empty());
+}
+
+/// A native watch whose Herdr stays unreachable connects once and reconnects three times, then
+/// stays Disconnected even after Herdr answers again. Only a new watch of the same pane, as
+/// subscribing again makes, reaches it.
+#[tokio::test(start_paused = true)]
+async fn a_native_watch_that_used_its_reconnects_stays_disconnected_until_watched_again() {
+    /// Pauses the outage lasts: three times what the watch's connections could use.
+    const OUTAGE_PAUSES: usize = 3 * CONNECTS_PER_WATCH;
+    assert_eq!(
+        (RECONNECTS_PER_WATCH, RECONNECT_PAUSE),
+        (3, Duration::from_secs(5)),
+        "the production reconnect budget"
+    );
+    let host = Arc::new(TerminalHost::new());
+    host.outage.store(true, Ordering::SeqCst);
+    let access = Arc::new(TickAccess::with_host(
+        HerdrContext {
+            socket: "/tmp/herdr-test.sock".into(),
+            caller_pane: "agent".into(),
+        },
+        host.clone(),
+    ));
+    let provider = native_provider(access);
+    let native = NativeTickStream::new(provider.clone());
+    let mut stream = native.open();
+    let (spent, fresh) = (Uuid::new_v4(), Uuid::new_v4());
+    let one = instance("one");
+    bind_watches(&native, &provider, [spent, fresh]);
+    stream
+        .desired
+        .send(BTreeMap::from([(spent, one.clone())]))
+        .unwrap();
+    for _ in 0..OUTAGE_PAUSES {
+        settle().await;
+        tokio::time::advance(RECONNECT_PAUSE).await;
+    }
+    settle().await;
+    assert_eq!(
+        host.refused.load(Ordering::SeqCst),
+        CONNECTS_PER_WATCH,
+        "the watch connects once and reconnects three times"
+    );
+
+    host.outage.store(false, Ordering::SeqCst);
+    for _ in 0..CONNECTS_PER_WATCH {
+        tokio::time::advance(RECONNECT_PAUSE).await;
+        settle().await;
+    }
+    assert_eq!(
+        host.content_reads.load(Ordering::SeqCst),
+        0,
+        "a watch out of reconnects never reads the recovered pane"
+    );
+    let mut spent_states = Vec::new();
+    while let Ok(event) = stream.events.try_recv() {
+        match event {
+            TickStreamEvent::Ready { watch } => assert_ne!(watch, spent, "never ready"),
+            TickStreamEvent::State {
+                state, audience, ..
+            } if audience.contains(&spent) => spent_states.push(state),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        spent_states.last(),
+        Some(&TickConnectionState::Disconnected),
+        "{spent_states:?}"
+    );
+
+    stream
+        .desired
+        .send(BTreeMap::from([(spent, one.clone()), (fresh, one)]))
+        .unwrap();
+    let fresh_ready = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match stream.events.recv().await.unwrap() {
+                TickStreamEvent::Ready { watch } if watch == fresh => return,
+                TickStreamEvent::Ready { watch } => panic!("{watch} became ready"),
+                _ => {}
+            }
+        }
+    })
+    .await;
+    assert!(fresh_ready.is_ok(), "a new watch reaches the pane");
+    assert!(host.content_reads.load(Ordering::SeqCst) > 0);
 }

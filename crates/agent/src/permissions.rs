@@ -57,6 +57,23 @@ pub enum Decision {
     Check,
 }
 
+impl Decision {
+    /// The stricter of the two, ranking Deny over Ask over Check over Allow.
+    pub(crate) fn stricter(self, other: Self) -> Self {
+        let strictness = |decision: Self| match decision {
+            Self::Allow => 0,
+            Self::Check => 1,
+            Self::Ask => 2,
+            Self::Deny => 3,
+        };
+        if strictness(other) > strictness(self) {
+            other
+        } else {
+            self
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub enum PermissionScope {
     Once,

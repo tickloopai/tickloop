@@ -135,20 +135,7 @@ impl Pty {
     pub async fn read(&self, buffer: &mut [u8]) -> io::Result<usize> {
         loop {
             let mut ready = self.master.readable().await?;
-            match ready.try_io(|master| {
-                let count = unsafe {
-                    libc::read(master.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len())
-                };
-                if count < 0 {
-                    let error = io::Error::last_os_error();
-                    // macOS reports a closed slave on the master as EIO.
-                    if error.raw_os_error() == Some(libc::EIO) {
-                        return Ok(0);
-                    }
-                    return Err(error);
-                }
-                Ok(count as usize)
-            }) {
+            match ready.try_io(|master| read_chunk(master.as_raw_fd(), buffer)) {
                 Ok(result) => return result,
                 Err(_would_block) => continue,
             }
@@ -160,13 +147,9 @@ impl Pty {
         while !bytes.is_empty() {
             let mut ready = self.master.writable().await?;
             match ready.try_io(|master| {
-                let count =
-                    unsafe { libc::write(master.as_raw_fd(), bytes.as_ptr().cast(), bytes.len()) };
-                if count < 0 {
-                    Err(io::Error::last_os_error())
-                } else {
-                    Ok(count as usize)
-                }
+                uninterrupted(|| unsafe {
+                    libc::write(master.as_raw_fd(), bytes.as_ptr().cast(), bytes.len())
+                })
             }) {
                 Ok(Ok(written)) => bytes = &bytes[written..],
                 Ok(Err(error)) => return Err(error),
@@ -203,6 +186,31 @@ impl PtySlave {
             });
         }
         Ok(())
+    }
+}
+
+/// One read of at most `buffer.len()` bytes. macOS reports a closed slave on the master as EIO,
+/// which reads as end of file.
+fn read_chunk(descriptor: RawFd, buffer: &mut [u8]) -> io::Result<usize> {
+    match uninterrupted(|| unsafe {
+        libc::read(descriptor, buffer.as_mut_ptr().cast(), buffer.len())
+    }) {
+        Err(error) if error.raw_os_error() == Some(libc::EIO) => Ok(0),
+        transferred => transferred,
+    }
+}
+
+/// Repeats a read or write that a signal interrupted before it transferred anything.
+fn uninterrupted(mut transfer: impl FnMut() -> libc::ssize_t) -> io::Result<usize> {
+    loop {
+        let count = transfer();
+        if count >= 0 {
+            return Ok(count as usize);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
     }
 }
 
@@ -249,5 +257,42 @@ mod tests {
             TerminalSize::default(),
             TerminalSize::validated(30, 120).unwrap()
         );
+    }
+
+    /// A drain step that a signal interrupts while it waits is retried, so the Tick's terminal
+    /// stays open.
+    #[test]
+    fn a_read_interrupted_by_a_signal_is_retried() {
+        extern "C" fn interrupt(_: libc::c_int) {}
+        // Without SA_RESTART, the signal makes a blocked read fail with EINTR.
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        action.sa_sigaction = interrupt as extern "C" fn(libc::c_int) as usize;
+        assert_eq!(
+            unsafe { libc::sigaction(libc::SIGUSR1, &action, std::ptr::null_mut()) },
+            0
+        );
+        let mut pipe = [0; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        let [reader, writer] = pipe;
+        let (started, reading) = std::sync::mpsc::channel();
+        let read = std::thread::spawn(move || {
+            started.send(unsafe { libc::pthread_self() }).unwrap();
+            let mut buffer = [0u8; 16];
+            read_chunk(reader, &mut buffer).map(|count| buffer[..count].to_vec())
+        });
+        let thread = reading.recv().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert_eq!(unsafe { libc::pthread_kill(thread, libc::SIGUSR1) }, 0);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert_eq!(
+            unsafe { libc::write(writer, b"tick".as_ptr().cast(), 4) },
+            4
+        );
+        let read = read.join().unwrap();
+        unsafe {
+            libc::close(reader);
+            libc::close(writer);
+        }
+        assert_eq!(read.unwrap(), b"tick");
     }
 }

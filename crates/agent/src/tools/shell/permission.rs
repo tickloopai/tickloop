@@ -24,6 +24,7 @@ pub(super) struct ShellPermissionContext<'a> {
     pub(super) cwd: &'a Path,
     pub(super) working_directories: Vec<PathBuf>,
     pub(super) readable_directories: &'a [PathBuf],
+    pub(super) editable_directory: Option<&'a Path>,
 }
 
 /// Whether Claude Code would allow `command` without asking when no permission rule matches.
@@ -40,6 +41,7 @@ pub(super) fn is_allowed_without_rules(
         cwd: context.cwd,
         working_directories: &context.working_directories,
         readable_directories: context.readable_directories,
+        editable_directory: context.editable_directory,
         accept_edits,
     };
     Evaluation { context, policy }.command_allowed(command, &commands)
@@ -144,10 +146,11 @@ impl Evaluation<'_> {
             return false;
         }
         let base_command = command.split_whitespace().next().unwrap_or_default();
-        if base_command == "sed" && !sed_command_is_allowed(command, self.policy.accept_edits) {
+        let allows_edits = self.policy.accept_edits || self.context.editable_directory.is_some();
+        if base_command == "sed" && !sed_command_is_allowed(command, allows_edits) {
             return false;
         }
-        if self.policy.accept_edits && ACCEPT_EDITS_ALLOWED_COMMANDS.contains(&base_command) {
+        if allows_edits && ACCEPT_EDITS_ALLOWED_COMMANDS.contains(&base_command) {
             return true;
         }
         is_read_only_subcommand(command, compound_has_cd, self.context.cwd)
@@ -180,6 +183,7 @@ mod tests {
                 cwd: &self.root,
                 working_directories: vec![self.root.clone()],
                 readable_directories: &[],
+                editable_directory: None,
             };
             is_allowed_without_rules(command, &context, accept_edits)
         }

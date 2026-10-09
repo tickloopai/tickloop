@@ -215,8 +215,9 @@ pub enum MonitorPreference {
     Hidden,
 }
 
-/// Whether Monitor may float a hosted Tick in a Herdr popup. Only `tickloop monitor popup
-/// install` enables it, after installing the popup plugin; the setting never installs anything.
+/// Whether Monitor may float a hosted Tick in a Herdr popup. Installing the popup plugin, with
+/// `tickloop monitor popup install` or Monitor's confirmed offer, enables it; the setting itself
+/// never installs anything.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MonitorPopup {

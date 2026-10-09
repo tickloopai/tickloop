@@ -1,5 +1,5 @@
 //! The terminal side of an attached view: it shows a hosted Tick's terminal in the current
-//! terminal and sends the user's keys to that same process until they detach.
+//! terminal and sends the user's keys to that same process until the user closes it.
 
 use std::{
     io::Write,
@@ -21,10 +21,13 @@ use tick_host::pty::{MAX_COLUMNS, MAX_ROWS, MIN_COLUMNS, MIN_ROWS};
 
 use super::controller::HostedViewGrant;
 
-/// Ctrl+B starts the detach prefix.
-pub const DETACH_PREFIX: u8 = 0x02;
-/// After the prefix, `q` detaches the view and leaves the Tick running.
-pub const DETACH_KEY: u8 = b'q';
+/// A lone Esc closes the view and leaves the Tick running.
+const ESCAPE: u8 = 0x1b;
+/// An Esc with nothing after it within this time was pressed alone; the bytes of an escape
+/// sequence, such as an arrow key, follow it at once.
+const ESCAPE_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+/// Ctrl+B Esc sends Esc to the Tick and Ctrl+B Ctrl+B sends Ctrl+B.
+const SEND_KEY_PREFIX: u8 = 0x02;
 
 const PASTE_START: &[u8] = b"\x1b[200~";
 const PASTE_END: &[u8] = b"\x1b[201~";
@@ -54,77 +57,106 @@ pub enum AttachEnd {
 }
 
 /// Shows the Tick `grant` names in this process's terminal, which must already be in raw mode,
-/// until the user detaches or the view ends. The terminal is restored whenever the view had
-/// taken it.
+/// until the user closes the view or it ends.
 pub async fn run_view(grant: &HostedViewGrant) -> Result<AttachEnd, HostError> {
-    let mut connection = HostConnection::connect(
-        &grant.endpoint,
-        Role::Viewer {
-            instance: grant.instance.clone(),
-            view: grant.view,
-        },
-        &[CAPABILITY_DATA],
-    )
-    .await?;
-    if connection.epoch() != grant.host_epoch {
-        return Err(HostError::before(
-            "EpochChanged",
-            "the Tick host was replaced since this view was granted",
-        ));
-    }
-    connection
-        .request("attach", json!({"size":terminal_size()}), CONTROL_TIMEOUT)
+    AttachedView::attach(grant).await?.run().await
+}
+
+/// A view that holds the Tick terminal's single attach lease but has not taken this terminal
+/// yet, so a refused attach never disturbs the screen.
+pub struct AttachedView {
+    events: tokio::io::BufReader<tokio::net::unix::OwnedReadHalf>,
+    requests: tokio::net::unix::OwnedWriteHalf,
+}
+
+impl AttachedView {
+    pub async fn attach(grant: &HostedViewGrant) -> Result<Self, HostError> {
+        let mut connection = HostConnection::connect(
+            &grant.endpoint,
+            Role::Viewer {
+                instance: grant.instance.clone(),
+                view: grant.view,
+            },
+            &[CAPABILITY_DATA],
+        )
         .await?;
-    let (mut events, mut requests) = connection.into_parts();
-    write_terminal(TAKE_SCREEN.as_bytes());
-    let stop = Arc::new(AtomicBool::new(false));
-    let (keys, mut typed) = tokio::sync::mpsc::channel(QUEUED_KEY_READS);
-    let reader = {
-        let stop = stop.clone();
-        std::thread::spawn(move || read_keys(&stop, &keys))
-    };
-    let outcome = async {
-        let mut resized =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
-                .map_err(|error| HostError::before("TerminalUnavailable", error.to_string()))?;
-        let mut filter = KeyFilter::default();
-        loop {
-            tokio::select! {
-                event = hosted::read_frame(&mut events, BUSINESS_FRAME_BYTES) => {
-                    let Some(event) = event? else {
-                        return Ok(AttachEnd::Lost("the Tick host closed this view".into()));
-                    };
-                    match event["event"].as_str() {
-                        Some("frame") => write_terminal(event["data"].as_str().unwrap_or_default().as_bytes()),
-                        Some("gone") => return Ok(AttachEnd::Gone),
-                        _ => return Ok(AttachEnd::Lost(view_error(&event))),
+        if connection.epoch() != grant.host_epoch {
+            return Err(HostError::before(
+                "EpochChanged",
+                "the Tick host was replaced since this view was granted",
+            ));
+        }
+        connection
+            .request("attach", json!({"size":terminal_size()}), CONTROL_TIMEOUT)
+            .await?;
+        let (events, requests) = connection.into_parts();
+        Ok(Self { events, requests })
+    }
+
+    /// Takes this terminal, which must already be in raw mode, until the user closes the view
+    /// or it ends; the terminal is restored afterwards.
+    pub async fn run(self) -> Result<AttachEnd, HostError> {
+        let Self {
+            mut events,
+            mut requests,
+        } = self;
+        write_terminal(TAKE_SCREEN.as_bytes());
+        let stop = Arc::new(AtomicBool::new(false));
+        let (keys, mut typed) = tokio::sync::mpsc::channel(QUEUED_KEY_READS);
+        let reader = {
+            let stop = stop.clone();
+            std::thread::spawn(move || read_keys(&stop, &keys))
+        };
+        let outcome = async {
+            let mut resized =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
+                    .map_err(|error| HostError::before("TerminalUnavailable", error.to_string()))?;
+            let mut filter = KeyFilter::default();
+            let mut escape_deadline: Option<tokio::time::Instant> = None;
+            loop {
+                tokio::select! {
+                    event = hosted::read_frame(&mut events, BUSINESS_FRAME_BYTES) => {
+                        let Some(event) = event? else {
+                            return Ok(AttachEnd::Lost("the Tick host closed this view".into()));
+                        };
+                        match event["event"].as_str() {
+                            Some("frame") => write_terminal(event["data"].as_str().unwrap_or_default().as_bytes()),
+                            Some("gone") => return Ok(AttachEnd::Gone),
+                            _ => return Ok(AttachEnd::Lost(view_error(&event))),
+                        }
                     }
-                }
-                keys = typed.recv() => {
-                    let (forwarded, detach) = match keys {
-                        Some(keys) => filter.feed(&keys),
-                        None => (Vec::new(), true),
-                    };
-                    for request in input_requests(&forwarded) {
-                        send(&mut requests, request).await?;
+                    keys = typed.recv() => {
+                        let Some(keys) = keys else {
+                            send(&mut requests, json!({"method":"detach"})).await?;
+                            return Ok(AttachEnd::Detached);
+                        };
+                        for request in input_requests(&filter.feed(&keys)) {
+                            send(&mut requests, request).await?;
+                        }
+                        escape_deadline = filter
+                            .holds_escape()
+                            .then(|| tokio::time::Instant::now() + ESCAPE_DELAY);
                     }
-                    if detach {
-                        send(&mut requests, json!({"method":"detach"})).await?;
-                        return Ok(AttachEnd::Detached);
+                    _ = tokio::time::sleep_until(escape_deadline.unwrap_or_else(tokio::time::Instant::now)), if escape_deadline.is_some() => {
+                        escape_deadline = None;
+                        if filter.take_lone_escape() {
+                            send(&mut requests, json!({"method":"detach"})).await?;
+                            return Ok(AttachEnd::Detached);
+                        }
                     }
-                }
-                _ = resized.recv() => {
-                    send(&mut requests, json!({"method":"resize","params":{"size":terminal_size()}})).await?;
+                    _ = resized.recv() => {
+                        send(&mut requests, json!({"method":"resize","params":{"size":terminal_size()}})).await?;
+                    }
                 }
             }
         }
+        .await;
+        stop.store(true, Ordering::Release);
+        drop(typed);
+        let _ = reader.join();
+        write_terminal(RESTORE_TERMINAL.as_bytes());
+        outcome
     }
-    .await;
-    stop.store(true, Ordering::Release);
-    drop(typed);
-    let _ = reader.join();
-    write_terminal(RESTORE_TERMINAL.as_bytes());
-    outcome
 }
 
 async fn send(
@@ -205,41 +237,57 @@ fn read_keys(stop: &AtomicBool, keys: &tokio::sync::mpsc::Sender<Vec<u8>>) {
     }
 }
 
-/// Splits the user's keys into what reaches the Tick and the detach request. Ctrl+B q detaches,
-/// Ctrl+B Ctrl+B sends one Ctrl+B and Ctrl+B followed by any other byte sends both in order; a
-/// prefix may span reads. Everything else, Esc included, reaches the Tick unchanged, and text
-/// inside a bracketed paste never counts as a prefix.
+/// Splits the user's keys into what reaches the Tick and the request to close the view. A lone
+/// Esc closes it once nothing follows within the escape delay, while escape sequences and
+/// Alt-keys reach the Tick. Ctrl+B Esc sends one Esc, Ctrl+B Ctrl+B sends one Ctrl+B and Ctrl+B
+/// followed by any other byte sends both in order; a prefix may span reads. Text inside a
+/// bracketed paste never closes the view or counts as a prefix.
 #[derive(Default)]
-pub struct KeyFilter {
+struct KeyFilter {
     after_prefix: bool,
     in_paste: bool,
+    /// An Esc that ended a read: the start of a sequence if more keys follow, else a lone Esc.
+    held_escape: bool,
     /// The newest forwarded bytes, enough to recognise a paste marker split across reads.
     recent: Vec<u8>,
 }
 
 impl KeyFilter {
-    /// The bytes of `input` the Tick receives, and whether the user asked to detach; nothing
-    /// after the detach request is sent.
-    pub fn feed(&mut self, input: &[u8]) -> (Vec<u8>, bool) {
-        let mut forwarded = Vec::with_capacity(input.len());
-        for &byte in input {
+    /// The bytes of `input` the Tick receives.
+    fn feed(&mut self, input: &[u8]) -> Vec<u8> {
+        let mut forwarded = Vec::with_capacity(input.len() + 1);
+        if !input.is_empty() && std::mem::take(&mut self.held_escape) {
+            self.forward(&mut forwarded, ESCAPE);
+        }
+        for (index, &byte) in input.iter().enumerate() {
             if self.after_prefix {
                 self.after_prefix = false;
                 match byte {
-                    DETACH_KEY => return (forwarded, true),
-                    DETACH_PREFIX => self.forward(&mut forwarded, DETACH_PREFIX),
+                    SEND_KEY_PREFIX | ESCAPE => self.forward(&mut forwarded, byte),
                     other => {
-                        self.forward(&mut forwarded, DETACH_PREFIX);
+                        self.forward(&mut forwarded, SEND_KEY_PREFIX);
                         self.forward(&mut forwarded, other);
                     }
                 }
-            } else if byte == DETACH_PREFIX && !self.in_paste {
+            } else if byte == SEND_KEY_PREFIX && !self.in_paste {
                 self.after_prefix = true;
+            } else if byte == ESCAPE && !self.in_paste && index + 1 == input.len() {
+                self.held_escape = true;
             } else {
                 self.forward(&mut forwarded, byte);
             }
         }
-        (forwarded, false)
+        forwarded
+    }
+
+    /// Whether a read ended with an Esc that may still begin a sequence.
+    fn holds_escape(&self) -> bool {
+        self.held_escape
+    }
+
+    /// Takes the held Esc once nothing followed it in time: it was pressed alone.
+    fn take_lone_escape(&mut self) -> bool {
+        std::mem::take(&mut self.held_escape)
     }
 
     fn forward(&mut self, forwarded: &mut Vec<u8>, byte: u8) {
@@ -260,33 +308,54 @@ impl KeyFilter {
 mod tests {
     use super::*;
 
-    fn feed_all(filter: &mut KeyFilter, chunks: &[&[u8]]) -> (Vec<u8>, bool) {
-        let mut forwarded = Vec::new();
-        for chunk in chunks {
-            let (bytes, detach) = filter.feed(chunk);
-            forwarded.extend(bytes);
-            if detach {
-                return (forwarded, true);
-            }
-        }
-        (forwarded, false)
+    fn feed_all(filter: &mut KeyFilter, chunks: &[&[u8]]) -> Vec<u8> {
+        chunks.iter().flat_map(|chunk| filter.feed(chunk)).collect()
     }
 
     #[test]
-    fn escape_and_ordinary_keys_reach_the_tick_unchanged() {
+    fn escape_sequences_alt_keys_and_ordinary_keys_reach_the_tick_unchanged() {
         let mut filter = KeyFilter::default();
         assert_eq!(
             filter.feed(b"\x1bjk\x1b[A\xe8\x85\xbe"),
-            (b"\x1bjk\x1b[A\xe8\x85\xbe".to_vec(), false)
+            b"\x1bjk\x1b[A\xe8\x85\xbe".to_vec()
+        );
+        assert_eq!(
+            feed_all(&mut filter, &[b"\x1b", b"[B"]),
+            b"\x1b[B".to_vec(),
+            "a sequence split across reads"
+        );
+        assert!(!filter.take_lone_escape());
+    }
+
+    #[test]
+    fn a_lone_escape_closes_the_view_once_nothing_follows_it() {
+        let mut filter = KeyFilter::default();
+        assert_eq!(filter.feed(b"ab\x1b"), b"ab".to_vec());
+        assert!(filter.holds_escape());
+        assert!(filter.take_lone_escape(), "a lone Esc closes the view");
+        assert!(!filter.holds_escape());
+    }
+
+    #[test]
+    fn the_prefix_sends_escape_or_itself_once_and_otherwise_both_bytes_even_across_reads() {
+        let mut filter = KeyFilter::default();
+        assert_eq!(filter.feed(b"\x02\x1b"), vec![ESCAPE]);
+        assert!(!filter.take_lone_escape(), "Ctrl+B Esc never closes");
+        assert_eq!(
+            feed_all(&mut filter, &[b"\x02", b"\x02"]),
+            vec![SEND_KEY_PREFIX]
+        );
+        assert_eq!(
+            feed_all(&mut filter, &[b"ab\x02", b"qz"]),
+            b"ab\x02qz".to_vec()
         );
     }
 
     #[test]
     fn a_held_prefix_and_a_full_read_go_out_as_requests_the_host_accepts() {
         let mut filter = KeyFilter::default();
-        assert_eq!(filter.feed(&[DETACH_PREFIX]), (Vec::new(), false));
-        let (forwarded, detach) = filter.feed(&[b'x'; ATTACH_INPUT_BYTES]);
-        assert!(!detach);
+        assert!(filter.feed(&[SEND_KEY_PREFIX]).is_empty());
+        let forwarded = filter.feed(&[b'x'; ATTACH_INPUT_BYTES]);
         assert_eq!(forwarded.len(), ATTACH_INPUT_BYTES + 1);
         let requests: Vec<Value> = input_requests(&forwarded).collect();
         assert_eq!(requests.len(), 2);
@@ -302,49 +371,17 @@ mod tests {
     }
 
     #[test]
-    fn the_prefix_then_q_detaches_even_across_reads() {
+    fn pasted_text_never_closes_the_view_even_when_its_markers_span_reads() {
         let mut filter = KeyFilter::default();
         assert_eq!(
-            feed_all(&mut filter, &[b"ab\x02q", b"zz"]),
-            (b"ab".to_vec(), true)
+            feed_all(&mut filter, &[b"\x1b[20", b"0~a\x02\x1b", b"b\x1b[201~"]),
+            b"\x1b[200~a\x02\x1bb\x1b[201~".to_vec()
         );
-        let mut filter = KeyFilter::default();
-        assert_eq!(
-            feed_all(&mut filter, &[b"ab\x02", b"qzz"]),
-            (b"ab".to_vec(), true)
-        );
-    }
-
-    #[test]
-    fn a_doubled_prefix_sends_one_and_another_key_follows_it_in_order() {
-        let mut filter = KeyFilter::default();
-        assert_eq!(
-            feed_all(&mut filter, &[b"\x02\x02"]),
-            (vec![DETACH_PREFIX], false)
-        );
-        let mut filter = KeyFilter::default();
-        assert_eq!(
-            feed_all(&mut filter, &[b"\x02", b"\x02x"]),
-            (b"\x02x".to_vec(), false)
-        );
-        let mut filter = KeyFilter::default();
-        assert_eq!(
-            feed_all(&mut filter, &[b"\x02x\x02", b"\x1b"]),
-            (b"\x02x\x02\x1b".to_vec(), false)
-        );
-    }
-
-    #[test]
-    fn pasted_text_never_detaches_even_when_its_markers_span_reads() {
-        let mut filter = KeyFilter::default();
-        assert_eq!(
-            feed_all(&mut filter, &[b"\x1b[20", b"0~a\x02q", b"b\x1b[201~"]),
-            (b"\x1b[200~a\x02qb\x1b[201~".to_vec(), false)
-        );
-        assert_eq!(
-            filter.feed(b"\x02q"),
-            (Vec::new(), true),
-            "the prefix works again after the paste"
+        assert!(!filter.holds_escape(), "an Esc inside the paste is text");
+        assert!(filter.feed(b"\x1b").is_empty());
+        assert!(
+            filter.take_lone_escape(),
+            "Esc closes again after the paste"
         );
     }
 }

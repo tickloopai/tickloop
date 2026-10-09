@@ -405,3 +405,30 @@ pub fn ok(id: &Value, result: Value) -> Value {
 pub fn error(id: &Value, error: &HostError) -> Value {
     json!({"id":id,"error":error})
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_frame_over_the_readers_limit_is_refused_and_one_at_it_is_read() {
+        const LIMIT: usize = 64;
+        let (mut writer, reader) = tokio::net::UnixStream::pair().unwrap();
+        let (reader, _) = reader.into_split();
+        let mut reader = BufReader::new(reader);
+        let within = format!("\"{}\"", "a".repeat(LIMIT - 2));
+        let over = format!("\"{}\"", "a".repeat(LIMIT - 1));
+        writer
+            .write_all(format!("{within}\n{over}\n").as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(
+            read_frame(&mut reader, LIMIT).await.unwrap(),
+            Some(Value::String("a".repeat(LIMIT - 2)))
+        );
+        assert_eq!(
+            read_frame(&mut reader, LIMIT).await.unwrap_err().code,
+            "FrameTooLarge"
+        );
+    }
+}
