@@ -40,6 +40,7 @@ tokio-util = "0.7"
 unicode-segmentation = "1"
 unicode-width = "0.2"
 uuid = { version = "1", features = ["v4", "serde"] }
+vt100 = "0.16.2"
 
 [dev-dependencies]
 jsonschema = { version = "0.56", default-features = false }

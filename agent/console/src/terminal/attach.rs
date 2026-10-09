@@ -1,5 +1,7 @@
 //! The terminal side of an attached view: it shows a hosted Tick's terminal in the current
-//! terminal and sends the user's keys to that same process until the user closes it.
+//! terminal and sends the user's keys to that same process until the user closes it. Other views
+//! may show the same Tick at once, and its screen takes the size of whichever view typed last,
+//! so this terminal can be smaller or larger than the screen it shows.
 
 use std::{
     io::Write,
@@ -9,6 +11,7 @@ use std::{
     },
 };
 
+use serde::Deserialize;
 use serde_json::{Value, json};
 use tickhost_connect::{
     host_error::HostError,
@@ -44,6 +47,10 @@ const TAKE_SCREEN: &str = "\x1b[?1049h\x1b[H\x1b[2J";
 /// Undoes every mode the Tick's frames may have turned on: colours, a hidden cursor, mouse and
 /// paste reporting, application cursor and keypad keys, and the view's own screen.
 const RESTORE_TERMINAL: &str = "\x1b[0m\x1b[?25h\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?2004l\x1b[?1l\x1b>\x1b[?1049l";
+/// Starts a redraw of a screen of another size: no cursor, default colours, nothing shown.
+const BEGIN_REDRAW: &[u8] = b"\x1b[?25l\x1b[m\x1b[H\x1b[J";
+const DEFAULT_COLOURS: &[u8] = b"\x1b[m";
+const SHOW_CURSOR: &str = "\x1b[?25h";
 
 /// How an attached view ended.
 #[derive(Debug, PartialEq, Eq)]
@@ -61,8 +68,8 @@ pub async fn run_view(grant: &HostedViewGrant) -> Result<AttachEnd, HostError> {
     AttachedView::attach(grant).await?.run().await
 }
 
-/// A view that holds the Tick terminal's single attach lease but has not taken this terminal
-/// yet, so a refused attach never disturbs the screen.
+/// A view attached to the Tick terminal that has not taken this terminal yet, so a refused attach
+/// never disturbs the screen.
 pub struct AttachedView {
     events: tokio::io::BufReader<tokio::net::unix::OwnedReadHalf>,
     requests: tokio::net::unix::OwnedWriteHalf,
@@ -86,7 +93,11 @@ impl AttachedView {
             ));
         }
         connection
-            .request("attach", json!({"size":terminal_size()}), CONTROL_TIMEOUT)
+            .request(
+                "attach",
+                json!({"size":requested_size(terminal_size())}),
+                CONTROL_TIMEOUT,
+            )
             .await?;
         let (events, requests) = connection.into_parts();
         Ok(Self { events, requests })
@@ -110,6 +121,7 @@ impl AttachedView {
             let mut resized =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
                     .map_err(|error| HostError::before("TerminalUnavailable", error.to_string()))?;
+            let mut screen = ViewScreen::new(terminal_size());
             let mut filter = KeyFilter::default();
             let mut escape_deadline: Option<tokio::time::Instant> = None;
             loop {
@@ -119,7 +131,13 @@ impl AttachedView {
                             return Ok(AttachEnd::Lost("the Tickhost closed this view".into()));
                         };
                         match event["event"].as_str() {
-                            Some("frame") => write_terminal(event["data"].as_str().unwrap_or_default().as_bytes()),
+                            Some("frame") => {
+                                let size = ScreenSize::deserialize(&event["size"]).map_err(|_| {
+                                    HostError::after("ProtocolViolation", "a frame did not name its screen size")
+                                })?;
+                                let data = event["data"].as_str().unwrap_or_default();
+                                write_terminal(&screen.frame(size, data.as_bytes()));
+                            }
                             Some("gone") => return Ok(AttachEnd::Gone),
                             _ => return Ok(AttachEnd::Lost(view_error(&event))),
                         }
@@ -144,7 +162,9 @@ impl AttachedView {
                         }
                     }
                     _ = resized.recv() => {
-                        send(&mut requests, json!({"method":"resize","params":{"size":terminal_size()}})).await?;
+                        let terminal = terminal_size();
+                        write_terminal(&screen.resize_terminal(terminal));
+                        send(&mut requests, json!({"method":"resize","params":{"size":requested_size(terminal)}})).await?;
                     }
                 }
             }
@@ -180,13 +200,111 @@ fn view_error(event: &Value) -> String {
         .to_owned()
 }
 
-/// The current terminal's size within the bounds a Tick terminal accepts.
-fn terminal_size() -> Value {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+struct ScreenSize {
+    rows: u16,
+    columns: u16,
+}
+
+/// This terminal's size, at least one row and one column.
+fn terminal_size() -> ScreenSize {
     let (columns, rows) = crossterm::terminal::size().unwrap_or(FALLBACK_TERMINAL_SIZE);
+    ScreenSize {
+        rows: rows.max(1),
+        columns: columns.max(1),
+    }
+}
+
+/// The size a view of `terminal` asks the Tick terminal for, within the bounds it accepts.
+fn requested_size(terminal: ScreenSize) -> Value {
     json!({
-        "rows": rows.clamp(MIN_ROWS, MAX_ROWS),
-        "columns": columns.clamp(MIN_COLUMNS, MAX_COLUMNS),
+        "rows": terminal.rows.clamp(MIN_ROWS, MAX_ROWS),
+        "columns": terminal.columns.clamp(MIN_COLUMNS, MAX_COLUMNS),
     })
+}
+
+/// What this terminal shows of the Tick's screen. A screen of this terminal's size is drawn as
+/// the host frames it; one of another size is redrawn whole from its top-left corner, cut where
+/// this terminal ends and blank where this terminal reaches beyond it.
+struct ViewScreen {
+    tick: vt100::Parser,
+    terminal: ScreenSize,
+}
+
+impl ViewScreen {
+    fn new(terminal: ScreenSize) -> Self {
+        Self {
+            tick: vt100::Parser::default(),
+            terminal,
+        }
+    }
+
+    /// The output that shows a frame the host drew for a Tick screen of `size`.
+    fn frame(&mut self, size: ScreenSize, data: &[u8]) -> Vec<u8> {
+        if self.tick_size() != size {
+            self.tick.screen_mut().set_size(size.rows, size.columns);
+        }
+        self.tick.process(data);
+        if size == self.terminal {
+            data.to_vec()
+        } else {
+            self.draw()
+        }
+    }
+
+    /// The output that shows the Tick's screen once this terminal is `terminal`.
+    fn resize_terminal(&mut self, terminal: ScreenSize) -> Vec<u8> {
+        self.terminal = terminal;
+        self.draw()
+    }
+
+    fn tick_size(&self) -> ScreenSize {
+        let (rows, columns) = self.tick.screen().size();
+        ScreenSize { rows, columns }
+    }
+
+    /// The whole Tick screen as this terminal shows it. At the same size it is drawn as the host
+    /// would draw it whole, so the host's later changes apply to it as they come.
+    fn draw(&self) -> Vec<u8> {
+        let screen = self.tick.screen();
+        let tick = self.tick_size();
+        if tick == self.terminal {
+            return screen.state_formatted();
+        }
+        let rows = tick.rows.min(self.terminal.rows);
+        let columns = tick.columns.min(self.terminal.columns);
+        let is_cut = columns < tick.columns;
+        // A wide character starting in the last column shown would spill past this terminal's
+        // edge, so such a row leaves that column blank.
+        let narrowed = is_cut.then(|| {
+            screen
+                .rows_formatted(0, columns - 1)
+                .take(rows.into())
+                .collect::<Vec<_>>()
+        });
+        let mut output = BEGIN_REDRAW.to_vec();
+        for (row, cells) in (0..rows).zip(screen.rows_formatted(0, columns)) {
+            output.extend(format!("\x1b[{};1H", row + 1).as_bytes());
+            output.extend(DEFAULT_COLOURS);
+            match &narrowed {
+                Some(narrowed)
+                    if screen
+                        .cell(row, columns - 1)
+                        .is_some_and(vt100::Cell::is_wide) =>
+                {
+                    output.extend(&narrowed[usize::from(row)])
+                }
+                _ => output.extend(cells),
+            }
+        }
+        output.extend(DEFAULT_COLOURS);
+        output.extend(screen.input_mode_formatted());
+        let (row, column) = screen.cursor_position();
+        if !screen.hide_cursor() && row < rows && column < columns {
+            output.extend(format!("\x1b[{};{}H{SHOW_CURSOR}", row + 1, column + 1).as_bytes());
+        }
+        output
+    }
 }
 
 fn write_terminal(bytes: &[u8]) {
@@ -306,6 +424,147 @@ impl KeyFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn size(rows: u16, columns: u16) -> ScreenSize {
+        ScreenSize { rows, columns }
+    }
+
+    /// Frames a Tick screen as the host does: whole at first and after a resize, then only what
+    /// changed.
+    struct HostScreen {
+        parser: vt100::Parser,
+        shown: Option<vt100::Screen>,
+    }
+
+    impl HostScreen {
+        fn new(rows: u16, columns: u16) -> Self {
+            Self {
+                parser: vt100::Parser::new(rows, columns, 0),
+                shown: None,
+            }
+        }
+
+        fn frame(&mut self, output: &[u8]) -> (ScreenSize, Vec<u8>) {
+            self.parser.process(output);
+            let current = self.parser.screen();
+            let bytes = match &self.shown {
+                Some(shown) if shown.size() == current.size() => current.state_diff(shown),
+                _ => current.state_formatted(),
+            };
+            self.shown = Some(current.clone());
+            let (rows, columns) = current.size();
+            (size(rows, columns), bytes)
+        }
+    }
+
+    /// A terminal of `terminal`'s size that showed something else before.
+    fn terminal(terminal: ScreenSize) -> vt100::Parser {
+        let mut parser = vt100::Parser::new(terminal.rows, terminal.columns, 0);
+        parser
+            .process(&b"stale".repeat(usize::from(terminal.rows) * usize::from(terminal.columns)));
+        parser
+    }
+
+    fn rows(terminal: &vt100::Parser) -> Vec<String> {
+        let (_, columns) = terminal.screen().size();
+        terminal.screen().rows(0, columns).collect()
+    }
+
+    #[test]
+    fn a_smaller_terminal_shows_the_top_left_of_the_screen_cut_at_its_edges() {
+        let mut host = HostScreen::new(6, 20);
+        let (tick, frame) = host
+            .frame("first line is long\r\nabcdefghi腾 wide\r\nthird\r\nfourth\r\nfifth".as_bytes());
+        let small = size(4, 10);
+        let mut view = ViewScreen::new(small);
+        let mut shown = terminal(small);
+        shown.process(&view.frame(tick, &frame));
+        assert_eq!(
+            rows(&shown),
+            ["first line", "abcdefghi", "third", "fourth"],
+            "the top-left part, never scrolled"
+        );
+        assert_eq!(
+            shown.screen().cell(1, 9).unwrap().contents(),
+            "",
+            "a wide character that would spill past the edge is left out"
+        );
+        assert!(
+            shown.screen().hide_cursor(),
+            "a cursor outside the part shown is hidden"
+        );
+
+        let (tick, change) = host.frame(b"\x1b[2;1HABC\x1b[1;3H");
+        shown.process(&view.frame(tick, &change));
+        assert_eq!(rows(&shown)[..2], ["first line", "ABCdefghi"]);
+        assert!(!shown.screen().hide_cursor());
+        assert_eq!(shown.screen().cursor_position(), (0, 2));
+    }
+
+    #[test]
+    fn a_larger_terminal_shows_the_whole_screen_with_blank_space_beyond_it() {
+        let mut host = HostScreen::new(3, 10);
+        let (tick, frame) = host.frame(b"\x1b[1;31m0123456789\x1b[mabc");
+        let large = size(6, 20);
+        let mut view = ViewScreen::new(large);
+        let mut shown = terminal(large);
+        shown.process(&view.frame(tick, &frame));
+        assert_eq!(
+            rows(&shown),
+            ["0123456789", "abc", "", "", "", ""],
+            "a wrapped line stays as the Tick drew it and the rest is blank"
+        );
+        assert_eq!(
+            shown.screen().cell(0, 0).unwrap().fgcolor(),
+            vt100::Color::Idx(1)
+        );
+        assert_eq!(
+            shown.screen().cell(1, 0).unwrap().fgcolor(),
+            vt100::Color::Default
+        );
+        assert_eq!(shown.screen().cursor_position(), (1, 3));
+        assert!(!shown.screen().hide_cursor());
+    }
+
+    #[test]
+    fn a_terminal_of_the_screen_size_gets_the_frames_as_drawn_and_a_redraw_when_either_resizes() {
+        let mut host = HostScreen::new(3, 10);
+        let same = size(3, 10);
+        let mut view = ViewScreen::new(same);
+        let mut shown = terminal(same);
+        let (tick, frame) = host.frame(b"hello");
+        let drawn = view.frame(tick, &frame);
+        assert_eq!(drawn, frame, "the host's frame as it is");
+        shown.process(&drawn);
+
+        let larger = size(5, 12);
+        shown.screen_mut().set_size(larger.rows, larger.columns);
+        shown.process(&view.resize_terminal(larger));
+        let (tick, change) = host.frame(b" world");
+        shown.process(&view.frame(tick, &change));
+        assert_eq!(rows(&shown), ["hello worl", "d", "", "", ""]);
+
+        shown.screen_mut().set_size(same.rows, same.columns);
+        shown.process(&view.resize_terminal(same));
+        let (tick, change) = host.frame(b"!");
+        let drawn = view.frame(tick, &change);
+        assert_eq!(
+            drawn, change,
+            "back at the same size, changes are drawn as they come"
+        );
+        shown.process(&drawn);
+        assert_eq!(shown.screen().contents(), host.parser.screen().contents());
+
+        host.parser.screen_mut().set_size(4, 12);
+        let (tick, frame) = host.frame(b"");
+        assert_eq!(tick, size(4, 12));
+        shown.process(&view.frame(tick, &frame));
+        assert_eq!(
+            rows(&shown),
+            ["hello worl", "d!", ""],
+            "a resized screen is cut to fit"
+        );
+    }
 
     fn feed_all(filter: &mut KeyFilter, chunks: &[&[u8]]) -> Vec<u8> {
         chunks.iter().flat_map(|chunk| filter.feed(chunk)).collect()
