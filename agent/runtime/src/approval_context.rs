@@ -15,13 +15,14 @@ use tickloop_agent_protocol::{
     AutoPolicy, ChatSnapshot, CompactionMarker, Content, OperationRecord, OriginalUserInput, Role,
 };
 
+pub(super) mod input_projection;
 mod reply_history;
+use input_projection::{InputPurpose, project_tool_input};
 pub(super) use reply_history::ReplyHistory;
 pub(super) use reply_history::capture as capture_reply_history;
 
-pub(super) const APPROVAL_CONTEXT_VERSION: &str = "trusted-approval-v6";
-pub(super) const REVIEW_TEMPLATE_VERSION: &str = "auto-review-v17";
-const MAX_TOOL_HISTORY_BYTES: usize = 64 * 1024;
+pub(super) const APPROVAL_CONTEXT_VERSION: &str = "trusted-approval-v7";
+pub(super) const REVIEW_TEMPLATE_VERSION: &str = "auto-review-v18";
 
 const DEPENDENCY_FILES: &[&str] = &[
     "package.json",
@@ -117,7 +118,6 @@ pub(super) struct HistoricalToolCall {
 pub(super) struct ToolHistory {
     pub complete: bool,
     pub compaction_gap: bool,
-    pub capacity_exceeded: bool,
     pub calls: Vec<HistoricalToolCall>,
 }
 
@@ -126,7 +126,6 @@ impl Default for ToolHistory {
         Self {
             complete: true,
             compaction_gap: false,
-            capacity_exceeded: false,
             calls: Vec::new(),
         }
     }
@@ -196,7 +195,6 @@ pub(super) fn recovered_tool_history(
             prepared.insert(key, None);
         }
     }
-    let mut bytes = 0usize;
     let mut observed_messages = HashSet::new();
     let recovered = ancestors
         .into_iter()
@@ -244,6 +242,22 @@ pub(super) fn recovered_tool_history(
                             boundary.is_none_or(|boundary| (index, block) < boundary)
                         }) =>
                 {
+                    let Some(projected_input) =
+                        project_tool_input(name, input, InputPurpose::Historical)
+                    else {
+                        if let Some(run) = run {
+                            let key = (run, id.as_str());
+                            if !seen_calls.insert(key) {
+                                history.complete = false;
+                                ambiguous.insert(key);
+                                pending.remove(&key);
+                            }
+                        }
+                        continue;
+                    };
+                    if input_projection::is_incomplete(&projected_input) {
+                        history.complete = false;
+                    }
                     let previous = run
                         .and_then(|run| prepared.get(&(run, id.as_str())))
                         .copied()
@@ -258,7 +272,7 @@ pub(super) fn recovered_tool_history(
                         run_id: run,
                         call_id: id.clone(),
                         tool: name.clone(),
-                        input: input.clone(),
+                        input: projected_input,
                         resolved_path: previous
                             .and_then(|prior| prior.input.get(path_field?))
                             .and_then(Value::as_str)
@@ -266,17 +280,6 @@ pub(super) fn recovered_tool_history(
                             .filter(|path| path.is_absolute()),
                         outcome: HistoricalToolOutcome::NotObserved,
                     };
-                    bytes = bytes.saturating_add(
-                        serde_json::to_vec(&call)
-                            .expect("tool history serializes")
-                            .len(),
-                    );
-                    if bytes > MAX_TOOL_HISTORY_BYTES {
-                        history.calls.clear();
-                        history.complete = false;
-                        history.capacity_exceeded = true;
-                        return history;
-                    }
                     let position = history.calls.len();
                     history.calls.push(call);
                     if let Some(run) = run {
@@ -619,7 +622,8 @@ pub(super) fn capture(
             loop_id: operation.loop_id,
             run_id: operation.run_id,
             tool: operation.name.clone(),
-            input: operation.input.clone(),
+            input: project_tool_input(&operation.name, &operation.input, InputPurpose::Proposed)
+                .unwrap_or(Value::Null),
         },
         original_user_inputs,
         working_directory: snapshot.workdir.clone(),
@@ -733,6 +737,20 @@ mod tests {
             tool_history(&snapshot, &operation).calls[0].outcome,
             HistoricalToolOutcome::OutcomeUnknown
         ));
+        for omitted_id in ["list", "write"] {
+            let mut with_omitted = snapshot.clone();
+            with_omitted.messages[0].content.insert(
+                0,
+                Content::ToolUse {
+                    id: omitted_id.into(),
+                    name: "ListSubagents".into(),
+                    input: serde_json::json!({}),
+                },
+            );
+            let projected = tool_history(&with_omitted, &operation);
+            assert_eq!(projected.calls.len(), 1);
+            assert_eq!(projected.complete, omitted_id != "write");
+        }
         snapshot.messages.splice(
             3..3,
             [snapshot.messages[0].clone(), snapshot.messages[2].clone()],

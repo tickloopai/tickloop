@@ -978,10 +978,15 @@ impl Agent {
             context.tool_history =
                 approval_context::recovered_tool_history(&snapshot, operation, Some(ancestors));
         }
-        if context.tool_history.capacity_exceeded {
+        if operation.name == "ListSubagents"
+            && operation
+                .input
+                .as_object()
+                .is_some_and(|input| input.is_empty())
+        {
             return Ok(approval_assessment::ApprovalAssessment::new(
                 &context,
-                AutoReview::ContextLimit,
+                AutoReview::Allow,
                 None,
             )
             .with_auto_settings(auto_settings.reviewer, &auto_revision));
@@ -1003,7 +1008,15 @@ impl Agent {
                     })
                     .cloned()
             });
-        context.prepared_facts = prepared_facts;
+        context.prepared_facts = prepared_facts.map(|mut facts| {
+            facts.normalized_input = approval_context::input_projection::project_tool_input(
+                &operation.name,
+                &facts.normalized_input,
+                approval_context::input_projection::InputPurpose::Proposed,
+            )
+            .unwrap_or(serde_json::Value::Null);
+            facts
+        });
         let preferred = auto_settings.reviewer;
         let configured_reviewer = self.inner.auto_reviewer.lock().await.clone();
         let has_isolated_reviewer = configured_reviewer.is_some();
@@ -1015,7 +1028,19 @@ impl Agent {
                       fallback_from: Option<ApprovalReviewerKind>,
                       fallback_failure: Option<ApprovalFailureKind>,
                       fallback_reason: Option<ApprovalFallbackReason>| {
-            approval_assessment::ApprovalAssessment::new(&context, run.review, run.reviewer)
+            let review = if matches!(run.review, AutoReview::Allow)
+                && (approval_context::input_projection::is_incomplete(&context.operation.input)
+                    || context.prepared_facts.as_ref().is_some_and(|facts| {
+                        approval_context::input_projection::is_incomplete(&facts.normalized_input)
+                    })) {
+                AutoReview::Ask {
+                    diagnostics: vec![tickloop_agent_protocol::ApprovalDiagnostic::TaskScopeUncertain],
+                    reason: "The reviewer received a bounded excerpt of this third-party tool input. Omitted details require manual review before execution.".into(),
+                }
+            } else {
+                run.review
+            };
+            approval_assessment::ApprovalAssessment::new(&context, review, run.reviewer)
                 .with_auto_settings(preferred, &auto_revision)
                 .with_attempts(run.attempts, fallback_from, fallback_failure)
                 .with_fallback_reason(fallback_reason)

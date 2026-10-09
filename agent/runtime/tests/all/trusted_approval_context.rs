@@ -15,8 +15,8 @@ use tickloop_agent_runtime::Agent;
 use tickloop_agent_test_support::{ScriptedModel, call, config, next_event, text, transcript_file};
 use tokio_util::sync::CancellationToken;
 
-struct RecordingJudgment {
-    requests: Mutex<Vec<EvaluationRequest>>,
+pub(super) struct RecordingJudgment {
+    pub(super) requests: Mutex<Vec<EvaluationRequest>>,
 }
 
 #[async_trait::async_trait]
@@ -79,6 +79,124 @@ async fn finish_one(
         }
     }
     receipt.loop_id
+}
+
+#[tokio::test]
+async fn oversized_unknown_tool_input_is_reviewed_as_an_excerpt_and_logged_before_manual_confirmation()
+ {
+    use std::os::unix::fs::PermissionsExt;
+    use tickloop_agent_protocol::{ChatId, ToolDefinition, ToolResult};
+    use tickloop_agent_runtime::host_tools::{HostToolPermission, HostToolProvider};
+    struct ExternalTool;
+    #[async_trait::async_trait]
+    impl HostToolProvider for ExternalTool {
+        fn definitions(&self) -> Vec<ToolDefinition> {
+            vec![ToolDefinition {
+                name: "ExternalTool".into(),
+                description: "Synthetic external operation".into(),
+                input_schema: json!({"type":"object"}),
+            }]
+        }
+        fn permission(&self, _: ChatId, _: &str, _: &Value) -> HostToolPermission {
+            HostToolPermission::Reviewable
+        }
+        async fn execute(&self, _: ChatId, _: &str, _: Value, _: CancellationToken) -> ToolResult {
+            panic!("partial evidence must not authorize execution")
+        }
+    }
+    for use_jev in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("state");
+        let original = json!({"destination":"https://example.test", "body":format!("# Purpose\n{}\nFinal instruction", "untrusted paragraph\n".repeat(5000)), "authorization":"Bearer never-log-this-secret"});
+        let agent = Agent::open_embedded(
+            root.clone(),
+            config(),
+            Arc::new(ScriptedModel::new(vec![
+                call("external", "ExternalTool", original.clone()),
+                text("done"),
+            ])),
+        )
+        .unwrap();
+        agent.install_host_tools(Arc::new(ExternalTool)).unwrap();
+        let llm = Arc::new(ScriptedModel::new(vec![text(
+            &tickloop_agent_test_support::auto_classification(false).to_string(),
+        )]));
+        let jev = Arc::new(RecordingJudgment {
+            requests: Mutex::new(Vec::new()),
+        });
+        if use_jev {
+            agent.set_judgment_client(jev.clone()).await;
+        } else {
+            agent.set_auto_reviewer(llm.clone()).await;
+        }
+        let chat = agent.create_chat(directory.path().into()).await.unwrap();
+        agent
+            .set_execution_mode(chat, ExecutionMode::Auto)
+            .await
+            .unwrap();
+        let mut events = agent.subscribe();
+        agent
+            .submit(chat, None, "Evaluate the external operation".into())
+            .await
+            .unwrap();
+        let mut prompted = false;
+        loop {
+            match next_event(&mut events).await.kind {
+                EventKind::PermissionRequested { request } => {
+                    assert_eq!(
+                        request.input, original,
+                        "manual approval retains complete execution input"
+                    );
+                    let logs = transcript_file(&root, chat).with_extension("auto-review");
+                    let paths = std::fs::read_dir(&logs)
+                        .unwrap()
+                        .map(|entry| entry.unwrap().path())
+                        .collect::<Vec<_>>();
+                    assert_eq!(paths.len(), 1, "diagnostics exist before the human answers");
+                    assert_eq!(
+                        std::fs::metadata(&paths[0]).unwrap().permissions().mode() & 0o777,
+                        0o600
+                    );
+                    assert_eq!(
+                        std::fs::metadata(&logs).unwrap().permissions().mode() & 0o777,
+                        0o700
+                    );
+                    let text = std::fs::read_to_string(&paths[0]).unwrap();
+                    assert!(!text.contains("never-log-this-secret"));
+                    let log: Value = serde_json::from_str(&text).unwrap();
+                    assert_eq!(log["review"]["outcome"], "needs_human");
+                    assert_eq!(log["context_metrics"]["operation_input_complete"], false);
+                    assert!(!log["review"]["attempts"].as_array().unwrap().is_empty());
+                    prompted = true;
+                    agent
+                        .answer_permission(chat, request.id, false)
+                        .await
+                        .unwrap();
+                }
+                EventKind::Completed { .. } | EventKind::Interrupted => break,
+                EventKind::Failed(error) => panic!("{error}"),
+                _ => {}
+            }
+        }
+        assert!(prompted);
+        let state = if use_jev {
+            let requests = jev.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            requests[0].state.clone()
+        } else {
+            let requests = llm.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            let Content::Text { text } = &requests[0].messages[1].content[0] else {
+                panic!()
+            };
+            serde_json::from_str::<Value>(text).unwrap()
+        };
+        let input = &state["operation"]["input"];
+        assert_eq!(input["review_projection"]["complete"], false);
+        assert_eq!(input["input"]["destination"], original["destination"]);
+        assert!(serde_json::to_vec(input).unwrap().len() <= 64 * 1024);
+        agent.shutdown().await;
+    }
 }
 
 #[tokio::test]
@@ -532,13 +650,39 @@ async fn repeated_call_ids_within_a_run_are_rejected_before_a_second_effect() {
 
 #[tokio::test]
 async fn oversized_written_history_is_not_truncated_into_an_automatic_allow() {
-    use tickloop_agent_protocol::ApprovalOutcome;
+    struct RejectingJudgment(RecordingJudgment);
+    #[async_trait::async_trait]
+    impl JudgmentClient for RejectingJudgment {
+        fn model(&self) -> &str {
+            "rejecting-jev"
+        }
+        async fn evaluate(
+            &self,
+            request: &EvaluationRequest,
+            cancel: CancellationToken,
+        ) -> Result<Evaluation, JudgmentError> {
+            let mut evaluation = self.0.evaluate(request, cancel).await?;
+            let Answer::Choice {
+                choice,
+                probabilities,
+                ..
+            } = evaluation.answers.get_mut("decision").unwrap()
+            else {
+                panic!()
+            };
+            *choice = "block_soft".into();
+            for (option, probability) in probabilities {
+                *probability = f64::from(option == "block_soft");
+            }
+            Ok(evaluation)
+        }
+    }
     for use_jev in [false, true] {
         let directory = tempfile::tempdir().unwrap();
         let script = directory.path().join("large.py");
         let body = format!(
             "#{}\nfrom pathlib import Path\nPath('executed').write_text('must not run')",
-            "x".repeat(70 * 1024)
+            "x".repeat(80 * 1024)
         );
         let mut batch = call("write", "Write", json!({"file_path":script,"content":body}));
         batch.extend(call("run", "Bash", json!({"command":"python3 large.py"})));
@@ -546,10 +690,11 @@ async fn oversized_written_history_is_not_truncated_into_an_automatic_allow() {
             config(),
             Arc::new(ScriptedModel::new(vec![batch, text("done")])),
         );
-        let llm = Arc::new(ScriptedModel::new(Vec::new()));
-        let jev = Arc::new(RecordingJudgment {
+        let block = tickloop_agent_test_support::auto_classification(true).to_string();
+        let llm = Arc::new(ScriptedModel::new(vec![text(&block), text(&block)]));
+        let jev = Arc::new(RejectingJudgment(RecordingJudgment {
             requests: Mutex::new(Vec::new()),
-        });
+        }));
         if use_jev {
             agent.set_judgment_client(jev.clone()).await;
         } else {
@@ -560,36 +705,53 @@ async fn oversized_written_history_is_not_truncated_into_an_automatic_allow() {
             .set_execution_mode(chat, ExecutionMode::Auto)
             .await
             .unwrap();
-        let mut events = agent.subscribe();
-        agent
-            .submit(chat, None, "Write and run the proposed draft".into())
-            .await
-            .unwrap();
-        let mut prompted = false;
-        let mut capacity = false;
-        loop {
-            match next_event(&mut events).await.kind {
-                EventKind::PermissionRequested { request } => {
-                    prompted = true;
-                    assert!(!directory.path().join("executed").exists());
-                    agent
-                        .answer_permission(chat, request.id, false)
-                        .await
-                        .unwrap();
-                }
-                EventKind::ApprovalAssessed { assessment } => {
-                    assert_eq!(assessment.outcome, ApprovalOutcome::ContextLimit);
-                    assert!(assessment.reviewer.is_none());
-                    capacity = true;
-                }
-                EventKind::Completed { .. } | EventKind::Interrupted => break,
-                EventKind::Failed(error) => panic!("{error}"),
-                _ => {}
-            }
+        finish_one(
+            &agent,
+            chat,
+            None,
+            "Write the proposed draft, but do not execute it",
+        )
+        .await;
+        let states = if use_jev {
+            jev.0
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|request| request.state.clone())
+                .collect::<Vec<_>>()
+        } else {
+            llm.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|request| {
+                    let Content::Text { text } = &request.messages[1].content[0] else {
+                        panic!()
+                    };
+                    serde_json::from_str::<Value>(text).unwrap()
+                })
+                .collect()
+        };
+        assert_eq!(states.len(), 2);
+        for state in states {
+            assert_eq!(state["tool_history"]["complete"], true);
+            assert_eq!(state["tool_history"]["calls"][0]["input"]["content"], body);
         }
-        assert!(prompted && capacity);
-        assert!(llm.requests.lock().unwrap().is_empty());
-        assert!(jev.requests.lock().unwrap().is_empty());
+        let history = agent.approval_history_view(chat).await.unwrap();
+        let assessment = history
+            .records
+            .iter()
+            .find(|record| record.tool == "Bash")
+            .unwrap()
+            .review
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            assessment.outcome,
+            tickloop_agent_protocol::ApprovalOutcome::Block
+        );
+        assert_eq!(assessment.attempts.len(), 2);
         assert!(!directory.path().join("executed").exists());
         agent.shutdown().await;
     }

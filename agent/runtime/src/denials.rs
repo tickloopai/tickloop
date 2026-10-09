@@ -22,6 +22,7 @@ const MAX_REQUEST_DETAIL_CHARS: usize = 4096;
 const MAX_REQUEST_VALUE_CHARS: usize = 768;
 const MAX_REQUEST_COLLECTION_ITEMS: usize = 24;
 const MAX_REQUEST_DEPTH: usize = 6;
+const AUTO_REVIEW_LOG_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) enum DirectApprovalBasis {
@@ -705,6 +706,92 @@ fn bounded(value: &str, max_chars: usize) -> DisplaySummary {
 }
 
 impl Agent {
+    pub(super) async fn log_auto_review(
+        &self,
+        receipt: &Receipt,
+        operation: &OperationRecord,
+        policy: &PermissionPolicy,
+        assessment: &super::approval_assessment::ApprovalAssessment,
+        decision: tickloop_agent_protocol::Decision,
+        reason: Option<&str>,
+    ) -> Option<String> {
+        if matches!(assessment.verdict, super::AutoReview::Allow) {
+            return None;
+        }
+        let transcript = self
+            .inner
+            .recorder
+            .as_ref()?
+            .path_for_chat(receipt.chat_id)?;
+        let directory = transcript.with_extension("auto-review");
+        let path = directory.join(format!("{}.log", operation.id));
+        let record = DenialCandidate::new(
+            operation,
+            &operation.input,
+            DenialCategory::Automatic,
+            Some(PermissionApprovalSource::AutoReviewer),
+            policy,
+            Some(&assessment.details),
+        )
+        .finish(receipt.chat_id, operation);
+        let diagnostic = serde_json::json!({
+            "version": AUTO_REVIEW_LOG_VERSION,
+            "at_ms": record.at_ms,
+            "chat_id": record.chat_id,
+            "loop_id": record.loop_id,
+            "run_id": record.run_id,
+            "operation_id": record.operation_id,
+            "call_id": record.call_id,
+            "tool": record.tool,
+            "decision": decision,
+            "reason": safe_request_details(&serde_json::json!({
+                "reviewer_reason": assessment.details.reason,
+                "resolution_reason": reason,
+            })),
+            "request_details": record.request_details,
+            "original_input_json_bytes": serde_json::to_vec(&operation.input).expect("input serializes").len(),
+            "context_metrics": assessment.context_metrics,
+            "review": record.review,
+        });
+        let result = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            use tickloop_agent_base::private_fs::{
+                PRIVATE_FILE_MODE, PrivateDirectory, replace_file_atomically,
+            };
+            let parent = directory.parent().expect("transcript has a parent");
+            PrivateDirectory::anchored(parent.into(), directory.file_name().unwrap()).create()?;
+            let bytes = serde_json::to_vec_pretty(&diagnostic)?;
+            replace_file_atomically(&path, &bytes, PRIVATE_FILE_MODE)?;
+            let mut logs = std::fs::read_dir(&directory)?
+                .filter_map(Result::ok)
+                .filter_map(|entry| {
+                    let path = entry.path();
+                    if path.extension()?.to_str()? != "log"
+                        || Uuid::parse_str(path.file_stem()?.to_str()?).is_err()
+                    {
+                        return None;
+                    }
+                    let metadata = entry.metadata().ok()?;
+                    (metadata.is_file() && !entry.file_type().ok()?.is_symlink())
+                        .then(|| (metadata.modified().ok(), path))
+                })
+                .collect::<Vec<_>>();
+            logs.sort();
+            for (_, old) in logs
+                .iter()
+                .take(logs.len().saturating_sub(MAX_RECENT_DENIALS))
+            {
+                std::fs::remove_file(old)?;
+            }
+            Ok(())
+        })
+        .await;
+        if matches!(result, Ok(Ok(()))) {
+            None
+        } else {
+            Some("The automatic-review diagnostic log could not be saved.".into())
+        }
+    }
+
     pub(super) async fn record_final_denial(&self, record: DenialRecord) {
         let mut chats = self.inner.chats.lock().await;
         let Some(chat) = chats.get_mut(&record.chat_id) else {

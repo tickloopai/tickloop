@@ -8,7 +8,7 @@ use tickloop_agent_protocol::AutoPolicy;
 
 // Bound local payload size; the provider enforces its model-specific token limits.
 const MAX_REVIEW_REQUEST_BYTES: usize = 1024 * 1024;
-pub(super) const QUESTION_VERSION: &str = "auto-jev-v13";
+pub(super) const QUESTION_VERSION: &str = "auto-jev-v14";
 
 #[cfg(test)]
 #[path = "jev_review_tests.rs"]
