@@ -827,15 +827,19 @@ async fn global_shell_count_and_open_keep_the_peer_task_and_stop_its_actual_owne
         agent.display_chat(Some(source)).await.unwrap();
         let source_origin = agent.origin().unwrap();
         let center = ShellTaskCenter::new(agent.clone());
-        let snapshot = tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                let snapshot = center.snapshot(source).await.unwrap();
-                if snapshot.tasks.iter().any(|task| task.id == peer_task && task.was_background && !task.state.is_terminal()) {
-                    break snapshot;
+        // Admission runs on a spawned task; waiting for the pid makes Stop reach the owner's live process.
+        let snapshot_once_running = async |task_id: Uuid| {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let snapshot = center.snapshot(source).await.unwrap();
+                    if snapshot.tasks.iter().any(|task| task.id == task_id && task.was_background && task.pid.is_some() && !task.state.is_terminal()) {
+                        break snapshot;
+                    }
+                    tokio::task::yield_now().await;
                 }
-                tokio::task::yield_now().await;
-            }
-        }).await.unwrap();
+            }).await.unwrap()
+        };
+        let snapshot = snapshot_once_running(peer_task).await;
         assert_eq!(snapshot.chat_id, source);
         assert_eq!(snapshot.tasks.len(), 1);
         assert_eq!(snapshot.tasks[0].chat_id, peer);
@@ -852,6 +856,7 @@ async fn global_shell_count_and_open_keep_the_peer_task_and_stop_its_actual_owne
         assert_eq!(agent.origin(), Some(source_origin));
         key(&console, KeyCode::Left);
         let source_task = agent.submit_user_shell_for_goal(source, None, "printf 'source-shell-marker'; while [ ! -f source-finish ]; do sleep 0.02; done".into(), true).await.unwrap().command_id;
+        snapshot_once_running(source_task).await;
         let fresh = fixture();
         fresh.state.lock().unwrap().chat = Some(source);
         update(&fresh, vec![]);
