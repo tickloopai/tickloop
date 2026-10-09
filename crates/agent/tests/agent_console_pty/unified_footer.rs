@@ -360,7 +360,7 @@ async fn run_shell_panel(fixture: &PrivateFixture) {
         .await;
     pty.resize(80, 24).await;
     let client = fixture.client().await;
-    pty.send(b"!printf 'prior-completed\\n'\r");
+    pty.send(b"!printf 'prior-completed\\n'; while [ ! -f prior-finish ]; do sleep 0.02; done\r");
     let execution = tokio::time::timeout(UI_TIMEOUT, async {
         loop {
             let rows = catalog(&client).await;
@@ -372,6 +372,12 @@ async fn run_shell_panel(fixture: &PrivateFixture) {
     })
     .await
     .unwrap();
+    pty.wait_for(
+        "setup Shell owns the foreground before completion",
+        |frame| frame.contains("Shell running"),
+    )
+    .await;
+    std::fs::write(fixture.path("work/prior-finish"), "finish").unwrap();
     wait_snapshot(
         &client,
         execution,

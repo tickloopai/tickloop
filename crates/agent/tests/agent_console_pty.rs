@@ -1174,11 +1174,12 @@ async fn run_child_views(fixture: &PrivateFixture) {
     const RAW_CHILD_CONTENT: &str =
         "123e4567-e89b-12d3-a456-426614174000 deadbeef /tmp/a --id deadbeef";
     const FOLLOW_UP: &str = "Continue the same bounded cadence task.";
+    const FIRST_CHILD_RESPONSE_INDEX: usize = 1;
     const PARENT_RESULT_RESPONSE_INDEX: usize = 4;
     let replies = vec![
         chat_reply(
             Some((
-                "DelegateAgent",
+                "Subagent",
                 "delegate-cli",
                 json!({"task":CHILD_TASK,"name":"cadence","description":CHILD_TASK}),
             )),
@@ -1204,12 +1205,14 @@ async fn run_child_views(fixture: &PrivateFixture) {
         chat_reply(None, "parent delegated result received"),
         chat_reply(None, "child follow-up acknowledged"),
     ];
-    let (base_url, mut requests, finish_parent) =
-        model_http_support::serve_responses_with_gated_response(
+    let (base_url, mut requests, mut releases) =
+        model_http_support::serve_responses_with_gated_responses(
             replies.into_iter().map(|reply| (200, reply)).collect(),
-            PARENT_RESULT_RESPONSE_INDEX,
+            &[FIRST_CHILD_RESPONSE_INDEX, PARENT_RESULT_RESPONSE_INDEX],
         )
         .await;
+    let finish_parent = releases.pop().unwrap();
+    let show_child_question = releases.pop().unwrap();
     let mut model = support::config();
     model.protocol = tickloop_agent::model::Protocol::ChatCompletions;
     model.base_url = base_url.trim_end_matches("/anthropic").into();
@@ -1286,10 +1289,7 @@ async fn run_child_views(fixture: &PrivateFixture) {
     let (parent, child) = tokio::time::timeout(UI_TIMEOUT, async {
         loop {
             let rows = catalog(&client).await;
-            if let Some(child) = rows
-                .iter()
-                .find(|row| row.parent.is_some() && row.waiting_questions == 1)
-            {
+            if let Some(child) = rows.iter().find(|row| row.parent.is_some()) {
                 assert_eq!(rows.len(), 3);
                 break (child.parent.unwrap(), child.execution);
             }
@@ -1297,7 +1297,7 @@ async fn run_child_views(fixture: &PrivateFixture) {
         }
     })
     .await
-    .expect("actual model-visible DelegateAgent must create a real child");
+    .expect("actual model-visible Subagent must create a real child");
     let child_before = snapshot(&client, child).await;
     assert_eq!(child_before.conversation.workdir, parent_project);
     assert_eq!(
@@ -1307,14 +1307,6 @@ async fn run_child_views(fixture: &PrivateFixture) {
     let child_loop = child_before.conversation.loops[0].id;
     let metadata =
         serde_json::to_value(child_before.conversation.delegation.as_ref().unwrap()).unwrap();
-    let question = child_before
-        .request_refs
-        .iter()
-        .find(|request| request.kind == RequestKind::Question)
-        .copied()
-        .unwrap();
-    assert_eq!(question.execution, child);
-    assert!(snapshot(&client, parent).await.questions.is_empty());
     first
         .wait_for("dispatch stays in the filtered overview", |frame| {
             frame.contains("Agents · local")
@@ -1325,10 +1317,7 @@ async fn run_child_views(fixture: &PrivateFixture) {
     first.send(b"\tp");
     let folded = first
         .wait_for("real child folded under its root", |frame| {
-            frame.contains("Agents · local")
-                && frame.contains("Project: all")
-                && frame.contains("questions 1")
-                && frame.contains("questions 1")
+            frame.contains("Agents · local") && frame.contains("Project: all")
         })
         .await;
     assert!(!folded.contains(CHILD_TASK), "{folded}");
@@ -1350,6 +1339,81 @@ async fn run_child_views(fixture: &PrivateFixture) {
         .await;
     first.send(b"\x1b[B\x1b[Bj\r");
     let child_label = "Agent cadence".to_owned();
+    first
+        .wait_for(
+            "first View displays the child before its question response",
+            |frame| {
+                frame.contains(&format!("Delegated Agent · {CHILD_TASK}"))
+                    && !frame.contains("Agent family · root")
+            },
+        )
+        .await;
+    let mut second = PtyView::start_with_flags(fixture, &["--dangerously-skip-permissions"]);
+    second
+        .wait_for("independent View ready", new_input_is_visible)
+        .await;
+    second.send(b"\x1b[D");
+    second
+        .wait_for("second overview", |frame| {
+            frame.contains("Agents · local") && frame.contains("Delegate bounded cadence.")
+        })
+        .await;
+    select_overview_row(&mut second, "Delegate bounded cadence.").await;
+    assert!(
+        second
+            .frame()
+            .lines()
+            .any(|line| line.starts_with('›') && line.contains("Delegate bounded cadence.")),
+        "the parent row is selected in the second View: {}",
+        second.frame()
+    );
+    second.send(b"\r");
+    second
+        .wait_for("second View opens the family root", |frame| {
+            frame.contains("Subagents 1") && !frame.contains("Agents · local")
+        })
+        .await;
+    second.send(b"\x1b[B\x1b[Bj\r");
+    second
+        .wait_for(
+            "second View displays the child before its question response",
+            |frame| {
+                frame.contains(&format!("Delegated Agent · {CHILD_TASK}"))
+                    && !frame.contains("Agent family · root")
+            },
+        )
+        .await;
+    tokio::time::timeout(UI_TIMEOUT, async {
+        loop {
+            let rows = catalog(&client).await;
+            if rows
+                .iter()
+                .find(|row| row.execution == child)
+                .is_some_and(|row| row.views.len() == 2)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("both rendered child Views must finish owner display registration");
+    show_child_question.send(()).unwrap();
+    let child_with_question = wait_snapshot(
+        &client,
+        child,
+        "the gated question is pending in the selected child",
+        |snapshot| !snapshot.questions.is_empty(),
+    )
+    .await;
+    let question = child_with_question
+        .request_refs
+        .iter()
+        .find(|request| request.kind == RequestKind::Question)
+        .copied()
+        .unwrap();
+    assert_eq!(question.execution, child);
+    assert!(snapshot(&client, parent).await.questions.is_empty());
     let child_frame = first
         .wait_for("overview enters child requester", |frame| {
             request_dialog_visible(frame, "Which bounded cadence?", &child_label)
@@ -1378,52 +1442,11 @@ async fn run_child_views(fixture: &PrivateFixture) {
         snapshot(&client, parent).await.conversation.loops[0].state,
         tickloop_agent::runtime::LoopState::Running
     );
-    let mut second = PtyView::start_with_flags(fixture, &["--dangerously-skip-permissions"]);
-    second
-        .wait_for("independent View ready", new_input_is_visible)
-        .await;
-    second.send(b"\x1b[D");
-    second
-        .wait_for("second overview", |frame| {
-            frame.contains("Agents · local") && frame.contains("questions 1")
-        })
-        .await;
-    select_overview_row(&mut second, "Delegate bounded cadence.").await;
-    assert!(
-        second
-            .frame()
-            .lines()
-            .any(|line| line.starts_with('›') && line.contains("Delegate bounded cadence.")),
-        "the parent row is selected in the second View: {}",
-        second.frame()
-    );
-    second.send(b"\r");
-    second
-        .wait_for("second View opens the family root", |frame| {
-            frame.contains("Subagents 1") && !frame.contains("Agents · local")
-        })
-        .await;
-    second.send(b"\x1b[B\x1b[Bj\r");
     second
         .wait_for("same real request in second View", |frame| {
             request_dialog_visible(frame, "Which bounded cadence?", &child_label)
         })
         .await;
-    tokio::time::timeout(UI_TIMEOUT, async {
-        loop {
-            let rows = catalog(&client).await;
-            if rows
-                .iter()
-                .find(|row| row.execution == child)
-                .is_some_and(|row| row.views.len() == 2)
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("both rendered child Views must finish owner display registration");
     let wrong = client
         .execute(CommandEnvelope {
             owner_epoch: client.owner_epoch(),
@@ -1691,14 +1714,14 @@ async fn run_child_views(fixture: &PrivateFixture) {
             .as_array()
             .unwrap()
             .iter()
-            .any(|tool| tool["function"]["name"] == "DelegateAgent")
+            .any(|tool| tool["function"]["name"] == "Subagent")
     );
     assert!(
         !seen[1].1["tools"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|tool| tool["function"]["name"] == "DelegateAgent")
+            .any(|tool| tool["function"]["name"] == "Subagent")
     );
     let follow_up_input = seen[5].1["messages"]
         .as_array()

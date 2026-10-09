@@ -2465,7 +2465,7 @@ async fn a_child_reopens_its_dismissed_approval_but_cannot_enter_plan_mode_witho
     let model = Arc::new(test_support::ScriptedModel::new(vec![
         test_support::call(
             "delegate",
-            "DelegateAgent",
+            "Subagent",
             serde_json::json!({"task":"Plan the delegated task."}),
         ),
         test_support::call("enter", "EnterPlanMode", serde_json::json!({})),

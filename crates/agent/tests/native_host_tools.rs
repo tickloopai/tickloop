@@ -81,7 +81,7 @@ async fn explicit_host_operations_continue_after_the_agent_view_closes() {
         ),
         call(
             "delegate-host",
-            "DelegateAgent",
+            "Subagent",
             json!({"task":"Read the inherited host Workspace without expanding it."}),
         ),
         call("child-discover", "ReadWorkspace", json!({})),

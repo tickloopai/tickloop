@@ -62,6 +62,27 @@ impl FamilyMailbox {
         Ok(())
     }
 
+    pub fn check_notification(
+        &self,
+        cause: &MessageCause,
+        pending: usize,
+    ) -> Result<(), FamilyMessageRejection> {
+        let code = if cause.depth > MAX_MESSAGE_DEPTH {
+            Some(FamilyMessageRejectionCode::DepthLimit)
+        } else if pending >= MAX_PENDING_AGENT_MESSAGES {
+            Some(FamilyMessageRejectionCode::InboxFull)
+        } else {
+            None
+        };
+        match code {
+            Some(code) => Err(FamilyMessageRejection {
+                code,
+                message: "Subagent completion delivery budget exhausted".into(),
+            }),
+            None => Ok(()),
+        }
+    }
+
     pub fn synchronize(&mut self, snapshot: &ChatSnapshot) {
         for source in snapshot.sent_agent_messages.values() {
             self.record_source(source);
@@ -104,7 +125,23 @@ pub(super) fn current_cause(
     snapshot: &ChatSnapshot,
     receipt: &Receipt,
 ) -> Result<MessageCause, FamilyMessageRejection> {
+    let primary_input = snapshot
+        .messages
+        .iter()
+        .enumerate()
+        .find_map(|(index, message)| {
+            (message.role == Role::User
+                && snapshot.message_runs.get(&index) == Some(&receipt.run_id))
+            .then_some(index)
+        });
     for (index, message) in snapshot.messages.iter().enumerate().rev() {
+        let genuine_human = snapshot.prompt_execution_modes.contains_key(&index)
+            && !snapshot.inherited_prompts.contains(&index);
+        if primary_input
+            .is_some_and(|primary| index < primary || (index != primary && !genuine_human))
+        {
+            continue;
+        }
         if message.role != Role::User
             || snapshot
                 .message_runs
@@ -115,6 +152,13 @@ pub(super) fn current_cause(
             continue;
         }
         let Some(id) = snapshot.message_ids.get(&index) else {
+            if Some(index) == primary_input {
+                return Ok(MessageCause {
+                    chain_id: receipt.run_id,
+                    depth: 0,
+                    reply_to: None,
+                });
+            }
             continue;
         };
         if let Some(source) = snapshot.agent_message_origins.get(id) {

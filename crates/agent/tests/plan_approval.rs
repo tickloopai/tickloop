@@ -287,7 +287,7 @@ async fn child_agent_requests_approval_without_expanding_its_delegated_authority
     let model = Arc::new(ScriptedModel::new(vec![
         call(
             "delegate",
-            "DelegateAgent",
+            "Subagent",
             serde_json::json!({"task":"Plan the child task and wait for approval."}),
         ),
         call("enter", "EnterPlanMode", serde_json::json!({})),

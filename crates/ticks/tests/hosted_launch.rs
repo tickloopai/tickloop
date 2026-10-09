@@ -600,26 +600,22 @@ async fn a_stalled_view_loses_its_lease_after_two_seconds_and_the_tick_keeps_run
         .unwrap();
     let attached_at = std::time::Instant::now();
     let mut reader = fixture.reader(&opened).await;
-    let mut released = None;
-    for _ in 0..60 {
-        reader
-            .request("call", json!({"tool":"flood","args":{}}), CALL_TIMEOUT)
-            .await
-            .unwrap();
-        let mut probe = fixture.reader(&opened).await;
-        match probe.request("attach", json!({}), CONTROL_TIMEOUT).await {
-            Ok(_) => {
-                released = Some(probe);
-                break;
+    let released = tokio::time::timeout(CONTROL_TIMEOUT, async {
+        loop {
+            reader
+                .request("call", json!({"tool":"flood","args":{}}), CALL_TIMEOUT)
+                .await
+                .unwrap();
+            let mut probe = fixture.reader(&opened).await;
+            match probe.request("attach", json!({}), CONTROL_TIMEOUT).await {
+                Ok(_) => break probe,
+                Err(error) if error.code == "Busy" => tokio::task::yield_now().await,
+                Err(error) => panic!("attach failed: {error:?}"),
             }
-            Err(error) if error.code == "Busy" => {}
-            Err(error) => panic!("attach failed: {error:?}"),
         }
-    }
-    assert!(
-        released.is_some(),
-        "a view that stops reading loses its lease"
-    );
+    })
+    .await
+    .expect("a view that stops reading loses its lease");
     assert!(attached_at.elapsed() >= host::STREAM_WRITE_TIMEOUT);
     let called = reader
         .request(
@@ -630,6 +626,7 @@ async fn a_stalled_view_loses_its_lease_after_two_seconds_and_the_tick_keeps_run
         .await
         .unwrap();
     assert_eq!(called["value"], 1, "the Tick keeps running");
+    drop(released);
     drop(stalled);
     shutdown(&fixture).await;
 }

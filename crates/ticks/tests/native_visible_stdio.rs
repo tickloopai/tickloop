@@ -13,6 +13,9 @@ use std::{
 use serde_json::{Value, json};
 use tick_connect::protocol::{TickDescriptor, descriptor_digest};
 
+const VISIBLE_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
+const VISIBLE_FRAME_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
 fn visible_demo() -> (
     std::process::Child,
     File,
@@ -261,6 +264,18 @@ fn visible_kline_keyboard_and_tool_share_the_same_stdio_instance() {
         }
     };
     assert_eq!(marked["params"]["data"]["marks"][0]["label"], "test");
+    let deadline = std::time::Instant::now() + VISIBLE_FRAME_TIMEOUT;
+    loop {
+        let rendered = String::from_utf8_lossy(&screen.lock().unwrap()).into_owned();
+        if rendered.contains("5m") && rendered.contains("test") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "visible TTY did not show switched period and mark: {rendered}"
+        );
+        std::thread::sleep(VISIBLE_FRAME_POLL_INTERVAL);
+    }
     writeln!(stdin, "{}", json!({"jsonrpc":"2.0","id":3,"method":"tool/call","params":{"tool":"unmark","args":{"label":"test"}}})).unwrap();
     let unmarked = loop {
         let frame = next(&frames);
@@ -272,12 +287,6 @@ fn visible_kline_keyboard_and_tool_share_the_same_stdio_instance() {
         }
     };
     assert_eq!(unmarked["params"]["data"]["marks"], json!([]));
-    std::thread::sleep(Duration::from_millis(100));
-    let rendered = String::from_utf8_lossy(&screen.lock().unwrap()).into_owned();
-    assert!(
-        rendered.contains("5m") && rendered.contains("test"),
-        "visible TTY did not show switched period and mark"
-    );
     let size = libc::winsize {
         ws_row: 25,
         ws_col: 81,

@@ -549,7 +549,7 @@ async fn schema_model() -> (
             } else {
                 root_calls += 1;
                 if root_calls == 1 {
-                    ["A", "B", "C"].into_iter().enumerate().map(|(index, task)| json!({"index":index,"id":format!("delegate-{task}"),"type":"function","function":{"name":"DelegateAgent","arguments":json!({"task":format!("Child {task}")}).to_string()}})).collect()
+                    ["A", "B", "C"].into_iter().enumerate().map(|(index, task)| json!({"index":index,"id":format!("delegate-{task}"),"type":"function","function":{"name":"Subagent","arguments":json!({"task":format!("Child {task}")}).to_string()}})).collect()
                 } else if root_calls == 2 {
                     let calls = ["A", "B", "C"].into_iter().enumerate().map(|(index, task)| {
                         let id = format!("delegate-{task}");
@@ -940,11 +940,7 @@ impl ModelClient for MessageBurstModel {
                     json!({"to":"parent","message":format!("READY {task}")}),
                 )
             } else {
-                support::call(
-                    "receive",
-                    "ReceiveAgentMessage",
-                    json!({"timeout_ms":60000}),
-                )
+                support::text("Ready for the next pushed context.")
             }
         } else if tool_result(&request, "delegate-A").is_none() {
             ["A", "B", "C"]
@@ -952,7 +948,7 @@ impl ModelClient for MessageBurstModel {
                 .flat_map(|label| {
                     support::call(
                         &format!("delegate-{label}"),
-                        "DelegateAgent",
+                        "Subagent",
                         json!({"task":format!("Child {label}")}),
                     )
                 })
