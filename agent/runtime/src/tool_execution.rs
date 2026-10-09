@@ -803,8 +803,15 @@ impl Agent {
             ));
             let mut auto_denial_message = None;
             if decision == Decision::Check {
-                let assessment = self
-                    .review_auto_operation(receipt, &operation, cancel.clone())
+                let mut assessment = self
+                    .review_auto_operation(
+                        receipt,
+                        &operation,
+                        prepared_host_call
+                            .as_ref()
+                            .map(|call| call.approval_facts().clone()),
+                        cancel.clone(),
+                    )
                     .await
                     .map_err(|error| error.to_string())?;
                 {
@@ -818,10 +825,10 @@ impl Agent {
                         },
                     );
                 }
-                assessment_details = Some(assessment.details.clone());
                 let reviewed = self
-                    .resolve_auto_assessment(receipt, &operation, &policy, assessment)
+                    .resolve_auto_assessment(receipt, &operation, &policy, &mut assessment)
                     .await?;
+                assessment_details = Some(assessment.details.clone());
                 decision = reviewed.decision;
                 approval_source = PermissionApprovalSource::AutoReviewer;
                 approval_reason = reviewed.approval_reason;
@@ -1236,8 +1243,13 @@ impl Agent {
                         let mut review_attempts = 0;
                         loop {
                             review_attempts += 1;
-                            let assessment = self
-                                .review_auto_operation(receipt, &operation, cancel.clone())
+                            let mut assessment = self
+                                .review_auto_operation(
+                                    receipt,
+                                    &operation,
+                                    Some(prepared.approval_facts()),
+                                    cancel.clone(),
+                                )
                                 .await
                                 .map_err(|error| error.to_string())?;
                             {
@@ -1304,8 +1316,14 @@ impl Agent {
                                 }
                             }
                             let reviewed = self
-                                .resolve_auto_assessment(receipt, &operation, &policy, assessment)
+                                .resolve_auto_assessment(
+                                    receipt,
+                                    &operation,
+                                    &policy,
+                                    &mut assessment,
+                                )
                                 .await?;
+                            assessment_details = Some(assessment.details.clone());
                             decision = reviewed.decision;
                             approval_source = PermissionApprovalSource::AutoReviewer;
                             approval_reason = reviewed.approval_reason;
@@ -1626,14 +1644,14 @@ impl Agent {
         receipt: &Receipt,
         operation: &OperationRecord,
         policy: &PermissionPolicy,
-        assessment: approval_assessment::ApprovalAssessment,
+        assessment: &mut approval_assessment::ApprovalAssessment,
     ) -> Result<AutoPermissionDecision, ToolCallError> {
         let decision;
         let mut approval_reason = None;
         let mut auto_denial_message = None;
-        match assessment.verdict {
+        match assessment.verdict.clone() {
             AutoReview::Allow => decision = Decision::Allow,
-            AutoReview::Ask { reason } => {
+            AutoReview::Ask { reason, .. } => {
                 decision = self.apply_prompt_policy(Decision::Ask);
                 approval_reason = Some(reason.clone());
                 if decision == Decision::Deny {
@@ -1678,6 +1696,13 @@ impl Agent {
             }
             AutoReview::Block { reason, kind, .. } => {
                 let limit_warning = self.record_auto_denial(receipt.chat_id).await;
+                if limit_warning.is_some() {
+                    assessment
+                        .details
+                        .diagnostics
+                        .get_or_insert_with(Vec::new)
+                        .push(tickloop_agent_protocol::ApprovalDiagnostic::DenialLimit);
+                }
                 match limit_warning {
                     Some(_)
                         if self.inner.host_options.prompt_policy == PromptPolicy::DenyOnPrompt =>

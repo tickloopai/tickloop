@@ -3,9 +3,9 @@ use super::approval_context::{
     APPROVAL_CONTEXT_VERSION, ApprovalSnapshot, REVIEW_TEMPLATE_VERSION,
 };
 use tickloop_agent_protocol::{
-    ApprovalAssessmentDetails, ApprovalAttemptDetails, ApprovalFailureKind, ApprovalFallbackReason,
-    ApprovalOutcome, ApprovalReviewer, ApprovalReviewerKind, AutoBlockKind, AutoReviewerPreference,
-    AutoRule, OperationRecord, VerdictEvidence,
+    ApprovalAssessmentDetails, ApprovalAttemptDetails, ApprovalDiagnostic, ApprovalFailureKind,
+    ApprovalFallbackReason, ApprovalOutcome, ApprovalReviewer, ApprovalReviewerKind, AutoBlockKind,
+    AutoReviewerPreference, AutoRule, OperationRecord, VerdictEvidence,
 };
 
 pub(super) struct ApprovalAssessment {
@@ -21,6 +21,13 @@ impl ApprovalAssessment {
     ) -> Self {
         let facts = verdict_facts(context, &verdict);
         let details = ApprovalAssessmentDetails {
+            diagnostics: Some(match &verdict {
+                AutoReview::Ask { diagnostics, .. } => diagnostics.clone(),
+                AutoReview::ContextLimit => vec![ApprovalDiagnostic::ReviewerFailure {
+                    failure: ApprovalFailureKind::ContextLimit,
+                }],
+                _ => Vec::new(),
+            }),
             operation_id: context.operation.id,
             call_id: context.operation.call_id.clone(),
             loop_id: context.operation.loop_id,
@@ -48,11 +55,14 @@ impl ApprovalAssessment {
         operation: &OperationRecord,
         permission_policy_revision: u64,
         missing_reason: String,
+        diagnostic: ApprovalDiagnostic,
     ) -> Self {
         let verdict = AutoReview::Ask {
+            diagnostics: vec![diagnostic.clone()],
             reason: missing_reason.clone(),
         };
         let details = ApprovalAssessmentDetails {
+            diagnostics: Some(vec![diagnostic]),
             operation_id: operation.id,
             call_id: operation.call_id.clone(),
             loop_id: operation.loop_id,
@@ -92,6 +102,11 @@ impl ApprovalAssessment {
         fallback_from: Option<ApprovalReviewerKind>,
         fallback_failure: Option<ApprovalFailureKind>,
     ) -> Self {
+        if matches!(self.verdict, AutoReview::Unavailable { .. })
+            && let Some(failure) = attempts.iter().rev().find_map(|attempt| attempt.failure)
+        {
+            self.details.diagnostics = Some(vec![ApprovalDiagnostic::ReviewerFailure { failure }]);
+        }
         self.details.attempts = attempts;
         self.details.fallback_from = fallback_from;
         self.details.fallback_failure = fallback_failure;
@@ -140,7 +155,7 @@ fn verdict_facts(context: &ApprovalSnapshot, verdict: &AutoReview) -> VerdictFac
             }),
             block_evidence: Some(evidence.clone()),
         },
-        AutoReview::Ask { reason } => VerdictFacts {
+        AutoReview::Ask { reason, .. } => VerdictFacts {
             outcome: ApprovalOutcome::NeedsHuman,
             reason: Some(reason.clone()),
             block_kind: None,

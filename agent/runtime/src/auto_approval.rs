@@ -22,7 +22,13 @@ const MAX_RETRY_DELAY: Duration = Duration::from_secs(10);
 pub(super) fn review_from_rule_verdict(verdict: RuleVerdict) -> AutoReview {
     match verdict {
         RuleVerdict::Allow => AutoReview::Allow,
-        RuleVerdict::NeedsHuman { reason } => AutoReview::Ask { reason },
+        RuleVerdict::NeedsHuman {
+            reason,
+            diagnostics,
+        } => AutoReview::Ask {
+            reason,
+            diagnostics,
+        },
         RuleVerdict::Block {
             reason,
             kind,

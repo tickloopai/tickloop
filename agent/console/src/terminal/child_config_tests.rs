@@ -746,7 +746,7 @@ fn inherited_auto_permissions_keep_judgment_read_only_and_root_key_settings_edit
     );
     view.send(b"\x1b[B\x1b[B\r");
     let details = view.wait_for("readable child Auto rules", |frame| {
-        frame.contains("Built-in v1 included") && !frame.contains("Reviewer")
+        frame.contains("Built-in defaults included") && !frame.contains("Reviewer")
     });
     assert!(
         details.contains("Soft allow"),

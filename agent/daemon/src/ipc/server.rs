@@ -169,16 +169,19 @@ pub(super) async fn serve_connection_mode(
     #[cfg(test)] observation_hooks: Option<Arc<ObservationTestHooks>>,
 ) -> Result<(), AccessError> {
     verify_peer(&stream)?;
-    let hello = crate::daemon_management::read::<_, crate::daemon_management::Request>(&mut stream)
-        .await
-        .map_err(AccessError::invalid)?;
+    let hello = tickloop_agent_client::daemon_management::read::<
+        _,
+        tickloop_agent_protocol::daemon_management::Request,
+    >(&mut stream)
+    .await
+    .map_err(AccessError::invalid)?;
     let minor = match hello {
-        Some(crate::daemon_management::Request::Hello {
+        Some(tickloop_agent_protocol::daemon_management::Request::Hello {
             major: PROTOCOL_MAJOR,
             ..
         }) => PROTOCOL_MINOR,
-        Some(crate::daemon_management::Request::Hello {
-            major: crate::daemon_management::CONTROL_MAJOR,
+        Some(tickloop_agent_protocol::daemon_management::Request::Hello {
+            major: tickloop_agent_protocol::daemon_management::CONTROL_MAJOR,
             minor: 0,
         }) if daemon_shutdown.is_some() => {
             return crate::daemon_management::serve_shutdown(
@@ -189,7 +192,7 @@ pub(super) async fn serve_connection_mode(
             .await
             .map_err(AccessError::invalid);
         }
-        Some(crate::daemon_management::Request::Hello { major, minor }) => {
+        Some(tickloop_agent_protocol::daemon_management::Request::Hello { major, minor }) => {
             write_frame(
                 &mut stream,
                 &ServerMessage::Error {

@@ -7,7 +7,10 @@ use std::{
     io,
     os::{
         fd::AsRawFd,
-        unix::{fs::OpenOptionsExt, process::CommandExt},
+        unix::{
+            fs::{MetadataExt, OpenOptionsExt},
+            process::CommandExt,
+        },
     },
     path::{Path, PathBuf},
     process::Stdio,
@@ -17,6 +20,8 @@ use std::{
 use tickloop_agent_protocol::{AccessError, AccessErrorCode, PROTOCOL_MAJOR, PROTOCOL_MINOR};
 
 pub mod daemon_endpoint;
+pub mod daemon_management;
+pub mod daemon_stop;
 pub mod frame;
 mod incoming;
 mod local;
@@ -36,9 +41,48 @@ pub const RUN_SUBCOMMAND: &str = "run";
 #[doc(hidden)]
 pub const DAEMON_RUN_ARGUMENTS: [&str; 2] = [DAEMON_COMMAND, RUN_SUBCOMMAND];
 
+#[derive(Debug)]
+pub struct DaemonStartupError {
+    message: String,
+    pub mismatch: Option<DaemonMismatch>,
+}
+
+#[derive(Debug)]
+pub struct DaemonMismatch {
+    pub directory: PathBuf,
+    pub description: String,
+    socket_identity: (u64, u64),
+}
+
+impl DaemonMismatch {
+    pub async fn prepare_stop(&self) -> Result<Option<daemon_stop::PreparedDaemonStop>, String> {
+        daemon_stop::prepare(&self.directory, Some(self.socket_identity)).await
+    }
+}
+
+impl std::fmt::Display for DaemonStartupError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+impl std::error::Error for DaemonStartupError {}
+impl From<String> for DaemonStartupError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            mismatch: None,
+        }
+    }
+}
+impl From<&str> for DaemonStartupError {
+    fn from(message: &str) -> Self {
+        message.to_owned().into()
+    }
+}
+
 /// Connects to the daemon of this user's runtime directory, starting it from `executable` when
 /// none serves it.
-pub async fn connect_or_start(executable: PathBuf) -> Result<LocalAgentClient, String> {
+pub async fn connect_or_start(executable: PathBuf) -> Result<LocalAgentClient, DaemonStartupError> {
     connect_or_start_at(runtime_directory(), executable).await
 }
 
@@ -52,7 +96,8 @@ pub async fn connect_to_running_daemon(executable: PathBuf) -> Result<LocalAgent
     let endpoint = directory.join(SOCKET_NAME);
     check_socket_length(&endpoint)?;
     connect_existing(&endpoint, &executable, false)
-        .await?
+        .await
+        .map_err(|error| error.to_string())?
         .ok_or_else(|| "Agent daemon is not running; launch tickloop to start it.".into())
 }
 
@@ -60,7 +105,7 @@ pub async fn connect_to_running_daemon(executable: PathBuf) -> Result<LocalAgent
 pub async fn connect_or_start_at(
     directory: PathBuf,
     executable: PathBuf,
-) -> Result<LocalAgentClient, String> {
+) -> Result<LocalAgentClient, DaemonStartupError> {
     validate_directory(&directory)?;
     let directory = directory
         .canonicalize()
@@ -119,7 +164,7 @@ pub async fn connect_or_start_at(
     } else {
         let error = io::Error::last_os_error();
         if error.kind() != io::ErrorKind::WouldBlock {
-            return Err(format!("cannot arbitrate Agent daemon startup: {error}"));
+            return Err(format!("cannot arbitrate Agent daemon startup: {error}").into());
         }
     }
     drop(lock);
@@ -141,16 +186,28 @@ async fn connect_existing(
     endpoint: &Path,
     executable: &Path,
     own_startup: bool,
-) -> Result<Option<LocalAgentClient>, String> {
+) -> Result<Option<LocalAgentClient>, DaemonStartupError> {
     if !endpoint.exists() {
         return Ok(None);
     }
     validate_socket(endpoint)?;
+    let metadata = std::fs::symlink_metadata(endpoint).map_err(|error| error.to_string())?;
+    let socket_identity = (metadata.dev(), metadata.ino());
     match tokio::time::timeout(STARTUP_DEADLINE, LocalAgentClient::connect(endpoint)).await {
         Ok(Ok(client)) => Ok(Some(client)),
-        Ok(Err(error)) if error.code == AccessErrorCode::VersionMismatch => Err(
-            incompatible_daemon_guidance(endpoint, executable, &error, own_startup),
-        ),
+        Ok(Err(error)) if error.code == AccessErrorCode::VersionMismatch => {
+            Err(DaemonStartupError {
+                message: incompatible_daemon_guidance(endpoint, executable, &error, own_startup),
+                mismatch: (!own_startup).then(|| DaemonMismatch {
+                    directory: endpoint
+                        .parent()
+                        .expect("daemon runtime directory")
+                        .to_owned(),
+                    description: error.message.clone(),
+                    socket_identity,
+                }),
+            })
+        }
         Ok(Err(error)) => {
             if matches!(error.code, AccessErrorCode::Unavailable)
                 && matches!(
@@ -162,7 +219,7 @@ async fn connect_existing(
             {
                 Ok(None)
             } else {
-                Err(error.to_string())
+                Err(error.to_string().into())
             }
         }
         Err(_) => Err("existing Agent daemon is not responding; it was left running".into()),

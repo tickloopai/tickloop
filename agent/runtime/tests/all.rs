@@ -1,5 +1,8 @@
 //! Every agent/runtime integration test, compiled as one binary.
 
+#[path = "all/auto_review_improvements.rs"]
+mod auto_review_improvements;
+
 #[path = "all/approval_assessment.rs"]
 mod approval_assessment;
 #[path = "all/artifact_real_service.rs"]

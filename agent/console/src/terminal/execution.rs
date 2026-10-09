@@ -399,10 +399,6 @@ fn rule_project(directory: &Path) -> Result<PathBuf, AccessError> {
 }
 
 /// Connects to the local daemon, starting it from this executable when none serves this user.
-pub(super) async fn connect_daemon() -> Result<LocalAgentClient, String> {
-    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
-    tickloop_agent_client::connect_or_start(executable).await
-}
 
 impl ConsoleExecution {
     pub(super) fn connected(
@@ -1985,7 +1981,7 @@ impl ConsoleExecution {
             execution_mode: configuration.execution_mode,
             chat_model_label: configuration.model.model.clone(),
             preferred_reviewer: auto.reviewer,
-            auto_policy: auto.policy(),
+            auto_policy: auto.policy_for_directory(&project),
             auto_rule_settings: auto.rules.clone(),
             jev_key_status,
             auto_reviewer_health: None,
@@ -2529,6 +2525,28 @@ impl ConsoleExecution {
             _ => Err(unexpected()),
         }
     }
+    pub(super) async fn generate_auto_environment(
+        &self,
+        chat: Uuid,
+        options: tickloop_agent_protocol::AutoSetupOptions,
+    ) -> Result<tickloop_agent_protocol::AutoEnvironmentDraft, AccessError> {
+        let execution = self.reference(chat).await?;
+        match self
+            .command(
+                AgentCommand::Configure {
+                    execution,
+                    change: ConfigurationChange::GenerateAutoEnvironment { options },
+                    provider: None,
+                },
+                None,
+            )
+            .await?
+        {
+            CommandResult::AutoEnvironmentDraft(draft) => Ok(draft),
+            _ => Err(unexpected()),
+        }
+    }
+
     pub(super) async fn permissions_view(
         &self,
         chat: Uuid,

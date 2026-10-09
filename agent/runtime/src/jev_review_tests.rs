@@ -56,6 +56,7 @@ fn review_request(
         tickloop_agent_config::AutoSettings::default().policy(),
     )
     .map_err(|_| AutoReview::Ask {
+        diagnostics: Vec::new(),
         reason: "Original user authorization is unavailable".into(),
     })?;
     super::review_request(&context)
@@ -198,7 +199,11 @@ fn independent_risks_require_their_own_authorization() {
     let (snapshot, bookkeeping, operation) = scenario("Run tests", "cargo test");
     let request = review_request(&snapshot, &bookkeeping, &operation).unwrap();
     let policy = tickloop_agent_config::AutoSettings::default().policy();
-    for rule in &policy.rules {
+    for rule in policy
+        .rules
+        .iter()
+        .filter(|rule| rule.kind != AutoRuleKind::SoftAllow)
+    {
         let id = &rule.id;
         let mut result = response(&request);
         assert!(matches!(verdict(&result, &policy), Ok(RuleVerdict::Allow)));
@@ -214,10 +219,17 @@ fn independent_risks_require_their_own_authorization() {
         {
             *confidence = 0.79;
         }
-        assert!(matches!(
-            verdict(&result, &policy),
-            Ok(RuleVerdict::NeedsHuman { .. })
-        ));
+        let Ok(RuleVerdict::NeedsHuman { diagnostics, .. }) = verdict(&result, &policy) else {
+            panic!("must ask")
+        };
+        assert_eq!(
+            diagnostics,
+            vec![
+                tickloop_agent_protocol::ApprovalDiagnostic::JevLowConfidence {
+                    question_id: format!("clear:{id}")
+                }
+            ]
+        );
     }
 }
 
@@ -271,18 +283,21 @@ fn custom_hard_deny_cannot_be_cleared_and_soft_allow_clears_only_its_restriction
         version: 1,
         rules: vec![
             AutoRule {
+                clears: None,
                 id: "allow-exact".into(),
                 kind: AutoRuleKind::SoftAllow,
                 text: "Allow publishing report.csv to reports.example only".into(),
                 source: AutoRuleSource::User,
             },
             AutoRule {
+                clears: None,
                 id: "no-trades".into(),
                 kind: AutoRuleKind::HardDeny,
                 text: "Never place orders in Auto review".into(),
                 source: AutoRuleSource::User,
             },
             AutoRule {
+                clears: None,
                 id: "external-share".into(),
                 kind: AutoRuleKind::SoftDeny,
                 text: "Do not transmit private files".into(),
@@ -290,6 +305,7 @@ fn custom_hard_deny_cannot_be_cleared_and_soft_allow_clears_only_its_restriction
             },
         ],
         environment: AutoEnvironment {
+            entries: Vec::new(),
             text: "Research environment".into(),
             source: AutoEnvironmentSource::UserReplacement,
         },

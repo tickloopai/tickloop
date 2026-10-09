@@ -60,6 +60,7 @@ pub struct PreparedHostCall {
     payload: Option<Box<dyn Any + Send + Sync>>,
     event_context: Option<EventToolContext>,
     policy_identity: Option<HostPolicyIdentity>,
+    approval_facts: tickloop_agent_protocol::PreparedApprovalFacts,
 }
 
 impl std::fmt::Debug for PreparedHostCall {
@@ -82,6 +83,10 @@ impl PreparedHostCall {
         approval_summary: String,
     ) -> Self {
         Self {
+            approval_facts: tickloop_agent_protocol::PreparedApprovalFacts {
+                normalized_input: input.clone(),
+                ..Default::default()
+            },
             name,
             source_input,
             permission_input: input.clone(),
@@ -97,6 +102,18 @@ impl PreparedHostCall {
     pub fn with_payload<T: Any + Send + Sync>(mut self, payload: T) -> Self {
         self.payload = Some(Box::new(payload));
         self
+    }
+
+    pub fn with_approval_facts(
+        mut self,
+        facts: tickloop_agent_protocol::PreparedApprovalFacts,
+    ) -> Self {
+        self.approval_facts = facts;
+        self
+    }
+
+    pub fn approval_facts(&self) -> &tickloop_agent_protocol::PreparedApprovalFacts {
+        &self.approval_facts
     }
 
     pub(crate) fn with_event_context(mut self, context: EventToolContext) -> Self {

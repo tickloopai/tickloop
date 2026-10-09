@@ -175,6 +175,27 @@ impl DenialCandidate {
             matching_rules,
             matching_rules_truncated,
             review: assessment.map(|details| DenialReviewFacts {
+                diagnostics: details.diagnostics.as_ref().map(|diagnostics| {
+                    diagnostics
+                        .iter()
+                        .take(32)
+                        .cloned()
+                        .map(|mut diagnostic| {
+                            use tickloop_agent_protocol::ApprovalDiagnostic;
+                            match &mut diagnostic {
+                                ApprovalDiagnostic::ApplicabilityUncertain { rule_id }
+                                | ApprovalDiagnostic::ClearanceUncertain { rule_id } => {
+                                    *rule_id = bounded(rule_id, 80).text
+                                }
+                                ApprovalDiagnostic::JevLowConfidence { question_id } => {
+                                    *question_id = bounded(question_id, 96).text
+                                }
+                                _ => {}
+                            }
+                            diagnostic
+                        })
+                        .collect()
+                }),
                 preferred_reviewer: details.preferred_reviewer,
                 reviewer: details.reviewer.clone().map(|mut reviewer| {
                     reviewer.requested_model = bounded(&reviewer.requested_model, 80).text;

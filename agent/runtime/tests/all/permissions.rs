@@ -850,7 +850,7 @@ async fn three_consecutive_auto_denials_require_user_intervention_before_more_mo
     assert_eq!(
         request.approval_reason.as_deref(),
         Some(
-            "3 consecutive actions were blocked. Please review the transcript before continuing.\n\nLatest blocked action: Auto Soft deny builtin.soft_deny.external_code (Builtin { version: 1 }) applies without clearance"
+            "3 consecutive actions were blocked. Please review the transcript before continuing.\n\nLatest blocked action: Auto Soft deny builtin.soft_deny.external_code (Builtin { version: 2 }) applies without clearance"
         )
     );
     assert_eq!(

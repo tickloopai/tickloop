@@ -65,6 +65,43 @@ fn incompatible_daemon_output(terminal: bool) -> String {
             "no command may follow an incompatible Hello"
         );
         assert!(endpoint.exists(), "the existing daemon socket must remain");
+        if terminal {
+            let (mut control, _) = loop {
+                match listener.accept() {
+                    Ok(connection) => break connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "no management handshake"
+                        );
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("{error}"),
+                }
+            };
+            control.set_nonblocking(false).unwrap();
+            control
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            control.read_exact(&mut header).unwrap();
+            let mut request = vec![0; u32::from_be_bytes(header) as usize];
+            control.read_exact(&mut request).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&request).unwrap(),
+                json!({"Hello":{"major":1,"minor":0}})
+            );
+            let response = serde_json::to_vec(
+                &json!({"Hello":{"major":1,"minor":0,"daemon_epoch":uuid::Uuid::new_v4()}}),
+            )
+            .unwrap();
+            control
+                .write_all(&(response.len() as u32).to_be_bytes())
+                .unwrap();
+            control.write_all(&response).unwrap();
+            let mut rest = Vec::new();
+            control.read_to_end(&mut rest).unwrap();
+            assert!(rest.is_empty(), "cancel must not send ShutdownDaemon");
+        }
         assert!(
             matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
         );
@@ -101,12 +138,33 @@ fn incompatible_daemon_output(terminal: bool) -> String {
         let mut child = pair.slave.spawn_command(command).unwrap();
         drop(pair.slave);
         let mut reader = pair.master.try_clone_reader().unwrap();
+        let mut writer = pair.master.take_writer().unwrap();
         let reader = thread::spawn(move || {
             let mut bytes = Vec::new();
-            let _ = reader.read_to_end(&mut bytes);
+            let mut chunk = [0u8; 4096];
+            let mut answered = false;
+            while let Ok(count) = reader.read(&mut chunk) {
+                if count == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&chunk[..count]);
+                if !answered
+                    && String::from_utf8_lossy(&bytes)
+                        .contains("Stop the running daemon and continue?")
+                {
+                    writer.write_all(b"n\r").unwrap();
+                    writer.flush().unwrap();
+                    answered = true;
+                }
+            }
+            assert!(
+                answered,
+                "interactive startup must offer confirmation before exiting: {}",
+                String::from_utf8_lossy(&bytes)
+            );
             bytes
         });
-        assert_eq!(child.wait().unwrap().exit_code(), 1);
+        assert_eq!(child.wait().unwrap().exit_code(), 0);
         String::from_utf8(reader.join().unwrap()).unwrap()
     } else {
         let output = Command::new(executable)
@@ -132,6 +190,12 @@ fn incompatible_daemon_output(terminal: bool) -> String {
     assert!(socket.exists());
     assert!(!runtime.join("daemon.lock").exists());
     assert!(!output.contains("private-fixture-key"));
+    if terminal {
+        assert!(output.contains("Stop the running daemon and continue?"));
+        assert!(output.contains("Saved history is kept"));
+        assert!(!output.contains("TICKLOOP_DAEMON_RUNTIME_DIR="));
+        return output;
+    }
     assert!(!output.contains("incompatible AgentAccess protocol major"));
     assert!(output.contains("This stops running Agents. Saved history is kept."));
     assert!(output.contains("Stop the daemon and relaunch:"));
@@ -199,9 +263,8 @@ fn incompatible_daemon_has_readable_plain_guidance_without_dispatching() {
 }
 
 #[test]
-fn incompatible_daemon_terminal_styles_only_the_title_and_preserves_guidance() {
+fn incompatible_daemon_terminal_offers_cancel_without_stopping() {
     let output = incompatible_daemon_output(true);
-    assert!(output.contains("\x1b["));
-    assert!(output.contains("Error: Agent daemon version mismatch"));
-    assert!(output.contains("\n\nStop the daemon and relaunch:"));
+    assert!(output.contains("Stop daemon and open this version"));
+    assert!(output.contains("Cancel"));
 }

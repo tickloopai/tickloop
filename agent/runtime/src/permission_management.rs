@@ -407,7 +407,7 @@ fn view_from_snapshot(
         execution_mode: snapshot.policy.mode,
         chat_model_label,
         preferred_reviewer: auto_settings.reviewer,
-        auto_policy: auto_settings.policy(),
+        auto_policy: auto_settings.policy_for_directory(&snapshot.workdir),
         auto_rule_settings: auto_settings.rules,
         auto_settings_revision,
         jev_key_status,

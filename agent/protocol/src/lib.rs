@@ -5,7 +5,9 @@ mod approvals;
 mod artifact;
 mod auto_rules;
 mod auto_settings;
+mod auto_setup;
 mod chat;
+pub mod daemon_management;
 mod denials;
 mod family;
 mod file_change;
@@ -52,9 +54,9 @@ pub use access::{
     TranscriptRef, UserInput, VIEW_LEASE_SECONDS, ViewRef, bounded_update,
 };
 pub use approvals::{
-    ApprovalAssessmentDetails, ApprovalAttemptDetails, ApprovalAttemptOutcome, ApprovalFailureKind,
-    ApprovalFallbackReason, ApprovalOutcome, ApprovalReviewer, ApprovalReviewerKind,
-    AutoReviewerHealth, OriginalUserInput,
+    ApprovalAssessmentDetails, ApprovalAttemptDetails, ApprovalAttemptOutcome, ApprovalDiagnostic,
+    ApprovalFailureKind, ApprovalFallbackReason, ApprovalOutcome, ApprovalReviewer,
+    ApprovalReviewerKind, AutoReviewerHealth, OriginalUserInput, PreparedApprovalFacts,
 };
 pub use artifact::ArtifactTick;
 pub use auto_rules::{
@@ -62,9 +64,11 @@ pub use auto_rules::{
     RuleApplicability, RuleFinding, SoftDenyClearance, TaskScopeFinding, VerdictEvidence,
 };
 pub use auto_settings::{
+    AutoEnvironmentChange, AutoEnvironmentEntry, AutoEnvironmentEntrySource,
     AutoReviewerPreference, AutoRuleChange, AutoRuleGroupSettings, AutoRuleKind, AutoRuleSettings,
     AutoSettingsRevision, CustomAutoRule,
 };
+pub use auto_setup::{AutoEnvironmentDraft, AutoSetupOptions, AutoSetupPurpose};
 pub use chat::{
     AgentHostOptions, AutoReviewerNotice, ChatSnapshot, DirectoryTrustPolicy, Event, EventKind,
     LoopId, OperationRecord, OperationState, PendingCommand, PendingInput,

@@ -7,8 +7,8 @@ use super::approval_context::ApprovalSnapshot;
 use super::auto_rules::{RuleVerdict, SemanticFindings, reduce};
 use tickloop_agent_model::judgment::{Answer, Evaluation, EvaluationRequest, Question};
 use tickloop_agent_protocol::{
-    AutoPolicy, AutoRule, AutoRuleKind, RuleApplicability, RuleFinding, SoftDenyClearance,
-    TaskScopeFinding,
+    ApprovalDiagnostic, AutoPolicy, AutoRule, AutoRuleKind, RuleApplicability, RuleFinding,
+    SoftDenyClearance, TaskScopeFinding,
 };
 
 // Conservative byte budgets below Jev 1.13's 64k request / 32k state-plus-question token limits.
@@ -17,7 +17,7 @@ const MAX_REVIEW_CONTEXT_BYTES: usize = 30 * 1024;
 const MAX_CHOICE_OPTIONS: usize = 255;
 const MIN_CONFIDENCE: f64 = 0.8;
 const MIN_SELECTED_PROBABILITY: f64 = 0.9;
-pub(super) const QUESTION_VERSION: &str = "auto-jev-v2";
+pub(super) const QUESTION_VERSION: &str = "auto-jev-v3";
 
 #[cfg(test)]
 #[path = "jev_review_tests.rs"]
@@ -99,7 +99,7 @@ pub(super) fn review_request(context: &ApprovalSnapshot) -> Result<EvaluationReq
                 ("missing".into(), "No applicable explicit consent or Soft allow exists, or the user forbids the effect.".into()),
                 ("uncertain".into(), "Consent, allowance applicability, target, extent, or a prerequisite is uncertain; broad task intent is insufficient.".into()),
             ];
-            criteria.extend(allows.iter().map(|allow| (format!("allow:{}", allow.id), format!("Soft allow {} ({:?}): {}. Choose only if this allowance actually clears restriction {} for this exact operation and no later restriction revokes it.", allow.id, allow.source, allow.text, rule.id))));
+            criteria.extend(allows.iter().filter(|allow| allow.can_clear(&rule.id, &context.auto_policy)).map(|allow| (format!("allow:{}", allow.id), format!("Soft allow {} ({:?}): {}. Choose only if this allowance actually clears restriction {} for this exact operation and no later restriction revokes it.", allow.id, allow.source, allow.text, rule.id))));
             questions.insert(format!("clear:{}", rule.id), choice(
                 format!("Assume Soft deny {} applies. Source: {:?}. What specifically clears this restriction? Full restriction: {}. Assess original authorization and each candidate independently of other answers.", rule.id, rule.source, rule.text), criteria)?);
         }
@@ -194,5 +194,32 @@ pub(super) fn verdict(evaluation: &Evaluation, policy: &AutoPolicy) -> Result<Ru
             clearance,
         });
     }
-    reduce(policy, &SemanticFindings { task_scope, rules })
+    let mut verdict = reduce(policy, &SemanticFindings { task_scope, rules })?;
+    if let RuleVerdict::NeedsHuman {
+        reason,
+        diagnostics,
+    } = &mut verdict
+    {
+        for diagnostic in diagnostics.iter_mut() {
+            let question_id = match diagnostic {
+                ApprovalDiagnostic::TaskScopeUncertain => "task_scope".to_owned(),
+                ApprovalDiagnostic::ApplicabilityUncertain { rule_id } => format!("app:{rule_id}"),
+                ApprovalDiagnostic::ClearanceUncertain { rule_id } => format!("clear:{rule_id}"),
+                _ => continue,
+            };
+            if confident_choice(evaluation, &question_id)?.is_none() {
+                *diagnostic = ApprovalDiagnostic::JevLowConfidence { question_id };
+            }
+        }
+        *reason = format!(
+            "{}. The action has not been executed.",
+            diagnostics
+                .iter()
+                .take(4)
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+    }
+    Ok(verdict)
 }

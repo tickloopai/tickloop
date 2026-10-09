@@ -15,6 +15,23 @@ pub struct AutoRule {
     pub kind: AutoRuleKind,
     pub text: String,
     pub source: AutoRuleSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clears: Option<Vec<String>>,
+}
+
+impl AutoRule {
+    pub fn can_clear(&self, restriction: &str, policy: &AutoPolicy) -> bool {
+        self.kind == AutoRuleKind::SoftAllow
+            && self.clears.as_ref().is_none_or(|ids| {
+                ids.iter().any(|id| id == restriction)
+                    && ids.iter().all(|id| {
+                        policy
+                            .rules
+                            .iter()
+                            .any(|rule| rule.id == *id && rule.kind == AutoRuleKind::SoftDeny)
+                    })
+            })
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -26,6 +43,8 @@ pub enum AutoEnvironmentSource {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AutoEnvironment {
+    #[serde(default)]
+    pub entries: Vec<crate::AutoEnvironmentEntry>,
     pub text: String,
     pub source: AutoEnvironmentSource,
 }

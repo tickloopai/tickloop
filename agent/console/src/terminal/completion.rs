@@ -78,7 +78,9 @@ impl CommandSpec {
             .then_some(OVERVIEW_AGENT_COMMAND),
             CommandScope::Child => match self.command {
                 "/clear" | "/branch" | "/rewind" | "/compact" => Some(CHILD_HISTORY_FIXED),
-                "/mode" | "/rule" | "/add-dir" => Some(CHILD_AUTHORIZATION_FIXED),
+                "/mode" | "/rule" | "/add-dir" | "/auto-mode-setup" => {
+                    Some(CHILD_AUTHORIZATION_FIXED)
+                }
                 _ => None,
             },
         }
@@ -227,6 +229,12 @@ const COMMANDS: &[CommandSpec] = &[
         arguments: "",
         description: "Lists permission rules for this Chat.",
         menu_group: Some(CommandGroup::Advanced),
+    },
+    CommandSpec {
+        command: "/auto-mode-setup",
+        arguments: "",
+        description: "Generate and review directory-scoped Auto Environment facts.",
+        menu_group: Some(CommandGroup::ToolsAndPermissions),
     },
     CommandSpec {
         command: "/permissions",
@@ -610,8 +618,8 @@ mod tests {
     fn discovery_separates_public_commands_advanced_controls_and_skills() {
         let mut completion = Completion::default();
         completion.update("/");
-        assert_eq!(completion.candidates().len(), 23);
-        assert_eq!(builtin_commands().len(), 43);
+        assert_eq!(completion.candidates().len(), 24);
+        assert_eq!(builtin_commands().len(), 44);
         assert_eq!(
             builtin_commands()
                 .iter()

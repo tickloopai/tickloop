@@ -28,10 +28,10 @@ use crate::{
     UserShellReceipt, UserShellRecord,
 };
 
-/// Business 12.0 adds Artifact linking and replaces the saved feedback source with an
-/// account-scoped live-document binding. Older business majors are refused before dispatch;
+/// Business 13.0 adds structured Auto Environment entries, setup generation and review diagnostics.
+/// Older business majors are refused before dispatch;
 /// the frozen daemon management protocol remains independent.
-pub const PROTOCOL_MAJOR: u16 = 12;
+pub const PROTOCOL_MAJOR: u16 = 13;
 pub const PROTOCOL_MINOR: u16 = 0;
 
 pub const REPLAY_CAPACITY: usize = 4096;
@@ -376,6 +376,9 @@ impl AgentCommand {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 #[allow(clippy::large_enum_variant)]
 pub enum ConfigurationChange {
+    GenerateAutoEnvironment {
+        options: crate::AutoSetupOptions,
+    },
     Model {
         config: ModelConfig,
         thinking: Option<Option<ReasoningEffort>>,
@@ -855,6 +858,7 @@ impl CommandReceipt {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum CommandResult {
+    AutoEnvironmentDraft(crate::AutoEnvironmentDraft),
     ArtifactTicks(Vec<ArtifactTick>),
     MonitorMembership(MonitorMembership),
     HostedTicks(Vec<HostedMember>),

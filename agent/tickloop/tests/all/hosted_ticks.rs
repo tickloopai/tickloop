@@ -973,6 +973,15 @@ for line in sys.stdin:
             )
             .await
             .unwrap();
+        assert_eq!(
+            approved
+                .approval_facts()
+                .tick_instance
+                .as_ref()
+                .map(|id| json!(id)),
+            Some(instance.clone())
+        );
+        assert!(approved.approval_facts().external_declaration.is_some());
         run_tool(
             &tools,
             chat,
@@ -1024,6 +1033,112 @@ for line in sys.stdin:
             launch_records(&daemon.root, chat).is_empty(),
             "a closed Tick leaves no launch record"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn auto_cleanup_requires_a_successful_creation_receipt_in_the_same_loop() {
+        use tickloop_agent_protocol::ExecutionMode;
+        use tickloop_agent_test_support::{ScriptedModel, auto_findings, call, next_event, text};
+        for same_loop in [true, false] {
+            let model = Arc::new(ScriptedModel::new(Vec::new()));
+            let daemon =
+                Daemon::start_with(model.clone(), super::support::hosted::IDLE_TIMEOUT, 1).await;
+            let (runtime, chat) = (daemon.runtimes[0].clone(), daemon.chats[0]);
+            runtime
+                .set_execution_mode(chat, ExecutionMode::Auto)
+                .await
+                .unwrap();
+            let mut cleanup = auto_findings(false);
+            cleanup["rules"][1]["applicability"] = json!("present");
+            cleanup["rules"][1]["clearance"] =
+                json!({"soft_allow":"builtin.soft_allow.loop_tick_cleanup"});
+            let reviewer = Arc::new(ScriptedModel::new(vec![
+                text(&auto_findings(false).to_string()),
+                text(&cleanup.to_string()),
+                text(&cleanup.to_string()),
+            ]));
+            runtime.set_auto_reviewer(reviewer.clone()).await;
+            model.enqueue(call("open", "ModifyTick", counter_command(&daemon)));
+            model.enqueue(text("opened"));
+            let results = run_turn(
+                &runtime,
+                chat,
+                "Open the task counter and close it after checking it",
+            )
+            .await;
+            let opened: Value = serde_json::from_str(&results["open"].content).unwrap();
+            assert!(!results["open"].is_error, "{opened}");
+            let instance = opened["tick_instance_id"].clone();
+            let loop_id = runtime
+                .snapshot(chat)
+                .await
+                .unwrap()
+                .loops
+                .last()
+                .unwrap()
+                .id;
+            model.enqueue(call(
+                "close",
+                "ModifyTick",
+                json!({"action":"close","tick_instance_id":instance}),
+            ));
+            model.enqueue(text("closed"));
+            let mut events = runtime.subscribe();
+            let receipt = runtime
+                .submit(
+                    chat,
+                    same_loop.then_some(loop_id),
+                    "Close the task counter".into(),
+                )
+                .await
+                .unwrap();
+            let mut prompted = false;
+            loop {
+                let event = next_event(&mut events).await;
+                match event.kind {
+                    EventKind::PermissionRequested { request } => {
+                        prompted = true;
+                        runtime
+                            .answer_permission(chat, request.id, false)
+                            .await
+                            .unwrap();
+                    }
+                    EventKind::Completed { .. } | EventKind::Failed(_) | EventKind::Interrupted
+                        if event.run_id == receipt.run_id =>
+                    {
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(prompted, !same_loop);
+            {
+                let requests = reviewer.requests.lock().unwrap();
+                let tickloop_agent_protocol::Content::Text { text } =
+                    &requests[1].messages[1].content[0]
+                else {
+                    panic!()
+                };
+                let snapshot: Value = serde_json::from_str(text).unwrap();
+                assert_eq!(snapshot["creation_receipt"].is_object(), same_loop);
+                assert_eq!(snapshot["prepared_facts"]["tick_instance"], instance);
+                assert_eq!(snapshot["prepared_facts"]["closes_tick"], true);
+            }
+            if same_loop {
+                assert!(super::gone(opened["business_pid"].as_u64().unwrap() as u32).await);
+            } else {
+                assert_eq!(
+                    run_tool(
+                        &daemon.tools(),
+                        chat,
+                        "ReadTick",
+                        json!({"tick_instance_id":instance})
+                    )
+                    .await["content"]["value"],
+                    0
+                );
+            }
+        }
     }
 
     /// A real root stops its direct child with StopSubagent; the worker's hook tells the daemon, which

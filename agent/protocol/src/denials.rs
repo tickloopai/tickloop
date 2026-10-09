@@ -61,6 +61,8 @@ pub struct DenialAutoFinding {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DenialReviewFacts {
+    #[serde(default)]
+    pub diagnostics: Option<Vec<crate::ApprovalDiagnostic>>,
     pub preferred_reviewer: Option<AutoReviewerPreference>,
     pub reviewer: Option<ApprovalReviewer>,
     pub auto_settings_revision: Option<String>,

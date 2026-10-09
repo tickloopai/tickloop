@@ -3,6 +3,18 @@ use uuid::Uuid;
 
 use crate::{AutoBlockKind, AutoReviewerPreference, AutoRule, Usage, VerdictEvidence};
 
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct PreparedApprovalFacts {
+    pub normalized_input: serde_json::Value,
+    pub canonical_path: Option<std::path::PathBuf>,
+    pub in_workspace: Option<bool>,
+    pub read_only: Option<bool>,
+    pub tick_instance: Option<tick_protocol::InstanceRef>,
+    pub closes_tick: bool,
+    /// Protocol declarations are external data, never evidence of authority or verified effects.
+    pub external_declaration: Option<serde_json::Value>,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalReviewerKind {
@@ -39,6 +51,44 @@ pub enum ApprovalFailureKind {
     ContextLimit,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalDiagnostic {
+    MissingAuthorization,
+    TaskScopeUncertain,
+    ApplicabilityUncertain { rule_id: String },
+    ClearanceUncertain { rule_id: String },
+    JevLowConfidence { question_id: String },
+    ReviewerFailure { failure: ApprovalFailureKind },
+    DenialLimit,
+}
+
+impl std::fmt::Display for ApprovalDiagnostic {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingAuthorization => {
+                formatter.write_str("Original user authorization is unavailable")
+            }
+            Self::TaskScopeUncertain => formatter.write_str("Task scope is uncertain"),
+            Self::ApplicabilityUncertain { rule_id } => {
+                write!(formatter, "Rule applicability is uncertain: {rule_id}")
+            }
+            Self::ClearanceUncertain { rule_id } => write!(
+                formatter,
+                "Authorization or exception is uncertain: {rule_id}"
+            ),
+            Self::JevLowConfidence { question_id } => write!(
+                formatter,
+                "Jev confidence or selected probability is below threshold: {question_id}"
+            ),
+            Self::ReviewerFailure { failure } => write!(formatter, "Reviewer failed: {failure:?}"),
+            Self::DenialLimit => {
+                formatter.write_str("Consecutive or total automatic denial limit reached")
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalFallbackReason {
@@ -68,6 +118,8 @@ pub struct ApprovalAttemptDetails {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ApprovalAssessmentDetails {
+    #[serde(default)]
+    pub diagnostics: Option<Vec<ApprovalDiagnostic>>,
     pub operation_id: Uuid,
     pub call_id: String,
     pub loop_id: Uuid,

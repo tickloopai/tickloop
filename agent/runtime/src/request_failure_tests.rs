@@ -202,7 +202,7 @@ async fn a_cancelled_auto_classifier_does_not_deny_and_keeps_reported_usage() {
         let cancel = cancel.clone();
         tokio::spawn(async move {
             agent
-                .review_auto_operation(&receipt, &operation(&receipt), cancel)
+                .review_auto_operation(&receipt, &operation(&receipt), None, cancel)
                 .await
         })
     };

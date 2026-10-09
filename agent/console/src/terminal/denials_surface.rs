@@ -555,6 +555,17 @@ fn detail_lines(record: &ApprovalRecord) -> Vec<DetailLine> {
                 ));
             }
         }
+        match &review.diagnostics {
+            None => lines.push(detail_entry(
+                DetailGroup::Review,
+                "Review diagnostics: not recorded".into(),
+            )),
+            Some(diagnostics) => {
+                for diagnostic in diagnostics {
+                    lines.push(detail_entry(DetailGroup::Review, diagnostic.to_string()));
+                }
+            }
+        }
         if let Some(rule) = &review.block_rule {
             lines.push(detail_entry(
                 DetailGroup::Rules,

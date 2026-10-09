@@ -178,6 +178,18 @@ pub struct ExecutionContext {
 }
 
 impl PreparedTool {
+    pub fn approval_facts(&self) -> tickloop_agent_protocol::PreparedApprovalFacts {
+        tickloop_agent_protocol::PreparedApprovalFacts {
+            normalized_input: self.input.clone(),
+            canonical_path: self
+                .operation
+                .path_field()
+                .map(|_| self.resolved_path.clone()),
+            in_workspace: Some(self.in_workspace),
+            read_only: Some(self.is_read_only),
+            ..Default::default()
+        }
+    }
     /// Repeats the family-temp admission right before the command runs, on a freshly resolved
     /// cwd that must still be the prepared one.
     fn revalidate_automatic_shell_paths(&self) -> Result<(), ToolError> {

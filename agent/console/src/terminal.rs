@@ -17,6 +17,7 @@ use tokio::sync::{broadcast, mpsc};
 mod artifact_ui;
 mod artifacts_picker;
 pub mod attach;
+mod auto_setup_surface;
 #[cfg(test)]
 mod child_config_tests;
 mod clipboard;
@@ -340,6 +341,7 @@ fn command_timing(command: &str) -> CommandTiming {
                 | "/artifacts"
                 | "/settings"
                 | "/permissions"
+                | "/auto-mode-setup"
                 | "/mode"
                 | "/model"
                 | "/provider"
@@ -608,6 +610,76 @@ async fn await_startup_directory_trust(
             _ => {}
         }
     }
+}
+
+async fn connect_startup_daemon(
+    interactive: bool,
+    preferences: tickloop_agent_config::DisplayPreferences,
+    startup_console: &mut Option<(Console, mpsc::Receiver<InputEvent>)>,
+) -> Result<Option<tickloop_agent_client::LocalAgentClient>, String> {
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let error = match tickloop_agent_client::connect_or_start(executable.clone()).await {
+        Ok(client) => return Ok(Some(client)),
+        Err(error) => error,
+    };
+    if !interactive {
+        return Err(error.to_string());
+    }
+    let Some(mismatch) = &error.mismatch else {
+        return Err(error.to_string());
+    };
+    let prepared = mismatch
+        .prepare_stop()
+        .await
+        .map_err(|reason| format!("{error}\n\n{reason}"))?
+        .ok_or("The Agent daemon changed before confirmation; launch tickloop again.")?;
+    if startup_console.is_none() {
+        *startup_console = Some(Console::start_with_display(true, preferences)?);
+    }
+    let (console, input) = startup_console
+        .as_mut()
+        .expect("startup console initialized");
+    console.finish_workspace_trust()?;
+    let menu_id = uuid::Uuid::new_v4();
+    console.show_focused_menu(console::Menu {
+        id: menu_id,
+        title: "Stop the running daemon and continue?".into(),
+        context: vec![
+            "A different Tick Loop version is running.".into(),
+            safe_text(&mismatch.description),
+            "This stops all running Agents. Saved history is kept. Ticks keep running.".into(),
+            "After confirmation, this version opens automatically with your current startup options.".into(),
+        ],
+        options: vec!["Stop daemon and open this version".into(), "Cancel — keep running Agents".into()],
+        selected: 1,
+        confirmation: true,
+    })?;
+    let confirmed = loop {
+        let event = tokio::select! {
+            event = input.recv() => event,
+            _ = tokio::signal::ctrl_c() => break false,
+        };
+        match event {
+            Some(InputEvent::Choice {
+                menu_id: id, index, ..
+            }) if id == menu_id => break index == 0,
+            Some(InputEvent::Cancel { menu_id: id }) if id == menu_id => break false,
+            Some(InputEvent::Eof | InputEvent::Interrupt) | None => break false,
+            Some(InputEvent::Error(error)) => return Err(error),
+            _ => {}
+        }
+    };
+    console.clear_menu(menu_id)?;
+    if !confirmed {
+        return Ok(None);
+    }
+    console.set_status("Stopping the previous Agent daemon…")?;
+    prepared.stop().await?;
+    let client = tickloop_agent_client::connect_or_start(executable)
+        .await
+        .map_err(|error| error.to_string())?;
+    console.set_status("")?;
+    Ok(Some(client))
 }
 
 pub fn print_help() {
@@ -969,12 +1041,28 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
         let core = tickloop_agent_daemon::build_runtime(&launch, None).await?;
         Agent::from_embedded_launch(core, launch)
     } else {
-        let client = execution::connect_daemon().await?;
+        let Some(client) = connect_startup_daemon(
+            interactive_terminal,
+            display_preferences.clone(),
+            &mut startup_console,
+        )
+        .await?
+        else {
+            return Ok(());
+        };
         Agent::connected(client, launch, view_host)
     };
     #[cfg(not(test))]
     let agent = {
-        let client = execution::connect_daemon().await?;
+        let Some(client) = connect_startup_daemon(
+            interactive_terminal,
+            display_preferences.clone(),
+            &mut startup_console,
+        )
+        .await?
+        else {
+            return Ok(());
+        };
         Agent::connected(client, launch, view_host)
     };
     if (resumes_saved_chat || exact_chat.is_some()) && !agent.saves_chats() {
@@ -2413,6 +2501,14 @@ async fn interact(
                         PermissionsEffect::Close { destination: PermissionsReturn::ModePicker { settings } } => {
                             menus.permission_modes(agent, console, ConfigTarget::visible(selected_chat), settings).await?;
                         },
+                        PermissionsEffect::GenerateEnvironment { generation, options } => {
+                            let Some(chat) = console.permissions_view_chat()? else { continue; };
+                            let agent = agent.clone(); let console = console.clone();
+                            tokio::spawn(async move {
+                                let result = agent.generate_auto_environment(chat, options).await.map_err(|error| safe_text(&error.to_string()));
+                                let _ = console.environment_generated(chat, generation, result);
+                            });
+                        },
                         PermissionsEffect::None => {},
                         PermissionsEffect::Apply(change) => match console.permissions_subject()? {
                             Some(PermissionsSubject::Agent { chat, revision }) => {
@@ -2930,6 +3026,14 @@ async fn interact(
                         },
                         "/settings" => {
                             menus.settings(agent,console,ConfigTarget::visible(selected_chat)).await?;
+                        },
+                        "/auto-mode-setup" => {
+                            if let Some(chat) = selected_chat {
+                                match agent.permissions_view(chat).await {
+                                    Ok(view) => { console.show_permissions(view, agent.approval_history_view(chat).await.map_err(|error| error.to_string()), false, true)?; console.open_environment_setup()?; }
+                                    Err(error) => outln!(console, "Cannot open Environment setup: {}", safe_text(&error.to_string())),
+                                }
+                            } else { outln!(console, "Enter a task before generating an Environment draft."); }
                         },
                         "/permissions" => {
                             if console.is_interactive() {
@@ -3721,7 +3825,7 @@ async fn interact(
                             outln!(console, "\n{}", safe_text(&message));
                         },
                         EventKind::PermissionChecked {decision,reason} => {
-                            if !interactive || decision != Decision::Deny {
+                            if decision != Decision::Allow && (!interactive || decision != Decision::Deny) {
                                 outln!(console, "\nAuto review: {decision:?} · {}",safe_text(&reason));
                             }
                         },
@@ -4769,11 +4873,15 @@ fn render_restored_observation(
                         );
                     }
                 }
-                EventKind::PermissionChecked { decision, reason } => outln!(
-                    console,
-                    "\nAuto review: {decision:?} · {}",
-                    safe_text(reason)
-                ),
+                EventKind::PermissionChecked { decision, reason }
+                    if *decision != Decision::Allow =>
+                {
+                    outln!(
+                        console,
+                        "\nAuto review: {decision:?} · {}",
+                        safe_text(reason)
+                    )
+                }
                 EventKind::ContextCompaction { status, error } => outln!(
                     console,
                     "\nContext compaction: {status:?} · {}",

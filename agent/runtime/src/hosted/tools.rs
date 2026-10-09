@@ -265,6 +265,24 @@ impl HostedTickTools {
             }
             _ => return Err(format!("unknown hosted Tick tool: {name}")),
         };
+        let mut facts = tickloop_agent_protocol::PreparedApprovalFacts {
+            normalized_input: input.clone(),
+            ..Default::default()
+        };
+        match &operation {
+            Operation::Close { instance, .. } => {
+                facts.tick_instance = Some(instance.clone());
+                facts.closes_tick = true;
+            }
+            Operation::Call {
+                instance, catalog, ..
+            } => {
+                facts.tick_instance = Some(instance.clone());
+                facts.external_declaration =
+                    Some(serde_json::to_value(catalog).map_err(|error| error.to_string())?);
+            }
+            _ => {}
+        }
         Ok(PreparedHostCall::new(
             name.to_owned(),
             input.clone(),
@@ -272,6 +290,7 @@ impl HostedTickTools {
             permission,
             summary,
         )
+        .with_approval_facts(facts)
         .with_payload(HostedPrepared { operation }))
     }
 

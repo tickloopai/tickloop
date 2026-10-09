@@ -1936,7 +1936,7 @@ async fn terminal_auto_mode_reviews_with_the_current_chat_model_by_default() {
         "checked output"
     );
     assert!(
-        String::from_utf8(output.stdout)
+        !String::from_utf8(output.stdout)
             .unwrap()
             .contains("Auto review: Allow")
     );

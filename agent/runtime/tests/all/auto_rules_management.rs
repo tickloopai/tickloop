@@ -18,17 +18,19 @@ async fn auto_rule_groups_and_environment_save_with_revision_and_restore_indepen
     .unwrap();
     let chat = agent.create_chat(temp.path().into()).await.unwrap();
     let initial = agent.permissions_view(chat).await.unwrap();
-    assert_eq!(initial.auto_policy.rules.len(), 8);
+    assert_eq!(initial.auto_policy.rules.len(), 9);
     assert!(
         initial
             .auto_policy
             .rules
             .iter()
-            .all(|rule| rule.kind == AutoRuleKind::SoftDeny)
+            .filter(|rule| rule.kind == AutoRuleKind::SoftDeny)
+            .count()
+            == 8
     );
     assert!(matches!(
         initial.auto_policy.environment.source,
-        AutoEnvironmentSource::Builtin { version: 1 }
+        AutoEnvironmentSource::Builtin { version: 2 }
     ));
 
     let added = agent
@@ -51,7 +53,7 @@ async fn auto_rule_groups_and_environment_save_with_revision_and_restore_indepen
         .find(|rule| rule.kind == AutoRuleKind::HardDeny)
         .unwrap();
     assert!(matches!(custom.source, AutoRuleSource::User));
-    assert_eq!(added.auto_policy.rules.len(), 9);
+    assert_eq!(added.auto_policy.rules.len(), 10);
     assert!(matches!(
         agent
             .apply_permission_change(
@@ -110,7 +112,7 @@ async fn auto_rule_groups_and_environment_save_with_revision_and_restore_indepen
         )
         .await
         .unwrap();
-    assert_eq!(restored.auto_policy.rules.len(), 9);
+    assert_eq!(restored.auto_policy.rules.len(), 10);
     assert!(matches!(
         restored.auto_policy.environment.source,
         AutoEnvironmentSource::UserReplacement
@@ -127,6 +129,6 @@ async fn auto_rule_groups_and_environment_save_with_revision_and_restore_indepen
         .unwrap();
     assert!(matches!(
         final_view.auto_policy.environment.source,
-        AutoEnvironmentSource::Builtin { version: 1 }
+        AutoEnvironmentSource::Builtin { version: 2 }
     ));
 }

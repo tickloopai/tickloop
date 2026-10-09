@@ -1,10 +1,13 @@
 use std::{
     collections::{HashMap, HashSet},
+    io::Read,
+    os::unix::fs::OpenOptionsExt,
     path::PathBuf,
 };
 
 use serde::Serialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::ChatBookkeeping;
@@ -12,8 +15,69 @@ use tickloop_agent_protocol::{
     AutoPolicy, ChatSnapshot, CompactionMarker, Content, OperationRecord, OriginalUserInput, Role,
 };
 
-pub(super) const APPROVAL_CONTEXT_VERSION: &str = "trusted-approval-v2";
-pub(super) const REVIEW_TEMPLATE_VERSION: &str = "auto-review-v3";
+pub(super) const APPROVAL_CONTEXT_VERSION: &str = "trusted-approval-v3";
+pub(super) const REVIEW_TEMPLATE_VERSION: &str = "auto-review-v4";
+
+const DEPENDENCY_FILES: &[&str] = &[
+    "package.json",
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "Cargo.toml",
+    "Cargo.lock",
+    "pyproject.toml",
+    "uv.lock",
+    "requirements.txt",
+    ".npmrc",
+    ".yarnrc.yml",
+    ".cargo/config.toml",
+];
+const MAX_DEPENDENCY_BYTES: u64 = 4 * 1024 * 1024;
+
+pub(super) fn dependency_fingerprints(
+    directory: &std::path::Path,
+) -> std::collections::BTreeMap<PathBuf, String> {
+    DEPENDENCY_FILES
+        .iter()
+        .filter_map(|name| {
+            let path = directory.join(name);
+            let canonical = path.canonicalize().ok()?;
+            if !canonical.starts_with(directory) {
+                return None;
+            }
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(&canonical)
+                .ok()?;
+            let metadata = file.metadata().ok()?;
+            if !metadata.is_file() || metadata.len() > MAX_DEPENDENCY_BYTES {
+                return None;
+            }
+            let mut bytes = Vec::new();
+            file.take(MAX_DEPENDENCY_BYTES + 1)
+                .read_to_end(&mut bytes)
+                .ok()?;
+            if bytes.len() as u64 > MAX_DEPENDENCY_BYTES {
+                return None;
+            }
+            Some((path, format!("{:x}", Sha256::digest(bytes))))
+        })
+        .collect()
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(super) struct DependencyEvidence {
+    pub path: PathBuf,
+    pub unchanged_since_loop_start: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(super) struct TickCreationReceipt {
+    pub loop_id: Uuid,
+    pub operation_id: Uuid,
+    pub instance: tick_protocol::InstanceRef,
+}
 
 #[derive(Clone, Debug, Serialize)]
 pub(super) struct ApprovalOperation {
@@ -27,6 +91,9 @@ pub(super) struct ApprovalOperation {
 
 #[derive(Clone, Debug, Serialize)]
 pub(super) struct ApprovalSnapshot {
+    pub dependency_files: Option<Vec<DependencyEvidence>>,
+    pub prepared_facts: Option<tickloop_agent_protocol::PreparedApprovalFacts>,
+    pub creation_receipt: Option<TickCreationReceipt>,
     pub context_version: &'static str,
     pub review_template_version: &'static str,
     pub operation: ApprovalOperation,
@@ -241,6 +308,25 @@ pub(super) fn capture(
         return Err(ApprovalContextError::MissingOriginalUserInput);
     }
     Ok(ApprovalSnapshot {
+        dependency_files: bookkeeping
+            .dependency_baselines
+            .get(&operation.loop_id)
+            .map(|baseline| {
+                let current = dependency_fingerprints(&snapshot.workdir);
+                baseline
+                    .keys()
+                    .chain(current.keys())
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .map(|path| DependencyEvidence {
+                        path: path.clone(),
+                        unchanged_since_loop_start: baseline.get(path).is_some()
+                            && baseline.get(path) == current.get(path),
+                    })
+                    .collect()
+            }),
+        prepared_facts: None,
+        creation_receipt: None,
         context_version: APPROVAL_CONTEXT_VERSION,
         review_template_version: REVIEW_TEMPLATE_VERSION,
         operation: ApprovalOperation {

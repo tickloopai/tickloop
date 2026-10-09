@@ -133,7 +133,7 @@ pub(super) fn tab_header_line(
     header
 }
 
-fn selected_row(label: impl Into<String>, selected: bool) -> RoleLine {
+pub(super) fn selected_row(label: impl Into<String>, selected: bool) -> RoleLine {
     let mut row = RoleLine::default();
     row.push(if selected { "❯ " } else { "  " }, Some(Role::Permission));
     row.push(
@@ -153,11 +153,11 @@ fn labelled_row(label: &str, value: impl Into<String>) -> RoleLine {
     row
 }
 
-fn plain_row(value: impl Into<String>) -> RoleLine {
+pub(super) fn plain_row(value: impl Into<String>) -> RoleLine {
     RoleLine::plain(value)
 }
 
-fn muted_row(value: impl Into<String>) -> RoleLine {
+pub(super) fn muted_row(value: impl Into<String>) -> RoleLine {
     RoleLine::role(value, Role::MutedText)
 }
 
@@ -281,6 +281,7 @@ enum AutoDraftPurpose {
     Update { kind: AutoRuleKind, id: String },
     Replace(AutoRuleKind),
     Environment,
+    EnvironmentEntry(tickloop_agent_protocol::AutoEnvironmentEntry),
 }
 
 impl AutoDraftPurpose {
@@ -290,6 +291,7 @@ impl AutoDraftPurpose {
             Self::Update { .. } => "Edit Auto rule",
             Self::Replace(_) => "Replace group contents",
             Self::Environment => "Replace Environment",
+            Self::EnvironmentEntry(_) => "Edit Environment entry",
         }
     }
 }
@@ -323,6 +325,12 @@ impl AutoDraft {
                     .collect(),
             },
             AutoDraftPurpose::Environment => AutoRuleChange::ReplaceEnvironment { text },
+            AutoDraftPurpose::EnvironmentEntry(entry) => AutoRuleChange::UpdateEnvironmentEntry {
+                previous: entry.clone(),
+                text,
+                directory: entry.directory.clone(),
+                include_descendants: entry.include_descendants,
+            },
         };
         Ok(PermissionChange::ChangeAutoRules { change })
     }
@@ -465,6 +473,7 @@ impl RuleDraft {
 }
 
 enum Focus {
+    AutoSetup(super::auto_setup_surface::AutoSetupSurface),
     List,
     Search(Editor),
     Detail,
@@ -496,10 +505,18 @@ enum Focus {
 }
 
 pub(super) enum PermissionsEffect {
+    GenerateEnvironment {
+        generation: Uuid,
+        options: tickloop_agent_protocol::AutoSetupOptions,
+    },
     None,
-    Close { destination: PermissionsReturn },
+    Close {
+        destination: PermissionsReturn,
+    },
     Apply(PermissionChange),
-    OpenJudgmentSettings { select_reviewer: bool },
+    OpenJudgmentSettings {
+        select_reviewer: bool,
+    },
     RefreshDenials,
     RetryDenial(Uuid),
 }
@@ -670,6 +687,48 @@ impl PermissionsSurface {
         self.subject.chat()
     }
 
+    pub(super) fn open_environment_setup(&mut self) {
+        if self.read_only.is_some() {
+            self.message = Some("Environment setup is unavailable in this read-only view".into());
+            return;
+        }
+        if self.subject.chat().is_none() {
+            self.message = Some("Enter a task before generating an Environment draft".into());
+            return;
+        }
+        if let Some(text) = &self.view.auto_rule_settings.environment_replacement {
+            self.preview(
+                PermissionChange::ChangeAutoRules {
+                    change: AutoRuleChange::MigrateEnvironment {
+                        expected_text: text.clone(),
+                    },
+                },
+                "Migrate legacy Environment".into(),
+            );
+            return;
+        }
+        self.page = Page::Auto;
+        self.focus = Focus::AutoSetup(super::auto_setup_surface::AutoSetupSurface::new(
+            self.view.working_directory.clone(),
+        ));
+    }
+
+    pub(super) fn environment_generated(
+        &mut self,
+        generation: Uuid,
+        result: Result<tickloop_agent_protocol::AutoEnvironmentDraft, String>,
+    ) {
+        let result = result.and_then(|draft| match &self.subject {
+            PermissionsSubject::Agent { revision, .. } if *revision == draft.revision => Ok(draft),
+            _ => Err(
+                "Permissions changed; refresh and generate a new draft. Nothing applied.".into(),
+            ),
+        });
+        if let Focus::AutoSetup(setup) = &mut self.focus {
+            setup.finish(generation, result);
+        }
+    }
+
     pub(super) fn subject(&self) -> &PermissionsSubject {
         &self.subject
     }
@@ -688,10 +747,12 @@ impl PermissionsSurface {
     pub(super) fn replace_view(&mut self, view: impl Into<PermissionsPage>) {
         let next_focus = match std::mem::replace(&mut self.focus, Focus::List) {
             Focus::AutoDraft(draft) => match draft.purpose {
-                AutoDraftPurpose::Environment => Focus::AutoEnvironment {
-                    selected: 0,
-                    scroll: 0,
-                },
+                AutoDraftPurpose::Environment | AutoDraftPurpose::EnvironmentEntry(_) => {
+                    Focus::AutoEnvironment {
+                        selected: 0,
+                        scroll: 0,
+                    }
+                }
                 AutoDraftPurpose::Add(kind)
                 | AutoDraftPurpose::Replace(kind)
                 | AutoDraftPurpose::Update { kind, .. } => {
@@ -702,12 +763,15 @@ impl PermissionsSurface {
                 change: PermissionChange::ChangeAutoRules { change },
                 ..
             } => match change {
-                AutoRuleChange::ReplaceEnvironment { .. } | AutoRuleChange::RestoreEnvironment => {
-                    Focus::AutoEnvironment {
-                        selected: 0,
-                        scroll: 0,
-                    }
-                }
+                AutoRuleChange::ReplaceEnvironment { .. }
+                | AutoRuleChange::RestoreEnvironment
+                | AutoRuleChange::MigrateEnvironment { .. }
+                | AutoRuleChange::AddEnvironmentEntries { .. }
+                | AutoRuleChange::RemoveEnvironmentEntries { .. }
+                | AutoRuleChange::UpdateEnvironmentEntry { .. } => Focus::AutoEnvironment {
+                    selected: 0,
+                    scroll: 0,
+                },
                 AutoRuleChange::ReplaceGroup { kind, .. }
                 | AutoRuleChange::RestoreGroup { kind } => {
                     Focus::AutoGroup(AutoGroupState::new(kind))
@@ -758,6 +822,22 @@ impl PermissionsSurface {
 
     pub(super) fn conflict(&mut self, view: impl Into<PermissionsPage>) {
         self.set_page(view);
+        if let Focus::AutoPreview {
+            change:
+                PermissionChange::ChangeAutoRules {
+                    change: AutoRuleChange::UpdateEnvironmentEntry { previous, .. },
+                },
+            ..
+        } = &mut self.focus
+            && let Some(current) = self
+                .view
+                .auto_rule_settings
+                .environment_entries
+                .iter()
+                .find(|entry| entry.id == previous.id)
+        {
+            *previous = current.clone();
+        }
         if let Focus::AutoPreview { change, .. } = &self.focus {
             let refreshed = self.preview_removed(change);
             if let Focus::AutoPreview {
@@ -799,7 +879,30 @@ impl PermissionsSurface {
         self.message.is_some() || self.notice.is_some() || !self.view.warnings.is_empty()
     }
 
+    pub(super) fn external_draft(&self) -> Option<String> {
+        match &self.focus {
+            Focus::AutoSetup(setup) => setup.external_draft(),
+            Focus::AutoDraft(draft) => Some(draft.editor.draft().to_owned()),
+            _ => None,
+        }
+    }
+
+    pub(super) fn replace_external_draft(&mut self, text: String) {
+        match &mut self.focus {
+            Focus::AutoSetup(setup) => setup.replace_external_draft(text),
+            Focus::AutoDraft(draft) => {
+                let len = text.len();
+                draft.editor.replace_draft(text, len);
+            }
+            _ => {}
+        }
+    }
+
     pub(super) fn paste(&mut self, text: &str) {
+        if let Focus::AutoSetup(setup) = &mut self.focus {
+            setup.paste(text);
+            return;
+        }
         let text = if matches!(self.focus, Focus::AutoDraft(_)) {
             text.to_owned()
         } else {
@@ -999,6 +1102,20 @@ impl PermissionsSurface {
                     )
                 })
                 .collect(),
+            AutoRuleChange::UpdateEnvironmentEntry { previous, .. } => vec![format!(
+                "{} · scope {:?}: {}",
+                previous.id, previous.directory, previous.text
+            )],
+            AutoRuleChange::RemoveEnvironmentEntries { entries } => entries
+                .iter()
+                .filter(|entry| {
+                    self.view
+                        .auto_rule_settings
+                        .environment_entries
+                        .contains(entry)
+                })
+                .map(|entry| format!("{} · {:?}: {}", entry.id, entry.source, entry.text))
+                .collect(),
             AutoRuleChange::ReplaceEnvironment { .. } | AutoRuleChange::RestoreEnvironment => {
                 vec![format!(
                     "{}: {}",
@@ -1169,11 +1286,14 @@ impl PermissionsSurface {
                 | Focus::ReviewerChoice(_)
                 | Focus::AutoDraft(_)
                 | Focus::AutoPreview { .. }
+                | Focus::AutoSetup(_)
         );
         if editing
             || matches!(
                 effect,
-                PermissionsEffect::Apply(_) | PermissionsEffect::OpenJudgmentSettings { .. }
+                PermissionsEffect::Apply(_)
+                    | PermissionsEffect::OpenJudgmentSettings { .. }
+                    | PermissionsEffect::GenerateEnvironment { .. }
             )
         {
             self.focus = Focus::List;
@@ -1200,6 +1320,40 @@ impl PermissionsSurface {
         }
         let focus = std::mem::replace(&mut self.focus, Focus::List);
         match focus {
+            Focus::AutoSetup(mut setup) => {
+                use super::auto_setup_surface::SetupEffect;
+                let effect = setup.key(key);
+                self.focus = Focus::AutoSetup(setup);
+                match effect {
+                    SetupEffect::None => PermissionsEffect::None,
+                    SetupEffect::Back => {
+                        self.focus = Focus::AutoEnvironment {
+                            selected: 2,
+                            scroll: 0,
+                        };
+                        PermissionsEffect::None
+                    }
+                    SetupEffect::Generate(generation, options) => {
+                        PermissionsEffect::GenerateEnvironment {
+                            generation,
+                            options,
+                        }
+                    }
+                    SetupEffect::Preview(entries) => {
+                        if entries.is_empty() {
+                            self.message = Some("No entries selected; nothing applied".into());
+                        } else {
+                            self.preview(
+                                PermissionChange::ChangeAutoRules {
+                                    change: AutoRuleChange::AddEnvironmentEntries { entries },
+                                },
+                                "Confirm Environment additions".into(),
+                            );
+                        }
+                        PermissionsEffect::None
+                    }
+                }
+            }
             Focus::List => self.list_key(key),
             Focus::Search(mut editor) => {
                 if key.code == KeyCode::Esc {
@@ -1463,7 +1617,61 @@ impl PermissionsSurface {
                         selected = selected.saturating_sub(1)
                     }
                     (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE) => {
-                        selected = (selected + 1).min(1)
+                        selected = (selected + 1)
+                            .min(3 + self.view.auto_rule_settings.environment_entries.len())
+                    }
+                    (KeyCode::Char('d'), KeyModifiers::NONE) if selected >= 4 => {
+                        let entry =
+                            self.view.auto_rule_settings.environment_entries[selected - 4].clone();
+                        self.preview(
+                            PermissionChange::ChangeAutoRules {
+                                change: AutoRuleChange::RemoveEnvironmentEntries {
+                                    entries: vec![entry],
+                                },
+                            },
+                            "Remove Environment entry".into(),
+                        );
+                        return PermissionsEffect::None;
+                    }
+                    (KeyCode::Char('s' | 'r'), KeyModifiers::NONE) if selected >= 4 => {
+                        let entry =
+                            self.view.auto_rule_settings.environment_entries[selected - 4].clone();
+                        let (directory, include_descendants) = if key.code == KeyCode::Char('s') {
+                            (
+                                if entry.directory.is_some() {
+                                    None
+                                } else {
+                                    Some(self.view.working_directory.clone())
+                                },
+                                false,
+                            )
+                        } else {
+                            (
+                                entry.directory.clone(),
+                                entry.directory.is_some() && !entry.include_descendants,
+                            )
+                        };
+                        self.preview(
+                            PermissionChange::ChangeAutoRules {
+                                change: AutoRuleChange::UpdateEnvironmentEntry {
+                                    text: entry.text.clone(),
+                                    previous: entry,
+                                    directory,
+                                    include_descendants,
+                                },
+                            },
+                            "Change Environment scope".into(),
+                        );
+                        return PermissionsEffect::None;
+                    }
+                    (KeyCode::Enter, _) if selected >= 4 => {
+                        let entry =
+                            self.view.auto_rule_settings.environment_entries[selected - 4].clone();
+                        self.focus = Focus::AutoDraft(AutoDraft::new(
+                            AutoDraftPurpose::EnvironmentEntry(entry.clone()),
+                            entry.text,
+                        ));
+                        return PermissionsEffect::None;
                     }
                     (KeyCode::PageUp, _) => scroll = scroll.saturating_sub(8),
                     (KeyCode::PageDown, _) => scroll += 8,
@@ -1472,6 +1680,21 @@ impl PermissionsSurface {
                             AutoDraftPurpose::Environment,
                             self.view.auto_policy.environment.text.clone(),
                         ));
+                        return PermissionsEffect::None;
+                    }
+                    (KeyCode::Enter, _) if selected == 2 => {
+                        self.open_environment_setup();
+                        return PermissionsEffect::None;
+                    }
+                    (KeyCode::Enter, _) if selected == 3 => {
+                        let latest_batch = self.view.auto_rule_settings.environment_entries.iter().filter_map(|entry| match entry.source { tickloop_agent_protocol::AutoEnvironmentEntrySource::Generated { batch, generated_at_ms, .. } => Some((generated_at_ms, batch)), _ => None }).max().map(|(_, batch)| batch);
+                        let entries = self.view.auto_rule_settings.environment_entries.iter().filter(|entry| entry.changes.is_empty() && matches!(entry.source, tickloop_agent_protocol::AutoEnvironmentEntrySource::Generated { batch, .. } if Some(batch) == latest_batch)).cloned().collect();
+                        self.preview(
+                            PermissionChange::ChangeAutoRules {
+                                change: AutoRuleChange::RemoveEnvironmentEntries { entries },
+                            },
+                            "Undo latest setup additions".into(),
+                        );
                         return PermissionsEffect::None;
                     }
                     (KeyCode::Enter, _) => {
@@ -1497,7 +1720,9 @@ impl PermissionsSurface {
                         Ok(change) => {
                             let preview = matches!(
                                 draft.purpose,
-                                AutoDraftPurpose::Replace(_) | AutoDraftPurpose::Environment
+                                AutoDraftPurpose::Replace(_)
+                                    | AutoDraftPurpose::Environment
+                                    | AutoDraftPurpose::EnvironmentEntry(_)
                             );
                             if preview {
                                 let title = draft.purpose.title().to_owned();
@@ -1512,10 +1737,12 @@ impl PermissionsSurface {
                 } else if key.code == KeyCode::Esc {
                     self.message = Some("No change".into());
                     self.focus = match draft.purpose {
-                        AutoDraftPurpose::Environment => Focus::AutoEnvironment {
-                            selected: 0,
-                            scroll: 0,
-                        },
+                        AutoDraftPurpose::Environment | AutoDraftPurpose::EnvironmentEntry(_) => {
+                            Focus::AutoEnvironment {
+                                selected: 0,
+                                scroll: 0,
+                            }
+                        }
                         AutoDraftPurpose::Add(kind)
                         | AutoDraftPurpose::Replace(kind)
                         | AutoDraftPurpose::Update { kind, .. } => {
@@ -1550,7 +1777,11 @@ impl PermissionsSurface {
                         PermissionChange::ChangeAutoRules {
                             change:
                                 AutoRuleChange::ReplaceEnvironment { .. }
-                                | AutoRuleChange::RestoreEnvironment,
+                                | AutoRuleChange::RestoreEnvironment
+                                | AutoRuleChange::MigrateEnvironment { .. }
+                                | AutoRuleChange::AddEnvironmentEntries { .. }
+                                | AutoRuleChange::RemoveEnvironmentEntries { .. }
+                                | AutoRuleChange::UpdateEnvironmentEntry { .. },
                         } => Focus::AutoEnvironment {
                             selected: 0,
                             scroll: 0,
@@ -1875,6 +2106,14 @@ impl PermissionsSurface {
 
     fn styled_detail(&self, width: usize, height: usize, body: &mut Vec<RoleLine>) -> &'static str {
         match &self.focus {
+            Focus::AutoSetup(setup) => {
+                body.push(plain_row(format!(
+                    "Directory: {}",
+                    self.view.working_directory.display()
+                )));
+                body.extend(setup.lines(width));
+                "j/k select · Enter toggle/continue · e edit · s scope · r descendants · Ctrl+G editor · Esc back"
+            }
             Focus::Detail => {
                 if self.page == Page::Directories {
                     if let Some(path) = self.directory_rows().get(self.selected.saturating_sub(1)) {
@@ -1910,7 +2149,7 @@ impl PermissionsSurface {
                     }
                 }
                 if self.selected_rule_editable() {
-                    "e edit · Esc back"
+                    "e edit · s scope · r descendants · Ctrl+G editor · Esc back"
                 } else {
                     "Esc back"
                 }
@@ -2058,7 +2297,44 @@ impl PermissionsSurface {
                 body.push(RoleLine::default());
                 body.push(selected_row("Replace Environment", *selected == 0));
                 body.push(selected_row("Restore built-in Environment", *selected == 1));
-                "Enter edit/preview · Esc back"
+                body.push(selected_row("Generate Environment draft", *selected == 2));
+                body.push(selected_row("Undo latest setup additions", *selected == 3));
+                for (index, entry) in self
+                    .view
+                    .auto_rule_settings
+                    .environment_entries
+                    .iter()
+                    .enumerate()
+                {
+                    body.push(selected_row(
+                        format!(
+                            "{} · {}",
+                            entry
+                                .directory
+                                .as_ref()
+                                .map_or_else(|| "Global".into(), |path| path.display().to_string()),
+                            entry.text
+                        ),
+                        *selected == index + 4,
+                    ));
+                    if *selected == index + 4 {
+                        body.push(muted_row(format!(
+                            "Origin: {} · confirmed {} · {} recent manual changes",
+                            entry.source,
+                            entry.confirmed_at_ms,
+                            entry.changes.len()
+                        )));
+                        for change in &entry.changes {
+                            body.push(muted_row(format!(
+                                "Changed at {}: previous scope {:?}, previous text {}",
+                                change.changed_at_ms,
+                                change.previous_directory,
+                                change.previous_text
+                            )));
+                        }
+                    }
+                }
+                "Enter edit · s scope · r descendants · d remove · Esc back"
             }
             Focus::AutoDraft(draft) => {
                 body.push(RoleLine::role(draft.purpose.title(), Role::DialogTitle));
@@ -2077,7 +2353,56 @@ impl PermissionsSurface {
                 ));
                 "Enter/Ctrl+S save · Esc cancel"
             }
-            Focus::AutoPreview { title, removed, .. } => {
+            Focus::AutoPreview {
+                title,
+                removed,
+                change,
+                ..
+            } => {
+                if let PermissionChange::ChangeAutoRules {
+                    change:
+                        AutoRuleChange::UpdateEnvironmentEntry {
+                            text,
+                            directory,
+                            include_descendants,
+                            ..
+                        },
+                } = change
+                {
+                    body.push(plain_row(format!(
+                        "+ {text}\nScope: {}{}",
+                        directory
+                            .as_ref()
+                            .map_or_else(|| "Global".into(), |path| path.display().to_string()),
+                        if *include_descendants {
+                            " and descendants"
+                        } else {
+                            ""
+                        }
+                    )));
+                    body.push(muted_row(
+                        "This manual change will be recorded in the entry's recent history.",
+                    ));
+                }
+                if let PermissionChange::ChangeAutoRules {
+                    change: AutoRuleChange::MigrateEnvironment { expected_text },
+                } = change
+                {
+                    body.push(muted_row("Not applied. This restores the built-in authority boundary and retains your entire legacy Environment as one global entry with historical source unknown. Review its scope separately after migration."));
+                    body.push(plain_row(format!("+ Global legacy entry: {expected_text}")));
+                }
+                if let PermissionChange::ChangeAutoRules {
+                    change: AutoRuleChange::AddEnvironmentEntries { entries },
+                } = change
+                {
+                    body.push(muted_row("Not applied. Built-in Environment stays active. Entries describe facts, not permission."));
+                    for entry in entries {
+                        body.push(plain_row(format!(
+                            "+ {}\nScope: {:?} · descendants {}\nSource: {}",
+                            entry.text, entry.directory, entry.include_descendants, entry.source
+                        )));
+                    }
+                }
                 body.push(RoleLine::role(title, Role::DialogTitle));
                 if let Focus::AutoPreview {
                     change:
@@ -2087,7 +2412,7 @@ impl PermissionsSurface {
                     ..
                 } = &self.focus
                 {
-                    body.push(muted_row("Built-in v1 restored; user edits removed"));
+                    body.push(muted_row("Built-in defaults restored; user edits removed"));
                 }
                 body.push(muted_row(format!("Will remove {} item(s)", removed.len())));
                 body.extend(removed.iter().map(|item| plain_row(format!("− {item}"))));
@@ -2105,7 +2430,7 @@ impl PermissionsSurface {
             Role::DialogTitle,
         ));
         body.push(muted_row(format!(
-            "Built-in v1 {} · {} custom",
+            "Built-in defaults {} · {} custom",
             if settings.include_builtins {
                 "included"
             } else {
@@ -2222,7 +2547,10 @@ impl PermissionsSurface {
             Focus::AutoRuleDetail { scroll, .. } | Focus::AutoPreview { scroll, .. } => {
                 (*scroll).min(max_scroll)
             }
-            Focus::ReviewerChoice(_) | Focus::AutoEnvironment { .. } | Focus::RuleForm(_) => rows
+            Focus::AutoSetup(_)
+            | Focus::ReviewerChoice(_)
+            | Focus::AutoEnvironment { .. }
+            | Focus::RuleForm(_) => rows
                 .iter()
                 .position(|line| line.fill == Some(Role::Selection))
                 .unwrap_or_default()
@@ -2419,7 +2747,7 @@ fn wrap_role_line(line: RoleLine, width: usize) -> Vec<RoleLine> {
     rows
 }
 
-fn editor_window(editor: &Editor, available_width: usize) -> String {
+pub(super) fn editor_window(editor: &Editor, available_width: usize) -> String {
     let available_width = available_width.max(3);
     let draft = editor.draft();
     let before = &draft[..editor.cursor()];
@@ -2461,7 +2789,7 @@ fn editor_window(editor: &Editor, available_width: usize) -> String {
     visible
 }
 
-fn edit_text(editor: &mut Editor, key: KeyEvent) {
+pub(super) fn edit_text(editor: &mut Editor, key: KeyEvent) {
     match (key.code, key.modifiers) {
         (KeyCode::Backspace, _) => {
             editor.apply(EditorCommand::DeleteBackward);

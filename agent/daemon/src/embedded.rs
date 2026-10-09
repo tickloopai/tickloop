@@ -938,6 +938,11 @@ impl EmbeddedAgentAccess {
                     .set_managed_permission_constraints(chat, rules)
                     .await?
             }
+            ConfigurationChange::GenerateAutoEnvironment { options } => {
+                return Ok(CommandResult::AutoEnvironmentDraft(
+                    agent.generate_auto_environment(chat, options).await?,
+                ));
+            }
             ConfigurationChange::PermissionChange { change, expected } => {
                 return match agent.apply_permission_change(chat, change, expected).await {
                     Ok(view) => Ok(CommandResult::Permissions(Box::new(view))),

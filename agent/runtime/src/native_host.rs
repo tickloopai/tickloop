@@ -115,6 +115,16 @@ impl NativeHostToolProvider {
             permission,
             prepared.summary.clone(),
         )
+        .with_approval_facts(tickloop_agent_protocol::PreparedApprovalFacts {
+            normalized_input: prepared.input.clone(),
+            tick_instance: prepared
+                .target
+                .as_ref()
+                .map(|target| target.instance.clone()),
+            closes_tick: operation_name == "modify_tick" && prepared.input["action"] == "close",
+            external_declaration: prepared.declaration.clone(),
+            ..Default::default()
+        })
         .with_payload(NativePreparedCall {
             operation: prepared,
             endpoint,

@@ -2537,6 +2537,36 @@ impl Console {
             .map(|surface| surface.subject().clone()))
     }
 
+    pub(super) fn open_environment_setup(&self) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        if let Some(surface) = &mut state.permissions_surface {
+            surface.open_environment_setup();
+        }
+        state
+            .draw(&mut io::stdout().lock())
+            .map_err(|error| error.to_string())
+    }
+
+    pub(super) fn environment_generated(
+        &self,
+        chat: Uuid,
+        generation: Uuid,
+        result: Result<tickloop_agent_protocol::AutoEnvironmentDraft, String>,
+    ) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        if let Some(surface) = state
+            .permissions_surface
+            .as_mut()
+            .filter(|surface| surface.chat_id() == Some(chat))
+        {
+            surface.environment_generated(generation, result);
+            state
+                .draw(&mut io::stdout().lock())
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
     pub(super) fn permissions_saved(&self, view: impl Into<PermissionsPage>) -> Result<(), String> {
         let view = view.into();
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
@@ -9859,6 +9889,19 @@ impl State {
         }
         if self.menu.is_none() && self.permissions_surface.is_some() {
             self.escape_confirmation = None;
+            if key.code == KeyCode::Char('g') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                if let Some(draft) = self
+                    .permissions_surface
+                    .as_ref()
+                    .and_then(|surface| surface.external_draft())
+                    && let Some(ExternalEditorOutcome::Updated { content }) =
+                        self.run_external_editor(&draft)
+                    && let Some(surface) = &mut self.permissions_surface
+                {
+                    surface.replace_external_draft(content);
+                }
+                return None;
+            }
             let effect = self.permissions_surface.as_mut().unwrap().key(key);
             return match effect {
                 PermissionsEffect::None => None,

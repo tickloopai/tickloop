@@ -4,8 +4,11 @@ pub(crate) mod approval_context;
 mod auto_approval;
 mod auto_health;
 mod auto_mode;
+#[cfg(test)]
+mod auto_replay_tests;
 pub(crate) mod auto_rules;
 mod auto_settings;
+mod auto_setup;
 mod branch;
 mod family;
 pub mod file_history;
@@ -318,6 +321,8 @@ struct Inner {
 /// Branch copies rebuild it from the conversation chain.
 #[derive(Clone, Debug, Default)]
 struct ChatBookkeeping {
+    dependency_baselines: BTreeMap<LoopId, BTreeMap<PathBuf, String>>,
+    tick_creation_receipts: Vec<approval_context::TickCreationReceipt>,
     denial_references: BTreeMap<usize, DenialReference>,
     /// 各 Loop 创建时的对话消息数。rewind 截断到这个位置或更早时 Loop 不再存在。
     loop_starts: BTreeMap<LoopId, usize>,
@@ -335,6 +340,10 @@ struct ChatBookkeeping {
 impl ChatBookkeeping {
     /// 新建 Loop，记下创建时的对话位置。
     fn add_loop(&mut self, snapshot: &mut ChatSnapshot, goal: LoopSnapshot) {
+        self.dependency_baselines.insert(
+            goal.id,
+            approval_context::dependency_fingerprints(&snapshot.workdir),
+        );
         self.loop_starts.insert(goal.id, snapshot.messages.len());
         snapshot.loops.push(goal);
     }
@@ -454,10 +463,11 @@ struct PendingApproval {
     operation: SessionPermissionOperation,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 enum AutoReview {
     Allow,
     Ask {
+        diagnostics: Vec<tickloop_agent_protocol::ApprovalDiagnostic>,
         reason: String,
     },
     Block {
@@ -782,6 +792,7 @@ impl Agent {
         &self,
         receipt: &Receipt,
         operation: &OperationRecord,
+        prepared_facts: Option<tickloop_agent_protocol::PreparedApprovalFacts>,
         cancel: CancellationToken,
     ) -> Result<approval_assessment::ApprovalAssessment, AgentError> {
         let (snapshot, bookkeeping, chat_client, boundary_id, legacy_path) = {
@@ -838,6 +849,9 @@ impl Agent {
                     operation,
                     snapshot.policy.revision,
                     reason,
+                    tickloop_agent_protocol::ApprovalDiagnostic::ReviewerFailure {
+                        failure: ApprovalFailureKind::Configuration,
+                    },
                 ));
             }
         };
@@ -846,9 +860,9 @@ impl Agent {
             &bookkeeping,
             operation,
             legacy,
-            auto_settings.policy(),
+            auto_settings.policy_for_directory(&snapshot.workdir),
         );
-        let context = match context {
+        let mut context = match context {
             Ok(context) => context,
             Err(approval_context::ApprovalContextError::MissingOriginalUserInput) => {
                 let reason = "Original user authorization for this Loop is unavailable; review this action manually.".to_owned();
@@ -862,9 +876,34 @@ impl Agent {
                     operation,
                     snapshot.policy.revision,
                     reason,
+                    tickloop_agent_protocol::ApprovalDiagnostic::MissingAuthorization,
                 ));
             }
         };
+        context.creation_receipt = prepared_facts
+            .as_ref()
+            .filter(|facts| facts.closes_tick)
+            .and_then(|facts| {
+                bookkeeping
+                    .tick_creation_receipts
+                    .iter()
+                    .find(|proof| {
+                        proof.loop_id == operation.loop_id
+                            && facts.tick_instance.as_ref() == Some(&proof.instance)
+                            && snapshot.operations.iter().any(|created| {
+                                created.id == proof.operation_id
+                                    && created.state == OperationState::Completed
+                            })
+                    })
+                    .cloned()
+            });
+        context.prepared_facts = prepared_facts;
+        if context.creation_receipt.is_none() {
+            context
+                .auto_policy
+                .rules
+                .retain(|rule| rule.id != "builtin.soft_allow.loop_tick_cleanup");
+        }
         let preferred = auto_settings.reviewer;
         let configured_reviewer = self.inner.auto_reviewer.lock().await.clone();
         let has_isolated_reviewer = configured_reviewer.is_some();
@@ -990,7 +1029,9 @@ impl Agent {
         let (decision, reason) = match review {
             AutoReview::Allow => (Decision::Allow, "Auto policy allowed the operation".into()),
             AutoReview::Block { reason, .. } => (Decision::Deny, reason.clone()),
-            AutoReview::Ask { reason } => (self.apply_prompt_policy(Decision::Ask), reason.clone()),
+            AutoReview::Ask { reason, .. } => {
+                (self.apply_prompt_policy(Decision::Ask), reason.clone())
+            }
             AutoReview::ContextLimit => (
                 self.apply_prompt_policy(Decision::Ask),
                 auto_mode::REVIEW_CONTEXT_LIMIT_MESSAGE.into(),
@@ -2517,7 +2558,12 @@ impl Agent {
                     if !result.is_error && host_call_status == Some(crate::host_tools::HostCallStatus::Completed) {
                         match &host_effect {
                             Some(crate::host_tools::HostEffect::CreatedArtifact(tick)) => self.auto_attach_artifact_tick(chat, tick.clone()),
-                            Some(crate::host_tools::HostEffect::OpenedTick { instance, title }) => self.record_opened_tick(chat, instance.clone(), title.clone()),
+                            Some(crate::host_tools::HostEffect::OpenedTick { instance, title }) => {
+                                if let Some(operation) = chat.snapshot.operations.iter().find(|operation| operation.run_id == receipt.run_id && operation.call_id == id && operation.state == OperationState::Completed) {
+                                    chat.bookkeeping.tick_creation_receipts.push(approval_context::TickCreationReceipt { loop_id: receipt.loop_id, operation_id: operation.id, instance: instance.clone() });
+                                }
+                                self.record_opened_tick(chat, instance.clone(), title.clone());
+                            },
                             Some(crate::host_tools::HostEffect::FinishedFeedbackRequest { request_id }) => {
                                 if let Some(active) = chat.active_event_claims.get_mut(&receipt.run_id)
                                     && active.claim.request_id == *request_id

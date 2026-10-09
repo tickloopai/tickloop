@@ -76,6 +76,7 @@ impl AgentConfiguration {
             ConfigurationChange::ExecutionMode { .. }
                 | ConfigurationChange::Directories { .. }
                 | ConfigurationChange::PermissionChange { .. }
+                | ConfigurationChange::GenerateAutoEnvironment { .. }
                 | ConfigurationChange::ReplaceRules { .. }
                 | ConfigurationChange::ProjectConstraints { .. }
                 | ConfigurationChange::ManagedConstraints { .. }

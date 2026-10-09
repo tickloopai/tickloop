@@ -700,6 +700,7 @@ async fn content_height_permission_management_history_fits_loaded_and_empty_reco
     ] {
         view.auto_policy.rules = (0..count)
             .map(|index| AutoRule {
+                clears: None,
                 id: format!("controlled-{index}"),
                 kind: tickloop_agent_protocol::AutoRuleKind::SoftAllow,
                 text: format!("Controlled rule {index}"),
