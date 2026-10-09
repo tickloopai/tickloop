@@ -425,7 +425,7 @@ impl ArtifactsPicker {
                 format!(
                     "    {} · {}{}",
                     artifact.access_role,
-                    super::tick_list::relative_time(updated, now),
+                    super::monitor::relative_time(updated, now),
                     if artifact.status == "reserved" {
                         " · reserved"
                     } else {

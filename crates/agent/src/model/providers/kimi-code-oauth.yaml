@@ -12,6 +12,11 @@ api_key_env: ''
 endpoints:
   kimi_chat_completions: https://api.kimi.com/coding/v1
 models:
+- id: kimi-for-coding
+  service_model_id: kimi-for-coding
+  display_name: Kimi for Coding (K2.8 Preview)
+  adapter: kimi_chat_completions
+  max_output_tokens: 4096
 - id: k3
   service_model_id: k3
   display_name: Kimi K3

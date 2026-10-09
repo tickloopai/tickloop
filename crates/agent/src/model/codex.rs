@@ -7,7 +7,7 @@ use std::{
 use async_trait::async_trait;
 use reqwest::{
     Url,
-    header::{AUTHORIZATION, HeaderValue, RETRY_AFTER},
+    header::{AUTHORIZATION, HeaderValue},
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -15,10 +15,10 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    CODEX_RESPONSES_URL, Content, MAX_ERROR_BODY_BYTES, ModelAuthSource, ModelClient, ModelConfig,
-    ModelDelta, ModelError, ModelIdentity, ModelOutput, ModelProvider, ModelRequest,
-    ModelRequestContext, ModelRequestStage, ModelResponseRejection, Protocol, ReasoningEffort,
-    Role, consume_sse_response, image_outside_user_message, is_context_limit_error,
+    CODEX_RESPONSES_URL, Content, ModelAuthSource, ModelClient, ModelConfig, ModelDelta,
+    ModelError, ModelIdentity, ModelOutput, ModelProvider, ModelRequest, ModelRequestContext,
+    ModelRequestStage, ModelResponseRejection, Protocol, ReasoningEffort, Role,
+    consume_sse_response, image_outside_user_message, is_context_limit_error,
     request_transport_error, responses, validate_reasoning_effort,
 };
 use crate::auth::{AuthError, CodexAuth};
@@ -180,6 +180,8 @@ impl CodexModelClient {
             match transport::complete(
                 &self.websocket_cache,
                 transport::WebSocketRequest {
+                    config: &self.config,
+                    client: &self.client,
                     chat_id,
                     endpoint: &self.endpoint,
                     body: &body,
@@ -279,48 +281,35 @@ impl CodexModelClient {
         let mut response = sent?;
         let status = response.status().as_u16();
         if !(200..=299).contains(&status) {
-            if status == 401 {
-                return Err(ModelError::AuthenticationAt {
-                    stage: ModelRequestStage::ResponseHeaders,
-                });
-            }
-            let retry_after = response
-                .headers()
-                .get(RETRY_AFTER)
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.parse::<u64>().ok())
-                .map(Duration::from_secs);
-            let server_retry = response
-                .headers()
-                .get("x-should-retry")
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| match value {
-                    "true" => Some(true),
-                    "false" => Some(false),
-                    _ => None,
-                });
-            let mut error_bytes = Vec::new();
-            while error_bytes.len() < MAX_ERROR_BODY_BYTES {
-                let chunk = tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => return Err(ModelError::Cancelled),
-                    result = response.chunk() => result.ok().flatten(),
-                };
-                let Some(chunk) = chunk else { break };
-                let remaining = MAX_ERROR_BODY_BYTES - error_bytes.len();
-                error_bytes.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
-            }
-            let body = serde_json::from_slice::<Value>(&error_bytes).ok();
-            if body.as_ref().is_some_and(is_context_limit_error) {
+            let (retry_after, server_retry) =
+                super::provider_failure::retry_headers(response.headers());
+            let error_body =
+                super::provider_failure::read_error_body(&mut response, &cancel).await?;
+            let error_bytes = &error_body.bytes;
+            let body = serde_json::from_slice::<Value>(error_bytes).ok();
+            if error_body.complete && body.as_ref().is_some_and(is_context_limit_error) {
                 return Err(
                     ModelError::ResponseRejected(ModelResponseRejection::ContextLimit)
                         .at_stage(ModelRequestStage::ResponseHeaders),
                 );
             }
-            return Err(
-                errors::http_error(status, body.as_ref(), retry_after, server_retry)
-                    .at_stage(ModelRequestStage::ResponseHeaders),
+            let mut failure = super::ProviderHttpFailure::from_response(
+                &self.config,
+                status,
+                error_bytes,
+                retry_after,
+                server_retry,
+                &[access_token, account_id],
             );
+            let classified = errors::http_error(status, body.as_ref(), retry_after, server_retry);
+            if let Some(body) = body.as_ref()
+                && body["error"]["resets_at"].is_number()
+                && let Some(detail) = classified.safe_quota_detail()
+            {
+                failure.hint.push_str(detail);
+            }
+            failure.require_complete_body(error_body.complete, &[access_token, account_id]);
+            return Err(ModelError::ProviderHttp(Box::new(failure)));
         }
         consume_sse_response(
             response,
@@ -337,6 +326,10 @@ impl CodexModelClient {
 
 #[async_trait]
 impl ModelClient for CodexModelClient {
+    fn connection_id(&self) -> Option<String> {
+        Some(self.config.provider_id.clone())
+    }
+
     fn identity(&self) -> ModelIdentity {
         self.config.identity()
     }

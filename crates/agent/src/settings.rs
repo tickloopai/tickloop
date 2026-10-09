@@ -46,7 +46,7 @@ const DEFAULT_MODE_KEY: &str = "defaultMode";
 const CONTEXT_WINDOW_KEY: &str = "contextWindowTokens";
 const GLYPH_SET_KEY: &str = "glyphSet";
 const PREFERS_REDUCED_MOTION_KEY: &str = "prefersReducedMotion";
-const TICK_LIST_KEY: &str = "tickList";
+const MONITOR_KEY: &str = "monitor";
 const PROMPT_SUGGESTION_ENABLED_KEY: &str = "promptSuggestionEnabled";
 /// Claude Code's `outputStyle` setting.
 const OUTPUT_STYLE_KEY: &str = "outputStyle";
@@ -208,7 +208,7 @@ pub struct DisplayPreferences {
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
-pub enum TickListPreference {
+pub enum MonitorPreference {
     #[default]
     Auto,
     Hidden,
@@ -366,9 +366,9 @@ impl LoadedSettings {
         }
     }
 
-    pub fn tick_list_preference(&self) -> TickListPreference {
+    pub fn monitor_preference(&self) -> MonitorPreference {
         self.settings
-            .get(TICK_LIST_KEY)
+            .get(MONITOR_KEY)
             .cloned()
             .and_then(|value| serde_json::from_value(value).ok())
             .unwrap_or_default()
@@ -891,14 +891,14 @@ impl UserSettings {
         })
     }
 
-    pub fn save_tick_list_preference(
+    pub fn save_monitor_preference(
         &self,
-        preference: TickListPreference,
+        preference: MonitorPreference,
     ) -> Result<(), SettingsError> {
         self.update(|settings| {
             settings.insert(
-                TICK_LIST_KEY.into(),
-                serde_json::to_value(preference).expect("tick list preference serializes to JSON"),
+                MONITOR_KEY.into(),
+                serde_json::to_value(preference).expect("Monitor preference serializes to JSON"),
             );
             Ok(())
         })

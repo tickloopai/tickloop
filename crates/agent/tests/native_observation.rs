@@ -14,7 +14,8 @@ use serde_json::{Value, json};
 use support::{ScriptedModel, call, config, next_event, text};
 use tick_connect::{
     access::TickAccess,
-    herdr::{HerdrContext, HerdrPort, HostError, Pane, process_birth},
+    herdr::{HerdrContext, HerdrPort, Pane, process_birth},
+    host_error::HostError,
     instance::InstanceRef,
     session::{SessionLaunch, TickSession},
 };
@@ -721,8 +722,10 @@ async fn protocol_tick_update_after_registration_reaches_its_loop() {
     let session = TickSession::spawn(SessionLaunch {
         command: vec!["python3".into(), script.to_string_lossy().into_owned()],
         cwd: directory.path().into(),
-        host_socket: host_socket.clone(),
-        terminal_id: "protocol".into(),
+        backend: tick_connect::session::SessionBackend::Herdr {
+            socket: host_socket.clone(),
+            terminal_id: "protocol".into(),
+        },
         runtime_dir: Some(runtime_dir.clone()),
     })
     .await
@@ -837,8 +840,10 @@ for line in sys.stdin:
             script.to_string_lossy().into_owned(),
         ],
         cwd: directory.path().into(),
-        host_socket: host_socket.clone(),
-        terminal_id: "protocol".into(),
+        backend: tick_connect::session::SessionBackend::Herdr {
+            socket: host_socket.clone(),
+            terminal_id: "protocol".into(),
+        },
         runtime_dir: Some(runtime_dir.clone()),
     })
     .await
@@ -929,8 +934,10 @@ async fn herdr_subscriptions_keep_native_query_permissions_and_target_admission(
     let session = TickSession::spawn(SessionLaunch {
         command: vec!["python3".into(), script.to_string_lossy().into_owned()],
         cwd: directory.path().into(),
-        host_socket: host_socket.clone(),
-        terminal_id: "protocol".into(),
+        backend: tick_connect::session::SessionBackend::Herdr {
+            socket: host_socket.clone(),
+            terminal_id: "protocol".into(),
+        },
         runtime_dir: Some(runtime_dir.clone()),
     })
     .await

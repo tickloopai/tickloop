@@ -306,7 +306,7 @@ async fn repeated_legal_images_cross_the_frame_limit_without_losing_history_or_r
     }
     assert_eq!(*model.image_counts.lock().unwrap(), [14, 28]);
     let mut observation = tokio::time::timeout(
-        Duration::from_secs(60),
+        RESPONSE_TIMEOUT,
         client.observe(ObservationRequest::Agent {
             execution,
             detail: AgentDetailQuery::Snapshot,

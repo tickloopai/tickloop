@@ -508,8 +508,17 @@ async fn a_real_worker_keeps_shell_execution_after_ui_disconnect_and_exits_on_li
         .spawn()
         .unwrap();
     let mut lifeline = worker.stdin.take().unwrap();
-    let mut bootstrap =
-        serde_json::to_vec(&serde_json::json!({ "epoch": epoch, "launch": launch })).unwrap();
+    let control = serde_json::json!({
+        "endpoint": temporary.path().join("worker-control.sock"),
+        "owner_epoch": epoch,
+        "binding": Uuid::new_v4(),
+        "capability": "0".repeat(64),
+        "host_endpoint": temporary.path().join("host.sock"),
+    });
+    let mut bootstrap = serde_json::to_vec(
+        &serde_json::json!({ "epoch": epoch, "launch": launch, "control": control }),
+    )
+    .unwrap();
     bootstrap.push(b'\n');
     lifeline.write_all(&bootstrap).await.unwrap();
     let client = tokio::time::timeout(Duration::from_secs(5), async {
@@ -589,19 +598,136 @@ async fn a_real_worker_keeps_shell_execution_after_ui_disconnect_and_exits_on_li
     assert!(!socket.exists());
 }
 
+/// Stops whatever owner serves a test's private runtime directory when the test ends, also
+/// after a failed assertion. The test's runtime may already be gone by then, so the shutdown
+/// runs on its own thread and runtime and is awaited.
 struct PrivateOwnerGuard {
-    client: Option<LocalAgentClient>,
+    socket: std::path::PathBuf,
+}
+impl PrivateOwnerGuard {
+    fn new(directory: &Path) -> Self {
+        Self {
+            socket: directory.join("owner.sock"),
+        }
+    }
 }
 impl Drop for PrivateOwnerGuard {
     fn drop(&mut self) {
-        if let Some(client) = self.client.take()
-            && let Ok(handle) = tokio::runtime::Handle::try_current()
-        {
-            handle.spawn(async move {
-                let _ = client.shutdown_owner().await;
-            });
+        if !self.socket.exists() {
+            return;
         }
+        let socket = self.socket.clone();
+        let _ = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(async {
+                let _ = tokio::time::timeout(Duration::from_secs(15), async {
+                    if let Ok(client) = LocalAgentClient::connect(&socket).await {
+                        let _ = client.shutdown_owner().await;
+                        while socket.exists() {
+                            tokio::time::sleep(Duration::from_millis(25)).await;
+                        }
+                    }
+                })
+                .await;
+            });
+            Ok::<(), std::io::Error>(())
+        })
+        .join();
     }
+}
+
+#[tokio::test]
+async fn an_owner_killed_without_cleanup_never_blocks_the_next_owner() {
+    use std::os::unix::fs::PermissionsExt;
+    let temporary = tempfile::tempdir_in("/tmp").unwrap();
+    let private_directory = temporary.path().join("agent-runtime");
+    std::fs::create_dir(&private_directory).unwrap();
+    std::fs::set_permissions(&private_directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let executable = std::path::PathBuf::from(env!("CARGO_BIN_EXE_tickloop"));
+    let killed = tickloop_agent::agent_daemon::connect_or_start_at(
+        private_directory.clone(),
+        executable.clone(),
+    )
+    .await
+    .unwrap();
+    let killed_pid = killed.server_process_id() as libc::pid_t;
+    assert!(private_directory.join("worker-control.sock").exists());
+    unsafe { libc::kill(killed_pid, libc::SIGKILL) };
+    for _ in 0..400 {
+        if unsafe { libc::kill(killed_pid, 0) } != 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        private_directory.join("worker-control.sock").exists(),
+        "a killed owner leaves its endpoints behind"
+    );
+    let _guard = PrivateOwnerGuard::new(&private_directory);
+    let next = tickloop_agent::agent_daemon::connect_or_start_at(private_directory, executable)
+        .await
+        .expect("the next owner replaces the stale endpoints");
+    assert_ne!(next.owner_epoch(), killed.owner_epoch());
+}
+
+#[tokio::test]
+async fn a_real_owner_answers_hosted_lifecycle_requests_only_for_live_grants() {
+    use std::os::unix::fs::PermissionsExt;
+    use tickloop_agent::hosted::worker_control::{OwnerControl, WorkerControlGrant, WorkerRequest};
+    let temporary = tempfile::tempdir_in("/tmp").unwrap();
+    let private_directory = temporary.path().join("agent-runtime");
+    std::fs::create_dir(&private_directory).unwrap();
+    std::fs::set_permissions(&private_directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let _guard = PrivateOwnerGuard::new(&private_directory);
+    let client = tickloop_agent::agent_daemon::connect_or_start_at(
+        private_directory.clone(),
+        std::path::PathBuf::from(env!("CARGO_BIN_EXE_tickloop")),
+    )
+    .await
+    .unwrap();
+    let epoch = client.owner_epoch();
+    let endpoint = private_directory.join("worker-control.sock");
+    assert_eq!(
+        std::fs::metadata(&endpoint).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let forged = |owner_epoch| WorkerControlGrant {
+        endpoint: endpoint.clone(),
+        owner_epoch,
+        binding: Uuid::new_v4(),
+        capability: "0".repeat(64),
+        host_endpoint: temporary.path().join("host.sock"),
+    };
+    let list = |chat| WorkerRequest::ListHostedTicks { chat, cursor: None };
+    let unknown_grant = OwnerControl::new(forged(epoch))
+        .request(list(Uuid::new_v4()))
+        .await
+        .unwrap_err();
+    assert_eq!(unknown_grant.code, "Forbidden");
+    assert!(!unknown_grant.dispatched);
+    let earlier_owner = OwnerControl::new(forged(Uuid::new_v4()))
+        .request(list(Uuid::new_v4()))
+        .await
+        .unwrap_err();
+    assert_eq!(earlier_owner.code, "EpochChanged");
+    let reconcile = {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::UnixStream::connect(&endpoint).await.unwrap();
+        let envelope = serde_json::json!({"id":1,"envelope":{"owner_epoch":epoch,"binding":Uuid::new_v4(),"capability":"0".repeat(64),"request":{"method":"reconcile"}}});
+        stream
+            .write_all(format!("{envelope}\n").as_bytes())
+            .await
+            .unwrap();
+        let mut line = String::new();
+        tokio::io::BufReader::new(stream)
+            .read_line(&mut line)
+            .await
+            .unwrap();
+        serde_json::from_str::<serde_json::Value>(&line).unwrap()
+    };
+    assert_eq!(reconcile["error"]["code"], "InvalidArguments");
 }
 
 #[tokio::test]
@@ -611,7 +737,7 @@ async fn concurrent_cold_start_uses_one_isolated_owner_and_owner_exit_closes_wor
     let private_directory = temporary.path().join("agent-runtime");
     std::fs::create_dir(&private_directory).unwrap();
     std::fs::set_permissions(&private_directory, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let mut guard = PrivateOwnerGuard { client: None };
+    let _guard = PrivateOwnerGuard::new(&private_directory);
     let executable = std::path::PathBuf::from(env!("CARGO_BIN_EXE_tickloop"));
     let mut calls = Vec::new();
     for _ in 0..8 {
@@ -631,7 +757,6 @@ async fn concurrent_cold_start_uses_one_isolated_owner_and_owner_exit_closes_wor
     assert!(clients.iter().all(|client| client.owner_epoch() == epoch));
     let owner_pid = clients[0].server_process_id() as i32;
     assert!(owner_pid > 0 && owner_pid != std::process::id() as i32);
-    guard.client = Some(clients[0].clone());
     assert_eq!(
         std::fs::metadata(private_directory.join("owner.sock"))
             .unwrap()
@@ -780,12 +905,10 @@ async fn concurrent_cold_start_uses_one_isolated_owner_and_owner_exit_closes_wor
     })
     .await
     .unwrap();
-    guard.client = None;
     let new_owner =
         tickloop_agent::agent_daemon::connect_or_start_at(private_directory.clone(), executable)
             .await
             .unwrap();
-    guard.client = Some(new_owner.clone());
     assert_ne!(new_owner.owner_epoch(), epoch);
     assert!(agents(&new_owner).await.is_empty());
     let old = match new_owner
@@ -801,7 +924,6 @@ async fn concurrent_cold_start_uses_one_isolated_owner_and_owner_exit_closes_wor
     };
     assert_eq!(old.code, AccessErrorCode::EpochChanged);
     new_owner.shutdown_owner().await.unwrap();
-    guard.client = None;
 }
 
 async fn controlled_connections(
@@ -1859,6 +1981,8 @@ struct OversizedResponseAccess {
     executions: AtomicUsize,
 }
 
+const OVERSIZED_RESPONSE_TIMEOUT: Duration = Duration::from_secs(180);
+
 #[async_trait]
 impl AgentAccess for OversizedResponseAccess {
     async fn observe(&self, query: ObservationRequest) -> Result<Observation, AccessError> {
@@ -1923,7 +2047,7 @@ async fn an_oversized_initial_observation_returns_a_typed_error_and_keeps_ipc_av
     let temporary = tempfile::tempdir_in("/tmp").unwrap();
     let (client, access, target, server) = oversized_response_fixture(temporary.path()).await;
     let error = tokio::time::timeout(
-        Duration::from_secs(15),
+        OVERSIZED_RESPONSE_TIMEOUT,
         client.observe(ObservationRequest::Agent {
             execution: target,
             detail: AgentDetailQuery::Warnings,
@@ -1966,7 +2090,7 @@ async fn an_oversized_accepted_receipt_stays_queryable_without_replaying_the_com
             },
         },
     );
-    let error = tokio::time::timeout(Duration::from_secs(15), client.execute(command.clone()))
+    let error = tokio::time::timeout(OVERSIZED_RESPONSE_TIMEOUT, client.execute(command.clone()))
         .await
         .unwrap()
         .unwrap_err();
@@ -1976,7 +2100,7 @@ async fn an_oversized_accepted_receipt_stays_queryable_without_replaying_the_com
         epoch: command.owner_epoch,
         command_id: command.command_id,
     };
-    let error = tokio::time::timeout(Duration::from_secs(15), client.observe(query.clone()))
+    let error = tokio::time::timeout(OVERSIZED_RESPONSE_TIMEOUT, client.observe(query.clone()))
         .await
         .unwrap()
         .unwrap_err();

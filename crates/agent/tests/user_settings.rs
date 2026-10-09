@@ -1349,29 +1349,59 @@ async fn resuming_retains_original_reasoning_and_projects_different_model_source
 }
 
 #[test]
-fn tick_list_preference_preserves_unknown_settings_and_defaults_invalid_values() {
-    use tickloop_agent::settings::TickListPreference;
+fn monitor_preference_preserves_unknown_settings_and_defaults_invalid_values() {
+    use tickloop_agent::settings::MonitorPreference;
     let directory = tempfile::tempdir().unwrap();
     let settings = UserSettings::in_root(directory.path());
     std::fs::write(
         directory.path().join("settings.json"),
-        r#"{"tickList":"invalid","futureKey":{"keep":true},"statusLinePosition":"left"}"#,
+        r#"{"monitor":"invalid","futureKey":{"keep":true},"statusLinePosition":"left"}"#,
     )
     .unwrap();
     assert_eq!(
-        settings.load().tick_list_preference(),
-        TickListPreference::Auto
+        settings.load().monitor_preference(),
+        MonitorPreference::Auto
     );
     settings
-        .save_tick_list_preference(TickListPreference::Hidden)
+        .save_monitor_preference(MonitorPreference::Hidden)
         .unwrap();
     assert_eq!(
-        settings.load().tick_list_preference(),
-        TickListPreference::Hidden
+        settings.load().monitor_preference(),
+        MonitorPreference::Hidden
     );
     let saved: serde_json::Value =
         serde_json::from_slice(&std::fs::read(directory.path().join("settings.json")).unwrap())
             .unwrap();
     assert_eq!(saved["futureKey"], json!({"keep":true}));
     assert_eq!(saved["statusLinePosition"], "left");
+    assert_eq!(saved["monitor"], "hidden");
+}
+
+#[test]
+fn the_former_tick_list_setting_is_neither_read_nor_migrated() {
+    use tickloop_agent::settings::MonitorPreference;
+    let directory = tempfile::tempdir().unwrap();
+    let settings = UserSettings::in_root(directory.path());
+    std::fs::write(
+        directory.path().join("settings.json"),
+        r#"{"tickList":"hidden","keep":1}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        settings.load().monitor_preference(),
+        MonitorPreference::Auto,
+        "only the monitor key controls Monitor"
+    );
+    settings
+        .save_monitor_preference(MonitorPreference::Auto)
+        .unwrap();
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(directory.path().join("settings.json")).unwrap())
+            .unwrap();
+    assert_eq!(saved["monitor"], "auto");
+    assert_eq!(saved["keep"], 1);
+    assert_eq!(
+        saved["tickList"], "hidden",
+        "saving never rewrites or migrates other keys"
+    );
 }

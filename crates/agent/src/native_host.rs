@@ -5,14 +5,15 @@ use std::{
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use tick_connect::access::{
-    AccessContext, AccessPermission, PreparedOperation, TickAccess, TickLocation,
+use tick_connect::{
+    access::{AccessContext, AccessPermission, PreparedOperation, TickAccess, TickLocation},
+    page::MAX_PAGE_SIZE,
 };
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     host_tools::{
-        HostCallContext, HostCallResult, HostEndpointIdentity, HostToolPermission,
+        HostCallContext, HostCallResult, HostEffect, HostEndpointIdentity, HostToolPermission,
         HostToolProvider, PreparedHostCall, WorkspaceHostContext,
     },
     model::ToolDefinition,
@@ -162,6 +163,20 @@ fn target_directory(target: &TickLocation) -> &str {
         .unwrap_or("")
 }
 
+/// The command line of a prepared open, used as the Monitor title until the Tick reports one.
+fn opened_program_title(operation: &PreparedOperation) -> Option<String> {
+    (operation.name == "modify_tick" && operation.input["action"] == "open")
+        .then(|| {
+            operation.input["command"]
+                .as_array()?
+                .iter()
+                .map(Value::as_str)
+                .collect::<Option<Vec<_>>>()
+                .map(|words| words.join(" "))
+        })
+        .flatten()
+}
+
 fn prepared_binding(call: &PreparedHostCall) -> Result<&NativePreparedCall, String> {
     call.payload::<NativePreparedCall>()
         .ok_or_else(|| "Native host operation has no prepared binding".into())
@@ -213,8 +228,8 @@ impl HostToolProvider for NativeHostToolProvider {
         vec![
             ToolDefinition {
                 name: "ReadWorkspace".into(),
-                description: "List running programs in the current Herdr Workspace, or in an explicitly named Workspace. Uses the Agent's Work Context by default; without one, discovers available Workspaces. The optional caller describes the View carrying this input, and may be null while the Agent works in the background. Each program has a stable Tick Instance reference.".into(),
-                input_schema: json!({"type":"object","properties":{"workspace_id":{"type":"string","minLength":1}},"additionalProperties":false}),
+                description: format!("List running programs in the current Herdr Workspace, or in an explicitly named Workspace. Uses the Agent's Work Context by default; without one, discovers available Workspaces. The optional caller describes the View carrying this input, and may be null while the Agent works in the background. Each program has a stable Tick Instance reference. Results come in pages of at most {MAX_PAGE_SIZE} programs with the complete total; pass next_cursor back as cursor until it is null. CursorExpired means the Workspace changed: list again from the first page. Listing never subscribes."),
+                input_schema: json!({"type":"object","properties":{"workspace_id":{"type":"string","minLength":1},"cursor":{"type":"object","properties":{"generation":{"type":"string"},"after":{"type":"string"}},"required":["generation","after"],"additionalProperties":false},"limit":{"type":"integer","minimum":1,"maximum":MAX_PAGE_SIZE}},"additionalProperties":false}),
             },
             ToolDefinition {
                 name: "ReadTick".into(),
@@ -316,6 +331,7 @@ impl HostToolProvider for NativeHostToolProvider {
                 "Native host operation has no prepared binding".into(),
             );
         };
+        let opened_title = opened_program_title(&binding.operation);
         match self.access.execute(binding.operation, cancel).await {
             Ok(value)
                 if value["status"] == "created_not_placed"
@@ -323,11 +339,34 @@ impl HostToolProvider for NativeHostToolProvider {
             {
                 HostCallResult::OutcomeUnknown(value.to_string())
             }
-            Ok(value) => HostCallResult::Completed(ToolResult {
-                is_error: value["status"] == "created_not_placed",
-                content: value.to_string(),
-                output_ref: None,
-            }),
+            Ok(value) => {
+                let result = ToolResult {
+                    is_error: value["status"] == "created_not_placed",
+                    content: value.to_string(),
+                    output_ref: None,
+                };
+                if value["status"] != "opened" {
+                    return HostCallResult::Completed(result);
+                }
+                match serde_json::from_value(value["tick_instance_id"].clone()) {
+                    Ok(instance) => HostCallResult::CompletedWithEffect(
+                        result,
+                        Box::new(HostEffect::OpenedTick {
+                            instance,
+                            title: opened_title,
+                        }),
+                    ),
+                    // The program runs, but without a verifiable identity it cannot join Monitor.
+                    Err(error) => HostCallResult::Completed(ToolResult {
+                        is_error: true,
+                        content: format!(
+                            "{}\nThe host reported an invalid Tick Instance ({error}); the program was opened but is not in Monitor. Use ReadWorkspace to find it before acting on it.",
+                            value
+                        ),
+                        output_ref: None,
+                    }),
+                }
+            }
             Err(error) if error.dispatched => HostCallResult::OutcomeUnknown(error.to_string()),
             Err(error) => HostCallResult::NotDispatched(error.to_string()),
         }

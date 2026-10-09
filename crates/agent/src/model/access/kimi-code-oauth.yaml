@@ -1,6 +1,11 @@
 ---
 provider: kimi-code-oauth
 series:
+- id: kimi-coding
+  name: Kimi for Coding
+  version: K2.8 Preview
+  model: kimi-for-coding
+  capability_order: 1
 - id: kimi
   name: Kimi
   version: K3
@@ -8,3 +13,6 @@ series:
   capability_order: 0
 notice: Kimi Code OAuth uses the registered Kimi Code client. K3 context is conservatively
   capped at 256K; 1M requires Pro entitlement.
+  Model listing does not verify plan access. kimi-for-coding is the default for all
+  plans; other models may require a higher plan. A usage-limit refusal may also mean
+  the plan does not include the model. Check the provider's subscription link.

@@ -78,6 +78,7 @@ async fn run_working_todo_list(fixture: &PrivateFixture) {
                 let rows = frame.lines().collect::<Vec<_>>();
                 rows.iter()
                     .position(|line| {
+                        // The first frames may not show the elapsed time yet.
                         line.contains("Inspecting the source-owned footer behavior")
                             && line.contains("s · Esc to interrupt)")
                     })
@@ -359,7 +360,7 @@ async fn run_shell_panel(fixture: &PrivateFixture) {
         .await;
     pty.resize(80, 24).await;
     let client = fixture.client().await;
-    pty.send(b"!printf 'prior-completed\\n'\r");
+    pty.send(b"!printf 'prior-completed\\n'; while [ ! -f prior-finish ]; do sleep 0.02; done\r");
     let execution = tokio::time::timeout(UI_TIMEOUT, async {
         loop {
             let rows = catalog(&client).await;
@@ -371,6 +372,12 @@ async fn run_shell_panel(fixture: &PrivateFixture) {
     })
     .await
     .unwrap();
+    pty.wait_for(
+        "setup Shell owns the foreground before completion",
+        |frame| frame.contains("Shell running"),
+    )
+    .await;
+    std::fs::write(fixture.path("work/prior-finish"), "finish").unwrap();
     wait_snapshot(
         &client,
         execution,
@@ -424,7 +431,7 @@ async fn run_shell_panel(fixture: &PrivateFixture) {
         .unwrap()
         .id;
     pty.wait_for("running and completed Shell Ticks are counted", |frame| {
-        frame.contains("Ticks 1")
+        frame.contains("Monitor 1")
     })
     .await;
     pty.wait_for_editor("background Shell releases the editor", Some(""))
@@ -434,8 +441,8 @@ async fn run_shell_panel(fixture: &PrivateFixture) {
         frame.contains("jk-SHELL-DRAFT")
     })
     .await;
-    click_category(&mut pty, "Ticks 1");
-    pty.wait_for("click opens the content-only Tick List", |frame| {
+    click_category(&mut pty, "Monitor 1");
+    pty.wait_for("click opens the content-only Monitor", |frame| {
         frame.contains("Shells (1)")
     })
     .await;
@@ -495,12 +502,12 @@ async fn run_shell_panel(fixture: &PrivateFixture) {
         .id;
     assert_ne!(first, second);
     pty.wait_for("completed Shell remains in the Tick count", |frame| {
-        frame.contains("Ticks 2")
+        frame.contains("Monitor 2")
     })
     .await;
     pty.wait_for_editor("second Shell releases input", Some(""))
         .await;
-    click_category(&mut pty, "Ticks 2");
+    click_category(&mut pty, "Monitor 2");
     pty.wait_for("all three Shell Ticks appear", |frame| {
         frame.contains("Shells (2)")
     })
@@ -553,15 +560,15 @@ async fn run_shell_panel(fixture: &PrivateFixture) {
     );
     assert!(requests.try_recv().is_err());
     pty.send(b"\x1b");
-    pty.wait_for("stopped detail returns to Tick List", |frame| {
+    pty.wait_for("stopped detail returns to Monitor", |frame| {
         frame.contains("Shells (2)")
     })
     .await;
     pty.send(b"\x1b");
     pty.wait_for_editor("stopped detail closes to input", Some(""))
         .await;
-    click_category(&mut pty, "Ticks 2");
-    pty.wait_for("Tick List opens after saved preference", |frame| {
+    click_category(&mut pty, "Monitor 2");
+    pty.wait_for("Monitor opens after saved preference", |frame| {
         frame.contains("Shells (2)")
     })
     .await;
@@ -586,7 +593,7 @@ async fn run_shell_panel(fixture: &PrivateFixture) {
     )
     .await;
     pty.send(b"\x1b");
-    pty.wait_for_editor("Tick List closes to input", Some(""))
+    pty.wait_for_editor("Monitor closes to input", Some(""))
         .await;
     pty.send(b"/tasks\r");
     pty.wait_for("Task Center retains the removed Tick's task", |frame| {

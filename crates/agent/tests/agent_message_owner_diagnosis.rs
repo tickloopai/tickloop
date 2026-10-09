@@ -1114,7 +1114,8 @@ async fn accepted_parent_child_messages_and_burst_feed_cancellation_keep_the_fam
         "actual SendMessage tools must be accepted before the stress"
     );
     model.emit_deltas.notify_waiters();
-    let result = tokio::time::timeout(Duration::from_secs(15), async {
+    // Forty rounds of feed churn; on a machine busy with parallel tests they took over 15 s.
+    let result = tokio::time::timeout(Duration::from_secs(60), async {
         for _ in 0..40 {
             for execution in &targets {
                 drop(

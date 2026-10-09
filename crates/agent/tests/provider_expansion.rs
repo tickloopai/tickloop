@@ -227,7 +227,7 @@ fn saved_subscription(root: &std::path::Path, provider: &str, kind: &str) {
     std::fs::create_dir(&directory).unwrap();
     std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
     let path = directory.join(format!("{provider}.json"));
-    std::fs::write(&path,json!({"provider":kind,"generation":uuid::Uuid::new_v4(),"credentials":{"token":"fixture-subscription","refresh_token":"fixture-refresh","identity":uuid::Uuid::new_v4(),"expires_at_ms":u64::MAX}}).to_string()).unwrap();
+    std::fs::write(&path,json!({"provider":kind,"generation":uuid::Uuid::new_v4(),"credentials":{"token":"fxm72vq84ep61aw9k","refresh_token":"fixture-refresh","identity":uuid::Uuid::new_v4(),"expires_at_ms":u64::MAX}}).to_string()).unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
 }
 
@@ -282,7 +282,7 @@ async fn kimi_code_oauth_schema_is_a_single_inert_auto_tool_on_its_own_route() {
     assert!(
         headers
             .to_lowercase()
-            .contains("authorization: bearer fixture-subscription")
+            .contains("authorization: bearer fxm72vq84ep61aw9k")
     );
     assert!(headers.starts_with("POST /anthropic/chat/completions "));
     assert_eq!(body["tool_choice"], "auto");
@@ -291,20 +291,20 @@ async fn kimi_code_oauth_schema_is_a_single_inert_auto_tool_on_its_own_route() {
 }
 
 #[tokio::test]
-async fn kimi_code_403_reports_plan_quota_or_denial_without_remote_text() {
+async fn kimi_code_403_preserves_safe_provider_text_and_ambiguous_plan_guidance() {
     let quota_body = json!({"error":{"type":"access_terminated_error","message":"You've reached your monthly usage limit for this billing cycle. Your quota will be refreshed in the next cycle. To continue now, purchase extra usage or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota"}});
     let denied_body =
         json!({"error":{"type":"access_terminated_error","message":"remote-secret-diagnostic"}});
     for (body, expected_kind, expected_text) in [
         (
             quota_body,
-            ModelFailureKind::QuotaExhausted,
-            "model allowance is exhausted (HTTP 403): the Kimi Code plan has no allowance for this model",
+            ModelFailureKind::EntitlementDenied,
+            "Usage limit OR the current plan does not include this model",
         ),
         (
             denied_body,
             ModelFailureKind::EntitlementDenied,
-            "model service denied access (HTTP 403): access_terminated_error",
+            "Model / plan access denied",
         ),
     ] {
         let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
@@ -323,8 +323,18 @@ async fn kimi_code_403_reports_plan_quota_or_denial_without_remote_text() {
         assert_eq!(error.kind(), expected_kind);
         assert!(!error.retry_hint().0);
         let message = error.to_string();
-        assert!(message.starts_with(expected_text), "{message}");
-        assert!(!message.contains("purchase extra usage"), "{message}");
+        assert!(
+            message.contains("Kimi Code") && message.contains("HTTP 403"),
+            "{message}"
+        );
+        assert!(message.contains(expected_text), "{message}");
+        if error.provider_failure().unwrap().class
+            == tickloop_agent::model::ProviderFailureClass::UsageOrPlan
+        {
+            assert!(message.contains("purchase extra usage"));
+            assert!(message.contains("https://www.kimi.com/membership/subscription?tab=quota"));
+            assert!(message.contains("kimi-for-coding"));
+        }
         assert!(!message.contains("remote-secret-diagnostic"), "{message}");
     }
 }
@@ -373,7 +383,7 @@ async fn xai_oauth_uses_responses_proxy_headers_and_preserves_encrypted_replay()
     let headers = headers.to_lowercase();
     assert!(headers.contains("x-xai-token-auth: xai-grok-cli"));
     assert!(headers.contains("x-grok-model-override: grok-4.6"));
-    assert!(headers.contains("authorization: bearer fixture-subscription"));
+    assert!(headers.contains("authorization: bearer fxm72vq84ep61aw9k"));
     assert_eq!(first["prompt_cache_key"], second["prompt_cache_key"]);
     assert!(second.to_string().contains("opaque-xai-fixture"));
 }

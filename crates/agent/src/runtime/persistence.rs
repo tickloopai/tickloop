@@ -33,9 +33,9 @@ use crate::transcript::{
     CompactMetadata, CompactTriggerEntry, ContentReplacementEntry, ContentReplacementRecord,
     CustomTitleEntry, DelegationEntry, FLUSH_INTERVAL, FileHistorySnapshotEntry, ForkedFrom,
     LOOP_CREATED_SUBTYPE, LOOP_ENDED_SUBTYPE, LOOP_STATE_SUBTYPE, LOOP_TRIGGER_SUBTYPE,
-    LastPromptEntry, Line, LoadedTranscript, LoopRecord, PartialCompactDirection,
-    SummarizeMetadataEntry, TranscriptWriter, format_timestamp, list_project, load, locate,
-    project_directory, transcript_path,
+    LastPromptEntry, Line, LoadedTranscript, LoopRecord, MonitorMembersEntry,
+    PartialCompactDirection, SummarizeMetadataEntry, TranscriptWriter, format_timestamp,
+    list_project, load, locate, project_directory, transcript_path,
 };
 
 /// 照 Claude Code：恢复时末尾是工具结果，追加这条 meta user 消息表示从中断处继续。
@@ -451,6 +451,19 @@ impl ChatRecorder {
                         removed_artifact_ticks: entry.removed_artifact_ticks,
                     })
                 }))
+                .chain(
+                    metadata
+                        .monitor_members
+                        .map(|entry| entry.monitor.for_new_chat())
+                        .filter(|monitor| !monitor.is_empty())
+                        .map(|monitor| {
+                            Line::MonitorMembers(MonitorMembersEntry {
+                                chat_id,
+                                cwd: Some(workdir.to_path_buf()),
+                                monitor,
+                            })
+                        }),
+                )
                 .collect(),
         );
     }
@@ -488,6 +501,14 @@ impl ChatRecorder {
                 custom_title: title.to_owned(),
             }),
         ];
+        let monitor = source.monitor.for_new_chat();
+        if !monitor.is_empty() {
+            lines.push(Line::MonitorMembers(MonitorMembersEntry {
+                chat_id: child_chat_id,
+                cwd: Some(source.workdir.clone()),
+                monitor,
+            }));
+        }
         if !source.artifact_ticks.is_empty() || !source.removed_artifact_ticks.is_empty() {
             lines.push(Line::ArtifactTicks(ArtifactTicksEntry {
                 chat_id: child_chat_id,
@@ -1166,6 +1187,12 @@ fn chain_entry(
 fn loop_entry_content(snapshot: &ChatSnapshot, goal: &LoopSnapshot) -> LoopEntryContent {
     (
         LoopRecord {
+            failure_events: snapshot
+                .failure_events
+                .iter()
+                .filter(|event| event.loop_id == goal.id)
+                .filter_map(|event| serde_json::to_value(event).ok())
+                .collect(),
             loop_id: goal.id,
             goal: goal.goal.clone(),
             state: serde_json::to_value(&goal.state).unwrap_or(serde_json::Value::Null),
@@ -1715,6 +1742,13 @@ fn recover_transcript(
                 .as_ref()
                 .and_then(|entry| entry.cwd.clone())
         })
+        .or_else(|| {
+            loaded
+                .metadata
+                .monitor_members
+                .as_ref()
+                .and_then(|entry| entry.cwd.clone())
+        })
         .unwrap_or_default();
     let mut snapshot = super::empty_snapshot(chat_id, workdir, super::unselected_model());
     snapshot.generated_title = loaded
@@ -1762,6 +1796,21 @@ fn recover_transcript(
         .artifact_ticks
         .as_ref()
         .map(|entry| entry.removed_artifact_ticks.clone())
+        .unwrap_or_default();
+    // Monitor membership belongs to the Chat that recorded it; a copy under a new Chat id is a
+    // new owner and keeps only the removals.
+    snapshot.monitor = loaded
+        .metadata
+        .monitor_members
+        .as_ref()
+        .filter(|entry| entry.chat_id == source_chat_id)
+        .map(|entry| {
+            if chat_id == source_chat_id {
+                entry.monitor.clone()
+            } else {
+                entry.monitor.for_new_chat()
+            }
+        })
         .unwrap_or_default();
     kept.fill_conversation(&mut snapshot);
     recover_snapshot_for_resume(snapshot, kept.meta_messages.clone())
@@ -1843,6 +1892,7 @@ impl RestoredChain {
         snapshot.loops.clear();
         snapshot.loop_starts.clear();
         snapshot.resume_triggers.clear();
+        snapshot.failure_events.clear();
         for (position, (record, run_id)) in &self.loop_records {
             let Ok(state) = serde_json::from_value::<LoopState>(record.state.clone()) else {
                 continue;
@@ -1855,6 +1905,20 @@ impl RestoredChain {
             else {
                 continue;
             };
+            for value in &record.failure_events {
+                if let Ok(mut event) = serde_json::from_value::<super::Event>(value.clone())
+                    && event.loop_id == record.loop_id
+                    && matches!(event.kind, super::EventKind::Failed(_))
+                    && !snapshot.failure_events.iter().any(|previous| {
+                        previous.run_id == event.run_id && previous.sequence == event.sequence
+                    })
+                {
+                    event.chat_id = snapshot.id;
+                    snapshot.last_sequence = snapshot.last_sequence.max(event.sequence);
+                    snapshot.events.push(event.clone());
+                    snapshot.failure_events.push(event);
+                }
+            }
             let goal = LoopSnapshot {
                 id: record.loop_id,
                 goal: record.goal.clone(),
@@ -2066,19 +2130,51 @@ impl Agent {
         artifact_ticks: Vec<crate::artifacts::ArtifactTick>,
         removed_artifact_ticks: std::collections::BTreeSet<String>,
     ) {
-        if let Some(recorder) = &self.inner.recorder
-            && let Some(log) = recorder.logs.lock().unwrap().get(&chat_id)
-        {
-            recorder.writer.enqueue(
-                &log.path,
-                vec![Line::ArtifactTicks(ArtifactTicksEntry {
-                    chat_id,
-                    cwd: Some(workdir.to_path_buf()),
-                    artifact_ticks,
-                    removed_artifact_ticks,
-                })],
-            );
-        }
+        self.record_chat_metadata(
+            chat_id,
+            Line::ArtifactTicks(ArtifactTicksEntry {
+                chat_id,
+                cwd: Some(workdir.to_path_buf()),
+                artifact_ticks,
+                removed_artifact_ticks,
+            }),
+        );
+    }
+
+    pub(super) fn record_monitor_membership(
+        &self,
+        chat_id: ChatId,
+        workdir: &Path,
+        monitor: super::MonitorMembership,
+    ) {
+        self.record_chat_metadata(
+            chat_id,
+            Line::MonitorMembers(MonitorMembersEntry {
+                chat_id,
+                cwd: Some(workdir.to_path_buf()),
+                monitor,
+            }),
+        );
+    }
+
+    /// Queues one Chat-level metadata line and wakes the background flush, so the change reaches
+    /// disk while a long-lived service keeps the Chat open.
+    fn record_chat_metadata(&self, chat_id: ChatId, line: Line) {
+        let Some(recorder) = &self.inner.recorder else {
+            return;
+        };
+        let Some(path) = recorder
+            .logs
+            .lock()
+            .unwrap()
+            .get(&chat_id)
+            .map(|log| log.path.clone())
+        else {
+            return;
+        };
+        recorder.writer.enqueue(&path, vec![line]);
+        recorder.notify.notify_one();
+        self.ensure_flush_loop(recorder);
     }
 
     pub(super) fn record_delegation(

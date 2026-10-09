@@ -44,6 +44,8 @@ pub use family::{
 pub use family_mailbox::MessageCause;
 mod artifact_ticks;
 mod chat_title;
+mod monitor_members;
+pub use monitor_members::{MonitorMember, MonitorMemberSource, MonitorMembership};
 mod compaction;
 mod context;
 mod delegation;
@@ -328,12 +330,18 @@ impl LoopSnapshot {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ChatSnapshot {
+    #[serde(default)]
+    pub failure_events: Vec<Event>,
+    #[serde(default)]
+    pub provider_failures: HashMap<String, crate::model::ProviderHttpFailure>,
     #[serde(skip)]
     pub tool_call_recoveries: Vec<ToolCallRecovery>,
     #[serde(default)]
     pub artifact_ticks: Vec<crate::artifacts::ArtifactTick>,
     #[serde(skip)]
     pub removed_artifact_ticks: std::collections::BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "MonitorMembership::is_empty")]
+    pub monitor: MonitorMembership,
     /// 本进程内的请求用量账本（不持久化，照 Claude Code 用量只记在 assistant 消息上）。
     #[serde(skip)]
     pub request_usage: RequestUsageLedger,
@@ -999,6 +1007,7 @@ struct Inner {
     settings_writes: Mutex<()>,
     /// 最近一次为各 Chat 读取用户设置时发现的问题。
     settings_warnings: std::sync::Mutex<HashMap<ChatId, Vec<String>>>,
+    provider_failures: std::sync::Mutex<HashMap<String, crate::model::ProviderHttpFailure>>,
     trusted_working_directories: std::sync::Mutex<HashSet<PathBuf>>,
     host_contexts: std::sync::Mutex<host_context::HostContexts>,
     subagent_invocations: Mutex<HashMap<(RunId, String), delegation::SubagentInvocation>>,
@@ -1298,9 +1307,12 @@ fn answerable_permission_request(
 
 fn empty_snapshot(id: ChatId, workdir: PathBuf, model: ModelConfig) -> ChatSnapshot {
     ChatSnapshot {
+        failure_events: Vec::new(),
+        provider_failures: HashMap::new(),
         tool_call_recoveries: Vec::new(),
         artifact_ticks: Vec::new(),
         removed_artifact_ticks: Default::default(),
+        monitor: MonitorMembership::default(),
         request_usage: RequestUsageLedger::new(),
         id,
         branch_origin: None,
@@ -1913,6 +1925,7 @@ impl Agent {
                 user_skills_directory,
                 settings_writes: Mutex::new(()),
                 settings_warnings: std::sync::Mutex::new(HashMap::new()),
+                provider_failures: std::sync::Mutex::new(HashMap::new()),
                 trusted_working_directories: std::sync::Mutex::new(HashSet::new()),
                 host_contexts: std::sync::Mutex::new(host_context::HostContexts::default()),
                 subagent_invocations: Mutex::new(HashMap::new()),
@@ -2634,6 +2647,9 @@ impl Agent {
             run_id: receipt.run_id,
             kind,
         };
+        if matches!(event.kind, EventKind::Failed(_)) {
+            chat.snapshot.failure_events.push(event.clone());
+        }
         chat.snapshot.events.push(event.clone());
         if chat.snapshot.events.len() > EVENT_REPLAY_LIMIT {
             chat.snapshot.events.remove(0);
@@ -3166,6 +3182,9 @@ impl Agent {
                             _ => None,
                         };
                         if let Some(tick) = tick { self.auto_attach_artifact_tick(chat, tick.clone()); }
+                        if let Some(crate::host_tools::HostEffect::OpenedTick { instance, title }) = &host_effect {
+                            self.record_opened_tick(chat, instance.clone(), title.clone());
+                        }
                     }
                     if let Some(crate::host_tools::HostEffect::PublishedSource(effect)) = host_effect
                         && !source_connection::has_recorded_publication(&chat.snapshot, &effect)
@@ -4294,7 +4313,11 @@ impl Agent {
             .lock()
             .await
             .get(&chat)
-            .map(|chat| chat.snapshot.clone())
+            .map(|chat| {
+                let mut snapshot = chat.snapshot.clone();
+                snapshot.provider_failures = self.inner.provider_failures.lock().unwrap().clone();
+                snapshot
+            })
             .ok_or(AgentError::NotFound)
     }
 

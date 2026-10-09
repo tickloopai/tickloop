@@ -18,8 +18,11 @@ use crate::{
     tools::{CommandSnapshot, SearchConfig},
 };
 
-pub const PROTOCOL_MAJOR: u16 = 6;
+/// Business 7.0 combines Monitor membership with required push-completion delivery and usage.
+/// Pre-push 6.0 peers are refused before dispatch; there are no minor feature gates.
+pub const PROTOCOL_MAJOR: u16 = 7;
 pub const PROTOCOL_MINOR: u16 = 0;
+
 pub const MAX_FRAME_BYTES: usize = 128 * 1024 * 1024;
 pub const RESPONSE_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 pub const FEED_CAPACITY: usize = 128;
@@ -247,6 +250,17 @@ pub enum AgentCommand {
     ListArtifactTicks {
         execution: ExecutionRef,
     },
+    /// Adds an existing Tick Instance to the Chat's Monitor without ownership or permission.
+    AddMonitorMember {
+        execution: ExecutionRef,
+        instance: tick_connect::instance::InstanceRef,
+        title: Option<String>,
+    },
+    /// Removes an instance from the Chat's Monitor view only.
+    RemoveMonitorMember {
+        execution: ExecutionRef,
+        instance: tick_connect::instance::InstanceRef,
+    },
     Create {
         launch: LaunchSpec,
         initial: Option<UserInput>,
@@ -335,6 +349,8 @@ impl AgentCommand {
             | Self::AddArtifactTick { execution, .. }
             | Self::RemoveArtifactTick { execution, .. }
             | Self::ListArtifactTicks { execution }
+            | Self::AddMonitorMember { execution, .. }
+            | Self::RemoveMonitorMember { execution, .. }
             | Self::EnqueueAfterTurn { execution, .. }
             | Self::RefreshConfiguration { execution } => Some(*execution),
             Self::DecidePermission { request, .. } | Self::AnswerQuestion { request, .. } => {
@@ -832,6 +848,7 @@ impl CommandReceipt {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum CommandResult {
     ArtifactTicks(Vec<crate::artifacts::ArtifactTick>),
+    MonitorMembership(crate::runtime::MonitorMembership),
     Created {
         execution: ExecutionRef,
         snapshot: Box<LiveChatSnapshot>,
@@ -1170,4 +1187,103 @@ pub(crate) enum ServerMessage {
         request_id: Option<Uuid>,
         error: AccessError,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn monitor_members_and_required_push_completion_fields_share_one_snapshot_wire() {
+        use runtime::{
+            FamilyCompletion, MonitorMember, MonitorMemberSource, SubagentNotificationDelivery,
+        };
+        let execution = ExecutionRef {
+            owner_epoch: Uuid::new_v4(),
+            agent_id: Uuid::new_v4(),
+            generation: 1,
+        };
+        let instance: tick_connect::instance::InstanceRef = "herdr:counter".parse().unwrap();
+        for notification in [
+            SubagentNotificationDelivery::Foreground,
+            SubagentNotificationDelivery::Pending,
+            SubagentNotificationDelivery::Queued,
+            SubagentNotificationDelivery::Rejected(runtime::FamilyMessageRejection {
+                code: runtime::FamilyMessageRejectionCode::StaleTarget,
+                message: "The receiving parent is stopped".into(),
+            }),
+        ] {
+            let mut snapshot: ChatSnapshot = serde_json::from_value(serde_json::json!({
+                "id":execution.agent_id, "workdir":"/test", "messages":[], "loops":[],
+            }))
+            .unwrap();
+            snapshot.monitor.members.push(MonitorMember {
+                instance: instance.clone(),
+                source: MonitorMemberSource::Added,
+                title: Some("Counter".into()),
+            });
+            snapshot.family_completions.push(FamilyCompletion {
+                notification,
+                usage: crate::model::Usage {
+                    input_tokens: Some(11),
+                    output_tokens: Some(7),
+                    ..Default::default()
+                },
+                child_chat_id: Uuid::new_v4(),
+                child_loop_id: Uuid::new_v4(),
+                child_run_id: Uuid::new_v4(),
+                handle: "audit".into(),
+                state: runtime::LoopState::Completed,
+                result: "Actual child report".into(),
+                error: None,
+                started_at: Some(1),
+                finished_at: 2,
+                triggering_message_ids: vec![],
+            });
+            let response = CommandResult::Loaded {
+                execution,
+                snapshot: Box::new(LiveChatSnapshot::from_snapshot(execution, snapshot, vec![])),
+            };
+            let wire = serde_json::to_value(response).unwrap();
+            let decoded: CommandResult = serde_json::from_value(wire.clone()).unwrap();
+            assert_eq!(serde_json::to_value(decoded).unwrap(), wire);
+            for required in ["notification", "usage"] {
+                let mut missing = wire.clone();
+                missing["Loaded"]["snapshot"]["conversation"]["family_completions"][0]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove(required);
+                assert!(
+                    serde_json::from_value::<CommandResult>(missing).is_err(),
+                    "{required} is part of the single required wire shape"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn monitor_membership_commands_cross_the_wire_unchanged() {
+        let execution = ExecutionRef {
+            owner_epoch: Uuid::new_v4(),
+            agent_id: Uuid::new_v4(),
+            generation: 1,
+        };
+        let instance: tick_connect::instance::InstanceRef = "herdr:counter".parse().unwrap();
+        for command in [
+            AgentCommand::AddMonitorMember {
+                execution,
+                instance: instance.clone(),
+                title: Some("Counter".into()),
+            },
+            AgentCommand::RemoveMonitorMember {
+                execution,
+                instance: instance.clone(),
+            },
+        ] {
+            let wire = serde_json::to_value(&command).unwrap();
+            let decoded: AgentCommand = serde_json::from_value(wire.clone()).unwrap();
+            assert_eq!(serde_json::to_value(&decoded).unwrap(), wire);
+            assert_eq!(decoded.execution(), Some(execution));
+        }
+    }
 }

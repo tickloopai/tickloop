@@ -14,6 +14,7 @@ pub(crate) enum Line {
     Assistant(ChainEntry),
     System(ChainEntry),
     ArtifactTicks(ArtifactTicksEntry),
+    MonitorMembers(MonitorMembersEntry),
     CustomTitle(CustomTitleEntry),
     AiTitle(AiTitleEntry),
     Subagents(SubagentsEntry),
@@ -43,6 +44,7 @@ pub(crate) enum MetadataKind {
     BranchOrigin,
     Delegation,
     ArtifactTicks,
+    MonitorMembers,
     Subagents,
     FamilyInputs,
     SentAgentMessages,
@@ -191,6 +193,8 @@ pub(crate) const LOOP_ENDED_SUBTYPE: &str = "loop_ended";
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct LoopRecord {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failure_events: Vec<serde_json::Value>,
     pub loop_id: Uuid,
     pub goal: String,
     pub state: serde_json::Value,
@@ -496,6 +500,23 @@ pub(crate) struct ArtifactTicksEntry {
     pub artifact_ticks: Vec<crate::artifacts::ArtifactTick>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
     pub removed_artifact_ticks: std::collections::BTreeSet<String>,
+}
+
+/// The latest Monitor membership of one Chat. An empty Chat with a working directory and members
+/// materializes its Transcript so the membership survives a restart.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct MonitorMembersEntry {
+    pub chat_id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<std::path::PathBuf>,
+    pub monitor: crate::runtime::MonitorMembership,
+}
+
+impl MonitorMembersEntry {
+    pub(crate) fn materializes_chat(&self) -> bool {
+        self.cwd.is_some() && !self.monitor.is_empty()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

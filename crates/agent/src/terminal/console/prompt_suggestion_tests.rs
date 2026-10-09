@@ -44,19 +44,19 @@ fn prompt_suggestion_is_ghost_text_until_tab_accepts_and_enter_submits() {
 }
 
 #[test]
-fn prompt_suggestion_right_accepts_before_the_tick_list_and_empty_enter_submits_once() {
+fn prompt_suggestion_right_accepts_before_the_monitor_and_empty_enter_submits_once() {
     for code in [KeyCode::Right, KeyCode::Enter] {
         let console = console();
         console
             .state
             .lock()
             .unwrap()
-            .tick_list
+            .monitor
             .replace(TickGroup::Artifacts, input_dialog_tests::fixture_ticks());
         show(&console, "run the tests");
         let mut state = console.state.lock().unwrap();
         let event = state.key(KeyEvent::new(code, KeyModifiers::NONE));
-        assert!(!state.tick_list.focused);
+        assert!(!state.monitor.focused);
         if code == KeyCode::Right {
             assert!(event.is_none());
             assert_eq!(state.editor.draft(), "run the tests");
@@ -69,6 +69,36 @@ fn prompt_suggestion_right_accepts_before_the_tick_list_and_empty_enter_submits_
             );
         }
     }
+}
+
+#[test]
+fn the_footer_hint_names_what_right_does_while_a_suggestion_is_visible() {
+    let console = console();
+    console
+        .state
+        .lock()
+        .unwrap()
+        .monitor
+        .replace(TickGroup::Artifacts, input_dialog_tests::fixture_ticks());
+    let hint = |console: &Console| {
+        let mut state = console.state.lock().unwrap();
+        let (lines, _, _) = state.normal_styled_frame();
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.text.as_str())
+                    .collect::<String>()
+            })
+            .find(|line| line.contains("? help"))
+            .unwrap()
+    };
+    assert!(hint(&console).contains("→ Monitor"));
+    show(&console, "run the tests");
+    let shown = hint(&console);
+    assert!(shown.contains("Tab/→ accept"), "{shown}");
+    assert!(!shown.contains("→ Monitor"), "{shown}");
 }
 
 #[test]

@@ -3,7 +3,7 @@ mod screen;
 
 mod support;
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::process::Command;
 use std::{process::Stdio, thread, time::Duration};
 
@@ -12,7 +12,9 @@ use serde_json::{Value, json};
 use tickloop_agent::settings::UserSettings;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 
-const INTERACTION_TIMEOUT: Duration = Duration::from_secs(10);
+/// Every wait here expects success; a real CLI with its own owner, worker and Shells needed more
+/// than ten seconds on a machine busy with parallel test runs. Only a failure waits this long.
+const INTERACTION_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn trust_working_directory(config_root: &std::path::Path, workdir: &std::path::Path) {
     UserSettings::in_root(config_root)
@@ -120,7 +122,7 @@ fn interactive_pty_trusts_the_directory_and_cycles_all_execution_modes() {
             pixel_height: 0,
         })
         .unwrap();
-    let mut reader = pty.master.try_clone_reader().unwrap();
+    let reader = pty.master.try_clone_reader().unwrap();
     let mut writer = pty.master.take_writer().unwrap();
     let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_tickloop"));
     command.env(
@@ -137,18 +139,8 @@ fn interactive_pty_trusts_the_directory_and_cycles_all_execution_modes() {
     drop(pty.slave);
     let output = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
     let reader_output = output.clone();
-    let output_reader = thread::spawn(move || {
-        let mut buffer = [0_u8; 4096];
-        while let Ok(length) = reader.read(&mut buffer) {
-            if length == 0 {
-                break;
-            }
-            reader_output
-                .lock()
-                .unwrap()
-                .push_str(&String::from_utf8_lossy(&buffer[..length]));
-        }
-    });
+    // Status glyphs are multi-byte; the shared capture keeps a character split across reads.
+    let output_reader = thread::spawn(move || screen::capture_output(reader, reader_output));
     let wait_for_output = |needle: &str, after: usize| {
         let deadline = std::time::Instant::now() + INTERACTION_TIMEOUT;
         let ansi = regex::Regex::new(r"\x1b\[[0-9;?]*[ -/]*[@-~]").unwrap();
@@ -161,7 +153,10 @@ fn interactive_pty_trusts_the_directory_and_cycles_all_execution_modes() {
                 return;
             }
             if std::time::Instant::now() >= deadline {
-                panic!("PTY output did not contain {needle:?}: {captured}");
+                // Release the output lock first, so the reader thread is not poisoned.
+                let text = captured.clone();
+                drop(captured);
+                panic!("PTY output did not contain {needle:?}: {text}");
             }
             drop(captured);
             thread::sleep(Duration::from_millis(20));
@@ -256,7 +251,10 @@ fn interactive_pty_opens_the_subscription_view_and_closes_it_with_escape() {
                 return;
             }
             if std::time::Instant::now() >= deadline {
-                panic!("PTY output did not contain {needle:?}: {captured}");
+                // Release the output lock first, so the reader thread is not poisoned.
+                let text = captured.clone();
+                drop(captured);
+                panic!("PTY output did not contain {needle:?}: {text}");
             }
             drop(captured);
             thread::sleep(Duration::from_millis(20));
@@ -1089,7 +1087,8 @@ async fn terminal_reports_failed_model_work_as_a_failed_process() {
     let server = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
         read_request(&mut socket).await;
-        socket.write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 14\r\nConnection: close\r\n\r\nserver-private").await.unwrap();
+        let body = "Access refused; Authorization: Bearer server-private";
+        socket.write_all(format!("HTTP/1.1 401 Unauthorized\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
     });
     let directory = tempfile::tempdir().unwrap();
     let config_path = directory.path().join("model.json");
@@ -1136,6 +1135,7 @@ async fn terminal_reports_failed_model_work_as_a_failed_process() {
     assert!(text.contains("Failed:"));
     assert!(!text.contains("Reply completed"));
     assert!(!text.contains("server-private"));
+    assert!(text.contains("Access refused"));
     server.await.unwrap();
 }
 
@@ -1312,15 +1312,22 @@ async fn a_run_whose_worker_is_lost_is_reported_and_the_cli_exits_at_end_of_inpu
         .expect("the worker socket identifies its peer");
     assert!(worker_pid > 0);
     assert_ne!(Some(worker_pid as u32), child.id());
+    let mut errors = child.stderr.take().unwrap();
+    let errors = tokio::spawn(async move {
+        let mut text = String::new();
+        let _ = errors.read_to_string(&mut text).await;
+        text
+    });
     assert_eq!(unsafe { libc::kill(worker_pid, libc::SIGKILL) }, 0);
     drop(input);
     let status = finish_process(child, output, &mut transcript).await;
-    assert!(!status.success(), "{transcript:?}");
+    let errors = errors.await.unwrap();
+    assert!(!status.success(), "{transcript:?}\n{errors}");
     assert!(
         transcript.iter().any(|line| {
             line.contains("unknown outcome") && line.contains("execution was lost")
         }),
-        "the run's lost execution is reported instead of awaited: {transcript:?}"
+        "the run's lost execution is reported instead of awaited: {transcript:?}\n{errors}"
     );
     assert!(
         transcript

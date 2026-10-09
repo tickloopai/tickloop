@@ -47,6 +47,9 @@ mod layout_tests;
 #[cfg(test)]
 #[path = "console/model_dialog_pty.rs"]
 mod model_dialog_pty;
+#[cfg(test)]
+#[path = "console/monitor_tests.rs"]
+mod monitor_tests;
 mod prompt_suggestion;
 #[cfg(test)]
 mod prompt_suggestion_pty;
@@ -55,9 +58,6 @@ mod prompt_suggestion_tests;
 #[cfg(test)]
 #[path = "console/request_layout_tests.rs"]
 mod request_layout_tests;
-#[cfg(test)]
-#[path = "console/tick_list_tests.rs"]
-mod tick_list_tests;
 #[cfg(test)]
 #[path = "console/unified_footer_tests.rs"]
 mod unified_footer_tests;
@@ -102,6 +102,7 @@ use super::{
         PastedText,
     },
     input_view::InputView,
+    monitor::{MONITOR_AUTO_MIN_COLUMNS, MONITOR_COLUMNS, Monitor, TickGroup},
     paste_blocks::{PasteBlocks, PasteRegistration},
     pasted_image_paths::{find_image_paths, read_pasted_image},
     permissions_surface::{
@@ -125,12 +126,13 @@ use super::{
         TaskOutputUpdate, TaskSurface, TaskSurfaceAction, TaskSurfaceEffect, TaskSurfaceFocus,
         TaskSurfaceSnapshot, TaskViewport,
     },
-    tick_list::{TICK_LIST_AUTO_MIN_COLUMNS, TICK_LIST_COLUMNS, TickGroup, TickList},
     transcript::{Transcript, TranscriptDocument, TranscriptEvent},
 };
 
 /// DECSTBM with no parameters: drop any scroll region the frame set up.
 const RESET_SCROLL_REGION: &str = "\x1b[r";
+/// The picker hint while a submitted choice is still being applied.
+pub(super) const MENU_SUBMISSION_PENDING_HINT: &str = "Working…";
 /// What a queued input names as its target when it starts a Loop of its own; one bound to an
 /// existing Loop of the shown Agent names nothing further.
 const NEW_LOOP_TARGET: &str = "new Loop";
@@ -184,7 +186,7 @@ impl TerminalSurface {
 }
 
 #[cfg(test)]
-use super::tick_list::TickListEntry;
+use super::monitor::MonitorEntry;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum RequestPresentation {
@@ -231,7 +233,7 @@ pub(super) enum InputEvent {
     OpenOverview,
     CloseOverview,
     OpenAgent(Uuid),
-    ToggleTickList {
+    ToggleMonitor {
         show: bool,
     },
     ArtifactChoice(Box<super::artifacts_picker::ArtifactChoice>),
@@ -282,8 +284,8 @@ pub(super) enum InputEvent {
 impl fmt::Debug for InputEvent {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ToggleTickList { show } => formatter
-                .debug_struct("ToggleTickList")
+            Self::ToggleMonitor { show } => formatter
+                .debug_struct("ToggleMonitor")
                 .field("show", show)
                 .finish(),
             Self::ArtifactChoice(choice) => formatter
@@ -408,6 +410,9 @@ pub(super) struct PickerPresentation {
     pub(super) connection_options: Option<usize>,
     pub(super) row_hints: Vec<String>,
     pub(super) compact_rows: Vec<CompactPickerRow>,
+    pub(super) failure_target: Option<Uuid>,
+    pub(super) failure_connections: Vec<Option<String>>,
+    pub(super) failure_message: bool,
 }
 
 #[derive(Clone)]
@@ -486,14 +491,10 @@ impl ArtifactMetadataSink {
         let Ok(mut state) = state.lock() else {
             return;
         };
-        let list = if state.chat == Some(chat) {
-            &mut state.tick_list
-        } else {
-            &mut state.view_cache.entry(Some(chat)).or_default().tick_list
-        };
-        list.metadata_failures.remove(&id);
-        list.metadata.insert(id, metadata);
-        list.rebuild();
+        let monitor = state.monitor_for_chat_mut(chat);
+        monitor.metadata_failures.remove(&id);
+        monitor.metadata.insert(id, metadata);
+        monitor.rebuild();
     }
 
     pub(super) fn failed(&self, chat: Uuid, id: String, error: String) {
@@ -504,13 +505,9 @@ impl ArtifactMetadataSink {
             return;
         };
         let is_current = state.chat == Some(chat);
-        let list = if is_current {
-            &mut state.tick_list
-        } else {
-            &mut state.view_cache.entry(Some(chat)).or_default().tick_list
-        };
-        list.metadata_failures.insert(id, error.clone());
-        list.rebuild();
+        let monitor = state.monitor_for_chat_mut(chat);
+        monitor.metadata_failures.insert(id, error.clone());
+        monitor.rebuild();
         if is_current {
             state.hold_status(&format!(
                 "Artifact refresh failed: {} · r retries",
@@ -568,8 +565,8 @@ pub(super) struct State {
     activity_interruptible: bool,
     back_to_bottom_target: Option<BackToBottomTarget>,
     back_to_bottom_pressed: bool,
-    tick_toggle_target: Option<BackToBottomTarget>,
-    tick_row_targets: Vec<TickRowTarget>,
+    monitor_toggle_target: Option<BackToBottomTarget>,
+    monitor_row_targets: Vec<MonitorRowTarget>,
     footer_bar_target: Option<FooterBarTarget>,
     pointer_input: Option<InputEvent>,
     completion: Completion,
@@ -644,8 +641,11 @@ pub(super) struct State {
     transcript: Option<(Uuid, Transcript)>,
     diff_screen: Option<DiffScreen>,
     diff_screen_cache: HashMap<Uuid, DiffDialog>,
-    pub(super) tick_list: TickList,
-    tick_list_preference: tickloop_agent::settings::TickListPreference,
+    pub(super) monitor: Monitor,
+    monitor_preference: tickloop_agent::settings::MonitorPreference,
+    /// Lists the View's Workspace programs for explicit adding; absent outside a Herdr View.
+    tick_discovery: Option<Arc<dyn crate::tick_adapter::TickDiscovery>>,
+    member_probe_running: bool,
     task_surface: Option<TaskSurface<Uuid>>,
     task_surface_cache: HashMap<Uuid, TaskSurface<Uuid>>,
     subscription_surface: Option<SubscriptionSurface>,
@@ -662,6 +662,8 @@ pub(super) struct State {
     footer_list_focused: bool,
     conversation_focused: bool,
     status: String,
+    provider_failure: Option<String>,
+    provider_failures: HashMap<Uuid, HashMap<String, crate::model::ProviderHttpFailure>>,
     configured_status_lines: Option<Vec<String>>,
     background_status_notice: Option<BackgroundStatusNotice>,
     connection_notice: Option<String>,
@@ -770,7 +772,7 @@ impl Default for ChatInput {
 
 #[derive(Default)]
 struct ViewPresentation {
-    pub(super) tick_list: TickList,
+    pub(super) monitor: Monitor,
     scrollback: Scrollback,
     echoed_inputs: HashSet<Uuid>,
     awaiting_input_echoes: HashSet<Uuid>,
@@ -865,11 +867,18 @@ struct FooterBarTarget {
     categories: Vec<(std::ops::Range<usize>, FooterItemId)>,
 }
 
-struct TickRowTarget {
+/// One claimed probe of a Chat's members; its result goes back through `update_member_states`.
+pub(super) struct MemberProbe {
+    pub(super) chat: Uuid,
+    pub(super) discovery: Arc<dyn crate::tick_adapter::TickDiscovery>,
+    pub(super) targets: Vec<crate::tick_stream::InstanceRef>,
+}
+
+struct MonitorRowTarget {
     chat: Uuid,
     row: usize,
     columns: std::ops::Range<usize>,
-    id: String,
+    instance: crate::tick_stream::InstanceRef,
 }
 
 fn status_notice_line(
@@ -1080,35 +1089,27 @@ impl Console {
         chat: Uuid,
         id: &str,
     ) -> Result<(), String> {
+        let instance: crate::tick_stream::InstanceRef = id.parse()?;
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         state.clear_artifact_picker(picker);
-        let overlay = state.width + 1 < TICK_LIST_AUTO_MIN_COLUMNS
-            || state.tick_list_preference == tickloop_agent::settings::TickListPreference::Hidden;
-        let list = state.tick_list_for_chat_mut(chat);
-        list.focus(overlay, Some(TickGroup::Artifacts));
-        list.select(id);
+        let overlay = state.monitor_overlay();
+        let monitor = state.monitor_for_chat_mut(chat);
+        monitor.focus(overlay, Some(TickGroup::Artifacts));
+        monitor.select(&instance);
         state.rendered_region = None;
         state
             .draw(&mut io::stdout().lock())
             .map_err(|error| error.to_string())
     }
 
-    pub(super) fn update_artifact_ticks(
+    pub(super) fn update_monitor_chat(
         &self,
         snapshot: &tickloop_agent::runtime::ChatSnapshot,
     ) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
-        let list = if state.chat == Some(snapshot.id) {
-            &mut state.tick_list
-        } else {
-            &mut state
-                .view_cache
-                .entry(Some(snapshot.id))
-                .or_default()
-                .tick_list
-        };
-        list.chat_snapshot = Some(snapshot.clone());
-        list.rebuild();
+        let monitor = state.monitor_for_chat_mut(snapshot.id);
+        monitor.chat_snapshot = Some(snapshot.clone());
+        monitor.rebuild();
         Ok(())
     }
     pub(super) fn update_artifact_metadata(
@@ -1118,14 +1119,10 @@ impl Console {
         metadata: Option<crate::artifacts::ArtifactMetadata>,
     ) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
-        let list = if state.chat == Some(chat) {
-            &mut state.tick_list
-        } else {
-            &mut state.view_cache.entry(Some(chat)).or_default().tick_list
-        };
-        list.metadata_failures.remove(&id);
-        list.metadata.insert(id, metadata);
-        list.rebuild();
+        let monitor = state.monitor_for_chat_mut(chat);
+        monitor.metadata_failures.remove(&id);
+        monitor.metadata.insert(id, metadata);
+        monitor.rebuild();
         Ok(())
     }
     pub(super) fn copy_artifact_link(&self, url: &str) -> Result<(), String> {
@@ -1146,7 +1143,7 @@ impl Console {
         if state.chat != Some(chat) {
             return Ok(());
         }
-        state.tick_list.confirmation = Some(super::tick_list::TickConfirmation {
+        state.monitor.confirmation = Some(super::monitor::TickConfirmation {
             instance,
             action,
             prompt: message.into(),
@@ -1154,19 +1151,91 @@ impl Console {
         state.status = message.into();
         Ok(())
     }
+    pub(super) fn set_tick_discovery(
+        &self,
+        discovery: Arc<dyn crate::tick_adapter::TickDiscovery>,
+    ) -> Result<(), String> {
+        self.state
+            .lock()
+            .map_err(|error| error.to_string())?
+            .tick_discovery = Some(discovery);
+        Ok(())
+    }
+    /// Opens the add picker in the current Chat's Monitor, even while the Monitor is empty.
+    pub(super) fn open_monitor_discovery(&self) -> Result<Option<InputEvent>, String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        let event = state.open_monitor_discovery();
+        state.rendered_region = None;
+        state
+            .draw(&mut io::stdout().lock())
+            .map_err(|error| error.to_string())?;
+        Ok(event)
+    }
+    /// Claims the next host probe of the visible Chat's members, if one is due and none runs.
+    pub(super) fn claim_member_probe(&self) -> Result<Option<MemberProbe>, String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        let (Some(chat), Some(discovery)) = (state.chat, state.tick_discovery.clone()) else {
+            return Ok(None);
+        };
+        let targets = state.monitor.probe_targets(discovery.tick_type());
+        if targets.is_empty() || state.member_probe_running {
+            return Ok(None);
+        }
+        state.member_probe_running = true;
+        Ok(Some(MemberProbe {
+            chat,
+            discovery,
+            targets,
+        }))
+    }
+    /// Applies a finished probe. A failed probe (`None`) keeps the earlier findings, and an
+    /// unchanged result neither rebuilds nor repaints.
+    pub(super) fn update_member_states(
+        &self,
+        chat: Uuid,
+        states: Option<HashMap<crate::tick_stream::InstanceRef, crate::tick_adapter::MemberState>>,
+    ) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        state.member_probe_running = false;
+        let Some(states) = states else {
+            return Ok(());
+        };
+        let visible = state.chat == Some(chat) && state.monitor_visible();
+        let monitor = state.monitor_for_chat_mut(chat);
+        if monitor.member_states == states {
+            return Ok(());
+        }
+        monitor.member_states = states;
+        monitor.rebuild();
+        if !visible {
+            return Ok(());
+        }
+        state.rendered_region = None;
+        state
+            .draw(&mut io::stdout().lock())
+            .map_err(|error| error.to_string())
+    }
+    pub(super) fn update_monitor_membership(
+        &self,
+        chat: Uuid,
+        membership: tickloop_agent::runtime::MonitorMembership,
+    ) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        state.monitor_for_chat_mut(chat).set_membership(membership);
+        state.rendered_region = None;
+        state
+            .draw(&mut io::stdout().lock())
+            .map_err(|error| error.to_string())
+    }
     pub(super) fn update_subscribed_ticks(
         &self,
         chat: Uuid,
         rows: &[TickSubscriptionStatus],
     ) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
-        let list = if state.chat == Some(chat) {
-            &mut state.tick_list
-        } else {
-            &mut state.view_cache.entry(Some(chat)).or_default().tick_list
-        };
-        list.subscriptions = rows.to_vec();
-        list.rebuild();
+        let monitor = state.monitor_for_chat_mut(chat);
+        monitor.subscriptions = rows.to_vec();
+        monitor.rebuild();
         Ok(())
     }
     pub(super) fn show_subscriptions_at(
@@ -1184,46 +1253,46 @@ impl Console {
                 surface.apply(SubscriptionAction::RequestCancel);
             }
         }
-        state.tick_list.focused = false;
-        state.tick_list.overlay = false;
+        state.monitor.focused = false;
+        state.monitor.overlay = false;
         state
             .draw(&mut io::stdout().lock())
             .map_err(|error| error.to_string())
     }
 
-    pub(super) fn tick_list_has_entries(&self) -> Result<bool, String> {
-        Ok(!self
-            .state
-            .lock()
-            .map_err(|error| error.to_string())?
-            .tick_list
-            .entries()
-            .is_empty())
-    }
-    pub(super) fn tick_list_is_visible(&self) -> Result<bool, String> {
+    pub(super) fn monitor_has_entries(&self) -> Result<bool, String> {
         Ok(self
             .state
             .lock()
             .map_err(|error| error.to_string())?
-            .tick_list_visible())
+            .monitor
+            .total()
+            > 0)
     }
-    pub(super) fn set_tick_list_preference(
+    pub(super) fn monitor_is_visible(&self) -> Result<bool, String> {
+        Ok(self
+            .state
+            .lock()
+            .map_err(|error| error.to_string())?
+            .monitor_visible())
+    }
+    pub(super) fn set_monitor_preference(
         &self,
-        preference: tickloop_agent::settings::TickListPreference,
+        preference: tickloop_agent::settings::MonitorPreference,
     ) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
-        state.tick_list_preference = preference;
-        state.tick_list.overlay = false;
-        state.tick_list.focused = false;
+        state.monitor_preference = preference;
+        state.monitor.overlay = false;
+        state.monitor.focused = false;
         state.rendered_region = None;
         state
             .draw(&mut io::stdout().lock())
             .map_err(|error| error.to_string())
     }
-    pub(super) fn open_tick_list(&self) -> Result<(), String> {
+    pub(super) fn open_monitor(&self) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
-        state.tick_list.overlay =
-            !state.tick_list.entries().is_empty() && state.width + 1 < TICK_LIST_AUTO_MIN_COLUMNS;
+        state.monitor.overlay =
+            state.monitor.total() > 0 && state.width + 1 < MONITOR_AUTO_MIN_COLUMNS;
         state.rendered_region = None;
         state
             .draw(&mut io::stdout().lock())
@@ -1234,9 +1303,9 @@ impl Console {
         snapshot: &tickloop_agent::runtime::ShellTaskSnapshot,
     ) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
-        let list = state.tick_list_for_chat_mut(snapshot.chat_id);
-        list.shell_snapshot = Some(snapshot.clone());
-        list.rebuild();
+        let monitor = state.monitor_for_chat_mut(snapshot.chat_id);
+        monitor.shell_snapshot = Some(snapshot.clone());
+        monitor.rebuild();
         Ok(())
     }
 
@@ -1244,10 +1313,10 @@ impl Console {
         &self,
     ) -> Result<Option<(Uuid, super::tick_actions::PreparedTickAction)>, String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
-        if !state.tick_list_visible() {
+        if !state.monitor_visible() {
             return Ok(None);
         }
-        let Some(detail) = state.tick_list.detail.as_mut() else {
+        let Some(detail) = state.monitor.detail.as_mut() else {
             return Ok(None);
         };
         let chat = detail.chat();
@@ -1262,8 +1331,8 @@ impl Console {
         update: impl FnOnce(&mut T) -> Option<R>,
     ) -> Result<Option<R>, String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
-        let list = state.tick_list_for_chat_mut(chat);
-        let Some(detail) = list
+        let monitor = state.monitor_for_chat_mut(chat);
+        let Some(detail) = monitor
             .detail
             .as_mut()
             .filter(|detail| detail.id() == panel)
@@ -1273,7 +1342,7 @@ impl Console {
         };
         let result = update(detail);
         if result.is_none() {
-            list.detail = None;
+            monitor.close_detail();
         }
         state
             .draw(&mut io::stdout().lock())
@@ -1753,6 +1822,27 @@ impl Console {
         state
             .draw(&mut io::stdout().lock())
             .map_err(|error| error.to_string())
+    }
+
+    pub(super) fn set_provider_failure(&self, failure: Option<String>) -> Result<(), String> {
+        self.state
+            .lock()
+            .map_err(|error| error.to_string())?
+            .provider_failure = failure;
+        Ok(())
+    }
+
+    pub(super) fn set_provider_failures(
+        &self,
+        chat: Uuid,
+        failures: &HashMap<String, crate::model::ProviderHttpFailure>,
+    ) -> Result<(), String> {
+        self.state
+            .lock()
+            .map_err(|error| error.to_string())?
+            .provider_failures
+            .insert(chat, failures.clone());
+        Ok(())
     }
 
     pub(super) fn update_status_area(
@@ -3267,7 +3357,15 @@ impl Console {
 
     pub(super) fn menu_snapshot(&self, id: Uuid) -> Result<Option<Menu>, String> {
         let state = self.state.lock().map_err(|error| error.to_string())?;
-        Ok(state.menu.as_ref().filter(|menu| menu.id == id).cloned())
+        Ok(state
+            .menu
+            .as_ref()
+            .filter(|menu| menu.id == id)
+            .map(|menu| {
+                let mut menu = menu.clone();
+                menu.context = state.picker_context(&menu);
+                menu
+            }))
     }
 
     pub(super) fn recover_menu(
@@ -3686,7 +3784,9 @@ impl Console {
         let navigation =
             state.menu_submission_pending == Some(id) && state.menu_submission_navigation;
         state.mark_menu_submission_finished(id);
-        if navigation && state.clear_finished_menu_submission() {
+        // A visible picker replaces its pending hint with its key hints at once.
+        let released = navigation && state.clear_finished_menu_submission();
+        if released || state.picker_kind.is_some() {
             state
                 .draw(&mut io::stdout().lock())
                 .map_err(|error| error.to_string())?;
@@ -4200,6 +4300,12 @@ impl ConversationPiece {
                 state,
                 ..
             } => scrollback.set_tool_call(*run_id, call_key, spans, *state),
+            Self::Styled(text, role) if *role == Some(Role::Error) => {
+                let links = hyperlink::web_links(text);
+                for (run, link) in hyperlink::runs(text, &links) {
+                    scrollback.append_span(run, *role, None, link);
+                }
+            }
             Self::Styled(text, role) => scrollback.append_as(text, *role, None),
             Self::Input {
                 spans,
@@ -4493,7 +4599,7 @@ impl State {
     fn replace_view(&mut self, mut next: ViewPresentation) -> ViewPresentation {
         next.status_area.agents_collapsed = self.status_area.agents_collapsed;
         ViewPresentation {
-            tick_list: std::mem::replace(&mut self.tick_list, next.tick_list),
+            monitor: std::mem::replace(&mut self.monitor, next.monitor),
             scrollback: std::mem::replace(&mut self.scrollback, next.scrollback),
             echoed_inputs: std::mem::replace(&mut self.echoed_inputs, next.echoed_inputs),
             awaiting_input_echoes: std::mem::replace(
@@ -4650,8 +4756,8 @@ impl State {
             activity_interruptible: false,
             back_to_bottom_target: None,
             back_to_bottom_pressed: false,
-            tick_toggle_target: None,
-            tick_row_targets: Vec::new(),
+            monitor_toggle_target: None,
+            monitor_row_targets: Vec::new(),
             footer_bar_target: None,
             pointer_input: None,
             completion: Completion::default(),
@@ -4713,8 +4819,10 @@ impl State {
             transcript: None,
             diff_screen: None,
             diff_screen_cache: HashMap::new(),
-            tick_list: TickList::default(),
-            tick_list_preference: tickloop_agent::settings::TickListPreference::Auto,
+            monitor: Monitor::default(),
+            monitor_preference: tickloop_agent::settings::MonitorPreference::Auto,
+            tick_discovery: None,
+            member_probe_running: false,
             task_surface: None,
             task_surface_cache: HashMap::new(),
             subscription_surface: None,
@@ -4731,6 +4839,8 @@ impl State {
             footer_list_focused: false,
             conversation_focused: false,
             status: String::new(),
+            provider_failure: None,
+            provider_failures: HashMap::new(),
             configured_status_lines: None,
             background_status_notice: None,
             connection_notice: None,
@@ -4953,34 +5063,34 @@ impl State {
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 if !self.input_dialog_visible()
-                    && self.tick_list_visible()
-                    && self.tick_list.confirmation.is_none()
+                    && self.monitor_visible()
+                    && self.monitor.confirmation.is_none()
                     && !self.menu_submission_is_pending()
                     && !self.branch_submission_owns_input()
-                    && let Some(id) = self
-                        .tick_row_targets
+                    && let Some(instance) = self
+                        .monitor_row_targets
                         .iter()
                         .find(|target| {
                             Some(target.chat) == self.chat
                                 && target.row == at.row
                                 && target.columns.contains(&at.column)
                         })
-                        .map(|target| target.id.clone())
+                        .map(|target| target.instance.clone())
                 {
                     self.clear_selection();
                     self.clear_footer_selection();
                     self.conversation_focused = false;
-                    self.tick_list.focus(self.tick_list.overlay, None);
-                    self.tick_list.select(&id);
+                    self.monitor.focus(self.monitor.overlay, None);
+                    self.monitor.select(&instance);
                     self.pointer_input =
                         self.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
                     return true;
                 }
-                if self.tick_toggle_target.as_ref().is_some_and(|target| {
+                if self.monitor_toggle_target.as_ref().is_some_and(|target| {
                     target.row == at.row && target.columns.contains(&at.column)
                 }) {
-                    self.pointer_input = Some(InputEvent::ToggleTickList {
-                        show: !self.tick_list_visible(),
+                    self.pointer_input = Some(InputEvent::ToggleMonitor {
+                        show: !self.monitor_visible(),
                     });
                     return true;
                 }
@@ -5115,9 +5225,37 @@ impl State {
         renderer::write_synchronized(output, |output| self.draw_frame(output))
     }
 
-    fn tick_list_visible(&self) -> bool {
+    /// Prepares the add picker and focuses Monitor for it.
+    fn open_monitor_discovery(&mut self) -> Option<InputEvent> {
+        let chat = self.chat?;
+        let executor = super::monitor_discovery::open(self.tick_discovery.clone());
+        match executor.prepare(&mut super::tick_actions::TickActionUi { state: self }) {
+            Ok(action) => {
+                let overlay = self.monitor_overlay();
+                self.monitor.focus(overlay, None);
+                Some(InputEvent::TickAction { chat, action })
+            }
+            Err(error) => {
+                self.hold_status(&error);
+                None
+            }
+        }
+    }
+
+    /// Whether a focused Monitor covers the conversation instead of sitting beside it.
+    fn monitor_overlay(&self) -> bool {
+        self.width + 1 < MONITOR_AUTO_MIN_COLUMNS
+            || self.monitor_preference == tickloop_agent::settings::MonitorPreference::Hidden
+    }
+
+    fn monitor_visible(&self) -> bool {
         self.chat.is_some()
-            && !self.tick_list.entries().is_empty()
+            && (self.monitor.total() > 0
+                || self
+                    .monitor
+                    .detail
+                    .as_ref()
+                    .is_some_and(|detail| detail.keeps_empty_monitor()))
             && self.overview.projection.is_none()
             && self.workspace_trust.is_none()
             && self.history_search.is_none()
@@ -5132,43 +5270,42 @@ impl State {
             && self.transcript.is_none()
             && self.diff_screen.is_none()
             && !self.full_review
-            && (self.tick_list.overlay
-                || self.width + 1 >= TICK_LIST_AUTO_MIN_COLUMNS
-                    && self.tick_list_preference
-                        == tickloop_agent::settings::TickListPreference::Auto)
+            && (self.monitor.overlay
+                || self.width + 1 >= MONITOR_AUTO_MIN_COLUMNS
+                    && self.monitor_preference == tickloop_agent::settings::MonitorPreference::Auto)
     }
 
     #[cfg(test)]
-    fn update_tick_entries(&mut self, chat: Uuid, group: TickGroup, entries: Vec<TickListEntry>) {
+    fn update_tick_entries(&mut self, chat: Uuid, group: TickGroup, entries: Vec<MonitorEntry>) {
         if self.chat == Some(chat) {
-            self.tick_list.replace(group, entries);
+            self.monitor.replace(group, entries);
         } else {
             self.view_cache
                 .entry(Some(chat))
                 .or_default()
-                .tick_list
+                .monitor
                 .replace(group, entries);
         }
     }
 
-    fn tick_list_for_chat_mut(&mut self, chat: Uuid) -> &mut TickList {
+    fn monitor_for_chat_mut(&mut self, chat: Uuid) -> &mut Monitor {
         if self.chat == Some(chat) {
-            &mut self.tick_list
+            &mut self.monitor
         } else {
-            &mut self.view_cache.entry(Some(chat)).or_default().tick_list
+            &mut self.view_cache.entry(Some(chat)).or_default().monitor
         }
     }
 
     fn content_columns(&self) -> usize {
-        if self.tick_list_visible() && !self.tick_list.overlay {
-            self.width.saturating_sub(TICK_LIST_COLUMNS).max(2)
+        if self.monitor_visible() && !self.monitor.overlay {
+            self.width.saturating_sub(MONITOR_COLUMNS).max(2)
         } else {
             self.width
         }
     }
 
     fn draw_frame(&mut self, output: &mut impl Write) -> io::Result<()> {
-        self.tick_row_targets.clear();
+        self.monitor_row_targets.clear();
         if self.full_review {
             let lines = self.full_review_frame();
             let rows = lines
@@ -5187,7 +5324,7 @@ impl State {
         }
         self.back_to_bottom_target = None;
         self.footer_bar_target = None;
-        self.tick_toggle_target = None;
+        self.monitor_toggle_target = None;
         if self.overview.projection.is_some() {
             let (bottom, row, column) = self.styled_frame();
             let top_height = self.height.saturating_sub(bottom.len());
@@ -5300,9 +5437,9 @@ impl State {
         self.initialize_screen(output)?;
         write!(output, "{RESET_SCROLL_REGION}")?;
         let padding = body_height.saturating_sub(body.lines.len());
-        let side_columns = TICK_LIST_COLUMNS.min(self.width);
-        let tick_lines = self.tick_list_visible().then(|| {
-            if let Some(detail) = &mut self.tick_list.detail {
+        let side_columns = MONITOR_COLUMNS.min(self.width);
+        let monitor_lines = self.monitor_visible().then(|| {
+            if let Some(detail) = &mut self.monitor.detail {
                 return detail
                     .lines(
                         side_columns.saturating_sub(2),
@@ -5313,22 +5450,23 @@ impl State {
                     .map(|line| line.line)
                     .collect();
             }
-            let frame = self.tick_list.frame(
+            let frame = self.monitor.frame(
                 side_columns.saturating_sub(2),
                 start,
                 self.display,
                 crate::private_fs::unix_time_milliseconds(),
+                self.tick_discovery.is_some() || !self.monitor.removed().is_empty(),
             );
             if let Some(chat) = self.chat {
                 let columns = self.width.saturating_sub(side_columns) + 1..self.width;
-                self.tick_row_targets = frame
+                self.monitor_row_targets = frame
                     .targets
                     .into_iter()
-                    .map(|(row, id)| TickRowTarget {
+                    .map(|(row, instance)| MonitorRowTarget {
                         chat,
                         row,
                         columns: columns.clone(),
-                        id,
+                        instance,
                     })
                     .collect();
             }
@@ -5353,7 +5491,7 @@ impl State {
                             .map(String::as_str)
                     })
                     .unwrap_or_default();
-                if let Some(tick_lines) = &tick_lines {
+                if let Some(monitor_lines) = &monitor_lines {
                     let left_columns = self.width.saturating_sub(side_columns);
                     let mut left = pinned
                         .cloned()
@@ -5362,7 +5500,7 @@ impl State {
                     left.truncate(left_columns);
                     let left =
                         self.with_selection(row, left.resolve(self.display.theme(), left_columns));
-                    let side = tick_lines.get(row).cloned().unwrap_or_default();
+                    let side = monitor_lines.get(row).cloned().unwrap_or_default();
                     let right = side.resolve(self.display.theme(), side_columns.saturating_sub(2));
                     format!(
                         "{}\x1b[0m│ {}",
@@ -5391,7 +5529,7 @@ impl State {
                 .render(self.colour_depth)
             }))
             .collect();
-        let scroll_rows = if sticky_prompt.is_none() && !self.tick_list_visible() {
+        let scroll_rows = if sticky_prompt.is_none() && !self.monitor_visible() {
             start
         } else {
             0
@@ -5415,13 +5553,16 @@ impl State {
                         .cloned()
                         .unwrap_or_default()
                 };
-                if let Some(tick_lines) = &tick_lines {
+                if let Some(monitor_lines) = &monitor_lines {
                     let left_columns = self.width.saturating_sub(side_columns);
                     let left = truncate_width(&line, left_columns);
                     format!(
                         "{left}{}│ {}",
                         " ".repeat(left_columns.saturating_sub(display_width(&left))),
-                        tick_lines.get(row).map(RoleLine::text).unwrap_or_default()
+                        monitor_lines
+                            .get(row)
+                            .map(RoleLine::text)
+                            .unwrap_or_default()
                     )
                 } else {
                     line
@@ -5448,7 +5589,7 @@ impl State {
             || (self.artifacts_picker.is_some() || self.conversation_picker.is_some())
                 && !self.dialog_cursor_visible
             || self.conversation_focused
-            || self.tick_list.focused && self.tick_list_visible() && !self.input_dialog_visible()
+            || self.monitor.focused && self.monitor_visible() && !self.input_dialog_visible()
         {
             queue!(output, Hide)?;
         } else {
@@ -5606,6 +5747,31 @@ impl State {
             .map(|(_, header)| header.as_str())
     }
 
+    fn picker_context(&self, menu: &Menu) -> Vec<String> {
+        let mut context = menu.context.clone();
+        if let Some(failure) = self
+            .picker_presentation
+            .failure_target
+            .and_then(|chat| self.provider_failures.get(&chat))
+            .and_then(|failures| {
+                self.picker_presentation
+                    .failure_connections
+                    .get(menu.selected)
+                    .and_then(Option::as_ref)
+                    .and_then(|connection| failures.get(connection))
+            })
+        {
+            context.splice(
+                0..0,
+                super::menus::providers::provider_failure_context(failure),
+            );
+            if self.picker_presentation.failure_message {
+                context.push(format!("Provider message: {}", failure.message));
+            }
+        }
+        context
+    }
+
     fn request_styled_frame(&mut self, capacity: usize) -> (Vec<RoleLine>, usize, usize) {
         if !self.menu_is_visible() {
             let mut lines = vec![RoleLine::role(
@@ -5620,6 +5786,7 @@ impl State {
         }
         let menu = self.menu.as_ref().expect("request menu is visible");
         let selected = menu.selected.min(menu.options.len().saturating_sub(1));
+        let picker_context = self.picker_context(menu);
         let title_rows = usize::from(capacity > 1);
         let hint_rows = usize::from(capacity > 2);
         let input_field = self.input_menu_active();
@@ -5704,7 +5871,7 @@ impl State {
                         .get(selected)
                         .is_some(),
             ) + usize::from(picker && !self.picker_presentation.headers.is_empty());
-        let context_reserve = usize::from(!menu.context.is_empty() || self.menu_review.is_some())
+        let context_reserve = usize::from(!picker_context.is_empty() || self.menu_review.is_some())
             * capacity
                 .saturating_sub(title_rows + hint_rows + comment_rows + minimum_option_rows)
                 .min(2);
@@ -5820,8 +5987,7 @@ impl State {
                     }
                 }));
             } else {
-                let context = menu
-                    .context
+                let context = picker_context
                     .iter()
                     .flat_map(|line| {
                         let link = self
@@ -6250,6 +6416,7 @@ impl State {
                         > self.width
             });
         let required_status = !self.status.is_empty() && command_feedback.is_none()
+            || self.provider_failure.is_some()
             || self.confirmation_hint().is_some()
             || short && !overview && !self.queued_inputs.is_empty()
             || !overview
@@ -6473,7 +6640,7 @@ impl State {
             );
         }
         let mut return_control = None;
-        let mut tick_control = None;
+        let mut monitor_toggle = None;
         if borders > 0 {
             let can_return = self.ordinary_input_is_visible() && !self.scrollback.is_following();
             let content_columns = self.content_columns();
@@ -6509,17 +6676,17 @@ impl State {
             if self.chat.is_some()
                 && self.overview.projection.is_none()
                 && !self.help_open
-                && !self.tick_list.entries().is_empty()
+                && self.monitor.total() > 0
             {
                 let label = format!(
-                    "{} Ticks {}",
+                    "{} Monitor {}",
                     self.display.glyph(Glyph::ProtocolTick),
-                    self.tick_list.entries().len()
+                    self.monitor.total()
                 );
                 let label_width = display_width(&label);
                 if label_width + DIVIDER_ENTRY_GAP_COLUMNS + DIVIDER_EDGE_RULE_COLUMNS <= self.width
                 {
-                    let tick_edge_width = if label_width
+                    let monitor_edge_width = if label_width
                         + DIVIDER_ENTRY_GAP_COLUMNS
                         + edge_width
                         + DIVIDER_EDGE_RULE_COLUMNS
@@ -6530,7 +6697,7 @@ impl State {
                         0
                     };
                     let column =
-                        self.width - label_width - tick_edge_width - DIVIDER_ENTRY_GAP_COLUMNS;
+                        self.width - label_width - monitor_edge_width - DIVIDER_ENTRY_GAP_COLUMNS;
                     let line = lines.last_mut().unwrap();
                     line.truncate(column);
                     if let Some((handle, role)) = &child_badge {
@@ -6546,19 +6713,19 @@ impl State {
                     line.push(" ".repeat(DIVIDER_ENTRY_GAP_COLUMNS), None);
                     line.push(
                         label,
-                        Some(if self.tick_list_visible() {
+                        Some(if self.monitor_visible() {
                             Role::Permission
                         } else {
                             Role::MutedText
                         }),
                     );
-                    if tick_edge_width > 0 {
+                    if monitor_edge_width > 0 {
                         line.push(" ".repeat(DIVIDER_ENTRY_GAP_COLUMNS), None);
                         line.push("─".repeat(DIVIDER_EDGE_RULE_COLUMNS), Some(border));
                     }
-                    tick_control = Some((
+                    monitor_toggle = Some((
                         lines.len() - 1,
-                        column + DIVIDER_ENTRY_GAP_COLUMNS..self.width - tick_edge_width,
+                        column + DIVIDER_ENTRY_GAP_COLUMNS..self.width - monitor_edge_width,
                     ));
                     if return_control
                         .as_ref()
@@ -6568,7 +6735,7 @@ impl State {
                     }
                 }
             }
-            if tick_control.is_none()
+            if monitor_toggle.is_none()
                 && let Some((handle, role)) = &child_badge
                 && let Some(line) = lines.last_mut()
             {
@@ -6729,13 +6896,13 @@ impl State {
                         notice = notice_line.text();
                         let overview_list_hint;
                         let return_hint;
-                        let tick_hint;
+                        let monitor_hint;
                         let hints = if self.confirmation_hint().is_some() || self.help_open {
                             // Help is focused and draws its own close hint; only facts remain.
                             ""
-                        } else if self.tick_list_visible() && self.tick_list.focused {
-                            tick_hint = self.tick_list.detail.as_ref().map_or_else(|| "Esc input".into(), |detail| detail.hint());
-                            tick_hint.as_str()
+                        } else if self.monitor_visible() && self.monitor.focused {
+                            monitor_hint = self.monitor.detail.as_ref().map_or_else(|| "Esc input".into(), |detail| detail.hint());
+                            monitor_hint.as_str()
                         } else if self.foreground_shell {
                             "Shell running · Ctrl+B background · Ctrl+C stop"
                         } else if self.footer.selected().is_some() || float_core_status {
@@ -6763,7 +6930,8 @@ impl State {
                             return_hint = self.back_to_bottom_label().unwrap_or_default();
                             return_hint.as_str()
                         } else if self.editor.draft().is_empty() {
-                            if self.tick_list.entries().is_empty() { "← Agents · ? help · Ctrl+O details · Ctrl+G editor · Ctrl+C interrupt" } else { "← Agents · → Ticks · ? help · Ctrl+O details · Ctrl+G editor · Ctrl+C interrupt" }
+                            // A visible suggestion takes Tab and →, so → no longer opens Monitor.
+                            if self.visible_prompt_suggestion().is_some() { "← Agents · Tab/→ accept · ? help · Ctrl+O details · Ctrl+G editor · Ctrl+C interrupt" } else if self.monitor.total() == 0 { "← Agents · ? help · Ctrl+O details · Ctrl+G editor · Ctrl+C interrupt" } else { "← Agents · → Monitor · ? help · Ctrl+O details · Ctrl+G editor · Ctrl+C interrupt" }
                         } else {
                             "Enter send · Ctrl+G editor · Ctrl+C clear"
                         };
@@ -6873,7 +7041,7 @@ impl State {
         for line in &mut lines {
             line.truncate(self.width);
         }
-        self.tick_toggle_target = tick_control.map(|(row, columns)| BackToBottomTarget {
+        self.monitor_toggle_target = monitor_toggle.map(|(row, columns)| BackToBottomTarget {
             row: self.height.saturating_sub(lines.len()) + row,
             columns,
         });
@@ -8094,6 +8262,12 @@ impl State {
 
     fn picker_hint(&self) -> Option<&str> {
         self.picker_kind.map(|_| {
+            // Keys are ignored until the submitted choice finishes, so no key hint is offered.
+            if self.menu_submission_pending.is_some()
+                && self.menu_submission_finished != self.menu_submission_pending
+            {
+                return MENU_SUBMISSION_PENDING_HINT;
+            }
             self.menu
                 .as_ref()
                 .and_then(|menu| self.picker_presentation.row_hints.get(menu.selected))
@@ -8265,7 +8439,7 @@ impl State {
             picker.paste(text);
             return;
         }
-        if !self.input_dialog_visible() && self.tick_list.focused && self.tick_list_visible() {
+        if !self.input_dialog_visible() && self.monitor.focused && self.monitor_visible() {
             return;
         }
         if self.input_menu_active() {
@@ -8792,6 +8966,12 @@ impl State {
     }
 
     fn status_notice(&self, status: &str) -> String {
+        let with_failure = match &self.provider_failure {
+            Some(failure) if status.is_empty() => failure.clone(),
+            Some(failure) => format!("{status} · {failure}"),
+            None => status.to_owned(),
+        };
+        let status = with_failure.as_str();
         let Some(hint) = self.confirmation_hint() else {
             return status.to_owned();
         };
@@ -9105,20 +9285,20 @@ impl State {
         if self.menu.is_none()
             && self.input_dialog_body_height() < 3
             && key.code == KeyCode::Enter
-            && (self.tick_list.confirmation.is_some()
+            && (self.monitor.confirmation.is_some()
                 || self
-                    .tick_list
+                    .monitor
                     .detail
                     .as_ref()
                     .is_some_and(|detail| detail.confirmation().is_some()))
         {
             return None;
         }
-        if self.menu.is_none() && self.tick_list.confirmation.is_some() {
+        if self.menu.is_none() && self.monitor.confirmation.is_some() {
             if key.code == KeyCode::Esc {
-                self.tick_list.confirmation = None;
+                self.monitor.confirmation = None;
             } else if key.code == KeyCode::Enter {
-                let confirmation = self.tick_list.confirmation.take().unwrap();
+                let confirmation = self.monitor.confirmation.take().unwrap();
                 let chat = self.chat?;
                 match confirmation
                     .action
@@ -9135,24 +9315,24 @@ impl State {
         }
         if (!self.input_dialog_visible()
             || self
-                .tick_list
+                .monitor
                 .detail
                 .as_ref()
                 .is_some_and(|detail| detail.confirmation().is_some()))
             && self.menu.is_none()
             && !self.help_open
-            && self.tick_list_visible()
-            && self.tick_list.focused
+            && self.monitor_visible()
+            && self.monitor.focused
         {
-            let width = TICK_LIST_COLUMNS.min(self.width).saturating_sub(2);
+            let width = MONITOR_COLUMNS.min(self.width).saturating_sub(2);
             let height = self.height.saturating_sub(self.styled_frame().0.len());
-            if let Some(detail) = self.tick_list.detail.as_mut() {
+            if let Some(detail) = self.monitor.detail.as_mut() {
                 let chat = detail.chat();
                 let result = detail.key(key, width, height);
                 return match result {
                     super::tick_actions::TickDetailKey::None => None,
                     super::tick_actions::TickDetailKey::Back => {
-                        self.tick_list.detail = None;
+                        self.monitor.close_detail();
                         self.rendered_region = None;
                         None
                     }
@@ -9162,25 +9342,28 @@ impl State {
                 };
             }
             match (key.code, key.modifiers) {
-                (KeyCode::Char('r'), KeyModifiers::NONE) => {
+                (KeyCode::Char(crate::tick_adapter::MONITOR_ADD_KEY), KeyModifiers::NONE) => {
+                    return self.open_monitor_discovery();
+                }
+                (KeyCode::Char(crate::tick_adapter::MONITOR_REFRESH_KEY), KeyModifiers::NONE) => {
                     let chat = self.chat?;
-                    let executor = self.tick_list.refresh_action();
+                    let executor = self.monitor.refresh_action();
                     let action = executor
                         .prepare(&mut super::tick_actions::TickActionUi { state: self })
                         .ok()?;
                     return Some(InputEvent::TickAction { chat, action });
                 }
                 (KeyCode::Esc | KeyCode::Left, _) => {
-                    self.tick_list.focused = false;
-                    self.tick_list.overlay = false;
+                    self.monitor.focused = false;
+                    self.monitor.overlay = false;
                     self.rendered_region = None;
                 }
                 (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE)
-                | (KeyCode::Char('n'), KeyModifiers::CONTROL) => self.tick_list.move_selection(1),
+                | (KeyCode::Char('n'), KeyModifiers::CONTROL) => self.monitor.move_selection(1),
                 (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE)
-                | (KeyCode::Char('p'), KeyModifiers::CONTROL) => self.tick_list.move_selection(-1),
+                | (KeyCode::Char('p'), KeyModifiers::CONTROL) => self.monitor.move_selection(-1),
                 (KeyCode::Enter, _) | (KeyCode::Char(_), KeyModifiers::NONE) => {
-                    if let Some(entry) = self.tick_list.selected().cloned() {
+                    if let Some(entry) = self.monitor.selected().cloned() {
                         let action_key = match key.code {
                             KeyCode::Enter => 'o',
                             KeyCode::Char(key) => key,
@@ -9191,7 +9374,7 @@ impl State {
                             .iter()
                             .find(|action| action.key == action_key)?;
                         match &action.operation {
-                            crate::tick_adapter::TickListOperation::Execute(executor) => {
+                            crate::tick_adapter::MonitorOperation::Execute(executor) => {
                                 let chat = self.chat?;
                                 match executor
                                     .prepare(&mut super::tick_actions::TickActionUi { state: self })
@@ -9202,10 +9385,7 @@ impl State {
                                     Err(error) => self.hold_status(&error),
                                 }
                             }
-                            crate::tick_adapter::TickListOperation::RemoveLocal => {
-                                self.tick_list.remove_local(&entry.id)
-                            }
-                            crate::tick_adapter::TickListOperation::Notify(message) => {
+                            crate::tick_adapter::MonitorOperation::Notify(message) => {
                                 self.hold_status(message)
                             }
                         }
@@ -9230,7 +9410,7 @@ impl State {
             }
         }
         if self.chat.is_some()
-            && !self.tick_list.entries().is_empty()
+            && self.monitor.total() > 0
             && self.ordinary_input_is_visible()
             && !self.conversation_focused
             && !self.footer_list_focused
@@ -9243,13 +9423,10 @@ impl State {
                     (KeyCode::Up | KeyCode::Down, KeyModifiers::SHIFT)
                 ))
         {
-            let overlay = self.width + 1 < TICK_LIST_AUTO_MIN_COLUMNS
-                || self.tick_list_preference
-                    == tickloop_agent::settings::TickListPreference::Hidden;
             let group = (key.modifiers == KeyModifiers::SHIFT).then_some(TickGroup::Shells);
-            self.tick_list.focus(overlay, group);
+            self.monitor.focus(self.monitor_overlay(), group);
             let chat = self.chat?;
-            let executor = self.tick_list.refresh_action();
+            let executor = self.monitor.refresh_action();
             let action = executor
                 .prepare(&mut super::tick_actions::TickActionUi { state: self })
                 .ok()?;
@@ -16919,12 +17096,12 @@ mod tests {
         let panel = {
             let mut state = console.state.lock().unwrap();
             state
-                .tick_list
-                .select(&crate::tick_stream::InstanceRef::shell(task).to_string());
+                .monitor
+                .select(&crate::tick_stream::InstanceRef::shell(task));
             state.key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
             state
-                .tick_list
-                .select(&crate::tick_stream::InstanceRef::shell(task).to_string());
+                .monitor
+                .select(&crate::tick_stream::InstanceRef::shell(task));
             let Some(InputEvent::TickAction { action, .. }) = state.key(key(KeyCode::Enter)) else {
                 panic!("Shell did not open the Tick panel");
             };
@@ -16932,7 +17109,7 @@ mod tests {
                 action.instance,
                 crate::tick_stream::InstanceRef::shell(task).to_string()
             );
-            state.tick_list.detail.as_ref().unwrap().id()
+            state.monitor.detail.as_ref().unwrap().id()
         };
         console
             .update_tick_detail::<crate::terminal::tick_shell::TickShell, _>(
@@ -16944,10 +17121,10 @@ mod tests {
         let mut state = console.state.lock().unwrap();
         state.key(key(KeyCode::Esc));
         assert!(state.task_surface.is_none());
-        assert!(state.tick_list.detail.is_none());
+        assert!(state.monitor.detail.is_none());
         assert_eq!(
-            state.tick_list.selected().unwrap().id,
-            crate::tick_stream::InstanceRef::shell(task).to_string()
+            state.monitor.selected().unwrap().instance,
+            crate::tick_stream::InstanceRef::shell(task)
         );
         assert_eq!(state.editor.draft(), "keep this draft");
     }
@@ -17023,9 +17200,9 @@ mod tests {
                 state.key(KeyEvent::new(direction, KeyModifiers::SHIFT)),
                 Some(InputEvent::TickAction { action, .. }) if action.key == 'r'
             ));
-            assert!(state.tick_list.focused);
-            assert!(state.tick_list.overlay);
-            assert_eq!(state.tick_list.selected().unwrap().group, TickGroup::Shells);
+            assert!(state.monitor.focused);
+            assert!(state.monitor.overlay);
+            assert_eq!(state.monitor.selected().unwrap().group, TickGroup::Shells);
             assert_eq!(state.editor.draft(), "draft");
         }
     }
@@ -17162,7 +17339,7 @@ mod tests {
         assert!(state.key(key(KeyCode::Char('j'))).is_none());
         assert_eq!(state.editor.draft(), "preserved draft");
         state.key(key(KeyCode::Esc));
-        assert!(!state.tick_list.focused);
+        assert!(!state.monitor.focused);
         state.key(key(KeyCode::Char('x')));
         assert_eq!(state.editor.draft(), "preserved draftx");
     }
@@ -18783,6 +18960,62 @@ mod tests {
                 && line.text().contains(&format!("Model {expected:02}"))));
             state.key(key(KeyCode::Char('k')));
         }
+    }
+
+    #[test]
+    fn provider_diagnostics_follow_model_keys_and_live_snapshot_without_moving_focus() {
+        let chat = Uuid::new_v4();
+        let mut state = State::new(true, 120, 25);
+        state.prompt_enabled = true;
+        state.menu_focused = true;
+        state.picker_kind = Some(PickerKind::Model);
+        let mut picker = menu();
+        picker.options = vec!["DeepSeek".into(), "MiniMax".into()];
+        picker.selected = 0;
+        let id = picker.id;
+        state.menu = Some(picker);
+        state.picker_presentation.failure_target = Some(chat);
+        state.picker_presentation.failure_connections =
+            vec![Some("deepseek-api".into()), Some("minimax-api".into())];
+        state.provider_failures.insert(
+            chat,
+            HashMap::from([(
+                "deepseek-api".into(),
+                crate::model::ProviderHttpFailure {
+                    provider_id: "deepseek-api".into(),
+                    provider_name: "DeepSeek".into(),
+                    status: 403,
+                    class: crate::model::ProviderFailureClass::UsageLimit,
+                    message: "Monthly limit".into(),
+                    hint: "Check allowance".into(),
+                    retry_after: None,
+                    retryable: false,
+                },
+            )]),
+        );
+        let context = |state: &State| {
+            state
+                .picker_context(state.menu.as_ref().unwrap())
+                .join("\n")
+        };
+        assert!(context(&state).contains("DeepSeek · HTTP 403"));
+        for down in [
+            key(KeyCode::Char('j')),
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
+        ] {
+            assert!(state.key(down).is_none());
+            assert!(!context(&state).contains("HTTP 403"));
+            assert!(state.key(key(KeyCode::Char('k'))).is_none());
+            assert!(context(&state).contains("HTTP 403"));
+        }
+        state
+            .provider_failures
+            .insert(Uuid::new_v4(), HashMap::new());
+        assert!(context(&state).contains("HTTP 403"));
+        state.provider_failures.insert(chat, HashMap::new());
+        assert!(!context(&state).contains("HTTP 403"));
+        assert_eq!(state.menu.as_ref().unwrap().id, id);
+        assert_eq!(state.menu.as_ref().unwrap().selected, 0);
     }
 
     #[test]

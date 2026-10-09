@@ -355,6 +355,31 @@ impl EmbeddedAgentAccess {
                     self.inner.agent.artifact_ticks(chat).await?,
                 ))
             }
+            AgentCommand::AddMonitorMember {
+                execution,
+                instance,
+                title,
+            } => {
+                let chat = self.chat(execution).await?;
+                Ok(CommandResult::MonitorMembership(
+                    self.inner
+                        .agent
+                        .add_monitor_member(chat, instance, title)
+                        .await?,
+                ))
+            }
+            AgentCommand::RemoveMonitorMember {
+                execution,
+                instance,
+            } => {
+                let chat = self.chat(execution).await?;
+                Ok(CommandResult::MonitorMembership(
+                    self.inner
+                        .agent
+                        .remove_monitor_member(chat, instance)
+                        .await?,
+                ))
+            }
             AgentCommand::Create {
                 launch,
                 initial,

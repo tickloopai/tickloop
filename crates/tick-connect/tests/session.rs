@@ -35,8 +35,10 @@ for line in sys.stdin:
             script.to_string_lossy().into_owned(),
         ],
         cwd: directory.path().into(),
-        host_socket: PathBuf::from("/tmp/example-herdr.sock"),
-        terminal_id: "fixture-terminal".into(),
+        backend: tick_connect::session::SessionBackend::Herdr {
+            socket: PathBuf::from("/tmp/example-herdr.sock"),
+            terminal_id: "fixture-terminal".into(),
+        },
         runtime_dir: Some(directory.path().join("sessions")),
     })
     .await
@@ -87,8 +89,10 @@ for line in sys.stdin:
             script.to_string_lossy().into_owned(),
         ],
         cwd: directory.path().into(),
-        host_socket: PathBuf::from("/tmp/example-herdr.sock"),
-        terminal_id: "jcs-pane".into(),
+        backend: tick_connect::session::SessionBackend::Herdr {
+            socket: PathBuf::from("/tmp/example-herdr.sock"),
+            terminal_id: "jcs-pane".into(),
+        },
         runtime_dir: Some(directory.path().join("sessions")),
     })
     .await
@@ -107,5 +111,81 @@ for line in sys.stdin:
         .unwrap();
     assert_eq!(result, json!({"value":1}));
     assert_eq!(client.read().await.unwrap().data, Some(json!({"value":1})));
+    session.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_hosted_session_answers_only_its_own_terminal_binding() {
+    use tick_connect::{
+        hosted::HostedTerminal,
+        session::{SessionBackend, SessionClient},
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let script = directory.path().join("quiet.py");
+    std::fs::write(&script, r#"
+import json, os, sys
+instance = os.environ['TICKLOOP_INSTANCE_ID']
+for line in sys.stdin:
+    request = json.loads(line)
+    if request['method'] == 'tick/describe':
+        result = {'protocol':2,'tick_type':'example.quiet','title':'Quiet','description':'Quiet','recover_with':None,'tools':[]}
+    else:
+        result = {'version':3,'tick_instance_id':instance,'initialized':True,'sequence':0,'observed_at':'2026-10-07T00:00:00Z','data':{}}
+    print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}),flush=True)
+"#).unwrap();
+    let terminal = HostedTerminal {
+        endpoint: directory.path().join("host.sock"),
+        epoch: uuid::Uuid::new_v4(),
+        terminal: uuid::Uuid::new_v4(),
+    };
+    let sessions = directory.path().join("sessions");
+    let session = TickSession::spawn(SessionLaunch {
+        command: vec![
+            "python3".into(),
+            "-u".into(),
+            script.to_string_lossy().into_owned(),
+        ],
+        cwd: directory.path().into(),
+        backend: SessionBackend::Hosted(terminal.clone()),
+        runtime_dir: Some(sessions.clone()),
+    })
+    .await
+    .unwrap();
+    let instance = session.instance().clone();
+    assert!(instance.hosted_run().is_some(), "{instance}");
+    SessionClient::connect(
+        instance.clone(),
+        SessionBackend::Hosted(terminal.clone()),
+        Some(sessions.clone()),
+    )
+    .await
+    .expect("the binding it was launched with");
+    let restarted_host = HostedTerminal {
+        epoch: uuid::Uuid::new_v4(),
+        ..terminal.clone()
+    };
+    assert!(
+        SessionClient::connect(
+            instance.clone(),
+            SessionBackend::Hosted(restarted_host),
+            Some(sessions.clone()),
+        )
+        .await
+        .is_err(),
+        "another host epoch is another binding"
+    );
+    assert!(
+        SessionClient::connect(
+            instance,
+            SessionBackend::Herdr {
+                socket: PathBuf::from("/tmp/example-herdr.sock"),
+                terminal_id: "fixture-terminal".into(),
+            },
+            Some(sessions),
+        )
+        .await
+        .is_err(),
+        "a hosted instance never belongs to a Herdr terminal"
+    );
     session.shutdown().await.unwrap();
 }

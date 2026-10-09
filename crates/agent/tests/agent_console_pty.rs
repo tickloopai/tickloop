@@ -27,6 +27,9 @@ mod unified_footer;
 #[path = "agent_console_pty/auto_review.rs"]
 mod auto_review;
 
+#[path = "agent_console_pty/provider_errors.rs"]
+mod provider_errors;
+
 use std::{
     io::{Read, Write},
     panic::AssertUnwindSafe,
@@ -46,6 +49,8 @@ mod screen {
 const TERMINAL_WIDTH: usize = 100;
 const TERMINAL_HEIGHT: usize = 32;
 const UI_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long the topmost history line must stay unchanged before wheel scrolling counts as done.
+const WHEEL_SETTLE_TIME: Duration = Duration::from_millis(1500);
 const COMPLETED_FRAME_START: &str = "\x1b[?2026h";
 const COMPLETED_FRAME_END: &str = "\x1b[?2026l";
 const CURSOR_VISIBLE: &str = "\x1b[?25h";
@@ -512,7 +517,7 @@ async fn run_lifecycle(fixture: &PrivateFixture) {
     reopened
         .wait_for(
             "open live Agent exposes its real background Task",
-            |frame| frame.contains("Ticks 1") && !frame.contains("Agents · local"),
+            |frame| frame.contains("Monitor 1") && !frame.contains("Agents · local"),
         )
         .await;
     let rows = catalog(&client).await;
@@ -522,13 +527,13 @@ async fn run_lifecycle(fixture: &PrivateFixture) {
     reopened.send(b"?");
     reopened
         .wait_for("help replaces the real Task summary", |frame| {
-            frame.contains("Ctrl+J newline") && !frame.contains("Ticks 1")
+            frame.contains("Ctrl+J newline") && !frame.contains("Monitor 1")
         })
         .await;
     reopened.send(b"\x1b");
     reopened
         .wait_for("help restores the real Task summary", |frame| {
-            frame.contains("Ticks 1")
+            frame.contains("Monitor 1")
         })
         .await;
     reopened.send(b"\x1b[C");
@@ -1028,7 +1033,7 @@ async fn run_sustained_owner_loss(
     assert!(busy.user_shells[1].starts_in_background);
     assert!(busy.last_model_run.is_none());
     view.wait_for("actual busy Shell task is cached in the View", |frame| {
-        frame.contains("Ticks 1")
+        frame.contains("Monitor 1")
     })
     .await;
     view.send(b"UNSENT-OWNER-LOSS-DRAFT-jk");
@@ -1837,12 +1842,35 @@ async fn run_reading_and_draft_return(fixture: &PrivateFixture) {
                 && !frame.contains("A gate active")
         })
         .await;
-    let first_visible_history = reading
-        .lines()
-        .find(|line| line.contains("stable history"))
-        .unwrap()
-        .trim()
-        .to_owned();
+    // The reading anchor is the topmost visible history line. The wheel events can still be
+    // applying when the draft first shows, so the anchor is taken once the topmost line stays
+    // unchanged; later waits compare the topmost line itself.
+    let topmost_history = |frame: &str| {
+        frame
+            .lines()
+            .find(|line| line.contains("stable history"))
+            .map(|line| line.trim().to_owned())
+    };
+    let first_visible_history = {
+        let mut anchor = topmost_history(&reading).unwrap();
+        let mut unchanged_since = std::time::Instant::now();
+        let deadline = std::time::Instant::now() + UI_TIMEOUT;
+        while unchanged_since.elapsed() < WHEEL_SETTLE_TIME {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the reading anchor never settled: {}",
+                view.frame()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if let Some(current) = topmost_history(&view.frame())
+                && current != anchor
+            {
+                anchor = current;
+                unchanged_since = std::time::Instant::now();
+            }
+        }
+        anchor
+    };
     let captured_output = Arc::clone(&view.output);
     view.wait_for(
         "wheel reading keeps editor focus without changing the anchor",
@@ -1906,17 +1934,10 @@ async fn run_reading_and_draft_return(fixture: &PrivateFixture) {
     view.send(b"\r");
     let returned = view
         .wait_for("return restores the original reading anchor", |frame| {
-            !frame.contains("Agents · local") && frame.contains(&first_visible_history)
+            !frame.contains("Agents · local")
+                && topmost_history(frame).as_ref() == Some(&first_visible_history)
         })
         .await;
-    assert_eq!(
-        returned
-            .lines()
-            .find(|line| line.contains("stable history"))
-            .unwrap()
-            .trim(),
-        first_visible_history
-    );
     assert!(!returned.contains("A final output after switching away"));
     view.send(b"\x13");
     view.wait_for(
@@ -1930,17 +1951,12 @@ async fn run_reading_and_draft_return(fixture: &PrivateFixture) {
     let restored = view
         .wait_for(
             "original cursor survives the full root round trip",
-            |frame| frame.contains(&expected),
+            |frame| {
+                frame.contains(&expected)
+                    && topmost_history(frame).as_ref() == Some(&first_visible_history)
+            },
         )
         .await;
-    assert_eq!(
-        restored
-            .lines()
-            .find(|line| line.contains("stable history"))
-            .unwrap()
-            .trim(),
-        first_visible_history
-    );
     assert!(!restored.contains("A final output after switching away"));
     assert!(snapshot(&client, other).await.last_model_run.is_none());
     for _ in 0..2 {
@@ -2718,11 +2734,16 @@ async fn select_overview_row(view: &mut PtyView, title: &str) {
 
 /// Opens the folded `group` heading with real keys: up to the first line, then down to it.
 async fn open_group_heading(view: &mut PtyView, group: &str) {
-    view.send(&b"k".repeat(40));
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    view.send(b"\x1b[5~");
+    view.wait_for("overview selection reaches its first group", |frame| {
+        selected_row_title(frame)
+            .is_some_and(|title| title.starts_with("Needs input") || title.starts_with("New Agent"))
+    })
+    .await;
     let folded = format!("› ▸ {group} · ");
     for _ in 0..40 {
-        if view.frame().contains(&folded) {
+        let frame = view.frame();
+        if frame.contains(&folded) {
             view.send(b"\r");
             view.wait_for("the group heading opens", |frame| {
                 frame.contains(&format!("› ▾ {group} · "))
@@ -2730,8 +2751,12 @@ async fn open_group_heading(view: &mut PtyView, group: &str) {
             .await;
             return;
         }
+        let selected = selected_row_title(&frame).map(str::to_owned);
         view.send(b"j");
-        tokio::time::sleep(Duration::from_millis(40)).await;
+        view.wait_for("overview navigation changes its selected row", |frame| {
+            selected_row_title(frame) != selected.as_deref()
+        })
+        .await;
     }
     panic!("no folded {group} heading: {}", view.frame());
 }

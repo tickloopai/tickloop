@@ -172,6 +172,8 @@ Agent 通过一个 `CallTickTool` 调用声明的能力。`SubscribeTick` 属于
 
 # 验证
 
+模型请求失败时，Agent 显示 Provider、HTTP 状态、脱敏后的服务原文与下一步；状态行和连接 Details 保留最近一次失败，直到该连接的模型请求成功。额度／余额错误不会自动重试，也不表示未登录。可通过 `/provider` 切换连接，或打开服务返回的额度／订阅链接。Kimi Code 默认使用 `kimi-for-coding`；模型目录列出 K3 不代表当前套餐可用，403 的 monthly usage limit 也可能表示套餐不含该模型。详见 [Agent 排查说明](crates/agent/README.md#provider-请求失败排查)。
+
 ```sh
 cargo fmt --all --check
 cargo check --workspace --all-targets

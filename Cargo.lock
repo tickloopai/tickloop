@@ -4565,10 +4565,12 @@ dependencies = [
  "http 1.5.0",
  "hyper-util",
  "icu_normalizer",
+ "icu_properties",
  "ignore",
  "image",
  "jsonschema",
  "libc",
+ "percent-encoding",
  "portable-pty",
  "regex",
  "reqwest 0.12.28",
@@ -4584,6 +4586,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "tick-connect",
+ "tickloop-tick-host",
  "tickloop-ui",
  "time",
  "tokio",
@@ -4592,6 +4595,22 @@ dependencies = [
  "unicode-segmentation",
  "unicode-width",
  "uuid",
+ "web_atoms",
+]
+
+[[package]]
+name = "tickloop-tick-host"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tick-connect",
+ "tokio",
+ "tokio-util",
+ "uuid",
+ "vt100",
 ]
 
 [[package]]
@@ -4615,14 +4634,16 @@ dependencies = [
  "sha1",
  "tempfile",
  "tick-connect",
+ "tickloop-tick-host",
  "tickloop-ui",
  "time",
  "time-tz",
  "tokio",
  "tokio-stream",
- "tokio-util",
  "toml",
  "toml_edit 0.22.27",
+ "uuid",
+ "vt100",
 ]
 
 [[package]]
@@ -5185,6 +5206,27 @@ name = "vsimd"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5c3082ca00d5a5ef149bb8b555a72ae84c9c59f7250f013ac822ac2e49b19c64"
+
+[[package]]
+name = "vt100"
+version = "0.16.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "054ff75fb8fa83e609e685106df4faeffdf3a735d3c74ebce97ec557d5d36fd9"
+dependencies = [
+ "itoa",
+ "unicode-width",
+ "vte",
+]
+
+[[package]]
+name = "vte"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5924018406ce0063cd67f8e008104968b74b563ee1b85dde3ed1f7cb87d3dbd"
+dependencies = [
+ "arrayvec",
+ "memchr",
+]
 
 [[package]]
 name = "vtparse"
