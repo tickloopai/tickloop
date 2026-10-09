@@ -45,7 +45,7 @@ async fn create_execution(
 ) -> (ExecutionRef, Uuid) {
     let receipt = access
         .execute(CommandEnvelope {
-            owner_epoch: access.owner_epoch(),
+            daemon_epoch: access.daemon_epoch(),
             command_id: Uuid::new_v4(),
             command: AgentCommand::Create {
                 launch,
@@ -131,7 +131,7 @@ async fn run_navigation(
     };
     let agent = Agent::from_access_for_test(
         access.clone(),
-        access.owner_epoch(),
+        access.daemon_epoch(),
         caller_view,
         launch_a,
         Some(source_host.clone()),
@@ -148,7 +148,7 @@ async fn run_navigation(
         .await
         .unwrap();
     let submitted = access.execute(CommandEnvelope {
-        owner_epoch: access.owner_epoch(),
+        daemon_epoch: access.daemon_epoch(),
         command_id: Uuid::new_v4(),
         command: AgentCommand::Submit {
             execution: execution_a,
@@ -167,7 +167,7 @@ async fn run_navigation(
     let mut menus = Menus::new(None, None);
     let mut global = AgentConsole::new(
         access.clone(),
-        access.owner_epoch(),
+        access.daemon_epoch(),
         work_a.clone(),
         Some(source_host),
     );

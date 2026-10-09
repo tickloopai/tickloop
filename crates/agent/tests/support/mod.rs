@@ -94,10 +94,10 @@ impl ModelClient for ScriptedModel {
     }
 }
 
-/// An Agent owner that accepts every Transcript deletion, for cleanups whose Chats own no Ticks.
-pub struct AcceptingOwner;
+/// An Agent daemon that accepts every Transcript deletion, for cleanups whose Chats own no Ticks.
+pub struct AcceptingDaemon;
 
-impl tickloop_agent::cleanup::ChatDeletionNotice for AcceptingOwner {
+impl tickloop_agent::cleanup::ChatDeletionNotice for AcceptingDaemon {
     fn begin(&self, _chat: uuid::Uuid) -> Result<uuid::Uuid, String> {
         Ok(uuid::Uuid::new_v4())
     }
@@ -323,9 +323,9 @@ pub fn model_script_requests(
         .collect()
 }
 
-/// Stops the Tick host a test started, if one still runs, through its management channel, so
+/// Stops the Tickhost a test started, if one still runs, through its management channel, so
 /// a failed assertion never leaves a host and its Ticks behind.
-pub fn stop_tick_host(runtime: &std::path::Path, key_file: &std::path::Path) {
+pub fn stop_tickhost(runtime: &std::path::Path, key_file: &std::path::Path) {
     use std::io::{BufRead, BufReader, Write};
     let (Ok(key), Ok(stream)) = (
         std::fs::read_to_string(key_file),

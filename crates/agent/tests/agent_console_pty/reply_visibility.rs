@@ -345,7 +345,7 @@ async fn multiline_after_interruption(fixture: &PrivateFixture) {
     let execution = catalog(&client).await[0].execution;
     client
         .execute(CommandEnvelope {
-            owner_epoch: client.owner_epoch(),
+            daemon_epoch: client.daemon_epoch(),
             command_id: uuid::Uuid::new_v4(),
             command: AgentCommand::ManageLoop {
                 execution,
@@ -545,7 +545,7 @@ async fn parked_loop_survives_other_completion(fixture: &PrivateFixture) {
         .expect("a model permission has its Run");
     client
         .execute(CommandEnvelope {
-            owner_epoch: client.owner_epoch(),
+            daemon_epoch: client.daemon_epoch(),
             command_id: uuid::Uuid::new_v4(),
             command: AgentCommand::Submit {
                 execution,
@@ -591,7 +591,7 @@ async fn parked_loop_survives_other_completion(fixture: &PrivateFixture) {
         .unwrap();
     client
         .execute(CommandEnvelope {
-            owner_epoch: client.owner_epoch(),
+            daemon_epoch: client.daemon_epoch(),
             command_id: uuid::Uuid::new_v4(),
             command: AgentCommand::DecidePermission {
                 request,
@@ -652,7 +652,7 @@ async fn interrupted_batch_has_the_same_state_on_attach(fixture: &PrivateFixture
     let execution = catalog(&client).await[0].execution;
     client
         .execute(CommandEnvelope {
-            owner_epoch: client.owner_epoch(),
+            daemon_epoch: client.daemon_epoch(),
             command_id: uuid::Uuid::new_v4(),
             command: AgentCommand::ManageLoop {
                 execution,
@@ -706,7 +706,7 @@ async fn actual_cli_interrupted_unadmitted_calls_keep_their_state_in_an_attached
     }
 }
 
-async fn interrupted_state_survives_event_eviction(fixture: &PrivateFixture, restart_owner: bool) {
+async fn interrupted_state_survives_event_eviction(fixture: &PrivateFixture, restart_daemon: bool) {
     const CALL: &str = "RETENTION-CALL";
     const QUEUED_QUESTION: &str = "RETENTION-QUEUED-QUESTION";
     const FLOOD_EVENTS: usize = 1100;
@@ -735,7 +735,7 @@ async fn interrupted_state_survives_event_eviction(fixture: &PrivateFixture, res
     )
     .await;
     fixture.set_chat_model(&url);
-    let mut view = PtyView::launch(fixture, &["--mode", "ask"], &[], restart_owner);
+    let mut view = PtyView::launch(fixture, &["--mode", "ask"], &[], restart_daemon);
     view.wait_for("retention View ready", new_input_is_visible)
         .await;
     view.resize(120, 60).await;
@@ -759,7 +759,7 @@ async fn interrupted_state_survives_event_eviction(fixture: &PrivateFixture, res
         .expect("a model permission has its Run");
     client
         .execute(CommandEnvelope {
-            owner_epoch: client.owner_epoch(),
+            daemon_epoch: client.daemon_epoch(),
             command_id: uuid::Uuid::new_v4(),
             command: AgentCommand::ManageLoop {
                 execution,
@@ -776,7 +776,7 @@ async fn interrupted_state_survives_event_eviction(fixture: &PrivateFixture, res
     .await;
     client
         .execute(CommandEnvelope {
-            owner_epoch: client.owner_epoch(),
+            daemon_epoch: client.daemon_epoch(),
             command_id: uuid::Uuid::new_v4(),
             command: AgentCommand::Submit {
                 execution,
@@ -871,10 +871,10 @@ async fn interrupted_state_survives_event_eviction(fixture: &PrivateFixture, res
             .unwrap()
             .unwrap();
     }
-    if restart_owner {
+    if restart_daemon {
         client
             .execute(CommandEnvelope {
-                owner_epoch: client.owner_epoch(),
+                daemon_epoch: client.daemon_epoch(),
                 command_id: uuid::Uuid::new_v4(),
                 command: AgentCommand::FlushTranscripts,
             })
@@ -926,7 +926,7 @@ async fn actual_cli_interrupted_state_survives_bounded_event_log_eviction() {
 }
 
 #[tokio::test]
-async fn actual_cli_interrupted_state_survives_eviction_and_owner_restart() {
+async fn actual_cli_interrupted_state_survives_eviction_and_daemon_restart() {
     let fixture = PrivateFixture::new();
     let result = AssertUnwindSafe(interrupted_state_survives_event_eviction(&fixture, true))
         .catch_unwind()

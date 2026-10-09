@@ -17,7 +17,7 @@ use tick_connect::{
         CAPABILITY_DATA, CONTROL_TIMEOUT, HostConnection, Role,
     },
 };
-use tick_host::pty::{MAX_COLUMNS, MAX_ROWS, MIN_COLUMNS, MIN_ROWS};
+use tickhost::pty::{MAX_COLUMNS, MAX_ROWS, MIN_COLUMNS, MIN_ROWS};
 
 use super::controller::HostedViewGrant;
 
@@ -83,7 +83,7 @@ impl AttachedView {
         if connection.epoch() != grant.host_epoch {
             return Err(HostError::before(
                 "EpochChanged",
-                "the Tick host was replaced since this view was granted",
+                "the Tickhost was replaced since this view was granted",
             ));
         }
         connection
@@ -117,7 +117,7 @@ impl AttachedView {
                 tokio::select! {
                     event = hosted::read_frame(&mut events, BUSINESS_FRAME_BYTES) => {
                         let Some(event) = event? else {
-                            return Ok(AttachEnd::Lost("the Tick host closed this view".into()));
+                            return Ok(AttachEnd::Lost("the Tickhost closed this view".into()));
                         };
                         match event["event"].as_str() {
                             Some("frame") => write_terminal(event["data"].as_str().unwrap_or_default().as_bytes()),
@@ -177,7 +177,7 @@ fn input_requests(forwarded: &[u8]) -> impl Iterator<Item = Value> + '_ {
 fn view_error(event: &Value) -> String {
     event["error"]["message"]
         .as_str()
-        .unwrap_or("the Tick host ended this view")
+        .unwrap_or("the Tickhost ended this view")
         .to_owned()
 }
 

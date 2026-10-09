@@ -5,29 +5,29 @@ const LOST_FIXTURE_VARIABLE: &str = "TICKLOOP_LOST_PRESENTATION_FIXTURE";
 const LOST_COMPLETED_VARIABLE: &str = "TICKLOOP_LOST_COMPLETED_FIXTURE";
 const LOST_UNKNOWN_VARIABLE: &str = "TICKLOOP_LOST_UNKNOWN_INPUT_FIXTURE";
 const LOST_UNKNOWN_FLAG: &str = "unknown-input";
-const OWNER_UNAVAILABLE_FLAG: &str = "owner-unavailable";
-const OWNER_UNAVAILABLE_CAUSE: &str = "owned owner catalog is unavailable";
+const DAEMON_UNAVAILABLE_FLAG: &str = "daemon-unavailable";
+const DAEMON_UNAVAILABLE_CAUSE: &str = "owned daemon catalog is unavailable";
 const LOST_FLAG: &str = "execution-lost";
 const LOST_PROOF: &str = "loss-proof.json";
 const LOST_MODEL: &str = "loss-model";
-const LOST_TASK: &str = "Investigate controlled owner loss";
-const LOST_RAW_ERROR: &str = "invalid request: execution owner lost";
+const LOST_TASK: &str = "Investigate controlled daemon loss";
+const LOST_RAW_ERROR: &str = "invalid request: execution worker lost";
 const LOST_WIDTH: usize = 180;
 const LOST_HEIGHT: usize = 30;
 
 struct LostPresentationAccess {
-    owner: EmbeddedAgentAccess,
+    daemon: EmbeddedAgentAccess,
     commands: AtomicUsize,
-    live_snapshots_during_owner_failure: AtomicUsize,
+    live_snapshots_during_daemon_failure: AtomicUsize,
 }
 
 #[async_trait]
 impl AgentAccess for LostPresentationAccess {
     async fn observe(&self, query: ObservationRequest) -> Result<Observation, AccessError> {
         let lost = std::path::Path::new(LOST_FLAG).exists();
-        let owner_unavailable = std::path::Path::new(OWNER_UNAVAILABLE_FLAG).exists();
-        if owner_unavailable && matches!(query, ObservationRequest::Overview { .. }) {
-            return Err(AccessError::unavailable(OWNER_UNAVAILABLE_CAUSE));
+        let daemon_unavailable = std::path::Path::new(DAEMON_UNAVAILABLE_FLAG).exists();
+        if daemon_unavailable && matches!(query, ObservationRequest::Overview { .. }) {
+            return Err(AccessError::unavailable(DAEMON_UNAVAILABLE_CAUSE));
         }
         let snapshot_query = matches!(
             query,
@@ -45,11 +45,11 @@ impl AgentAccess for LostPresentationAccess {
                 }
             )
         {
-            return Err(AccessError::invalid("execution owner lost"));
+            return Err(AccessError::invalid("execution worker lost"));
         }
-        let mut observation = self.owner.observe(query).await?;
-        if owner_unavailable && snapshot_query {
-            self.live_snapshots_during_owner_failure
+        let mut observation = self.daemon.observe(query).await?;
+        if daemon_unavailable && snapshot_query {
+            self.live_snapshots_during_daemon_failure
                 .fetch_add(1, Ordering::SeqCst);
         }
         if lost && let ObservationValue::Overview(rows) = &mut observation.initial {
@@ -70,11 +70,11 @@ impl AgentAccess for LostPresentationAccess {
                 "owned fixture lost the input acknowledgement",
             ));
         }
-        self.owner.execute(command).await
+        self.daemon.execute(command).await
     }
 
     async fn show_view(&self, update: DisplayUpdate) -> Result<DisplayReceipt, AccessError> {
-        self.owner.show_view(update).await
+        self.daemon.show_view(update).await
     }
 }
 
@@ -144,9 +144,9 @@ fn lost_presentation_pty_fixture() {
                 });
                 let core = runtime::Agent::new_embedded(config.clone(), model.clone());
                 let access = Arc::new(LostPresentationAccess {
-                    owner: EmbeddedAgentAccess::new(core.clone()),
+                    daemon: EmbeddedAgentAccess::new(core.clone()),
                     commands: AtomicUsize::new(0),
-                    live_snapshots_during_owner_failure: AtomicUsize::new(0),
+                    live_snapshots_during_daemon_failure: AtomicUsize::new(0),
                 });
                 let workdir = std::env::current_dir().unwrap();
                 let mut launch = LaunchSpec::embedded(workdir.clone());
@@ -155,7 +155,7 @@ fn lost_presentation_pty_fixture() {
                 launch.session_persistence = false;
                 let agent = Agent::from_access_for_test(
                     access.clone(),
-                    access.owner.owner_epoch(),
+                    access.daemon.daemon_epoch(),
                     ViewRef {
                         session_id: Uuid::new_v4(),
                         view_id: Uuid::new_v4(),
@@ -199,7 +199,7 @@ fn lost_presentation_pty_fixture() {
                 let proof_agent = agent.clone();
                 let proof_task = tokio::task::spawn_local(async move {
                     loop {
-                        if std::path::Path::new(OWNER_UNAVAILABLE_FLAG).exists() {
+                        if std::path::Path::new(DAEMON_UNAVAILABLE_FLAG).exists() {
                             proof_agent.snapshot(chat).await.unwrap();
                         }
                         let snapshot = proof_core.snapshot(chat).await.unwrap();
@@ -212,7 +212,7 @@ fn lost_presentation_pty_fixture() {
                                 "model_calls": proof_model.calls.load(Ordering::SeqCst),
                                 "state": snapshot.loops[0].state,
                                 "unknown_input_at_start": unknown_input_at_start,
-                                "live_snapshots_during_owner_failure": proof_access.live_snapshots_during_owner_failure.load(Ordering::SeqCst),
+                                "live_snapshots_during_daemon_failure": proof_access.live_snapshots_during_daemon_failure.load(Ordering::SeqCst),
                             }))
                             .unwrap(),
                         )
@@ -389,7 +389,7 @@ fn lost_execution_has_one_readable_notice_and_keeps_the_core_status() {
     assert_eq!(
         status.matches(LOST_RAW_ERROR).count(),
         0,
-        "the raw owner-loss cause belongs in explicit details: {status}"
+        "the raw daemon-loss cause belongs in explicit details: {status}"
     );
     let core = frame
         .lines()
@@ -519,23 +519,27 @@ fn an_unknown_input_after_a_completed_run_still_has_an_unknown_outcome_on_loss()
 }
 
 #[test]
-fn an_unavailable_owner_catalog_preserves_the_live_worker_core_and_connection_details() {
+fn an_unavailable_daemon_catalog_preserves_the_live_worker_core_and_connection_details() {
     let (mut view, directory) = start_lost_presentation_fixture(LostFixtureState::Running);
     wait_for_lost_presentation(&mut view, |frame| {
         frame.contains("Working") && frame.contains(LOST_MODEL)
     });
     let before = lost_presentation_proof(directory.path());
-    std::fs::write(directory.path().join(OWNER_UNAVAILABLE_FLAG), "unavailable").unwrap();
+    std::fs::write(
+        directory.path().join(DAEMON_UNAVAILABLE_FLAG),
+        "unavailable",
+    )
+    .unwrap();
     wait_for_lost_presentation(&mut view, |frame| {
-        frame.contains(OWNER_UNAVAILABLE_CAUSE) || frame.contains("Disconnected · cached view")
+        frame.contains(DAEMON_UNAVAILABLE_CAUSE) || frame.contains("Disconnected · cached view")
     });
     std::thread::sleep(Duration::from_millis(60));
     let frame = lost_presentation_frame(&view);
-    println!("OWNER_UNAVAILABLE_FRAME_BEGIN\n{frame}\nOWNER_UNAVAILABLE_FRAME_END");
+    println!("DAEMON_UNAVAILABLE_FRAME_BEGIN\n{frame}\nDAEMON_UNAVAILABLE_FRAME_END");
     let after = lost_presentation_proof(directory.path());
     assert_eq!(after["state"], "Running");
     assert!(
-        after["live_snapshots_during_owner_failure"]
+        after["live_snapshots_during_daemon_failure"]
             .as_u64()
             .unwrap()
             > 0,
@@ -544,7 +548,7 @@ fn an_unavailable_owner_catalog_preserves_the_live_worker_core_and_connection_de
     assert_eq!(after["commands"], before["commands"]);
     assert_eq!(after["model_calls"], before["model_calls"]);
     assert!(
-        !frame.contains(OWNER_UNAVAILABLE_CAUSE),
+        !frame.contains(DAEMON_UNAVAILABLE_CAUSE),
         "raw connection diagnosis belongs in details: {frame}"
     );
     assert!(
@@ -565,7 +569,7 @@ fn an_unavailable_owner_catalog_preserves_the_live_worker_core_and_connection_de
     view.writer.flush().unwrap();
     let details = wait_for_lost_presentation(&mut view, |frame| {
         frame.contains("Last connection diagnostic (this View)")
-            && frame.contains(OWNER_UNAVAILABLE_CAUSE)
+            && frame.contains(DAEMON_UNAVAILABLE_CAUSE)
     });
     assert!(
         details.contains(&format!("/resume {}", before["chat"].as_str().unwrap())),
@@ -573,7 +577,7 @@ fn an_unavailable_owner_catalog_preserves_the_live_worker_core_and_connection_de
     );
     view.writer.write_all(b"\x1b").unwrap();
     view.writer.flush().unwrap();
-    std::fs::remove_file(directory.path().join(OWNER_UNAVAILABLE_FLAG)).unwrap();
+    std::fs::remove_file(directory.path().join(DAEMON_UNAVAILABLE_FLAG)).unwrap();
     let recovered = wait_for_lost_presentation(&mut view, |frame| {
         !frame.contains("Transcript ·")
             && !frame.contains("Disconnected")

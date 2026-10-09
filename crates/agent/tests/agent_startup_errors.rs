@@ -13,7 +13,7 @@ use std::{
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use serde_json::json;
 
-fn incompatible_service_output(terminal: bool) -> String {
+fn incompatible_daemon_output(terminal: bool) -> String {
     let fixture = tempfile::tempdir_in("/private/tmp").unwrap();
     let root = fixture.path().canonicalize().unwrap();
     let runtime = root.join("runtime");
@@ -21,12 +21,12 @@ fn incompatible_service_output(terminal: bool) -> String {
     std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
     let config = root.join("config with ' and $(literal)");
     std::fs::create_dir(&config).unwrap();
-    let socket = runtime.join("owner.sock");
+    let socket = runtime.join("daemon.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
     listener.set_nonblocking(true).unwrap();
     let endpoint = socket.clone();
-    let owner = thread::spawn(move || {
+    let daemon = thread::spawn(move || {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         let (mut stream, _) = loop {
             match listener.accept() {
@@ -49,7 +49,7 @@ fn incompatible_service_output(terminal: bool) -> String {
         let hello: serde_json::Value = serde_json::from_slice(&request).unwrap();
         assert!(hello.get("Hello").is_some());
         let response = serde_json::to_vec(&json!({"Hello": {
-            "major": 1, "minor": 1, "owner_epoch": uuid::Uuid::new_v4(),
+            "major": 1, "minor": 1, "daemon_epoch": uuid::Uuid::new_v4(),
             "session_id": uuid::Uuid::new_v4(), "capabilities": []
         }}))
         .unwrap();
@@ -64,7 +64,7 @@ fn incompatible_service_output(terminal: bool) -> String {
             rest.is_empty(),
             "no command may follow an incompatible Hello"
         );
-        assert!(endpoint.exists(), "the existing owner socket must remain");
+        assert!(endpoint.exists(), "the existing daemon socket must remain");
         assert!(
             matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
         );
@@ -96,7 +96,7 @@ fn incompatible_service_output(terminal: bool) -> String {
         command.env("HOME", &root);
         command.env("TERM", "xterm-256color");
         command.env("TICKLOOP_CONFIG_DIR", &config);
-        command.env("TICKLOOP_AGENT_RUNTIME_DIR", &runtime);
+        command.env("TICKLOOP_DAEMON_RUNTIME_DIR", &runtime);
         command.env("TICKLOOP_FIXTURE_API_KEY", "private-fixture-key");
         let mut child = pair.slave.spawn_command(command).unwrap();
         drop(pair.slave);
@@ -118,7 +118,7 @@ fn incompatible_service_output(terminal: bool) -> String {
             .env("TERM", "xterm-256color")
             .env("NO_COLOR", "1")
             .env("TICKLOOP_CONFIG_DIR", &config)
-            .env("TICKLOOP_AGENT_RUNTIME_DIR", &runtime)
+            .env("TICKLOOP_DAEMON_RUNTIME_DIR", &runtime)
             .env("TICKLOOP_FIXTURE_API_KEY", "private-fixture-key")
             .stdin(Stdio::null())
             .output()
@@ -128,16 +128,16 @@ fn incompatible_service_output(terminal: bool) -> String {
         String::from_utf8(output.stderr).unwrap()
     };
     let output = output.replace('\r', "");
-    owner.join().unwrap();
+    daemon.join().unwrap();
     assert!(socket.exists());
-    assert!(!runtime.join("owner.lock").exists());
+    assert!(!runtime.join("daemon.lock").exists());
     assert!(!output.contains("private-fixture-key"));
     assert!(!output.contains("incompatible AgentAccess protocol major"));
     assert!(output.contains("This stops running Agents. Saved history is kept."));
-    assert!(output.contains("Stop the service and relaunch:"));
+    assert!(output.contains("Stop the daemon and relaunch:"));
     assert!(!output.contains("mktemp"));
     let command = output
-        .split("Stop the service and relaunch:")
+        .split("Stop the daemon and relaunch:")
         .nth(1)
         .unwrap()
         .split("This stops running Agents.")
@@ -160,12 +160,12 @@ fn incompatible_service_output(terminal: bool) -> String {
     assert!(command.contains(&shell_words::quote(config.to_str().unwrap()).to_string()));
     let commands = command.lines().map(str::trim).collect::<Vec<_>>();
     assert_eq!(commands.len(), 2);
-    assert!(commands[0].ends_with(" service stop"));
+    assert!(commands[0].ends_with(" daemon stop"));
     let resolved_executable = std::fs::canonicalize(executable).unwrap();
     let resolved_executable = resolved_executable.to_str().unwrap();
     let quoted_executable = shell_words::quote(resolved_executable);
     assert!(
-        commands[0].ends_with(&format!("{quoted_executable} service stop")),
+        commands[0].ends_with(&format!("{quoted_executable} daemon stop")),
         "{command}"
     );
     assert!(commands[1].ends_with(quoted_executable.as_ref()));
@@ -178,7 +178,7 @@ fn incompatible_service_output(terminal: bool) -> String {
     )));
     assert!(output.contains("peer protocol 1.1"));
     let runtime_argument = format!(
-        "TICKLOOP_AGENT_RUNTIME_DIR={}",
+        "TICKLOOP_DAEMON_RUNTIME_DIR={}",
         shell_words::quote(runtime.to_str().unwrap())
     );
     assert!(commands.iter().all(|line| line.contains(&runtime_argument)));
@@ -188,10 +188,10 @@ fn incompatible_service_output(terminal: bool) -> String {
 }
 
 #[test]
-fn incompatible_service_has_readable_plain_guidance_without_dispatching() {
-    let output = incompatible_service_output(false);
+fn incompatible_daemon_has_readable_plain_guidance_without_dispatching() {
+    let output = incompatible_daemon_output(false);
     assert!(output.starts_with(&format!(
-        "Error: Agent service version mismatch (client {}.{}).",
+        "Error: Agent daemon version mismatch (client {}.{}).",
         tickloop_agent::agent_access::PROTOCOL_MAJOR,
         tickloop_agent::agent_access::PROTOCOL_MINOR
     )));
@@ -199,9 +199,9 @@ fn incompatible_service_has_readable_plain_guidance_without_dispatching() {
 }
 
 #[test]
-fn incompatible_service_terminal_styles_only_the_title_and_preserves_guidance() {
-    let output = incompatible_service_output(true);
+fn incompatible_daemon_terminal_styles_only_the_title_and_preserves_guidance() {
+    let output = incompatible_daemon_output(true);
     assert!(output.contains("\x1b["));
-    assert!(output.contains("Error: Agent service version mismatch"));
-    assert!(output.contains("\n\nStop the service and relaunch:"));
+    assert!(output.contains("Error: Agent daemon version mismatch"));
+    assert!(output.contains("\n\nStop the daemon and relaunch:"));
 }

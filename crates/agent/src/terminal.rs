@@ -50,6 +50,8 @@ mod input_history;
 pub(crate) use input_history::{PASTE_CACHE_DIRECTORY, PASTE_FILE_EXTENSION};
 #[cfg(test)]
 mod child_config_tests;
+#[cfg(test)]
+mod daemon_loss_tests;
 mod denials_surface;
 mod hosted_detail;
 mod input_view;
@@ -66,8 +68,6 @@ mod monitor_discovery;
 #[cfg(test)]
 mod navigation_tests;
 mod new_agent_draft;
-#[cfg(test)]
-mod owner_loss_tests;
 mod paste_blocks;
 mod pasted_image_paths;
 mod permissions_surface;
@@ -622,12 +622,12 @@ Usage: tickloop [--cwd DIRECTORY]
        [--working-directory-is-trusted]
        [-c | --continue | -r [CHAT] | --resume [CHAT] | --chat-id CHAT] [--fork-session]
        [--no-session-persistence]
-       tickloop service stop
+       tickloop daemon stop
        tickloop monitor popup install|remove --herdr-socket SOCKET
        tickloop monitor attach
 
-service stop ends the local Agent service and its running Agents; saved history is kept.
-Run tickloop again to start this build. TICKLOOP_AGENT_RUNTIME_DIR selects the service.
+daemon stop ends the local Agent daemon and all of its workers, which is every running Agent; saved history is kept and Ticks in the Tickhost keep running.
+Run tickloop again to start this build. TICKLOOP_DAEMON_RUNTIME_DIR selects the daemon.
 monitor popup install asks before registering Tick Loop's popup plugin in that Herdr session and sets monitorPopup to enabled; remove asks before unregistering only that plugin and sets it to disabled. Running Ticks continue either way.
 monitor attach is the popup's attach client: it shows the hosted Tick its one-time view grant in TICKLOOP_MONITOR_ATTACH names until a lone Esc closes it.
 
@@ -1036,7 +1036,7 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
     console.set_monitor_preference(monitor_preference)?;
     console.set_monitor_popup(monitor_popup)?;
     // Inside Herdr the View also discovers and probes Herdr programs; in every View the Agent's
-    // new Ticks run in the Tick host and are probed there.
+    // new Ticks run in the Tickhost and are probed there.
     if let Some(discovery) = tick_discovery {
         console.set_tick_discovery(discovery)?;
     }
@@ -1364,15 +1364,15 @@ async fn interact(
     let mut selected_chat = None;
     let mut global = crate::agent_console::AgentConsole::new(
         agent.access(),
-        agent.owner_epoch(),
+        agent.daemon_epoch(),
         workdir.clone(),
         agent.host_location(),
     );
     let mut overview_active = false;
     let mut history_return_overview = false;
     let mut visible_family = Vec::new();
-    // The owner fact behind the shared catalog; set by a failed refresh and cleared by the next success.
-    let mut owner_unreachable: Option<String> = None;
+    // The daemon fact behind the shared catalog; set by a failed refresh and cleared by the next success.
+    let mut daemon_unreachable: Option<String> = None;
     let mut global_refresh = tokio::time::interval(std::time::Duration::from_secs(1));
     global_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut ui_selected = selected_chat;
@@ -1510,11 +1510,11 @@ async fn interact(
                         .interpret(crate::agent_console::Intent::Overview)
                         .map_err(|error| error.to_string())?;
                     if let Err(error) = global.refresh().await {
-                        owner_unreachable = Some(format!(
+                        daemon_unreachable = Some(format!(
                             "{DISCONNECTED_CACHED_VIEW_NOTICE} · {}",
                             safe_text(&error.to_string())
                         ));
-                        console.set_connection_notice(owner_unreachable.clone())?;
+                        console.set_connection_notice(daemon_unreachable.clone())?;
                     }
                     console.set_global_overview(Some(agent_overview(&global.projection())))?;
                     if let Err(error) = agent.display_chat(None).await {
@@ -1724,14 +1724,14 @@ async fn interact(
                                 UserShellState::Completed | UserShellState::Failed
                             )
                         }),
-                    owner_unreachable.is_some(),
+                    daemon_unreachable.is_some(),
                 );
                 if connection.is_some() {
                     console.set_execution_connection_notice(
                         connection,
-                        agent.disconnected().or_else(|| owner_unreachable.clone()),
+                        agent.disconnected().or_else(|| daemon_unreachable.clone()),
                     )?;
-                } else if let Some(notice) = owner_unreachable.clone() {
+                } else if let Some(notice) = daemon_unreachable.clone() {
                     console.set_connection_notice(Some(notice))?;
                 } else {
                     console.set_execution_connection_notice(connection, agent.disconnected())?;
@@ -1759,7 +1759,7 @@ async fn interact(
                         label: working_activity(&snapshot, running_loop),
                         started_at: running_receipt
                             .and_then(|receipt| observed_run_starts.get(&receipt.run_id).copied()),
-                        interruptible: owner_unreachable.is_none()
+                        interruptible: daemon_unreachable.is_none()
                             && agent.disconnected().is_none()
                             && global.projection().rows.iter().any(|row| {
                                 row.chat_id == chat
@@ -2121,11 +2121,11 @@ async fn interact(
                     // Only a registered conversation is something to return to; a new draft has none.
                     let source=match selected_chat { Some(chat)=>agent.reference(chat).await.ok(), None=>None };
                     global.visible_ready(source);
-                    // An unreachable owner leaves the cached catalog on screen with a stale label;
+                    // An unreachable daemon leaves the cached catalog on screen with a stale label;
                     // the View, its drafts and its reading positions stay alive.
                     if let Err(error)=global.refresh().await {
-                        owner_unreachable=Some(format!("{DISCONNECTED_CACHED_VIEW_NOTICE} · {}",safe_text(&error.to_string())));
-                        console.set_connection_notice(owner_unreachable.clone())?;
+                        daemon_unreachable=Some(format!("{DISCONNECTED_CACHED_VIEW_NOTICE} · {}",safe_text(&error.to_string())));
+                        console.set_connection_notice(daemon_unreachable.clone())?;
                     }
                     global.interpret(crate::agent_console::Intent::Overview).map_err(|error|error.to_string())?;
                     let projection=global.projection();
@@ -2159,9 +2159,9 @@ async fn interact(
                 },
                 Some(InputEvent::OpenAgent(agent_id)) => {
                     if let Err(error)=global.refresh().await {
-                        owner_unreachable=Some(format!("{DISCONNECTED_CACHED_VIEW_NOTICE} · {}",safe_text(&error.to_string())));
-                        console.set_connection_notice(owner_unreachable.clone())?;
-                        console.set_status("Cannot open the Agent while its owner is unreachable; the overview shows cached facts")?;
+                        daemon_unreachable=Some(format!("{DISCONNECTED_CACHED_VIEW_NOTICE} · {}",safe_text(&error.to_string())));
+                        console.set_connection_notice(daemon_unreachable.clone())?;
+                        console.set_status("Cannot open the Agent while its daemon is unreachable; the overview shows cached facts")?;
                         status_dirty = true;
                         continue;
                     }
@@ -3881,7 +3881,7 @@ async fn interact(
                             }
                         }
                         let projection=global.projection();
-                        // A run whose execution the owner has lost can no longer report its end.
+                        // A run whose execution the daemon has lost can no longer report its end.
                         for notice in end_runs_of_lost_executions(&projection.rows,&mut pending,&mut permissions,&mut questions) {
                             failed=true;
                             if interactive {
@@ -3961,7 +3961,7 @@ async fn interact(
                             }
                         }
                         let live_visible=selected_chat.filter(|chat|visible_rows.iter().any(|row|row.chat_id==*chat && row.availability==crate::agent_access::ExecutionAvailability::Live));
-                        owner_unreachable=None;
+                        daemon_unreachable=None;
                         let notice=if let Err(error)=agent.display_chat(if overview_active {None}else{live_visible}).await {
                             Some(format!("{VIEW_REGISTRATION_UNAVAILABLE_NOTICE} · {}",safe_line(&error.to_string())))
                         } else if let Err(error)=agent.renew_display().await {
@@ -3973,10 +3973,10 @@ async fn interact(
                         status_dirty=true;
                     }
                     Err(error)=>{
-                        owner_unreachable=Some(format!("{DISCONNECTED_CACHED_VIEW_NOTICE} · {}",safe_text(&error.to_string())));
+                        daemon_unreachable=Some(format!("{DISCONNECTED_CACHED_VIEW_NOTICE} · {}",safe_text(&error.to_string())));
                         if !overview_active && selected_chat.is_some() {
                             status_dirty=true;
-                        } else {console.set_connection_notice(owner_unreachable.clone())?;}
+                        } else {console.set_connection_notice(daemon_unreachable.clone())?;}
                     }
                 }
             },
@@ -6276,7 +6276,7 @@ fn background_wait(
     })
 }
 
-/// A run that stopped being waited for because the owner reports its execution Lost.
+/// A run that stopped being waited for because the daemon reports its execution Lost.
 struct LostRunNotice {
     chat: uuid::Uuid,
     run: uuid::Uuid,
@@ -6288,7 +6288,7 @@ fn execution_connection_notice(
     chat: uuid::Uuid,
     disconnected: bool,
     cached_completed: bool,
-    owner_unreachable: bool,
+    daemon_unreachable: bool,
 ) -> Option<console::ExecutionConnectionNotice> {
     if rows.iter().any(|row| {
         row.chat_id == chat && row.availability == crate::agent_access::ExecutionAvailability::Lost
@@ -6300,14 +6300,14 @@ fn execution_connection_notice(
         })
     } else if disconnected {
         Some(console::ExecutionConnectionNotice::CachedExecution)
-    } else if owner_unreachable {
+    } else if daemon_unreachable {
         Some(console::ExecutionConnectionNotice::CachedView)
     } else {
         None
     }
 }
 
-/// Stops waiting for runs whose execution the owner reports Lost; their outcome is unknown and
+/// Stops waiting for runs whose execution the daemon reports Lost; their outcome is unknown and
 /// nothing is resent.
 fn end_runs_of_lost_executions(
     rows: &[crate::agent_access::AgentSummary],
@@ -7022,7 +7022,7 @@ mod tests {
     fn global_overview_keeps_the_root_title_and_aggregates_requests_without_child_rows() {
         let epoch = uuid::Uuid::new_v4();
         let root = crate::agent_access::ExecutionRef {
-            owner_epoch: epoch,
+            daemon_epoch: epoch,
             agent_id: uuid::Uuid::from_u128(1),
             generation: 1,
         };
@@ -7062,7 +7062,7 @@ mod tests {
     #[test]
     fn family_root_aggregate_request_glyph_keeps_warning_role() {
         let root = crate::agent_access::ExecutionRef {
-            owner_epoch: uuid::Uuid::new_v4(),
+            daemon_epoch: uuid::Uuid::new_v4(),
             agent_id: uuid::Uuid::from_u128(1),
             generation: 1,
         };
@@ -7092,7 +7092,7 @@ mod tests {
     #[test]
     fn family_child_description_never_emits_terminal_controls() {
         let child = crate::agent_access::ExecutionRef {
-            owner_epoch: uuid::Uuid::new_v4(),
+            daemon_epoch: uuid::Uuid::new_v4(),
             agent_id: uuid::Uuid::new_v4(),
             generation: 1,
         };
@@ -7165,7 +7165,7 @@ mod tests {
         snapshot.last_sequence = 2;
         let mut observation = super::ExecutionObservation {
             execution: crate::agent_access::ExecutionRef {
-                owner_epoch: uuid::Uuid::nil(),
+                daemon_epoch: uuid::Uuid::nil(),
                 agent_id: chat,
                 generation: 1,
             },
@@ -7266,7 +7266,7 @@ mod tests {
         snapshot.last_sequence = 2;
         let mut observation = super::ExecutionObservation {
             execution: crate::agent_access::ExecutionRef {
-                owner_epoch: uuid::Uuid::nil(),
+                daemon_epoch: uuid::Uuid::nil(),
                 agent_id: chat,
                 generation: 1,
             },
@@ -7372,7 +7372,7 @@ mod tests {
         snapshot.last_sequence = 2;
         let mut observation = super::ExecutionObservation {
             execution: crate::agent_access::ExecutionRef {
-                owner_epoch: uuid::Uuid::nil(),
+                daemon_epoch: uuid::Uuid::nil(),
                 agent_id: chat,
                 generation: 1,
             },
@@ -8129,6 +8129,22 @@ mod tests {
     }
 
     #[test]
+    fn help_offers_daemon_stop_and_hides_the_process_entries() {
+        let help = help_text();
+        assert!(help.contains("tickloop daemon stop"));
+        assert!(help.contains("all of its workers, which is every running Agent"));
+        assert!(help.contains("Ticks in the Tickhost keep running"));
+        for hidden in [
+            "daemon run",
+            "tickloop worker",
+            "tickhost run",
+            "service stop",
+        ] {
+            assert!(!help.contains(hidden), "{hidden}");
+        }
+    }
+
+    #[test]
     fn rewind_command_dispatches_immediately_and_has_help() {
         {
             let command = "/rewind";
@@ -8551,7 +8567,7 @@ mod tests {
         let lost = crate::agent_access::AgentSummary {
             availability: crate::agent_access::ExecutionAvailability::Lost,
             execution: crate::agent_access::ExecutionRef {
-                owner_epoch: Uuid::new_v4(),
+                daemon_epoch: Uuid::new_v4(),
                 agent_id: chat,
                 generation: 1,
             },

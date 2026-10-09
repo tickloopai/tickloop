@@ -213,7 +213,7 @@ async fn batched_and_large_unicode_packets_reach_agent_access_without_resync() {
             launch.model = Some(support::config());
             let created = access
                 .execute(CommandEnvelope {
-                    owner_epoch: access.owner_epoch(),
+                    daemon_epoch: access.daemon_epoch(),
                     command_id: uuid::Uuid::new_v4(),
                     command: AgentCommand::Create {
                         launch,

@@ -5,7 +5,7 @@ use std::fmt;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 const HERDR_SOURCE: &str = "herdr:";
-/// The Tick type of Ticks the dedicated Tick host runs.
+/// The Tick type of Ticks the dedicated Tickhost runs.
 pub const HOSTED_TYPE: &str = "hosted";
 
 pub fn artifact_instance_id(origin: &str, id: &str) -> String {
@@ -68,7 +68,7 @@ impl InstanceRef {
         Ok(Self(identity))
     }
 
-    /// A Tick running in the dedicated Tick host. `hosted` names where it runs, not a kind of
+    /// A Tick running in the dedicated Tickhost. `hosted` names where it runs, not a kind of
     /// Tick: its protocol and tools are those of the program it runs.
     pub fn hosted(run: uuid::Uuid) -> Self {
         Self(format!("{HOSTED_TYPE}:{run}"))

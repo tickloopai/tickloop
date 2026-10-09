@@ -1,4 +1,4 @@
-//! Observation stream between a Tick host and the Agent's Loop scheduler.
+//! Observation stream between a Tickhost and the Agent's Loop scheduler.
 
 mod artifact;
 mod hosted;

@@ -339,7 +339,7 @@ mod timestamp_tests {
     }
 
     #[tokio::test]
-    async fn completed_shell_time_is_recovered_when_an_older_owner_snapshot_is_resynced() {
+    async fn completed_shell_time_is_recovered_when_an_older_daemon_snapshot_is_resynced() {
         let directory = tempfile::tempdir().unwrap();
         let runtime = crate::runtime::Agent::new_embedded(
             test_support::config(),
@@ -348,7 +348,7 @@ mod timestamp_tests {
         let access = Arc::new(OlderTaskRecords(EmbeddedAgentAccess::new(runtime.clone())));
         let agent = ConsoleExecution::from_access_for_test(
             access.clone(),
-            access.0.owner_epoch(),
+            access.0.daemon_epoch(),
             ViewRef {
                 session_id: Uuid::new_v4(),
                 view_id: Uuid::new_v4(),
@@ -468,7 +468,7 @@ mod availability_tests {
                 Arc::new(test_support::ScriptedModel::new(vec![])),
             );
             let actual = EmbeddedAgentAccess::new(runtime.clone());
-            let epoch = actual.owner_epoch();
+            let epoch = actual.daemon_epoch();
             let access = Arc::new(FailedTaskLookup {
                 actual,
                 failed: AtomicBool::new(false),

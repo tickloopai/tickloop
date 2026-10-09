@@ -1,5 +1,5 @@
-//! The Agent owner's single controller of the Tick host. The owner starts the host on its first
-//! open, keeps the controller key in its private runtime directory so a restarted owner fences
+//! The Agent daemon's single controller of the Tickhost. The daemon starts the host on its first
+//! open, keeps the controller key in its private runtime directory so a restarted daemon fences
 //! the previous one, and never replaces a host it cannot verify.
 
 use std::{
@@ -18,22 +18,22 @@ use tick_connect::{
     host_error::HostError,
     hosted::{CAPABILITY_LIFECYCLE, CONTROL_TIMEOUT, HostConnection, Role},
 };
-use tick_host::{
+use tickhost::{
     host::{OpenRequest, OpenedTick, OwnerSnapshotChunk, Receipt, TickOwner},
     paths::HostPaths,
 };
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-/// The owner's internal mode that runs the host library in its own process.
-pub const HOST_MODE: &str = "--tick-host";
-const KEY_FILE: &str = "tick-host.key";
+/// The daemon's hidden entry that runs the host library in its own process.
+pub const TICKHOST_RUN_ARGUMENTS: [&str; 2] = ["tickhost", "run"];
+const KEY_FILE: &str = "tickhost.key";
 pub const START_ATTEMPTS: u32 = 3;
 pub const START_WAIT: Duration = Duration::from_secs(3);
 /// An open: the host waits up to the control timeout for the Tick to become ready, plus the
 /// launch itself and its reply.
 pub const OPEN_TIMEOUT: Duration = Duration::from_secs(2 * CONTROL_TIMEOUT.as_secs());
-/// The longest the owner may take for one worker lifecycle request: starting a host, then
+/// The longest the daemon may take for one worker lifecycle request: starting a host, then
 /// opening.
 pub const LIFECYCLE_TIMEOUT: Duration =
     Duration::from_secs(START_ATTEMPTS as u64 * START_WAIT.as_secs() + OPEN_TIMEOUT.as_secs());
@@ -98,7 +98,7 @@ impl HostListing {
     /// One page of a host `list` reply, which names the host epoch that produced it.
     fn from_page(page: &Value) -> Option<ListedPage> {
         let epoch = serde_json::from_value(page.get("epoch")?.clone()).ok()?;
-        let page: tick_connect::page::Page<tick_host::host::TickRow> =
+        let page: tick_connect::page::Page<tickhost::host::TickRow> =
             serde_json::from_value(page.clone()).ok()?;
         Some(ListedPage {
             listing: HostListing {
@@ -123,9 +123,9 @@ enum Start {
 pub struct HostController {
     paths: HostPaths,
     key_file: PathBuf,
-    owner_epoch: Uuid,
+    daemon_epoch: Uuid,
     executable: PathBuf,
-    /// How long a host this owner starts lets an unused Tick idle.
+    /// How long a host this daemon starts lets an unused Tick idle.
     idle_timeout: Duration,
     /// Connections between requests. Each request holds its own connection, so a slow open of
     /// one Tick never delays another worker's request.
@@ -138,14 +138,14 @@ impl HostController {
     pub fn new(
         agent_runtime: &Path,
         paths: HostPaths,
-        owner_epoch: Uuid,
+        daemon_epoch: Uuid,
         executable: PathBuf,
         idle_timeout: Duration,
     ) -> Self {
         Self {
             paths,
             key_file: agent_runtime.join(KEY_FILE),
-            owner_epoch,
+            daemon_epoch,
             executable,
             idle_timeout,
             idle: Mutex::new(Vec::new()),
@@ -157,7 +157,7 @@ impl HostController {
         self.paths.socket()
     }
 
-    /// How long a host this owner starts lets a Tick idle, and lets Watch intents go unrenewed.
+    /// How long a host this daemon starts lets a Tick idle, and lets Watch intents go unrenewed.
     pub fn idle_timeout(&self) -> Duration {
         self.idle_timeout
     }
@@ -352,7 +352,7 @@ impl HostController {
                 Some(_) => {
                     return Err(HostError::before(
                         "EpochChanged",
-                        "another Tick host started while its Ticks were listed",
+                        "another Tickhost started while its Ticks were listed",
                     ));
                 }
             }
@@ -405,7 +405,7 @@ impl HostController {
             .await
         {
             Err(error) if error.code == HOST_NOT_RUNNING => {
-                let rows = Vec::<tick_host::host::TickRow>::new();
+                let rows = Vec::<tickhost::host::TickRow>::new();
                 tick_connect::page::paginate(
                     rows,
                     |row| row.terminal.to_string(),
@@ -457,11 +457,11 @@ impl HostController {
         unreachable!("the second attempt always returns")
     }
 
-    /// Connects with this owner's key, or starts a host. A live host this owner cannot verify
+    /// Connects with this daemon's key, or starts a host. A live host this daemon cannot verify
     /// is refused, never replaced: a new host only binds after taking the host lock.
     async fn connect_or_start(&self) -> Result<HostConnection, HostError> {
         let _starting = self.starting.lock().await;
-        // Only a missing key means no host of this owner can exist; an unreadable key is never
+        // Only a missing key means no host of this daemon can exist; an unreadable key is never
         // replaced, or a live host's Ticks would lose their controller.
         let known = match std::fs::read_to_string(&self.key_file) {
             Ok(key) => Some(key.trim().to_owned()),
@@ -469,7 +469,7 @@ impl HostController {
             Err(error) => {
                 return Err(HostError::before(
                     "HostUnavailable",
-                    format!("cannot read the Tick host controller key: {error}"),
+                    format!("cannot read the Tickhost controller key: {error}"),
                 ));
             }
         };
@@ -485,7 +485,7 @@ impl HostController {
         let key = match known {
             Some(key) => key,
             None => {
-                let key = tick_host::host::random_token();
+                let key = tickhost::host::random_token();
                 write_private(&self.key_file, &key)
                     .map_err(|error| HostError::before("HostUnavailable", error.to_string()))?;
                 key
@@ -511,7 +511,7 @@ impl HostController {
         Err(HostError::before(
             "HostUnavailable",
             format!(
-                "the Tick host did not start in {START_ATTEMPTS} attempts of {}s each (last: {last_failure})",
+                "the Tickhost did not start in {START_ATTEMPTS} attempts of {}s each (last: {last_failure})",
                 START_WAIT.as_secs()
             ),
         ))
@@ -527,13 +527,13 @@ impl HostController {
         if !running {
             return Err(HostError::before(
                 HOST_NOT_RUNNING,
-                "no Tick host is running",
+                "no Tickhost is running",
             ));
         }
         let key = std::fs::read_to_string(&self.key_file).map_err(|_| {
             HostError::before(
                 "Forbidden",
-                "the running Tick host was not started by this Agent owner",
+                "the running Tickhost was not started by this Agent daemon",
             )
         })?;
         self.connect(key.trim()).await
@@ -544,20 +544,20 @@ impl HostController {
             &self.paths.socket(),
             Role::Controller {
                 controller_key: key.to_owned(),
-                owner_epoch: self.owner_epoch,
+                daemon_epoch: self.daemon_epoch,
             },
             &[CAPABILITY_LIFECYCLE],
         )
         .await
     }
 
-    /// Starts the host as its own session: it outlives this owner and is reaped here only
-    /// while the owner still runs.
+    /// Starts the host as its own session: it outlives this daemon and is reaped here only
+    /// while the daemon still runs.
     fn spawn(&self, key: &str) -> std::io::Result<()> {
         let mut command = std::process::Command::new(&self.executable);
         command
-            .arg(HOST_MODE)
-            .env(tick_host::paths::RUNTIME_DIR_ENV, &self.paths.runtime)
+            .args(TICKHOST_RUN_ARGUMENTS)
+            .env(tickhost::paths::RUNTIME_DIR_ENV, &self.paths.runtime)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -570,7 +570,7 @@ impl HostController {
             });
         }
         let mut child = command.spawn()?;
-        let config = serde_json::to_string(&tick_host::host::HostConfig {
+        let config = serde_json::to_string(&tickhost::host::HostConfig {
             controller_key: key.to_owned(),
             idle_timeout: self.idle_timeout,
         })?;
@@ -584,7 +584,7 @@ impl HostController {
     }
 }
 
-/// A host that answered and refused this owner is never retried or replaced.
+/// A host that answered and refused this daemon is never retried or replaced.
 fn is_definite_refusal(error: &HostError) -> bool {
     matches!(error.code.as_str(), "IncompatibleHost" | "Forbidden")
 }

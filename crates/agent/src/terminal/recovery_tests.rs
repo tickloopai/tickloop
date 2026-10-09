@@ -171,14 +171,14 @@ impl ModelClient for GatedReply {
 }
 
 struct DelayedTerminalEvents {
-    owner: EmbeddedAgentAccess,
+    daemon: EmbeddedAgentAccess,
     release: CancellationToken,
 }
 
 #[async_trait]
 impl AgentAccess for DelayedTerminalEvents {
     async fn observe(&self, query: ObservationRequest) -> Result<Observation, AccessError> {
-        let mut observation = self.owner.observe(query).await?;
+        let mut observation = self.daemon.observe(query).await?;
         if let Some(mut changes) = observation.changes.take() {
             let (forward, receiver) = mpsc::channel(FEED_CAPACITY);
             let release = self.release.clone();
@@ -210,11 +210,11 @@ impl AgentAccess for DelayedTerminalEvents {
     }
 
     async fn execute(&self, command: CommandEnvelope) -> Result<CommandReceipt, AccessError> {
-        self.owner.execute(command).await
+        self.daemon.execute(command).await
     }
 
     async fn show_view(&self, update: DisplayUpdate) -> Result<DisplayReceipt, AccessError> {
-        self.owner.show_view(update).await
+        self.daemon.show_view(update).await
     }
 }
 
@@ -258,7 +258,7 @@ async fn run_completed_reply_recovery_fixture() {
     );
     let workdir = std::env::current_dir().unwrap();
     let adapter = Arc::new(DelayedTerminalEvents {
-        owner: EmbeddedAgentAccess::new(core.clone()),
+        daemon: EmbeddedAgentAccess::new(core.clone()),
         release: CancellationToken::new(),
     });
     let view = ViewRef {
@@ -270,7 +270,7 @@ async fn run_completed_reply_recovery_fixture() {
     launch.session_persistence = false;
     let agent = Agent::from_access_for_test(
         adapter.clone(),
-        adapter.owner.owner_epoch(),
+        adapter.daemon.daemon_epoch(),
         view,
         launch,
         None,
@@ -287,7 +287,7 @@ async fn run_completed_reply_recovery_fixture() {
     } else {
         None
     };
-    let mut owner_events = core.subscribe();
+    let mut daemon_events = core.subscribe();
     let checkpoint = Arc::new(tokio::sync::Semaphore::new(0));
     if route == "lagged" {
         agent.hold_recovery_checkpoint(checkpoint.clone());
@@ -375,7 +375,7 @@ async fn run_completed_reply_recovery_fixture() {
     if route != "global" && route != "interrupted" {
         tokio::time::timeout(RECOVERY_TIMEOUT, async {
             loop {
-                let event = owner_events.recv().await.unwrap();
+                let event = daemon_events.recv().await.unwrap();
                 if event.chat_id == chat
                     && event.run_id == run
                     && if route == "running" {
@@ -393,7 +393,7 @@ async fn run_completed_reply_recovery_fixture() {
         if route == "lagged" {
             let background = adapter
                 .execute(CommandEnvelope {
-                    owner_epoch: adapter.owner.owner_epoch(),
+                    daemon_epoch: adapter.daemon.daemon_epoch(),
                     command_id: Uuid::new_v4(),
                     command: AgentCommand::Submit {
                         execution: other_execution.unwrap(),
@@ -448,7 +448,7 @@ async fn run_completed_reply_recovery_fixture() {
         finish_model.send(()).unwrap();
         tokio::time::timeout(RECOVERY_TIMEOUT, async {
             loop {
-                let event = owner_events.recv().await.unwrap();
+                let event = daemon_events.recv().await.unwrap();
                 if event.chat_id == chat
                     && event.run_id == run
                     && matches!(event.kind, EventKind::Completed { .. })
@@ -514,11 +514,11 @@ async fn run_completed_reply_recovery_fixture() {
         matches!(skipped,RecoveryFact::Skipped {chat:received_chat,run:received_run,sequence:received_sequence,completed:terminal_completed} if terminal_completed==(route!="interrupted") && received_chat==chat && received_run==run && received_sequence==completed.last_sequence)
             || route == "running"
                 && matches!(skipped,RecoveryFact::Completed {chat:received_chat,run:received_run,sequence:received_sequence} if received_chat==chat && received_run==run && received_sequence==completed.last_sequence),
-        "the caller must process the delayed terminal event exactly at its owner cursor: {skipped:?}"
+        "the caller must process the delayed terminal event exactly at its daemon cursor: {skipped:?}"
     );
     std::fs::write(
         std::env::var_os(PROOF_VARIABLE).unwrap(),
-        serde_json::to_vec(&serde_json::json!({"route":route,"recoveries":recoveries.load(std::sync::atomic::Ordering::Relaxed),"execution":execution,"view":view,"run":run,"buffered":buffered,"restored":restored,"skipped":skipped,"owner_last_sequence":completed.last_sequence})).unwrap(),
+        serde_json::to_vec(&serde_json::json!({"route":route,"recoveries":recoveries.load(std::sync::atomic::Ordering::Relaxed),"execution":execution,"view":view,"run":run,"buffered":buffered,"restored":restored,"skipped":skipped,"daemon_last_sequence":completed.last_sequence})).unwrap(),
     ).unwrap();
     console.write("\nRecovery facts verified\n").unwrap();
     interaction.await.unwrap().unwrap();
@@ -1045,14 +1045,14 @@ const UNARMED_INPUT: &str = "Original 33333333-3333-4333-8333-333333333333 deadb
 const RAW_TOOL_CONTENT: &str = "44444444-4444-4444-8444-444444444444 deadbeef /tmp/tool --ack";
 
 struct SavedInputObservation {
-    owner: EmbeddedAgentAccess,
+    daemon: EmbeddedAgentAccess,
     pending_run: Uuid,
 }
 
 #[async_trait]
 impl AgentAccess for SavedInputObservation {
     async fn observe(&self, query: ObservationRequest) -> Result<Observation, AccessError> {
-        let mut observation = self.owner.observe(query).await?;
+        let mut observation = self.daemon.observe(query).await?;
         if std::path::Path::new(UNARMED_INPUT_FILE).exists()
             && let ObservationValue::Agent(snapshot) = &mut observation.initial
             && let Some(goal) = snapshot.conversation.loops.first()
@@ -1067,11 +1067,11 @@ impl AgentAccess for SavedInputObservation {
     }
 
     async fn execute(&self, command: CommandEnvelope) -> Result<CommandReceipt, AccessError> {
-        self.owner.execute(command).await
+        self.daemon.execute(command).await
     }
 
     async fn show_view(&self, update: DisplayUpdate) -> Result<DisplayReceipt, AccessError> {
-        self.owner.show_view(update).await
+        self.daemon.show_view(update).await
     }
 }
 
@@ -1114,7 +1114,7 @@ fn routine_restore_pty_fixture() {
                 let workdir = std::env::current_dir().unwrap();
                 let access = EmbeddedAgentAccess::new(core.clone());
                 let adapter = Arc::new(SavedInputObservation {
-                    owner: access.clone(),
+                    daemon: access.clone(),
                     pending_run: Uuid::new_v4(),
                 });
                 let mut launch = LaunchSpec::embedded(workdir.clone());
@@ -1122,7 +1122,7 @@ fn routine_restore_pty_fixture() {
                 launch.session_persistence = false;
                 let agent = Agent::from_access_for_test(
                     adapter,
-                    access.owner_epoch(),
+                    access.daemon_epoch(),
                     ViewRef {
                         session_id: Uuid::new_v4(),
                         view_id: Uuid::new_v4(),
@@ -1373,7 +1373,7 @@ async fn run_retained_completion_lifecycle_fixture() {
     launch.session_persistence = false;
     let agent = Agent::from_access_for_test(
         Arc::new(access.clone()),
-        access.owner_epoch(),
+        access.daemon_epoch(),
         ViewRef {
             session_id: Uuid::new_v4(),
             view_id: Uuid::new_v4(),
@@ -1824,14 +1824,14 @@ impl ModelClient for HeldRequests {
 /// Forwards the first InputMerged change of each stream and holds every later change, in order,
 /// until `release` is cancelled.
 struct HeldMerges {
-    owner: EmbeddedAgentAccess,
+    daemon: EmbeddedAgentAccess,
     release: CancellationToken,
 }
 
 #[async_trait]
 impl AgentAccess for HeldMerges {
     async fn observe(&self, query: ObservationRequest) -> Result<Observation, AccessError> {
-        let mut observation = self.owner.observe(query).await?;
+        let mut observation = self.daemon.observe(query).await?;
         if let Some(mut changes) = observation.changes.take() {
             let (forward, receiver) = mpsc::channel(FEED_CAPACITY);
             let release = self.release.clone();
@@ -1871,11 +1871,11 @@ impl AgentAccess for HeldMerges {
     }
 
     async fn execute(&self, command: CommandEnvelope) -> Result<CommandReceipt, AccessError> {
-        self.owner.execute(command).await
+        self.daemon.execute(command).await
     }
 
     async fn show_view(&self, update: DisplayUpdate) -> Result<DisplayReceipt, AccessError> {
-        self.owner.show_view(update).await
+        self.daemon.show_view(update).await
     }
 }
 
@@ -1932,7 +1932,7 @@ async fn run_merge_boundary_fixture() {
     );
     let workdir = std::env::current_dir().unwrap();
     let adapter = Arc::new(HeldMerges {
-        owner: EmbeddedAgentAccess::new(core.clone()),
+        daemon: EmbeddedAgentAccess::new(core.clone()),
         release: CancellationToken::new(),
     });
     let mut launch = LaunchSpec::embedded(workdir.clone());
@@ -1940,7 +1940,7 @@ async fn run_merge_boundary_fixture() {
     launch.session_persistence = false;
     let agent = Agent::from_access_for_test(
         adapter.clone(),
-        adapter.owner.owner_epoch(),
+        adapter.daemon.daemon_epoch(),
         ViewRef {
             session_id: Uuid::new_v4(),
             view_id: Uuid::new_v4(),

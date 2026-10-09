@@ -29,7 +29,7 @@ fn retired_commands_do_not_execute_or_become_prompts() {
     ];
     let runtime_directory = support::cli_runtime::directory();
     let mut child = Command::new(env!("CARGO_BIN_EXE_tickloop"))
-        .env("TICKLOOP_AGENT_RUNTIME_DIR", &runtime_directory)
+        .env("TICKLOOP_DAEMON_RUNTIME_DIR", &runtime_directory)
         .args(["--working-directory-is-trusted", "--no-session-persistence"])
         .current_dir(directory.path())
         .env("TICKLOOP_CONFIG_DIR", directory.path().join("state"))
@@ -67,7 +67,7 @@ fn retired_commands_do_not_execute_or_become_prompts() {
         .build()
         .unwrap()
         .block_on(async {
-            let client = LocalAgentClient::connect(runtime_directory.join("owner.sock"))
+            let client = LocalAgentClient::connect(runtime_directory.join("daemon.sock"))
                 .await
                 .unwrap();
             client
@@ -84,7 +84,7 @@ fn retired_commands_do_not_execute_or_become_prompts() {
                 .initial
         });
     let ObservationValue::Overview(agents) = catalog else {
-        panic!("expected the owner catalog");
+        panic!("expected the daemon catalog");
     };
     assert!(agents.is_empty(), "{agents:?}");
 }
@@ -127,7 +127,7 @@ async fn loops_pipe_controls_preserve_history_scope_and_trigger_capabilities() {
     );
     let runtime_directory = support::cli_runtime::directory();
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_tickloop"))
-        .env("TICKLOOP_AGENT_RUNTIME_DIR", &runtime_directory)
+        .env("TICKLOOP_DAEMON_RUNTIME_DIR", &runtime_directory)
         .args([
             "--working-directory-is-trusted",
             "--chat-id",

@@ -8,7 +8,7 @@ use tick_connect::hosted::{
     BUSINESS_FRAME_BYTES, CAPABILITY_LIFECYCLE, HostConnection, MANAGEMENT_FRAME_BYTES, Role,
     read_frame, write_frame,
 };
-use tick_host::{host, paths::HostPaths};
+use tickhost::{host, paths::HostPaths};
 use tokio::{io::BufReader, net::UnixStream};
 
 struct Fixture {
@@ -82,19 +82,20 @@ async fn raw(
 fn controller(fixture: &Fixture) -> Role {
     Role::Controller {
         controller_key: fixture.key.clone(),
-        owner_epoch: uuid::Uuid::new_v4(),
+        daemon_epoch: uuid::Uuid::new_v4(),
     }
 }
 
 #[tokio::test]
-async fn only_the_owner_key_controls_and_incompatible_or_mixed_requests_are_refused() {
+async fn only_the_daemon_key_controls_and_incompatible_or_mixed_requests_are_refused() {
     let fixture = start().await;
     let socket = fixture.paths.socket();
-    let mut owner = HostConnection::connect(&socket, controller(&fixture), &[CAPABILITY_LIFECYCLE])
-        .await
-        .unwrap();
-    let epoch = owner.epoch();
-    owner
+    let mut daemon =
+        HostConnection::connect(&socket, controller(&fixture), &[CAPABILITY_LIFECYCLE])
+            .await
+            .unwrap();
+    let epoch = daemon.epoch();
+    daemon
         .request("list", json!({}), Duration::from_secs(5))
         .await
         .unwrap();
@@ -103,7 +104,7 @@ async fn only_the_owner_key_controls_and_incompatible_or_mixed_requests_are_refu
         &socket,
         Role::Controller {
             controller_key: "0".repeat(64),
-            owner_epoch: uuid::Uuid::new_v4(),
+            daemon_epoch: uuid::Uuid::new_v4(),
         },
         &[CAPABILITY_LIFECYCLE],
     )
@@ -129,7 +130,7 @@ async fn only_the_owner_key_controls_and_incompatible_or_mixed_requests_are_refu
 
     let (_, _, future_major) = raw(
         &socket,
-        json!({"channel":"business","major":tick_connect::hosted::BUSINESS_MAJOR + 1,"minor":0,"required":[],"role":{"kind":"controller","controller_key":fixture.key,"owner_epoch":uuid::Uuid::new_v4()}}),
+        json!({"channel":"business","major":tick_connect::hosted::BUSINESS_MAJOR + 1,"minor":0,"required":[],"role":{"kind":"controller","controller_key":fixture.key,"daemon_epoch":uuid::Uuid::new_v4()}}),
     )
     .await;
     assert_eq!(future_major["error"]["code"], "IncompatibleHost");
@@ -158,7 +159,7 @@ async fn only_the_owner_key_controls_and_incompatible_or_mixed_requests_are_refu
         mixed["error"]["code"], "MethodNotAllowed",
         "management never carries business requests"
     );
-    let business_shutdown = owner
+    let business_shutdown = daemon
         .request(
             "shutdown_host",
             json!({"epoch":epoch,"operation":uuid::Uuid::new_v4()}),
@@ -176,10 +177,10 @@ async fn only_the_owner_key_controls_and_incompatible_or_mixed_requests_are_refu
     shutdown(fixture).await;
 }
 
-/// The Agent owner lock admits one owner at a time, so the controller that said hello last is
-/// the current owner.
+/// The Agent daemon lock admits one daemon at a time, so the controller that said hello last is
+/// the current daemon.
 #[tokio::test]
-async fn a_later_owner_fences_the_earlier_controller() {
+async fn a_later_daemon_fences_the_earlier_controller() {
     let fixture = start().await;
     let socket = fixture.paths.socket();
     let mut old = HostConnection::connect(&socket, controller(&fixture), &[CAPABILITY_LIFECYCLE])
@@ -223,10 +224,11 @@ async fn oversized_and_partial_frames_never_stop_the_host() {
         .await
         .unwrap();
     drop(partial);
-    let mut owner = HostConnection::connect(&socket, controller(&fixture), &[CAPABILITY_LIFECYCLE])
-        .await
-        .unwrap();
-    owner
+    let mut daemon =
+        HostConnection::connect(&socket, controller(&fixture), &[CAPABILITY_LIFECYCLE])
+            .await
+            .unwrap();
+    daemon
         .request("list", json!({}), Duration::from_secs(5))
         .await
         .unwrap();

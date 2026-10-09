@@ -65,7 +65,7 @@ impl ModelClient for ActivityModel {
 }
 
 struct ActivityAccess {
-    owner: EmbeddedAgentAccess,
+    daemon: EmbeddedAgentAccess,
     queries: AtomicUsize,
 }
 
@@ -82,7 +82,7 @@ impl AgentAccess for ActivityAccess {
             let count = self.queries.fetch_add(1, Ordering::Relaxed) + 1;
             std::fs::write(ACTIVITY_QUERIES, count.to_string()).unwrap();
         }
-        let mut observation = self.owner.observe(query).await?;
+        let mut observation = self.daemon.observe(query).await?;
         if std::env::var(ACTIVITY_ROUTE).as_deref() == Ok("observe-only")
             && let ObservationValue::Overview(rows) = &mut observation.initial
         {
@@ -93,7 +93,7 @@ impl AgentAccess for ActivityAccess {
         Ok(observation)
     }
     async fn execute(&self, command: CommandEnvelope) -> Result<CommandReceipt, AccessError> {
-        let receipt = self.owner.execute(command).await?;
+        let receipt = self.daemon.execute(command).await?;
         if let Some(CommandResult::Created {
             execution,
             snapshot,
@@ -109,14 +109,14 @@ impl AgentAccess for ActivityAccess {
             if submitted.is_some()
                 && std::env::var(ACTIVITY_ROUTE).as_deref() == Ok("overview-dispatch")
             {
-                let owner = self.owner.clone();
+                let daemon = self.daemon.clone();
                 let execution = *execution;
                 let chat = snapshot.conversation.id;
                 tokio::spawn(async move {
                     loop {
                         if std::fs::read_to_string(ACTIVITY_STAGE)
                             .is_ok_and(|stage| stage == "continue-2")
-                            && owner
+                            && daemon
                                 .runtime()
                                 .snapshot(chat)
                                 .await
@@ -129,9 +129,9 @@ impl AgentAccess for ActivityAccess {
                         }
                         tokio::time::sleep(Duration::from_millis(5)).await;
                     }
-                    owner
+                    daemon
                         .execute(CommandEnvelope {
-                            owner_epoch: owner.owner_epoch(),
+                            daemon_epoch: daemon.daemon_epoch(),
                             command_id: Uuid::new_v4(),
                             command: AgentCommand::Submit {
                                 execution,
@@ -155,7 +155,7 @@ impl AgentAccess for ActivityAccess {
         Ok(receipt)
     }
     async fn show_view(&self, update: DisplayUpdate) -> Result<DisplayReceipt, AccessError> {
-        self.owner.show_view(update).await
+        self.daemon.show_view(update).await
     }
 }
 
@@ -179,7 +179,7 @@ fn working_activity_pty_fixture() {
                     Arc::new(ActivityModel(AtomicUsize::new(0))),
                 );
                 let access = Arc::new(ActivityAccess {
-                    owner: EmbeddedAgentAccess::new(core),
+                    daemon: EmbeddedAgentAccess::new(core),
                     queries: AtomicUsize::new(0),
                 });
                 std::fs::write(ACTIVITY_QUERIES, "0").unwrap();
@@ -189,7 +189,7 @@ fn working_activity_pty_fixture() {
                 launch.session_persistence = false;
                 let agent = Agent::from_access_for_test(
                     access.clone(),
-                    access.owner.owner_epoch(),
+                    access.daemon.daemon_epoch(),
                     ViewRef {
                         session_id: Uuid::new_v4(),
                         view_id: Uuid::new_v4(),

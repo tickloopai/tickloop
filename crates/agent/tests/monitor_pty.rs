@@ -73,7 +73,7 @@ impl Session {
         command.args(arguments);
         command.env("TICKLOOP_CONFIG_DIR", directory.join("state"));
         command.env(
-            "TICKLOOP_AGENT_RUNTIME_DIR",
+            "TICKLOOP_DAEMON_RUNTIME_DIR",
             support::cli_runtime::directory(),
         );
         command.env("HERDR_ENV", "0");

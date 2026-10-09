@@ -43,15 +43,15 @@ const VIEW_REGISTRATION_DELAY: Duration = Duration::from_millis(50);
 /// Records every command the View sends, one JSON line each in `commands.jsonl`. On the
 /// Each command retains the stable execution identity used by the View. Slow View
 /// registration separates the initial transcript frame from the initialized editor.
-struct RecordingOwner {
-    owner: EmbeddedAgentAccess,
+struct RecordingDaemon {
+    daemon: EmbeddedAgentAccess,
     directory: PathBuf,
 }
 
 #[async_trait]
-impl AgentAccess for RecordingOwner {
+impl AgentAccess for RecordingDaemon {
     async fn observe(&self, query: ObservationRequest) -> Result<Observation, AccessError> {
-        let observation = self.owner.observe(query).await?;
+        let observation = self.daemon.observe(query).await?;
         Ok(observation)
     }
 
@@ -67,12 +67,12 @@ impl AgentAccess for RecordingOwner {
             serde_json::to_string(&command.command).unwrap()
         )
         .unwrap();
-        self.owner.execute(command).await
+        self.daemon.execute(command).await
     }
 
     async fn show_view(&self, update: DisplayUpdate) -> Result<DisplayReceipt, AccessError> {
         tokio::time::sleep(VIEW_REGISTRATION_DELAY).await;
-        self.owner.show_view(update).await
+        self.daemon.show_view(update).await
     }
 }
 
@@ -147,8 +147,8 @@ async fn run_child_config_fixture() {
         Arc::new(test_support::ScriptedModel::new(replies)),
     );
     let workdir = std::env::current_dir().unwrap();
-    let adapter = Arc::new(RecordingOwner {
-        owner: EmbeddedAgentAccess::new(core.clone()),
+    let adapter = Arc::new(RecordingDaemon {
+        daemon: EmbeddedAgentAccess::new(core.clone()),
         directory: directory.clone(),
     });
     let mut launch = LaunchSpec::embedded(workdir.clone());
@@ -157,7 +157,7 @@ async fn run_child_config_fixture() {
     launch.config_root = config_root.clone();
     let agent = Agent::from_access_for_test(
         adapter.clone(),
-        adapter.owner.owner_epoch(),
+        adapter.daemon.daemon_epoch(),
         ViewRef {
             session_id: Uuid::new_v4(),
             view_id: Uuid::new_v4(),
@@ -303,7 +303,7 @@ impl ChildPty {
         command.env("TERM", "xterm-256color");
         command.env("HOME", directory);
         command.env("TICKLOOP_CONFIG_DIR", directory.join("config-root"));
-        command.env("TICKLOOP_AGENT_RUNTIME_DIR", directory.join("runtime"));
+        command.env("TICKLOOP_DAEMON_RUNTIME_DIR", directory.join("runtime"));
         command.env("TICKLOOP_TMPDIR", directory);
         for model in crate::model::cards::built_in_model_profiles() {
             if !model.api_key_env.is_empty() {
@@ -1101,7 +1101,7 @@ fn shift_tab_in_the_overview_changes_no_hidden_agent_and_the_root_keeps_its_key(
             .unwrap();
     assert_eq!(
         final_state["root_mode"], "FullAccess",
-        "one cycle from Ask; the overview presses never reached the owner"
+        "one cycle from Ask; the overview presses never reached the daemon"
     );
 }
 

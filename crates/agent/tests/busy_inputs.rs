@@ -162,7 +162,7 @@ impl Busy {
             "{receipt:?}"
         );
         assert_eq!(receipt.command_id, command.command_id);
-        assert_eq!(receipt.owner_epoch, self.access.owner_epoch());
+        assert_eq!(receipt.daemon_epoch, self.access.daemon_epoch());
         assert_eq!(receipt.target, Some(self.execution));
         let Some(CommandResult::Submitted(accepted)) = receipt.result.clone() else {
             panic!("a busy Submit is accepted with its own run: {receipt:?}");
@@ -255,7 +255,7 @@ impl Busy {
 
 fn envelope(access: &EmbeddedAgentAccess, command: AgentCommand) -> CommandEnvelope {
     CommandEnvelope {
-        owner_epoch: access.owner_epoch(),
+        daemon_epoch: access.daemon_epoch(),
         command_id: Uuid::new_v4(),
         command,
     }

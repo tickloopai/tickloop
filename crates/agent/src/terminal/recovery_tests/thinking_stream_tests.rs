@@ -165,7 +165,7 @@ fn write_thinking_progress(phase: &str) {
 }
 
 struct MeasuredThinkingAccess {
-    owner: EmbeddedAgentAccess,
+    daemon: EmbeddedAgentAccess,
     task_queries: AtomicUsize,
 }
 
@@ -183,15 +183,15 @@ impl AgentAccess for MeasuredThinkingAccess {
             std::fs::write(THINKING_QUERY_FILE, queries.to_string()).unwrap();
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        self.owner.observe(query).await
+        self.daemon.observe(query).await
     }
 
     async fn execute(&self, command: CommandEnvelope) -> Result<CommandReceipt, AccessError> {
-        self.owner.execute(command).await
+        self.daemon.execute(command).await
     }
 
     async fn show_view(&self, update: DisplayUpdate) -> Result<DisplayReceipt, AccessError> {
-        self.owner.show_view(update).await
+        self.daemon.show_view(update).await
     }
 }
 
@@ -221,7 +221,7 @@ fn thinking_stream_pty_fixture() {
                     }
                 });
                 let access = Arc::new(MeasuredThinkingAccess {
-                    owner: EmbeddedAgentAccess::new(core.clone()),
+                    daemon: EmbeddedAgentAccess::new(core.clone()),
                     task_queries: AtomicUsize::new(0),
                 });
                 let workdir = std::env::current_dir().unwrap();
@@ -230,7 +230,7 @@ fn thinking_stream_pty_fixture() {
                 launch.session_persistence = false;
                 let agent = Agent::from_access_for_test(
                     access.clone(),
-                    access.owner.owner_epoch(),
+                    access.daemon.daemon_epoch(),
                     ViewRef {
                         session_id: Uuid::new_v4(),
                         view_id: Uuid::new_v4(),

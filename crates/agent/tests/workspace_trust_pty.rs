@@ -53,7 +53,7 @@ impl Fixture {
         vec![
             ("HOME", self.path("home")),
             ("TICKLOOP_CONFIG_DIR", self.path("config")),
-            ("TICKLOOP_AGENT_RUNTIME_DIR", self.path("runtime")),
+            ("TICKLOOP_DAEMON_RUNTIME_DIR", self.path("runtime")),
             ("TICKLOOP_TMPDIR", self.path("scratch")),
         ]
     }
@@ -66,7 +66,7 @@ impl Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = support::fixture_cli::command()
-            .args(["service", "stop"])
+            .args(["daemon", "stop"])
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
             .envs(self.environment())

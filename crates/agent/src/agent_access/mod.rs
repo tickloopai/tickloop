@@ -1,18 +1,19 @@
 mod chunked;
+mod daemon;
 mod embedded;
 mod ipc;
-mod owner;
 mod protocol;
 mod receipts;
 mod records;
 mod recovering;
 mod views;
 
+pub use daemon::{DaemonServer, WorkerFactory};
 pub use embedded::EmbeddedAgentAccess;
 pub use ipc::{
-    LocalAgentClient, serve_connection, serve_listener, serve_owner_listener, serve_worker_listener,
+    LocalAgentClient, serve_connection, serve_daemon_listener, serve_listener,
+    serve_worker_listener,
 };
-pub use owner::{OwnerServer, WorkerFactory};
 pub use protocol::*;
 pub use recovering::{ReconnectFactory, RecoveringAgentClient, worker_link};
 

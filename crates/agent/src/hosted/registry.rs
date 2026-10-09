@@ -1,7 +1,7 @@
-//! The owner daemon's durable record of hosted Tick ownership. Each config root keeps its own
-//! private `tick-host/` directory: a lease lock held for the owner's life, and per Chat its owner
-//! state and one file per launch record. Only the owner daemon writes it; the files outlive host
-//! and owner restarts so ownership, recovery and end events never depend on a live process.
+//! The daemon's durable record of hosted Tick ownership. Each config root keeps its own
+//! private `tickhost/` directory: a lease lock held for the daemon's life, and per Chat its owner
+//! state and one file per launch record. Only the daemon writes it; the files outlive host
+//! and daemon restarts so ownership, recovery and end events never depend on a live process.
 
 use std::{
     collections::{BTreeSet, HashMap},
@@ -15,7 +15,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use tick_connect::{host_error::HostError, instance::InstanceRef};
-use tick_host::host::{Receipt, TickOwner};
+use tickhost::host::{Receipt, TickOwner};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -29,14 +29,14 @@ use crate::{
     transcript::retention::RetentionGuard,
 };
 
-const REGISTRY_DIRECTORY: &str = "tick-host";
+const REGISTRY_DIRECTORY: &str = "tickhost";
 const LEASE_FILE: &str = "registry.lock";
 const CHATS_DIRECTORY: &str = "chats";
 const OWNER_FILE: &str = "owner.json";
 const MANIFEST_FILE: &str = "manifest.json";
 const LAUNCH_PREFIX: &str = "launch-";
 const RECORD_EXTENSION: &str = ".json";
-/// How often the owner checks whether a cleanup still holds a Chat it is deleting.
+/// How often the daemon checks whether a cleanup still holds a Chat it is deleting.
 const DELETION_SETTLE_POLL: std::time::Duration = std::time::Duration::from_secs(1);
 /// The host's answer for an instance or owner it no longer runs.
 pub const TARGET_GONE: &str = "TargetGone";
@@ -212,7 +212,7 @@ fn settled_launch_transition(
     }
 }
 
-/// The registries of every config root this owner serves, opened on first use.
+/// The registries of every config root this daemon serves, opened on first use.
 #[derive(Default)]
 pub struct Registry {
     roots: Mutex<HashMap<PathBuf, Arc<RootRegistry>>>,
@@ -220,7 +220,7 @@ pub struct Registry {
 
 impl Registry {
     /// The registry of `config_root`, taking its lease on first use. A root whose lease another
-    /// owner holds is unavailable rather than shared.
+    /// daemon holds is unavailable rather than shared.
     pub async fn root(&self, config_root: &Path) -> Result<Arc<RootRegistry>, HostError> {
         let config_root = config_root.to_path_buf();
         let canonical = tokio::task::spawn_blocking(move || config_root.canonicalize())
@@ -249,7 +249,7 @@ impl Registry {
 }
 
 /// One config root's registry. Holding it holds the root's lease. Its files are read and
-/// written on blocking threads, never on the owner's async workers.
+/// written on blocking threads, never on the daemon's async workers.
 pub struct RootRegistry {
     files: Arc<RegistryFiles>,
     /// Keeps each Watch intent change and its delivery to the host in arrival order.
@@ -318,7 +318,7 @@ impl RegistryFiles {
         if unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
-                "another Agent owner holds this config root's hosted Tick registry",
+                "another Agent daemon holds this config root's hosted Tick registry",
             ));
         }
         Ok(Self {
@@ -1069,7 +1069,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn records_survive_a_new_owner_and_a_root_has_one_owner_at_a_time() {
+    async fn records_survive_a_new_daemon_and_a_root_has_one_daemon_at_a_time() {
         let directory = tempfile::tempdir().unwrap();
         let chat = Uuid::new_v4();
         let instance = InstanceRef::hosted(Uuid::new_v4());
@@ -1091,7 +1091,7 @@ mod tests {
             assert_eq!(
                 second.err().unwrap().code,
                 "RegistryUnavailable",
-                "a second owner never writes the same root"
+                "a second daemon never writes the same root"
             );
         }
         let registry = Registry::default();

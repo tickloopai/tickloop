@@ -1,34 +1,34 @@
 ---
 name: tickloop
-description: Show stock prices, quotes or K-line charts in Ticks, operate a Tick, or subscribe to updates. Use for 看看特斯拉股价 and 打开K线, even without the word Tick, and for Shell or Artifact Tick updates. New Ticks run hidden in the Tick host and appear in this Chat's Monitor; Herdr Panes are opened only when the user asks for a place.
+description: Show stock prices, quotes or K-line charts in Ticks, operate a Tick, or subscribe to updates. Use for 看看特斯拉股价 and 打开K线, even without the word Tick, and for Shell or Artifact Tick updates. New Ticks run hidden in the Tickhost and appear in this Chat's Monitor; Herdr Panes are opened only when the user asks for a place.
 ---
 
 # Tick Loop Ticks
 
 ## 1. Select the Tick and where it runs
 
-Keep the complete `<type>:<id>` reference: `hosted:` for a Tick running hidden in the Tick host, `herdr:` for a program in a Herdr Pane, `shell:` for a Shell task and `artifact:` for an artifact. Shared Tick behavior means updates reach the same Loop; operations keep each type's native tools. For Shell tasks use `Bash`, `Read` on the returned `output_file`, and `TaskStop` with `task_id`. TaskStop stops only the current Loop's Agent command and retains its Ask/Deny and Plan behavior; user Shells and other Loops use explicit user UI stops. Subscribe to `shell:<task id>` for subsequent output/completion. For artifacts use the installed `mcp__artifacts__*` tools for reads, edits and publishing, and `artifact:<origin>/<artifact_id>` from `artifact_ticks` for subscriptions. `ReadTick` and `CallTickTool` operate on `hosted:` and `herdr:` instances; use section 4 to subscribe to any type.
+Keep the complete `<type>:<id>` reference: `hosted:` for a Tick running hidden in the Tickhost, `herdr:` for a program in a Herdr Pane, `shell:` for a Shell task and `artifact:` for an artifact. Shared Tick behavior means updates reach the same Loop; operations keep each type's native tools. For Shell tasks use `Bash`, `Read` on the returned `output_file`, and `TaskStop` with `task_id`. TaskStop stops only the current Loop's Agent command and retains its Ask/Deny and Plan behavior; user Shells and other Loops use explicit user UI stops. Subscribe to `shell:<task id>` for subsequent output/completion. For artifacts use the installed `mcp__artifacts__*` tools for reads, edits and publishing, and `artifact:<origin>/<artifact_id>` from `artifact_ticks` for subscriptions. `ReadTick` and `CallTickTool` operate on `hosted:` and `herdr:` instances; use section 4 to subscribe to any type.
 
-Use the installed host tools as the authority for targets and capabilities. Start with `workspace_host` in Current host state; an installed multiplexer command or a repository name is not proof of the current environment. `tick_host` says whether this Agent can run hidden Ticks, `name` and `integration` say whether Herdr Panes can be operated, and `tick_executable` is the bundled `tick` to launch.
+Use the installed host tools as the authority for targets and capabilities. Start with `workspace_host` in Current host state; an installed multiplexer command or a repository name is not proof of the current environment. `tickhost` says whether this Agent can run hidden Ticks, `name` and `integration` say whether Herdr Panes can be operated, and `tick_executable` is the bundled `tick` to launch.
 
 | Current host state | Action |
 | --- | --- |
-| `tick_host` `available` | Open, read, operate and subscribe to hidden Ticks (section 2). This works in every terminal, inside Herdr or not. |
+| `tickhost` `available` | Open, read, operate and subscribe to hidden Ticks (section 2). This works in every terminal, inside Herdr or not. |
 | `herdr`, integration `available` | Programs in Herdr Panes can also be discovered and operated, and a visible Pane can be opened where the user asks (section 3). Confirm live access with `ReadWorkspace({})`. |
-| `herdr`, integration `unavailable`, or a failed host connection | Explain that Pane programs cannot be operated and report the connection diagnostic; hidden Ticks still work when `tick_host` is available. |
-| `tmux` or `zellij` | Say that the multiplexer was detected but Tick Loop's Pane integration for it is not implemented yet; hidden Ticks still work when `tick_host` is available. |
-| `standalone` | No workspace host is connected; hidden Ticks still work when `tick_host` is available. |
-| `tick_host` `unavailable` and no Herdr integration | No Tick can be opened here. Explain why and end this Tick workflow. |
+| `herdr`, integration `unavailable`, or a failed host connection | Explain that Pane programs cannot be operated and report the connection diagnostic; hidden Ticks still work when `tickhost` is available. |
+| `tmux` or `zellij` | Say that the multiplexer was detected but Tick Loop's Pane integration for it is not implemented yet; hidden Ticks still work when `tickhost` is available. |
+| `standalone` | No workspace host is connected; hidden Ticks still work when `tickhost` is available. |
+| `tickhost` `unavailable` and no Herdr integration | No Tick can be opened here. Explain why and end this Tick workflow. |
 
 For an unavailable branch, briefly name what is missing in ordinary language, without dumping internal context fields, then wait for a new request before troubleshooting installation. Ordinary questions remain available. Do not simulate a successful Tick operation or bypass a missing integration through shell multiplexer commands. If host metadata is missing, report that the environment cannot be confirmed rather than assuming Herdr.
 
-## 2. Hidden Ticks in the Tick host
+## 2. Hidden Ticks in the Tickhost
 
 “看看特斯拉股价” requests a quote Tick even though the user did not say Tick. Prefer an existing matching instance in this Chat when the user asks to see information; open one if none exists. An explicit request to open a new Tick creates a new instance. A request to see a price uses Quote; a request for K线 or a chart uses Kline. A request explicitly asking for text only can use an ordinary data lookup instead. Opening, reading or listing a Tick never subscribes; use section 4 only for continued observation.
 
 ### Open a bundled Tick
 
-Call `ModifyTick` with `action: "open"`, a `command` argv array and optional `cwd`, and no `placement`. The Tick runs hidden in the Tick host: it needs no View or layout, takes no focus, joins this Chat's Monitor and is not subscribed. Omitted `cwd` uses the Agent's file work directory. Use `workspace_host.tick_executable` as the executable; if it is null, explain that the companion `tick` is missing and needs to be built or installed (`make build` and `make install` include both binaries) instead of searching project source for a launcher. Build the argv from the requested view:
+Call `ModifyTick` with `action: "open"`, a `command` argv array and optional `cwd`, and no `placement`. The Tick runs hidden in the Tickhost: it needs no View or layout, takes no focus, joins this Chat's Monitor and is not subscribed. Omitted `cwd` uses the Agent's file work directory. Use `workspace_host.tick_executable` as the executable; if it is null, explain that the companion `tick` is missing and needs to be built or installed (`make build` and `make install` include both binaries) instead of searching project source for a launcher. Build the argv from the requested view:
 
 | Requested view | Arguments after the executable |
 | --- | --- |
@@ -48,7 +48,7 @@ A hidden Tick is shown by the user, not by the Agent: Enter or a click on its Mo
 
 `ReadTick` returns a protocol Tick's structured content and tool catalog. After reading the catalog, call `CallTickTool` with the declared `tool` and `args` matching its schema. Query tools have `mutates: false`; actions have `mutates: true`. Existing execution modes and permission rules govern the resolved action. Verify changes by reading the same instance again. A changed target or tool catalog requires fresh preparation and permission.
 
-`ModifyTick` `close` ends a hidden Tick's process. Removing its Monitor row (`x`) or closing its view (Esc) leaves it running. A hidden Tick that no Watch keeps, no view attaches and nothing explicitly uses ends after five idle minutes. When the Tick host was lost, its Ticks are lost too; nothing restarts them on its own. `ModifyTick` `reopen` with the lost `tick_instance_id` starts a new instance from the recorded program after approval: it has a new identity and fresh state, and no subscription follows it, so subscribe again only if the user still wants updates. Never reopen without being asked.
+`ModifyTick` `close` ends a hidden Tick's process. Removing its Monitor row (`x`) or closing its view (Esc) leaves it running. A hidden Tick that no Watch keeps, no view attaches and nothing explicitly uses ends after five idle minutes. When the Tickhost was lost, its Ticks are lost too; nothing restarts them on its own. `ModifyTick` `reopen` with the lost `tick_instance_id` starts a new instance from the recorded program after approval: it has a new identity and fresh state, and no subscription follows it, so subscribe again only if the user still wants updates. Never reopen without being asked.
 
 ## 3. Herdr Panes
 

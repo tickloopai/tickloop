@@ -27,17 +27,17 @@ const WIDTH: usize = 100;
 const HEIGHT: usize = 30;
 const TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The owner the View talks to: while `lose-replies`, `lose-create` or `lose-configure` exists a
+/// The daemon the View talks to: while `lose-replies`, `lose-create` or `lose-configure` exists a
 /// Submit, Create or Configure runs but its reply is lost, and while `hide-receipts` exists
 /// receipt lookups find nothing (each counted in `hidden-receipt-reads`). Submits, Shell
 /// submissions and after-turn queues are counted in `submits`, `shell-submits` and
 /// `after-turn-queues`.
-struct LateReceiptOwner {
-    owner: EmbeddedAgentAccess,
+struct LateReceiptDaemon {
+    daemon: EmbeddedAgentAccess,
     directory: PathBuf,
 }
 
-impl LateReceiptOwner {
+impl LateReceiptDaemon {
     fn flag(&self, name: &str) -> bool {
         self.directory.join(name).exists()
     }
@@ -60,14 +60,14 @@ impl LateReceiptOwner {
 }
 
 #[async_trait]
-impl AgentAccess for LateReceiptOwner {
+impl AgentAccess for LateReceiptDaemon {
     async fn observe(&self, query: ObservationRequest) -> Result<Observation, AccessError> {
         let hides =
             matches!(query, ObservationRequest::Receipt { .. }) && self.flag("hide-receipts");
         if hides {
             self.count("hidden-receipt-reads");
         }
-        let mut observation = self.owner.observe(query).await?;
+        let mut observation = self.daemon.observe(query).await?;
         if hides {
             observation.initial = ObservationValue::Receipt(None);
         }
@@ -102,7 +102,7 @@ impl AgentAccess for LateReceiptOwner {
             AgentCommand::EnqueueAfterTurn { .. } => self.count("after-turn-queues"),
             _ => {}
         }
-        let receipt = self.owner.execute(command).await?;
+        let receipt = self.daemon.execute(command).await?;
         if self.flag("lose-configure")
             && let Some(name) = record_name
         {
@@ -112,7 +112,7 @@ impl AgentAccess for LateReceiptOwner {
             && let Some((execution, change)) = configured_choice
         {
             let observation = self
-                .owner
+                .daemon
                 .observe(ObservationRequest::Agent {
                     execution,
                     detail: AgentDetailQuery::Snapshot,
@@ -120,7 +120,7 @@ impl AgentAccess for LateReceiptOwner {
                 })
                 .await?;
             let ObservationValue::Agent(snapshot) = observation.initial else {
-                panic!("the owner's configured Agent snapshot");
+                panic!("the daemon's configured Agent snapshot");
             };
             self.record("configured-state.json", serde_json::json!({
                 "execution": snapshot.execution,
@@ -147,7 +147,7 @@ impl AgentAccess for LateReceiptOwner {
             DisplayUpdate::Displayed { execution, .. } => Some(*execution),
             _ => None,
         };
-        let receipt = self.owner.show_view(update).await?;
+        let receipt = self.daemon.show_view(update).await?;
         if self.flag("lose-configure")
             && let Some(execution) = execution
         {
@@ -233,8 +233,8 @@ async fn run_late_receipt_fixture() {
         }),
     );
     let workdir = std::env::current_dir().unwrap();
-    let adapter = Arc::new(LateReceiptOwner {
-        owner: EmbeddedAgentAccess::new(core.clone()),
+    let adapter = Arc::new(LateReceiptDaemon {
+        daemon: EmbeddedAgentAccess::new(core.clone()),
         directory: directory.clone(),
     });
     let mut launch = LaunchSpec::embedded(workdir.clone());
@@ -242,7 +242,7 @@ async fn run_late_receipt_fixture() {
     launch.session_persistence = false;
     let agent = Agent::from_access_for_test(
         adapter.clone(),
-        adapter.owner.owner_epoch(),
+        adapter.daemon.daemon_epoch(),
         ViewRef {
             session_id: Uuid::new_v4(),
             view_id: Uuid::new_v4(),
@@ -255,7 +255,7 @@ async fn run_late_receipt_fixture() {
     } else {
         let chat = agent.create_chat(workdir.clone()).await.unwrap();
         let execution = agent.reference(chat).await.unwrap();
-        tokio::task::spawn_local(answer_owner_probes(adapter.clone(), execution));
+        tokio::task::spawn_local(answer_daemon_probes(adapter.clone(), execution));
         StartupChat::Resumed(Box::new(agent.snapshot(chat).await.unwrap()), false)
     };
     let (console, input) = Console::start(true).unwrap();
@@ -275,14 +275,14 @@ async fn run_late_receipt_fixture() {
     result.unwrap();
 }
 
-/// Writes the owner's own state of `execution` to `owner-state.json` whenever the test asks
-/// for it with `probe-owner`.
-async fn answer_owner_probes(owner: Arc<LateReceiptOwner>, execution: ExecutionRef) {
-    let request = owner.directory.join("probe-owner");
+/// Writes the daemon's own state of `execution` to `daemon-state.json` whenever the test asks
+/// for it with `probe-daemon`.
+async fn answer_daemon_probes(daemon: Arc<LateReceiptDaemon>, execution: ExecutionRef) {
+    let request = daemon.directory.join("probe-daemon");
     loop {
         if request.exists()
-            && let Ok(observation) = owner
-                .owner
+            && let Ok(observation) = daemon
+                .daemon
                 .observe(ObservationRequest::Agent {
                     execution,
                     detail: AgentDetailQuery::Snapshot,
@@ -300,9 +300,9 @@ async fn answer_owner_probes(owner: Arc<LateReceiptOwner>, execution: ExecutionR
                 "pending_inputs": snapshot.pending_inputs.len(),
                 "pending_commands": snapshot.pending_commands.len(),
             });
-            let pending = owner.directory.join("owner-state.pending");
+            let pending = daemon.directory.join("daemon-state.pending");
             std::fs::write(&pending, state.to_string()).unwrap();
-            std::fs::rename(pending, owner.directory.join("owner-state.json")).unwrap();
+            std::fs::rename(pending, daemon.directory.join("daemon-state.json")).unwrap();
             std::fs::remove_file(&request).unwrap();
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -456,17 +456,17 @@ fn wait_for_hidden_receipt_read(directory: &std::path::Path, before: usize) {
     }
 }
 
-/// The owner's own state of the fixture Agent: whether a Loop runs, and its pending inputs and
+/// The daemon's own state of the fixture Agent: whether a Loop runs, and its pending inputs and
 /// commands.
-fn owner_state(directory: &std::path::Path) -> serde_json::Value {
-    let state = directory.join("owner-state.json");
+fn daemon_state(directory: &std::path::Path) -> serde_json::Value {
+    let state = directory.join("daemon-state.json");
     let _ = std::fs::remove_file(&state);
-    std::fs::write(directory.join("probe-owner"), "").unwrap();
+    std::fs::write(directory.join("probe-daemon"), "").unwrap();
     let deadline = Instant::now() + TIMEOUT;
     while !state.exists() {
         assert!(
             Instant::now() < deadline,
-            "the fixture never reported the owner state"
+            "the fixture never reported the daemon state"
         );
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -893,7 +893,7 @@ fn a_busy_command_held_behind_an_unknown_input_is_queued_and_shown_once() {
 
     // The first input's run is still active, so the edited command would wait for the turn.
     assert_eq!(
-        owner_state(directory.path())["running"],
+        daemon_state(directory.path())["running"],
         true,
         "the first input runs"
     );
@@ -914,7 +914,7 @@ fn a_busy_command_held_behind_an_unknown_input_is_queued_and_shown_once() {
         0,
         "nothing was queued"
     );
-    let held = owner_state(directory.path());
+    let held = daemon_state(directory.path());
     assert_eq!(held["pending_commands"], 0, "{held}");
 
     std::fs::remove_file(flag("hide-receipts")).unwrap();
@@ -957,7 +957,7 @@ fn a_busy_command_held_behind_an_unknown_input_is_queued_and_shown_once() {
         1,
         "queued once"
     );
-    let queued = owner_state(directory.path());
+    let queued = daemon_state(directory.path());
     assert_eq!(
         (
             &queued["running"],

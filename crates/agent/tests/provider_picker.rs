@@ -56,7 +56,7 @@ impl Terminal {
             })
             .unwrap();
         let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_tickloop"));
-        command.env("TICKLOOP_AGENT_RUNTIME_DIR", &runtime);
+        command.env("TICKLOOP_DAEMON_RUNTIME_DIR", &runtime);
         command.args(["--working-directory-is-trusted", "--mode", "acceptEdits"]);
         command.arg("--cwd");
         command.arg(workdir);
@@ -263,16 +263,16 @@ impl Drop for Terminal {
         let _ = self.child.kill();
         let _ = self.child.wait();
         let result = std::process::Command::new(env!("CARGO_BIN_EXE_tickloop"))
-            .args(["service", "stop"])
+            .args(["daemon", "stop"])
             .env_clear()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", &self.home)
             .env("TICKLOOP_CONFIG_DIR", &self.config_root)
-            .env("TICKLOOP_AGENT_RUNTIME_DIR", &self.runtime)
+            .env("TICKLOOP_DAEMON_RUNTIME_DIR", &self.runtime)
             .output();
         if !result.is_ok_and(|output| output.status.success()) {
             eprintln!(
-                "Fixture service stop failed; owned runtime retained at {}",
+                "Fixture daemon stop failed; owned runtime retained at {}",
                 self.runtime.display()
             );
         }

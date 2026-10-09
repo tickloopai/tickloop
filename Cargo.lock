@@ -4586,7 +4586,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "tick-connect",
- "tickloop-tick-host",
+ "tickloop-tickhost",
  "tickloop-ui",
  "time",
  "tokio",
@@ -4600,7 +4600,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "tickloop-tick-host"
+name = "tickloop-tickhost"
 version = "0.1.0"
 dependencies = [
  "libc",
@@ -4635,7 +4635,7 @@ dependencies = [
  "sha1",
  "tempfile",
  "tick-connect",
- "tickloop-tick-host",
+ "tickloop-tickhost",
  "tickloop-ui",
  "time",
  "time-tz",

@@ -11,13 +11,13 @@ use uuid::Uuid;
 mod support;
 
 struct Catalog {
-    owner: EmbeddedAgentAccess,
+    daemon: EmbeddedAgentAccess,
     rows: Mutex<Vec<AgentSummary>>,
 }
 
 fn catalog(epoch: Uuid, rows: Vec<AgentSummary>) -> Arc<Catalog> {
     Arc::new(Catalog {
-        owner: EmbeddedAgentAccess::with_epoch(
+        daemon: EmbeddedAgentAccess::with_epoch(
             tickloop_agent::runtime::Agent::new_embedded(
                 support::config(),
                 Arc::new(support::ScriptedModel::new(vec![])),
@@ -31,7 +31,7 @@ fn catalog(epoch: Uuid, rows: Vec<AgentSummary>) -> Arc<Catalog> {
 #[async_trait]
 impl AgentAccess for Catalog {
     async fn observe(&self, query: ObservationRequest) -> Result<Observation, AccessError> {
-        let mut observation = self.owner.observe(query).await?;
+        let mut observation = self.daemon.observe(query).await?;
         observation.initial = ObservationValue::Overview(self.rows.lock().unwrap().clone());
         Ok(observation)
     }
@@ -44,7 +44,7 @@ impl AgentAccess for Catalog {
 }
 
 fn row(epoch: Uuid, id: u128, parent: Option<ExecutionRef>, state: &str) -> AgentSummary {
-    serde_json::from_value(serde_json::json!({"execution":{"owner_epoch":epoch,"agent_id":Uuid::from_u128(id),"generation":1},"chat_id":Uuid::from_u128(id+100),"workdir":"/test","state":state,"title":format!("Root title {id}"),"has_work":true,"waiting_permissions":0,"waiting_questions":0,"parent":parent,"record":null,"workspace":null,"capabilities":[],"views":[],"updated_at":100000,"subagent":parent.map(|_|serde_json::json!({"child_chat_id":Uuid::from_u128(id+100),"handle":format!("child-{id}"),"description":"task","created_at":100000}))})).unwrap()
+    serde_json::from_value(serde_json::json!({"execution":{"daemon_epoch":epoch,"agent_id":Uuid::from_u128(id),"generation":1},"chat_id":Uuid::from_u128(id+100),"workdir":"/test","state":state,"title":format!("Root title {id}"),"has_work":true,"waiting_permissions":0,"waiting_questions":0,"parent":parent,"record":null,"workspace":null,"capabilities":[],"views":[],"updated_at":100000,"subagent":parent.map(|_|serde_json::json!({"child_chat_id":Uuid::from_u128(id+100),"handle":format!("child-{id}"),"description":"task","created_at":100000}))})).unwrap()
 }
 
 #[tokio::test]
@@ -119,7 +119,7 @@ async fn viewed_finished_children_survive_until_thirty_seconds_after_leaving_and
         2,
         "continued work reappears"
     );
-    catalog.owner.shutdown().await;
+    catalog.daemon.shutdown().await;
 }
 
 #[tokio::test]
@@ -168,7 +168,7 @@ async fn family_returns_to_last_member_and_missing_child_falls_back_to_root() {
         .unwrap()
         .unwrap();
     assert_eq!(fallback.target, main.execution);
-    catalog.owner.shutdown().await;
+    catalog.daemon.shutdown().await;
 }
 
 #[tokio::test]
@@ -199,7 +199,7 @@ async fn a_new_draft_starts_the_finished_child_departure_grace() {
         .unwrap()
         .unwrap();
     assert_eq!(target.target, main.execution);
-    catalog.owner.shutdown().await;
+    catalog.daemon.shutdown().await;
 }
 
 #[tokio::test]
@@ -233,7 +233,7 @@ async fn a_continuation_completed_between_refreshes_gets_a_new_terminal_grace() 
         clock.store(second_completion + 30_000, Ordering::SeqCst);
         console.refresh().await.unwrap();
         assert_eq!(console.family(main.execution).len(), 1);
-        catalog.owner.shutdown().await;
+        catalog.daemon.shutdown().await;
     }
 }
 
@@ -263,7 +263,7 @@ async fn run_identity_rearms_completion_without_a_reported_timestamp() {
     clock.store(170_000, Ordering::SeqCst);
     console.refresh().await.unwrap();
     assert_eq!(console.family(main.execution).len(), 1);
-    catalog.owner.shutdown().await;
+    catalog.daemon.shutdown().await;
 }
 
 #[tokio::test]
@@ -288,5 +288,5 @@ async fn departure_grace_survives_an_unobserved_completion() {
     clock.store(230_000, Ordering::SeqCst);
     console.refresh().await.unwrap();
     assert_eq!(console.family(main.execution).len(), 1);
-    catalog.owner.shutdown().await;
+    catalog.daemon.shutdown().await;
 }

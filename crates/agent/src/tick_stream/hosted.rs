@@ -1,6 +1,6 @@
-//! Tick Updates of hosted Ticks, which run in the dedicated Tick host. A watch follows the
+//! Tick Updates of hosted Ticks, which run in the dedicated Tickhost. A watch follows the
 //! instance through the data binding its Chat owns, so a Tick whose host was replaced or whose
-//! owner ended is never silently rebound. The approved watches of each instance reach the owner
+//! owner ended is never silently rebound. The approved watches of each instance reach the daemon
 //! as Watch intents, which keep the Tick from idling out.
 
 use std::{
@@ -30,7 +30,7 @@ use crate::{
     tick_tool_router::READ_TICK,
 };
 
-/// How soon a Watch intent change the owner did not take is offered again.
+/// How soon a Watch intent change the daemon did not take is offered again.
 const INTENT_RETRY_PAUSE: Duration = Duration::from_secs(5);
 
 pub struct HostedTickStream {
@@ -75,13 +75,13 @@ struct HostedScope {
 }
 
 impl HostedScope {
-    /// A hosted watch is admitted only under the authority of this worker's own Tick host.
+    /// A hosted watch is admitted only under the authority of this worker's own Tickhost.
     fn authorizes(&self, authority: Option<&HostToolAuthority>) -> Result<(), String> {
         let Some(HostToolAuthority::Native { .. }) = authority else {
             return Err("Hosted watch has no admitted host authority; subscribe explicitly".into());
         };
         if authority != Some(&self.tools.authority()) {
-            return Err("Hosted watch is outside its admitted Tick host".into());
+            return Err("Hosted watch is outside its admitted Tickhost".into());
         }
         Ok(())
     }
@@ -248,7 +248,7 @@ impl WatchAdmission for OwnedWatches<'_> {
     }
 }
 
-/// One hosted instance as its owning Chat reaches it through the Tick host.
+/// One hosted instance as its owning Chat reaches it through the Tickhost.
 struct HostedFeed {
     tools: Arc<HostedTickTools>,
     chat: Uuid,
@@ -293,7 +293,7 @@ impl ProtocolFeed for HostedFeed {
             .map_err(|error| error.to_string())?;
         let received = registered["received"]
             .as_u64()
-            .ok_or("the Tick host registered no observation count")?;
+            .ok_or("the Tickhost registered no observation count")?;
         let (sender, receiver) = watch::channel(SessionObservation {
             update: None,
             received,
@@ -317,7 +317,7 @@ impl ProtocolFeed for HostedFeed {
                         None => {
                             sender.send_modify(|current| {
                                 current.state = SessionLinkState::ProtocolError(
-                                    "the Tick host sent a malformed watch event".into(),
+                                    "the Tickhost sent a malformed watch event".into(),
                                 );
                             });
                             return;
@@ -339,8 +339,8 @@ fn observation(event: &Value) -> Option<SessionObservation> {
     serde_json::from_value(event["observation"].clone()).ok()
 }
 
-/// Keeps the owner's Watch intents equal to the hosted watches each Chat wants, one change at a
-/// time and in order, and renews them before they lapse. A change the owner did not take is
+/// Keeps the daemon's Watch intents equal to the hosted watches each Chat wants, one change at a
+/// time and in order, and renews them before they lapse. A change the daemon did not take is
 /// offered again until it is; one whose answer was lost counts as possibly applied, so an ended
 /// watch is always withdrawn and never keeps protecting its Tick.
 async fn sync_watch_intents(
@@ -348,7 +348,7 @@ async fn sync_watch_intents(
     mut desired: watch::Receiver<BTreeMap<WatchId, InstanceRef>>,
 ) {
     let mut chats = scope.chats.clone();
-    // What the owner holds per (Chat, instance); `None` when the last report's outcome is unknown.
+    // What the daemon holds per (Chat, instance); `None` when the last report's outcome is unknown.
     let mut sent: BTreeMap<(Uuid, InstanceRef), Option<BTreeSet<WatchId>>> = BTreeMap::new();
     let mut renewal = tokio::time::interval(scope.tools.intent_renewal());
     renewal.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -457,9 +457,9 @@ impl TickStreamPort for HostedTickStream {
         self.authorities.send_replace(authorities);
     }
 
-    /// A hosted watch holds only while its authority is this worker's Tick host and its Chat
+    /// A hosted watch holds only while its authority is this worker's Tickhost and its Chat
     /// still owns a current binding of the instance: a live registration proves it, otherwise
-    /// the owner is asked again.
+    /// the daemon is asked again.
     async fn revalidate_watch(
         &self,
         chat: Uuid,

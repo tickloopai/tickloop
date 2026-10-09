@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use tickloop_agent::settings::UserSettings;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 
-/// Every wait here expects success; a real CLI with its own owner, worker and Shells needed more
+/// Every wait here expects success; a real CLI with its own daemon, worker and Shells needed more
 /// than ten seconds on a machine busy with parallel test runs. Only a failure waits this long.
 const INTERACTION_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -25,7 +25,7 @@ fn trust_working_directory(config_root: &std::path::Path, workdir: &std::path::P
 fn trusted_agent_command() -> Command {
     let mut command = support::fixture_cli::command();
     command.env(
-        "TICKLOOP_AGENT_RUNTIME_DIR",
+        "TICKLOOP_DAEMON_RUNTIME_DIR",
         support::cli_runtime::directory(),
     );
     command.args(["--working-directory-is-trusted", "--mode", "acceptEdits"]);
@@ -35,7 +35,7 @@ fn trusted_agent_command() -> Command {
 fn trusted_async_agent_command() -> tokio::process::Command {
     let mut command = support::fixture_cli::tokio_command();
     command.env(
-        "TICKLOOP_AGENT_RUNTIME_DIR",
+        "TICKLOOP_DAEMON_RUNTIME_DIR",
         support::cli_runtime::directory(),
     );
     command.args(["--working-directory-is-trusted", "--mode", "acceptEdits"]);
@@ -45,7 +45,7 @@ fn trusted_async_agent_command() -> tokio::process::Command {
 fn product_async_agent_command() -> tokio::process::Command {
     let mut command = support::fixture_cli::tokio_command();
     command.env(
-        "TICKLOOP_AGENT_RUNTIME_DIR",
+        "TICKLOOP_DAEMON_RUNTIME_DIR",
         support::cli_runtime::directory(),
     );
     command.arg("--working-directory-is-trusted");
@@ -60,7 +60,7 @@ fn malformed_auto_settings_do_not_exit_the_terminal_on_permissions_commands() {
     std::fs::write(config_root.join("settings.json"), r#"{"autoApproval":{"rules":{"softDeny":{"includeBuiltins":false,"custom":[{"id":"invalid","text":"rule"}]}}}}"#).unwrap();
     let output = support::fixture_cli::command()
         .env(
-            "TICKLOOP_AGENT_RUNTIME_DIR",
+            "TICKLOOP_DAEMON_RUNTIME_DIR",
             support::cli_runtime::directory(),
         )
         .args(["--working-directory-is-trusted", "--no-session-persistence"])
@@ -126,7 +126,7 @@ fn interactive_pty_trusts_the_directory_and_cycles_all_execution_modes() {
     let mut writer = pty.master.take_writer().unwrap();
     let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_tickloop"));
     command.env(
-        "TICKLOOP_AGENT_RUNTIME_DIR",
+        "TICKLOOP_DAEMON_RUNTIME_DIR",
         support::cli_runtime::directory(),
     );
     command.cwd(directory.path());
@@ -225,7 +225,7 @@ fn interactive_pty_opens_the_subscription_view_and_closes_it_with_escape() {
     let mut writer = pty.master.take_writer().unwrap();
     let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_tickloop"));
     command.env(
-        "TICKLOOP_AGENT_RUNTIME_DIR",
+        "TICKLOOP_DAEMON_RUNTIME_DIR",
         support::cli_runtime::directory(),
     );
     command.cwd(directory.path());
@@ -338,7 +338,7 @@ fn noninteractive_startup_rejects_an_untrusted_current_directory() {
     let directory = tempfile::tempdir().unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_tickloop"))
         .env(
-            "TICKLOOP_AGENT_RUNTIME_DIR",
+            "TICKLOOP_DAEMON_RUNTIME_DIR",
             support::cli_runtime::directory(),
         )
         .env("TICKLOOP_CONFIG_DIR", directory.path().join("config-root"))
@@ -511,7 +511,7 @@ fn chat_id_opens_the_exact_chat_identity() {
     let chat_id = "00000000-0000-4000-8000-000000000123";
     let output = support::fixture_cli::command()
         .env(
-            "TICKLOOP_AGENT_RUNTIME_DIR",
+            "TICKLOOP_DAEMON_RUNTIME_DIR",
             support::cli_runtime::directory(),
         )
         .env("TICKLOOP_CONFIG_DIR", directory.path().join("config-root"))
@@ -1339,7 +1339,7 @@ async fn a_run_whose_worker_is_lost_is_reported_and_the_cli_exits_at_end_of_inpu
     );
     use tickloop_agent::agent_access::AgentAccess as _;
     let client = tickloop_agent::agent_access::LocalAgentClient::connect(
-        runtime_directory.join("owner.sock"),
+        runtime_directory.join("daemon.sock"),
     )
     .await
     .unwrap();
@@ -1355,23 +1355,23 @@ async fn a_run_whose_worker_is_lost_is_reported_and_the_cli_exits_at_end_of_inpu
         .await
         .unwrap();
     let tickloop_agent::agent_access::ObservationValue::Overview(rows) = catalog.initial else {
-        panic!("expected the owner catalog");
+        panic!("expected the daemon catalog");
     };
     assert_eq!(rows.len(), 1);
     assert_eq!(
         rows[0].availability,
         tickloop_agent::agent_access::ExecutionAvailability::Lost,
-        "the owner does not present the lost worker as live"
+        "the daemon does not present the lost worker as live"
     );
     server.abort();
-    client.shutdown_owner().await.unwrap();
+    client.shutdown_daemon().await.unwrap();
     tokio::time::timeout(INTERACTION_TIMEOUT, async {
-        while runtime_directory.join("owner.sock").exists() {
+        while runtime_directory.join("daemon.sock").exists() {
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("the test's private owner removes its socket after shutdown");
+    .expect("the test's private daemon removes its socket after shutdown");
 }
 
 #[tokio::test]
@@ -1887,7 +1887,7 @@ fn legacy_independent_reviewer_flags_report_the_permissions_migration() {
     for flag in ["--auto-reviewer-config", "--permission-checker-config"] {
         let output = support::fixture_cli::command()
             .env(
-                "TICKLOOP_AGENT_RUNTIME_DIR",
+                "TICKLOOP_DAEMON_RUNTIME_DIR",
                 support::cli_runtime::directory(),
             )
             .args([flag, "legacy.json"])
@@ -2495,7 +2495,7 @@ async fn resuming_recovered_queued_input_starts_no_work_and_exits_at_eof() {
         .await
         .unwrap()
         .unwrap();
-    support::cli_runtime::shutdown_owner(&runtime_directory)
+    support::cli_runtime::shutdown_daemon(&runtime_directory)
         .await
         .unwrap();
     drop(socket);
@@ -2581,7 +2581,7 @@ async fn operations_from_a_crashed_process_are_not_listed_after_resume() {
         .await
         .unwrap()
         .unwrap();
-    support::cli_runtime::shutdown_owner(&runtime_directory)
+    support::cli_runtime::shutdown_daemon(&runtime_directory)
         .await
         .unwrap();
     server.await.unwrap();
@@ -2729,7 +2729,7 @@ async fn run_with_config(
         .await
         .unwrap()
         .unwrap();
-    if runtime_directory.join("owner.sock").exists() {
+    if runtime_directory.join("daemon.sock").exists() {
         support::cli_runtime::flush_transcripts(&runtime_directory)
             .await
             .unwrap();
@@ -3769,13 +3769,13 @@ fn a_zero_cleanup_period_explains_why_chats_cannot_be_resumed() {
     assert!(text.contains("cleanupPeriodDays"), "{text}");
 }
 
-async fn owner_catalog(
+async fn daemon_catalog(
     runtime_directory: &std::path::Path,
 ) -> Vec<tickloop_agent::agent_access::AgentSummary> {
     use tickloop_agent::agent_access::{
         AgentAccess, AgentFilter, LocalAgentClient, ObservationRequest, ObservationValue, Page,
     };
-    let client = LocalAgentClient::connect(runtime_directory.join("owner.sock"))
+    let client = LocalAgentClient::connect(runtime_directory.join("daemon.sock"))
         .await
         .unwrap();
     let observation = client
@@ -3790,7 +3790,7 @@ async fn owner_catalog(
         .await
         .unwrap();
     let ObservationValue::Overview(rows) = observation.initial else {
-        panic!("expected the owner catalog");
+        panic!("expected the daemon catalog");
     };
     rows
 }
@@ -3832,12 +3832,12 @@ async fn new_agent_configuration_waits_for_the_first_input_to_create_the_agent()
     );
     assert!(!transcript.contains("Chat: "), "{transcript}");
     assert!(
-        owner_catalog(&runtime_directory).await.is_empty(),
+        daemon_catalog(&runtime_directory).await.is_empty(),
         "configuring the New Agent registers no execution: {transcript}"
     );
 
     let mut child = trusted_async_agent_command()
-        .env("TICKLOOP_AGENT_RUNTIME_DIR", &runtime_directory)
+        .env("TICKLOOP_DAEMON_RUNTIME_DIR", &runtime_directory)
         .env("TICKLOOP_CONFIG_DIR", &config_root)
         .arg("--cwd")
         .arg(directory.path())
@@ -3861,7 +3861,7 @@ async fn new_agent_configuration_waits_for_the_first_input_to_create_the_agent()
         .unwrap();
     let transcript = String::from_utf8_lossy(&output.stdout).into_owned();
     assert!(output.status.success(), "{transcript}");
-    let rows = owner_catalog(&runtime_directory).await;
+    let rows = daemon_catalog(&runtime_directory).await;
     assert_eq!(
         rows.len(),
         1,
@@ -3869,7 +3869,7 @@ async fn new_agent_configuration_waits_for_the_first_input_to_create_the_agent()
     );
     assert_eq!(rows[0].has_work, Some(true));
     let client = tickloop_agent::agent_access::LocalAgentClient::connect(
-        runtime_directory.join("owner.sock"),
+        runtime_directory.join("daemon.sock"),
     )
     .await
     .unwrap();

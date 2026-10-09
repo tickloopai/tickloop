@@ -4116,7 +4116,7 @@ fn agent_layout_commands_show_and_enforce_their_scope_before_sending() {
                 submit(&mut state, "/project-skill"),
                 Some(InputEvent::Prompt { .. })
             ),
-            "unknown names stay Skill input for the owner to validate"
+            "unknown names stay Skill input for the daemon to validate"
         );
     }
     console.set_global_overview(None).unwrap();
@@ -4130,7 +4130,7 @@ fn agent_layout_commands_show_and_enforce_their_scope_before_sending() {
             Some(CHILD_AGENT),
         )
         .unwrap();
-    // The scope follows the owner's delegation fact from the visible Agent's snapshot.
+    // The scope follows the daemon's delegation fact from the visible Agent's snapshot.
     console.set_visible_delegation(true).unwrap();
     let mut state = console.state.lock().unwrap();
     state.editor.apply(EditorCommand::Clear);

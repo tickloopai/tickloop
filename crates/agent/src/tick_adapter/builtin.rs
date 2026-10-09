@@ -86,8 +86,8 @@ pub(crate) const HOSTED_CLOSE_KEY: char = 'c';
 /// Starts a new instance in place of a hosted Tick lost with its host, after confirmation.
 pub(crate) const HOSTED_REOPEN_KEY: char = 'n';
 
-/// Ticks this Chat opened in the dedicated Tick host. They belong to the Chat that opened them;
-/// only a worker with a Tick host grant follows them.
+/// Ticks this Chat opened in the dedicated Tickhost. They belong to the Chat that opened them;
+/// only a worker with a Tickhost grant follows them.
 pub struct HostedAdapter {
     stream: Option<Arc<dyn TickStreamPort>>,
 }

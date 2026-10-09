@@ -105,7 +105,7 @@ impl PrivateFixture {
     }
 
     async fn client(&self) -> LocalAgentClient {
-        let endpoint = self.path("runtime/owner.sock");
+        let endpoint = self.path("runtime/daemon.sock");
         tokio::time::timeout(UI_TIMEOUT, async {
             loop {
                 if let Ok(client) = LocalAgentClient::connect(&endpoint).await {
@@ -115,15 +115,15 @@ impl PrivateFixture {
             }
         })
         .await
-        .expect("the private CLI owner must become ready")
+        .expect("the private CLI daemon must become ready")
     }
 
     async fn shutdown(&self) {
-        support::stop_tick_host(&self.path("tick-host"), &self.path("runtime/tick-host.key"));
-        let endpoint = self.path("runtime/owner.sock");
+        support::stop_tickhost(&self.path("tickhost"), &self.path("runtime/tickhost.key"));
+        let endpoint = self.path("runtime/daemon.sock");
         if endpoint.exists() {
             let client = self.client().await;
-            client.shutdown_owner().await.unwrap();
+            client.shutdown_daemon().await.unwrap();
             tokio::time::timeout(UI_TIMEOUT, async {
                 loop {
                     let sockets = std::fs::read_dir(self.path("runtime"))
@@ -142,7 +142,7 @@ impl PrivateFixture {
                 }
             })
             .await
-            .expect("private owner and worker sockets must close gracefully");
+            .expect("private daemon and worker sockets must close gracefully");
         }
     }
 }
@@ -205,8 +205,8 @@ impl PtyView {
         command.env("PATH", "/usr/bin:/bin");
         command.env("HOME", fixture.path("home"));
         command.env("TICKLOOP_CONFIG_DIR", fixture.path("config"));
-        command.env("TICKLOOP_AGENT_RUNTIME_DIR", fixture.path("runtime"));
-        command.env("TICKLOOP_TICK_HOST_RUNTIME_DIR", fixture.path("tick-host"));
+        command.env("TICKLOOP_DAEMON_RUNTIME_DIR", fixture.path("runtime"));
+        command.env("TICKLOOP_TICKHOST_RUNTIME_DIR", fixture.path("tickhost"));
         command.env("TICKLOOP_TMPDIR", fixture.path("scratch"));
         command.env("TMPDIR", fixture.path("scratch"));
         command.env("TICKLOOP_FIXTURE_API_KEY", "fixture-key");
@@ -1012,12 +1012,12 @@ async fn actual_cli_os_resize_matrix_preserves_ordinary_and_dispatch_input_reach
     }
 }
 
-async fn run_sustained_owner_loss(
+async fn run_sustained_daemon_loss(
     fixture: &PrivateFixture,
-    owner_stopped: &std::sync::atomic::AtomicBool,
+    daemon_stopped: &std::sync::atomic::AtomicBool,
 ) {
     let mut view = PtyView::start(fixture);
-    view.wait_for("owner-loss View ready", new_input_is_visible)
+    view.wait_for("daemon-loss View ready", new_input_is_visible)
         .await;
     let client = fixture.client().await;
     view.send(b"!printf 'cached shell output\\n'\r");
@@ -1038,7 +1038,7 @@ async fn run_sustained_owner_loss(
     assert_eq!(before.user_shells.len(), 1);
     assert_eq!(before.user_shells[0].state, UserShellState::Completed);
     assert!(before.last_model_run.is_none());
-    view.send(b"!printf 'background shell began\\n'; while [ ! -f owner-loss-finish ]; do sleep 0.02; done\r");
+    view.send(b"!printf 'background shell began\\n'; while [ ! -f daemon-loss-finish ]; do sleep 0.02; done\r");
     wait_snapshot(
         &client,
         rows[0].execution,
@@ -1059,7 +1059,7 @@ async fn run_sustained_owner_loss(
     let busy = wait_snapshot(
         &client,
         rows[0].execution,
-        "background Shell is busy before owner loss",
+        "background Shell is busy before daemon loss",
         |snapshot| {
             snapshot.user_shells.len() == 2
                 && snapshot.user_shells[1].state == UserShellState::Background
@@ -1072,29 +1072,29 @@ async fn run_sustained_owner_loss(
         frame.contains("Monitor 1")
     })
     .await;
-    view.send(b"UNSENT-OWNER-LOSS-DRAFT-jk");
-    view.wait_for("unsent draft before owner loss", |frame| {
-        frame.contains("UNSENT-OWNER-LOSS-DRAFT-jk")
+    view.send(b"UNSENT-DAEMON-LOSS-DRAFT-jk");
+    view.wait_for("unsent draft before daemon loss", |frame| {
+        frame.contains("UNSENT-DAEMON-LOSS-DRAFT-jk")
     })
     .await;
     std::fs::rename(fixture.path("runtime"), fixture.path("owned-runtime")).unwrap();
-    std::fs::write(fixture.path("runtime"), "fixture blocks owner restart").unwrap();
-    client.shutdown_owner().await.unwrap();
-    owner_stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+    std::fs::write(fixture.path("runtime"), "fixture blocks daemon restart").unwrap();
+    client.shutdown_daemon().await.unwrap();
+    daemon_stopped.store(true, std::sync::atomic::Ordering::SeqCst);
     view.wait_for(
         "sustained loss retains a disconnected cached View",
-        |frame| frame.contains("Disconnected") && frame.contains("UNSENT-OWNER-LOSS-DRAFT-jk"),
+        |frame| frame.contains("Disconnected") && frame.contains("UNSENT-DAEMON-LOSS-DRAFT-jk"),
     )
     .await;
     for _ in 0..12 {
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(
             view.child.try_wait().unwrap().is_none(),
-            "owner loss must not exit the interactive View"
+            "daemon loss must not exit the interactive View"
         );
         let frame = view.frame();
         assert!(frame.contains("Disconnected"), "{frame}");
-        assert!(frame.contains("UNSENT-OWNER-LOSS-DRAFT-jk"), "{frame}");
+        assert!(frame.contains("UNSENT-DAEMON-LOSS-DRAFT-jk"), "{frame}");
         assert!(
             frame
                 .lines()
@@ -1103,28 +1103,28 @@ async fn run_sustained_owner_loss(
         );
         assert!(
             fixture.path("runtime").is_file(),
-            "the unavailable owner must remain blocked"
+            "the unavailable daemon must remain blocked"
         );
     }
     view.send(b"x");
     view.wait_for("cached View still accepts ordinary editing", |frame| {
-        frame.contains("UNSENT-OWNER-LOSS-DRAFT-jkx")
+        frame.contains("UNSENT-DAEMON-LOSS-DRAFT-jkx")
     })
     .await;
     view.close().await;
 }
 
 #[tokio::test]
-async fn actual_cli_sustained_owner_loss_keeps_cached_output_draft_and_editing_alive() {
+async fn actual_cli_sustained_daemon_loss_keeps_cached_output_draft_and_editing_alive() {
     let fixture = PrivateFixture::new();
-    let owner_stopped = std::sync::atomic::AtomicBool::new(false);
-    let result = AssertUnwindSafe(run_sustained_owner_loss(&fixture, &owner_stopped))
+    let daemon_stopped = std::sync::atomic::AtomicBool::new(false);
+    let result = AssertUnwindSafe(run_sustained_daemon_loss(&fixture, &daemon_stopped))
         .catch_unwind()
         .await;
     if fixture.path("owned-runtime").exists() {
         std::fs::remove_file(fixture.path("runtime")).unwrap();
         std::fs::rename(fixture.path("owned-runtime"), fixture.path("runtime")).unwrap();
-        if owner_stopped.load(std::sync::atomic::Ordering::SeqCst) {
+        if daemon_stopped.load(std::sync::atomic::Ordering::SeqCst) {
             for entry in std::fs::read_dir(fixture.path("runtime"))
                 .unwrap()
                 .filter_map(Result::ok)
@@ -1312,7 +1312,7 @@ async fn run_child_views(fixture: &PrivateFixture) {
         execution: other, ..
     } = client
         .execute(CommandEnvelope {
-            owner_epoch: client.owner_epoch(),
+            daemon_epoch: client.daemon_epoch(),
             command_id: uuid::Uuid::new_v4(),
             command: AgentCommand::Create {
                 launch: other_launch,
@@ -1492,7 +1492,7 @@ async fn run_child_views(fixture: &PrivateFixture) {
         .await;
     let wrong = client
         .execute(CommandEnvelope {
-            owner_epoch: client.owner_epoch(),
+            daemon_epoch: client.daemon_epoch(),
             command_id: uuid::Uuid::new_v4(),
             command: AgentCommand::AnswerQuestion {
                 request: RequestRef {
@@ -1717,7 +1717,7 @@ async fn run_child_views(fixture: &PrivateFixture) {
         .await;
     let configured = client
         .execute(CommandEnvelope {
-            owner_epoch: client.owner_epoch(),
+            daemon_epoch: client.daemon_epoch(),
             command_id: uuid::Uuid::new_v4(),
             command: AgentCommand::Configure {
                 provider: None,
@@ -1768,7 +1768,7 @@ async fn run_child_views(fixture: &PrivateFixture) {
         .await;
     let forbidden = client
         .execute(CommandEnvelope {
-            owner_epoch: client.owner_epoch(),
+            daemon_epoch: client.daemon_epoch(),
             command_id: uuid::Uuid::new_v4(),
             command: AgentCommand::Configure {
                 provider: None,
@@ -1880,7 +1880,7 @@ async fn run_reading_and_draft_return(fixture: &PrivateFixture) {
         execution: other, ..
     } = client
         .execute(CommandEnvelope {
-            owner_epoch: client.owner_epoch(),
+            daemon_epoch: client.daemon_epoch(),
             command_id: uuid::Uuid::new_v4(),
             command: AgentCommand::Create {
                 launch,
@@ -2165,7 +2165,7 @@ async fn run_stashed_image_payload(fixture: &PrivateFixture, switch_roots: bool)
         launch.session_persistence = false;
         let CommandResult::Created { execution, .. } = client
             .execute(CommandEnvelope {
-                owner_epoch: client.owner_epoch(),
+                daemon_epoch: client.daemon_epoch(),
                 command_id: uuid::Uuid::new_v4(),
                 command: AgentCommand::Create {
                     launch,
@@ -3185,7 +3185,7 @@ async fn run_dense_overview(fixture: &PrivateFixture) {
         launch.model = Some(model.clone());
         launch.session_persistence = false;
         CommandEnvelope {
-            owner_epoch: client.owner_epoch(),
+            daemon_epoch: client.daemon_epoch(),
             command_id: uuid::Uuid::new_v4(),
             command: AgentCommand::Create {
                 launch,
@@ -3234,7 +3234,7 @@ async fn run_dense_overview(fixture: &PrivateFixture) {
         }
     })
     .await
-    .expect("the owner reports which Agents have worked");
+    .expect("the daemon reports which Agents have worked");
     view.send(b"\x1b[D");
     for (width, height) in [(40, 16), (80, 24), (120, 48)] {
         view.resize(width, height).await;
@@ -3318,7 +3318,7 @@ async fn actual_cli_dense_overview_folds_never_used_sessions_and_keeps_them_open
     }
 }
 
-/// Summary fields an owner or worker built before them never sends.
+/// Summary fields a daemon or worker built before them never sends.
 const POST_LEGACY_SUMMARY_FIELDS: [&str; 3] = ["has_work", "updated_at", "preview"];
 
 /// Rewrites the summaries of `legacy` executions into the schema an older worker sends, the way
@@ -3349,7 +3349,7 @@ fn strip_work_facts(value: &mut Value, legacy: &[ExecutionRef]) {
     }
 }
 
-/// Relays one View connection to the private owner, rewriting replies into the legacy schema.
+/// Relays one View connection to the private daemon, rewriting replies into the legacy schema.
 async fn relay_legacy(
     downstream: tokio::net::UnixStream,
     upstream: tokio::net::UnixStream,
@@ -3357,12 +3357,12 @@ async fn relay_legacy(
 ) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let (mut view_read, mut view_write) = downstream.into_split();
-    let (mut owner_read, mut owner_write) = upstream.into_split();
-    let requests = tokio::io::copy(&mut view_read, &mut owner_write);
+    let (mut daemon_read, mut daemon_write) = upstream.into_split();
+    let requests = tokio::io::copy(&mut view_read, &mut daemon_write);
     let replies = async {
-        while let Ok(length) = owner_read.read_u32().await {
+        while let Ok(length) = daemon_read.read_u32().await {
             let mut bytes = vec![0; length as usize];
-            if owner_read.read_exact(&mut bytes).await.is_err() {
+            if daemon_read.read_exact(&mut bytes).await.is_err() {
                 break;
             }
             let mut reply: Value = serde_json::from_slice(&bytes).unwrap();
@@ -3381,9 +3381,9 @@ async fn relay_legacy(
     }
 }
 
-/// A private runtime directory whose owner endpoint relays to `fixture`'s owner, rewriting the
-/// `legacy` executions' summaries into the older schema. Only this fixture's own owner is reached.
-fn legacy_owner_endpoint(
+/// A private runtime directory whose daemon endpoint relays to `fixture`'s daemon, rewriting the
+/// `legacy` executions' summaries into the older schema. Only this fixture's own daemon is reached.
+fn legacy_daemon_endpoint(
     fixture: &PrivateFixture,
     legacy: Vec<ExecutionRef>,
 ) -> (std::path::PathBuf, tokio::task::JoinHandle<()>) {
@@ -3393,10 +3393,10 @@ fn legacy_owner_endpoint(
         .mode(0o700)
         .create(&directory)
         .unwrap();
-    let endpoint = directory.join("owner.sock");
+    let endpoint = directory.join("daemon.sock");
     let listener = tokio::net::UnixListener::bind(&endpoint).unwrap();
     std::fs::set_permissions(&endpoint, std::fs::Permissions::from_mode(0o600)).unwrap();
-    let upstream = fixture.path("runtime/owner.sock");
+    let upstream = fixture.path("runtime/daemon.sock");
     let legacy = Arc::new(legacy);
     let relay = tokio::spawn(async move {
         while let Ok((downstream, _)) = listener.accept().await {
@@ -3421,9 +3421,9 @@ fn unreported_rows(frame: &str) -> usize {
 }
 
 async fn run_legacy_dense_overview(fixture: &PrivateFixture) {
-    let mut owner_view = PtyView::start(fixture);
-    owner_view
-        .wait_for("owner View ready", new_input_is_visible)
+    let mut daemon_view = PtyView::start(fixture);
+    daemon_view
+        .wait_for("daemon View ready", new_input_is_visible)
         .await;
     let client = fixture.client().await;
     let mut model = support::config();
@@ -3435,7 +3435,7 @@ async fn run_legacy_dense_overview(fixture: &PrivateFixture) {
         launch.model = Some(model.clone());
         launch.session_persistence = false;
         CommandEnvelope {
-            owner_epoch: client.owner_epoch(),
+            daemon_epoch: client.daemon_epoch(),
             command_id: uuid::Uuid::new_v4(),
             command: AgentCommand::Create {
                 launch,
@@ -3484,12 +3484,12 @@ async fn run_legacy_dense_overview(fixture: &PrivateFixture) {
         }
     })
     .await
-    .expect("the owner lists every Agent as Idle");
+    .expect("the daemon lists every Agent as Idle");
     // Only the seventeen configured sessions arrive in the old schema; the three Shell Agents keep
     // their explicit work facts as known-worked controls.
-    let (legacy, relay) = legacy_owner_endpoint(fixture, unreported.clone());
+    let (legacy, relay) = legacy_daemon_endpoint(fixture, unreported.clone());
     let mut view =
-        PtyView::start_with_environment(fixture, &[], &[("TICKLOOP_AGENT_RUNTIME_DIR", &legacy)]);
+        PtyView::start_with_environment(fixture, &[], &[("TICKLOOP_DAEMON_RUNTIME_DIR", &legacy)]);
     view.wait_for("legacy View ready", new_input_is_visible)
         .await;
     view.send(b"\x1b[D");
@@ -3560,7 +3560,7 @@ async fn run_legacy_dense_overview(fixture: &PrivateFixture) {
     );
     view.close().await;
     relay.abort();
-    owner_view.close().await;
+    daemon_view.close().await;
 }
 
 #[tokio::test]

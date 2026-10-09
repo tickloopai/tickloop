@@ -1,4 +1,4 @@
-//! Run-loop regression: an unreachable owner leaves the View, its drafts and its feedback alive.
+//! Run-loop regression: an unreachable daemon leaves the View, its drafts and its feedback alive.
 use super::*;
 use crate::{agent_access::*, runtime};
 use async_trait::async_trait;
@@ -17,22 +17,22 @@ mod screen {
     ));
 }
 
-const FIXTURE_VARIABLE: &str = "TICKLOOP_OWNER_LOSS_FIXTURE";
-const UNREACHABLE_VARIABLE: &str = "TICKLOOP_OWNER_LOSS_FLAG";
+const FIXTURE_VARIABLE: &str = "TICKLOOP_DAEMON_LOSS_FIXTURE";
+const UNREACHABLE_VARIABLE: &str = "TICKLOOP_DAEMON_LOSS_FLAG";
 const WIDTH: usize = 100;
 const HEIGHT: usize = 30;
 const TIMEOUT: Duration = Duration::from_secs(10);
 const OVERVIEW_RESPONSE_DELAY: Duration = Duration::from_millis(250);
 
-/// Fails catalog and Agent observations while the flag file exists, as an unreachable owner does.
+/// Fails catalog and Agent observations while the flag file exists, as an unreachable daemon does.
 /// Slow catalog replies separate the initial prompt from the initialized cached View.
-struct SwitchableOwner {
-    owner: EmbeddedAgentAccess,
+struct SwitchableDaemon {
+    daemon: EmbeddedAgentAccess,
     unreachable: std::path::PathBuf,
 }
 
 #[async_trait]
-impl AgentAccess for SwitchableOwner {
+impl AgentAccess for SwitchableDaemon {
     async fn observe(&self, query: ObservationRequest) -> Result<Observation, AccessError> {
         if matches!(query, ObservationRequest::Overview { .. }) {
             tokio::time::sleep(OVERVIEW_RESPONSE_DELAY).await;
@@ -43,49 +43,49 @@ impl AgentAccess for SwitchableOwner {
                 ObservationRequest::Overview { .. } | ObservationRequest::Agent { .. }
             )
         {
-            return Err(AccessError::unavailable("owner socket is unreachable"));
+            return Err(AccessError::unavailable("daemon socket is unreachable"));
         }
-        self.owner.observe(query).await
+        self.daemon.observe(query).await
     }
 
     async fn execute(&self, command: CommandEnvelope) -> Result<CommandReceipt, AccessError> {
-        self.owner.execute(command).await
+        self.daemon.execute(command).await
     }
 
     async fn show_view(&self, update: DisplayUpdate) -> Result<DisplayReceipt, AccessError> {
-        self.owner.show_view(update).await
+        self.daemon.show_view(update).await
     }
 }
 
 #[test]
-#[ignore = "owned PTY producer for the owner-loss run-loop regression"]
-fn owner_loss_pty_fixture() {
+#[ignore = "owned PTY producer for the daemon-loss run-loop regression"]
+fn daemon_loss_pty_fixture() {
     if std::env::var(FIXTURE_VARIABLE).as_deref() != Ok("1") {
         return;
     }
     std::thread::Builder::new()
-        .name("owner-loss-fixture".into())
+        .name("daemon-loss-fixture".into())
         .stack_size(8 * 1024 * 1024)
         .spawn(|| {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .unwrap();
-            tokio::task::LocalSet::new().block_on(&runtime, run_owner_loss_fixture());
+            tokio::task::LocalSet::new().block_on(&runtime, run_daemon_loss_fixture());
         })
         .unwrap()
         .join()
         .unwrap();
 }
 
-async fn run_owner_loss_fixture() {
+async fn run_daemon_loss_fixture() {
     let core = runtime::Agent::new_embedded(
         test_support::config(),
         Arc::new(test_support::ScriptedModel::new(vec![])),
     );
     let workdir = std::env::current_dir().unwrap();
-    let adapter = Arc::new(SwitchableOwner {
-        owner: EmbeddedAgentAccess::new(core.clone()),
+    let adapter = Arc::new(SwitchableDaemon {
+        daemon: EmbeddedAgentAccess::new(core.clone()),
         unreachable: std::env::var_os(UNREACHABLE_VARIABLE).unwrap().into(),
     });
     let mut launch = LaunchSpec::embedded(workdir.clone());
@@ -93,7 +93,7 @@ async fn run_owner_loss_fixture() {
     launch.session_persistence = false;
     let agent = Agent::from_access_for_test(
         adapter.clone(),
-        adapter.owner.owner_epoch(),
+        adapter.daemon.daemon_epoch(),
         ViewRef {
             session_id: Uuid::new_v4(),
             view_id: Uuid::new_v4(),
@@ -114,14 +114,14 @@ async fn run_owner_loss_fixture() {
     result.unwrap();
 }
 
-struct OwnerLossPty {
+struct DaemonLossPty {
     child: Box<dyn portable_pty::Child + Send + Sync>,
     writer: Box<dyn Write + Send>,
     output: Arc<Mutex<Vec<u8>>>,
     _master: Box<dyn portable_pty::MasterPty + Send>,
 }
 
-impl OwnerLossPty {
+impl DaemonLossPty {
     fn frame(&self) -> String {
         screen::visible_screen(
             &String::from_utf8_lossy(&self.output.lock().unwrap()),
@@ -149,11 +149,11 @@ impl OwnerLossPty {
             );
             std::thread::sleep(Duration::from_millis(20));
         }
-        panic!("owner-loss View never showed {label}: {}", self.frame());
+        panic!("daemon-loss View never showed {label}: {}", self.frame());
     }
 }
 
-impl Drop for OwnerLossPty {
+impl Drop for DaemonLossPty {
     fn drop(&mut self) {
         if self.child.try_wait().ok().flatten().is_none() {
             let _ = self.child.kill();
@@ -163,9 +163,9 @@ impl Drop for OwnerLossPty {
 }
 
 #[test]
-fn an_unreachable_owner_keeps_the_view_drafts_and_feedback_alive() {
+fn an_unreachable_daemon_keeps_the_view_drafts_and_feedback_alive() {
     let directory = tempfile::tempdir_in("/tmp").unwrap();
-    let flag = directory.path().join("owner-unreachable");
+    let flag = directory.path().join("daemon-unreachable");
     let pair = native_pty_system()
         .openpty(PtySize {
             rows: HEIGHT as u16,
@@ -178,7 +178,7 @@ fn an_unreachable_owner_keeps_the_view_drafts_and_feedback_alive() {
     command.args([
         "--ignored",
         "--exact",
-        "terminal::owner_loss_tests::owner_loss_pty_fixture",
+        "terminal::daemon_loss_tests::daemon_loss_pty_fixture",
         "--nocapture",
     ]);
     command.env(FIXTURE_VARIABLE, "1");
@@ -202,7 +202,7 @@ fn an_unreachable_owner_keeps_the_view_drafts_and_feedback_alive() {
             captured.lock().unwrap().extend_from_slice(&bytes[..count]);
         }
     });
-    let mut view = OwnerLossPty {
+    let mut view = DaemonLossPty {
         child,
         writer,
         output,
@@ -218,13 +218,14 @@ fn an_unreachable_owner_keeps_the_view_drafts_and_feedback_alive() {
     });
     view.send(b"\tkept dispatch draft");
     view.wait_for(
-        "the dispatch draft while the owner is unreachable",
+        "the dispatch draft while the daemon is unreachable",
         |frame| frame.contains("kept dispatch draft") && frame.contains("Disconnected"),
     );
     std::fs::remove_file(&flag).unwrap();
-    view.wait_for("the stale label to clear once the owner answers", |frame| {
-        !frame.contains("Disconnected") && frame.contains("kept dispatch draft")
-    });
+    view.wait_for(
+        "the stale label to clear once the daemon answers",
+        |frame| !frame.contains("Disconnected") && frame.contains("kept dispatch draft"),
+    );
     view.send(b"\x15/model\r");
     view.wait_for("the rejected command feedback", |frame| {
         frame.contains("/model isn't available")

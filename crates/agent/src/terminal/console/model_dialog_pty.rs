@@ -48,7 +48,7 @@ fn model_dialog_pty_fixture() {
             launch.model = Some(model);
             launch.config_root = Some(root.clone());
             launch.session_persistence = false;
-            let agent = Agent::from_access_for_test(access.clone(), access.owner_epoch(), ViewRef { session_id: Uuid::new_v4(), view_id: Uuid::new_v4() }, launch, None);
+            let agent = Agent::from_access_for_test(access.clone(), access.daemon_epoch(), ViewRef { session_id: Uuid::new_v4(), view_id: Uuid::new_v4() }, launch, None);
             let first = agent.create_chat(directory.clone()).await.unwrap();
             let second = agent.create_chat(directory.clone()).await.unwrap();
             let (console, mut input) = Console::start(true).unwrap();
@@ -159,7 +159,7 @@ fn model_dialog_pty_matches_question_permission_chrome_and_restores_agent_picker
         command.env("HOME", directory.path());
         command.env("TICKLOOP_CONFIG_DIR", directory.path().join("config"));
         command.env(
-            "TICKLOOP_AGENT_RUNTIME_DIR",
+            "TICKLOOP_DAEMON_RUNTIME_DIR",
             directory.path().join("runtime"),
         );
         command.env("TICKLOOP_TMPDIR", directory.path());

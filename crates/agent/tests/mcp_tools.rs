@@ -2574,7 +2574,7 @@ async fn explicit_resume_retries_an_association_confirmed_not_dispatched() {
         ))
         .unwrap();
     let access = Arc::new(EmbeddedAgentAccess::new(agent.clone()));
-    let epoch = access.owner_epoch();
+    let epoch = access.daemon_epoch();
     let socket = directory.path().join("access.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     let server = tokio::spawn(serve_listener(
@@ -2586,7 +2586,7 @@ async fn explicit_resume_retries_an_association_confirmed_not_dispatched() {
     let client = LocalAgentClient::connect(&socket).await.unwrap();
     let created = client
         .execute(CommandEnvelope {
-            owner_epoch: epoch,
+            daemon_epoch: epoch,
             command_id: uuid::Uuid::new_v4(),
             command: AgentCommand::Create {
                 launch: LaunchSpec::embedded(directory.path().into()),
@@ -2636,7 +2636,7 @@ async fn explicit_resume_retries_an_association_confirmed_not_dispatched() {
     assert!(!initial.association_unknown);
     let resumed = client
         .execute(CommandEnvelope {
-            owner_epoch: epoch,
+            daemon_epoch: epoch,
             command_id: uuid::Uuid::new_v4(),
             command: AgentCommand::ManageLoop {
                 execution,
@@ -2673,7 +2673,7 @@ async fn explicit_resume_retries_an_association_confirmed_not_dispatched() {
     );
     client
         .execute(CommandEnvelope {
-            owner_epoch: epoch,
+            daemon_epoch: epoch,
             command_id: uuid::Uuid::new_v4(),
             command: AgentCommand::ManageLoop {
                 execution,

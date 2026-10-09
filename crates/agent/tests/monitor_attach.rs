@@ -22,7 +22,7 @@ const KEYS_TICK: &str = include_str!("support/keys_tick.py");
 struct Host {
     directory: tempfile::TempDir,
     controller: HostController,
-    owner: tick_host::host::TickOwner,
+    owner: tickhost::host::TickOwner,
 }
 
 impl Host {
@@ -33,28 +33,28 @@ impl Host {
             .unwrap();
         let controller = HostController::new(
             directory.path(),
-            tick_host::paths::HostPaths {
+            tickhost::paths::HostPaths {
                 runtime: directory.path().join("h"),
             },
             Uuid::new_v4(),
             support::fixture_cli::executable(),
-            tick_host::host::DEFAULT_IDLE_TIMEOUT,
+            tickhost::host::DEFAULT_IDLE_TIMEOUT,
         );
         Self {
             directory,
             controller,
-            owner: tick_host::host::TickOwner {
+            owner: tickhost::host::TickOwner {
                 root: "fixture-root".into(),
                 chat: Uuid::new_v4(),
             },
         }
     }
 
-    async fn open_keys(&self) -> tick_host::host::OpenedTick {
+    async fn open_keys(&self) -> tickhost::host::OpenedTick {
         let script = self.directory.path().join("keys.py");
         std::fs::write(&script, KEYS_TICK).unwrap();
         self.controller
-            .open(tick_host::host::OpenRequest {
+            .open(tickhost::host::OpenRequest {
                 operation: Uuid::new_v4(),
                 owner: self.owner.clone(),
                 owner_revision: 0,
@@ -76,7 +76,7 @@ impl Host {
             .unwrap()
     }
 
-    async fn grant(&self, opened: &tick_host::host::OpenedTick) -> HostedViewGrant {
+    async fn grant(&self, opened: &tickhost::host::OpenedTick) -> HostedViewGrant {
         self.controller
             .allow_view(&self.owner, &opened.instance)
             .await
@@ -86,9 +86,9 @@ impl Host {
 
 impl Drop for Host {
     fn drop(&mut self) {
-        support::stop_tick_host(
+        support::stop_tickhost(
             &self.directory.path().join("h"),
-            &self.directory.path().join("tick-host.key"),
+            &self.directory.path().join("tickhost.key"),
         );
     }
 }

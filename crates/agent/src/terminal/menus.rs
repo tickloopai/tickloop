@@ -3691,7 +3691,7 @@ mod tests {
         launch.config_root = Some(root_a.clone());
         let receipt = access
             .execute(CommandEnvelope {
-                owner_epoch: access.owner_epoch(),
+                daemon_epoch: access.daemon_epoch(),
                 command_id: Uuid::new_v4(),
                 command: AgentCommand::Create {
                     launch: launch.clone(),
@@ -3709,7 +3709,7 @@ mod tests {
         launch.config_root = Some(root_b.clone());
         let view = Agent::from_access_for_test(
             access.clone(),
-            access.owner_epoch(),
+            access.daemon_epoch(),
             ViewRef {
                 session_id: Uuid::new_v4(),
                 view_id: Uuid::new_v4(),
@@ -3794,7 +3794,7 @@ mod tests {
         launch.model = Some(config.clone());
         let receipt = access
             .execute(CommandEnvelope {
-                owner_epoch: access.owner_epoch(),
+                daemon_epoch: access.daemon_epoch(),
                 command_id: Uuid::new_v4(),
                 command: AgentCommand::Create {
                     launch,
@@ -3893,7 +3893,7 @@ mod tests {
         launch.model = Some(config.clone());
         let created = access
             .execute(CommandEnvelope {
-                owner_epoch: access.owner_epoch(),
+                daemon_epoch: access.daemon_epoch(),
                 command_id: Uuid::new_v4(),
                 command: AgentCommand::Create {
                     launch: launch.clone(),
@@ -3909,9 +3909,9 @@ mod tests {
             panic!("Agent not created")
         };
         let target = ConfigTarget::Agent(snapshot.conversation.id);
-        let endpoint = project.join("owner.sock");
+        let endpoint = project.join("daemon.sock");
         let listener = tokio::net::UnixListener::bind(&endpoint).unwrap();
-        let epoch = access.owner_epoch();
+        let epoch = access.daemon_epoch();
         let ipc = tokio::spawn(crate::agent_access::serve_listener(
             listener,
             access,
@@ -3992,7 +3992,7 @@ mod tests {
         launch.model = Some(config.clone());
         let result = access
             .execute(CommandEnvelope {
-                owner_epoch: access.owner_epoch(),
+                daemon_epoch: access.daemon_epoch(),
                 command_id: Uuid::new_v4(),
                 command: AgentCommand::Create {
                     launch: launch.clone(),
@@ -4010,7 +4010,7 @@ mod tests {
         let target = ConfigTarget::Agent(snapshot.conversation.id);
         let view = Agent::from_access_for_test(
             access.clone(),
-            access.owner_epoch(),
+            access.daemon_epoch(),
             ViewRef {
                 session_id: Uuid::new_v4(),
                 view_id: Uuid::new_v4(),

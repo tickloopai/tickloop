@@ -261,7 +261,7 @@ async fn run_working_todo_list(fixture: &PrivateFixture) {
     pty.close().await;
     client
         .execute(CommandEnvelope {
-            owner_epoch: client.owner_epoch(),
+            daemon_epoch: client.daemon_epoch(),
             command_id: uuid::Uuid::new_v4(),
             command: AgentCommand::FlushTranscripts,
         })
@@ -271,9 +271,10 @@ async fn run_working_todo_list(fixture: &PrivateFixture) {
     let chat_id = completed.conversation.id.to_string();
     let mut resumed = PtyView::launch(fixture, &["--resume", &chat_id], &[], true);
     let restored = resumed
-        .wait_for("expired Todos do not return after owner restart", |frame| {
-            frame.contains("History opened.") && frame.contains("TODO-THIRD-REPLY")
-        })
+        .wait_for(
+            "expired Todos do not return after daemon restart",
+            |frame| frame.contains("History opened.") && frame.contains("TODO-THIRD-REPLY"),
+        )
         .await;
     assert!(
         !restored.contains(TODO_FIRST)
@@ -324,7 +325,7 @@ async fn shell_tasks(client: &LocalAgentClient, execution: ExecutionRef) -> Vec<
         .await
         .unwrap();
     let ObservationValue::Tasks(tasks) = observed.initial else {
-        panic!("the public owner returned an unexpected task response");
+        panic!("the public daemon returned an unexpected task response");
     };
     tasks
 }

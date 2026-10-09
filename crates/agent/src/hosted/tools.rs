@@ -1,5 +1,5 @@
-//! The Tick host backend of the native Tick tools: the hidden Ticks a Chat opened. Opening,
-//! reopening and closing go through the owner, which alone controls the Tick host; reading and
+//! The Tickhost backend of the native Tick tools: the hidden Ticks a Chat opened. Opening,
+//! reopening and closing go through the daemon, which alone controls the Tickhost; reading and
 //! calling use the instance's data binding directly. Each call is prepared once — target,
 //! catalog, executable, working directory and operation id frozen — and the same preparation is
 //! approved and dispatched.
@@ -17,7 +17,7 @@ use tick_connect::{
     instance::InstanceRef,
     protocol::TickDescriptor,
 };
-use tick_host::host::Receipt;
+use tickhost::host::Receipt;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -25,7 +25,7 @@ use uuid::Uuid;
 use super::{
     controller::HostedViewGrant,
     registry::{FileIdentity, TARGET_GONE},
-    worker_control::{HostedAdmission, HostedTickPage, OwnerControl, WorkerRequest},
+    worker_control::{DaemonControl, HostedAdmission, HostedTickPage, WorkerRequest},
 };
 use crate::{
     host_tools::{
@@ -38,8 +38,8 @@ use crate::{
     tools::ToolResult,
 };
 
-/// How results name the Tick host that runs a hidden Tick.
-const HOSTED_HOST: &str = "tick-host";
+/// How results name the Tickhost that runs a hidden Tick.
+const HOSTED_HOST: &str = "tickhost";
 
 #[derive(Clone)]
 struct DataBinding {
@@ -53,14 +53,14 @@ pub struct HostedMember {
     pub instance: InstanceRef,
     pub title: Option<String>,
     pub state: HostedMemberState,
-    pub resources: Option<tick_host::host::Resources>,
+    pub resources: Option<tickhost::host::Resources>,
 }
 
 /// A hosted Tick's screen as text when it was taken: the newest lines within the snapshot
 /// limits, saying whether older ones were cut.
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
 pub struct HostedSnapshot {
-    pub screen: tick_host::screen::ScreenSnapshot,
+    pub screen: tickhost::screen::ScreenSnapshot,
     pub taken_at_ms: u64,
 }
 
@@ -106,7 +106,7 @@ struct HostedPrepared {
 }
 
 pub struct HostedTickTools {
-    owner: OwnerControl,
+    daemon: DaemonControl,
     environment: Vec<(String, String)>,
     endpoint: HostEndpointIdentity,
     /// Data bindings of the Ticks each Chat owns; another Chat of this worker never shares one.
@@ -117,10 +117,10 @@ pub struct HostedTickTools {
 impl HostedTickTools {
     /// `environment` is the launch environment hosted Ticks start with; the host removes
     /// inherited Herdr and Tick launch context from it.
-    pub fn new(owner: OwnerControl, environment: Vec<(String, String)>) -> Self {
+    pub fn new(daemon: DaemonControl, environment: Vec<(String, String)>) -> Self {
         Self {
-            endpoint: owner.host_endpoint(),
-            owner,
+            endpoint: daemon.host_endpoint(),
+            daemon,
             environment,
             bindings: Mutex::new(HashMap::new()),
         }
@@ -166,11 +166,11 @@ impl HostedTickTools {
                         directory: FileIdentity::directory(&cwd)?,
                         command,
                         cwd: cwd.clone(),
-                        title: tick_host::host::display_title(&command_line),
+                        title: tickhost::host::display_title(&command_line),
                     },
                     HostToolPermission::Reviewable,
                     format!(
-                        "Open `{command_line}` hidden in the Tick host (cwd {})",
+                        "Open `{command_line}` hidden in the Tickhost (cwd {})",
                         cwd.display()
                     ),
                 )
@@ -188,7 +188,7 @@ impl HostedTickTools {
             }
             (MODIFY_TICK, Some("reopen")) => {
                 let lost = hosted_target(input)?;
-                // The owner alone judges whether the instance can be reopened; the listing only
+                // The daemon alone judges whether the instance can be reopened; the listing only
                 // names it for the approval.
                 let title = self
                     .list_page(chat, None)
@@ -199,7 +199,7 @@ impl HostedTickTools {
                     .find(|listed| listed.instance == lost)
                     .and_then(|listed| listed.title);
                 let summary = format!(
-                    "Reopen {} as a new hidden instance from its recorded program, if it was lost with its Tick host; its earlier subscriptions do not follow",
+                    "Reopen {} as a new hidden instance from its recorded program, if it was lost with its Tickhost; its earlier subscriptions do not follow",
                     title.as_deref().unwrap_or(lost.as_str())
                 );
                 (
@@ -401,7 +401,7 @@ impl HostedTickTools {
         }
     }
 
-    /// The authority every hosted Tick call runs under: this worker's own Tick host.
+    /// The authority every hosted Tick call runs under: this worker's own Tickhost.
     pub(crate) fn authority(&self) -> HostToolAuthority {
         HostToolAuthority::Native {
             endpoint: self.endpoint.clone(),
@@ -423,7 +423,7 @@ impl HostedTickTools {
         operation: Uuid,
         request: WorkerRequest,
     ) -> Result<Value, HostCallResult> {
-        let lost = match self.owner.request(request).await {
+        let lost = match self.daemon.request(request).await {
             Ok(answer) => return Ok(answer),
             Err(error) if !error.dispatched => {
                 return Err(HostCallResult::NotDispatched(error.to_string()));
@@ -436,7 +436,7 @@ impl HostedTickTools {
             ))
         };
         let receipt = self
-            .owner
+            .daemon
             .request(WorkerRequest::GetHostedOperationReceipt { chat, operation })
             .await
             .map_err(|error| unknown(format!("{lost}; its receipt is unavailable: {error}")))?;
@@ -468,7 +468,7 @@ impl HostedTickTools {
             Ok(instance) => instance,
             Err(error) => {
                 return HostCallResult::OutcomeUnknown(format!(
-                    "the owner reported an opened Tick without a valid instance ({error})"
+                    "the daemon reported an opened Tick without a valid instance ({error})"
                 ));
             }
         };
@@ -548,7 +548,7 @@ impl HostedTickTools {
         }))
     }
 
-    /// A data connection for an instance this Chat owns. A binding is recovered from the owner,
+    /// A data connection for an instance this Chat owns. A binding is recovered from the daemon,
     /// which lists only this Chat's running Ticks, after a worker restart or once a cached one
     /// stops connecting because its host was replaced.
     pub(crate) async fn data(
@@ -640,7 +640,7 @@ impl HostedTickTools {
         cursor: Option<tick_connect::page::PageCursor>,
     ) -> Result<HostedTickPage, HostError> {
         let page = self
-            .owner
+            .daemon
             .request(WorkerRequest::ListHostedTicks { chat, cursor })
             .await?;
         serde_json::from_value(page)
@@ -648,7 +648,7 @@ impl HostedTickTools {
     }
 
     /// Starts a new instance in place of a lost one because its user asked to, through the same
-    /// prepared reopen a model's approved ModifyTick runs. The owner checks the recorded launch
+    /// prepared reopen a model's approved ModifyTick runs. The daemon checks the recorded launch
     /// again under the Chat's current authority; the lost instance and its Watches stay gone, and
     /// nothing reopens on its own. Returns the new instance.
     pub async fn reopen_for_user(
@@ -719,7 +719,7 @@ impl HostedTickTools {
 
     /// How often Watch intents must be reported again to keep protecting their Ticks.
     pub(crate) fn intent_renewal(&self) -> std::time::Duration {
-        self.owner.intent_renewal()
+        self.daemon.intent_renewal()
     }
 
     /// The current screen of one of the Chat's hosted Ticks as text. Taking it reads host state
@@ -748,7 +748,7 @@ impl HostedTickTools {
         instance: &InstanceRef,
     ) -> Result<HostedViewGrant, HostError> {
         let granted = self
-            .owner
+            .daemon
             .request(WorkerRequest::AllowHostedView {
                 chat,
                 instance: instance.clone(),
@@ -758,14 +758,14 @@ impl HostedTickTools {
             .map_err(|error| HostError::after("ProtocolViolation", error.to_string()))
     }
 
-    /// Tells the owner which approved Watches of `chat` keep `instance` from idling.
+    /// Tells the daemon which approved Watches of `chat` keep `instance` from idling.
     pub(crate) async fn set_watch_intents(
         &self,
         chat: ChatId,
         instance: &InstanceRef,
         watches: BTreeSet<Uuid>,
     ) -> Result<(), HostError> {
-        self.owner
+        self.daemon
             .request(WorkerRequest::SetWatchIntents {
                 chat,
                 instance: instance.clone(),
@@ -950,15 +950,15 @@ mod tests {
         hosted::{BUSINESS_FRAME_BYTES, read_frame, write_frame},
         page::Page,
     };
-    use tick_host::host::{TickOwner, TickRow, TickState};
+    use tickhost::host::{TickOwner, TickRow, TickState};
 
     use super::*;
     use crate::hosted::worker_control::WorkerControlGrant;
 
-    /// An owner that answers every request with one complete listing of `chat`'s `running`
+    /// A daemon that answers every request with one complete listing of `chat`'s `running`
     /// Ticks.
-    fn listing_owner(directory: &Path, chat: ChatId, running: &[InstanceRef]) -> OwnerControl {
-        let endpoint = directory.join("owner.sock");
+    fn listing_daemon(directory: &Path, chat: ChatId, running: &[InstanceRef]) -> DaemonControl {
+        let endpoint = directory.join("daemon.sock");
         let listener = tokio::net::UnixListener::bind(&endpoint).unwrap();
         let rows = running
             .iter()
@@ -996,9 +996,9 @@ mod tests {
                 }
             }
         });
-        OwnerControl::new(WorkerControlGrant {
+        DaemonControl::new(WorkerControlGrant {
             endpoint,
-            owner_epoch: Uuid::new_v4(),
+            daemon_epoch: Uuid::new_v4(),
             binding: Uuid::new_v4(),
             capability: "capability".into(),
             host_endpoint: directory.join("host.sock"),
@@ -1029,8 +1029,8 @@ mod tests {
             .tempdir_in("/private/tmp")
             .unwrap();
         let chat = Uuid::new_v4();
-        let tools = HostedTickTools::new(listing_owner(directory.path(), chat, &[]), Vec::new());
-        let argument = "x".repeat(tick_host::host::TITLE_CHARACTERS * 4);
+        let tools = HostedTickTools::new(listing_daemon(directory.path(), chat, &[]), Vec::new());
+        let argument = "x".repeat(tickhost::host::TITLE_CHARACTERS * 4);
         let prepared = tools
             .prepare(
                 chat,
@@ -1049,7 +1049,7 @@ mod tests {
             panic!("an open prepares an open");
         };
         assert_eq!(command, &["/bin/echo".to_owned(), argument]);
-        assert_eq!(title, &tick_host::host::display_title(&whole));
+        assert_eq!(title, &tickhost::host::display_title(&whole));
     }
 
     /// A binding goes once its Tick is no longer listed running, is looked up as gone, or was
@@ -1064,7 +1064,7 @@ mod tests {
         let hosted = || InstanceRef::hosted(Uuid::new_v4());
         let (running, ended, elsewhere) = (hosted(), hosted(), hosted());
         let tools = HostedTickTools::new(
-            listing_owner(directory.path(), chat, std::slice::from_ref(&running)),
+            listing_daemon(directory.path(), chat, std::slice::from_ref(&running)),
             Vec::new(),
         );
 

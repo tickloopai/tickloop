@@ -1,4 +1,4 @@
-//! The failure of a native terminal host or the Tick host, shared by their clients.
+//! The failure of a native terminal host or the Tickhost, shared by their clients.
 
 use serde::{Deserialize, Serialize};
 

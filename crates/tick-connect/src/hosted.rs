@@ -1,4 +1,4 @@
-//! The Tick host wire contract shared by the host service, its Agent owner client, data clients
+//! The Tickhost wire contract shared by the host service, its Agent daemon client, data clients
 //! and the hosted launcher. Frames are one JSON object per line on a private Unix socket. The
 //! first frame names the channel: the frozen management channel only says hello and shuts the
 //! host down; the business channel negotiates its minor version and capabilities and then
@@ -27,9 +27,10 @@ pub const MANAGEMENT_MAJOR: u16 = 1;
 pub const MANAGEMENT_MINOR: u16 = 0;
 pub const MANAGEMENT_FRAME_BYTES: usize = 64 * 1024;
 /// 3.0: owner revisions on open, listings that name their host epoch, owner reconcile/end,
-/// Watch-intent leases, explicit or automatic reads, and one-time view grants; a host of any
-/// other major is refused at hello.
-pub const BUSINESS_MAJOR: u16 = 3;
+/// Watch-intent leases, explicit or automatic reads, and one-time view grants. 4.0: the
+/// controller role carries `daemon_epoch` and the launch binding is read from
+/// `TICKLOOP_TICKHOST_LAUNCH`. A host of any other major is refused at hello.
+pub const BUSINESS_MAJOR: u16 = 4;
 pub const BUSINESS_MINOR: u16 = 0;
 /// A complete business frame, large enough for one legal 8 MiB Tick Tool response.
 pub const BUSINESS_FRAME_BYTES: usize = 8 * 1024 * 1024 + 64 * 1024;
@@ -46,7 +47,7 @@ pub const ATTACH_INPUT_BYTES: usize = 4 * 1024;
 /// An attached view's request frame: one input chunk, a resize or detach.
 pub const ATTACH_REQUEST_FRAME_BYTES: usize = 64 * 1024;
 /// The launch binding a hosted launcher reads from its environment.
-pub const LAUNCH_ENV: &str = "TICKLOOP_TICK_HOST_LAUNCH";
+pub const LAUNCH_ENV: &str = "TICKLOOP_TICKHOST_LAUNCH";
 
 pub const CAPABILITY_LIFECYCLE: &str = "lifecycle";
 pub const CAPABILITY_DATA: &str = "data";
@@ -73,10 +74,10 @@ pub enum Hello {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Role {
-    /// The Agent owner daemon: the only writer of opens, closes and ownership.
+    /// The Agent daemon: the only writer of opens, closes and ownership.
     Controller {
         controller_key: String,
-        owner_epoch: uuid::Uuid,
+        daemon_epoch: uuid::Uuid,
     },
     /// A reader of one instance, holding the data token issued when it opened.
     Instance {
@@ -224,7 +225,7 @@ fn verify_endpoint(endpoint: &Path) -> Result<u32, HostError> {
     if !metadata.file_type().is_socket() || metadata.uid() != uid {
         return Err(HostError::before(
             "HostUnavailable",
-            "Tick host endpoint must be a socket owned by this user",
+            "Tickhost endpoint must be a socket owned by this user",
         ));
     }
     Ok(metadata.uid())
@@ -276,7 +277,7 @@ impl HostConnection {
         if peer_uid(&stream)? != owner {
             return Err(HostError::before(
                 "HostUnavailable",
-                "Tick host endpoint belongs to another user",
+                "Tickhost endpoint belongs to another user",
             ));
         }
         let (reader, mut writer) = stream.into_split();
@@ -305,7 +306,7 @@ impl HostConnection {
             return Err(HostError::before(
                 "IncompatibleHost",
                 format!(
-                    "Tick host business protocol {}.{} is incompatible with client {BUSINESS_MAJOR}.{BUSINESS_MINOR}",
+                    "Tickhost business protocol {}.{} is incompatible with client {BUSINESS_MAJOR}.{BUSINESS_MINOR}",
                     reply.major, reply.minor
                 ),
             ));
@@ -316,7 +317,7 @@ impl HostConnection {
         {
             return Err(HostError::before(
                 "IncompatibleHost",
-                format!("Tick host lacks the required {missing} capability"),
+                format!("Tickhost lacks the required {missing} capability"),
             ));
         }
         Ok(Self {
@@ -353,10 +354,10 @@ impl HostConnection {
             tokio::time::timeout(timeout, read_frame(&mut self.reader, BUSINESS_FRAME_BYTES))
                 .await
                 .map_err(|_| {
-                    HostError::after("OutcomeUnknown", "Tick host did not answer in time")
+                    HostError::after("OutcomeUnknown", "Tickhost did not answer in time")
                 })??
                 .ok_or_else(|| {
-                    HostError::after("OutcomeUnknown", "Tick host closed the connection")
+                    HostError::after("OutcomeUnknown", "Tickhost closed the connection")
                 })?;
         response_result(response, Some(id))
     }
@@ -384,18 +385,18 @@ pub fn response_result(response: Value, expected: Option<u64>) -> Result<Value, 
     {
         return Err(HostError::after(
             "ProtocolViolation",
-            "Tick host answered another request",
+            "Tickhost answered another request",
         ));
     }
     if let Some(error) = response.get("error") {
         return Err(serde_json::from_value(error.clone()).unwrap_or_else(|_| {
-            HostError::after("ProtocolViolation", "Tick host returned a malformed error")
+            HostError::after("ProtocolViolation", "Tickhost returned a malformed error")
         }));
     }
     response
         .get("result")
         .cloned()
-        .ok_or_else(|| HostError::after("ProtocolViolation", "Tick host response has no result"))
+        .ok_or_else(|| HostError::after("ProtocolViolation", "Tickhost response has no result"))
 }
 
 pub fn ok(id: &Value, result: Value) -> Value {

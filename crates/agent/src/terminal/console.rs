@@ -697,7 +697,7 @@ pub(super) struct State {
     last_connection_diagnostics: HashMap<Uuid, String>,
     rendered_execution_losses: HashSet<Uuid>,
     creation_notice: Option<String>,
-    /// The visible Agent's owner-reported delegation; reset whenever the visible Agent changes.
+    /// The visible Agent's daemon-reported delegation; reset whenever the visible Agent changes.
     visible_delegated: bool,
     /// The status explains why the last action did nothing; periodic refreshes keep it until the
     /// next key.
@@ -14722,7 +14722,7 @@ mod tests {
         std::fs::write(directory.path().join("audit.txt"), "evidence").unwrap();
         let target = FamilyMentionTarget {
             execution: crate::agent_access::ExecutionRef {
-                owner_epoch: Uuid::new_v4(),
+                daemon_epoch: Uuid::new_v4(),
                 agent_id: Uuid::new_v4(),
                 generation: 1,
             },
@@ -16212,7 +16212,7 @@ mod tests {
         state.interactive = false;
         let console = console_with_state(state);
         console
-            .set_connection_notice(Some("Disconnected · cached view · owner gone".into()))
+            .set_connection_notice(Some("Disconnected · cached view · daemon gone".into()))
             .unwrap();
         let mut state = console.state.lock().unwrap();
         state.interactive = true;

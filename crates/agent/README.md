@@ -15,14 +15,14 @@ Agent 的权限、问题、确认、工作目录信任、设置、帮助、`/res
 cargo run -p tickloop-agent
 ```
 
-To replace an incompatible local Agent service, run this build's stop command, then launch again:
+To replace an incompatible local Agent daemon, run this build's stop command, then launch again:
 
 ```sh
-./target/debug/tickloop service stop
+./target/debug/tickloop daemon stop
 ./target/debug/tickloop
 ```
 
-This stops the service and its running Agents. Saved history is kept. `TICKLOOP_AGENT_RUNTIME_DIR` selects the service; keep it unchanged between these commands. Closing a View still leaves its work running. The next launch starts this build's service without automatically continuing saved work.
+This stops the daemon and all of its workers, which is every running Agent. Saved history is kept, and Ticks in the Tickhost keep running. `TICKLOOP_DAEMON_RUNTIME_DIR` selects the daemon; keep it unchanged between these commands. Closing a View still leaves its work running. The next launch starts this build's daemon without automatically continuing saved work. A daemon started by a build from before the daemon rename runs from its old runtime directory, which this build never finds; end it once by hand.
 
 从仓库根目录执行 `make package`，将 Agent 与 example Tick 编译为 Release 并打包到 `dist/tickloop-<target>.tar.gz`，默认使用当前主机的 Rust target。压缩包包含 `tickloop` 和 `tick`，不包含 `.env`、配置或会话数据；解压后在匹配的系统与架构上运行，无需安装 Rust。模型凭据通过下述配置入口提供，默认状态目录为 `~/.tickloop`，可用 `TICKLOOP_CONFIG_DIR` 指定。
 
@@ -35,7 +35,7 @@ This stops the service and its running Agents. Saved history is kept. `TICKLOOP_
 
 `Subagent {task,name?,description?,run_in_background?}` 注册不可复用的家族代号：前台等待实际报告并返回工具结果；后台立即返回，完成通知自动进入父 Loop 并携带状态、结果与用量。`SendMessage {to,message,relay_user_message_id?}` 自动送达同一家族的根、直接子和同级子；忙时在下个工具回合接入，空闲时开始新回合。正常完成、失败或停止的子任务可按原冻结权限继续，停止的根和过期任务仍需要真人 Continue。`ListSubagents` 用于发现不可变代号与实际状态；`StopSubagent {to}` 只供根停止直接 child 的本次执行。模型无需查询收件箱或等待结果的另一个工具。Agent 消息与核验后的转述始终不是人类审批或新增授权。真实 @handle 输入保留来源、附件与原始字节，不直接启动来源模型。独立 root、跨家族、嵌套和广播不开放。详见[家族消息合同](../../.scratch/agent-layout-redesign/parent-child-messaging.md)。
 
-owner 自动启动使用当前登录用户私有 Unix socket，启动锁协调并发 CLI，不安装 launchd 服务。关闭终端／Pane、`/exit` 或 View EOF 只撤界面；owner／worker 退出后旧 execution 失效。`/resume` 打开历史不执行，明确向原 Loop Continue 才恢复其原有效 Trigger；没有自动崩溃续跑或跨崩溃 exactly-once 承诺。确认丢失先查询原 CommandId，创建仍未知时保留输入并阻止盲目重复创建；检查总览与历史后，可按提示 `/acknowledge-create COMMAND_ID` 显式承认未知，以允许另一条新提交，此动作不重放旧命令。New Agent 的暂存选择逐条以回执证明后才提交首个输入，未知或被拒的选择不会重发，也不会让输入落到配置不全的 Agent；同一命令可取消其余选择。普通输入结果未知时原样恢复到输入区，在不改动的情况下再次 Enter 只读取原收据：已被接受就采纳原结果、不再发送；改动后的输入等原结果确定后作为新输入发送；`/acknowledge-input COMMAND_ID` 只停止跟踪、不重发。
+daemon 自动启动使用当前登录用户私有 Unix socket，启动锁协调并发 CLI，不安装 launchd 服务。关闭终端／Pane、`/exit` 或 View EOF 只撤界面；daemon／worker 退出后旧 execution 失效。`/resume` 打开历史不执行，明确向原 Loop Continue 才恢复其原有效 Trigger；没有自动崩溃续跑或跨崩溃 exactly-once 承诺。确认丢失先查询原 CommandId，创建仍未知时保留输入并阻止盲目重复创建；检查总览与历史后，可按提示 `/acknowledge-create COMMAND_ID` 显式承认未知，以允许另一条新提交，此动作不重放旧命令。New Agent 的暂存选择逐条以回执证明后才提交首个输入，未知或被拒的选择不会重发，也不会让输入落到配置不全的 Agent；同一命令可取消其余选择。普通输入结果未知时原样恢复到输入区，在不改动的情况下再次 Enter 只读取原收据：已被接受就采纳原结果、不再发送；改动后的输入等原结果确定后作为新输入发送；`/acknowledge-input COMMAND_ID` 只停止跟踪、不重发。
 
 输入区自然增长并独立滚动，正文使用底部真实占位后的空间。下方展开 Agents 会缩小正文；Todo 始终在消息流左栏的 Working 下方，有条目时空闲也保留，全部完成后保留 5 秒再持久化清空；Shell Tick 在内容区右侧的 Monitor 中显示，输入和底栏保持全宽；帮助在输入对话框内显示，替换整个输入区及 Subagents 面板。条件顶栏只摘要当前正在阅读且 user 消息已滚出视口的回合。`settings.json` 的可选 `statusLines` 是字符串数组，未配置使用默认状态行，空数组隐藏普通状态行，最多显示三条物理行；必要连接／未知提示仍占一行，帮助或请求界面临时隐藏普通 status。预算、焦点与可交互原型见[布局契约](../../.scratch/agent-layout-redesign/layout-contract.md)，真实运行与未测边界见[实施记录](../../.scratch/agent-layout-redesign/implementation.md)。
 
@@ -126,7 +126,7 @@ OAuth 使用 Portal 设备授权，终端显示地址和用户码；在自己的
 
 模型选择和 Thinking 保存在状态目录 `settings.json` 的 `defaultModel`、`effortLevel` 和 `alwaysThinkingEnabled`。旧的内置选择与兼容别名继续使用当前版本内置定义；引用未知外部身份的旧选择给出一条明确提示并回退到内置默认。旧定义/调优文件被忽略，用户文件不会被删除。
 
-API Key 仍读取状态目录 `.env`，OAuth 登录使用私有认证存储，Google service account 等凭据文件继续支持。凭据不参与 Provider/model 定义，不在厂商、地区、产品或计费连接之间自动复制或别名匹配。开发入口 `make dev` 在共享 target 中增量构建，再用每次保留的唯一固定副本启动 CLI／owner／worker，沿用调用方 cwd 与全局配置（`TICKLOOP_CONFIG_DIR` 或默认状态目录），不另建开发配置。
+API Key 仍读取状态目录 `.env`，OAuth 登录使用私有认证存储，Google service account 等凭据文件继续支持。凭据不参与 Provider/model 定义，不在厂商、地区、产品或计费连接之间自动复制或别名匹配。开发入口 `make dev` 在共享 target 中增量构建，再用每次保留的唯一固定副本启动 CLI／daemon／worker，沿用调用方 cwd 与全局配置（`TICKLOOP_CONFIG_DIR` 或默认状态目录），不另建开发配置。
 
 内置目录与 AccessCatalog 控制普通菜单的模型系列和推荐卡；既有已退休内置选择保持兼容，不因目录更新静默升级。新增支持通过源码/SOP、验证和程序发布提供，外部 Provider 示例不构成产品加载入口。
 
@@ -260,13 +260,13 @@ Jev 非敏感服务配置仍可写在用户 `settings.json` 的 `jev`，例如 `
 
 当前 Chat 的 Recent activity 页保留最多 100 条最终权限结果，包括只读工具的直接放行、LLM／Jev 审批、人工确认和拒绝。每项占一行，显示结果、判定方式和操作；`No review` 表示直接放行且未调用审批模型，`LLM`／`Jev` 表示实际完成审批的模型来源，`Manual` 表示人工决定。Enter 查看请求参数、时间、原因、规则和回退经过。请求详情保留有界的命令、路径和普通输入内容，敏感值脱敏；旧记录未保存请求时明确提示。权限放行不代表工具执行成功。启用 Chat 持久保存且记录成功时，重启恢复同一 Chat 后可继续查看；关闭持久保存时只在本次运行中保留。已有拒绝记录可继续读取，旧对话中未记录的放行不会补造。只有拒绝详情可按 `r` 请求 Agent 重新计划和审批，不能直接重放历史工具命令或建立 Allow。Allow／Ask／Deny 和 Directories 管理页本期暂不展示，既有规则与 `/rule`、`/add-dir` 等命令继续生效。明确拒绝作为可恢复工具结果；软拒绝连续达到阈值时交互 Chat 可转人工，Hard deny 不能这样放行。`--deny-on-prompt` 和 `--dangerously-skip-permissions` 是不进入普通模式选择的高级启动策略；后者只应用于外部隔离环境。
 
-首次进入未知的规范化工作目录时，先启动终端界面，再显示目录信任选择；默认选中 `No, exit`，用方向键、j/k 或 Ctrl+N/P 选择后 Enter 确认。No、Esc、Ctrl+C 或 EOF 安静退出（exit 0），不保存信任或发起模型、工具请求。明确选择 Yes 后才加载项目内容、连接执行服务并进入普通输入。信任通过用户本地 `settings.json` 保存精确目录（包括 home），等价符号链接共享同一身份，子目录不自动继承；保存失败留在选择页，可重试或取消。非交互启动默认拒绝未知目录；外部宿主已经独立建立信任时才使用 `--working-directory-is-trusted` 明确声明该前提，且该参数不保存信任。
+首次进入未知的规范化工作目录时，先启动终端界面，再显示目录信任选择；默认选中 `No, exit`，用方向键、j/k 或 Ctrl+N/P 选择后 Enter 确认。No、Esc、Ctrl+C 或 EOF 安静退出（exit 0），不保存信任或发起模型、工具请求。明确选择 Yes 后才加载项目内容、连接 daemon 并进入普通输入。信任通过用户本地 `settings.json` 保存精确目录（包括 home），等价符号链接共享同一身份，子目录不自动继承；保存失败留在选择页，可重试或取消。非交互启动默认拒绝未知目录；外部宿主已经独立建立信任时才使用 `--working-directory-is-trusted` 明确声明该前提，且该参数不保存信任。
 
 选择时光标停在聚焦选项的指示符。窗口必须完整显示标题、目录路径、两个选项与确认提示；放不下时提示调整窗口并禁止 Yes，仍可取消。真实输入 PTY 关闭也按 EOF 安静退出。
 
 搜索配置示例为 `examples/mwmbl-search-config.json`，指向公开的 Mwmbl 搜索接口。设置服务地址不等于授予联网权限；工具执行前仍按当前规则检查。定时任务、后台进程与切走的 Chat 依赖本机 daemon／worker 存活。退出 View 不停止执行；所有者或机器退出后的恢复需要显式装载与 Continue。
 
-每个 Chat 的对话照 Claude Code 写成只追加的 Transcript：`<root>/projects/<项目目录名>/<chatId>.jsonl`，状态根目录默认为 `~/.tickloop`，可用 `TICKLOOP_CONFIG_DIR` 指定，`--no-session-persistence` 关闭持久保存。项目目录名由工作目录的 canonical 路径生成，文件在第一条消息写入时创建，之后 `/cwd` 改变工作目录也不移动文件。条目每 100ms 批量追加，不加锁；进程被强制结束时最多丢失最后一批。同一目录可以同时运行多个 `tickloop` View；同一 owner 仲裁同 store＋Chat 的装载并返回同一个活执行。独立 Embedded 容器继续保留原文件分叉约定，最近活动链用于恢复；这不是全局 Transcript 写锁。
+每个 Chat 的对话照 Claude Code 写成只追加的 Transcript：`<root>/projects/<项目目录名>/<chatId>.jsonl`，状态根目录默认为 `~/.tickloop`，可用 `TICKLOOP_CONFIG_DIR` 指定，`--no-session-persistence` 关闭持久保存。项目目录名由工作目录的 canonical 路径生成，文件在第一条消息写入时创建，之后 `/cwd` 改变工作目录也不移动文件。条目每 100ms 批量追加，不加锁；进程被强制结束时最多丢失最后一批。同一目录可以同时运行多个 `tickloop` View；同一 daemon 仲裁同 store＋Chat 的装载并返回同一个活执行。独立 Embedded 容器继续保留原文件分叉约定，最近活动链用于恢复；这不是全局 Transcript 写锁。
 
 压缩照 Claude Code 写成压缩边界：`/compact` 与自动压缩在对话末尾追加一个 `compact_boundary` system 条目（父指针为空，逻辑父指针指向压缩前最后一条）和一条压缩摘要 user 消息，之后的消息接在摘要后面；模型只看到最后一个边界之后的消息。本进程内边界之前的消息仍在 Ctrl+O 的完整记录中，rewind 到边界之前的提示时边界随之丢弃，模型重新看到原始对话，下一条消息在 Transcript 中从边界之前分叉（重新出现的私有推理按目标来源投影，原始块仍保留）；恢复 Chat 时模型对话链在边界处断开，边界之前的提示不再作为模型历史加载。审批依据另行保留真实用户输入及来源：新边界记录压缩前的原始输入，旧边界从当前对话链的 Transcript 记录恢复；摘要、工具结果、Agent 叙述或其他 Loop 的消息不因此获得授权效力，来源缺失则转人工。定向摘要不照 Claude Code 写保留区段（叠加摘要或 rewind 到保留消息的第一条提示后，区段重接会丢失或复活消息），保留的消息直线重写在新边界之后，恢复时沿最新叶子自然只得到新链；读取 Claude Code 格式、带保留区段的文件时仍按区段重接并清零保留 assistant 消息的用量，只有最新叶子的对话链经过文件中最后一个边界时才删除该边界之前的其他内容，区段校验失败时加载完整历史并在打开 Chat 时显示警告。超过 5MB 的 Transcript 只加载最后一个不带保留区段、父指针为空的边界之后的模型历史，边界之前只读取标题和 Branch 来源；审批所需原始输入仍从边界元数据或旧文件的当前链定向恢复。最新叶子的对话链走到被跳过的内容（rewind 越过该边界后继续的分支）时改为加载完整文件。自动压缩的摘要消息照 Claude Code 带继续指令，要求模型不再提问、直接接着做；手动 `/compact` 不带。压缩后元数据重新追加到文件末尾。
 

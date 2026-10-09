@@ -79,7 +79,7 @@ impl ModelClient for HiddenReplyModel {
 }
 
 struct HiddenRecoveryAccess {
-    owner: EmbeddedAgentAccess,
+    daemon: EmbeddedAgentAccess,
     source: Mutex<Option<ExecutionRef>>,
     in_overview: AtomicBool,
     overview_entered: Mutex<Option<oneshot::Sender<()>>>,
@@ -93,7 +93,7 @@ struct HiddenRecoveryAccess {
 #[async_trait]
 impl AgentAccess for HiddenRecoveryAccess {
     async fn observe(&self, query: ObservationRequest) -> Result<Observation, AccessError> {
-        self.owner.observe(query).await
+        self.daemon.observe(query).await
     }
 
     async fn execute(&self, command: CommandEnvelope) -> Result<CommandReceipt, AccessError> {
@@ -109,14 +109,14 @@ impl AgentAccess for HiddenRecoveryAccess {
         ) {
             self.interrupts.fetch_add(1, Ordering::SeqCst);
         }
-        self.owner.execute(command).await
+        self.daemon.execute(command).await
     }
 
     async fn show_view(&self, update: DisplayUpdate) -> Result<DisplayReceipt, AccessError> {
         let scene = matches!(update, DisplayUpdate::Scene { .. });
         let source_displayed = matches!(&update, DisplayUpdate::Displayed { execution, .. }
             if Some(*execution) == *self.source.lock().unwrap());
-        let receipt = self.owner.show_view(update).await?;
+        let receipt = self.daemon.show_view(update).await?;
         if scene {
             self.in_overview.store(true, Ordering::SeqCst);
             let release = self.overview_release.lock().unwrap().take();
@@ -185,7 +185,7 @@ async fn run_hidden_view_fixture() {
     let (return_sender, returning) = oneshot::channel();
     let (release_return, return_gate) = oneshot::channel();
     let access = Arc::new(HiddenRecoveryAccess {
-        owner: EmbeddedAgentAccess::new(core.clone()),
+        daemon: EmbeddedAgentAccess::new(core.clone()),
         source: Mutex::new(None),
         in_overview: AtomicBool::new(false),
         overview_entered: Mutex::new(lagged.then_some(overview_entered)),
@@ -205,7 +205,7 @@ async fn run_hidden_view_fixture() {
     };
     let agent = Agent::from_access_for_test(
         access.clone(),
-        access.owner.owner_epoch(),
+        access.daemon.daemon_epoch(),
         view,
         launch,
         None,
@@ -299,7 +299,7 @@ async fn run_hidden_view_fixture() {
         .unwrap();
         let receipt = access
             .execute(CommandEnvelope {
-                owner_epoch: access.owner.owner_epoch(),
+                daemon_epoch: access.daemon.daemon_epoch(),
                 command_id: Uuid::new_v4(),
                 command: AgentCommand::Submit {
                     execution: other_execution,

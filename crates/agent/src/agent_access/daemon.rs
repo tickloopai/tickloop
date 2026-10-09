@@ -24,7 +24,7 @@ pub trait WorkerFactory: Send + Sync {
     async fn start(
         &self,
         launch: &LaunchSpec,
-        owner_epoch: Uuid,
+        daemon_epoch: Uuid,
     ) -> Result<Arc<dyn AgentAccess>, AccessError>;
     /// Whether the worker behind `worker` has positively exited. An unknown or still running
     /// worker is `false`, because a replacement must never run beside work that can still act.
@@ -32,15 +32,15 @@ pub trait WorkerFactory: Send + Sync {
 }
 
 #[derive(Clone)]
-pub struct OwnerServer {
-    inner: Arc<OwnerInner>,
+pub struct DaemonServer {
+    inner: Arc<DaemonInner>,
 }
 struct Worker {
     access: Arc<dyn AgentAccess>,
     launch: LaunchSpec,
     last_directory: Vec<AgentSummary>,
 }
-struct OwnerInner {
+struct DaemonInner {
     epoch: Uuid,
     factory: Arc<dyn WorkerFactory>,
     routes: Mutex<HashMap<ExecutionRef, Arc<dyn AgentAccess>>>,
@@ -54,10 +54,10 @@ struct OwnerInner {
     changes: broadcast::Sender<ObservationUpdate>,
 }
 
-impl OwnerServer {
+impl DaemonServer {
     pub fn new(epoch: Uuid, factory: Arc<dyn WorkerFactory>) -> Self {
-        let owner = Self {
-            inner: Arc::new(OwnerInner {
+        let daemon = Self {
+            inner: Arc::new(DaemonInner {
                 epoch,
                 factory,
                 routes: Mutex::new(HashMap::new()),
@@ -71,10 +71,10 @@ impl OwnerServer {
                 changes: broadcast::channel(REPLAY_CAPACITY).0,
             }),
         };
-        tokio::spawn(monitor_directory(Arc::downgrade(&owner.inner)));
-        owner
+        tokio::spawn(monitor_directory(Arc::downgrade(&daemon.inner)));
+        daemon
     }
-    pub fn owner_epoch(&self) -> Uuid {
+    pub fn daemon_epoch(&self) -> Uuid {
         self.inner.epoch
     }
     async fn workers(&self) -> Vec<Arc<dyn AgentAccess>> {
@@ -87,16 +87,16 @@ impl OwnerServer {
             .collect()
     }
     async fn worker(&self, execution: ExecutionRef) -> Result<Arc<dyn AgentAccess>, AccessError> {
-        if execution.owner_epoch != self.inner.epoch {
+        if execution.daemon_epoch != self.inner.epoch {
             return Err(AccessError::new(
                 AccessErrorCode::EpochChanged,
-                "execution belongs to another owner epoch",
+                "execution belongs to another daemon epoch",
             ));
         }
         if self.inner.lost.lock().await.contains(&execution) {
             return Err(AccessError::new(
                 AccessErrorCode::StaleExecution,
-                "execution owner was lost; explicitly load its record to continue",
+                "execution worker was lost; explicitly load its record to continue",
             ));
         }
         if let Some(worker) = self.inner.routes.lock().await.get(&execution).cloned() {
@@ -116,7 +116,7 @@ impl OwnerServer {
                 )
             })
     }
-    /// Whether `chat` currently runs in any worker of this owner.
+    /// Whether `chat` currently runs in any worker of this daemon.
     pub async fn runs_chat(&self, chat: Uuid) -> Result<bool, AccessError> {
         Ok(self.directory().await?.iter().any(|entry| {
             entry.chat_id == chat && entry.availability != ExecutionAvailability::Lost
@@ -140,7 +140,7 @@ impl OwnerServer {
             .ok_or_else(|| {
                 AccessError::new(
                     AccessErrorCode::AccessDenied,
-                    "the Chat is not running in this owner",
+                    "the Chat is not running in this daemon",
                 )
             })?;
         let routed = self.inner.routes.lock().await.get(&execution).cloned();
@@ -154,7 +154,7 @@ impl OwnerServer {
     }
     fn cursor(&self) -> Cursor {
         Cursor {
-            owner_epoch: self.inner.epoch,
+            daemon_epoch: self.inner.epoch,
             execution: None,
             sequence: self.inner.sequence.load(Ordering::SeqCst),
         }
@@ -241,7 +241,7 @@ impl OwnerServer {
         let sequence = self.inner.sequence.fetch_add(1, Ordering::SeqCst) + 1;
         let _ = self.inner.changes.send(ObservationUpdate {
             cursor: Cursor {
-                owner_epoch: self.inner.epoch,
+                daemon_epoch: self.inner.epoch,
                 execution: None,
                 sequence,
             },
@@ -564,7 +564,7 @@ impl OwnerServer {
 }
 
 #[async_trait]
-impl AgentAccess for OwnerServer {
+impl AgentAccess for DaemonServer {
     async fn observe(&self, query: ObservationRequest) -> Result<Observation, AccessError> {
         match query {
             ObservationRequest::Receipt { epoch, command_id } => Ok(Observation {
@@ -607,7 +607,7 @@ impl AgentAccess for OwnerServer {
                         .take(page.bounded_limit())
                         .collect();
                 let reset = after.and_then(|after| {
-                    if after.owner_epoch != cursor.owner_epoch {
+                    if after.daemon_epoch != cursor.daemon_epoch {
                         Some(ResetReason::EpochChanged)
                     } else if after.execution.is_some() || after.sequence > cursor.sequence {
                         Some(ResetReason::ConversationChanged)
@@ -620,7 +620,7 @@ impl AgentAccess for OwnerServer {
                     }
                 });
                 let (sender, changes) = mpsc::channel(FEED_CAPACITY);
-                let owner = Arc::downgrade(&self.inner);
+                let daemon = Arc::downgrade(&self.inner);
                 tokio::spawn(async move {
                     loop {
                         let update = tokio::select! { _ = sender.closed() => break, update = receiver.recv() => update };
@@ -628,11 +628,11 @@ impl AgentAccess for OwnerServer {
                             Ok(update) if update.cursor.sequence > cursor.sequence => update,
                             Ok(_) => continue,
                             Err(broadcast::error::RecvError::Lagged(_)) => {
-                                let Some(owner) = owner.upgrade() else {
+                                let Some(daemon) = daemon.upgrade() else {
                                     break;
                                 };
                                 ObservationUpdate {
-                                    cursor: OwnerServer { inner: owner }.cursor(),
+                                    cursor: DaemonServer { inner: daemon }.cursor(),
                                     change: ObservationChange::Changed,
                                 }
                             }
@@ -673,7 +673,7 @@ impl AgentAccess for OwnerServer {
                 for worker in self.workers().await {
                     let _ = worker
                         .execute(CommandEnvelope {
-                            owner_epoch: self.inner.epoch,
+                            daemon_epoch: self.inner.epoch,
                             command_id: Uuid::new_v4(),
                             command: AgentCommand::FlushTranscripts,
                         })
@@ -734,21 +734,21 @@ impl AgentAccess for OwnerServer {
     }
 }
 
-async fn monitor_directory(owner: Weak<OwnerInner>) {
+async fn monitor_directory(daemon: Weak<DaemonInner>) {
     let mut interval = tokio::time::interval(Duration::from_millis(250));
     let mut previous = Vec::new();
     loop {
         interval.tick().await;
-        let Some(inner) = owner.upgrade() else {
+        let Some(inner) = daemon.upgrade() else {
             break;
         };
-        let owner = OwnerServer { inner };
-        if let Ok(directory) = owner.directory().await
+        let daemon = DaemonServer { inner };
+        if let Ok(directory) = daemon.directory().await
             && let Ok(current) = serde_json::to_vec(&directory)
             && previous != current
         {
             previous = current;
-            owner.changed();
+            daemon.changed();
         }
     }
 }

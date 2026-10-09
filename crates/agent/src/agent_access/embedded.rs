@@ -108,7 +108,7 @@ impl EmbeddedAgentAccess {
         access
     }
 
-    pub fn owner_epoch(&self) -> Uuid {
+    pub fn daemon_epoch(&self) -> Uuid {
         self.inner.epoch
     }
     pub fn runtime(&self) -> &Agent {
@@ -125,7 +125,7 @@ impl EmbeddedAgentAccess {
             return *execution;
         }
         let execution = ExecutionRef {
-            owner_epoch: self.inner.epoch,
+            daemon_epoch: self.inner.epoch,
             agent_id: Uuid::new_v4(),
             generation: 1,
         };
@@ -149,10 +149,10 @@ impl EmbeddedAgentAccess {
     }
 
     async fn chat(&self, execution: ExecutionRef) -> Result<Uuid, AccessError> {
-        if execution.owner_epoch != self.inner.epoch {
+        if execution.daemon_epoch != self.inner.epoch {
             return Err(AccessError::new(
                 AccessErrorCode::EpochChanged,
-                "execution belongs to an earlier owner",
+                "execution belongs to an earlier daemon",
             ));
         }
         let executions = self.inner.executions.lock().await;
@@ -1099,7 +1099,7 @@ impl EmbeddedAgentAccess {
         let sequence = self.inner.sequence.fetch_add(1, Ordering::SeqCst) + 1;
         let update = super::bounded_update(ObservationUpdate {
             cursor: Cursor {
-                owner_epoch: self.inner.epoch,
+                daemon_epoch: self.inner.epoch,
                 execution,
                 sequence,
             },
@@ -1138,7 +1138,7 @@ impl EmbeddedAgentAccess {
             .get(&execution)
             .and_then(|launch| launch.config_root.clone());
         let cursor = Cursor {
-            owner_epoch: self.inner.epoch,
+            daemon_epoch: self.inner.epoch,
             execution: Some(execution),
             sequence: self.inner.sequence.load(Ordering::SeqCst),
         };
@@ -1262,12 +1262,12 @@ impl EmbeddedAgentAccess {
             AgentDetailQuery::Warnings => ObservationValue::Warnings(snapshot.warnings),
         };
         let cursor = Cursor {
-            owner_epoch: self.inner.epoch,
+            daemon_epoch: self.inner.epoch,
             execution: Some(execution),
             sequence,
         };
         let reset = after.and_then(|old| {
-            if old.owner_epoch != cursor.owner_epoch {
+            if old.daemon_epoch != cursor.daemon_epoch {
                 Some(ResetReason::EpochChanged)
             } else if old.execution != cursor.execution || old.sequence > cursor.sequence {
                 Some(ResetReason::ConversationChanged)
@@ -1299,7 +1299,7 @@ impl EmbeddedAgentAccess {
                         match access.snapshot(execution).await {
                             Ok(snapshot) => ObservationUpdate {
                                 cursor: Cursor {
-                                    owner_epoch: access.inner.epoch,
+                                    daemon_epoch: access.inner.epoch,
                                     execution: Some(execution),
                                     sequence: access.inner.sequence.load(Ordering::SeqCst),
                                 },
@@ -1344,7 +1344,7 @@ impl AgentAccess for EmbeddedAgentAccess {
             } => {
                 let mut receiver = self.inner.changes.subscribe();
                 let cursor = Cursor {
-                    owner_epoch: self.inner.epoch,
+                    daemon_epoch: self.inner.epoch,
                     execution: None,
                     sequence: self.inner.sequence.load(Ordering::SeqCst),
                 };
@@ -1445,7 +1445,7 @@ impl AgentAccess for EmbeddedAgentAccess {
                 entries.sort_by_key(|entry| entry.execution);
                 let limit = page.bounded_limit();
                 let reset = after.and_then(|after| {
-                    if after.owner_epoch != cursor.owner_epoch {
+                    if after.daemon_epoch != cursor.daemon_epoch {
                         Some(ResetReason::EpochChanged)
                     } else if after.execution.is_some() || after.sequence > cursor.sequence {
                         Some(ResetReason::ConversationChanged)
@@ -1507,7 +1507,7 @@ impl AgentAccess for EmbeddedAgentAccess {
                         .map(Box::new),
                 ),
                 cursor: Cursor {
-                    owner_epoch: self.inner.epoch,
+                    daemon_epoch: self.inner.epoch,
                     execution: None,
                     sequence: self.inner.sequence.load(Ordering::SeqCst),
                 },
@@ -1525,7 +1525,7 @@ impl AgentAccess for EmbeddedAgentAccess {
                     return Ok(Observation {
                         initial: super::records::saved_records(root, workdir, page).await?,
                         cursor: Cursor {
-                            owner_epoch: self.inner.epoch,
+                            daemon_epoch: self.inner.epoch,
                             execution: None,
                             sequence: 0,
                         },
@@ -1541,7 +1541,7 @@ impl AgentAccess for EmbeddedAgentAccess {
                         records.into_iter().skip(page.offset).take(limit).collect(),
                     ),
                     cursor: Cursor {
-                        owner_epoch: self.inner.epoch,
+                        daemon_epoch: self.inner.epoch,
                         execution: None,
                         sequence: 0,
                     },
@@ -1553,7 +1553,7 @@ impl AgentAccess for EmbeddedAgentAccess {
             ObservationRequest::Transcript { record, page } => Ok(Observation {
                 initial: super::records::transcript(record, page).await?,
                 cursor: Cursor {
-                    owner_epoch: self.inner.epoch,
+                    daemon_epoch: self.inner.epoch,
                     execution: None,
                     sequence: 0,
                 },

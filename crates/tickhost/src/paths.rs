@@ -1,4 +1,4 @@
-//! Private runtime and state locations of the Tick host. Directories are 0700 and sockets or
+//! Private runtime and state locations of the Tickhost. Directories are 0700 and sockets or
 //! state files 0600, owned by this user and never reached through a symlink.
 
 use std::{
@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub const RUNTIME_DIR_ENV: &str = "TICKLOOP_TICK_HOST_RUNTIME_DIR";
+pub const RUNTIME_DIR_ENV: &str = "TICKLOOP_TICKHOST_RUNTIME_DIR";
 pub const SOCKET_NAME: &str = "host.sock";
 pub const LOCK_NAME: &str = "host.lock";
 /// Holds one private directory per Tick, where its launcher binds the Tick Session socket.
@@ -31,7 +31,7 @@ impl HostPaths {
             runtime: std::env::var_os(RUNTIME_DIR_ENV)
                 .map(PathBuf::from)
                 .unwrap_or_else(|| {
-                    PathBuf::from(format!("/tmp/tickloop-tick-host-{}", current_uid()))
+                    PathBuf::from(format!("/tmp/tickloop-tickhost-{}", current_uid()))
                 }),
         }
     }
@@ -137,14 +137,14 @@ impl HostPaths {
         use std::os::unix::ffi::OsStrExt;
         if self.socket().as_os_str().as_bytes().len() > MAX_SOCKET_PATH_BYTES {
             return Err(io::Error::other(
-                "Tick host runtime directory is too long for a Unix socket path",
+                "Tickhost runtime directory is too long for a Unix socket path",
             ));
         }
         let longest_tick_session_directory = self.tick_session_directory(u64::MAX);
         if longest_tick_session_directory.as_os_str().as_bytes().len() > MAX_SESSION_DIRECTORY_BYTES
         {
             return Err(io::Error::other(
-                "Tick host session directory is too long for Tick Session sockets",
+                "Tickhost session directory is too long for Tick Session sockets",
             ));
         }
         Ok(())

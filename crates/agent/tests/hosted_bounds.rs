@@ -1,6 +1,6 @@
-//! Resource bounds of the owner's hosted Tick registry and host controller: one registry record
+//! Resource bounds of the daemon's hosted Tick registry and host controller: one registry record
 //! or Watch message is at most one 1 MiB shard, a host start gives up after its budget, and a
-//! running host the owner cannot verify is never replaced.
+//! running host the daemon cannot verify is never replaced.
 
 mod support;
 
@@ -23,7 +23,7 @@ use tick_connect::{
     },
     instance::InstanceRef,
 };
-use tick_host::{host::TickOwner, paths::HostPaths};
+use tickhost::{host::TickOwner, paths::HostPaths};
 use tickloop_agent::hosted::{
     controller::{HostController, START_ATTEMPTS, START_WAIT, WatchIntents},
     registry::{LaunchRecord, LaunchState, Registry, SHARD_BYTES},
@@ -42,7 +42,7 @@ fn private_directory(prefix: &str) -> tempfile::TempDir {
 
 fn launch_path(config_root: &Path, chat: Uuid, operation: Uuid) -> PathBuf {
     config_root
-        .join("tick-host/chats")
+        .join("tickhost/chats")
         .join(chat.to_string())
         .join(format!("launch-{operation}.json"))
 }
@@ -82,7 +82,7 @@ fn idle_controller(directory: &Path) -> HostController {
         },
         Uuid::new_v4(),
         PathBuf::from("/usr/bin/false"),
-        tick_host::host::DEFAULT_IDLE_TIMEOUT,
+        tickhost::host::DEFAULT_IDLE_TIMEOUT,
     )
 }
 
@@ -114,7 +114,7 @@ async fn a_registry_record_over_one_shard_is_refused_before_anything_changes() {
     assert!(!refused.dispatched);
     assert!(
         !config_root
-            .join("tick-host/chats")
+            .join("tickhost/chats")
             .join(unseen.to_string())
             .exists(),
         "nothing is created for a refused record"
@@ -208,7 +208,7 @@ fn watch_intents_over_one_shard_never_reach_the_host() {
     assert!(!refused.dispatched);
 }
 
-/// A stand-in for the owner's executable that records each start and never serves.
+/// A stand-in for the daemon's executable that records each start and never serves.
 fn recording_executable(directory: &Path) -> (PathBuf, PathBuf) {
     use std::os::unix::fs::PermissionsExt;
     let starts = directory.join("starts");
@@ -262,7 +262,7 @@ async fn a_host_that_never_serves_is_started_three_times_then_reported_unavailab
         },
         Uuid::new_v4(),
         executable,
-        tick_host::host::DEFAULT_IDLE_TIMEOUT,
+        tickhost::host::DEFAULT_IDLE_TIMEOUT,
     );
     let owner = TickOwner {
         root: "fixture-root".into(),
@@ -287,7 +287,7 @@ async fn a_host_that_never_serves_is_started_three_times_then_reported_unavailab
     let budget = START_WAIT * START_ATTEMPTS;
     assert!(
         elapsed >= budget && elapsed < budget + Duration::from_secs(3),
-        "the owner waited {elapsed:?} for a budget of {budget:?}"
+        "the daemon waited {elapsed:?} for a budget of {budget:?}"
     );
 }
 
@@ -360,7 +360,7 @@ struct StopHost {
 
 impl Drop for StopHost {
     fn drop(&mut self) {
-        support::stop_tick_host(&self.runtime, &self.key_file);
+        support::stop_tickhost(&self.runtime, &self.key_file);
     }
 }
 
@@ -377,14 +377,14 @@ async fn an_incompatible_host_is_refused_and_never_replaced() {
     };
     let host = FakeHost::start(&paths, BUSINESS_MAJOR + 1);
     let inode = socket_inode(&paths);
-    std::fs::write(directory.path().join("tick-host.key"), "owner-key").unwrap();
+    std::fs::write(directory.path().join("tickhost.key"), "daemon-key").unwrap();
     let (executable, starts_file) = recording_executable(directory.path());
     let controller = HostController::new(
         directory.path(),
         paths.clone(),
         Uuid::new_v4(),
         executable,
-        tick_host::host::DEFAULT_IDLE_TIMEOUT,
+        tickhost::host::DEFAULT_IDLE_TIMEOUT,
     );
     let owner = TickOwner {
         root: "fixture-root".into(),
@@ -409,14 +409,14 @@ async fn an_open_that_reached_the_host_is_never_sent_again() {
         runtime: directory.path().join("h"),
     };
     let host = FakeHost::start(&paths, BUSINESS_MAJOR);
-    std::fs::write(directory.path().join("tick-host.key"), "owner-key").unwrap();
+    std::fs::write(directory.path().join("tickhost.key"), "daemon-key").unwrap();
     let (executable, starts_file) = recording_executable(directory.path());
     let controller = HostController::new(
         directory.path(),
         paths.clone(),
         Uuid::new_v4(),
         executable,
-        tick_host::host::DEFAULT_IDLE_TIMEOUT,
+        tickhost::host::DEFAULT_IDLE_TIMEOUT,
     );
     let owner = TickOwner {
         root: "fixture-root".into(),
@@ -431,10 +431,10 @@ async fn an_open_that_reached_the_host_is_never_sent_again() {
     assert_eq!(starts(&starts_file, 0).await, 0, "no other host is started");
 }
 
-/// A host this owner did not start keeps running whatever the owner's key: a wrong, unreadable
+/// A host this daemon did not start keeps running whatever the daemon's key: a wrong, unreadable
 /// or missing key never replaces or stops it, and its Tick keeps running.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_running_host_this_owner_cannot_verify_is_never_replaced_or_stopped() {
+async fn a_running_host_this_daemon_cannot_verify_is_never_replaced_or_stopped() {
     use std::os::unix::fs::PermissionsExt;
     let directory = private_directory("hbv");
     let paths = HostPaths {
@@ -444,14 +444,14 @@ async fn a_running_host_this_owner_cannot_verify_is_never_replaced_or_stopped() 
     std::fs::create_dir(&first_runtime).unwrap();
     let _stop = StopHost {
         runtime: paths.runtime.clone(),
-        key_file: first_runtime.join("tick-host.key"),
+        key_file: first_runtime.join("tickhost.key"),
     };
     let first = HostController::new(
         &first_runtime,
         paths.clone(),
         Uuid::new_v4(),
         support::fixture_cli::executable(),
-        tick_host::host::DEFAULT_IDLE_TIMEOUT,
+        tickhost::host::DEFAULT_IDLE_TIMEOUT,
     );
     let owner = TickOwner {
         root: "fixture-root".into(),
@@ -471,11 +471,11 @@ async fn a_running_host_this_owner_cannot_verify_is_never_replaced_or_stopped() 
         paths.clone(),
         Uuid::new_v4(),
         executable,
-        tick_host::host::DEFAULT_IDLE_TIMEOUT,
+        tickhost::host::DEFAULT_IDLE_TIMEOUT,
     );
-    let key_file = second_runtime.join("tick-host.key");
+    let key_file = second_runtime.join("tickhost.key");
 
-    std::fs::write(&key_file, "another-owner-key").unwrap();
+    std::fs::write(&key_file, "another-daemon-key").unwrap();
     let wrong = second
         .open(counter_request(owner.clone(), directory.path()))
         .await

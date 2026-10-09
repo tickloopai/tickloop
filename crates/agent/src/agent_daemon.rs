@@ -31,7 +31,7 @@ use uuid::Uuid;
 
 use crate::{
     agent_access::{
-        AccessError, AgentAccess, EmbeddedAgentAccess, LaunchSpec, LocalAgentClient, OwnerServer,
+        AccessError, AgentAccess, DaemonServer, EmbeddedAgentAccess, LaunchSpec, LocalAgentClient,
         WorkerFactory, serve_worker_listener, worker_link,
     },
     model::{ModelClient, ModelConfig, cards::ModelCatalog, model_client},
@@ -40,15 +40,22 @@ use crate::{
     settings::UserSettings,
 };
 
-mod service_control;
+mod daemon_control;
 
 const ARTIFACT_EVENT_BRIDGE_URI: &str = "tickloop://event-bridge/v2";
 const ARTIFACT_EVENT_BRIDGE_FALLBACK_URI: &str = "tickloop://event-bridge/v1";
 
 const STARTUP_DEADLINE: Duration = Duration::from_secs(5);
 const CONNECT_INTERVAL: Duration = Duration::from_millis(25);
-const SOCKET_NAME: &str = "owner.sock";
-const LOCK_NAME: &str = "owner.lock";
+const SOCKET_NAME: &str = "daemon.sock";
+const LOCK_NAME: &str = "daemon.lock";
+const DAEMON_COMMAND: &str = "daemon";
+const RUN_SUBCOMMAND: &str = "run";
+/// Hidden process entries: none appears in `--help`, and each names its role in `ps`.
+#[doc(hidden)]
+pub const DAEMON_RUN_ARGUMENTS: [&str; 2] = [DAEMON_COMMAND, RUN_SUBCOMMAND];
+#[doc(hidden)]
+pub const WORKER_ARGUMENT: &str = "worker";
 /// A bootstrap line carries the launch environment as JSON byte arrays, up to four characters
 /// for each byte of an environment the operating system already bounds.
 #[doc(hidden)]
@@ -58,7 +65,7 @@ pub const WORKER_BOOTSTRAP_MAX_BYTES: usize = 16 * 1024 * 1024;
 struct WorkerBootstrap {
     epoch: Uuid,
     launch: LaunchSpec,
-    /// The worker's private grant for hosted Tick requests to its owner.
+    /// The worker's private grant for hosted Tick requests to its daemon.
     control: crate::hosted::worker_control::WorkerControlGrant,
     /// The transport limits the worker serves its daemon with.
     limits: AccessLimits,
@@ -105,10 +112,10 @@ impl WorkerFactory for ProcessWorkerFactory {
     async fn start(
         &self,
         launch: &LaunchSpec,
-        owner_epoch: Uuid,
+        daemon_epoch: Uuid,
     ) -> Result<Arc<dyn AgentAccess>, AccessError> {
         if self.shutting_down.load(Ordering::SeqCst) {
-            return Err(AccessError::unavailable("Agent owner is shutting down"));
+            return Err(AccessError::unavailable("Agent daemon is shutting down"));
         }
         let endpoint = self.directory.join(format!("w-{}.sock", Uuid::new_v4()));
         check_socket_length(&endpoint).map_err(AccessError::unavailable)?;
@@ -116,7 +123,7 @@ impl WorkerFactory for ProcessWorkerFactory {
             std::env::current_exe().map_err(|error| AccessError::unavailable(error.to_string()))?;
         let mut command = Command::new(executable);
         command
-            .arg("--agent-worker")
+            .arg(WORKER_ARGUMENT)
             .arg(&endpoint)
             .current_dir(&launch.workdir)
             .env_clear();
@@ -140,7 +147,7 @@ impl WorkerFactory for ProcessWorkerFactory {
             .ok_or_else(|| AccessError::unavailable("cannot open worker bootstrap pipe"))?;
         let grant = self.control.grant();
         let mut bootstrap = serde_json::to_vec(&WorkerBootstrap {
-            epoch: owner_epoch,
+            epoch: daemon_epoch,
             launch: launch.clone(),
             control: grant.clone(),
             limits: self.limits,
@@ -170,9 +177,9 @@ impl WorkerFactory for ProcessWorkerFactory {
                     .await
                 {
                     Ok(Ok(client)) => {
-                        if client.owner_epoch() != owner_epoch {
+                        if client.daemon_epoch() != daemon_epoch {
                             return Err(AccessError::unavailable(
-                                "worker belongs to another owner epoch",
+                                "worker belongs to another daemon epoch",
                             ));
                         }
                         let mut workers = self.workers.lock().await;
@@ -180,7 +187,7 @@ impl WorkerFactory for ProcessWorkerFactory {
                             drop(lifeline);
                             let _ = tokio::time::timeout(STARTUP_DEADLINE, process.wait()).await;
                             return Err(AccessError::unavailable(
-                                "Agent owner stopped during worker startup",
+                                "Agent daemon stopped during worker startup",
                             ));
                         }
                         let process = Arc::new(Mutex::new(process));
@@ -242,10 +249,10 @@ impl WorkerFactory for ProcessWorkerFactory {
 }
 
 pub(crate) fn runtime_directory() -> PathBuf {
-    std::env::var_os("TICKLOOP_AGENT_RUNTIME_DIR")
+    std::env::var_os("TICKLOOP_DAEMON_RUNTIME_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            PathBuf::from(format!("/tmp/tickloop-agent-{}", unsafe {
+            PathBuf::from(format!("/tmp/tickloop-daemon-{}", unsafe {
                 libc::geteuid()
             }))
         })
@@ -282,10 +289,10 @@ pub async fn connect_or_start_at(
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(directory.join(LOCK_NAME))
-        .map_err(|error| format!("cannot open Agent owner lock: {error}"))?;
-    validate_file(&lock, "Agent owner lock")?;
+        .map_err(|error| format!("cannot open Agent daemon lock: {error}"))?;
+    validate_file(&lock, "Agent daemon lock")?;
     let deadline = Instant::now() + STARTUP_DEADLINE;
-    let mut spawned_owner = None;
+    let mut spawned_daemon = None;
     if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
         if let Some(client) = connect_existing(&endpoint, &executable, false).await? {
             return Ok(client);
@@ -294,13 +301,13 @@ pub async fn connect_or_start_at(
         let lock_fd = lock.as_raw_fd();
         let mut command = std::process::Command::new(&executable);
         command
-            .arg("--agent-owner")
+            .args(DAEMON_RUN_ARGUMENTS)
             .arg(&directory)
             .arg(lock_fd.to_string())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        // Only the winner's already-validated lock is inherited by the detached owner.
+        // Only the winner's already-validated lock is inherited by the detached daemon.
         unsafe {
             command.pre_exec(move || {
                 if libc::setsid() == -1 {
@@ -312,27 +319,27 @@ pub async fn connect_or_start_at(
                 Ok(())
             });
         }
-        spawned_owner = Some(
+        spawned_daemon = Some(
             command
                 .spawn()
-                .map_err(|error| format!("cannot start local Agent owner: {error}"))?,
+                .map_err(|error| format!("cannot start local Agent daemon: {error}"))?,
         );
     } else {
         let error = io::Error::last_os_error();
         if error.kind() != io::ErrorKind::WouldBlock {
-            return Err(format!("cannot arbitrate Agent owner startup: {error}"));
+            return Err(format!("cannot arbitrate Agent daemon startup: {error}"));
         }
     }
     drop(lock);
     loop {
-        let own_startup = spawned_owner
+        let own_startup = spawned_daemon
             .as_mut()
             .is_some_and(|process| matches!(process.try_wait(), Ok(None)));
         if let Some(client) = connect_existing(&endpoint, &executable, own_startup).await? {
             return Ok(client);
         }
         if Instant::now() >= deadline {
-            return Err("local Agent owner did not become ready within 5 seconds".into());
+            return Err("local Agent daemon did not become ready within 5 seconds".into());
         }
         tokio::time::sleep(CONNECT_INTERVAL).await;
     }
@@ -350,7 +357,7 @@ async fn connect_existing(
     match tokio::time::timeout(STARTUP_DEADLINE, LocalAgentClient::connect(endpoint)).await {
         Ok(Ok(client)) => Ok(Some(client)),
         Ok(Err(error)) if error.code == crate::agent_access::AccessErrorCode::VersionMismatch => {
-            Err(incompatible_owner_guidance(
+            Err(incompatible_daemon_guidance(
                 endpoint,
                 executable,
                 &error,
@@ -372,11 +379,11 @@ async fn connect_existing(
                 Err(error.to_string())
             }
         }
-        Err(_) => Err("existing Agent owner is not responding; it was left running".into()),
+        Err(_) => Err("existing Agent daemon is not responding; it was left running".into()),
     }
 }
 
-fn incompatible_owner_guidance(
+fn incompatible_daemon_guidance(
     endpoint: &Path,
     executable: &Path,
     error: &AccessError,
@@ -384,11 +391,11 @@ fn incompatible_owner_guidance(
 ) -> String {
     let runtime = endpoint
         .parent()
-        .expect("owner endpoint has a runtime directory");
+        .expect("daemon endpoint has a runtime directory");
     let title = if own_startup {
         "Agent executable changed during startup"
     } else {
-        "Agent service version mismatch"
+        "Agent daemon version mismatch"
     };
     let details = format!(
         "{title} (client {}.{}).\nProtocol: {}\nRuntime: {}\nExecutable: {}",
@@ -400,16 +407,16 @@ fn incompatible_owner_guidance(
     );
     let (Some(runtime), Some(executable)) = (runtime.to_str(), executable.to_str()) else {
         return format!(
-            "{details}\n\nRun this build with service stop, then relaunch.\nThis stops running Agents. Saved history is kept."
+            "{details}\n\nRun this build with daemon stop, then relaunch.\nThis stops running Agents. Saved history is kept."
         );
     };
     let stop = format!(
-        "TICKLOOP_AGENT_RUNTIME_DIR={} {}",
+        "TICKLOOP_DAEMON_RUNTIME_DIR={} {}",
         shell_words::quote(runtime),
         shell_words::quote(executable)
     );
     let mut launch = format!(
-        "TICKLOOP_AGENT_RUNTIME_DIR={} ",
+        "TICKLOOP_DAEMON_RUNTIME_DIR={} ",
         shell_words::quote(runtime)
     );
     if let Some(config) = std::env::var_os("TICKLOOP_CONFIG_DIR")
@@ -422,46 +429,50 @@ fn incompatible_owner_guidance(
     }
     launch.push_str(&shell_words::quote(executable));
     let startup_note = if own_startup {
-        "\nUse a pinned executable for CLI, owner, and workers before relaunching."
+        "\nUse a pinned executable for CLI, daemon, and workers before relaunching."
     } else {
         ""
     };
     format!(
-        "{details}{startup_note}\n\nStop the service and relaunch:\n  {stop} service stop\n  {launch}\n\nThis stops running Agents. Saved history is kept."
+        "{details}{startup_note}\n\nStop the daemon and relaunch:\n  {stop} daemon stop\n  {launch}\n\nThis stops running Agents. Saved history is kept."
     )
 }
 
 pub async fn run_internal(arguments: &[OsString]) -> Option<Result<(), String>> {
-    match arguments.first().and_then(|value| value.to_str()) {
-        Some("--agent-owner") => Some(run_owner(arguments).await),
-        Some("--agent-worker") => Some(run_worker(arguments).await),
-        Some(crate::hosted::controller::HOST_MODE) => Some(run_tick_host().await),
-        Some("service") => Some(service_control::run(&arguments[1..]).await),
-        Some("monitor") => Some(crate::monitor_command::run(&arguments[1..]).await),
+    let command = arguments.first()?.to_str()?;
+    let subcommand = arguments.get(1).and_then(|value| value.to_str());
+    match (command, subcommand) {
+        (DAEMON_COMMAND, Some(RUN_SUBCOMMAND)) => Some(run_daemon(&arguments[2..]).await),
+        (DAEMON_COMMAND, _) => Some(daemon_control::run(&arguments[1..]).await),
+        (WORKER_ARGUMENT, _) => Some(run_worker(&arguments[1..]).await),
+        _ if arguments == crate::hosted::controller::TICKHOST_RUN_ARGUMENTS => {
+            Some(run_tickhost().await)
+        }
+        ("monitor", _) => Some(crate::monitor_command::run(&arguments[1..]).await),
         _ => None,
     }
 }
 
-async fn run_owner(arguments: &[OsString]) -> Result<(), String> {
-    if arguments.len() != 3 {
-        return Err("invalid private owner invocation".into());
-    }
-    let directory = PathBuf::from(&arguments[1]);
+async fn run_daemon(arguments: &[OsString]) -> Result<(), String> {
+    let [directory, descriptor] = arguments else {
+        return Err("invalid private daemon invocation".into());
+    };
+    let directory = PathBuf::from(directory);
     validate_directory(&directory)?;
-    let descriptor = arguments[2]
+    let descriptor = descriptor
         .to_str()
         .and_then(|value| value.parse::<i32>().ok())
         .filter(|value| *value >= 3)
-        .ok_or("invalid owner lock descriptor")?;
+        .ok_or("invalid daemon lock descriptor")?;
     let lock = unsafe { File::from_raw_fd(descriptor) };
-    validate_file(&lock, "Agent owner lock")?;
+    validate_file(&lock, "Agent daemon lock")?;
     let lock_path = directory.join(LOCK_NAME);
-    validate_owner_lock_path(&lock, &lock_path)?;
+    validate_daemon_lock_path(&lock, &lock_path)?;
     if unsafe { libc::flock(descriptor, libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        return Err("Agent owner lock is not held by this process".into());
+        return Err("Agent daemon lock is not held by this process".into());
     }
     if unsafe { libc::fcntl(descriptor, libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
-        return Err("cannot isolate owner lock from workers".into());
+        return Err("cannot isolate daemon lock from workers".into());
     }
     let endpoint = directory.join(SOCKET_NAME);
     let (listener, socket_identity) = private_listener(&endpoint)?;
@@ -469,16 +480,16 @@ async fn run_owner(arguments: &[OsString]) -> Result<(), String> {
     let executable = std::env::current_exe().map_err(|error| error.to_string())?;
     let controller = Arc::new(crate::hosted::controller::HostController::new(
         &directory,
-        tick_host::paths::HostPaths::from_environment(),
+        tickhost::paths::HostPaths::from_environment(),
         epoch,
         executable,
-        tick_host::host::DEFAULT_IDLE_TIMEOUT,
+        tickhost::host::DEFAULT_IDLE_TIMEOUT,
     ));
     let control = Arc::new(crate::hosted::worker_control::WorkerControl::new(
         &directory, epoch, controller,
     ));
     let control_endpoint = control.endpoint().to_path_buf();
-    // The owner lock proves no other owner serves this endpoint; a socket left by an owner that
+    // The daemon lock proves no other daemon serves this endpoint; a socket left by a daemon that
     // was killed is stale.
     remove_stale_socket(&control_endpoint)?;
     let (control_listener, control_identity) = private_listener(&control_endpoint)?;
@@ -490,15 +501,15 @@ async fn run_owner(arguments: &[OsString]) -> Result<(), String> {
         shutting_down: AtomicBool::new(false),
         control: control.clone(),
     });
-    let owner = Arc::new(OwnerServer::new(epoch, factory.clone()));
-    control.attach_owner((*owner).clone());
+    let daemon = Arc::new(DaemonServer::new(epoch, factory.clone()));
+    control.attach_daemon((*daemon).clone());
     let control_service = tokio::spawn(control.clone().serve(control_listener));
-    let result = crate::agent_access::serve_owner_listener(listener, owner, epoch, limits)
+    let result = crate::agent_access::serve_daemon_listener(listener, daemon, epoch, limits)
         .await
         .map_err(|error| error.to_string());
     factory.shutdown().await;
     control_service.abort();
-    let cleanup = validate_owner_lock_path(&lock, &lock_path)
+    let cleanup = validate_daemon_lock_path(&lock, &lock_path)
         .and_then(|()| remove_owned_socket(&endpoint, socket_identity))
         .and_then(|()| remove_owned_socket(&control_endpoint, control_identity));
     drop(lock);
@@ -506,20 +517,20 @@ async fn run_owner(arguments: &[OsString]) -> Result<(), String> {
     result
 }
 
-/// The Tick host process the owner starts on demand. It runs only the host library.
-async fn run_tick_host() -> Result<(), String> {
+/// The Tickhost process the daemon starts on demand. It runs only the host library.
+async fn run_tickhost() -> Result<(), String> {
     let config =
-        tick_host::host::read_config(std::io::stdin().lock()).map_err(|error| error.to_string())?;
-    tick_host::host::serve(tick_host::paths::HostPaths::from_environment(), config)
+        tickhost::host::read_config(std::io::stdin().lock()).map_err(|error| error.to_string())?;
+    tickhost::host::serve(tickhost::paths::HostPaths::from_environment(), config)
         .await
-        .map_err(|error| format!("Tick host: {error}"))
+        .map_err(|error| format!("Tickhost: {error}"))
 }
 
 async fn run_worker(arguments: &[OsString]) -> Result<(), String> {
-    if arguments.len() != 2 {
+    let [endpoint] = arguments else {
         return Err("invalid private worker invocation".into());
-    }
-    let endpoint = PathBuf::from(&arguments[1]);
+    };
+    let endpoint = PathBuf::from(endpoint);
     let directory = endpoint.parent().ok_or("worker socket has no directory")?;
     validate_directory(directory)?;
     let mut stdin = BufReader::new(tokio::io::stdin());
@@ -546,7 +557,7 @@ async fn run_worker(arguments: &[OsString]) -> Result<(), String> {
         crate::housekeeping::HousekeepingSchedule::new(
             root.clone(),
             crate::housekeeping::UserActivity::process().clone(),
-            Arc::new(crate::hosted::lifecycle::OwnerLifecycle::new(
+            Arc::new(crate::hosted::lifecycle::DaemonLifecycle::new(
                 bootstrap.control.clone(),
             )),
         )
@@ -642,16 +653,16 @@ pub async fn build_runtime_with_client(
         ))
     });
     if let (Some(grant), Some(_)) = (&control, &launch.config_root) {
-        agent.install_stopped_child_hook(Arc::new(crate::hosted::lifecycle::OwnerLifecycle::new(
+        agent.install_stopped_child_hook(Arc::new(crate::hosted::lifecycle::DaemonLifecycle::new(
             grant.clone(),
         )));
     }
-    // Every worker the owner granted a Tick host opens hidden Ticks there, with its host's own
+    // Every worker the daemon granted a Tickhost opens hidden Ticks there, with its host's own
     // authority; a worker in a Herdr View also keeps Herdr Workspaces and visible Panes. Each
     // Tick tool call is routed by its target to one of the two.
     let hosted = control.map(|grant| {
         Arc::new(crate::hosted::tools::HostedTickTools::new(
-            crate::hosted::worker_control::OwnerControl::new(grant),
+            crate::hosted::worker_control::DaemonControl::new(grant),
             launch
                 .environment
                 .iter()
@@ -753,10 +764,10 @@ fn remove_stale_socket(endpoint: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_owner_lock_path(lock: &File, path: &Path) -> Result<(), String> {
+fn validate_daemon_lock_path(lock: &File, path: &Path) -> Result<(), String> {
     let inherited = lock.metadata().map_err(|error| error.to_string())?;
     let current = std::fs::symlink_metadata(path).map_err(|error| {
-        format!("Agent service lock path changed; endpoint was preserved: {error}")
+        format!("Agent daemon lock path changed; endpoint was preserved: {error}")
     })?;
     if !current.file_type().is_file()
         || current.uid() != unsafe { libc::geteuid() }
@@ -764,7 +775,7 @@ fn validate_owner_lock_path(lock: &File, path: &Path) -> Result<(), String> {
         || inherited.dev() != current.dev()
         || inherited.ino() != current.ino()
     {
-        return Err("Agent service lock changed; endpoint was preserved.".into());
+        return Err("Agent daemon lock changed; endpoint was preserved.".into());
     }
     Ok(())
 }
@@ -813,7 +824,7 @@ mod tests {
     #[tokio::test]
     async fn a_published_listener_is_private_and_accepts_connections() {
         let directory = tempfile::tempdir_in("/tmp").unwrap();
-        let endpoint = directory.path().join("owner.sock");
+        let endpoint = directory.path().join("daemon.sock");
         let (listener, identity) = private_listener(&endpoint).unwrap();
         validate_socket(&endpoint).unwrap();
         let client = tokio::net::UnixStream::connect(&endpoint).await.unwrap();
@@ -831,7 +842,7 @@ mod tests {
     #[tokio::test]
     async fn publishing_a_listener_preserves_an_existing_endpoint() {
         let directory = tempfile::tempdir_in("/tmp").unwrap();
-        let endpoint = directory.path().join("owner.sock");
+        let endpoint = directory.path().join("daemon.sock");
         std::fs::write(&endpoint, "replacement").unwrap();
         assert!(private_listener(&endpoint).is_err());
         assert_eq!(std::fs::read_to_string(&endpoint).unwrap(), "replacement");

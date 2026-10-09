@@ -68,7 +68,7 @@ impl Fixture {
         ]));
         let runtime = Agent::open_embedded(root.clone(), support::config(), model.clone()).unwrap();
         let embedded = Arc::new(EmbeddedAgentAccess::new(runtime.clone()));
-        let epoch = embedded.owner_epoch();
+        let epoch = embedded.daemon_epoch();
         let (first, second, server): (Arc<dyn AgentAccess>, Arc<dyn AgentAccess>, _) = match adapter
         {
             Adapter::Embedded => (embedded.clone(), embedded, None),
@@ -165,7 +165,7 @@ impl Fixture {
         execute(
             &*self.first,
             envelope(
-                self.execution.owner_epoch,
+                self.execution.daemon_epoch,
                 AgentCommand::Submit {
                     execution: self.execution,
                     target_loop: Some(self.loop_id),
@@ -208,7 +208,7 @@ impl Drop for Fixture {
 
 fn envelope(epoch: Uuid, command: AgentCommand) -> CommandEnvelope {
     CommandEnvelope {
-        owner_epoch: epoch,
+        daemon_epoch: epoch,
         command_id: Uuid::new_v4(),
         command,
     }
@@ -216,7 +216,7 @@ fn envelope(epoch: Uuid, command: AgentCommand) -> CommandEnvelope {
 
 fn answer(request: RequestRef, scope: PermissionScope, allow: bool) -> CommandEnvelope {
     envelope(
-        request.execution.owner_epoch,
+        request.execution.daemon_epoch,
         AgentCommand::DecidePermission {
             request,
             allow,
@@ -405,7 +405,7 @@ async fn race_once_against(scope: PermissionScope) {
                         1
                     );
                     assert!(matches!(
-                        receipt(&*fixture.second, fixture.execution.owner_epoch, scoped_id)
+                        receipt(&*fixture.second, fixture.execution.daemon_epoch, scoped_id)
                             .await
                             .state,
                         ReceiptState::Accepted | ReceiptState::Running
@@ -437,7 +437,7 @@ async fn race_once_against(scope: PermissionScope) {
             for original in [&once_result, &scoped_result] {
                 let known = receipt(
                     &*fixture.second,
-                    fixture.execution.owner_epoch,
+                    fixture.execution.daemon_epoch,
                     original.command_id,
                 )
                 .await;
@@ -504,7 +504,7 @@ async fn race_once_against(scope: PermissionScope) {
             fixture.completed("Second read completed.").await;
             assert_eq!(fixture.model.requests.lock().unwrap().len(), 4);
             assert_eq!(
-                receipt(&*fixture.second, fixture.execution.owner_epoch, once_id)
+                receipt(&*fixture.second, fixture.execution.daemon_epoch, once_id)
                     .await
                     .command_id,
                 once_id
@@ -548,7 +548,7 @@ async fn a_completed_once_answer_leaves_losing_session_and_persistent_answers_wi
             assert_eq!(rejected.target, Some(fixture.execution));
             let known = receipt(
                 &*fixture.first,
-                fixture.execution.owner_epoch,
+                fixture.execution.daemon_epoch,
                 rejected.command_id,
             )
             .await;
@@ -590,7 +590,7 @@ async fn a_completed_once_answer_leaves_losing_session_and_persistent_answers_wi
             assert!(matches!(
                 receipt(
                     &*fixture.second,
-                    fixture.execution.owner_epoch,
+                    fixture.execution.daemon_epoch,
                     once.command_id
                 )
                 .await
@@ -619,7 +619,7 @@ async fn permission_claim_before_a_blocked_persistent_write_rejects_once_and_ses
                 .unwrap()
         });
         gate.reader_arrived().await;
-        let accepted = receipt(&*fixture.second, fixture.execution.owner_epoch, command_id).await;
+        let accepted = receipt(&*fixture.second, fixture.execution.daemon_epoch, command_id).await;
         assert!(matches!(
             accepted.state,
             ReceiptState::Accepted | ReceiptState::Running
@@ -642,7 +642,7 @@ async fn permission_claim_before_a_blocked_persistent_write_rejects_once_and_ses
             assert!(matches!(rejected.state, ReceiptState::Failed));
             assert_eq!(rejected.error.unwrap().code, AccessErrorCode::Responding);
             assert_eq!(
-                receipt(&*fixture.second, fixture.execution.owner_epoch, id)
+                receipt(&*fixture.second, fixture.execution.daemon_epoch, id)
                     .await
                     .error
                     .unwrap()
@@ -691,7 +691,7 @@ async fn an_authorized_persistent_write_survives_run_interrupt_with_a_queryable_
                 .unwrap()
         });
         gate.reader_arrived().await;
-        let accepted = receipt(&*fixture.second, fixture.execution.owner_epoch, command_id).await;
+        let accepted = receipt(&*fixture.second, fixture.execution.daemon_epoch, command_id).await;
         assert!(matches!(
             accepted.state,
             ReceiptState::Accepted | ReceiptState::Running
@@ -707,7 +707,7 @@ async fn an_authorized_persistent_write_survives_run_interrupt_with_a_queryable_
         tokio::time::timeout(
             WAIT,
             fixture.second.execute(envelope(
-                fixture.execution.owner_epoch,
+                fixture.execution.daemon_epoch,
                 AgentCommand::ManageLoop {
                     execution: fixture.execution,
                     action: LoopAction::Interrupt,
@@ -741,7 +741,7 @@ async fn an_authorized_persistent_write_survives_run_interrupt_with_a_queryable_
         assert!(!interrupted.events.iter().any(|event| matches!(&event.kind, EventKind::ToolCompleted { call_id, .. } if call_id == "first-read")));
         assert_eq!(fixture.model.requests.lock().unwrap().len(), 1);
         assert!(matches!(
-            receipt(&*fixture.second, fixture.execution.owner_epoch, command_id)
+            receipt(&*fixture.second, fixture.execution.daemon_epoch, command_id)
                 .await
                 .state,
             ReceiptState::Accepted | ReceiptState::Running
@@ -754,7 +754,7 @@ async fn an_authorized_persistent_write_survives_run_interrupt_with_a_queryable_
         let failure = finished.error.unwrap();
         assert_eq!(failure.code, AccessErrorCode::Invalid);
         assert!(failure.message.contains("permission request expired"));
-        let queried = receipt(&*fixture.second, fixture.execution.owner_epoch, command_id).await;
+        let queried = receipt(&*fixture.second, fixture.execution.daemon_epoch, command_id).await;
         assert!(matches!(queried.state, ReceiptState::Failed));
         assert_eq!(queried.error.unwrap().code, AccessErrorCode::Invalid);
         let current = snapshot(&*fixture.second, fixture.execution).await;
@@ -803,7 +803,7 @@ async fn a_failed_persistent_write_is_queryable_and_requires_a_fresh_request_ver
         });
         gate.reader_arrived().await;
         assert!(matches!(
-            receipt(&*fixture.second, fixture.execution.owner_epoch, command_id)
+            receipt(&*fixture.second, fixture.execution.daemon_epoch, command_id)
                 .await
                 .state,
             ReceiptState::Accepted | ReceiptState::Running
@@ -812,7 +812,7 @@ async fn a_failed_persistent_write_is_queryable_and_requires_a_fresh_request_ver
         let failure = tokio::time::timeout(WAIT, writing).await.unwrap().unwrap();
         assert!(matches!(failure.state, ReceiptState::Failed));
         assert_eq!(failure.error.unwrap().code, AccessErrorCode::Storage);
-        let known = receipt(&*fixture.second, fixture.execution.owner_epoch, command_id).await;
+        let known = receipt(&*fixture.second, fixture.execution.daemon_epoch, command_id).await;
         assert!(matches!(known.state, ReceiptState::Failed));
         assert_eq!(known.error.unwrap().code, AccessErrorCode::Storage);
         let current = snapshot(&*fixture.second, fixture.execution).await;

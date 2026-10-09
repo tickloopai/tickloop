@@ -18,7 +18,7 @@ cp "$target_directory/debug/tick" "$bin_directory/tick"
 chmod 0500 "$bin_directory/tickloop" "$bin_directory/tick"
 chmod 0500 "$bin_directory" "$run_directory"
 
-# Detached owners and workers can still exec this bundle after the View exits.
+# Detached daemons and workers can still exec this bundle after the View exits.
 trap - 0 1 2 15
 cd "$launch_directory"
 printf 'Development executable: %s\n' "$bin_directory/tickloop" >&2

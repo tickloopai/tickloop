@@ -140,7 +140,7 @@ impl AgentAccess for FixtureWorker {
 
 fn envelope(epoch: Uuid, command: AgentCommand) -> CommandEnvelope {
     CommandEnvelope {
-        owner_epoch: epoch,
+        daemon_epoch: epoch,
         command_id: Uuid::new_v4(),
         command,
     }
@@ -183,18 +183,18 @@ async fn agents(access: &dyn AgentAccess) -> Vec<AgentSummary> {
 }
 async fn serve(
     directory: &Path,
-    owner: Arc<OwnerServer>,
+    daemon: Arc<DaemonServer>,
 ) -> (LocalAgentClient, tokio::task::JoinHandle<()>) {
-    serve_with_limits(directory, owner, support::TRANSPORT_LIMITS).await
+    serve_with_limits(directory, daemon, support::TRANSPORT_LIMITS).await
 }
 async fn serve_with_limits(
     directory: &Path,
-    daemon: Arc<OwnerServer>,
+    daemon: Arc<DaemonServer>,
     limits: AccessLimits,
 ) -> (LocalAgentClient, tokio::task::JoinHandle<()>) {
     let socket = directory.join("a.sock");
     let listener = UnixListener::bind(&socket).unwrap();
-    let epoch = daemon.owner_epoch();
+    let epoch = daemon.daemon_epoch();
     let server = tokio::spawn(async move {
         serve_listener(listener, daemon, epoch, limits)
             .await
@@ -207,9 +207,9 @@ async fn serve_with_limits(
 async fn ipc_duplicate_commands_and_generations_preserve_the_original_target() {
     let directory = tempfile::tempdir_in("/tmp").unwrap();
     let factory = Arc::new(FixtureFactory::new(vec![]));
-    let owner = Arc::new(OwnerServer::new(Uuid::new_v4(), factory.clone()));
-    let (client, server) = serve(directory.path(), owner).await;
-    let command = create(client.owner_epoch(), directory.path());
+    let daemon = Arc::new(DaemonServer::new(Uuid::new_v4(), factory.clone()));
+    let (client, server) = serve(directory.path(), daemon).await;
+    let command = create(client.daemon_epoch(), directory.path());
     let first = execution(client.execute(command.clone()).await.unwrap());
     let second = execution(client.execute(command.clone()).await.unwrap());
     assert_eq!(first, second);
@@ -222,7 +222,7 @@ async fn ipc_duplicate_commands_and_generations_preserve_the_original_target() {
     );
     let observed = client
         .observe(ObservationRequest::Receipt {
-            epoch: client.owner_epoch(),
+            epoch: client.daemon_epoch(),
             command_id: command.command_id,
         })
         .await
@@ -236,7 +236,7 @@ async fn ipc_duplicate_commands_and_generations_preserve_the_original_target() {
     };
     let rejected = client
         .execute(envelope(
-            client.owner_epoch(),
+            client.daemon_epoch(),
             AgentCommand::Submit {
                 execution: invalid,
                 target_loop: None,
@@ -265,11 +265,11 @@ async fn ipc_duplicate_commands_and_generations_preserve_the_original_target() {
 async fn views_are_versioned_per_session_and_disconnection_does_not_stop_the_agent() {
     let temporary = tempfile::tempdir_in("/tmp").unwrap();
     let factory = Arc::new(FixtureFactory::new(vec![]));
-    let owner = Arc::new(OwnerServer::new(Uuid::new_v4(), factory.clone()));
-    let (first, server) = serve(temporary.path(), owner.clone()).await;
+    let daemon = Arc::new(DaemonServer::new(Uuid::new_v4(), factory.clone()));
+    let (first, server) = serve(temporary.path(), daemon.clone()).await;
     let target = execution(
         first
-            .execute(create(first.owner_epoch(), temporary.path()))
+            .execute(create(first.daemon_epoch(), temporary.path()))
             .await
             .unwrap(),
     );
@@ -344,7 +344,7 @@ async fn views_are_versioned_per_session_and_disconnection_does_not_stop_the_age
     .await
     .unwrap();
     assert_eq!(
-        owner
+        daemon
             .show_view(DisplayUpdate::Displayed {
                 view: second_view,
                 expected_version: 0,
@@ -381,9 +381,9 @@ async fn an_accepted_create_survives_a_lost_ack_and_can_be_queried_after_reconne
         gate: Some(gate.clone()),
         ..FixtureFactory::new(vec![])
     });
-    let owner = Arc::new(OwnerServer::new(Uuid::new_v4(), factory.clone()));
-    let (client, server) = serve(temporary.path(), owner).await;
-    let command = create(client.owner_epoch(), temporary.path());
+    let daemon = Arc::new(DaemonServer::new(Uuid::new_v4(), factory.clone()));
+    let (client, server) = serve(temporary.path(), daemon).await;
+    let command = create(client.daemon_epoch(), temporary.path());
     let task_client = client.clone();
     let sent = command.clone();
     let task = tokio::spawn(async move { task_client.execute(sent).await });
@@ -402,7 +402,7 @@ async fn an_accepted_create_survives_a_lost_ack_and_can_be_queried_after_reconne
         .unwrap();
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
-            let observation = replacement.observe(ObservationRequest::Receipt { epoch: command.owner_epoch, command_id: command.command_id }).await.unwrap();
+            let observation = replacement.observe(ObservationRequest::Receipt { epoch: command.daemon_epoch, command_id: command.command_id }).await.unwrap();
             if matches!(observation.initial, ObservationValue::Receipt(Some(receipt)) if matches!(receipt.state, ReceiptState::Completed)) { break; }
             tokio::task::yield_now().await;
         }
@@ -418,8 +418,8 @@ async fn an_accepted_create_survives_a_lost_ack_and_can_be_queried_after_reconne
 async fn a_scene_can_supply_the_first_input_without_becoming_an_agent_view() {
     let temporary = tempfile::tempdir_in("/tmp").unwrap();
     let factory = Arc::new(FixtureFactory::new(vec![support::text("Finished.")]));
-    let owner = Arc::new(OwnerServer::new(Uuid::new_v4(), factory.clone()));
-    let (client, server) = serve(temporary.path(), owner).await;
+    let daemon = Arc::new(DaemonServer::new(Uuid::new_v4(), factory.clone()));
+    let (client, server) = serve(temporary.path(), daemon).await;
     let view = ViewRef {
         session_id: client.session_id(),
         view_id: Uuid::new_v4(),
@@ -435,7 +435,7 @@ async fn a_scene_can_supply_the_first_input_without_becoming_an_agent_view() {
     assert!(!scene.displayed);
     let receipt = client
         .execute(envelope(
-            client.owner_epoch(),
+            client.daemon_epoch(),
             AgentCommand::Create {
                 launch: LaunchSpec::embedded(temporary.path().to_path_buf()),
                 initial: Some(UserInput::Text {
@@ -465,7 +465,7 @@ async fn a_scene_can_supply_the_first_input_without_becoming_an_agent_view() {
         .unwrap();
     let stale = client
         .execute(envelope(
-            client.owner_epoch(),
+            client.daemon_epoch(),
             AgentCommand::Submit {
                 execution: target,
                 target_loop: None,
@@ -503,7 +503,7 @@ async fn a_real_worker_keeps_shell_execution_after_ui_disconnect_and_exits_on_li
     model.api_key_env = "TICKLOOP_FIXTURE_API_KEY".into();
     launch.model = Some(model);
     let mut worker = tokio::process::Command::new(env!("CARGO_BIN_EXE_tickloop"))
-        .arg("--agent-worker")
+        .arg(tickloop_agent::agent_daemon::WORKER_ARGUMENT)
         .arg(&socket)
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
@@ -519,7 +519,7 @@ async fn a_real_worker_keeps_shell_execution_after_ui_disconnect_and_exits_on_li
     let mut lifeline = worker.stdin.take().unwrap();
     let control = serde_json::json!({
         "endpoint": temporary.path().join("worker-control.sock"),
-        "owner_epoch": epoch,
+        "daemon_epoch": epoch,
         "binding": Uuid::new_v4(),
         "capability": "0".repeat(64),
         "host_endpoint": temporary.path().join("host.sock"),
@@ -611,20 +611,20 @@ async fn a_real_worker_keeps_shell_execution_after_ui_disconnect_and_exits_on_li
     assert!(!socket.exists());
 }
 
-/// Stops whatever owner serves a test's private runtime directory when the test ends, also
+/// Stops whatever daemon serves a test's private runtime directory when the test ends, also
 /// after a failed assertion. The test's runtime may already be gone by then, so the shutdown
 /// runs on its own thread and runtime and is awaited.
-struct PrivateOwnerGuard {
+struct PrivateDaemonGuard {
     socket: std::path::PathBuf,
 }
-impl PrivateOwnerGuard {
+impl PrivateDaemonGuard {
     fn new(directory: &Path) -> Self {
         Self {
-            socket: directory.join("owner.sock"),
+            socket: directory.join("daemon.sock"),
         }
     }
 }
-impl Drop for PrivateOwnerGuard {
+impl Drop for PrivateDaemonGuard {
     fn drop(&mut self) {
         if !self.socket.exists() {
             return;
@@ -637,7 +637,7 @@ impl Drop for PrivateOwnerGuard {
             runtime.block_on(async {
                 let _ = tokio::time::timeout(Duration::from_secs(15), async {
                     if let Ok(client) = LocalAgentClient::connect(&socket).await {
-                        let _ = client.shutdown_owner().await;
+                        let _ = client.shutdown_daemon().await;
                         while socket.exists() {
                             tokio::time::sleep(Duration::from_millis(25)).await;
                         }
@@ -652,7 +652,7 @@ impl Drop for PrivateOwnerGuard {
 }
 
 #[tokio::test]
-async fn an_owner_killed_without_cleanup_never_blocks_the_next_owner() {
+async fn a_daemon_killed_without_cleanup_never_blocks_the_next_daemon() {
     use std::os::unix::fs::PermissionsExt;
     let temporary = tempfile::tempdir_in("/tmp").unwrap();
     let private_directory = temporary.path().join("agent-runtime");
@@ -676,60 +676,62 @@ async fn an_owner_killed_without_cleanup_never_blocks_the_next_owner() {
     }
     assert!(
         private_directory.join("worker-control.sock").exists(),
-        "a killed owner leaves its endpoints behind"
+        "a killed daemon leaves its endpoints behind"
     );
-    let _guard = PrivateOwnerGuard::new(&private_directory);
+    let _guard = PrivateDaemonGuard::new(&private_directory);
     let next = tickloop_agent::agent_daemon::connect_or_start_at(private_directory, executable)
         .await
-        .expect("the next owner replaces the stale endpoints");
-    assert_ne!(next.owner_epoch(), killed.owner_epoch());
+        .expect("the next daemon replaces the stale endpoints");
+    assert_ne!(next.daemon_epoch(), killed.daemon_epoch());
 }
 
 #[tokio::test]
-async fn a_real_owner_answers_hosted_lifecycle_requests_only_for_live_grants() {
+async fn a_real_daemon_answers_hosted_lifecycle_requests_only_for_live_grants() {
     use std::os::unix::fs::PermissionsExt;
-    use tickloop_agent::hosted::worker_control::{OwnerControl, WorkerControlGrant, WorkerRequest};
+    use tickloop_agent::hosted::worker_control::{
+        DaemonControl, WorkerControlGrant, WorkerRequest,
+    };
     let temporary = tempfile::tempdir_in("/tmp").unwrap();
     let private_directory = temporary.path().join("agent-runtime");
     std::fs::create_dir(&private_directory).unwrap();
     std::fs::set_permissions(&private_directory, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let _guard = PrivateOwnerGuard::new(&private_directory);
+    let _guard = PrivateDaemonGuard::new(&private_directory);
     let client = tickloop_agent::agent_daemon::connect_or_start_at(
         private_directory.clone(),
         std::path::PathBuf::from(env!("CARGO_BIN_EXE_tickloop")),
     )
     .await
     .unwrap();
-    let epoch = client.owner_epoch();
+    let epoch = client.daemon_epoch();
     let endpoint = private_directory.join("worker-control.sock");
     assert_eq!(
         std::fs::metadata(&endpoint).unwrap().permissions().mode() & 0o777,
         0o600
     );
-    let forged = |owner_epoch| WorkerControlGrant {
+    let forged = |daemon_epoch| WorkerControlGrant {
         endpoint: endpoint.clone(),
-        owner_epoch,
+        daemon_epoch,
         binding: Uuid::new_v4(),
         capability: "0".repeat(64),
         host_endpoint: temporary.path().join("host.sock"),
         intent_renewal: std::time::Duration::from_secs(100),
     };
     let list = |chat| WorkerRequest::ListHostedTicks { chat, cursor: None };
-    let unknown_grant = OwnerControl::new(forged(epoch))
+    let unknown_grant = DaemonControl::new(forged(epoch))
         .request(list(Uuid::new_v4()))
         .await
         .unwrap_err();
     assert_eq!(unknown_grant.code, "Forbidden");
     assert!(!unknown_grant.dispatched);
-    let earlier_owner = OwnerControl::new(forged(Uuid::new_v4()))
+    let earlier_daemon = DaemonControl::new(forged(Uuid::new_v4()))
         .request(list(Uuid::new_v4()))
         .await
         .unwrap_err();
-    assert_eq!(earlier_owner.code, "EpochChanged");
+    assert_eq!(earlier_daemon.code, "EpochChanged");
     let reconcile = {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
         let mut stream = tokio::net::UnixStream::connect(&endpoint).await.unwrap();
-        let envelope = serde_json::json!({"id":1,"envelope":{"owner_epoch":epoch,"binding":Uuid::new_v4(),"capability":"0".repeat(64),"request":{"method":"reconcile"}}});
+        let envelope = serde_json::json!({"id":1,"envelope":{"daemon_epoch":epoch,"binding":Uuid::new_v4(),"capability":"0".repeat(64),"request":{"method":"reconcile"}}});
         stream
             .write_all(format!("{envelope}\n").as_bytes())
             .await
@@ -745,14 +747,14 @@ async fn a_real_owner_answers_hosted_lifecycle_requests_only_for_live_grants() {
 }
 
 #[tokio::test]
-async fn concurrent_cold_start_uses_one_isolated_owner_and_owner_exit_closes_worker_lifelines() {
+async fn concurrent_cold_start_uses_one_isolated_daemon_and_daemon_exit_closes_worker_lifelines() {
     use std::os::{fd::AsRawFd, unix::fs::PermissionsExt};
-    const OWNER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+    const DAEMON_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
     let temporary = tempfile::tempdir_in("/tmp").unwrap();
     let private_directory = temporary.path().join("agent-runtime");
     std::fs::create_dir(&private_directory).unwrap();
     std::fs::set_permissions(&private_directory, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let _guard = PrivateOwnerGuard::new(&private_directory);
+    let _guard = PrivateDaemonGuard::new(&private_directory);
     let executable = std::path::PathBuf::from(env!("CARGO_BIN_EXE_tickloop"));
     let mut calls = Vec::new();
     for _ in 0..8 {
@@ -768,12 +770,12 @@ async fn concurrent_cold_start_uses_one_isolated_owner_and_owner_exit_closes_wor
     for call in calls {
         clients.push(call.await.unwrap());
     }
-    let epoch = clients[0].owner_epoch();
-    assert!(clients.iter().all(|client| client.owner_epoch() == epoch));
-    let owner_pid = clients[0].server_process_id() as i32;
-    assert!(owner_pid > 0 && owner_pid != std::process::id() as i32);
+    let epoch = clients[0].daemon_epoch();
+    assert!(clients.iter().all(|client| client.daemon_epoch() == epoch));
+    let daemon_pid = clients[0].server_process_id() as i32;
+    assert!(daemon_pid > 0 && daemon_pid != std::process::id() as i32);
     assert_eq!(
-        std::fs::metadata(private_directory.join("owner.sock"))
+        std::fs::metadata(private_directory.join("daemon.sock"))
             .unwrap()
             .permissions()
             .mode()
@@ -781,7 +783,7 @@ async fn concurrent_cold_start_uses_one_isolated_owner_and_owner_exit_closes_wor
         0o600
     );
     assert_eq!(
-        std::fs::metadata(private_directory.join("owner.lock"))
+        std::fs::metadata(private_directory.join("daemon.lock"))
             .unwrap()
             .permissions()
             .mode()
@@ -850,7 +852,7 @@ async fn concurrent_cold_start_uses_one_isolated_owner_and_owner_exit_closes_wor
     )
     .await
     .unwrap();
-    assert_eq!(replacement.owner_epoch(), epoch);
+    assert_eq!(replacement.daemon_epoch(), epoch);
     for (label, target, task_id) in &targets {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
@@ -912,16 +914,16 @@ async fn concurrent_cold_start_uses_one_isolated_owner_and_owner_exit_closes_wor
         })
         .collect::<Vec<_>>();
     assert_eq!(worker_sockets.len(), 2);
-    replacement.shutdown_owner().await.unwrap();
-    let owner_lock = std::fs::OpenOptions::new()
+    replacement.shutdown_daemon().await.unwrap();
+    let daemon_lock = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .open(private_directory.join("owner.lock"))
+        .open(private_directory.join("daemon.lock"))
         .unwrap();
-    tokio::time::timeout(OWNER_SHUTDOWN_TIMEOUT, async {
+    tokio::time::timeout(DAEMON_SHUTDOWN_TIMEOUT, async {
         loop {
             if !worker_sockets.iter().any(|path| path.exists())
-                && unsafe { libc::flock(owner_lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }
+                && unsafe { libc::flock(daemon_lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }
                     == 0
             {
                 break;
@@ -931,14 +933,14 @@ async fn concurrent_cold_start_uses_one_isolated_owner_and_owner_exit_closes_wor
     })
     .await
     .unwrap();
-    drop(owner_lock);
-    let new_owner =
+    drop(daemon_lock);
+    let new_daemon =
         tickloop_agent::agent_daemon::connect_or_start_at(private_directory.clone(), executable)
             .await
             .unwrap();
-    assert_ne!(new_owner.owner_epoch(), epoch);
-    assert!(agents(&new_owner).await.is_empty());
-    let old = match new_owner
+    assert_ne!(new_daemon.daemon_epoch(), epoch);
+    assert!(agents(&new_daemon).await.is_empty());
+    let old = match new_daemon
         .observe(ObservationRequest::Agent {
             execution: targets[0].1,
             detail: AgentDetailQuery::Snapshot,
@@ -947,15 +949,15 @@ async fn concurrent_cold_start_uses_one_isolated_owner_and_owner_exit_closes_wor
         .await
     {
         Err(error) => error,
-        Ok(_) => panic!("old execution must be fenced after owner restart"),
+        Ok(_) => panic!("old execution must be fenced after daemon restart"),
     };
     assert_eq!(old.code, AccessErrorCode::EpochChanged);
-    new_owner.shutdown_owner().await.unwrap();
+    new_daemon.shutdown_daemon().await.unwrap();
 }
 
 async fn controlled_connections(
     directory: &Path,
-    owner: Arc<OwnerServer>,
+    daemon: Arc<DaemonServer>,
 ) -> (
     LocalAgentClient,
     Arc<Mutex<Vec<tokio::task::AbortHandle>>>,
@@ -965,13 +967,13 @@ async fn controlled_connections(
     let listener = UnixListener::bind(&socket).unwrap();
     let handles = Arc::new(Mutex::new(Vec::new()));
     let saved = handles.clone();
-    let epoch = owner.owner_epoch();
+    let epoch = daemon.daemon_epoch();
     let listener_task = tokio::spawn(async move {
         loop {
             let (stream, _) = listener.accept().await.unwrap();
-            let owner = owner.clone();
+            let daemon = daemon.clone();
             let task = tokio::spawn(async move {
-                let _ = serve_connection(stream, owner, epoch, support::TRANSPORT_LIMITS).await;
+                let _ = serve_connection(stream, daemon, epoch, support::TRANSPORT_LIMITS).await;
             });
             saved.lock().await.push(task.abort_handle());
         }
@@ -987,9 +989,9 @@ async fn controlled_connections(
 async fn a_recovering_client_rebuilds_observation_in_the_same_epoch_and_fences_old_ui_ready() {
     let temporary = tempfile::tempdir_in("/tmp").unwrap();
     let factory = Arc::new(FixtureFactory::new(vec![]));
-    let owner = Arc::new(OwnerServer::new(Uuid::new_v4(), factory.clone()));
-    let (client, connections, listener) = controlled_connections(temporary.path(), owner).await;
-    let epoch = client.owner_epoch();
+    let daemon = Arc::new(DaemonServer::new(Uuid::new_v4(), factory.clone()));
+    let (client, connections, listener) = controlled_connections(temporary.path(), daemon).await;
+    let epoch = client.daemon_epoch();
     let old_session = client.session_id();
     let socket = temporary.path().join("c.sock");
     let reconnects = Arc::new(AtomicUsize::new(0));
@@ -1044,7 +1046,7 @@ async fn a_recovering_client_rebuilds_observation_in_the_same_epoch_and_fences_o
     })
     .await
     .unwrap();
-    assert_eq!(access.owner_epoch(), epoch);
+    assert_eq!(access.daemon_epoch(), epoch);
     assert_ne!(access.session_id(), old_session);
     assert_eq!(access.connection_revision(), 2);
     assert_eq!(reconnects.load(Ordering::SeqCst), 1);
@@ -1091,15 +1093,15 @@ async fn reconnecting_a_lost_command_ack_queries_the_original_receipt_without_re
         gate: Some(gate.clone()),
         ..FixtureFactory::new(vec![])
     });
-    let owner = Arc::new(OwnerServer::new(Uuid::new_v4(), factory.clone()));
-    let (client, connections, listener) = controlled_connections(temporary.path(), owner).await;
+    let daemon = Arc::new(DaemonServer::new(Uuid::new_v4(), factory.clone()));
+    let (client, connections, listener) = controlled_connections(temporary.path(), daemon).await;
     let socket = temporary.path().join("c.sock");
     let reconnect: ReconnectFactory = Arc::new(move || {
         let socket = socket.clone();
         Box::pin(async move { LocalAgentClient::connect(socket).await })
     });
     let access = RecoveringAgentClient::new(client, reconnect);
-    let command = create(access.owner_epoch(), temporary.path());
+    let command = create(access.daemon_epoch(), temporary.path());
     let sent = command.clone();
     let cloned = access.clone();
     let executing = tokio::spawn(async move { cloned.execute(sent).await.unwrap() });
@@ -1123,7 +1125,7 @@ async fn reconnecting_a_lost_command_ack_queries_the_original_receipt_without_re
     assert_eq!(factory.started.load(Ordering::SeqCst), 1);
     gate.notify_one();
     tokio::time::timeout(Duration::from_secs(3), async { loop {
-        let observation = access.observe(ObservationRequest::Receipt { epoch: command.owner_epoch, command_id: command.command_id }).await.unwrap();
+        let observation = access.observe(ObservationRequest::Receipt { epoch: command.daemon_epoch, command_id: command.command_id }).await.unwrap();
         if matches!(observation.initial, ObservationValue::Receipt(Some(receipt)) if matches!(receipt.state, ReceiptState::Completed)) { break; }
         tokio::task::yield_now().await;
     }}).await.unwrap();
@@ -1141,12 +1143,12 @@ async fn record_preview_is_read_only_and_concurrent_resume_reuses_one_live_execu
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path().join("state");
     let first_factory = Arc::new(FixtureFactory::new(vec![support::text("Recorded result.")]));
-    let first = OwnerServer::new(Uuid::new_v4(), first_factory.clone());
+    let first = DaemonServer::new(Uuid::new_v4(), first_factory.clone());
     let mut launch = LaunchSpec::embedded(temporary.path().to_path_buf());
     launch.config_root = Some(root.clone());
     let created = first
         .execute(envelope(
-            first.owner_epoch(),
+            first.daemon_epoch(),
             AgentCommand::Create {
                 launch: launch.clone(),
                 initial: Some(UserInput::Text {
@@ -1180,7 +1182,7 @@ async fn record_preview_is_read_only_and_concurrent_resume_reuses_one_live_execu
     }}).await.unwrap();
     first
         .execute(envelope(
-            first.owner_epoch(),
+            first.daemon_epoch(),
             AgentCommand::FlushTranscripts,
         ))
         .await
@@ -1189,8 +1191,8 @@ async fn record_preview_is_read_only_and_concurrent_resume_reuses_one_live_execu
         .unwrap();
     first_factory.shutdown().await;
     let factory = Arc::new(FixtureFactory::new(vec![]));
-    let owner = OwnerServer::new(Uuid::new_v4(), factory.clone());
-    let preview = owner
+    let daemon = DaemonServer::new(Uuid::new_v4(), factory.clone());
+    let preview = daemon
         .observe(ObservationRequest::Transcript {
             record: record.clone(),
             page: Page {
@@ -1204,10 +1206,10 @@ async fn record_preview_is_read_only_and_concurrent_resume_reuses_one_live_execu
         matches!(preview.initial, ObservationValue::Transcript(transcript) if transcript.messages.iter().any(|entry| entry.message.content.iter().any(|block| matches!(block, tickloop_agent::model::Content::Text { text } if text == "Recorded result."))))
     );
     assert_eq!(factory.started.load(Ordering::SeqCst), 0);
-    assert!(agents(&owner).await.is_empty());
+    assert!(agents(&daemon).await.is_empty());
     let command = || {
         envelope(
-            owner.owner_epoch(),
+            daemon.daemon_epoch(),
             AgentCommand::LoadRecord {
                 record: record.clone(),
                 as_new: false,
@@ -1215,30 +1217,30 @@ async fn record_preview_is_read_only_and_concurrent_resume_reuses_one_live_execu
             },
         )
     };
-    let (one, two) = tokio::join!(owner.execute(command()), owner.execute(command()));
+    let (one, two) = tokio::join!(daemon.execute(command()), daemon.execute(command()));
     assert_eq!(execution(one.unwrap()), execution(two.unwrap()));
     assert_eq!(factory.started.load(Ordering::SeqCst), 1);
-    assert_eq!(agents(&owner).await.len(), 1);
+    assert_eq!(agents(&daemon).await.len(), 1);
     assert!(factory.model.requests.lock().unwrap().is_empty());
     factory.shutdown().await;
 }
 
 #[tokio::test]
-async fn a_recovering_client_fences_an_old_execution_when_the_owner_epoch_changes() {
+async fn a_recovering_client_fences_an_old_execution_when_the_daemon_epoch_changes() {
     let temporary = tempfile::tempdir_in("/tmp").unwrap();
-    let socket = temporary.path().join("owner.sock");
+    let socket = temporary.path().join("daemon.sock");
     let factory = Arc::new(FixtureFactory::new(vec![]));
-    let owner = Arc::new(OwnerServer::new(Uuid::new_v4(), factory.clone()));
+    let daemon = Arc::new(DaemonServer::new(Uuid::new_v4(), factory.clone()));
     let listener = UnixListener::bind(&socket).unwrap();
-    let epoch = owner.owner_epoch();
-    let old_server = tokio::spawn(serve_owner_listener(
+    let epoch = daemon.daemon_epoch();
+    let old_server = tokio::spawn(serve_daemon_listener(
         listener,
-        owner,
+        daemon,
         epoch,
         support::TRANSPORT_LIMITS,
     ));
     let initial = LocalAgentClient::connect(&socket).await.unwrap();
-    let old_epoch = initial.owner_epoch();
+    let old_epoch = initial.daemon_epoch();
     let old_session = initial.session_id();
     let target = execution(
         initial
@@ -1260,20 +1262,20 @@ async fn a_recovering_client_fences_an_old_execution_when_the_owner_epoch_change
         })
         .await
         .unwrap();
-    initial.shutdown_owner().await.unwrap();
+    initial.shutdown_daemon().await.unwrap();
     old_server.await.unwrap().unwrap();
     factory.shutdown().await;
     std::fs::remove_file(&socket).unwrap();
     let replacement_factory = Arc::new(FixtureFactory::new(vec![]));
-    let replacement_owner = Arc::new(OwnerServer::new(
+    let replacement_daemon = Arc::new(DaemonServer::new(
         Uuid::new_v4(),
         replacement_factory.clone(),
     ));
-    let epoch = replacement_owner.owner_epoch();
+    let epoch = replacement_daemon.daemon_epoch();
     let listener = UnixListener::bind(&socket).unwrap();
-    let new_server = tokio::spawn(serve_owner_listener(
+    let new_server = tokio::spawn(serve_daemon_listener(
         listener,
-        replacement_owner,
+        replacement_daemon,
         epoch,
         support::TRANSPORT_LIMITS,
     ));
@@ -1288,7 +1290,7 @@ async fn a_recovering_client_fences_an_old_execution_when_the_owner_epoch_change
     .await
     .unwrap();
     assert_eq!(error.code, AccessErrorCode::EpochChanged);
-    assert_ne!(access.owner_epoch(), old_epoch);
+    assert_ne!(access.daemon_epoch(), old_epoch);
     assert_ne!(access.session_id(), old_session);
     assert!(agents(&access).await.is_empty());
     let rejected = access
@@ -1324,20 +1326,20 @@ async fn a_recovering_client_fences_an_old_execution_when_the_owner_epoch_change
         AccessErrorCode::AccessDenied
     );
     let replacement = LocalAgentClient::connect(socket).await.unwrap();
-    replacement.shutdown_owner().await.unwrap();
+    replacement.shutdown_daemon().await.unwrap();
     new_server.await.unwrap().unwrap();
     replacement_factory.shutdown().await;
 }
 
 #[tokio::test]
-async fn a_lost_user_shell_agent_keeps_its_task_title_in_the_owner_directory() {
+async fn a_lost_user_shell_agent_keeps_its_task_title_in_the_daemon_directory() {
     let temporary = tempfile::tempdir().unwrap();
     let factory = Arc::new(FixtureFactory::new(vec![]));
-    let owner = OwnerServer::new(Uuid::new_v4(), factory.clone());
+    let daemon = DaemonServer::new(Uuid::new_v4(), factory.clone());
     let target = execution(
-        owner
+        daemon
             .execute(envelope(
-                owner.owner_epoch(),
+                daemon.daemon_epoch(),
                 AgentCommand::Create {
                     launch: LaunchSpec::embedded(temporary.path().to_path_buf()),
                     initial: Some(UserInput::Shell {
@@ -1350,12 +1352,12 @@ async fn a_lost_user_shell_agent_keeps_its_task_title_in_the_owner_directory() {
             .await
             .unwrap(),
     );
-    let live = agents(&owner).await;
+    let live = agents(&daemon).await;
     assert_eq!(live.len(), 1);
     assert_eq!(live[0].execution, target);
     assert_eq!(live[0].title, "!printf alpha");
     factory.availability.lock().await[0].store(false, Ordering::SeqCst);
-    let lost = agents(&owner).await;
+    let lost = agents(&daemon).await;
     assert_eq!(lost[0].availability, ExecutionAvailability::Lost);
     assert_eq!(lost[0].title, "!printf alpha");
     factory.shutdown().await;
@@ -1368,13 +1370,13 @@ async fn a_lost_worker_stays_visible_and_only_explicit_resume_creates_a_new_exec
     let factory = Arc::new(FixtureFactory::new(vec![support::text(
         "Saved before disconnect.",
     )]));
-    let owner = OwnerServer::new(Uuid::new_v4(), factory.clone());
+    let daemon = DaemonServer::new(Uuid::new_v4(), factory.clone());
     let mut launch = LaunchSpec::embedded(temporary.path().to_path_buf());
     launch.config_root = Some(root.clone());
     let target = execution(
-        owner
+        daemon
             .execute(envelope(
-                owner.owner_epoch(),
+                daemon.daemon_epoch(),
                 AgentCommand::Create {
                     launch: launch.clone(),
                     initial: Some(UserInput::Text {
@@ -1389,11 +1391,11 @@ async fn a_lost_worker_stays_visible_and_only_explicit_resume_creates_a_new_exec
             .unwrap(),
     );
     tokio::time::timeout(Duration::from_secs(3), async { loop {
-        let snapshot = owner.observe(ObservationRequest::Agent { execution: target, detail: AgentDetailQuery::Snapshot, after: None }).await.unwrap();
+        let snapshot = daemon.observe(ObservationRequest::Agent { execution: target, detail: AgentDetailQuery::Snapshot, after: None }).await.unwrap();
         if matches!(snapshot.initial, ObservationValue::Agent(snapshot) if snapshot.conversation.loops.iter().any(|goal| goal.state == tickloop_agent::runtime::LoopState::Completed)) { break; }
         tokio::task::yield_now().await;
     }}).await.unwrap();
-    let saved = owner
+    let saved = daemon
         .observe(ObservationRequest::SavedRecords {
             store_root: Some(root),
             workdir: temporary.path().to_path_buf(),
@@ -1405,18 +1407,18 @@ async fn a_lost_worker_stays_visible_and_only_explicit_resume_creates_a_new_exec
         .await
         .unwrap();
     assert!(matches!(saved.initial, ObservationValue::Records(records) if records.len() == 1));
-    let before = agents(&owner).await;
+    let before = agents(&daemon).await;
     let record = before[0].record.clone().unwrap();
     factory.availability.lock().await[0].store(false, Ordering::SeqCst);
-    let lost = agents(&owner).await;
+    let lost = agents(&daemon).await;
     assert_eq!(lost.len(), 1);
     assert_eq!(lost[0].execution, target);
     assert_eq!(lost[0].availability, ExecutionAvailability::Lost);
     assert_eq!(lost[0].record.as_ref(), Some(&record));
     assert_eq!(factory.started.load(Ordering::SeqCst), 1);
-    let rejected = owner
+    let rejected = daemon
         .execute(envelope(
-            owner.owner_epoch(),
+            daemon.daemon_epoch(),
             AgentCommand::Submit {
                 execution: target,
                 target_loop: None,
@@ -1437,9 +1439,9 @@ async fn a_lost_worker_stays_visible_and_only_explicit_resume_creates_a_new_exec
     factory.runtimes.lock().await[0].shutdown().await;
     factory.exits.lock().await[0].store(true, Ordering::SeqCst);
     let restored = execution(
-        owner
+        daemon
             .execute(envelope(
-                owner.owner_epoch(),
+                daemon.daemon_epoch(),
                 AgentCommand::LoadRecord {
                     record: record.clone(),
                     as_new: false,
@@ -1451,7 +1453,7 @@ async fn a_lost_worker_stays_visible_and_only_explicit_resume_creates_a_new_exec
     );
     assert_ne!(restored, target);
     assert_eq!(factory.started.load(Ordering::SeqCst), 2);
-    let after = agents(&owner).await;
+    let after = agents(&daemon).await;
     assert_eq!(after.len(), 2);
     assert!(after.iter().any(
         |entry| entry.execution == target && entry.availability == ExecutionAvailability::Lost
@@ -1498,7 +1500,7 @@ impl tickloop_agent::model::ModelClient for HeldModel {
 }
 
 /// Serves every started worker runtime behind its own listener, as a worker process does, so a
-/// test can close the owner's link or stop the listener while the runtime itself keeps running.
+/// test can close the daemon's link or stop the listener while the runtime itself keeps running.
 struct LinkFixtureFactory {
     directory: PathBuf,
     model: Arc<HeldModel>,
@@ -1665,14 +1667,14 @@ fn record_launch(workdir: &Path) -> LaunchSpec {
 }
 
 async fn create_running(
-    owner: &OwnerServer,
+    daemon: &DaemonServer,
     model: &HeldModel,
     launch: &LaunchSpec,
 ) -> ExecutionRef {
     let target = execution(
-        owner
+        daemon
             .execute(envelope(
-                owner.owner_epoch(),
+                daemon.daemon_epoch(),
                 AgentCommand::Create {
                     launch: launch.clone(),
                     initial: Some(UserInput::Text {
@@ -1715,31 +1717,31 @@ async fn wait_until_completed(access: &dyn AgentAccess, target: ExecutionRef) {
 }
 
 #[tokio::test]
-async fn a_live_worker_whose_owner_link_closes_keeps_its_execution_and_is_never_restarted() {
+async fn a_live_worker_whose_daemon_link_closes_keeps_its_execution_and_is_never_restarted() {
     let temporary = tempfile::tempdir_in("/tmp").unwrap();
     let factory = Arc::new(LinkFixtureFactory::new(
         temporary.path(),
         vec![support::text("Finished after the link closed.")],
     ));
-    let owner = OwnerServer::new(Uuid::new_v4(), factory.clone());
+    let daemon = DaemonServer::new(Uuid::new_v4(), factory.clone());
     let launch = record_launch(temporary.path());
-    let target = create_running(&owner, &factory.model, &launch).await;
+    let target = create_running(&daemon, &factory.model, &launch).await;
 
     factory.close_links().await;
-    let relinked = agents(&owner).await;
+    let relinked = agents(&daemon).await;
     assert_eq!(relinked.len(), 1);
     assert_eq!(relinked[0].execution, target);
     assert_eq!(relinked[0].availability, ExecutionAvailability::Live);
     assert_eq!(factory.accepted(0).await, 2);
 
     factory.model.release.notify_one();
-    wait_until_completed(&owner, target).await;
+    wait_until_completed(&daemon, target).await;
     assert_eq!(factory.model.script.requests.lock().unwrap().len(), 1);
-    let record = agents(&owner).await[0].record.clone().unwrap();
+    let record = agents(&daemon).await[0].record.clone().unwrap();
     let loaded = execution(
-        owner
+        daemon
             .execute(envelope(
-                owner.owner_epoch(),
+                daemon.daemon_epoch(),
                 AgentCommand::LoadRecord {
                     record,
                     as_new: false,
@@ -1759,21 +1761,21 @@ async fn a_lost_execution_whose_worker_is_still_running_cannot_be_resumed_twice(
     let temporary = tempfile::tempdir_in("/tmp").unwrap();
     let factory = Arc::new(LinkFixtureFactory::new(
         temporary.path(),
-        vec![support::text("Finished without its owner.")],
+        vec![support::text("Finished without its daemon.")],
     ));
-    let owner = OwnerServer::new(Uuid::new_v4(), factory.clone());
+    let daemon = DaemonServer::new(Uuid::new_v4(), factory.clone());
     let launch = record_launch(temporary.path());
-    let target = create_running(&owner, &factory.model, &launch).await;
+    let target = create_running(&daemon, &factory.model, &launch).await;
 
     factory.stop_listening().await;
-    let lost = agents(&owner).await;
+    let lost = agents(&daemon).await;
     assert_eq!(lost.len(), 1);
     assert_eq!(lost[0].execution, target);
     assert_eq!(lost[0].availability, ExecutionAvailability::Lost);
     let record = lost[0].record.clone().unwrap();
-    let submitted = owner
+    let submitted = daemon
         .execute(envelope(
-            owner.owner_epoch(),
+            daemon.daemon_epoch(),
             AgentCommand::Submit {
                 execution: target,
                 target_loop: None,
@@ -1793,7 +1795,7 @@ async fn a_lost_execution_whose_worker_is_still_running_cannot_be_resumed_twice(
     );
     let resume = |record: TranscriptRef| {
         envelope(
-            owner.owner_epoch(),
+            daemon.daemon_epoch(),
             AgentCommand::LoadRecord {
                 record,
                 as_new: false,
@@ -1801,7 +1803,7 @@ async fn a_lost_execution_whose_worker_is_still_running_cannot_be_resumed_twice(
             },
         )
     };
-    let refused = owner
+    let refused = daemon
         .execute(resume(record.clone()))
         .await
         .unwrap()
@@ -1817,7 +1819,7 @@ async fn a_lost_execution_whose_worker_is_still_running_cannot_be_resumed_twice(
     factory.model.release.notify_one();
     wait_until_completed(factory.served(0).await.as_ref(), target).await;
     factory.exit(0).await;
-    let restored = execution(owner.execute(resume(record)).await.unwrap());
+    let restored = execution(daemon.execute(resume(record)).await.unwrap());
     assert_ne!(restored, target);
     assert_eq!(factory.started.load(Ordering::SeqCst), 2);
     assert_eq!(factory.model.script.requests.lock().unwrap().len(), 1);
@@ -1829,12 +1831,12 @@ async fn a_lost_execution_stays_lost_when_its_still_running_worker_answers_again
     let temporary = tempfile::tempdir_in("/tmp").unwrap();
     let factory = Arc::new(LinkFixtureFactory::new(
         temporary.path(),
-        vec![support::text("Finished without its owner.")],
+        vec![support::text("Finished without its daemon.")],
     ));
-    let owner = OwnerServer::new(Uuid::new_v4(), factory.clone());
+    let daemon = DaemonServer::new(Uuid::new_v4(), factory.clone());
     let launch = record_launch(temporary.path());
-    let target = create_running(&owner, &factory.model, &launch).await;
-    owner
+    let target = create_running(&daemon, &factory.model, &launch).await;
+    daemon
         .show_view(DisplayUpdate::Displayed {
             view: ViewRef {
                 session_id: Uuid::new_v4(),
@@ -1847,24 +1849,24 @@ async fn a_lost_execution_stays_lost_when_its_still_running_worker_answers_again
         .await
         .unwrap();
     factory.stop_listening().await;
-    let lost = agents(&owner).await;
+    let lost = agents(&daemon).await;
     assert_eq!(lost[0].availability, ExecutionAvailability::Lost);
     let record = lost[0].record.clone().unwrap();
 
     factory.listen_again(0).await;
-    let answered = agents(&owner).await;
+    let answered = agents(&daemon).await;
     assert_eq!(
         factory.accepted(0).await,
         2,
-        "the owner reached the worker again"
+        "the daemon reached the worker again"
     );
     assert_eq!(answered.len(), 1);
     assert_eq!(answered[0].execution, target);
     assert_eq!(answered[0].availability, ExecutionAvailability::Lost);
     assert!(answered[0].views.is_empty());
-    let submitted = owner
+    let submitted = daemon
         .execute(envelope(
-            owner.owner_epoch(),
+            daemon.daemon_epoch(),
             AgentCommand::Submit {
                 execution: target,
                 target_loop: None,
@@ -1884,7 +1886,7 @@ async fn a_lost_execution_stays_lost_when_its_still_running_worker_answers_again
     );
     let resume = |record: TranscriptRef| {
         envelope(
-            owner.owner_epoch(),
+            daemon.daemon_epoch(),
             AgentCommand::LoadRecord {
                 record,
                 as_new: false,
@@ -1892,21 +1894,21 @@ async fn a_lost_execution_stays_lost_when_its_still_running_worker_answers_again
             },
         )
     };
-    let refused = owner.execute(resume(record.clone())).await.unwrap();
+    let refused = daemon.execute(resume(record.clone())).await.unwrap();
     assert!(refused.error.is_some(), "{refused:?}");
     assert_eq!(factory.started.load(Ordering::SeqCst), 1);
 
     factory.model.release.notify_one();
     wait_until_completed(factory.served(0).await.as_ref(), target).await;
     factory.exit(0).await;
-    let restored = execution(owner.execute(resume(record)).await.unwrap());
+    let restored = execution(daemon.execute(resume(record)).await.unwrap());
     assert_ne!(restored, target);
     assert_eq!(factory.started.load(Ordering::SeqCst), 2);
     factory.shutdown().await;
 }
 
 #[tokio::test]
-async fn an_execution_feed_can_close_while_the_owner_connection_stays_available() {
+async fn an_execution_feed_can_close_while_the_daemon_connection_stays_available() {
     let temporary = tempfile::tempdir_in("/tmp").unwrap();
     let runtime = Agent::new_embedded(
         support::config(),
@@ -1915,7 +1917,7 @@ async fn an_execution_feed_can_close_while_the_owner_connection_stays_available(
     let access = Arc::new(EmbeddedAgentAccess::new(runtime));
     let socket = temporary.path().join("feed.sock");
     let listener = UnixListener::bind(&socket).unwrap();
-    let epoch = access.owner_epoch();
+    let epoch = access.daemon_epoch();
     let service = access.clone();
     let server = tokio::spawn(serve_listener(
         listener,
@@ -1967,9 +1969,9 @@ async fn a_directory_change_during_snapshot_handoff_is_delivered_after_the_snaps
         snapshot_gate: Some(gate.clone()),
         ..FixtureFactory::new(vec![])
     });
-    let owner = OwnerServer::new(Uuid::new_v4(), factory.clone());
-    owner
-        .execute(create(owner.owner_epoch(), temporary.path()))
+    let daemon = DaemonServer::new(Uuid::new_v4(), factory.clone());
+    daemon
+        .execute(create(daemon.daemon_epoch(), temporary.path()))
         .await
         .unwrap()
         .into_result()
@@ -1977,7 +1979,7 @@ async fn a_directory_change_during_snapshot_handoff_is_delivered_after_the_snaps
     gate.next.store(true, Ordering::SeqCst);
     let (observation, second) = tokio::time::timeout(Duration::from_secs(3), async {
         tokio::join!(
-            owner.observe(ObservationRequest::Overview {
+            daemon.observe(ObservationRequest::Overview {
                 filter: AgentFilter::default(),
                 page: Page {
                     offset: 0,
@@ -1987,8 +1989,8 @@ async fn a_directory_change_during_snapshot_handoff_is_delivered_after_the_snaps
             }),
             async {
                 gate.entered.notified().await;
-                let second = owner
-                    .execute(create(owner.owner_epoch(), temporary.path()))
+                let second = daemon
+                    .execute(create(daemon.daemon_epoch(), temporary.path()))
                     .await;
                 gate.release.notify_one();
                 second
@@ -2008,7 +2010,7 @@ async fn a_directory_change_during_snapshot_handoff_is_delivered_after_the_snaps
         .unwrap();
     assert!(update.cursor.sequence > observation.cursor.sequence);
     assert!(
-        agents(&owner)
+        agents(&daemon)
             .await
             .iter()
             .any(|entry| entry.execution == second)
@@ -2069,7 +2071,7 @@ async fn oversized_response_fixture(
         Arc::new(support::ScriptedModel::new(vec![])),
     );
     let inner = EmbeddedAgentAccess::new(runtime);
-    let epoch = inner.owner_epoch();
+    let epoch = inner.daemon_epoch();
     let target = execution(inner.execute(create(epoch, directory)).await.unwrap());
     let access = Arc::new(OversizedResponseAccess {
         inner,
@@ -2127,7 +2129,7 @@ async fn an_oversized_accepted_receipt_stays_queryable_without_replaying_the_com
     let temporary = tempfile::tempdir_in("/tmp").unwrap();
     let (client, access, target, server) = oversized_response_fixture(temporary.path()).await;
     let command = envelope(
-        client.owner_epoch(),
+        client.daemon_epoch(),
         AgentCommand::Configure {
             provider: None,
             execution: target,
@@ -2144,7 +2146,7 @@ async fn an_oversized_accepted_receipt_stays_queryable_without_replaying_the_com
     assert_eq!(error.code, AccessErrorCode::OutcomeUnknown);
     assert!(client.is_connected());
     let query = ObservationRequest::Receipt {
-        epoch: command.owner_epoch,
+        epoch: command.daemon_epoch,
         command_id: command.command_id,
     };
     let error = tokio::time::timeout(OVERSIZED_RESPONSE_TIMEOUT, client.observe(query.clone()))
@@ -2235,11 +2237,11 @@ async fn replacing_the_host_socket_rejects_a_frozen_view_even_with_identical_pan
     let host = serve_host_socket(listener, pane.clone(), Arc::new(AtomicUsize::new(0)));
     let frozen = host_location(&socket, &*pane.lock().await);
     let factory = Arc::new(FixtureFactory::new(vec![]));
-    let owner = Arc::new(OwnerServer::new(Uuid::new_v4(), factory.clone()));
-    let (client, server) = serve(temporary.path(), owner).await;
+    let daemon = Arc::new(DaemonServer::new(Uuid::new_v4(), factory.clone()));
+    let (client, server) = serve(temporary.path(), daemon).await;
     let target = execution(
         client
-            .execute(create(client.owner_epoch(), temporary.path()))
+            .execute(create(client.daemon_epoch(), temporary.path()))
             .await
             .unwrap(),
     );
@@ -2289,11 +2291,11 @@ async fn moving_a_source_pane_requires_a_new_display_version_before_the_next_inp
     let factory = Arc::new(FixtureFactory::new(vec![support::text(
         "The moved source was accepted.",
     )]));
-    let owner = Arc::new(OwnerServer::new(Uuid::new_v4(), factory.clone()));
-    let (client, server) = serve(temporary.path(), owner).await;
+    let daemon = Arc::new(DaemonServer::new(Uuid::new_v4(), factory.clone()));
+    let (client, server) = serve(temporary.path(), daemon).await;
     let target = execution(
         client
-            .execute(create(client.owner_epoch(), temporary.path()))
+            .execute(create(client.daemon_epoch(), temporary.path()))
             .await
             .unwrap(),
     );
@@ -2317,7 +2319,7 @@ async fn moving_a_source_pane_requires_a_new_display_version_before_the_next_inp
     }
     let submit = |version, source: HostLocation| {
         envelope(
-            client.owner_epoch(),
+            client.daemon_epoch(),
             AgentCommand::Submit {
                 execution: target,
                 target_loop: None,
@@ -2393,8 +2395,8 @@ async fn a_nonterminal_creation_receipt_keeps_the_console_dispatch_gate_closed()
         gate: Some(gate.clone()),
         ..FixtureFactory::new(vec![support::text("The original dispatch finished.")])
     });
-    let owner = Arc::new(OwnerServer::new(Uuid::new_v4(), factory.clone()));
-    let (client, connections, listener) = controlled_connections(temporary.path(), owner).await;
+    let daemon = Arc::new(DaemonServer::new(Uuid::new_v4(), factory.clone()));
+    let (client, connections, listener) = controlled_connections(temporary.path(), daemon).await;
     let socket = temporary.path().join("c.sock");
     let reconnect: ReconnectFactory = Arc::new(move || {
         let socket = socket.clone();
@@ -2403,7 +2405,7 @@ async fn a_nonterminal_creation_receipt_keeps_the_console_dispatch_gate_closed()
     let access = Arc::new(RecoveringAgentClient::new(client, reconnect));
     let mut console = AgentConsole::new(
         access.clone(),
-        access.owner_epoch(),
+        access.daemon_epoch(),
         temporary.path().into(),
         None,
     );
@@ -2472,15 +2474,15 @@ async fn failed_first_input_reports_the_created_agent_without_retrying_or_losing
     let factory = Arc::new(FixtureFactory::new(vec![support::text(
         "Explicit correction worked.",
     )]));
-    let owner = Arc::new(OwnerServer::new(Uuid::new_v4(), factory.clone()));
-    let (client, server) = serve(temporary.path(), owner).await;
+    let daemon = Arc::new(DaemonServer::new(Uuid::new_v4(), factory.clone()));
+    let (client, server) = serve(temporary.path(), daemon).await;
     // The runtime registers the Agent before it checks the first input's file references, so a
     // reference outside the workspace fails only after registration.
     let outside = tempfile::tempdir_in("/tmp").unwrap();
     let outside_file = outside.path().join("outside.txt");
     std::fs::write(&outside_file, "outside").unwrap();
     let command = envelope(
-        client.owner_epoch(),
+        client.daemon_epoch(),
         AgentCommand::Create {
             launch: LaunchSpec::embedded(temporary.path().into()),
             initial: Some(UserInput::Text {
@@ -2526,7 +2528,7 @@ async fn failed_first_input_reports_the_created_agent_without_retrying_or_losing
     assert_eq!(agents(&client).await.len(), 1);
     let corrected = client
         .execute(envelope(
-            client.owner_epoch(),
+            client.daemon_epoch(),
             AgentCommand::Submit {
                 execution: target,
                 target_loop: None,
@@ -2557,10 +2559,10 @@ async fn failed_first_input_reports_the_created_agent_without_retrying_or_losing
 async fn an_unknown_first_skill_registers_no_agent_runs_no_model_and_deduplicates() {
     let temporary = tempfile::tempdir_in("/tmp").unwrap();
     let factory = Arc::new(FixtureFactory::new(vec![]));
-    let owner = Arc::new(OwnerServer::new(Uuid::new_v4(), factory.clone()));
-    let (client, server) = serve(temporary.path(), owner).await;
+    let daemon = Arc::new(DaemonServer::new(Uuid::new_v4(), factory.clone()));
+    let (client, server) = serve(temporary.path(), daemon).await;
     let command = envelope(
-        client.owner_epoch(),
+        client.daemon_epoch(),
         AgentCommand::Create {
             launch: LaunchSpec::embedded(temporary.path().into()),
             initial: Some(UserInput::Skill {
@@ -2582,7 +2584,7 @@ async fn an_unknown_first_skill_registers_no_agent_runs_no_model_and_deduplicate
     assert_eq!(duplicate.error.unwrap().message, message);
     assert!(agents(&client).await.is_empty());
     assert!(factory.model.requests.lock().unwrap().is_empty());
-    // The owner starts one worker before that worker checks the Skill; the duplicate is answered
+    // The daemon starts one worker before that worker checks the Skill; the duplicate is answered
     // from the receipt and starts nothing.
     assert_eq!(factory.started.load(Ordering::SeqCst), 1);
     factory.shutdown().await;
@@ -2597,15 +2599,15 @@ async fn default_history_pages_return_multiple_records_and_transcript_messages()
         support::text("Two"),
         support::text("Three"),
     ]));
-    let owner = Arc::new(OwnerServer::new(Uuid::new_v4(), factory.clone()));
-    let (client, server) = serve(temporary.path(), owner).await;
+    let daemon = Arc::new(DaemonServer::new(Uuid::new_v4(), factory.clone()));
+    let (client, server) = serve(temporary.path(), daemon).await;
     let mut ids = Vec::new();
     for prompt in ["First", "Second", "Third"] {
         let mut launch = LaunchSpec::embedded(temporary.path().into());
         launch.config_root = Some(temporary.path().join("state"));
         let receipt = client
             .execute(envelope(
-                client.owner_epoch(),
+                client.daemon_epoch(),
                 AgentCommand::Create {
                     launch,
                     initial: Some(UserInput::Text {
@@ -2629,7 +2631,7 @@ async fn default_history_pages_return_multiple_records_and_transcript_messages()
     }
     client
         .execute(envelope(
-            client.owner_epoch(),
+            client.daemon_epoch(),
             AgentCommand::FlushTranscripts,
         ))
         .await
@@ -2702,22 +2704,22 @@ async fn default_history_pages_return_multiple_records_and_transcript_messages()
 }
 
 #[tokio::test]
-async fn the_owner_discovers_and_routes_more_than_one_page_in_one_worker() {
+async fn the_daemon_discovers_and_routes_more_than_one_page_in_one_worker() {
     let temporary = tempfile::tempdir_in("/tmp").unwrap();
     let factory = Arc::new(FixtureFactory::new(vec![]));
-    let owner = Arc::new(OwnerServer::new(Uuid::new_v4(), factory.clone()));
+    let daemon = Arc::new(DaemonServer::new(Uuid::new_v4(), factory.clone()));
     // A full directory page is larger than the small test frame.
-    let (client, server) = serve_with_limits(temporary.path(), owner, AccessLimits::DEFAULT).await;
+    let (client, server) = serve_with_limits(temporary.path(), daemon, AccessLimits::DEFAULT).await;
     let root = execution(
         client
-            .execute(create(client.owner_epoch(), temporary.path()))
+            .execute(create(client.daemon_epoch(), temporary.path()))
             .await
             .unwrap(),
     );
     let worker = factory.accesses.lock().await[0].clone();
     for _ in 0..MAX_PAGE_LIMIT {
         worker
-            .execute(create(client.owner_epoch(), temporary.path()))
+            .execute(create(client.daemon_epoch(), temporary.path()))
             .await
             .unwrap()
             .into_result()
@@ -2779,11 +2781,11 @@ async fn a_client_rejected_oversized_create_does_not_mark_acceptance_unknown() {
     use tickloop_agent::agent_console::AgentConsole;
     let temporary = tempfile::tempdir_in("/tmp").unwrap();
     let factory = Arc::new(FixtureFactory::new(vec![]));
-    let owner = Arc::new(OwnerServer::new(Uuid::new_v4(), factory.clone()));
-    let (client, server) = serve(temporary.path(), owner).await;
+    let daemon = Arc::new(DaemonServer::new(Uuid::new_v4(), factory.clone()));
+    let (client, server) = serve(temporary.path(), daemon).await;
     let access = Arc::new(client.clone());
     let mut console =
-        AgentConsole::new(access, client.owner_epoch(), temporary.path().into(), None);
+        AgentConsole::new(access, client.daemon_epoch(), temporary.path().into(), None);
     let error = console
         .dispatch(
             LaunchSpec::embedded(temporary.path().into()),
@@ -2873,10 +2875,10 @@ async fn the_daemon_frames_its_worker_hop_with_the_limits_that_worker_announces(
         announced: Mutex::new(Vec::new()),
         servers: Mutex::new(Vec::new()),
     });
-    let daemon = Arc::new(OwnerServer::new(Uuid::new_v4(), factory.clone()));
+    let daemon = Arc::new(DaemonServer::new(Uuid::new_v4(), factory.clone()));
     // Only the worker hop is small; the console hop keeps the production limits.
     let (client, server) = serve_with_limits(temporary.path(), daemon, AccessLimits::DEFAULT).await;
-    let epoch = client.owner_epoch();
+    let epoch = client.daemon_epoch();
     let target = execution(
         client
             .execute(create(epoch, temporary.path()))

@@ -35,7 +35,7 @@ fn settings_ux_pty_fixture() {
             let settings = UserSettings::in_root(&root);
             let core = crate::runtime::Agent::new_with_user_settings_embedded(model.clone(), Arc::new(test_support::ScriptedModel::new(Vec::new())), settings.clone());
             let embedded = EmbeddedAgentAccess::new(core.clone());
-            let epoch = embedded.owner_epoch();
+            let epoch = embedded.daemon_epoch();
             let access = Arc::new(FixtureAccess { inner: embedded, directory: directory.clone(), epoch });
             let mut launch = LaunchSpec::embedded(directory.clone());
             launch.model = Some(model);
@@ -173,7 +173,7 @@ impl AgentAccess for FixtureAccess {
                     },
                 )),
                 cursor: Cursor {
-                    owner_epoch: self.epoch,
+                    daemon_epoch: self.epoch,
                     execution: Some(*execution),
                     sequence: 0,
                 },
@@ -234,7 +234,7 @@ impl Fixture {
         command.env("HOME", directory.path());
         command.env("TICKLOOP_CONFIG_DIR", directory.path().join("config"));
         command.env(
-            "TICKLOOP_AGENT_RUNTIME_DIR",
+            "TICKLOOP_DAEMON_RUNTIME_DIR",
             directory.path().join("runtime"),
         );
         command.env("TICKLOOP_TMPDIR", directory.path());

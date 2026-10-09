@@ -33,7 +33,7 @@ impl TerminalFixture {
             })
             .unwrap();
         let mut command = portable_pty::CommandBuilder::new(env!("CARGO_BIN_EXE_tickloop"));
-        command.env("TICKLOOP_AGENT_RUNTIME_DIR", &runtime);
+        command.env("TICKLOOP_DAEMON_RUNTIME_DIR", &runtime);
         command.args(["--working-directory-is-trusted", "--mode", "acceptEdits"]);
         command.arg("--cwd");
         command.arg(root);
@@ -148,12 +148,12 @@ impl Drop for TerminalFixture {
         let _ = self.child.kill();
         let _ = self.child.wait();
         let _ = std::process::Command::new(env!("CARGO_BIN_EXE_tickloop"))
-            .args(["service", "stop"])
+            .args(["daemon", "stop"])
             .env_clear()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", self.root.join("home"))
             .env("TICKLOOP_CONFIG_DIR", self.root.join("state"))
-            .env("TICKLOOP_AGENT_RUNTIME_DIR", &self.runtime)
+            .env("TICKLOOP_DAEMON_RUNTIME_DIR", &self.runtime)
             .output();
     }
 }
@@ -273,7 +273,7 @@ async fn piped_commands_wait_for_logout_before_provider_navigation_and_exit() {
 
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_tickloop"))
         .env(
-            "TICKLOOP_AGENT_RUNTIME_DIR",
+            "TICKLOOP_DAEMON_RUNTIME_DIR",
             support::cli_runtime::directory(),
         )
         .args(["--working-directory-is-trusted", "--mode", "acceptEdits"])

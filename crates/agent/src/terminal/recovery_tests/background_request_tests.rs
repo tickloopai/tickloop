@@ -16,7 +16,7 @@ struct AfterAnswerGate {
 }
 
 struct RecoveringBackgroundAccess {
-    owner: EmbeddedAgentAccess,
+    daemon: EmbeddedAgentAccess,
     background: Mutex<Option<ExecutionRef>>,
     unavailable: AtomicBool,
 }
@@ -32,13 +32,13 @@ impl AgentAccess for RecoveringBackgroundAccess {
                 "fixture background connection unavailable",
             ));
         }
-        self.owner.observe(query).await
+        self.daemon.observe(query).await
     }
     async fn execute(&self, command: CommandEnvelope) -> Result<CommandReceipt, AccessError> {
-        self.owner.execute(command).await
+        self.daemon.execute(command).await
     }
     async fn show_view(&self, update: DisplayUpdate) -> Result<DisplayReceipt, AccessError> {
-        self.owner.show_view(update).await
+        self.daemon.show_view(update).await
     }
 }
 
@@ -168,9 +168,9 @@ async fn run_background_request_fixture() {
         question_first,
     });
     let core = runtime::Agent::new_embedded(test_support::config(), model.clone());
-    let owner = Arc::new(EmbeddedAgentAccess::new(core.clone()));
+    let daemon = Arc::new(EmbeddedAgentAccess::new(core.clone()));
     let monitor_access = Arc::new(RecoveringBackgroundAccess {
-        owner: (*owner).clone(),
+        daemon: (*daemon).clone(),
         background: Mutex::new(None),
         unavailable: AtomicBool::new(false),
     });
@@ -186,14 +186,14 @@ async fn run_background_request_fixture() {
     let answerer_view = view();
     let monitor = Agent::from_access_for_test(
         monitor_access.clone(),
-        owner.owner_epoch(),
+        daemon.daemon_epoch(),
         monitor_view,
         launch.clone(),
         None,
     );
     let answerer = Agent::from_access_for_test(
-        owner.clone(),
-        owner.owner_epoch(),
+        daemon.clone(),
+        daemon.daemon_epoch(),
         answerer_view,
         launch,
         None,
@@ -215,7 +215,7 @@ async fn run_background_request_fixture() {
     )
     .await
     .unwrap();
-    let mut owner_events = core.subscribe();
+    let mut daemon_events = core.subscribe();
     let (console, input) = Console::start(true).unwrap();
     console.set_prompt_enabled(true).unwrap();
     let startup = StartupState {
@@ -242,7 +242,7 @@ async fn run_background_request_fixture() {
         .await
         .unwrap();
     let request_id = loop {
-        let event = test_support::next_event(&mut owner_events).await;
+        let event = test_support::next_event(&mut daemon_events).await;
         match event.kind {
             EventKind::PermissionRequested { request } if !question_first => break request.id,
             EventKind::QuestionAsked { request } if question_first => break request.id,
@@ -338,7 +338,7 @@ async fn run_background_request_fixture() {
         monitor_access.unavailable.store(true, Ordering::Relaxed);
         model.release.add_permits(1);
         let next = loop {
-            let event = test_support::next_event(&mut owner_events).await;
+            let event = test_support::next_event(&mut daemon_events).await;
             if let EventKind::PermissionRequested { request } = event.kind {
                 break request;
             }

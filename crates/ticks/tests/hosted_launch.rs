@@ -1,5 +1,5 @@
 #![cfg(unix)]
-//! Real `tick` launchers under the Tick host library: hidden PTYs, the hosted launch contract,
+//! Real `tick` launchers under the Tickhost library: hidden PTYs, the hosted launch contract,
 //! one business process shared by protocol calls, its screen and an attached view, and process
 //! cleanup.
 
@@ -11,7 +11,7 @@ use tick_connect::hosted::{
     CALL_TIMEOUT, CAPABILITY_DATA, CAPABILITY_LIFECYCLE, CONTROL_TIMEOUT, HostConnection, Role,
     read_frame, write_frame,
 };
-use tick_host::{host, paths::HostPaths};
+use tickhost::{host, paths::HostPaths};
 use tokio::{
     io::BufReader,
     net::unix::{OwnedReadHalf, OwnedWriteHalf},
@@ -42,7 +42,7 @@ for line in sys.stdin:
     if method == 'tick/describe':
         result = {'protocol':2,'tick_type':'example.counter','title':'Counter','description':'Counter','recover_with':'current','tools':[{'name':'increment','description':'Increment','params':{'type':'object'},'mutates':True},{'name':'current','description':'Read','params':{'type':'object'},'mutates':False},{'name':'flood','description':'Print many lines','params':{'type':'object'},'mutates':False},{'name':'slow','description':'Answer after 16 seconds','params':{'type':'object'},'mutates':False},{'name':'large','description':'Answer with almost 8 MiB','params':{'type':'object'},'mutates':False},{'name':'oversized_update','description':'Send an update beyond the limit','params':{'type':'object'},'mutates':False}]}
     elif method == 'tick/read':
-        result = {'version':3,'tick_instance_id':instance,'initialized':True,'sequence':value,'observed_at':'2026-10-07T00:00:00Z','data':{'value':value,'note':open('note.txt').read(),'sees_launch_token':'TICKLOOP_TICK_HOST_LAUNCH' in os.environ,'argument_bytes':sum(len(argument) for argument in sys.argv[1:])}}
+        result = {'version':3,'tick_instance_id':instance,'initialized':True,'sequence':value,'observed_at':'2026-10-07T00:00:00Z','data':{'value':value,'note':open('note.txt').read(),'sees_launch_token':'TICKLOOP_TICKHOST_LAUNCH' in os.environ,'argument_bytes':sum(len(argument) for argument in sys.argv[1:])}}
     elif method == 'tool/call':
         if request['params']['tool'] == 'increment':
             value += 1
@@ -69,7 +69,7 @@ struct Fixture {
     directory: tempfile::TempDir,
     paths: HostPaths,
     key: String,
-    owner_epoch: uuid::Uuid,
+    daemon_epoch: uuid::Uuid,
     owner: Value,
     server: tokio::task::JoinHandle<std::io::Result<()>>,
 }
@@ -105,7 +105,7 @@ impl Fixture {
             directory,
             paths,
             key,
-            owner_epoch: uuid::Uuid::new_v4(),
+            daemon_epoch: uuid::Uuid::new_v4(),
             owner: json!({"root":"fixture-root","chat":uuid::Uuid::new_v4()}),
             server,
         }
@@ -116,7 +116,7 @@ impl Fixture {
             &self.paths.socket(),
             Role::Controller {
                 controller_key: self.key.clone(),
-                owner_epoch: self.owner_epoch,
+                daemon_epoch: self.daemon_epoch,
             },
             &[CAPABILITY_LIFECYCLE],
         )
@@ -409,7 +409,7 @@ async fn killing_the_launcher_ends_its_business_process_and_the_host_reaps_it() 
         .unwrap();
     let opened = fixture.open(&mut controller, command, &work).await.unwrap();
     let business = opened["business_pid"].as_u64().unwrap() as u32;
-    let launcher = tick_host::process::sample(business).unwrap().parent;
+    let launcher = tickhost::process::sample(business).unwrap().parent;
     unsafe { libc::kill(launcher as libc::pid_t, libc::SIGKILL) };
     assert!(
         gone(business).await,
@@ -578,7 +578,7 @@ async fn a_launcher_outside_the_foreground_is_refused_before_its_tick_starts() {
     let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_tick"))
         .args(["run", "--", "/usr/bin/touch"])
         .arg(&marker)
-        .env("TICKLOOP_TICK_HOST_LAUNCH", binding.to_string())
+        .env("TICKLOOP_TICKHOST_LAUNCH", binding.to_string())
         .env_remove("HERDR_ENV")
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
@@ -924,7 +924,7 @@ async fn ending_a_stubborn_idle_tick_never_pauses_new_connections() {
         while let Ok(Some(_)) = read_frame(&mut view_events, BUSINESS_FRAME_BYTES).await {}
     });
     let business = stubborn["business_pid"].as_u64().unwrap() as u32;
-    let launcher = tick_host::process::sample(business).unwrap().parent;
+    let launcher = tickhost::process::sample(business).unwrap().parent;
     // A stopped launcher leaves SIGTERM pending, so only SIGKILL after the grace ends it.
     unsafe { libc::kill(launcher as libc::pid_t, libc::SIGSTOP) };
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
@@ -1026,7 +1026,7 @@ async fn the_session_sockets_of_killed_launchers_go_with_their_ticks() {
     assert_eq!(named(&sockets, &socket_of(&killed)), 1, "{sockets:?}");
 
     let business = killed["business_pid"].as_u64().unwrap() as u32;
-    let launcher = tick_host::process::sample(business).unwrap().parent;
+    let launcher = tickhost::process::sample(business).unwrap().parent;
     unsafe { libc::kill(launcher as libc::pid_t, libc::SIGKILL) };
     assert!(gone(business).await);
     for _ in 0..200 {
@@ -1530,7 +1530,7 @@ async fn a_legal_eight_mebibyte_tool_answer_passes_through_the_host() {
 /// foreground, proves a wrong terminal, and reuses its launch token.
 const PROBE_LAUNCHER: &str = r#"
 import json, os, socket, sys
-binding = json.loads(os.environ['TICKLOOP_TICK_HOST_LAUNCH'])
+binding = json.loads(os.environ['TICKLOOP_TICKHOST_LAUNCH'])
 def connect():
     channel = socket.socket(socket.AF_UNIX)
     channel.connect(binding['terminal']['endpoint'])
@@ -1609,7 +1609,7 @@ async fn conflicting_or_unreadable_launch_contexts_never_start_a_tick() {
     let cases: [(&[(&str, &str)], &str); 3] = [
         (
             &[
-                ("TICKLOOP_TICK_HOST_LAUNCH", &binding),
+                ("TICKLOOP_TICKHOST_LAUNCH", &binding),
                 herdr[0],
                 herdr[1],
                 herdr[2],
@@ -1617,8 +1617,8 @@ async fn conflicting_or_unreadable_launch_contexts_never_start_a_tick() {
             "cannot also carry a Herdr Pane context",
         ),
         (
-            &[("TICKLOOP_TICK_HOST_LAUNCH", "{not json")],
-            "TICKLOOP_TICK_HOST_LAUNCH is invalid",
+            &[("TICKLOOP_TICKHOST_LAUNCH", "{not json")],
+            "TICKLOOP_TICKHOST_LAUNCH is invalid",
         ),
         (&[herdr[0]], "HERDR_SOCKET_PATH is required"),
     ];
@@ -1633,7 +1633,7 @@ async fn conflicting_or_unreadable_launch_contexts_never_start_a_tick() {
         let output = command
             .args(["run", "--", "/usr/bin/touch"])
             .arg(&marker)
-            .env_remove("TICKLOOP_TICK_HOST_LAUNCH")
+            .env_remove("TICKLOOP_TICKHOST_LAUNCH")
             .envs(environment.iter().copied())
             .stdin(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
@@ -1723,7 +1723,7 @@ async fn concurrent_launches_leave_every_terminal_master_only_in_the_host() {
     while let Some(opened) = launches.join_next().await {
         let business = opened.unwrap()["business_pid"].as_u64().unwrap() as u32;
         processes.push(business);
-        processes.push(tick_host::process::sample(business).unwrap().parent);
+        processes.push(tickhost::process::sample(business).unwrap().parent);
     }
     assert!(
         holds_a_terminal_master(std::process::id()),
@@ -1788,7 +1788,7 @@ async fn a_launcher_in_a_background_process_group_of_its_terminal_is_refused() {
         "operation": uuid::Uuid::new_v4(),
         "launch_token": "0".repeat(64),
     });
-    let (terminal, slave) = tick_host::pty::Pty::open(Default::default()).unwrap();
+    let (terminal, slave) = tickhost::pty::Pty::open(Default::default()).unwrap();
     // Job control puts the launcher in its own process group, which is not the terminal's
     // foreground group.
     let mut shell = tokio::process::Command::new("/bin/sh");
@@ -1800,7 +1800,7 @@ async fn a_launcher_in_a_background_process_group_of_its_terminal_is_refused() {
         .env("TICK", env!("CARGO_BIN_EXE_tick"))
         .env("MARKER", &marker)
         .env("STATUS", &status)
-        .env("TICKLOOP_TICK_HOST_LAUNCH", binding.to_string())
+        .env("TICKLOOP_TICKHOST_LAUNCH", binding.to_string())
         .env_remove("HERDR_ENV");
     slave.attach(&mut shell).unwrap();
     let mut child = shell.spawn().unwrap();

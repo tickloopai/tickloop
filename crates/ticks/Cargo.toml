@@ -44,6 +44,6 @@ schemars = "1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
-tickloop-tick-host = { path = "../tick-host" }
+tickloop-tickhost = { path = "../tickhost" }
 uuid = { version = "1", features = ["v4"] }
 vt100 = "0.16.2"

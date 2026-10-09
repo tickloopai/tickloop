@@ -1,16 +1,21 @@
-//! Test executable providing a local model transport to the real CLI/owner/worker chain.
+//! Test executable providing a local model transport to the real CLI/daemon/worker chain.
 //! No fixture definition enters the compiled model catalog or saved model selection.
-//! The first argument picks the process: `--cli` runs the product CLI, a product process mode
+//! The arguments pick the process: `--cli` runs the product CLI, a whole product process entry
 //! runs as the product starts it, and anything else is a libtest probe of a target without tests.
 #[path = "mod.rs"]
 mod support;
 use async_trait::async_trait;
 use serde::Deserialize;
-use std::{ffi::OsString, path::PathBuf, sync::Arc};
+use std::{
+    ffi::OsString,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 use support::fixture_cli::CLI_MODE;
 use tickloop_agent::{
     agent_access::*,
-    hosted::controller::HOST_MODE,
+    agent_daemon::{DAEMON_RUN_ARGUMENTS, WORKER_ARGUMENT},
+    hosted::{controller::TICKHOST_RUN_ARGUMENTS, popup::ATTACH_ARGUMENTS},
     model::{ModelConfig, model_client},
 };
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
@@ -18,8 +23,6 @@ use uuid::Uuid;
 
 const TRANSPORT_FILE: &str = "TICKLOOP_TRANSPORT_FIXTURE";
 const TRANSPORT_FIXTURE_FLAG: &str = "--transport-fixture";
-const DAEMON_MODE: &str = "--agent-owner";
-const WORKER_MODE: &str = "--agent-worker";
 const TICK_LAUNCH_MODE: &str = "--tick-launch";
 
 #[derive(Deserialize)]
@@ -35,13 +38,10 @@ fn main() {
     let result = match arguments.first().and_then(|argument| argument.to_str()) {
         Some(CLI_MODE) => run_cli(arguments[1..].to_vec()),
         Some(TICK_LAUNCH_MODE) => run_tick_launch(&arguments),
-        Some(WORKER_MODE) if std::env::var_os(TRANSPORT_FILE).is_some() => {
+        _ if is_worker_entry(&arguments) && std::env::var_os(TRANSPORT_FILE).is_some() => {
             runtime().block_on(worker(&arguments))
         }
-        Some(DAEMON_MODE | WORKER_MODE | HOST_MODE) => run_product_process(&arguments),
-        _ if arguments == tickloop_agent::hosted::popup::ATTACH_ARGUMENTS => {
-            run_product_process(&arguments)
-        }
+        _ if is_product_process(&arguments) => run_product_process(&arguments),
         // No arguments, `--list`, `--exact`, `--nocapture`, a filter or `--help`.
         _ => return,
     };
@@ -49,6 +49,20 @@ fn main() {
         eprintln!("Error: {}", tickloop_agent::terminal::safe_text(&error));
         std::process::exit(1);
     }
+}
+
+/// Whether `arguments` are a whole entry the product starts itself, so that a libtest filter
+/// such as `daemon` or `worker` stays a probe.
+fn is_product_process(arguments: &[OsString]) -> bool {
+    let daemon_run = DAEMON_RUN_ARGUMENTS.len();
+    is_worker_entry(arguments)
+        || (arguments.len() > daemon_run && arguments[..daemon_run] == DAEMON_RUN_ARGUMENTS)
+        || arguments == TICKHOST_RUN_ARGUMENTS
+        || arguments == ATTACH_ARGUMENTS
+}
+
+fn is_worker_entry(arguments: &[OsString]) -> bool {
+    matches!(arguments, [entry, endpoint] if entry == WORKER_ARGUMENT && Path::new(endpoint).is_absolute())
 }
 
 fn runtime() -> tokio::runtime::Runtime {
@@ -62,7 +76,7 @@ fn runtime() -> tokio::runtime::Runtime {
 fn run_product_process(arguments: &[OsString]) -> Result<(), String> {
     runtime()
         .block_on(tickloop_agent::agent_daemon::run_internal(arguments))
-        .expect("run_internal serves every product process mode")
+        .expect("run_internal serves every product process entry")
 }
 
 fn run_cli(mut arguments: Vec<OsString>) -> Result<(), String> {

@@ -31,10 +31,10 @@ impl ReceiptStore {
         &self,
         command: &CommandEnvelope,
     ) -> Result<Option<CommandReceipt>, AccessError> {
-        if command.owner_epoch != self.epoch {
+        if command.daemon_epoch != self.epoch {
             return Err(AccessError::new(
                 AccessErrorCode::EpochChanged,
-                "command belongs to an earlier execution owner",
+                "command belongs to an earlier daemon",
             ));
         }
         let payload = serde_json::to_vec(&command.command)
@@ -70,7 +70,7 @@ impl ReceiptStore {
                 digest,
                 updated: now,
                 receipt: CommandReceipt {
-                    owner_epoch: self.epoch,
+                    daemon_epoch: self.epoch,
                     command_id: command.command_id,
                     target: command.command.execution(),
                     state: ReceiptState::Accepted,

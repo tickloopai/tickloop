@@ -3,7 +3,7 @@ use crate::runtime::Event;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 struct ControlledDelivery {
-    owner: EmbeddedAgentAccess,
+    daemon: EmbeddedAgentAccess,
     feeds: Mutex<HashMap<ExecutionRef, mpsc::Sender<ObservationUpdate>>>,
     fail_catalog: AtomicBool,
     fail_snapshot: AtomicBool,
@@ -43,7 +43,7 @@ impl AgentAccess for ControlledDelivery {
             } => Some(*execution),
             _ => None,
         };
-        let mut observation = self.owner.observe(query).await?;
+        let mut observation = self.daemon.observe(query).await?;
         if execution.is_some()
             && let Some(replacement) = self.replacement_snapshot.lock().unwrap().take()
         {
@@ -80,7 +80,7 @@ impl AgentAccess for ControlledDelivery {
             delayed.entered.send(()).unwrap();
             delayed.release.await.unwrap();
             return Ok(CommandReceipt {
-                owner_epoch: command.owner_epoch,
+                daemon_epoch: command.daemon_epoch,
                 command_id: command.command_id,
                 target: Some(execution),
                 state: ReceiptState::Completed,
@@ -92,11 +92,11 @@ impl AgentAccess for ControlledDelivery {
                 persistence: PersistenceState::NotApplicable,
             });
         }
-        self.owner.execute(command).await
+        self.daemon.execute(command).await
     }
 
     async fn show_view(&self, update: DisplayUpdate) -> Result<DisplayReceipt, AccessError> {
-        self.owner.show_view(update).await
+        self.daemon.show_view(update).await
     }
 }
 
@@ -106,7 +106,7 @@ impl ControlledDelivery {
         sender
             .send(ObservationUpdate {
                 cursor: Cursor {
-                    owner_epoch: self.owner.owner_epoch(),
+                    daemon_epoch: self.daemon.daemon_epoch(),
                     execution: Some(execution),
                     sequence: event.sequence,
                 },
@@ -132,7 +132,7 @@ async fn delivery_fixture() -> (
         )])),
     );
     let access = Arc::new(ControlledDelivery {
-        owner: EmbeddedAgentAccess::new(core.clone()),
+        daemon: EmbeddedAgentAccess::new(core.clone()),
         feeds: Mutex::new(HashMap::new()),
         fail_catalog: AtomicBool::new(false),
         fail_snapshot: AtomicBool::new(false),
@@ -145,7 +145,7 @@ async fn delivery_fixture() -> (
     launch.session_persistence = false;
     let agent = Agent::from_access_for_test(
         access.clone(),
-        access.owner.owner_epoch(),
+        access.daemon.daemon_epoch(),
         ViewRef {
             session_id: Uuid::new_v4(),
             view_id: Uuid::new_v4(),
@@ -308,7 +308,7 @@ async fn a_delayed_reset_cannot_roll_back_the_snapshot_covered_by_recovery() {
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let execution = agent.reference(chat).await.unwrap();
     let initial = access
-        .owner
+        .daemon
         .observe(ObservationRequest::Agent {
             execution,
             detail: AgentDetailQuery::Snapshot,
@@ -383,7 +383,7 @@ async fn delayed_changed_and_resync_queries_cannot_roll_back_recovered_requests(
         sender
             .send(ObservationUpdate {
                 cursor: Cursor {
-                    owner_epoch: access.owner.owner_epoch(),
+                    daemon_epoch: access.daemon.daemon_epoch(),
                     execution: Some(execution),
                     sequence: 0,
                 },
@@ -445,7 +445,7 @@ async fn replaced_execution_recovery(cover_before_reset: bool) {
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let old_execution = agent.reference(chat).await.unwrap();
     let initial = access
-        .owner
+        .daemon
         .observe(ObservationRequest::Agent {
             execution: old_execution,
             detail: AgentDetailQuery::Snapshot,
@@ -537,7 +537,7 @@ async fn a_delayed_old_execution_query_cannot_replace_a_new_binding() {
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let old_execution = agent.reference(chat).await.unwrap();
     let initial = access
-        .owner
+        .daemon
         .observe(ObservationRequest::Agent {
             execution: old_execution,
             detail: AgentDetailQuery::Snapshot,
@@ -572,7 +572,7 @@ async fn a_delayed_old_execution_query_cannot_replace_a_new_binding() {
     *access.replacement_snapshot.lock().unwrap() = Some(replacement);
     assert!(
         agent.live_snapshot(chat).await.is_err(),
-        "the controlled new execution has no real owner watch"
+        "the controlled new execution has no real daemon watch"
     );
     assert_eq!(agent.reference(chat).await.unwrap(), new_execution);
     release.send(()).unwrap();
@@ -596,7 +596,7 @@ async fn a_delayed_old_execution_compaction_cannot_replace_a_new_binding() {
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let old_execution = agent.reference(chat).await.unwrap();
     let initial = access
-        .owner
+        .daemon
         .observe(ObservationRequest::Agent {
             execution: old_execution,
             detail: AgentDetailQuery::Snapshot,

@@ -139,7 +139,7 @@ fn lost_diagnostics_follow_the_chat_across_cache_reset_and_details() {
     console
         .set_execution_connection_notice(
             Some(ExecutionConnectionNotice::Lost),
-            Some("invalid request: execution owner lost".into()),
+            Some("invalid request: execution worker lost".into()),
         )
         .unwrap();
     console.record_execution_loss(chat, notice.clone()).unwrap();
@@ -181,7 +181,7 @@ fn lost_diagnostics_follow_the_chat_across_cache_reset_and_details() {
     assert!(
         details.contains(&run.to_string())
             && details.contains(&format!("/resume {chat}"))
-            && details.contains("invalid request: execution owner lost"),
+            && details.contains("invalid request: execution worker lost"),
         "{details}"
     );
     console.close_transcript().unwrap();

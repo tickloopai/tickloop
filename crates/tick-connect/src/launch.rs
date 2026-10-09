@@ -112,7 +112,7 @@ impl LaunchContext {
                 if connection.epoch() != binding.terminal.epoch {
                     return Err(HostError::before(
                         "EpochChanged",
-                        "the Tick host restarted after this launch was prepared",
+                        "the Tickhost restarted after this launch was prepared",
                     ));
                 }
                 connection

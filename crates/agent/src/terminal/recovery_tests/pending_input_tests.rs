@@ -16,7 +16,7 @@ struct QueueModel {
 }
 
 struct QueueAccess {
-    owner: EmbeddedAgentAccess,
+    daemon: EmbeddedAgentAccess,
 }
 
 #[async_trait]
@@ -33,13 +33,13 @@ impl AgentAccess for QueueAccess {
         {
             return Err(AccessError::unavailable("owned queue snapshot unavailable"));
         }
-        self.owner.observe(query).await
+        self.daemon.observe(query).await
     }
     async fn execute(&self, command: CommandEnvelope) -> Result<CommandReceipt, AccessError> {
-        self.owner.execute(command).await
+        self.daemon.execute(command).await
     }
     async fn show_view(&self, update: DisplayUpdate) -> Result<DisplayReceipt, AccessError> {
-        self.owner.show_view(update).await
+        self.daemon.show_view(update).await
     }
 }
 
@@ -124,14 +124,14 @@ fn pending_input_pty_fixture() {
                     requests: Mutex::new(Vec::new()),
                 });
                 let core = runtime::Agent::new_embedded(test_support::config(), model.clone());
-                let access = Arc::new(QueueAccess {owner:EmbeddedAgentAccess::new(core.clone())});
+                let access = Arc::new(QueueAccess {daemon:EmbeddedAgentAccess::new(core.clone())});
                 let workdir = std::env::current_dir().unwrap();
                 let mut launch = LaunchSpec::embedded(workdir.clone());
                 launch.model = Some(test_support::config());
                 launch.session_persistence = false;
                 let agent = Agent::from_access_for_test(
                     access.clone(),
-                    access.owner.owner_epoch(),
+                    access.daemon.daemon_epoch(),
                     ViewRef {
                         session_id: Uuid::new_v4(),
                         view_id: Uuid::new_v4(),
@@ -139,7 +139,7 @@ fn pending_input_pty_fixture() {
                     launch.clone(),
                     None,
                 );
-                let other_view=Agent::from_access_for_test(access.clone(),access.owner.owner_epoch(),ViewRef {session_id:Uuid::new_v4(),view_id:Uuid::new_v4()},launch,None);
+                let other_view=Agent::from_access_for_test(access.clone(),access.daemon.daemon_epoch(),ViewRef {session_id:Uuid::new_v4(),view_id:Uuid::new_v4()},launch,None);
                 let proof_core = core.clone();
                 let proof_agent = agent.clone();
                 tokio::task::spawn_local(async move {
@@ -462,7 +462,7 @@ fn up_takes_back_pending_messages_without_creating_sent_body_echoes() {
 }
 
 #[test]
-fn messages_submitted_by_another_view_echo_once_when_the_owner_consumes_them() {
+fn messages_submitted_by_another_view_echo_once_when_the_daemon_consumes_them() {
     let (mut fixture, directory) = start_queue_fixture("external");
     fixture.wait_for("Tick Loop Agent");
     fixture.send(format!("{INITIAL_MESSAGE}\r").as_bytes());

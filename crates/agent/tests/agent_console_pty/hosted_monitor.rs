@@ -1,6 +1,6 @@
 use super::*;
 
-/// A View whose Agent opened `count` keys Ticks hidden in the Tick host, now in its Monitor.
+/// A View whose Agent opened `count` keys Ticks hidden in the Tickhost, now in its Monitor.
 async fn view_with_keys_ticks(
     fixture: &PrivateFixture,
     environment: &[(&str, &std::path::Path)],
@@ -185,7 +185,7 @@ async fn actual_cli_monitor_shows_a_hosted_tick_snapshot_and_attaches_it_full_sc
         let attached_output_start = view.output.lock().unwrap().len();
         client
             .execute(CommandEnvelope {
-                owner_epoch: client.owner_epoch(),
+                daemon_epoch: client.daemon_epoch(),
                 command_id: uuid::Uuid::new_v4(),
                 command: AgentCommand::Submit {
                     execution,

@@ -715,7 +715,7 @@ mod tests {
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    /// Each PTY test re-executes this test binary and starts an Agent owner and worker; on a
+    /// Each PTY test re-executes this test binary and starts an Agent daemon and worker; on a
     /// machine busy with parallel test runs that has taken more than 20 seconds. Only a failure
     /// waits this long.
     const PTY_TIMEOUT: Duration = Duration::from_secs(90);
@@ -855,7 +855,7 @@ mod tests {
         ]);
         command.cwd(&root);
         command.env("TICKLOOP_CONFIG_DIR", root.join("state"));
-        command.env("TICKLOOP_AGENT_RUNTIME_DIR", root.join("runtime"));
+        command.env("TICKLOOP_DAEMON_RUNTIME_DIR", root.join("runtime"));
         let rejected_login = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         command.env(
             "TICKLOOP_TEST_CODEX_OAUTH",
@@ -1203,7 +1203,7 @@ mod tests {
         ]);
         command.cwd(&root);
         command.env("TICKLOOP_CONFIG_DIR", root.join("state"));
-        command.env("TICKLOOP_AGENT_RUNTIME_DIR", root.join("runtime"));
+        command.env("TICKLOOP_DAEMON_RUNTIME_DIR", root.join("runtime"));
         command.env("TICKLOOP_TEST_CODEX_OAUTH", &origin);
         command.env(
             "TICKLOOP_TEST_CODEX_RESPONSES",

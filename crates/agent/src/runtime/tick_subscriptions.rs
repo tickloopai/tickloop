@@ -756,7 +756,7 @@ impl Agent {
                 TickLinkState::IdentityUncertain =>
                     "the Tick Instance identity could not be proved; select the target explicitly",
                 TickLinkState::Disconnected =>
-                    "the Tick host is disconnected; observation has not started",
+                    "the Tickhost is disconnected; observation has not started",
                 _ =>
                     "the Tick watch did not reach its baseline before the readiness deadline; check subscription status before relying on updates",
             });

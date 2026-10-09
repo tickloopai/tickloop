@@ -19,11 +19,11 @@ use crate::{
     tools::{CommandSnapshot, SearchConfig},
 };
 
-/// Business 10.0 combines hosted Monitor commands, attach grants, routed per-tool authority
-/// sets, and typed model-call versus direct human Shell permission requests.
-/// A 9.0 peer requires the old flat run/call fields and cannot decode the new request shape;
-/// other business majors are refused before dispatch. Frozen management remains independent.
-pub const PROTOCOL_MAJOR: u16 = 10;
+/// Business 11.0 names the per-user background process the daemon on the wire: `daemon_epoch`
+/// in hellos and references, and `ShutdownDaemon`/`DaemonStopped`. A 10.0 peer cannot decode
+/// these fields; other business majors are refused before dispatch. Frozen management on
+/// daemon.sock remains independent.
+pub const PROTOCOL_MAJOR: u16 = 11;
 pub const PROTOCOL_MINOR: u16 = 0;
 
 pub const REPLAY_CAPACITY: usize = 4096;
@@ -35,7 +35,7 @@ pub const MAX_PAGE_LIMIT: usize = 256;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ExecutionRef {
-    pub owner_epoch: Uuid,
+    pub daemon_epoch: Uuid,
     pub agent_id: Uuid,
     pub generation: u64,
 }
@@ -229,7 +229,7 @@ pub enum UserInput {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CommandEnvelope {
-    pub owner_epoch: Uuid,
+    pub daemon_epoch: Uuid,
     pub command_id: Uuid,
     pub command: AgentCommand,
 }
@@ -607,7 +607,7 @@ pub enum ObservationRequest {
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Cursor {
-    pub owner_epoch: Uuid,
+    pub daemon_epoch: Uuid,
     pub execution: Option<ExecutionRef>,
     pub sequence: u64,
 }
@@ -641,7 +641,7 @@ pub struct AgentSummary {
     pub subagent: Option<runtime::SubagentRegistration>,
     /// Whether this execution ever received work: a Loop, a message, a user Shell or queued input.
     /// Configuration alone does not count. `None` means the producer did not report the fact (an
-    /// older owner or worker); it is neither worked nor empty and stays absent when re-sent.
+    /// older daemon or worker); it is neither worked nor empty and stays absent when re-sent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub has_work: Option<bool>,
     /// Unix milliseconds when a Loop or user Shell of this execution last entered its current
@@ -852,7 +852,7 @@ pub enum PersistenceState {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CommandReceipt {
-    pub owner_epoch: Uuid,
+    pub daemon_epoch: Uuid,
     pub command_id: Uuid,
     pub target: Option<ExecutionRef>,
     pub state: ReceiptState,
@@ -1126,7 +1126,7 @@ pub struct ServerHello {
     pub process_id: u32,
     pub major: u16,
     pub minor: u16,
-    pub owner_epoch: Uuid,
+    pub daemon_epoch: Uuid,
     pub session_id: Uuid,
     #[serde(default)]
     pub capabilities: Vec<AccessCapability>,
@@ -1136,9 +1136,9 @@ pub struct ServerHello {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum ClientMessage {
-    ShutdownOwner {
+    ShutdownDaemon {
         request_id: Uuid,
-        owner_epoch: Uuid,
+        daemon_epoch: Uuid,
     },
     Hello {
         major: u16,
@@ -1186,7 +1186,7 @@ pub(crate) enum ServerMessage {
         total_bytes: u64,
         sha256: String,
     },
-    OwnerStopped {
+    DaemonStopped {
         request_id: Uuid,
     },
     Hello(ServerHello),
@@ -1230,7 +1230,7 @@ mod tests {
             FamilyCompletion, MonitorMember, MonitorMemberSource, SubagentNotificationDelivery,
         };
         let execution = ExecutionRef {
-            owner_epoch: Uuid::new_v4(),
+            daemon_epoch: Uuid::new_v4(),
             agent_id: Uuid::new_v4(),
             generation: 1,
         };
@@ -1295,7 +1295,7 @@ mod tests {
     #[test]
     fn monitor_membership_commands_cross_the_wire_unchanged() {
         let execution = ExecutionRef {
-            owner_epoch: Uuid::new_v4(),
+            daemon_epoch: Uuid::new_v4(),
             agent_id: Uuid::new_v4(),
             generation: 1,
         };

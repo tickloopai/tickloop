@@ -160,7 +160,7 @@ fn image_contexts(image: &Image, count: u32) -> Vec<InputContext> {
 
 fn envelope(epoch: Uuid, command: AgentCommand) -> CommandEnvelope {
     CommandEnvelope {
-        owner_epoch: epoch,
+        daemon_epoch: epoch,
         command_id: Uuid::new_v4(),
         command,
     }
@@ -276,7 +276,7 @@ async fn repeated_legal_images_case(
     let access = Arc::new(EmbeddedAgentAccess::new(runtime.clone()));
     let socket = directory.path().join("history.sock");
     let listener = UnixListener::bind(&socket).unwrap();
-    let epoch = access.owner_epoch();
+    let epoch = access.daemon_epoch();
     let server_access = access.clone();
     let server = tokio::spawn(async move {
         serve_listener(listener, server_access, epoch, limits)
@@ -506,7 +506,7 @@ async fn large_text_history_is_complete_and_a_corrupt_end_is_never_published() {
     let access = Arc::new(EmbeddedAgentAccess::new(runtime.clone()));
     let socket = directory.path().join("text.sock");
     let listener = UnixListener::bind(&socket).unwrap();
-    let epoch = access.owner_epoch();
+    let epoch = access.daemon_epoch();
     let server_access = access.clone();
     let server = tokio::spawn(async move {
         serve_listener(listener, server_access, epoch, limits)
@@ -641,7 +641,7 @@ async fn a_response_with_a_gap_or_an_incomplete_end_never_becomes_an_observation
             assert!(read_json(&mut stream, limits).await.get("Hello").is_some());
             write_json(&mut stream, &serde_json::json!({"Hello": {
                 "process_id": std::process::id(), "major": PROTOCOL_MAJOR, "minor": PROTOCOL_MINOR,
-                "owner_epoch": epoch, "session_id": Uuid::new_v4(), "capabilities": ["ChunkedResponses"],
+                "daemon_epoch": epoch, "session_id": Uuid::new_v4(), "capabilities": ["ChunkedResponses"],
                 "limits": ProtocolLimits::from(limits)
             }}), limits).await;
             let request = read_json(&mut stream, limits).await;
@@ -662,7 +662,7 @@ async fn a_response_with_a_gap_or_an_incomplete_end_never_becomes_an_observation
             Duration::from_secs(5),
             client.observe(ObservationRequest::Agent {
                 execution: ExecutionRef {
-                    owner_epoch: epoch,
+                    daemon_epoch: epoch,
                     agent_id: Uuid::new_v4(),
                     generation: 1,
                 },

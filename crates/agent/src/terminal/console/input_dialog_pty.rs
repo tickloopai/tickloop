@@ -147,7 +147,7 @@ impl Fixture {
         command.env("TICKLOOP_AGENT_TUI", "fullscreen");
         command.env("TERM", "xterm-256color");
         command.env("TICKLOOP_CONFIG_DIR", directory);
-        command.env("TICKLOOP_AGENT_RUNTIME_DIR", directory);
+        command.env("TICKLOOP_DAEMON_RUNTIME_DIR", directory);
         command.env("TICKLOOP_TMPDIR", directory);
         command.cwd(directory);
         let child = pair.slave.spawn_command(command).unwrap();

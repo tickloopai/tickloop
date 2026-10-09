@@ -7,7 +7,7 @@
 //! Live runtimes hold shared retention locks for Transcripts and associated resources.
 //! Cleanup holds an exclusive lock throughout deletion and conservatively retains uncertain locks.
 //! After runtime exit, the kernel releases its lock and the existing modification-time policy applies.
-//! Removing a whole Transcript ends the Chat, so the Agent owner hears of it before and after the
+//! Removing a whole Transcript ends the Chat, so the Agent daemon hears of it before and after the
 //! unlink ([`ChatDeletionNotice`]); without its answer the Transcript stays for a later round.
 //!
 //! 只认 Tick Loop 自己写出的名称：`<chatId>.jsonl` 的 Transcript、`<chatId>` 命名的 Chat 目录、文件回滚
@@ -68,7 +68,7 @@ impl CleanupResult {
     }
 }
 
-/// The Agent owner's side of deleting a whole Transcript, called with the Chat's retention lock
+/// The Agent daemon's side of deleting a whole Transcript, called with the Chat's retention lock
 /// held so no runtime can load the Chat meanwhile. Only Transcripts are announced: tool results,
 /// plans and caches never end a Chat.
 pub trait ChatDeletionNotice: Send + Sync {
@@ -506,7 +506,7 @@ fn is_old(path: &Path, cutoff: SystemTime) -> io::Result<bool> {
     Ok(fs::symlink_metadata(path)?.modified()? < cutoff)
 }
 
-/// Removes an expired Transcript between the owner's begin and finish notices, and with it the
+/// Removes an expired Transcript between the daemon's begin and finish notices, and with it the
 /// Chat's Tick delivery watermarks; a Transcript that is not expired is never announced.
 fn remove_old_transcript(
     path: &Path,

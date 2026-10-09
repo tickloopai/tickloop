@@ -549,7 +549,7 @@ mod tests {
         });
         let agent = ConsoleExecution::from_access_for_test(
             remote.clone(),
-            remote.inner.owner_epoch(),
+            remote.inner.daemon_epoch(),
             ViewRef {
                 session_id: Uuid::new_v4(),
                 view_id: Uuid::new_v4(),
@@ -807,7 +807,7 @@ mod tests {
         });
         let agent = ConsoleExecution::from_access_for_test(
             remote.clone(),
-            remote.inner.owner_epoch(),
+            remote.inner.daemon_epoch(),
             ViewRef {
                 session_id: Uuid::new_v4(),
                 view_id: Uuid::new_v4(),

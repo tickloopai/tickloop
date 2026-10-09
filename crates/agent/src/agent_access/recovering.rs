@@ -24,15 +24,15 @@ pub type ReconnectFactory = Arc<
 
 const WORKER_RECONNECT_DEADLINE: Duration = Duration::from_secs(5);
 
-/// The owner's link to one worker. A closed link is rebuilt only to the same endpoint, only
+/// The daemon's link to one worker. A closed link is rebuilt only to the same endpoint, only
 /// while `is_running` reports that worker process alive, and only when it still answers for the
-/// same owner epoch; otherwise the link stays Unavailable and the owner marks its executions Lost.
+/// same daemon epoch; otherwise the link stays Unavailable and the daemon marks its executions Lost.
 pub fn worker_link(
     client: LocalAgentClient,
     endpoint: PathBuf,
     is_running: impl Fn() -> bool + Send + Sync + 'static,
 ) -> RecoveringAgentClient {
-    let owner_epoch = client.owner_epoch();
+    let daemon_epoch = client.daemon_epoch();
     let is_running = Arc::new(is_running);
     let reconnect: ReconnectFactory = Arc::new(move || {
         let endpoint = endpoint.clone();
@@ -49,9 +49,9 @@ pub fn worker_link(
             )
             .await
             .map_err(|_| AccessError::unavailable("Agent worker did not answer a reconnect"))??;
-            if client.owner_epoch() != owner_epoch {
+            if client.daemon_epoch() != daemon_epoch {
                 return Err(AccessError::unavailable(
-                    "worker belongs to another owner epoch",
+                    "worker belongs to another daemon epoch",
                 ));
             }
             Ok(client)
@@ -82,8 +82,8 @@ impl RecoveringAgentClient {
             }),
         }
     }
-    pub fn owner_epoch(&self) -> Uuid {
-        self.inner.client.read().unwrap().owner_epoch()
+    pub fn daemon_epoch(&self) -> Uuid {
+        self.inner.client.read().unwrap().daemon_epoch()
     }
     pub fn session_id(&self) -> Uuid {
         self.inner.client.read().unwrap().session_id()
@@ -148,14 +148,14 @@ impl AgentAccess for RecoveringAgentClient {
         })
     }
     async fn execute(&self, command: CommandEnvelope) -> Result<CommandReceipt, AccessError> {
-        if command.owner_epoch != self.owner_epoch() {
+        if command.daemon_epoch != self.daemon_epoch() {
             return Err(AccessError::new(
                 AccessErrorCode::EpochChanged,
-                "command belongs to the previous owner; old execution was not restarted",
+                "command belongs to the previous daemon; old execution was not restarted",
             ));
         }
         let command_id = command.command_id;
-        let epoch = command.owner_epoch;
+        let epoch = command.daemon_epoch;
         match self.client().execute(command).await {
             Ok(receipt) => Ok(receipt),
             Err(error) if error.code == AccessErrorCode::OutcomeUnknown => {
@@ -169,7 +169,7 @@ impl AgentAccess for RecoveringAgentClient {
                 Err(AccessError::new(
                     AccessErrorCode::OutcomeUnknown,
                     format!(
-                        "Command {command_id} has an unknown result in owner {epoch}; it was not replayed"
+                        "Command {command_id} has an unknown result in daemon {epoch}; it was not replayed"
                     ),
                 ))
             }

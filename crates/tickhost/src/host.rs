@@ -1,5 +1,5 @@
-//! The Tick host service: one per user by default, holding each hosted Tick's PTY master,
-//! terminal model and launcher. Only the Agent owner controls lifecycles; data clients read
+//! The Tickhost service: one per user by default, holding each hosted Tick's PTY master,
+//! terminal model and launcher. Only the Agent daemon controls lifecycles; data clients read
 //! through a per-instance token; launchers report through a one-time launch token.
 
 use std::{
@@ -50,7 +50,7 @@ pub const INITIAL_GRACE: Duration = Duration::from_secs(5);
 pub const REAP_INTERVAL: Duration = Duration::from_millis(250);
 /// A Tick nobody attaches to, watches or explicitly uses for this long is reaped.
 pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
-/// The start configuration the owner writes on the host's standard input.
+/// The start configuration the daemon writes on the host's standard input.
 const CONFIG_BYTES: u64 = 1024;
 /// How long a host's emptied mark is kept for owners to settle that host's records.
 const EMPTIED_MARK_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
@@ -89,7 +89,7 @@ const HERDR_ENVIRONMENT_PREFIX: &str = "HERDR_";
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
 pub struct TickOwner {
-    /// The canonical config root identity the owner daemon verified for this Chat.
+    /// The canonical config root identity the daemon verified for this Chat.
     pub root: String,
     pub chat: Uuid,
 }
@@ -404,12 +404,12 @@ impl HostState {
         });
     }
 
-    /// Refuses a controller connection that a newer Agent owner fenced.
+    /// Refuses a controller connection that a newer Agent daemon fenced.
     fn ensure_current_controller(&self, generation: u64) -> Result<(), HostError> {
         if self.controller_generation != generation {
             return Err(HostError::before(
                 "Fenced",
-                "a newer Agent owner controls this Tick host",
+                "a newer Agent daemon controls this Tickhost",
             ));
         }
         Ok(())
@@ -430,7 +430,7 @@ struct StagedSnapshot {
     owners: HashSet<Uuid>,
 }
 
-/// What the owner starts a host with.
+/// What the daemon starts a host with.
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostConfig {
@@ -526,7 +526,7 @@ impl Host {
             if self.shutdown.is_cancelled() || state.exiting {
                 return Err(HostError::before(
                     "ShuttingDown",
-                    "the Tick host is stopping",
+                    "the Tickhost is stopping",
                 ));
             }
             validate_launch(&request)?;
@@ -785,7 +785,7 @@ impl Host {
             snapshots.staged = None;
             snapshots.applied_revision = Some(revision);
             // An owner ended before this revision needs no fence any more: an older controller's
-            // open is refused at spawn, and an owner serves a root only after reconciling it, so
+            // open is refused at spawn, and a daemon serves a root only after reconciling it, so
             // its opens carry this revision or a later one.
             state
                 .ended
@@ -1168,7 +1168,7 @@ pub async fn serve(paths: HostPaths, config: HostConfig) -> std::io::Result<()> 
     if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::AddrInUse,
-            "another Tick host owns this runtime directory",
+            "another Tickhost owns this runtime directory",
         ));
     }
     let socket = paths.socket();
@@ -1178,7 +1178,7 @@ pub async fn serve(paths: HostPaths, config: HostConfig) -> std::io::Result<()> 
         use std::os::unix::fs::{FileTypeExt, MetadataExt};
         if !metadata.file_type().is_socket() || metadata.uid() != paths::current_uid() {
             return Err(std::io::Error::other(
-                "the Tick host endpoint path is occupied by something else",
+                "the Tickhost endpoint path is occupied by something else",
             ));
         }
         std::fs::remove_file(&socket)?;
@@ -1237,7 +1237,7 @@ pub async fn serve(paths: HostPaths, config: HostConfig) -> std::io::Result<()> 
     host.shutdown_state.send_replace(ShutdownState::Stopping);
     host.shut_down().await;
     if emptied {
-        // Without the mark an owner later counts this host's Ticks as lost rather than ended.
+        // Without the mark a daemon later counts this host's Ticks as lost rather than ended.
         let _ = host.paths.record_emptied(host.epoch);
     }
     paths::remove_if_identity(&socket, identity);
@@ -1284,7 +1284,7 @@ async fn connection(stream: UnixStream, host: Arc<Host>) -> Result<(), HostError
             if major != MANAGEMENT_MAJOR || !same_secret(&controller_key, &host.controller_key) {
                 let error = HostError::before(
                     "Forbidden",
-                    "management requires the frozen 1.0 protocol and the owner's controller key",
+                    "management requires the frozen 1.0 protocol and the daemon's controller key",
                 );
                 let _ = write_within(
                     &mut writer,
@@ -1322,7 +1322,7 @@ async fn connection(stream: UnixStream, host: Arc<Host>) -> Result<(), HostError
             let refusal = if major != BUSINESS_MAJOR {
                 Some(HostError::before(
                     "IncompatibleHost",
-                    format!("Tick host serves business protocol {BUSINESS_MAJOR}.{BUSINESS_MINOR}"),
+                    format!("Tickhost serves business protocol {BUSINESS_MAJOR}.{BUSINESS_MINOR}"),
                 ))
             } else {
                 required
@@ -1331,7 +1331,7 @@ async fn connection(stream: UnixStream, host: Arc<Host>) -> Result<(), HostError
                     .map(|missing| {
                         HostError::before(
                             "IncompatibleHost",
-                            format!("Tick host lacks the {missing} capability"),
+                            format!("Tickhost lacks the {missing} capability"),
                         )
                     })
             };
@@ -1394,19 +1394,19 @@ async fn authenticate(host: &Arc<Host>, role: Role) -> Result<Authority, HostErr
     match role {
         Role::Controller {
             controller_key,
-            owner_epoch,
+            daemon_epoch,
         } => {
             if !same_secret(&controller_key, &host.controller_key) {
                 return Err(HostError::before(
                     "Forbidden",
-                    "only the Agent owner controls Tick lifecycles",
+                    "only the Agent daemon controls Tick lifecycles",
                 ));
             }
             let mut state = host.state.lock().await;
-            if state.controller_epoch != Some(owner_epoch) {
-                // A new owner fences every earlier controller connection.
+            if state.controller_epoch != Some(daemon_epoch) {
+                // A new daemon fences every earlier controller connection.
                 state.controller_generation += 1;
-                state.controller_epoch = Some(owner_epoch);
+                state.controller_epoch = Some(daemon_epoch);
             }
             Ok(Authority::Controller {
                 generation: state.controller_generation,
@@ -1500,7 +1500,7 @@ async fn management_request(host: &Host, request: Value) -> Result<Value, HostEr
     if epoch != host.epoch {
         return Err(HostError::before(
             "EpochChanged",
-            "this endpoint now serves another Tick host process",
+            "this endpoint now serves another Tickhost process",
         ));
     }
     if method == "shutdown_status" {
@@ -2117,7 +2117,7 @@ fn request_send_buffer(writer: &OwnedWriteHalf, bytes: usize) {
     };
 }
 
-/// Reads the start configuration the owner writes on the host's standard input.
+/// Reads the start configuration the daemon writes on the host's standard input.
 pub fn read_config(input: impl std::io::Read) -> std::io::Result<HostConfig> {
     use std::io::BufRead;
     const KEY_CHARACTERS: usize = TOKEN_BYTES * 2;
@@ -2133,7 +2133,7 @@ pub fn read_config(input: impl std::io::Read) -> std::io::Result<HostConfig> {
                     .all(|byte| byte.is_ascii_hexdigit())
         })
         .ok_or_else(|| {
-            std::io::Error::other("the Tick host needs its start configuration on standard input")
+            std::io::Error::other("the Tickhost needs its start configuration on standard input")
         })?;
     Ok(config)
 }
@@ -2400,7 +2400,7 @@ mod tests {
             tokio::spawn(async move { host.launch(&request, 0).await })
         };
         tokio::time::sleep(Duration::from_millis(100)).await;
-        // A newer owner takes over while the open waits for the registry.
+        // A newer daemon takes over while the open waits for the registry.
         registry.controller_generation += 1;
         drop(registry);
         let outcome = tokio::time::timeout(CONTROL_TIMEOUT, launching)

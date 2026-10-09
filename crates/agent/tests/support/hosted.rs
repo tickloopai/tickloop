@@ -1,9 +1,9 @@
-//! Opens of hosted Ticks for tests that run a private Tick host: each Tick starts through the
-//! fixture CLI's Tick launcher, as the owner starts one.
+//! Opens of hosted Ticks for tests that run a private Tickhost: each Tick starts through the
+//! fixture CLI's Tick launcher, as the daemon starts one.
 
 use std::path::{Path, PathBuf};
 
-use tick_host::host::{OpenRequest, TickOwner};
+use tickhost::host::{OpenRequest, TickOwner};
 use uuid::Uuid;
 
 /// The environment a hosted test Tick runs with.

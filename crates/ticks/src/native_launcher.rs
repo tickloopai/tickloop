@@ -82,7 +82,7 @@ pub async fn maybe_launch(cli: &Cli, arguments: &[OsString]) -> Option<Result<()
         Ok(None) if !external => return None,
         Ok(None) => {
             return Some(Err(Error::usage(
-                "tick run requires a Herdr Pane or a Tick host launch; standalone programs can use their own stdio entry",
+                "tick run requires a Herdr Pane or a Tickhost launch; standalone programs can use their own stdio entry",
             )));
         }
         Err(error) => return Some(Err(Error::usage(error))),

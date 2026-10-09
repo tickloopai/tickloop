@@ -140,7 +140,7 @@ impl AgentConsole {
                 return Err(AccessError::unavailable("invalid overview response"));
             };
             let complete = page.len() < MAX_PAGE_LIMIT;
-            self.epoch = observation.cursor.owner_epoch;
+            self.epoch = observation.cursor.daemon_epoch;
             rows.extend(page);
             if complete {
                 break;
@@ -573,7 +573,7 @@ impl AgentConsole {
         match self
             .access
             .execute(CommandEnvelope {
-                owner_epoch: self.epoch,
+                daemon_epoch: self.epoch,
                 command_id,
                 command: AgentCommand::Create {
                     launch,

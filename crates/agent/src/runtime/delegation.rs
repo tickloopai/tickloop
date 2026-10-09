@@ -247,7 +247,7 @@ pub(super) fn check_call(
                     .into(),
             );
         }
-        // A hosted Tick belongs to the Chat that opened it, which the owner enforces on every
+        // A hosted Tick belongs to the Chat that opened it, which the daemon enforces on every
         // call; every other target stays scoped by the inherited Workspace.
         if TickBackends::ALL.route(name, input) != Ok(TickBackend::Hosted) {
             let workspace = ceiling

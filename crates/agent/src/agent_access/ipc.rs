@@ -189,29 +189,29 @@ impl LocalAgentClient {
         !self.inner.cancel.is_cancelled()
     }
 
-    pub fn owner_epoch(&self) -> Uuid {
-        self.inner.hello.owner_epoch
+    pub fn daemon_epoch(&self) -> Uuid {
+        self.inner.hello.daemon_epoch
     }
     pub fn protocol(&self) -> &ServerHello {
         &self.inner.hello
     }
-    pub async fn shutdown_owner(&self) -> Result<(), AccessError> {
+    pub async fn shutdown_daemon(&self) -> Result<(), AccessError> {
         let request_id = Uuid::new_v4();
         match self
             .request(
                 request_id,
-                ClientMessage::ShutdownOwner {
+                ClientMessage::ShutdownDaemon {
                     request_id,
-                    owner_epoch: self.owner_epoch(),
+                    daemon_epoch: self.daemon_epoch(),
                 },
             )
             .await?
         {
-            Reply::Message(message) if matches!(*message, ServerMessage::OwnerStopped { .. }) => {
+            Reply::Message(message) if matches!(*message, ServerMessage::DaemonStopped { .. }) => {
                 Ok(())
             }
             _ => Err(AccessError::invalid(
-                "server returned an invalid owner shutdown reply",
+                "server returned an invalid daemon shutdown reply",
             )),
         }
     }
@@ -240,7 +240,7 @@ impl LocalAgentClient {
         written: Option<oneshot::Sender<()>>,
     ) -> Result<Reply, AccessError> {
         if self.inner.cancel.is_cancelled() {
-            return Err(AccessError::unavailable("owner connection is closed"));
+            return Err(AccessError::unavailable("daemon connection is closed"));
         }
         let (sender, receiver) = oneshot::channel();
         self.inner.pending.lock().await.insert(request_id, sender);
@@ -252,7 +252,7 @@ impl LocalAgentClient {
         let send = async move {
             let result = tokio::select! {
                 biased;
-                () = connection.cancelled() => Err(AccessError::unavailable("owner connection is closed")),
+                () = connection.cancelled() => Err(AccessError::unavailable("daemon connection is closed")),
                 result = async { write_frame(&mut *writer.lock().await, &message, frame_bytes).await } => result,
             };
             if let Err(error) = result {
@@ -277,9 +277,9 @@ impl LocalAgentClient {
         } else {
             send.await?;
         }
-        receiver
-            .await
-            .map_err(|_| AccessError::unavailable("owner disconnected before returning a result"))?
+        receiver.await.map_err(|_| {
+            AccessError::unavailable("daemon disconnected before returning a result")
+        })?
     }
 }
 
@@ -318,7 +318,7 @@ impl AgentAccess for LocalAgentClient {
                 terminal_error,
             }),
             _ => Err(AccessError::invalid(
-                "owner returned the wrong observation reply",
+                "daemon returned the wrong observation reply",
             )),
         }
     }
@@ -337,16 +337,16 @@ impl AgentAccess for LocalAgentClient {
             Ok(Reply::Message(message)) => match *message {
                 ServerMessage::Receipt { receipt, .. } => Ok(receipt),
                 _ => Err(AccessError::invalid(
-                    "owner returned the wrong command reply",
+                    "daemon returned the wrong command reply",
                 )),
             },
             Err(error) if error.code == AccessErrorCode::Unavailable => Err(AccessError::new(
                 AccessErrorCode::OutcomeUnknown,
-                "owner disconnected; query the original CommandId before retrying",
+                "daemon disconnected; query the original CommandId before retrying",
             )),
             Err(error) => Err(error),
             _ => Err(AccessError::invalid(
-                "owner returned the wrong command reply",
+                "daemon returned the wrong command reply",
             )),
         }
     }
@@ -359,11 +359,11 @@ impl AgentAccess for LocalAgentClient {
             Reply::Message(message) => match *message {
                 ServerMessage::Display { receipt, .. } => Ok(receipt),
                 _ => Err(AccessError::invalid(
-                    "owner returned the wrong display reply",
+                    "daemon returned the wrong display reply",
                 )),
             },
             _ => Err(AccessError::invalid(
-                "owner returned the wrong display reply",
+                "daemon returned the wrong display reply",
             )),
         }
     }
@@ -390,7 +390,7 @@ async fn negotiate(stream: &mut UnixStream) -> Result<(ServerHello, AccessLimits
     let reply = read_frame::<_, serde_json::Value>(stream, HANDSHAKE_FRAME_BYTES)
         .await?
         .ok_or_else(|| {
-            AccessError::unavailable("owner disconnected during protocol negotiation")
+            AccessError::unavailable("daemon disconnected during protocol negotiation")
         })?;
     if let Some(Ok(peer)) = reply.get("Hello").map(PeerVersion::deserialize)
         && peer.major != PROTOCOL_MAJOR
@@ -411,7 +411,7 @@ async fn negotiate(stream: &mut UnixStream) -> Result<(ServerHello, AccessLimits
         _ => {
             return Err(AccessError::new(
                 AccessErrorCode::VersionMismatch,
-                "owner did not complete protocol negotiation",
+                "daemon did not complete protocol negotiation",
             ));
         }
     };
@@ -601,7 +601,7 @@ async fn read_responses(
                 }
             }
             response @ (ServerMessage::Receipt { request_id, .. }
-            | ServerMessage::OwnerStopped { request_id }
+            | ServerMessage::DaemonStopped { request_id }
             | ServerMessage::Display { request_id, .. }) => {
                 if let Some(sender) = inner.pending.lock().await.remove(&request_id) {
                     let _ = sender.send(Ok(Reply::Message(Box::new(response))));
@@ -613,7 +613,7 @@ async fn read_responses(
     if let Some(inner) = inner.upgrade() {
         inner.cancel.cancel();
         for (_, sender) in inner.pending.lock().await.drain() {
-            let _ = sender.send(Err(AccessError::unavailable("owner connection closed")));
+            let _ = sender.send(Err(AccessError::unavailable("daemon connection closed")));
         }
         for (_, subscription) in inner.subscriptions.lock().await.drain() {
             subscription.cancel.cancel();
@@ -639,7 +639,7 @@ pub async fn serve_listener(
     }
 }
 
-pub async fn serve_owner_listener(
+pub async fn serve_daemon_listener(
     listener: UnixListener,
     access: Arc<dyn AgentAccess>,
     epoch: Uuid,
@@ -720,33 +720,31 @@ async fn serve_connection_mode(
     epoch: Uuid,
     limits: AccessLimits,
     forwarded_sessions: bool,
-    owner_shutdown: Option<CancellationToken>,
+    daemon_shutdown: Option<CancellationToken>,
     #[cfg(test)] observation_hooks: Option<Arc<ObservationTestHooks>>,
 ) -> Result<(), AccessError> {
     verify_peer(&stream)?;
-    let hello =
-        crate::service_management::read::<_, crate::service_management::Request>(&mut stream)
-            .await
-            .map_err(AccessError::invalid)?;
+    let hello = crate::daemon_management::read::<_, crate::daemon_management::Request>(&mut stream)
+        .await
+        .map_err(AccessError::invalid)?;
     let minor = match hello {
-        Some(crate::service_management::Request::Hello {
+        Some(crate::daemon_management::Request::Hello {
             major: PROTOCOL_MAJOR,
             ..
         }) => PROTOCOL_MINOR,
-        Some(crate::service_management::Request::Hello { major, minor: 0 })
-            if crate::service_management::CONTROL_MAJORS.contains(&major)
-                && owner_shutdown.is_some() =>
-        {
-            return crate::service_management::serve_shutdown(
+        Some(crate::daemon_management::Request::Hello {
+            major: crate::daemon_management::CONTROL_MAJOR,
+            minor: 0,
+        }) if daemon_shutdown.is_some() => {
+            return crate::daemon_management::serve_shutdown(
                 stream,
-                major,
                 epoch,
-                owner_shutdown.expect("owner management session"),
+                daemon_shutdown.expect("daemon management session"),
             )
             .await
             .map_err(AccessError::invalid);
         }
-        Some(crate::service_management::Request::Hello { major, minor }) => {
+        Some(crate::daemon_management::Request::Hello { major, minor }) => {
             write_frame(
                 &mut stream,
                 &ServerMessage::Error {
@@ -807,7 +805,7 @@ async fn serve_connection_mode(
         &ServerMessage::Hello(ServerHello {
             major: PROTOCOL_MAJOR,
             minor,
-            owner_epoch: epoch,
+            daemon_epoch: epoch,
             process_id: std::process::id(),
             session_id,
             capabilities,
@@ -822,7 +820,7 @@ async fn serve_connection_mode(
     let observations: Arc<Mutex<HashMap<Uuid, FeedTask>>> = Arc::new(Mutex::new(HashMap::new()));
     let pending_observations: Arc<Mutex<HashMap<Uuid, CancellationToken>>> =
         Arc::new(Mutex::new(HashMap::new()));
-    let cancel = owner_shutdown
+    let cancel = daemon_shutdown
         .as_ref()
         .map_or_else(CancellationToken::new, CancellationToken::child_token);
     let _cleanup = ConnectionCleanup {
@@ -839,28 +837,28 @@ async fn serve_connection_mode(
             Ok(None) => break Ok(()),
             Err(error) => break Err(error),
         };
-        if let ClientMessage::ShutdownOwner {
+        if let ClientMessage::ShutdownDaemon {
             request_id,
-            owner_epoch,
+            daemon_epoch,
         } = message
         {
-            if owner_epoch != epoch {
+            if daemon_epoch != epoch {
                 write_frame(
                     &mut *writer.lock().await,
                     &ServerMessage::Error {
                         request_id: Some(request_id),
                         error: AccessError::new(
                             AccessErrorCode::EpochChanged,
-                            "owner shutdown belongs to another epoch",
+                            "daemon shutdown belongs to another epoch",
                         ),
                     },
                     frame_bytes,
                 )
                 .await?;
-            } else if let Some(shutdown) = &owner_shutdown {
+            } else if let Some(shutdown) = &daemon_shutdown {
                 write_frame(
                     &mut *writer.lock().await,
-                    &ServerMessage::OwnerStopped { request_id },
+                    &ServerMessage::DaemonStopped { request_id },
                     frame_bytes,
                 )
                 .await?;
@@ -873,7 +871,7 @@ async fn serve_connection_mode(
                         request_id: Some(request_id),
                         error: AccessError::new(
                             AccessErrorCode::Unsupported,
-                            "this endpoint does not expose owner administration",
+                            "this endpoint does not expose daemon administration",
                         ),
                     },
                     frame_bytes,
@@ -1399,7 +1397,7 @@ mod tests {
             Ok(Observation {
                 initial,
                 cursor: Cursor {
-                    owner_epoch: self.epoch,
+                    daemon_epoch: self.epoch,
                     execution: None,
                     sequence: 0,
                 },
@@ -1419,7 +1417,7 @@ mod tests {
     #[tokio::test]
     async fn a_peer_closing_during_hello_is_unavailable_without_a_version_claim() {
         let temporary = tempfile::tempdir_in("/tmp").unwrap();
-        let path = temporary.path().join("owner.sock");
+        let path = temporary.path().join("daemon.sock");
         let listener = UnixListener::bind(&path).unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
@@ -1510,7 +1508,7 @@ mod tests {
                     process_id: 0,
                     major: PROTOCOL_MAJOR,
                     minor: PROTOCOL_MINOR,
-                    owner_epoch: Uuid::new_v4(),
+                    daemon_epoch: Uuid::new_v4(),
                     session_id: Uuid::new_v4(),
                     capabilities: Vec::new(),
                     limits,
@@ -1614,7 +1612,7 @@ mod tests {
             Ok(Observation {
                 initial,
                 cursor: Cursor {
-                    owner_epoch: self.epoch,
+                    daemon_epoch: self.epoch,
                     execution: None,
                     sequence: 0,
                 },
@@ -1677,7 +1675,7 @@ mod tests {
                     request_id: cancelled_request,
                     query: ObservationRequest::Agent {
                         execution: ExecutionRef {
-                            owner_epoch: epoch,
+                            daemon_epoch: epoch,
                             agent_id: Uuid::new_v4(),
                             generation: 1,
                         },
@@ -1806,7 +1804,7 @@ mod tests {
                     process_id: 0,
                     major: PROTOCOL_MAJOR,
                     minor: PROTOCOL_MINOR,
-                    owner_epoch: epoch,
+                    daemon_epoch: epoch,
                     session_id: Uuid::new_v4(),
                     capabilities: Vec::new(),
                     limits: AccessLimits::DEFAULT.into(),
@@ -1855,7 +1853,7 @@ mod tests {
                     observation_id: request_id,
                     initial: ObservationValue::Overview(Vec::new()),
                     cursor: Cursor {
-                        owner_epoch: epoch,
+                        daemon_epoch: epoch,
                         execution: None,
                         sequence: 0,
                     },
@@ -1929,7 +1927,7 @@ mod tests {
                         process_id: 0,
                         major: PROTOCOL_MAJOR,
                         minor: PROTOCOL_MINOR,
-                        owner_epoch: epoch,
+                        daemon_epoch: epoch,
                         session_id: Uuid::new_v4(),
                         capabilities: Vec::new(),
                         limits: AccessLimits::DEFAULT.into(),
@@ -1953,7 +1951,7 @@ mod tests {
                             observation_id: request_id,
                             initial: ObservationValue::Overview(Vec::new()),
                             cursor: Cursor {
-                                owner_epoch: epoch,
+                                daemon_epoch: epoch,
                                 execution: None,
                                 sequence: 0,
                             },
@@ -2041,7 +2039,7 @@ mod tests {
                         process_id: 0,
                         major: PROTOCOL_MAJOR,
                         minor: PROTOCOL_MINOR,
-                        owner_epoch: epoch,
+                        daemon_epoch: epoch,
                         session_id: Uuid::new_v4(),
                         capabilities: Vec::new(),
                         limits: AccessLimits::DEFAULT.into(),
@@ -2189,7 +2187,7 @@ mod tests {
         };
         let update = |sequence, text: &str| ObservationUpdate {
             cursor: Cursor {
-                owner_epoch: epoch,
+                daemon_epoch: epoch,
                 execution: None,
                 sequence,
             },
@@ -2468,7 +2466,7 @@ mod tests {
                 process_id: 0,
                 major: PROTOCOL_MAJOR,
                 minor: PROTOCOL_MINOR,
-                owner_epoch: epoch,
+                daemon_epoch: epoch,
                 session_id: Uuid::new_v4(),
                 capabilities: Vec::new(),
                 limits: TRANSPORT_LIMITS.into(),
@@ -2485,7 +2483,7 @@ mod tests {
                         "request_id": request_id,
                         "observation_id": Uuid::new_v4(),
                         "initial": { "Overview": rows.clone() },
-                        "cursor": { "owner_epoch": epoch, "execution": null, "sequence": 0 },
+                        "cursor": { "daemon_epoch": epoch, "execution": null, "sequence": 0 },
                         "reset": null,
                         "feed": false,
                     }
@@ -2508,7 +2506,7 @@ mod tests {
             subagent: None,
             availability: ExecutionAvailability::Live,
             execution: ExecutionRef {
-                owner_epoch: epoch,
+                daemon_epoch: epoch,
                 agent_id: Uuid::new_v4(),
                 generation: 1,
             },

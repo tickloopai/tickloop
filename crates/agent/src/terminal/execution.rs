@@ -44,7 +44,7 @@ pub(super) struct ConsoleExecution {
 pub(super) enum CreationAcceptance {
     /// This View follows the created Agent; carries the receipt of its first submitted run.
     Attached(Option<Receipt>),
-    /// The owner created the Agent, but this View could not follow it.
+    /// The daemon created the Agent, but this View could not follow it.
     AttachUnavailable(AgentError),
     Rejected(AgentError),
 }
@@ -58,7 +58,7 @@ enum FirstCreateState {
         command_id: Uuid,
         draft: NewAgentDraft,
     },
-    /// The Create failed after the owner registered `execution` for it. That Agent may be
+    /// The Create failed after the daemon registered `execution` for it. That Agent may be
     /// incomplete, so nothing is sent for it and no other Create follows until the user
     /// acknowledges `command_id`.
     RegisteredFailed {
@@ -80,20 +80,20 @@ enum FirstCreateState {
 enum BlockedChoice {
     /// Its reply was lost; only its receipt decides, and it is never resent.
     Unknown { epoch: Uuid, command_id: Uuid },
-    /// The owner refused it; the remaining choices wait until the user cancels them.
+    /// The daemon refused it; the remaining choices wait until the user cancels them.
     Refused { command_id: Uuid, error: String },
 }
 
 /// What a command's reply or receipt proves about it.
 enum CommandOutcome {
     Completed(CommandResult),
-    /// The owner refused it. For a Create, `registered` names the execution the owner had
+    /// The daemon refused it. For a Create, `registered` names the execution the daemon had
     /// already registered before the failure.
     Refused {
         error: AccessError,
         registered: Option<ExecutionRef>,
     },
-    /// It never reached the owner, so nothing was applied.
+    /// It never reached the daemon, so nothing was applied.
     Undelivered(AccessError),
     /// Accepted, running or with a lost result: only its receipt may decide later.
     Unknown,
@@ -118,7 +118,7 @@ impl CommandOutcome {
 
 /// What the receipt of an input whose acceptance was unknown proves.
 pub(super) enum InputResolution {
-    /// The owner accepted the original input; this is its result, so nothing is resent.
+    /// The daemon accepted the original input; this is its result, so nothing is resent.
     Accepted(CommandResult),
     Refused,
     Unknown,
@@ -179,7 +179,7 @@ impl ConfigurationOutcome {
 pub(super) enum DraftCreationError {
     /// No Agent was created; the draft and its staged settings are unchanged.
     NotCreated(AgentError),
-    /// The Create failed after the owner registered an Agent for it; nothing more is sent for it
+    /// The Create failed after the daemon registered an Agent for it; nothing more is sent for it
     /// until the user acknowledges `command_id`.
     RegisteredFailed {
         command_id: Uuid,
@@ -191,14 +191,14 @@ pub(super) enum DraftCreationError {
     Unapplied { chat: Uuid, error: AgentError },
     /// A staged choice's result is unknown; its receipt decides before anything else is sent.
     ChoiceUnknown { chat: Uuid, command_id: Uuid },
-    /// The owner refused a staged choice; no input reaches the Agent until the user cancels the
+    /// The daemon refused a staged choice; no input reaches the Agent until the user cancels the
     /// remaining choices.
     ChoiceRefused {
         chat: Uuid,
         command_id: Uuid,
         error: String,
     },
-    /// The owner created the Agent, but this View cannot attach to it yet; staged settings and the
+    /// The daemon created the Agent, but this View cannot attach to it yet; staged settings and the
     /// input wait for the next attempt, which never sends another Create.
     AttachUnavailable { chat: Uuid, error: AgentError },
     /// The first Create's acceptance is unknown; its receipt decides before anything is resent.
@@ -361,7 +361,7 @@ impl ConsoleExecution {
         launch: LaunchSpec,
         host: Option<HostLocation>,
     ) -> Self {
-        let epoch = client.owner_epoch();
+        let epoch = client.daemon_epoch();
         let view = ViewRef {
             session_id: client.session_id(),
             view_id: Uuid::new_v4(),
@@ -516,7 +516,7 @@ impl ConsoleExecution {
     #[cfg(test)]
     pub(super) fn from_embedded(core: runtime::Agent, model: ModelConfig) -> Self {
         let adapter = EmbeddedAgentAccess::new(core.clone());
-        let epoch = adapter.owner_epoch();
+        let epoch = adapter.daemon_epoch();
         let view = ViewRef {
             session_id: Uuid::new_v4(),
             view_id: Uuid::new_v4(),
@@ -533,11 +533,11 @@ impl ConsoleExecution {
     pub(super) fn access(&self) -> Arc<dyn AgentAccess> {
         self.inner.access.clone()
     }
-    pub(super) fn owner_epoch(&self) -> Uuid {
+    pub(super) fn daemon_epoch(&self) -> Uuid {
         self.inner
             .recovery
             .as_ref()
-            .map(RecoveringAgentClient::owner_epoch)
+            .map(RecoveringAgentClient::daemon_epoch)
             .unwrap_or(self.inner.epoch)
     }
     pub(super) fn host_location(&self) -> Option<HostLocation> {
@@ -757,7 +757,7 @@ impl ConsoleExecution {
             }
         }
         let command_id = command_id.unwrap_or_else(Uuid::new_v4);
-        let epoch = self.owner_epoch();
+        let epoch = self.daemon_epoch();
         let input_target = input_execution(&command);
         if let Some(execution) = input_target.or(match &command {
             AgentCommand::Configure { execution, .. } => Some(*execution),
@@ -797,7 +797,7 @@ impl ConsoleExecution {
             .inner
             .access
             .execute(CommandEnvelope {
-                owner_epoch: epoch,
+                daemon_epoch: epoch,
                 command_id,
                 command,
             })
@@ -1318,7 +1318,7 @@ impl ConsoleExecution {
     /// Creates the New Agent for its first input: one Create from the View's effective launch, then
     /// the staged process-local choices through the same Configure commands a visible Agent uses.
     /// Every command is proven by its reply or receipt before the next one is sent. A Create or a
-    /// choice whose reply is lost, a choice the owner refuses, and an Agent this View cannot attach
+    /// choice whose reply is lost, a choice the daemon refuses, and an Agent this View cannot attach
     /// to yet are all remembered with what remains: the next attempt reads receipts or attaches
     /// again, never sends a second Create or an unknown choice again, and no input reaches the
     /// Agent until every choice is applied or the user cancels the rest.
@@ -1381,7 +1381,7 @@ impl ConsoleExecution {
                 let replay = draft
                     .clone()
                     .into_first_create(self.effective_launch(), workdir);
-                let epoch = self.owner_epoch();
+                let epoch = self.daemon_epoch();
                 let command_id = Uuid::new_v4();
                 let outcome = self
                     .send_create(epoch, command_id, replay.launch.clone())
@@ -1453,7 +1453,7 @@ impl ConsoleExecution {
                     return Err(DraftCreationError::Unapplied { chat, error });
                 }
             };
-            let epoch = self.owner_epoch();
+            let epoch = self.daemon_epoch();
             let command_id = Uuid::new_v4();
             match self
                 .apply_replayed(chat, execution, epoch, command_id, change)
@@ -1490,7 +1490,7 @@ impl ConsoleExecution {
         }
         Ok(chat)
     }
-    /// An owner starts each Agent's worker with the launch model, but the in-process runtime gives
+    /// The daemon starts each Agent's worker with the launch model, but the in-process runtime gives
     /// every Agent its own model. There the launch model precedes staged model and effort choices,
     /// after execution mode, directories and rules have been replayed.
     fn apply_launch_model_in_process(&self, chat: Uuid, replay: &mut FirstCreate) {
@@ -2587,7 +2587,7 @@ impl ConsoleExecution {
             .inner
             .access
             .execute(CommandEnvelope {
-                owner_epoch: self.owner_epoch(),
+                daemon_epoch: self.daemon_epoch(),
                 command_id: Uuid::new_v4(),
                 command: AgentCommand::Configure {
                     execution,
@@ -3649,7 +3649,7 @@ impl ConsoleExecution {
 }
 
 fn unexpected() -> AgentError {
-    AgentError::Invalid("Agent owner returned an unexpected typed result".into())
+    AgentError::Invalid("Agent daemon returned an unexpected typed result".into())
 }
 fn agent_error(error: AccessError) -> AgentError {
     match error.code {
@@ -3687,7 +3687,7 @@ mod tests {
         )]));
         let runtime = runtime::Agent::new_embedded(support::config(), model.clone());
         let access = Arc::new(EmbeddedAgentAccess::new(runtime.clone()));
-        let epoch = access.owner_epoch();
+        let epoch = access.daemon_epoch();
         let terminal = ConsoleExecution::from_access_for_test(
             access.clone(),
             epoch,
@@ -3707,7 +3707,7 @@ mod tests {
         assert!(elapsed.elapsed() >= std::time::Duration::from_secs(VIEW_LEASE_SECONDS + 1));
         let rejected = access
             .execute(CommandEnvelope {
-                owner_epoch: epoch,
+                daemon_epoch: epoch,
                 command_id: Uuid::new_v4(),
                 command: AgentCommand::Submit {
                     execution,
@@ -3752,7 +3752,7 @@ mod tests {
             old_source.display_version + 1
         );
         assert_eq!(terminal.reference(chat).await.unwrap(), execution);
-        assert_eq!(terminal.owner_epoch(), epoch);
+        assert_eq!(terminal.daemon_epoch(), epoch);
         assert_eq!(accepted.chat_id, chat);
         assert_eq!(model.requests.lock().unwrap().len(), 1);
         let snapshot = runtime.snapshot(chat).await.unwrap();
@@ -3876,7 +3876,7 @@ mod tests {
             .install_host_tools(Arc::new(ReadInteractionSource))
             .unwrap();
         let access = Arc::new(EmbeddedAgentAccess::new(runtime.clone()));
-        let epoch = access.owner_epoch();
+        let epoch = access.daemon_epoch();
         let metadata = std::fs::symlink_metadata(&socket).unwrap();
         let mut launch = LaunchSpec::embedded(directory.path().into());
         launch.host_work_context = Some(HostWorkContext {
@@ -3961,7 +3961,7 @@ mod tests {
         )]));
         let runtime = runtime::Agent::new_embedded(support::config(), model.clone());
         let access = Arc::new(EmbeddedAgentAccess::new(runtime.clone()));
-        let epoch = access.owner_epoch();
+        let epoch = access.daemon_epoch();
         let server = tokio::spawn(async move {
             serve_listener(listener, access, epoch, TRANSPORT_LIMITS)
                 .await
@@ -4039,13 +4039,13 @@ mod tests {
             Arc::new(support::ScriptedModel::new(vec![])),
         );
         let actual = EmbeddedAgentAccess::new(runtime.clone());
-        let epoch = actual.owner_epoch();
+        let epoch = actual.daemon_epoch();
         let view = || ViewRef {
             session_id: Uuid::new_v4(),
             view_id: Uuid::new_v4(),
         };
         let create = |workdir: PathBuf| CommandEnvelope {
-            owner_epoch: epoch,
+            daemon_epoch: epoch,
             command_id: Uuid::new_v4(),
             command: AgentCommand::Create {
                 launch: LaunchSpec::embedded(workdir),
@@ -4104,7 +4104,7 @@ mod tests {
         commands: Mutex<Vec<AgentCommand>>,
         refuse_create: std::sync::atomic::AtomicBool,
         refuse_execution_mode: std::sync::atomic::AtomicBool,
-        /// Agent observations fail, as when the owner accepted work but this View cannot attach.
+        /// Agent observations fail, as when the daemon accepted work but this View cannot attach.
         refuse_agent_observation: std::sync::atomic::AtomicBool,
         /// Create and input commands run, but their replies are lost.
         lose_replies: std::sync::atomic::AtomicBool,
@@ -4117,7 +4117,7 @@ mod tests {
         fail_after_register: std::sync::atomic::AtomicBool,
     }
 
-    /// Turns a completed Create receipt into the owner's failed-after-registration receipt.
+    /// Turns a completed Create receipt into the daemon's failed-after-registration receipt.
     fn failed_after_register(receipt: &mut CommandReceipt) {
         if let Some(CommandResult::Created { execution, .. }) = &receipt.result {
             receipt.target = Some(*execution);
@@ -4176,10 +4176,10 @@ mod tests {
             if matches!(&command.command, AgentCommand::Create { .. }) && flag(&self.refuse_create)
             {
                 return Err(AccessError::unavailable(
-                    "fixture owner refuses this command",
+                    "fixture daemon refuses this command",
                 ));
             }
-            // The owner refuses a change it cannot apply with a Failed receipt, kept under the
+            // The daemon refuses a change it cannot apply with a Failed receipt, kept under the
             // same command id; an unusable directory stands in for the refused mode.
             if let AgentCommand::Configure { change, .. } = &mut command.command
                 && matches!(change, ConfigurationChange::ExecutionMode { .. })
@@ -4225,7 +4225,7 @@ mod tests {
             Arc::new(support::ScriptedModel::new(vec![])),
         );
         let actual = EmbeddedAgentAccess::new(runtime.clone());
-        let epoch = actual.owner_epoch();
+        let epoch = actual.daemon_epoch();
         let access = Arc::new(Recording {
             actual,
             commands: Mutex::default(),
@@ -4506,7 +4506,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_owner_that_refuses_creation_leaves_the_new_agent_draft_unchanged() {
+    async fn a_daemon_that_refuses_creation_leaves_the_new_agent_draft_unchanged() {
         let directory = tempfile::tempdir().unwrap();
         let (runtime, access, terminal) = recording_terminal(directory.path());
         terminal
@@ -5046,7 +5046,7 @@ mod tests {
         assert_eq!(saved(&settings), vec![first.id, elsewhere.id]);
         assert!(
             access.commands().is_empty() && runtime.list_chats().await.is_empty(),
-            "nothing reaches an owner before the first input"
+            "nothing reaches the daemon before the first input"
         );
 
         let Ok(chat) = terminal.create_from_draft(directory.path().into()).await else {

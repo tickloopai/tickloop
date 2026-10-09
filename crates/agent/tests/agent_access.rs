@@ -28,7 +28,7 @@ async fn embedded_caller_can_answer_the_original_request_and_observe_the_result(
     let access = EmbeddedAgentAccess::new(runtime.clone());
     let created = access
         .execute(CommandEnvelope {
-            owner_epoch: access.owner_epoch(),
+            daemon_epoch: access.daemon_epoch(),
             command_id: Uuid::new_v4(),
             command: AgentCommand::Create {
                 launch: LaunchSpec::embedded(PathBuf::from(directory.path())),
@@ -80,7 +80,7 @@ async fn embedded_caller_can_answer_the_original_request_and_observe_the_result(
     .unwrap();
     access
         .execute(CommandEnvelope {
-            owner_epoch: access.owner_epoch(),
+            daemon_epoch: access.daemon_epoch(),
             command_id: Uuid::new_v4(),
             command: AgentCommand::AnswerQuestion {
                 request,
@@ -148,7 +148,7 @@ async fn failed_question_validation_advances_the_version_and_only_one_answer_win
     let access = EmbeddedAgentAccess::new(runtime.clone());
     let created = access
         .execute(CommandEnvelope {
-            owner_epoch: access.owner_epoch(),
+            daemon_epoch: access.daemon_epoch(),
             command_id: Uuid::new_v4(),
             command: AgentCommand::Create {
                 launch: LaunchSpec::embedded(temporary.path().to_path_buf()),
@@ -179,7 +179,7 @@ async fn failed_question_validation_advances_the_version_and_only_one_answer_win
     .unwrap();
     let failed = access
         .execute(CommandEnvelope {
-            owner_epoch: access.owner_epoch(),
+            daemon_epoch: access.daemon_epoch(),
             command_id: Uuid::new_v4(),
             command: AgentCommand::AnswerQuestion {
                 request,
@@ -204,7 +204,7 @@ async fn failed_question_validation_advances_the_version_and_only_one_answer_win
     assert_eq!(wire.request_refs[0], updated);
     let stale = access
         .execute(CommandEnvelope {
-            owner_epoch: access.owner_epoch(),
+            daemon_epoch: access.daemon_epoch(),
             command_id: Uuid::new_v4(),
             command: AgentCommand::AnswerQuestion {
                 request,
@@ -215,7 +215,7 @@ async fn failed_question_validation_advances_the_version_and_only_one_answer_win
         .unwrap();
     assert_eq!(stale.error.unwrap().code, AccessErrorCode::VersionConflict);
     let command = |label: &str| CommandEnvelope {
-        owner_epoch: access.owner_epoch(),
+        daemon_epoch: access.daemon_epoch(),
         command_id: Uuid::new_v4(),
         command: AgentCommand::AnswerQuestion {
             request: updated,
@@ -264,7 +264,7 @@ async fn after_turn_failures_are_observable_and_do_not_block_the_next_queued_act
     let access = EmbeddedAgentAccess::new(runtime.clone());
     let created = access
         .execute(CommandEnvelope {
-            owner_epoch: access.owner_epoch(),
+            daemon_epoch: access.daemon_epoch(),
             command_id: Uuid::new_v4(),
             command: AgentCommand::Create {
                 launch: LaunchSpec::embedded(temporary.path().to_path_buf()),
@@ -281,7 +281,7 @@ async fn after_turn_failures_are_observable_and_do_not_block_the_next_queued_act
     };
     let queued = access
         .execute(CommandEnvelope {
-            owner_epoch: access.owner_epoch(),
+            daemon_epoch: access.daemon_epoch(),
             command_id: Uuid::new_v4(),
             command: AgentCommand::EnqueueAfterTurn {
                 execution,
@@ -326,7 +326,7 @@ async fn after_turn_failures_are_observable_and_do_not_block_the_next_queued_act
     .unwrap();
     access
         .execute(CommandEnvelope {
-            owner_epoch: access.owner_epoch(),
+            daemon_epoch: access.daemon_epoch(),
             command_id: Uuid::new_v4(),
             command: AgentCommand::EnqueueAfterTurn {
                 execution,
@@ -368,7 +368,7 @@ async fn a_permission_storage_failure_preserves_the_request_for_an_explicit_retr
     let access = EmbeddedAgentAccess::new(runtime.clone());
     let created = access
         .execute(CommandEnvelope {
-            owner_epoch: access.owner_epoch(),
+            daemon_epoch: access.daemon_epoch(),
             command_id: Uuid::new_v4(),
             command: AgentCommand::Create {
                 launch: LaunchSpec::embedded(temporary.path().to_path_buf()),
@@ -405,7 +405,7 @@ async fn a_permission_storage_failure_preserves_the_request_for_an_explicit_retr
     std::fs::create_dir(root.join("settings.json")).unwrap();
     let failed = access
         .execute(CommandEnvelope {
-            owner_epoch: access.owner_epoch(),
+            daemon_epoch: access.daemon_epoch(),
             command_id: Uuid::new_v4(),
             command: AgentCommand::DecidePermission {
                 request,
@@ -424,7 +424,7 @@ async fn a_permission_storage_failure_preserves_the_request_for_an_explicit_retr
     std::fs::remove_dir(root.join("settings.json")).unwrap();
     access
         .execute(CommandEnvelope {
-            owner_epoch: access.owner_epoch(),
+            daemon_epoch: access.daemon_epoch(),
             command_id: Uuid::new_v4(),
             command: AgentCommand::DecidePermission {
                 request: retry,
@@ -458,7 +458,7 @@ async fn large_execution_output_arrives_in_bounded_updates_without_resync() {
     let access = EmbeddedAgentAccess::new(runtime.clone());
     let created = access
         .execute(CommandEnvelope {
-            owner_epoch: access.owner_epoch(),
+            daemon_epoch: access.daemon_epoch(),
             command_id: Uuid::new_v4(),
             command: AgentCommand::Create {
                 launch: LaunchSpec::embedded(temporary.path().to_path_buf()),
@@ -483,7 +483,7 @@ async fn large_execution_output_arrives_in_bounded_updates_without_resync() {
         .unwrap();
     access
         .execute(CommandEnvelope {
-            owner_epoch: access.owner_epoch(),
+            daemon_epoch: access.daemon_epoch(),
             command_id: Uuid::new_v4(),
             command: AgentCommand::Submit {
                 execution,
@@ -551,7 +551,7 @@ async fn embedded_directory_observation_reports_a_new_execution_after_its_snapsh
     );
     let created = access
         .execute(CommandEnvelope {
-            owner_epoch: access.owner_epoch(),
+            daemon_epoch: access.daemon_epoch(),
             command_id: Uuid::new_v4(),
             command: AgentCommand::Create {
                 launch: LaunchSpec::embedded(temporary.path().to_path_buf()),
@@ -607,7 +607,7 @@ async fn overview_title_fallback_uses_short_task_or_shell_text_before_generation
     ] {
         let created = access
             .execute(CommandEnvelope {
-                owner_epoch: access.owner_epoch(),
+                daemon_epoch: access.daemon_epoch(),
                 command_id: Uuid::new_v4(),
                 command: AgentCommand::Create {
                     launch: LaunchSpec::embedded(temporary.path().to_path_buf()),
@@ -658,7 +658,7 @@ async fn creating_with_an_unknown_skill_rejects_without_registering_an_empty_age
     );
     let access = EmbeddedAgentAccess::new(runtime.clone());
     let create = |name: &str| CommandEnvelope {
-        owner_epoch: access.owner_epoch(),
+        daemon_epoch: access.daemon_epoch(),
         command_id: Uuid::new_v4(),
         command: AgentCommand::Create {
             launch: LaunchSpec::embedded(PathBuf::from(directory.path())),
@@ -714,7 +714,7 @@ async fn embedded_artifact_commands_add_list_and_remove_from_the_selected_chat()
     );
     let access = EmbeddedAgentAccess::new(runtime.clone());
     let envelope = |command| CommandEnvelope {
-        owner_epoch: access.owner_epoch(),
+        daemon_epoch: access.daemon_epoch(),
         command_id: Uuid::new_v4(),
         command,
     };
@@ -781,7 +781,7 @@ async fn embedded_monitor_commands_add_and_remove_members_of_the_selected_chat()
     );
     let access = EmbeddedAgentAccess::new(runtime.clone());
     let envelope = |command| CommandEnvelope {
-        owner_epoch: access.owner_epoch(),
+        daemon_epoch: access.daemon_epoch(),
         command_id: Uuid::new_v4(),
         command,
     };

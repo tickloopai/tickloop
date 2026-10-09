@@ -90,7 +90,7 @@ async fn hidden_finished_children_remain_addressable_by_handle_and_reappear_on_m
     let access = Arc::new(EmbeddedAgentAccess::new(core.clone()));
     let created = access
         .execute(CommandEnvelope {
-            owner_epoch: access.owner_epoch(),
+            daemon_epoch: access.daemon_epoch(),
             command_id: Uuid::new_v4(),
             command: AgentCommand::Create {
                 launch: LaunchSpec::embedded(directory.path().into()),
@@ -140,7 +140,7 @@ async fn hidden_finished_children_remain_addressable_by_handle_and_reappear_on_m
     let injected = clock.clone();
     let mut view = AgentConsole::new(
         access.clone(),
-        access.owner_epoch(),
+        access.daemon_epoch(),
         directory.path().into(),
         None,
     )
@@ -1001,7 +1001,7 @@ async fn stopped_parent_does_not_resume_from_child_messages_or_eventual_results(
 }
 
 #[tokio::test]
-async fn restarting_the_owner_loads_origin_metadata_without_replaying_messages_or_starting_models()
+async fn restarting_the_daemon_loads_origin_metadata_without_replaying_messages_or_starting_models()
 {
     let directory = tempfile::tempdir().unwrap();
     let store = directory.path().join("state");
@@ -1240,7 +1240,7 @@ async fn leaving_and_reattaching_a_view_keeps_the_live_parent_child_round_trip()
     let access = EmbeddedAgentAccess::new(agent.clone());
     let create = access
         .execute(CommandEnvelope {
-            owner_epoch: access.owner_epoch(),
+            daemon_epoch: access.daemon_epoch(),
             command_id: uuid::Uuid::new_v4(),
             command: AgentCommand::Create {
                 launch: LaunchSpec::embedded(directory.path().into()),
@@ -1269,7 +1269,7 @@ async fn leaving_and_reattaching_a_view_keeps_the_live_parent_child_round_trip()
     let mut events = agent.subscribe();
     let submit = access
         .execute(CommandEnvelope {
-            owner_epoch: access.owner_epoch(),
+            daemon_epoch: access.daemon_epoch(),
             command_id: uuid::Uuid::new_v4(),
             command: AgentCommand::Submit {
                 execution,
@@ -1706,7 +1706,7 @@ async fn literal_agent_protocol_overview_uses_metadata_to_distinguish_human_text
     let access = EmbeddedAgentAccess::new(agent.clone());
     let created = access
         .execute(CommandEnvelope {
-            owner_epoch: access.owner_epoch(),
+            daemon_epoch: access.daemon_epoch(),
             command_id: uuid::Uuid::new_v4(),
             command: AgentCommand::Create {
                 launch: LaunchSpec::embedded(directory.path().into()),
@@ -2100,7 +2100,7 @@ impl tickloop_agent::runtime::StoppedChildHook for RecordingStopHook {
 
 #[tokio::test]
 async fn stop_subagent_tells_its_hook_which_direct_child_stopped_and_reports_a_failed_end() {
-    for answer in [Ok(()), Err("the Agent owner did not answer".to_owned())] {
+    for answer in [Ok(()), Err("the Agent daemon did not answer".to_owned())] {
         let directory = tempfile::tempdir().unwrap();
         let model = Arc::new(RoutedModel::new(|request| {
             if !state(request)["delegation"].is_null() {
@@ -2241,7 +2241,7 @@ async fn authenticated_family_input_is_genuine_human_and_never_turns_the_source_
     let access = EmbeddedAgentAccess::new(core.clone());
     let created = access
         .execute(CommandEnvelope {
-            owner_epoch: access.owner_epoch(),
+            daemon_epoch: access.daemon_epoch(),
             command_id: Uuid::new_v4(),
             command: AgentCommand::Create {
                 launch: LaunchSpec::embedded(directory.path().into()),
@@ -2326,7 +2326,7 @@ async fn authenticated_family_input_is_genuine_human_and_never_turns_the_source_
     let command: AgentCommand = serde_json::from_value(json!({"kind":"send_family_input","source_execution":source,"target_execution":target,"target_loop":child_before.loops[0].id,"origin":origin,"input":{"kind":"text","text":"@audit 你好","contexts":[],"paths":[]}})).expect("business4 directed input command");
     let command_id = Uuid::new_v4();
     let envelope = CommandEnvelope {
-        owner_epoch: access.owner_epoch(),
+        daemon_epoch: access.daemon_epoch(),
         command_id,
         command: command.clone(),
     };
@@ -2402,7 +2402,7 @@ async fn authenticated_family_input_is_genuine_human_and_never_turns_the_source_
     assert!(
         access
             .execute(CommandEnvelope {
-                owner_epoch: access.owner_epoch(),
+                daemon_epoch: access.daemon_epoch(),
                 command_id: Uuid::new_v4(),
                 command: stale_source
             })
@@ -2421,7 +2421,7 @@ async fn authenticated_family_input_is_genuine_human_and_never_turns_the_source_
     assert!(
         access
             .execute(CommandEnvelope {
-                owner_epoch: access.owner_epoch(),
+                daemon_epoch: access.daemon_epoch(),
                 command_id: Uuid::new_v4(),
                 command: wrong_family
             })
@@ -2561,7 +2561,7 @@ impl DirectedFixture {
             ..
         } = access
             .execute(CommandEnvelope {
-                owner_epoch: access.owner_epoch(),
+                daemon_epoch: access.daemon_epoch(),
                 command_id: Uuid::new_v4(),
                 command: AgentCommand::Create {
                     launch: LaunchSpec::embedded(directory.path().into()),
@@ -2638,7 +2638,7 @@ impl DirectedFixture {
         use tickloop_agent::agent_access::*;
         self.access
             .execute(CommandEnvelope {
-                owner_epoch: self.access.owner_epoch(),
+                daemon_epoch: self.access.daemon_epoch(),
                 command_id: Uuid::new_v4(),
                 command: AgentCommand::SendFamilyInput {
                     source_execution: self.root,
@@ -2766,7 +2766,7 @@ async fn family_human_main_input_uses_normal_multiple_loop_semantics_instead_of_
     let result = fixture
         .access
         .execute(CommandEnvelope {
-            owner_epoch: fixture.access.owner_epoch(),
+            daemon_epoch: fixture.access.daemon_epoch(),
             command_id: Uuid::new_v4(),
             command: AgentCommand::SendFamilyInput {
                 source_execution: fixture.child,
@@ -2865,7 +2865,7 @@ async fn directed_human_body_preserves_whitespace_after_the_routing_separator() 
     let sent = fixture
         .access
         .execute(CommandEnvelope {
-            owner_epoch: fixture.access.owner_epoch(),
+            daemon_epoch: fixture.access.daemon_epoch(),
             command_id: Uuid::new_v4(),
             command: AgentCommand::SendFamilyInput {
                 source_execution: fixture.root,

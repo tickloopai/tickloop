@@ -1,10 +1,10 @@
 //! Configuration chosen on the New Agent screen before its first submit.
 //!
-//! The draft never reaches the Agent owner. The first submit creates the Agent from `launch`, then
+//! The draft never reaches the Agent daemon. The first submit creates the Agent from `launch`, then
 //! `ConsoleExecution` previews choices and saves user defaults locally, then replays staged
-//! choices through the same Configure commands a visible Agent uses. The owner validates them
+//! choices through the same Configure commands a visible Agent uses. The daemon validates them
 //! again against the created Agent. Only fields and commands
-//! that protocol 1.1 already carries are used: an owner that does not understand a staged change
+//! that protocol 1.1 already carries are used: a daemon that does not understand a staged change
 //! cannot exist, so none can be silently dropped.
 
 use std::path::PathBuf;
@@ -23,7 +23,7 @@ use super::completion::CHILD_AUTHORIZATION_FIXED;
 /// Which configuration a settings menu or command shows and changes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ConfigTarget {
-    /// The visible Agent, root or child; its owner validates scope and ceilings.
+    /// The visible Agent, root or child; its daemon validates scope and ceilings.
     Agent(Uuid),
     /// The New Agent screen, before its first submit creates the Agent.
     NewDraft,
@@ -51,7 +51,7 @@ pub(super) struct AgentConfiguration {
     pub(super) thinking_enabled: bool,
     pub(super) execution_mode: ExecutionMode,
     pub(super) additional_directories: Vec<PathBuf>,
-    /// The owner's delegation fact for this Agent, never inferred from the visible tree.
+    /// The daemon's delegation fact for this Agent, never inferred from the visible tree.
     pub(super) delegated: bool,
 }
 
@@ -68,7 +68,7 @@ impl AgentConfiguration {
         }
     }
 
-    /// Why `change` cannot apply to this Agent, known before anything is sent. The owner still
+    /// Why `change` cannot apply to this Agent, known before anything is sent. The daemon still
     /// validates every change it receives; model, effort, Thinking, context window and search stay
     /// available to a child.
     pub(super) fn unavailable_change(&self, change: &ConfigurationChange) -> Option<&'static str> {
@@ -121,7 +121,7 @@ impl FirstCreate {
         self.changes.first().cloned().map(ReplayStep::Change)
     }
 
-    /// Drops the step `next_step` returned once the owner proves it applied.
+    /// Drops the step `next_step` returned once the daemon proves it applied.
     pub(super) fn complete_step(&mut self) {
         if self.execution_mode.take().is_some() {
             return;

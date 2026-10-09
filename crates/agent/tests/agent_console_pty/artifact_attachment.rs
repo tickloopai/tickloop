@@ -128,12 +128,12 @@ async fn actual_cli_creation_adds_an_artifact_tick_before_the_next_model_reply()
         pty.close().await;
     }).catch_unwind().await;
     let stopped = std::process::Command::new(env!("CARGO_BIN_EXE_tickloop"))
-        .args(["service", "stop"])
+        .args(["daemon", "stop"])
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env("HOME", fixture.path("home"))
         .env("TICKLOOP_CONFIG_DIR", fixture.path("config"))
-        .env("TICKLOOP_AGENT_RUNTIME_DIR", fixture.path("runtime"))
+        .env("TICKLOOP_DAEMON_RUNTIME_DIR", fixture.path("runtime"))
         .output()
         .unwrap();
     fixture.shutdown().await;

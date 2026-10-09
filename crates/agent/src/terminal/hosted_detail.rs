@@ -194,7 +194,7 @@ mod tests {
         assert!(text(&mut detail).contains("Screen    loading…"));
         assert_eq!(detail.hint(), "r refresh · Esc back");
         detail.show(Ok(HostedSnapshot {
-            screen: tick_host::screen::ScreenSnapshot {
+            screen: tickhost::screen::ScreenSnapshot {
                 lines: vec!["newest".into()],
                 truncated: true,
                 rows: 30,

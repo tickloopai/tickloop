@@ -1,6 +1,6 @@
 //! The native Tick tools a worker installs. Each call is routed by its target alone, before any
 //! host resolves it: Workspace discovery, `herdr:` instances and explicit placements go to the
-//! Herdr backend, while hidden opens and `hosted:` instances go to the Tick host backend. Every
+//! Herdr backend, while hidden opens and `hosted:` instances go to the Tickhost backend. Every
 //! call runs under the authority of the backend it was routed to; artifact and Shell references
 //! go to their native tools instead.
 
@@ -27,7 +27,7 @@ pub const READ_WORKSPACE: &str = "ReadWorkspace";
 pub const READ_TICK: &str = "ReadTick";
 pub const CALL_TICK_TOOL: &str = "CallTickTool";
 pub const MODIFY_TICK: &str = "ModifyTick";
-/// The open placement that runs a Tick hidden in the Tick host. An open without a placement
+/// The open placement that runs a Tick hidden in the Tickhost. An open without a placement
 /// means the same.
 pub const HIDDEN_PLACEMENT: &str = "hidden";
 const HERDR_TYPE: &str = "herdr";
@@ -113,7 +113,7 @@ impl TickBackends {
                 Some("reopen") => match self.target(name, input)? {
                     TickBackend::Hosted => TickBackend::Hosted,
                     TickBackend::Herdr => {
-                        return Err("UnsupportedCapability: reopen starts a new hosted instance in place of one lost with its Tick host; a Herdr Pane is never reopened".into());
+                        return Err("UnsupportedCapability: reopen starts a new hosted instance in place of one lost with its Tickhost; a Herdr Pane is never reopened".into());
                     }
                 },
                 _ => {
@@ -128,13 +128,13 @@ impl TickBackends {
             TickBackend::Herdr if !self.herdr => Err(format!(
                 "UnsupportedCapability: this Agent does not run in Herdr, so Workspaces, herdr: instances and visible Panes are unavailable{}",
                 if self.hosted {
-                    "; omit placement to open the Tick hidden in the Tick host"
+                    "; omit placement to open the Tick hidden in the Tickhost"
                 } else {
                     ""
                 }
             )),
             TickBackend::Hosted if !self.hosted => Err(format!(
-                "UnsupportedCapability: this Agent has no Tick host, so hidden opens and hosted: instances are unavailable{}",
+                "UnsupportedCapability: this Agent has no Tickhost, so hidden opens and hosted: instances are unavailable{}",
                 if self.herdr {
                     "; pass an explicit placement to open a visible Herdr Pane"
                 } else {
@@ -173,10 +173,10 @@ impl TickBackends {
         }
         let identity = match (self.herdr, self.hosted) {
             (true, true) => {
-                "its complete instance identity: hosted:<id> for a Tick this Chat opened hidden in the Tick host, or herdr:<id> for a Herdr program from ReadWorkspace"
+                "its complete instance identity: hosted:<id> for a Tick this Chat opened hidden in the Tickhost, or herdr:<id> for a Herdr program from ReadWorkspace"
             }
             (false, true) => {
-                "its complete hosted: instance identity, for a Tick this Chat opened hidden in the Tick host"
+                "its complete hosted: instance identity, for a Tick this Chat opened hidden in the Tickhost"
             }
             _ => "the complete herdr: instance identity of a Herdr program from ReadWorkspace",
         };
@@ -218,25 +218,25 @@ impl TickBackends {
     fn modify_description(self) -> String {
         let mut parts = Vec::new();
         if self.hosted {
-            parts.push("open runs a protocol Tick hidden in the Tick host when placement is omitted or {\"type\":\"hidden\"}: it keeps running without any View or layout, joins this Chat's Monitor, and is not subscribed.");
+            parts.push("open runs a protocol Tick hidden in the Tickhost when placement is omitted or {\"type\":\"hidden\"}: it keeps running without any View or layout, joins this Chat's Monitor, and is not subscribed.");
         }
         if self.herdr {
             parts.push(if self.hosted {
                 "An explicit placement opens a visible Herdr Pane instead: current_tab places relative to the View captured for this input, which must still be valid; pane places relative to the named Pane in the selected Workspace; new_tab opens a new Tab."
             } else {
-                "open needs an explicit placement and opens a visible Herdr Pane, since this Agent has no Tick host for hidden Ticks: current_tab places relative to the View captured for this input, which must still be valid; pane places relative to the named Pane in the selected Workspace; new_tab opens a new Tab."
+                "open needs an explicit placement and opens a visible Herdr Pane, since this Agent has no Tickhost for hidden Ticks: current_tab places relative to the View captured for this input, which must still be valid; pane places relative to the named Pane in the selected Workspace; new_tab opens a new Tab."
             });
             parts.push("Explicit Pane targets and new_tab work without an Agent View. Direction accepts left, right, up, or down and defaults to right. Placement is frozen before approval and never follows UI focus. move keeps a herdr: instance and its subscriptions and defaults to current_tab; for an explicit relative direction, invoke move even when the Tick is already in the target Tab. send_input types into a herdr: Pane and is checked before sending, without an atomic identity/send guarantee.");
         }
         parts.push(match (self.herdr, self.hosted) {
-            (true, true) => "close ends the Tick's process: a hosted: Tick in the Tick host, or the herdr: Pane in Herdr.",
+            (true, true) => "close ends the Tick's process: a hosted: Tick in the Tickhost, or the herdr: Pane in Herdr.",
             (false, true) => "close ends the hosted Tick's process.",
             _ => "close ends the herdr: Pane's program.",
         });
         if self.hosted {
-            parts.push("reopen starts a new hosted instance from the recorded program of one lost with its Tick host; it needs approval again, gets a new identity, and no subscription follows it.");
+            parts.push("reopen starts a new hosted instance from the recorded program of one lost with its Tickhost; it needs approval again, gets a new identity, and no subscription follows it.");
         }
-        parts.push("Omitted cwd uses the Agent file work directory; for command[0]='tick', prefer the bundled sibling executable, then PATH. Results report only verified facts: the instance, whether it runs hidden in the Tick host or visible in a Herdr Pane, and its host and location. Use the tickloop Skill for guidance.");
+        parts.push("Omitted cwd uses the Agent file work directory; for command[0]='tick', prefer the bundled sibling executable, then PATH. Results report only verified facts: the instance, whether it runs hidden in the Tickhost or visible in a Herdr Pane, and its host and location. Use the tickloop Skill for guidance.");
         parts.join(" ")
     }
 
@@ -281,7 +281,7 @@ fn herdr_placements(allow_new_tab: bool) -> Vec<Value> {
 }
 
 /// The native Tick tools of a worker: its Herdr backend when it runs in a Herdr View, and its
-/// Tick host backend when its owner granted one.
+/// Tickhost backend when its daemon granted one.
 pub struct TickToolRouter {
     herdr: Option<Arc<NativeHostToolProvider>>,
     hosted: Option<Arc<HostedTickTools>>,
@@ -342,7 +342,7 @@ impl HostToolProvider for TickToolRouter {
             .and_then(|herdr| herdr.workspace_host_context())
             .unwrap_or_else(WorkspaceHostContext::from_environment);
         Some(if self.hosted.is_some() {
-            context.with_tick_host()
+            context.with_tickhost()
         } else {
             context
         })

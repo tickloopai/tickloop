@@ -73,16 +73,16 @@ enum Notice {
     },
 }
 
-/// Stands in for the Agent owner: records what it is told and whether the Transcript was still
+/// Stands in for the Agent daemon: records what it is told and whether the Transcript was still
 /// there at that moment; refuses deletions while `is_unavailable`.
 #[derive(Default)]
-struct OwnerNotices {
+struct DaemonNotices {
     root: PathBuf,
     is_unavailable: bool,
     notices: Mutex<Vec<Notice>>,
 }
 
-impl OwnerNotices {
+impl DaemonNotices {
     fn of(root: &Path) -> Self {
         Self {
             root: root.into(),
@@ -102,10 +102,10 @@ impl OwnerNotices {
     }
 }
 
-impl ChatDeletionNotice for OwnerNotices {
+impl ChatDeletionNotice for DaemonNotices {
     fn begin(&self, chat: Uuid) -> Result<Uuid, String> {
         if self.is_unavailable {
-            return Err("the Agent owner did not answer".into());
+            return Err("the Agent daemon did not answer".into());
         }
         let transcript_present = self.transcript_present(chat);
         self.notices.lock().unwrap().push(Notice::Begin {
@@ -125,7 +125,7 @@ impl ChatDeletionNotice for OwnerNotices {
 }
 
 fn cleanup(root: &Path) -> CleanupOutcome {
-    cleanup_old_message_files_in_background(root, &OwnerNotices::of(root))
+    cleanup_old_message_files_in_background(root, &DaemonNotices::of(root))
 }
 
 fn completed(outcome: CleanupOutcome) -> tickloop_agent::cleanup::CleanupResult {
@@ -135,11 +135,11 @@ fn completed(outcome: CleanupOutcome) -> tickloop_agent::cleanup::CleanupResult 
     }
 }
 
-/// Removing a whole Transcript ends its Chat, so the owner hears of it while the Transcript is
+/// Removing a whole Transcript ends its Chat, so the daemon hears of it while the Transcript is
 /// still there and again after the unlink; nothing else a cleanup removes is announced. Without
-/// the owner's answer the Transcript stays.
+/// the daemon's answer the Transcript stays.
 #[test]
-fn the_owner_hears_of_each_removed_transcript_before_and_after_the_unlink() {
+fn the_daemon_hears_of_each_removed_transcript_before_and_after_the_unlink() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path();
     let project = root.join("projects/-work");
@@ -179,8 +179,8 @@ fn the_owner_hears_of_each_removed_transcript_before_and_after_the_unlink() {
     std::fs::set_permissions(&locked_project, std::fs::Permissions::from_mode(0o500)).unwrap();
     std::fs::rename(&refused, root.join("held.jsonl")).unwrap();
 
-    let owner = OwnerNotices::of(root);
-    let result = completed(cleanup_old_message_files_in_background(root, &owner));
+    let daemon = DaemonNotices::of(root);
+    let result = completed(cleanup_old_message_files_in_background(root, &daemon));
     std::fs::set_permissions(&locked_project, std::fs::Permissions::from_mode(0o700)).unwrap();
 
     assert!(!exists(&expired) && exists(&recent) && !exists(&old_tool_result));
@@ -191,7 +191,7 @@ fn the_owner_hears_of_each_removed_transcript_before_and_after_the_unlink() {
     assert!(!exists(&expired_watermark) && exists(&recent_watermark));
     assert!(exists(&unlink_fails));
     assert_eq!(result.errors, 1, "the failed unlink is reported");
-    let mut notices = owner.taken();
+    let mut notices = daemon.taken();
     notices.sort_by_key(|notice| format!("{notice:?}"));
     let mut expected = vec![
         Notice::Begin {
@@ -215,9 +215,9 @@ fn the_owner_hears_of_each_removed_transcript_before_and_after_the_unlink() {
     assert_eq!(notices, expected);
 
     std::fs::rename(root.join("held.jsonl"), &refused).unwrap();
-    let unavailable = OwnerNotices {
+    let unavailable = DaemonNotices {
         is_unavailable: true,
-        ..OwnerNotices::of(root)
+        ..DaemonNotices::of(root)
     };
     let result = completed(cleanup_old_message_files_in_background(root, &unavailable));
     assert!(
@@ -526,7 +526,7 @@ async fn recent_user_input_defers_background_cleanup() {
     let housekeeping = start_background_housekeeping(
         root.clone(),
         activity.clone(),
-        Arc::new(OwnerNotices::of(&root)),
+        Arc::new(DaemonNotices::of(&root)),
     );
     let delay = SLOW_HOUSEKEEPING_DELAY;
     // 先让后台任务开始计时，再推进时钟。
@@ -565,7 +565,7 @@ async fn interactive_housekeeping_starts_counting_at_the_first_submitted_prompt(
     let mut schedule = HousekeepingSchedule::new(
         root.clone(),
         UserActivity::default(),
-        Arc::new(OwnerNotices::of(&root)),
+        Arc::new(DaemonNotices::of(&root)),
     );
     let delay = SLOW_HOUSEKEEPING_DELAY;
     settle().await;

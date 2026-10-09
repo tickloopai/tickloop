@@ -43,7 +43,7 @@ fn startup_status_pty_fixture() {
                 launch.session_persistence = false;
                 let agent = Agent::from_access_for_test(
                     access.clone(),
-                    access.owner_epoch(),
+                    access.daemon_epoch(),
                     ViewRef {
                         session_id: Uuid::new_v4(),
                         view_id: Uuid::new_v4(),

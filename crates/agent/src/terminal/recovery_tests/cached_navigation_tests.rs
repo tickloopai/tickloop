@@ -15,7 +15,7 @@ const RESTORE_ROUTE: &str = "restore";
 const DISPLAY_ROUTE: &str = "display";
 
 struct RejectedNavigationAccess {
-    owner: EmbeddedAgentAccess,
+    daemon: EmbeddedAgentAccess,
     target: Mutex<Option<ExecutionRef>>,
     armed: AtomicBool,
     target_snapshots: AtomicUsize,
@@ -34,7 +34,7 @@ impl AgentAccess for RejectedNavigationAccess {
             && self.armed.load(Ordering::SeqCst)
             && target_snapshot
             && self.target_snapshots.fetch_add(1, Ordering::SeqCst) == 1;
-        let mut observation = self.owner.observe(query).await?;
+        let mut observation = self.daemon.observe(query).await?;
         if reject {
             self.armed.store(false, Ordering::SeqCst);
             self.rejected.fetch_add(1, Ordering::SeqCst);
@@ -52,7 +52,7 @@ impl AgentAccess for RejectedNavigationAccess {
             } => Some((*execution, text.clone())),
             _ => None,
         };
-        let receipt = self.owner.execute(command).await?;
+        let receipt = self.daemon.execute(command).await?;
         if receipt.error.is_none()
             && let Some(submitted) = submitted
         {
@@ -73,7 +73,7 @@ impl AgentAccess for RejectedNavigationAccess {
                 "owned fixture rejected target display",
             ));
         }
-        self.owner.show_view(update).await
+        self.daemon.show_view(update).await
     }
 }
 
@@ -107,7 +107,7 @@ async fn complete_input(
 ) {
     let accepted = access
         .execute(CommandEnvelope {
-            owner_epoch: access.owner.owner_epoch(),
+            daemon_epoch: access.daemon.daemon_epoch(),
             command_id: Uuid::new_v4(),
             command: AgentCommand::Submit {
                 execution,
@@ -161,7 +161,7 @@ async fn run_cached_navigation_fixture() {
     ]));
     let core = runtime::Agent::new_embedded(test_support::config(), model.clone());
     let access = Arc::new(RejectedNavigationAccess {
-        owner: EmbeddedAgentAccess::new(core.clone()),
+        daemon: EmbeddedAgentAccess::new(core.clone()),
         target: Mutex::new(None),
         armed: AtomicBool::new(false),
         target_snapshots: AtomicUsize::new(0),
@@ -179,7 +179,7 @@ async fn run_cached_navigation_fixture() {
     };
     let agent = Agent::from_access_for_test(
         access.clone(),
-        access.owner.owner_epoch(),
+        access.daemon.daemon_epoch(),
         view,
         launch,
         None,
@@ -287,7 +287,7 @@ async fn run_cached_navigation_fixture() {
     let source_snapshot = core.snapshot(source).await.unwrap();
     let target_snapshot = core.snapshot(target).await.unwrap();
     let ObservationValue::Overview(rows) = access
-        .owner
+        .daemon
         .observe(ObservationRequest::Overview {
             page: Page {
                 offset: 0,

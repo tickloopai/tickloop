@@ -68,7 +68,7 @@ pub(super) fn command_refusal(scope: CommandScope, command: &str, reason: &str) 
 }
 
 impl CommandSpec {
-    /// Why this command cannot act in `scope`, when it cannot; the owner still validates the rest.
+    /// Why this command cannot act in `scope`, when it cannot; the daemon still validates the rest.
     pub(super) fn unavailable_in(&self, scope: CommandScope) -> Option<&'static str> {
         match scope {
             CommandScope::Root => None,

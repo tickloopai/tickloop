@@ -1,12 +1,12 @@
 [package]
-name = "tickloop-tick-host"
+name = "tickloop-tickhost"
 description = "Local service that runs Agent-opened protocol Ticks in private PTYs"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
 [lib]
-name = "tick_host"
+name = "tickhost"
 doctest = false
 
 [dependencies]

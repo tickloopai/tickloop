@@ -156,7 +156,7 @@ async fn continue_waiting(
     let before = snapshot(client, execution).await;
     let receipt = client
         .execute(CommandEnvelope {
-            owner_epoch: client.owner_epoch(),
+            daemon_epoch: client.daemon_epoch(),
             command_id: uuid::Uuid::new_v4(),
             command: AgentCommand::Submit {
                 execution,

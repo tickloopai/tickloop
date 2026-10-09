@@ -1,5 +1,5 @@
-//! The authenticated worker-to-owner channel for hosted Tick lifecycles. A worker proves its
-//! private grant and names the Chat it acts for; the owner verifies that the Chat runs in that
+//! The authenticated worker-to-daemon channel for hosted Tick lifecycles. A worker proves its
+//! private grant and names the Chat it acts for; the daemon verifies that the Chat runs in that
 //! worker, derives the config root from the worker's launch itself, and dispatches through its
 //! own host controller. Workers never hold host control or reconcile rights.
 
@@ -20,7 +20,7 @@ use tick_connect::{
     instance::InstanceRef,
     page::PageCursor,
 };
-use tick_host::host::{OpenRequest, Receipt, TickOwner};
+use tickhost::host::{OpenRequest, Receipt, TickOwner};
 use tokio::{
     io::BufReader,
     net::{UnixListener, UnixStream},
@@ -37,8 +37,8 @@ use super::{
 };
 use crate::{
     agent_access::{
-        AgentAccess, AgentDetailQuery, ExecutionRef, LiveChatSnapshot, ObservationRequest,
-        ObservationValue, OwnerServer,
+        AgentAccess, AgentDetailQuery, DaemonServer, ExecutionRef, LiveChatSnapshot,
+        ObservationRequest, ObservationValue,
     },
     host_tools::{HostEndpointIdentity, HostToolAuthority},
     runtime::LoopState,
@@ -48,8 +48,8 @@ use crate::{
 pub const ENDPOINT_NAME: &str = "worker-control.sock";
 /// A worker request is small: an open carries argv, cwd and the launch environment.
 const REQUEST_FRAME_BYTES: usize = tick_connect::protocol::MAX_REQUEST_BYTES;
-/// How long a worker waits for the owner: the longest lifecycle request plus transport.
-const OWNER_ANSWER_TIMEOUT: Duration =
+/// How long a worker waits for the daemon: the longest lifecycle request plus transport.
+const DAEMON_ANSWER_TIMEOUT: Duration =
     Duration::from_secs(LIFECYCLE_TIMEOUT.as_secs() + CONTROL_TIMEOUT.as_secs());
 const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
 /// Watch intents are renewed this many times within the idle timeout that lapses them.
@@ -59,10 +59,10 @@ const INTENT_RENEWALS_PER_LEASE: u32 = 3;
 #[derive(Clone, Deserialize, Serialize)]
 pub struct WorkerControlGrant {
     pub endpoint: PathBuf,
-    pub owner_epoch: Uuid,
+    pub daemon_epoch: Uuid,
     pub binding: Uuid,
     pub capability: String,
-    /// The Tick host endpoint this owner controls: the authority of the worker's hosted tools.
+    /// The Tickhost endpoint this daemon controls: the authority of the worker's hosted tools.
     pub host_endpoint: PathBuf,
     /// How often the worker renews its Watch intents, well within the host's idle timeout after
     /// which unrenewed intents lapse.
@@ -74,7 +74,7 @@ impl std::fmt::Debug for WorkerControlGrant {
         formatter
             .debug_struct("WorkerControlGrant")
             .field("endpoint", &self.endpoint)
-            .field("owner_epoch", &self.owner_epoch)
+            .field("daemon_epoch", &self.daemon_epoch)
             .field("binding", &self.binding)
             .field("host_endpoint", &self.host_endpoint)
             .field("intent_renewal", &self.intent_renewal)
@@ -146,11 +146,11 @@ pub enum WorkerRequest {
     },
 }
 
-/// One page of a Chat's hosted Ticks, as the owner answers its worker.
+/// One page of a Chat's hosted Ticks, as the daemon answers its worker.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct HostedTickPage {
     #[serde(flatten)]
-    pub page: tick_connect::page::Page<tick_host::host::TickRow>,
+    pub page: tick_connect::page::Page<tickhost::host::TickRow>,
     /// The host endpoint the listed Ticks' data bindings reach.
     pub endpoint: PathBuf,
     /// On a listing from the start: the Chat's instances lost with their host.
@@ -165,7 +165,7 @@ pub struct LostTick {
 }
 
 /// What a lifecycle request was admitted under in the worker: the tool it prepared and the
-/// host authority it froze. The owner checks both against its own host and the Chat's ceiling.
+/// host authority it froze. The daemon checks both against its own host and the Chat's ceiling.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct HostedAdmission {
@@ -208,7 +208,7 @@ impl WorkerRequest {
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct WorkerEnvelope {
-    owner_epoch: Uuid,
+    daemon_epoch: Uuid,
     binding: Uuid,
     capability: String,
     request: WorkerRequest,
@@ -221,16 +221,16 @@ struct Grant {
     config_root: Option<PathBuf>,
 }
 
-/// The owner side: one private endpoint, one grant per running worker.
+/// The daemon side: one private endpoint, one grant per running worker.
 pub struct WorkerControl {
     endpoint: PathBuf,
     epoch: Uuid,
     grants: Mutex<HashMap<Uuid, Grant>>,
     controller: Arc<HostController>,
     registry: Registry,
-    /// Per config root: reconciled with the host once since this owner started.
+    /// Per config root: reconciled with the host once since this daemon started.
     reconciled: std::sync::Mutex<HashMap<String, Arc<tokio::sync::OnceCell<()>>>>,
-    owner: OnceLock<OwnerServer>,
+    daemon: OnceLock<DaemonServer>,
 }
 
 impl WorkerControl {
@@ -242,7 +242,7 @@ impl WorkerControl {
             controller,
             registry: Registry::default(),
             reconciled: std::sync::Mutex::new(HashMap::new()),
-            owner: OnceLock::new(),
+            daemon: OnceLock::new(),
         }
     }
 
@@ -250,25 +250,25 @@ impl WorkerControl {
         &self.endpoint
     }
 
-    /// Completes the owner wiring once the owner server exists.
-    pub fn attach_owner(&self, owner: OwnerServer) {
-        let _ = self.owner.set(owner);
+    /// Completes the daemon wiring once the daemon server exists.
+    pub fn attach_daemon(&self, daemon: DaemonServer) {
+        let _ = self.daemon.set(daemon);
     }
 
     /// A fresh grant for a worker about to start.
     pub fn grant(&self) -> WorkerControlGrant {
         WorkerControlGrant {
             endpoint: self.endpoint.clone(),
-            owner_epoch: self.epoch,
+            daemon_epoch: self.epoch,
             binding: Uuid::new_v4(),
-            capability: tick_host::host::random_token(),
+            capability: tickhost::host::random_token(),
             host_endpoint: self.controller.endpoint(),
             intent_renewal: self.controller.idle_timeout() / INTENT_RENEWALS_PER_LEASE,
         }
     }
 
     /// Records the grant once its worker is running, with the config root it was launched for,
-    /// and reconciles that root with the host if this owner has not yet.
+    /// and reconciles that root with the host if this daemon has not yet.
     pub async fn register(
         self: &Arc<Self>,
         grant: &WorkerControlGrant,
@@ -342,10 +342,10 @@ impl WorkerControl {
     }
 
     async fn handle(&self, envelope: WorkerEnvelope) -> Result<Value, HostError> {
-        if envelope.owner_epoch != self.epoch {
+        if envelope.daemon_epoch != self.epoch {
             return Err(HostError::before(
                 "EpochChanged",
-                "this worker belongs to an earlier Agent owner",
+                "this worker belongs to an earlier Agent daemon",
             ));
         }
         let (worker, root, config_root) = {
@@ -360,10 +360,10 @@ impl WorkerControl {
                 grant.config_root.clone(),
             )
         };
-        let owner = self
-            .owner
+        let daemon = self
+            .daemon
             .get()
-            .ok_or_else(|| HostError::before("HostUnavailable", "the owner is starting"))?;
+            .ok_or_else(|| HostError::before("HostUnavailable", "the daemon is starting"))?;
         let chat = envelope.request.chat();
         // A Transcript is only deleted for a Chat no runtime runs; every other request acts for
         // a Chat that runs in the asking worker.
@@ -372,7 +372,7 @@ impl WorkerControl {
             envelope.request,
             WorkerRequest::BeginChatDeletion { .. } | WorkerRequest::FinishChatDeletion { .. }
         ) {
-            if owner
+            if daemon
                 .runs_chat(chat)
                 .await
                 .map_err(|error| HostError::before("HostUnavailable", error.message))?
@@ -383,7 +383,7 @@ impl WorkerControl {
                 ));
             }
         } else {
-            let execution = owner
+            let execution = daemon
                 .verify_worker_chat(chat, &worker)
                 .await
                 .map_err(|error| HostError::before("Forbidden", error.message))?;
@@ -630,7 +630,7 @@ impl WorkerControl {
             }
             WorkerRequest::BeginChatDeletion { operation, .. } => {
                 registry.begin_deletion(chat, operation).await?;
-                // The owner settles the deletion itself once the cleanup lets go of the Chat,
+                // The daemon settles the deletion itself once the cleanup lets go of the Chat,
                 // so a lost finish answer never leaves it undecided.
                 tokio::spawn(registry.clone().settle_deletion_once_released(
                     self.controller.clone(),
@@ -662,7 +662,7 @@ impl WorkerControl {
             WorkerRequest::EndStoppedChild {
                 child, operation, ..
             } => {
-                self.verify_stopped_child(owner, &worker, chat, child)
+                self.verify_stopped_child(daemon, &worker, chat, child)
                     .await?;
                 let child_owner = TickOwner {
                     root: tick_owner.root,
@@ -733,7 +733,7 @@ impl WorkerControl {
         owner_revision: u64,
         record: LaunchRecord,
         environment: Vec<(String, String)>,
-    ) -> Result<tick_host::host::OpenedTick, HostError> {
+    ) -> Result<tickhost::host::OpenedTick, HostError> {
         registry.record_launch(&record).await?;
         let (chat, operation) = (record.chat, record.operation);
         let opened = self
@@ -786,7 +786,7 @@ impl WorkerControl {
         }
     }
 
-    /// The registry of a worker's config root. On its first use since this owner started, the
+    /// The registry of a worker's config root. On its first use since this daemon started, the
     /// root is reconciled with the host before anything else is served for it.
     async fn root_registry(
         &self,
@@ -807,9 +807,9 @@ impl WorkerControl {
         Ok(registry)
     }
 
-    /// A lifecycle request must have been prepared for this owner's Tick host with the tool
+    /// A lifecycle request must have been prepared for this daemon's Tickhost with the tool
     /// that changes Ticks, and a delegated Chat must have inherited that tool for this host. The
-    /// ceiling is read through the owner's own route to the Chat, not from the request.
+    /// ceiling is read through the daemon's own route to the Chat, not from the request.
     async fn admit(
         &self,
         worker: &Arc<dyn AgentAccess>,
@@ -817,15 +817,15 @@ impl WorkerControl {
         admission: &HostedAdmission,
     ) -> Result<Box<LiveChatSnapshot>, HostError> {
         let expected = HostToolAuthority::Native {
-            endpoint: HostEndpointIdentity::TickHost {
+            endpoint: HostEndpointIdentity::Tickhost {
                 endpoint: self.controller.endpoint(),
-                uid: tick_host::paths::current_uid(),
+                uid: tickhost::paths::current_uid(),
             },
         };
         if admission.tool != MODIFY_TICK || admission.authority != expected {
             return Err(HostError::before(
                 "Forbidden",
-                "the request was not prepared for this owner's Tick host",
+                "the request was not prepared for this daemon's Tickhost",
             ));
         }
         let snapshot = chat_snapshot(worker, execution).await?;
@@ -845,15 +845,15 @@ impl WorkerControl {
     }
 
     /// StopSubagent's end hook is believed only for a direct child of `root` that runs in the same
-    /// worker and whose Loops StopSubagent actually stopped, read through the owner's own route.
+    /// worker and whose Loops StopSubagent actually stopped, read through the daemon's own route.
     async fn verify_stopped_child(
         &self,
-        owner: &OwnerServer,
+        daemon: &DaemonServer,
         worker: &Arc<dyn AgentAccess>,
         root: Uuid,
         child: Uuid,
     ) -> Result<(), HostError> {
-        let execution = owner
+        let execution = daemon
             .verify_worker_chat(child, worker)
             .await
             .map_err(|error| HostError::before("Forbidden", error.message))?;
@@ -896,11 +896,11 @@ async fn chat_snapshot(
 
 /// The worker side: one request per connection, so a lost connection only affects its own
 /// request, whose outcome the worker then reads from the operation receipt.
-pub struct OwnerControl {
+pub struct DaemonControl {
     grant: WorkerControlGrant,
 }
 
-impl OwnerControl {
+impl DaemonControl {
     pub fn new(grant: WorkerControlGrant) -> Self {
         Self { grant }
     }
@@ -909,11 +909,11 @@ impl OwnerControl {
         self.grant.intent_renewal
     }
 
-    /// The Tick host this worker's owner controls.
+    /// The Tickhost this worker's daemon controls.
     pub fn host_endpoint(&self) -> HostEndpointIdentity {
-        HostEndpointIdentity::TickHost {
+        HostEndpointIdentity::Tickhost {
             endpoint: self.grant.host_endpoint.clone(),
-            uid: tick_host::paths::current_uid(),
+            uid: tickhost::paths::current_uid(),
         }
     }
 
@@ -922,13 +922,13 @@ impl OwnerControl {
             tokio::time::timeout(CONTROL_TIMEOUT, UnixStream::connect(&self.grant.endpoint))
                 .await
                 .map_err(|_| {
-                    HostError::before("OwnerUnavailable", "the Agent owner did not answer")
+                    HostError::before("DaemonUnavailable", "the Agent daemon did not answer")
                 })?
-                .map_err(|error| HostError::before("OwnerUnavailable", error.to_string()))?;
+                .map_err(|error| HostError::before("DaemonUnavailable", error.to_string()))?;
         let (reader, mut writer) = stream.into_split();
         let mut reader = BufReader::new(reader);
         let envelope = WorkerEnvelope {
-            owner_epoch: self.grant.owner_epoch,
+            daemon_epoch: self.grant.daemon_epoch,
             binding: self.grant.binding,
             capability: self.grant.capability.clone(),
             request,
@@ -941,13 +941,15 @@ impl OwnerControl {
         .await
         .map_err(|error| HostError::before(&error.code, error.message))?;
         let response = tokio::time::timeout(
-            OWNER_ANSWER_TIMEOUT,
+            DAEMON_ANSWER_TIMEOUT,
             read_frame(&mut reader, BUSINESS_FRAME_BYTES),
         )
         .await
-        .map_err(|_| HostError::after("OutcomeUnknown", "the Agent owner did not answer in time"))??
+        .map_err(|_| {
+            HostError::after("OutcomeUnknown", "the Agent daemon did not answer in time")
+        })??
         .ok_or_else(|| {
-            HostError::after("OutcomeUnknown", "the Agent owner closed the connection")
+            HostError::after("OutcomeUnknown", "the Agent daemon closed the connection")
         })?;
         tick_connect::hosted::response_result(response, Some(1))
     }

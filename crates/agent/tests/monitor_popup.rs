@@ -319,7 +319,7 @@ fn popup_attach_processes(herdr: &PrivateHerdr) -> Vec<u32> {
         .collect()
 }
 
-fn row(rows: &Value, opened: &tick_host::host::OpenedTick) -> Value {
+fn row(rows: &Value, opened: &tickhost::host::OpenedTick) -> Value {
     rows["items"]
         .as_array()
         .unwrap()
@@ -355,21 +355,21 @@ async fn the_installed_popup_shows_the_same_hosted_tick_until_esc_closes_it() {
         .unwrap();
     let controller = HostController::new(
         directory.path(),
-        tick_host::paths::HostPaths {
+        tickhost::paths::HostPaths {
             runtime: directory.path().join("h"),
         },
         Uuid::new_v4(),
         support::fixture_cli::executable(),
-        tick_host::host::DEFAULT_IDLE_TIMEOUT,
+        tickhost::host::DEFAULT_IDLE_TIMEOUT,
     );
-    let owner = tick_host::host::TickOwner {
+    let owner = tickhost::host::TickOwner {
         root: "fixture-root".into(),
         chat: Uuid::new_v4(),
     };
     let script = directory.path().join("keys.py");
     std::fs::write(&script, KEYS_TICK).unwrap();
     let opened = controller
-        .open(tick_host::host::OpenRequest {
+        .open(tickhost::host::OpenRequest {
             operation: Uuid::new_v4(),
             owner: owner.clone(),
             owner_revision: 0,

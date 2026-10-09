@@ -239,7 +239,7 @@ fn install_routed_authorities(agent: &Agent, directory: &std::path::Path) -> Sco
     use tickloop_agent::{
         hosted::{
             tools::HostedTickTools,
-            worker_control::{OwnerControl, WorkerControlGrant},
+            worker_control::{DaemonControl, WorkerControlGrant},
         },
         native_host::NativeHostToolProvider,
         tick_tool_router::TickToolRouter,
@@ -251,8 +251,8 @@ fn install_routed_authorities(agent: &Agent, directory: &std::path::Path) -> Sco
         )),
     )));
     let grant = WorkerControlGrant {
-        endpoint: directory.join("owner.sock"),
-        owner_epoch: uuid::Uuid::new_v4(),
+        endpoint: directory.join("daemon.sock"),
+        daemon_epoch: uuid::Uuid::new_v4(),
         binding: uuid::Uuid::new_v4(),
         capability: "0".repeat(64),
         host_endpoint: directory.join("host.sock"),
@@ -262,7 +262,7 @@ fn install_routed_authorities(agent: &Agent, directory: &std::path::Path) -> Sco
         .install_host_tools(Arc::new(TickToolRouter::new(
             Some(native),
             Some(Arc::new(HostedTickTools::new(
-                OwnerControl::new(grant),
+                DaemonControl::new(grant),
                 vec![],
             ))),
         )))
@@ -277,7 +277,7 @@ async fn access_command(
     use tickloop_agent::agent_access::{AgentAccess, CommandEnvelope};
     let receipt = access
         .execute(CommandEnvelope {
-            owner_epoch: access.owner_epoch(),
+            daemon_epoch: access.daemon_epoch(),
             command_id: uuid::Uuid::new_v4(),
             command,
         })
@@ -511,10 +511,10 @@ async fn loaded_delegated_host_authority_stays_with_its_original_socket_and_work
 }
 
 /// A child freezes, per tool, the authorities of the backends present when it was delegated.
-/// A Tick host added afterwards never serves it, while the frozen Herdr backend still does,
+/// A Tickhost added afterwards never serves it, while the frozen Herdr backend still does,
 /// and a record frozen with one authority per tool is no longer restored.
 #[tokio::test]
-async fn a_child_never_gains_a_tick_host_added_after_its_delegation() {
+async fn a_child_never_gains_a_tickhost_added_after_its_delegation() {
     use tickloop_agent::{
         agent_access::{
             AgentCommand, CommandResult, ConfigurationChange, EmbeddedAgentAccess, HostWorkContext,
@@ -522,7 +522,7 @@ async fn a_child_never_gains_a_tick_host_added_after_its_delegation() {
         },
         hosted::{
             tools::HostedTickTools,
-            worker_control::{OwnerControl, WorkerControlGrant},
+            worker_control::{DaemonControl, WorkerControlGrant},
         },
         native_host::NativeHostToolProvider,
         tick_tool_router::TickToolRouter,
@@ -645,8 +645,8 @@ async fn a_child_never_gains_a_tick_host_added_after_its_delegation() {
     access.shutdown().await;
 
     let grant = WorkerControlGrant {
-        endpoint: directory.path().join("owner.sock"),
-        owner_epoch: uuid::Uuid::new_v4(),
+        endpoint: directory.path().join("daemon.sock"),
+        daemon_epoch: uuid::Uuid::new_v4(),
         binding: uuid::Uuid::new_v4(),
         capability: "0".repeat(64),
         host_endpoint: directory.path().join("host.sock"),
@@ -670,7 +670,7 @@ async fn a_child_never_gains_a_tick_host_added_after_its_delegation() {
         .install_host_tools(Arc::new(TickToolRouter::new(
             Some(native()),
             Some(Arc::new(HostedTickTools::new(
-                OwnerControl::new(grant),
+                DaemonControl::new(grant),
                 Vec::new(),
             ))),
         )))
@@ -1499,7 +1499,7 @@ async fn console_opens_the_real_child_in_place_and_routes_follow_up_with_its_cei
     let access = EmbeddedAgentAccess::new(runtime.clone());
     let receipt = access
         .execute(CommandEnvelope {
-            owner_epoch: access.owner_epoch(),
+            daemon_epoch: access.daemon_epoch(),
             command_id: uuid::Uuid::new_v4(),
             command: AgentCommand::Create {
                 launch: LaunchSpec::embedded(directory.path().into()),
@@ -1536,7 +1536,7 @@ async fn console_opens_the_real_child_in_place_and_routes_follow_up_with_its_cei
     ] {
         let receipt = access
             .execute(CommandEnvelope {
-                owner_epoch: access.owner_epoch(),
+                daemon_epoch: access.daemon_epoch(),
                 command_id: uuid::Uuid::new_v4(),
                 command,
             })
@@ -1606,7 +1606,7 @@ async fn console_opens_the_real_child_in_place_and_routes_follow_up_with_its_cei
     assert!(display.displayed);
     let mut console = AgentConsole::new(
         Arc::new(access.clone()),
-        access.owner_epoch(),
+        access.daemon_epoch(),
         directory.path().into(),
         Some(HostLocation {
             tab: Some("current-tab".into()),
@@ -1645,7 +1645,7 @@ async fn console_opens_the_real_child_in_place_and_routes_follow_up_with_its_cei
     };
     let wrong = access
         .execute(CommandEnvelope {
-            owner_epoch: access.owner_epoch(),
+            daemon_epoch: access.daemon_epoch(),
             command_id: uuid::Uuid::new_v4(),
             command: AgentCommand::AnswerQuestion {
                 request: RequestRef {
@@ -1660,7 +1660,7 @@ async fn console_opens_the_real_child_in_place_and_routes_follow_up_with_its_cei
     assert!(wrong.error.is_some());
     let shell = access
         .execute(CommandEnvelope {
-            owner_epoch: access.owner_epoch(),
+            daemon_epoch: access.daemon_epoch(),
             command_id: uuid::Uuid::new_v4(),
             command: AgentCommand::Submit {
                 execution: child.execution,
@@ -1677,7 +1677,7 @@ async fn console_opens_the_real_child_in_place_and_routes_follow_up_with_its_cei
     assert!(shell.error.is_none());
     let answered = access
         .execute(CommandEnvelope {
-            owner_epoch: access.owner_epoch(),
+            daemon_epoch: access.daemon_epoch(),
             command_id: uuid::Uuid::new_v4(),
             command: AgentCommand::AnswerQuestion {
                 request,
@@ -1733,7 +1733,7 @@ async fn console_opens_the_real_child_in_place_and_routes_follow_up_with_its_cei
         serde_json::from_value(parent_result["child_run_id"].clone()).unwrap();
     let follow_up = access
         .execute(CommandEnvelope {
-            owner_epoch: access.owner_epoch(),
+            daemon_epoch: access.daemon_epoch(),
             command_id: uuid::Uuid::new_v4(),
             command: AgentCommand::Submit {
                 execution: console.projection().visible.unwrap(),
@@ -1784,7 +1784,7 @@ async fn console_opens_the_real_child_in_place_and_routes_follow_up_with_its_cei
     );
     let forbidden = access
         .execute(CommandEnvelope {
-            owner_epoch: access.owner_epoch(),
+            daemon_epoch: access.daemon_epoch(),
             command_id: uuid::Uuid::new_v4(),
             command: AgentCommand::Configure {
                 provider: None,

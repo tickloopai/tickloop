@@ -129,7 +129,7 @@ impl Fixture {
         command.env("HOME", directory.path());
         command.env("TICKLOOP_CONFIG_DIR", directory.path().join("config"));
         command.env(
-            "TICKLOOP_AGENT_RUNTIME_DIR",
+            "TICKLOOP_DAEMON_RUNTIME_DIR",
             directory.path().join("runtime"),
         );
         command.env("TICKLOOP_TMPDIR", directory.path());

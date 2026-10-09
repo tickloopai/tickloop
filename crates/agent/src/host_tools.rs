@@ -32,9 +32,9 @@ pub enum HostEndpointIdentity {
     TrustedAdapter {
         scope: uuid::Uuid,
     },
-    /// The user's Tick host endpoint. Its process epoch changes across restarts and is checked
+    /// The user's Tickhost endpoint. Its process epoch changes across restarts and is checked
     /// per call through each instance's binding, not here.
-    TickHost {
+    Tickhost {
         endpoint: PathBuf,
         uid: u32,
     },
@@ -382,8 +382,8 @@ pub struct WorkspaceHostContext {
     pub name: WorkspaceHostName,
     /// Whether this Agent can operate the container's Panes.
     pub integration: WorkspaceIntegration,
-    /// Whether this Agent can run Ticks hidden in the Tick host, in any container.
-    pub tick_host: WorkspaceIntegration,
+    /// Whether this Agent can run Ticks hidden in the Tickhost, in any container.
+    pub tickhost: WorkspaceIntegration,
     pub tick_executable: Option<PathBuf>,
 }
 
@@ -398,8 +398,8 @@ impl WorkspaceHostContext {
     }
 
     /// The same container, where this Agent can also run hidden Ticks with the bundled `tick`.
-    pub fn with_tick_host(mut self) -> Self {
-        self.tick_host = WorkspaceIntegration::Available;
+    pub fn with_tickhost(mut self) -> Self {
+        self.tickhost = WorkspaceIntegration::Available;
         self.tick_executable = self
             .tick_executable
             .or_else(tick_connect::access::bundled_tick_executable);
@@ -419,7 +419,7 @@ impl WorkspaceHostContext {
         Self {
             name,
             integration: WorkspaceIntegration::Unavailable,
-            tick_host: WorkspaceIntegration::Unavailable,
+            tickhost: WorkspaceIntegration::Unavailable,
             tick_executable: None,
         }
     }
@@ -428,7 +428,7 @@ impl WorkspaceHostContext {
         Self {
             name: WorkspaceHostName::Herdr,
             integration: WorkspaceIntegration::Available,
-            tick_host: WorkspaceIntegration::Unavailable,
+            tickhost: WorkspaceIntegration::Unavailable,
             tick_executable,
         }
     }
@@ -436,7 +436,7 @@ impl WorkspaceHostContext {
     /// Whether this Agent can open or operate any Tick outside Shell and Artifact.
     pub fn runs_ticks(&self) -> bool {
         self.integration == WorkspaceIntegration::Available
-            || self.tick_host == WorkspaceIntegration::Available
+            || self.tickhost == WorkspaceIntegration::Available
     }
 }
 

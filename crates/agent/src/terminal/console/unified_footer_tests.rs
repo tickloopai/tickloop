@@ -811,7 +811,7 @@ async fn global_shell_count_and_open_keep_the_peer_task_and_stop_its_actual_owne
     let access = Arc::new(EmbeddedAgentAccess::new(runtime.clone()));
     let agent = ConsoleExecution::from_access_for_test(
         access.clone(),
-        access.owner_epoch(),
+        access.daemon_epoch(),
         ViewRef {
             session_id: Uuid::new_v4(),
             view_id: Uuid::new_v4(),

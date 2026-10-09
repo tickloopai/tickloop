@@ -31,17 +31,19 @@ use tokio::{
 use uuid::Uuid;
 
 const CLI_TIMEOUT: Duration = Duration::from_secs(25);
-const FIXTURE_TEXT: &str = "Keep this saved service-stop fixture history.";
+const FIXTURE_TEXT: &str = "Keep this saved daemon-stop fixture history.";
+/// The frozen management major on daemon.sock; it has no aliases.
+const MANAGEMENT_MAJOR: u16 = 1;
 
-struct ServiceFixture {
+struct DaemonFixture {
     directory: tempfile::TempDir,
     runtime: PathBuf,
     config: PathBuf,
-    owner: Option<(u16, Uuid)>,
+    daemon_epoch: Option<Uuid>,
     launch_in_progress: bool,
 }
 
-impl ServiceFixture {
+impl DaemonFixture {
     fn new() -> Self {
         let directory = tempfile::Builder::new()
             .prefix("tl-stop-")
@@ -58,7 +60,7 @@ impl ServiceFixture {
             directory,
             runtime,
             config,
-            owner: None,
+            daemon_epoch: None,
             launch_in_progress: false,
         }
     }
@@ -73,7 +75,7 @@ impl ServiceFixture {
             .env("HOME", self.directory.path())
             .env("NO_COLOR", "1")
             .env("TICKLOOP_CONFIG_DIR", &self.config)
-            .env("TICKLOOP_AGENT_RUNTIME_DIR", &self.runtime)
+            .env("TICKLOOP_DAEMON_RUNTIME_DIR", &self.runtime)
             .stdin(Stdio::null())
             .kill_on_drop(true);
         command
@@ -82,12 +84,12 @@ impl ServiceFixture {
     async fn run(&self, arguments: &[&str]) -> Output {
         tokio::time::timeout(CLI_TIMEOUT, self.command(arguments).output())
             .await
-            .expect("service CLI exceeded its bounded shutdown window")
+            .expect("daemon CLI exceeded its bounded shutdown window")
             .unwrap()
     }
 
     fn listener(&self) -> UnixListener {
-        let socket = self.runtime.join("owner.sock");
+        let socket = self.runtime.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600)).unwrap();
         listener
@@ -99,28 +101,28 @@ impl ServiceFixture {
             .write(true)
             .create_new(true)
             .mode(0o600)
-            .open(self.runtime.join("owner.lock"))
+            .open(self.runtime.join("daemon.lock"))
             .unwrap()
     }
 }
 
-impl Drop for ServiceFixture {
+impl Drop for DaemonFixture {
     fn drop(&mut self) {
-        let Some((major, epoch)) = self.owner else {
+        let Some(epoch) = self.daemon_epoch else {
             if self.launch_in_progress {
                 self.directory.disable_cleanup(true);
                 eprintln!(
-                    "Retained owned service fixture after an unconfirmed launch: {}",
+                    "Retained owned daemon fixture after an unconfirmed launch: {}",
                     self.runtime.display()
                 );
             }
             return;
         };
-        let socket = self.runtime.join("owner.sock");
+        let socket = self.runtime.join("daemon.sock");
         let Ok(mut stream) = BlockingUnixStream::connect(&socket) else {
             self.directory.disable_cleanup(true);
             eprintln!(
-                "Retained unreachable owned service fixture: {}",
+                "Retained unreachable owned daemon fixture: {}",
                 self.runtime.display()
             );
             return;
@@ -128,18 +130,21 @@ impl Drop for ServiceFixture {
         let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
         let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
         let cleanup = (|| -> std::io::Result<bool> {
-            write_blocking(&mut stream, &json!({"Hello":{"major":major,"minor":0}}))?;
+            write_blocking(
+                &mut stream,
+                &json!({"Hello":{"major":MANAGEMENT_MAJOR,"minor":0}}),
+            )?;
             let hello = read_blocking(&mut stream)?;
-            if hello["Hello"]["owner_epoch"] != json!(epoch) {
+            if hello["Hello"]["daemon_epoch"] != json!(epoch) {
                 return Ok(false);
             }
             let request_id = Uuid::new_v4();
             write_blocking(
                 &mut stream,
-                &json!({"ShutdownOwner":{"request_id":request_id,"owner_epoch":epoch}}),
+                &json!({"ShutdownDaemon":{"request_id":request_id,"daemon_epoch":epoch}}),
             )?;
             let response = read_blocking(&mut stream)?;
-            Ok(response["OwnerStopped"]["request_id"] == json!(request_id))
+            Ok(response["DaemonStopped"]["request_id"] == json!(request_id))
         })();
         drop(stream);
         let confirmed = matches!(cleanup, Ok(true));
@@ -152,7 +157,7 @@ impl Drop for ServiceFixture {
         if !confirmed || socket.exists() {
             self.directory.disable_cleanup(true);
             eprintln!(
-                "Retained owned service fixture after incomplete cleanup: {}",
+                "Retained owned daemon fixture after incomplete cleanup: {}",
                 self.runtime.display()
             );
         }
@@ -192,38 +197,22 @@ async fn read_frame(stream: &mut UnixStream) -> Option<Value> {
     Some(serde_json::from_slice(&bytes).unwrap())
 }
 
-async fn legacy_connect(socket: &Path) -> (UnixStream, Value) {
+async fn management_connect(socket: &Path) -> UnixStream {
     let mut stream = UnixStream::connect(socket).await.unwrap();
-    write_frame(&mut stream, &json!({"Hello":{"major":1,"minor":0}})).await;
+    write_frame(
+        &mut stream,
+        &json!({"Hello":{"major":MANAGEMENT_MAJOR,"minor":0}}),
+    )
+    .await;
     let response = read_frame(&mut stream).await.unwrap();
-    assert_eq!(response["Hello"]["major"], 1);
-    (stream, response["Hello"].clone())
-}
-
-async fn legacy_request(stream: &mut UnixStream, kind: &str, mut body: Value) -> Value {
-    let request_id = Uuid::new_v4();
-    body["request_id"] = json!(request_id);
-    write_frame(stream, &json!({kind:body})).await;
-    let response = read_frame(stream).await.unwrap();
-    assert_eq!(
-        response[kind_response(kind)]["request_id"],
-        json!(request_id)
-    );
-    response[kind_response(kind)].clone()
-}
-
-fn kind_response(kind: &str) -> &str {
-    match kind {
-        "Execute" => "Receipt",
-        "Observe" => "Opened",
-        _ => panic!("fixture request kind {kind}"),
-    }
+    assert_eq!(response["Hello"]["major"], MANAGEMENT_MAJOR);
+    stream
 }
 
 fn assert_failed(output: &Output) -> String {
     assert!(!output.status.success());
     let message = String::from_utf8_lossy(&output.stderr).into_owned();
-    assert!(!String::from_utf8_lossy(&output.stdout).contains("Agent service stopped."));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("Agent daemon stopped."));
     message
 }
 
@@ -239,18 +228,18 @@ async fn assert_disconnected(stream: &mut UnixStream, listener: &UnixListener) {
         tokio::time::timeout(Duration::from_millis(100), listener.accept())
             .await
             .is_err(),
-        "the stop operation must not reconnect or start another owner"
+        "the stop operation must not reconnect or start another daemon"
     );
 }
 
 #[tokio::test]
-async fn absent_stale_or_unready_service_is_never_started_or_removed() {
-    let fixture = ServiceFixture::new();
+async fn absent_stale_or_unready_daemon_is_never_started_or_removed() {
+    let fixture = DaemonFixture::new();
     std::fs::remove_dir(&fixture.runtime).unwrap();
     for _ in 0..2 {
-        let output = fixture.run(&["service", "stop"]).await;
+        let output = fixture.run(&["daemon", "stop"]).await;
         assert!(output.status.success());
-        assert_eq!(output.stdout, b"Agent service is not running.\n");
+        assert_eq!(output.stdout, b"Agent daemon is not running.\n");
         assert!(output.stderr.is_empty());
         assert!(!fixture.runtime.exists());
     }
@@ -258,39 +247,39 @@ async fn absent_stale_or_unready_service_is_never_started_or_removed() {
     std::fs::set_permissions(&fixture.runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
     let listener = fixture.listener();
     drop(listener);
-    let socket = fixture.runtime.join("owner.sock");
-    let output = fixture.run(&["service", "stop"]).await;
+    let socket = fixture.runtime.join("daemon.sock");
+    let output = fixture.run(&["daemon", "stop"]).await;
     assert!(output.status.success());
     assert!(
         socket.exists(),
         "stale sockets belong to startup arbitration"
     );
-    assert!(!fixture.runtime.join("owner.lock").exists());
+    assert!(!fixture.runtime.join("daemon.lock").exists());
     std::fs::remove_file(&socket).unwrap();
     let lock = fixture.lock();
     assert_eq!(
         unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
         0
     );
-    let output = fixture.run(&["service", "stop"]).await;
+    let output = fixture.run(&["daemon", "stop"]).await;
     assert!(assert_failed(&output).contains("starting or stopping"));
     assert!(!socket.exists());
-    assert!(fixture.runtime.join("owner.lock").exists());
+    assert!(fixture.runtime.join("daemon.lock").exists());
 }
 
 #[tokio::test]
-async fn service_help_and_invalid_arguments_do_not_connect_or_touch_runtime() {
-    let fixture = ServiceFixture::new();
+async fn daemon_help_and_invalid_arguments_do_not_connect_or_touch_runtime() {
+    let fixture = DaemonFixture::new();
     let listener = fixture.listener();
     for arguments in [
-        vec!["service", "--help"],
-        vec!["service", "stop", "-h"],
-        vec!["service", "stop", "--help"],
-        vec!["service"],
-        vec!["service", "start"],
-        vec!["service", "stop", "--force"],
-        vec!["service", "stop", "extra"],
-        vec!["service", "stop", "--help", "--unknown"],
+        vec!["daemon", "--help"],
+        vec!["daemon", "stop", "-h"],
+        vec!["daemon", "stop", "--help"],
+        vec!["daemon"],
+        vec!["daemon", "start"],
+        vec!["daemon", "stop", "--force"],
+        vec!["daemon", "stop", "extra"],
+        vec!["daemon", "stop", "--help", "--unknown"],
     ] {
         let output = fixture.run(&arguments).await;
         let help = arguments.contains(&"--help") || arguments.contains(&"-h");
@@ -303,48 +292,59 @@ async fn service_help_and_invalid_arguments_do_not_connect_or_touch_runtime() {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        assert!(text.contains("Usage: tickloop service stop"));
-        assert!(!fixture.runtime.join("owner.lock").exists());
+        assert!(text.contains("Usage: tickloop daemon stop"));
+        if help && output.status.success() {
+            for promise in [
+                "all of its workers, which ends every running Agent",
+                "Saved history is kept.",
+                "Ticks in the Tickhost keep running.",
+                "The next tickloop launch starts this build.",
+            ] {
+                assert!(text.contains(promise), "{promise}: {text}");
+            }
+            assert!(!text.contains("daemon run"), "{text}");
+        }
+        assert!(!fixture.runtime.join("daemon.lock").exists());
     }
     assert!(
         tokio::time::timeout(Duration::from_millis(100), listener.accept())
             .await
             .is_err()
     );
-    assert!(fixture.runtime.join("owner.sock").exists());
+    assert!(fixture.runtime.join("daemon.sock").exists());
 }
 
 #[tokio::test]
 async fn unsafe_runtime_socket_and_lock_are_rejected_before_any_handshake() {
-    let fixture = ServiceFixture::new();
+    let fixture = DaemonFixture::new();
     let listener = fixture.listener();
     for (path, unsafe_mode, safe_mode) in [
         (&fixture.runtime, 0o755, 0o700),
-        (&fixture.runtime.join("owner.sock"), 0o666, 0o600),
+        (&fixture.runtime.join("daemon.sock"), 0o666, 0o600),
     ] {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(unsafe_mode)).unwrap();
-        let output = fixture.run(&["service", "stop"]).await;
+        let output = fixture.run(&["daemon", "stop"]).await;
         assert_failed(&output);
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(safe_mode)).unwrap();
     }
     let lock = fixture.lock();
     std::fs::set_permissions(
-        fixture.runtime.join("owner.lock"),
+        fixture.runtime.join("daemon.lock"),
         std::fs::Permissions::from_mode(0o644),
     )
     .unwrap();
-    assert_failed(&fixture.run(&["service", "stop"]).await);
+    assert_failed(&fixture.run(&["daemon", "stop"]).await);
     drop(lock);
-    std::fs::remove_file(fixture.runtime.join("owner.lock")).unwrap();
+    std::fs::remove_file(fixture.runtime.join("daemon.lock")).unwrap();
     let target = fixture.directory.path().join("unrelated");
     std::fs::write(&target, b"unrelated private file").unwrap();
-    symlink(&target, fixture.runtime.join("owner.lock")).unwrap();
-    assert_failed(&fixture.run(&["service", "stop"]).await);
+    symlink(&target, fixture.runtime.join("daemon.lock")).unwrap();
+    assert_failed(&fixture.run(&["daemon", "stop"]).await);
     assert_eq!(std::fs::read(&target).unwrap(), b"unrelated private file");
-    std::fs::remove_file(fixture.runtime.join("owner.lock")).unwrap();
-    std::fs::remove_file(fixture.runtime.join("owner.sock")).unwrap();
-    symlink(&target, fixture.runtime.join("owner.sock")).unwrap();
-    assert_failed(&fixture.run(&["service", "stop"]).await);
+    std::fs::remove_file(fixture.runtime.join("daemon.lock")).unwrap();
+    std::fs::remove_file(fixture.runtime.join("daemon.sock")).unwrap();
+    symlink(&target, fixture.runtime.join("daemon.sock")).unwrap();
+    assert_failed(&fixture.run(&["daemon", "stop"]).await);
     assert!(
         tokio::time::timeout(Duration::from_millis(100), listener.accept())
             .await
@@ -356,23 +356,26 @@ async fn unsafe_runtime_socket_and_lock_are_rejected_before_any_handshake() {
 #[tokio::test]
 async fn malformed_and_unknown_hello_never_receive_shutdown() {
     for hello in [
-        json!({"Hello":{"major":3,"minor":0,"owner_epoch":Uuid::new_v4()}}),
-        json!({"Hello":{"major":1,"minor":0}}),
-        json!({"Hello":{"major":1,"minor":1,"owner_epoch":Uuid::new_v4()}}),
-        json!({"OwnerStopped":{"request_id":Uuid::new_v4()}}),
+        json!({"Hello":{"major":3,"minor":0,"daemon_epoch":Uuid::new_v4()}}),
+        json!({"Hello":{"major":MANAGEMENT_MAJOR,"minor":0}}),
+        json!({"Hello":{"major":MANAGEMENT_MAJOR,"minor":1,"daemon_epoch":Uuid::new_v4()}}),
+        json!({"DaemonStopped":{"request_id":Uuid::new_v4()}}),
     ] {
-        let fixture = ServiceFixture::new();
+        let fixture = DaemonFixture::new();
         let listener = fixture.listener();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            assert_eq!(read_frame(&mut stream).await.unwrap()["Hello"]["major"], 1);
+            assert_eq!(
+                read_frame(&mut stream).await.unwrap()["Hello"]["major"],
+                MANAGEMENT_MAJOR
+            );
             write_frame(&mut stream, &hello).await;
             assert_disconnected(&mut stream, &listener).await;
         });
-        assert_failed(&fixture.run(&["service", "stop"]).await);
+        assert_failed(&fixture.run(&["daemon", "stop"]).await);
         server.await.unwrap();
-        assert!(fixture.runtime.join("owner.sock").exists());
-        assert!(!fixture.runtime.join("owner.lock").exists());
+        assert!(fixture.runtime.join("daemon.sock").exists());
+        assert!(!fixture.runtime.join("daemon.lock").exists());
     }
 }
 
@@ -385,7 +388,7 @@ async fn shutdown_requires_correlated_ack_and_is_never_resent() {
         "disconnect",
         "timeout",
     ] {
-        let fixture = ServiceFixture::new();
+        let fixture = DaemonFixture::new();
         let listener = fixture.listener();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
@@ -399,16 +402,16 @@ async fn shutdown_requires_correlated_ack_and_is_never_resent() {
             let epoch = Uuid::new_v4();
             write_frame(
                 &mut stream,
-                &json!({"Hello":{"major":1,"minor":0,"owner_epoch":epoch}}),
+                &json!({"Hello":{"major":MANAGEMENT_MAJOR,"minor":0,"daemon_epoch":epoch}}),
             )
             .await;
             let shutdown = read_frame(&mut stream).await.unwrap();
-            assert_eq!(shutdown["ShutdownOwner"]["owner_epoch"], json!(epoch));
+            assert_eq!(shutdown["ShutdownDaemon"]["daemon_epoch"], json!(epoch));
             assert_eq!(shutdown.as_object().unwrap().len(), 1);
-            let request_id = shutdown["ShutdownOwner"]["request_id"].clone();
+            let request_id = shutdown["ShutdownDaemon"]["request_id"].clone();
             match response_kind {
-                "wrong-id" => write_frame(&mut stream, &json!({"OwnerStopped":{"request_id":Uuid::new_v4()}})).await,
-                "wrong-epoch" => write_frame(&mut stream, &json!({"Error":{"request_id":request_id,"error":{"code":"EpochChanged","message":"fixture owner epoch changed"}}})).await,
+                "wrong-id" => write_frame(&mut stream, &json!({"DaemonStopped":{"request_id":Uuid::new_v4()}})).await,
+                "wrong-epoch" => write_frame(&mut stream, &json!({"Error":{"request_id":request_id,"error":{"code":"EpochChanged","message":"fixture daemon epoch changed"}}})).await,
                 "wrong-response" => write_frame(&mut stream, &json!({"Receipt":{"request_id":request_id}})).await,
                 "disconnect" => { drop(stream); assert!(tokio::time::timeout(Duration::from_millis(150), listener.accept()).await.is_err()); return; }
                 "timeout" => tokio::time::sleep(Duration::from_millis(5250)).await,
@@ -416,7 +419,7 @@ async fn shutdown_requires_correlated_ack_and_is_never_resent() {
             }
             assert_disconnected(&mut stream, &listener).await;
         });
-        let message = assert_failed(&fixture.run(&["service", "stop"]).await);
+        let message = assert_failed(&fixture.run(&["daemon", "stop"]).await);
         if response_kind != "wrong-epoch" {
             assert!(
                 message.contains("not confirmed"),
@@ -424,19 +427,19 @@ async fn shutdown_requires_correlated_ack_and_is_never_resent() {
             );
             assert!(message.contains("no stop request was resent"));
         } else {
-            assert!(message.contains("fixture owner epoch changed"));
+            assert!(message.contains("fixture daemon epoch changed"));
         }
         server.await.unwrap();
-        assert!(fixture.runtime.join("owner.sock").exists());
-        assert!(!fixture.runtime.join("owner.lock").exists());
+        assert!(fixture.runtime.join("daemon.sock").exists());
+        assert!(!fixture.runtime.join("daemon.lock").exists());
     }
 }
 
 #[tokio::test]
-async fn acknowledged_shutdown_preserves_a_replacement_owner_socket() {
-    let fixture = ServiceFixture::new();
+async fn acknowledged_shutdown_preserves_a_replacement_daemon_socket() {
+    let fixture = DaemonFixture::new();
     let listener = fixture.listener();
-    let socket = fixture.runtime.join("owner.sock");
+    let socket = fixture.runtime.join("daemon.sock");
     let old_socket = fixture.runtime.join("old.sock");
     let server = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
@@ -444,52 +447,52 @@ async fn acknowledged_shutdown_preserves_a_replacement_owner_socket() {
         let epoch = Uuid::new_v4();
         write_frame(
             &mut stream,
-            &json!({"Hello":{"major":1,"minor":0,"owner_epoch":epoch}}),
+            &json!({"Hello":{"major":MANAGEMENT_MAJOR,"minor":0,"daemon_epoch":epoch}}),
         )
         .await;
         let shutdown = read_frame(&mut stream).await.unwrap();
-        assert_eq!(shutdown["ShutdownOwner"]["owner_epoch"], json!(epoch));
+        assert_eq!(shutdown["ShutdownDaemon"]["daemon_epoch"], json!(epoch));
         std::fs::rename(&socket, old_socket).unwrap();
         let replacement = UnixListener::bind(&socket).unwrap();
         std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
         write_frame(
             &mut stream,
-            &json!({"OwnerStopped":{"request_id":shutdown["ShutdownOwner"]["request_id"]}}),
+            &json!({"DaemonStopped":{"request_id":shutdown["ShutdownDaemon"]["request_id"]}}),
         )
         .await;
         assert_disconnected(&mut stream, &replacement).await;
         assert!(socket.exists());
     });
-    let output = fixture.run(&["service", "stop"]).await;
-    assert!(assert_failed(&output).contains("service changed while stopping"));
+    let output = fixture.run(&["daemon", "stop"]).await;
+    assert!(assert_failed(&output).contains("daemon changed while stopping"));
     server.await.unwrap();
-    assert!(fixture.runtime.join("owner.sock").exists());
+    assert!(fixture.runtime.join("daemon.sock").exists());
 }
 
 #[tokio::test]
-async fn shutdown_ack_is_not_success_until_the_original_owner_lock_is_released() {
-    let fixture = ServiceFixture::new();
+async fn shutdown_ack_is_not_success_until_the_original_daemon_lock_is_released() {
+    let fixture = DaemonFixture::new();
     let listener = fixture.listener();
     let lock = fixture.lock();
     assert_eq!(
         unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
         0
     );
-    let socket = fixture.runtime.join("owner.sock");
+    let socket = fixture.runtime.join("daemon.sock");
     let server = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
         read_frame(&mut stream).await.unwrap();
         let epoch = Uuid::new_v4();
         write_frame(
             &mut stream,
-            &json!({"Hello":{"major":1,"minor":0,"owner_epoch":epoch}}),
+            &json!({"Hello":{"major":MANAGEMENT_MAJOR,"minor":0,"daemon_epoch":epoch}}),
         )
         .await;
         let shutdown = read_frame(&mut stream).await.unwrap();
-        assert_eq!(shutdown["ShutdownOwner"]["owner_epoch"], json!(epoch));
+        assert_eq!(shutdown["ShutdownDaemon"]["daemon_epoch"], json!(epoch));
         write_frame(
             &mut stream,
-            &json!({"OwnerStopped":{"request_id":shutdown["ShutdownOwner"]["request_id"]}}),
+            &json!({"DaemonStopped":{"request_id":shutdown["ShutdownDaemon"]["request_id"]}}),
         )
         .await;
         std::fs::remove_file(socket).unwrap();
@@ -498,10 +501,10 @@ async fn shutdown_ack_is_not_success_until_the_original_owner_lock_is_released()
         tokio::time::sleep(Duration::from_millis(10250)).await;
         drop(lock);
     });
-    let message = assert_failed(&fixture.run(&["service", "stop"]).await);
+    let message = assert_failed(&fixture.run(&["daemon", "stop"]).await);
     assert!(message.contains("still stopping"));
-    assert!(fixture.runtime.join("owner.lock").exists());
-    assert!(!fixture.runtime.join("owner.sock").exists());
+    assert!(fixture.runtime.join("daemon.lock").exists());
+    assert!(!fixture.runtime.join("daemon.sock").exists());
     server.await.unwrap();
 }
 
@@ -534,11 +537,11 @@ async fn assert_processes_exited(process_ids: &[u32]) {
         }
     })
     .await
-    .expect("an owned owner/worker PID is still running after service stop succeeded");
+    .expect("an owned daemon/worker PID is still running after daemon stop succeeded");
 }
 
 async fn launch_active_worker(
-    fixture: &ServiceFixture,
+    fixture: &DaemonFixture,
 ) -> (
     LaunchSpec,
     tokio::sync::mpsc::UnboundedReceiver<(String, Value)>,
@@ -573,7 +576,7 @@ async fn launch_active_worker(
 
 fn create_command(epoch: Uuid, launch: LaunchSpec) -> CommandEnvelope {
     CommandEnvelope {
-        owner_epoch: epoch,
+        daemon_epoch: epoch,
         command_id: Uuid::new_v4(),
         command: AgentCommand::Create {
             launch,
@@ -588,20 +591,20 @@ fn create_command(epoch: Uuid, launch: LaunchSpec) -> CommandEnvelope {
 }
 
 async fn verify_stopped_and_restart(
-    fixture: &mut ServiceFixture,
+    fixture: &mut DaemonFixture,
     old_epoch: Uuid,
     record: TranscriptRef,
     worker_socket: PathBuf,
     process_ids: &[u32],
 ) {
-    let output = fixture.run(&["service", "stop"]).await;
+    let output = fixture.run(&["daemon", "stop"]).await;
     assert!(
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(String::from_utf8_lossy(&output.stdout).contains("Agent service stopped."));
-    assert!(!fixture.runtime.join("owner.sock").exists());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Agent daemon stopped."));
+    assert!(!fixture.runtime.join("daemon.sock").exists());
     assert!(!worker_socket.exists());
     assert_processes_exited(process_ids).await;
     let replacement = tickloop_agent::agent_daemon::connect_or_start_at(
@@ -610,8 +613,8 @@ async fn verify_stopped_and_restart(
     )
     .await
     .unwrap();
-    fixture.owner = Some((PROTOCOL_MAJOR, replacement.owner_epoch()));
-    assert_ne!(replacement.owner_epoch(), old_epoch);
+    fixture.daemon_epoch = Some(replacement.daemon_epoch());
+    assert_ne!(replacement.daemon_epoch(), old_epoch);
     let history = replacement
         .observe(ObservationRequest::Transcript {
             record,
@@ -654,30 +657,39 @@ async fn verify_stopped_and_restart(
             .to_string_lossy()
             .starts_with("w-")
     }));
-    let output = fixture.run(&["service", "stop"]).await;
+    let output = fixture.run(&["daemon", "stop"]).await;
     assert!(
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    fixture.owner = None;
+    fixture.daemon_epoch = None;
+}
+
+/// The command line `ps` shows for `process_id`.
+fn process_arguments(process_id: u32) -> String {
+    let output = std::process::Command::new("/bin/ps")
+        .args(["-o", "command=", "-p", &process_id.to_string()])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn explicit_cli_stop_ends_current_owner_and_active_worker_preserving_saved_history() {
-    let mut fixture = ServiceFixture::new();
+async fn explicit_cli_stop_ends_current_daemon_and_active_worker_preserving_saved_history() {
+    let mut fixture = DaemonFixture::new();
     fixture.launch_in_progress = true;
-    let owner = tickloop_agent::agent_daemon::connect_or_start_at(
+    let daemon = tickloop_agent::agent_daemon::connect_or_start_at(
         fixture.runtime.clone(),
         support::fixture_cli::executable(),
     )
     .await
     .unwrap();
-    let epoch = owner.owner_epoch();
-    fixture.owner = Some((PROTOCOL_MAJOR, epoch));
+    let epoch = daemon.daemon_epoch();
+    fixture.daemon_epoch = Some(epoch);
     fixture.launch_in_progress = false;
     let (launch, mut requests, _release) = launch_active_worker(&fixture).await;
-    let created = owner
+    let created = daemon
         .execute(create_command(epoch, launch))
         .await
         .unwrap()
@@ -697,7 +709,15 @@ async fn explicit_cli_stop_ends_current_owner_and_active_worker_preserving_saved
         .unwrap()
         .path();
     let worker = LocalAgentClient::connect(&worker_socket).await.unwrap();
-    assert_eq!(worker.owner_epoch(), epoch);
+    assert_eq!(worker.daemon_epoch(), epoch);
+    assert!(
+        process_arguments(daemon.protocol().process_id).contains(" daemon run "),
+        "ps names the daemon by its role"
+    );
+    assert!(
+        process_arguments(worker.protocol().process_id).contains(" worker "),
+        "ps names the worker by its role"
+    );
     let record = TranscriptRef {
         store_root: fixture.config.clone(),
         chat_id: snapshot.conversation.id,
@@ -707,7 +727,7 @@ async fn explicit_cli_stop_ends_current_owner_and_active_worker_preserving_saved
         epoch,
         record,
         worker_socket,
-        &[owner.protocol().process_id, worker.protocol().process_id],
+        &[daemon.protocol().process_id, worker.protocol().process_id],
     )
     .await;
     assert!(
@@ -715,125 +735,52 @@ async fn explicit_cli_stop_ends_current_owner_and_active_worker_preserving_saved
         "stopping and restarting must not resend model work"
     );
     eprintln!(
-        "actual current owner + active worker stopped; saved history readable; new owner epoch and zero resumed workers"
+        "actual current daemon + active worker stopped; saved history readable; new daemon epoch and zero resumed workers"
     );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires an isolated preserved major-1 executable; never uses the default daemon"]
-async fn rejected_startup_then_cli_stop_ends_legacy_owner_and_worker_before_current_restart() {
-    let mut fixture = ServiceFixture::new();
-    let executable = fixture.directory.path().join("legacy-tickloop");
-    std::fs::copy(
-        std::env::var_os("TICKLOOP_DIAG_OLD_OWNER").expect("preserved major-1 executable"),
-        &executable,
-    )
-    .unwrap();
+async fn frozen_management_wire_stops_a_daemon_of_any_business_major() {
+    let mut fixture = DaemonFixture::new();
     fixture.launch_in_progress = true;
-    let rejected =
-        tickloop_agent::agent_daemon::connect_or_start_at(fixture.runtime.clone(), executable)
-            .await;
-    assert!(rejected.is_err());
-    let (mut owner, hello) = legacy_connect(&fixture.runtime.join("owner.sock")).await;
-    let epoch: Uuid = serde_json::from_value(hello["owner_epoch"].clone()).unwrap();
-    fixture.owner = Some((1, epoch));
-    fixture.launch_in_progress = false;
-    let (launch, mut requests, _release) = launch_active_worker(&fixture).await;
-    let created = legacy_request(
-        &mut owner,
-        "Execute",
-        json!({"command":create_command(epoch, launch)}),
-    )
-    .await;
-    let receipt: CommandReceipt = serde_json::from_value(created["receipt"].clone()).unwrap();
-    let CommandResult::Created { snapshot, .. } = receipt.into_result().unwrap() else {
-        panic!("legacy active worker created")
-    };
-    tokio::time::timeout(Duration::from_secs(5), requests.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    let worker_socket = std::fs::read_dir(&fixture.runtime)
-        .unwrap()
-        .filter_map(Result::ok)
-        .find(|entry| entry.file_name().to_string_lossy().starts_with("w-"))
-        .unwrap()
-        .path();
-    let (_, worker_hello) = legacy_connect(&worker_socket).await;
-    assert_eq!(worker_hello["owner_epoch"], hello["owner_epoch"]);
-    let output = fixture
-        .command(&["--working-directory-is-trusted"])
-        .output()
-        .await
-        .unwrap();
-    assert!(assert_failed(&output).contains("service stop"));
-    let (_, unchanged) = legacy_connect(&fixture.runtime.join("owner.sock")).await;
-    assert_eq!(unchanged["owner_epoch"], hello["owner_epoch"]);
-    assert_eq!(unchanged["process_id"], hello["process_id"]);
-    let (_, unchanged_worker) = legacy_connect(&worker_socket).await;
-    assert_eq!(unchanged_worker["process_id"], worker_hello["process_id"]);
-    let record = TranscriptRef {
-        store_root: fixture.config.clone(),
-        chat_id: snapshot.conversation.id,
-    };
-    verify_stopped_and_restart(
-        &mut fixture,
-        epoch,
-        record,
-        worker_socket,
-        &[
-            serde_json::from_value(hello["process_id"].clone()).unwrap(),
-            serde_json::from_value(worker_hello["process_id"].clone()).unwrap(),
-        ],
-    )
-    .await;
-    assert!(
-        requests.try_recv().is_err(),
-        "the legacy task must never be resent by the new build"
-    );
-    eprintln!(
-        "actual major-1 owner + active worker kept their PID/epoch after startup rejection, then current CLI stopped them; history preserved and current owner starts a new epoch"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn old_stop_wire_can_stop_a_future_business_owner() {
-    let mut fixture = ServiceFixture::new();
-    fixture.launch_in_progress = true;
-    let owner = tickloop_agent::agent_daemon::connect_or_start_at(
+    let daemon = tickloop_agent::agent_daemon::connect_or_start_at(
         fixture.runtime.clone(),
         env!("CARGO_BIN_EXE_tickloop").into(),
     )
     .await
     .unwrap();
-    fixture.owner = Some((PROTOCOL_MAJOR, owner.owner_epoch()));
+    fixture.daemon_epoch = Some(daemon.daemon_epoch());
     fixture.launch_in_progress = false;
-    let mut stream = UnixStream::connect(fixture.runtime.join("owner.sock"))
+    let mut stream = UnixStream::connect(fixture.runtime.join("daemon.sock"))
         .await
         .unwrap();
-    write_frame(&mut stream, &json!({"Hello":{"major":1,"minor":0}})).await;
+    write_frame(
+        &mut stream,
+        &json!({"Hello":{"major":MANAGEMENT_MAJOR,"minor":0}}),
+    )
+    .await;
     let hello = read_frame(&mut stream).await.unwrap();
-    assert_eq!(hello["Hello"]["major"], 1);
-    assert_eq!(hello["Hello"]["owner_epoch"], json!(owner.owner_epoch()));
+    assert_eq!(hello["Hello"]["major"], MANAGEMENT_MAJOR);
+    assert_eq!(hello["Hello"]["daemon_epoch"], json!(daemon.daemon_epoch()));
     let request_id = Uuid::new_v4();
     write_frame(
         &mut stream,
-        &json!({"ShutdownOwner":{"request_id":request_id,"owner_epoch":owner.owner_epoch()}}),
+        &json!({"ShutdownDaemon":{"request_id":request_id,"daemon_epoch":daemon.daemon_epoch()}}),
     )
     .await;
     assert_eq!(
-        read_frame(&mut stream).await.unwrap()["OwnerStopped"]["request_id"],
+        read_frame(&mut stream).await.unwrap()["DaemonStopped"]["request_id"],
         json!(request_id)
     );
     tokio::time::timeout(Duration::from_secs(7), async {
-        while fixture.runtime.join("owner.sock").exists() {
+        while fixture.runtime.join("daemon.sock").exists() {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     })
     .await
     .unwrap();
-    assert_processes_exited(&[owner.protocol().process_id]).await;
-    fixture.owner = None;
+    assert_processes_exited(&[daemon.protocol().process_id]).await;
+    fixture.daemon_epoch = None;
 }
 
 struct UndispatchedAccess(std::sync::atomic::AtomicUsize);
@@ -855,11 +802,11 @@ impl AgentAccess for UndispatchedAccess {
 }
 
 #[tokio::test]
-async fn management_aliases_reject_every_business_request_before_dispatch() {
-    let fixture = ServiceFixture::new();
+async fn management_session_rejects_every_business_request_before_dispatch() {
+    let fixture = DaemonFixture::new();
     let access = std::sync::Arc::new(UndispatchedAccess(std::sync::atomic::AtomicUsize::new(0)));
     let epoch = Uuid::new_v4();
-    let server = tokio::spawn(serve_owner_listener(
+    let server = tokio::spawn(serve_daemon_listener(
         fixture.listener(),
         access.clone(),
         epoch,
@@ -873,35 +820,33 @@ async fn management_aliases_reject_every_business_request_before_dispatch() {
         json!({"Execute":{"request_id":request_id,"command":create_command(epoch, LaunchSpec::embedded(fixture.directory.path().into()))}}),
         json!({"ShowView":{"request_id":request_id,"update":DisplayUpdate::SessionClosed {session_id:Uuid::new_v4()}}}),
     ];
-    for major in [1, 2] {
-        for request in &requests {
-            let mut stream = UnixStream::connect(fixture.runtime.join("owner.sock"))
-                .await
-                .unwrap();
-            write_frame(&mut stream, &json!({"Hello":{"major":major,"minor":0}})).await;
-            let hello = read_frame(&mut stream).await.unwrap();
-            assert_eq!(hello["Hello"]["major"], major);
-            assert_eq!(hello["Hello"]["minor"], 0);
-            write_frame(&mut stream, request).await;
-            let response = read_frame(&mut stream).await.unwrap();
-            assert_eq!(response["Error"]["error"]["code"], "VersionMismatch");
-            assert_eq!(response["Error"]["request_id"], json!(request_id));
-            assert!(read_frame(&mut stream).await.is_none());
-        }
+    for request in &requests {
+        let mut stream = UnixStream::connect(fixture.runtime.join("daemon.sock"))
+            .await
+            .unwrap();
+        write_frame(
+            &mut stream,
+            &json!({"Hello":{"major":MANAGEMENT_MAJOR,"minor":0}}),
+        )
+        .await;
+        let hello = read_frame(&mut stream).await.unwrap();
+        assert_eq!(hello["Hello"]["major"], MANAGEMENT_MAJOR);
+        assert_eq!(hello["Hello"]["minor"], 0);
+        write_frame(&mut stream, request).await;
+        let response = read_frame(&mut stream).await.unwrap();
+        assert_eq!(response["Error"]["error"]["code"], "VersionMismatch");
+        assert_eq!(response["Error"]["request_id"], json!(request_id));
+        assert!(read_frame(&mut stream).await.is_none());
     }
     assert_eq!(access.0.load(std::sync::atomic::Ordering::SeqCst), 0);
-    let mut stream = UnixStream::connect(fixture.runtime.join("owner.sock"))
-        .await
-        .unwrap();
-    write_frame(&mut stream, &json!({"Hello":{"major":2,"minor":0}})).await;
-    read_frame(&mut stream).await.unwrap();
+    let mut stream = management_connect(&fixture.runtime.join("daemon.sock")).await;
     write_frame(
         &mut stream,
-        &json!({"ShutdownOwner":{"request_id":request_id,"owner_epoch":epoch}}),
+        &json!({"ShutdownDaemon":{"request_id":request_id,"daemon_epoch":epoch}}),
     )
     .await;
     assert_eq!(
-        read_frame(&mut stream).await.unwrap()["OwnerStopped"]["request_id"],
+        read_frame(&mut stream).await.unwrap()["DaemonStopped"]["request_id"],
         json!(request_id)
     );
     server.await.unwrap().unwrap();
@@ -909,10 +854,10 @@ async fn management_aliases_reject_every_business_request_before_dispatch() {
 
 #[tokio::test]
 async fn management_rejects_wrong_epoch_malformed_and_oversize_frames_without_dispatch() {
-    let fixture = ServiceFixture::new();
+    let fixture = DaemonFixture::new();
     let access = std::sync::Arc::new(UndispatchedAccess(std::sync::atomic::AtomicUsize::new(0)));
     let epoch = Uuid::new_v4();
-    let server = tokio::spawn(serve_owner_listener(
+    let server = tokio::spawn(serve_daemon_listener(
         fixture.listener(),
         access.clone(),
         epoch,
@@ -920,11 +865,11 @@ async fn management_rejects_wrong_epoch_malformed_and_oversize_frames_without_di
     ));
     let request_id = Uuid::new_v4();
     for request in [
-        json!({"ShutdownOwner":{"request_id":request_id,"owner_epoch":Uuid::new_v4()}}),
-        json!({"ShutdownOwner":{"request_id":"invalid-uuid","owner_epoch":epoch}}),
-        json!({"Hello":{"major":1,"minor":0}}),
+        json!({"ShutdownDaemon":{"request_id":request_id,"daemon_epoch":Uuid::new_v4()}}),
+        json!({"ShutdownDaemon":{"request_id":"invalid-uuid","daemon_epoch":epoch}}),
+        json!({"Hello":{"major":MANAGEMENT_MAJOR,"minor":0}}),
     ] {
-        let (mut stream, _) = legacy_connect(&fixture.runtime.join("owner.sock")).await;
+        let mut stream = management_connect(&fixture.runtime.join("daemon.sock")).await;
         write_frame(&mut stream, &request).await;
         assert!(
             read_frame(&mut stream)
@@ -937,11 +882,15 @@ async fn management_rejects_wrong_epoch_malformed_and_oversize_frames_without_di
         assert!(!server.is_finished());
     }
     for after_hello in [false, true] {
-        let mut stream = UnixStream::connect(fixture.runtime.join("owner.sock"))
+        let mut stream = UnixStream::connect(fixture.runtime.join("daemon.sock"))
             .await
             .unwrap();
         if after_hello {
-            write_frame(&mut stream, &json!({"Hello":{"major":1,"minor":0}})).await;
+            write_frame(
+                &mut stream,
+                &json!({"Hello":{"major":MANAGEMENT_MAJOR,"minor":0}}),
+            )
+            .await;
             read_frame(&mut stream).await.unwrap();
         }
         stream.write_u32(65537).await.unwrap();
@@ -953,46 +902,26 @@ async fn management_rejects_wrong_epoch_malformed_and_oversize_frames_without_di
         );
         assert!(!server.is_finished());
     }
-    let mut stream = UnixStream::connect(fixture.runtime.join("owner.sock"))
+    let mut stream = UnixStream::connect(fixture.runtime.join("daemon.sock"))
         .await
         .unwrap();
     stream.write_u32(1).await.unwrap();
     stream.write_all(b"{").await.unwrap();
     assert!(read_frame(&mut stream).await.is_none());
-    let mut ordinary = UnixStream::connect(fixture.runtime.join("owner.sock"))
-        .await
-        .unwrap();
-    write_frame(&mut ordinary, &json!({"Hello":{"major":2,"minor":1}})).await;
-    assert_eq!(
-        read_frame(&mut ordinary).await.unwrap()["Error"]["error"]["code"],
-        "VersionMismatch"
-    );
-    assert!(read_frame(&mut ordinary).await.is_none());
-    assert_eq!(access.0.load(std::sync::atomic::Ordering::SeqCst), 0);
-    server.abort();
-    let _ = server.await;
-}
-
-#[tokio::test]
-async fn worker_socket_has_no_cross_version_management_facade() {
-    let fixture = ServiceFixture::new();
-    let access = std::sync::Arc::new(UndispatchedAccess(std::sync::atomic::AtomicUsize::new(0)));
-    let server = tokio::spawn(serve_worker_listener(
-        fixture.listener(),
-        access.clone(),
-        Uuid::new_v4(),
-        support::TRANSPORT_LIMITS,
-    ));
-    for major in [1, 2] {
-        let mut stream = UnixStream::connect(fixture.runtime.join("owner.sock"))
+    // The retired 2.0 alias and any other minor are ordinary incompatible peers now.
+    for hello in [
+        json!({"Hello":{"major":2,"minor":0}}),
+        json!({"Hello":{"major":MANAGEMENT_MAJOR,"minor":1}}),
+    ] {
+        let mut ordinary = UnixStream::connect(fixture.runtime.join("daemon.sock"))
             .await
             .unwrap();
-        write_frame(&mut stream, &json!({"Hello":{"major":major,"minor":0}})).await;
+        write_frame(&mut ordinary, &hello).await;
         assert_eq!(
-            read_frame(&mut stream).await.unwrap()["Error"]["error"]["code"],
+            read_frame(&mut ordinary).await.unwrap()["Error"]["error"]["code"],
             "VersionMismatch"
         );
-        assert!(read_frame(&mut stream).await.is_none());
+        assert!(read_frame(&mut ordinary).await.is_none());
     }
     assert_eq!(access.0.load(std::sync::atomic::Ordering::SeqCst), 0);
     server.abort();
@@ -1000,42 +929,72 @@ async fn worker_socket_has_no_cross_version_management_facade() {
 }
 
 #[tokio::test]
-async fn only_version_mismatch_allows_the_legacy_control_alias_retry() {
-    let fixture = ServiceFixture::new();
+async fn worker_socket_has_no_cross_version_management_facade() {
+    let fixture = DaemonFixture::new();
+    let access = std::sync::Arc::new(UndispatchedAccess(std::sync::atomic::AtomicUsize::new(0)));
+    let server = tokio::spawn(serve_worker_listener(
+        fixture.listener(),
+        access.clone(),
+        Uuid::new_v4(),
+        support::TRANSPORT_LIMITS,
+    ));
+    let mut stream = UnixStream::connect(fixture.runtime.join("daemon.sock"))
+        .await
+        .unwrap();
+    write_frame(
+        &mut stream,
+        &json!({"Hello":{"major":MANAGEMENT_MAJOR,"minor":0}}),
+    )
+    .await;
+    assert_eq!(
+        read_frame(&mut stream).await.unwrap()["Error"]["error"]["code"],
+        "VersionMismatch"
+    );
+    assert!(read_frame(&mut stream).await.is_none());
+    assert_eq!(access.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn a_version_mismatch_is_reported_without_another_attempt() {
+    let fixture = DaemonFixture::new();
     let listener = fixture.listener();
-    let socket = fixture.runtime.join("owner.sock");
     let server = tokio::spawn(async move {
-        let (mut first, _) = listener.accept().await.unwrap();
-        assert_eq!(
-            read_frame(&mut first).await.unwrap(),
-            json!({"Hello":{"major":1,"minor":0}})
-        );
-        write_frame(&mut first, &json!({"Error":{"request_id":null,"error":{"code":"VersionMismatch","message":"legacy v2"}}})).await;
-        assert!(read_frame(&mut first).await.is_none());
         let (mut stream, _) = listener.accept().await.unwrap();
         assert_eq!(
             read_frame(&mut stream).await.unwrap(),
-            json!({"Hello":{"major":2,"minor":0}})
+            json!({"Hello":{"major":MANAGEMENT_MAJOR,"minor":0}})
         );
-        let epoch = Uuid::new_v4();
-        write_frame(&mut stream, &json!({"Hello":{"major":2,"minor":0,"owner_epoch":epoch,"capabilities":["UnknownFutureBusinessCapability"]}})).await;
-        let shutdown = read_frame(&mut stream).await.unwrap();
-        assert_eq!(shutdown["ShutdownOwner"]["owner_epoch"], json!(epoch));
-        std::fs::remove_file(socket).unwrap();
-        write_frame(
-            &mut stream,
-            &json!({"OwnerStopped":{"request_id":shutdown["ShutdownOwner"]["request_id"]}}),
-        )
-        .await;
+        write_frame(&mut stream, &json!({"Error":{"request_id":null,"error":{"code":"VersionMismatch","message":"another management major"}}})).await;
         assert_disconnected(&mut stream, &listener).await;
     });
-    assert!(fixture.run(&["service", "stop"]).await.status.success());
+    let message = assert_failed(&fixture.run(&["daemon", "stop"]).await);
+    assert!(
+        message.contains("cannot be stopped by this build"),
+        "{message}"
+    );
     server.await.unwrap();
+    assert!(fixture.runtime.join("daemon.sock").exists());
+}
+
+#[tokio::test]
+async fn the_service_command_no_longer_exists() {
+    let fixture = DaemonFixture::new();
+    let listener = fixture.listener();
+    let message = assert_failed(&fixture.run(&["service", "stop"]).await);
+    assert!(message.contains("unknown argument service"), "{message}");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), listener.accept())
+            .await
+            .is_err()
+    );
+    assert!(!fixture.runtime.join("daemon.lock").exists());
 }
 
 #[tokio::test]
 async fn control_oversize_reply_is_rejected_without_shutdown() {
-    let fixture = ServiceFixture::new();
+    let fixture = DaemonFixture::new();
     let listener = fixture.listener();
     let server = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
@@ -1043,14 +1002,14 @@ async fn control_oversize_reply_is_rejected_without_shutdown() {
         stream.write_u32(65537).await.unwrap();
         assert_disconnected(&mut stream, &listener).await;
     });
-    assert!(assert_failed(&fixture.run(&["service", "stop"]).await).contains("64 KiB"));
+    assert!(assert_failed(&fixture.run(&["daemon", "stop"]).await).contains("64 KiB"));
     server.await.unwrap();
 }
 
 #[tokio::test]
 async fn replacement_lock_before_shutdown_or_after_ack_is_preserved() {
     for after_ack in [false, true] {
-        let fixture = ServiceFixture::new();
+        let fixture = DaemonFixture::new();
         let listener = fixture.listener();
         let original = fixture.lock();
         assert_eq!(
@@ -1065,41 +1024,41 @@ async fn replacement_lock_before_shutdown_or_after_ack_is_preserved() {
             if after_ack {
                 write_frame(
                     &mut stream,
-                    &json!({"Hello":{"major":1,"minor":0,"owner_epoch":epoch}}),
+                    &json!({"Hello":{"major":MANAGEMENT_MAJOR,"minor":0,"daemon_epoch":epoch}}),
                 )
                 .await;
                 let shutdown = read_frame(&mut stream).await.unwrap();
-                assert_eq!(shutdown["ShutdownOwner"]["owner_epoch"], json!(epoch));
-                std::fs::rename(runtime.join("owner.lock"), runtime.join("old.lock")).unwrap();
+                assert_eq!(shutdown["ShutdownDaemon"]["daemon_epoch"], json!(epoch));
+                std::fs::rename(runtime.join("daemon.lock"), runtime.join("old.lock")).unwrap();
                 let replacement = OpenOptions::new()
                     .write(true)
                     .create_new(true)
                     .mode(0o600)
-                    .open(runtime.join("owner.lock"))
+                    .open(runtime.join("daemon.lock"))
                     .unwrap();
                 assert_eq!(
                     unsafe { libc::flock(replacement.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
                     0
                 );
-                std::fs::remove_file(runtime.join("owner.sock")).unwrap();
+                std::fs::remove_file(runtime.join("daemon.sock")).unwrap();
                 write_frame(
                     &mut stream,
-                    &json!({"OwnerStopped":{"request_id":shutdown["ShutdownOwner"]["request_id"]}}),
+                    &json!({"DaemonStopped":{"request_id":shutdown["ShutdownDaemon"]["request_id"]}}),
                 )
                 .await;
                 assert_disconnected(&mut stream, &listener).await;
                 drop(replacement);
             } else {
-                std::fs::rename(runtime.join("owner.lock"), runtime.join("old.lock")).unwrap();
+                std::fs::rename(runtime.join("daemon.lock"), runtime.join("old.lock")).unwrap();
                 let replacement = OpenOptions::new()
                     .write(true)
                     .create_new(true)
                     .mode(0o600)
-                    .open(runtime.join("owner.lock"))
+                    .open(runtime.join("daemon.lock"))
                     .unwrap();
                 write_frame(
                     &mut stream,
-                    &json!({"Hello":{"major":1,"minor":0,"owner_epoch":epoch}}),
+                    &json!({"Hello":{"major":MANAGEMENT_MAJOR,"minor":0,"daemon_epoch":epoch}}),
                 )
                 .await;
                 assert_disconnected(&mut stream, &listener).await;
@@ -1107,20 +1066,20 @@ async fn replacement_lock_before_shutdown_or_after_ack_is_preserved() {
             }
             drop(original);
         });
-        let error = assert_failed(&fixture.run(&["service", "stop"]).await);
-        assert!(error.contains("owner lock was replaced"), "{error}");
+        let error = assert_failed(&fixture.run(&["daemon", "stop"]).await);
+        assert!(error.contains("daemon lock was replaced"), "{error}");
         server.await.unwrap();
-        assert!(fixture.runtime.join("owner.lock").is_file());
+        assert!(fixture.runtime.join("daemon.lock").is_file());
         assert!(fixture.runtime.join("old.lock").is_file());
     }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn real_owner_preserves_replacement_endpoint_after_shutdown_dispatch() {
+async fn real_daemon_preserves_replacement_endpoint_after_shutdown_dispatch() {
     use std::os::unix::fs::MetadataExt;
 
     for replace_lock in [false, true] {
-        let fixture = ServiceFixture::new();
+        let fixture = DaemonFixture::new();
         let lock = fixture.lock();
         assert_eq!(
             unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
@@ -1128,7 +1087,8 @@ async fn real_owner_preserves_replacement_endpoint_after_shutdown_dispatch() {
         );
         let lock_fd = lock.as_raw_fd();
         let mut command = fixture.command(&[
-            "--agent-owner",
+            tickloop_agent::agent_daemon::DAEMON_RUN_ARGUMENTS[0],
+            tickloop_agent::agent_daemon::DAEMON_RUN_ARGUMENTS[1],
             fixture.runtime.to_str().unwrap(),
             &lock_fd.to_string(),
         ]);
@@ -1143,8 +1103,8 @@ async fn real_owner_preserves_replacement_endpoint_after_shutdown_dispatch() {
         }
         let original = command.spawn().unwrap();
         drop(lock);
-        let endpoint = fixture.runtime.join("owner.sock");
-        let owner = tokio::time::timeout(Duration::from_secs(5), async {
+        let endpoint = fixture.runtime.join("daemon.sock");
+        let daemon = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if let Ok(client) = LocalAgentClient::connect(&endpoint).await {
                     break client;
@@ -1155,8 +1115,8 @@ async fn real_owner_preserves_replacement_endpoint_after_shutdown_dispatch() {
         .await
         .unwrap();
         let (launch, mut requests, _release) = launch_active_worker(&fixture).await;
-        owner
-            .execute(create_command(owner.owner_epoch(), launch))
+        daemon
+            .execute(create_command(daemon.daemon_epoch(), launch))
             .await
             .unwrap()
             .into_result()
@@ -1178,23 +1138,23 @@ async fn real_owner_preserves_replacement_endpoint_after_shutdown_dispatch() {
             0
         );
 
-        let (mut management, _) = legacy_connect(&endpoint).await;
+        let mut management = management_connect(&endpoint).await;
         let request_id = Uuid::new_v4();
         write_frame(
             &mut management,
-            &json!({"ShutdownOwner": {
-                "request_id":request_id,"owner_epoch":owner.owner_epoch(),
+            &json!({"ShutdownDaemon": {
+                "request_id":request_id,"daemon_epoch":daemon.daemon_epoch(),
             }}),
         )
         .await;
         assert_eq!(
-            read_frame(&mut management).await.unwrap()["OwnerStopped"]["request_id"],
+            read_frame(&mut management).await.unwrap()["DaemonStopped"]["request_id"],
             json!(request_id)
         );
         std::fs::rename(&endpoint, fixture.runtime.join("original.sock")).unwrap();
         let replacement_lock = if replace_lock {
             std::fs::rename(
-                fixture.runtime.join("owner.lock"),
+                fixture.runtime.join("daemon.lock"),
                 fixture.runtime.join("original.lock"),
             )
             .unwrap();
@@ -1220,7 +1180,7 @@ async fn real_owner_preserves_replacement_endpoint_after_shutdown_dispatch() {
             .unwrap();
         assert_processes_exited(&[worker_pid]).await;
         let remaining = std::fs::symlink_metadata(&endpoint)
-            .expect("original daemon deleted the replacement owner's endpoint");
+            .expect("original daemon deleted the replacement daemon's endpoint");
         assert_eq!((remaining.dev(), remaining.ino()), replacement_identity);
         assert!(
             !output.status.success(),

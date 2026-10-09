@@ -196,7 +196,7 @@ async fn console_publication_enables_feedback_and_keeps_lifecycle_tools_host_onl
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env("HOME", &home)
-        .env("TICKLOOP_AGENT_RUNTIME_DIR", &runtime_directory)
+        .env("TICKLOOP_DAEMON_RUNTIME_DIR", &runtime_directory)
         .args([
             "--working-directory-is-trusted",
             "--mode",
@@ -234,7 +234,7 @@ async fn console_publication_enables_feedback_and_keeps_lifecycle_tools_host_onl
         .await
         .unwrap()
         .unwrap();
-    support::cli_runtime::shutdown_owner(&runtime_directory)
+    support::cli_runtime::shutdown_daemon(&runtime_directory)
         .await
         .unwrap();
     server.abort();

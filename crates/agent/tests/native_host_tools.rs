@@ -118,7 +118,7 @@ async fn explicit_host_operations_continue_after_the_agent_view_closes() {
     });
     let created = access
         .execute(CommandEnvelope {
-            owner_epoch: access.owner_epoch(),
+            daemon_epoch: access.daemon_epoch(),
             command_id: uuid::Uuid::new_v4(),
             command: AgentCommand::Create {
                 launch,
@@ -139,7 +139,7 @@ async fn explicit_host_operations_continue_after_the_agent_view_closes() {
     let chat = created_snapshot.conversation.id;
     let configured = access
         .execute(CommandEnvelope {
-            owner_epoch: access.owner_epoch(),
+            daemon_epoch: access.daemon_epoch(),
             command_id: uuid::Uuid::new_v4(),
             command: AgentCommand::Configure {
                 provider: None,
@@ -155,7 +155,7 @@ async fn explicit_host_operations_continue_after_the_agent_view_closes() {
     let mut events = agent.subscribe();
     let submitted = access
         .execute(CommandEnvelope {
-            owner_epoch: access.owner_epoch(),
+            daemon_epoch: access.daemon_epoch(),
             command_id: uuid::Uuid::new_v4(),
             command: AgentCommand::Submit {
                 execution,
@@ -1522,7 +1522,7 @@ async fn isolated_herdr_keeps_background_host_access_and_places_beside_the_input
     });
     let receipt = access
         .execute(CommandEnvelope {
-            owner_epoch: access.owner_epoch(),
+            daemon_epoch: access.daemon_epoch(),
             command_id: uuid::Uuid::new_v4(),
             command: AgentCommand::Create {
                 launch,
@@ -1537,7 +1537,7 @@ async fn isolated_herdr_keeps_background_host_access_and_places_beside_the_input
     };
     let configured = access
         .execute(CommandEnvelope {
-            owner_epoch: access.owner_epoch(),
+            daemon_epoch: access.daemon_epoch(),
             command_id: uuid::Uuid::new_v4(),
             command: AgentCommand::Configure {
                 provider: None,
@@ -1553,7 +1553,7 @@ async fn isolated_herdr_keeps_background_host_access_and_places_beside_the_input
     let mut events = runtime.subscribe();
     let submitted = access
         .execute(CommandEnvelope {
-            owner_epoch: access.owner_epoch(),
+            daemon_epoch: access.daemon_epoch(),
             command_id: uuid::Uuid::new_v4(),
             command: AgentCommand::Submit {
                 execution,
@@ -1646,7 +1646,7 @@ async fn isolated_herdr_keeps_background_host_access_and_places_beside_the_input
         .unwrap();
     let submitted = access
         .execute(CommandEnvelope {
-            owner_epoch: access.owner_epoch(),
+            daemon_epoch: access.daemon_epoch(),
             command_id: uuid::Uuid::new_v4(),
             command: AgentCommand::Submit {
                 execution,

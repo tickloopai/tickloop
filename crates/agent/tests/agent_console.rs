@@ -12,7 +12,7 @@ use uuid::Uuid;
 async fn create(access: &dyn AgentAccess, epoch: Uuid, directory: PathBuf) -> ExecutionRef {
     let receipt = access
         .execute(CommandEnvelope {
-            owner_epoch: epoch,
+            daemon_epoch: epoch,
             command_id: Uuid::new_v4(),
             command: AgentCommand::Create {
                 launch: LaunchSpec::embedded(directory),
@@ -39,7 +39,7 @@ async fn overview_filters_never_change_new_dispatch_directory_or_visible_executi
         )])),
     );
     let access = Arc::new(EmbeddedAgentAccess::new(runtime.clone()));
-    let epoch = access.owner_epoch();
+    let epoch = access.daemon_epoch();
     let mut console = AgentConsole::new(access.clone(), epoch, directory.path().into(), None);
     assert!(console.refresh().await.unwrap().rows.is_empty());
     assert!(console.projection().visible.is_none());
@@ -98,7 +98,7 @@ async fn overview_keeps_each_completed_state_group_contiguous_without_changing_t
         ])),
     );
     let access = Arc::new(EmbeddedAgentAccess::new(runtime.clone()));
-    let epoch = access.owner_epoch();
+    let epoch = access.daemon_epoch();
     let mut executions = Vec::new();
     for _ in 0..3 {
         executions.push(create(access.as_ref(), epoch, directory.path().into()).await);
@@ -107,7 +107,7 @@ async fn overview_keeps_each_completed_state_group_contiguous_without_changing_t
     for execution in [executions[0], executions[2]] {
         access
             .execute(CommandEnvelope {
-                owner_epoch: epoch,
+                daemon_epoch: epoch,
                 command_id: Uuid::new_v4(),
                 command: AgentCommand::Submit {
                     execution,
@@ -165,7 +165,7 @@ async fn overview_keeps_each_completed_state_group_contiguous_without_changing_t
 async fn submit(access: &dyn AgentAccess, epoch: Uuid, execution: ExecutionRef, text: &str) {
     access
         .execute(CommandEnvelope {
-            owner_epoch: epoch,
+            daemon_epoch: epoch,
             command_id: Uuid::new_v4(),
             command: AgentCommand::Submit {
                 execution,
@@ -200,7 +200,7 @@ async fn overview_completed_families_rank_by_recent_finish() {
         ])),
     );
     let access = Arc::new(EmbeddedAgentAccess::new(runtime.clone()));
-    let epoch = access.owner_epoch();
+    let epoch = access.daemon_epoch();
     let mut executions = [
         create(access.as_ref(), epoch, directory.path().into()).await,
         create(access.as_ref(), epoch, directory.path().into()).await,
@@ -285,7 +285,7 @@ async fn overview_completed_families_rank_by_recent_finish() {
     let image = tickloop_agent::image::prepare(&png.into_inner()).unwrap();
     access
         .execute(CommandEnvelope {
-            owner_epoch: epoch,
+            daemon_epoch: epoch,
             command_id: Uuid::new_v4(),
             command: AgentCommand::Submit {
                 execution: latest,
@@ -347,7 +347,7 @@ async fn overview_prioritizes_a_waiting_child_family_before_an_independent_runni
         ])),
     );
     let access = Arc::new(EmbeddedAgentAccess::new(runtime.clone()));
-    let epoch = access.owner_epoch();
+    let epoch = access.daemon_epoch();
     let mut executions = [
         create(access.as_ref(), epoch, directory.path().into()).await,
         create(access.as_ref(), epoch, directory.path().into()).await,
@@ -379,7 +379,7 @@ async fn overview_prioritizes_a_waiting_child_family_before_an_independent_runni
         ] {
             access
                 .execute(CommandEnvelope {
-                    owner_epoch: epoch,
+                    daemon_epoch: epoch,
                     command_id: Uuid::new_v4(),
                     command,
                 })
@@ -515,7 +515,7 @@ async fn overview_prioritizes_a_waiting_child_family_before_an_independent_runni
         .await
         .unwrap();
     let ObservationValue::Overview(canonical) = observed.initial else {
-        panic!("actual owner catalog")
+        panic!("actual daemon catalog")
     };
     assert_eq!(
         canonical
@@ -535,7 +535,7 @@ async fn late_navigation_and_closed_view_cannot_replace_newer_target() {
         Arc::new(support::ScriptedModel::new(vec![])),
     );
     let access = Arc::new(EmbeddedAgentAccess::new(runtime.clone()));
-    let epoch = access.owner_epoch();
+    let epoch = access.daemon_epoch();
     let b = create(access.as_ref(), epoch, directory.path().into()).await;
     let c = create(access.as_ref(), epoch, directory.path().into()).await;
     let mut console = AgentConsole::new(access, epoch, directory.path().into(), None);
@@ -561,7 +561,7 @@ async fn same_host_multiple_views_require_choice_and_focus_does_not_forge_local_
         Arc::new(support::ScriptedModel::new(vec![])),
     );
     let access = Arc::new(EmbeddedAgentAccess::new(runtime.clone()));
-    let epoch = access.owner_epoch();
+    let epoch = access.daemon_epoch();
     let a = create(access.as_ref(), epoch, directory.path().into()).await;
     let b = create(access.as_ref(), epoch, directory.path().into()).await;
     let host = HostLocation {
@@ -630,7 +630,7 @@ async fn an_unavailable_pane_falls_back_in_place_until_a_fresh_display_is_regist
         Arc::new(support::ScriptedModel::new(vec![])),
     );
     let access = Arc::new(EmbeddedAgentAccess::new(runtime.clone()));
-    let epoch = access.owner_epoch();
+    let epoch = access.daemon_epoch();
     let a = create(access.as_ref(), epoch, directory.path().into()).await;
     let b = create(access.as_ref(), epoch, directory.path().into()).await;
     let host = HostLocation {
@@ -767,7 +767,7 @@ async fn unknown_creation_requires_receipt_or_explicit_acknowledgement_and_never
         ])),
     );
     let actual = EmbeddedAgentAccess::new(runtime.clone());
-    let epoch = actual.owner_epoch();
+    let epoch = actual.daemon_epoch();
     let access = Arc::new(LostCreationReply {
         actual,
         hide_receipt: AtomicBool::new(true),
@@ -836,7 +836,7 @@ async fn create_with(
 ) -> ExecutionRef {
     let receipt = access
         .execute(CommandEnvelope {
-            owner_epoch: epoch,
+            daemon_epoch: epoch,
             command_id: Uuid::new_v4(),
             command: AgentCommand::Create {
                 launch: LaunchSpec::embedded(directory),
@@ -862,7 +862,7 @@ async fn an_accepted_dispatch_names_its_actual_execution_without_moving_filter_t
         Arc::new(support::ScriptedModel::new(vec![])),
     );
     let access = Arc::new(EmbeddedAgentAccess::new(runtime.clone()));
-    let epoch = access.owner_epoch();
+    let epoch = access.daemon_epoch();
     let bravo = create_with(
         access.as_ref(),
         epoch,
@@ -976,7 +976,7 @@ async fn only_a_resolved_creation_receipt_produces_a_created_execution() {
         Arc::new(support::ScriptedModel::new(vec![])),
     );
     let actual = EmbeddedAgentAccess::new(runtime.clone());
-    let epoch = actual.owner_epoch();
+    let epoch = actual.daemon_epoch();
     let access = Arc::new(LostCreationReply {
         actual,
         hide_receipt: AtomicBool::new(false),
@@ -1051,11 +1051,11 @@ async fn overview_rows_tell_configured_empty_sessions_from_agents_that_worked() 
         Arc::new(support::ScriptedModel::new(vec![support::text("done")])),
     );
     let access = Arc::new(EmbeddedAgentAccess::new(runtime.clone()));
-    let epoch = access.owner_epoch();
+    let epoch = access.daemon_epoch();
     let configured = create(access.as_ref(), epoch, directory.path().into()).await;
     access
         .execute(CommandEnvelope {
-            owner_epoch: epoch,
+            daemon_epoch: epoch,
             command_id: Uuid::new_v4(),
             command: AgentCommand::Configure {
                 provider: None,
@@ -1127,7 +1127,7 @@ async fn an_armed_waiting_goal_is_not_masked_by_a_later_completed_loop() {
         ])),
     );
     let access = Arc::new(EmbeddedAgentAccess::new(runtime.clone()));
-    let epoch = access.owner_epoch();
+    let epoch = access.daemon_epoch();
     let execution = create(access.as_ref(), epoch, directory.path().into()).await;
     let mut console = AgentConsole::new(access.clone(), epoch, directory.path().into(), None);
     let chat = console.refresh().await.unwrap().rows[0].chat_id;
@@ -1176,7 +1176,7 @@ async fn an_armed_waiting_goal_is_not_masked_by_a_later_completed_loop() {
     runtime.shutdown().await;
 }
 
-/// Reports chosen executions the way the owner reports a lost worker's last directory entries.
+/// Reports chosen executions the way the daemon reports a lost worker's last directory entries.
 struct LostWorkerDirectory {
     actual: EmbeddedAgentAccess,
     lost: ExecutionRef,
@@ -1214,7 +1214,7 @@ async fn a_lost_execution_stays_an_error_even_before_it_ever_worked() {
         Arc::new(support::ScriptedModel::new(vec![support::text("done")])),
     );
     let actual = EmbeddedAgentAccess::new(runtime.clone());
-    let epoch = actual.owner_epoch();
+    let epoch = actual.daemon_epoch();
     let configured = create(&actual, epoch, directory.path().into()).await;
     let finished = create_with(
         &actual,
@@ -1260,7 +1260,7 @@ async fn an_active_user_shell_keeps_an_agent_working_after_its_loops_finish() {
         Arc::new(support::ScriptedModel::new(vec![support::text("done")])),
     );
     let access = Arc::new(EmbeddedAgentAccess::new(runtime.clone()));
-    let epoch = access.owner_epoch();
+    let epoch = access.daemon_epoch();
     let hold = |name: &str| {
         format!(
             "for _ in $(seq 1 500); do [ -f {} ] && break; sleep 0.02; done",
@@ -1286,7 +1286,7 @@ async fn an_active_user_shell_keeps_an_agent_working_after_its_loops_finish() {
     .await;
     access
         .execute(CommandEnvelope {
-            owner_epoch: epoch,
+            daemon_epoch: epoch,
             command_id: Uuid::new_v4(),
             command: AgentCommand::Submit {
                 execution: finished,
@@ -1379,7 +1379,7 @@ async fn overview_refresh_cost_with_many_long_histories() {
             )),
         );
         let access = Arc::new(EmbeddedAgentAccess::new(runtime.clone()));
-        let epoch = access.owner_epoch();
+        let epoch = access.daemon_epoch();
         let input = || UserInput::Text {
             text: "x".repeat(history_bytes),
             contexts: vec![],

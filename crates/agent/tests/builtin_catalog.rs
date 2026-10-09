@@ -61,7 +61,7 @@ fn command(root: &Path) -> std::process::Command {
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", root.join("home"))
         .env("TICKLOOP_CONFIG_DIR", root.join("state"))
-        .env("TICKLOOP_AGENT_RUNTIME_DIR", runtime)
+        .env("TICKLOOP_DAEMON_RUNTIME_DIR", runtime)
         .current_dir(root);
     command
 }
@@ -171,7 +171,7 @@ async fn builtin_worker_refuses_context_tuning_even_without_a_settings_root() {
     let access = EmbeddedAgentAccess::for_worker(runtime.clone(), epoch);
     let result = access
         .execute(CommandEnvelope {
-            owner_epoch: epoch,
+            daemon_epoch: epoch,
             command_id: Uuid::new_v4(),
             command: AgentCommand::Create {
                 launch: LaunchSpec::embedded(directory.path().into()),
@@ -188,7 +188,7 @@ async fn builtin_worker_refuses_context_tuning_even_without_a_settings_root() {
     };
     let result = access
         .execute(CommandEnvelope {
-            owner_epoch: epoch,
+            daemon_epoch: epoch,
             command_id: Uuid::new_v4(),
             command: AgentCommand::Configure {
                 execution,

@@ -1210,7 +1210,7 @@ mod tests {
         let mut state = FileMentionState::with_index(index);
         let target = FamilyMentionTarget {
             execution: crate::agent_access::ExecutionRef {
-                owner_epoch: uuid::Uuid::new_v4(),
+                daemon_epoch: uuid::Uuid::new_v4(),
                 agent_id: uuid::Uuid::new_v4(),
                 generation: 1,
             },
@@ -1245,7 +1245,7 @@ mod tests {
             FileMentionState::with_index(FileMentionIndex::build(directory.path(), &[]).unwrap());
         let target = FamilyMentionTarget {
             execution: crate::agent_access::ExecutionRef {
-                owner_epoch: uuid::Uuid::new_v4(),
+                daemon_epoch: uuid::Uuid::new_v4(),
                 agent_id: uuid::Uuid::new_v4(),
                 generation: 1,
             },

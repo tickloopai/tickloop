@@ -20,7 +20,7 @@ use tickloop_agent::{
     host_tools::{HostEndpointIdentity, HostToolAuthority, HostToolProvider},
     hosted::{
         tools::HostedTickTools,
-        worker_control::{OwnerControl, WorkerControlGrant},
+        worker_control::{DaemonControl, WorkerControlGrant},
     },
     native_host::NativeHostToolProvider,
     tick_tool_router::TickToolRouter,
@@ -54,7 +54,7 @@ struct Backends {
     hosted: Arc<HostedTickTools>,
 }
 
-/// A trusted Herdr adapter and a Tick host behind an owner nobody listens on, so a call that
+/// A trusted Herdr adapter and a Tickhost behind a daemon nobody listens on, so a call that
 /// reached either backend would fail visibly.
 fn backends() -> Backends {
     let herdr = Arc::new(CountingHerdr::default());
@@ -67,8 +67,8 @@ fn backends() -> Backends {
         scope,
     ));
     let grant = WorkerControlGrant {
-        endpoint: "/private/tmp/unused-owner.sock".into(),
-        owner_epoch: uuid::Uuid::new_v4(),
+        endpoint: "/private/tmp/unused-daemon.sock".into(),
+        daemon_epoch: uuid::Uuid::new_v4(),
         binding: uuid::Uuid::new_v4(),
         capability: "0".repeat(64),
         host_endpoint: "/private/tmp/unused-host.sock".into(),
@@ -80,13 +80,13 @@ fn backends() -> Backends {
             endpoint: HostEndpointIdentity::TrustedAdapter { scope },
         },
         host_authority: HostToolAuthority::Native {
-            endpoint: HostEndpointIdentity::TickHost {
+            endpoint: HostEndpointIdentity::Tickhost {
                 endpoint: grant.host_endpoint.clone(),
                 uid: unsafe { libc::geteuid() },
             },
         },
         native,
-        hosted: Arc::new(HostedTickTools::new(OwnerControl::new(grant), Vec::new())),
+        hosted: Arc::new(HostedTickTools::new(DaemonControl::new(grant), Vec::new())),
     }
 }
 
@@ -203,7 +203,7 @@ async fn each_tick_tool_runs_under_the_authority_of_the_backend_its_target_names
     let hidden = herdr_router
         .call_authority("ModifyTick", &json!({"action":"open","command":["tick"]}))
         .unwrap_err();
-    assert!(hidden.contains("Tick host"), "{hidden}");
+    assert!(hidden.contains("Tickhost"), "{hidden}");
     assert_eq!(
         herdr_router.tool_authorities("ReadTick"),
         Ok(BTreeSet::from([backends.herdr_authority.clone()]))
@@ -448,7 +448,7 @@ async fn peers_with_the_old_delegation_authority_schema_are_rejected_at_handshak
         let length = stream.read_u32().await.unwrap();
         let mut request = vec![0; length as usize];
         stream.read_exact(&mut request).await.unwrap();
-        let response = serde_json::to_vec(&json!({"Hello":{"major":3,"minor":2,"owner_epoch":uuid::Uuid::new_v4(),"session_id":uuid::Uuid::new_v4()}})).unwrap();
+        let response = serde_json::to_vec(&json!({"Hello":{"major":3,"minor":2,"daemon_epoch":uuid::Uuid::new_v4(),"session_id":uuid::Uuid::new_v4()}})).unwrap();
         stream.write_u32(response.len() as u32).await.unwrap();
         stream.write_all(&response).await.unwrap();
     });
