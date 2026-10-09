@@ -2224,8 +2224,17 @@ for line in sys.stdin:
         let business_pid = opened["business_pid"].as_u64().unwrap() as u32;
         let launcher = tick_host::process::sample(business_pid).unwrap().parent;
         let host = tick_host::process::sample(launcher).unwrap().parent;
+        let host_paths = tick_host::paths::HostPaths {
+            runtime: owner.root.join("h"),
+        };
         unsafe { libc::kill(host as libc::pid_t, libc::SIGKILL) };
-        assert!(super::gone(business_pid).await);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while super::alive(business_pid) || host_paths.host_running().unwrap() {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("the killed host releases its ownership lock and business process");
         let CommandResult::HostedTicks(members) = owner
             .command(AgentCommand::ListHostedTicks { execution })
             .await
@@ -2235,9 +2244,6 @@ for line in sys.stdin:
         assert_eq!(members.len(), 1);
         assert_eq!(members[0].instance, lost);
         assert_eq!(members[0].state, HostedMemberState::Lost);
-        let host_paths = tick_host::paths::HostPaths {
-            runtime: owner.root.join("h"),
-        };
         assert!(
             !host_paths.host_running().unwrap(),
             "nothing reopened by itself"
@@ -2356,7 +2362,13 @@ for line in sys.stdin:
             "nothing ends while the cleanup holds the Chat"
         );
         drop(cleanup);
-        assert!(super::gone(tick.business_pid).await);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while super::alive(tick.business_pid) || owner.owner_state(deleted).is_some() {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("the finished deletion ends its business process and removes owner state");
         assert_eq!(owner.owner_state(deleted), None);
     }
 

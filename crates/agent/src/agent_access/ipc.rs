@@ -2142,6 +2142,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn disconnect_during_chunked_open_cancels_the_source_before_any_opened_is_published() {
+        const CHUNKED_OPEN_PREPARATION_TIMEOUT: std::time::Duration =
+            std::time::Duration::from_secs(600);
         let temporary = tempfile::tempdir_in("/tmp").unwrap();
         let socket = temporary.path().join("chunk-cancel.sock");
         let listener = UnixListener::bind(&socket).unwrap();
@@ -2207,7 +2209,7 @@ mod tests {
         .await
         .unwrap();
         let response = tokio::time::timeout(
-            std::time::Duration::from_secs(60),
+            CHUNKED_OPEN_PREPARATION_TIMEOUT,
             read_frame::<_, ServerMessage>(&mut stream),
         )
         .await

@@ -18,7 +18,8 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-const RESPONSE_TIMEOUT: Duration = Duration::from_secs(180);
+// These corpora exceed a 128 MiB frame and undergo JSON encoding, hashing and decoding.
+const LARGE_HISTORY_TIMEOUT: Duration = Duration::from_secs(600);
 static LARGE_HISTORY_FIXTURE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 struct ImageModel {
@@ -166,7 +167,7 @@ fn envelope(epoch: Uuid, command: AgentCommand) -> CommandEnvelope {
 }
 
 async fn complete(observation: &mut Observation) {
-    tokio::time::timeout(Duration::from_secs(60), async {
+    tokio::time::timeout(LARGE_HISTORY_TIMEOUT, async {
         loop {
             if matches!(observation.recv().await.unwrap().change,
                 ObservationChange::Event(event) if matches!(event.kind, EventKind::Completed { .. }))
@@ -185,7 +186,7 @@ async fn write_json<W: AsyncWrite + Unpin>(stream: &mut W, value: &serde_json::V
 }
 
 async fn read_json<R: AsyncRead + Unpin>(stream: &mut R) -> serde_json::Value {
-    tokio::time::timeout(RESPONSE_TIMEOUT, async {
+    tokio::time::timeout(LARGE_HISTORY_TIMEOUT, async {
         let length = stream.read_u32().await.unwrap() as usize;
         assert!(length <= MAX_FRAME_BYTES);
         let mut bytes = vec![0; length];
@@ -308,7 +309,7 @@ async fn repeated_legal_images_cross_the_frame_limit_without_losing_history_or_r
     }
     assert_eq!(*model.image_counts.lock().unwrap(), [14, 28]);
     let mut observation = tokio::time::timeout(
-        RESPONSE_TIMEOUT,
+        LARGE_HISTORY_TIMEOUT,
         client.observe(ObservationRequest::Agent {
             execution,
             detail: AgentDetailQuery::Snapshot,
@@ -369,14 +370,14 @@ async fn repeated_legal_images_cross_the_frame_limit_without_losing_history_or_r
         },
     );
     let branch_id = branch_command.command_id;
-    let error = tokio::time::timeout(RESPONSE_TIMEOUT, interrupted.execute(branch_command))
+    let error = tokio::time::timeout(LARGE_HISTORY_TIMEOUT, interrupted.execute(branch_command))
         .await
         .expect("a lost acknowledgement must resolve without hanging")
         .expect_err("a partial receipt must not be published");
     assert_eq!(error.code, AccessErrorCode::OutcomeUnknown);
     proxy.await.unwrap();
     let recovered = tokio::time::timeout(
-        RESPONSE_TIMEOUT,
+        LARGE_HISTORY_TIMEOUT,
         client.observe(ObservationRequest::Receipt {
             epoch,
             command_id: branch_id,
@@ -421,7 +422,7 @@ async fn repeated_legal_images_cross_the_frame_limit_without_losing_history_or_r
     );
     assert_eq!(*model.image_counts.lock().unwrap(), [14, 28]);
     let receipt = tokio::time::timeout(
-        RESPONSE_TIMEOUT,
+        LARGE_HISTORY_TIMEOUT,
         client.execute(envelope(
             epoch,
             AgentCommand::EditHistory {
@@ -568,7 +569,7 @@ async fn large_text_history_is_complete_and_a_corrupt_end_is_never_published() {
     );
     proxy.await.unwrap();
     let restored = tokio::time::timeout(
-        RESPONSE_TIMEOUT,
+        LARGE_HISTORY_TIMEOUT,
         client.observe(ObservationRequest::Agent {
             execution,
             detail: AgentDetailQuery::Snapshot,

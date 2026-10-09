@@ -485,25 +485,68 @@ impl Drop for HerdrClient {
 
 /// The `tickloop monitor attach` processes the private Herdr server runs for its popup.
 fn popup_attach_processes(herdr: &PrivateHerdr) -> Vec<u32> {
-    let attach = format!(
-        "{} monitor attach",
-        Path::new(env!("CARGO_BIN_EXE_tickloop"))
-            .canonicalize()
-            .unwrap()
-            .display()
-    );
-    let listed = Command::new("/bin/ps")
-        .args(["-ax", "-o", "pid=,ppid=,command="])
-        .output()
+    let attach = Path::new(env!("CARGO_BIN_EXE_tickloop"))
+        .canonicalize()
         .unwrap();
-    String::from_utf8_lossy(&listed.stdout)
-        .lines()
-        .filter_map(|line| {
-            let mut fields = line.split_whitespace();
-            let pid = fields.next()?.parse().ok()?;
-            let parent = fields.next()?.parse::<u32>().ok()?;
-            let command = fields.collect::<Vec<_>>().join(" ");
-            (parent == herdr.server.id() && command == attach).then_some(pid)
+    #[cfg(target_os = "macos")]
+    let children = {
+        const INITIAL_CHILD_PID_CAPACITY: usize = 16;
+        let mut children = vec![0 as libc::pid_t; INITIAL_CHILD_PID_CAPACITY];
+        loop {
+            let count = unsafe {
+                libc::proc_listchildpids(
+                    herdr.server.id() as libc::pid_t,
+                    children.as_mut_ptr().cast(),
+                    std::mem::size_of_val(children.as_slice()) as libc::c_int,
+                )
+            };
+            assert!(count >= 0, "{}", std::io::Error::last_os_error());
+            if (count as usize) < children.len() {
+                children.truncate(count as usize);
+                break children
+                    .into_iter()
+                    .map(|pid| pid as u32)
+                    .collect::<Vec<_>>();
+            }
+            children.resize(children.len() * 2, 0);
+        }
+    };
+    #[cfg(target_os = "linux")]
+    let children = {
+        let mut children = std::fs::read_dir(format!("/proc/{}/task", herdr.server.id()))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|thread| std::fs::read_to_string(thread.path().join("children")).ok())
+            .flat_map(|pids| {
+                pids.split_whitespace()
+                    .filter_map(|pid| pid.parse::<u32>().ok())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        children.sort_unstable();
+        children.dedup();
+        children
+    };
+    children
+        .into_iter()
+        .filter(|pid| {
+            #[cfg(target_os = "macos")]
+            let executable = {
+                use std::os::unix::ffi::OsStrExt;
+                let mut path = vec![0; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+                let length = unsafe {
+                    libc::proc_pidpath(
+                        *pid as libc::pid_t,
+                        path.as_mut_ptr().cast(),
+                        path.len() as u32,
+                    )
+                };
+                (length > 0)
+                    .then(|| PathBuf::from(std::ffi::OsStr::from_bytes(&path[..length as usize])))
+            };
+            #[cfg(target_os = "linux")]
+            let executable = std::fs::read_link(format!("/proc/{pid}/exe")).ok();
+            executable.as_ref() == Some(&attach)
         })
         .collect()
 }
@@ -528,6 +571,7 @@ async fn the_installed_popup_shows_the_same_hosted_tick_until_it_detaches() {
     let state = State::new();
     let installed = state.run_in_terminal("install", &herdr, b"y\r");
     assert!(installed.succeeded, "{installed:?}");
+    assert_our_plugin(&herdr, &state);
     let workspace = herdr
         .request(
             "workspace.create",

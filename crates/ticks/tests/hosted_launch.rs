@@ -838,10 +838,20 @@ async fn an_idle_tick_is_reaped_unless_attached_watched_or_explicitly_used() {
     );
     assert!(gone(pid(&watched)).await);
 
-    let diagnostics = controller
-        .request("diagnostics", json!({}), CONTROL_TIMEOUT)
-        .await
-        .unwrap();
+    let diagnostics = tokio::time::timeout(CONTROL_TIMEOUT, async {
+        loop {
+            let diagnostics = controller
+                .request("diagnostics", json!({}), CONTROL_TIMEOUT)
+                .await
+                .unwrap();
+            if diagnostics["reaped"].as_array().unwrap().len() >= 4 {
+                break diagnostics;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("every finished idle reap is recorded in diagnostics");
     let reasons = diagnostics["reaped"]
         .as_array()
         .unwrap()
