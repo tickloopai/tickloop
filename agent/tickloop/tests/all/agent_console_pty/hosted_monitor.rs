@@ -64,6 +64,44 @@ async fn terminal_shows(view: &PtyView, text: &str) {
     .unwrap_or_else(|_| panic!("{text:?} never appeared:\n{}", terminal_screen(view)));
 }
 
+/// Notices the Console used to show after a hosted Tick opened or closed; it now returns to the
+/// Monitor list quietly.
+const RETIRED_NOTICES: [&str; 4] = [
+    "Not inside Herdr",
+    "keeps running",
+    "Herdr popup",
+    "Herdr plugin",
+];
+
+/// The Monitor list is back without a notice on how the Tick was opened or closed.
+fn quietly_back_in_monitor(frame: &str) -> bool {
+    frame.contains("Enter open") && !RETIRED_NOTICES.iter().any(|notice| frame.contains(notice))
+}
+
+/// Waits until the Console has taken the terminal back from a full-screen Tick, whose screen
+/// shows its size, and returns the Monitor list, which must carry no such notice.
+async fn back_in_monitor_quietly(view: &PtyView) -> String {
+    tokio::time::timeout(UI_TIMEOUT, async {
+        loop {
+            let screen = terminal_screen(view);
+            if screen.contains("Enter open") && !screen.contains("size 100x32") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "the Console never took the terminal back:\n{}",
+            terminal_screen(view)
+        )
+    });
+    let frame = view.frame();
+    assert!(quietly_back_in_monitor(&frame), "{frame}");
+    frame
+}
+
 /// A plugin of someone else's, linked before Tick Loop registers its own.
 const OTHER_PLUGIN_ID: &str = "test.other";
 
@@ -74,8 +112,8 @@ const SEND_ESCAPE: &[u8] = b"\x02\x1b";
 
 /// Enter on a hosted Tick outside Herdr opens the same process full screen in this terminal at
 /// once: the Console stops reading and drawing, keys reach the Tick, Ctrl+B Esc sends Esc, and a
-/// lone Esc gives the terminal back to the Monitor list with the same row selected, the reason it
-/// did not float and nothing typed left in the input. `s` opens the text snapshot detail instead.
+/// lone Esc gives the terminal back to the Monitor list quietly with the same row selected and
+/// nothing typed left in the input. `s` opens the text snapshot detail instead.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn actual_cli_enter_opens_a_hosted_tick_full_screen_outside_herdr_and_esc_closes_it() {
     let fixture = PrivateFixture::new();
@@ -109,12 +147,7 @@ async fn actual_cli_enter_opens_a_hosted_tick_full_screen_outside_herdr_and_esc_
         view.send(SEND_ESCAPE);
         terminal_shows(&view, "keys 7a 1b").await;
         view.send(CLOSE);
-        let back = view
-            .wait_for("the Monitor list is back", |frame| {
-                frame.contains("Not inside Herdr · Closed; the Tick keeps running")
-                    && frame.contains("Enter open")
-            })
-            .await;
+        let back = back_in_monitor_quietly(&view).await;
         assert_eq!(
             selected_row(&back),
             selected_row(&second),
@@ -221,10 +254,7 @@ async fn actual_cli_monitor_shows_a_hosted_tick_snapshot_and_attaches_it_full_sc
             "the Agent reply must not overwrite the attached Tick"
         );
         view.send(CLOSE);
-        view.wait_for("the Console takes the terminal back", |frame| {
-            frame.contains("Closed; the Tick keeps running") && frame.contains("Enter open")
-        })
-        .await;
+        back_in_monitor_quietly(&view).await;
         view.send(b"s");
         view.wait_for("the snapshot retains attached input", |frame| {
             frame.contains("keys 7a 1b") && frame.contains("r refresh")
@@ -327,6 +357,11 @@ async fn actual_cli_enter_opens_a_hosted_tick_in_a_herdr_popup_after_a_one_key_r
         client.shows("keys 7a");
         client.send(SEND_ESCAPE);
         client.shows("keys 7a 1b");
+        assert!(
+            quietly_back_in_monitor(&view.frame()),
+            "the View says nothing about the popup: {}",
+            view.frame()
+        );
         client.send(CLOSE);
         wait_until("the popup to close", || {
             Some(()).filter(|()| !client.screen().contains("┌Tick Loop"))
@@ -380,11 +415,115 @@ async fn actual_cli_enter_opens_a_hosted_tick_in_a_herdr_popup_after_a_one_key_r
     }
 }
 
-/// Declining the one-time registration offer with Esc links nothing and is not asked again: the
-/// next Enter opens the Tick full screen and says the popup plugin is not registered. With another
-/// plugin holding Tick Loop's popup id, Enter opens full screen too, says so and leaves it linked.
+/// Tick Loop's own popup plugin linked by another tickloop build runs that build's attach client,
+/// which may not speak this Tickhost's protocol and would close the popup at once. Enter offers to
+/// register the plugin for this tickloop instead of floating the Tick into the other one, and once
+/// confirmed the popup shows the Tick.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn actual_cli_enter_without_a_usable_popup_opens_full_screen_and_says_why() {
+async fn actual_cli_enter_re_registers_a_popup_plugin_another_tickloop_linked() {
+    use std::os::unix::fs::PermissionsExt;
+    use support::herdr::{HerdrClient, PLUGIN_ID, PrivateHerdr, wait_until};
+    let herdr = PrivateHerdr::start();
+    let pane = herdr.create_workspace();
+    let mut client = HerdrClient::attach(&herdr);
+    let fixture = PrivateFixture::new();
+    let socket = herdr.socket();
+    let result = AssertUnwindSafe(async {
+        let other_tickloop = fixture.path("other-build/tickloop");
+        std::fs::create_dir_all(other_tickloop.parent().unwrap()).unwrap();
+        std::fs::write(
+            &other_tickloop,
+            "#!/bin/sh\necho 'Error: IncompatibleHost' >&2\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&other_tickloop, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let other_tickloop = other_tickloop.canonicalize().unwrap();
+        let plugin = fixture
+            .path("config")
+            .canonicalize()
+            .unwrap()
+            .join("herdr-popup-plugin");
+        std::fs::create_dir(&plugin).unwrap();
+        std::fs::set_permissions(&plugin, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(
+            plugin.join("herdr-plugin.toml"),
+            format!(
+                "id = \"{PLUGIN_ID}\"\nname = \"Tick Loop Monitor\"\nversion = \"0.1.0\"\nmin_herdr_version = \"0.9.0\"\nplatforms = [\"macos\", \"linux\"]\n\n[[panes]]\nid = \"attach\"\ntitle = \"Tick Loop\"\nplacement = \"popup\"\nwidth = \"85%\"\nheight = \"85%\"\ncommand = [{:?}, \"monitor\", \"attach\"]\n",
+                other_tickloop.to_str().unwrap()
+            ),
+        )
+        .unwrap();
+        herdr
+            .request("plugin.link", json!({"path": plugin, "enabled": true}))
+            .unwrap();
+        let settings = fixture.path("config/settings.json");
+        let mut enabled = std::fs::read(&settings)
+            .map(|saved| serde_json::from_slice::<serde_json::Value>(&saved).unwrap())
+            .unwrap_or_else(|_| json!({}));
+        enabled["monitorPopup"] = json!("enabled");
+        std::fs::write(&settings, enabled.to_string()).unwrap();
+        let mut view = view_with_keys_ticks(
+            &fixture,
+            &[
+                ("HERDR_ENV", std::path::Path::new("1")),
+                ("HERDR_SOCKET_PATH", &socket),
+                ("HERDR_PANE_ID", std::path::Path::new(&pane)),
+            ],
+            1,
+            None,
+        )
+        .await;
+        view.send(b"\x1b[C");
+        view.wait_for("Monitor focused", |frame| frame.contains("Enter open"))
+            .await;
+        view.send(b"\r");
+        view.wait_for("the offer to register this tickloop", |frame| {
+            frame.contains("runs another tickloop") && frame.contains("Enter confirm")
+        })
+        .await;
+        assert_eq!(
+            herdr.plugins()[0]["panes"][0]["command"][0],
+            json!(other_tickloop),
+            "nothing is re-registered before Enter"
+        );
+
+        view.send(b"\r");
+        wait_until("the popup shows the Tick", || {
+            Some(client.screen())
+                .filter(|screen| screen.contains("┌Tick Loop") && screen.contains("keys"))
+        });
+        let plugins = herdr.plugins();
+        assert_eq!(plugins.len(), 1, "{plugins:?}");
+        assert_eq!(plugins[0]["plugin_root"], json!(plugin));
+        assert_ne!(
+            plugins[0]["panes"][0]["command"][0],
+            json!(other_tickloop),
+            "the popup runs this tickloop now: {plugins:?}"
+        );
+        client.send(CLOSE);
+        wait_until("the popup to close", || {
+            Some(()).filter(|()| !client.screen().contains("┌Tick Loop"))
+        });
+        view.send(b"\x1b");
+        view.wait_for("input focused again", new_input_is_visible)
+            .await;
+        view.close().await;
+    })
+    .catch_unwind()
+    .await;
+    fixture.shutdown().await;
+    drop(client);
+    drop(herdr);
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+/// Declining the one-time registration offer with Esc links nothing and is not asked again: the
+/// next Enter opens the Tick full screen and returns quietly. With another plugin holding Tick
+/// Loop's popup id, Enter opens full screen too and leaves that plugin linked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn actual_cli_enter_without_a_usable_popup_opens_full_screen() {
     use support::herdr::PrivateHerdr;
     let herdr = PrivateHerdr::start();
     let pane = herdr.create_workspace();
@@ -420,12 +559,7 @@ async fn actual_cli_enter_without_a_usable_popup_opens_full_screen_and_says_why(
         view.send(b"\r");
         terminal_shows(&view, "size 100x32").await;
         view.send(CLOSE);
-        let back = view
-            .wait_for("the reason it did not float", |frame| {
-                frame.contains("The Herdr popup plugin is not registered")
-                    && frame.contains("Enter open")
-            })
-            .await;
+        let back = back_in_monitor_quietly(&view).await;
         assert!(
             !back.contains("Register Tick Loop"),
             "the offer is made once: {back}"
@@ -439,10 +573,7 @@ async fn actual_cli_enter_without_a_usable_popup_opens_full_screen_and_says_why(
         view.send(b"\r");
         terminal_shows(&view, "size 100x32").await;
         view.send(CLOSE);
-        view.wait_for("the foreign plugin named", |frame| {
-            frame.contains("Another Herdr plugin") && frame.contains("Enter open")
-        })
-        .await;
+        back_in_monitor_quietly(&view).await;
         let plugins = herdr.plugins();
         assert_eq!(
             (plugins.len(), plugins[0]["plugin_root"].as_str()),

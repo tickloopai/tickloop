@@ -118,16 +118,26 @@ impl TickKind {
         }
     }
 
-    /// The smallest Panel a Tick renders in. The renderer reads this on every
+    /// The narrowest and shortest Panel that shows every key field of the Tick whole; a
+    /// smaller Panel scrolls over a canvas of this size. The renderer reads this on every
     /// frame, so it stays independent of the Tick Tool catalog.
     pub fn minimum_panel_size(self) -> MinimumPanelSize {
         let (columns, rows) = match self {
-            Self::Quote | Self::Watchlist => (32, 6),
-            Self::Kline => (40, 14),
-            Self::Positions => (40, 8),
+            // Symbol, CJK name, price, change and change %.
+            Self::Quote => (52, 6),
+            // Symbol, name, price and change % beside the market-state marker.
+            Self::Watchlist => (44, 6),
+            // The two-line price summary and the full footer keys for three-digit prices.
+            Self::Kline => (45, 14),
+            // Symbol, quantity, price, value, P/L and P/L %.
+            Self::Positions => (49, 8),
+            // A headline of at least 19 columns beside the time and source.
             Self::News => (40, 10),
-            Self::Earnings => (100, 14),
-            Self::Options => (60, 14),
+            // The detail mode's source time and estimate note, the widest Earnings line.
+            Self::Earnings => (62, 14),
+            // Strike, both bid/ask pairs and both IVs at their designed widths.
+            Self::Options => (58, 14),
+            // The document heading and wrapped prose.
             Self::Reader => (40, 10),
         };
         MinimumPanelSize { columns, rows }

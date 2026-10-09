@@ -150,7 +150,7 @@ impl TickActionExecutor for OpenHosted {
 impl TickActionBackend for OpenHosted {
     async fn execute(&self, ctx: TickActionContext<'_>) -> Result<TickActionOutcome, String> {
         let floated = match HerdrPopup::reach(&ctx).await {
-            Ok(None) => return open_full_screen(&ctx, &self.instance, NOT_IN_HERDR.into()).await,
+            Ok(None) => return open_full_screen(&ctx, &self.instance).await,
             Ok(Some(popup)) => match popup.check(&ctx).await {
                 Ok(()) => popup.float(&ctx, &self.instance).await,
                 Err(reason)
@@ -175,24 +175,26 @@ impl TickActionBackend for OpenHosted {
     }
 }
 
-const FLOATED: &str = "Shown in a Herdr popup · Esc closes it; the Tick keeps running";
-const NOT_IN_HERDR: &str = "Not inside Herdr";
-const NO_STATE_DIRECTORY: &str = "no Tick Loop state directory";
 const REGISTER_POPUP_PROMPT: &str =
     "Register Tick Loop's Herdr popup plugin? No other plugin is touched.";
 const TURN_ON_POPUP_PROMPT: &str = "Turn Tick Loop's Herdr popup on? No other plugin is touched.";
+const REGISTER_THIS_TICKLOOP_PROMPT: &str =
+    "Tick Loop's Herdr popup runs another tickloop. Register this one instead?";
+const HERDR_BUSY: &str = "Herdr is showing another view; close it and press Enter again";
 
 /// Why a hosted Tick did not float in the Herdr popup.
 enum NotFloated {
     NotRegistered,
     /// Our plugin is disabled in Herdr, or `monitorPopup` is off.
     TurnedOff,
-    /// Another plugin holds our id; Tick Loop never replaces it.
-    ForeignPlugin(std::path::PathBuf),
+    /// Our plugin runs another tickloop build's attach client.
+    Outdated,
+    /// The popup cannot show it here, such as when another plugin holds our id; nothing opened.
+    Unavailable,
+    /// The user confirmed registering our plugin, but it could not be registered.
+    RegistrationFailed(String),
     /// Herdr is showing something other than its workspace view, such as another popup.
     Busy,
-    /// Nothing opened.
-    Refused(String),
     /// Herdr may be showing the popup; opening again could show the Tick twice.
     Unknown(String),
 }
@@ -202,7 +204,7 @@ impl From<crate::terminal::popup::FloatError> for NotFloated {
         use crate::terminal::popup::FloatError;
         match error {
             FloatError::Busy => Self::Busy,
-            FloatError::Refused(reason) => Self::Refused(reason),
+            FloatError::Refused => Self::Unavailable,
             FloatError::Unknown(reason) => Self::Unknown(reason),
         }
     }
@@ -210,35 +212,14 @@ impl From<crate::terminal::popup::FloatError> for NotFloated {
 
 impl NotFloated {
     fn offers_registration(&self) -> bool {
-        matches!(self, Self::NotRegistered | Self::TurnedOff)
+        matches!(self, Self::NotRegistered | Self::TurnedOff | Self::Outdated)
     }
 
     fn registration_prompt(&self) -> &'static str {
         match self {
             Self::TurnedOff => TURN_ON_POPUP_PROMPT,
+            Self::Outdated => REGISTER_THIS_TICKLOOP_PROMPT,
             _ => REGISTER_POPUP_PROMPT,
-        }
-    }
-
-    /// Whether the Tick opens full screen instead: only when no popup can be showing it and
-    /// Herdr is not busy with something the user is looking at.
-    fn opens_full_screen(&self) -> bool {
-        !matches!(self, Self::Busy | Self::Unknown(_))
-    }
-
-    fn notice(&self) -> String {
-        match self {
-            Self::NotRegistered => "The Herdr popup plugin is not registered".into(),
-            Self::TurnedOff => "The Herdr popup is turned off".into(),
-            Self::ForeignPlugin(root) => format!(
-                "Another Herdr plugin ({}) holds Tick Loop's popup id",
-                root.display()
-            ),
-            Self::Busy => "Herdr is showing another view; close it and press Enter again".into(),
-            Self::Refused(reason) => format!("The Herdr popup could not open: {reason}"),
-            Self::Unknown(reason) => format!(
-                "The Herdr popup may have opened ({reason}); look in Herdr before opening again"
-            ),
         }
     }
 }
@@ -254,17 +235,19 @@ impl HerdrPopup {
     /// Verifies the Herdr session this View runs inside; `None` outside Herdr.
     async fn reach(ctx: &TickActionContext<'_>) -> Result<Option<Self>, NotFloated> {
         use crate::terminal::popup::{HerdrSession, PopupPlugin};
-        let Some(socket) = ctx.console.herdr_socket().map_err(NotFloated::Refused)? else {
+        let Some(socket) = ctx
+            .console
+            .herdr_socket()
+            .map_err(|_| NotFloated::Unavailable)?
+        else {
             return Ok(None);
         };
-        let root = ctx
-            .root
-            .ok_or_else(|| NotFloated::Refused(NO_STATE_DIRECTORY.into()))?;
+        let root = ctx.root.ok_or(NotFloated::Unavailable)?;
         Ok(Some(Self {
             herdr: HerdrSession::verify(&socket)
                 .await
-                .map_err(NotFloated::Refused)?,
-            plugin: PopupPlugin::for_this_executable(root).map_err(NotFloated::Refused)?,
+                .map_err(|_| NotFloated::Unavailable)?,
+            plugin: PopupPlugin::for_this_executable(root).map_err(|_| NotFloated::Unavailable)?,
             settings: tickloop_agent_config::UserSettings::in_root(root),
         }))
     }
@@ -276,14 +259,18 @@ impl HerdrPopup {
             .herdr
             .readiness(&self.plugin)
             .await
-            .map_err(NotFloated::Refused)?
+            .map_err(|_| NotFloated::Unavailable)?
         {
             PopupReadiness::Ready => {}
             PopupReadiness::NotInstalled => return Err(NotFloated::NotRegistered),
             PopupReadiness::Disabled => return Err(NotFloated::TurnedOff),
-            PopupReadiness::Foreign { root } => return Err(NotFloated::ForeignPlugin(root)),
+            PopupReadiness::Outdated => return Err(NotFloated::Outdated),
+            PopupReadiness::Foreign { .. } => return Err(NotFloated::Unavailable),
         }
-        if ctx.console.monitor_popup().map_err(NotFloated::Refused)?
+        if ctx
+            .console
+            .monitor_popup()
+            .map_err(|_| NotFloated::Unavailable)?
             == tickloop_agent_config::MonitorPopup::Disabled
         {
             return Err(NotFloated::TurnedOff);
@@ -296,10 +283,10 @@ impl HerdrPopup {
         self.herdr
             .install(&self.plugin, &self.settings)
             .await
-            .map_err(|error| NotFloated::Refused(format!("cannot register the plugin: {error}")))?;
+            .map_err(NotFloated::RegistrationFailed)?;
         ctx.console
             .set_monitor_popup(tickloop_agent_config::MonitorPopup::Enabled)
-            .map_err(NotFloated::Refused)
+            .map_err(NotFloated::RegistrationFailed)
     }
 
     /// Opens the popup on `instance` with a one-time view grant.
@@ -312,7 +299,7 @@ impl HerdrPopup {
             .agent
             .attach_hosted_tick(ctx.chat, instance.clone())
             .await
-            .map_err(|error| NotFloated::Refused(error.to_string()))?;
+            .map_err(|_| NotFloated::Unavailable)?;
         Ok(self.herdr.float(&grant).await?)
     }
 }
@@ -339,7 +326,7 @@ impl TickActionBackend for RegisterPopup {
         let floated = async {
             let popup = HerdrPopup::reach(&ctx)
                 .await?
-                .ok_or_else(|| NotFloated::Refused(NOT_IN_HERDR.into()))?;
+                .ok_or(NotFloated::Unavailable)?;
             popup.register(&ctx).await?;
             popup.float(&ctx, &self.instance).await
         }
@@ -348,37 +335,38 @@ impl TickActionBackend for RegisterPopup {
     }
 }
 
-/// Says the Tick floated, or opens it full screen when nothing can be showing it; otherwise
-/// only says why it did not open.
+/// Leaves a floated Tick to its popup and opens it full screen when nothing can be showing it;
+/// otherwise only says what keeps it from opening.
 async fn settle_float(
     ctx: &TickActionContext<'_>,
     instance: &tick_protocol::InstanceRef,
     floated: Result<(), NotFloated>,
 ) -> Result<TickActionOutcome, String> {
     match floated {
-        Ok(()) => ctx.console.hold_status(FLOATED)?,
-        Err(reason) if reason.opens_full_screen() => {
-            return open_full_screen(ctx, instance, reason.notice()).await;
-        }
-        Err(reason) => ctx.console.hold_status(&reason.notice())?,
+        Ok(()) => {}
+        Err(NotFloated::Busy) => ctx.console.hold_status(HERDR_BUSY)?,
+        Err(NotFloated::Unknown(reason)) => ctx.console.hold_status(&format!(
+            "The Herdr popup may have opened ({reason}); look in Herdr before opening again"
+        ))?,
+        Err(NotFloated::RegistrationFailed(reason)) => ctx.console.hold_status(&format!(
+            "Cannot register Tick Loop's Herdr popup: {reason}"
+        ))?,
+        Err(_) => return open_full_screen(ctx, instance).await,
     }
     Ok(TickActionOutcome::Done)
 }
 
-/// Attaches the hosted Tick full screen in this View's terminal with a one-time view grant;
-/// `reason` says why it did not float and is shown when the view closes.
+/// Attaches the hosted Tick full screen in this View's terminal with a one-time view grant.
 async fn open_full_screen(
     ctx: &TickActionContext<'_>,
     instance: &tick_protocol::InstanceRef,
-    reason: String,
 ) -> Result<TickActionOutcome, String> {
     let grant = ctx
         .agent
         .attach_hosted_tick(ctx.chat, instance.clone())
         .await
         .map_err(|error| format!("Cannot open {instance}: {error}"))?;
-    ctx.console
-        .begin_full_screen_attach(ctx.chat, grant, reason)?;
+    ctx.console.begin_full_screen_attach(ctx.chat, grant)?;
     Ok(TickActionOutcome::Done)
 }
 

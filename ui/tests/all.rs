@@ -6,3 +6,5 @@ mod charts;
 mod markdown;
 #[path = "all/presentation.rs"]
 mod presentation;
+#[path = "all/scroll.rs"]
+mod scroll;

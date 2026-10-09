@@ -7,10 +7,25 @@ use super::{
     style::{Role, RoleLine},
 };
 
+/// Monitor's preferred column, its `│ ` separator included.
 pub(super) const MONITOR_COLUMNS: usize = 42;
+/// The narrowest Monitor column beside the conversation: 30 text columns still hold a row's
+/// indented kind · state · age line, such as `    Terminal · live · 60s · 2m`, whole.
+const MONITOR_MIN_COLUMNS: usize = 32;
+/// The narrowest conversation left beside Monitor: what the narrowest Monitor leaves of an
+/// 80-column terminal, the product's minimum, once the console's reserved last column is taken.
+/// Below it Monitor covers the conversation instead.
+pub(super) const CONVERSATION_MIN_COLUMNS: usize = 47;
 const MILLISECONDS_PER_SECOND: f64 = 1000.0;
 const BYTES_PER_MIB: f64 = 1024.0 * 1024.0;
-pub(super) const MONITOR_AUTO_MIN_COLUMNS: usize = 121;
+
+/// Monitor's column beside a content area `width` columns wide: as wide as preferred, narrowing
+/// so the conversation keeps its minimum, or `None` when even the narrowest Monitor leaves the
+/// conversation too little room and Monitor can only open as an overlay.
+pub(super) fn side_columns(width: usize) -> Option<usize> {
+    let spare = width.checked_sub(CONVERSATION_MIN_COLUMNS)?;
+    (spare >= MONITOR_MIN_COLUMNS).then(|| spare.min(MONITOR_COLUMNS))
+}
 
 pub(super) use crate::monitor_rows::TickGroup;
 use crate::monitor_rows::{

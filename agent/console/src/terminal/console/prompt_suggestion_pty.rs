@@ -185,12 +185,17 @@ async fn prompt_suggestion_pty_generates_ghost_without_submitting_until_accepted
     fixture.wait(|frame| frame.contains("Chat:") && frame.contains("fixture"));
     fixture.send("修好了检查一下\r".as_bytes());
     let frame = fixture.wait(|frame| frame.contains("进度怎么样了"));
-    assert!(frame.contains("Done"), "{frame}");
-    assert!(frame.contains("1 shell still running"), "{frame}");
+    // At 80 columns Monitor sits beside the conversation, so the status line wraps within the
+    // conversation column; rejoining its rows reads it whole.
+    let conversation: String = frame
+        .lines()
+        .map(|line| line.split('│').next().unwrap())
+        .collect();
+    assert!(conversation.contains("1 shell still running"), "{frame}");
     assert!(
         regex::Regex::new(r"Done · \d+s · done \d{2}:\d{2}")
             .unwrap()
-            .is_match(&frame),
+            .is_match(&conversation),
         "{frame}"
     );
     assert!(!frame.contains("Accepted fixture prompt."), "{frame}");

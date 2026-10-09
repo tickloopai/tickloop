@@ -190,7 +190,7 @@ async fn quitting_does_not_wait_forever_for_unsubscribe() {
 }
 
 #[tokio::test]
-async fn quote_reports_its_minimum_size_in_a_small_panel_without_losing_content() {
+async fn quote_scrolls_a_small_panel_without_losing_content() {
     let (_push, events) = tokio::sync::mpsc::unbounded_channel();
     let api = Quotes {
         events: Mutex::new(Some(events)),
@@ -224,8 +224,11 @@ async fn quote_reports_its_minimum_size_in_a_small_panel_without_losing_content(
         .iter()
         .map(|cell| cell.symbol())
         .collect();
-    assert!(screen.contains("Need 32x6"), "{screen}");
-    assert!(screen.contains("22x4"), "{screen}");
+    assert!(screen.contains("TSLA.US"), "{screen}");
+    assert!(
+        screen.contains("━━─") && screen.contains("─ ↕ 1–3/6"),
+        "{screen}"
+    );
     let record: serde_json::Value = updates.records().all().remove(0);
     assert_eq!(record["data"][0]["symbol"], "TSLA.US");
 }
@@ -242,7 +245,8 @@ async fn minimum_quote_panel_keeps_symbol_price_and_percentage_visible() {
         symbols: vec!["TSLA".into()],
         output: OnceArgs::default(),
     };
-    let mut terminal = Terminal::new(TestBackend::new(32, 6)).unwrap();
+    let minimum = TickKind::Quote.minimum_panel_size();
+    let mut terminal = Terminal::new(TestBackend::new(minimum.columns, minimum.rows)).unwrap();
     let input = futures_util::stream::iter([Ok(Event::Key(KeyEvent::new(
         KeyCode::Char('q'),
         KeyModifiers::NONE,
@@ -266,7 +270,11 @@ async fn minimum_quote_panel_keeps_symbol_price_and_percentage_visible() {
         .map(|cell| cell.symbol())
         .collect();
     assert!(
-        screen.contains("TSLA.US") && screen.contains("100") && screen.contains("11.11%"),
+        screen.contains("TSLA.US")
+            && screen.contains("Tesla")
+            && screen.contains("100")
+            && screen.contains("11.11%")
+            && !screen.contains("scroll"),
         "{screen}"
     );
 }

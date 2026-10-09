@@ -5,6 +5,8 @@
 //! one-time view grant `plugin.pane.open` passes in `TICKLOOP_MONITOR_ATTACH`. Herdr copies a
 //! manifest when it links a plugin and silently replaces a linked plugin that has the same id, so
 //! a plugin under our id counts as ours only when Herdr reports our own directory as its root.
+//! Every tickloop build shares that directory, so ours may still run another build's attach
+//! client, which need not speak this build's Tickhost protocol; it is registered again first.
 //! Herdr 0.9 opens a popup in front of the session's current client and cannot target one: with
 //! several clients on one session it may appear where Herdr places it.
 
@@ -52,6 +54,9 @@ pub(crate) enum PopupReadiness {
     NotInstalled,
     /// Ours, but disabled in Herdr.
     Disabled,
+    /// Ours, but its pane is not the one this executable writes, such as another tickloop
+    /// build's attach client.
+    Outdated,
     /// Another plugin holds our id; it is never replaced.
     Foreign {
         root: PathBuf,
@@ -228,16 +233,12 @@ command = [{command}]
                     root: registered.plugin_root,
                 }
             }
+            Some(registered) if registered.panes.as_slice() != std::slice::from_ref(&self.pane) => {
+                PopupReadiness::Outdated
+            }
             Some(registered) if registered.enabled => PopupReadiness::Ready,
             Some(_) => PopupReadiness::Disabled,
         }
-    }
-
-    fn is_registered_as_written(&self, registered: &RegisteredPlugin) -> bool {
-        registered.plugin_id == PLUGIN_ID
-            && registered.plugin_root == self.directory()
-            && registered.enabled
-            && registered.panes.as_slice() == std::slice::from_ref(&self.pane)
     }
 }
 
@@ -313,7 +314,7 @@ impl HerdrSession {
     /// Refuses unless the plugin under our id is our own.
     pub(crate) async fn require_ours(&self, plugin: &PopupPlugin) -> Result<(), String> {
         match self.readiness(plugin).await? {
-            PopupReadiness::Ready | PopupReadiness::Disabled => Ok(()),
+            PopupReadiness::Ready | PopupReadiness::Disabled | PopupReadiness::Outdated => Ok(()),
             PopupReadiness::NotInstalled => Err(format!(
                 "{} has no Tick Loop popup plugin {PLUGIN_ID}",
                 self.socket.display()
@@ -337,7 +338,9 @@ impl HerdrSession {
             .request("plugin.link", json!({"path": directory, "enabled": true}))
             .await?;
         let registered = serde_json::from_value::<RegisteredPlugin>(linked["plugin"].clone());
-        if !registered.is_ok_and(|registered| plugin.is_registered_as_written(&registered)) {
+        if !registered
+            .is_ok_and(|registered| plugin.readiness(vec![registered]) == PopupReadiness::Ready)
+        {
             self.request(PLUGIN_UNLINK, json!({"plugin_id": PLUGIN_ID}))
                 .await?;
             settings
@@ -380,8 +383,7 @@ impl HerdrSession {
     /// Floats the hosted Tick `grant` names in our popup: its attach client shows the same
     /// process until the user closes it.
     pub(crate) async fn float(&self, grant: &HostedViewGrant) -> Result<(), FloatError> {
-        let grant =
-            serde_json::to_string(grant).map_err(|error| FloatError::Refused(error.to_string()))?;
+        let grant = serde_json::to_string(grant).map_err(|_| FloatError::Refused)?;
         self.api
             .request(
                 PLUGIN_PANE_OPEN,
@@ -400,7 +402,7 @@ pub(crate) enum FloatError {
     /// Herdr is showing something other than its workspace view, such as another popup.
     Busy,
     /// Herdr refused the popup or was never reached; nothing opened.
-    Refused(String),
+    Refused,
     /// The request reached Herdr but its answer did not come back; the popup may be showing.
     Unknown(String),
 }
@@ -412,7 +414,7 @@ impl From<HostError> for FloatError {
         } else if error.code == HERDR_UI_BUSY {
             Self::Busy
         } else {
-            Self::Refused(error.message)
+            Self::Refused
         }
     }
 }
@@ -434,7 +436,7 @@ mod tests {
         assert_eq!(FloatError::from(refused(HERDR_UI_BUSY)), FloatError::Busy);
         assert_eq!(
             FloatError::from(refused("plugin_not_found")),
-            FloatError::Refused("refused".into())
+            FloatError::Refused
         );
         for code in ["OutcomeUnknown", HERDR_UI_BUSY] {
             assert_eq!(
@@ -504,7 +506,8 @@ mod tests {
     }
 
     #[test]
-    fn a_plugin_under_our_id_is_ours_only_from_our_directory_and_ready_only_when_enabled() {
+    fn a_plugin_under_our_id_is_ours_only_from_our_directory_and_ready_only_as_written_and_enabled()
+    {
         let plugin = PopupPlugin::new(Path::new("/state"), "/bin/tickloop".into());
         let registered = |root: &str| RegisteredPlugin {
             plugin_id: PLUGIN_ID.into(),
@@ -536,12 +539,21 @@ mod tests {
             plugin.readiness(vec![switched_off]),
             PopupReadiness::Disabled
         );
-        assert!(plugin.is_registered_as_written(&registered("/state/herdr-popup-plugin")));
-        let mut changed = registered("/state/herdr-popup-plugin");
-        changed.panes[0].command[0] = "/tmp/other".into();
-        assert!(!plugin.is_registered_as_written(&changed));
-        let mut disabled = registered("/state/herdr-popup-plugin");
-        disabled.enabled = false;
-        assert!(!plugin.is_registered_as_written(&disabled));
+        let mut other_build = registered("/state/herdr-popup-plugin");
+        other_build.panes[0].command[0] = "/other-build/tickloop".into();
+        assert_eq!(
+            plugin.readiness(vec![other_build]),
+            PopupReadiness::Outdated
+        );
+        let mut other_build_switched_off = registered("/state/herdr-popup-plugin");
+        other_build_switched_off.panes[0].command[0] = "/other-build/tickloop".into();
+        other_build_switched_off.enabled = false;
+        assert_eq!(
+            plugin.readiness(vec![other_build_switched_off]),
+            PopupReadiness::Outdated
+        );
+        let mut resized = registered("/state/herdr-popup-plugin");
+        resized.panes[0].width = Some("50%".into());
+        assert_eq!(plugin.readiness(vec![resized]), PopupReadiness::Outdated);
     }
 }

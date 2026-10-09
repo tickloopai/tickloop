@@ -14,6 +14,8 @@ mod kline;
 mod kline_tools;
 #[path = "all/live_quote.rs"]
 mod live_quote;
+#[path = "all/minimum_width.rs"]
+mod minimum_width;
 #[path = "all/narrow_errors.rs"]
 mod narrow_errors;
 #[path = "all/news.rs"]

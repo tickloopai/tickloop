@@ -174,7 +174,8 @@ async fn help_overlay_and_undersized_canvas_keep_the_injected_background_on_blan
         Modifier::DIM | Modifier::ITALIC | Modifier::UNDERLINED
     );
     let small = screen(20, 4, vec![KeyCode::Char('q')], settings()).await;
-    assert_eq!(small.backend().buffer()[(19, 3)].bg, Color::Indexed(1));
+    assert_eq!(small.backend().buffer()[(19, 0)].bg, Color::Indexed(4));
+    assert_eq!(small.backend().buffer()[(19, 3)].bg, Color::Indexed(10));
 }
 
 #[tokio::test]

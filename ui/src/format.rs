@@ -117,3 +117,70 @@ pub fn write_text(
         column += size;
     }
 }
+
+/// One key hint of a status line, with the shorter form a narrow Panel falls back to.
+#[derive(Clone, Copy)]
+pub struct Hint<'a> {
+    pub full: &'a str,
+    pub short: &'a str,
+}
+
+impl<'a> Hint<'a> {
+    pub const fn new(full: &'a str, short: &'a str) -> Self {
+        Self { full, short }
+    }
+
+    /// A hint with no shorter form: it is shown whole or not at all.
+    pub const fn whole(text: &'a str) -> Self {
+        Self::new(text, text)
+    }
+}
+
+/// Joins the hints into at most `columns`: hints shorten from the last one back, then drop
+/// from the end, so a hint is never cut mid-word. The help overlay keeps every key.
+pub fn fit_hints(
+    hints: &[Hint<'_>],
+    separator: &str,
+    columns: usize,
+    ambiguous: AmbiguousWidth,
+) -> String {
+    let mut forms: Vec<&str> = hints.iter().map(|hint| hint.full).collect();
+    let fits = |forms: &[&str]| width(&forms.join(separator), ambiguous) <= columns;
+    for index in (0..hints.len()).rev() {
+        if fits(&forms) {
+            break;
+        }
+        forms[index] = hints[index].short;
+    }
+    while !fits(&forms) {
+        forms.pop();
+    }
+    forms.join(separator)
+}
+
+/// Packs fields into as few lines of `columns` as the order allows, `gap` columns apart, and
+/// returns the fields of each line; a field wider than a whole line gets a line of its own.
+pub fn pack_fields<S: AsRef<str>>(
+    fields: &[S],
+    gap: usize,
+    columns: usize,
+    ambiguous: AmbiguousWidth,
+) -> Vec<std::ops::Range<usize>> {
+    let mut lines = Vec::new();
+    let mut start = 0;
+    let mut used = 0;
+    for (index, field) in fields.iter().enumerate() {
+        let field_width = width(field.as_ref(), ambiguous);
+        if index > start && used + gap + field_width > columns {
+            lines.push(start..index);
+            start = index;
+            used = field_width;
+        } else {
+            used += if index > start { gap } else { 0 } + field_width;
+        }
+    }
+    if start < fields.len() {
+        lines.push(start..fields.len());
+    }
+    lines
+}

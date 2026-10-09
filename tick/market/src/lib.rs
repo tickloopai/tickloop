@@ -2,6 +2,7 @@
 //! its content through the Tick SDK and draws with the shared terminal UI.
 
 pub mod args;
+mod canvas;
 pub mod commands;
 pub mod config;
 pub mod earnings;

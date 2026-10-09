@@ -489,3 +489,58 @@ async fn the_installed_popup_shows_the_same_hosted_tick_until_esc_closes_it() {
         .await
         .unwrap();
 }
+
+/// A popup whose attach client cannot show its Tick keeps the reason on screen until a key is
+/// pressed instead of vanishing at once; that key closes it.
+#[test]
+fn a_popup_that_cannot_attach_shows_why_until_a_key_closes_it() {
+    let herdr = PrivateHerdr::start();
+    let state = State::new();
+    let installed = state.run_in_terminal("install", &herdr, b"y\r");
+    assert!(installed.succeeded, "{installed:?}");
+    herdr
+        .request(
+            "workspace.create",
+            json!({"cwd": herdr.root.path(), "label": "popup", "focus": true}),
+        )
+        .unwrap();
+    let mut client = HerdrClient::attach(&herdr);
+    client.shows("popup");
+
+    let unreachable = tickloop_agent_protocol::HostedViewGrant {
+        endpoint: herdr.root.path().join("no-tickhost.sock"),
+        host_epoch: Uuid::new_v4(),
+        instance: "hosted:00000000-0000-0000-0000-000000000000"
+            .parse()
+            .unwrap(),
+        view: Uuid::new_v4(),
+    };
+    let opened = herdr.request(
+        "plugin.pane.open",
+        json!({
+            "plugin_id": PLUGIN_ID,
+            "entrypoint": "attach",
+            "env": {"TICKLOOP_MONITOR_ATTACH": serde_json::to_string(&unreachable).unwrap()},
+        }),
+    );
+    assert_eq!(opened.unwrap()["type"], "ok");
+    let shown = client.shows("Press any key to close");
+    assert!(shown.contains("┌Tick Loop"), "{shown}");
+    assert!(
+        shown.contains("HostUnavailable"),
+        "the reason is shown: {shown}"
+    );
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        client.screen().contains("Press any key to close"),
+        "the popup waits for a key"
+    );
+
+    client.send(b"x");
+    wait_until("the popup closes", || {
+        Some(()).filter(|()| !client.screen().contains("┌Tick Loop"))
+    });
+    wait_until("the attach process exits", || {
+        popup_attach_processes(&herdr).is_empty().then_some(())
+    });
+}

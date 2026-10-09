@@ -9,6 +9,7 @@ mod command_feedback;
 mod family_messaging;
 mod family_navigation;
 mod hosted_monitor;
+mod monitor_width;
 mod provider_errors;
 mod reply_visibility;
 mod resume_picker;
@@ -1091,8 +1092,9 @@ async fn run_sustained_daemon_loss(
         assert!(
             frame
                 .lines()
-                .any(|line| line.trim() == "cached shell output"),
-            "{frame}"
+                .filter_map(|line| line.split('│').next())
+                .any(|conversation| conversation.trim() == "cached shell output"),
+            "the cached output stays in the conversation beside Monitor: {frame}"
         );
         assert!(
             fixture.path("runtime").is_file(),

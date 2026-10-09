@@ -20,6 +20,13 @@ use tick_provider::{
 };
 
 const CALENDAR_LOOKAROUND_DAYS: i64 = 45;
+/// The release, window and baseline lines and the key rows stay whole from this size; the
+/// plain candlestick layout of the Kline Tick needs less.
+pub const MINIMUM_PANEL_SIZE: crate::metadata::MinimumPanelSize =
+    crate::metadata::MinimumPanelSize {
+        columns: 60,
+        rows: 14,
+    };
 const MAX_EVENT_CANDLES: usize = 12_000;
 pub const MAX_EVENT_PAGE_CANDLES: usize = 1_000;
 type PriceVolumeBin = (f64, f64, f64, f64, i64);

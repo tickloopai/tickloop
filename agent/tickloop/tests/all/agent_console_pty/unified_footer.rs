@@ -359,7 +359,9 @@ async fn run_shell_panel(fixture: &PrivateFixture) {
     let mut pty = PtyView::start_with_flags(fixture, &["--dangerously-skip-permissions"]);
     pty.wait_for("Shell fixture editor ready", new_input_is_visible)
         .await;
-    pty.resize(80, 24).await;
+    // Below the 80-column minimum layout width Monitor stays out of the way until the category
+    // click opens it as the overlay this flow drives.
+    pty.resize(79, 24).await;
     let client = fixture.client().await;
     pty.send(b"!printf 'prior-completed\\n'; while [ ! -f prior-finish ]; do sleep 0.02; done\r");
     let execution = tokio::time::timeout(UI_TIMEOUT, async {

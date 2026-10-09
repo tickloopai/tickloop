@@ -6,7 +6,10 @@ use ratatui::{Frame, layout::Rect, widgets::Clear};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tickloop_ui::format::write_text;
+use tickloop_ui::{
+    format::{Hint, fit_hints, truncate, width, write_text},
+    settings::AmbiguousWidth,
+};
 
 use crate::{
     args::{EarningsArgs, OutputFormat},
@@ -35,6 +38,7 @@ use tick_sdk::{stream::TickStream, tools::ToolCall};
 pub const MARKET: &str = "US";
 const SYMBOL_SUFFIX: &str = ".US";
 const NON_US_SYMBOL: &str = "Earnings covers US symbols only in this version";
+const INFO_SEPARATOR: &str = " · ";
 
 /// The calendar answers one date per page, so a search window costs at most this many pages
 /// before the Tick gives up on it.
@@ -1021,7 +1025,7 @@ impl LiveView for EarningsView {
             } else {
                 "Longbridge"
             };
-            let info = match self.mode {
+            let (facts, hints): (Vec<String>, &[Hint]) = match self.mode {
                 EarningsMode::Detail => {
                     let missing = self
                         .table
@@ -1031,32 +1035,50 @@ impl LiveView for EarningsView {
                         .map(|item| item.dataset)
                         .collect::<Vec<_>>()
                         .join(", ");
-                    format!(
-                        "{source} · {observed} · estimates not archived{}",
-                        if missing.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" · unavailable: {missing}")
-                        }
-                    )
+                    let mut facts = vec![
+                        source.to_owned(),
+                        observed.to_owned(),
+                        "estimates not archived".to_owned(),
+                    ];
+                    if !missing.is_empty() {
+                        facts.push(format!("unavailable: {missing}"));
+                    }
+                    (facts, &[])
                 }
-                EarningsMode::Filings => format!(
-                    "{source} · filename metadata matched; body not verified · Enter opens original"
+                EarningsMode::Filings => (
+                    vec![
+                        source.to_owned(),
+                        "filename metadata matched; body not verified".to_owned(),
+                    ],
+                    &[Hint::whole("Enter opens original")],
                 ),
-                EarningsMode::Upcoming => format!(
-                    "{source} · {observed} · awaiting actuals · refresh {}s · R refresh",
-                    self.refresh_in.as_secs()
+                EarningsMode::Upcoming => (
+                    vec![
+                        source.to_owned(),
+                        observed.to_owned(),
+                        "awaiting actuals".to_owned(),
+                        format!("refresh {}s", self.refresh_in.as_secs()),
+                    ],
+                    &[Hint::whole("R refresh")],
                 ),
-                _ => format!(
-                    "{source} · {observed} · Enter detail · c compare · r reactions · [ ] periods"
+                _ => (
+                    vec![source.to_owned(), observed.to_owned()],
+                    &[
+                        Hint::whole("Enter detail"),
+                        Hint::whole("c compare"),
+                        Hint::whole("r reactions"),
+                        Hint::whole("[ ] periods"),
+                    ],
                 ),
             };
+            let content = crate::runtime::table_content_area(area);
+            let columns = content.width as usize;
             write_text(
                 frame.buffer_mut(),
-                area.x + 2,
+                content.x,
                 area.y + 1,
-                &info,
-                area.width.saturating_sub(4) as usize,
+                &info_line(&facts, hints, columns, settings.ambiguous_width),
+                columns,
                 settings.ambiguous_width,
                 styles.panel_base().patch(styles.muted_text),
             );
@@ -1064,6 +1086,24 @@ impl LiveView for EarningsView {
         if let Some(prompt) = &self.prompt {
             self.draw_prompt(frame, settings, prompt);
         }
+    }
+}
+
+/// Joins the facts, truncating them only when they alone overflow, then the key hints that
+/// still fit whole; the help overlay lists every key the line drops.
+fn info_line(
+    facts: &[String],
+    hints: &[Hint<'_>],
+    columns: usize,
+    ambiguous: AmbiguousWidth,
+) -> String {
+    let facts = truncate(&facts.join(INFO_SEPARATOR), columns, ambiguous);
+    let room = columns.saturating_sub(width(&facts, ambiguous) + width(INFO_SEPARATOR, ambiguous));
+    let keys = fit_hints(hints, INFO_SEPARATOR, room, ambiguous);
+    if keys.is_empty() {
+        facts
+    } else {
+        format!("{facts}{INFO_SEPARATOR}{keys}")
     }
 }
 
@@ -1093,4 +1133,25 @@ pub async fn run_live<
     }
     let (_market_sender, market) = tokio::sync::mpsc::unbounded_channel();
     crate::runtime::run(&mut view, api, settings, terminal, input, market, updates).await
+}
+
+#[cfg(test)]
+mod info_line_tests {
+    use super::info_line;
+    use tickloop_ui::{format::Hint, settings::AmbiguousWidth};
+
+    #[test]
+    fn key_hints_drop_whole_while_facts_truncate_only_when_they_alone_overflow() {
+        let facts = ["Demo".to_owned(), "2026-10-10T06:00:00Z".to_owned()];
+        let hints = [Hint::whole("Enter detail"), Hint::whole("c compare")];
+        let line = |columns| info_line(&facts, &hints, columns, AmbiguousWidth::Narrow);
+
+        assert_eq!(
+            line(80),
+            "Demo · 2026-10-10T06:00:00Z · Enter detail · c compare"
+        );
+        assert_eq!(line(50), "Demo · 2026-10-10T06:00:00Z · Enter detail");
+        assert_eq!(line(30), "Demo · 2026-10-10T06:00:00Z");
+        assert_eq!(line(12), "Demo · 2026…");
+    }
 }

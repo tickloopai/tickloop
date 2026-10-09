@@ -271,8 +271,11 @@ async fn narrow_watchlists_keep_symbol_and_change_percent_in_both_icon_themes() 
             group: None,
             output: OnceArgs::default(),
         };
-        let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(32, 8)).unwrap();
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(
+            TickKind::Watchlist.minimum_panel_size().columns,
+            8,
+        ))
+        .unwrap();
         let input = futures_util::stream::iter([Ok(crossterm::event::Event::Key(
             crossterm::event::KeyEvent::new(
                 crossterm::event::KeyCode::Char('q'),
@@ -300,7 +303,7 @@ async fn narrow_watchlists_keep_symbol_and_change_percent_in_both_icon_themes() 
         assert!(screen.contains("700.HK"), "{screen}");
         assert!(screen.contains("+20.00%"), "{screen}");
         assert!(!screen.contains("Latest Price"), "{screen}");
-        assert!(!screen.contains("腾讯控股"), "{screen}");
+        assert!(!screen.contains("scroll"), "{screen}");
         assert!(
             screen.contains(tickloop_ui::icons::Icon::MarketOpen.glyph(theme).trim_end()),
             "{screen}"

@@ -3,7 +3,13 @@
 
 mod popup;
 
-use std::{ffi::OsString, io::IsTerminal, path::PathBuf};
+use std::{
+    ffi::OsString,
+    io::{IsTerminal, Read, Write},
+    path::PathBuf,
+};
+
+use crossterm::style::Stylize;
 
 use crate::terminal::attach::{ATTACH_ENVIRONMENT, AttachEnd, run_view};
 use tickloop_agent_protocol::HostedViewGrant;
@@ -11,6 +17,7 @@ use tickloop_agent_protocol::HostedViewGrant;
 const MONITOR_USAGE: &str = "Usage: tickloop monitor attach
        tickloop monitor popup install --herdr-socket SOCKET
        tickloop monitor popup remove --herdr-socket SOCKET";
+const CLOSE_HINT: &str = "Press any key to close";
 
 #[derive(Debug, PartialEq, Eq)]
 enum MonitorCommand {
@@ -51,24 +58,17 @@ fn parse(arguments: &[OsString]) -> Result<MonitorCommand, String> {
     }
 }
 
-/// Shows the hosted Tick its popup was granted in this terminal until the user detaches.
+/// Shows the hosted Tick its popup was granted in this terminal until the user detaches. When
+/// it cannot, the reason stays on screen until a key is pressed, so the popup never just vanishes.
 async fn attach() -> Result<(), String> {
-    let grant: HostedViewGrant = std::env::var(ATTACH_ENVIRONMENT)
-        .map_err(|_| format!("{ATTACH_ENVIRONMENT} names no view to attach"))
-        .and_then(|grant| {
-            serde_json::from_str(&grant)
-                .map_err(|error| format!("{ATTACH_ENVIRONMENT} is not a view grant: {error}"))
-        })?;
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         return Err("tickloop monitor attach needs an interactive terminal".into());
     }
     crossterm::terminal::enable_raw_mode().map_err(|error| error.to_string())?;
-    let ended = match run_view(&grant).await {
-        Ok(AttachEnd::Detached) => Ok(()),
-        Ok(AttachEnd::Gone) => Err("the Tick has ended".to_owned()),
-        Ok(AttachEnd::Lost(reason)) => Err(reason),
-        Err(error) => Err(error.to_string()),
-    };
+    let ended = show_granted_view().await;
+    if let Err(reason) = &ended {
+        hold_until_a_key(reason);
+    }
     match (ended, crossterm::terminal::disable_raw_mode()) {
         (ended, Ok(())) => ended,
         (Ok(()), Err(restore)) => Err(format!("cannot restore the terminal: {restore}")),
@@ -76,6 +76,35 @@ async fn attach() -> Result<(), String> {
             Err(format!("{error}; cannot restore the terminal: {restore}"))
         }
     }
+}
+
+async fn show_granted_view() -> Result<(), String> {
+    let grant: HostedViewGrant = std::env::var(ATTACH_ENVIRONMENT)
+        .map_err(|_| format!("{ATTACH_ENVIRONMENT} names no view to attach"))
+        .and_then(|grant| {
+            serde_json::from_str(&grant)
+                .map_err(|error| format!("{ATTACH_ENVIRONMENT} is not a view grant: {error}"))
+        })?;
+    match run_view(&grant).await {
+        Ok(AttachEnd::Detached) => Ok(()),
+        Ok(AttachEnd::Gone) => Err("the Tick has ended".to_owned()),
+        Ok(AttachEnd::Lost(reason)) => Err(reason),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// Shows `reason` in this raw-mode terminal and waits for one key.
+fn hold_until_a_key(reason: &str) {
+    let reason = crate::terminal::safe_text(reason).replace('\n', "\r\n");
+    let mut output = std::io::stdout().lock();
+    let _ = write!(
+        output,
+        "\r\n{}\r\n\r\n{CLOSE_HINT}",
+        format!("Error: {reason}").red().bold()
+    )
+    .and_then(|()| output.flush());
+    drop(output);
+    let _ = std::io::stdin().read(&mut [0; 1]);
 }
 
 #[cfg(test)]

@@ -190,7 +190,7 @@ impl View {
 /// included; Ctrl+B Esc sends Esc, Ctrl+B Ctrl+B sends one Ctrl+B, Ctrl+B with another key sends
 /// both, pasted text never closes the view, and a resize reaches the Tick. A lone Esc closes the
 /// view, leaves the Tick running, restores the terminal and releases the view, so a second
-/// client is refused only while one is attached.
+/// client is refused only while one is attached; it shows why until a key is pressed.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_attached_view_reaches_the_same_process_until_esc_closes_it() {
     let host = Host::start().await;
@@ -217,6 +217,8 @@ async fn an_attached_view_reaches_the_same_process_until_esc_closes_it() {
     view.shows(24, 80, "7e 1b 5b 3c 30 3b 35 3b 35 4d");
 
     let mut busy = View::start(&host.grant(&opened).await, &home);
+    busy.shows(24, 80, "Press any key to close");
+    busy.send(b"x");
     assert_ne!(busy.exit_code(), 0, "a second view is refused");
     assert!(
         busy.output_text().contains("Busy"),

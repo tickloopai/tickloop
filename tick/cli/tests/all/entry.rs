@@ -366,7 +366,7 @@ fn tick_descriptions_use_tick_terminology_and_minimum_panel_sizes() {
     let kline = descriptor("kline");
     assert_eq!(
         kline["minimum_panel_size"],
-        serde_json::json!({"columns":40,"rows":14})
+        serde_json::json!({"columns":45,"rows":14})
     );
     assert_eq!(kline["title"], "Kline");
     assert_eq!(kline["runtime"], "command");
@@ -405,7 +405,7 @@ fn tick_descriptions_use_tick_terminology_and_minimum_panel_sizes() {
     let earnings = descriptor("earnings");
     assert_eq!(
         earnings["minimum_panel_size"],
-        serde_json::json!({"columns":100,"rows":14})
+        serde_json::json!({"columns":62,"rows":14})
     );
     assert_eq!(earnings["title"], "Earnings");
     assert_eq!(earnings["runtime"], "command");

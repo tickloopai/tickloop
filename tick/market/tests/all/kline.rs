@@ -459,7 +459,7 @@ async fn resizing_recomputes_visible_candles_without_losing_selection_or_emittin
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let mut samples = Vec::new();
-        for (width, height) in [(40, 14), (20, 8), (110, 24)] {
+        for (width, height) in [(45, 14), (20, 8), (110, 24)] {
             observed.lock().unwrap().resize(width, height);
             keys.send(Ok(Event::Resize(width, height))).unwrap();
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -498,7 +498,7 @@ async fn resizing_recomputes_visible_candles_without_losing_selection_or_emittin
     for (width, buffer) in samples {
         let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
         if width == 20 {
-            assert!(text.contains("40") && text.contains("14"), "{text}");
+            assert!(text.contains("━") && text.contains("↕ 1–7/14"), "{text}");
         } else {
             assert!(text.contains("C 179"), "selection survives resize: {text}");
             plotted.push(

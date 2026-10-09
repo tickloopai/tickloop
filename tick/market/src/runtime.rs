@@ -1,12 +1,12 @@
-use crate::{config::Settings, output::TableData, tools::Tools};
+use crate::{canvas::CanvasBackend, config::Settings, output::TableData, tools::Tools};
 use async_trait::async_trait;
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use futures_util::{Stream, StreamExt, stream::FuturesUnordered};
 use ratatui::{
     Frame, Terminal,
     backend::Backend,
-    layout::Rect,
-    widgets::{Block, Borders, Clear, Paragraph},
+    layout::{Rect, Size},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 use serde_json::{Value, json};
 use tick_protocol::{INVALID_PARAMS, TOOL_FAILED};
@@ -18,7 +18,10 @@ use tick_sdk::{
     stream::{RpcError, TickStream, ToolRequest},
     tools::{ToolCall, ToolDispatch},
 };
-use tickloop_ui::format::{pad, width, write_text};
+use tickloop_ui::{
+    format::{pad, width, write_text},
+    scroll::{ScrollViewport, ViewportLayout},
+};
 
 const FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(33);
 const WIDE_PANEL_COLUMNS: u16 = 64;
@@ -68,6 +71,10 @@ pub struct ViewState {
     pub help: bool,
     pub connection: ConnectionState,
     pub last_error: Option<String>,
+    /// The canvas column and row of what the view has focused in this frame; a scrolling
+    /// Panel keeps them in view.
+    pub focus_column: Option<u16>,
+    pub focus_row: Option<u16>,
 }
 
 impl Default for ViewState {
@@ -78,6 +85,8 @@ impl Default for ViewState {
             help: false,
             connection: ConnectionState::Connected,
             last_error: None,
+            focus_column: None,
+            focus_row: None,
         }
     }
 }
@@ -125,6 +134,11 @@ pub trait LiveView: Send {
     }
     fn tick(&self) -> crate::metadata::TickKind {
         crate::metadata::TickKind::Quote
+    }
+    /// The Panel this view needs now: the Tick's declared minimum unless the view is in a
+    /// mode with a wider layout of its own.
+    fn minimum_panel_size(&self) -> crate::metadata::MinimumPanelSize {
+        self.tick().minimum_panel_size()
     }
     fn title(&self) -> String;
     fn table(&self) -> TableData;
@@ -263,6 +277,7 @@ pub async fn run<V: LiveView, B: Backend, S: Stream<Item = std::io::Result<Event
     let tools = view.tools();
     let mut running_calls = FuturesUnordered::new();
     let mut state = ViewState::default();
+    let mut viewport = ScrollViewport::default();
     let mut market_open = true;
     let mut frames = tokio::time::interval(FRAME_INTERVAL);
     frames.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -325,7 +340,7 @@ pub async fn run<V: LiveView, B: Backend, S: Stream<Item = std::io::Result<Event
             _ = refreshes.tick(), if configured_refresh.is_some() => {
                 if state.connection != ConnectionState::Connected {
                     state.connection = ConnectionState::Reconnecting;
-                    render(view, terminal, &mut state, settings)?;
+                    render(view, terminal, &mut state, &mut viewport, settings)?;
                 }
                 match refresh_cancellable(view, api, &mut input).await {
                     Ok(None) => break,
@@ -335,7 +350,7 @@ pub async fn run<V: LiveView, B: Backend, S: Stream<Item = std::io::Result<Event
                 dirty = true;
             }
             _ = frames.tick() => {
-                if dirty { render(view, terminal, &mut state, settings)?; dirty = false; }
+                if dirty { render(view, terminal, &mut state, &mut viewport, settings)?; dirty = false; }
             }
             event = market.recv(), if market_open => {
                 dirty = true;
@@ -347,7 +362,7 @@ pub async fn run<V: LiveView, B: Backend, S: Stream<Item = std::io::Result<Event
                                 let recovered = connection == ConnectionState::Connected && state.connection != ConnectionState::Connected;
                                 if recovered && view.refresh_on_recovery() {
                                     state.connection = ConnectionState::Reconnecting;
-                                    render(view, terminal, &mut state, settings)?;
+                                    render(view, terminal, &mut state, &mut viewport, settings)?;
                                     match refresh_cancellable(view, api, &mut input).await {
                                         Ok(None) => break,
                                         Ok(Some(())) => { state.received_data(); updates.publish(view.content())?; }
@@ -384,6 +399,7 @@ pub async fn run<V: LiveView, B: Backend, S: Stream<Item = std::io::Result<Event
                         if !capturing && key.code == KeyCode::Char('q') { break; }
                         if !capturing && key.code == KeyCode::Char('?') { state.help = !state.help; continue; }
                         if state.help { if key.code == KeyCode::Esc { state.help = false; } continue; }
+                        if !capturing && let KeyCode::Char(character) = key.code && viewport.handle_key(character) { continue; }
                         let code = if key.modifiers.contains(KeyModifiers::CONTROL) {
                             match key.code {
                                 KeyCode::Char('n') => KeyCode::Down,
@@ -426,7 +442,7 @@ pub async fn run<V: LiveView, B: Backend, S: Stream<Item = std::io::Result<Event
         }
     }
     if dirty {
-        render(view, terminal, &mut state, settings)?;
+        render(view, terminal, &mut state, &mut viewport, settings)?;
     }
     Ok(())
 }
@@ -435,157 +451,205 @@ fn render<V: LiveView, B: Backend>(
     view: &V,
     terminal: &mut Terminal<B>,
     state: &mut ViewState,
+    viewport: &mut ScrollViewport,
     settings: &Settings,
 ) -> Result<()> {
+    let size = terminal
+        .size()
+        .map_err(|error| Error::usage(error.to_string()))?;
+    let minimum = view.minimum_panel_size();
+    viewport.set_layout(ViewportLayout::of(
+        Rect::new(0, 0, size.width, size.height),
+        Size::new(minimum.columns, minimum.rows),
+    ));
+    let canvas = match viewport.layout() {
+        Some(layout) => {
+            // ratatui hands out a Frame only through a Terminal, so the canvas is an in-memory one.
+            let Ok(mut canvas) = Terminal::new(CanvasBackend::new(layout.canvas));
+            let Ok(_) = canvas.draw(|frame| draw_canvas(view, frame, state, settings));
+            let backend = canvas.backend();
+            let cursor = backend.cursor();
+            viewport.follow(
+                cursor.map(|cursor| cursor.x).or(state.focus_column),
+                cursor.map(|cursor| cursor.y).or(state.focus_row),
+            );
+            Some((backend.buffer().clone(), cursor))
+        }
+        None => None,
+    };
     terminal
         .draw(|frame| {
-            let area = frame.area();
             let styles = settings.styles();
-            frame.buffer_mut().set_style(area, styles.canvas);
-            let minimum = view.tick().minimum_panel_size();
-            if area.width < minimum.columns || area.height < minimum.rows {
-                frame.render_widget(
-                    Paragraph::new(format!(
-                        "Need {}x{}\nCurrent {}x{}\nResize panel · q quit",
-                        minimum.columns, minimum.rows, area.width, area.height
-                    ))
-                    .style(styles.text.patch(styles.muted_text)),
-                    area,
-                );
-                return;
-            }
-            view.draw(frame, state, settings);
-            let horizontal_padding = if area.width >= WIDE_PANEL_COLUMNS {
-                2
-            } else {
-                1
-            };
-            if settings.is_demo {
-                let heading_area = Rect::new(area.x, area.y, area.width, 1);
-                frame
-                    .buffer_mut()
-                    .set_style(heading_area, styles.panel_base());
-                write_text(
-                    frame.buffer_mut(),
-                    area.x,
-                    area.y,
-                    &" ".repeat(area.width as usize),
-                    area.width as usize,
-                    settings.ambiguous_width,
-                    styles.panel_base(),
-                );
-                let title_width = area
-                    .width
-                    .saturating_sub(horizontal_padding * 2)
-                    .saturating_sub(7);
-                write_text(
-                    frame.buffer_mut(),
-                    area.x + horizontal_padding,
-                    area.y,
-                    &pad(
-                        &view.title(),
-                        title_width as usize,
-                        settings.ambiguous_width,
-                        false,
-                    ),
-                    title_width as usize,
-                    settings.ambiguous_width,
-                    styles.panel_base().patch(styles.title),
-                );
-                write_text(
-                    frame.buffer_mut(),
-                    area.right() - horizontal_padding - 4,
-                    area.y,
-                    "DEMO",
-                    4,
-                    settings.ambiguous_width,
-                    styles.panel_base().patch(styles.muted_text),
-                );
-            }
-            let status_area = Rect::new(area.x, area.bottom() - 1, area.width, 1);
-            let mut status_style = styles.status_base().patch(styles.muted_text);
-            if state.last_error.is_some() {
-                status_style = status_style.patch(styles.error);
-            }
-            frame
-                .buffer_mut()
-                .set_style(status_area, styles.status_base());
-            let icon = tickloop_ui::icons::Icon::Connection.glyph(settings.icon_theme);
-            let status = if let Some(error) = &state.last_error {
-                if state.connection == ConnectionState::Connected {
-                    error.clone()
-                } else {
-                    format!("{icon} {} · {error}", state.availability())
+            match &canvas {
+                None => draw_canvas(view, frame, state, settings),
+                Some((buffer, cursor)) => {
+                    let area = frame.area();
+                    frame.buffer_mut().set_style(area, styles.canvas);
+                    viewport.render(buffer, frame.buffer_mut(), styles, settings.ambiguous_width);
+                    if let Some(cursor) = cursor.and_then(|cursor| viewport.on_panel(cursor)) {
+                        frame.set_cursor_position(cursor);
+                    }
                 }
-            } else if settings.is_demo {
-                "Simulated data".to_owned()
-            } else {
-                format!("{icon} {}", state.availability())
-            };
-            let keys = if view.captures_text() && area.width >= 40 {
-                "Enter Apply  Esc Back"
-            } else if view.captures_text() {
-                "Esc Back"
-            } else if area.width >= 40 {
-                "? Help  q Quit"
-            } else {
-                "?  q Quit"
-            };
-            let keys_width = width(keys, settings.ambiguous_width) as u16;
-            write_text(
-                frame.buffer_mut(),
-                area.x,
-                area.bottom() - 1,
-                &" ".repeat(area.width as usize),
-                area.width as usize,
-                settings.ambiguous_width,
-                styles.status_base(),
-            );
-            write_text(
-                frame.buffer_mut(),
-                area.x + horizontal_padding,
-                area.bottom() - 1,
-                &status,
-                area.width
-                    .saturating_sub(horizontal_padding * 2 + keys_width + 2)
-                    as usize,
-                settings.ambiguous_width,
-                status_style,
-            );
-            write_text(
-                frame.buffer_mut(),
-                area.right() - horizontal_padding - keys_width,
-                area.bottom() - 1,
-                keys,
-                keys_width as usize,
-                settings.ambiguous_width,
-                styles.status_base().patch(styles.muted_text),
-            );
+            }
             if state.help {
                 let area = frame.area();
+                let help = Paragraph::new(match viewport.help() {
+                    Some(scroll_keys) => format!("{}\n{scroll_keys}", view.help()),
+                    None => view.help().to_owned(),
+                })
+                .block(
+                    Block::default()
+                        .title(" Keys · ? / Esc close ")
+                        .borders(Borders::ALL)
+                        .border_style(styles.border),
+                )
+                .wrap(Wrap { trim: false })
+                .style(styles.overlay_base());
+                // A narrow Panel grows the overlay toward its edges before wrapping the keys.
+                let width = (area.width * 3 / 4).max(
+                    u16::try_from(help.line_width())
+                        .unwrap_or(u16::MAX)
+                        .min(area.width.saturating_sub(2)),
+                );
+                let height = (area.height * 3 / 4).max(
+                    u16::try_from(help.line_count(width))
+                        .unwrap_or(u16::MAX)
+                        .min(area.height.saturating_sub(2)),
+                );
                 let popup = Rect::new(
-                    area.x + area.width / 8,
-                    area.y + area.height / 8,
-                    area.width * 3 / 4,
-                    area.height * 3 / 4,
+                    area.x + (area.width / 8).min((area.width - width) / 2),
+                    area.y + (area.height / 8).min((area.height - height) / 2),
+                    width,
+                    height,
                 );
                 frame.render_widget(Clear, popup);
                 frame.buffer_mut().set_style(popup, styles.overlay_base());
-                frame.render_widget(
-                    Paragraph::new(view.help())
-                        .block(
-                            Block::default()
-                                .title(" Keys · ? / Esc close ")
-                                .borders(Borders::ALL)
-                                .border_style(styles.border),
-                        )
-                        .style(styles.overlay_base()),
-                    popup,
-                );
+                frame.render_widget(help, popup);
             }
         })
         .map_err(|error| Error::usage(error.to_string()))?;
     Ok(())
+}
+
+/// Draws the view with the demo heading and the status row into the frame, which is the Panel
+/// itself or, for a Panel smaller than the Tick's minimum, the canvas it scrolls over.
+fn draw_canvas<V: LiveView>(
+    view: &V,
+    frame: &mut Frame<'_>,
+    state: &mut ViewState,
+    settings: &Settings,
+) {
+    let area = frame.area();
+    let styles = settings.styles();
+    frame.buffer_mut().set_style(area, styles.canvas);
+    state.focus_column = None;
+    state.focus_row = None;
+    view.draw(frame, state, settings);
+    let horizontal_padding = if area.width >= WIDE_PANEL_COLUMNS {
+        2
+    } else {
+        1
+    };
+    if settings.is_demo {
+        let heading_area = Rect::new(area.x, area.y, area.width, 1);
+        frame
+            .buffer_mut()
+            .set_style(heading_area, styles.panel_base());
+        write_text(
+            frame.buffer_mut(),
+            area.x,
+            area.y,
+            &" ".repeat(area.width as usize),
+            area.width as usize,
+            settings.ambiguous_width,
+            styles.panel_base(),
+        );
+        let title_width = area
+            .width
+            .saturating_sub(horizontal_padding * 2)
+            .saturating_sub(7);
+        write_text(
+            frame.buffer_mut(),
+            area.x + horizontal_padding,
+            area.y,
+            &pad(
+                &view.title(),
+                title_width as usize,
+                settings.ambiguous_width,
+                false,
+            ),
+            title_width as usize,
+            settings.ambiguous_width,
+            styles.panel_base().patch(styles.title),
+        );
+        write_text(
+            frame.buffer_mut(),
+            area.right() - horizontal_padding - 4,
+            area.y,
+            "DEMO",
+            4,
+            settings.ambiguous_width,
+            styles.panel_base().patch(styles.muted_text),
+        );
+    }
+    let status_area = Rect::new(area.x, area.bottom() - 1, area.width, 1);
+    let mut status_style = styles.status_base().patch(styles.muted_text);
+    if state.last_error.is_some() {
+        status_style = status_style.patch(styles.error);
+    }
+    frame
+        .buffer_mut()
+        .set_style(status_area, styles.status_base());
+    let icon = tickloop_ui::icons::Icon::Connection.glyph(settings.icon_theme);
+    let status = if let Some(error) = &state.last_error {
+        if state.connection == ConnectionState::Connected {
+            error.clone()
+        } else {
+            format!("{icon} {} · {error}", state.availability())
+        }
+    } else if settings.is_demo {
+        "Simulated data".to_owned()
+    } else {
+        format!("{icon} {}", state.availability())
+    };
+    let keys = if view.captures_text() && area.width >= 40 {
+        "Enter Apply  Esc Back"
+    } else if view.captures_text() {
+        "Esc Back"
+    } else if area.width >= 40 {
+        "? Help  q Quit"
+    } else {
+        "?  q Quit"
+    };
+    let keys_width = width(keys, settings.ambiguous_width) as u16;
+    write_text(
+        frame.buffer_mut(),
+        area.x,
+        area.bottom() - 1,
+        &" ".repeat(area.width as usize),
+        area.width as usize,
+        settings.ambiguous_width,
+        styles.status_base(),
+    );
+    write_text(
+        frame.buffer_mut(),
+        area.x + horizontal_padding,
+        area.bottom() - 1,
+        &status,
+        area.width
+            .saturating_sub(horizontal_padding * 2 + keys_width + 2) as usize,
+        settings.ambiguous_width,
+        status_style,
+    );
+    write_text(
+        frame.buffer_mut(),
+        area.right() - horizontal_padding - keys_width,
+        area.bottom() - 1,
+        keys,
+        keys_width as usize,
+        settings.ambiguous_width,
+        styles.status_base().patch(styles.muted_text),
+    );
 }
 
 pub fn table_content_area(area: Rect) -> Rect {
@@ -693,6 +757,7 @@ pub fn draw_table(
     for (row_index, row) in rows.iter().enumerate().skip(state.offset).take(visible) {
         let y = inner.y + 1 + (row_index - state.offset) as u16;
         if row_index == state.selected {
+            state.focus_row = Some(y);
             frame.buffer_mut().set_style(
                 Rect::new(inner.x, y, inner.width, 1),
                 styles.panel_base().patch(styles.selection),

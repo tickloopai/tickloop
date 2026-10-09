@@ -98,7 +98,7 @@ use super::{
         PastedText,
     },
     input_view::InputView,
-    monitor::{MONITOR_AUTO_MIN_COLUMNS, MONITOR_COLUMNS, Monitor, TickGroup},
+    monitor::{MONITOR_COLUMNS, Monitor, TickGroup},
     paste_blocks::{PasteBlocks, PasteRegistration},
     pasted_image_paths::{find_image_paths, read_pasted_image},
     permissions_surface::{
@@ -525,12 +525,10 @@ struct Lifetime {
     surface: TerminalSurface,
 }
 
-/// A hosted Tick of `chat` waiting to take the terminal; `reason` says why it did not float in
-/// a Herdr popup.
+/// A hosted Tick of `chat` waiting to take the terminal.
 struct FullScreenAttach {
     chat: Uuid,
     grant: tickloop_agent_protocol::HostedViewGrant,
-    reason: String,
 }
 
 pub(super) struct State {
@@ -1389,17 +1387,12 @@ impl Console {
         &self,
         chat: Uuid,
         grant: tickloop_agent_protocol::HostedViewGrant,
-        reason: String,
     ) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         if state.chat != Some(chat) || !state.interactive {
             return Err("This View can no longer show the Tick full screen".into());
         }
-        state.full_screen_attach = Some(FullScreenAttach {
-            chat,
-            grant,
-            reason,
-        });
+        state.full_screen_attach = Some(FullScreenAttach { chat, grant });
         Ok(())
     }
 
@@ -1429,7 +1422,7 @@ impl Console {
     pub(super) fn open_monitor(&self) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         state.monitor.overlay =
-            state.monitor.total() > 0 && state.width + 1 < MONITOR_AUTO_MIN_COLUMNS;
+            state.monitor.total() > 0 && super::monitor::side_columns(state.width).is_none();
         state.rendered_region = None;
         state
             .draw(&mut io::stdout().lock())
@@ -5405,7 +5398,7 @@ impl State {
 
     /// Whether a focused Monitor covers the conversation instead of sitting beside it.
     fn monitor_overlay(&self) -> bool {
-        self.width + 1 < MONITOR_AUTO_MIN_COLUMNS
+        super::monitor::side_columns(self.width).is_none()
             || self.monitor_preference == tickloop_agent_config::MonitorPreference::Hidden
     }
 
@@ -5432,7 +5425,7 @@ impl State {
             && self.diff_screen.is_none()
             && !self.full_review
             && (self.monitor.overlay
-                || self.width + 1 >= MONITOR_AUTO_MIN_COLUMNS
+                || super::monitor::side_columns(self.width).is_some()
                     && self.monitor_preference == tickloop_agent_config::MonitorPreference::Auto)
     }
 
@@ -5459,10 +5452,19 @@ impl State {
 
     fn content_columns(&self) -> usize {
         if self.monitor_visible() && !self.monitor.overlay {
-            self.width.saturating_sub(MONITOR_COLUMNS).max(2)
+            self.width.saturating_sub(self.monitor_columns())
         } else {
             self.width
         }
+    }
+
+    /// Columns Monitor takes at the right of the content area, its separator included: the same
+    /// width beside the conversation or over it wherever both fit, and its preferred width as the
+    /// overlay of a terminal too narrow for both.
+    fn monitor_columns(&self) -> usize {
+        super::monitor::side_columns(self.width)
+            .unwrap_or(MONITOR_COLUMNS)
+            .min(self.width)
     }
 
     fn draw_frame(&mut self, output: &mut impl Write) -> io::Result<()> {
@@ -5598,7 +5600,7 @@ impl State {
         self.initialize_screen(output)?;
         write!(output, "{RESET_SCROLL_REGION}")?;
         let padding = body_height.saturating_sub(body.lines.len());
-        let side_columns = MONITOR_COLUMNS.min(self.width);
+        let side_columns = self.monitor_columns();
         let monitor_lines = self.monitor_visible().then(|| {
             if let Some(detail) = &mut self.monitor.detail {
                 let width = side_columns.saturating_sub(2);
@@ -9110,8 +9112,8 @@ impl State {
     }
 
     /// Takes the terminal back from an attached view; the Monitor list is shown as it was, with
-    /// `note` on how the view ended.
-    fn reclaim_terminal(&mut self, note: &str) {
+    /// `failure` when the view did not end with the user closing it.
+    fn reclaim_terminal(&mut self, failure: Option<&str>) {
         let mut output = io::stdout().lock();
         let restored = self
             .surface
@@ -9123,7 +9125,11 @@ impl State {
         self.rendered_region = None;
         match restored {
             Err(error) => self.status = format!("Cannot restore terminal after attach: {error}"),
-            Ok(()) => self.hold_status(note),
+            Ok(()) => {
+                if let Some(failure) = failure {
+                    self.hold_status(failure);
+                }
+            }
         }
     }
 
@@ -9625,7 +9631,7 @@ impl State {
             && self.monitor_visible()
             && self.monitor.focused
         {
-            let width = MONITOR_COLUMNS.min(self.width).saturating_sub(2);
+            let width = self.monitor_columns().saturating_sub(2);
             let height = self.height.saturating_sub(self.styled_frame().0.len());
             if let Some(detail) = self.monitor.detail.as_mut() {
                 let chat = detail.chat();
@@ -10764,10 +10770,7 @@ fn lend_terminal_to_attached_view(
     {
         let mut state = lock()?;
         if state.chat != Some(attach.chat) {
-            state.hold_status(&format!(
-                "{} · Not opened: another Chat is shown now",
-                attach.reason
-            ));
+            state.hold_status("Not opened: another Chat is shown now");
             state.draw(&mut io::stdout().lock())?;
             return Ok(!stop.load(Ordering::Acquire));
         }
@@ -10786,24 +10789,21 @@ fn lend_terminal_to_attached_view(
         Ok(attached) => attached,
         Err(error) => {
             let mut state = lock()?;
-            state.hold_status(&format!(
-                "{} · Cannot open the Tick: {error}",
-                attach.reason
-            ));
+            state.hold_status(&format!("Cannot open the Tick: {error}"));
             state.draw(&mut io::stdout().lock())?;
             return Ok(!stop.load(Ordering::Acquire));
         }
     };
     let lent = lock()?.lend_terminal();
-    let ending = match lent.map(|()| runtime.block_on(view.run())) {
-        Ok(Ok(AttachEnd::Detached)) => "Closed; the Tick keeps running".to_owned(),
-        Ok(Ok(AttachEnd::Gone)) => "The Tick ended while open".to_owned(),
-        Ok(Ok(AttachEnd::Lost(reason))) => format!("The view ended: {reason}"),
-        Ok(Err(error)) => format!("The view ended: {error}"),
-        Err(error) => format!("Cannot hand the terminal to the Tick: {error}"),
+    let failure = match lent.map(|()| runtime.block_on(view.run())) {
+        Ok(Ok(AttachEnd::Detached)) => None,
+        Ok(Ok(AttachEnd::Gone)) => Some("The Tick ended while open".to_owned()),
+        Ok(Ok(AttachEnd::Lost(reason))) => Some(format!("The view ended: {reason}")),
+        Ok(Err(error)) => Some(format!("The view ended: {error}")),
+        Err(error) => Some(format!("Cannot hand the terminal to the Tick: {error}")),
     };
     let mut state = lock()?;
-    state.reclaim_terminal(&format!("{} · {ending}", attach.reason));
+    state.reclaim_terminal(failure.as_deref());
     state.draw(&mut io::stdout().lock())?;
     Ok(!stop.load(Ordering::Acquire))
 }
@@ -17585,9 +17585,13 @@ mod tests {
 
     #[test]
     fn shift_arrows_open_active_background_tasks_from_the_chat() {
-        for direction in [KeyCode::Up, KeyCode::Down] {
+        for (direction, width, overlay) in [
+            (KeyCode::Up, 80, false),
+            (KeyCode::Down, 80, false),
+            (KeyCode::Down, 79, true),
+        ] {
             let chat = Uuid::new_v4();
-            let mut state = State::new(true, 80, 24);
+            let mut state = State::new(true, width, 24);
             state.chat = Some(chat);
             state.prompt_enabled = true;
             state.insert("draft");
@@ -17601,7 +17605,7 @@ mod tests {
                 Some(InputEvent::TickAction { action, .. }) if action.key == 'r'
             ));
             assert!(state.monitor.focused);
-            assert!(state.monitor.overlay);
+            assert_eq!(state.monitor.overlay, overlay);
             assert_eq!(state.monitor.selected().unwrap().group, TickGroup::Shells);
             assert_eq!(state.editor.draft(), "draft");
         }

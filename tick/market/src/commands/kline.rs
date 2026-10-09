@@ -264,6 +264,7 @@ pub async fn run_once(
 
 const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 const MOVING_AVERAGE_WINDOWS: [usize; 3] = [5, 10, 20];
+const LEGEND_GAP: usize = 2;
 
 pub struct KlineView {
     pub request: CandleRequest,
@@ -470,6 +471,13 @@ impl KlineView {
 impl crate::runtime::LiveView for KlineView {
     fn tick(&self) -> crate::metadata::TickKind {
         crate::metadata::TickKind::Kline
+    }
+    fn minimum_panel_size(&self) -> crate::metadata::MinimumPanelSize {
+        if self.event.is_some() {
+            crate::event_chart::MINIMUM_PANEL_SIZE
+        } else {
+            self.tick().minimum_panel_size()
+        }
     }
     fn title(&self) -> String {
         if let Some(context) = &self.research {
@@ -761,7 +769,7 @@ impl crate::runtime::LiveView for KlineView {
     fn draw(
         &self,
         frame: &mut ratatui::Frame<'_>,
-        _state: &mut crate::runtime::ViewState,
+        state: &mut crate::runtime::ViewState,
         settings: &Settings,
     ) {
         if self.research.is_some() && self.event.is_none() {
@@ -811,7 +819,7 @@ impl crate::runtime::LiveView for KlineView {
         use ratatui::widgets::{Block, Borders, Paragraph};
         use rust_decimal::prelude::ToPrimitive;
         use tickloop_ui::{
-            format::{width, write_text},
+            format::{Hint, fit_hints, pack_fields, width, write_text},
             styles::PriceDirection,
         };
         let area = frame.area();
@@ -846,38 +854,39 @@ impl crate::runtime::LiveView for KlineView {
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap_or_default();
         let date = timestamp.get(..16).unwrap_or(&timestamp).replace('T', " ");
-        let summary = format!(
-            "{date} O {} H {} L {}",
-            selected.open.normalize(),
-            selected.high.normalize(),
-            selected.low.normalize()
-        );
-        write_text(
-            frame.buffer_mut(),
-            inner.x,
-            inner.y,
-            &summary,
-            inner.width as usize,
-            settings.ambiguous_width,
-            styles.text,
-        );
-        let summary = format!(
-            "C {} V {} Change {}",
-            selected.close.normalize(),
-            selected.volume,
-            change
-                .map(|value| format!("{value:+.2}%"))
-                .unwrap_or_else(|| "--".into())
-        );
-        write_text(
-            frame.buffer_mut(),
-            inner.x,
-            inner.y + 1,
-            &summary,
-            inner.width as usize,
-            settings.ambiguous_width,
-            styles.text,
-        );
+        let change = change
+            .map(|value| format!("{value:+.2}%"))
+            .unwrap_or_else(|| "--".into());
+        // The prices and the close each keep their own lines and wrap between fields, so a
+        // narrow Panel never cuts a value.
+        let summary_groups = [
+            vec![
+                date,
+                format!("O {}", selected.open.normalize()),
+                format!("H {}", selected.high.normalize()),
+                format!("L {}", selected.low.normalize()),
+            ],
+            vec![
+                format!("C {}", selected.close.normalize()),
+                format!("V {}", selected.volume),
+                format!("Change {change}"),
+            ],
+        ];
+        let mut summary_rows = 0;
+        for fields in &summary_groups {
+            for line in pack_fields(fields, 1, inner.width as usize, settings.ambiguous_width) {
+                write_text(
+                    frame.buffer_mut(),
+                    inner.x,
+                    inner.y + summary_rows,
+                    &fields[line].join(" "),
+                    inner.width as usize,
+                    settings.ambiguous_width,
+                    styles.text,
+                );
+                summary_rows += 1;
+            }
+        }
         let glyph_width = width("┃", settings.ambiguous_width).max(1);
         let scale = self
             .candles
@@ -910,8 +919,6 @@ impl crate::runtime::LiveView for KlineView {
         self.viewport_start.set(start);
         let end = (start + capacity).min(self.candles.len());
         let visible = &self.candles[start..end];
-        let plot_height = inner.height.saturating_sub(7).max(1);
-        let plot_y = inner.y + 3;
         let mut minimum = visible
             .iter()
             .map(|candle| candle.low.to_f64().unwrap_or(0.0))
@@ -933,25 +940,46 @@ impl crate::runtime::LiveView for KlineView {
         } else {
             Vec::new()
         };
-        if self.show_averages {
-            let mut legend_x = inner.x;
-            for (index, window) in MOVING_AVERAGE_WINDOWS.iter().enumerate() {
-                let value = averages[index][self.cursor]
+        let legend: Vec<String> = MOVING_AVERAGE_WINDOWS
+            .iter()
+            .zip(&averages)
+            .map(|(window, values)| {
+                let value = values[self.cursor]
                     .map(|value| format!("{value:.2}"))
                     .unwrap_or_else(|| "--".into());
-                let label = format!("MA{window} {value}  ");
+                format!("MA{window} {value}")
+            })
+            .collect();
+        let legend_lines = pack_fields(
+            &legend,
+            LEGEND_GAP,
+            inner.width as usize,
+            settings.ambiguous_width,
+        );
+        for (row, line) in legend_lines.iter().enumerate() {
+            let mut legend_x = inner.x;
+            for index in line.clone() {
                 write_text(
                     frame.buffer_mut(),
                     legend_x,
-                    inner.y + 2,
-                    &label,
+                    inner.y + summary_rows + row as u16,
+                    &legend[index],
                     inner.right().saturating_sub(legend_x) as usize,
                     settings.ambiguous_width,
                     styles.moving_averages[index],
                 );
-                legend_x = legend_x.saturating_add(width(&label, settings.ambiguous_width) as u16);
+                legend_x = legend_x.saturating_add(
+                    (width(&legend[index], settings.ambiguous_width) + LEGEND_GAP) as u16,
+                );
             }
         }
+        // Below the plot: volume, dates, the cursor marker and the footer.
+        let legend_rows = (legend_lines.len() as u16).max(1);
+        let plot_y = inner.y + summary_rows + legend_rows;
+        let plot_height = inner
+            .height
+            .saturating_sub(summary_rows + legend_rows + 4)
+            .max(1);
         for values in &averages {
             for value in values[start..end].iter().flatten() {
                 minimum = minimum.min(*value);
@@ -1156,27 +1184,37 @@ impl crate::runtime::LiveView for KlineView {
             );
             next_column = column + label.len() + 3;
         }
+        let cursor_x = inner.x + ((self.cursor - start) * glyph_width) as u16;
+        state.focus_column = Some(cursor_x);
         write_text(
             frame.buffer_mut(),
-            inner.x + ((self.cursor - start) * glyph_width) as u16,
+            cursor_x,
             date_y + 1,
             "▲",
             glyph_width,
             settings.ambiguous_width,
             styles.chart_cursor,
         );
-        let footer = format!(
-            "1–8 Period · m {} · {}",
-            if self.show_averages {
-                "MA5/10/20"
-            } else {
-                "MA off"
-            },
-            if self.supports_push {
-                "Live + 30s sync"
-            } else {
-                "30s refresh"
-            }
+        let footer = fit_hints(
+            &[
+                Hint::new("1–8 Period", "1–8"),
+                Hint::new(
+                    if self.show_averages {
+                        "m MA5/10/20"
+                    } else {
+                        "m MA off"
+                    },
+                    "m MA",
+                ),
+                if self.supports_push {
+                    Hint::new("Live + 30s sync", "Live")
+                } else {
+                    Hint::new("30s refresh", "30s")
+                },
+            ],
+            " · ",
+            inner.width as usize,
+            settings.ambiguous_width,
         );
         frame.buffer_mut().set_style(
             ratatui::layout::Rect::new(inner.x, inner.bottom() - 1, inner.width, 1),

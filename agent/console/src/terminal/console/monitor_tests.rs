@@ -544,7 +544,7 @@ fn tick_action_signature(input: Option<InputEvent>) -> String {
 
 #[test]
 fn monitor_row_title_and_metadata_clicks_perform_the_same_enter_action() {
-    for (width, overlay) in [(140, false), (100, true)] {
+    for (width, overlay) in [(140, false), (80, false), (60, true)] {
         for group in [TickGroup::Artifacts, TickGroup::Shells, TickGroup::Ticks] {
             for meta in [false, true] {
                 let mut state = click_fixture(width, overlay, group);
@@ -554,7 +554,7 @@ fn monitor_row_title_and_metadata_clicks_perform_the_same_enter_action() {
                     .position(|row| row.contains("Clickable row"))
                     .unwrap()
                     + usize::from(meta);
-                let column = state.width.saturating_sub(MONITOR_COLUMNS) + 2;
+                let column = state.width - state.monitor_columns() + 2;
                 assert!(!state.monitor.focused);
                 state.pointer(
                     MouseEvent {
@@ -925,14 +925,120 @@ fn monitor_follows_agent_and_restores_selection_without_leaking_old_results() {
 }
 
 #[test]
+fn monitor_sits_beside_reflowed_conversation_until_the_conversation_minimum() {
+    let reply = (0..40)
+        .map(|index| format!("reply{index:02} "))
+        .collect::<String>();
+    // (terminal columns, Monitor columns beside the conversation; None covers it)
+    for (terminal_columns, beside) in [
+        (140, Some(42)),
+        (120, Some(42)),
+        (100, Some(42)),
+        (90, Some(42)),
+        (85, Some(37)),
+        (80, Some(32)),
+        (79, None),
+    ] {
+        // A non-interactive State keeps `open_monitor` from painting the test's stdout.
+        let mut state = State::new(false, terminal_columns, 30);
+        state.switch_view_chat(Some(Uuid::new_v4()));
+        state.prompt_enabled = true;
+        state
+            .monitor
+            .replace(TickGroup::Shells, vec![shell(Uuid::new_v4(), "A")]);
+        state.scrollback.append(&format!("{reply}\n"));
+        let console = tests::console_with_state(state);
+        console.open_monitor().unwrap();
+        let mut state = console.state.lock().unwrap();
+        state.draw_frame(&mut Vec::new()).unwrap();
+        let content_rows = state.height - state.frame().0.len();
+        let rows = &state.rendered_screen[..content_rows];
+        assert!(state.monitor_visible(), "{terminal_columns}");
+        assert_eq!(
+            state.monitor.overlay,
+            beside.is_none(),
+            "{terminal_columns}"
+        );
+        let monitor_columns = beside.unwrap_or(MONITOR_COLUMNS);
+        let left = state.width - monitor_columns;
+        assert!(
+            rows.iter()
+                .all(|row| display_width(row.split('│').next().unwrap()) == left),
+            "{terminal_columns}: {rows:#?}"
+        );
+        let shown = rows
+            .iter()
+            .map(|row| row.split('│').next().unwrap())
+            .collect::<String>();
+        let every_word_shown = (0..40).all(|index| shown.contains(&format!("reply{index:02}")));
+        assert_eq!(
+            every_word_shown,
+            beside.is_some(),
+            "a side column reflows the conversation; an overlay covers it: {rows:#?}"
+        );
+        if beside.is_some() {
+            assert!(left >= crate::terminal::monitor::CONVERSATION_MIN_COLUMNS);
+        }
+    }
+}
+
+#[test]
+fn below_the_minimum_width_monitor_overlays_a_conversation_that_keeps_the_full_width() {
+    let reply = (0..40)
+        .map(|index| format!("reply{index:02} "))
+        .collect::<String>();
+    let every_word_shown = |rows: &[String]| {
+        let shown = rows.concat();
+        (0..40).all(|index| shown.contains(&format!("reply{index:02}")))
+    };
+    let mut state = State::new(false, 60, 30);
+    state.switch_view_chat(Some(Uuid::new_v4()));
+    state.prompt_enabled = true;
+    state
+        .monitor
+        .replace(TickGroup::Shells, vec![shell(Uuid::new_v4(), "A")]);
+    state.scrollback.append(&format!("{reply}\n"));
+    let (input, _, _) = state.frame();
+    let console = tests::console_with_state(state);
+    console.open_monitor().unwrap();
+    let mut state = console.state.lock().unwrap();
+    assert!(state.monitor_visible());
+    assert!(state.monitor.overlay);
+    assert_eq!(state.content_columns(), state.width);
+    state.draw_frame(&mut Vec::new()).unwrap();
+    let content_rows = state.height - input.len();
+    assert_eq!(&state.rendered_screen[content_rows..], input.as_slice());
+    assert!(state.rendered_screen[..content_rows].iter().all(|row| {
+        display_width(row.split('│').next().unwrap()) == state.width - MONITOR_COLUMNS
+    }));
+    assert!(
+        state.rendered_screen[..content_rows]
+            .iter()
+            .any(|row| row.contains("Shells (1)"))
+    );
+    state.prompt_enabled = true;
+    state.key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+    assert!(state.monitor.focused);
+    state.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(!state.monitor_visible());
+    state.draw_frame(&mut Vec::new()).unwrap();
+    let rows = state.rendered_screen[..content_rows].to_vec();
+    assert!(rows.iter().all(|row| !row.contains('│')));
+    assert!(
+        every_word_shown(&rows),
+        "closing the overlay leaves the conversation wrapped to the full width: {rows:#?}"
+    );
+}
+
+#[test]
 fn monitor_width_boundary_and_overlay_do_not_change_visibility_preference() {
-    let mut state = State::new(true, 121, 25);
+    let mut state = State::new(true, 80, 25);
     state.switch_view_chat(Some(Uuid::new_v4()));
     state
         .monitor
         .replace(TickGroup::Shells, vec![shell(Uuid::new_v4(), "A")]);
     assert!(state.monitor_visible());
-    state.width = 119;
+    state.width = 78;
     assert!(!state.monitor_visible());
     state.prompt_enabled = true;
     state.key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
@@ -1005,7 +1111,7 @@ fn empty_monitor_has_no_column_overlay_hint_or_mouse_target() {
 
 #[test]
 fn monitor_toggle_mouse_target_requests_saved_visibility_without_touching_the_editor() {
-    let mut state = State::new(true, 100, 25);
+    let mut state = State::new(true, 60, 25);
     state.switch_view_chat(Some(Uuid::new_v4()));
     state.prompt_enabled = true;
     state
@@ -1057,7 +1163,7 @@ fn monitor_columns_preserve_full_width_input_dividers_cursor_and_mouse_geometry(
             .as_ref()
             .map(|target| (target.row, target.columns.clone()));
         state.monitor_preference = tickloop_agent_config::MonitorPreference::Auto;
-        state.monitor.overlay = width <= 120;
+        state.monitor.overlay = crate::terminal::monitor::side_columns(state.width).is_none();
         let (shown, shown_row, shown_column) = state.frame();
         assert_eq!(shown, hidden, "input rows changed at {width} columns");
         assert_eq!((shown_row, shown_column), (hidden_row, hidden_column));
@@ -1187,17 +1293,17 @@ fn a_subscribed_artifact_is_visible_and_merges_with_its_added_tick() {
 #[test]
 fn background_rows_never_paint_past_the_left_column_or_hide_the_tick_separator() {
     let ansi = regex::Regex::new(r"\x1b\[[0-9;?]*[ -/]*[@-~]").unwrap();
-    for width in [140, 100] {
+    for width in [140, 80, 60] {
         for fill in [Role::UserMessageBg, Role::ShellMessageBg, Role::Selection] {
             let mut state = State::new(true, width, 24);
             state.chat = Some(Uuid::new_v4());
             state.prompt_enabled = true;
-            state.monitor.overlay = width <= 120;
+            state.monitor.overlay = crate::terminal::monitor::side_columns(state.width).is_none();
             state.monitor.replace(
                 TickGroup::Shells,
                 vec![shell(Uuid::new_v4(), "right column tick")],
             );
-            let left_width = state.width - MONITOR_COLUMNS;
+            let left_width = state.width - state.monitor_columns();
             let text = format!("› 卡了吗\n{}中\n", "x".repeat(left_width - 1));
             state
                 .scrollback

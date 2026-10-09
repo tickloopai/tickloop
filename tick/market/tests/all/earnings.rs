@@ -675,18 +675,19 @@ async fn panel(api: &QuoteServices, columns: u16, rows: u16) -> String {
 }
 
 #[tokio::test]
-async fn a_panel_below_the_minimum_size_asks_for_the_size_it_needs() {
+async fn a_panel_below_the_minimum_size_scrolls_over_the_full_layout() {
     let api = Fundamentals::new(time::OffsetDateTime::now_utc().date());
-    let screen = panel(&api, 80, 12).await;
+    let screen = panel(&api, 61, 12).await;
 
-    assert!(screen.contains("Need 100x14"), "{screen}");
-    assert!(screen.contains("80x12"), "{screen}");
+    assert!(screen.contains("Compare periods"), "{screen}");
+    assert!(screen.contains("< > ↕ 1–11/14 { } scroll"), "{screen}");
 }
 
 #[tokio::test]
 async fn the_minimum_panel_draws_fiscal_comparisons_and_source_time() {
     let api = Fundamentals::new(time::OffsetDateTime::now_utc().date());
-    let screen = panel(&api, 100, 14).await;
+    let minimum = TickKind::Earnings.minimum_panel_size();
+    let screen = panel(&api, minimum.columns, minimum.rows).await;
 
     assert!(screen.contains("TSLA.US · Earnings"), "{screen}");
     for heading in ["Period", "EPS Act", "Revenue", "YoY"] {

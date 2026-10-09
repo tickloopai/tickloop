@@ -12,7 +12,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tickloop_ui::{
-    format::{width, write_text},
+    format::{Hint, fit_hints, width, write_text},
     markdown,
 };
 
@@ -34,6 +34,8 @@ use tick_provider::{
     error::{Error, Result},
 };
 use tick_sdk::{stream::TickStream, tools::ToolCall};
+
+const FOOTER_SEPARATOR: &str = "  ";
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -1110,11 +1112,21 @@ impl LiveView for ReaderView {
                 self.search_matches.get()
             )
         } else {
-            format!(
-                "d Docs  t Contents  / Search  [ ] Section  {}/{}",
-                self.section.get() + 1,
-                document.sections.len()
-            )
+            let position = format!("{}/{}", self.section.get() + 1, document.sections.len());
+            let keys = fit_hints(
+                &[
+                    Hint::new("d Docs", "d"),
+                    Hint::new("t Contents", "t"),
+                    Hint::new("/ Search", "/"),
+                    Hint::new("[ ] Section", "[ ]"),
+                ],
+                FOOTER_SEPARATOR,
+                (inner.width as usize).saturating_sub(
+                    width(&position, settings.ambiguous_width) + FOOTER_SEPARATOR.len(),
+                ),
+                settings.ambiguous_width,
+            );
+            format!("{keys}{FOOTER_SEPARATOR}{position}")
         };
         write_text(
             frame.buffer_mut(),

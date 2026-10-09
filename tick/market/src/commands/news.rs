@@ -351,6 +351,7 @@ impl LiveView for NewsView<'_> {
                 x = x.saturating_add(columns as u16 + 2);
             }
             if row > 0 && state.offset + row - 1 == state.selected {
+                state.focus_row = Some(inner.y + row as u16);
                 frame.buffer_mut().set_style(
                     Rect::new(inner.x, inner.y + row as u16, inner.width, 1),
                     styles.selection,

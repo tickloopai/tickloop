@@ -35,7 +35,7 @@ async fn demo_keeps_streaming_after_switching_candle_periods() {
         event: Default::default(),
         output: OnceArgs::default(),
     };
-    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 14)).unwrap();
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(45, 14)).unwrap();
     let mut events = TickStream::in_memory(TickKind::Kline, "demo");
     kline::run_live(
         &args,

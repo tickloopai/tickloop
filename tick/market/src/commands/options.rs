@@ -33,6 +33,7 @@ use tick_provider::{
 use tick_sdk::{stream::TickStream, tools::ToolCall};
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+const TABLE_HEADER_ROWS: u16 = 1;
 const HEADERS: &[&str] = &[
     "Strike",
     "Call bid/ask",
@@ -664,18 +665,6 @@ impl LiveView for OptionsView {
         let area = frame.area();
         let styles = settings.styles();
         frame.buffer_mut().set_style(area, styles.panel_base());
-        let body = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1));
-        let parts = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Length(if self.research.is_some() { 5 } else { 3 }),
-            Constraint::Min(3),
-            Constraint::Length(2),
-        ])
-        .split(body);
-        frame.render_widget(
-            Paragraph::new(self.title()).style(styles.panel_base().patch(styles.title)),
-            parts[0],
-        );
         let description = if let Some(history) = &self.history {
             format!(
                 "Local saved snapshots: {} · {}\n{}",
@@ -726,19 +715,36 @@ impl LiveView for OptionsView {
         } else {
             description
         };
+        let body = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1));
+        let description = Paragraph::new(description)
+            .style(styles.text)
+            .wrap(Wrap { trim: false });
+        let description_rows = if self.research.is_some() { 5 } else { 3 }
+            .max(u16::try_from(description.line_count(body.width)).unwrap_or(u16::MAX));
+        let note=self.notice.as_deref().unwrap_or(if self.research.is_some() { "b before · p after · c current · a Ask Chat · Enter details\ns save CURRENT · r refresh current · h event history · Esc back" } else { "[ ] expiry · Enter details · r refresh · s save · h history · Esc back\nNo last-price substitution; bid/ask midpoint is a pricing approximation." });
+        let note = Paragraph::new(note)
+            .style(styles.muted_text)
+            .wrap(Wrap { trim: false });
+        let note_rows = 2.max(u16::try_from(note.line_count(body.width)).unwrap_or(u16::MAX));
+        let parts = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(description_rows),
+            Constraint::Min(3),
+            Constraint::Length(note_rows),
+        ])
+        .split(body);
         frame.render_widget(
-            Paragraph::new(description)
-                .style(styles.text)
-                .wrap(Wrap { trim: false }),
-            parts[1],
+            Paragraph::new(self.title()).style(styles.panel_base().patch(styles.title)),
+            parts[0],
         );
+        frame.render_widget(description, parts[1]);
         let table = self.table();
         state.selected = state.selected.min(table.rows.len().saturating_sub(1));
         let columns = if self.history.is_some() {
             4
         } else if area.width >= 112 {
             9
-        } else if area.width >= 82 {
+        } else if area.width >= 80 {
             7
         } else {
             5
@@ -754,7 +760,7 @@ impl LiveView for OptionsView {
             (0..columns)
                 .map(|index| {
                     Constraint::Length(match index {
-                        0 => 9,
+                        0 => 8,
                         1 | 2 => 14,
                         3 | 4 => 8,
                         _ => 10,
@@ -780,13 +786,9 @@ impl LiveView for OptionsView {
             .highlight_symbol("› ");
         let mut table_state = TableState::default().with_selected(Some(state.selected));
         frame.render_stateful_widget(widget, parts[2], &mut table_state);
-        let note=self.notice.as_deref().unwrap_or(if self.research.is_some() { "b before · p after · c current · a Ask Chat · Enter details\ns save CURRENT · r refresh current · h event history · Esc back" } else { "[ ] expiry · Enter details · r refresh · s save · h history · Esc back\nNo last-price substitution; bid/ask midpoint is a pricing approximation." });
-        frame.render_widget(
-            Paragraph::new(note)
-                .style(styles.muted_text)
-                .wrap(Wrap { trim: false }),
-            parts[3],
-        );
+        state.focus_row =
+            Some(parts[2].y + TABLE_HEADER_ROWS + (state.selected - table_state.offset()) as u16);
+        frame.render_widget(note, parts[3]);
         if self.detail {
             let popup = Rect::new(
                 area.x + 1,
