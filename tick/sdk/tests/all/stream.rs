@@ -1,25 +1,25 @@
 use serde_json::{Value, json};
 use tick_protocol::{
-    DESCRIBE_METHOD, INVALID_REQUEST, NATIVE_PROTOCOL_VERSION, READ_METHOD, TickDescriptor,
-    TickTool, UPDATE_METHOD,
+    CALL_METHOD, DESCRIBE_METHOD, INVALID_PARAMS, INVALID_REQUEST, NATIVE_PROTOCOL_VERSION,
+    READ_METHOD, REVISION_MISMATCH, TickDescriptor, TickTool, UPDATE_METHOD,
 };
-use tick_sdk::stream::{Describe, InboundFrame, TickStream};
+use tick_sdk::stream::{Describe, InboundFrame, TickStream, ToolRequest};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-const INSTANCE: &str = "hosted:counter-1";
 
 /// A third-party Tick that knows nothing of the financial Ticks.
 struct Counter {
+    revision: &'static str,
     tools: Vec<TickTool>,
 }
 
 impl Counter {
     fn with_read_tool() -> Self {
         Self {
+            revision: "1",
             tools: vec![TickTool {
                 name: "current".into(),
                 description: "Read the value".into(),
-                params: json!({"type": "object"}),
+                input_schema: json!({"type": "object"}),
                 mutates: false,
             }],
         }
@@ -27,16 +27,13 @@ impl Counter {
 }
 
 impl Describe for Counter {
-    fn tick_type(&self) -> &str {
-        "example.counter"
-    }
-
     fn descriptor(&self) -> Result<TickDescriptor, String> {
         Ok(TickDescriptor {
             protocol: NATIVE_PROTOCOL_VERSION,
-            tick_type: self.tick_type().into(),
+            kind: "example.counter".into(),
             title: "Counter".into(),
             description: "Counts".into(),
+            revision: self.revision.into(),
             recover_with: Some("current".into()),
             tools: self.tools.clone(),
         })
@@ -44,17 +41,15 @@ impl Describe for Counter {
 }
 
 /// Feeds `requests` to a stream for `tick`, publishes `published`, and returns every frame the
-/// stream wrote back.
-async fn serve(tick: Counter, requests: &[Value], published: Option<Value>) -> Vec<Value> {
+/// stream wrote back with the `tick/call` requests it surfaced to the runtime.
+async fn serve(
+    tick: Counter,
+    requests: &[Value],
+    published: Option<Value>,
+) -> (Vec<Value>, Vec<ToolRequest>) {
     let (mut client_requests, tick_requests) = tokio::io::duplex(8 * 1024);
     let (tick_responses, mut client_responses) = tokio::io::duplex(64 * 1024);
-    let mut stream = TickStream::duplex(
-        tick,
-        "example",
-        INSTANCE.to_owned(),
-        tick_requests,
-        tick_responses,
-    );
+    let mut stream = TickStream::duplex(tick, tick_requests, tick_responses);
     if let Some(data) = published {
         stream.publish(data).unwrap();
     }
@@ -65,23 +60,25 @@ async fn serve(tick: Counter, requests: &[Value], published: Option<Value>) -> V
     }
     client_requests.shutdown().await.unwrap();
     let mut inbound = stream.take_requests();
+    let mut dispatched = Vec::new();
     while let Some(frame) = inbound.next().await {
         assert!(matches!(&frame, InboundFrame::Line(_)));
-        assert!(stream.dispatch(frame).is_none(), "no tool call was sent");
+        dispatched.extend(stream.dispatch(frame));
     }
     stream.close().await;
     let mut bytes = Vec::new();
     client_responses.read_to_end(&mut bytes).await.unwrap();
-    String::from_utf8(bytes)
+    let frames = String::from_utf8(bytes)
         .unwrap()
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
-        .collect()
+        .collect();
+    (frames, dispatched)
 }
 
 #[tokio::test]
 async fn any_tick_answers_describe_and_read_with_what_it_declares_and_publishes() {
-    let frames = serve(
+    let (frames, _) = serve(
         Counter::with_read_tool(),
         &[
             json!({"jsonrpc": "2.0", "id": 1, "method": DESCRIBE_METHOD}),
@@ -94,23 +91,82 @@ async fn any_tick_answers_describe_and_read_with_what_it_declares_and_publishes(
         .iter()
         .find(|frame| frame["method"] == UPDATE_METHOD)
         .unwrap();
-    assert_eq!(update["params"]["tick"], "example.counter");
-    assert_eq!(update["params"]["source"], "example");
-    assert_eq!(update["params"]["tick_instance_id"], INSTANCE);
+    let mut fields: Vec<_> = update["params"].as_object().unwrap().keys().collect();
+    fields.sort();
+    assert_eq!(fields, ["at", "data", "seq"]);
+    assert_eq!(update["params"]["seq"], 1);
     let answer = |id: u64| frames.iter().find(|frame| frame["id"] == id).unwrap();
-    assert_eq!(answer(1)["result"]["tick_type"], "example.counter");
+    assert_eq!(answer(1)["result"]["kind"], "example.counter");
+    assert_eq!(answer(1)["result"]["revision"], "1");
     assert_eq!(answer(1)["result"]["recover_with"], "current");
-    assert_eq!(answer(2)["result"]["data"], json!({"value": 3}));
+    assert_eq!(answer(2)["result"], update["params"]);
+}
+
+#[tokio::test]
+async fn a_tick_without_content_reads_as_null_data() {
+    let (frames, _) = serve(
+        Counter::with_read_tool(),
+        &[json!({"jsonrpc": "2.0", "id": 1, "method": READ_METHOD})],
+        None,
+    )
+    .await;
+    assert_eq!(frames[0]["result"], json!({"seq": 0, "data": null}));
+}
+
+#[tokio::test]
+async fn a_call_runs_only_against_the_current_catalog_revision() {
+    let call = |id: u64, params: Value| json!({"jsonrpc": "2.0", "id": id, "method": CALL_METHOD, "params": params});
+    let (frames, dispatched) = serve(
+        Counter {
+            revision: "2",
+            ..Counter::with_read_tool()
+        },
+        &[
+            call(1, json!({"tool": "current", "args": {}, "revision": "1"})),
+            call(2, json!({"tool": "current", "args": {}})),
+            call(
+                3,
+                json!({"tool": "current", "args": {"n": 1}, "revision": "2"}),
+            ),
+        ],
+        None,
+    )
+    .await;
+    let answer = |id: u64| frames.iter().find(|frame| frame["id"] == id).unwrap();
+    assert_eq!(answer(1)["error"]["code"], REVISION_MISMATCH);
+    assert_eq!(answer(2)["error"]["code"], INVALID_PARAMS);
+    assert_eq!(
+        dispatched,
+        [ToolRequest {
+            id: json!(3),
+            tool: "current".into(),
+            args: json!({"n": 1}),
+        }],
+        "only the call naming the current revision reaches the runtime"
+    );
 }
 
 #[tokio::test]
 async fn a_descriptor_that_breaks_the_standard_is_refused_instead_of_answered() {
-    let undeclared_recovery = Counter { tools: Vec::new() };
-    let frames = serve(
+    let undeclared_recovery = Counter {
+        revision: "1",
+        tools: Vec::new(),
+    };
+    let (frames, _) = serve(
         undeclared_recovery,
         &[json!({"jsonrpc": "2.0", "id": 1, "method": DESCRIBE_METHOD})],
         None,
     )
     .await;
     assert_eq!(frames[0]["error"]["code"], INVALID_REQUEST);
+}
+
+#[test]
+fn a_tick_update_needs_data() {
+    let mut stream = TickStream::in_memory(Counter::with_read_tool());
+    assert!(stream.publish(Value::Null).is_err());
+    stream.publish(json!({"value": 1})).unwrap();
+    stream.publish(json!({"value": 1})).unwrap();
+    assert_eq!(stream.seq(), 1, "unchanged data publishes nothing");
+    assert_eq!(stream.records().len(), 1);
 }

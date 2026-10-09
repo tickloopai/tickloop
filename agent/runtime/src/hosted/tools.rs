@@ -1,8 +1,8 @@
 //! The Tickhost backend of the native Tick tools: the hidden Ticks a Chat opened. Opening,
 //! reopening and closing go through the daemon, which alone controls the Tickhost; reading and
 //! calling use the instance's data binding directly. Each call is prepared once — target,
-//! catalog, executable, working directory and operation id frozen — and the same preparation is
-//! approved and dispatched.
+//! catalog revision, executable, working directory and operation id frozen — and the same
+//! preparation is approved and dispatched.
 
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
@@ -99,11 +99,13 @@ enum Operation {
     Read {
         instance: InstanceRef,
     },
+    /// A Tick Tool call bound to the catalog revision it was prepared against: the Tick refuses
+    /// it unrun once its catalog changed.
     Call {
         instance: InstanceRef,
         tool: String,
         args: Value,
-        catalog: TickDescriptor,
+        revision: String,
     },
 }
 
@@ -140,6 +142,7 @@ impl HostedTickTools {
         workdir: Option<&Path>,
     ) -> Result<PreparedHostCall, String> {
         TickBackends::HOSTED.route(name, input)?;
+        let mut external_declaration = None;
         let (operation, permission, summary) = match (name, input["action"].as_str()) {
             (MODIFY_TICK, Some("open")) => {
                 let words = input["command"]
@@ -244,7 +247,7 @@ impl HostedTickTools {
                     .iter()
                     .find(|declared| declared.name == tool)
                     .ok_or_else(|| format!("{instance} declares no tool {tool:?}"))?;
-                jsonschema::validator_for(&declaration.params)
+                jsonschema::validator_for(&declaration.input_schema)
                     .map_err(|error| error.to_string())?
                     .validate(&args)
                     .map_err(|error| format!("invalid args for {tool}: {error}"))?;
@@ -253,12 +256,16 @@ impl HostedTickTools {
                 } else {
                     HostToolPermission::ReadOnly
                 };
+                // The approval reviewer sees the whole catalog; the call itself is bound to its
+                // revision.
+                external_declaration =
+                    Some(serde_json::to_value(&catalog).map_err(|error| error.to_string())?);
                 (
                     Operation::Call {
                         instance: instance.clone(),
                         tool: tool.clone(),
                         args,
-                        catalog,
+                        revision: catalog.revision,
                     },
                     permission,
                     format!("Call {tool} on hosted Tick {instance}"),
@@ -275,12 +282,9 @@ impl HostedTickTools {
                 facts.tick_instance = Some(instance.clone());
                 facts.closes_tick = true;
             }
-            Operation::Call {
-                instance, catalog, ..
-            } => {
+            Operation::Call { instance, .. } => {
                 facts.tick_instance = Some(instance.clone());
-                facts.external_declaration =
-                    Some(serde_json::to_value(catalog).map_err(|error| error.to_string())?);
+                facts.external_declaration = external_declaration;
             }
             _ => {}
         }
@@ -296,7 +300,7 @@ impl HostedTickTools {
     }
 
     /// Checks before dispatch that nothing the approval relied on changed.
-    async fn revalidate(&self, chat: ChatId, prepared: &HostedPrepared) -> Result<(), String> {
+    fn revalidate(prepared: &HostedPrepared) -> Result<(), String> {
         match &prepared.operation {
             Operation::Open {
                 command,
@@ -315,23 +319,16 @@ impl HostedTickTools {
                 }
                 Ok(())
             }
-            Operation::Close { .. } | Operation::Reopen { .. } | Operation::Read { .. } => Ok(()),
-            Operation::Call {
-                instance, catalog, ..
-            } => {
-                if self.describe(chat, instance).await? != *catalog {
-                    return Err(
-                        "the Tick's tool catalog changed before dispatch; read it and call again"
-                            .into(),
-                    );
-                }
-                Ok(())
-            }
+            // A call's catalog is checked by the Tick itself against the prepared revision.
+            Operation::Close { .. }
+            | Operation::Reopen { .. }
+            | Operation::Read { .. }
+            | Operation::Call { .. } => Ok(()),
         }
     }
 
     async fn execute_operation(&self, chat: ChatId, prepared: HostedPrepared) -> HostCallResult {
-        if let Err(error) = self.revalidate(chat, &prepared).await {
+        if let Err(error) = Self::revalidate(&prepared) {
             return HostCallResult::NotDispatched(error);
         }
         match prepared.operation {
@@ -401,7 +398,7 @@ impl HostedTickTools {
                 instance,
                 tool,
                 args,
-                ..
+                revision,
             } => {
                 let mut connection = match self.data(chat, &instance).await {
                     Ok(connection) => connection,
@@ -410,7 +407,7 @@ impl HostedTickTools {
                 match connection
                     .request(
                         "call",
-                        json!({"tool":tool,"args":args}),
+                        json!({"tool":tool,"args":args,"revision":revision}),
                         CALL_RESPONSE_TIMEOUT,
                     )
                     .await
@@ -576,10 +573,9 @@ impl HostedTickTools {
         Ok(json!({
             "tick_instance_id": instance,
             "source": "protocol",
-            "initialized": read["initialized"],
-            "sequence": read["sequence"],
-            "observed_at": read["observed_at"],
-            "content": read["data"],
+            "seq": read["seq"],
+            "at": read["at"],
+            "data": read["data"],
             "descriptor": descriptor,
             "tools": descriptor["tools"],
         }))
@@ -900,7 +896,7 @@ async fn described_title(
     let descriptor: TickDescriptor = serde_json::from_value(descriptor).ok()?;
     Some(tickhost_connect::naming::tick_title(
         &descriptor.title,
-        &descriptor.tick_type,
+        &descriptor.kind,
         command,
     ))
 }
@@ -975,7 +971,7 @@ impl HostToolProvider for HostedTickTools {
 
     async fn revalidate_call(
         &self,
-        chat: ChatId,
+        _: ChatId,
         call: &PreparedHostCall,
         cancel: CancellationToken,
     ) -> Result<(), String> {
@@ -985,7 +981,7 @@ impl HostToolProvider for HostedTickTools {
         let prepared = call
             .payload::<HostedPrepared>()
             .ok_or("hosted Tick operation has no prepared binding")?;
-        self.revalidate(chat, prepared).await
+        Self::revalidate(prepared)
     }
 
     async fn execute_prepared(

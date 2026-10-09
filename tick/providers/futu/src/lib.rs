@@ -20,7 +20,7 @@ use tick_provider::{
     options::{Contract, Expiration, MarketQuote, OptionSide, OptionsApi, normalize_symbol},
 };
 
-/// The `source` of the Tick Updates Futu data produces.
+/// The source Futu data names.
 pub const SOURCE: &str = "futu";
 
 pub const INTERFACES: &[Interface] = &[Interface::Options];

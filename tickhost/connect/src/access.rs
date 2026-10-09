@@ -38,13 +38,14 @@ pub struct AccessContext {
     pub interaction: Option<Pane>,
 }
 
+/// A Tick's current state as a read returns it: a protocol Tick's `tick/read`, whose data is
+/// null until the Tick has content, or an ordinary program's recent plain text.
 #[derive(Clone, Debug)]
 pub struct TickSnapshot {
     pub instance: InstanceRef,
     pub data: Value,
-    pub sequence: u64,
-    pub observed_at: String,
-    pub initialized: bool,
+    pub seq: u64,
+    pub at: String,
     pub terminal: bool,
     pub truncated: bool,
     pub descriptor: Option<Value>,
@@ -264,7 +265,7 @@ impl TickAccess {
         match (descriptor, command) {
             (Some(descriptor), command) => Some(crate::naming::tick_title(
                 descriptor["title"].as_str()?,
-                descriptor["tick_type"].as_str()?,
+                descriptor["kind"].as_str()?,
                 command.as_deref().unwrap_or_default(),
             )),
             (None, command) => command,
@@ -295,7 +296,7 @@ impl TickAccess {
         .await;
         match described {
             Ok(Some(descriptor)) => {
-                crate::naming::tick_title(&descriptor.title, &descriptor.tick_type, command)
+                crate::naming::tick_title(&descriptor.title, &descriptor.kind, command)
             }
             _ => command.to_owned(),
         }
@@ -332,7 +333,7 @@ impl TickAccess {
                     if location.protocol {
                         let descriptor = match self.read(&location.instance).await {
                             Ok(snapshot) => {
-                                tick["state"] = json!(if snapshot.initialized { "live" } else { "initializing" });
+                                tick["state"] = json!(if snapshot.data.is_null() { "initializing" } else { "live" });
                                 tick["capabilities"] = json!(["read","call_tick_tool","subscribe"]);
                                 snapshot.descriptor
                             }
@@ -552,10 +553,9 @@ impl TickAccess {
             let read = client.read().await.map_err(session_error)?;
             return Ok(TickSnapshot {
                 instance: instance.clone(),
-                data: read.data.unwrap_or(Value::Null),
-                sequence: read.sequence,
-                observed_at: read.observed_at,
-                initialized: read.initialized,
+                data: read.data,
+                seq: read.seq,
+                at: read.at.unwrap_or_else(observed_now),
                 terminal: false,
                 truncated: false,
                 descriptor: Some(serde_json::to_value(descriptor).map_err(invalid_host_response)?),
@@ -577,9 +577,8 @@ impl TickAccess {
         Ok(TickSnapshot {
             instance: instance.clone(),
             data: json!({"text":text}),
-            sequence: 0,
-            observed_at: observed_now(),
-            initialized: true,
+            seq: 0,
+            at: observed_now(),
             terminal: true,
             truncated: truncated || response["truncated"].as_bool().unwrap_or(false),
             descriptor: None,
@@ -694,12 +693,12 @@ impl TickAccess {
                 )
             })?;
         let args = input.get("args").cloned().unwrap_or_else(|| json!({}));
-        let validator = jsonschema::validator_for(&tool.params)
+        let validator = jsonschema::validator_for(&tool.input_schema)
             .map_err(|error| HostError::before("InvalidDeclaration", error.to_string()))?;
         validator.validate(&args).map_err(|error| {
             HostError::before(
                 "InvalidArguments",
-                format!("{error}; schema: {}", tool.params),
+                format!("{error}; schema: {}", tool.input_schema),
             )
         })?;
 
@@ -988,20 +987,6 @@ impl TickAccess {
                     "source Tick moved after approval",
                 ));
             }
-            if let Some(expected) = &prepared.declaration {
-                let descriptor = self
-                    .session(&target.instance)
-                    .await?
-                    .describe()
-                    .await
-                    .map_err(session_error)?;
-                if serde_json::to_value(descriptor).map_err(invalid_host_response)? != *expected {
-                    return Err(HostError::before(
-                        "CapabilitiesChanged",
-                        "Tick declarations changed after preparation; prepare and approve again",
-                    ));
-                }
-            }
         }
         self.revalidate_placement(&prepared.placement).await?;
         Ok(())
@@ -1061,7 +1046,7 @@ impl TickAccess {
                     .cloned()
                     .unwrap_or_else(|| json!([]));
                 Ok(
-                    json!({"tick_instance_id":snapshot.instance,"source":if snapshot.terminal {"terminal"} else {"protocol"},"initialized":snapshot.initialized,"sequence":snapshot.sequence,"observed_at":snapshot.observed_at,"content":snapshot.data,"truncated":snapshot.truncated,"descriptor":snapshot.descriptor,"tools":tools}),
+                    json!({"tick_instance_id":snapshot.instance,"source":if snapshot.terminal {"terminal"} else {"protocol"},"seq":snapshot.seq,"at":snapshot.at,"data":snapshot.data,"truncated":snapshot.truncated,"descriptor":snapshot.descriptor,"tools":tools}),
                 )
             }
             "call_tick_tool" => {
@@ -1072,15 +1057,17 @@ impl TickAccess {
                 let tool = prepared.input["tool"]
                     .as_str()
                     .ok_or_else(|| HostError::before("InvalidArguments", "missing tool name"))?;
-                let descriptor = serde_json::from_value(prepared.declaration.ok_or_else(|| {
-                    HostError::before("InvalidDeclaration", "prepared Tick call has no catalog")
-                })?)
-                .map_err(invalid_host_response)?;
+                let descriptor: tick_protocol::TickDescriptor =
+                    serde_json::from_value(prepared.declaration.ok_or_else(|| {
+                        HostError::before("InvalidDeclaration", "prepared Tick call has no catalog")
+                    })?)
+                    .map_err(invalid_host_response)?;
+                // The Tick runs the call only while its catalog keeps the approved revision.
                 client
-                    .call_prepared(
+                    .call(
                         tool,
                         prepared.input["args"].clone(),
-                        &tick_protocol::descriptor_digest(&descriptor),
+                        &descriptor.revision,
                         cancel,
                     )
                     .await
@@ -1712,6 +1699,7 @@ fn session_error(error: SessionError) -> HostError {
         SessionError::CancelledBeforeSend => "Cancelled",
         SessionError::OutcomeUnknown => "OutcomeUnknown",
         SessionError::ChildError(_) => "TickToolFailed",
+        SessionError::RevisionMismatch => "CapabilitiesChanged",
     };
     HostError {
         code: code.into(),

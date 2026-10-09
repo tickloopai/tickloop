@@ -107,11 +107,11 @@ impl Served {
         self.updates().last().unwrap()["data"]["marks"].clone()
     }
 
-    /// The sequence of the last Tick Update. The latest-only stream may drop
-    /// intermediate records, so the sequence, not the delivered count, says how
+    /// The seq of the last Tick Update. The latest-only stream may drop
+    /// intermediate records, so the seq, not the delivered count, says how
     /// many updates the Panel published.
     fn published(&self) -> u64 {
-        self.updates().last().unwrap()["sequence"].as_u64().unwrap()
+        self.updates().last().unwrap()["seq"].as_u64().unwrap()
     }
 }
 
@@ -120,13 +120,7 @@ impl Served {
 async fn serve(requests: &[Value]) -> Served {
     let (mut client_requests, tick_requests) = tokio::io::duplex(8 * 1024);
     let (tick_responses, mut client_responses) = tokio::io::duplex(256 * 1024);
-    let mut session = TickStream::duplex(
-        TickKind::Kline,
-        "longbridge",
-        "herdr:test-kline".to_owned(),
-        tick_requests,
-        tick_responses,
-    );
+    let mut session = TickStream::duplex(TickKind::Kline, tick_requests, tick_responses);
     for request in requests {
         let mut line = serde_json::to_vec(request).unwrap();
         line.push(b'\n');
@@ -174,7 +168,7 @@ async fn serve(requests: &[Value]) -> Served {
 }
 
 fn call(id: u64, tool: &str, args: Value) -> Value {
-    json!({"jsonrpc": "2.0", "id": id, "method": "tool/call", "params": {"tool": tool, "args": args}})
+    json!({"jsonrpc": "2.0", "id": id, "method": "tick/call", "params": {"tool": tool, "args": args, "revision": "1"}})
 }
 
 #[tokio::test]
@@ -182,7 +176,7 @@ async fn kline_recovers_updates_with_candles_and_declares_event_and_mark_tools()
     let served = serve(&[json!({"jsonrpc": "2.0", "id": 1, "method": "tick/describe"})]).await;
 
     let describe = served.answer(1);
-    assert_eq!(describe["result"]["tick_type"], "kline");
+    assert_eq!(describe["result"]["kind"], "kline");
     assert_eq!(describe["result"]["recover_with"], "candles");
     let tools = describe["result"]["tools"].as_array().unwrap();
     let declared: Vec<(&str, bool)> = tools
@@ -207,17 +201,20 @@ async fn kline_recovers_updates_with_candles_and_declares_event_and_mark_tools()
         ]
     );
 
-    let candles = tools[0]["params"].to_string();
+    let candles = tools[0]["input_schema"].to_string();
     assert!(
         candles.contains("\"15m\"") && candles.contains("\"forward\""),
         "the tool speaks the Tick's period and adjust vocabulary: {candles}"
     );
     assert_eq!(
-        tools[0]["params"]["required"],
+        tools[0]["input_schema"]["required"],
         json!(["symbol", "from", "to"])
     );
-    assert_eq!(tools[1]["params"]["required"], json!(["price", "label"]));
-    assert_eq!(tools[2]["params"]["required"], json!(["label"]));
+    assert_eq!(
+        tools[1]["input_schema"]["required"],
+        json!(["price", "label"])
+    );
+    assert_eq!(tools[2]["input_schema"]["required"], json!(["label"]));
 }
 
 #[tokio::test]

@@ -81,13 +81,18 @@ async fn a_hidden_builtin_watchlist_runs_on_a_private_pty_without_herdr() {
         .request("describe", json!({}), CONTROL_TIMEOUT)
         .await
         .unwrap();
-    assert_eq!(descriptor["protocol"], 2);
-    assert_eq!(descriptor["tick_type"], "watchlist");
+    assert_eq!(descriptor["protocol"], 3);
+    assert_eq!(descriptor["kind"], "watchlist");
+    assert_eq!(descriptor["revision"], "1");
     let read = reader
         .request("read", json!({"activity":"explicit"}), CONTROL_TIMEOUT)
         .await
         .unwrap();
-    assert_eq!(read["tick_instance_id"], opened["instance"]);
+    assert!(read["seq"].is_u64(), "{read}");
+    assert!(
+        read["at"].is_string(),
+        "the host fills in when it received the state: {read}"
+    );
     let business = opened["business_pid"].as_u64().unwrap() as libc::pid_t;
     let closed = controller
         .request(

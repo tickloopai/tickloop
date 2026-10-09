@@ -13,7 +13,7 @@ use std::{
 };
 
 use serde_json::{Value, json};
-use tick_protocol::{TickDescriptor, descriptor_digest};
+use tick_protocol::{REVISION_MISMATCH, TickDescriptor};
 
 const VISIBLE_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 const VISIBLE_FRAME_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -146,8 +146,9 @@ fn visible_kline_keyboard_and_tool_share_the_same_stdio_instance() {
             );
         });
     assert_eq!(first["method"], "tick/update");
-    assert_eq!(first["params"]["version"], 3);
-    assert_eq!(first["params"]["tick_instance_id"], "herdr:visible-kline");
+    let mut fields: Vec<_> = first["params"].as_object().unwrap().keys().collect();
+    fields.sort();
+    assert_eq!(fields, ["at", "data", "seq"]);
 
     let stdin = child.stdin.as_mut().unwrap();
     writeln!(
@@ -170,7 +171,7 @@ fn visible_kline_keyboard_and_tool_share_the_same_stdio_instance() {
         }
     };
     assert_eq!(read["result"]["data"]["period"], "day");
-    assert_eq!(read["result"]["tick_instance_id"], "herdr:visible-kline");
+    assert!(read["result"]["seq"].as_u64().unwrap() >= first["params"]["seq"].as_u64().unwrap());
 
     writeln!(
         stdin,
@@ -184,8 +185,8 @@ fn visible_kline_keyboard_and_tool_share_the_same_stdio_instance() {
             break frame;
         }
     };
-    assert_eq!(describe["result"]["protocol"], 2);
-    assert_eq!(describe["result"]["tick_type"], "kline");
+    assert_eq!(describe["result"]["protocol"], 3);
+    assert_eq!(describe["result"]["kind"], "kline");
     assert!(
         describe["result"]["tools"]
             .as_array()
@@ -194,36 +195,31 @@ fn visible_kline_keyboard_and_tool_share_the_same_stdio_instance() {
             .any(|tool| tool["name"] == "mark")
     );
     let descriptor: TickDescriptor = serde_json::from_value(describe["result"].clone()).unwrap();
-    writeln!(stdin, "{}", json!({"jsonrpc":"2.0","id":13,"method":"tool/call","params":{"tool":"mark","args":{"label":"test","price":500.0},"expected_descriptor_digest":"stale"}})).unwrap();
+    writeln!(stdin, "{}", json!({"jsonrpc":"2.0","id":13,"method":"tick/call","params":{"tool":"mark","args":{"label":"test","price":500.0},"revision":"stale"}})).unwrap();
     let stale_catalog = loop {
         let frame = next(&frames);
         if frame["id"] == 13 {
             break frame;
         }
     };
-    assert_eq!(stale_catalog["error"]["code"], -32600);
-
+    assert_eq!(stale_catalog["error"]["code"], REVISION_MISMATCH);
     writeln!(
         stdin,
         "{}",
-        json!({"jsonrpc":"2.0","id":11,"method":"tick/read","params":{"protocol":1}})
+        json!({"jsonrpc":"2.0","id":11,"method":"tick/read"})
     )
     .unwrap();
-    let rejected_version = loop {
+    let unmarked_read = loop {
         let frame = next(&frames);
         if frame["id"] == 11 {
             break frame;
         }
     };
-    assert_eq!(rejected_version["error"]["code"], -32001);
-    writeln!(stdin, "{}", json!({"jsonrpc":"2.0","id":12,"method":"tick/read","params":{"tick_instance_id":"herdr:other"}})).unwrap();
-    let rejected_instance = loop {
-        let frame = next(&frames);
-        if frame["id"] == 12 {
-            break frame;
-        }
-    };
-    assert_eq!(rejected_instance["error"]["code"], -32002);
+    assert_eq!(
+        unmarked_read["result"]["data"]["marks"],
+        json!([]),
+        "the call naming a stale revision never ran"
+    );
 
     writeln!(stdin, "not-json").unwrap();
     let parse_error = loop {
@@ -249,12 +245,9 @@ fn visible_kline_keyboard_and_tool_share_the_same_stdio_instance() {
             break frame;
         }
     };
-    assert!(
-        switched["params"]["sequence"].as_u64().unwrap()
-            > first["params"]["sequence"].as_u64().unwrap()
-    );
+    assert!(switched["params"]["seq"].as_u64().unwrap() > first["params"]["seq"].as_u64().unwrap());
 
-    writeln!(stdin, "{}", json!({"jsonrpc":"2.0","id":2,"method":"tool/call","params":{"tool":"mark","args":{"label":"test","price":500.0},"expected_descriptor_digest":descriptor_digest(&descriptor)}})).unwrap();
+    writeln!(stdin, "{}", json!({"jsonrpc":"2.0","id":2,"method":"tick/call","params":{"tool":"mark","args":{"label":"test","price":500.0},"revision":descriptor.revision}})).unwrap();
     let marked = loop {
         let frame = next(&frames);
         if frame["method"] == "tick/update"
@@ -278,12 +271,12 @@ fn visible_kline_keyboard_and_tool_share_the_same_stdio_instance() {
         );
         std::thread::sleep(VISIBLE_FRAME_POLL_INTERVAL);
     }
-    writeln!(stdin, "{}", json!({"jsonrpc":"2.0","id":3,"method":"tool/call","params":{"tool":"unmark","args":{"label":"test"}}})).unwrap();
+    writeln!(stdin, "{}", json!({"jsonrpc":"2.0","id":3,"method":"tick/call","params":{"tool":"unmark","args":{"label":"test"},"revision":descriptor.revision}})).unwrap();
     let unmarked = loop {
         let frame = next(&frames);
         if frame["method"] == "tick/update"
-            && frame["params"]["sequence"].as_u64().unwrap_or(0)
-                > marked["params"]["sequence"].as_u64().unwrap()
+            && frame["params"]["seq"].as_u64().unwrap_or(0)
+                > marked["params"]["seq"].as_u64().unwrap()
         {
             break frame;
         }

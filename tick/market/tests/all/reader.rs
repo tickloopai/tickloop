@@ -126,7 +126,7 @@ async fn reader_escape_and_control_navigation_do_not_quit_or_publish_cursor_upda
     ];
     let input = futures_util::stream::iter(keys.into_iter().map(|key| Ok(Event::Key(key))));
     let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
-    let mut updates = TickStream::in_memory(TickKind::Reader, "longbridge");
+    let mut updates = TickStream::in_memory(TickKind::Reader);
     run_live(
         library,
         &Settings::default(),

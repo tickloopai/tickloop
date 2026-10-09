@@ -22,7 +22,6 @@ use tokio::{
 const COUNTER: &str = r#"
 import json, os, signal, sys, threading, time
 LARGE_PAYLOAD = 8 * 1024 * 1024 - 4096
-instance = os.environ['TICKLOOP_INSTANCE_ID']
 value = 0
 typed = ''
 def draw(*_):
@@ -40,10 +39,10 @@ for line in sys.stdin:
     request = json.loads(line)
     method = request['method']
     if method == 'tick/describe':
-        result = {'protocol':2,'tick_type':'example.counter','title':'Counter','description':'Counter','recover_with':'current','tools':[{'name':'increment','description':'Increment','params':{'type':'object'},'mutates':True},{'name':'current','description':'Read','params':{'type':'object'},'mutates':False},{'name':'flood','description':'Print many lines','params':{'type':'object'},'mutates':False},{'name':'slow','description':'Answer after 16 seconds','params':{'type':'object'},'mutates':False},{'name':'large','description':'Answer with almost 8 MiB','params':{'type':'object'},'mutates':False},{'name':'oversized_update','description':'Send an update beyond the limit','params':{'type':'object'},'mutates':False}]}
+        result = {'protocol':3,'revision':'1','kind':'example.counter','title':'Counter','description':'Counter','recover_with':'current','tools':[{'name':'increment','description':'Increment','input_schema':{'type':'object'},'mutates':True},{'name':'current','description':'Read','input_schema':{'type':'object'},'mutates':False},{'name':'flood','description':'Print many lines','input_schema':{'type':'object'},'mutates':False},{'name':'slow','description':'Answer after 16 seconds','input_schema':{'type':'object'},'mutates':False},{'name':'large','description':'Answer with almost 8 MiB','input_schema':{'type':'object'},'mutates':False},{'name':'oversized_update','description':'Send an update beyond the limit','input_schema':{'type':'object'},'mutates':False}]}
     elif method == 'tick/read':
-        result = {'version':3,'tick_instance_id':instance,'initialized':True,'sequence':value,'observed_at':'2026-10-07T00:00:00Z','data':{'value':value,'note':open('note.txt').read(),'sees_launch_token':'TICKLOOP_TICKHOST_LAUNCH' in os.environ,'argument_bytes':sum(len(argument) for argument in sys.argv[1:])}}
-    elif method == 'tool/call':
+        result = {'seq':value,'at':'2026-10-07T00:00:00Z','data':{'value':value,'note':open('note.txt').read(),'sees_launch_token':'TICKLOOP_TICKHOST_LAUNCH' in os.environ,'argument_bytes':sum(len(argument) for argument in sys.argv[1:])}}
+    elif method == 'tick/call':
         if request['params']['tool'] == 'increment':
             value += 1
             draw()
@@ -54,7 +53,7 @@ for line in sys.stdin:
         elif request['params']['tool'] == 'slow':
             time.sleep(16)
         elif request['params']['tool'] == 'oversized_update':
-            print(json.dumps({'jsonrpc':'2.0','method':'tick/update','params':{'version':3,'tick_instance_id':instance,'source':'example.counter','sequence':value + 1,'observed_at':'2026-10-07T00:00:01Z','data':{'blob':'x' * (600 * 1024)}}}), flush=True)
+            print(json.dumps({'jsonrpc':'2.0','method':'tick/update','params':{'seq':value + 1,'at':'2026-10-07T00:00:01Z','data':{'blob':'x' * (600 * 1024)}}}), flush=True)
         elif request['params']['tool'] == 'large':
             result = {'value':value,'payload':'x' * LARGE_PAYLOAD}
             print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}), flush=True)
@@ -326,7 +325,7 @@ async fn protocol_calls_and_the_screen_belong_to_one_counter_process() {
     let called = reader
         .request(
             "call",
-            json!({"tool":"increment","args":{}}),
+            json!({"tool":"increment","args":{},"revision":"1"}),
             CONTROL_TIMEOUT,
         )
         .await
@@ -383,7 +382,7 @@ async fn killing_the_launcher_ends_its_business_process_and_the_host_reaps_it() 
     reader
         .request(
             "call",
-            json!({"tool":"increment","args":{}}),
+            json!({"tool":"increment","args":{},"revision":"1"}),
             CONTROL_TIMEOUT,
         )
         .await
@@ -589,7 +588,7 @@ async fn one_attached_view_controls_the_terminal_until_it_detaches_or_disconnect
     let called = second
         .request(
             "call",
-            json!({"tool":"increment","args":{}}),
+            json!({"tool":"increment","args":{},"revision":"1"}),
             CONTROL_TIMEOUT,
         )
         .await
@@ -728,7 +727,11 @@ async fn a_stalled_view_loses_its_lease_after_two_seconds_and_the_tick_keeps_run
     let released = tokio::time::timeout(CONTROL_TIMEOUT, async {
         loop {
             reader
-                .request("call", json!({"tool":"flood","args":{}}), CALL_TIMEOUT)
+                .request(
+                    "call",
+                    json!({"tool":"flood","args":{},"revision":"1"}),
+                    CALL_TIMEOUT,
+                )
                 .await
                 .unwrap();
             let mut probe = fixture.reader(&opened).await;
@@ -745,7 +748,7 @@ async fn a_stalled_view_loses_its_lease_after_two_seconds_and_the_tick_keeps_run
     let called = reader
         .request(
             "call",
-            json!({"tool":"increment","args":{}}),
+            json!({"tool":"increment","args":{},"revision":"1"}),
             CONTROL_TIMEOUT,
         )
         .await
@@ -803,7 +806,7 @@ async fn an_invalid_resize_is_refused_and_leaves_the_terminal_and_the_tick_uncha
     let called = reader
         .request(
             "call",
-            json!({"tool":"increment","args":{}}),
+            json!({"tool":"increment","args":{},"revision":"1"}),
             CONTROL_TIMEOUT,
         )
         .await
@@ -826,7 +829,7 @@ async fn a_reply_left_unread_past_the_control_bound_closes_only_its_connection()
     let (mut replies, mut requests) = fixture.reader(&opened).await.into_parts();
     write_frame(
         &mut requests,
-        &json!({"id":1,"method":"call","params":{"tool":"large","args":{}}}),
+        &json!({"id":1,"method":"call","params":{"tool":"large","args":{},"revision":"1"}}),
         BUSINESS_FRAME_BYTES,
     )
     .await
@@ -845,7 +848,11 @@ async fn a_reply_left_unread_past_the_control_bound_closes_only_its_connection()
     let current = fixture
         .reader(&opened)
         .await
-        .request("call", json!({"tool":"current","args":{}}), CONTROL_TIMEOUT)
+        .request(
+            "call",
+            json!({"tool":"current","args":{},"revision":"1"}),
+            CONTROL_TIMEOUT,
+        )
         .await
         .unwrap();
     assert_eq!(current["value"], 0, "the Tick keeps serving");
@@ -1384,7 +1391,7 @@ async fn an_oversized_update_breaks_only_its_own_tick() {
     let _ = reader
         .request(
             "call",
-            json!({"tool":"oversized_update","args":{}}),
+            json!({"tool":"oversized_update","args":{},"revision":"1"}),
             CONTROL_TIMEOUT,
         )
         .await;
@@ -1412,7 +1419,7 @@ async fn an_oversized_update_breaks_only_its_own_tick() {
         .await
         .request(
             "call",
-            json!({"tool":"increment","args":{}}),
+            json!({"tool":"increment","args":{},"revision":"1"}),
             CONTROL_TIMEOUT,
         )
         .await
@@ -1442,7 +1449,7 @@ async fn watchers_that_leave_a_quiet_tick_release_their_session_connections() {
         .await
         .request(
             "call",
-            json!({"tool":"increment","args":{}}),
+            json!({"tool":"increment","args":{},"revision":"1"}),
             CONTROL_TIMEOUT,
         )
         .await
@@ -1459,13 +1466,21 @@ async fn a_legal_eight_mebibyte_tool_answer_passes_through_the_host() {
     let opened = fixture.open(&mut controller, command, &work).await.unwrap();
     let mut reader = fixture.reader(&opened).await;
     let answered = reader
-        .request("call", json!({"tool":"large","args":{}}), CALL_TIMEOUT)
+        .request(
+            "call",
+            json!({"tool":"large","args":{},"revision":"1"}),
+            CALL_TIMEOUT,
+        )
         .await
         .unwrap();
     let payload = answered["payload"].as_str().unwrap().len();
     assert!(payload > tick_protocol::MAX_TOOL_RESPONSE_BYTES - 8192);
     let current = reader
-        .request("call", json!({"tool":"current","args":{}}), CONTROL_TIMEOUT)
+        .request(
+            "call",
+            json!({"tool":"current","args":{},"revision":"1"}),
+            CONTROL_TIMEOUT,
+        )
         .await
         .unwrap();
     assert_eq!(current["value"], 0, "the connection stays usable");
@@ -1603,7 +1618,11 @@ async fn a_tool_call_keeps_its_sixty_second_budget() {
     let mut reader = fixture.reader(&opened).await;
     let started = std::time::Instant::now();
     let answered = reader
-        .request("call", json!({"tool":"slow","args":{}}), CALL_TIMEOUT)
+        .request(
+            "call",
+            json!({"tool":"slow","args":{},"revision":"1"}),
+            CALL_TIMEOUT,
+        )
         .await
         .unwrap();
     assert_eq!(answered["value"], 0);
@@ -1624,7 +1643,7 @@ async fn oversized_requests_never_reach_the_tick_or_change_its_value() {
     let refused = reader
         .request(
             "call",
-            json!({"tool":"increment","args":{"padding":padding}}),
+            json!({"tool":"increment","args":{"padding":padding},"revision":"1"}),
             CONTROL_TIMEOUT,
         )
         .await
@@ -1635,7 +1654,11 @@ async fn oversized_requests_never_reach_the_tick_or_change_its_value() {
     frame.push(b'\n');
     let _ = oversized.write_all(&frame).await;
     let current = reader
-        .request("call", json!({"tool":"current","args":{}}), CONTROL_TIMEOUT)
+        .request(
+            "call",
+            json!({"tool":"current","args":{},"revision":"1"}),
+            CONTROL_TIMEOUT,
+        )
         .await
         .unwrap();
     assert_eq!(current["value"], 0, "no oversized request reached the Tick");
