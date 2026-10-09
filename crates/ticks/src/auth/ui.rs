@@ -466,7 +466,7 @@ fn waiting_text(language: Language) -> &'static str {
 
 fn notice_text(language: Language, notice: LoginNotice) -> &'static str {
     match (language, notice) {
-        (Language::ZhCn, LoginNotice::ConnectionRetry) => "连接中断，正在自动重试",
+        (Language::ZhCn, LoginNotice::TemporaryFailureRetry) => "授权服务暂时不可用，正在自动重试",
         (Language::ZhCn, LoginNotice::EndpointUnavailable) => "正在改用另一个授权端点",
         (Language::ZhCn, LoginNotice::SlowerPolling) => "Longbridge 要求降低检查频率",
         (Language::En, notice) => notice.message(),

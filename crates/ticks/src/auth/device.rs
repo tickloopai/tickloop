@@ -1,6 +1,7 @@
 use std::{
     io::{BufRead, Write},
     path::Path,
+    sync::atomic::{AtomicUsize, Ordering},
     time::Duration,
 };
 
@@ -299,6 +300,7 @@ async fn wait_for_token(
         device,
         deadline,
         interval,
+        active_transient_failures: AtomicUsize::new(0),
         notices,
     };
     let ap = poll.run(&endpoints.ap, "ap");
@@ -324,7 +326,7 @@ async fn wait_for_token(
 }
 
 pub(super) enum LoginNotice {
-    ConnectionRetry,
+    TemporaryFailureRetry,
     EndpointUnavailable,
     SlowerPolling,
 }
@@ -332,8 +334,8 @@ pub(super) enum LoginNotice {
 impl LoginNotice {
     pub(super) fn message(&self) -> &'static str {
         match self {
-            Self::ConnectionRetry => {
-                "Connection to Longbridge was interrupted; retrying automatically."
+            Self::TemporaryFailureRetry => {
+                "Longbridge authorization is temporarily unavailable; retrying automatically."
             }
             Self::EndpointUnavailable => {
                 "One Longbridge authorization endpoint failed; checking the other endpoint."
@@ -362,6 +364,7 @@ struct TokenPoll<'a> {
     device: &'a DeviceCode,
     deadline: Instant,
     interval: watch::Sender<u64>,
+    active_transient_failures: AtomicUsize,
     notices: &'a mpsc::UnboundedSender<LoginNotice>,
 }
 
@@ -369,7 +372,7 @@ impl TokenPoll<'_> {
     async fn run(&self, base: &str, center: &str) -> std::result::Result<StoredToken, PollFailure> {
         let mut changes = self.interval.subscribe();
         let mut previous_poll = Instant::now();
-        let mut connection_failed = false;
+        let mut has_transient_failure = false;
         loop {
             let next_poll = previous_poll
                 .checked_add(Duration::from_secs(*changes.borrow_and_update()))
@@ -380,7 +383,7 @@ impl TokenPoll<'_> {
                 _ = changes.changed() => continue,
             }
             if Instant::now() >= self.deadline {
-                return Err(if connection_failed {
+                return Err(if has_transient_failure {
                     PollFailure::Unavailable(Error::network(format!(
                         "cannot reach Longbridge authorization server ({center}); device code expired"
                     )))
@@ -408,18 +411,27 @@ impl TokenPoll<'_> {
             })?;
             previous_poll = Instant::now();
             let response = match response {
-                Ok(response) => response,
-                Err(_) => {
-                    if !connection_failed {
-                        let _ = self.notices.send(LoginNotice::ConnectionRetry);
+                Ok(response) if !response.status().is_server_error() => response,
+                _ => {
+                    if !has_transient_failure
+                        && self
+                            .active_transient_failures
+                            .fetch_add(1, Ordering::SeqCst)
+                            == 0
+                    {
+                        let _ = self.notices.send(LoginNotice::TemporaryFailureRetry);
                     }
-                    connection_failed = true;
+                    has_transient_failure = true;
                     self.interval
                         .send_modify(|seconds| *seconds = seconds.saturating_mul(2).min(30));
                     continue;
                 }
             };
-            connection_failed = false;
+            if has_transient_failure {
+                self.active_transient_failures
+                    .fetch_sub(1, Ordering::SeqCst);
+                has_transient_failure = false;
+            }
             if response.status().is_success() {
                 let token = timeout_at(
                     self.deadline,
