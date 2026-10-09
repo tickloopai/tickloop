@@ -2870,8 +2870,7 @@ async fn open_group_heading(view: &mut PtyView, group: &str) {
             .to_owned();
         view.send(b"j");
         view.wait_for("overview navigation selects the next listed row", |frame| {
-            selected_row_title(frame)
-                .and_then(|title| title.split(" · ").next())
+            selected_row_title(frame).and_then(|title| title.split(" · ").next())
                 == Some(next.as_str())
         })
         .await;
@@ -3022,12 +3021,15 @@ async fn run_filter_hidden_dispatch(fixture: &PrivateFixture) {
         bravo_output
     );
     view.send(b"p");
-    view.wait_for("launch filter has projected both completed Shells", |frame| {
-        frame
-            .lines()
-            .any(|line| line.starts_with("Project: ") && line.contains("work"))
-            && frame.contains("▸ Idle · 2")
-    })
+    view.wait_for(
+        "launch filter has projected both completed Shells",
+        |frame| {
+            frame
+                .lines()
+                .any(|line| line.starts_with("Project: ") && line.contains("work"))
+                && frame.contains("▸ Idle · 2")
+        },
+    )
     .await;
     // Both finished Shell Agents are Idle; Idle starts folded behind its heading.
     open_group_heading(&mut view, "Idle").await;

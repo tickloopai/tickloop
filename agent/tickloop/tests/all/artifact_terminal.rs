@@ -46,17 +46,17 @@ fn post_login_account_failure_preserves_the_view_and_artifacts_can_retry() {
             let request = String::from_utf8_lossy(&bytes[..count]);
             let user =
                 serde_json::json!({"id":"owner","name":"Owner","email":"owner@example.test"});
-            let (status, body) = if request.starts_with("POST /api/v1/auth/device ") {
+            let (status, body) = if request.starts_with("POST /artifact/api/v1/auth/device ") {
                 (
                     200,
-                    serde_json::json!({"device_code":"device","user_code":"CODE","verification_uri":format!("{endpoint}/device?code=CODE"),"expires_in":60,"interval":1}),
+                    serde_json::json!({"device_code":"device","user_code":"CODE","verification_uri":format!("{endpoint}/artifact/device?code=CODE"),"expires_in":60,"interval":1}),
                 )
-            } else if request.starts_with("POST /api/v1/auth/device/token ") {
+            } else if request.starts_with("POST /artifact/api/v1/auth/device/token ") {
                 (
                     200,
                     serde_json::json!({"access_token":"test-token","token_type":"Bearer","expires_in":600,"user":user}),
                 )
-            } else if request.starts_with("GET /api/v1/auth/session ") {
+            } else if request.starts_with("GET /artifact/api/v1/auth/session ") {
                 sessions += 1;
                 if sessions == 1 {
                     (503, serde_json::json!({"error":"temporarily_unavailable"}))
@@ -141,10 +141,11 @@ fn artifact_commands_are_visible_and_device_login_can_be_cancelled_without_a_mod
         let mut request = [0_u8; 4096];
         let count = stream.read(&mut request).unwrap();
         assert!(
-            String::from_utf8_lossy(&request[..count]).starts_with("POST /api/v1/auth/device ")
+            String::from_utf8_lossy(&request[..count])
+                .starts_with("POST /artifact/api/v1/auth/device ")
         );
         let body = format!(
-            r#"{{"device_code":"private-code","user_code":"ABCD","verification_uri":"{server_origin}/device?code=ABCD","expires_in":30,"interval":2}}"#
+            r#"{{"device_code":"private-code","user_code":"ABCD","verification_uri":"{server_origin}/artifact/device?code=ABCD","expires_in":30,"interval":2}}"#
         );
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",

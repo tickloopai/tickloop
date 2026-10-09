@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use tickloop_agent_protocol::{InvokedSkill, SkillSource, ToolDefinition};
 
 pub const TICKLOOP_SKILL: &str = include_str!("../skills/tickloop/SKILL.md");
+pub const ARTIFACT_DRAFT_SKILL: &str = include_str!("../skills/artifact-draft/SKILL.md");
+pub const BUILTIN_SKILLS: [&str; 2] = [TICKLOOP_SKILL, ARTIFACT_DRAFT_SKILL];
 pub const SKILL_TOOL_NAME: &str = "Skill";
 
 const SKILL_FILE_NAME: &str = "SKILL.md";
@@ -94,7 +96,7 @@ struct Frontmatter {
 
 impl SkillRegistry {
     pub fn discover(workdir: &Path, user_skills_directory: Option<&Path>) -> Self {
-        Self::discover_with_builtins(workdir, user_skills_directory, [TICKLOOP_SKILL])
+        Self::discover_with_builtins(workdir, user_skills_directory, BUILTIN_SKILLS)
     }
 
     pub fn discover_with_builtins<'a>(

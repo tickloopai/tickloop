@@ -11,7 +11,7 @@ use std::{
 };
 
 use serde_json::{Value, json};
-use tickloop_agent_artifacts::ArtifactClient;
+use tickloop_agent_artifacts::{APP_BASE_PATH, ArtifactClient, artifact_url};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
@@ -124,14 +124,14 @@ fn call_tool(control: &ServiceControl, origin: &str, params: &Value) -> Value {
         arguments["action"].as_str().unwrap_or(""),
     ) {
         ("ArtifactRead", "read") => {
-            json!({"artifact_id":artifact_id,"title":"Fixture","format":"markdown","url":format!("{origin}/a/{artifact_id}"),"access_role":"owner","revision":3,"blocks":[{"id":"b1","hash":"h1","markdown":"# Fixture body"}],"next_cursor":null})
+            json!({"artifact_id":artifact_id,"title":"Fixture","format":"markdown","url":artifact_url(origin, artifact_id),"access_role":"owner","revision":3,"blocks":[{"id":"b1","hash":"h1","markdown":"# Fixture body"}],"next_cursor":null})
         }
         ("ArtifactRead", "threads") => {
             json!({"threads":[{"thread_id":"thread-1","status":"open","anchor":thread_anchor(),"anchor_description":ANCHOR_DESCRIPTION,"messages":[{"message_id":"m1","author":{"name":"One","kind":"human"},"text":"@tickloop tighten this","created_at":REQUEST_CREATED_AT}],"request":{"request_id":"request-1","status":"pending","requested_by":"One"}}],"next_cursor":null})
         }
         ("ArtifactRead", _) => json!({"items":[],"next_cursor":null}),
         ("ArtifactEdit", "create") => {
-            json!({"artifact_id":CREATED_ARTIFACT,"title":arguments["title"],"format":arguments["format"],"url":format!("{origin}/a/{CREATED_ARTIFACT}"),"revision":0})
+            json!({"artifact_id":CREATED_ARTIFACT,"title":arguments["title"],"format":arguments["format"],"url":artifact_url(origin, CREATED_ARTIFACT),"revision":0})
         }
         ("ArtifactEdit", "patch") => {
             json!({"artifact_id":artifact_id,"revision":4,"changed":[{"id":"b1","hash":"h2"}]})
@@ -396,7 +396,13 @@ impl ArtifactService {
                     let line = head.lines().next().unwrap_or("").to_owned();
                     let mut parts = line.split_whitespace();
                     let method = parts.next().unwrap_or("").to_owned();
-                    let target = parts.next().unwrap_or("").to_owned();
+                    // Every service route lives under the base path; a request outside it matches nothing.
+                    let target = parts
+                        .next()
+                        .unwrap_or("")
+                        .strip_prefix(APP_BASE_PATH)
+                        .unwrap_or("/outside-the-service")
+                        .to_owned();
                     let body: Value =
                         serde_json::from_slice(&bytes[header_end + 4..]).unwrap_or(Value::Null);
                     control
@@ -416,7 +422,7 @@ impl ArtifactService {
                     let (mut status, response) = if target == "/api/v1/auth/device" {
                         (
                             200,
-                            json!({"device_code":"test-device","user_code":"TEST","verification_uri":format!("{origin}/device?code=TEST"),"expires_in":30,"interval":1}),
+                            json!({"device_code":"test-device","user_code":"TEST","verification_uri":format!("{origin}/artifact/device?code=TEST"),"expires_in":30,"interval":1}),
                         )
                     } else if target == "/api/v1/auth/device/token" {
                         let revision = control.credential_revision.load(Ordering::SeqCst);

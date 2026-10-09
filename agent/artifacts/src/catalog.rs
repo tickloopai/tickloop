@@ -203,7 +203,7 @@ impl ArtifactClient {
             return Err(ArtifactError::InvalidResponse);
         }
         if metadata.url.is_empty() {
-            metadata.url = format!("{}/a/{}", self.origin(), metadata.id);
+            metadata.url = crate::artifact_url(self.origin(), &metadata.id);
         }
         Ok(metadata)
     }

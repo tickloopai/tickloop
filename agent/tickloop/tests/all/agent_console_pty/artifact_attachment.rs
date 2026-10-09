@@ -44,19 +44,19 @@ async fn artifact_service() -> (String, Arc<Mutex<Vec<Value>>>, tokio::task::Joi
                     .lock()
                     .unwrap()
                     .push(json!({"path":path,"body":body}));
-                let response = if path.starts_with("POST /api/v1/auth/device/token ") {
+                let response = if path.starts_with("POST /artifact/api/v1/auth/device/token ") {
                     json!({"access_token":"test-artifact-token","token_type":"Bearer","expires_in":3600,"user":{"id":"owner","name":"Owner","email":"owner@example.test"}})
-                } else if path.starts_with("POST /api/v1/auth/device ") {
-                    json!({"device_code":"device","user_code":"TEST","verification_uri":format!("{origin}/device?code=TEST"),"expires_in":30,"interval":1})
-                } else if path.starts_with("GET /api/v1/auth/session ") {
+                } else if path.starts_with("POST /artifact/api/v1/auth/device ") {
+                    json!({"device_code":"device","user_code":"TEST","verification_uri":format!("{origin}/artifact/device?code=TEST"),"expires_in":30,"interval":1})
+                } else if path.starts_with("GET /artifact/api/v1/auth/session ") {
                     json!({"user":{"id":"owner","name":"Owner","email":"owner@example.test"},"expires_at":"2099-01-01T00:00:00Z"})
-                } else if path.starts_with("GET /api/v1/artifacts/document ") {
-                    json!({"id":"document","title":CREATED_TITLE,"format":"markdown","access_role":"owner","url":format!("{origin}/a/document"),"publication":{"audience":"private","membership_revision":0}})
-                } else if path.starts_with("PUT /api/v1/agent/links/document ") {
+                } else if path.starts_with("GET /artifact/api/v1/artifacts/document ") {
+                    json!({"id":"document","title":CREATED_TITLE,"format":"markdown","access_role":"owner","url":format!("{origin}/artifact/document"),"publication":{"audience":"private","membership_revision":0}})
+                } else if path.starts_with("PUT /artifact/api/v1/agent/links/document ") {
                     json!({"artifact_id":"document","binding_id":body["binding_id"],"epoch":1})
-                } else if path.starts_with("GET /api/v1/agent/requests?") {
+                } else if path.starts_with("GET /artifact/api/v1/agent/requests?") {
                     json!({"items":[],"next_cursor":null})
-                } else if path.starts_with("POST /mcp ") {
+                } else if path.starts_with("POST /artifact/mcp ") {
                     let result = match body["method"].as_str().unwrap() {
                         "server/discover" => {
                             json!({"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{}},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"tickloop-docs","version":"1"}}})
@@ -121,7 +121,7 @@ async fn creation_adds_an_artifact_in_mode(flags: &[&str]) {
         assert!(!frame.contains("Auto review: Allow"));
         assert!(!frame.contains("Permission required"));
         eprintln!("[artifact-created-live]\n{frame}\n[/artifact-created-live]");
-        assert!(calls.lock().unwrap().iter().any(|request|request["path"].as_str().unwrap().starts_with("PUT /api/v1/agent/links/document ")));
+        assert!(calls.lock().unwrap().iter().any(|request|request["path"].as_str().unwrap().starts_with("PUT /artifact/api/v1/agent/links/document ")));
         release.send(()).unwrap();
         let (_, updated) = tokio::time::timeout(UI_TIMEOUT, requests.recv()).await.unwrap().unwrap();
         assert_eq!(updated["messages"].as_array().unwrap().iter().filter(|message| message["role"] == "tool").count(), 2,
