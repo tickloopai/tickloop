@@ -48,7 +48,7 @@ fn settings_ux_pty_fixture() {
             console.select_chat(Some(chat)).unwrap();
             console.set_prompt_enabled(true).unwrap();
             let mut menus = Menus::new(Some(settings), Some(root));
-            // Font installation is outside this controlled picker fixture.
+            // Keep navigation fixtures independent of the host's font-management tools.
             menus.font_manager = None;
             std::fs::write(directory.join("ready"), "ready").unwrap();
             let mut login: Option<super::super::login::LoginFlow> = None;

@@ -34,6 +34,7 @@ pub use usage::{
 };
 mod agent_messages;
 mod family;
+pub use family::SubagentNotificationDelivery;
 pub(crate) use family::summary_state;
 mod family_mailbox;
 pub use family::{
@@ -177,12 +178,11 @@ pub type LoopId = Uuid;
 pub type RunId = Uuid;
 pub use agent_messages::{
     AgentMessageSource, FamilyMessageRejection, FamilyMessageRejectionCode,
-    LIST_FAMILY_AGENTS_TOOL_NAME, RECEIVE_AGENT_MESSAGE_TOOL_NAME, SEND_AGENT_MESSAGE_TOOL_NAME,
-    VerifiedUserRelay, WAIT_FOR_AGENT_TOOL_NAME,
+    LIST_SUBAGENTS_TOOL_NAME, SEND_AGENT_MESSAGE_TOOL_NAME, VerifiedUserRelay,
 };
 pub use delegation::{
-    DELEGATE_AGENT_TOOL_NAME, DelegationCeiling, DelegationMetadata,
-    MAX_SUBAGENT_HANDLE_CHARACTERS, SubagentRegistration,
+    DelegationCeiling, DelegationMetadata, MAX_SUBAGENT_HANDLE_CHARACTERS, SUBAGENT_TOOL_NAME,
+    SubagentRegistration,
 };
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1010,10 +1010,9 @@ struct Inner {
     provider_failures: std::sync::Mutex<HashMap<String, crate::model::ProviderHttpFailure>>,
     trusted_working_directories: std::sync::Mutex<HashSet<PathBuf>>,
     host_contexts: std::sync::Mutex<host_context::HostContexts>,
-    delegations: Mutex<HashMap<(RunId, String), Receipt>>,
+    subagent_invocations: Mutex<HashMap<(RunId, String), delegation::SubagentInvocation>>,
     family_mailbox: Mutex<family_mailbox::FamilyMailbox>,
     input_wakeup: tokio::sync::watch::Sender<()>,
-    parent_result_waits: Mutex<HashMap<RunId, Receipt>>,
     title_requests: Mutex<HashSet<ChatId>>,
     subagent_registry: Mutex<HashMap<ChatId, Vec<SubagentRegistration>>>,
     chats: Mutex<HashMap<ChatId, Chat>>,
@@ -1929,10 +1928,9 @@ impl Agent {
                 provider_failures: std::sync::Mutex::new(HashMap::new()),
                 trusted_working_directories: std::sync::Mutex::new(HashSet::new()),
                 host_contexts: std::sync::Mutex::new(host_context::HostContexts::default()),
-                delegations: Mutex::new(HashMap::new()),
+                subagent_invocations: Mutex::new(HashMap::new()),
                 family_mailbox: Mutex::new(family_mailbox::FamilyMailbox::default()),
                 input_wakeup: tokio::sync::watch::channel(()).0,
-                parent_result_waits: Mutex::new(HashMap::new()),
                 title_requests: Mutex::new(HashSet::new()),
                 subagent_registry: Mutex::new(HashMap::new()),
                 chats: Mutex::new(HashMap::new()),
@@ -2939,6 +2937,7 @@ impl Agent {
         for event in events {
             let _ = self.inner.events.send(event);
         }
+        self.flush_subagent_notifications(active.chat_id).await;
         Ok(())
     }
 
@@ -3428,6 +3427,7 @@ impl Agent {
                 None
             }
         };
+        self.flush_subagent_notifications(receipt.chat_id).await;
         self.record_directed_replies(&receipt, &finished_snapshot)
             .await;
         if finished_snapshot.delegation.is_some() {

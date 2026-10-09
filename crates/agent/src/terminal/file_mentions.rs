@@ -99,6 +99,7 @@ pub(super) struct FileMentionState {
     next_generation: u64,
     requested_generation: Option<IndexGeneration>,
     completion: Option<FileMentionCompletion>,
+    query_canceled: bool,
     selected: Option<usize>,
     draft: String,
     cursor: usize,
@@ -173,6 +174,10 @@ impl FileMentionState {
     }
 
     pub(super) fn update_at(&mut self, draft: &str, cursor: usize, limit: usize) {
+        let cursor = floor_char_boundary(draft, cursor.min(draft.len()));
+        if self.draft != draft || self.cursor != cursor {
+            self.query_canceled = false;
+        }
         self.sync_accepted_mentions(draft);
         if self.accepted_family.as_ref().is_some_and(|target| {
             draft.split_whitespace().next() != Some(format!("@{}", target.handle).as_str())
@@ -181,7 +186,7 @@ impl FileMentionState {
         }
         self.draft.clear();
         self.draft.push_str(draft);
-        self.cursor = floor_char_boundary(draft, cursor.min(draft.len()));
+        self.cursor = cursor;
         self.limit = limit;
         self.refresh_completion();
     }
@@ -230,6 +235,9 @@ impl FileMentionState {
 
     /// Reinstates mentions taken from `draft`, whose ranges still point into it.
     pub(super) fn restore_accepted(&mut self, draft: &str, accepted: Vec<AcceptedMention>) {
+        if self.draft != draft {
+            self.query_canceled = false;
+        }
         self.draft.clear();
         self.draft.push_str(draft);
         self.accepted = accepted;
@@ -264,6 +272,7 @@ impl FileMentionState {
                 self.accept_candidate(candidate_index)
             }
             FileMentionKey::Cancel => {
+                self.query_canceled = true;
                 self.dismiss();
                 FileMentionAction::Consumed
             }
@@ -307,6 +316,10 @@ impl FileMentionState {
     }
 
     fn refresh_completion(&mut self) {
+        if self.query_canceled {
+            self.dismiss();
+            return;
+        }
         self.selected = None;
         let files = self
             .index
@@ -1615,6 +1628,32 @@ mod tests {
         );
         assert!(!state.is_open());
         assert_eq!(state.accepted_mentions().len(), 0);
+    }
+
+    #[test]
+    fn canceled_mentions_stay_closed_across_unchanged_input_and_async_index_refresh() {
+        let fixture = Fixture::new();
+        fixture.file("alpha.txt");
+        let mut state = FileMentionState::with_index(fixture.index());
+        state.update_at("@al", 3, 8);
+        assert!(state.is_open());
+        assert_eq!(
+            state.handle_key(FileMentionKey::Cancel),
+            FileMentionAction::Consumed
+        );
+        state.update_at("@al", 3, 8);
+        assert!(
+            !state.is_open(),
+            "a background refresh cannot undo the user's cancellation"
+        );
+        let generation = state.request_index_generation();
+        state.replace_index(generation, fixture.index());
+        assert!(
+            !state.is_open(),
+            "an index response cannot reopen the canceled query"
+        );
+        state.update_at("@alp", 4, 8);
+        assert!(state.is_open(), "new input opens its own completion query");
     }
 
     #[test]

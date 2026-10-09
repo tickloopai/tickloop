@@ -1126,7 +1126,7 @@ async fn restored_native_watch_refuses_a_changed_frozen_endpoint() {
         ),
         call(
             "delegate",
-            "DelegateAgent",
+            "Subagent",
             json!({"task":"Watch the authorized terminal"}),
         ),
         call(

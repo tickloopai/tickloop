@@ -30,15 +30,15 @@ async fn run_family_messaging(fixture: &PrivateFixture) {
         if state["delegation"].is_null() {
             if history.contains("STOP-WORKER") {
                 if !has_result(request, "stop") {
-                    return chat_reply(Some(("StopAgent", "stop", json!({"to":"audit"}))), "");
+                    return chat_reply(Some(("StopSubagent", "stop", json!({"to":"audit"}))), "");
                 }
                 return chat_reply(None, "Child stop confirmed");
             }
             if !has_result(request, "audit-delegate") {
-                return chat_reply(Some(("DelegateAgent", "audit-delegate", json!({"task":"Audit bounded evidence","name":"audit","description":"Audit bounded evidence"}))), "");
+                return chat_reply(Some(("Subagent", "audit-delegate", json!({"task":"Audit bounded evidence","name":"audit","description":"Audit bounded evidence"}))), "");
             }
             if !has_result(request, "echo-delegate") {
-                return chat_reply(Some(("DelegateAgent", "echo-delegate", json!({"task":"Echo bounded evidence","name":"echo","description":"Echo bounded evidence"}))), "");
+                return chat_reply(Some(("Subagent", "echo-delegate", json!({"task":"Echo bounded evidence","name":"echo","description":"Echo bounded evidence"}))), "");
             }
             chat_reply(None, "Root family ready")
         } else if state["delegation"]["parent_call_id"] == "audit-delegate" {
@@ -89,6 +89,10 @@ async fn run_family_messaging(fixture: &PrivateFixture) {
         })
         .unwrap()
         .execution;
+    assert!(
+        !String::from_utf8_lossy(&pty.output.lock().unwrap()).contains("Subagent @audit finished"),
+        "foreground audit must not print a separate live completion card"
+    );
     let before = snapshot(&client, root).await;
     while requests.try_recv().is_ok() {}
     pty.send(b"@a");
@@ -130,17 +134,22 @@ async fn run_family_messaging(fixture: &PrivateFixture) {
     );
     let after = snapshot(&client, root).await;
     assert_eq!(
-        after.conversation.messages.len(),
-        before.conversation.messages.len(),
-        "source receipt/preview/completions never turn its model"
+        after.conversation.prompt_execution_modes, before.conversation.prompt_execution_modes,
+        "directed input is not a source human checkpoint"
     );
+    assert!(after.conversation.messages.iter().flat_map(|message|&message.content).any(|content|matches!(content,tickloop_agent::model::Content::Text {text} if text.starts_with("<task-notification>") && text.contains("@echo"))),"the sibling's background completion must reach the root");
     let mut child_requests = 0;
     while let Ok((_, request)) = requests.try_recv() {
-        assert!(
-            !request_state(&request)["delegation"].is_null(),
-            "directed human input and sibling activity never call the root model"
-        );
-        child_requests += 1;
+        if request_state(&request)["delegation"].is_null() {
+            assert!(
+                request["messages"]
+                    .to_string()
+                    .contains("<task-notification>"),
+                "only the independent background completion wakes the source"
+            );
+        } else {
+            child_requests += 1;
+        }
     }
     assert!(child_requests >= 3);
     pty.send(b"STOP-WORKER\r");

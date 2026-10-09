@@ -1357,44 +1357,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn business_three_is_fenced_before_a_query_can_dispatch() {
-        let epoch = Uuid::new_v4();
-        let source = Arc::new(CompletingLookup {
-            epoch,
-            started: tokio::sync::Notify::new(),
-            release: std::sync::atomic::AtomicBool::new(true),
-        });
-        let (server_stream, mut client) = UnixStream::pair().unwrap();
-        let server = tokio::spawn(serve_connection(server_stream, source.clone(), epoch));
-        write_frame(&mut client, &ClientMessage::Hello { major: 3, minor: 2 })
-            .await
-            .unwrap();
-        let response = read_frame::<_, ServerMessage>(&mut client).await.unwrap();
-        assert!(matches!(
-            response,
-            Some(ServerMessage::Error {
-                error: AccessError {
-                    code: AccessErrorCode::VersionMismatch,
-                    ..
-                },
-                ..
-            })
-        ));
-        assert!(
-            read_frame::<_, ServerMessage>(&mut client)
+    async fn older_business_peers_are_fenced_before_a_query_can_dispatch() {
+        for (major, minor) in [(3, 2), (5, 0), (6, 0)] {
+            let epoch = Uuid::new_v4();
+            let source = Arc::new(CompletingLookup {
+                epoch,
+                started: tokio::sync::Notify::new(),
+                release: std::sync::atomic::AtomicBool::new(true),
+            });
+            let (server_stream, mut client) = UnixStream::pair().unwrap();
+            let server = tokio::spawn(serve_connection(server_stream, source.clone(), epoch));
+            write_frame(&mut client, &ClientMessage::Hello { major, minor })
                 .await
-                .unwrap()
-                .is_none()
-        );
-        server.await.unwrap().unwrap();
-        assert!(
-            tokio::time::timeout(
-                std::time::Duration::from_millis(10),
-                source.started.notified()
-            )
-            .await
-            .is_err()
-        );
+                .unwrap();
+            let response = read_frame::<_, ServerMessage>(&mut client).await.unwrap();
+            assert!(matches!(
+                response,
+                Some(ServerMessage::Error {
+                    error: AccessError {
+                        code: AccessErrorCode::VersionMismatch,
+                        ..
+                    },
+                    ..
+                })
+            ));
+            assert!(
+                read_frame::<_, ServerMessage>(&mut client)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            server.await.unwrap().unwrap();
+            assert!(
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(10),
+                    source.started.notified()
+                )
+                .await
+                .is_err()
+            );
+        }
     }
 
     struct CompletingLookup {

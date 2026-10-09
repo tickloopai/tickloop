@@ -850,7 +850,6 @@ fn tool_summary(name: &str, input: &Value) -> String {
     let asked_questions;
     let primary = match name {
         crate::runtime::SEND_AGENT_MESSAGE_TOOL_NAME => input["message"].as_str(),
-        crate::runtime::WAIT_FOR_AGENT_TOOL_NAME => Some("Child Agent"),
         BASH_TOOL_NAME => input["description"]
             .as_str()
             .filter(|description| !description.trim().is_empty())
@@ -984,12 +983,26 @@ pub(super) fn local_message_text(
             text
         }
         LocalMessage::Interrupted { .. } => format!("{}\n", interrupted_notice(display)),
-        LocalMessage::TaskNotification { summary, .. } => {
-            format!(
+        LocalMessage::TaskNotification {
+            summary,
+            result,
+            usage,
+            ..
+        } => {
+            let mut text = format!(
                 "\n{} {}\n",
                 display.glyph(Glyph::ToolCall),
                 safe_text(summary)
-            )
+            );
+            if matches!(detail, OutputDetail::Full) {
+                if let Some(result) = result {
+                    append_response_block(&mut text, result, detail, display);
+                }
+                if let Some(usage) = usage {
+                    text.push_str(&format!("Usage{}\n", super::usage_text(usage)));
+                }
+            }
+            text
         }
         LocalMessage::TickDelivery { items, truncated } => {
             tick_delivery_text(items, *truncated, display)
@@ -1097,21 +1110,15 @@ fn compact_result_with_prefix(
     let value = serde_json::from_str::<Value>(&result.content).ok();
     if matches!(
         name,
-        crate::runtime::DELEGATE_AGENT_TOOL_NAME
-            | crate::runtime::WAIT_FOR_AGENT_TOOL_NAME
-            | crate::runtime::SEND_AGENT_MESSAGE_TOOL_NAME
-            | crate::runtime::RECEIVE_AGENT_MESSAGE_TOOL_NAME
+        crate::runtime::SUBAGENT_TOOL_NAME | crate::runtime::SEND_AGENT_MESSAGE_TOOL_NAME
     ) && let Some(value) = &value
     {
         let status = match value["status"].as_str() {
-            Some("running") => "Child continues working",
+            Some("async_launched") => "Child started in background",
             Some("accepted") => "Message sent",
-            Some("input_pending") => "Message ready",
-            Some("timeout") => "Wait timed out",
             Some("completed") => "Child completed",
             Some("failed") => "Child failed",
             Some("interrupted") => "Child interrupted",
-            Some("wait_interrupted") => "Wait interrupted · Child continues working",
             other => other.unwrap_or("Completed"),
         };
         let mut text = format!("  {prefix} {} · {status}\n", tool_name(name));
@@ -1318,6 +1325,17 @@ pub(super) fn family_completion_text(
     completion: &crate::runtime::FamilyCompletion,
     detail: OutputDetail,
 ) -> String {
+    if !completion.notification.is_background() {
+        return String::new();
+    }
+
+    let delivery = match &completion.notification {
+        crate::runtime::SubagentNotificationDelivery::Rejected(rejection) => format!(
+            "\n  Notification not delivered: {}\n",
+            super::safe_line(&rejection.message)
+        ),
+        _ => String::new(),
+    };
     let status = match completion.state {
         crate::runtime::LoopState::Failed => "failed",
         crate::runtime::LoopState::Stopped | crate::runtime::LoopState::Expired => "stopped",
@@ -1335,7 +1353,7 @@ pub(super) fn family_completion_text(
         .map(safe_text)
         .unwrap_or_default();
     format!(
-        "\nSubagent @{} {status}\n  {}{}\n",
+        "\nSubagent @{} {status}\n  {}{}{delivery}\n",
         completion.handle,
         result,
         if error.is_empty() {
@@ -1930,9 +1948,9 @@ mod tests {
         assert!(to_main.contains("Main Agent · Bounded research"));
         assert!(!to_main.contains("Parent Agent"));
         assert!(!to_main.contains(&internal));
-        for status in ["failed", "interrupted", "wait_interrupted"] {
+        for status in ["failed", "interrupted"] {
             let result=ToolResult {content:json!({"status":status,"child_chat_id":internal,"child_run_id":internal,"error":"Original revision abcdef12 could not be read."}).to_string(),is_error:true,output_ref:None};
-            let shown = compact_result(crate::runtime::WAIT_FOR_AGENT_TOOL_NAME, None, &result);
+            let shown = compact_result(crate::runtime::SUBAGENT_TOOL_NAME, None, &result);
             assert!(shown.contains("abcdef12"));
             assert!(!shown.contains(&internal));
         }

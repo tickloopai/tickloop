@@ -510,7 +510,7 @@ async fn verify_delegated_watch_account(restore: bool) {
         ),
         support::call(
             "delegate",
-            "DelegateAgent",
+            "Subagent",
             json!({"task":"Watch the same authorized artifact"}),
         ),
         support::call(

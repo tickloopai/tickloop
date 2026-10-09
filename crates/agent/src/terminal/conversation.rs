@@ -357,6 +357,12 @@ pub(super) fn project(snapshot: &ChatSnapshot) -> ConversationProjection {
         snapshot
             .family_completions
             .iter()
+            .filter(|completion| {
+                completion.notification.is_background()
+                    && !snapshot
+                        .agent_message_origins
+                        .contains_key(&completion.child_run_id)
+            })
             .cloned()
             .map(|completion| ConversationBlock {
                 id: ConversationBlockId::FamilyCompletion {
@@ -393,16 +399,21 @@ pub(super) fn project_event(event: &Event) -> Option<ConversationBlock> {
                 record: record.clone(),
             },
         },
-        EventKind::FamilyRunCompleted { completion } => ConversationBlock {
-            id: ConversationBlockId::FamilyCompletion {
-                chat_id: event.chat_id,
-                child_run_id: completion.child_run_id,
-            },
-            metadata: event_metadata,
-            kind: ConversationBlockKind::FamilyCompletion {
-                completion: completion.clone(),
-            },
-        },
+        EventKind::FamilyRunCompleted { completion } => {
+            if !completion.notification.is_background() {
+                return None;
+            }
+            ConversationBlock {
+                id: ConversationBlockId::FamilyCompletion {
+                    chat_id: event.chat_id,
+                    child_run_id: completion.child_run_id,
+                },
+                metadata: event_metadata,
+                kind: ConversationBlockKind::FamilyCompletion {
+                    completion: completion.clone(),
+                },
+            }
+        }
         EventKind::Text(text) => ConversationBlock {
             id: ConversationBlockId::Event {
                 chat_id: event.chat_id,

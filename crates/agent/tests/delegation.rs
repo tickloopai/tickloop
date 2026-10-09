@@ -12,19 +12,19 @@ async fn handles_use_short_description_fallback_and_reserve_parent_keywords() {
     let model = Arc::new(ScriptedModel::new(vec![
         call(
             "one",
-            "DelegateAgent",
+            "Subagent",
             json!({"task":"Audit the report in detail","description":"Audit revenue growth"}),
         ),
         text("one done"),
         call(
             "two",
-            "DelegateAgent",
+            "Subagent",
             json!({"task":"Audit another report","description":"Audit revenue growth"}),
         ),
         text("two done"),
         call(
             "three",
-            "DelegateAgent",
+            "Subagent",
             json!({"task":"Check metadata","name":"parent"}),
         ),
         text("three done"),
@@ -69,7 +69,7 @@ async fn invalid_handles_never_create_a_child_or_reserve_a_name() {
             Arc::new(ScriptedModel::new(vec![
                 call(
                     "invalid",
-                    "DelegateAgent",
+                    "Subagent",
                     json!({"task":"Check input","name":name}),
                 ),
                 text("invalid handled"),
@@ -107,13 +107,13 @@ async fn child_handles_are_reserved_in_the_parent_registry_across_completion_and
     let replies = vec![
         call(
             "first",
-            "DelegateAgent",
+            "Subagent",
             json!({"task":"Audit the first file","name":"Audit"}),
         ),
         text("first done"),
         call(
             "second",
-            "DelegateAgent",
+            "Subagent",
             json!({"task":"Audit the second file","name":"audit"}),
         ),
         text("second done"),
@@ -148,7 +148,7 @@ async fn child_handles_are_reserved_in_the_parent_registry_across_completion_and
         Arc::new(ScriptedModel::new(vec![
             call(
                 "third",
-                "DelegateAgent",
+                "Subagent",
                 json!({"task":"Audit a third file","name":"audit"}),
             ),
             text("third done"),
@@ -271,7 +271,7 @@ async fn loaded_delegated_host_authority_stays_with_its_original_socket_and_work
         Arc::new(ScriptedModel::new(vec![
             call(
                 "delegate",
-                "DelegateAgent",
+                "Subagent",
                 json!({"task":"Read only the inherited Workspace."}),
             ),
             call("child-host", "ReadWorkspace", json!({})),
@@ -530,7 +530,7 @@ async fn delegated_full_access_keeps_the_parent_session_denial_after_restore() {
         call("parent-denied", "Write", denied_input.clone()),
         call(
             "delegate",
-            "DelegateAgent",
+            "Subagent",
             json!({"task":"Try the same scoped write."}),
         ),
         call("child-denied", "Write", denied_input.clone()),
@@ -660,7 +660,7 @@ async fn a_new_parent_session_denial_blocks_the_childs_final_admission() {
         Arc::new(ScriptedModel::new(vec![
             call(
                 "delegate",
-                "DelegateAgent",
+                "Subagent",
                 json!({"task":"Prepare the scoped write for approval."}),
             ),
             call("child-write", "Write", input.clone()),
@@ -789,7 +789,7 @@ async fn model_delegates_a_real_child_and_observes_its_result() {
     let model = Arc::new(ScriptedModel::new(vec![
         call(
             "delegate",
-            "DelegateAgent",
+            "Subagent",
             json!({"task":"Read task.txt and report the evidence.","name":" File CHECK ","description":"Check file evidence"}),
         ),
         call("read", "Read", json!({"file_path":"task.txt"})),
@@ -862,18 +862,8 @@ async fn model_delegates_a_real_child_and_observes_its_result() {
     }
     {
         let requests = model.requests.lock().unwrap();
-        assert!(
-            requests[0]
-                .tools
-                .iter()
-                .any(|tool| tool.name == "DelegateAgent")
-        );
-        assert!(
-            !requests[1]
-                .tools
-                .iter()
-                .any(|tool| tool.name == "DelegateAgent")
-        );
+        assert!(requests[0].tools.iter().any(|tool| tool.name == "Subagent"));
+        assert!(!requests[1].tools.iter().any(|tool| tool.name == "Subagent"));
     }
     agent.shutdown().await;
     let transcript = std::fs::read_to_string(support::transcript_file(&store, child)).unwrap();
@@ -915,7 +905,7 @@ async fn child_follow_up_and_direct_shell_cannot_expand_the_frozen_ceiling() {
     let model = Arc::new(ScriptedModel::new(vec![
         call(
             "delegate",
-            "DelegateAgent",
+            "Subagent",
             json!({"task":"Check the inherited task boundary."}),
         ),
         call("outside", "Read", json!({"file_path":outside_file})),
@@ -1083,7 +1073,7 @@ async fn permission_and_question_requests_belong_to_the_child() {
     let model = Arc::new(ScriptedModel::new(vec![
         call(
             "delegate",
-            "DelegateAgent",
+            "Subagent",
             json!({"task":"Write the approved report and ask its cadence."}),
         ),
         call(
@@ -1190,7 +1180,7 @@ async fn console_opens_the_real_child_in_place_and_routes_follow_up_with_its_cei
     let model = Arc::new(ScriptedModel::new(vec![
         call(
             "delegate",
-            "DelegateAgent",
+            "Subagent",
             json!({"task":"Ask the user for the report cadence."}),
         ),
         call(
@@ -1514,7 +1504,7 @@ async fn interrupting_the_parent_wait_does_not_stop_or_redelegate_the_child() {
     let model = Arc::new(ScriptedModel::new(vec![
         call(
             "delegate",
-            "DelegateAgent",
+            "Subagent",
             json!({"task":"Ask which cadence and continue independently."}),
         ),
         call(
@@ -1587,11 +1577,7 @@ async fn missing_frozen_tool_authority_refuses_child_restore_instead_of_becoming
     let directory = tempfile::tempdir().unwrap();
     let store = directory.path().join("state");
     let model = Arc::new(ScriptedModel::new(vec![
-        call(
-            "delegate",
-            "DelegateAgent",
-            json!({"task":"Inspect fixture"}),
-        ),
+        call("delegate", "Subagent", json!({"task":"Inspect fixture"})),
         text("Child done."),
         text("Parent done."),
     ]));
@@ -1662,7 +1648,7 @@ async fn compacted_child_retains_authorization_with_legal_metadata_whitespace_an
         store.clone(),
         config(),
         Arc::new(ScriptedModel::new(vec![
-            call("delegate", "DelegateAgent", json!({"task":"Fixture task"})),
+            call("delegate", "Subagent", json!({"task":"Fixture task"})),
             text("Child done."),
             text("Parent done."),
         ])),

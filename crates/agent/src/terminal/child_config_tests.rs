@@ -120,7 +120,7 @@ async fn run_child_config_fixture() {
     };
     let replies = if requester {
         vec![
-            test_support::call("delegate", "DelegateAgent", json!({"task":TASK})),
+            test_support::call("delegate", "Subagent", json!({"task":TASK})),
             test_support::call(
                 "child-question",
                 "AskUserQuestion",
@@ -136,7 +136,7 @@ async fn run_child_config_fixture() {
         ]
     } else {
         vec![
-            test_support::call("delegate", "DelegateAgent", json!({"task":TASK})),
+            test_support::call("delegate", "Subagent", json!({"task":TASK})),
             test_support::text("child reviewed"),
             test_support::text("parent done"),
             test_support::text("child follow-up done"),
