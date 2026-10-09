@@ -1047,7 +1047,7 @@ mod tests {
                 title: None,
                 state: TickState::Running,
                 business_pid: None,
-                attached: false,
+                views: 0,
             })
             .collect::<Vec<_>>();
         let page = HostedTickPage {

@@ -31,8 +31,10 @@ pub const MANAGEMENT_FRAME_BYTES: usize = 64 * 1024;
 /// 3.0: owner revisions on open, listings that name their host epoch, owner reconcile/end,
 /// Watch-intent leases, explicit or automatic reads, and one-time view grants. 4.0: the
 /// controller role carries `daemon_epoch` and the launch binding is read from
-/// `TICKLOOP_TICKHOST_LAUNCH`. A host of any other major is refused at hello.
-pub const BUSINESS_MAJOR: u16 = 4;
+/// `TICKLOOP_TICKHOST_LAUNCH`. 5.0: several views attach to one Tick at once, each naming its
+/// size, every frame names the screen size it draws, every view grant admits its own view, and
+/// listings count each Tick's views. A host of any other major is refused at hello.
+pub const BUSINESS_MAJOR: u16 = 5;
 pub const BUSINESS_MINOR: u16 = 0;
 /// A complete business frame, large enough for one legal 8 MiB Tick Tool response.
 pub const BUSINESS_FRAME_BYTES: usize = 8 * 1024 * 1024 + 64 * 1024;
