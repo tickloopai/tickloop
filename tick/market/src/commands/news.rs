@@ -159,7 +159,7 @@ impl<'a> NewsView<'a> {
                 frame.buffer_mut(),
                 inner.x,
                 inner.bottom() - 1,
-                "Esc Back  ·  j/k Scroll  ·  q Quit",
+                "Backspace Back · j/k Scroll · q Quit",
                 inner.width as usize,
                 settings.ambiguous_width,
                 styles.muted_text,
@@ -215,7 +215,7 @@ impl LiveView for NewsView<'_> {
     ) -> Result<bool> {
         if self.open_article.is_some() {
             match key {
-                KeyCode::Esc => self.open_article = None,
+                KeyCode::Backspace => self.open_article = None,
                 KeyCode::Down | KeyCode::Char('j') => self
                     .detail_scroll
                     .set(self.detail_scroll.get().saturating_add(1)),
@@ -265,7 +265,7 @@ impl LiveView for NewsView<'_> {
         Ok(true)
     }
     fn help(&self) -> &'static str {
-        "Enter  Read selected article\nEsc  Back to list\nj / k / Ctrl+N / Ctrl+P / arrows  Move / scroll\nPageUp / PageDown  Page\ng / G  First / last\nq / Ctrl+C  Quit\n?  Help"
+        "Enter  Read selected article\nBackspace  Back to list\nj / k / Ctrl+N / Ctrl+P / arrows  Move / scroll\nPageUp / PageDown  Page\ng / G  First / last\nq / Ctrl+C  Quit\n?  Help"
     }
     fn draw(&self, frame: &mut Frame<'_>, state: &mut ViewState, settings: &Settings) {
         if let Some(article) = self

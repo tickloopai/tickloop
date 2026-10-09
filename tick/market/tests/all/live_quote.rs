@@ -66,7 +66,12 @@ async fn quote_view_redraws_after_a_push_and_unsubscribes_when_quitting() {
         old.latest_price = "1".parse().unwrap();
         old.updated_at = "2020-01-01T00:00:00Z".into();
         push.send(MarketEvent::Quote(old)).unwrap();
-        for key in [KeyCode::Char('?'), KeyCode::Esc, KeyCode::Down, KeyCode::Up] {
+        for key in [
+            KeyCode::Char('?'),
+            KeyCode::Backspace,
+            KeyCode::Down,
+            KeyCode::Up,
+        ] {
             keys.send(Ok(Event::Key(KeyEvent::new(key, KeyModifiers::NONE))))
                 .unwrap();
         }
@@ -113,6 +118,10 @@ async fn quote_view_redraws_after_a_push_and_unsubscribes_when_quitting() {
         .collect();
     assert!(screen.contains("123.45"), "{screen}");
     assert!(screen.contains("TSLA.US"), "{screen}");
+    assert!(
+        !screen.contains("Keys ·"),
+        "Backspace closed the help: {screen}"
+    );
     assert!(api.subscriptions.lock().unwrap().is_empty());
 }
 

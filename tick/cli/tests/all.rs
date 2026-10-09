@@ -14,6 +14,8 @@ mod entry;
 mod hosted;
 #[path = "all/native_visible_stdio.rs"]
 mod native_visible_stdio;
+#[path = "all/standalone_keys.rs"]
+mod standalone_keys;
 #[path = "all/support/mod.rs"]
 mod support;
 #[path = "all/us_positions.rs"]

@@ -19,7 +19,7 @@ use tickloop_ui::{
 use crate::{
     args::ReaderArgs,
     config::Settings,
-    input::{EditOutcome, VimInput},
+    input::{EditOutcome, TextInput},
     metadata::TickKind,
     output::TableData,
     reader::{Document, Library, library_documents},
@@ -213,7 +213,7 @@ pub struct ReaderView {
     search: String,
     pending_search: Cell<Option<bool>>,
     search_matches: Cell<usize>,
-    editor: Option<VimInput>,
+    editor: Option<TextInput>,
     editor_purpose: EditorPurpose,
     notice: Option<String>,
     context: Option<ResearchContext>,
@@ -482,6 +482,9 @@ impl LiveView for ReaderView {
     fn captures_text(&self) -> bool {
         self.editor.is_some()
     }
+    fn cancel_text(&mut self) {
+        self.editor = None;
+    }
     fn table(&self) -> TableData {
         TableData {
             headers: vec!["Title", "Source", "Fiscal period"],
@@ -644,31 +647,27 @@ impl LiveView for ReaderView {
     }
     async fn on_key(&mut self, key: KeyCode, _: &QuoteServices, _: &mut ViewState) -> Result<bool> {
         if let Some(editor) = &mut self.editor {
-            match editor.handle(key) {
-                EditOutcome::Submit => {
-                    let text = editor.text().trim().to_owned();
-                    self.editor = None;
-                    if self.editor_purpose == EditorPurpose::OpenOriginal {
-                        let context = self.context.clone();
-                        match self.act(ToolCall { tool: "open_document".into(), args: json!({"location":text,"symbol":context.as_ref().map(|context| &context.symbol),"fiscal_period":context.as_ref().map(|context| &context.period_id)}) }).await {
-                            Ok(_) => self.notice = Some("Original supplied by user; verify the fiscal period and metric in its text".into()),
-                            Err(error) => { self.notice = Some(error.message); self.editor = Some(VimInput::new(text)); }
-                        }
-                    } else {
-                        self.search = text;
-                        if !self.search.is_empty() {
-                            self.search_next(false);
-                        }
+            if editor.handle(key) == EditOutcome::Submit {
+                let text = editor.text().trim().to_owned();
+                self.editor = None;
+                if self.editor_purpose == EditorPurpose::OpenOriginal {
+                    let context = self.context.clone();
+                    match self.act(ToolCall { tool: "open_document".into(), args: json!({"location":text,"symbol":context.as_ref().map(|context| &context.symbol),"fiscal_period":context.as_ref().map(|context| &context.period_id)}) }).await {
+                        Ok(_) => self.notice = Some("Original supplied by user; verify the fiscal period and metric in its text".into()),
+                        Err(error) => { self.notice = Some(error.message); self.editor = Some(TextInput::new(text)); }
+                    }
+                } else {
+                    self.search = text;
+                    if !self.search.is_empty() {
+                        self.search_next(false);
                     }
                 }
-                EditOutcome::Cancel => self.editor = None,
-                _ => (),
             }
             return Ok(true);
         }
         if key == KeyCode::Char('o') {
             self.editor_purpose = EditorPurpose::OpenOriginal;
-            self.editor = Some(VimInput::new(String::new()));
+            self.editor = Some(TextInput::new(String::new()));
             return Ok(true);
         }
         if key == KeyCode::Char('R') {
@@ -723,7 +722,7 @@ impl LiveView for ReaderView {
                 document.sections.len()
             };
             match key {
-                KeyCode::Esc => self.mode = ReaderMode::Reading,
+                KeyCode::Backspace => self.mode = ReaderMode::Reading,
                 KeyCode::Down | KeyCode::Char('j') => {
                     self.selection = (self.selection + 1).min(count.saturating_sub(1))
                 }
@@ -760,7 +759,7 @@ impl LiveView for ReaderView {
             return Ok(true);
         }
         match key {
-            KeyCode::Esc => {
+            KeyCode::Backspace => {
                 self.notice = None;
                 self.search.clear();
             }
@@ -774,7 +773,7 @@ impl LiveView for ReaderView {
             }
             KeyCode::Char('/') => {
                 self.editor_purpose = EditorPurpose::Search;
-                self.editor = Some(VimInput::new(self.search.clone()));
+                self.editor = Some(TextInput::new(self.search.clone()));
             }
             KeyCode::Char('n') if !self.search.is_empty() => self.search_next(false),
             KeyCode::Char('N') if !self.search.is_empty() => self.search_next(true),
@@ -814,7 +813,7 @@ impl LiveView for ReaderView {
         Ok(true)
     }
     fn help(&self) -> &'static str {
-        "j/k / Ctrl+N/P / arrows  Navigate / scroll\nEnter  Open selected document / section\nd  Documents    t  Table of contents\n[ / ]  Previous / next section\n/  Search    n / N  Next / previous visible match\nc  Show stable citation    a  Ask Chat about visible paragraph\no  Open original URL/path    R  Retry context originals\nPageUp/PageDown  Page    g/G  Start/end\nEsc  Leave Insert, then cancel / return\nq / Ctrl+C  Quit    ?  Help\nSearch editor: i/a Insert, h/l move, x delete, u undo"
+        "j/k / Ctrl+N/P / arrows  Navigate / scroll\nEnter  Open selected document / section\nd  Documents    t  Table of contents\n[ / ]  Previous / next section\n/  Search    n / N  Next / previous visible match\nc  Show stable citation    a  Ask Chat about visible paragraph\no  Open original URL/path    R  Retry context originals\nPageUp/PageDown  Page    g/G  Start/end\nBackspace  Return / clear search\nq / Ctrl+C  Quit    ?  Help\nSearch / original editor: Enter apply · Ctrl+C cancel"
     }
     fn draw(&self, frame: &mut Frame<'_>, _: &mut ViewState, settings: &Settings) {
         let styles = settings.styles();
@@ -858,8 +857,8 @@ impl LiveView for ReaderView {
             if let Some(editor) = &self.editor {
                 let line = Rect::new(inner.x, inner.bottom() - 1, inner.width, 1);
                 frame.render_widget(ratatui::widgets::Clear, line);
-                let label = format!("[{}] Original: ", editor.mode_label());
-                let prefix = width(&label, settings.ambiguous_width);
+                let label = "Original: ";
+                let prefix = width(label, settings.ambiguous_width);
                 let (text, cursor) = editor.viewport(
                     (inner.width as usize).saturating_sub(prefix),
                     settings.ambiguous_width,
@@ -1081,16 +1080,12 @@ impl LiveView for ReaderView {
             }
         }
         let footer = if let Some(editor) = &self.editor {
-            let prefix = format!(
-                "[{}] {}",
-                editor.mode_label(),
-                if self.editor_purpose == EditorPurpose::Search {
-                    "/"
-                } else {
-                    "Original: "
-                }
-            );
-            let prefix_width = width(&prefix, settings.ambiguous_width);
+            let prefix = if self.editor_purpose == EditorPurpose::Search {
+                "/"
+            } else {
+                "Original: "
+            };
+            let prefix_width = width(prefix, settings.ambiguous_width);
             let (text, cursor) = editor.viewport(
                 (inner.width as usize).saturating_sub(prefix_width),
                 settings.ambiguous_width,

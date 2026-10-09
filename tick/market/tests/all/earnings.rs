@@ -760,11 +760,57 @@ async fn the_symbol_prompt_owns_the_keys_and_reloads_the_panel_in_place() {
     view.on_key(KeyCode::Char('s'), &api, &mut state)
         .await
         .unwrap();
-    view.on_key(KeyCode::Esc, &api, &mut state).await.unwrap();
-    assert!(view.captures_text(), "first Esc changes Insert to Normal");
-    view.on_key(KeyCode::Esc, &api, &mut state).await.unwrap();
-    assert!(!view.captures_text(), "second Esc closes the prompt");
+    for key in [KeyCode::Esc, KeyCode::Backspace] {
+        view.on_key(key, &api, &mut state).await.unwrap();
+        assert!(
+            view.captures_text(),
+            "{key:?} in an empty prompt leaves it open"
+        );
+    }
+    view.cancel_text();
+    assert!(!view.captures_text(), "cancelling closes the prompt");
     assert!(view.title().contains("AAPL.US"));
+}
+
+#[tokio::test]
+async fn in_the_running_tick_the_prompt_keeps_q_as_text_and_ctrl_c_cancels_it() {
+    let api = Fundamentals::new(today());
+    let (keys, input) = tokio::sync::mpsc::unbounded_channel();
+    let keyboard = tokio::spawn(async move {
+        let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let typed = |text: &'static str| text.chars().map(move |key| press(KeyCode::Char(key)));
+        let events = typed("sqx")
+            .chain([KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)])
+            .chain(typed("saaplz"))
+            .chain([KeyCode::Backspace, KeyCode::Enter, KeyCode::Char('q')].map(press));
+        for event in events {
+            tokio::time::sleep(std::time::Duration::from_millis(45)).await;
+            keys.send(Ok(Event::Key(event))).unwrap();
+        }
+    });
+    let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    run_live(
+        &args(OutputFormat::Table),
+        &api,
+        &Settings::default(),
+        &mut terminal,
+        tokio_stream::wrappers::UnboundedReceiverStream::new(input),
+        &mut TickStream::in_memory(TickKind::Earnings, "longbridge"),
+    )
+    .await
+    .unwrap();
+    keyboard.await.unwrap();
+    let screen: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    assert!(
+        screen.contains(" AAPL.US · Earnings"),
+        "Ctrl+C discarded the first prompt and Backspace edited the second: {screen}"
+    );
 }
 
 fn request_of(symbol: &str) -> EarningsRequest {
@@ -1320,7 +1366,9 @@ async fn fiscal_navigation_and_agent_selection_keep_history_and_citations_stable
     view.on_key(KeyCode::Enter, &api, &mut state).await.unwrap();
     assert!(view.title().contains(&second));
     assert_eq!(view.selected_detail().unwrap().period_id, second);
-    view.on_key(KeyCode::Esc, &api, &mut state).await.unwrap();
+    view.on_key(KeyCode::Backspace, &api, &mut state)
+        .await
+        .unwrap();
     assert!(view.title().contains("Compare periods"));
     let result = view
         .act(ToolCall {
