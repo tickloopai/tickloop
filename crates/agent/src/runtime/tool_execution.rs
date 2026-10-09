@@ -537,7 +537,7 @@ impl Agent {
             });
         let prepared_host_call = if let Some(provider) = host_tools.as_ref() {
             if let Err(error) = self
-                .check_delegated_host_tool(receipt, provider.as_ref(), &name)
+                .check_delegated_host_call(receipt, provider.as_ref(), &name, &input)
                 .await
             {
                 return Ok(ToolCallOutcome::not_admitted(error));
@@ -560,14 +560,19 @@ impl Agent {
             };
             match prepared {
                 Ok(prepared) => {
+                    if prepared.name() != name || prepared.source_input() != &input {
+                        return Err("host provider prepared a different tool invocation".into());
+                    }
                     if let Err(error) = self
-                        .check_delegated_host_tool(receipt, provider.as_ref(), &name)
+                        .check_delegated_host_call(
+                            receipt,
+                            provider.as_ref(),
+                            prepared.name(),
+                            prepared.source_input(),
+                        )
                         .await
                     {
                         return Ok(ToolCallOutcome::not_admitted(error));
-                    }
-                    if prepared.name() != name || prepared.source_input() != &input {
-                        return Err("host provider prepared a different tool invocation".into());
                     }
                     Some(match event_context {
                         Some(context) => prepared.with_event_context(context),
@@ -889,7 +894,12 @@ impl Agent {
                     (host_tools.as_ref(), prepared_host_call.as_ref())
                 {
                     match self
-                        .check_delegated_host_tool(receipt, provider.as_ref(), &name)
+                        .check_delegated_host_call(
+                            receipt,
+                            provider.as_ref(),
+                            prepared.name(),
+                            prepared.source_input(),
+                        )
                         .await
                     {
                         Ok(()) => {

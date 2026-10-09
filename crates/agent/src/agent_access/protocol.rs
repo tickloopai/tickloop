@@ -18,11 +18,13 @@ use crate::{
     tools::{CommandSnapshot, SearchConfig},
 };
 
-/// Business 8.0 adds the Monitor's hosted Ticks (`ListHostedTicks`, `CloseHostedTick`,
-/// `ReopenHostedTick`) to 7.0's Monitor membership and push-completion delivery and usage. A 7.0
-/// peer cannot decode those commands and would drop the whole connection, so other majors are
-/// refused at hello; there are no minor feature gates.
-pub const PROTOCOL_MAJOR: u16 = 8;
+/// Business 9.0: 7.0's Monitor membership and push-completion delivery and usage, the Monitor's
+/// hosted Ticks (`ListHostedTicks`, `CloseHostedTick`, `ReopenHostedTick`, 8.0), and in 9.0 their
+/// screen snapshot and one-time view grant (`HostedTickSnapshot`, `AttachHostedTick`) and a
+/// delegated child's frozen set of authorities per host tool. An older peer cannot decode the
+/// newer commands or snapshots and would drop the whole connection, so other majors are refused
+/// at hello; there are no minor feature gates.
+pub const PROTOCOL_MAJOR: u16 = 9;
 pub const PROTOCOL_MINOR: u16 = 0;
 
 pub const MAX_FRAME_BYTES: usize = 128 * 1024 * 1024;
@@ -277,6 +279,16 @@ pub enum AgentCommand {
         execution: ExecutionRef,
         instance: tick_connect::instance::InstanceRef,
     },
+    /// The current screen of one of the Chat's hosted Ticks as text, for its Monitor detail.
+    HostedTickSnapshot {
+        execution: ExecutionRef,
+        instance: tick_connect::instance::InstanceRef,
+    },
+    /// Lets the asking View attach to one of the Chat's hosted Ticks once.
+    AttachHostedTick {
+        execution: ExecutionRef,
+        instance: tick_connect::instance::InstanceRef,
+    },
     Create {
         launch: LaunchSpec,
         initial: Option<UserInput>,
@@ -370,6 +382,8 @@ impl AgentCommand {
             | Self::ListHostedTicks { execution }
             | Self::CloseHostedTick { execution, .. }
             | Self::ReopenHostedTick { execution, .. }
+            | Self::HostedTickSnapshot { execution, .. }
+            | Self::AttachHostedTick { execution, .. }
             | Self::EnqueueAfterTurn { execution, .. }
             | Self::RefreshConfiguration { execution } => Some(*execution),
             Self::DecidePermission { request, .. } | Self::AnswerQuestion { request, .. } => {
@@ -873,6 +887,8 @@ pub enum CommandResult {
         instance: tick_connect::instance::InstanceRef,
         membership: crate::runtime::MonitorMembership,
     },
+    HostedTickSnapshot(crate::hosted::tools::HostedSnapshot),
+    HostedTickView(crate::hosted::controller::HostedViewGrant),
     Created {
         execution: ExecutionRef,
         snapshot: Box<LiveChatSnapshot>,

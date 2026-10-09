@@ -428,6 +428,7 @@ pub async fn run_internal(arguments: &[OsString]) -> Option<Result<(), String>> 
         Some("--agent-worker") => Some(run_worker(arguments).await),
         Some(crate::hosted::controller::HOST_MODE) => Some(run_tick_host().await),
         Some("service") => Some(service_control::run(&arguments[1..]).await),
+        Some("monitor") => Some(crate::monitor_command::run(&arguments[1..]).await),
         _ => None,
     }
 }
@@ -634,10 +635,11 @@ pub async fn build_runtime_with_client(
             grant.clone(),
         )));
     }
-    // A worker with a Herdr View keeps the Herdr tools; one without gets hosted Ticks, opened
-    // through its owner, whose authority is the Tick host's own endpoint.
-    let hosted = match (&access, control) {
-        (None, Some(grant)) => Some(Arc::new(crate::hosted::tools::HostedTickTools::new(
+    // Every worker the owner granted a Tick host opens hidden Ticks there, with its host's own
+    // authority; a worker in a Herdr View also keeps Herdr Workspaces and visible Panes. Each
+    // Tick tool call is routed by its target to one of the two.
+    let hosted = control.map(|grant| {
+        Arc::new(crate::hosted::tools::HostedTickTools::new(
             crate::hosted::worker_control::OwnerControl::new(grant),
             launch
                 .environment
@@ -649,18 +651,19 @@ pub async fn build_runtime_with_client(
                     ))
                 })
                 .collect(),
-        ))),
-        _ => None,
-    };
-    let native_host = match (&access, &hosted) {
-        (Some(access), _) => Some(Arc::new(crate::native_host::NativeHostToolProvider::new(
+        ))
+    });
+    let herdr = access.as_ref().map(|access| {
+        Arc::new(crate::native_host::NativeHostToolProvider::new(
             access.clone(),
-        )) as Arc<dyn crate::host_tools::HostToolProvider>),
-        (None, Some(hosted)) => {
-            Some(hosted.clone() as Arc<dyn crate::host_tools::HostToolProvider>)
-        }
-        (None, None) => None,
-    };
+        ))
+    });
+    let native_host = (herdr.is_some() || hosted.is_some()).then(|| {
+        Arc::new(crate::tick_tool_router::TickToolRouter::new(
+            herdr,
+            hosted.clone(),
+        )) as Arc<dyn crate::host_tools::HostToolProvider>
+    });
     if let Some(hosted) = &hosted {
         agent.install_hosted_ticks(hosted.clone());
     }

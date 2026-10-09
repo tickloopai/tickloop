@@ -285,6 +285,7 @@ fn first_model_request_identifies_host_without_advertising_missing_integrations(
         ("tmux", "tmux", "unavailable"),
         ("zellij", "zellij", "unavailable"),
         ("standalone", "standalone", "unavailable"),
+        ("tick_host", "standalone", "unavailable"),
     ] {
         let mut child = Command::new(&binary);
         child
@@ -308,7 +309,7 @@ fn first_model_request_identifies_host_without_advertising_missing_integrations(
             "zellij" => {
                 child.env("ZELLIJ", "0");
             }
-            "standalone" => {}
+            "standalone" | "tick_host" => {}
             _ => unreachable!(),
         }
         let output = child.output().unwrap();
@@ -331,7 +332,20 @@ fn first_model_request_identifies_host_without_advertising_missing_integrations(
             state["workspace_host"]["integration"], integration,
             "{case}"
         );
-        assert!(state["workspace_host"]["tick_executable"].is_null() || case == "herdr");
+        let runs_ticks = matches!(case, "herdr" | "tick_host");
+        assert!(
+            runs_ticks || state["workspace_host"]["tick_executable"].is_null(),
+            "{case}: only an Agent that can run Ticks names the tick executable"
+        );
+        assert_eq!(
+            state["workspace_host"]["tick_host"],
+            if case == "tick_host" {
+                "available"
+            } else {
+                "unavailable"
+            },
+            "{case}: hidden Ticks need the Tick host"
+        );
         assert!(!state.to_string().contains("/private/tmux.sock"));
     }
 }
@@ -364,6 +378,26 @@ async fn workspace_host_request_probe() {
             .install_host_tools(Arc::new(NativeHostToolProvider::new(access)))
             .unwrap();
     }
+    if case == "tick_host" {
+        let hosted = tickloop_agent::hosted::tools::HostedTickTools::new(
+            tickloop_agent::hosted::worker_control::OwnerControl::new(
+                tickloop_agent::hosted::worker_control::WorkerControlGrant {
+                    endpoint: directory.path().join("unused-owner.sock"),
+                    owner_epoch: uuid::Uuid::new_v4(),
+                    binding: uuid::Uuid::new_v4(),
+                    capability: "unused".into(),
+                    host_endpoint: directory.path().join("unused-host.sock"),
+                    intent_renewal: std::time::Duration::from_secs(100),
+                },
+            ),
+            Vec::new(),
+        );
+        agent
+            .install_host_tools(Arc::new(
+                tickloop_agent::tick_tool_router::TickToolRouter::new(None, Some(Arc::new(hosted))),
+            ))
+            .unwrap();
+    }
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     for input in ["Check host", "Check host again"] {
@@ -382,7 +416,8 @@ async fn workspace_host_request_probe() {
         .unwrap();
     }
     let snapshot = agent.snapshot(chat).await.unwrap();
-    if case == "herdr" {
+    let runs_ticks = matches!(case.as_str(), "herdr" | "tick_host");
+    if runs_ticks {
         assert_eq!(snapshot.invoked_skills.len(), 1);
         assert_eq!(snapshot.invoked_skills[0].name, "tickloop");
         assert_eq!(snapshot.invoked_skills[0].source, SkillSource::BuiltIn);
@@ -405,7 +440,7 @@ async fn workspace_host_request_probe() {
                     _ => None,
                 })
                 .collect::<Vec<_>>();
-            if case == "herdr" {
+            if runs_ticks {
                 assert_eq!(active_skill.len(), 1);
                 assert!(active_skill[0].contains(&snapshot.invoked_skills[0].content));
             } else {

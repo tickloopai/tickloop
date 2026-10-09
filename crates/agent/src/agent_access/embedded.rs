@@ -404,6 +404,30 @@ impl EmbeddedAgentAccess {
                     membership,
                 })
             }
+            AgentCommand::HostedTickSnapshot {
+                execution,
+                instance,
+            } => {
+                let chat = self.chat(execution).await?;
+                Ok(CommandResult::HostedTickSnapshot(
+                    self.hosted_ticks()?
+                        .snapshot(chat, &instance)
+                        .await
+                        .map_err(hosted_access_error)?,
+                ))
+            }
+            AgentCommand::AttachHostedTick {
+                execution,
+                instance,
+            } => {
+                let chat = self.chat(execution).await?;
+                Ok(CommandResult::HostedTickView(
+                    self.hosted_ticks()?
+                        .allow_view(chat, &instance)
+                        .await
+                        .map_err(hosted_access_error)?,
+                ))
+            }
             AgentCommand::AddMonitorMember {
                 execution,
                 instance,

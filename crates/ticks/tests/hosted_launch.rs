@@ -598,6 +598,87 @@ async fn one_attached_view_controls_the_terminal_until_it_detaches_or_disconnect
     shutdown(&fixture).await;
 }
 
+/// The owner lets one view attach to its Tick's terminal without handing out the Tick's data
+/// token: a grant works once, only to attach, only for the Tick it names, and a newer grant
+/// replaces an earlier one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_view_grant_attaches_one_view_once_and_allows_nothing_else() {
+    async fn grant(controller: &mut HostConnection, owner: &Value, instance: &Value) -> Value {
+        controller
+            .request(
+                "allow_view",
+                json!({"owner":owner,"instance":instance}),
+                CONTROL_TIMEOUT,
+            )
+            .await
+            .unwrap()["view"]
+            .clone()
+    }
+    async fn viewer(
+        fixture: &Fixture,
+        instance: &Value,
+        view: &Value,
+    ) -> Result<HostConnection, tick_connect::host_error::HostError> {
+        HostConnection::connect(
+            &fixture.paths.socket(),
+            Role::Viewer {
+                instance: serde_json::from_value(instance.clone()).unwrap(),
+                view: serde_json::from_value(view.clone()).unwrap(),
+            },
+            &[CAPABILITY_DATA],
+        )
+        .await
+    }
+    let fixture = Fixture::start().await;
+    let mut controller = fixture.controller().await;
+    let (command, work) = fixture.counter();
+    let opened = fixture.open(&mut controller, command, &work).await.unwrap();
+    let instance = opened["instance"].clone();
+    let foreign = controller
+        .request(
+            "allow_view",
+            json!({"owner":{"root":"fixture-root","chat":uuid::Uuid::new_v4()},"instance":instance}),
+            CONTROL_TIMEOUT,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        foreign.code, "TargetGone",
+        "only the Tick's owner grants a view"
+    );
+
+    let replaced = grant(&mut controller, &fixture.owner, &instance).await;
+    let granted = grant(&mut controller, &fixture.owner, &instance).await;
+    let refused = viewer(&fixture, &instance, &replaced).await.err().unwrap();
+    assert_eq!(
+        refused.code, "Forbidden",
+        "a newer grant replaces an earlier one"
+    );
+    let mut view = viewer(&fixture, &instance, &granted).await.unwrap();
+    let read = view
+        .request("read", json!({}), CONTROL_TIMEOUT)
+        .await
+        .unwrap_err();
+    assert_eq!(read.code, "MethodNotAllowed", "a view only attaches");
+    let attached = view
+        .request(
+            "attach",
+            json!({"size":{"rows":20,"columns":80}}),
+            CONTROL_TIMEOUT,
+        )
+        .await
+        .unwrap();
+    assert_eq!(attached["attached"], true);
+    let (mut events, mut requests) = view.into_parts();
+    let mut screen = vt100::Parser::new(20, 80, 0);
+    view_shows(&mut events, &mut screen, "Counter 0 in work 80x20").await;
+    send(&mut requests, json!({"method":"detach"})).await;
+    assert_eq!(view_end(&mut events).await, None, "detach ends the view");
+    let reused = viewer(&fixture, &instance, &granted).await.err().unwrap();
+    assert_eq!(reused.code, "Forbidden", "a grant works once");
+    shutdown(&fixture).await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stalled_view_loses_its_lease_after_two_seconds_and_the_tick_keeps_running() {
     let fixture = Fixture::start().await;

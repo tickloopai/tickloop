@@ -2894,6 +2894,46 @@ impl ConsoleExecution {
             _ => Err(unexpected()),
         }
     }
+    pub(super) async fn hosted_tick_snapshot(
+        &self,
+        chat: Uuid,
+        instance: crate::tick_stream::InstanceRef,
+    ) -> Result<tickloop_agent::hosted::tools::HostedSnapshot, AgentError> {
+        let execution = self.reference(chat).await?;
+        match self
+            .command(
+                AgentCommand::HostedTickSnapshot {
+                    execution,
+                    instance,
+                },
+                None,
+            )
+            .await?
+        {
+            CommandResult::HostedTickSnapshot(snapshot) => Ok(snapshot),
+            _ => Err(unexpected()),
+        }
+    }
+    pub(super) async fn attach_hosted_tick(
+        &self,
+        chat: Uuid,
+        instance: crate::tick_stream::InstanceRef,
+    ) -> Result<tickloop_agent::hosted::controller::HostedViewGrant, AgentError> {
+        let execution = self.reference(chat).await?;
+        match self
+            .command(
+                AgentCommand::AttachHostedTick {
+                    execution,
+                    instance,
+                },
+                None,
+            )
+            .await?
+        {
+            CommandResult::HostedTickView(grant) => Ok(grant),
+            _ => Err(unexpected()),
+        }
+    }
     pub(super) async fn tick_subscriptions(
         &self,
         chat: Uuid,

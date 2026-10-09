@@ -66,6 +66,16 @@ impl TickActionUi<'_> {
     pub fn notify(&mut self, message: &str) {
         self.state.hold_status(message);
     }
+    pub(super) fn not_floated(&self) -> super::hosted_detail::NotFloated {
+        super::hosted_detail::NotFloated::of(
+            tickloop_agent::host_tools::WorkspaceHostContext::from_environment().name
+                == tickloop_agent::host_tools::WorkspaceHostName::Herdr,
+            self.state.monitor_popup,
+        )
+    }
+    pub(super) fn can_take_over_terminal(&self) -> bool {
+        self.state.interactive
+    }
     pub(super) fn monitor_members(
         &self,
     ) -> std::collections::BTreeSet<crate::tick_stream::InstanceRef> {

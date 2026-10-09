@@ -576,10 +576,10 @@ async fn verify_delegated_watch_account(restore: bool) {
             .unwrap()
             .ceiling
             .host_tools["mcp__artifacts__artifact_read"],
-        tickloop_agent::host_tools::HostToolAuthority::Mcp {
+        std::collections::BTreeSet::from([tickloop_agent::host_tools::HostToolAuthority::Mcp {
             server_id: origin.clone(),
             account_id: "owner".into()
-        }
+        }])
     );
     assert_eq!(agent.tick_subscriptions(child).await.unwrap().len(), 1);
     let saved = agent.snapshot(child).await.unwrap().loops[0].clone();

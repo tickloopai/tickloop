@@ -152,6 +152,8 @@ pub enum MemberState {
     IdentityUncertain,
 }
 
+/// The row action Enter and a click run.
+pub const MONITOR_ENTER_KEY: char = 'o';
 /// Adds a program to Monitor from discovery.
 pub const MONITOR_ADD_KEY: char = 'a';
 pub const MONITOR_REFRESH_KEY: char = 'r';
@@ -192,7 +194,7 @@ pub fn member_descriptor(member: &MonitorMember) -> TickDescriptor {
         resources: None,
         actions: vec![
             MonitorAction {
-                key: 'o',
+                key: MONITOR_ENTER_KEY,
                 label: "details",
                 operation: MonitorOperation::Execute(
                     crate::terminal::tick_actions::builtin::details(member.instance.clone()),
