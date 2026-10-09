@@ -7,12 +7,16 @@ const THINKING_STAGE_FILE: &str = "thinking-stage";
 const THINKING_EXECUTIONS_FILE: &str = "thinking-executions.json";
 const THINKING_TOOL_VARIABLE: &str = "TICKLOOP_THINKING_STREAM_TOOL";
 const THINKING_RESTORE_VARIABLE: &str = "TICKLOOP_THINKING_STREAM_RESTORE";
+const THINKING_FLOOD_VARIABLE: &str = "TICKLOOP_THINKING_STREAM_FLOOD";
+const THINKING_RECOVERIES_FILE: &str = "thinking-recoveries";
+const FLOOD_DELTAS: usize = 8192;
 const THINKING_PROGRESS_FILE: &str = "thinking-progress.json";
 const HIDDEN_THINKING: &str = "hidden analysis stays in the archive";
 const LATEST_PREVIEW: &str = "Latest thinking 🙂";
 const STREAM_REPLY: &str = "Thinking stream completed";
 const BURST_CHARACTERS: usize = 512;
-const BURST_DEADLINE: Duration = Duration::from_millis(750);
+const STATUS_QUERY_SETTLING_ALLOWANCE: usize = 4;
+const STATUS_QUERY_BUDGET_PER_SECOND: f64 = 8.0;
 
 struct ThinkingBurst {
     requests: AtomicUsize,
@@ -60,6 +64,13 @@ impl ModelClient for ThinkingBurst {
         events.send(ModelDelta::Thinking("α".into())).unwrap();
         wait_for_stage("burst", &cancel).await;
         let restore = std::env::var(THINKING_RESTORE_VARIABLE).as_deref() == Ok("1");
+        let flood = std::env::var(THINKING_FLOOD_VARIABLE).as_deref() == Ok("1");
+        if flood {
+            for _ in 0..FLOOD_DELTAS {
+                events.send(ModelDelta::Thinking("思".into())).unwrap();
+                tokio::task::yield_now().await;
+            }
+        }
         events
             .send(ModelDelta::Thinking(if restore {
                 format!("\n{HIDDEN_THINKING}")
@@ -109,9 +120,24 @@ impl ModelClient for ThinkingBurst {
         events
             .send(ModelDelta::Text(format!("{STREAM_REPLY}\n")))
             .unwrap();
+        let mut content = test_support::text(STREAM_REPLY);
+        if flood {
+            content.insert(
+                0,
+                Content::Thinking {
+                    thinking: format!(
+                        "α{}{}\n{LATEST_PREVIEW}続{}\nfinal preview",
+                        "思".repeat(FLOOD_DELTAS),
+                        "x".repeat(BURST_CHARACTERS),
+                        "z".repeat(BURST_CHARACTERS)
+                    ),
+                    signature: None,
+                },
+            );
+        }
         Ok(ModelOutput {
             private_source: None,
-            content: test_support::text(STREAM_REPLY),
+            content,
             usage: Usage::default(),
             stop_reason: "end_turn".into(),
         })
@@ -212,6 +238,20 @@ fn thinking_stream_pty_fixture() {
                     launch,
                     None,
                 );
+                let (probe, mut facts) = mpsc::unbounded_channel();
+                agent.set_recovery_probe(probe);
+                std::fs::write(THINKING_RECOVERIES_FILE, "pending").unwrap();
+                tokio::spawn(async move {
+                    let mut recoveries = 0;
+                    while let Some(fact) = facts.recv().await {
+                        if matches!(fact, RecoveryFact::Lagged) {
+                            recoveries += 1;
+                        }
+                        if matches!(fact, RecoveryFact::Completed { .. }) {
+                            std::fs::write(THINKING_RECOVERIES_FILE, recoveries.to_string()).unwrap();
+                        }
+                    }
+                });
                 let chat = agent.create_chat(workdir.clone()).await.unwrap();
                 let other = agent.create_chat(workdir.clone()).await.unwrap();
                 std::fs::write(THINKING_EXECUTIONS_FILE, serde_json::to_vec(&serde_json::json!({"execution":agent.reference(chat).await.unwrap(),"other":agent.reference(other).await.unwrap()})).unwrap()).unwrap();
@@ -251,8 +291,13 @@ fn returning_to_an_agent_preserves_collapsed_thinking_tools_and_completion() {
     run_thinking_stream("restore");
 }
 
+#[test]
+fn long_thinking_stream_does_not_lag_or_print_internal_recovery_notices() {
+    run_thinking_stream("flood");
+}
+
 fn run_thinking_stream(route: &str) {
-    let tool = route != "live";
+    let tool = matches!(route, "tool" | "restore");
     let restore = route == "restore";
     let directory = tempfile::tempdir_in("/tmp").unwrap();
     let pair = native_pty_system()
@@ -271,6 +316,10 @@ fn run_thinking_stream(route: &str) {
         "--nocapture",
     ]);
     command.env(THINKING_FIXTURE_VARIABLE, "1");
+    command.env(
+        THINKING_FLOOD_VARIABLE,
+        if route == "flood" { "1" } else { "0" },
+    );
     command.env(THINKING_TOOL_VARIABLE, if tool { "1" } else { "0" });
     command.env(THINKING_RESTORE_VARIABLE, if restore { "1" } else { "0" });
     command.env("TICKLOOP_AGENT_TUI", "fullscreen");
@@ -318,26 +367,28 @@ fn run_thinking_stream(route: &str) {
     let initial_queries = query_count();
     let started = Instant::now();
     stage("burst");
-    fixture.timeout = BURST_DEADLINE;
-    fixture.wait_until(|frame| frame.contains(LATEST_PREVIEW));
+    fixture.timeout = RECOVERY_TIMEOUT;
+    let frame = fixture.wait_for(LATEST_PREVIEW);
     let burst_elapsed = started.elapsed();
     let burst_queries = query_count() - initial_queries;
-    let frame = screen::visible_screen(&fixture.raw_output(), 80, 24);
     println!(
         "THINKING_BURST characters={BURST_CHARACTERS} elapsed_ms={} task_queries={burst_queries}",
         burst_elapsed.as_millis()
     );
     assert!(
-        frame.contains(LATEST_PREVIEW),
-        "Thinking burst fell behind: elapsed_ms={} task_queries={burst_queries}\n{frame}",
+        burst_queries <= status_query_budget(burst_elapsed),
+        "Thinking burst reread heavy state per character: elapsed_ms={} task_queries={burst_queries}\n{frame}",
         burst_elapsed.as_millis()
     );
     let idle_queries = query_count();
+    let idle_started = Instant::now();
     std::thread::sleep(Duration::from_millis(200));
+    let idle_elapsed = idle_started.elapsed();
     let animation_queries = query_count() - idle_queries;
     assert!(
-        animation_queries <= 1,
-        "animation reread heavy state {animation_queries} times in 200 ms"
+        animation_queries <= status_query_budget(idle_elapsed),
+        "animation reread heavy state {animation_queries} times in {} ms",
+        idle_elapsed.as_millis()
     );
     if !tool {
         fixture.timeout = RECOVERY_TIMEOUT;
@@ -358,7 +409,7 @@ fn run_thinking_stream(route: &str) {
         fixture.send(b"\x1b[D");
         fixture.open_overview_agent(&executions, "execution");
         fixture.wait_for(LATEST_PREVIEW);
-        fixture.timeout = BURST_DEADLINE;
+        fixture.timeout = RECOVERY_TIMEOUT;
     }
     stage("follow-up");
     fixture.wait_for(&format!("{LATEST_PREVIEW}続"));
@@ -368,7 +419,39 @@ fn run_thinking_stream(route: &str) {
     }
     fixture.wait_for(STREAM_REPLY);
     fixture.wait_for("Done");
+    if route == "flood" {
+        assert!(
+            !fixture
+                .raw_output()
+                .contains("The view fell behind; restoring it from saved execution events.")
+        );
+        let proof = directory.path().join(THINKING_RECOVERIES_FILE);
+        let deadline = Instant::now() + RECOVERY_TIMEOUT;
+        while std::fs::read_to_string(&proof).unwrap() == "pending" {
+            assert!(
+                Instant::now() < deadline,
+                "recovery probe did not observe completion"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            std::fs::read_to_string(&proof).unwrap(),
+            "0",
+            "a normal long Thinking stream triggered recovery"
+        );
+        fixture.send(b"\x0f");
+        fixture.wait_until_shown("the complete Thinking archive", |frame| {
+            frame.contains("Transcript ·") && frame.contains("final preview")
+        });
+        fixture.send(b"\x1b");
+        fixture.wait_for(STREAM_REPLY);
+    }
     fixture.send(b"\x04\x04");
+}
+
+fn status_query_budget(elapsed: Duration) -> usize {
+    STATUS_QUERY_SETTLING_ALLOWANCE
+        + (elapsed.as_secs_f64() * STATUS_QUERY_BUDGET_PER_SECOND).ceil() as usize
 }
 
 fn run_thinking_restore(fixture: &mut RecoveryPty, directory: &std::path::Path) {

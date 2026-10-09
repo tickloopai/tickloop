@@ -702,9 +702,11 @@ async fn interrupted_state_survives_event_eviction(fixture: &PrivateFixture, res
     const QUEUED_QUESTION: &str = "RETENTION-QUEUED-QUESTION";
     const FLOOD_EVENTS: usize = 1100;
     let marker = fixture.path("retention-marker");
-    let mut deltas = vec![json!({"role":"assistant"})];
-    deltas.extend((0..FLOOD_EVENTS).map(|_| json!({"content":"."})));
-    deltas.push(json!({"content":"RETENTION-FLOOD-DONE"}));
+    let mut noisy_reply = (0..FLOOD_EVENTS).map(|_| format!("data: {}\n\n", json!({"id":"streamed-fixture","choices":[{"index":0,"delta":{"role":"assistant","content":"."},"finish_reason":null}],"usage":{"prompt_tokens":0,"completion_tokens":0}}))).collect::<String>();
+    noisy_reply.push_str(&streamed_reply(
+        vec![json!({"content":"RETENTION-FLOOD-DONE"})],
+        "stop",
+    ));
     let proposal = streamed_reply(
         vec![
             json!({"role":"assistant","content":"RETENTION-REPLY","tool_calls":[
@@ -717,7 +719,7 @@ async fn interrupted_state_survives_event_eviction(fixture: &PrivateFixture, res
     let (url, mut requests, _release) = model_http_support::serve_responses_with_gated_response(
         vec![
             (200, proposal),
-            (200, streamed_reply(deltas, "stop")),
+            (200, noisy_reply),
             (200, chat_reply(None, "UNEXPECTED-RESUME-REQUEST")),
         ],
         2,

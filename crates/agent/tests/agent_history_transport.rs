@@ -19,6 +19,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(180);
+static LARGE_HISTORY_FIXTURE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 struct ImageModel {
     image_digest: [u8; 32],
@@ -237,6 +238,7 @@ async fn fault_proxy(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn repeated_legal_images_cross_the_frame_limit_without_losing_history_or_rewind_bytes() {
+    let _large_history_fixture = LARGE_HISTORY_FIXTURE.lock().await;
     let directory = tempfile::tempdir_in("/tmp").unwrap();
     let image = legal_large_image();
     let digest: [u8; 32] = Sha256::digest(image.data.as_bytes()).into();
@@ -460,6 +462,7 @@ async fn repeated_legal_images_cross_the_frame_limit_without_losing_history_or_r
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn large_text_history_is_complete_and_a_corrupt_end_is_never_published() {
+    let _large_history_fixture = LARGE_HISTORY_FIXTURE.lock().await;
     let directory = tempfile::tempdir_in("/tmp").unwrap();
     let prompt = format!(
         "Original long prompt:{}\n\"Original ending\"",

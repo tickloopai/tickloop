@@ -60,6 +60,7 @@ impl ModelClient for HiddenReplyModel {
                 events
                     .send(ModelDelta::Thinking("B bounded event flood".into()))
                     .unwrap();
+                events.send(ModelDelta::Usage(Usage::default())).unwrap();
                 self.flood_acknowledgements
                     .acquire()
                     .await

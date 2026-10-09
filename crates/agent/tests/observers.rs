@@ -153,6 +153,7 @@ impl tickloop_agent::model::ModelClient for BurstAfterCommand {
         {
             for _ in 0..300 {
                 let _ = sender.send(ModelDelta::Text("part ".into()));
+                let _ = sender.send(ModelDelta::Usage(Usage::default()));
             }
             text("The real command finished while observers were slow.")
         } else {

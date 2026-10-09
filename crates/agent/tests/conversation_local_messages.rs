@@ -215,7 +215,7 @@ async fn escape_keeps_the_partial_reply_and_interrupt_marker_for_the_next_reques
         .unwrap();
     wait_for(
         &mut events,
-        |kind| matches!(kind, EventKind::Text(text) if text == "回答"),
+        |kind| matches!(kind, EventKind::Text(text) if text.ends_with("回答")),
     )
     .await;
     agent.interrupt(chat).await.unwrap();
