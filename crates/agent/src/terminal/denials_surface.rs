@@ -105,6 +105,25 @@ impl DenialsSurface {
         DenialsEffect::None
     }
 
+    pub(super) fn content_rows(&self, width: usize) -> usize {
+        let body = if let Some(record) = &self.detail {
+            styled_detail_lines(record, width).len()
+        } else {
+            self.view.as_ref().map_or(1, |view| {
+                if view.records.is_empty() {
+                    2
+                } else {
+                    view.records.len()
+                }
+            })
+        };
+        self.header_lines().len() + body + 1
+    }
+
+    pub(super) fn minimum_frame_rows(&self) -> usize {
+        self.header_lines().len() + 2
+    }
+
     pub(super) fn styled_lines(&mut self, width: usize, height: usize) -> Vec<RoleLine> {
         if height == 0 {
             return Vec::new();
@@ -131,7 +150,7 @@ impl DenialsSurface {
         } else {
             None
         };
-        let mut header = self.header_lines(height);
+        let mut header = self.header_lines();
         let mut body_height = height.saturating_sub(header.len() + usize::from(footer.is_some()));
 
         if body_height == 0 && self.detail.is_none() {
@@ -201,10 +220,7 @@ impl DenialsSurface {
             .collect()
     }
 
-    fn header_lines(&self, height: usize) -> Vec<RoleLine> {
-        if height < 4 {
-            return Vec::new();
-        }
+    fn header_lines(&self) -> Vec<RoleLine> {
         let Some(view) = &self.view else {
             return Vec::new();
         };
@@ -218,19 +234,17 @@ impl DenialsSurface {
         let mut status = RoleLine::role(format!("{} records", view.records.len()), Role::Strong);
         status.push(format!(" · {persistence}"), Some(Role::MutedText));
         let mut lines = vec![status];
-        if height >= 6 {
-            if let Some(warning) = &view.load_warning {
-                lines.push(RoleLine::role(
-                    format!("History warning: {}", super::safe_line(warning)),
-                    Role::Warning,
-                ));
-            }
-            if let Some(error) = &self.error {
-                lines.push(RoleLine::role(
-                    format!("History error: {}", super::safe_line(error)),
-                    Role::Error,
-                ));
-            }
+        if let Some(warning) = &view.load_warning {
+            lines.push(RoleLine::role(
+                format!("History warning: {}", super::safe_line(warning)),
+                Role::Warning,
+            ));
+        }
+        if let Some(error) = &self.error {
+            lines.push(RoleLine::role(
+                format!("History error: {}", super::safe_line(error)),
+                Role::Error,
+            ));
         }
         lines
     }

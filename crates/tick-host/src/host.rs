@@ -393,6 +393,7 @@ impl Host {
         slave
             .attach(&mut command)
             .map_err(|error| HostError::before("TerminalUnavailable", error.to_string()))?;
+        let mut state = self.state.lock().await;
         let launcher = command
             .spawn()
             .map_err(|error| HostError::before("LaunchFailed", error.to_string()))?;
@@ -418,7 +419,8 @@ impl Host {
             screen_changes: watch::channel(()).0,
             terminal_closed: CancellationToken::new(),
         });
-        self.state.lock().await.ticks.insert(terminal, tick.clone());
+        state.ticks.insert(terminal, tick.clone());
+        drop(state);
         tokio::spawn(drain_terminal(tick.clone()));
         let mut lifecycle = tick.lifecycle.subscribe();
         let live = tokio::time::timeout(CONTROL_TIMEOUT, async {
@@ -1592,6 +1594,64 @@ pub fn read_controller_key(input: impl std::io::Read) -> std::io::Result<String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_launcher_waits_until_its_registration_can_be_published() {
+        let directory = tempfile::tempdir().unwrap();
+        let host = Arc::new(Host {
+            paths: HostPaths {
+                runtime: directory.path().join("host"),
+            },
+            epoch: Uuid::new_v4(),
+            controller_key: random_token(),
+            started: Instant::now(),
+            state: Mutex::new(HostState {
+                ticks: HashMap::new(),
+                receipts: Receipts::default(),
+                pending_opens: 0,
+                ever_used: false,
+                exiting: false,
+                controller_generation: 0,
+                controller_epoch: None,
+                diagnostics: Diagnostics::default(),
+            }),
+            shutdown: CancellationToken::new(),
+            shutdown_requests: std::sync::Mutex::new(HashSet::new()),
+            shutdown_state: watch::channel(ShutdownState::Running).0,
+        });
+        let request = OpenRequest {
+            operation: Uuid::new_v4(),
+            owner: owner(),
+            command: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "printf started > started".into(),
+            ],
+            cwd: directory.path().to_path_buf(),
+            environment: Vec::new(),
+            title: None,
+        };
+        let registry = host.state.lock().await;
+        let launching = {
+            let host = Arc::clone(&host);
+            tokio::spawn(async move { host.launch(&request).await })
+        };
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let started_without_registration = directory.path().join("started").exists();
+        drop(registry);
+        let outcome = tokio::time::timeout(CONTROL_TIMEOUT, launching)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome.unwrap_err().code, "LaunchFailed");
+        assert!(directory.path().join("started").exists());
+        assert!(host.state.lock().await.ticks.is_empty());
+        assert!(
+            !started_without_registration,
+            "a launcher ran before its token registration could be published"
+        );
+    }
 
     fn owner() -> TickOwner {
         TickOwner {

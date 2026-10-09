@@ -36,6 +36,10 @@ mod connection_tests;
 #[cfg(test)]
 #[path = "console/conversation_picker_tests.rs"]
 mod conversation_picker_tests;
+#[cfg(test)]
+mod dialog_height_pty;
+#[cfg(test)]
+mod dialog_height_tests;
 mod input_dialog;
 #[cfg(test)]
 mod input_dialog_pty;
@@ -842,6 +846,17 @@ struct MenuCommentState {
     cursor: usize,
     secret: bool,
     standalone_input: bool,
+}
+
+impl MenuCommentState {
+    fn is_visible_for(&self, selected: usize, input_field: bool) -> bool {
+        self.editing
+            || input_field
+                && self
+                    .values
+                    .get(&selected)
+                    .is_some_and(|value| !value.is_empty())
+    }
 }
 
 struct MenuReviewState {
@@ -2256,7 +2271,11 @@ impl Console {
                 (surface, effect)
             };
         if let Some(task_id) = selected_task {
-            let viewport = task_surface_content_viewport(state.width, state.height);
+            let viewport = task_surface_content_viewport(
+                state.width,
+                state.input_dialog_body_height(),
+                TaskSurfaceFocus::Detail { task_id },
+            );
             effect = surface.open_detail(task_id, viewport);
         }
         if state.request_layout.is_some() {
@@ -3784,9 +3803,12 @@ impl Console {
         let navigation =
             state.menu_submission_pending == Some(id) && state.menu_submission_navigation;
         state.mark_menu_submission_finished(id);
-        // A visible picker replaces its pending hint with its key hints at once.
+        // A visible user menu replaces its pending hint with its key hints at once.
         let released = navigation && state.clear_finished_menu_submission();
-        if released || state.picker_kind.is_some() {
+        if released
+            || state.picker_kind.is_some()
+            || state.menu.is_some() && !state.input_dialog_has_fixed_height()
+        {
             state
                 .draw(&mut io::stdout().lock())
                 .map_err(|error| error.to_string())?;
@@ -4859,6 +4881,9 @@ impl State {
     /// Pointer input scrolls the conversation, selects text and activates the return control.
     /// Other events are captured so the terminal does not translate the wheel into arrow keys.
     fn pointer(&mut self, event: MouseEvent, output: &mut impl Write) -> bool {
+        if self.transcript.is_some() {
+            return false;
+        }
         let height = self.input_dialog_height();
         let start = self.height.saturating_sub(height);
         let body_height = self.input_dialog_body_height();
@@ -4887,6 +4912,9 @@ impl State {
             return true;
         }
         self.pointer_input = None;
+        if self.input_dialog_requires_resize() && usize::from(event.row) >= start {
+            return true;
+        }
         if self.menu_submission_is_pending()
             || self.branch_submission_owns_input()
             || self.request_layout.is_some() && self.menu.is_none()
@@ -4976,8 +5004,13 @@ impl State {
                                     self.pointer_input = Some(InputEvent::Permissions(effect));
                                 }
                             } else {
-                                let viewport =
-                                    task_surface_content_viewport(self.width, self.height);
+                                let viewport = task_surface_content_viewport(
+                                    self.width,
+                                    self.input_dialog_body_height(),
+                                    self.task_surface
+                                        .as_ref()
+                                        .map_or(TaskSurfaceFocus::List, TaskSurface::focus),
+                                );
                                 let capacity = self.input_dialog_body_height();
                                 let selected = if let Some(surface) = &mut self.task_surface {
                                     body_row
@@ -5747,6 +5780,109 @@ impl State {
             .map(|(_, header)| header.as_str())
     }
 
+    fn menu_comment_frame(&self, selected: usize) -> (Vec<String>, (usize, usize)) {
+        self.menu_comment
+            .as_ref()
+            .filter(|comment| comment.is_visible_for(selected, self.input_menu_active()))
+            .map_or_else(
+                || (Vec::new(), (0, 0)),
+                |comment| {
+                    let value = comment
+                        .values
+                        .get(&selected)
+                        .map(String::as_str)
+                        .unwrap_or_default();
+                    let prefix = format!(
+                        "{}{}: ",
+                        if self.question_menu.is_some() {
+                            ""
+                        } else {
+                            "  "
+                        },
+                        comment.label
+                    );
+                    let text = if comment.secret {
+                        "*".repeat(value.chars().count())
+                    } else {
+                        display_text(value)
+                    };
+                    let before_cursor = if comment.secret {
+                        "*".repeat(value[..comment.cursor.min(value.len())].chars().count())
+                    } else {
+                        display_text(&value[..comment.cursor.min(value.len())])
+                    };
+                    let cursor_lines = wrap_text(&format!("{prefix}{before_cursor}"), self.width);
+                    let column = display_width(cursor_lines.last().expect("the field has a line"));
+                    let cursor = if text
+                        .chars()
+                        .nth(before_cursor.chars().count())
+                        .is_some_and(|next| column + next.width().unwrap_or(0) > self.width)
+                    {
+                        (cursor_lines.len(), 0)
+                    } else {
+                        (
+                            cursor_lines.len() - 1,
+                            column.min(self.width.saturating_sub(1)),
+                        )
+                    };
+                    (wrap_text(&format!("{prefix}{text}"), self.width), cursor)
+                },
+            )
+    }
+
+    fn editing_menu_hint(&self, comment: &MenuCommentState) -> String {
+        if self.user_menu_submission_is_unfinished() {
+            return MENU_SUBMISSION_PENDING_HINT.into();
+        }
+        let hint = if self.input_menu_active() {
+            format!(
+                "{} · Enter save · Ctrl+G external editor · Esc close field",
+                comment.label
+            )
+        } else if let Some(hint) = self.picker_presentation.editing_hint {
+            hint.into()
+        } else if self.menu_link.is_some() {
+            format!("{} · Enter submit · Esc close field", comment.label)
+        } else if self.question_menu.is_some() {
+            "Type your answer · Enter submit · Esc close field".into()
+        } else if comment.label == "Guidance" {
+            "add context (optional) · Enter submit · Tab close · Esc close".into()
+        } else {
+            "Type a comment · Enter submit · Tab close · Esc close".into()
+        };
+        if self.input_dialog_has_fixed_height() {
+            return hint;
+        }
+        let parts = self
+            .user_hint_parts(&hint)
+            .into_iter()
+            .filter(|(part, _)| part != comment.label)
+            .collect::<Vec<_>>();
+        super::conversation_picker::fit_hint(&parts, self.width, self.display)
+    }
+
+    fn user_hint_parts(&self, hint: &str) -> Vec<(String, u8)> {
+        hint.split(" · ")
+            .map(|part| {
+                let part = if self.width < 48 && part.starts_with("Enter return") {
+                    "Enter return"
+                } else if self.width < 48 && part.starts_with("Ctrl+G") {
+                    "Ctrl+G editor"
+                } else {
+                    part
+                };
+                let priority = if part.contains("Esc") {
+                    12
+                } else if part.starts_with("Enter") {
+                    11
+                } else {
+                    5
+                };
+                (part.to_owned(), priority)
+            })
+            .collect()
+    }
+
     fn picker_context(&self, menu: &Menu) -> Vec<String> {
         let mut context = menu.context.clone();
         if let Some(failure) = self
@@ -5790,59 +5926,37 @@ impl State {
         let title_rows = usize::from(capacity > 1);
         let hint_rows = usize::from(capacity > 2);
         let input_field = self.input_menu_active();
-        let comment = self.menu_comment.as_ref().filter(|comment| {
-            comment.editing
-                || input_field
-                    && comment
-                        .values
-                        .get(&selected)
-                        .is_some_and(|value| !value.is_empty())
-        });
+        let comment = self
+            .menu_comment
+            .as_ref()
+            .filter(|comment| comment.is_visible_for(selected, input_field));
         let editing = comment.is_some_and(|comment| comment.editing);
-        let (comment_lines, comment_cursor) = comment.map_or_else(
-            || (Vec::new(), (0, 0)),
-            |comment| {
-                let value = comment
-                    .values
-                    .get(&selected)
-                    .map(String::as_str)
-                    .unwrap_or_default();
-                let prefix = format!(
-                    "{}{}: ",
-                    if self.question_menu.is_some() {
-                        ""
-                    } else {
-                        "  "
-                    },
-                    comment.label
-                );
-                let text = if comment.secret {
-                    "*".repeat(value.chars().count())
-                } else {
-                    display_text(value)
-                };
-                let before_cursor = if comment.secret {
-                    "*".repeat(value[..comment.cursor.min(value.len())].chars().count())
-                } else {
-                    display_text(&value[..comment.cursor.min(value.len())])
-                };
-                let cursor_lines = wrap_text(&format!("{prefix}{before_cursor}"), self.width);
-                let column = display_width(cursor_lines.last().expect("the field has a line"));
-                let cursor = if text
-                    .chars()
-                    .nth(before_cursor.chars().count())
-                    .is_some_and(|next| column + next.width().unwrap_or(0) > self.width)
-                {
-                    (cursor_lines.len(), 0)
-                } else {
-                    (
-                        cursor_lines.len() - 1,
-                        column.min(self.width.saturating_sub(1)),
-                    )
-                };
-                (wrap_text(&format!("{prefix}{text}"), self.width), cursor)
-            },
-        );
+        let (comment_lines, comment_cursor) = self.menu_comment_frame(selected);
+        if editing && capacity <= 3 && !self.input_dialog_has_fixed_height() {
+            let field_rows = capacity.saturating_sub(2).max(1);
+            let start = comment_cursor.0.saturating_sub(field_rows - 1);
+            let mut lines = vec![RoleLine::role(
+                display_single_line(&menu.title),
+                Role::DialogTitle,
+            )];
+            lines.extend(
+                comment_lines
+                    .into_iter()
+                    .skip(start)
+                    .take(field_rows)
+                    .map(RoleLine::plain),
+            );
+            lines.resize(capacity.saturating_sub(1), RoleLine::default());
+            lines.push(RoleLine::role(
+                self.editing_menu_hint(comment.unwrap()),
+                Role::MutedText,
+            ));
+            for line in &mut lines {
+                line.truncate(self.width);
+            }
+            self.dialog_cursor_visible = true;
+            return (lines, 1 + comment_cursor.0 - start, comment_cursor.1);
+        }
         if editing && capacity <= 3 {
             let start = comment_cursor.0.saturating_sub(capacity - 1);
             let mut lines = comment_lines
@@ -5871,10 +5985,14 @@ impl State {
                         .get(selected)
                         .is_some(),
             ) + usize::from(picker && !self.picker_presentation.headers.is_empty());
-        let context_reserve = usize::from(!picker_context.is_empty() || self.menu_review.is_some())
-            * capacity
-                .saturating_sub(title_rows + hint_rows + comment_rows + minimum_option_rows)
-                .min(2);
+        let context_rows = if self.input_dialog_has_fixed_height() {
+            2 * usize::from(!picker_context.is_empty() || self.menu_review.is_some())
+        } else {
+            self.menu_context_rows(menu, capacity).min(2)
+        };
+        let context_reserve = capacity
+            .saturating_sub(title_rows + hint_rows + comment_rows + minimum_option_rows)
+            .min(context_rows);
         let option_capacity =
             capacity.saturating_sub(title_rows + hint_rows + comment_rows + context_reserve);
         let options = menu
@@ -6067,31 +6185,19 @@ impl State {
             );
         }
         lines.resize(capacity.saturating_sub(hint_rows), RoleLine::default());
-        if hint_rows > 0 {
+        if hint_rows > 0 && self.user_menu_submission_is_unfinished() {
+            lines.push(RoleLine::role(
+                MENU_SUBMISSION_PENDING_HINT,
+                Role::MutedText,
+            ));
+        } else if hint_rows > 0 {
             let hint = if input_field && !editing {
                 format!(
                     "Enter confirm · Esc back · Tab edit {}",
                     self.menu_comment.as_ref().unwrap().label
                 )
             } else if let Some(comment) = comment {
-                if self.input_menu_active() {
-                    format!(
-                        "{} · Enter save · Ctrl+G external editor · Esc close field",
-                        comment.label
-                    )
-                } else if let Some(hint) = self.picker_presentation.editing_hint {
-                    hint.into()
-                } else if self.menu_link.is_some() {
-                    format!("{} · Enter submit · Esc close field", comment.label)
-                } else if self.question_menu.is_some() {
-                    "Type your answer · Enter submit · Esc close field".into()
-                } else {
-                    if comment.label == "Guidance" {
-                        "add context (optional) · Enter submit · Tab close · Esc close".into()
-                    } else {
-                        "Type a comment · Enter submit · Tab close · Esc close".into()
-                    }
-                }
+                self.editing_menu_hint(comment)
             } else if picker && !self.review_focused {
                 self.picker_hint().unwrap_or_default().into()
             } else if self.review_focused {
@@ -6109,13 +6215,19 @@ impl State {
             } else {
                 if self.selected_menu_accepts_comment() {
                     "Tab comment".into()
+                } else if !self.input_dialog_has_fixed_height() {
+                    "Enter confirm · Esc back".into()
                 } else {
                     String::new()
                 }
             };
             let mut hints = Vec::new();
             if !hint.is_empty() {
-                hints.push((hint, 10));
+                if self.input_dialog_has_fixed_height() {
+                    hints.push((hint, 10));
+                } else {
+                    hints.extend(self.user_hint_parts(&hint));
+                }
             }
             if picker && (option_start > 0 || option_end < options.len()) {
                 let scroll = match (option_start > 0, option_end < options.len()) {
@@ -7640,6 +7752,13 @@ impl State {
         self.menu_submission_pending.is_some()
     }
 
+    fn user_menu_submission_is_unfinished(&self) -> bool {
+        self.menu.is_some()
+            && !self.input_dialog_has_fixed_height()
+            && self.menu_submission_pending.is_some()
+            && self.menu_submission_finished != self.menu_submission_pending
+    }
+
     fn commit_branch_submission(&mut self) {
         if self.branch_submission != BranchSubmission::Pending {
             return;
@@ -8173,7 +8292,13 @@ impl State {
                 _ => return None,
             },
         };
-        let viewport = task_surface_content_viewport(self.width, self.height);
+        let viewport = task_surface_content_viewport(
+            self.width,
+            self.input_dialog_body_height(),
+            self.task_surface
+                .as_ref()
+                .map_or(TaskSurfaceFocus::List, TaskSurface::focus),
+        );
         let effect = self.task_surface.as_mut()?.apply(action, viewport);
         match effect {
             TaskSurfaceEffect::None => None,
@@ -8263,9 +8388,7 @@ impl State {
     fn picker_hint(&self) -> Option<&str> {
         self.picker_kind.map(|_| {
             // Keys are ignored until the submitted choice finishes, so no key hint is offered.
-            if self.menu_submission_pending.is_some()
-                && self.menu_submission_finished != self.menu_submission_pending
-            {
+            if self.user_menu_submission_is_unfinished() {
                 return MENU_SUBMISSION_PENDING_HINT;
             }
             self.menu
@@ -8402,6 +8525,13 @@ impl State {
     }
 
     fn paste(&mut self, text: &str) {
+        if let Some((_, transcript)) = &mut self.transcript {
+            transcript.paste(text);
+            return;
+        }
+        if self.input_dialog_requires_resize() {
+            return;
+        }
         if self.ordinary_input_is_visible() {
             self.clear_prompt_suggestion();
         }
@@ -8459,10 +8589,6 @@ impl State {
         if self.menu.is_none()
             && (self.task_surface.is_some() || self.subscription_surface.is_some())
         {
-            return;
-        }
-        if let Some((_, transcript)) = &mut self.transcript {
-            transcript.paste(text);
             return;
         }
         if self.menu.is_none() && self.history_search.is_some() {
@@ -9194,6 +9320,9 @@ impl State {
 
     fn key(&mut self, key: KeyEvent) -> Option<InputEvent> {
         if key.kind == KeyEventKind::Release {
+            return None;
+        }
+        if self.input_dialog_requires_resize() && key.code != KeyCode::Esc {
             return None;
         }
         if self.ordinary_input_is_visible() && matches!(key.code, KeyCode::Char(_)) {
@@ -10517,11 +10646,18 @@ fn send_input(sender: &mpsc::Sender<InputEvent>, stop: &AtomicBool, mut input: I
     }
 }
 
-fn task_surface_content_viewport(width: usize, height: usize) -> TaskViewport {
+fn task_surface_content_viewport(
+    width: usize,
+    body_height: usize,
+    focus: TaskSurfaceFocus,
+) -> TaskViewport {
     TaskViewport {
-        width: width.saturating_sub(2).max(1),
-        height: input_dialog::body_height(input_dialog::height_for_terminal(height))
-            .saturating_sub(TASK_SURFACE_HEADER_FOOTER_ROWS),
+        width: if focus == TaskSurfaceFocus::List {
+            width.saturating_sub(2).max(1)
+        } else {
+            width.max(1)
+        },
+        height: body_height.saturating_sub(TASK_SURFACE_HEADER_FOOTER_ROWS),
     }
 }
 
@@ -10573,14 +10709,7 @@ fn task_surface_lines(
         return Vec::new();
     }
     let focus = surface.focus();
-    let viewport = TaskViewport {
-        width: if focus == TaskSurfaceFocus::List {
-            width.saturating_sub(2).max(1)
-        } else {
-            width.max(1)
-        },
-        height: height.saturating_sub(2),
-    };
+    let viewport = task_surface_content_viewport(width, height, focus);
     let frame = surface.frame(viewport);
     let action_error = frame.action_error.clone();
     let selected_capabilities = frame.selected_capabilities;
@@ -12181,7 +12310,7 @@ mod tests {
     }
 
     #[test]
-    fn tiny_diff_review_blocks_hidden_permission_choices() {
+    fn tiny_diff_review_blocks_hidden_user_confirmation_choices() {
         let mut state = State::new(true, 40, 4);
         state.menu = Some(menu());
         state.menu_review = Some(MenuReviewState {
@@ -12197,7 +12326,7 @@ mod tests {
         assert!(state.key(key(KeyCode::Enter)).is_none());
         assert!(state.key(key(KeyCode::Char('y'))).is_none());
         assert!(state.menu.is_some());
-        assert!(state.frame().0[0].contains("Resize"));
+        assert!(state.frame().0.iter().any(|line| line.contains("Resize")));
     }
 
     #[test]
@@ -17421,6 +17550,7 @@ mod tests {
             state.scrollback.append(&format!("tool log {index}\n"));
         }
         state.menu = Some(menu());
+        state.request_layout = state.menu.as_ref().map(|menu| menu.id);
         state.menu_focused = false;
         state.width = 79;
         state.height = 18;
@@ -17440,6 +17570,7 @@ mod tests {
                 .any(|line| line.contains("DeepSeek · Messages"))
         );
         state.menu = None;
+        state.request_layout = None;
         state.width = 139;
         state.height = 40;
         let mut output = Vec::new();
@@ -17475,8 +17606,9 @@ mod tests {
     }
 
     #[test]
-    fn tiny_terminals_block_invisible_menu_choices_and_restore_the_reviewed_selection() {
-        for height in 1..=6 {
+    fn tiny_terminals_block_invisible_user_confirmation_choices_and_restore_the_reviewed_selection()
+    {
+        for height in 1..=5 {
             let mut state = State::new(true, 80, height);
             state.prompt_enabled = true;
             state.insert("未提交\n\t保留缩进");
@@ -17603,7 +17735,10 @@ mod tests {
             }
             assert_eq!(state.editor.draft(), "preserved input");
             if height == 2 {
-                assert!(output.contains("Resize terminal"), "{output}");
+                assert!(
+                    output.contains("Resize") && output.contains("Esc back"),
+                    "{output}"
+                );
             }
             assert!(!output.contains("Auto-scroll off"), "{output}");
         }

@@ -61,7 +61,7 @@ fn the_open_picker_owns_every_key_and_cancelling_restores_the_same_screen_and_dr
     let menu_id = picker.id();
     state.conversation_picker = Some(picker);
     let opened = screen(&mut state);
-    assert_eq!(opened.len(), 8);
+    assert_eq!(opened.len(), 10);
     assert!(opened[1].starts_with("Resume Chat · 1 of 3"), "{opened:?}");
     assert_eq!(opened[2], "⌕ Search…");
     assert!(opened[3].starts_with("❯ 请分析腾讯控股") && opened[3].ends_with('…'));
@@ -283,7 +283,7 @@ fn dismissing_the_menu_clears_the_picker_and_returns_keys_to_the_editor() {
     state.conversation_picker = Some(picker);
     let tiny = screen(&mut state);
     assert_eq!(tiny.len(), 1);
-    assert_eq!(tiny[0], "❯ 请分析腾讯控股最近三个季度的财报，…");
+    assert_eq!(tiny[0], "Resize · Esc back");
     assert!(!state.clear_menu(Uuid::new_v4()));
     assert!(state.conversation_picker.is_some());
     assert!(state.clear_menu(menu_id));

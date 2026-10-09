@@ -616,6 +616,32 @@ impl<Restore> TaskSurface<Restore> {
         true
     }
 
+    pub fn content_rows(&self, width: usize, limit: usize) -> usize {
+        match self.focus {
+            TaskSurfaceFocus::List => (self.tasks.len().max(1)
+                + usize::from(self.unavailable_task_id.is_some()))
+            .min(limit),
+            TaskSurfaceFocus::Detail { task_id } => {
+                let Some(task) = self.task(task_id) else {
+                    return 2.min(limit);
+                };
+                let empty = DetailState::default();
+                let detail = self.detail_states.get(&task_id).unwrap_or(&empty);
+                let layout = DetailLayout::new(task, self.chat_id, detail, width);
+                let mut rows = 0usize;
+                layout.visit(&mut |line| {
+                    rows = rows
+                        .saturating_add(
+                            measure_wrapped(line.bytes, layout.width, None).segment_count,
+                        )
+                        .min(limit);
+                    rows < limit
+                });
+                rows
+            }
+        }
+    }
+
     pub fn frame(&mut self, viewport: TaskViewport) -> TaskSurfaceFrame {
         self.normalize_selection(Some(viewport.height));
         match self.focus {

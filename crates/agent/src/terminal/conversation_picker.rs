@@ -389,6 +389,10 @@ impl ConversationPicker {
     /// Draws the whole screen: title, search field, conversations and, after them, the key
     /// hint, each row cut to `width` columns. Short screens drop the purpose line, then the
     /// title and hint, and keep the selected conversation and the search field.
+    pub(super) fn content_rows(&self) -> usize {
+        3 + (self.matches.len() * ENTRY_ROWS).max(1)
+    }
+
     pub(super) fn frame_in_dialog(
         &mut self,
         width: usize,
