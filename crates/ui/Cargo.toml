@@ -7,6 +7,7 @@ publish.workspace = true
 
 [lib]
 name = "tickloop_ui"
+doctest = false
 
 [dependencies]
 pulldown-cmark = "0.13"

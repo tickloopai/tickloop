@@ -179,11 +179,11 @@ Agent 通过一个 `CallTickTool` 调用声明的能力。`SubscribeTick` 属于
 ```sh
 cargo fmt --all --check
 cargo check --workspace --all-targets
-cargo test --locked --workspace
+cargo nextest run --locked --workspace
 cargo clippy --locked --workspace --all-targets -- -D warnings
 ```
 
-`make check` 执行格式、严格 Clippy 和整仓测试，并为测试使用隔离状态目录、清除继承的 Herdr 调用者环境。测试的本地 HTTP mock 使用 NO_PROXY，避免开发机代理干扰回环请求。
+整仓测试由 cargo-nextest 运行（`cargo install --locked cargo-nextest`），每个测试独立进程，慢测试超时与 PTY 分组见 `.config/nextest.toml`。`make check` 执行格式、严格 Clippy 和整仓测试（`make test`），并为测试使用隔离状态目录、清除继承的 Herdr 调用者环境。测试的本地 HTTP mock 使用 NO_PROXY，避免开发机代理干扰回环请求。
 
 主要测试入口是 Agent 工具与权限、Tick Subscription 驱动 Loop。真实 stdio 子进程和 PTY 验证协议、可见界面与终端恢复；隔离 Herdr 验证完整 Console 的双向操作。可复核步骤和当前结果见[实施记录](.scratch/herdr-workspace/implementation.md)。
 

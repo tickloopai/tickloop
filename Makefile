@@ -31,12 +31,13 @@ package:
 	@printf 'Package: %s\n' "$(PACKAGE_ARCHIVE)"
 
 test:
+	@cargo nextest --version >/dev/null 2>&1 || { echo 'make test requires cargo-nextest; install it with: cargo install --locked cargo-nextest' >&2; exit 1; }
 	@mkdir -p /tmp/tickloop-test
 	TICKLOOP_CONFIG_DIR=$$(mktemp -d /tmp/tickloop-test/config.XXXXXX) \
 	TICKLOOP_TMPDIR=$$(mktemp -d /tmp/tickloop-test/tmp.XXXXXX) \
 	NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost \
 	env $$(env | grep -o '^HERDR_[A-Za-z0-9_]*' | sed 's/^/-u /') \
-	cargo test --locked --workspace --no-fail-fast
+	cargo nextest run --locked --workspace --no-fail-fast
 
 check:
 	cargo fmt --all --check

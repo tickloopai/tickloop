@@ -7,6 +7,7 @@ publish.workspace = true
 
 [lib]
 name = "tick_host"
+doctest = false
 
 [dependencies]
 libc = "0.2"

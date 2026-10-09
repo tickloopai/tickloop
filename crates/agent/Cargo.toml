@@ -6,6 +6,9 @@ publish = false
 default-run = "tickloop"
 autobins = false
 
+[lib]
+doctest = false
+
 [[bin]]
 name = "tickloop"
 path = "src/main.rs"
