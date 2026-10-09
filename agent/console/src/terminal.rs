@@ -644,18 +644,31 @@ async fn connect_startup_daemon(
         .await
         .map_err(|reason| format!("{error}\n\n{reason}"))?
         .ok_or("The Agent daemon changed before confirmation; launch tickloop again.")?;
+    let running_executable = mismatch.running_executable.clone();
+    let mut context = vec![
+        "A different Tick Loop version is running.".into(),
+        safe_text(&mismatch.description),
+        "Stopping it stops all running Agents. Saved history is kept. Ticks keep running.".into(),
+        "After stopping, this version opens automatically with your current startup options."
+            .into(),
+    ];
+    let mut options = vec!["Stop daemon and open this version".into()];
+    if let Some(running) = &running_executable {
+        context.push(format!(
+            "Or open the running version from {}; its Agents keep running.",
+            safe_text(&running.display().to_string())
+        ));
+        options.push("Open the running version — keep running Agents".into());
+    }
+    options.push("Cancel — keep running Agents".into());
+    let cancel_index = options.len() - 1;
     let menu_id = uuid::Uuid::new_v4();
     let menu = console::Menu {
         id: menu_id,
         title: "Stop the running daemon and continue?".into(),
-        context: vec![
-            "A different Tick Loop version is running.".into(),
-            safe_text(&mismatch.description),
-            "This stops all running Agents. Saved history is kept. Ticks keep running.".into(),
-            "After confirmation, this version opens automatically with your current startup options.".into(),
-        ],
-        options: vec!["Stop daemon and open this version".into(), "Cancel — keep running Agents".into()],
-        selected: 1,
+        context,
+        options,
+        selected: cancel_index,
         confirmation: true,
     };
     if let Some((console, _)) = startup_console.as_ref() {
@@ -668,24 +681,38 @@ async fn connect_startup_daemon(
     let (console, input) = startup_console
         .as_mut()
         .expect("startup console initialized");
-    let confirmed = loop {
+    let choice = loop {
         let event = tokio::select! {
             event = input.recv() => event,
-            _ = tokio::signal::ctrl_c() => break false,
+            _ = tokio::signal::ctrl_c() => break cancel_index,
         };
         match event {
             Some(InputEvent::Choice {
                 menu_id: id, index, ..
-            }) if id == menu_id => break index == 0,
-            Some(InputEvent::Cancel { menu_id: id }) if id == menu_id => break false,
-            Some(InputEvent::Eof | InputEvent::Interrupt) | None => break false,
+            }) if id == menu_id => break index,
+            Some(InputEvent::Cancel { menu_id: id }) if id == menu_id => break cancel_index,
+            Some(InputEvent::Eof | InputEvent::Interrupt) | None => break cancel_index,
             Some(InputEvent::Error(error)) => return Err(error),
             _ => {}
         }
     };
     console.clear_menu(menu_id)?;
-    if !confirmed {
+    if choice == cancel_index {
         return Ok(None);
+    }
+    if choice != 0
+        && let Some(running) = running_executable
+    {
+        use std::os::unix::process::CommandExt;
+        // The running build's own View takes over this terminal with the same arguments.
+        drop(startup_console.take());
+        let error = std::process::Command::new(&running)
+            .args(std::env::args_os().skip(1))
+            .exec();
+        return Err(format!(
+            "Cannot open the running version {}: {error}",
+            running.display()
+        ));
     }
     console.set_status("Stopping the previous Agent daemon…")?;
     prepared.stop().await?;

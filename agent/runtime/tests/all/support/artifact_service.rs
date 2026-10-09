@@ -51,6 +51,8 @@ pub struct ServiceControl {
     pub server_name: Mutex<Option<String>>,
     pub directory_revision: AtomicUsize,
     pub omit_comment_tool: AtomicBool,
+    /// Answers a creation with the catalog's stored format names, as deployed services do.
+    pub catalog_format_names: AtomicBool,
     pub drop_call_response: AtomicBool,
     pub fail_link: AtomicBool,
     pub links: Mutex<BTreeMap<String, Link>>,
@@ -132,7 +134,16 @@ fn call_tool(control: &ServiceControl, origin: &str, params: &Value) -> Value {
         }
         ("ArtifactRead", _) => json!({"items":[],"next_cursor":null}),
         ("ArtifactEdit", "create") => {
-            json!({"artifact_id":CREATED_ARTIFACT,"title":arguments["title"],"format":arguments["format"],"url":artifact_url(origin, CREATED_ARTIFACT),"revision":0})
+            let format = match arguments["format"].as_str() {
+                Some("doc") if control.catalog_format_names.load(Ordering::SeqCst) => {
+                    json!("markdown")
+                }
+                Some("design") if control.catalog_format_names.load(Ordering::SeqCst) => {
+                    json!("html")
+                }
+                _ => arguments["format"].clone(),
+            };
+            json!({"artifact_id":CREATED_ARTIFACT,"title":arguments["title"],"format":format,"url":artifact_url(origin, CREATED_ARTIFACT),"revision":0})
         }
         ("ArtifactEdit", "patch") => {
             json!({"artifact_id":artifact_id,"revision":4,"changed":[{"id":"b1","hash":"h2"}]})

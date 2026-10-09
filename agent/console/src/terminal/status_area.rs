@@ -602,15 +602,15 @@ impl StatusArea {
         lines
     }
 
-    /// When time alone next changes the open Subagents list: a working member's dot blinking or
-    /// its run time ticking, or another member's age. `None` while the list is closed.
-    pub(super) fn next_frame_ms(&self, now: u64, display: DisplayProfile) -> Option<u64> {
+    /// When time alone next changes the open Subagents list: a working member's run time ticking,
+    /// or another member's age. `None` while the list is closed.
+    pub(super) fn next_frame_ms(&self, now: u64) -> Option<u64> {
         if !self.is_open() {
             return None;
         }
         self.visible_agents()
             .into_iter()
-            .filter_map(|row| super::subagent_panel::next_change_ms(row, display, now))
+            .filter_map(|row| super::subagent_panel::next_change_ms(row, now))
             .min()
     }
 
@@ -909,10 +909,15 @@ mod tests {
         };
         assert_eq!(dot(161_000).text, "●", "the viewed member's dot is filled");
         assert_eq!(dot(161_000).role, Some(Role::RunningMark));
-        assert_eq!(dot(161_500).role, Some(Role::RunningMarkDim), "it blinks");
         assert_eq!(
-            area.next_frame_ms(161_100, DisplayProfile::default()),
-            Some(161_500)
+            dot(161_500).role,
+            Some(Role::RunningMark),
+            "it never blinks"
+        );
+        assert_eq!(
+            area.next_frame_ms(161_100),
+            Some(162_000),
+            "only the run time ticks"
         );
         rows[1].group = AttentionGroup::Waiting;
         rows[1].state = tickloop_agent_protocol::LoopState::WaitingTrigger;
@@ -1540,7 +1545,7 @@ mod tests {
             }
         }
         assert_eq!(
-            area.next_frame_ms(70_000, DisplayProfile::default()),
+            area.next_frame_ms(70_000),
             Some(71_000),
             "the ages tick each second"
         );

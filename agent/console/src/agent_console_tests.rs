@@ -31,6 +31,8 @@ async fn serve_overview_stub(listener: UnixListener, epoch: Uuid, rows: serde_js
             session_id: Uuid::new_v4(),
             capabilities: Vec::new(),
             limits: TRANSPORT_LIMITS.into(),
+            build: None,
+            executable: None,
         }),
         HANDSHAKE_FRAME_BYTES,
     )

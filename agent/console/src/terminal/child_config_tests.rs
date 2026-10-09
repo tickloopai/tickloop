@@ -1046,7 +1046,9 @@ fn shift_tab_in_the_overview_changes_no_hidden_agent_and_the_root_keeps_its_key(
 
     view.send(b"\x1b");
     view.wait_for("the root with its periodic status", |frame| {
-        frame.contains("parent done") && !frame.contains("shift+tab mode isn't available")
+        frame.contains("parent done")
+            && !frame.contains("Agents · local")
+            && !frame.contains("shift+tab mode isn't available")
     });
     view.send(b"\x1b[D");
     view.wait_for("the overview list again", |frame| {

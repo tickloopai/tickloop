@@ -5,6 +5,7 @@ use crossterm::style::Stylize;
 const TERMINAL_WORKER_THREADS: usize = 2;
 
 fn main() {
+    tickloop_agent::name_this_build();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(TERMINAL_WORKER_THREADS)
         .enable_all()

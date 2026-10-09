@@ -268,3 +268,168 @@ fn incompatible_daemon_terminal_offers_cancel_without_stopping() {
     assert!(output.contains("Stop daemon and open this version"));
     assert!(output.contains("Cancel"));
 }
+
+fn accept_within(listener: &UnixListener, label: &str) -> std::os::unix::net::UnixStream {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                return stream;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(std::time::Instant::now() < deadline, "{label}");
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("{error}"),
+        }
+    }
+}
+
+fn read_json_frame(stream: &mut std::os::unix::net::UnixStream) -> serde_json::Value {
+    let mut header = [0u8; 4];
+    stream.read_exact(&mut header).unwrap();
+    let mut request = vec![0u8; u32::from_be_bytes(header) as usize];
+    stream.read_exact(&mut request).unwrap();
+    serde_json::from_slice(&request).unwrap()
+}
+
+fn write_json_frame(stream: &mut std::os::unix::net::UnixStream, value: &serde_json::Value) {
+    let response = serde_json::to_vec(value).unwrap();
+    stream
+        .write_all(&(response.len() as u32).to_be_bytes())
+        .unwrap();
+    stream.write_all(&response).unwrap();
+    stream.flush().unwrap();
+}
+
+/// A daemon of the same protocol but another build is a different version too; choosing to open
+/// the running version replaces this View with that daemon's executable and its arguments, and
+/// never stops the daemon.
+#[test]
+fn another_build_of_the_daemon_can_open_its_own_view_without_stopping() {
+    let fixture = support::runtime_dir();
+    let root = fixture.path().canonicalize().unwrap();
+    let runtime = root.join("runtime");
+    std::fs::create_dir(&runtime).unwrap();
+    std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let opened = root.join("opened-arguments");
+    let running_view = root.join("running-tickloop");
+    std::fs::write(
+        &running_view,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n",
+            opened.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&running_view, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let socket = runtime.join("daemon.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let announced_view = running_view.clone();
+    let daemon = thread::spawn(move || {
+        let mut stream = accept_within(&listener, "the View never connected");
+        assert!(read_json_frame(&mut stream).get("Hello").is_some());
+        let hello = tickloop_agent_protocol::ServerHello {
+            process_id: std::process::id(),
+            major: tickloop_agent_protocol::PROTOCOL_MAJOR,
+            minor: tickloop_agent_protocol::PROTOCOL_MINOR,
+            daemon_epoch: uuid::Uuid::new_v4(),
+            session_id: uuid::Uuid::new_v4(),
+            capabilities: Vec::new(),
+            limits: tickloop_agent_protocol::AccessLimits::DEFAULT.into(),
+            build: Some("0.0.0+another-build".into()),
+            executable: Some(announced_view),
+        };
+        write_json_frame(&mut stream, &json!({ "Hello": hello }));
+        let mut rest = Vec::new();
+        stream.read_to_end(&mut rest).unwrap();
+        assert!(
+            rest.is_empty(),
+            "no command may follow another build's Hello"
+        );
+        let mut control = accept_within(&listener, "no management handshake");
+        assert_eq!(
+            read_json_frame(&mut control),
+            json!({"Hello":{"major":1,"minor":0}})
+        );
+        write_json_frame(
+            &mut control,
+            &json!({"Hello":{"major":1,"minor":0,"daemon_epoch":uuid::Uuid::new_v4()}}),
+        );
+        let mut rest = Vec::new();
+        control.read_to_end(&mut rest).unwrap();
+        assert!(
+            rest.is_empty(),
+            "opening the running version must not stop it"
+        );
+    });
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 32,
+            cols: 120,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+    let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_tickloop"));
+    command.args(["--working-directory-is-trusted", "--continue"]);
+    command.cwd(&root);
+    command.env_clear();
+    command.env("PATH", "/usr/bin:/bin");
+    command.env("HOME", &root);
+    command.env("TERM", "xterm-256color");
+    command.env("TICKLOOP_CONFIG_DIR", root.join("config"));
+    command.env("TICKLOOP_DAEMON_RUNTIME_DIR", &runtime);
+    let mut child = pair.slave.spawn_command(command).unwrap();
+    drop(pair.slave);
+    let mut reader = pair.master.try_clone_reader().unwrap();
+    let mut writer = pair.master.take_writer().unwrap();
+    let reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let mut answered = false;
+        while let Ok(count) = reader.read(&mut chunk) {
+            if count == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&chunk[..count]);
+            if !answered
+                && String::from_utf8_lossy(&bytes)
+                    .contains("Open the running version — keep running Agents")
+            {
+                // Up from the preselected Cancel to the running version, then confirm.
+                writer.write_all(b"\x1b[A").unwrap();
+                writer.flush().unwrap();
+                thread::sleep(Duration::from_millis(200));
+                writer.write_all(b"\r").unwrap();
+                writer.flush().unwrap();
+                answered = true;
+            }
+        }
+        String::from_utf8_lossy(&bytes).replace('\r', "")
+    });
+    assert_eq!(child.wait().unwrap().exit_code(), 0);
+    drop(pair.master);
+    let output = reader.join().unwrap();
+    daemon.join().unwrap();
+    assert!(
+        output.contains("Running daemon build 0.0.0+another-build"),
+        "{output}"
+    );
+    assert!(
+        output.contains("Stop daemon and open this version"),
+        "{output}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&opened).unwrap(),
+        "--working-directory-is-trusted\n--continue\n",
+        "{output}"
+    );
+    assert!(socket.exists(), "the running daemon keeps its socket");
+}

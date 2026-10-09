@@ -549,10 +549,11 @@ impl McpHostToolProvider {
             return None;
         }
         let title = structured.get("title")?.as_str()?;
-        // The tool contract names types by intent; the catalog keeps its stored format names.
+        // The tool contract names types by intent and the catalog by its stored format names;
+        // a service may answer with either.
         let format = match structured.get("format")?.as_str()? {
-            "doc" => "markdown",
-            "design" => "html",
+            "doc" | "markdown" => "markdown",
+            "design" | "html" => "html",
             _ => return None,
         };
         let url = structured.get("url")?.as_str()?;

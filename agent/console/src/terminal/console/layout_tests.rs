@@ -3070,7 +3070,7 @@ fn agent_layout_creation_cue_uses_the_existing_status_row_at_supported_sizes() {
             let label = format!("{width}×{height} {configured:?}: {frame:#?}");
             let cue = frame
                 .iter()
-                .find(|line| line.starts_with("Created !pwd (2)"))
+                .find(|line| line.contains("Created !pwd (2)"))
                 .unwrap_or_else(|| panic!("{label}"));
             assert!(cue.contains("hidden by"), "{label}");
             assert!(display_width(cue) <= usize::from(width), "{label}");
@@ -3452,7 +3452,7 @@ fn agent_layout_real_pty_accepted_dispatch_cue_keeps_the_monitored_filter_and_se
         let frame = terminal.wait_for("visible accept cue", |frame| {
             frame
                 .lines()
-                .any(|line| line.starts_with("Created !pwd (2)") && line.contains("hidden by"))
+                .any(|line| line.contains("Created !pwd (2)") && line.contains("hidden by"))
         });
         eprintln!("Console PTY {label}: accepted hidden dispatch\n{frame}");
         assert!(monitoring_bravo(&frame), "{label}: {frame}");
@@ -3483,7 +3483,7 @@ fn agent_layout_real_pty_accepted_dispatch_cue_keeps_the_monitored_filter_and_se
             frame.contains("Project: all")
                 && frame
                     .lines()
-                    .any(|line| line.starts_with("Created !pwd (2) · Completed"))
+                    .any(|line| line.ends_with("Created !pwd (2) · Completed"))
         });
         eprintln!("Console PTY {label}: filter cleared, created row identified\n{frame}");
         let tree = frame

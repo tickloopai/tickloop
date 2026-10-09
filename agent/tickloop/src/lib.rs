@@ -7,6 +7,11 @@ use tickloop_agent_daemon::{WORKER_ARGUMENT, daemon_control, run_daemon, run_wor
 
 const MONITOR_COMMAND: &str = "monitor";
 
+/// Names this build, from its sources, for the comparison between a View and the running daemon.
+pub fn name_this_build() {
+    tickloop_agent_protocol::set_build_identity(env!("TICKLOOP_BUILD_IDENTITY"));
+}
+
 /// Runs the process entry `arguments` name, or returns `None` when they name none and the
 /// Console should start.
 pub async fn run_internal(arguments: &[OsString]) -> Option<Result<(), String>> {

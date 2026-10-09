@@ -29,6 +29,7 @@ crossterm = "0.29"
 tickloop-agent-client = { path = "../client" }
 tickloop-agent-console = { path = "../console" }
 tickloop-agent-daemon = { path = "../daemon" }
+tickloop-agent-protocol = { path = "../protocol" }
 tokio = { version = "1", features = ["full"] }
 
 [dev-dependencies]
@@ -49,7 +50,6 @@ tempfile = "3"
 tickloop-agent-artifacts = { path = "../artifacts" }
 tickloop-agent-config = { path = "../config" }
 tickloop-agent-model = { path = "../model" }
-tickloop-agent-protocol = { path = "../protocol" }
 tickloop-agent-runtime = { path = "../runtime" }
 tickloop-agent-test-support = { path = "../test-support" }
 tickloop-tick-protocol = { path = "../../tick/protocol" }

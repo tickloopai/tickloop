@@ -1484,6 +1484,43 @@ async fn relinking_an_artifact_keeps_it_in_the_loop_that_holds_it() {
 }
 
 #[tokio::test]
+async fn a_creation_answered_with_catalog_format_names_still_joins_monitor() {
+    let service = ArtifactService::start().await;
+    service
+        .control
+        .catalog_format_names
+        .store(true, Ordering::SeqCst);
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "create",
+            "ArtifactEdit",
+            json!({"action":"create","title":"Board","format":"design","content":"<h1>Board</h1>"}),
+        ),
+        text("Created."),
+    ]));
+    let agent = signed_in_agent(&service, directory.path(), model).await;
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    agent
+        .submit(chat, None, "Mock up a board".into())
+        .await
+        .unwrap();
+    eventually(async || {
+        !agent
+            .snapshot(chat)
+            .await
+            .unwrap()
+            .artifact_ticks
+            .is_empty()
+    })
+    .await;
+    let snapshot = agent.snapshot(chat).await.unwrap();
+    assert_eq!(snapshot.artifact_ticks[0].format, "html");
+    assert_eq!(snapshot.artifact_ticks[0].title, "Board");
+    agent.shutdown().await;
+}
+
+#[tokio::test]
 async fn a_created_artifact_joins_monitor_and_links_to_the_creating_loop() {
     let service = ArtifactService::start().await;
     let directory = tempfile::tempdir().unwrap();

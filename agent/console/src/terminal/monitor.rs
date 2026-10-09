@@ -500,12 +500,13 @@ impl Monitor {
         } else {
             "Monitor".into()
         };
+        // The column's title stands out from its muted group headings.
         let mut lines = vec![RoleLine::role(
             heading,
             if self.focused {
-                Role::Text
+                Role::Title
             } else {
-                Role::MutedText
+                Role::Text
             },
         )];
 

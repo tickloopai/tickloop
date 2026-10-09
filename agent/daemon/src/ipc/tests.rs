@@ -170,6 +170,8 @@ async fn a_hello_announcing_unusable_limits_is_an_incompatible_peer() {
                 session_id: Uuid::new_v4(),
                 capabilities: Vec::new(),
                 limits,
+                build: None,
+                executable: None,
             }),
             HANDSHAKE_FRAME_BYTES,
         )
@@ -464,6 +466,8 @@ async fn cancelling_a_backpressured_lookup_keeps_the_live_request_frame_whole() 
                 session_id: Uuid::new_v4(),
                 capabilities: Vec::new(),
                 limits: AccessLimits::DEFAULT.into(),
+                build: None,
+                executable: None,
             }),
             HANDSHAKE_FRAME_BYTES,
         )
@@ -587,6 +591,8 @@ async fn dropped_opened_feed_cannot_keep_a_backpressured_client_alive() {
                     session_id: Uuid::new_v4(),
                     capabilities: Vec::new(),
                     limits: AccessLimits::DEFAULT.into(),
+                    build: None,
+                    executable: None,
                 }),
                 HANDSHAKE_FRAME_BYTES,
             )
@@ -699,6 +705,8 @@ async fn backpressured_observation_write_stops_on_eof_or_last_client_drop() {
                     session_id: Uuid::new_v4(),
                     capabilities: Vec::new(),
                     limits: AccessLimits::DEFAULT.into(),
+                    build: None,
+                    executable: None,
                 }),
                 HANDSHAKE_FRAME_BYTES,
             )
@@ -1146,6 +1154,8 @@ async fn a_reply_written_before_the_daemon_closed_survives_a_failed_write() {
                 session_id: Uuid::new_v4(),
                 capabilities: Vec::new(),
                 limits: TRANSPORT_LIMITS.into(),
+                build: None,
+                executable: None,
             }),
         );
         let ClientMessage::ShutdownDaemon { request_id, .. } = read(&mut stream) else {

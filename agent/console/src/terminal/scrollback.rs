@@ -932,8 +932,8 @@ impl Scrollback {
                 line,
                 style,
                 0,
-                previous.spinner_frame(0),
-                next.spinner_frame(0),
+                previous.glyph(Glyph::AgentRunning),
+                next.glyph(Glyph::AgentRunning),
                 Role::Accent,
             );
         }

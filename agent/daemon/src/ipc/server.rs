@@ -258,6 +258,8 @@ pub(super) async fn serve_connection_mode(
             session_id,
             capabilities,
             limits: limits.into(),
+            build: tickloop_agent_protocol::build_identity().map(str::to_owned),
+            executable: std::env::current_exe().ok(),
         }),
         HANDSHAKE_FRAME_BYTES,
     )

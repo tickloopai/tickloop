@@ -130,6 +130,9 @@ const DIVIDER_EDGE_RULE_COLUMNS: usize = 1;
 const DIVIDER_ENTRY_GAP_COLUMNS: usize = 1;
 const CREATION_ATTACH_UNAVAILABLE_PREFIX: &str = "New Agent created; local connection unavailable";
 const EXECUTION_CONNECTION_DETAILS_HINT: &str = "ctrl+o details";
+const HINT_SEGMENT_SEPARATOR: &str = " · ";
+/// Blank columns between the key hints and the right-aligned notice.
+const HINT_NOTICE_GAP_COLUMNS: usize = 2;
 const SHELL_INPUT_PROMPT: &str = "!";
 pub(super) const CHECKED_OPTION: &str = "[x] ";
 pub(super) const UNCHECKED_OPTION: &str = "[ ] ";
@@ -1043,6 +1046,37 @@ fn status_notice_line(
             line.spans.extend(background.line(available).spans);
         }
     }
+    line.filled(Role::StatusBar)
+}
+
+/// Key hints hold the left of the hint row and the notice its right edge. The notice wins the
+/// width: hints give up whole segments from their end, and the notice stands alone at the left
+/// once not even the first segment fits beside it.
+fn hints_beside_notice(hints: &str, notice: RoleLine, width: usize) -> RoleLine {
+    let notice_width = display_width(&notice.text());
+    if notice_width == 0 {
+        return RoleLine::role(hints, Role::StatusBar);
+    }
+    let mut segments = hints
+        .split(HINT_SEGMENT_SEPARATOR)
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    while !segments.is_empty()
+        && display_width(&segments.join(HINT_SEGMENT_SEPARATOR))
+            + HINT_NOTICE_GAP_COLUMNS
+            + notice_width
+            > width
+    {
+        segments.pop();
+    }
+    if segments.is_empty() {
+        return notice;
+    }
+    let kept_hints = segments.join(HINT_SEGMENT_SEPARATOR);
+    let gap = width - display_width(&kept_hints) - notice_width;
+    let mut line = RoleLine::role(kept_hints, Role::StatusBar);
+    line.push(" ".repeat(gap), None);
+    line.spans.extend(notice.spans);
     line.filled(Role::StatusBar)
 }
 
@@ -5521,7 +5555,7 @@ impl State {
             .then(|| self.monitor.next_frame_ms(now_ms, self.display))
             .flatten();
         let panel = (!self.full_review && self.transcript.is_none())
-            .then(|| self.status_area.next_frame_ms(now_ms, self.display))
+            .then(|| self.status_area.next_frame_ms(now_ms))
             .flatten();
         monitor.into_iter().chain(panel).min()
     }
@@ -6437,6 +6471,14 @@ impl State {
         (lines, cursor.0, cursor.1)
     }
 
+    /// The warning glyph leading the hint row's notice while a connection fact is in it; the
+    /// fact keeps the columns when both do not fit.
+    fn connection_warning_prefix(&self) -> Option<String> {
+        (self.connection_notice.is_some()
+            || self.execution_connection_notice.is_some() && self.overview.projection.is_none())
+        .then(|| format!("{} ", self.display.glyph(Glyph::Warning)))
+    }
+
     fn leading_status_notice(&self, width: usize) -> String {
         let creation_cue = (!self.help_open)
             .then(|| self.overview.orientation_cue(width))
@@ -6559,7 +6601,16 @@ impl State {
         background: Option<&BackgroundStatusNotice>,
         pending: Option<&str>,
     ) -> RoleLine {
-        let mut line = status_notice_line(notice, background, pending, self.width);
+        let prefix = self.connection_warning_prefix().filter(|prefix| {
+            !notice.is_empty() && display_width(prefix) + display_width(notice) <= self.width
+        });
+        let prefix_width = prefix.as_ref().map_or(0, |prefix| display_width(prefix));
+        let mut line = status_notice_line(
+            notice,
+            background,
+            pending,
+            self.width.saturating_sub(prefix_width),
+        );
         if self.execution_connection_notice.is_some()
             && self.connection_notice.is_none()
             && self.overview.projection.is_none()
@@ -6571,6 +6622,16 @@ impl State {
             {
                 span.role = Some(Role::Warning);
             }
+        }
+        if let Some(prefix) = prefix {
+            line.spans.insert(
+                0,
+                RoleSpan {
+                    text: prefix,
+                    role: Some(Role::Warning),
+                    link: None,
+                },
+            );
         }
         line
     }
@@ -7168,7 +7229,6 @@ impl State {
             } else {
                 let mut notice_line =
                     self.connection_status_line(&notice, background, compact_pending.as_deref());
-                notice = notice_line.text();
                 let overview_list_hint;
                 let return_hint;
                 let monitor_hint;
@@ -7225,28 +7285,34 @@ impl State {
                 } else {
                     "enter send · ctrl+g editor · ctrl+c clear"
                 };
-                if notice.is_empty() {
+                if self.execution_connection_notice.is_some()
+                    && self.ordinary_input_is_visible()
+                    && !self.conversation_focused
+                    && !hints.contains(EXECUTION_CONNECTION_DETAILS_HINT)
+                    && display_width(&notice_line.text())
+                        + display_width(HINT_SEGMENT_SEPARATOR)
+                        + display_width(EXECUTION_CONNECTION_DETAILS_HINT)
+                        <= self.width
+                {
+                    notice_line.push(HINT_SEGMENT_SEPARATOR, Some(Role::MutedText));
+                    notice_line.push(EXECUTION_CONNECTION_DETAILS_HINT, Some(Role::MutedText));
+                }
+                // An overview refusal no key holds any more yields the row back to the hints.
+                let stale_overview_status =
+                    overview && leading_notice.is_empty() && !self.status_held;
+                if stale_overview_status
+                    && display_width(hints)
+                        + HINT_NOTICE_GAP_COLUMNS
+                        + display_width(&notice_line.text())
+                        > self.width
+                {
                     RoleLine::role(hints, Role::StatusBar)
-                } else if hints.is_empty() {
-                    notice_line
-                } else if overview && leading_notice.is_empty() && !self.status_held {
-                    RoleLine::role(format!("{hints} · {notice}"), Role::StatusBar)
-                } else if overview {
-                    RoleLine::role(
-                        Some(format!("{notice} · {hints}"))
-                            .filter(|text| display_width(text) <= self.width)
-                            .unwrap_or(notice),
-                        Role::StatusBar,
-                    )
                 } else {
-                    notice_line.push(" · ", Some(Role::MutedText));
-                    notice_line.push(hints, Some(Role::StatusBar));
-                    notice_line
+                    hints_beside_notice(hints, notice_line, self.width)
                 }
             };
             if self.execution_connection_notice.is_some()
-                && (core_in_hint_row
-                    || self.ordinary_input_is_visible() && !self.conversation_focused)
+                && core_in_hint_row
                 && !line.text().contains(EXECUTION_CONNECTION_DETAILS_HINT)
                 && display_width(&line.text())
                     + 3
@@ -9482,6 +9548,7 @@ impl State {
                     }
                 };
             }
+            let mut types_into_input = false;
             match (key.code, key.modifiers) {
                 (KeyCode::Char(crate::monitor_rows::MONITOR_ADD_KEY), KeyModifiers::NONE) => {
                     return self.open_monitor_discovery();
@@ -9503,6 +9570,18 @@ impl State {
                 | (KeyCode::Char('n'), KeyModifiers::CONTROL) => self.monitor.move_selection(1),
                 (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE)
                 | (KeyCode::Char('p'), KeyModifiers::CONTROL) => self.monitor.move_selection(-1),
+                // As in Claude Code's footer, a character the selected row does not bind leaves
+                // the list and is typed into the input instead of being swallowed.
+                (KeyCode::Char(character), KeyModifiers::NONE | KeyModifiers::SHIFT)
+                    if !self.monitor.selected().is_some_and(|entry| {
+                        entry.actions.iter().any(|action| action.key == character)
+                    }) =>
+                {
+                    self.monitor.focused = false;
+                    self.monitor.overlay = false;
+                    self.rendered_region = None;
+                    types_into_input = true;
+                }
                 (KeyCode::Enter, _) | (KeyCode::Char(_), KeyModifiers::NONE) => {
                     if let Some(entry) = self.monitor.selected().cloned() {
                         let action_key = match key.code {
@@ -9539,7 +9618,9 @@ impl State {
                 }
                 _ => {}
             }
-            return None;
+            if !types_into_input {
+                return None;
+            }
         }
         if self.visible_prompt_suggestion().is_some()
             && key.modifiers == KeyModifiers::NONE
@@ -15374,9 +15455,11 @@ mod tests {
         let start = Instant::now();
         refocus(&mut state, start);
         state.poll_clipboard_hint(start + Duration::from_secs(1));
-        assert_eq!(
-            status_line(&mut state),
-            "Cannot open Diff: disk full · Image in clipboard · ctrl+v to paste"
+        let line = status_line(&mut state);
+        assert!(
+            line.starts_with("Image in clipboard · ctrl+v to paste ")
+                && line.ends_with(" Cannot open Diff: disk full"),
+            "{line}"
         );
 
         state.request_exit('C');

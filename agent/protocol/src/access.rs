@@ -28,11 +28,26 @@ use crate::{
     UserShellReceipt, UserShellRecord,
 };
 
-/// Business 16.0 adds the Shell description request kind to the usage ledger.
+/// Business 16.0 adds the Shell description request kind to the usage ledger; 16.1 adds the
+/// daemon's build identity and executable to its Hello.
 /// Older business majors are refused before dispatch;
 /// the frozen daemon management protocol remains independent.
 pub const PROTOCOL_MAJOR: u16 = 16;
-pub const PROTOCOL_MINOR: u16 = 0;
+pub const PROTOCOL_MINOR: u16 = 1;
+
+static BUILD_IDENTITY: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+
+/// Records which build this process is, once, at its entry; the daemon announces it and a View
+/// compares it with the daemon's.
+pub fn set_build_identity(identity: &'static str) {
+    let _ = BUILD_IDENTITY.set(identity);
+}
+
+/// `None` in processes that never named their build, such as in-process tests, which then skip
+/// the comparison.
+pub fn build_identity() -> Option<&'static str> {
+    BUILD_IDENTITY.get().copied()
+}
 
 pub const REPLAY_CAPACITY: usize = 4096;
 pub const RECEIPT_CAPACITY: usize = 4096;
@@ -1096,6 +1111,12 @@ pub struct ServerHello {
     #[serde(default)]
     pub capabilities: Vec<AccessCapability>,
     pub limits: ProtocolLimits,
+    /// Absent from daemons older than 16.1 and from those that never named their build.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<String>,
+    /// The executable the daemon runs, which can open a View of the same build.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

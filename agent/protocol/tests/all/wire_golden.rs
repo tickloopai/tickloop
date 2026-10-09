@@ -853,6 +853,8 @@ fn server_messages_keep_their_recorded_wire() {
                     default_page_items: 100,
                     chunk_bytes: 4_194_304,
                 },
+                build: Some("0.2.0+00c0ffee00c0ffee".into()),
+                executable: Some("/opt/tickloop/bin/tickloop".into()),
             }),
             ServerMessage::Opened {
                 request_id: id(0x02),

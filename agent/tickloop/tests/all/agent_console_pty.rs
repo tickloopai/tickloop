@@ -2973,13 +2973,13 @@ async fn run_filter_hidden_dispatch(fixture: &PrivateFixture) {
     let frame = view
         .wait_for("visible accept cue for the hidden Agent", |frame| {
             frame.lines().any(|line| {
-                line.starts_with("Created !pwd (") && line.contains("hidden by Project filter")
+                line.contains("Created !pwd (") && line.contains("hidden by Project filter")
             })
         })
         .await;
     let cue = frame
         .lines()
-        .find(|line| line.starts_with("Created !pwd ("))
+        .find_map(|line| line.find("Created !pwd (").map(|start| &line[start..]))
         .unwrap();
     // The cue names the new Agent by its title and the reading number its row carries; no
     // execution hash appears. Opening that row below proves which execution the number names.
@@ -3065,7 +3065,7 @@ async fn run_filter_hidden_dispatch(fixture: &PrivateFixture) {
                     == 2
                     && frame
                         .lines()
-                        .any(|line| line.starts_with(&format!("Created {label} · ")))
+                        .any(|line| line.contains(&format!("Created {label} · ")))
             },
         )
         .await;

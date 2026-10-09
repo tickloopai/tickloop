@@ -16,8 +16,8 @@ fn display_width(text: &str) -> usize {
 }
 
 /// One member of the Subagents panel. The dot is filled for the member this View shows and
-/// hollow for the others; its colour is the member's state, blinking while it works, as the
-/// glyph of a Monitor row. The right side keeps only details: how long a working member has run,
+/// hollow for the others; its steady colour is the member's state, as the glyph of a Monitor row
+/// except that it never blinks. The right side keeps only details: how long a working member has run,
 /// how long ago any other member last changed state, or its waiting requests.
 pub(super) fn family_line(
     row: &AgentRow,
@@ -41,7 +41,7 @@ pub(super) fn family_line(
         Glyph::AgentUnviewed
     });
     let mut line = RoleLine::role(marker, identity.unwrap_or(role));
-    line.push(dot, Some(state_mark(row, display, now)));
+    line.push(dot, Some(state_mark(row)));
     line.push(" ", Some(role));
     if row.parent_id.is_none() && row.subagent.is_none() {
         line.push("main", Some(role));
@@ -118,11 +118,11 @@ pub(super) fn family_line(
     line
 }
 
-/// The colour of a member's dot: accent and blinking while it works, warning while it needs
+/// The colour of a member's dot: accent while it works, warning while it needs
 /// input or after it stopped, error after it failed, success after it completed, muted otherwise.
-fn state_mark(row: &AgentRow, display: DisplayProfile, now: u64) -> Role {
+fn state_mark(row: &AgentRow) -> Role {
     if row.group == AttentionGroup::Working {
-        return list_row::running_mark(display, now);
+        return Role::RunningMark;
     }
     match row.glyph_role() {
         Role::Success => Role::SuccessMark,
@@ -149,11 +149,15 @@ fn time_detail(row: &AgentRow, now: u64) -> String {
     }
 }
 
-/// When time alone next changes `row`'s line: its dot's next blink phase or the next second of
-/// its run while it works, otherwise the next change of its age.
-pub(super) fn next_change_ms(row: &AgentRow, display: DisplayProfile, now: u64) -> Option<u64> {
+/// When time alone next changes `row`'s line: the next second of its run while it works,
+/// otherwise the next change of its age.
+pub(super) fn next_change_ms(row: &AgentRow, now: u64) -> Option<u64> {
     if row.group == AttentionGroup::Working {
-        return Some(display.next_running_change_ms(now));
+        const SECOND: u64 = 1000;
+        return row.subagent.as_ref().map(|registration| {
+            let since = registration.created_at;
+            since + (now.saturating_sub(since) / SECOND + 1) * SECOND
+        });
     }
     let is_family_member = row.parent_id.is_some() || row.subagent.is_some();
     let shows_age = is_family_member && row.approvals + row.questions == 0;

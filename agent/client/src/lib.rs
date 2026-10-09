@@ -17,7 +17,7 @@ use std::{
     time::Instant,
 };
 
-use tickloop_agent_protocol::{AccessError, AccessErrorCode, PROTOCOL_MAJOR, PROTOCOL_MINOR};
+use tickloop_agent_protocol::{AccessErrorCode, PROTOCOL_MAJOR, PROTOCOL_MINOR};
 
 pub mod daemon_endpoint;
 pub mod daemon_management;
@@ -35,6 +35,8 @@ pub use local::{LocalAgentClient, negotiate};
 pub use recovering::{ReconnectFactory, RecoveringAgentClient, worker_link};
 
 pub const DAEMON_COMMAND: &str = "daemon";
+/// How a daemon older than 16.1, or one that never named its build, appears in a mismatch.
+const UNNAMED_DAEMON_BUILD: &str = "unknown (an older Tickloop)";
 pub const RUN_SUBCOMMAND: &str = "run";
 /// The hidden process entry of the daemon: it does not appear in `--help`, and names its role in
 /// `ps`.
@@ -51,6 +53,9 @@ pub struct DaemonStartupError {
 pub struct DaemonMismatch {
     pub directory: PathBuf,
     pub description: String,
+    /// The running daemon's executable when it is another file than this one, so a View of that
+    /// build can open instead of stopping the daemon.
+    pub running_executable: Option<PathBuf>,
     socket_identity: (u64, u64),
 }
 
@@ -193,20 +198,41 @@ async fn connect_existing(
     validate_socket(endpoint)?;
     let metadata = std::fs::symlink_metadata(endpoint).map_err(|error| error.to_string())?;
     let socket_identity = (metadata.dev(), metadata.ino());
+    let mismatch = |description: String, running_executable: Option<PathBuf>| DaemonStartupError {
+        message: incompatible_daemon_guidance(endpoint, executable, &description, own_startup),
+        mismatch: (!own_startup).then(|| DaemonMismatch {
+            directory: endpoint
+                .parent()
+                .expect("daemon runtime directory")
+                .to_owned(),
+            description,
+            running_executable,
+            socket_identity,
+        }),
+    };
     match tokio::time::timeout(STARTUP_DEADLINE, LocalAgentClient::connect(endpoint)).await {
-        Ok(Ok(client)) => Ok(Some(client)),
+        Ok(Ok(client)) => {
+            let Some(own_build) = tickloop_agent_protocol::build_identity() else {
+                return Ok(Some(client));
+            };
+            let hello = client.protocol();
+            if hello.build.as_deref() == Some(own_build) {
+                return Ok(Some(client));
+            }
+            let description = format!(
+                "Running daemon build {}; this build {own_build}",
+                hello.build.as_deref().unwrap_or(UNNAMED_DAEMON_BUILD)
+            );
+            let running_executable = hello
+                .executable
+                .clone()
+                .or_else(|| process_executable(hello.process_id))
+                .and_then(|path| path.canonicalize().ok())
+                .filter(|path| path.is_file() && path != executable);
+            Err(mismatch(description, running_executable))
+        }
         Ok(Err(error)) if error.code == AccessErrorCode::VersionMismatch => {
-            Err(DaemonStartupError {
-                message: incompatible_daemon_guidance(endpoint, executable, &error, own_startup),
-                mismatch: (!own_startup).then(|| DaemonMismatch {
-                    directory: endpoint
-                        .parent()
-                        .expect("daemon runtime directory")
-                        .to_owned(),
-                    description: error.message.clone(),
-                    socket_identity,
-                }),
-            })
+            Err(mismatch(error.message, None))
         }
         Ok(Err(error)) => {
             if matches!(error.code, AccessErrorCode::Unavailable)
@@ -226,10 +252,37 @@ async fn connect_existing(
     }
 }
 
+/// The executable a process runs, for daemons older than 16.1 that do not announce theirs.
+fn process_executable(process_id: u32) -> Option<PathBuf> {
+    if process_id == 0 {
+        return None;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        let mut buffer = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+        let length = unsafe {
+            libc::proc_pidpath(
+                process_id as libc::c_int,
+                buffer.as_mut_ptr().cast(),
+                buffer.len() as u32,
+            )
+        };
+        (length > 0).then(|| {
+            buffer.truncate(length as usize);
+            PathBuf::from(std::ffi::OsString::from_vec(buffer))
+        })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        std::fs::read_link(format!("/proc/{process_id}/exe")).ok()
+    }
+}
+
 fn incompatible_daemon_guidance(
     endpoint: &Path,
     executable: &Path,
-    error: &AccessError,
+    description: &str,
     own_startup: bool,
 ) -> String {
     let runtime = endpoint
@@ -241,10 +294,10 @@ fn incompatible_daemon_guidance(
         "Agent daemon version mismatch"
     };
     let details = format!(
-        "{title} (client {}.{}).\nProtocol: {}\nRuntime: {}\nExecutable: {}",
+        "{title} (client {}.{}).\nDaemon: {}\nRuntime: {}\nExecutable: {}",
         PROTOCOL_MAJOR,
         PROTOCOL_MINOR,
-        error.message,
+        description,
         runtime.display(),
         executable.display(),
     );

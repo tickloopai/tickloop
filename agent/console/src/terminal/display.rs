@@ -3,19 +3,30 @@ use tickloop_agent_config::{DisplayPreferences, GlyphSet};
 use super::style::{Theme, ThemeName};
 
 const UNICODE_SPINNER: [&str; 12] = ["·", "✢", "✳", "✶", "✻", "✽", "✽", "✻", "✶", "✳", "✢", "·"];
-const NERD_FONT_SPINNER: [&str; 12] = [
-    "\u{f0a9e}",
+const NERD_FONT_CIRCLE_EMPTY: &str = "\u{f0766}";
+const NERD_FONT_CIRCLE_SLICE_1: &str = "\u{f0a9e}";
+const NERD_FONT_CIRCLE_SLICE_5: &str = "\u{f0aa2}";
+/// Material Design circle slices filling from empty to full and draining back, holding each end
+/// for a frame as the Unicode spinner does.
+const NERD_FONT_SPINNER: [&str; 18] = [
+    NERD_FONT_CIRCLE_EMPTY,
+    NERD_FONT_CIRCLE_SLICE_1,
     "\u{f0a9f}",
     "\u{f0aa0}",
     "\u{f0aa1}",
-    "\u{f0aa2}",
+    NERD_FONT_CIRCLE_SLICE_5,
     "\u{f0aa3}",
     "\u{f0aa4}",
+    "\u{f0aa5}",
+    "\u{f0aa5}",
+    "\u{f0aa4}",
     "\u{f0aa3}",
-    "\u{f0aa2}",
+    NERD_FONT_CIRCLE_SLICE_5,
     "\u{f0aa1}",
     "\u{f0aa0}",
     "\u{f0a9f}",
+    NERD_FONT_CIRCLE_SLICE_1,
+    NERD_FONT_CIRCLE_EMPTY,
 ];
 
 /// How long a blinking glyph stays in each phase. Every blinking glyph takes its phase from the
@@ -144,11 +155,11 @@ impl DisplayProfile {
             (GlyphSet::NerdFont, Glyph::Success) => "\u{f05e1}",
             (GlyphSet::NerdFont, Glyph::Failure) => "\u{f015a}",
             (GlyphSet::NerdFont, Glyph::Warning) => "\u{f0026}",
-            (GlyphSet::NerdFont, Glyph::TurnSummary) => NERD_FONT_SPINNER[4],
+            (GlyphSet::NerdFont, Glyph::TurnSummary) => NERD_FONT_CIRCLE_SLICE_5,
             (GlyphSet::NerdFont, Glyph::ScrollUp) => "\u{f0143}",
             (GlyphSet::NerdFont, Glyph::ScrollDown) => "\u{f0140}",
             (GlyphSet::NerdFont, Glyph::AgentNeedsInput) => "\u{f173b}",
-            (GlyphSet::NerdFont, Glyph::AgentRunning) => NERD_FONT_SPINNER[0],
+            (GlyphSet::NerdFont, Glyph::AgentRunning) => NERD_FONT_CIRCLE_SLICE_1,
             (GlyphSet::NerdFont, Glyph::AgentWaiting) => "\u{f051f}",
             (GlyphSet::NerdFont, Glyph::AgentIdle) => "\u{f03e6}",
             (GlyphSet::NerdFont, Glyph::AgentCompleted) => "\u{f05e1}",
@@ -162,15 +173,19 @@ impl DisplayProfile {
         }
     }
 
+    /// Under Reduce motion every frame is the still running glyph.
     pub(super) fn spinner_frame(self, frame: usize) -> &'static str {
-        let frame = if self.preferences.prefers_reduced_motion {
-            0
-        } else {
-            frame % UNICODE_SPINNER.len()
-        };
+        if self.preferences.prefers_reduced_motion {
+            return self.glyph(Glyph::AgentRunning);
+        }
+        let frames = self.spinner_frames();
+        frames[frame % frames.len()]
+    }
+
+    fn spinner_frames(self) -> &'static [&'static str] {
         match self.preferences.glyph_set {
-            GlyphSet::Unicode => UNICODE_SPINNER[frame],
-            GlyphSet::NerdFont => NERD_FONT_SPINNER[frame],
+            GlyphSet::Unicode => &UNICODE_SPINNER,
+            GlyphSet::NerdFont => &NERD_FONT_SPINNER,
         }
     }
 
@@ -219,7 +234,7 @@ impl DisplayProfile {
             self.glyph(Glyph::ScrollUp),
             self.glyph(Glyph::ScrollDown),
         ];
-        glyphs.extend((0..UNICODE_SPINNER.len()).map(|frame| self.spinner_frame(frame)));
+        glyphs.extend((0..self.spinner_frames().len()).map(|frame| self.spinner_frame(frame)));
         glyphs.join("  ")
     }
 }
@@ -277,6 +292,26 @@ mod tests {
         assert_eq!(nerd_font.glyph(Glyph::Assistant), "\u{f06a9}");
         assert_eq!(nerd_font.glyph(Glyph::ToolResult), "\u{f060c}");
         assert_eq!(nerd_font.spinner_frame(7), "\u{f0a9e}");
+
+        let moving_nerd_font = DisplayProfile::new(DisplayPreferences {
+            glyph_set: GlyphSet::NerdFont,
+            prefers_reduced_motion: false,
+        });
+        let frames = (0..NERD_FONT_SPINNER.len())
+            .map(|frame| moving_nerd_font.spinner_frame(frame))
+            .collect::<Vec<_>>();
+        assert_eq!(frames.first(), Some(&"\u{f0766}"), "it starts empty");
+        assert_eq!(frames.last(), Some(&"\u{f0766}"), "it drains back to empty");
+        assert_eq!(
+            frames.iter().filter(|frame| **frame == "\u{f0aa5}").count(),
+            2,
+            "it holds the full circle for a frame"
+        );
+        assert_eq!(
+            moving_nerd_font.spinner_frame(NERD_FONT_SPINNER.len()),
+            "\u{f0766}",
+            "it loops"
+        );
     }
 
     #[test]

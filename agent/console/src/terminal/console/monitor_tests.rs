@@ -2027,8 +2027,9 @@ fn a_monitor_row_glyph_carries_its_state_and_blinks_while_it_runs() {
     failed.tone = StatusTone::Failed;
     let mut monitor = Monitor::default();
     monitor.replace(TickGroup::Shells, vec![running, failed]);
+    // Rows of equal standing order by their random ids, so only the Build-first sort is fixed.
     let glyph_role = |now_ms, display| {
-        monitor
+        let mut roles = monitor
             .lines(40, 10, display, now_ms)
             .iter()
             .filter_map(|line| {
@@ -2040,7 +2041,9 @@ fn a_monitor_row_glyph_carries_its_state_and_blinks_while_it_runs() {
                     .and_then(|span| span.role)?;
                 Some((title.contains("Build"), role))
             })
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        roles.sort_by_key(|(is_build, _)| !is_build);
+        roles
     };
     let display = DisplayProfile::default();
     assert_eq!(
@@ -2742,4 +2745,27 @@ async fn closing_the_detail_of_a_shell_stopped_from_it_marks_its_end_seen() {
     );
     std::fs::write(&gate, "").unwrap();
     core.shutdown().await;
+}
+
+#[test]
+fn a_character_the_focused_row_does_not_bind_is_typed_into_the_input() {
+    let mut state = monitor_state(140, vec![shell(Uuid::new_v4(), "Build")]);
+    state.monitor.focus(false, None);
+    assert!(state.monitor.focused);
+    assert!(
+        state
+            .key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE))
+            .is_some(),
+        "a key the row binds keeps its row action"
+    );
+    state.monitor.detail = None;
+    state.monitor.focus(false, None);
+    for (code, modifiers) in [
+        (KeyCode::Char('H'), KeyModifiers::SHIFT),
+        (KeyCode::Char('i'), KeyModifiers::NONE),
+    ] {
+        state.key(KeyEvent::new(code, modifiers));
+    }
+    assert!(!state.monitor.focused, "typing leaves the list");
+    assert_eq!(state.editor.draft(), "Hi");
 }

@@ -1,8 +1,9 @@
 //! A list row in the Subagents panel's look: a `›` marker on the selected row, a glyph whose
 //! colour is the row's state, the name, and right-aligned muted details. A row whose whole name
-//! does not fit beside its details moves them to a second, indented line.
+//! does not fit beside its details continues the name on a second line, under its first, and keeps
+//! the details at the right edge there, so details line up whatever a row's height.
 
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::{
     conversation_picker::ellipsize,
@@ -14,7 +15,6 @@ use crate::monitor_rows::{StatusTone, Unread};
 const SELECTED_MARKER: &str = "› ";
 const UNSELECTED_MARKER: &str = "  ";
 const STATUS_GAP_COLUMNS: usize = 2;
-const SECOND_LINE_INDENT: &str = "    ";
 const SEGMENT_SEPARATOR: &str = " · ";
 const MILLISECONDS_PER_SECOND: u64 = 1000;
 
@@ -51,13 +51,21 @@ impl ListRow<'_> {
         line
     }
 
-    /// Columns a one-line row needs beside its name: the marker, glyph, gap and status.
-    fn reserved_columns(&self) -> usize {
-        self.prefix().text().width() + STATUS_GAP_COLUMNS + status_columns(&self.status)
+    /// Columns a row's details take at its right, with the gap before them.
+    fn status_reserve(&self) -> usize {
+        match status_columns(&self.status) {
+            0 => 0,
+            columns => STATUS_GAP_COLUMNS + columns,
+        }
     }
 
-    /// The row's lines: one when the whole name fits beside the status, else the name and then the
-    /// status, so a name is never cut for its status.
+    /// Columns a one-line row needs beside its name: the marker, glyph and details.
+    fn reserved_columns(&self) -> usize {
+        self.prefix().text().width() + self.status_reserve()
+    }
+
+    /// The row's lines: one when the whole name fits beside the details, else two, with the name
+    /// running on into the second, so a name is never cut for its details while two lines hold it.
     pub(super) fn lines(&self, width: usize) -> Vec<RoleLine> {
         if self.reserved_columns() + self.name.width() <= width {
             vec![self.one_line(width)]
@@ -81,14 +89,21 @@ impl ListRow<'_> {
     }
 
     fn two_lines(&self, width: usize) -> [RoleLine; 2] {
-        let mut name = self.prefix();
-        let name_columns = width.saturating_sub(name.text().width());
-        name.push(ellipsize(self.name, name_columns), Some(self.role()));
-        let mut status = RoleLine::role(SECOND_LINE_INDENT, self.role());
+        let mut first = self.prefix();
+        let name_column = first.text().width();
+        let (head, tail) = split_at_columns(self.name, width.saturating_sub(name_column));
+        first.push(head, Some(self.role()));
+        let mut second = RoleLine::role(" ".repeat(name_column), self.role());
+        let tail_columns = width.saturating_sub(name_column + self.status_reserve());
+        second.push(ellipsize(tail, tail_columns), Some(self.role()));
+        second.push(
+            " ".repeat(width.saturating_sub(second.text().width() + status_columns(&self.status))),
+            None,
+        );
         for (text, role) in &self.status {
-            status.push(text.as_str(), Some(*role));
+            second.push(text.as_str(), Some(*role));
         }
-        [self.finish(name, width), self.finish(status, width)]
+        [self.finish(first, width), self.finish(second, width)]
     }
 
     fn finish(&self, mut line: RoleLine, width: usize) -> RoleLine {
@@ -99,6 +114,25 @@ impl ListRow<'_> {
             line
         }
     }
+}
+
+/// Splits `text` where its first `columns` end, at the last space within them when there is one,
+/// so a name continues on the next line at a word.
+fn split_at_columns(text: &str, columns: usize) -> (&str, &str) {
+    let mut used = 0;
+    let mut last_space = None;
+    for (index, character) in text.char_indices() {
+        let character_columns = character.width().unwrap_or(0);
+        if used + character_columns > columns {
+            let cut = last_space.filter(|space| *space > 0).unwrap_or(index);
+            return (text[..cut].trim_end(), text[cut..].trim_start());
+        }
+        if character == ' ' {
+            last_space = Some(index);
+        }
+        used += character_columns;
+    }
+    (text, "")
 }
 
 fn status_columns(status: &[(String, Role)]) -> usize {
@@ -213,6 +247,55 @@ mod tests {
     }
 
     #[test]
+    fn a_long_name_continues_on_its_second_line_with_the_details_still_at_the_right() {
+        let row = ListRow {
+            selected: false,
+            glyph: "$",
+            glyph_role: Role::RunningMark,
+            name: "Rerun full test suite in background to verify",
+            status: vec![("14s".into(), Role::MutedText)],
+        };
+        let lines = row.lines(30).iter().map(RoleLine::text).collect::<Vec<_>>();
+        assert_eq!(
+            lines,
+            [
+                "  $ Rerun full test suite in",
+                "    background to verify   14s"
+            ]
+        );
+        let one_line = ListRow {
+            name: "cargo test",
+            ..row
+        };
+        let line = one_line.lines(30)[0].text();
+        assert_eq!(line, "  $ cargo test             14s");
+        assert_eq!(
+            line.width(),
+            lines[1].width(),
+            "details share one right edge"
+        );
+    }
+
+    #[test]
+    fn a_name_too_long_for_two_lines_is_cut_before_the_details() {
+        let row = ListRow {
+            selected: false,
+            glyph: "$",
+            glyph_role: Role::RunningMark,
+            name: "a b c d e f g h i j k l m n o p q r s t u v w x y z",
+            status: vec![("2m 3s".into(), Role::MutedText)],
+        };
+        let lines = row.lines(20);
+        assert_eq!(lines[0].text(), "  $ a b c d e f g h");
+        let second = lines[1].text();
+        assert!(
+            second.contains('…') && second.ends_with("  2m 3s"),
+            "{second}"
+        );
+        assert_eq!(lines[1].text().width(), 20);
+    }
+
+    #[test]
     fn the_glyph_colour_carries_the_state() {
         let display = DisplayProfile::default();
         for (tone, role) in [
@@ -310,7 +393,7 @@ mod tests {
     }
 
     #[test]
-    fn one_line_rows_right_align_the_status_and_two_line_rows_indent_it() {
+    fn one_line_and_two_line_rows_both_right_align_the_status() {
         let row = ListRow {
             selected: true,
             glyph: "$",
@@ -325,8 +408,10 @@ mod tests {
         assert_eq!(line.spans[1].role, Some(Role::SuccessMark));
         assert_eq!(line.fill, Some(Role::Selection));
         let [name, status] = row.two_lines(30);
-        assert_eq!(name.text(), "› $ Run the console tests in…");
-        assert_eq!(status.text(), "    12s");
+        assert_eq!(name.text(), "› $ Run the console tests in");
+        assert_eq!(status.text(), "    the worktree           12s");
+        assert_eq!(name.fill, Some(Role::Selection));
+        assert_eq!(status.fill, Some(Role::Selection));
     }
 
     #[test]
