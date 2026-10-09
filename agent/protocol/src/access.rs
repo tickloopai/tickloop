@@ -28,10 +28,10 @@ use crate::{
     UserShellReceipt, UserShellRecord,
 };
 
-/// Business 14.0 adds model-card sampling and thinking-off capabilities.
+/// Business 15.0 adds the Auto setup request kind to the usage ledger.
 /// Older business majors are refused before dispatch;
 /// the frozen daemon management protocol remains independent.
-pub const PROTOCOL_MAJOR: u16 = 14;
+pub const PROTOCOL_MAJOR: u16 = 15;
 pub const PROTOCOL_MINOR: u16 = 0;
 
 pub const REPLAY_CAPACITY: usize = 4096;

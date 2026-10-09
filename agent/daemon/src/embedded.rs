@@ -939,8 +939,9 @@ impl EmbeddedAgentAccess {
                     .await?
             }
             ConfigurationChange::GenerateAutoEnvironment { options } => {
+                // Keep setup and its model retries out of every command-dispatch stack frame.
                 return Ok(CommandResult::AutoEnvironmentDraft(
-                    agent.generate_auto_environment(chat, options).await?,
+                    Box::pin(agent.generate_auto_environment(chat, options)).await?,
                 ));
             }
             ConfigurationChange::PermissionChange { change, expected } => {

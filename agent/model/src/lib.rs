@@ -145,7 +145,7 @@ pub(crate) fn sampling_temperature(
         _ => TemperatureControl::Supported,
     };
     let control = cards::model_card(config)
-        .and_then(|card| card.temperature_control)
+        .and_then(|card| card.temperature_control.flatten())
         .unwrap_or(default);
     requested.filter(|_| match control {
         TemperatureControl::Supported => true,
@@ -1202,7 +1202,7 @@ impl HttpModelClient {
             self.ensure_credential_history_compatible(chat_id, &request, key.as_ref())?;
         }
         let structured_response =
-            structured_response::StructuredResponsePolicy::for_request(&self.config, &request)?;
+            structured_response::StructuredResponsePolicy::for_request(&request)?;
         let (endpoint, mut body) = match self.config.adapter() {
             Adapter::Messages | Adapter::DeepseekMessages | Adapter::MinimaxMessages => {
                 ("v1/messages", messages_request(&self.config, request)?)
@@ -1856,7 +1856,8 @@ fn messages_request(config: &ModelConfig, request: ModelRequest) -> Result<Value
         body["thinking"] = json!({"type":"adaptive"});
     }
     if request.reasoning_effort == Some(ReasoningEffort::Off)
-        && let Some(encoding) = cards::model_card(config).and_then(|card| card.thinking_off)
+        && let Some(encoding) =
+            cards::model_card(config).and_then(|card| card.thinking_off.flatten())
     {
         body["thinking"] = json!({"type":encoding.wire_value()});
     }
@@ -2986,6 +2987,27 @@ mod tests {
     }
 
     #[test]
+    fn cleared_model_capabilities_survive_persistence_and_client_construction() {
+        let mut config = default_model("anthropic-api", "claude-sonnet-5-5");
+        let patch: tickloop_agent_protocol::ModelPatch = serde_json::from_value(json!({
+            "id": config.model_id,
+            "temperature_control": null,
+            "thinking_off": null
+        }))
+        .unwrap();
+        patch.apply_to(config.card.as_mut().unwrap());
+        let saved = serde_json::to_value(config).unwrap();
+        let restored = serde_json::from_value(saved).unwrap();
+        let client = HttpModelClient::deferred(restored).unwrap();
+        let mut request = structured_request();
+        request.reasoning_effort = Some(ReasoningEffort::Off);
+        request.temperature = Some(0.0);
+        let body = messages_request(&client.config, request).unwrap();
+        assert_eq!(body["thinking"], json!({"type":"disabled"}));
+        assert_eq!(body["temperature"], 0.0);
+    }
+
+    #[test]
     fn model_card_controls_sampling_and_thinking_off_without_model_name_checks() {
         let mut config = default_model("anthropic-api", "claude-sonnet-5-5");
         config.model = "custom-future-model".into();
@@ -3000,9 +3022,9 @@ mod tests {
         assert_eq!(body["thinking"], json!({"type":"between_tools"}));
         assert!(body.get("temperature").is_none());
         config.card.as_mut().unwrap().temperature_control =
-            Some(tickloop_agent_protocol::TemperatureControl::Supported);
+            Some(Some(tickloop_agent_protocol::TemperatureControl::Supported));
         config.card.as_mut().unwrap().thinking_off =
-            Some(tickloop_agent_protocol::ThinkingOffEncoding::Disabled);
+            Some(Some(tickloop_agent_protocol::ThinkingOffEncoding::Disabled));
         let body = messages_request(&config, request).unwrap();
         assert_eq!(body["thinking"], json!({"type":"disabled"}));
         assert_eq!(body["temperature"], 0.0);
@@ -3020,8 +3042,9 @@ mod tests {
                 protocol,
                 "https://example.test",
             ));
-            config.card.as_mut().unwrap().temperature_control =
-                Some(tickloop_agent_protocol::TemperatureControl::Unsupported);
+            config.card.as_mut().unwrap().temperature_control = Some(Some(
+                tickloop_agent_protocol::TemperatureControl::Unsupported,
+            ));
             let mut request = structured_request();
             request.temperature = Some(0.0);
             let body = match protocol {

@@ -549,12 +549,9 @@ fn encode_request(
         body["temperature"] = json!(temperature);
     }
     if let Some(format) = request.structured_output {
-        if !request.tools.is_empty()
-            || format.name.trim().is_empty()
-            || format.schema["type"] != "object"
-        {
+        if !request.tools.is_empty() || format.name.trim().is_empty() {
             return Err(ModelError::Configuration(
-                "Codex structured output requires one named object schema without business tools"
+                "Codex structured output requires a named JSON schema without executable tools"
                     .into(),
             ));
         }
@@ -700,6 +697,88 @@ mod tests {
                 .contains(&schema.to_string())
         );
         assert!(body["text"]["format"].is_null());
+    }
+
+    #[tokio::test]
+    async fn structured_sse_accepts_non_object_schemas_and_still_validates_results() {
+        for (schema, result, valid) in [
+            (
+                json!({"type":"array","items":{"type":"integer"}}),
+                json!([1, 2]),
+                true,
+            ),
+            (
+                json!({"anyOf":[{"type":"boolean"},{"type":"null"}]}),
+                json!(true),
+                true,
+            ),
+            (
+                json!({"type":"array","items":{"type":"integer"}}),
+                json!({}),
+                false,
+            ),
+        ] {
+            let (_directory, state_dir) = state_with_credentials();
+            let message = json!({"type":"message","id":"json-result","role":"assistant","status":"completed","content":[{"type":"output_text","text":result.to_string()}]});
+            let response = [
+                event(
+                    "response.created",
+                    0,
+                    json!({"response":{"id":"json","status":"in_progress"}}),
+                ),
+                event(
+                    "response.output_item.added",
+                    1,
+                    json!({"output_index":0,"item":{"type":"message","id":"json-result","role":"assistant","status":"in_progress","content":[]}}),
+                ),
+                event(
+                    "response.output_item.done",
+                    2,
+                    json!({"output_index":0,"item":message}),
+                ),
+                event(
+                    "response.done",
+                    3,
+                    json!({"response":{"id":"json","status":"completed","output":[message]}}),
+                ),
+            ]
+            .concat();
+            let (endpoint, captured) = serve_scripted_responses(vec![(200, response)]).await;
+            let config = ModelCatalog::defaults()
+                .get("openai-codex", "gpt-5.5")
+                .unwrap();
+            let client = CodexModelClient::new(config, &state_dir)
+                .unwrap()
+                .with_loopback_test_endpoint(endpoint.as_str())
+                .unwrap();
+            let mut request = simple_request();
+            request.structured_output = Some(crate::StructuredOutput {
+                name: "json_result".into(),
+                schema,
+            });
+            let (events, _) = tokio::sync::mpsc::unbounded_channel();
+            let output = client
+                .complete(request, events, CancellationToken::new())
+                .await;
+            if valid {
+                assert_eq!(
+                    output.unwrap().content,
+                    vec![Content::Text {
+                        text: result.to_string()
+                    }]
+                );
+            } else {
+                assert!(matches!(
+                    output,
+                    Err(ModelError::ResponseRejected(
+                        ModelResponseRejection::MalformedStructuredOutput
+                    ))
+                ));
+            }
+            let requests = captured.await.unwrap();
+            assert_eq!(requests.len(), 1);
+            assert!(requests[0].get("tools").is_none());
+        }
     }
 
     #[test]

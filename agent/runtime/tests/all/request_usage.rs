@@ -234,6 +234,132 @@ async fn completed_usage(events: &mut broadcast::Receiver<Event>, run: RunId) ->
 }
 
 #[tokio::test]
+async fn auto_setup_records_chat_owned_usage_and_terminal_outcomes_without_a_loop() {
+    for (step, outcome) in [
+        (
+            ResponseStep::reply(text(r#"{"selected":[0]}"#), counters(12, 3, 0, 0)),
+            RequestOutcome::Accepted,
+        ),
+        (
+            ResponseStep::reply(text(r#"{"selected":[99]}"#), counters(12, 3, 0, 0)),
+            RequestOutcome::HostRejected(ResponseRejection::InvalidVerdict),
+        ),
+        (
+            ResponseStep {
+                result: Err(ModelError::Configuration("fixture failure".into())),
+                ..ResponseStep::reply(Vec::new(), counters(12, 3, 0, 0))
+            },
+            RequestOutcome::Failed(RequestFailure::LocalConfiguration),
+        ),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("README.md"), "Project metadata").unwrap();
+        let archive = directory.path().join("state");
+        let model = Arc::new(UsageModel::new(main_identity(), vec![step]));
+        let agent =
+            Agent::open_embedded(archive.clone(), config(&main_identity()), model.clone()).unwrap();
+        let chat = agent.create_chat(directory.path().into()).await.unwrap();
+        let before = agent.permissions_view(chat).await.unwrap().revision;
+        let result = agent
+            .generate_auto_environment(chat, Default::default())
+            .await;
+        assert_eq!(
+            result.is_ok(),
+            outcome == RequestOutcome::Accepted,
+            "{result:?}"
+        );
+        let snapshot = agent.snapshot(chat).await.unwrap();
+        assert!(snapshot.loops.is_empty());
+        assert!(snapshot.messages.is_empty());
+        let entries = snapshot.request_usage.entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, ModelRequestKind::AutoSetup);
+        assert_eq!(entries[0].chat_id, chat);
+        assert_eq!(entries[0].loop_id, None);
+        assert_eq!(entries[0].run_id, None);
+        assert_eq!(entries[0].outcome, outcome);
+        assert_eq!(entries[0].usage, counters(12, 3, 0, 0));
+        assert_eq!(model.request_count(), 1);
+        assert_eq!(agent.permissions_view(chat).await.unwrap().revision, before);
+        agent.shutdown().await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn auto_setup_timeout_retains_observed_usage_and_closes_the_request() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("README.md"), "Project metadata").unwrap();
+    let model = Arc::new(UsageModel::new(
+        main_identity(),
+        vec![ResponseStep::pending(
+            counters(17, 2, 0, 0),
+            Arc::new(Notify::new()),
+        )],
+    ));
+    let agent = Agent::open_embedded(
+        directory.path().join("state"),
+        config(&main_identity()),
+        model.clone(),
+    )
+    .unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let error = agent
+        .generate_auto_environment(chat, Default::default())
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("timed out"), "{error}");
+    let snapshot = agent.snapshot(chat).await.unwrap();
+    assert!(snapshot.loops.is_empty());
+    assert_eq!(snapshot.request_usage.entries().len(), 1);
+    let record = &snapshot.request_usage.entries()[0];
+    assert_eq!(record.kind, ModelRequestKind::AutoSetup);
+    assert_eq!(record.outcome, RequestOutcome::TimedOut);
+    assert_eq!(record.usage, counters(17, 2, 0, 0));
+    assert_eq!(model.request_count(), 1);
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn auto_setup_shutdown_cancels_the_request_and_retains_usage() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("README.md"), "Project metadata").unwrap();
+    let entered = Arc::new(Notify::new());
+    let model = Arc::new(UsageModel::new(
+        main_identity(),
+        vec![ResponseStep::pending(
+            counters(17, 2, 0, 0),
+            entered.clone(),
+        )],
+    ));
+    let agent = Agent::open_embedded(
+        directory.path().join("state"),
+        config(&main_identity()),
+        model.clone(),
+    )
+    .unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let task_agent = agent.clone();
+    let task = tokio::spawn(async move {
+        task_agent
+            .generate_auto_environment(chat, Default::default())
+            .await
+    });
+    tokio::time::timeout(EVENT_TIMEOUT, entered.notified())
+        .await
+        .unwrap();
+    agent.shutdown().await;
+    assert!(task.await.unwrap().is_err());
+    let snapshot = agent.snapshot(chat).await.unwrap();
+    assert!(snapshot.loops.is_empty());
+    assert_eq!(snapshot.request_usage.entries().len(), 1);
+    let record = &snapshot.request_usage.entries()[0];
+    assert_eq!(record.kind, ModelRequestKind::AutoSetup);
+    assert_eq!(record.outcome, RequestOutcome::Cancelled);
+    assert_eq!(record.usage, counters(17, 2, 0, 0));
+    assert_eq!(model.request_count(), 1);
+}
+
+#[tokio::test]
 async fn one_reply_observations_and_final_usage_are_recorded_once() {
     let directory = tempfile::tempdir().unwrap();
     let archive = directory.path().join("archive");

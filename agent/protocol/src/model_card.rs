@@ -107,10 +107,20 @@ pub struct ModelCard {
     /// Messages models without adaptive thinking take a token budget per effort level instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_budgets: Option<ThinkingBudgets>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub temperature_control: Option<TemperatureControl>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub thinking_off: Option<ThinkingOffEncoding>,
+    /// Missing inherits catalog capabilities; explicit null selects the adapter default.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_nullable"
+    )]
+    pub temperature_control: Option<Option<TemperatureControl>>,
+    /// Missing inherits catalog capabilities; explicit null selects the adapter default.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_nullable"
+    )]
+    pub thinking_off: Option<Option<ThinkingOffEncoding>>,
 }
 
 /// Manual thinking budgets for the effort levels a budget-only Messages model offers; pi uses
@@ -243,10 +253,10 @@ impl ModelPatch {
             model.thinking_budgets = Some(value);
         }
         if let Some(value) = self.temperature_control {
-            model.temperature_control = value;
+            model.temperature_control = Some(value);
         }
         if let Some(value) = self.thinking_off {
-            model.thinking_off = value;
+            model.thinking_off = Some(value);
         }
     }
 
@@ -272,8 +282,8 @@ impl ModelPatch {
             effort_levels: self.effort_levels.unwrap_or_default(),
             input_modalities: self.input_modalities.unwrap_or_else(text_only),
             thinking_budgets: self.thinking_budgets,
-            temperature_control: self.temperature_control.unwrap_or(None),
-            thinking_off: self.thinking_off.unwrap_or(None),
+            temperature_control: self.temperature_control,
+            thinking_off: self.thinking_off,
         })
     }
 }

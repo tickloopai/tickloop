@@ -2843,9 +2843,9 @@ async fn select_overview_row(view: &mut PtyView, title: &str) {
 /// Opens the folded `group` heading with real keys: up to the first line, then down to it.
 async fn open_group_heading(view: &mut PtyView, group: &str) {
     view.send(b"\x1b[5~");
+    // New Agent is the second row; accepting it can acknowledge a frame from before PageUp.
     view.wait_for("overview selection reaches its first group", |frame| {
-        selected_row_title(frame)
-            .is_some_and(|title| title.starts_with("Needs input") || title.starts_with("New Agent"))
+        selected_row_title(frame).is_some_and(|title| title.starts_with("Needs input"))
     })
     .await;
     let folded = format!("› ▸ {group} · ");
@@ -2859,10 +2859,20 @@ async fn open_group_heading(view: &mut PtyView, group: &str) {
             .await;
             return;
         }
-        let selected = selected_row_title(&frame).map(str::to_owned);
+        let next = frame
+            .lines()
+            .skip_while(|line| !line.starts_with('›'))
+            .nth(1)
+            .map(row_title)
+            .and_then(|title| title.split(" · ").next())
+            .filter(|title| !title.is_empty())
+            .unwrap_or_else(|| panic!("no row below the overview selection: {frame}"))
+            .to_owned();
         view.send(b"j");
-        view.wait_for("overview navigation changes its selected row", |frame| {
-            selected_row_title(frame) != selected.as_deref()
+        view.wait_for("overview navigation selects the next listed row", |frame| {
+            selected_row_title(frame)
+                .and_then(|title| title.split(" · ").next())
+                == Some(next.as_str())
         })
         .await;
     }
@@ -3012,10 +3022,11 @@ async fn run_filter_hidden_dispatch(fixture: &PrivateFixture) {
         bravo_output
     );
     view.send(b"p");
-    view.wait_for("launch filter", |frame| {
+    view.wait_for("launch filter has projected both completed Shells", |frame| {
         frame
             .lines()
             .any(|line| line.starts_with("Project: ") && line.contains("work"))
+            && frame.contains("▸ Idle · 2")
     })
     .await;
     // Both finished Shell Agents are Idle; Idle starts folded behind its heading.

@@ -1,7 +1,7 @@
 use serde_json::Value;
 
 use super::{ModelError, ModelOutput, ModelRequest, ModelResponseRejection};
-use tickloop_agent_protocol::{Content, ModelConfig, Protocol};
+use tickloop_agent_protocol::{Content, Protocol};
 
 #[derive(Default)]
 pub(super) struct StructuredResponsePolicy {
@@ -9,10 +9,7 @@ pub(super) struct StructuredResponsePolicy {
 }
 
 impl StructuredResponsePolicy {
-    pub fn for_request(
-        _config: &ModelConfig,
-        request: &ModelRequest,
-    ) -> Result<Option<Self>, ModelError> {
+    pub fn for_request(request: &ModelRequest) -> Result<Option<Self>, ModelError> {
         let Some(format) = &request.structured_output else {
             return Ok(None);
         };

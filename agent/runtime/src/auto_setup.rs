@@ -9,16 +9,18 @@ use std::{
 use serde::Deserialize;
 use serde_json::json;
 use tickloop_agent_base::private_fs::unix_time_milliseconds;
-use tickloop_agent_model::{ModelRequest, StructuredOutput};
+use tickloop_agent_model::{ModelError, ModelRequest, ModelResponseRejection, StructuredOutput};
 use tickloop_agent_protocol::{
     AutoEnvironmentDraft, AutoEnvironmentEntry, AutoEnvironmentEntrySource, AutoSetupOptions,
-    ChatId, Content, Decision, Message, Role,
+    ChatId, Content, Decision, Message, RequestOutcome, Role,
 };
 use tickloop_agent_tools::{Workspace, permissions::PermissionPolicyExt};
-use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use super::{Agent, AgentError};
+use super::{
+    Agent, AgentError,
+    model_request::{RequestContext, model_failure_outcome},
+};
 
 const MAX_SCAN_BYTES: u64 = 64 * 1024;
 const PROJECT_FILES: &[&str] = &[
@@ -258,60 +260,64 @@ impl Agent {
             ],
             structured_output: Some(StructuredOutput { name: "environment_candidates".into(), schema: json!({"type":"object","properties":{"selected":{"type":"array","items":{"type":"integer","minimum":0,"maximum":candidates.len()-1}}},"required":["selected"],"additionalProperties":false}) }),
         };
-        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
-        let cancel = CancellationToken::new();
-        let output = tokio::time::timeout(
-            Duration::from_secs(30),
-            client.complete(request, sender, cancel.clone()),
-        )
-        .await;
+        let format = request
+            .structured_output
+            .clone()
+            .expect("setup has a JSON contract");
+        let cancel = self.inner.shutdown.child_token();
+        let response = self
+            .tracked_model_request(
+                RequestContext::auto_setup(chat_id),
+                client,
+                request,
+                cancel.clone(),
+                Some(Duration::from_secs(30)),
+            )
+            .await;
         cancel.cancel();
-        let output = output
-            .map_err(|_| {
-                AgentError::Invalid(
-                    "Environment draft generation timed out; no settings changed".into(),
-                )
-            })?
-            .map_err(|_| {
-                AgentError::Invalid(
-                    "Environment draft generation failed; no settings changed".into(),
-                )
-            })?;
-        if !matches!(output.stop_reason.as_str(), "end_turn" | "stop")
-            || output.content.iter().any(|content| {
-                matches!(
-                    content,
-                    Content::ToolUse { .. } | Content::ToolResult { .. }
-                )
-            })
-        {
-            return Err(AgentError::Invalid(
-                "Invalid Environment draft response; no settings changed".into(),
-            ));
-        }
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Selection {
             selected: Vec<usize>,
         }
-        let text = output
-            .content
-            .iter()
-            .filter_map(|content| match content {
-                Content::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<String>();
-        let selected: Selection = serde_json::from_str(&text).map_err(|_| {
-            AgentError::Invalid("Invalid Environment draft response; no settings changed".into())
-        })?;
-        if selected
-            .selected
-            .iter()
-            .any(|index| *index >= candidates.len())
-        {
-            return Err(AgentError::Invalid("Unknown Environment candidate".into()));
-        }
+        let selected = match response {
+            Ok(response) => {
+                let selection = format.validate_output(response.output).and_then(|output| {
+                    let text = output
+                        .content
+                        .iter()
+                        .filter_map(|content| match content {
+                            Content::Text { text } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<String>();
+                    serde_json::from_str::<Selection>(&text).map_err(|_| {
+                        ModelError::ResponseRejected(
+                            ModelResponseRejection::MalformedStructuredOutput,
+                        )
+                    })
+                });
+                let outcome = match &selection {
+                    Ok(_) => RequestOutcome::Accepted,
+                    Err(error) => model_failure_outcome(error),
+                };
+                self.finish_model_request(chat_id, response.sequence, outcome)
+                    .await?;
+                selection.map_err(|_| {
+                    AgentError::Invalid(
+                        "Invalid Environment draft response; no settings changed".into(),
+                    )
+                })
+            }
+            Err(AgentError::Model(ModelError::TimedOut)) => Err(AgentError::Invalid(
+                "Environment draft generation timed out; no settings changed".into(),
+            )),
+            Err(AgentError::Model(_)) => Err(AgentError::Invalid(
+                "Environment draft generation failed; no settings changed".into(),
+            )),
+            Err(error) => Err(error),
+        };
+        let selected = selected?;
         let entries = candidates
             .into_iter()
             .enumerate()

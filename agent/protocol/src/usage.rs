@@ -20,6 +20,7 @@ pub struct RequestOwner {
 pub enum ModelRequestKind {
     Conversation,
     Title,
+    AutoSetup,
     CompactionAutomatic,
     CompactionManual,
     CompactionDirected,
@@ -284,6 +285,7 @@ impl RequestUsageLedger {
         let valid_owner = match kind {
             ModelRequestKind::CompactionManual
             | ModelRequestKind::CompactionDirected
+            | ModelRequestKind::AutoSetup
             | ModelRequestKind::Title => owner.loop_id.is_none() && owner.run_id.is_none(),
             _ => owner.loop_id.is_some() && owner.run_id.is_some(),
         };
@@ -625,6 +627,7 @@ mod tests {
         for kind in [
             ModelRequestKind::CompactionManual,
             ModelRequestKind::CompactionDirected,
+            ModelRequestKind::AutoSetup,
         ] {
             assert!(ledger.start(owner(), kind, identity()).is_err());
         }

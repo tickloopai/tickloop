@@ -234,7 +234,7 @@ impl ModelCatalog {
                         "{location}: unsupported thinking cannot declare effort or adaptive defaults"
                     ));
                 }
-                if model.thinking_off.is_some()
+                if model.thinking_off.flatten().is_some()
                     && (model.adapter.protocol() != Protocol::Messages
                         || model.thinking != ThinkingControl::Toggle
                         || model.thinking_budgets.is_some())
@@ -813,24 +813,28 @@ mod tests {
         let upgraded = model_for_persistent_selection(saved.clone());
         assert_eq!(
             upgraded.card.as_ref().unwrap().temperature_control,
-            Some(tickloop_agent_protocol::TemperatureControl::Unsupported)
+            Some(Some(
+                tickloop_agent_protocol::TemperatureControl::Unsupported
+            ))
         );
         assert_eq!(
             upgraded.card.as_ref().unwrap().thinking_off,
-            Some(tickloop_agent_protocol::ThinkingOffEncoding::BetweenTools)
+            Some(Some(
+                tickloop_agent_protocol::ThinkingOffEncoding::BetweenTools
+            ))
         );
         saved.card.as_mut().unwrap().temperature_control =
-            Some(tickloop_agent_protocol::TemperatureControl::Supported);
+            Some(Some(tickloop_agent_protocol::TemperatureControl::Supported));
         saved.card.as_mut().unwrap().thinking_off =
-            Some(tickloop_agent_protocol::ThinkingOffEncoding::Disabled);
+            Some(Some(tickloop_agent_protocol::ThinkingOffEncoding::Disabled));
         let overridden = model_for_persistent_selection(saved);
         assert_eq!(
             overridden.card.as_ref().unwrap().temperature_control,
-            Some(tickloop_agent_protocol::TemperatureControl::Supported)
+            Some(Some(tickloop_agent_protocol::TemperatureControl::Supported))
         );
         assert_eq!(
             overridden.card.as_ref().unwrap().thinking_off,
-            Some(tickloop_agent_protocol::ThinkingOffEncoding::Disabled)
+            Some(Some(tickloop_agent_protocol::ThinkingOffEncoding::Disabled))
         );
     }
 
@@ -842,11 +846,15 @@ mod tests {
         let card = config.card.as_mut().unwrap();
         assert_eq!(
             card.temperature_control,
-            Some(tickloop_agent_protocol::TemperatureControl::Unsupported)
+            Some(Some(
+                tickloop_agent_protocol::TemperatureControl::Unsupported
+            ))
         );
         assert_eq!(
             card.thinking_off,
-            Some(tickloop_agent_protocol::ThinkingOffEncoding::BetweenTools)
+            Some(Some(
+                tickloop_agent_protocol::ThinkingOffEncoding::BetweenTools
+            ))
         );
         let patch: tickloop_agent_protocol::ModelPatch =
             serde_json::from_value(serde_json::json!({
@@ -854,8 +862,8 @@ mod tests {
             }))
             .unwrap();
         patch.apply_to(card);
-        assert_eq!(card.temperature_control, None);
-        assert_eq!(card.thinking_off, None);
+        assert_eq!(card.temperature_control, Some(None));
+        assert_eq!(card.thinking_off, Some(None));
         let patch: tickloop_agent_protocol::ModelPatch =
             serde_json::from_value(serde_json::json!({
                 "id":card.id,"temperature_control":"supported","thinking_off":"disabled"
@@ -864,11 +872,11 @@ mod tests {
         patch.apply_to(card);
         assert_eq!(
             card.temperature_control,
-            Some(tickloop_agent_protocol::TemperatureControl::Supported)
+            Some(Some(tickloop_agent_protocol::TemperatureControl::Supported))
         );
         assert_eq!(
             card.thinking_off,
-            Some(tickloop_agent_protocol::ThinkingOffEncoding::Disabled)
+            Some(Some(tickloop_agent_protocol::ThinkingOffEncoding::Disabled))
         );
     }
 

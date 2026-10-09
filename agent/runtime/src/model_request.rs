@@ -51,6 +51,17 @@ impl RequestContext {
         }
     }
 
+    pub(super) fn auto_setup(chat_id: ChatId) -> Self {
+        Self {
+            owner: RequestOwner {
+                chat_id,
+                loop_id: None,
+                run_id: None,
+            },
+            kind: ModelRequestKind::AutoSetup,
+        }
+    }
+
     pub(super) fn manual_compaction(chat_id: ChatId) -> Self {
         Self {
             owner: RequestOwner {
@@ -450,7 +461,12 @@ impl Agent {
         let model_context = ModelRequestContext::new(max_attempts);
         let deadline = tracking
             .timeout
-            .filter(|_| context.kind == ModelRequestKind::PermissionCheck)
+            .filter(|_| {
+                matches!(
+                    context.kind,
+                    ModelRequestKind::PermissionCheck | ModelRequestKind::AutoSetup
+                )
+            })
             .map(|timeout| tokio::time::Instant::now() + timeout);
         loop {
             if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {

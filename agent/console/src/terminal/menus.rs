@@ -3411,6 +3411,7 @@ fn request_kind_label(kind: ModelRequestKind) -> &'static str {
         ModelRequestKind::PermissionCheck => "Permission checks",
         ModelRequestKind::WebFetch => "WebFetch",
         ModelRequestKind::Title => "Chat titles",
+        ModelRequestKind::AutoSetup => "Auto setup",
     }
 }
 
