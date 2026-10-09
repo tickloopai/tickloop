@@ -205,8 +205,17 @@ pub(super) enum DraftCreationError {
     Unconfirmed(Uuid),
 }
 
+#[derive(Clone, Debug)]
+pub(super) struct ExecutionObservation {
+    pub(super) execution: ExecutionRef,
+    pub(super) snapshot: ChatSnapshot,
+    pub(super) events: Vec<runtime::Event>,
+    pub(super) reset_required: bool,
+}
+
 pub(super) struct EventRecovery {
     covered: tokio::sync::OwnedMutexGuard<HashMap<Uuid, (ExecutionRef, u64)>>,
+    inner: Arc<Inner>,
 }
 
 impl EventRecovery {
@@ -218,13 +227,12 @@ impl EventRecovery {
         covered.1 = covered.1.max(snapshot.last_sequence);
     }
 
-    fn covers(&self, event: &runtime::Event) -> bool {
-        event.sequence
-            <= self
-                .covered
-                .get(&event.chat_id)
-                .map(|(_, sequence)| *sequence)
-                .unwrap_or(0)
+    fn covers(&self, event: &runtime::Event, references: &HashMap<Uuid, ExecutionRef>) -> bool {
+        self.covered
+            .get(&event.chat_id)
+            .is_some_and(|(execution, sequence)| {
+                references.get(&event.chat_id) == Some(execution) && event.sequence <= *sequence
+            })
     }
 
     pub(super) fn retain_uncovered(
@@ -232,10 +240,11 @@ impl EventRecovery {
         receiver: &mut broadcast::Receiver<runtime::Event>,
         deferred: &mut VecDeque<runtime::Event>,
     ) {
-        deferred.retain(|event| !self.covers(event));
+        let references = self.inner.references.read().unwrap();
+        deferred.retain(|event| !self.covers(event, &references));
         loop {
             match receiver.try_recv() {
-                Ok(event) if !self.covers(&event) => deferred.push_back(event),
+                Ok(event) if !self.covers(&event, &references) => deferred.push_back(event),
                 Ok(_) | Err(broadcast::error::TryRecvError::Lagged(_)) => {}
                 Err(
                     broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed,
@@ -287,19 +296,28 @@ struct DisplayState {
 }
 
 impl Inner {
-    fn cache_snapshot(&self, snapshot: Box<LiveChatSnapshot>) -> Box<LiveChatSnapshot> {
+    fn cache_snapshot(
+        &self,
+        snapshot: Box<LiveChatSnapshot>,
+        observed_execution: Option<ExecutionRef>,
+    ) -> Box<LiveChatSnapshot> {
         let chat = snapshot.conversation.id;
         let mut snapshots = self.snapshots.write().unwrap();
+        let mut references = self.references.write().unwrap();
+        if observed_execution.is_some_and(|expected| references.get(&chat) != Some(&expected)) {
+            return snapshots
+                .get(&chat)
+                .cloned()
+                .map(Box::new)
+                .unwrap_or(snapshot);
+        }
         if let Some(current) = snapshots.get(&chat)
             && current.execution == snapshot.execution
             && current.last_sequence > snapshot.last_sequence
         {
             return Box::new(current.clone());
         }
-        self.references
-            .write()
-            .unwrap()
-            .insert(chat, snapshot.execution);
+        references.insert(chat, snapshot.execution);
         snapshots.insert(chat, (*snapshot).clone());
         snapshot
     }
@@ -530,6 +548,7 @@ impl ConsoleExecution {
     }
 
     pub(super) async fn catalog(&self) -> Result<Vec<AgentSummary>, AgentError> {
+        let known = self.inner.references.read().unwrap().clone();
         let mut offset = 0;
         let mut rows = Vec::new();
         loop {
@@ -552,11 +571,12 @@ impl ConsoleExecution {
             let done = page.len() < MAX_PAGE_LIMIT;
             offset += page.len();
             for row in &page {
-                self.inner
-                    .references
-                    .write()
-                    .unwrap()
-                    .insert(row.chat_id, row.execution);
+                let mut references = self.inner.references.write().unwrap();
+                if references.get(&row.chat_id) == known.get(&row.chat_id)
+                    || references.get(&row.chat_id) == Some(&row.execution)
+                {
+                    references.insert(row.chat_id, row.execution);
+                }
             }
             rows.extend(page);
             if done {
@@ -666,6 +686,16 @@ impl ConsoleExecution {
         chat: Uuid,
         detail: AgentDetailQuery,
     ) -> Result<ObservationValue, AgentError> {
+        self.observed_value(chat, detail)
+            .await
+            .map(|(_, value)| value)
+    }
+
+    async fn observed_value(
+        &self,
+        chat: Uuid,
+        detail: AgentDetailQuery,
+    ) -> Result<(ExecutionRef, ObservationValue), AgentError> {
         let execution = self.reference(chat).await?;
         self.inner
             .access
@@ -675,7 +705,7 @@ impl ConsoleExecution {
                 after: None,
             })
             .await
-            .map(|observation| observation.initial)
+            .map(|observation| (execution, observation.initial))
             .map_err(agent_error)
     }
 
@@ -1074,7 +1104,7 @@ impl ConsoleExecution {
             }
         };
         if let ObservationValue::Agent(snapshot) = observation.initial.clone() {
-            self.inner.cache_snapshot(snapshot);
+            self.inner.cache_snapshot(snapshot, Some(execution));
         }
         let events = self.inner.events.clone();
         let event_delivery = self.inner.event_delivery.clone();
@@ -1146,7 +1176,7 @@ impl ConsoleExecution {
                         ..
                     }) => {
                         if let Some(inner) = weak.upgrade() {
-                            inner.cache_snapshot(snapshot);
+                            inner.cache_snapshot(snapshot, Some(execution));
                             let _ = inner.facts.send(());
                         }
                     }
@@ -1172,7 +1202,7 @@ impl ConsoleExecution {
                         {
                             Ok(next) => {
                                 if let ObservationValue::Agent(snapshot) = next.initial {
-                                    inner.cache_snapshot(snapshot);
+                                    inner.cache_snapshot(snapshot, Some(execution));
                                     let _ = inner.facts.send(());
                                 }
                             }
@@ -1200,6 +1230,7 @@ impl ConsoleExecution {
     pub(super) async fn pause_event_delivery(&self) -> EventRecovery {
         EventRecovery {
             covered: self.inner.event_delivery.clone().lock_owned().await,
+            inner: self.inner.clone(),
         }
     }
 
@@ -1216,12 +1247,21 @@ impl ConsoleExecution {
     }
 
     pub(super) async fn snapshot(&self, chat: Uuid) -> Result<ChatSnapshot, AgentError> {
-        match self.value(chat, AgentDetailQuery::Snapshot).await {
-            Ok(ObservationValue::Agent(snapshot)) => {
+        self.live_snapshot(chat)
+            .await
+            .map(|snapshot| snapshot.into_snapshot())
+    }
+
+    pub(super) async fn live_snapshot(
+        &self,
+        chat: Uuid,
+    ) -> Result<Box<LiveChatSnapshot>, AgentError> {
+        match self.observed_value(chat, AgentDetailQuery::Snapshot).await {
+            Ok((execution, ObservationValue::Agent(snapshot))) => {
                 *self.inner.disconnected.lock().unwrap() = None;
-                let snapshot = self.inner.cache_snapshot(snapshot);
+                let snapshot = self.inner.cache_snapshot(snapshot, Some(execution));
                 self.watch(snapshot.execution).await?;
-                Ok(snapshot.into_snapshot())
+                Ok(snapshot)
             }
             Ok(_) => Err(unexpected()),
             Err(error) => {
@@ -1232,7 +1272,7 @@ impl ConsoleExecution {
                     .unwrap()
                     .get(&chat)
                     .cloned()
-                    .map(LiveChatSnapshot::into_snapshot)
+                    .map(Box::new)
                     .ok_or(error)
             }
         }
@@ -1241,8 +1281,10 @@ impl ConsoleExecution {
         &self,
         chat: Uuid,
         after: u64,
-    ) -> Result<runtime::Observation, AgentError> {
-        let snapshot = self.snapshot(chat).await?;
+    ) -> Result<ExecutionObservation, AgentError> {
+        let live = self.live_snapshot(chat).await?;
+        let execution = live.execution;
+        let snapshot = live.into_snapshot();
         let reset_required = after > snapshot.last_sequence
             || snapshot
                 .events
@@ -1258,7 +1300,8 @@ impl ConsoleExecution {
                 .cloned()
                 .collect()
         };
-        Ok(runtime::Observation {
+        Ok(ExecutionObservation {
+            execution,
             snapshot,
             events,
             reset_required,
@@ -1484,7 +1527,7 @@ impl ConsoleExecution {
             CommandOutcome::Completed(CommandResult::Created { snapshot, .. }) => {
                 let chat = snapshot.conversation.id;
                 let execution = snapshot.execution;
-                self.inner.cache_snapshot(snapshot);
+                self.inner.cache_snapshot(snapshot, None);
                 Ok((chat, execution))
             }
             CommandOutcome::Refused {
@@ -2256,7 +2299,7 @@ impl ConsoleExecution {
         };
         let chat = snapshot.conversation.id;
         let execution = snapshot.execution;
-        self.inner.cache_snapshot(snapshot);
+        self.inner.cache_snapshot(snapshot, None);
         self.watch(execution).await?;
         Ok((chat, submitted))
     }
@@ -2274,7 +2317,7 @@ impl ConsoleExecution {
             return CreationAcceptance::Rejected(unexpected());
         };
         let execution = snapshot.execution;
-        self.inner.cache_snapshot(snapshot);
+        self.inner.cache_snapshot(snapshot, None);
         match self.watch(execution).await {
             Ok(()) => CreationAcceptance::Attached(submitted),
             Err(error) => CreationAcceptance::AttachUnavailable(error),
@@ -3034,7 +3077,7 @@ impl ConsoleExecution {
                 session_permissions,
                 ..
             } => {
-                self.inner.cache_snapshot(snapshot.clone());
+                self.inner.cache_snapshot(snapshot.clone(), None);
                 Ok(runtime::BranchOutcome {
                     source_chat_id,
                     child_chat_id,
@@ -3056,7 +3099,8 @@ impl ConsoleExecution {
             .await?
         {
             CommandResult::Compact { summary, snapshot } => {
-                self.inner.cache_snapshot(snapshot.clone());
+                self.inner
+                    .cache_snapshot(snapshot.clone(), Some(snapshot.execution));
                 Ok(runtime::CompactionOutcome {
                     summary,
                     snapshot: snapshot.into_snapshot(),
@@ -3083,7 +3127,8 @@ impl ConsoleExecution {
                 draft,
                 continuation_error,
             } => {
-                self.inner.cache_snapshot(snapshot.clone());
+                self.inner
+                    .cache_snapshot(snapshot.clone(), Some(snapshot.execution));
                 Ok(runtime::DirectedSummaryOutcome {
                     snapshot: snapshot.into_snapshot(),
                     direction,
@@ -3114,7 +3159,8 @@ impl ConsoleExecution {
                 conversation_restored,
                 draft,
             } => {
-                self.inner.cache_snapshot(snapshot.clone());
+                self.inner
+                    .cache_snapshot(snapshot.clone(), Some(snapshot.execution));
                 Ok(runtime::RewindOutcome {
                     snapshot: snapshot.into_snapshot(),
                     mode,
@@ -3200,7 +3246,7 @@ impl ConsoleExecution {
         match result {
             CommandResult::Loaded { snapshot, .. } => {
                 let execution = snapshot.execution;
-                self.inner.cache_snapshot(snapshot.clone());
+                self.inner.cache_snapshot(snapshot.clone(), None);
                 self.watch(execution).await?;
                 Ok(snapshot.into_snapshot())
             }
@@ -3465,11 +3511,11 @@ impl ConsoleExecution {
         }
     }
 
-    pub(super) async fn list_chats(&self) -> Vec<ChatSnapshot> {
+    pub(super) async fn list_chats(&self) -> Vec<Box<LiveChatSnapshot>> {
         let mut snapshots = Vec::new();
         if let Ok(rows) = self.catalog().await {
             for row in rows {
-                if let Ok(snapshot) = self.snapshot(row.chat_id).await {
+                if let Ok(snapshot) = self.live_snapshot(row.chat_id).await {
                     snapshots.push(snapshot);
                 }
             }

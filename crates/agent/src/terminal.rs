@@ -106,7 +106,7 @@ use directed_summary::{DirectedSummaryTasks, SummaryTaskCompletion};
 use display::{DisplayProfile, Glyph};
 use execution::{
     ConsoleExecution as Agent, CreateAcknowledgement, CreationAcceptance, DraftCreationError,
-    DraftPermissionsError, InputResolution, RuleSave,
+    DraftPermissionsError, ExecutionObservation, InputResolution, RuleSave,
 };
 use login::{LoginFlow, LoginSession, LoginUpdate, LogoutFlow};
 use menus::{MenuOutcome, Menus};
@@ -3730,14 +3730,14 @@ async fn interact(
                         displayed_sequences.insert(chat,observation.snapshot.last_sequence);
                         sync_snapshot(&observation.snapshot,&mut pending,&mut permissions,&mut questions);
                         menus.note_snapshot_requests(&observation.snapshot);
-                        recovery.cover(agent.reference(chat).await.map_err(|error|error.to_string())?, &observation.snapshot);
+                        recovery.cover(observation.execution, &observation.snapshot);
                     }
-                    let mut background_snapshots=agent.list_chats().await.into_iter().filter(|snapshot|overview_active || Some(snapshot.id)!=selected_chat).collect::<Vec<_>>();
+                    let mut background_snapshots=agent.list_chats().await.into_iter().filter(|snapshot|overview_active || Some(snapshot.conversation.id)!=selected_chat).collect::<Vec<_>>();
                     let unlisted_chats=pending.values().map(|receipt|receipt.chat_id)
-                        .filter(|chat|(overview_active || Some(*chat)!=selected_chat)&&!background_snapshots.iter().any(|snapshot|snapshot.id==*chat))
+                        .filter(|chat|(overview_active || Some(*chat)!=selected_chat)&&!background_snapshots.iter().any(|snapshot|snapshot.conversation.id==*chat))
                         .collect::<HashSet<_>>();
                     for chat in unlisted_chats {
-                        match agent.snapshot(chat).await {
+                        match agent.live_snapshot(chat).await {
                             Ok(snapshot)=>background_snapshots.push(snapshot),
                             Err(AgentError::NotFound)=>{
                                 let runs=pending.extract_if(|_,receipt|receipt.chat_id==chat).map(|(run,_)|run).collect::<HashSet<_>>();
@@ -3747,10 +3747,12 @@ async fn interact(
                             Err(error)=>return Err(error.to_string()),
                         }
                     }
-                    for snapshot in &background_snapshots {
-                        menus.note_snapshot_requests(snapshot);
-                        recovery.cover(agent.reference(snapshot.id).await.map_err(|error|error.to_string())?, snapshot);
-                        let recovery=recover_background_chat(snapshot,&background_label(agent,console,snapshot.id),&mut pending,&mut permissions,&mut questions);
+                    for live in background_snapshots {
+                        let execution = live.execution;
+                        let snapshot = live.into_snapshot();
+                        menus.note_snapshot_requests(&snapshot);
+                        recovery.cover(execution, &snapshot);
+                        let recovery=recover_background_chat(&snapshot,&background_label(agent,console,snapshot.id),&mut pending,&mut permissions,&mut questions);
                         failed |= recovery.failed;
                         if !interactive {
                             for notice in &recovery.run_notices {outln!(console,"Background {}",notice.text(&background_label(agent,console,snapshot.id)));}
@@ -4494,7 +4496,7 @@ async fn restore_view(
     chat: uuid::Uuid,
     after: u64,
     buffered_replies: &mut HashMap<uuid::Uuid, ReplyLines>,
-) -> Result<tickloop_agent::runtime::Observation, String> {
+) -> Result<ExecutionObservation, String> {
     let observation = agent
         .observe(chat, after)
         .await
@@ -4517,8 +4519,8 @@ fn render_restored_observation(
     chat: uuid::Uuid,
     after: u64,
     buffered_replies: &mut HashMap<uuid::Uuid, ReplyLines>,
-    observation: tickloop_agent::runtime::Observation,
-) -> Result<tickloop_agent::runtime::Observation, String> {
+    observation: ExecutionObservation,
+) -> Result<ExecutionObservation, String> {
     let conversation_events = observation.snapshot.conversation_events();
     console.select_chat(Some(chat))?;
     let failed_runs = conversation_events
@@ -5975,7 +5977,7 @@ async fn answer_permission(
                 .iter()
                 .any(|pending| pending.id == request)
         })
-        .map(|snapshot| snapshot.id)
+        .map(|snapshot| snapshot.conversation.id)
         .or(selected_chat)
         .ok_or("no Chat is selected")?;
     agent
@@ -7134,7 +7136,12 @@ mod tests {
             },
         ];
         snapshot.last_sequence = 2;
-        let mut observation = crate::runtime::Observation {
+        let mut observation = super::ExecutionObservation {
+            execution: crate::agent_access::ExecutionRef {
+                owner_epoch: uuid::Uuid::nil(),
+                agent_id: chat,
+                generation: 1,
+            },
             events: snapshot.events.clone(),
             snapshot,
             reset_required: false,
@@ -7230,7 +7237,12 @@ mod tests {
             },
         ];
         snapshot.last_sequence = 2;
-        let mut observation = crate::runtime::Observation {
+        let mut observation = super::ExecutionObservation {
+            execution: crate::agent_access::ExecutionRef {
+                owner_epoch: uuid::Uuid::nil(),
+                agent_id: chat,
+                generation: 1,
+            },
             events: snapshot.events.clone(),
             snapshot,
             reset_required: false,
@@ -7331,7 +7343,12 @@ mod tests {
             },
         ];
         snapshot.last_sequence = 2;
-        let mut observation = crate::runtime::Observation {
+        let mut observation = super::ExecutionObservation {
+            execution: crate::agent_access::ExecutionRef {
+                owner_epoch: uuid::Uuid::nil(),
+                agent_id: chat,
+                generation: 1,
+            },
             events: snapshot.events.clone(),
             snapshot,
             reset_required: false,

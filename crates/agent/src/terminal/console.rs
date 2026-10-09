@@ -13032,12 +13032,12 @@ mod tests {
             .list_chats()
             .await
             .into_iter()
-            .find(|snapshot| snapshot.id != source_chat)
+            .find(|snapshot| snapshot.conversation.id != source_chat)
             .expect("the durable child was not published");
 
-        assert!(error.contains(&format!("Branch {} was saved", child.id)));
+        assert!(error.contains(&format!("Branch {} was saved", child.conversation.id)));
         assert!(error.contains("Use /resume to find it"));
-        assert!(error.contains(&format!("/resume {}", child.id)));
+        assert!(error.contains(&format!("/resume {}", child.conversation.id)));
         {
             let mut state = console.state.lock().unwrap();
             assert_eq!(state.chat, Some(source_chat));

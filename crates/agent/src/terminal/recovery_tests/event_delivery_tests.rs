@@ -8,6 +8,14 @@ struct ControlledDelivery {
     fail_catalog: AtomicBool,
     fail_snapshot: AtomicBool,
     delayed_snapshot: Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
+    replacement_snapshot: Mutex<Option<Box<LiveChatSnapshot>>>,
+    delayed_compaction: Mutex<Option<DelayedCompaction>>,
+}
+
+struct DelayedCompaction {
+    snapshot: Box<LiveChatSnapshot>,
+    entered: oneshot::Sender<()>,
+    release: oneshot::Receiver<()>,
 }
 
 #[async_trait]
@@ -36,6 +44,11 @@ impl AgentAccess for ControlledDelivery {
             _ => None,
         };
         let mut observation = self.owner.observe(query).await?;
+        if execution.is_some()
+            && let Some(replacement) = self.replacement_snapshot.lock().unwrap().take()
+        {
+            observation.initial = ObservationValue::Agent(replacement);
+        }
         let delay = execution.and_then(|_| self.delayed_snapshot.lock().unwrap().take());
         if let Some((entered, release)) = delay {
             entered.send(()).unwrap();
@@ -53,6 +66,32 @@ impl AgentAccess for ControlledDelivery {
     }
 
     async fn execute(&self, command: CommandEnvelope) -> Result<CommandReceipt, AccessError> {
+        let delayed = matches!(
+            command.command,
+            AgentCommand::EditHistory {
+                action: HistoryAction::Compact { .. },
+                ..
+            }
+        )
+        .then(|| self.delayed_compaction.lock().unwrap().take())
+        .flatten();
+        if let Some(delayed) = delayed {
+            let execution = delayed.snapshot.execution;
+            delayed.entered.send(()).unwrap();
+            delayed.release.await.unwrap();
+            return Ok(CommandReceipt {
+                owner_epoch: command.owner_epoch,
+                command_id: command.command_id,
+                target: Some(execution),
+                state: ReceiptState::Completed,
+                result: Some(CommandResult::Compact {
+                    summary: "controlled completed summary".into(),
+                    snapshot: delayed.snapshot,
+                }),
+                error: None,
+                persistence: PersistenceState::NotApplicable,
+            });
+        }
         self.owner.execute(command).await
     }
 
@@ -98,6 +137,8 @@ async fn delivery_fixture() -> (
         fail_catalog: AtomicBool::new(false),
         fail_snapshot: AtomicBool::new(false),
         delayed_snapshot: Mutex::new(None),
+        replacement_snapshot: Mutex::new(None),
+        delayed_compaction: Mutex::new(None),
     });
     let mut launch = LaunchSpec::embedded(std::env::current_dir().unwrap());
     launch.model = Some(test_support::config());
@@ -386,4 +427,219 @@ async fn delayed_changed_and_resync_queries_cannot_roll_back_recovered_requests(
         agent.leave_view().await.unwrap();
         core.shutdown().await;
     }
+}
+
+#[tokio::test]
+async fn replaced_execution_keeps_new_requests_when_recovery_catalog_fails() {
+    replaced_execution_recovery(true).await;
+}
+
+#[tokio::test]
+async fn reset_between_observation_and_cover_keeps_new_execution_requests() {
+    replaced_execution_recovery(false).await;
+}
+
+async fn replaced_execution_recovery(cover_before_reset: bool) {
+    let directory = tempfile::tempdir().unwrap();
+    let (core, agent, access, _facts) = delivery_fixture().await;
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let old_execution = agent.reference(chat).await.unwrap();
+    let initial = access
+        .owner
+        .observe(ObservationRequest::Agent {
+            execution: old_execution,
+            detail: AgentDetailQuery::Snapshot,
+            after: None,
+        })
+        .await
+        .unwrap();
+    let ObservationValue::Agent(mut replacement) = initial.initial else {
+        panic!("expected initial snapshot");
+    };
+    let new_execution = ExecutionRef {
+        generation: old_execution.generation + 1,
+        ..old_execution
+    };
+    replacement.execution = new_execution;
+    let mut observed = agent.observe(chat, 0).await.unwrap();
+    observed.snapshot.last_sequence = 100;
+    let mut recovery = agent.pause_event_delivery().await;
+    if cover_before_reset {
+        recovery.cover(old_execution, &observed.snapshot);
+    }
+    let mut updates = agent.subscribe_facts();
+    let sender = access.feeds.lock().unwrap()[&old_execution].clone();
+    sender
+        .send(ObservationUpdate {
+            cursor: Cursor {
+                execution: Some(new_execution),
+                sequence: 0,
+                ..initial.cursor
+            },
+            change: ObservationChange::Reset {
+                reason: ResetReason::ConversationChanged,
+                snapshot: replacement,
+            },
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(RECOVERY_TIMEOUT, updates.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(agent.reference(chat).await.unwrap(), new_execution);
+    if !cover_before_reset {
+        recovery.cover(observed.execution, &observed.snapshot);
+    }
+    let receipt = core
+        .submit(chat, None, "Ask after execution replacement".into())
+        .await
+        .unwrap();
+    let snapshot = tokio::time::timeout(RECOVERY_TIMEOUT, async {
+        loop {
+            let snapshot = core.snapshot(chat).await.unwrap();
+            if !snapshot.questions.is_empty() {
+                break snapshot;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    access.fail_catalog.store(true, Ordering::Relaxed);
+    assert!(agent.list_chats().await.is_empty());
+    let mut deferred = VecDeque::from(snapshot.events.clone());
+    let mut receiver = agent.subscribe();
+    recovery.retain_uncovered(&mut receiver, &mut deferred);
+    assert!(
+        deferred
+            .iter()
+            .any(|event| matches!(event.kind, EventKind::Started)),
+        "an old execution prefix discarded the replacement's Started event"
+    );
+    let mut pending = HashMap::new();
+    let mut permissions = HashMap::new();
+    let mut questions = HashMap::new();
+    for event in &deferred {
+        track_run_requests(event, &mut pending, &mut permissions, &mut questions);
+    }
+    assert!(pending.contains_key(&receipt.run_id));
+    assert!(questions.contains_key(&snapshot.questions[0].id));
+    drop(recovery);
+    agent.leave_view().await.unwrap();
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_delayed_old_execution_query_cannot_replace_a_new_binding() {
+    let directory = tempfile::tempdir().unwrap();
+    let (core, agent, access, _facts) = delivery_fixture().await;
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let old_execution = agent.reference(chat).await.unwrap();
+    let initial = access
+        .owner
+        .observe(ObservationRequest::Agent {
+            execution: old_execution,
+            detail: AgentDetailQuery::Snapshot,
+            after: None,
+        })
+        .await
+        .unwrap();
+    let ObservationValue::Agent(mut replacement) = initial.initial else {
+        panic!("expected initial snapshot");
+    };
+    let new_execution = ExecutionRef {
+        generation: old_execution.generation + 1,
+        ..old_execution
+    };
+    replacement.execution = new_execution;
+    let (entered, captured) = oneshot::channel();
+    let (release, delayed) = oneshot::channel();
+    *access.delayed_snapshot.lock().unwrap() = Some((entered, delayed));
+    let mut updates = agent.subscribe_facts();
+    let sender = access.feeds.lock().unwrap()[&old_execution].clone();
+    sender
+        .send(ObservationUpdate {
+            cursor: initial.cursor,
+            change: ObservationChange::Changed,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(RECOVERY_TIMEOUT, captured)
+        .await
+        .unwrap()
+        .unwrap();
+    *access.replacement_snapshot.lock().unwrap() = Some(replacement);
+    assert!(
+        agent.live_snapshot(chat).await.is_err(),
+        "the controlled new execution has no real owner watch"
+    );
+    assert_eq!(agent.reference(chat).await.unwrap(), new_execution);
+    release.send(()).unwrap();
+    tokio::time::timeout(RECOVERY_TIMEOUT, updates.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        agent.reference(chat).await.unwrap(),
+        new_execution,
+        "a stale query reverted the current execution binding"
+    );
+    agent.leave_view().await.unwrap();
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_delayed_old_execution_compaction_cannot_replace_a_new_binding() {
+    let directory = tempfile::tempdir().unwrap();
+    let (core, agent, access, _facts) = delivery_fixture().await;
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let old_execution = agent.reference(chat).await.unwrap();
+    let initial = access
+        .owner
+        .observe(ObservationRequest::Agent {
+            execution: old_execution,
+            detail: AgentDetailQuery::Snapshot,
+            after: None,
+        })
+        .await
+        .unwrap();
+    let ObservationValue::Agent(mut replacement) = initial.initial else {
+        panic!("expected initial snapshot");
+    };
+    let (entered, captured) = oneshot::channel();
+    let (release, delayed) = oneshot::channel();
+    *access.delayed_compaction.lock().unwrap() = Some(DelayedCompaction {
+        snapshot: replacement.clone(),
+        entered,
+        release: delayed,
+    });
+    let command_agent = agent.clone();
+    let command =
+        tokio::spawn(async move { command_agent.compact_with_instructions(chat, None).await });
+    tokio::time::timeout(RECOVERY_TIMEOUT, captured)
+        .await
+        .unwrap()
+        .unwrap();
+    let new_execution = ExecutionRef {
+        generation: old_execution.generation + 1,
+        ..old_execution
+    };
+    replacement.execution = new_execution;
+    *access.replacement_snapshot.lock().unwrap() = Some(replacement);
+    assert!(agent.live_snapshot(chat).await.is_err());
+    assert_eq!(agent.reference(chat).await.unwrap(), new_execution);
+    release.send(()).unwrap();
+    tokio::time::timeout(RECOVERY_TIMEOUT, command)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        agent.reference(chat).await.unwrap(),
+        new_execution,
+        "a stale history command reverted the current execution binding"
+    );
+    agent.leave_view().await.unwrap();
+    core.shutdown().await;
 }
