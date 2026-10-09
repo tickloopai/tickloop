@@ -132,7 +132,7 @@ pub use model_card::{
     Adapter, ModelCard, ModelPatch, ProviderPatch, TemperatureControl, ThinkingBudgets,
     ThinkingControl, ThinkingOffEncoding,
 };
-pub use monitor::{MonitorMember, MonitorMemberSource, MonitorMembership};
+pub use monitor::{MonitorMember, MonitorMembership};
 pub use permissions::{Decision, ExecutionMode, PermissionPolicy, PermissionRule, PermissionScope};
 pub use permissions_view::{
     PermissionChange, PermissionRuleScope, PermissionRuleSource, PermissionRuleView,

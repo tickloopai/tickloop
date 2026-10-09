@@ -15,7 +15,9 @@ Call `ArtifactRead` `{"action":"read","artifact_id":"…"}`. The result gives `t
 
 ## 2. Keep the title and the first heading identical
 
-The artifact's name is `title`, and a doc's first `# ` heading shows that same name. Keep the first heading exactly `# <title>` as read returned it, and never write a different H1 to rename it; only the user renames, on the web page. For a design, keep `<title>` equal to the title.
+The artifact's name is `title`, and a doc's first `# ` heading shows that same name. Keep the first heading exactly `# <title>` as read returned it, and never write a different H1 to rename it. For a design, keep `<title>` equal to the title.
+
+To rename, call `ArtifactEdit` `{"action":"rename","artifact_id":"…","title":"<new title>","expected_title":"<title from read>"}`. A doc's first heading, or a design's `<title>`, that still shows the old title follows the new one; read again before patching that heading.
 
 ## 3. Write a doc (`format` `doc`)
 

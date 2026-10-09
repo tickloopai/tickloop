@@ -85,15 +85,15 @@ async fn an_ended_shell_is_unread_until_a_turn_takes_in_its_notification() {
         .await
         .unwrap();
     finish_run(&agent, chat, &mut events).await;
+    let monitor = agent.snapshot(chat).await.unwrap().monitor;
     assert!(
-        agent
-            .snapshot(chat)
-            .await
-            .unwrap()
-            .monitor
-            .handled_at(&shell)
-            .is_some(),
+        monitor.handled_at(&shell).is_some(),
         "the turn that took in the notification handled the end"
+    );
+    assert_eq!(
+        monitor.taken_in_at(&shell),
+        monitor.handled_at(&shell),
+        "a turn handled it, not the user"
     );
 }
 
@@ -182,6 +182,11 @@ async fn the_user_opening_a_row_handles_it_and_the_mark_survives_resume() {
     let handled = membership
         .handled_at(&instance)
         .expect("opening the row handles it");
+    assert_eq!(
+        membership.taken_in_at(&instance),
+        None,
+        "no turn took the updates in"
+    );
     agent.shutdown().await;
     drop(agent);
 
@@ -193,20 +198,22 @@ async fn the_user_opening_a_row_handles_it_and_the_mark_survives_resume() {
 }
 
 #[tokio::test]
-async fn adding_an_instance_starts_from_what_it_already_did() {
+async fn a_reopened_instance_starts_from_what_it_already_did() {
     let directory = tempfile::tempdir().unwrap();
     let agent = Agent::new_embedded(config(), Arc::new(ScriptedModel::new(Vec::new())));
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    let instance: InstanceRef = "herdr:quotes".parse().unwrap();
+    let lost = InstanceRef::hosted(uuid::Uuid::new_v4());
+    let instance = InstanceRef::hosted(uuid::Uuid::new_v4());
     let before = tickloop_agent_base::private_fs::unix_time_milliseconds();
     let membership = agent
-        .add_monitor_member(chat, instance.clone(), Some("Quotes".into()))
+        .record_reopened_tick(chat, &lost, instance.clone())
         .await
         .unwrap();
     assert!(
         membership
             .handled_at(&instance)
             .is_some_and(|at| at >= before),
-        "updates from before the add are no news"
+        "updates from before it joined are no news"
     );
+    assert_eq!(membership.taken_in_at(&instance), None);
 }

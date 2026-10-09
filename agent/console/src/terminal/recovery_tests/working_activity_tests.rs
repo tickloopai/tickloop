@@ -445,11 +445,15 @@ fn overview_dispatch_records_a_live_observed_run_clock_before_opening_the_agent(
         !directory.path().join(ACTIVITY_OBSERVED_START).exists(),
         "initial Create has a snapshot start, not a live event observed by this View"
     );
+    fixture.wait_until_shown("the dispatched Agent opens", |frame| {
+        frame.contains("Continue the same controlled Overview activity")
+            && !frame.contains("Agents · local")
+    });
     std::fs::write(directory.path().join(ACTIVITY_STAGE), "finish-1").unwrap();
-    fixture.wait_until_shown(
-        "the initial dispatch actually completes in Overview",
-        |frame| frame.contains("Completed"),
-    );
+    fixture.wait_for_turn_summary();
+    // Back in Overview, the next run starts while only the list is open.
+    fixture.send(b"\x1b[D");
+    fixture.wait_for("Agents · local");
     std::fs::write(directory.path().join(ACTIVITY_STAGE), "continue-2").unwrap();
     fixture.wait_for_phase(&directory.path().join(ACTIVITY_PHASE), "running-2");
     let observed = fixture.wait_for_phase(

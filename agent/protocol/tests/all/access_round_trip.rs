@@ -4,7 +4,7 @@ use tick_protocol::InstanceRef;
 use tickloop_agent_protocol::{
     AgentCommand, ChatSnapshot, CommandResult, ExecutionRef, FamilyCompletion,
     FamilyMessageRejection, FamilyMessageRejectionCode, LiveChatSnapshot, LoopState, MonitorMember,
-    MonitorMemberSource, SubagentNotificationDelivery, Usage,
+    SubagentNotificationDelivery, Usage,
 };
 use uuid::Uuid;
 
@@ -31,7 +31,6 @@ fn monitor_members_and_required_push_completion_fields_share_one_snapshot_wire()
         .unwrap();
         snapshot.monitor.members.push(MonitorMember {
             instance: instance.clone(),
-            source: MonitorMemberSource::Added,
             title: Some("Counter".into()),
         });
         snapshot.family_completions.push(FamilyCompletion {
@@ -82,11 +81,6 @@ fn monitor_membership_commands_cross_the_wire_unchanged() {
     };
     let instance: InstanceRef = "herdr:counter".parse().unwrap();
     for command in [
-        AgentCommand::AddMonitorMember {
-            execution,
-            instance: instance.clone(),
-            title: Some("Counter".into()),
-        },
         AgentCommand::RemoveMonitorMember {
             execution,
             instance: instance.clone(),
@@ -163,5 +157,72 @@ fn handled_marks_only_move_forward_and_stay_bounded() {
     assert!(
         !marks_only.is_empty(),
         "a Chat whose only Monitor facts are handled marks still sends them"
+    );
+}
+
+#[test]
+fn an_agent_turn_taking_updates_in_handles_them_and_says_so() {
+    use tickloop_agent_protocol::MonitorMembership;
+    let mut membership = MonitorMembership::default();
+    let opened: InstanceRef = "herdr:opened".parse().unwrap();
+    let delivered: InstanceRef = "herdr:delivered".parse().unwrap();
+    assert!(membership.mark_handled(opened.clone(), 2_000));
+    assert!(membership.mark_taken_in(delivered.clone(), 2_000));
+    assert_eq!(membership.handled_at(&delivered), Some(2_000));
+    assert_eq!(membership.taken_in_at(&delivered), Some(2_000));
+    assert_eq!(
+        membership.taken_in_at(&opened),
+        None,
+        "opening a row handles it without an Agent turn"
+    );
+    assert!(!membership.mark_taken_in(opened.clone(), 1_000));
+    assert_eq!(
+        membership.taken_in_at(&opened),
+        None,
+        "an older take-in neither moves the mark nor claims the later handling"
+    );
+    for index in 0..600_u64 {
+        membership.mark_handled(
+            InstanceRef::native(format!("run-{index}")).unwrap(),
+            10_000 + index,
+        );
+    }
+    assert!(
+        membership.taken_in.is_empty(),
+        "a take-in leaves with its handled mark"
+    );
+    let older: MonitorMembership =
+        serde_json::from_value(serde_json::json!({ "handled": { "herdr:opened": 2000 } })).unwrap();
+    assert!(older.taken_in.is_empty(), "16.3 membership still decodes");
+}
+
+#[test]
+fn a_membership_saved_with_member_sources_loads_every_member_as_opened() {
+    use tickloop_agent_protocol::MonitorMembership;
+    let saved: MonitorMembership = serde_json::from_value(serde_json::json!({
+        "members": [
+            { "instance": "herdr:opened", "source": "opened", "title": "Quotes" },
+            { "instance": "herdr:added", "source": "added" },
+        ],
+        "removed": ["herdr:hidden"],
+    }))
+    .unwrap();
+    assert_eq!(
+        saved.members,
+        [
+            MonitorMember {
+                instance: "herdr:opened".parse().unwrap(),
+                title: Some("Quotes".into()),
+            },
+            MonitorMember {
+                instance: "herdr:added".parse().unwrap(),
+                title: None,
+            },
+        ]
+    );
+    assert!(saved.is_removed(&"herdr:hidden".parse().unwrap()));
+    assert!(
+        !serde_json::to_string(&saved).unwrap().contains("source"),
+        "the source is no longer written"
     );
 }

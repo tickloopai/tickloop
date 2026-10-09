@@ -4,8 +4,7 @@ use crate::terminal::{
     task_surface::{TaskOutputUpdate, TaskSurfaceEffect},
 };
 use tickloop_agent_protocol::{
-    ChatSnapshot, MonitorMember, MonitorMemberSource, MonitorMembership, ShellTaskOutputChunk,
-    TickSubscriptionStatus,
+    ChatSnapshot, MonitorMember, MonitorMembership, ShellTaskOutputChunk, TickSubscriptionStatus,
 };
 
 fn shell(id: Uuid, title: &str) -> MonitorEntry {
@@ -45,9 +44,8 @@ fn chat_snapshot(chat: Uuid) -> ChatSnapshot {
 
 fn removed(instance: tick_protocol::InstanceRef) -> MonitorMembership {
     MonitorMembership {
-        handled: Default::default(),
-        members: Vec::new(),
         removed: [instance].into(),
+        ..Default::default()
     }
 }
 
@@ -891,6 +889,49 @@ async fn failed_artifact_refresh_keeps_cached_title_but_marks_the_row_and_notifi
 }
 
 #[test]
+fn an_artifact_renamed_in_the_chat_replaces_its_cached_metadata_title() {
+    let chat = Uuid::new_v4();
+    let console = Console::test_for_chat(chat);
+    let tick = |title: &str| tickloop_agent_protocol::ArtifactTick {
+        artifact_id: "doc".into(),
+        origin: "https://docs.example".into(),
+        title: title.into(),
+        format: "markdown".into(),
+        url: "https://docs.example/a/doc".into(),
+        access_role: "owner".into(),
+        added_at_ms: 1,
+    };
+    let cached = |title: &str| {
+        serde_json::from_value(
+            serde_json::json!({"id":"doc","title":title,"format":"markdown","access_role":"owner"}),
+        )
+        .unwrap()
+    };
+    let id = tick("Plan").instance_id();
+    let mut snapshot = chat_snapshot(chat);
+    snapshot.artifact_ticks = vec![tick("Plan")];
+    console.update_monitor_chat(&snapshot).unwrap();
+    console
+        .update_artifact_metadata(chat, id.clone(), Some(cached("Renamed on the web")))
+        .unwrap();
+    console.update_monitor_chat(&snapshot).unwrap();
+    assert_eq!(
+        console.state.lock().unwrap().monitor.entries()[0].title,
+        "Renamed on the web",
+        "an unchanged Chat title leaves the newer metadata title in place"
+    );
+
+    snapshot.artifact_ticks = vec![tick("Q3 plan")];
+    console.update_monitor_chat(&snapshot).unwrap();
+    let state = console.state.lock().unwrap();
+    assert_eq!(state.monitor.entries()[0].title, "Q3 plan");
+    assert_eq!(
+        state.monitor.metadata[&id].as_ref().unwrap().title,
+        "Q3 plan"
+    );
+}
+
+#[test]
 fn focused_monitor_does_not_paste_into_composer_or_show_basic_navigation_hints() {
     let mut state = State::new(true, 140, 25);
     state.switch_view_chat(Some(Uuid::new_v4()));
@@ -1692,23 +1733,10 @@ async fn shell_detail_confirmation_runs_the_production_adapter_control_callback(
     core.shutdown().await;
 }
 
-struct FixtureDiscovery;
+/// A Herdr probe that finds every member gone.
+struct FixtureHerdrProbe;
 #[async_trait::async_trait]
-impl crate::monitor_rows::TickDiscovery for FixtureDiscovery {
-    async fn page(
-        &self,
-        _: Option<tickhost_connect::page::PageCursor>,
-    ) -> Result<
-        tickhost_connect::page::Page<crate::monitor_rows::DiscoveredTick>,
-        crate::monitor_rows::DiscoveryError,
-    > {
-        Err(crate::monitor_rows::DiscoveryError::Unavailable(
-            "not listed in this fixture".into(),
-        ))
-    }
-}
-#[async_trait::async_trait]
-impl crate::monitor_rows::TickProbe for FixtureDiscovery {
+impl crate::monitor_rows::TickProbe for FixtureHerdrProbe {
     fn tick_type(&self) -> &'static str {
         "herdr"
     }
@@ -1716,7 +1744,7 @@ impl crate::monitor_rows::TickProbe for FixtureDiscovery {
         &self,
         _chat: Uuid,
         instances: &[tick_protocol::InstanceRef],
-    ) -> Result<crate::monitor_rows::MemberFindings, crate::monitor_rows::DiscoveryError> {
+    ) -> Result<crate::monitor_rows::MemberFindings, crate::monitor_rows::ProbeError> {
         Ok(crate::monitor_rows::MemberFindings {
             states: instances
                 .iter()
@@ -1740,11 +1768,9 @@ impl crate::monitor_rows::TickProbe for FixtureHostedProbe {
         &self,
         _chat: Uuid,
         instances: &[tick_protocol::InstanceRef],
-    ) -> Result<crate::monitor_rows::MemberFindings, crate::monitor_rows::DiscoveryError> {
+    ) -> Result<crate::monitor_rows::MemberFindings, crate::monitor_rows::ProbeError> {
         if self.fails {
-            return Err(crate::monitor_rows::DiscoveryError::Unavailable(
-                "host unreachable".into(),
-            ));
+            return Err(crate::monitor_rows::ProbeError("host unreachable".into()));
         }
         Ok(crate::monitor_rows::MemberFindings {
             updates: Default::default(),
@@ -1813,13 +1839,12 @@ fn a_herdr_view_probes_hosted_members_beside_herdr_ones() {
     ] {
         snapshot.monitor.members.push(MonitorMember {
             instance,
-            source: MonitorMemberSource::Opened,
             title: Some(title.into()),
         });
     }
     console.update_monitor_chat(&snapshot).unwrap();
     console
-        .set_tick_discovery(Arc::new(FixtureDiscovery))
+        .add_member_probe(Arc::new(FixtureHerdrProbe))
         .unwrap();
     console
         .add_member_probe(Arc::new(FixtureHostedProbe { fails: false }))
@@ -1863,66 +1888,6 @@ fn screen(state: &mut State) -> String {
 }
 
 #[test]
-fn adding_from_the_workspace_opens_even_on_an_empty_monitor_and_only_where_discovery_exists() {
-    let mut state = State::new(true, 140, 25);
-    state.switch_view_chat(Some(Uuid::new_v4()));
-    state.prompt_enabled = true;
-    assert!(state.open_monitor_discovery().is_none());
-    assert!(screen(&mut state).contains("Nothing to add"));
-    assert!(!state.monitor_visible());
-    assert!(!state.monitor.focused);
-
-    state.tick_discovery = Some(Arc::new(FixtureDiscovery));
-    assert!(matches!(
-        state.open_monitor_discovery(),
-        Some(InputEvent::TickAction { action, .. }) if action.key == 'a'
-    ));
-    assert!(
-        state.monitor_visible(),
-        "the picker shows on an empty Monitor"
-    );
-    assert!(screen(&mut state).contains("Add to Monitor"));
-    state.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
-    assert_eq!(state.editor.draft(), "", "the picker owns its keys");
-    state.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-    assert!(state.monitor.detail.is_none());
-    assert!(!state.monitor_visible());
-    assert!(
-        !state.monitor.focused,
-        "an empty Monitor gives focus back to the input"
-    );
-    state.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
-    assert_eq!(state.editor.draft(), "j", "text input owns j again");
-}
-
-#[test]
-fn removed_rows_can_be_restored_without_a_workspace() {
-    let mut state = State::new(true, 140, 25);
-    let chat = Uuid::new_v4();
-    state.switch_view_chat(Some(chat));
-    state.prompt_enabled = true;
-    let mut snapshot = chat_snapshot(chat);
-    let shell = tick_protocol::InstanceRef::shell(Uuid::new_v4());
-    snapshot.monitor.removed.insert(shell.clone());
-    state.monitor.chat_snapshot = Some(snapshot);
-    state.monitor.rebuild();
-    assert!(matches!(
-        state.open_monitor_discovery(),
-        Some(InputEvent::TickAction { .. })
-    ));
-    let picker = screen(&mut state);
-    assert!(
-        picker.contains("Add to Monitor · Removed · page 1"),
-        "{picker}"
-    );
-    assert!(picker.contains("› shell:"), "{picker}");
-    assert!(matches!(
-        state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-        Some(InputEvent::TickAction { action, .. }) if action.instance == shell.to_string()
-    ));
-}
-
-#[test]
 fn monitor_pages_hold_at_most_128_rows_while_n_counts_the_full_set() {
     let mut state = State::new(true, 140, 25);
     let chat = Uuid::new_v4();
@@ -1932,7 +1897,6 @@ fn monitor_pages_hold_at_most_128_rows_while_n_counts_the_full_set() {
     for index in 0..130 {
         snapshot.monitor.members.push(MonitorMember {
             instance: format!("herdr:member-{index:03}").parse().unwrap(),
-            source: MonitorMemberSource::Added,
             title: None,
         });
     }
@@ -1966,23 +1930,19 @@ fn probed_herdr_members_report_their_host_state_and_owner() {
     let console = Console::test_for_chat(Uuid::new_v4());
     let chat = console.state.lock().unwrap().chat.unwrap();
     let mut snapshot = chat_snapshot(chat);
-    for (id, source) in [
-        ("added", MonitorMemberSource::Added),
-        ("opened", MonitorMemberSource::Opened),
-    ] {
+    for id in ["quotes", "news"] {
         snapshot.monitor.members.push(MonitorMember {
             instance: format!("herdr:{id}").parse().unwrap(),
-            source,
             title: Some(id.into()),
         });
     }
     console.update_monitor_chat(&snapshot).unwrap();
     assert!(
         console.claim_member_probe().unwrap().is_none(),
-        "no discovery, no probe"
+        "outside Herdr nothing probes Herdr members"
     );
     console
-        .set_tick_discovery(Arc::new(FixtureDiscovery))
+        .add_member_probe(Arc::new(FixtureHerdrProbe))
         .unwrap();
     let probe = console.claim_member_probe().unwrap().unwrap();
     assert_eq!(probe.chat, chat);
@@ -1998,35 +1958,25 @@ fn probed_herdr_members_report_their_host_state_and_owner() {
         .update_member_findings(chat, vec![("herdr", None)])
         .unwrap();
     let state = console.state.lock().unwrap();
-    let added = state
-        .monitor
-        .entries()
-        .iter()
-        .find(|entry| entry.title == "added")
-        .unwrap();
-    assert_eq!(added.status, "gone");
-    assert_eq!(added.owner, crate::monitor_rows::TickOwner::Herdr);
-    let opened = state
-        .monitor
-        .entries()
-        .iter()
-        .find(|entry| entry.title == "opened")
-        .unwrap();
-    assert_eq!(opened.owner, crate::monitor_rows::TickOwner::ThisChat);
+    for entry in state.monitor.entries() {
+        assert_eq!(entry.status, "gone", "{}", entry.title);
+        assert_eq!(entry.owner, crate::monitor_rows::TickOwner::ThisChat);
+    }
 }
 
 #[test]
-fn a_focused_monitor_advertises_and_routes_add_only_with_discovery() {
+fn a_focused_monitor_has_no_add_key_and_types_a_into_the_input() {
     let mut state = click_fixture(140, false, TickGroup::Shells);
     state.monitor.focus(false, None);
     assert!(!screen(&mut state).contains("a add"));
-    state.tick_discovery = Some(Arc::new(FixtureDiscovery));
-    assert!(screen(&mut state).contains("a add"));
-    assert!(matches!(
-        state.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
-        Some(InputEvent::TickAction { action, .. }) if action.key == 'a'
-    ));
-    assert!(screen(&mut state).contains("Add to Monitor"));
+    assert!(
+        state
+            .key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
+            .is_none()
+    );
+    assert!(!state.monitor.focused);
+    assert!(state.monitor.detail.is_none());
+    assert_eq!(state.editor.draft(), "a");
 }
 
 #[test]
@@ -2038,7 +1988,6 @@ fn member_details_show_the_recorded_owner_and_no_invented_resources() {
     let mut snapshot = chat_snapshot(chat);
     snapshot.monitor.members.push(MonitorMember {
         instance: tick_protocol::InstanceRef::new("herdr", "opened").unwrap(),
-        source: MonitorMemberSource::Opened,
         title: Some("Opened counter".into()),
     });
     state.monitor.chat_snapshot = Some(snapshot);
@@ -2096,6 +2045,7 @@ fn monitor_rows_take_one_line_when_the_status_fits_beside_the_name_and_two_other
     subscribed.update = Some(crate::monitor_rows::RowUpdate {
         at_ms: 1000,
         unread: Some(Unread { count: Some(3) }),
+        taken_in_at_ms: None,
     });
     for (width, preferred, entry, details, two_lines) in [
         (140, None, &finished, "101", false),
@@ -2287,6 +2237,54 @@ fn a_finished_background_shell_leaves_once_handled_unless_its_detail_is_open() {
 }
 
 #[test]
+fn a_shell_end_flashes_as_a_turn_takes_it_in_and_a_chat_switch_does_not_replay_it() {
+    let chat = Uuid::new_v4();
+    let console = Console::test_for_chat(chat);
+    let ended = tickloop_agent_base::private_fs::unix_time_milliseconds();
+    let mut snapshot = tests::task_snapshot(chat, 1);
+    snapshot.tasks[0].was_background = true;
+    snapshot.tasks[0].state = tickloop_agent_protocol::ShellTaskState::Completed;
+    snapshot.tasks[0].exit_code = Some(0);
+    snapshot.tasks[0].updated_at_ms = Some(ended);
+    snapshot.tasks[0].command = "make test".into();
+    let shell = tick_protocol::InstanceRef::shell(snapshot.tasks[0].id);
+    let mut chat_snapshot = chat_snapshot(chat);
+    console.update_monitor_chat(&chat_snapshot).unwrap();
+    console.update_shell_ticks(&snapshot).unwrap();
+    let display = DisplayProfile::default();
+    let row_fill = |state: &State, now_ms| {
+        let lines = state.monitor.frame(40, 10, display, now_ms).lines;
+        let row = lines
+            .iter()
+            .find(|line| line.text().contains("make test"))
+            .expect("the Shell keeps its row");
+        row.fill
+    };
+    {
+        let state = console.state.lock().unwrap();
+        assert_eq!(row_fill(&state, ended + 500), Some(Role::UnreadRow));
+        assert_eq!(state.monitor.next_frame_ms(ended + 500, display), None);
+    }
+
+    let taken_in = ended + 1_000;
+    chat_snapshot.monitor.mark_taken_in(shell, taken_in);
+    console.update_monitor_chat(&chat_snapshot).unwrap();
+    let mut state = console.state.lock().unwrap();
+    assert_eq!(row_fill(&state, taken_in + 100), Some(Role::UnreadFlash));
+    assert_eq!(
+        state.monitor.next_frame_ms(taken_in + 100, display),
+        Some(taken_in + 400)
+    );
+    state.switch_view_chat(Some(Uuid::new_v4()));
+    state.switch_view_chat(Some(chat));
+    drop(state);
+    console.update_monitor_chat(&chat_snapshot).unwrap();
+    let state = console.state.lock().unwrap();
+    assert_eq!(row_fill(&state, taken_in + 100), None);
+    assert_eq!(state.monitor.next_frame_ms(taken_in + 100, display), None);
+}
+
+#[test]
 fn an_emptied_monitor_keeps_its_column_and_its_label_still_hides_it() {
     let mut state = monitor_state(140, vec![shell(Uuid::new_v4(), "Short lived")]);
     let conversation = state.content_columns();
@@ -2451,7 +2449,10 @@ fn a_subscribed_row_shows_its_marker_and_manages_subscriptions_inside_monitor() 
     let mut state = subscribed_fixture(1);
     let text = monitor_text(&mut state);
     assert!(text.contains("⟳ 60s") && !text.contains("live"), "{text}");
-    assert!(text.contains("enter subscriptions"), "{text}");
+    assert!(
+        text.contains("enter open") && text.contains("w subscriptions"),
+        "{text}"
+    );
     assert_eq!(
         state
             .monitor
@@ -2462,14 +2463,15 @@ fn a_subscribed_row_shows_its_marker_and_manages_subscriptions_inside_monitor() 
             .map(|action| (action.key, action.label))
             .collect::<Vec<_>>(),
         [
-            ('o', "subscriptions"),
+            ('o', "open"),
             ('x', "remove"),
+            ('w', "subscriptions"),
             ('e', "cadence"),
             ('u', "unsubscribe")
         ]
     );
 
-    assert_eq!(requested_key(press(&mut state, KeyCode::Enter)), 'o');
+    assert_eq!(requested_key(press(&mut state, KeyCode::Char('w'))), 'w');
     let text = monitor_text(&mut state);
     assert!(text.contains("Tick Subscriptions 1"), "{text}");
     assert!(text.contains("› ⟳ every 60s"), "{text}");
@@ -2507,7 +2509,7 @@ fn several_subscriptions_on_one_row_show_a_summary_and_open_as_a_list() {
         "a row with no update time shows no unread mark: {text}"
     );
 
-    assert_eq!(requested_key(press(&mut state, KeyCode::Char('u'))), 'o');
+    assert_eq!(requested_key(press(&mut state, KeyCode::Char('u'))), 'u');
     let text = monitor_text(&mut state);
     assert!(text.contains("Tick Subscriptions 3"), "{text}");
     assert!(
@@ -2652,8 +2654,12 @@ async fn opening_a_row_handles_its_updates_and_other_keys_do_not() {
         ConsoleExecution::from_embedded(core.clone(), tickloop_agent_test_support::config());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let quotes = tick_protocol::InstanceRef::native("quotes-run").unwrap();
-    let added = agent
-        .add_monitor_member(chat, quotes.clone(), Some("Quotes".into()))
+    let joined = core
+        .record_reopened_tick(
+            chat,
+            &tick_protocol::InstanceRef::native("lost-run").unwrap(),
+            quotes.clone(),
+        )
         .await
         .unwrap()
         .handled_at(&quotes)
@@ -2690,7 +2696,7 @@ async fn opening_a_row_handles_its_updates_and_other_keys_do_not() {
         .monitor
         .handled_at(&quotes)
         .unwrap();
-    assert!(handled > added, "opening the row handled its updates");
+    assert!(handled > joined, "opening the row handled its updates");
     assert_eq!(
         console
             .state
@@ -2956,6 +2962,7 @@ fn an_artifact_linked_here_shows_the_subscription_marker_and_x_unlinks_it() {
             ('x', "unlink"),
             ('c', "copy"),
             ('f', "feedback"),
+            ('w', "subscriptions"),
             ('e', "cadence"),
             ('u', "unsubscribe")
         ]

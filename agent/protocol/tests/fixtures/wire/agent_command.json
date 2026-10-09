@@ -291,14 +291,13 @@
     }
   },
   {
-    "kind": "add_monitor_member",
+    "kind": "remove_monitor_member",
     "execution": {
       "daemon_epoch": "00000000-0000-0000-0000-0000000000e0",
       "agent_id": "00000000-0000-0000-0000-0000000000a1",
       "generation": 3
     },
-    "instance": "herdr:session/workspace/pane/counter",
-    "title": "Counter"
+    "instance": "herdr:session/workspace/pane/counter"
   },
   {
     "kind": "hosted_tick_snapshot",
@@ -331,6 +330,19 @@
     "action": {
       "kind": "take_back_interrupted_prompt",
       "run_id": "00000000-0000-0000-0000-000000000020"
+    }
+  },
+  {
+    "kind": "decline_question",
+    "request": {
+      "execution": {
+        "daemon_epoch": "00000000-0000-0000-0000-0000000000e0",
+        "agent_id": "00000000-0000-0000-0000-0000000000a1",
+        "generation": 3
+      },
+      "request_id": "00000000-0000-0000-0000-000000000062",
+      "kind": "Question",
+      "version": 1
     }
   }
 ]

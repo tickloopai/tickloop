@@ -216,12 +216,9 @@ async fn explicit_host_operations_continue_after_the_agent_view_closes() {
         membership
             .members
             .iter()
-            .map(|member| (member.instance.as_str(), member.source))
+            .map(|member| member.instance.as_str())
             .collect::<Vec<_>>(),
-        vec![(
-            opened["tick_instance_id"].as_str().unwrap(),
-            tickloop_agent_protocol::MonitorMemberSource::Opened
-        )],
+        vec![opened["tick_instance_id"].as_str().unwrap()],
         "a verified open joins the opening Chat's Monitor"
     );
     assert!(subscriptions.is_empty(), "opening never subscribes");

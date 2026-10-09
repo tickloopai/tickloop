@@ -779,7 +779,7 @@ fn content_height_tiny_picker_requires_resize_and_never_submits_hidden_controls(
 
 #[test]
 fn content_height_help_counts_columns_and_uses_the_full_available_budget() {
-    for (width, height, expected) in [(160, 40, 10), (80, 24, 14), (32, 24, 22), (32, 10, 8)] {
+    for (width, height, expected) in [(160, 40, 10), (80, 24, 13), (32, 24, 22), (32, 10, 8)] {
         let mut state = State::new(true, width, height);
         state.help_open = true;
         let lines = state.styled_frame().0;

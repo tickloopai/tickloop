@@ -42,9 +42,8 @@ pub(super) fn dragged_columns(width: usize, column: usize) -> Option<usize> {
 
 pub(super) use crate::monitor_rows::TickGroup;
 use crate::monitor_rows::{
-    GONE_DISPLAY_MS, MONITOR_ADD_KEY, MonitorAction, MonitorContext, MonitorRowsRegistry,
-    RowUpdate, StatusTone, TickDescriptor, TickGlyph, TickOwner, TickResources,
-    finished_shell_until, page_of,
+    GONE_DISPLAY_MS, MonitorAction, MonitorContext, MonitorRowsRegistry, RowUpdate, StatusTone,
+    TickDescriptor, TickGlyph, TickOwner, TickResources, finished_shell_until, page_of,
 };
 use tick_protocol::InstanceRef;
 use tickloop_agent_protocol::{
@@ -129,6 +128,15 @@ pub(super) struct Monitor {
     refresh_at: Option<u64>,
     /// Since when each instance has shown as gone, as this View saw it.
     gone_since: HashMap<InstanceRef, u64>,
+    /// Since when this View has shown this Chat's Monitor; an Agent turn taking an update in
+    /// earlier never flashes its row.
+    flashes_since: Option<u64>,
+    /// The update each row last listed as handled; taking the same update in again, such as a
+    /// second read of it, does not flash the row.
+    handled_updates: HashMap<InstanceRef, u64>,
+    /// When an Agent turn took in each row's update while this View showed the Chat; the row
+    /// flashes from then on before its fill clears.
+    taken_in: HashMap<InstanceRef, u64>,
 }
 
 pub(super) struct MonitorFrame {
@@ -161,20 +169,13 @@ impl Monitor {
                 .find(|entry| &entry.instance == instance)
         })
     }
-    /// Instances this Chat opened or explicitly added, as opposed to rows other sources show.
-    pub(super) fn members(&self) -> BTreeSet<InstanceRef> {
+    /// Instances this Chat opened, as opposed to rows other sources show.
+    fn members(&self) -> BTreeSet<InstanceRef> {
         self.chat_snapshot
             .iter()
             .flat_map(|chat| &chat.monitor.members)
             .map(|member| member.instance.clone())
             .collect()
-    }
-    /// Instances removed from this Chat's Monitor, which an explicit add restores.
-    pub(super) fn removed(&self) -> BTreeSet<InstanceRef> {
-        self.chat_snapshot
-            .as_ref()
-            .map(|chat| chat.monitor.removed.clone())
-            .unwrap_or_default()
     }
     /// Whether the column has shown rows in this Chat, so it stays on screen when empty.
     pub(super) fn is_shown(&self) -> bool {
@@ -187,6 +188,26 @@ impl Monitor {
         }
         self.rebuild_at(now_ms);
         true
+    }
+    /// Takes the Chat's newest snapshot. An artifact title that changed in the Chat since the
+    /// previous snapshot, such as after the Agent's own rename, is newer than the one the last
+    /// metadata read cached, so it replaces that one.
+    pub(super) fn set_chat_snapshot(&mut self, snapshot: ChatSnapshot) {
+        let previous = self.chat_snapshot.take();
+        for tick in &snapshot.artifact_ticks {
+            let id = tick.instance_id();
+            let is_renamed = previous.as_ref().is_some_and(|previous| {
+                previous
+                    .artifact_ticks
+                    .iter()
+                    .any(|known| known.instance_id() == id && known.title != tick.title)
+            });
+            if is_renamed && let Some(Some(metadata)) = self.metadata.get_mut(&id) {
+                metadata.title = tick.title.clone();
+            }
+        }
+        self.chat_snapshot = Some(snapshot);
+        self.rebuild();
     }
     pub(super) fn rebuild(&mut self) {
         self.rebuild_at(tickloop_agent_base::private_fs::unix_time_milliseconds());
@@ -211,6 +232,7 @@ impl Monitor {
             .rows
             .get_or_insert_with(MonitorRowsRegistry::builtin)
             .list(&context);
+        self.note_taken_in(&listed, now_ms);
         // A row that left as gone stays out; one that shows again as anything else starts over.
         for entry in &listed {
             if entry.tone == StatusTone::Gone {
@@ -269,6 +291,39 @@ impl Monitor {
         }
         self.reconcile_selection();
     }
+    /// Notes the rows whose update an Agent turn has just taken in, so they flash before their
+    /// fill clears. A row the user opened does not flash, nor one taken in before this View
+    /// showed the Chat, nor an update the row already showed handled that a turn takes in again.
+    fn note_taken_in(&mut self, listed: &[TickDescriptor], now_ms: u64) {
+        let flashes_since = *self.flashes_since.get_or_insert(now_ms);
+        let mut handled_updates = HashMap::new();
+        for entry in listed {
+            let Some(update) = entry
+                .update
+                .as_ref()
+                .filter(|update| update.unread.is_none())
+            else {
+                continue;
+            };
+            if let Some(taken_in) = update.taken_in_at_ms
+                && taken_in >= flashes_since
+                && self.handled_updates.get(&entry.instance) != Some(&update.at_ms)
+            {
+                self.taken_in.insert(entry.instance.clone(), taken_in);
+            }
+            handled_updates.insert(entry.instance.clone(), update.at_ms);
+        }
+        self.taken_in
+            .retain(|instance, _| handled_updates.contains_key(instance));
+        self.handled_updates = handled_updates;
+    }
+    /// Ends the flashes under way and lets only later take-ins flash, as when this Chat's Monitor
+    /// comes back into view: what an Agent turn took in while the View showed another Chat does
+    /// not replay.
+    pub(super) fn settle_flashes(&mut self, now_ms: u64) {
+        self.taken_in.clear();
+        self.flashes_since = Some(now_ms);
+    }
     /// When time alone next changes the list: the next finished Shell or gone Tick to leave.
     fn next_refresh_ms(&self, now_ms: u64) -> Option<u64> {
         let handled = |task: &tickloop_agent_protocol::ShellTask| {
@@ -289,15 +344,23 @@ impl Monitor {
             .min()
     }
     /// When time alone next changes the drawn list without changing its rows: a running row's
-    /// glyph blinking or its elapsed time ticking. `None` while nothing runs or a detail covers
-    /// the list.
+    /// glyph blinking or its elapsed time ticking, or a row flashing as an Agent turn takes its
+    /// update in. `None` while nothing runs or flashes, or a detail covers the list.
     pub(super) fn next_frame_ms(&self, now_ms: u64, display: DisplayProfile) -> Option<u64> {
-        (self.detail.is_none()
-            && self
-                .entries
-                .iter()
-                .any(|entry| matches!(entry.tone, StatusTone::Running { .. })))
-        .then(|| display.next_running_change_ms(now_ms))
+        if self.detail.is_some() {
+            return None;
+        }
+        let running = self
+            .entries
+            .iter()
+            .any(|entry| matches!(entry.tone, StatusTone::Running { .. }))
+            .then(|| display.next_running_change_ms(now_ms));
+        let flashing = self
+            .entries
+            .iter()
+            .filter_map(|entry| self.taken_in.get(&entry.instance))
+            .filter_map(|taken_in| display.next_flash_change_ms(*taken_in, now_ms));
+        running.into_iter().chain(flashing).min()
     }
     /// The row's title, or the instance itself when no row shows it.
     pub(super) fn title_of(&self, instance: &InstanceRef) -> String {
@@ -331,12 +394,7 @@ impl Monitor {
         self.reconcile_selection();
     }
     fn reconcile_selection(&mut self) {
-        if self.entries.is_empty()
-            && !self
-                .detail
-                .as_ref()
-                .is_some_and(|detail| detail.keeps_empty_monitor())
-        {
+        if self.entries.is_empty() {
             self.detail = None;
             self.focused = false;
             self.overlay = false;
@@ -454,8 +512,8 @@ impl Monitor {
         self.frame(width, height, display, now_ms).lines
     }
 
-    /// The keys of the focused list: the selected row's actions, adding, and Esc.
-    pub(super) fn hint(&self, can_add: bool) -> String {
+    /// The keys of the focused list: the selected row's actions and Esc.
+    pub(super) fn hint(&self) -> String {
         let mut hints = self
             .selected()
             .map(|entry| {
@@ -476,9 +534,6 @@ impl Monitor {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        if can_add {
-            hints.push(format!("{MONITOR_ADD_KEY} add"));
-        }
         hints.push("esc input".into());
         hints.join(" · ")
     }
@@ -528,6 +583,15 @@ impl Monitor {
                 glyph_role: list_row::state_mark(entry.tone, display, now_ms),
                 name: title,
                 status: entry.status_spans(now_ms),
+                fill: list_row::update_fill(
+                    entry
+                        .update
+                        .as_ref()
+                        .is_some_and(|update| update.unread.is_some()),
+                    self.taken_in.get(&entry.instance).copied(),
+                    display,
+                    now_ms,
+                ),
             })
             .collect::<Vec<_>>();
         let groups = self
@@ -847,6 +911,230 @@ mod registered_rows_tests {
         );
         assert!(!text.contains("Subscribed"));
         assert!(!text.contains("enter"), "keys are on the hint row: {text}");
-        assert_eq!(list.hint(false), "enter inspect · z expand · esc input");
+        assert_eq!(list.hint(), "enter inspect · z expand · esc input");
+    }
+}
+
+#[cfg(test)]
+mod unread_fill_tests {
+    use super::*;
+    use crate::monitor_rows::{MonitorRows, RowUpdate};
+    use std::sync::Arc;
+    use tickloop_agent_config::DisplayPreferences;
+
+    const UPDATED_AT: u64 = 10_000;
+    const HANDLED_AT: u64 = 10_500;
+
+    fn quotes() -> InstanceRef {
+        InstanceRef::new("calendar", "quotes").unwrap()
+    }
+
+    /// One live row whose latest update came at [`UPDATED_AT`].
+    struct Updated;
+    impl MonitorRows for Updated {
+        fn tick_type(&self) -> &'static str {
+            "calendar"
+        }
+        fn list(&self, _: &MonitorContext) -> Vec<TickDescriptor> {
+            vec![TickDescriptor {
+                instance: quotes(),
+                group: TickGroup::Ticks,
+                glyph: TickGlyph::Protocol,
+                title: "Quotes".into(),
+                kind: "Tick".into(),
+                status: "live".into(),
+                notes: Vec::new(),
+                inherent_subscription: false,
+                owner: TickOwner::Unknown,
+                tone: StatusTone::Live,
+                updated_at_ms: Some(UPDATED_AT),
+                update: Some(RowUpdate::new(UPDATED_AT)),
+                running: true,
+                resources: None,
+                actions: Vec::new(),
+            }]
+        }
+    }
+
+    fn monitor(chat: Option<ChatSnapshot>) -> Monitor {
+        Monitor {
+            rows: Some(
+                MonitorRowsRegistry::new([Arc::new(Updated) as Arc<dyn MonitorRows>]).unwrap(),
+            ),
+            chat_snapshot: chat,
+            ..Default::default()
+        }
+    }
+
+    fn chat() -> ChatSnapshot {
+        serde_json::from_value(serde_json::json!({
+            "id": uuid::Uuid::from_u128(1),
+            "workdir": "/fixture",
+            "messages": [],
+            "loops": []
+        }))
+        .unwrap()
+    }
+
+    fn chat_handled(mark: fn(&mut MonitorMembership, InstanceRef, u64) -> bool) -> ChatSnapshot {
+        let mut chat = chat();
+        mark(&mut chat.monitor, quotes(), HANDLED_AT);
+        chat
+    }
+
+    /// A Monitor that listed the row unread, then learnt how the Chat handled it.
+    fn handled_while_listed(mark: fn(&mut MonitorMembership, InstanceRef, u64) -> bool) -> Monitor {
+        let mut monitor = monitor(Some(chat()));
+        monitor.rebuild_at(UPDATED_AT + 100);
+        monitor.chat_snapshot = Some(chat_handled(mark));
+        monitor.rebuild_at(HANDLED_AT + 50);
+        monitor
+    }
+
+    /// The row's fill: the frame's heading and group title come first.
+    fn fill(monitor: &Monitor, display: DisplayProfile, now_ms: u64) -> Option<Role> {
+        monitor.frame(40, 10, display, now_ms).lines[2].fill
+    }
+
+    fn reduced_motion() -> DisplayProfile {
+        DisplayProfile::new(DisplayPreferences {
+            prefers_reduced_motion: true,
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn an_unread_update_holds_the_soft_fill_without_flashing() {
+        let mut monitor = monitor(Some(chat()));
+        monitor.rebuild_at(UPDATED_AT + 100);
+        let animated = DisplayProfile::default();
+        for now in [UPDATED_AT + 100, UPDATED_AT + 500, UPDATED_AT + 60_000] {
+            assert_eq!(fill(&monitor, animated, now), Some(Role::UnreadRow));
+        }
+        assert_eq!(
+            monitor.next_frame_ms(UPDATED_AT + 100, animated),
+            None,
+            "a steady fill asks for no frames"
+        );
+    }
+
+    #[test]
+    fn a_turn_taking_the_update_in_flashes_the_row_then_clears_it() {
+        let monitor = handled_while_listed(MonitorMembership::mark_taken_in);
+        let animated = DisplayProfile::default();
+        let fills = [0, 399, 400, 799, 800, 1_199, 1_200, 5_000]
+            .map(|elapsed| fill(&monitor, animated, HANDLED_AT + elapsed));
+        assert_eq!(
+            fills,
+            [
+                Some(Role::UnreadFlash),
+                Some(Role::UnreadFlash),
+                Some(Role::UnreadRow),
+                Some(Role::UnreadRow),
+                Some(Role::UnreadFlash),
+                Some(Role::UnreadFlash),
+                None,
+                None
+            ]
+        );
+        assert_eq!(
+            monitor.next_frame_ms(HANDLED_AT + 50, animated),
+            Some(HANDLED_AT + 400)
+        );
+        assert_eq!(
+            monitor.next_frame_ms(HANDLED_AT + 900, animated),
+            Some(HANDLED_AT + 1_200),
+            "the end of the flash is its last frame"
+        );
+        assert_eq!(
+            monitor.next_frame_ms(HANDLED_AT + 1_200, animated),
+            None,
+            "a finished flash schedules nothing"
+        );
+    }
+
+    #[test]
+    fn under_reduce_motion_a_taken_in_row_clears_at_once() {
+        let monitor = handled_while_listed(MonitorMembership::mark_taken_in);
+        assert_eq!(fill(&monitor, reduced_motion(), HANDLED_AT + 50), None);
+        assert_eq!(
+            monitor.next_frame_ms(HANDLED_AT + 50, reduced_motion()),
+            None
+        );
+    }
+
+    #[test]
+    fn the_user_opening_the_row_clears_it_without_a_flash() {
+        let monitor = handled_while_listed(MonitorMembership::mark_handled);
+        let animated = DisplayProfile::default();
+        assert_eq!(fill(&monitor, animated, HANDLED_AT + 50), None);
+        assert_eq!(monitor.next_frame_ms(HANDLED_AT + 50, animated), None);
+    }
+
+    #[test]
+    fn a_take_in_from_before_the_view_showed_the_chat_never_flashes() {
+        let animated = DisplayProfile::default();
+        let mut opened_after = monitor(None);
+        opened_after.rebuild_at(HANDLED_AT + 50);
+        opened_after.chat_snapshot = Some(chat_handled(MonitorMembership::mark_taken_in));
+        opened_after.rebuild_at(HANDLED_AT + 80);
+        assert_eq!(
+            fill(&opened_after, animated, HANDLED_AT + 80),
+            None,
+            "a View that opens after the turn shows the row handled, whenever the Chat arrives"
+        );
+
+        let mut switched_back = handled_while_listed(MonitorMembership::mark_taken_in);
+        switched_back.settle_flashes(HANDLED_AT + 60);
+        assert_eq!(fill(&switched_back, animated, HANDLED_AT + 60), None);
+        assert_eq!(switched_back.next_frame_ms(HANDLED_AT + 60, animated), None);
+        switched_back.rebuild_at(HANDLED_AT + 70);
+        assert_eq!(
+            fill(&switched_back, animated, HANDLED_AT + 70),
+            None,
+            "coming back to the Chat does not replay what happened while away"
+        );
+    }
+
+    #[test]
+    fn a_take_in_flashes_even_before_the_view_listed_the_update_unread_but_not_twice() {
+        let animated = DisplayProfile::default();
+        let mut monitor = monitor(Some(chat()));
+        monitor.rows = Some(MonitorRowsRegistry::new(Vec::<Arc<dyn MonitorRows>>::new()).unwrap());
+        monitor.rebuild_at(UPDATED_AT - 1_000);
+        monitor.rows =
+            Some(MonitorRowsRegistry::new([Arc::new(Updated) as Arc<dyn MonitorRows>]).unwrap());
+        monitor.chat_snapshot = Some(chat_handled(MonitorMembership::mark_taken_in));
+        monitor.rebuild_at(HANDLED_AT + 50);
+        assert_eq!(
+            fill(&monitor, animated, HANDLED_AT + 50),
+            Some(Role::UnreadFlash),
+            "the turn took the update in while the View showed the Chat"
+        );
+
+        let mut read_again = chat_handled(MonitorMembership::mark_taken_in);
+        read_again
+            .monitor
+            .mark_taken_in(quotes(), HANDLED_AT + 5_000);
+        monitor.chat_snapshot = Some(read_again);
+        monitor.rebuild_at(HANDLED_AT + 5_050);
+        assert_eq!(
+            fill(&monitor, animated, HANDLED_AT + 5_050),
+            None,
+            "reading an update the row already showed handled is no hand-over"
+        );
+    }
+
+    #[test]
+    fn a_selected_unread_row_keeps_the_selection_and_its_accent_mark() {
+        let mut monitor = monitor(Some(chat()));
+        monitor.rebuild_at(UPDATED_AT + 100);
+        monitor.focus(false, None);
+        let line = &monitor
+            .frame(40, 10, DisplayProfile::default(), UPDATED_AT + 100)
+            .lines[2];
+        assert_eq!(line.fill, Some(Role::Selection));
+        let mark = line.spans.iter().find(|span| span.text == "●").unwrap();
+        assert_eq!(mark.role, Some(Role::UnreadMark));
     }
 }

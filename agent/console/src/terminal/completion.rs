@@ -124,8 +124,8 @@ impl CommandSpec {
 const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         command: "/monitor",
-        arguments: "[add]",
-        description: "Show or hide Monitor; add lists Ticks removed here and, in Herdr, Workspace programs.",
+        arguments: "",
+        description: "Show or hide Monitor.",
         menu_group: Some(CommandGroup::ToolsAndPermissions),
     },
     CommandSpec {

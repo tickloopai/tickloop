@@ -6,9 +6,9 @@ use uuid::Uuid;
 
 use serde_json::Value;
 use tickloop_agent_tools::{
-    ASK_USER_QUESTION_TOOL_NAME, BASH_TOOL_NAME, EDIT_TOOL_NAME, READ_TOOL_NAME,
-    TASK_STOP_TOOL_NAME, TODO_WRITE_TOOL_NAME, WEB_FETCH_TOOL_NAME, WEB_SEARCH_TOOL_NAME,
-    WRITE_TOOL_NAME,
+    ASK_USER_QUESTION_TOOL_NAME, BASH_TOOL_NAME, DECLINED_QUESTIONS_RESULT, EDIT_TOOL_NAME,
+    READ_TOOL_NAME, TASK_STOP_TOOL_NAME, TODO_WRITE_TOOL_NAME, WEB_FETCH_TOOL_NAME,
+    WEB_SEARCH_TOOL_NAME, WRITE_TOOL_NAME,
     file_change::{FileChangeLineKind, FileChangeReview, load_file_change_review},
 };
 use tickloop_ui::markdown;
@@ -55,10 +55,16 @@ const NO_OUTPUT: &str = "(No output)";
 /// The hint under output that was cut short.
 const DETAILS_HINT: &str = "… ctrl+o for details";
 /// How the runtime's result starts when the user declined the call, with or without a reason.
-const REJECTION_PREFIXES: [&str; 2] = [
+const REJECTION_PREFIXES: [&str; 3] = [
     "permission denied; the requested operation was not executed",
     "The user denied permission for this operation",
+    DECLINED_QUESTIONS_RESULT,
 ];
+/// Claude Code's `AskUserQuestion` rejection and answer rows.
+const DECLINED_QUESTIONS: &str = "User declined to answer questions";
+const ANSWERED_QUESTIONS_PREFIX: &str = "User has answered your questions: ";
+const ANSWERED_QUESTIONS_SUFFIX: &str = ". You can now continue with the user's answers in mind.";
+const ANSWER_PREVIEW_MARKER: &str = "\" selected preview:\n";
 /// Lines of a written file shown under its result, as Claude Code's `MAX_LINES_TO_RENDER`.
 const WRITE_PREVIEW_LINES: usize = 10;
 /// Diff lines shown under an edit before the rest is left to Ctrl+O.
@@ -705,6 +711,17 @@ fn transcript_result_lines(
         && let Some(value) = &value
     {
         return subagent_result_lines(input, value, elapsed_ms, report);
+    }
+    if name == ASK_USER_QUESTION_TOOL_NAME {
+        if is_error && content.starts_with(DECLINED_QUESTIONS_RESULT) {
+            return vec![ResultLine::new(DECLINED_QUESTIONS, None)];
+        }
+        if let Some(answers) = input.and_then(|input| answered_question_lines(input, content)) {
+            return answers
+                .into_iter()
+                .map(|answer| ResultLine::new(answer, None))
+                .collect();
+        }
     }
     if is_error {
         let text = safe_text(content);
@@ -1942,6 +1959,40 @@ fn push_connector(runs: &mut RoleRuns, glyph: &str) {
     runs.push(("  ".into(), None));
 }
 
+/// The answers an `AskUserQuestion` result reports, one `· question → answer` row each as
+/// Claude Code lists them. The result names every asked question in order as
+/// `"question"="answer"`, and an answer that chose a previewed option adds the preview.
+fn answered_question_lines(input: &Value, content: &str) -> Option<Vec<String>> {
+    let questions = input["questions"]
+        .as_array()?
+        .iter()
+        .map(|question| question["question"].as_str())
+        .collect::<Option<Vec<_>>>()?;
+    let mut rest = content
+        .strip_prefix(ANSWERED_QUESTIONS_PREFIX)?
+        .strip_suffix(ANSWERED_QUESTIONS_SUFFIX)?;
+    let mut lines = Vec::new();
+    for (index, question) in questions.iter().enumerate() {
+        rest = rest.strip_prefix(&format!("\"{question}\"=\""))?;
+        let end = match questions.get(index + 1) {
+            Some(next) => rest.find(&format!(", \"{next}\"=\""))?,
+            None => rest.len(),
+        };
+        let (answer, remainder) = rest.split_at(end);
+        let answer = match answer.split_once(ANSWER_PREVIEW_MARKER) {
+            Some((answer, _)) => answer,
+            None => answer.strip_suffix('"')?,
+        };
+        lines.push(format!(
+            "· {} → {}",
+            super::safe_line(question),
+            super::safe_line(answer)
+        ));
+        rest = remainder.strip_prefix(", ").unwrap_or(remainder);
+    }
+    rest.is_empty().then_some(lines)
+}
+
 /// Whether a failed result only reports that the user declined the call.
 pub(super) fn is_rejection(result: &ToolResult) -> bool {
     result.is_error
@@ -1985,7 +2036,20 @@ fn compact_result_runs(
                 ),
                 (path, Some(Role::MutedStrong)),
             ]),
+            None if name == ASK_USER_QUESTION_TOOL_NAME => {
+                rows.row([(DECLINED_QUESTIONS.into(), Some(Role::MutedText))])
+            }
             None => rows.row([(INTERRUPTED.into(), Some(Role::MutedText))]),
+        }
+        return rows.runs;
+    }
+    if name == ASK_USER_QUESTION_TOOL_NAME
+        && !result.is_error
+        && let Some(answers) =
+            input.and_then(|input| answered_question_lines(input, &result.content))
+    {
+        for answer in answers {
+            rows.row([(answer, Some(Role::MutedText))]);
         }
         return rows.runs;
     }
@@ -3606,11 +3670,75 @@ mod tests {
         let rendered = view.render_event(&completed).unwrap();
         assert!(
             rendered.starts_with("  ↳  Completed\n     User has answered"),
-            "{rendered}"
+            "a result that does not answer every asked question is shown as it is: {rendered}"
         );
-        assert!(
-            rendered.contains("\"Which report?\"=\"Weekly\""),
-            "{rendered}"
+        let answered = event(
+            run,
+            EventKind::ToolCompleted {
+                call_id: "clarify".into(),
+                result: ToolResult {
+                    content: "User has answered your questions: \"Which report?\"=\"Weekly, with totals\" selected preview:\nRevenue | Costs, \"Which sections?\"=\"Summary, Charts\". You can now continue with the user's answers in mind.".into(),
+                    is_error: false,
+                    output_ref: None,
+                },
+            },
+        );
+        view.record(&answered);
+        assert_eq!(
+            view.render_event(&answered).unwrap(),
+            "  ↳  · Which report? → Weekly, with totals\n     · Which sections? → Summary, Charts\n"
+        );
+        assert!(!view.ended_with_rejection(run));
+    }
+
+    #[test]
+    fn a_declined_question_reads_as_one_line_that_stands_for_the_interruption() {
+        let mut view = ToolPresentation::new(false);
+        let run = Uuid::new_v4();
+        let input =
+            json!({"questions":[{"question":"Which scope?","header":"Scope","options":[]}]});
+        view.record(&event(
+            run,
+            EventKind::ToolStarted {
+                call_id: "clarify".into(),
+                name: ASK_USER_QUESTION_TOOL_NAME.into(),
+                input: input.clone(),
+            },
+        ));
+        let result = ToolResult {
+            content: DECLINED_QUESTIONS_RESULT.into(),
+            is_error: true,
+            output_ref: None,
+        };
+        let declined = event(
+            run,
+            EventKind::ToolCompleted {
+                call_id: "clarify".into(),
+                result: result.clone(),
+            },
+        );
+        view.record(&declined);
+        assert_eq!(
+            view.render_event(&declined).unwrap(),
+            "  ↳  User declined to answer questions\n"
+        );
+        assert!(view.ended_with_rejection(run));
+        let transcript = transcript_result_lines(
+            ASK_USER_QUESTION_TOOL_NAME,
+            Some(&input),
+            &result.content,
+            true,
+            None,
+            None,
+        );
+        assert_eq!(transcript.len(), 1);
+        assert_eq!(
+            transcript[0]
+                .spans
+                .iter()
+                .map(|(text, _)| text.as_str())
+                .collect::<String>(),
+            "User declined to answer questions"
         );
     }
 

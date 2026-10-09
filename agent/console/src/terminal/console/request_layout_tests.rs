@@ -61,8 +61,12 @@ fn request_question_descriptions_and_other_use_separate_physical_rows() {
             .unwrap();
         assert!(selected_row < description, "{text:?}");
         assert!(
-            text.iter()
-                .any(|line| line == "enter select · esc answer later"),
+            text.iter().any(|line| line
+                == if width < 50 {
+                    "enter select · esc cancel"
+                } else {
+                    "enter select · ↑/↓ navigate · esc cancel"
+                }),
             "{text:?}"
         );
         for code in [KeyCode::Down, KeyCode::Up] {
@@ -116,7 +120,8 @@ fn request_question_wraps_within_the_row_budget_after_resize() {
             if capacity >= 3 && width >= 40 {
                 assert!(
                     text.iter()
-                        .any(|line| line.starts_with("space/enter toggle · esc answer later")),
+                        .any(|line| line.starts_with("space/enter toggle")
+                            && line.contains("esc cancel")),
                     "{text:?}"
                 );
             }
@@ -142,7 +147,7 @@ fn request_other_field_wraps_and_keeps_its_cursor_and_submit_hint() {
         .collect::<Vec<_>>();
     assert!(
         text.iter()
-            .any(|line| line == "enter type answer · esc answer later"),
+            .any(|line| line == "enter type answer · ↑/↓ navigate · esc cancel"),
         "{text:?}"
     );
     state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -172,4 +177,149 @@ fn request_other_field_wraps_and_keeps_its_cursor_and_submit_hint() {
         matches!(submitted, Some(InputEvent::Choice { menu_id: id, index: 2, comment: Some(ref value) }) if id == menu_id && value == &answer),
         "{submitted:?}"
     );
+}
+
+fn report_question() -> Question {
+    Question {
+        question: "Which report should be shortened?".into(),
+        header: "Report".into(),
+        options: ["Weekly", "Monthly"]
+            .into_iter()
+            .map(|label| QuestionOption {
+                label: label.into(),
+                description: format!("The {label} report"),
+                preview: None,
+            })
+            .collect(),
+        multi_select: false,
+    }
+}
+
+fn present_question(state: State) -> Console {
+    let console = super::tests::console_with_state(state);
+    let flow = QuestionFlow::new(
+        QuestionRequest {
+            id: REQUEST,
+            chat_id: Uuid::from_u128(481),
+            loop_id: Uuid::from_u128(482),
+            run_id: Uuid::from_u128(483),
+            call_id: "question-keys".into(),
+            questions: vec![report_question()],
+        },
+        "Agent Shorten the report".into(),
+    );
+    console.set_request_layout(Some(REQUEST)).unwrap();
+    let (menu, keys) = flow.menu(console.display_profile().unwrap());
+    console.show_question_menu(menu, keys).unwrap();
+    console
+}
+
+fn wheel(kind: MouseEventKind, row: u16) -> MouseEvent {
+    MouseEvent {
+        kind,
+        column: 0,
+        row,
+        modifiers: KeyModifiers::NONE,
+    }
+}
+
+#[test]
+fn esc_and_ctrl_c_decline_a_question_whose_dialog_hints_only_its_own_keys() {
+    for key in [
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+    ] {
+        let mut state = State::new(true, 120, 30);
+        state.prompt_enabled = true;
+        state.switch_view_chat(Some(Uuid::from_u128(481)));
+        state.monitor.replace(
+            TickGroup::Artifacts,
+            super::input_dialog_tests::fixture_ticks(),
+        );
+        state.monitor.focus(true, None);
+        assert!(state.monitor_visible());
+        let console = present_question(state);
+        let mut state = console.state.lock().unwrap();
+        state.draw_frame(&mut Vec::new()).unwrap();
+        let screen = state.rendered_screen.join("\n");
+        assert!(
+            screen.contains("enter select · ↑/↓ navigate · esc cancel"),
+            "{screen}"
+        );
+        for foreign in ["answer later", "esc input", "enter open"] {
+            assert!(!screen.contains(foreign), "{foreign}: {screen}");
+        }
+        let menu_id = state.menu.as_ref().unwrap().id;
+        let event = state.key(key);
+        assert!(
+            matches!(event, Some(InputEvent::Cancel { menu_id: id }) if id == menu_id),
+            "{key:?}: {event:?}"
+        );
+    }
+}
+
+#[test]
+fn ctrl_c_declines_from_the_other_field_and_esc_first_closes_the_field() {
+    let mut state = State::new(true, 100, 30);
+    state.prompt_enabled = true;
+    let console = present_question(state);
+    let mut state = console.state.lock().unwrap();
+    for code in [KeyCode::Down, KeyCode::Down, KeyCode::Enter] {
+        state.key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+    assert!(state.menu_comment_is_editing());
+    assert!(
+        state
+            .key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .is_none()
+    );
+    assert!(!state.menu_comment_is_editing() && state.menu.is_some());
+    state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(state.menu_comment_is_editing());
+    assert!(matches!(
+        state.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+        Some(InputEvent::Cancel { .. })
+    ));
+}
+
+#[test]
+fn page_keys_and_the_wheel_scroll_the_conversation_behind_a_question() {
+    let mut state = State::new(true, 80, 30);
+    state.prompt_enabled = true;
+    state.scrollback.append(
+        &(0..100)
+            .map(|index| format!("history-{index}\n"))
+            .collect::<String>(),
+    );
+    let console = present_question(state);
+    let mut state = console.state.lock().unwrap();
+    state.draw(&mut Vec::new()).unwrap();
+    let conversation = |state: &mut State| {
+        let width = state.width;
+        state.scrollback.frame(width, 10).lines
+    };
+    let at_tail = conversation(&mut state);
+
+    assert!(
+        state
+            .key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE))
+            .is_none()
+    );
+    assert_ne!(
+        conversation(&mut state),
+        at_tail,
+        "PageUp moves the conversation"
+    );
+    assert!(state.menu.is_some() && state.menu_focused);
+    state.key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+    assert_eq!(conversation(&mut state), at_tail);
+
+    let dialog_top = u16::try_from(state.height - state.input_dialog_height()).unwrap();
+    for row in [0, dialog_top + 2] {
+        assert!(state.pointer(wheel(MouseEventKind::ScrollUp, row), &mut Vec::new()));
+        assert_ne!(conversation(&mut state), at_tail, "the wheel on row {row}");
+        state.pointer(wheel(MouseEventKind::ScrollDown, row), &mut Vec::new());
+        assert_eq!(conversation(&mut state), at_tail);
+    }
+    assert!(state.menu.is_some() && !state.conversation_focused);
 }

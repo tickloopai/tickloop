@@ -1589,17 +1589,9 @@ for line in sys.stdin:
         assert_eq!(
             members
                 .iter()
-                .map(|member| (
-                    member.instance.as_str(),
-                    member.source,
-                    member.title.as_deref()
-                ))
+                .map(|member| (member.instance.as_str(), member.title.as_deref()))
                 .collect::<Vec<_>>(),
-            vec![(
-                instance.as_str(),
-                tickloop_agent_protocol::MonitorMemberSource::Opened,
-                Some("Counter"),
-            )],
+            vec![(instance.as_str(), Some("Counter"))],
             "the hidden Tick joins this Chat's Monitor under its declared title"
         );
         assert!(
@@ -1857,10 +1849,6 @@ for line in sys.stdin:
             .into_iter()
             .find(|member| member.instance.as_str() == instance)
             .expect("the reopened Tick joins Monitor");
-        assert_eq!(
-            member.source,
-            tickloop_agent_protocol::MonitorMemberSource::Opened
-        );
         assert!(lost_title.is_string(), "the lost Tick keeps a title");
         assert_eq!(
             member.title.as_deref(),

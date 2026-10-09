@@ -59,8 +59,9 @@ pub(super) struct ConsoleExecution {
 }
 
 pub(super) enum CreationAcceptance {
-    /// This View follows the created Agent; carries the receipt of its first submitted run.
-    Attached(Option<Receipt>),
+    /// This View follows the created Agent; carries its id and the receipt of its first
+    /// submitted run.
+    Attached(Uuid, Option<Receipt>),
     /// The daemon created the Agent, but this View could not follow it.
     AttachUnavailable(AccessError),
     Rejected(AccessError),
@@ -2331,7 +2332,7 @@ impl ConsoleExecution {
         let execution = snapshot.execution;
         self.inner.cache_snapshot(snapshot, None);
         match self.watch(execution).await {
-            Ok(()) => CreationAcceptance::Attached(submitted),
+            Ok(()) => CreationAcceptance::Attached(execution.agent_id, submitted),
             Err(error) => CreationAcceptance::AttachUnavailable(error),
         }
     }
@@ -2733,6 +2734,12 @@ impl ConsoleExecution {
             .await
             .map(|_| ())
     }
+    pub(super) async fn decline_question(&self, chat: Uuid, id: Uuid) -> Result<(), AccessError> {
+        let request = self.request(chat, id, PendingRequestKind::Question).await?;
+        self.command(AgentCommand::DeclineQuestion { request }, None)
+            .await
+            .map(|_| ())
+    }
 
     async fn loop_command(
         &self,
@@ -2923,28 +2930,6 @@ impl ConsoleExecution {
             .await?
         {
             CommandResult::ArtifactTicks(ticks) => Ok(ticks),
-            _ => Err(unexpected()),
-        }
-    }
-    pub(super) async fn add_monitor_member(
-        &self,
-        chat: Uuid,
-        instance: tick_protocol::InstanceRef,
-        title: Option<String>,
-    ) -> Result<MonitorMembership, AccessError> {
-        let execution = self.reference(chat).await?;
-        match self
-            .command(
-                AgentCommand::AddMonitorMember {
-                    execution,
-                    instance,
-                    title,
-                },
-                None,
-            )
-            .await?
-        {
-            CommandResult::MonitorMembership(membership) => Ok(membership),
             _ => Err(unexpected()),
         }
     }
@@ -4165,7 +4150,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             terminal.accept_created(receipt).await,
-            CreationAcceptance::Attached(_)
+            CreationAcceptance::Attached(..)
         ));
         runtime.shutdown().await;
     }

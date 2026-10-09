@@ -28,13 +28,12 @@ use crate::{
     TriggerSource, UserShellReceipt, UserShellRecord,
 };
 
-/// Business 16.0 adds the Shell description request kind to the usage ledger; 16.1 adds the
-/// daemon's build identity and executable to its Hello; 16.2 adds the Loop action that sends a
-/// queued message now; 16.3 adds taking back an interrupted prompt to the history actions.
-/// Older business majors are refused before dispatch;
-/// the frozen daemon management protocol remains independent.
-pub const PROTOCOL_MAJOR: u16 = 16;
-pub const PROTOCOL_MINOR: u16 = 3;
+/// Business 17.0 removes adding an existing instance to a Chat's Monitor: the
+/// `AddMonitorMember` command and the source of each Monitor member, since every member is one
+/// the Chat opened; 17.1 adds declining a question. Older business majors are refused before
+/// dispatch; the frozen daemon management protocol remains independent.
+pub const PROTOCOL_MAJOR: u16 = 17;
+pub const PROTOCOL_MINOR: u16 = 1;
 
 static BUILD_IDENTITY: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
 
@@ -249,12 +248,6 @@ pub enum AgentCommand {
     ListArtifactTicks {
         execution: ExecutionRef,
     },
-    /// Adds an existing Tick Instance to the Chat's Monitor without ownership or permission.
-    AddMonitorMember {
-        execution: ExecutionRef,
-        instance: InstanceRef,
-        title: Option<String>,
-    },
     /// Removes an instance from the Chat's Monitor view only.
     RemoveMonitorMember {
         execution: ExecutionRef,
@@ -329,6 +322,11 @@ pub enum AgentCommand {
         request: RequestRef,
         answers: Vec<QuestionAnswer>,
     },
+    /// Declines a pending question, as Esc in its dialog: the call reports the rejection and the
+    /// run that asked it ends there.
+    DeclineQuestion {
+        request: RequestRef,
+    },
     Configure {
         execution: ExecutionRef,
         change: ConfigurationChange,
@@ -378,7 +376,6 @@ impl AgentCommand {
             | Self::RemoveArtifactTick { execution, .. }
             | Self::LinkArtifact { execution, .. }
             | Self::ListArtifactTicks { execution }
-            | Self::AddMonitorMember { execution, .. }
             | Self::RemoveMonitorMember { execution, .. }
             | Self::MarkMonitorHandled { execution, .. }
             | Self::ListHostedTicks { execution }
@@ -388,9 +385,9 @@ impl AgentCommand {
             | Self::AttachHostedTick { execution, .. }
             | Self::EnqueueAfterTurn { execution, .. }
             | Self::RefreshConfiguration { execution } => Some(*execution),
-            Self::DecidePermission { request, .. } | Self::AnswerQuestion { request, .. } => {
-                Some(request.execution)
-            }
+            Self::DecidePermission { request, .. }
+            | Self::AnswerQuestion { request, .. }
+            | Self::DeclineQuestion { request } => Some(request.execution),
             _ => None,
         }
     }

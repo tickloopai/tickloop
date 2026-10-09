@@ -370,7 +370,7 @@ fn artifact_login_opens_picker_adds_tick_and_uses_a_substitute_browser() {
 }
 
 #[test]
-fn a_saved_member_is_shown_detailed_removed_and_restored_across_restarts_in_a_real_pty() {
+fn a_saved_member_is_shown_detailed_and_stays_removed_across_restarts_in_a_real_pty() {
     let directory = tempfile::tempdir().unwrap();
     let workdir = directory.path().canonicalize().unwrap();
     let chat = tokio::runtime::Builder::new_current_thread()
@@ -386,10 +386,10 @@ fn a_saved_member_is_shown_detailed_removed_and_restored_across_restarts_in_a_re
             .unwrap();
             let chat = agent.create_chat(workdir.clone()).await.unwrap();
             agent
-                .add_monitor_member(
+                .record_reopened_tick(
                     chat,
+                    &"herdr:pty-lost".parse().unwrap(),
                     "herdr:pty-member".parse().unwrap(),
-                    Some("PTY member".into()),
                 )
                 .await
                 .unwrap();
@@ -400,24 +400,24 @@ fn a_saved_member_is_shown_detailed_removed_and_restored_across_restarts_in_a_re
     let mut session = Session::resume(&workdir, chat);
     session.wait_for_editor();
     session.wait("Monitor 1");
-    session.wait("PTY member");
+    session.wait("herdr:pty-member");
     session.send(b"jk");
     session.wait("❯\u{a0}jk");
     assert!(
-        session.frame().contains("PTY member"),
+        session.frame().contains("herdr:pty-member"),
         "typing j/k edits the input while Monitor is not focused"
     );
     session.send(b"\x7f\x7f");
     session.wait_without("❯\u{a0}jk");
     session.send(b"\x1b[C");
-    session.wait("enter details · x remove · esc");
+    session.wait("enter details · x remove · esc input");
     session.send(b"\r");
-    session.wait("Owner     Herdr");
+    session.wait("Owner     this Chat");
     session.wait("Resources unavailable");
     session.send(b"\x1b");
-    session.wait_without("Owner     Herdr");
+    session.wait_without("Owner     this Chat");
     session.send(b"x");
-    session.wait_without("PTY member");
+    session.wait_without("herdr:pty-member");
     session.wait_without("Monitor 1");
     session.exit();
     drop(session);
@@ -427,16 +427,8 @@ fn a_saved_member_is_shown_detailed_removed_and_restored_across_restarts_in_a_re
     thread::sleep(Duration::from_millis(500));
     let frame = restarted.frame();
     assert!(
-        !frame.contains("Monitor 1") && !frame.contains("PTY member"),
+        !frame.contains("Monitor 1") && !frame.contains("herdr:pty-member"),
         "the removal survives a restart: {frame}"
     );
-    restarted.send(b"/monitor add\r");
-    restarted.wait("Add to Monitor · Removed");
-    restarted.send(b"\r");
-    restarted.wait("Added to Monitor");
-    restarted.send(b"\x1b");
-    restarted.wait("Monitor 1");
-    restarted.wait("enter details · x remove · esc");
-    restarted.send(b"\x1b");
     restarted.exit();
 }

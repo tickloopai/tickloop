@@ -791,7 +791,7 @@ async fn embedded_artifact_commands_add_list_and_remove_from_the_selected_chat()
 }
 
 #[tokio::test]
-async fn embedded_monitor_commands_add_and_remove_members_of_the_selected_chat() {
+async fn embedded_monitor_commands_remove_members_of_the_selected_chat() {
     let directory = tempfile::tempdir().unwrap();
     let runtime = Agent::new_embedded(
         tickloop_agent_test_support::config(),
@@ -825,22 +825,6 @@ async fn embedded_monitor_commands_add_and_remove_members_of_the_selected_chat()
         panic!("missing second execution");
     };
     let instance: tick_protocol::InstanceRef = "herdr:counter".parse().unwrap();
-    let added = access
-        .execute(envelope(AgentCommand::AddMonitorMember {
-            execution,
-            instance: instance.clone(),
-            title: Some("Counter".into()),
-        }))
-        .await
-        .unwrap();
-    let Some(CommandResult::MonitorMembership(membership)) = added.result else {
-        panic!("add returned {added:?}");
-    };
-    assert_eq!(membership.members[0].instance, instance);
-    assert_eq!(
-        membership.members[0].source,
-        tickloop_agent_protocol::MonitorMemberSource::Added
-    );
     let removed = access
         .execute(envelope(AgentCommand::RemoveMonitorMember {
             execution,

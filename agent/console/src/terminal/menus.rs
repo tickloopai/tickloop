@@ -6,7 +6,7 @@ mod settings_ux_pty;
 use providers::{ModelChoice, ProviderModels, ProviderRow};
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     path::PathBuf,
 };
 
@@ -29,7 +29,7 @@ use super::{
     new_agent_draft::ConfigTarget,
     permissions_surface::PermissionsSubject,
     presentation::permission_context,
-    questions::{FlowUpdate, QuestionFlow, question_lines},
+    questions::{FlowUpdate, QuestionFlow},
     safe_line, safe_text, settings,
     style::ThemeName,
     workflows::{self, Workflow},
@@ -466,9 +466,7 @@ pub(super) struct Menus {
     provider_login_results: HashMap<Option<Uuid>, bool>,
     suspended_active: HashMap<Option<Uuid>, (Uuid, Selection)>,
     request_order: VecDeque<(Uuid, Uuid)>,
-    /// Questions whose dialog was closed; they wait for typed answers instead.
-    deferred_questions: HashSet<Uuid>,
-    /// Answers typed so far, one line per question.
+    /// Answers typed so far without a terminal, one line per question.
     typed_questions: HashMap<Uuid, QuestionFlow>,
     restored_plans: HashMap<Uuid, RestoredPlanApproval>,
     scanned_plan_executions: HashMap<Uuid, ExecutionRef>,
@@ -501,7 +499,6 @@ impl Menus {
             provider_login_results: HashMap::new(),
             suspended_active: HashMap::new(),
             request_order: VecDeque::new(),
-            deferred_questions: HashSet::new(),
             typed_questions: HashMap::new(),
             restored_plans: HashMap::new(),
             scanned_plan_executions: HashMap::new(),
@@ -561,7 +558,6 @@ pub(super) struct MenuOutcome {
     pub provider_login: Option<super::login::LoginMethod>,
     pub permission: Option<Uuid>,
     pub question: Option<Uuid>,
-    pub draft_question: Option<Uuid>,
     pub selection: Option<(Uuid, Option<Uuid>)>,
     pub restored: Option<ChatSnapshot>,
     pub receipt: Option<Receipt>,
@@ -1203,20 +1199,15 @@ impl Menus {
         result
     }
 
-    /// Answers the next unanswered question of `request` with typed text. Returns the lines
-    /// that ask the following question, or `None` once every answer was submitted.
+    /// Answers the next unanswered question of `request` with typed text, which only a View
+    /// without a terminal reads as an answer. Returns the lines that ask the following question,
+    /// or `None` once every answer was submitted.
     pub(super) async fn answer_typed(
         &mut self,
         agent: &Agent,
-        console: &Console,
         request: &QuestionRequest,
         text: &str,
     ) -> Result<Option<Vec<String>>, String> {
-        if matches!(&self.active, Some((_, Selection::Question(flow))) if flow.request().id == request.id)
-        {
-            self.dismiss(console)?;
-        }
-        self.deferred_questions.insert(request.id);
         let mut flow = self
             .typed_questions
             .remove(&request.id)
@@ -2163,7 +2154,7 @@ impl Menus {
         let queued = self
             .request_order
             .iter()
-            .filter(|(chat, id)| family.contains(chat) && !self.deferred_questions.contains(id))
+            .filter(|(chat, _)| family.contains(chat))
             .count();
         let active_unqueued = usize::from(
             self.active
@@ -2225,7 +2216,7 @@ impl Menus {
         let queued = self
             .request_order
             .iter()
-            .filter(|(chat, id)| family.contains(chat) && !self.deferred_questions.contains(id))
+            .filter(|(chat, _)| family.contains(chat))
             .copied()
             .collect::<Vec<_>>();
         console.set_request_queue_count(queued.len())?;
@@ -2245,8 +2236,6 @@ impl Menus {
         pending: &HashMap<Uuid, super::PermissionRequestOwner>,
         questions: &HashMap<Uuid, QuestionRequest>,
     ) -> Result<(), String> {
-        self.deferred_questions
-            .retain(|id| questions.contains_key(id));
         self.typed_questions
             .retain(|id, _| questions.contains_key(id));
         if let Some((_, selection)) = &self.active {
@@ -2278,7 +2267,7 @@ impl Menus {
             let next_request = self
                 .request_order
                 .iter()
-                .find(|(requester, id)| *requester == chat && !self.deferred_questions.contains(id))
+                .find(|(requester, _)| *requester == chat)
                 .map(|(_, id)| *id);
             let requester = requester_label(agent, console, &snapshot).await;
             let restored_request = self
@@ -2327,8 +2316,7 @@ impl Menus {
                     snapshot.delegation.is_none(),
                 )?;
             } else if let Some(request) = snapshot.questions.iter().find(|request| {
-                !self.deferred_questions.contains(&request.id)
-                    && questions.contains_key(&request.id)
+                questions.contains_key(&request.id)
                     && next_request.is_none_or(|id| id == request.id)
             }) {
                 let goal = snapshot
@@ -2700,25 +2688,19 @@ impl Menus {
                             .answer_question(request.chat_id, request.id, answers)
                             .await
                             .map_err(|error| error.to_string())?;
-                        console.write("Answer accepted. Continuing…\n")?;
                         return Ok(MenuOutcome {
                             question: Some(request.id),
                             ..Default::default()
                         });
                     }
-                    FlowUpdate::Defer => {
+                    FlowUpdate::Decline => {
                         let request = flow.request();
-                        self.deferred_questions.insert(request.id);
-                        let mut message =
-                            "Enter your answer below. The question is still waiting.\n".to_owned();
-                        for line in question_lines(&request.questions[0], 0, request.questions.len())
-                        {
-                            message.push_str(&line);
-                            message.push('\n');
-                        }
-                        console.write(&message)?;
+                        agent
+                            .decline_question(request.chat_id, request.id)
+                            .await
+                            .map_err(|error| error.to_string())?;
                         return Ok(MenuOutcome {
-                            draft_question: Some(request.id),
+                            question: Some(request.id),
                             ..Default::default()
                         });
                     }

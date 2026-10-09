@@ -14,6 +14,7 @@ mod hosted_monitor;
 mod interrupted_prompt;
 mod monitor_width;
 mod provider_errors;
+mod question_decline;
 mod reply_visibility;
 mod resume_picker;
 mod unified_footer;
@@ -525,7 +526,7 @@ async fn run_lifecycle(fixture: &PrivateFixture) {
     .await
     .expect("real worker must start the Shell");
     first
-        .wait_for("dispatch keeps overview", |frame| {
+        .wait_for("a Shell dispatch keeps overview", |frame| {
             frame.contains("Agents · local")
         })
         .await;
@@ -1221,7 +1222,8 @@ fn request_dialog_visible(frame: &str, question: &str, requester: &str) -> bool 
         && frame
             .lines()
             .any(|line| line.contains("Goal:") && line.contains(requester))
-        && frame.contains("enter select · esc answer later")
+        && frame.contains("enter select")
+        && frame.contains("esc cancel")
 }
 
 async fn open_family_child(pty: &mut PtyView, task: &str) {
@@ -1424,7 +1426,13 @@ async fn run_child_views(fixture: &PrivateFixture) {
     let metadata =
         serde_json::to_value(child_before.conversation.delegation.as_ref().unwrap()).unwrap();
     first
-        .wait_for("dispatch stays in the filtered overview", |frame| {
+        .wait_for("dispatch opens the new Agent", |frame| {
+            !frame.contains("Agents · local")
+        })
+        .await;
+    first.send(b"\x1b[D");
+    first
+        .wait_for("back in the filtered overview", |frame| {
             frame.contains("Agents · local")
                 && frame.contains("Project:")
                 && !frame.contains("Project: all")

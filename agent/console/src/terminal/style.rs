@@ -207,6 +207,13 @@ pub(super) enum Role {
     SuccessMark,
     ErrorMark,
     WarningMark,
+    /// A Monitor row's unread update. `UnreadMark` is its `●`, a mark in the accent colour that
+    /// keeps its hue on a selected row; `UnreadRow` is the soft accent-tinted fill the row keeps
+    /// until the update is handled, and `UnreadFlash` the stronger fill it alternates with while
+    /// an Agent turn takes the update in.
+    UnreadMark,
+    UnreadRow,
+    UnreadFlash,
     /// A Markdown link label: the terminal's own blue, as Claude Code's `chalk.blue`.
     Link,
     /// Inline code inside strong text or a heading: the code colour, still bold.
@@ -292,6 +299,9 @@ impl Role {
         Self::SuccessMark,
         Self::ErrorMark,
         Self::WarningMark,
+        Self::UnreadMark,
+        Self::UnreadRow,
+        Self::UnreadFlash,
         Self::Link,
         Self::StrongCode,
         Self::MutedStrong,
@@ -329,6 +339,7 @@ impl Role {
                 | Self::SuccessMark
                 | Self::ErrorMark
                 | Self::WarningMark
+                | Self::UnreadMark
         )
     }
 
@@ -362,7 +373,7 @@ impl Role {
     }
 }
 
-const ROLE_COUNT: usize = 74;
+const ROLE_COUNT: usize = 77;
 
 /// `AgentRed` … `AgentCyan`, reproduced from Claude Code's agent palette (Tailwind 600).
 const AGENT_COLORS: [Style; 8] = [
@@ -535,6 +546,9 @@ const DARK_PALETTE: [Style; ROLE_COUNT] = [
     fg(78, 186, 101), // SuccessMark     <- success
     fg(255, 107, 128), // ErrorMark       <- error
     fg(255, 193, 7),  // WarningMark     <- warning
+    fg(215, 119, 87), // UnreadMark      <- claude
+    bg(58, 43, 39),   // UnreadRow       <- local: claude tinted into the dark background
+    bg(95, 61, 50),   // UnreadFlash     <- local: claude tinted twice as strong
     ansi(AnsiColour::Blue), // Link            <- chalk.blue
     strong(177, 185, 249), // StrongCode      <- permission + bold
     strong(153, 153, 153), // MutedStrong     <- inactive + bold
@@ -622,6 +636,9 @@ const LIGHT_PALETTE: [Style; ROLE_COUNT] = [
     fg(44, 122, 57),  // SuccessMark
     fg(171, 43, 63),  // ErrorMark
     fg(150, 108, 30), // WarningMark
+    fg(215, 119, 87), // UnreadMark
+    bg(250, 239, 235), // UnreadRow
+    bg(243, 214, 205), // UnreadFlash
     ansi(AnsiColour::Blue), // Link
     strong(87, 105, 247), // StrongCode
     strong(102, 102, 102), // MutedStrong
@@ -1362,8 +1379,51 @@ mod tests {
                 (Role::SuccessMark, Role::Success),
                 (Role::ErrorMark, Role::Error),
                 (Role::WarningMark, Role::Warning),
+                (Role::UnreadMark, Role::Accent),
             ] {
                 assert_eq!(theme.style(mark), theme.style(state), "{name:?} {mark:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn unread_fills_stay_readable_and_apart_from_each_other_and_the_selection() {
+        for name in ThemeName::ALL {
+            let theme = Theme::new(name);
+            let fill = |role: Role| {
+                theme
+                    .style(role)
+                    .background
+                    .expect("an unread fill paints only the background")
+            };
+            let foreground = |role: Role| theme.style(role).foreground.unwrap();
+            for role in [Role::UnreadRow, Role::UnreadFlash] {
+                assert_eq!(theme.style(role).foreground, None, "{name:?} {role:?}");
+            }
+            for depth in [ColourDepth::Indexed256, ColourDepth::TrueColour] {
+                let sent = |role: Role| match fill(role) {
+                    Colour::Rgb(colour) if depth == ColourDepth::Indexed256 => {
+                        xterm_colour(indexed(colour))
+                    }
+                    Colour::Rgb(colour) => colour,
+                    Colour::Ansi(_) => unreachable!("unread fills are theme colours"),
+                };
+                let fills = [Role::UnreadRow, Role::UnreadFlash, Role::Selection].map(sent);
+                assert!(
+                    fills[0] != fills[1] && fills[0] != fills[2] && fills[1] != fills[2],
+                    "{name:?} {depth:?}: {fills:?}"
+                );
+                for (text, background, minimum) in [
+                    (Role::MutedText, Role::UnreadRow, 4.5),
+                    (Role::Text, Role::UnreadFlash, 4.5),
+                    (Role::MutedText, Role::UnreadFlash, 3.0),
+                ] {
+                    let ratio = emitted_contrast(foreground(text), fill(background), depth);
+                    assert!(
+                        ratio >= minimum,
+                        "{name:?} {depth:?} {text:?} on {background:?}: {ratio:.2}"
+                    );
+                }
             }
         }
     }

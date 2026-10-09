@@ -20,12 +20,12 @@ use tickloop_agent_protocol::{
     HostedScreenSnapshot, HostedSnapshot, HostedViewGrant, ImageMediaType, ImageSource,
     InputModality, InteractionSource, LaunchSpec, LiveChatSnapshot, LoopAction, Message,
     ModelAuthSource, ModelCard, ModelConfig, ModelDiscovery, ModelProvider, MonitorMember,
-    MonitorMemberSource, MonitorMembership, ObservationChange, ObservationRequest,
-    ObservationUpdate, ObservationValue, PROTOCOL_MAJOR, PROTOCOL_MINOR, Page, PendingRequestKind,
-    PermissionPolicy, PermissionRule, PermissionScope, PersistenceState, ProductKind, Protocol,
-    ProtocolLimits, ProviderConnection, ProviderCredentialScope, ReasoningEffort, ReceiptState,
-    RequestRef, ResetReason, Role, ServerHello, ServerMessage, TakenBackPrompt, ThinkingBudgets,
-    ThinkingControl, ToolResultBlock, ToolResultContent, TranscriptRef, UserInput, ViewRef,
+    MonitorMembership, ObservationChange, ObservationRequest, ObservationUpdate, ObservationValue,
+    PROTOCOL_MAJOR, PROTOCOL_MINOR, Page, PendingRequestKind, PermissionPolicy, PermissionRule,
+    PermissionScope, PersistenceState, ProductKind, Protocol, ProtocolLimits, ProviderConnection,
+    ProviderCredentialScope, ReasoningEffort, ReceiptState, RequestRef, ResetReason, Role,
+    ServerHello, ServerMessage, TakenBackPrompt, ThinkingBudgets, ThinkingControl, ToolResultBlock,
+    ToolResultContent, TranscriptRef, UserInput, ViewRef,
 };
 
 const BLESS_VARIABLE: &str = "TICKLOOP_BLESS_WIRE_FIXTURES";
@@ -358,11 +358,11 @@ fn chat_snapshot() -> ChatSnapshot {
     snapshot.monitor = MonitorMembership {
         members: vec![MonitorMember {
             instance: herdr_instance(),
-            source: MonitorMemberSource::Added,
             title: Some("Counter".into()),
         }],
         removed: [hosted_instance()].into(),
         handled: [(herdr_instance(), 7_500)].into(),
+        taken_in: [(herdr_instance(), 7_500)].into(),
     };
     snapshot.model = model_config();
     snapshot.policy = permission_policy();
@@ -439,11 +439,11 @@ fn monitor_membership() -> MonitorMembership {
     MonitorMembership {
         members: vec![MonitorMember {
             instance: hosted_instance(),
-            source: MonitorMemberSource::Opened,
             title: Some("Quotes".into()),
         }],
         removed: [herdr_instance()].into(),
         handled: [(hosted_instance(), 8_500)].into(),
+        taken_in: [(hosted_instance(), 8_500)].into(),
     }
 }
 
@@ -523,10 +523,9 @@ fn agent_commands_keep_their_recorded_wire() {
                 execution: execution(),
                 action: LoopAction::SendNow { run_id: id(0x22) },
             },
-            AgentCommand::AddMonitorMember {
+            AgentCommand::RemoveMonitorMember {
                 execution: execution(),
                 instance: herdr_instance(),
-                title: Some("Counter".into()),
             },
             AgentCommand::HostedTickSnapshot {
                 execution: execution(),
@@ -544,6 +543,13 @@ fn agent_commands_keep_their_recorded_wire() {
             AgentCommand::EditHistory {
                 execution: execution(),
                 action: HistoryAction::TakeBackInterruptedPrompt { run_id: id(0x20) },
+            },
+            AgentCommand::DeclineQuestion {
+                request: RequestRef {
+                    request_id: id(0x62),
+                    kind: PendingRequestKind::Question,
+                    ..request
+                },
             },
         ],
     );

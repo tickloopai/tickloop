@@ -59,7 +59,6 @@ mod menus;
 mod mode_cycle_tests;
 mod monitor;
 pub mod monitor_command;
-mod monitor_discovery;
 #[cfg(test)]
 mod navigation_tests;
 mod new_agent_draft;
@@ -457,9 +456,6 @@ fn switch_to_saved_branch(console: &Console, child_chat_id: uuid::Uuid) -> Resul
         }
     }
 }
-
-/// Opens Monitor's add picker, like its `a` key.
-const MONITOR_ADD_COMMAND: &str = "/monitor add";
 
 async fn branch_from_terminal(
     console: &Console,
@@ -1037,7 +1033,7 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
         },
     };
     use std::os::unix::ffi::OsStrExt;
-    let (host_work_context, view_host, tick_discovery) =
+    let (host_work_context, view_host, herdr_probe) =
         if let Some(context) = HerdrContext::from_environment()? {
             let access = std::sync::Arc::new(TickAccess::new(context.clone()));
             let pane = access
@@ -1061,10 +1057,7 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
                     terminal: Some(pane.terminal_id),
                     client: None,
                 }),
-                Some(
-                    std::sync::Arc::new(crate::monitor_rows::HerdrDiscovery::new(access))
-                        as std::sync::Arc<dyn crate::monitor_rows::TickDiscovery>,
-                ),
+                Some(crate::monitor_rows::HerdrProbe::new(access)),
             )
         } else {
             (None, None, None)
@@ -1172,10 +1165,10 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
     console.set_monitor_preference(monitor_preference)?;
     console.set_monitor_popup(monitor_popup)?;
     console.set_monitor_width(monitor_width.map(usize::from))?;
-    // Inside Herdr the View also discovers and probes Herdr programs; in every View the Agent's
-    // new Ticks run in the Tickhost and are probed there.
-    if let Some(discovery) = tick_discovery {
-        console.set_tick_discovery(discovery)?;
+    // Inside Herdr the View also probes Herdr members; in every View the Agent's new Ticks run in
+    // the Tickhost and are probed there.
+    if let Some(probe) = herdr_probe {
+        console.add_member_probe(std::sync::Arc::new(probe))?;
     }
     if let Some(socket) = herdr_socket {
         console.set_herdr_socket(socket)?;
@@ -1528,7 +1521,6 @@ async fn interact(
     let mut observed_run_starts = HashMap::new();
     let mut cached_activity_status: Option<(uuid::Uuid, String)> = None;
     let mut menu_outcome: Option<MenuOutcome> = None;
-    let mut draft_question = None;
     let mut menu_commands = VecDeque::new();
     let mut paused_inputs = VecDeque::new();
     let mut foreground_shells = HashMap::new();
@@ -1717,12 +1709,6 @@ async fn interact(
             }
             if let Some(id) = outcome.question {
                 questions.remove(&id);
-                if draft_question == Some(id) {
-                    draft_question = None;
-                }
-            }
-            if let Some(id) = outcome.draft_question {
-                draft_question = Some(id);
             }
             if let Some(snapshot) = outcome.restored {
                 displayed_sequences.insert(snapshot.id, snapshot.last_sequence);
@@ -1735,7 +1721,6 @@ async fn interact(
                 }
                 selected_chat = Some(chat);
                 goal = selected_goal;
-                draft_question = None;
             }
             if let Some(receipt) = outcome.receipt {
                 selected_chat = Some(receipt.chat_id);
@@ -2224,22 +2209,6 @@ async fn interact(
                 if !matches!(&line,Some(InputEvent::Line(input)|InputEvent::Prompt {family_target: None, text:input,..}) if !input.trim_start().starts_with('/')) {
                     merged_echoes.next_submission_block();
                 }
-                // `/monitor add` is the `a` key of Monitor: it opens the same prepared action.
-                let line = match line {
-                    Some(InputEvent::Line(command) | InputEvent::Prompt { text: command, .. })
-                        if command.trim() == MONITOR_ADD_COMMAND && !overview_active && !login_active =>
-                    {
-                        if selected_chat.is_none() {
-                            outln!(console, "No Chat is selected. Enter a task first.");
-                            continue;
-                        }
-                        match console.open_monitor_discovery()? {
-                            Some(event) => Some(event),
-                            None => continue,
-                        }
-                    }
-                    other => other,
-                };
                 let line = match line {
                     Some(InputEvent::TickAction { chat, action }) if selected_chat == Some(chat) && !overview_active && !login_active => {
                         let context = tick_actions::TickActionContext { agent, console, root:config_root.as_deref(), chat };
@@ -2330,7 +2299,7 @@ async fn interact(
                         };
                         if let Some(snapshot)=opened {
                             overview_active=false;selected_chat=Some(snapshot.id);
-                            goal=selected_loops.get(&snapshot.id).copied().unwrap_or_else(||snapshot.default_input_loop());draft_question=None;
+                            goal=selected_loops.get(&snapshot.id).copied().unwrap_or_else(||snapshot.default_input_loop());
                             displayed_sequences.insert(snapshot.id,snapshot.last_sequence);
                             tools.restore(&snapshot.conversation_events());
                             sync_snapshot(&snapshot,&mut pending,&mut permissions,&mut questions);
@@ -2662,7 +2631,8 @@ async fn interact(
                         let receipt=global.dispatch(agent.launch_spec(),UserInput::Shell { command:submission.command().into(),background:true },agent.origin()).await;
                         match receipt {
                             Ok(receipt)=>match agent.accept_created(receipt).await {
-                                CreationAcceptance::Attached(_)=>{},
+                                // A background Shell started from Overview leaves the list open for the next one.
+                                CreationAcceptance::Attached(..)=>{},
                                 CreationAcceptance::AttachUnavailable(error)=>console.set_status(&creation_attach_unavailable(&error))?,
                                 CreationAcceptance::Rejected(error)=>console.restore_rejected_shell(submission.command(),&format!("New Agent was not accepted: {}",safe_line(&error.to_string())))?,
                             },
@@ -2855,7 +2825,11 @@ async fn interact(
                         }
                         match global.dispatch(agent.launch_spec(),input,agent.origin()).await {
                             Ok(receipt)=>match agent.accept_created(receipt).await {
-                                CreationAcceptance::Attached(submitted)=>{if let Some(receipt)=submitted {suggestible_runs.insert(receipt.run_id);pending.insert(receipt.run_id,receipt);}},
+                                CreationAcceptance::Attached(created,submitted)=>{
+                                    if let Some(receipt)=submitted {suggestible_runs.insert(receipt.run_id);pending.insert(receipt.run_id,receipt);}
+                                    // The View goes on to the Agent it just started.
+                                    paused_inputs.push_back(InputEvent::OpenAgent(created));
+                                },
                                 CreationAcceptance::AttachUnavailable(error)=>{
                                     let notice=creation_attach_unavailable(&error);
                                     console.set_status(&notice)?;
@@ -3026,7 +3000,6 @@ async fn interact(
                             selected_chat=None;
                             agent.display_chat(None).await.map_err(|error|error.to_string())?;
                             goal=None;
-                            draft_question=None;
 
                             message_groups=MessageGroups::default();
                             tools.restore(&[]);
@@ -3142,7 +3115,6 @@ async fn interact(
                                     workflows::write_public_history(console, &outcome.snapshot)?;
                                     selected_chat=Some(outcome.child_chat_id);
                                     goal=None;
-                                    draft_question=None;
 
                                     message_groups=MessageGroups::default();
                                     displayed_sequences.insert(outcome.child_chat_id,outcome.snapshot.last_sequence);
@@ -3420,6 +3392,8 @@ async fn interact(
                                 Err(error) => outln!(console, "Permission decision failed: {}", safe_text(&error)),
                             }
                         },
+                        // A terminal answers questions only in their dialog; typed answers are for a View without one.
+                        _ if line.starts_with("/answer ") && interactive => outln!(console, "Answer the question in its dialog."),
                         _ if line.starts_with("/answer ") => {
                             let request=line.trim_start_matches("/answer ").split_once(' ').ok_or("use /answer QUESTION ANSWER").and_then(|(id,answer)|{
                                 let id=id.parse::<uuid::Uuid>().map_err(|_|"question ID must be a UUID")?;
@@ -3428,7 +3402,7 @@ async fn interact(
                             });
                             match request {
                                 Ok((request,answer)) => {
-                                    if answer_typed_question(agent,console,&mut menus,&mut questions,&request,&answer).await? && draft_question==Some(request.id) {draft_question=None;}
+                                    answer_typed_question(agent,console,&mut menus,&mut questions,&request,&answer).await?;
                                 },
                                 Err(error) => outln!(console, "Cannot answer question: {}",safe_text(error)),
                             }
@@ -3439,7 +3413,6 @@ async fn interact(
                                     learn_agent_colors(console,agent,&snapshot).await?;
                                     goal=show_opened_chat(console,agent,&snapshot,true)?;
                                     selected_chat=Some(snapshot.id);
-                                    draft_question=None;
 
                                     message_groups=MessageGroups::default();
                                     displayed_sequences.insert(snapshot.id,snapshot.last_sequence);
@@ -3494,11 +3467,7 @@ async fn interact(
                             }
                         },
                         _ => {
-                            if let Some(request)=draft_question.and_then(|id|questions.get(&id)).filter(|request|Some(request.chat_id)==selected_chat).cloned() {
-                                if answer_typed_question(agent,console,&mut menus,&mut questions,&request,&original_input).await? {draft_question=None;}
-                                continue;
-                            }
-                            let visible=questions.values().filter(|request|Some(request.chat_id)==selected_chat).cloned().collect::<Vec<_>>();
+                            let visible=questions.values().filter(|request|!interactive && Some(request.chat_id)==selected_chat).cloned().collect::<Vec<_>>();
                             if !visible.is_empty() {
                                 if let [request]=visible.as_slice() {
                                     answer_typed_question(agent,console,&mut menus,&mut questions,request,&original_input).await?;
@@ -4090,7 +4059,7 @@ async fn interact(
                     Ok(_)=>{
                         if let Ok(Some(receipt))=global.reconcile_dispatch().await {
                             match agent.accept_created(receipt).await {
-                                CreationAcceptance::Attached(submitted)=>{if let Some(receipt)=submitted {pending.insert(receipt.run_id,receipt);}},
+                                CreationAcceptance::Attached(_,submitted)=>{if let Some(receipt)=submitted {pending.insert(receipt.run_id,receipt);}},
                                 CreationAcceptance::AttachUnavailable(error)=>{
                                     let notice=creation_attach_unavailable(&error);
                                     console.set_status(&notice)?;
@@ -5033,14 +5002,9 @@ fn render_restored_observation(
     Ok(observation)
 }
 
+/// Lists a pending question for a View without a terminal; a terminal asks it in its dialog.
 fn print_question(console: &Console, request: &QuestionRequest) -> Result<(), String> {
     if console.is_interactive() {
-        let questions = request
-            .questions
-            .iter()
-            .map(|question| safe_line(&question.question))
-            .collect::<Vec<_>>();
-        outln!(console, "\nYour input is needed: {}", questions.join(" · "));
         return Ok(());
     }
     outln!(
@@ -5063,8 +5027,7 @@ fn print_question(console: &Console, request: &QuestionRequest) -> Result<(), St
     Ok(())
 }
 
-/// Answers the next question of `request` with typed text; returns whether every question of
-/// the request has now been answered.
+/// Answers the next question of `request` with typed text, in a View without a terminal.
 async fn answer_typed_question(
     agent: &Agent,
     console: &Console,
@@ -5072,25 +5035,21 @@ async fn answer_typed_question(
     questions: &mut HashMap<uuid::Uuid, QuestionRequest>,
     request: &QuestionRequest,
     text: &str,
-) -> Result<bool, String> {
-    match menus.answer_typed(agent, console, request, text).await {
+) -> Result<(), String> {
+    match menus.answer_typed(agent, request, text).await {
         Ok(None) => {
             questions.remove(&request.id);
             outln!(console, "Answer accepted.");
-            Ok(true)
         }
         Ok(Some(next_question)) => {
             outln!(console, "Answer recorded. Next question:");
             for line in next_question {
                 outln!(console, "{line}");
             }
-            Ok(false)
         }
-        Err(error) => {
-            outln!(console, "Cannot answer question: {}", safe_text(&error));
-            Ok(false)
-        }
+        Err(error) => outln!(console, "Cannot answer question: {}", safe_text(&error)),
     }
+    Ok(())
 }
 
 fn print_goal_end(

@@ -24,8 +24,10 @@ fn artifact_draft_is_a_model_invocable_builtin_that_names_only_real_artifact_too
         "\"action\":\"read\"",
         "\"action\":\"patch\"",
         "\"action\":\"replace\"",
+        "\"action\":\"rename\"",
         "expected_hash",
         "expected_revision",
+        "expected_title",
         "content_conflict",
         "# <title>",
     ] {

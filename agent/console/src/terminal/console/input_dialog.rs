@@ -709,6 +709,7 @@ impl State {
 
     pub(super) fn input_dialog_frame(&mut self) -> (Vec<RoleLine>, usize, usize) {
         self.dialog_option_rows.clear();
+        self.dialog_scrolls_own_content = false;
         let height = self.input_dialog_height();
         let capacity = self.input_dialog_body_height();
         let rule_rows = height - capacity;

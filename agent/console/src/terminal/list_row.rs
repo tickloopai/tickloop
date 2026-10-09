@@ -25,6 +25,9 @@ pub(super) struct ListRow<'a> {
     pub(super) glyph_role: Role,
     pub(super) name: &'a str,
     pub(super) status: Vec<(String, Role)>,
+    /// The row's background unless it is selected, where the selection fill wins; see
+    /// [`update_fill`].
+    pub(super) fill: Option<Role>,
 }
 
 impl ListRow<'_> {
@@ -108,10 +111,10 @@ impl ListRow<'_> {
 
     fn finish(&self, mut line: RoleLine, width: usize) -> RoleLine {
         line.truncate(width);
-        if self.selected {
-            line.filled(Role::Selection)
-        } else {
-            line
+        match (self.selected, self.fill) {
+            (true, _) => line.filled(Role::Selection),
+            (false, Some(fill)) => line.filled(fill),
+            (false, None) => line,
         }
     }
 }
@@ -161,6 +164,27 @@ pub(super) fn running_mark(display: DisplayProfile, now_ms: u64) -> Role {
     }
 }
 
+/// The background of a row whose latest update the Chat has not handled: the soft unread fill
+/// until it is handled. When an Agent turn takes it in at `taken_in_at`, the row flashes between
+/// the strong and the soft fill, then clears; the user opening the row, or Reduce motion, clears
+/// it at once.
+pub(super) fn update_fill(
+    unread: bool,
+    taken_in_at: Option<u64>,
+    display: DisplayProfile,
+    now_ms: u64,
+) -> Option<Role> {
+    if unread {
+        return Some(Role::UnreadRow);
+    }
+    let strong = display.flash_strong(taken_in_at?, now_ms)?;
+    Some(if strong {
+        Role::UnreadFlash
+    } else {
+        Role::UnreadRow
+    })
+}
+
 /// Marks an update the Chat has not handled yet.
 const UNREAD_MARKER: &str = "●";
 
@@ -173,7 +197,7 @@ pub(super) struct UpdateMark {
 /// The details at a row's right. The glyph's colour already tells the state, so no status word
 /// or result glyph repeats it: a running row's elapsed time and the row's notes, muted, then its
 /// latest update, its muted age once handled or `●` with the waiting count, else the age, in the
-/// accent colour while unread.
+/// accent colour while unread. The `●` is a mark, so it keeps the accent on a selected row.
 pub(super) fn status_spans(
     tone: StatusTone,
     notes: &[String],
@@ -189,28 +213,28 @@ pub(super) fn status_spans(
     let mut segments = elapsed
         .into_iter()
         .chain(notes.iter().cloned())
-        .map(|text| (text, Role::MutedText))
+        .map(|text| vec![(text, Role::MutedText)])
         .collect::<Vec<_>>();
     match update {
-        Some(UpdateMark { age, unread: None }) => segments.push((age, Role::MutedText)),
+        Some(UpdateMark { age, unread: None }) => segments.push(vec![(age, Role::MutedText)]),
         Some(UpdateMark {
             age,
             unread: Some(unread),
-        }) => segments.push((
-            format!(
-                "{UNREAD_MARKER} {}",
-                unread.count.map_or(age, |count| count.to_string())
+        }) => segments.push(vec![
+            (UNREAD_MARKER.to_owned(), Role::UnreadMark),
+            (
+                format!(" {}", unread.count.map_or(age, |count| count.to_string())),
+                Role::Accent,
             ),
-            Role::Accent,
-        )),
+        ]),
         None => {}
     }
     let mut spans = Vec::new();
-    for (text, role) in segments {
+    for segment in segments {
         if !spans.is_empty() {
             spans.push((SEGMENT_SEPARATOR.to_owned(), Role::MutedText));
         }
-        spans.push((text, role));
+        spans.extend(segment);
     }
     spans
 }
@@ -254,6 +278,7 @@ mod tests {
             glyph_role: Role::RunningMark,
             name: "Rerun full test suite in background to verify",
             status: vec![("14s".into(), Role::MutedText)],
+            fill: None,
         };
         let lines = row.lines(30).iter().map(RoleLine::text).collect::<Vec<_>>();
         assert_eq!(
@@ -284,6 +309,7 @@ mod tests {
             glyph_role: Role::RunningMark,
             name: "a b c d e f g h i j k l m n o p q r s t u v w x y z",
             status: vec![("2m 3s".into(), Role::MutedText)],
+            fill: None,
         };
         let lines = row.lines(20);
         assert_eq!(lines[0].text(), "  $ a b c d e f g h");
@@ -379,9 +405,15 @@ mod tests {
             0,
         );
         assert_eq!(text(&tick), "⟳ 60s · ● 3");
-        assert_eq!(tick.last().unwrap(), &("● 3".into(), Role::Accent));
+        assert_eq!(
+            tick[tick.len() - 2..],
+            [("●".into(), Role::UnreadMark), (" 3".into(), Role::Accent)]
+        );
         let shell = status_spans(StatusTone::Succeeded, &[], Some(unread(None)), 0);
-        assert_eq!(shell, [("● 2s".into(), Role::Accent)]);
+        assert_eq!(
+            shell,
+            [("●".into(), Role::UnreadMark), (" 2s".into(), Role::Accent)]
+        );
         let stopped = status_spans(
             StatusTone::Stopped,
             &["SIGTERM".into()],
@@ -400,6 +432,7 @@ mod tests {
             glyph_role: Role::SuccessMark,
             name: "Run the console tests in the worktree",
             status: vec![("12s".into(), Role::MutedText)],
+            fill: None,
         };
         let line = row.one_line(40);
         assert_eq!(line.text().width(), 40);
@@ -412,6 +445,75 @@ mod tests {
         assert_eq!(status.text(), "    the worktree           12s");
         assert_eq!(name.fill, Some(Role::Selection));
         assert_eq!(status.fill, Some(Role::Selection));
+    }
+
+    #[test]
+    fn a_row_fill_spans_both_lines_and_the_selection_wins_over_it() {
+        let row = ListRow {
+            selected: false,
+            glyph: "◉",
+            glyph_role: Role::SuccessMark,
+            name: "Quote board for the whole watchlist",
+            status: vec![("●".into(), Role::UnreadMark), (" 3".into(), Role::Accent)],
+            fill: Some(Role::UnreadRow),
+        };
+        assert!(
+            row.lines(30)
+                .iter()
+                .all(|line| line.fill == Some(Role::UnreadRow))
+        );
+        let selected = ListRow {
+            selected: true,
+            ..row
+        };
+        let line = &selected.lines(60)[0];
+        assert_eq!(line.fill, Some(Role::Selection));
+        assert!(
+            line.text().ends_with("● 3"),
+            "the selected row still shows its unread mark: {line:?}"
+        );
+    }
+
+    #[test]
+    fn an_unread_row_holds_its_fill_until_handled_and_flashes_only_when_taken_in() {
+        let animated = DisplayProfile::default();
+        let still = DisplayProfile::new(DisplayPreferences {
+            prefers_reduced_motion: true,
+            ..Default::default()
+        });
+        for display in [animated, still] {
+            assert_eq!(
+                update_fill(true, None, display, 5_000),
+                Some(Role::UnreadRow),
+                "an unread update holds the soft fill"
+            );
+            assert_eq!(
+                update_fill(false, None, display, 5_000),
+                None,
+                "opening the row clears it at once"
+            );
+        }
+        let taken_in = 5_000;
+        assert_eq!(
+            [5_000, 5_400, 5_800, 6_200].map(|now| update_fill(
+                false,
+                Some(taken_in),
+                animated,
+                now
+            )),
+            [
+                Some(Role::UnreadFlash),
+                Some(Role::UnreadRow),
+                Some(Role::UnreadFlash),
+                None
+            ],
+            "taken in, it flashes for 1.2 s and clears"
+        );
+        assert_eq!(
+            update_fill(false, Some(taken_in), still, taken_in),
+            None,
+            "under Reduce motion it clears at once"
+        );
     }
 
     #[test]

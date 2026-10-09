@@ -100,9 +100,20 @@ impl TickActionExecutor for OpenSubscriptions {
     fn prepare(&self, ui: &mut TickActionUi<'_>) -> Result<PreparedTickAction, String> {
         let detail = ui.subscription_detail(&self.instance, self.operation)?;
         ui.open_detail(Box::new(detail));
+        let key = match self.operation {
+            crate::monitor_rows::SubscriptionOperation::View => {
+                crate::monitor_rows::SUBSCRIPTIONS_KEY
+            }
+            crate::monitor_rows::SubscriptionOperation::EditCadence => {
+                crate::monitor_rows::SUBSCRIPTION_CADENCE_KEY
+            }
+            crate::monitor_rows::SubscriptionOperation::Cancel => {
+                crate::monitor_rows::UNSUBSCRIBE_KEY
+            }
+        };
         Ok(PreparedTickAction::new(
             self.instance.to_string(),
-            crate::monitor_rows::MONITOR_ENTER_KEY,
+            key,
             Arc::new(RefreshSubscriptions),
         ))
     }

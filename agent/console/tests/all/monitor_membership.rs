@@ -8,7 +8,7 @@ use tickloop_agent_console::monitor_rows::{
     TickGroup, TickIntent, TickOwner,
 };
 use tickloop_agent_protocol::{
-    ChatId, EventKind, MonitorMemberSource, TickSubscriptionChange, ToolDefinition, ToolResult,
+    ChatId, EventKind, TickSubscriptionChange, ToolDefinition, ToolResult,
 };
 use tickloop_agent_runtime::{
     Agent,
@@ -165,10 +165,6 @@ async fn an_unsubscribed_open_joins_only_its_chat_monitor_without_watch_or_model
     let snapshot = agent.snapshot(chat).await.unwrap();
     assert_eq!(snapshot.monitor.members.len(), 1);
     assert_eq!(snapshot.monitor.members[0].instance, calendar("opened"));
-    assert_eq!(
-        snapshot.monitor.members[0].source,
-        MonitorMemberSource::Opened
-    );
     let rows = monitor_rows(&agent, chat).await;
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert_eq!(rows[0].instance, calendar("opened"));
@@ -217,7 +213,7 @@ async fn an_unsubscribed_open_joins_only_its_chat_monitor_without_watch_or_model
 }
 
 #[tokio::test]
-async fn removal_outlives_restart_until_explicit_add_but_never_hides_a_subscription() {
+async fn removal_outlives_restart_but_never_hides_a_subscription() {
     let directory = tempfile::tempdir().unwrap();
     let store = directory.path().join("archive");
     let model = Arc::new(tickloop_agent_test_support::ScriptedModel::new(vec![
@@ -270,21 +266,6 @@ async fn removal_outlives_restart_until_explicit_add_but_never_hides_a_subscript
         monitor_rows(&restored, chat).await.is_empty(),
         "restart and projection keep the removal"
     );
-    restored
-        .add_monitor_member(chat, calendar("watched"), None)
-        .await
-        .unwrap();
-    let rows = monitor_rows(&restored, chat).await;
-    assert_eq!(rows.len(), 1);
-    assert_eq!(
-        restored.snapshot(chat).await.unwrap().monitor.members[0].source,
-        MonitorMemberSource::Added
-    );
-    assert_eq!(
-        rows[0].owner,
-        TickOwner::Unknown,
-        "adding never takes ownership"
-    );
     restored.shutdown().await;
 }
 
@@ -300,7 +281,7 @@ async fn an_empty_chat_keeps_members_and_removals_across_restart() {
     .unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     agent
-        .add_monitor_member(chat, calendar("kept"), Some("Kept calendar".into()))
+        .record_reopened_tick(chat, &calendar("lost"), calendar("kept"))
         .await
         .unwrap();
     agent
@@ -320,10 +301,6 @@ async fn an_empty_chat_keeps_members_and_removals_across_restart() {
     let membership = restored.snapshot(chat).await.unwrap().monitor;
     assert_eq!(membership.members.len(), 1);
     assert_eq!(membership.members[0].instance, calendar("kept"));
-    assert_eq!(
-        membership.members[0].title.as_deref(),
-        Some("Kept calendar")
-    );
     assert!(membership.removed.contains(&calendar("hidden")));
     restored.shutdown().await;
 }
@@ -352,19 +329,19 @@ async fn one_row_merges_every_source_and_frequency_and_pages_cover_the_full_set(
     run_turn(&agent, chat, "first watcher").await;
     run_turn(&agent, chat, "second watcher").await;
     let requests = model.requests.lock().unwrap().len();
-    agent
-        .add_monitor_member(chat, calendar("shared"), Some("Shared calendar".into()))
-        .await
-        .unwrap();
+    let mut snapshot = agent.snapshot(chat).await.unwrap();
+    snapshot
+        .monitor
+        .record_opened(calendar("shared"), Some("Shared calendar".into()));
     for index in 0..200 {
-        agent
-            .add_monitor_member(chat, calendar(&format!("m{index:03}")), None)
-            .await
-            .unwrap();
+        snapshot
+            .monitor
+            .record_opened(calendar(&format!("m{index:03}")), None);
     }
+    let subscriptions = agent.tick_subscriptions(chat).await.unwrap();
     let context = MonitorContext {
-        chat: Some(agent.snapshot(chat).await.unwrap()),
-        subscriptions: agent.tick_subscriptions(chat).await.unwrap(),
+        chat: Some(snapshot.clone()),
+        subscriptions: subscriptions.clone(),
         ..Default::default()
     };
     let monitor = monitor();
@@ -406,13 +383,10 @@ async fn one_row_merges_every_source_and_frequency_and_pages_cover_the_full_set(
     assert_eq!(seen, expected);
 
     let first = monitor.page(&context, None, None).unwrap();
-    agent
-        .remove_monitor_member(chat, calendar("m000"))
-        .await
-        .unwrap();
+    snapshot.monitor.remove(calendar("m000"));
     let changed = MonitorContext {
-        chat: Some(agent.snapshot(chat).await.unwrap()),
-        subscriptions: agent.tick_subscriptions(chat).await.unwrap(),
+        chat: Some(snapshot),
+        subscriptions,
         ..Default::default()
     };
     assert!(
@@ -502,11 +476,11 @@ async fn hosted_members_show_their_probed_state_and_sample_and_offer_close() {
         InstanceRef::hosted(uuid::Uuid::new_v4()),
         InstanceRef::hosted(uuid::Uuid::new_v4()),
     );
+    let mut snapshot = agent.snapshot(chat).await.unwrap();
     for instance in [&running, &gone, &lost] {
-        agent
-            .add_monitor_member(chat, instance.clone(), Some("Counter".into()))
-            .await
-            .unwrap();
+        snapshot
+            .monitor
+            .record_opened(instance.clone(), Some("Counter".into()));
     }
     let sample = TickResources {
         pid: 4242,
@@ -516,7 +490,7 @@ async fn hosted_members_show_their_probed_state_and_sample_and_offer_close() {
         sampled_at_ms: 1,
     };
     let rows = MonitorRowsRegistry::builtin().list(&MonitorContext {
-        chat: Some(agent.snapshot(chat).await.unwrap()),
+        chat: Some(snapshot),
         member_states: HashMap::from([
             (running.clone(), MemberState::Live { protocol: true }),
             (gone.clone(), MemberState::Gone),

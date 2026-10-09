@@ -84,6 +84,9 @@ pub const EXIT_PLAN_MODE_TOOL_NAME: &str = "ExitPlanMode";
 pub const TODO_WRITE_TOOL_NAME: &str = "TodoWrite";
 pub const START_GOAL_TOOL_NAME: &str = "StartGoal";
 pub const ASK_USER_QUESTION_TOOL_NAME: &str = "AskUserQuestion";
+/// The result of an `AskUserQuestion` call the user declined: Claude Code's `REJECT_MESSAGE`,
+/// which its question dialog sends on Esc. The runtime writes it and the Console recognizes it.
+pub const DECLINED_QUESTIONS_RESULT: &str = "The user doesn't want to proceed with this tool use. The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the file). STOP what you are doing and wait for the user to tell you how to proceed.";
 
 /// Tools Auto admits without the classifier, mapped from Claude Code's
 /// `SAFE_YOLO_ALLOWLISTED_TOOLS`.

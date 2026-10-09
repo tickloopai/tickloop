@@ -32,6 +32,10 @@ const NERD_FONT_SPINNER: [&str; 18] = [
 /// How long a blinking glyph stays in each phase. Every blinking glyph takes its phase from the
 /// same clock, so they blink together.
 const BLINK_PHASE_MS: u64 = 500;
+/// A one-off flash runs a little quicker than the blink, so it reads as an event beside it.
+const FLASH_PHASE_MS: u64 = 400;
+/// Strong, soft, strong: the flash ends after its third phase.
+const FLASH_PHASES: u64 = 3;
 const MILLISECONDS_PER_SECOND: u64 = 1000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -151,9 +155,11 @@ impl DisplayProfile {
             (GlyphSet::Unicode, Glyph::Collapsed) => "▸",
             (GlyphSet::Unicode, Glyph::Expanded) => "▾",
             (GlyphSet::NerdFont, Glyph::Prompt) => "\u{f0142}",
-            (GlyphSet::NerdFont, Glyph::Assistant | Glyph::Subagents) => "\u{f06a9}",
-            (GlyphSet::NerdFont, Glyph::ToolCall) => "\u{f1064}",
-            (GlyphSet::NerdFont, Glyph::ToolResult) => "\u{f060c}",
+            // The conversation's gutter keeps Claude Code's marks in every glyph set: one dot shape
+            // whose colour tells assistant from tool state, so no pictogram competes with the text.
+            (GlyphSet::NerdFont, Glyph::Assistant | Glyph::ToolCall) => "⏺",
+            (GlyphSet::NerdFont, Glyph::ToolResult) => "⎿",
+            (GlyphSet::NerdFont, Glyph::Subagents) => "\u{f06a9}",
             (GlyphSet::NerdFont, Glyph::TickDelivery) => "\u{f0318}",
             (GlyphSet::NerdFont, Glyph::AgentMessage) => "\u{f01ee}",
             (GlyphSet::NerdFont, Glyph::Success) => "\u{f05e1}",
@@ -208,6 +214,27 @@ impl DisplayProfile {
             BLINK_PHASE_MS
         };
         (now_ms / period + 1) * period
+    }
+
+    /// Whether a one-off flash that began at `since_ms` shows its strong phase at `now_ms`:
+    /// `Some(true)` in its first and third phase, `Some(false)` in the second, and `None` once it
+    /// ended and always under Reduce motion. A start a little ahead of this clock counts as its
+    /// first phase.
+    pub(super) fn flash_strong(self, since_ms: u64, now_ms: u64) -> Option<bool> {
+        self.flash_phase(since_ms, now_ms)
+            .map(|phase| phase % 2 == 0)
+    }
+
+    /// When a flash that began at `since_ms` next changes; `None` once it ended or under Reduce
+    /// motion, so a finished flash schedules no frame.
+    pub(super) fn next_flash_change_ms(self, since_ms: u64, now_ms: u64) -> Option<u64> {
+        self.flash_phase(since_ms, now_ms)
+            .map(|phase| since_ms + (phase + 1) * FLASH_PHASE_MS)
+    }
+
+    fn flash_phase(self, since_ms: u64, now_ms: u64) -> Option<u64> {
+        let phase = now_ms.saturating_sub(since_ms) / FLASH_PHASE_MS;
+        (!self.preferences.prefers_reduced_motion && phase < FLASH_PHASES).then_some(phase)
     }
 
     pub(super) fn navigation_hint(self, hint: &str) -> String {
@@ -293,8 +320,9 @@ mod tests {
             prefers_reduced_motion: true,
         });
         assert_eq!(nerd_font.glyph(Glyph::Prompt), "\u{f0142}");
-        assert_eq!(nerd_font.glyph(Glyph::Assistant), "\u{f06a9}");
-        assert_eq!(nerd_font.glyph(Glyph::ToolResult), "\u{f060c}");
+        assert_eq!(nerd_font.glyph(Glyph::Assistant), "⏺");
+        assert_eq!(nerd_font.glyph(Glyph::ToolCall), "⏺");
+        assert_eq!(nerd_font.glyph(Glyph::ToolResult), "⎿");
         assert_eq!(nerd_font.spinner_frame(7), "\u{f0a9e}");
 
         let moving_nerd_font = DisplayProfile::new(DisplayPreferences {
@@ -351,6 +379,39 @@ mod tests {
             2_000,
             "only the elapsed time still ticks"
         );
+    }
+
+    #[test]
+    fn a_flash_runs_strong_soft_strong_for_1200_ms_unless_motion_is_reduced() {
+        let animated = DisplayProfile::default();
+        assert_eq!(
+            [999, 1_000, 1_399, 1_400, 1_799, 1_800, 2_199, 2_200]
+                .map(|now| animated.flash_strong(1_000, now)),
+            [
+                Some(true),
+                Some(true),
+                Some(true),
+                Some(false),
+                Some(false),
+                Some(true),
+                Some(true),
+                None
+            ],
+            "a start just ahead of this clock already shows the first phase"
+        );
+        assert_eq!(animated.next_flash_change_ms(1_000, 1_100), Some(1_400));
+        assert_eq!(
+            animated.next_flash_change_ms(1_000, 1_900),
+            Some(2_200),
+            "its end is its last frame"
+        );
+        assert_eq!(animated.next_flash_change_ms(1_000, 2_200), None);
+        let still = DisplayProfile::new(DisplayPreferences {
+            prefers_reduced_motion: true,
+            ..Default::default()
+        });
+        assert_eq!(still.flash_strong(1_000, 1_000), None);
+        assert_eq!(still.next_flash_change_ms(1_000, 1_000), None);
     }
 
     #[test]

@@ -2,11 +2,12 @@ use serde_json::json;
 use std::sync::Arc;
 use tickloop_agent_model::ModelRequest;
 use tickloop_agent_protocol::{
-    Content, EventKind, LoopState, QuestionAnswer, Trigger, TriggerSource,
+    Content, EventKind, INTERRUPT_MESSAGE_FOR_TOOL_USE, LoopState, QuestionAnswer, Trigger,
+    TriggerSource,
 };
 use tickloop_agent_runtime::Agent;
 use tickloop_agent_test_support::*;
-use tickloop_agent_tools::ASK_USER_QUESTION_TOOL_NAME;
+use tickloop_agent_tools::{ASK_USER_QUESTION_TOOL_NAME, DECLINED_QUESTIONS_RESULT};
 use uuid::Uuid;
 
 const UNIQUENESS_ERROR: &str =
@@ -668,5 +669,115 @@ async fn an_answer_accepted_before_interrupt_remains_in_the_conversation() {
     let snapshot = agent.snapshot(chat).await.unwrap();
     assert!(snapshot.messages.iter().flat_map(|message| &message.content).any(|block| matches!(block,Content::ToolResult {tool_use_id,content,is_error:false} if tool_use_id == "clarify" && content.text() == "User has answered your questions: \"Which report?\"=\"Weekly, preserve totals.\". You can now continue with the user's answers in mind.")));
     assert_eq!(model.requests.lock().unwrap().len(), 1);
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn declining_a_question_rejects_the_call_ends_the_run_and_later_input_starts_a_new_run() {
+    const FOLLOW_UP: &str = "Write the current protocol as an HTML page instead.";
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call("clarify", ASK_USER_QUESTION_TOOL_NAME, report_questions()),
+        text("Here is the protocol as an HTML page."),
+    ]));
+    let agent = Agent::new_embedded(config(), model.clone());
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let other_chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let mut events = agent.subscribe();
+    let asked = agent
+        .submit(chat, None, "Change the protocol.".into())
+        .await
+        .unwrap();
+    let question = loop {
+        match next_event(&mut events).await.kind {
+            EventKind::QuestionAsked { request } => break request,
+            EventKind::Failed(error) => panic!("{error}"),
+            _ => {}
+        }
+    };
+    assert!(
+        agent
+            .decline_question(other_chat, question.id)
+            .await
+            .is_err()
+    );
+    agent.decline_question(chat, question.id).await.unwrap();
+    assert!(agent.decline_question(chat, question.id).await.is_err());
+    assert!(
+        agent
+            .answer_question(
+                chat,
+                question.id,
+                vec![
+                    QuestionAnswer::option("Weekly"),
+                    QuestionAnswer::option("Summary"),
+                ],
+            )
+            .await
+            .is_err(),
+        "a declined question takes no answer"
+    );
+    let declined = loop {
+        let event = next_event(&mut events).await;
+        match event.kind {
+            EventKind::ToolCompleted { call_id, result } if call_id == "clarify" => {
+                assert_eq!(event.run_id, asked.run_id);
+                break result;
+            }
+            EventKind::Completed { .. } | EventKind::Failed(_) => panic!("{:?}", event.kind),
+            _ => {}
+        }
+    };
+    assert_eq!(
+        (declined.content.as_str(), declined.is_error),
+        (DECLINED_QUESTIONS_RESULT, true)
+    );
+    loop {
+        let event = next_event(&mut events).await;
+        match event.kind {
+            EventKind::Interrupted if event.run_id == asked.run_id => break,
+            EventKind::Completed { .. } | EventKind::Failed(_) => panic!("{:?}", event.kind),
+            _ => {}
+        }
+    }
+    let snapshot = agent.snapshot(chat).await.unwrap();
+    assert!(snapshot.questions.is_empty());
+    assert_eq!(snapshot.loops[0].state, LoopState::Interrupted);
+    assert_eq!(
+        model.requests.lock().unwrap().len(),
+        1,
+        "the declined run asks the model nothing more"
+    );
+
+    let follow_up = agent.submit(chat, None, FOLLOW_UP.into()).await.unwrap();
+    assert_ne!(follow_up.run_id, asked.run_id);
+    loop {
+        let event = next_event(&mut events).await;
+        match event.kind {
+            EventKind::Completed { .. } if event.run_id == follow_up.run_id => break,
+            EventKind::Failed(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    let requests = model.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        tool_result(&requests, "clarify"),
+        (DECLINED_QUESTIONS_RESULT.to_owned(), true)
+    );
+    let texts = requests[1]
+        .messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .filter_map(|block| match block {
+            Content::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(texts.contains(&INTERRUPT_MESSAGE_FOR_TOOL_USE), "{texts:?}");
+    assert!(
+        texts.last().is_some_and(|text| text.contains(FOLLOW_UP)),
+        "{texts:?}"
+    );
     agent.shutdown().await;
 }

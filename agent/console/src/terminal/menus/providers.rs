@@ -16,6 +16,7 @@ pub(in crate::terminal) struct ProviderModels {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     #[test]
     fn scoped_discovery_preserves_other_and_newer_refreshes_until_check_completion() {
@@ -508,10 +509,14 @@ mod tests {
         assert!(!menus.discovery_active());
         release.send(()).unwrap();
         let question_menu = menus.id().unwrap();
-        menus
-            .choose(&agent, &console, question_menu, None, None)
-            .await
-            .unwrap();
+        // Esc declines the question; this fixture's question is not pending in the Agent, so
+        // the decline fails, and the dialog still gives way to the suspended picker.
+        assert!(
+            menus
+                .choose(&agent, &console, question_menu, None, None)
+                .await
+                .is_err()
+        );
         console.clear_menu(question_menu).unwrap();
         menus.sync_dialog_chat(&console).unwrap();
         assert_eq!(menus.id(), Some(model_menu));

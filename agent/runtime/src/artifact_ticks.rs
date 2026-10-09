@@ -16,7 +16,33 @@ impl Agent {
         let instance = tick_protocol::InstanceRef::artifact(&tick.origin, &tick.artifact_id).ok();
         upsert_artifact_tick(chat, tick);
         // What the artifact went through before it joined is no news for this Chat.
-        self.mark_handled(chat, instance);
+        self.mark_joined(chat, instance);
+        self.record_artifact_ticks(
+            chat.snapshot.id,
+            &chat.snapshot.workdir,
+            chat.snapshot.artifact_ticks.clone(),
+            chat.snapshot.removed_artifact_ticks.clone(),
+        );
+    }
+    /// A confirmed rename: the Chat's artifact row and every subscription on the artifact show
+    /// the new title before its metadata is read again.
+    pub(super) fn retitle_artifact_tick(
+        &self,
+        chat: &mut super::Chat,
+        instance: &tick_protocol::InstanceRef,
+        title: &str,
+    ) {
+        self.tick_deliveries().retitle(instance, title);
+        let Some(tick) = chat
+            .snapshot
+            .artifact_ticks
+            .iter_mut()
+            .find(|tick| tick.instance_id() == instance.as_str())
+            .filter(|tick| tick.title != title)
+        else {
+            return;
+        };
+        tick.title = title.to_owned();
         self.record_artifact_ticks(
             chat.snapshot.id,
             &chat.snapshot.workdir,
@@ -37,7 +63,7 @@ impl Agent {
             .remove(&tick.instance_id());
         let instance = tick_protocol::InstanceRef::artifact(&tick.origin, &tick.artifact_id).ok();
         upsert_artifact_tick(chat, tick);
-        self.mark_handled(chat, instance);
+        self.mark_joined(chat, instance);
         let ticks = chat.snapshot.artifact_ticks.clone();
         self.record_artifact_ticks(
             chat_id,

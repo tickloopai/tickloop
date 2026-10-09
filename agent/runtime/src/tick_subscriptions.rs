@@ -183,6 +183,17 @@ impl DeliveryItem {
 }
 
 impl TickDeliveries {
+    /// A confirmed rename names the instance's subscriptions before its metadata is read again.
+    pub(super) fn retitle(&mut self, instance: &InstanceRef, title: &str) {
+        for subscription in self
+            .subscriptions
+            .values_mut()
+            .filter(|subscription| subscription.instance == *instance)
+        {
+            subscription.title = Some(title.to_owned());
+        }
+    }
+
     fn apply_event(&mut self, event: TickStreamEvent) {
         match event {
             TickStreamEvent::Metadata {

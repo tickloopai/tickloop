@@ -6,7 +6,8 @@ use tickloop_agent_protocol::{
     QuestionRequest, Receipt, ToolDefinition, ToolResult,
 };
 use tickloop_agent_tools::{
-    ASK_USER_QUESTION_TOOL_NAME, EXIT_PLAN_MODE_TOOL_NAME, START_GOAL_TOOL_NAME,
+    ASK_USER_QUESTION_TOOL_NAME, DECLINED_QUESTIONS_RESULT, EXIT_PLAN_MODE_TOOL_NAME,
+    START_GOAL_TOOL_NAME,
 };
 
 const QUESTION_HEADER_MAX_CHARACTERS: usize = 12;
@@ -17,6 +18,16 @@ const MAX_QUESTION_OPTIONS: usize = 4;
 const MAX_ANSWER_BYTES: usize = 65536;
 const UNIQUENESS_ERROR: &str =
     "Question texts must be unique, option labels must be unique within each question";
+const QUESTION_SETTLED: &str = "question was already answered";
+
+/// How the user settled a pending `AskUserQuestion` call.
+pub(super) enum QuestionReply {
+    /// The tool result that reports the answers.
+    Answered(String),
+    /// Esc in the question dialog, as Claude Code's cancel: the call is rejected and the run
+    /// ends there.
+    Declined,
+}
 
 /// `answers`, `annotations` and `metadata` are accepted by the input schema for Claude Code
 /// compatibility; its permission component fills them, so the host ignores them here.
@@ -57,6 +68,32 @@ fn validate_answer(answer: &QuestionAnswer, question: &Question) -> Result<(), S
         ));
     }
     Ok(())
+}
+
+fn pending_question(chat: &Chat, request_id: Uuid) -> Result<QuestionRequest, AgentError> {
+    chat.snapshot
+        .questions
+        .iter()
+        .find(|request| request.id == request_id)
+        .cloned()
+        .ok_or_else(|| AgentError::Invalid("question expired".into()))
+}
+
+/// Fails unless the run that asked `request` is still waiting for its reply.
+fn ensure_question_waits(chat: &Chat, request: &QuestionRequest) -> Result<(), AgentError> {
+    let run_is_live = !chat
+        .run_cancel(request.run_id)
+        .is_none_or(CancellationToken::is_cancelled);
+    let loop_waits = chat.snapshot.loops.iter().any(|goal| {
+        goal.id == request.loop_id
+            && goal.run_id == Some(request.run_id)
+            && goal.state == LoopState::WaitingQuestion
+    });
+    if run_is_live && loop_waits {
+        Ok(())
+    } else {
+        Err(AgentError::Invalid("question was cancelled".into()))
+    }
 }
 
 fn has_unique_questions_and_labels(questions: &[Question]) -> bool {
@@ -237,13 +274,7 @@ impl Agent {
     ) -> Result<(), AgentError> {
         let mut chats = self.inner.chats.lock().await;
         let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
-        let request = chat
-            .snapshot
-            .questions
-            .iter()
-            .find(|request| request.id == request_id)
-            .cloned()
-            .ok_or_else(|| AgentError::Invalid("question expired".into()))?;
+        let request = pending_question(chat, request_id)?;
         if answers.len() != request.questions.len() {
             return Err(AgentError::Invalid(format!(
                 "answer each of the {} questions",
@@ -259,20 +290,10 @@ impl Agent {
                 "answers must fit in {MAX_ANSWER_BYTES} bytes"
             )));
         }
-        if chat
-            .run_cancel(request.run_id)
-            .is_none_or(CancellationToken::is_cancelled)
-            || !chat.snapshot.loops.iter().any(|goal| {
-                goal.id == request.loop_id
-                    && goal.run_id == Some(request.run_id)
-                    && goal.state == LoopState::WaitingQuestion
-            })
-        {
-            return Err(AgentError::Invalid("question was cancelled".into()));
-        }
+        ensure_question_waits(chat, &request)?;
         let mut pending_answers = self.inner.question_answers.lock().await;
         if !pending_answers.contains_key(&request_id) {
-            return Err(AgentError::Invalid("question was already answered".into()));
+            return Err(AgentError::Invalid(QUESTION_SETTLED.into()));
         }
         let mut snapshot = chat.snapshot.clone();
         snapshot
@@ -293,7 +314,37 @@ impl Agent {
         pending_answers
             .remove(&request_id)
             .unwrap()
-            .send(result)
+            .send(QuestionReply::Answered(result))
+            .map_err(|_| AgentError::Invalid("question expired".into()))
+    }
+
+    /// Declines a pending `AskUserQuestion` call, as Esc does in Claude Code's question dialog:
+    /// the call reports the rejection and its run ends there, like a declined permission. Input
+    /// the user sends afterwards starts a new run.
+    pub async fn decline_question(
+        &self,
+        chat_id: ChatId,
+        request_id: Uuid,
+    ) -> Result<(), AgentError> {
+        let mut chats = self.inner.chats.lock().await;
+        let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
+        let request = pending_question(chat, request_id)?;
+        ensure_question_waits(chat, &request)?;
+        let reply = self
+            .inner
+            .question_answers
+            .lock()
+            .await
+            .remove(&request_id)
+            .ok_or_else(|| AgentError::Invalid(QUESTION_SETTLED.into()))?;
+        let mut snapshot = chat.snapshot.clone();
+        snapshot
+            .questions
+            .retain(|request| request.id != request_id);
+        self.save(&snapshot);
+        chat.snapshot = snapshot;
+        reply
+            .send(QuestionReply::Declined)
             .map_err(|_| AgentError::Invalid("question expired".into()))
     }
 
@@ -476,12 +527,12 @@ impl Agent {
         if let Some(next) = next {
             self.inner.tasks.lock().await.push(self.run_task(next));
         }
-        let answer = tokio::select! {
+        let reply = tokio::select! {
             biased;
             _ = cancel.cancelled() => Err("question was cancelled".to_string()),
-            answer = receiver => answer.map_err(|_| "question expired".to_string()),
+            reply = receiver => reply.map_err(|_| "question expired".to_string()),
         };
-        let resumed = if answer.is_ok() {
+        let resumed = if reply.is_ok() {
             self.resume_parked_run(receipt, cancel.clone()).await
         } else {
             Ok(())
@@ -510,10 +561,21 @@ impl Agent {
             return Ok(result);
         }
         resumed?;
-        answer.map(|content| ToolResult {
-            content,
-            is_error: false,
-            output_ref: None,
-        })
+        match reply? {
+            QuestionReply::Answered(content) => Ok(ToolResult {
+                content,
+                is_error: false,
+                output_ref: None,
+            }),
+            // As a declined permission: the result reaches the conversation, then the run ends.
+            QuestionReply::Declined => {
+                chat.user_cancelled_runs.insert(receipt.run_id);
+                Ok(ToolResult {
+                    content: DECLINED_QUESTIONS_RESULT.into(),
+                    is_error: true,
+                    output_ref: None,
+                })
+            }
+        }
     }
 }

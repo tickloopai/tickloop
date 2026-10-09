@@ -37,18 +37,14 @@ impl MonitorRows for HerdrRows {
                     update: subscription_update(row),
                     running: row.link == TickLinkState::Live,
                     resources: None,
-                    actions: subscription_actions(row),
+                    actions: vec![remove_from_monitor(&row.instance)],
                 }
             })
             .collect()
     }
-    /// A Herdr member reports the latest probe of its Pane; a program the user started in Herdr
-    /// stays Herdr's even when added here.
+    /// A Herdr member reports the latest probe of its Pane.
     fn member(&self, member: &MonitorMember, context: &MonitorContext) -> TickDescriptor {
         let mut row = super::member_descriptor(member);
-        if member.source == MonitorMemberSource::Added {
-            row.owner = TickOwner::Herdr;
-        }
         add_probed_update(&mut row, context);
         match context.member_states.get(&member.instance) {
             Some(MemberState::Live { protocol }) => {
@@ -107,7 +103,7 @@ impl MonitorRows for HostedRows {
                 update: subscription_update(row),
                 running: row.link == TickLinkState::Live,
                 resources: None,
-                actions: subscription_actions(row),
+                actions: hosted_subscription_actions(row),
             })
             .collect()
     }
@@ -757,10 +753,22 @@ pub(crate) fn artifact_actions(id: &str, holds_association: bool) -> Vec<Monitor
     .collect()
 }
 
-/// A subscription's own row only removes; the Monitor list adds the subscription keys, and Enter
-/// stays with a projection that opens the instance itself.
-fn subscription_actions(row: &TickSubscriptionStatus) -> Vec<MonitorAction> {
-    vec![remove_from_monitor(&row.instance)]
+/// A hosted Tick known only through a subscription still opens and shows its snapshot like a
+/// member; the Monitor list adds the subscription keys.
+fn hosted_subscription_actions(row: &TickSubscriptionStatus) -> Vec<MonitorAction> {
+    vec![
+        MonitorAction {
+            key: MONITOR_ENTER_KEY,
+            label: "open",
+            intent: TickIntent::OpenHosted(row.instance.clone()),
+        },
+        MonitorAction {
+            key: HOSTED_SNAPSHOT_KEY,
+            label: "snapshot",
+            intent: TickIntent::ShowHostedSnapshot(row.instance.clone()),
+        },
+        remove_from_monitor(&row.instance),
+    ]
 }
 
 #[cfg(test)]
@@ -1017,7 +1025,8 @@ mod tests {
         .unwrap();
         chat.monitor
             .record_opened(quote.clone(), Some("Quote · AAPL.US".into()));
-        chat.monitor.add(terminal.clone(), Some("make dev".into()));
+        chat.monitor
+            .record_opened(terminal.clone(), Some("make dev".into()));
         let context = MonitorContext {
             chat: Some(chat),
             subscriptions: vec![TickSubscriptionStatus {
@@ -1097,7 +1106,7 @@ mod tests {
         let shell = InstanceRef::shell(ended.id);
         let mut chat = empty_chat();
         chat.monitor.record_opened(calendar.clone(), None);
-        chat.monitor.mark_handled(calendar.clone(), 6_000);
+        chat.monitor.mark_taken_in(calendar.clone(), 6_000);
         let mut context = MonitorContext {
             chat: Some(chat),
             shells: Some(tickloop_agent_protocol::ShellTaskSnapshot {
@@ -1124,20 +1133,29 @@ mod tests {
         }
 
         let chat = context.chat.as_mut().unwrap();
-        for (instance, at) in [
-            (&quote, 5_000),
-            (&calendar, 7_500),
-            (&shell, 8_000),
-            (&artifact, 4_500),
-        ] {
-            chat.monitor.mark_handled(instance.clone(), at);
-        }
+        chat.monitor.mark_taken_in(quote.clone(), 5_000);
+        chat.monitor.mark_handled(calendar.clone(), 7_500);
+        chat.monitor.mark_taken_in(shell.clone(), 8_000);
+        chat.monitor.mark_handled(artifact.clone(), 4_500);
         assert!(
             unread(&context).values().all(Option::is_none),
             "{:?}",
             unread(&context)
         );
         let rows = MonitorRowsRegistry::builtin().list(&context);
+        let taken_in = |instance: &InstanceRef| {
+            rows.iter()
+                .find(|row| &row.instance == instance)
+                .and_then(|row| row.update.as_ref()?.taken_in_at_ms)
+        };
+        assert_eq!(taken_in(&quote), Some(5_000), "a turn took the delivery in");
+        assert_eq!(taken_in(&shell), Some(8_000));
+        assert_eq!(taken_in(&artifact), None, "the user opened it");
+        assert_eq!(
+            taken_in(&calendar),
+            None,
+            "an earlier take-in does not cover the later update the user opened"
+        );
         let quote_row = rows.iter().find(|row| row.instance == quote).unwrap();
         assert_eq!(quote_row.status, "live");
         assert_eq!(quote_row.notes, ["⟳ 60s"], "the marker no longer counts");
@@ -1149,7 +1167,8 @@ mod tests {
         let running = task("make", None);
         let pane = InstanceRef::native("terminal:t1:20:birth").unwrap();
         let mut chat = empty_chat();
-        chat.monitor.add(pane.clone(), Some("make dev".into()));
+        chat.monitor
+            .record_opened(pane.clone(), Some("make dev".into()));
         let context = MonitorContext {
             chat: Some(chat),
             shells: Some(tickloop_agent_protocol::ShellTaskSnapshot {

@@ -1,7 +1,7 @@
 //! AskUserQuestion answers in the terminal. The dialog steps through the questions like
 //! Claude Code's `AskUserQuestionPermissionRequest`: one tab per question, an automatic
-//! "Other" choice, multi-select toggles and a review step before submitting. Typed input
-//! answers the questions one line at a time instead.
+//! "Other" choice, multi-select toggles and a review step before submitting; Esc or its Cancel
+//! declines the questions. Without a terminal, typed lines answer the questions one at a time.
 
 use uuid::Uuid;
 
@@ -20,7 +20,7 @@ const UNANSWERED_CHIP: &str = "☐";
 const REVIEW_TITLE: &str = "Review your answers";
 const REVIEW_PROMPT: &str = "Ready to submit your answers?";
 const SUBMIT_ANSWERS: &str = "Submit answers";
-const ANSWER_LATER: &str = "Answer later";
+const CANCEL: &str = "Cancel";
 const NEXT_QUESTION: &str = "Next";
 const LAST_QUESTION: &str = "Submit";
 const MULTI_SELECT_NOTE: &str = "(choose one or more)";
@@ -37,8 +37,8 @@ pub(super) enum FlowUpdate {
     /// Show the current step again.
     Show,
     Submit(Vec<QuestionAnswer>),
-    /// Close the dialog; the question keeps waiting for a typed answer.
-    Defer,
+    /// Esc or the review's Cancel: the user declines to answer, as Claude Code's cancel.
+    Decline,
 }
 
 #[derive(Clone, Default)]
@@ -145,11 +145,11 @@ impl QuestionFlow {
     pub(super) fn choose(&mut self, index: Option<usize>, comment: Option<String>) -> FlowUpdate {
         self.notice = None;
         let Some(index) = index else {
-            return FlowUpdate::Defer;
+            return FlowUpdate::Decline;
         };
         if self.step == self.review_step() {
             if index != 0 {
-                return FlowUpdate::Defer;
+                return FlowUpdate::Decline;
             }
             return match self.answers() {
                 Some(answers) => FlowUpdate::Submit(answers),
@@ -252,7 +252,7 @@ impl QuestionFlow {
                 id: Uuid::new_v4(),
                 title: REVIEW_TITLE.into(),
                 context,
-                options: vec![SUBMIT_ANSWERS.into(), ANSWER_LATER.into()],
+                options: vec![SUBMIT_ANSWERS.into(), CANCEL.into()],
                 selected: self.focus.min(1),
                 confirmation: false,
             };
@@ -549,7 +549,7 @@ mod tests {
         match update {
             FlowUpdate::Submit(answers) => answers,
             FlowUpdate::Show => panic!("expected answers, the dialog stayed open"),
-            FlowUpdate::Defer => panic!("expected answers, the dialog was deferred"),
+            FlowUpdate::Decline => panic!("expected answers, the questions were declined"),
         }
     }
 
@@ -622,7 +622,7 @@ mod tests {
         shown(dialog.choose(Some(4), None));
         let (review, keys) = dialog.menu(DisplayProfile::default());
         assert_eq!(review.title, REVIEW_TITLE);
-        assert_eq!(review.options, [SUBMIT_ANSWERS, ANSWER_LATER]);
+        assert_eq!(review.options, [SUBMIT_ANSWERS, CANCEL]);
         assert_eq!(keys.entry_option, None);
         assert!(
             review
@@ -684,13 +684,13 @@ mod tests {
     }
 
     #[test]
-    fn esc_or_answer_later_defers_the_dialog() {
+    fn esc_or_the_review_cancel_declines_the_questions() {
         let mut dialog = flow(vec![report(), sections()]);
-        assert!(matches!(dialog.choose(None, None), FlowUpdate::Defer));
+        assert!(matches!(dialog.choose(None, None), FlowUpdate::Decline));
         shown(dialog.choose(Some(0), None));
         shown(dialog.choose(Some(0), None));
         shown(dialog.choose(Some(4), None));
-        assert!(matches!(dialog.choose(Some(1), None), FlowUpdate::Defer));
+        assert!(matches!(dialog.choose(Some(1), None), FlowUpdate::Decline));
     }
 
     #[test]

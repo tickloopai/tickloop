@@ -185,7 +185,7 @@ async fn queued_batch(fixture: &PrivateFixture) {
                 && body.matches("Queued").count() == 2
         })
         .await;
-    assert!(!pending.contains("esc answer later"));
+    assert!(!pending.contains("esc cancel"));
     assert!(!fixture.path("work/admission-marker").exists());
     let mut attached = PtyView::start(fixture);
     attached
@@ -228,7 +228,7 @@ async fn queued_batch(fixture: &PrivateFixture) {
         })
         .await;
     assert_eq!(conversation_body(&running).matches("Bash").count(), 1);
-    assert!(!running.contains("esc answer later"));
+    assert!(!running.contains("esc cancel"));
     attached
         .wait_for("attached queued row also updates once", |frame| {
             conversation_body(frame).matches("Queued").count() == 1
@@ -237,7 +237,7 @@ async fn queued_batch(fixture: &PrivateFixture) {
         .await;
     std::fs::write(fixture.path("work/finish-command"), "").unwrap();
     view.wait_for("answer UI activates only after Bash finishes", |frame| {
-        frame.contains(QUESTION) && frame.contains("esc answer later")
+        frame.contains(QUESTION) && frame.contains("esc cancel")
     })
     .await;
     view.send(b"\r");
@@ -477,7 +477,7 @@ async fn independent_question(fixture: &PrivateFixture) {
         .await;
     view.send(b"Ask an independent question\r");
     view.wait_for("independent answer menu and reply are visible", |frame| {
-        frame.contains(REPLY) && frame.contains(QUESTION) && frame.contains("esc answer later")
+        frame.contains(REPLY) && frame.contains(QUESTION) && frame.contains("esc cancel")
     })
     .await;
     view.send(b"\r");

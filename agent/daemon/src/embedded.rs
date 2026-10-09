@@ -466,19 +466,6 @@ impl EmbeddedAgentAccess {
                         .map_err(hosted_access_error)?,
                 ))
             }
-            AgentCommand::AddMonitorMember {
-                execution,
-                instance,
-                title,
-            } => {
-                let chat = self.chat(execution).await?;
-                Ok(CommandResult::MonitorMembership(
-                    self.inner
-                        .agent
-                        .add_monitor_member(chat, instance, title)
-                        .await?,
-                ))
-            }
             AgentCommand::RemoveMonitorMember {
                 execution,
                 instance,
@@ -747,6 +734,21 @@ impl EmbeddedAgentAccess {
                     .inner
                     .agent
                     .answer_question(chat, request.request_id, answers)
+                    .await
+                {
+                    self.release_answer(request).await;
+                    return Err(error.into());
+                }
+                Ok(CommandResult::Done)
+            }
+            AgentCommand::DeclineQuestion { request } => {
+                self.claim_answer(request, PendingRequestKind::Question, envelope.command_id)
+                    .await?;
+                let chat = self.chat(request.execution).await?;
+                if let Err(error) = self
+                    .inner
+                    .agent
+                    .decline_question(chat, request.request_id)
                     .await
                 {
                     self.release_answer(request).await;

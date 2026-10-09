@@ -2017,13 +2017,10 @@ mod tests {
         );
 
         assert!(history.contains("\u{f0142} prefix prompt"), "{history}");
-        assert!(history.contains("\u{f06a9} prefix answer"), "{history}");
-        assert!(history.contains("\u{f1064} Read"), "{history}");
-        assert!(history.contains("\u{f060c}  Completed"), "{history}");
-        assert!(
-            history.contains("\u{f060c}  prefix shell output"),
-            "{history}"
-        );
+        assert!(history.contains("⏺ prefix answer"), "{history}");
+        assert!(history.contains("⏺ Read"), "{history}");
+        assert!(history.contains("⎿  Completed"), "{history}");
+        assert!(history.contains("⎿  prefix shell output"), "{history}");
     }
 
     #[test]

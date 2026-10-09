@@ -402,8 +402,8 @@ fn a_subscribed_instance_always_has_a_row_with_its_marker() {
 #[test]
 fn built_in_rows_describe_their_actions_as_intents() {
     use tickloop_agent_protocol::{
-        MonitorMember, MonitorMemberSource, ShellTask, ShellTaskCapabilities, ShellTaskOrigin,
-        ShellTaskOwner, ShellTaskSnapshot, ShellTaskState, TickSubscriptionStatus,
+        MonitorMember, ShellTask, ShellTaskCapabilities, ShellTaskOrigin, ShellTaskOwner,
+        ShellTaskSnapshot, ShellTaskState, TickSubscriptionStatus,
     };
     let chat = Uuid::new_v4();
     let shell = |state| ShellTask {
@@ -458,6 +458,7 @@ fn built_in_rows_describe_their_actions_as_intents() {
     let action = |key, label, intent| MonitorAction { key, label, intent };
     let manage = |instance: &InstanceRef| {
         [
+            ('w', "subscriptions", SubscriptionOperation::View),
             ('e', "cadence", SubscriptionOperation::EditCadence),
             ('u', "unsubscribe", SubscriptionOperation::Cancel),
         ]
@@ -496,14 +497,7 @@ fn built_in_rows_describe_their_actions_as_intents() {
         ]
     );
     let mut pane_actions = vec![
-        action(
-            'o',
-            "subscriptions",
-            TickIntent::ManageSubscriptions {
-                instance: pane.instance.clone(),
-                operation: SubscriptionOperation::View,
-            },
-        ),
+        action('o', "open", TickIntent::ShowDetails(pane.instance.clone())),
         action(
             'x',
             "remove",
@@ -538,7 +532,6 @@ fn built_in_rows_describe_their_actions_as_intents() {
     let member = InstanceRef::new("cal", "member").unwrap();
     let member_row = tickloop_agent_console::monitor_rows::member_descriptor(&MonitorMember {
         instance: member.clone(),
-        source: MonitorMemberSource::Added,
         title: None,
     });
     assert_eq!(

@@ -204,6 +204,12 @@ pub enum HostEffect {
     /// A confirmed `ArtifactEdit` create; the new artifact joins Monitor and is linked to the
     /// calling Loop.
     CreatedArtifact(tickloop_agent_protocol::ArtifactTick),
+    /// A confirmed `ArtifactEdit` rename; Monitor shows the artifact's new title without waiting
+    /// for its metadata to be read again.
+    RenamedArtifact {
+        instance: tick_protocol::InstanceRef,
+        title: String,
+    },
     /// A verified open created this Tick Instance for the calling Chat. It joins that Chat's
     /// Monitor without subscribing; a failed or unknown open never produces this effect.
     OpenedTick {

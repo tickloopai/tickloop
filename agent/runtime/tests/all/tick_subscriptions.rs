@@ -235,15 +235,17 @@ async fn a_cadence_delivers_the_latest_update_and_counts_the_ones_it_dropped() {
     tokio::time::advance(CADENCE).await;
     wait_for_completion(&mut events).await;
 
+    let monitor = agent.snapshot(chat).await.unwrap().monitor;
     assert!(
-        agent
-            .snapshot(chat)
-            .await
-            .unwrap()
-            .monitor
+        monitor
             .handled_at(&fixture_instance(7))
             .is_some_and(|handled| handled >= updated),
         "the turn the delivery started handled the updates"
+    );
+    assert_eq!(
+        monitor.taken_in_at(&fixture_instance(7)),
+        monitor.handled_at(&fixture_instance(7)),
+        "the delivery is a turn taking the updates in"
     );
     assert_eq!(model.requests.lock().unwrap().len(), 3);
     let delivered = last_user_text(&model);

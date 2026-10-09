@@ -140,6 +140,9 @@ fn artifact_update_id<'a>(name: &str, input: &'a Value) -> Option<&'a str> {
         "replace" => {
             fields.len() == 4 && input["expected_revision"].is_u64() && input["content"].is_string()
         }
+        "rename" => {
+            fields.len() == 4 && input["title"].is_string() && input["expected_title"].is_string()
+        }
         _ => false,
     };
     valid_fields
@@ -570,6 +573,35 @@ impl McpHostToolProvider {
             url: url.into(),
             access_role: "owner".into(),
             added_at_ms: tickloop_agent_base::private_fs::unix_time_milliseconds(),
+        })
+    }
+
+    /// The title a confirmed `ArtifactEdit` rename gave the artifact it named. The service answers
+    /// with the artifact's canonical ID, also when the call named it by its short ID.
+    fn rename_effect(
+        result: &rmcp::model::CallToolResult,
+        prepared: &PreparedMcpCall,
+    ) -> Option<HostEffect> {
+        if result.is_error == Some(true) || !has_action(&prepared.arguments, "rename") {
+            return None;
+        }
+        let requested = artifact_update_id(ARTIFACT_EDIT_TOOL, &prepared.arguments)?;
+        let saved = result.structured_content.as_ref()?;
+        let artifact_id = bounded_identifier(saved.get("artifact_id"))?;
+        if tickloop_agent_artifacts::short_artifact_id(artifact_id)
+            != tickloop_agent_artifacts::short_artifact_id(requested)
+        {
+            return None;
+        }
+        let title = saved.get("title")?.as_str()?;
+        if title.trim().is_empty() || title.encode_utf16().count() > MAX_ARTIFACT_TITLE_UTF16_UNITS
+        {
+            return None;
+        }
+        let origin = prepared.credential.origin.trim_end_matches('/');
+        Some(HostEffect::RenamedArtifact {
+            instance: tick_protocol::InstanceRef::artifact(origin, artifact_id).ok()?,
+            title: title.to_owned(),
         })
     }
 
@@ -1257,9 +1289,9 @@ impl HostToolProvider for McpHostToolProvider {
             }
         };
         let effect = match name.as_str() {
-            ARTIFACT_EDIT_TOOL => {
-                Self::creation_effect(&result, &prepared).map(HostEffect::CreatedArtifact)
-            }
+            ARTIFACT_EDIT_TOOL => Self::creation_effect(&result, &prepared)
+                .map(HostEffect::CreatedArtifact)
+                .or_else(|| Self::rename_effect(&result, &prepared)),
             ARTIFACT_COMMENT_TOOL => event_context.as_ref().and_then(|context| {
                 Self::finished_request_effect(&result, &prepared.arguments, context)
             }),

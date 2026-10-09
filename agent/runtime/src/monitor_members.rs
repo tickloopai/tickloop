@@ -1,11 +1,12 @@
-//! A Chat's Monitor membership: the Tick Instances it opened or explicitly added, the ones the
-//! user removed from view, and when the Chat last handled each instance's updates. Membership
-//! never subscribes, reads or calls the model; removal only hides an instance and leaves its
-//! process, subscriptions and feedback associations untouched.
+//! A Chat's Monitor membership: the Tick Instances it opened, the ones the user removed from
+//! view, and when the Chat last handled each instance's updates. Membership never subscribes,
+//! reads or calls the model; removal only hides an instance and leaves its process,
+//! subscriptions and feedback associations untouched.
 //!
 //! An update is handled once it enters one of this Chat's Agent turns (a subscription delivery,
 //! a read tool on the instance, a completion notification or a claimed feedback request) or the
-//! user opens the instance's row; a later update is unread.
+//! user opens the instance's row; a later update is unread. A turn taking updates in is recorded
+//! apart from the other handling, so a View can show the update going to the Agent.
 
 use std::path::{Path, PathBuf};
 
@@ -97,21 +98,6 @@ impl Agent {
         );
     }
 
-    /// Adds an existing instance to the Chat's Monitor and clears its removal mark. Adding
-    /// neither transfers ownership nor grants read, modify or subscribe permission.
-    pub async fn add_monitor_member(
-        &self,
-        chat_id: ChatId,
-        instance: InstanceRef,
-        title: Option<String>,
-    ) -> Result<MonitorMembership, AgentError> {
-        self.update_monitor(chat_id, |membership| {
-            membership.add(instance.clone(), title);
-            membership.mark_handled(instance, now_ms());
-        })
-        .await
-    }
-
     /// Joins the instance reopened in place of `lost` to the Chat's Monitor as one it opened,
     /// under the lost one's title; the lost row stays until it is removed.
     pub async fn record_reopened_tick(
@@ -155,15 +141,34 @@ impl Agent {
     }
 
     /// Records that one of this Chat's turns took in the instances' updates.
-    pub(super) fn mark_handled(
+    pub(super) fn mark_taken_in(
         &self,
         chat: &mut Chat,
         instances: impl IntoIterator<Item = InstanceRef>,
     ) {
+        self.record_handled(chat, instances, MonitorMembership::mark_taken_in);
+    }
+
+    /// Records that what the instances went through before they joined the Chat's Monitor is no
+    /// news for it; no turn took anything in.
+    pub(super) fn mark_joined(
+        &self,
+        chat: &mut Chat,
+        instances: impl IntoIterator<Item = InstanceRef>,
+    ) {
+        self.record_handled(chat, instances, MonitorMembership::mark_handled);
+    }
+
+    fn record_handled(
+        &self,
+        chat: &mut Chat,
+        instances: impl IntoIterator<Item = InstanceRef>,
+        mark: fn(&mut MonitorMembership, InstanceRef, u64) -> bool,
+    ) {
         let now = now_ms();
         let mut moved = false;
         for instance in instances {
-            moved |= chat.snapshot.monitor.mark_handled(instance, now);
+            moved |= mark(&mut chat.snapshot.monitor, instance, now);
         }
         if moved {
             self.record_monitor_membership(
@@ -177,7 +182,7 @@ impl Agent {
     /// A completed tool call whose result the turn reads next handled what it read.
     pub(super) fn mark_read_handled(&self, chat: &mut Chat, target: ReadTarget) {
         if let Some(instance) = target.instance(chat) {
-            self.mark_handled(chat, [instance]);
+            self.mark_taken_in(chat, [instance]);
         }
     }
 
@@ -204,7 +209,7 @@ impl Agent {
                 InstanceRef::artifact(&claim.source.origin, &claim.source.artifact_id).ok(),
             );
         }
-        self.mark_handled(chat, instances);
+        self.mark_taken_in(chat, instances);
     }
 
     async fn update_monitor(

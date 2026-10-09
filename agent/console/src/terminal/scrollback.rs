@@ -1668,9 +1668,9 @@ mod tests {
             scrollback.frame(80, 8).lines,
             [
                 "literal ↑↓ and ⏺ stay text",
-                "\u{f06a9} assistant",
-                "\u{f1064} tool",
-                "  \u{f060c} result",
+                "⏺ assistant",
+                "⏺ tool",
+                "  ⎿ result",
                 "\u{f05e1} Done",
                 "",
             ]
@@ -1811,7 +1811,7 @@ mod tests {
     }
 
     #[test]
-    fn a_glyph_switch_remaps_markdown_leads() {
+    fn a_glyph_switch_keeps_claude_codes_mark_on_markdown_leads() {
         let mut scrollback = Scrollback::new();
         scrollback.append_markdown("reply", "⏺ ", true);
         scrollback.frame(20, 4);
@@ -1820,7 +1820,7 @@ mod tests {
             prefers_reduced_motion: false,
         });
         scrollback.remap_display(DisplayProfile::default(), nerd_font);
-        assert_eq!(scrollback.frame(20, 4).lines, ["", "\u{f06a9} reply", ""]);
+        assert_eq!(scrollback.frame(20, 4).lines, ["", "⏺ reply", ""]);
     }
 
     fn done_notice(usage: &str) -> Vec<(String, Option<Role>)> {

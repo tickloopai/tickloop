@@ -1746,7 +1746,6 @@ pub(super) fn help_lines(
             "shift+↑/↓ Monitor Shells",
             "enter open Shell (Monitor)",
             "x remove from Monitor",
-            "a add to Monitor",
             "j/k list navigation",
             "pgup/pgdn conversation",
             "ctrl+end latest",

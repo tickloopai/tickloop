@@ -16,8 +16,8 @@ use tickloop_agent_protocol::{
 use tickloop_agent_runtime::{
     Agent,
     host_tools::{
-        HostToolPermission, HostToolProvider, PreparedHostCall, WorkspaceHostContext,
-        WorkspaceHostName, WorkspaceIntegration,
+        HostCallResult, HostEffect, HostToolPermission, HostToolProvider, PreparedHostCall,
+        WorkspaceHostContext, WorkspaceHostName, WorkspaceIntegration,
     },
     mcp_tools::McpHostToolProvider,
 };
@@ -333,6 +333,121 @@ async fn reading_runs_without_approval_while_edits_ask_under_their_own_name() {
             .any(|operation| operation.name == "ArtifactEdit"
                 && operation.state == OperationState::Completed)
     );
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_rename_prepares_dispatches_and_admits_like_a_content_edit_of_the_same_artifact() {
+    let service = ArtifactService::start().await;
+    let directory = tempfile::tempdir().unwrap();
+    let provider = McpHostToolProvider::new(service.login(directory.path()).await, None);
+    provider.refresh(CancellationToken::new()).await.unwrap();
+    let patch = json!({"action":"patch","artifact_id":"doc","patches":[{"type":"replace","target":"b1","expected_hash":"h1","text":"# Fixture"}]});
+    let rename =
+        json!({"action":"rename","artifact_id":"doc","title":"Q3 plan","expected_title":"Fixture"});
+    let chat = uuid::Uuid::new_v4();
+    let prepare = async |input: &Value| {
+        provider
+            .prepare_call(chat, "ArtifactEdit", input, CancellationToken::new())
+            .await
+            .unwrap()
+    };
+    for audience in [None, Some("private"), Some("shared"), Some("public")] {
+        *service.control.publication.lock().unwrap() =
+            audience.map(|audience| json!({"audience":audience,"membership_revision":0}));
+        let (edit, retitle) = (prepare(&patch).await, prepare(&rename).await);
+        assert_eq!(retitle.permission(), edit.permission(), "{audience:?}");
+        assert_eq!(
+            retitle.approval_facts().artifact_publication,
+            edit.approval_facts().artifact_publication,
+            "{audience:?}"
+        );
+    }
+
+    let private = json!({"audience":"private","membership_revision":0});
+    *service.control.publication.lock().unwrap() = Some(private.clone());
+    let prepared = prepare(&rename).await;
+    assert_eq!(
+        prepared.permission(),
+        HostToolPermission::PrivateArtifactWrite
+    );
+    let HostCallResult::CompletedWithEffect(result, effect) = provider
+        .execute_prepared(chat, prepared, CancellationToken::new())
+        .await
+    else {
+        panic!("a confirmed rename reports the new title");
+    };
+    assert!(!result.is_error);
+    let HostEffect::RenamedArtifact { instance, title } = *effect else {
+        panic!("a rename is not a creation");
+    };
+    assert_eq!(
+        instance,
+        tick_protocol::InstanceRef::artifact(&service.origin, "doc").unwrap()
+    );
+    assert_eq!(title, "Q3 plan");
+    assert_eq!(
+        service.tool_calls().last().unwrap()["_meta"]["tickloop.ai/publication"],
+        private,
+        "the service checks the audience the permission was prepared against"
+    );
+    assert_eq!(
+        prepare(&patch).await.permission(),
+        HostToolPermission::ArtifactContinuation,
+        "the confirmed rename admits later writes to the same private artifact"
+    );
+}
+
+#[tokio::test]
+async fn an_approved_agent_rename_retitles_the_chat_artifact_and_a_refused_one_does_not() {
+    let service = ArtifactService::start().await;
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "stale",
+            "ArtifactEdit",
+            json!({"action":"rename","artifact_id":"doc","title":"Lost","expected_title":"Older"}),
+        ),
+        call(
+            "rename",
+            "ArtifactEdit",
+            json!({"action":"rename","artifact_id":"doc","title":"Q3 plan","expected_title":"Fixture"}),
+        ),
+        text("Renamed."),
+    ]));
+    let agent = signed_in_agent(&service, directory.path(), model).await;
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    agent
+        .add_artifact_tick(chat, artifact_tick(&service, "doc"))
+        .await
+        .unwrap();
+    let mut events = agent.subscribe();
+    agent
+        .submit(chat, None, "Rename it to Q3 plan".into())
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        let permission = next_permission(&mut events).await;
+        assert_eq!(
+            permission.name, "ArtifactEdit",
+            "a rename asks like an edit"
+        );
+        assert_eq!(
+            agent.artifact_ticks(chat).await.unwrap()[0].title,
+            "Fixture",
+            "neither an unapproved nor a refused rename changes the title"
+        );
+        agent
+            .answer_permission(chat, permission.id, true)
+            .await
+            .unwrap();
+    }
+    wait_for_completion(&agent, chat).await;
+    assert_eq!(service.tool_calls().len(), 2);
+    let ticks = agent.artifact_ticks(chat).await.unwrap();
+    assert_eq!(ticks.len(), 1);
+    assert_eq!(ticks[0].title, "Q3 plan");
+    assert_eq!(ticks[0].added_at_ms, 1);
     agent.shutdown().await;
 }
 

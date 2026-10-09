@@ -55,6 +55,8 @@ pub struct ServiceControl {
     pub catalog_format_names: AtomicBool,
     pub drop_call_response: AtomicBool,
     pub fail_link: AtomicBool,
+    /// Who the fixture artifact is published to, as its metadata reports it; unknown when unset.
+    pub publication: Mutex<Option<Value>>,
     pub links: Mutex<BTreeMap<String, Link>>,
     pub pending: Mutex<Vec<(String, String)>>,
     pub running: Mutex<BTreeMap<String, String>>,
@@ -147,6 +149,12 @@ fn call_tool(control: &ServiceControl, origin: &str, params: &Value) -> Value {
         }
         ("ArtifactEdit", "patch") => {
             json!({"artifact_id":artifact_id,"revision":4,"changed":[{"id":"b1","hash":"h2"}]})
+        }
+        ("ArtifactEdit", "rename") if arguments["expected_title"] != "Fixture" => {
+            return tool_error("content_conflict", "The title changed since it was read");
+        }
+        ("ArtifactEdit", "rename") => {
+            json!({"artifact_id":artifact_id,"title":arguments["title"].as_str().unwrap_or_default().trim(),"revision":4})
         }
         ("ArtifactEdit", _) => json!({"artifact_id":artifact_id,"revision":4}),
         ("ArtifactComment", "reply") => {
@@ -359,7 +367,7 @@ fn lifecycle(control: &ServiceControl, method: &str, target: &str, body: &Value)
             let link = control.links.lock().unwrap().get(*artifact_id).cloned();
             (
                 200,
-                json!({"id":artifact_id,"title":"Fixture","format":"markdown","access_role":"owner","agent_link":link.map(|link| json!({"binding_id":link.binding_id,"chat_id":link.chat_id,"loop_id":link.loop_id,"epoch":link.epoch}))}),
+                json!({"id":artifact_id,"title":"Fixture","format":"markdown","access_role":"owner","publication":control.publication.lock().unwrap().clone(),"agent_link":link.map(|link| json!({"binding_id":link.binding_id,"chat_id":link.chat_id,"loop_id":link.loop_id,"epoch":link.epoch}))}),
             )
         }
         _ => (

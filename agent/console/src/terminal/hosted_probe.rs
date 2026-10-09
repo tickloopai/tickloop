@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 use super::execution::ConsoleExecution;
-use crate::monitor_rows::{DiscoveryError, MemberFindings, MemberState, TickProbe, TickResources};
+use crate::monitor_rows::{MemberFindings, MemberState, ProbeError, TickProbe, TickResources};
 use tick_protocol::InstanceRef;
 use tickloop_agent_protocol::HostedMemberState;
 
@@ -31,12 +31,12 @@ impl TickProbe for HostedProbe {
         &self,
         chat: Uuid,
         instances: &[InstanceRef],
-    ) -> Result<MemberFindings, DiscoveryError> {
+    ) -> Result<MemberFindings, ProbeError> {
         let running = self
             .agent
             .hosted_ticks(chat)
             .await
-            .map_err(|error| DiscoveryError::Unavailable(error.to_string()))?
+            .map_err(|error| ProbeError(error.to_string()))?
             .into_iter()
             .map(|member| (member.instance.clone(), member))
             .collect::<HashMap<_, _>>();

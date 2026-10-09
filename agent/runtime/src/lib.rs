@@ -310,7 +310,7 @@ struct Inner {
     /// 本进程持有的 Trigger 租约；Inner 释放时随之归还。
     loop_leases: loop_lease::LoopLeases,
     approvals: Mutex<HashMap<Uuid, PendingApproval>>,
-    question_answers: Mutex<HashMap<Uuid, oneshot::Sender<String>>>,
+    question_answers: Mutex<HashMap<Uuid, oneshot::Sender<interaction::QuestionReply>>>,
     closed: AtomicBool,
     auto_reviewer: Mutex<Option<Arc<dyn ModelClient>>>,
     judgment: Mutex<Option<Arc<dyn tickloop_agent_model::judgment::JudgmentClient>>>,
@@ -2713,6 +2713,7 @@ impl Agent {
                     if !result.is_error && host_call_status == Some(crate::host_tools::HostCallStatus::Completed) {
                         match &host_effect {
                             Some(crate::host_tools::HostEffect::CreatedArtifact(tick)) => self.auto_attach_artifact_tick(chat, tick.clone()),
+                            Some(crate::host_tools::HostEffect::RenamedArtifact { instance, title }) => self.retitle_artifact_tick(chat, instance, title),
                             Some(crate::host_tools::HostEffect::OpenedTick { instance, title }) => {
                                 if let Some(operation) = chat.snapshot.operations.iter().find(|operation| operation.run_id == receipt.run_id && operation.call_id == id && operation.state == OperationState::Completed) {
                                     chat.bookkeeping.tick_creation_receipts.push(approval_context::TickCreationReceipt { loop_id: receipt.loop_id, operation_id: operation.id, instance: instance.clone() });
@@ -4134,7 +4135,7 @@ impl Agent {
         let notified = std::mem::take(&mut chat.bookkeeping.deferred_notifications);
         if chat.active.is_some() {
             // Written between tool results, so the running turn reads them next.
-            self.mark_handled(chat, notified);
+            self.mark_taken_in(chat, notified);
         } else {
             chat.bookkeeping.unread_notifications.extend(notified);
         }

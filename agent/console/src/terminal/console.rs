@@ -661,6 +661,9 @@ pub(super) struct State {
         HashMap<Option<Uuid>, (input_dialog::DialogState, Option<input_dialog::DialogState>)>,
     dialog_cursor_visible: bool,
     dialog_option_rows: Vec<(std::ops::Range<usize>, usize)>,
+    /// Whether the last dialog frame offered PageUp/PageDown for its own content; otherwise
+    /// they and the wheel scroll the conversation behind it, as in Claude Code.
+    dialog_scrolls_own_content: bool,
     request_queue_count: usize,
     menu: Option<Menu>,
     menu_rule_role: Option<Role>,
@@ -709,11 +712,8 @@ pub(super) struct State {
     full_screen_attach: Option<FullScreenAttach>,
     /// An attached view owns the terminal; nothing is drawn until it is taken back.
     terminal_lent: bool,
-    /// Lists the View's Workspace programs for explicit adding; absent outside a Herdr View.
-    tick_discovery: Option<Arc<dyn crate::monitor_rows::TickDiscovery>>,
-    /// Reads the host state of Monitor members: the discovery inside Herdr, otherwise the
-    /// hosted Tick probe.
-    /// One probe per Tick type whose members' host state can be read.
+    /// One probe per Tick type whose members' host state can be read: Herdr members inside a
+    /// Herdr View and hosted Ticks in every View.
     member_probes: Vec<Arc<dyn crate::monitor_rows::TickProbe>>,
     member_probe_running: bool,
     permissions_surface: Option<PermissionsSurface>,
@@ -1318,9 +1318,9 @@ impl Console {
         snapshot: &tickloop_agent_protocol::ChatSnapshot,
     ) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
-        let monitor = state.monitor_for_chat_mut(snapshot.id);
-        monitor.chat_snapshot = Some(snapshot.clone());
-        monitor.rebuild();
+        state
+            .monitor_for_chat_mut(snapshot.id)
+            .set_chat_snapshot(snapshot.clone());
         Ok(())
     }
     pub(super) fn update_artifact_metadata(
@@ -1362,16 +1362,6 @@ impl Console {
         state.status = message.into();
         Ok(())
     }
-    /// Installs the discovery that lists what can be added; it also probes members.
-    pub(super) fn set_tick_discovery(
-        &self,
-        discovery: Arc<dyn crate::monitor_rows::TickDiscovery>,
-    ) -> Result<(), String> {
-        let mut state = self.state.lock().map_err(|error| error.to_string())?;
-        state.member_probes.push(discovery.clone());
-        state.tick_discovery = Some(discovery);
-        Ok(())
-    }
     /// Adds the probe of one more Tick type's members.
     pub(super) fn add_member_probe(
         &self,
@@ -1383,16 +1373,6 @@ impl Console {
             .member_probes
             .push(probe);
         Ok(())
-    }
-    /// Opens the add picker in the current Chat's Monitor, even while the Monitor is empty.
-    pub(super) fn open_monitor_discovery(&self) -> Result<Option<InputEvent>, String> {
-        let mut state = self.state.lock().map_err(|error| error.to_string())?;
-        let event = state.open_monitor_discovery();
-        state.rendered_region = None;
-        state
-            .draw(&mut io::stdout().lock())
-            .map_err(|error| error.to_string())?;
-        Ok(event)
     }
     /// Claims the next host probe of the visible Chat's members, if one is due and none runs.
     pub(super) fn claim_member_probe(&self) -> Result<Option<MemberProbe>, String> {
@@ -4978,6 +4958,8 @@ impl State {
         self.switch_editor_chat(chat);
         let previous = self.replace_view(next);
         self.view_cache.insert(previous_chat, previous);
+        self.monitor
+            .settle_flashes(tickloop_agent_base::private_fs::unix_time_milliseconds());
         self.hide_diff_screen();
         if let Some((dialog, suspended)) = self.dialog_cache.remove(&chat) {
             self.replace_dialog(dialog);
@@ -5183,6 +5165,7 @@ impl State {
             dialog_cache: HashMap::new(),
             dialog_cursor_visible: false,
             dialog_option_rows: Vec::new(),
+            dialog_scrolls_own_content: false,
             request_queue_count: 0,
             menu: None,
             menu_rule_role: None,
@@ -5221,7 +5204,6 @@ impl State {
             popup_registration_offered: false,
             full_screen_attach: None,
             terminal_lent: false,
-            tick_discovery: None,
             member_probes: Vec::new(),
             member_probe_running: false,
             permissions_surface: None,
@@ -5366,13 +5348,11 @@ impl State {
         }
         if self.input_dialog_visible() {
             let start = self.height.saturating_sub(self.input_dialog_height());
+            // A menu dialog leaves the conversation above it in view; the wheel scrolls it there.
             if at.row < start
-                && matches!(
-                    event.kind,
-                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
-                )
+                && let Some(action) = wheel_scroll(event.kind)
             {
-                return false;
+                return self.menu.is_some() && self.scroll_conversation(action);
             }
             if at.row >= start {
                 let row = at.row - start;
@@ -5437,6 +5417,12 @@ impl State {
                     return true;
                 }
                 match event.kind {
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                        if self.menu.is_some() && !self.dialog_scrolls_own_content =>
+                    {
+                        return wheel_scroll(event.kind)
+                            .is_some_and(|action| self.scroll_conversation(action));
+                    }
                     MouseEventKind::ScrollUp => {
                         self.context_offset = self.context_offset.saturating_sub(1)
                     }
@@ -5492,11 +5478,8 @@ impl State {
             return resized;
         }
         match event.kind {
-            MouseEventKind::ScrollUp => {
-                self.scroll_conversation(ScrollAction::LinesUp(renderer::WHEEL_SCROLL_LINES))
-            }
-            MouseEventKind::ScrollDown => {
-                self.scroll_conversation(ScrollAction::LinesDown(renderer::WHEEL_SCROLL_LINES))
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                wheel_scroll(event.kind).is_some_and(|action| self.scroll_conversation(action))
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 if !self.input_dialog_visible()
@@ -5665,23 +5648,6 @@ impl State {
         renderer::write_synchronized(output, |output| self.draw_frame(output))
     }
 
-    /// Prepares the add picker and focuses Monitor for it.
-    fn open_monitor_discovery(&mut self) -> Option<InputEvent> {
-        let chat = self.chat?;
-        let executor = super::monitor_discovery::open(self.tick_discovery.clone());
-        match executor.prepare(&mut super::tick_actions::TickActionUi { state: self }) {
-            Ok(action) => {
-                let overlay = self.monitor_overlay();
-                self.monitor.focus(overlay, None);
-                Some(InputEvent::TickAction { chat, action })
-            }
-            Err(error) => {
-                self.hold_status(&error);
-                None
-            }
-        }
-    }
-
     /// Whether a focused Monitor covers the conversation instead of sitting beside it.
     fn monitor_overlay(&self) -> bool {
         self.monitor_side_columns().is_none()
@@ -5690,13 +5656,7 @@ impl State {
 
     fn monitor_visible(&self) -> bool {
         self.chat.is_some()
-            && (self.monitor.total() > 0
-                || self.monitor.is_shown()
-                || self
-                    .monitor
-                    .detail
-                    .as_ref()
-                    .is_some_and(|detail| detail.keeps_empty_monitor()))
+            && (self.monitor.total() > 0 || self.monitor.is_shown())
             && self.overview.projection.is_none()
             && self.workspace_trust.is_none()
             && self.history_search.is_none()
@@ -6378,7 +6338,7 @@ impl State {
                 };
                 let priority = if part.split([' ', '/']).any(|key| key == "esc") {
                     12
-                } else if part.starts_with("enter") {
+                } else if part.split([' ', '/']).any(|key| key == "enter") {
                     11
                 } else {
                     5
@@ -6722,7 +6682,8 @@ impl State {
             };
             let mut hints = Vec::new();
             if !hint.is_empty() {
-                if self.input_dialog_has_fixed_height() {
+                // A narrow question dialog drops navigation before Enter and Esc.
+                if self.input_dialog_has_fixed_height() && self.question_menu.is_none() {
                     hints.push((hint, 10));
                 } else {
                     hints.extend(self.user_hint_parts(&hint));
@@ -6740,6 +6701,7 @@ impl State {
                 hints.push(("v full plan".into(), 12));
                 if !editing {
                     hints.push(("pgup/pgdn plan".into(), 10));
+                    self.dialog_scrolls_own_content = true;
                     if self.menu_comment.is_some() {
                         hints.push(("tab feedback".into(), 10));
                     }
@@ -6757,6 +6719,7 @@ impl State {
                 > context_capacity
             {
                 hints.push(("pgup/pgdn details".into(), 6));
+                self.dialog_scrolls_own_content = true;
             }
             let hint = super::conversation_picker::fit_hint(&hints, self.width, self.display);
             lines.push(RoleLine::role(hint, Role::MutedText));
@@ -7533,14 +7496,11 @@ impl State {
                     // Help is focused and draws its own close hint; only facts remain.
                     ""
                 } else if self.monitor_visible() && self.monitor.focused {
-                    monitor_hint = self.monitor.detail.as_ref().map_or_else(
-                        || {
-                            self.monitor.hint(
-                                self.tick_discovery.is_some() || !self.monitor.removed().is_empty(),
-                            )
-                        },
-                        |detail| detail.hint(),
-                    );
+                    monitor_hint = self
+                        .monitor
+                        .detail
+                        .as_ref()
+                        .map_or_else(|| self.monitor.hint(), |detail| detail.hint());
                     monitor_hint.as_str()
                 } else if self.foreground_shell {
                     "Shell running · ctrl+b background · ctrl+c stop"
@@ -8615,6 +8575,12 @@ impl State {
         self.menu_comment
             .as_ref()
             .is_some_and(|comment| comment.editing)
+    }
+
+    /// PageUp and PageDown scroll the conversation unless a focused dialog offers them for its
+    /// own content; Claude Code keeps them for the transcript behind its dialogs.
+    fn page_keys_scroll_conversation(&self) -> bool {
+        !(self.review_focused || self.menu_focused && self.dialog_scrolls_own_content)
     }
 
     fn input_menu_active(&self) -> bool {
@@ -9925,9 +9891,6 @@ impl State {
             }
             let mut types_into_input = false;
             match (key.code, key.modifiers) {
-                (KeyCode::Char(crate::monitor_rows::MONITOR_ADD_KEY), KeyModifiers::NONE) => {
-                    return self.open_monitor_discovery();
-                }
                 (KeyCode::Char(crate::monitor_rows::MONITOR_REFRESH_KEY), KeyModifiers::NONE) => {
                     let chat = self.chat?;
                     let executor = self.monitor.refresh_action();
@@ -10216,6 +10179,17 @@ impl State {
         {
             self.exit_confirmation = None;
         }
+        // Claude Code binds Ctrl+C in its question dialog to the same cancel as Esc, also from the
+        // Other field.
+        if self.menu_focused
+            && self.question_menu.is_some()
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && key.code == KeyCode::Char('c')
+            && let Some(menu_id) = self.menu.as_ref().map(|menu| menu.id)
+        {
+            self.begin_menu_submission(menu_id);
+            return Some(InputEvent::Cancel { menu_id });
+        }
         if (self.menu_focused || self.review_focused)
             && key.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key.code, KeyCode::Char('b' | 'c' | 'd' | 'x'))
@@ -10294,17 +10268,22 @@ impl State {
             KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 Some(ScrollAction::Last)
             }
-            KeyCode::PageUp if !self.menu_focused && !self.review_focused => {
+            KeyCode::PageUp if self.page_keys_scroll_conversation() => {
                 Some(ScrollAction::HalfPageUp)
             }
-            KeyCode::PageDown if !self.menu_focused && !self.review_focused => {
+            KeyCode::PageDown if self.page_keys_scroll_conversation() => {
                 Some(ScrollAction::HalfPageDown)
             }
             _ => None,
         };
         if let Some(action) = scroll {
-            self.scrollback.scroll(action);
-            self.conversation_focused = action != ScrollAction::Last;
+            if self.menu_focused {
+                // The dialog keeps the keys; the conversation behind it only moves.
+                self.scroll_conversation(action);
+            } else {
+                self.scrollback.scroll(action);
+                self.conversation_focused = action != ScrollAction::Last;
+            }
             return None;
         }
         let menu_is_visible = self.menu_is_visible();
@@ -11374,16 +11353,31 @@ pub(super) fn display_single_line(text: &str) -> String {
         .collect()
 }
 
+/// How one wheel step moves the conversation.
+fn wheel_scroll(kind: MouseEventKind) -> Option<ScrollAction> {
+    match kind {
+        MouseEventKind::ScrollUp => Some(ScrollAction::LinesUp(renderer::WHEEL_SCROLL_LINES)),
+        MouseEventKind::ScrollDown => Some(ScrollAction::LinesDown(renderer::WHEEL_SCROLL_LINES)),
+        _ => None,
+    }
+}
+
+/// Claude Code's question footer, `Enter to select · ↑/↓ to navigate · Esc to cancel`, with
+/// arrow keys for several questions; the first part names what Enter does on the focused row.
 fn question_menu_hint(question: &QuestionMenu, selected: usize) -> String {
-    let mut hint = String::from(if question.entry_option == Some(selected) {
+    let action = if question.entry_option == Some(selected) {
         "enter type answer"
     } else if question.multi_select {
         "space/enter toggle"
     } else {
         "enter select"
-    });
-    hint.push_str(" · esc answer later");
-    hint
+    };
+    let navigation = if question.navigable {
+        "arrow keys navigate"
+    } else {
+        "↑/↓ navigate"
+    };
+    format!("{action} · {navigation} · esc cancel")
 }
 
 fn display_text(text: &str) -> String {

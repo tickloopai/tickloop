@@ -43,10 +43,6 @@ pub trait TickDetailView: Send + Any {
     fn instance(&self) -> Option<tick_protocol::InstanceRef> {
         None
     }
-    /// Whether the view stays open while the Monitor has no rows, as the add picker does.
-    fn keeps_empty_monitor(&self) -> bool {
-        false
-    }
     /// Whether the view covers the whole screen, as the detailed transcript does, instead of
     /// Monitor's column; an input dialog still opens below it.
     fn full_screen(&self) -> bool {
@@ -78,12 +74,6 @@ impl TickActionUi<'_> {
     }
     pub fn notify(&mut self, message: &str) {
         self.state.hold_status(message);
-    }
-    pub(super) fn monitor_members(&self) -> std::collections::BTreeSet<tick_protocol::InstanceRef> {
-        self.state.monitor.members()
-    }
-    pub(super) fn monitor_removed(&self) -> std::collections::BTreeSet<tick_protocol::InstanceRef> {
-        self.state.monitor.removed()
     }
     /// The subscriptions on `instance` as a Monitor detail starting with `operation`.
     pub(super) fn subscription_detail(

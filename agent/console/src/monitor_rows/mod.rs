@@ -2,7 +2,7 @@
 //! intents and refresh from what the View already holds; the runtime's `TickAdapter` of the same
 //! `<type>` supplies the stream.
 mod builtin;
-mod discovery;
+mod probe;
 
 #[cfg(test)]
 pub(crate) use builtin::artifact_actions;
@@ -12,9 +12,7 @@ pub use builtin::{
 pub(crate) use builtin::{
     HOSTED_CLOSE_KEY, HOSTED_REOPEN_KEY, feedback_binding, key_command, shell_tone, signal_name,
 };
-pub use discovery::{
-    DiscoveredTick, DiscoveryError, HerdrDiscovery, MemberFindings, TickDiscovery, TickProbe,
-};
+pub use probe::{HerdrProbe, MemberFindings, ProbeError, TickProbe};
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -23,7 +21,7 @@ use std::{
 use tick_protocol::InstanceRef;
 use tickloop_agent_artifacts::ArtifactMetadata;
 use tickloop_agent_protocol::{
-    ChatSnapshot, LoopState, MonitorMember, MonitorMemberSource, ShellTaskSnapshot,
+    ChatSnapshot, LoopState, MonitorMember, MonitorMembership, ShellTaskSnapshot,
     TickSubscriptionStatus,
 };
 use uuid::Uuid;
@@ -163,6 +161,9 @@ pub struct RowUpdate {
     pub at_ms: u64,
     /// `None` once the Chat handled the update.
     pub unread: Option<Unread>,
+    /// When one of the Chat's Agent turns took the update in, once one did; the user opening the
+    /// row handles it without one.
+    pub taken_in_at_ms: Option<u64>,
 }
 
 /// An update the Chat has not handled yet.
@@ -179,6 +180,7 @@ impl RowUpdate {
         Self {
             at_ms,
             unread: Some(Unread::default()),
+            taken_in_at_ms: None,
         }
     }
 }
@@ -252,16 +254,16 @@ pub enum MemberState {
 
 /// The row action Enter and a click run.
 pub const MONITOR_ENTER_KEY: char = 'o';
-/// Adds a program to Monitor from discovery.
-pub const MONITOR_ADD_KEY: char = 'a';
 pub const MONITOR_REFRESH_KEY: char = 'r';
 /// Edits the cadence of a subscribed row's subscription.
 pub const SUBSCRIPTION_CADENCE_KEY: char = 'e';
 /// Cancels a subscribed row's subscription after confirmation.
 pub const UNSUBSCRIBE_KEY: char = 'u';
+/// Shows a subscribed row's Tick Subscriptions; Enter stays with opening the Tick.
+pub const SUBSCRIPTIONS_KEY: char = 'w';
 /// Keys the Monitor list itself owns. Row actions never use them, so the list's hints always
 /// match what a key does.
-pub const MONITOR_KEYS: [char; 2] = [MONITOR_ADD_KEY, MONITOR_REFRESH_KEY];
+pub const MONITOR_KEYS: [char; 1] = [MONITOR_REFRESH_KEY];
 
 /// The Monitor half of a Tick type. Rows are computed from the View's own Chat snapshot,
 /// subscriptions, Shell tasks, artifact metadata and host probes; they never read Tick content,
@@ -346,7 +348,8 @@ fn subscription_descriptor(row: &TickSubscriptionStatus) -> TickDescriptor {
 
 /// Shows the row's subscriptions as a marker, `⟳ 60s` for one Tick Subscription, `⟳` for the
 /// type's inherent one, which has no cadence, or `⟳ 2` for several, and adds the keys that manage
-/// Tick Subscriptions. Enter shows them unless the type opens the instance itself.
+/// Tick Subscriptions. Enter always opens the Tick itself; a row without its own opening shows the
+/// Tick's details.
 fn mark_subscribed(entry: &mut TickDescriptor, rows: &[&TickSubscriptionStatus]) {
     entry.notes.push(match (entry.inherent_subscription, rows) {
         (false, [row]) => format!("⟳ {}s", row.every_seconds),
@@ -361,21 +364,26 @@ fn mark_subscribed(entry: &mut TickDescriptor, rows: &[&TickSubscriptionStatus])
         instance: instance.clone(),
         operation,
     };
-    let subscriptions = MonitorAction {
-        key: MONITOR_ENTER_KEY,
-        label: "subscriptions",
-        intent: manage(SubscriptionOperation::View),
-    };
-    match entry
+    if !entry
         .actions
-        .iter_mut()
-        .find(|action| action.key == MONITOR_ENTER_KEY)
+        .iter()
+        .any(|action| action.key == MONITOR_ENTER_KEY)
     {
-        Some(enter) if matches!(enter.intent, TickIntent::ShowDetails(_)) => *enter = subscriptions,
-        Some(_) => {}
-        None => entry.actions.insert(0, subscriptions),
+        entry.actions.insert(
+            0,
+            MonitorAction {
+                key: MONITOR_ENTER_KEY,
+                label: "open",
+                intent: TickIntent::ShowDetails(instance.clone()),
+            },
+        );
     }
     for (key, label, operation) in [
+        (
+            SUBSCRIPTIONS_KEY,
+            "subscriptions",
+            SubscriptionOperation::View,
+        ),
         (
             SUBSCRIPTION_CADENCE_KEY,
             "cadence",
@@ -398,14 +406,21 @@ fn mark_subscribed(entry: &mut TickDescriptor, rows: &[&TickSubscriptionStatus])
 }
 
 /// Settles whether the Chat still has the row's latest update to handle: handled once a turn
-/// took it in or the user opened the row at or after it; while unread, a subscription's count
-/// of updates waiting for delivery counts it.
-fn resolve_unread(entry: &mut TickDescriptor, handled_at: Option<u64>, accumulated: u64) {
+/// took it in or the user opened the row at or after it, and taken in only by the turn; while
+/// unread, a subscription's count of updates waiting for delivery counts it.
+fn resolve_unread(
+    entry: &mut TickDescriptor,
+    membership: Option<&MonitorMembership>,
+    accumulated: u64,
+) {
+    let handled_at = membership.and_then(|membership| membership.handled_at(&entry.instance));
+    let taken_in_at = membership.and_then(|membership| membership.taken_in_at(&entry.instance));
     let Some(update) = &mut entry.update else {
         return;
     };
     if handled_at.is_some_and(|handled| handled >= update.at_ms) {
         update.unread = None;
+        update.taken_in_at_ms = taken_in_at.filter(|taken_in| *taken_in >= update.at_ms);
     } else if accumulated > 0 {
         update.unread = Some(Unread {
             count: Some(accumulated),
@@ -448,7 +463,7 @@ pub fn member_descriptor(member: &MonitorMember) -> TickDescriptor {
         status: String::new(),
         notes: Vec::new(),
         inherent_subscription: false,
-        owner: member_owner(member),
+        owner: TickOwner::ThisChat,
         tone: StatusTone::Neutral,
         updated_at_ms: None,
         update: None,
@@ -471,13 +486,6 @@ pub fn remove_from_monitor(instance: &InstanceRef) -> MonitorAction {
         key: 'x',
         label: "remove",
         intent: TickIntent::RemoveFromMonitor(instance.clone()),
-    }
-}
-
-fn member_owner(member: &MonitorMember) -> TickOwner {
-    match member.source {
-        MonitorMemberSource::Opened => TickOwner::ThisChat,
-        MonitorMemberSource::Added => TickOwner::Unknown,
     }
 }
 
@@ -509,10 +517,9 @@ impl MonitorRowsRegistry {
         ])
         .expect("unique built-in Monitor rows")
     }
-    /// The Chat's complete deduplicated Monitor set: each type's rows plus opened and added
-    /// members, minus the instances the user removed. An instance a Loop subscribes to always
-    /// has a row, so no subscription runs out of sight. Listing never subscribes or calls the
-    /// model.
+    /// The Chat's complete deduplicated Monitor set: each type's rows plus the members the Chat
+    /// opened, minus the instances the user removed. An instance a Loop subscribes to always has
+    /// a row, so no subscription runs out of sight. Listing never subscribes or calls the model.
     pub fn list(&self, context: &MonitorContext) -> Vec<TickDescriptor> {
         let mut merged = merge_descriptors(
             self.rows
@@ -537,9 +544,7 @@ impl MonitorRowsRegistry {
                         {
                             entry.title = title.clone();
                         }
-                        if member.source == MonitorMemberSource::Opened {
-                            entry.owner = TickOwner::ThisChat;
-                        }
+                        entry.owner = TickOwner::ThisChat;
                     }
                     None => {
                         let row = match self.rows.get(member.instance.tick_type()) {
@@ -574,14 +579,14 @@ impl MonitorRowsRegistry {
             if entry.inherent_subscription || !rows.is_empty() {
                 mark_subscribed(entry, rows);
             }
-            let handled_at = context
-                .chat
-                .as_ref()
-                .and_then(|chat| chat.monitor.handled_at(&entry.instance));
             let accumulated = subscribed
                 .get(&entry.instance)
                 .map_or(0, |rows| rows.iter().map(|row| row.accumulated).sum());
-            resolve_unread(entry, handled_at, accumulated);
+            resolve_unread(
+                entry,
+                context.chat.as_ref().map(|chat| &chat.monitor),
+                accumulated,
+            );
         }
         entries.retain(|entry| {
             !has_left_as_gone(entry, context, subscribed.contains_key(&entry.instance))

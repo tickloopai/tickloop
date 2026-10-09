@@ -141,7 +141,7 @@ async fn input_dialog_top_rule_covers_every_surface_with_semantic_theme_roles() 
             let (lines, row, _) = state.styled_frame();
             let expected = match surface {
                 "permission" | "question" | "plan" | "plan feedback" | "trust" => 12,
-                "help" => 14,
+                "help" => 13,
                 "settings" | "login" | "resume" => 6,
                 "artifacts" | "tick confirmation" => 5,
                 "permissions" => 4,

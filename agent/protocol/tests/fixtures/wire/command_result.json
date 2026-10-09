@@ -43,7 +43,6 @@
         "members": [
           {
             "instance": "hosted:00000000-0000-0000-0000-000000000040",
-            "source": "opened",
             "title": "Quotes"
           }
         ],
@@ -51,6 +50,9 @@
           "herdr:session/workspace/pane/counter"
         ],
         "handled": {
+          "hosted:00000000-0000-0000-0000-000000000040": 8500
+        },
+        "taken_in": {
           "hosted:00000000-0000-0000-0000-000000000040": 8500
         }
       }
@@ -108,7 +110,6 @@
             "members": [
               {
                 "instance": "herdr:session/workspace/pane/counter",
-                "source": "added",
                 "title": "Counter"
               }
             ],
@@ -116,6 +117,9 @@
               "hosted:00000000-0000-0000-0000-000000000040"
             ],
             "handled": {
+              "herdr:session/workspace/pane/counter": 7500
+            },
+            "taken_in": {
               "herdr:session/workspace/pane/counter": 7500
             }
           },
@@ -637,7 +641,6 @@
             "members": [
               {
                 "instance": "herdr:session/workspace/pane/counter",
-                "source": "added",
                 "title": "Counter"
               }
             ],
@@ -645,6 +648,9 @@
               "hosted:00000000-0000-0000-0000-000000000040"
             ],
             "handled": {
+              "herdr:session/workspace/pane/counter": 7500
+            },
+            "taken_in": {
               "herdr:session/workspace/pane/counter": 7500
             }
           },
