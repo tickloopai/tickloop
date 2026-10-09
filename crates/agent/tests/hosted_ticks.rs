@@ -1767,6 +1767,7 @@ for line in sys.stdin:
         let tools = owner.tools();
         let opened = run_tool(&tools, chat, "ModifyTick", counter_command(&owner)).await;
         let lost = opened["tick_instance_id"].as_str().unwrap().to_owned();
+        let lost_title = launch_records(&owner.root, chat)[0]["title"].clone();
         let business_pid = opened["business_pid"].as_u64().unwrap() as u32;
         let launcher = tick_host::process::sample(business_pid).unwrap().parent;
         let host = tick_host::process::sample(launcher).unwrap().parent;
@@ -1832,13 +1833,8 @@ for line in sys.stdin:
             member.source,
             tickloop_agent::runtime::MonitorMemberSource::Opened
         );
-        assert!(
-            member
-                .title
-                .as_deref()
-                .is_some_and(|title| title.contains("counter.py")),
-            "{member:?}"
-        );
+        assert!(lost_title.is_string(), "the lost Tick keeps a title");
+        assert_eq!(json!(member.title), lost_title, "{member:?}");
         assert!(
             runtime.tick_subscriptions(chat).await.unwrap().is_empty(),
             "no subscription follows a reopen"
@@ -2192,17 +2188,22 @@ for line in sys.stdin:
             .unwrap();
 
         let grown = seen.len();
-        assert!(
-            matches!(
-                call_tool(
-                    &tools,
-                    chat,
-                    "CallTickTool",
-                    json!({"tick_instance_id":growing["tick_instance_id"],"tool":"grow","args":{}}),
-                )
-                .await,
-                HostCallResult::OutcomeUnknown(_)
-            ),
+        let settled = match call_tool(
+            &tools,
+            chat,
+            "CallTickTool",
+            json!({"tick_instance_id":growing["tick_instance_id"],"tool":"grow","args":{}}),
+        )
+        .await
+        {
+            HostCallResult::OutcomeUnknown(_) => None,
+            HostCallResult::Completed(result) | HostCallResult::CompletedWithEffect(result, _) => {
+                Some(format!("completed: {}", result.content))
+            }
+            HostCallResult::NotDispatched(reason) => Some(format!("not dispatched: {reason}")),
+        };
+        assert_eq!(
+            settled, None,
             "the call whose Tick broke the protocol mid-call has an unknown outcome"
         );
         let forwarded = tokio::time::timeout(HOSTED_EVENT_WAIT, raw.next_event())

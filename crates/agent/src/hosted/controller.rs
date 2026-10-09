@@ -493,8 +493,11 @@ impl HostController {
         };
         let mut last_failure = String::new();
         for _ in 0..START_ATTEMPTS {
-            self.spawn(&key)
-                .map_err(|error| HostError::before("HostUnavailable", error.to_string()))?;
+            // A host that exits before it takes its configuration is one more failed start.
+            if let Err(error) = self.spawn(&key) {
+                last_failure = error.to_string();
+                continue;
+            }
             let deadline = tokio::time::Instant::now() + START_WAIT;
             while tokio::time::Instant::now() < deadline {
                 match self.connect(&key).await {
