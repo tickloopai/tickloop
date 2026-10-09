@@ -3,7 +3,7 @@ use crate::agent_console::AttentionGroup;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::io::Read;
 
-use tickloop_agent_protocol::{LoopState, SubagentRegistration};
+use tickloop_agent_protocol::{AgentColor, LoopState, SubagentRegistration};
 use tickloop_agent_test_support::screen;
 
 const ROOT_AGENT: Uuid = Uuid::from_u128(100);
@@ -139,7 +139,7 @@ fn agent_layout_unsaved_status_and_exit_confirmation_keep_both_required_facts() 
             let status = line_with(&frame, "Not saved")
                 .unwrap_or_else(|| panic!("{configured:?}, help {help_open}: {frame:#?}"));
             assert!(
-                status.contains("Ctrl+C"),
+                status.contains("ctrl+c"),
                 "{configured:?}, help {help_open}: {frame:#?}"
             );
             assert!(
@@ -383,7 +383,7 @@ fn agent_layout_held_overview_refusal_precedes_hints_at_narrow_widths() {
         state.key(key(KeyCode::Char('x')));
         let frame = drawn(&mut state);
         assert!(
-            line_with(&frame, "Enter dispatch").is_some(),
+            line_with(&frame, "enter dispatch").is_some(),
             "hints return on the next key at {width} columns: {frame:#?}"
         );
         for input_focused in [false, true] {
@@ -391,7 +391,7 @@ fn agent_layout_held_overview_refusal_precedes_hints_at_narrow_widths() {
             assert!(state.key(key(KeyCode::BackTab)).is_none());
             let frame = drawn(&mut state);
             assert!(
-                line_with(&frame, "Shift+Tab mode isn't").is_some(),
+                line_with(&frame, "shift+tab mode isn't").is_some(),
                 "{width} columns, input focused {input_focused}: {frame:#?}"
             );
         }
@@ -418,12 +418,12 @@ fn agent_layout_child_refusal_keeps_the_parent_reason_at_narrow_widths() {
         assert!(state.key(key(KeyCode::BackTab)).is_none());
         let frame = drawn(&mut state);
         assert!(
-            line_with(&frame, "Shift+Tab mode isn't").is_some(),
+            line_with(&frame, "shift+tab mode isn't").is_some(),
             "{width} columns: {frame:#?}"
         );
         if width == 120 {
             assert!(
-                line_with(&frame, "Shift+Tab mode isn't available").is_some(),
+                line_with(&frame, "shift+tab mode isn't available").is_some(),
                 "{frame:#?}"
             );
             assert!(
@@ -534,6 +534,7 @@ fn agent_row(id: Uuid, parent: Option<Uuid>, title: &str) -> AgentRow {
             handle: format!("child-{}", id.as_u128() % 1000),
             description: title.into(),
             created_at: tickloop_agent_base::private_fs::unix_time_milliseconds(),
+            color: Some(AgentColor::ALL[(id.as_u128() % 8) as usize]),
         }),
     }
 }
@@ -672,7 +673,7 @@ fn agent_layout_footer_enters_at_the_bottom_with_following_disabled() {
 }
 
 #[test]
-fn agent_layout_first_down_expands_and_list_keys_preserve_the_draft() {
+fn agent_layout_first_down_enters_the_list_and_list_keys_preserve_the_draft() {
     let mut state = State::new(true, 80, 24);
     state.prompt_enabled = true;
     state
@@ -685,24 +686,17 @@ fn agent_layout_first_down_expands_and_list_keys_preserve_the_draft() {
     state.insert("keep jk");
     assert!(state.frame().0.iter().any(|line| line.contains("main")));
     assert!(state.footer.selected().is_none());
-    assert!(!state.footer_list_focused);
     state.key(key(KeyCode::Down));
     assert_eq!(state.footer.selected(), Some(FooterItemId::Agents));
     assert!(state.frame().0.iter().any(|line| line.contains("main")));
-    assert!(!state.footer_list_focused);
-    state.key(key(KeyCode::Down));
-    assert!(state.footer_list_focused);
     for _ in 0..12 {
         state.key(key(KeyCode::Char('j')));
     }
     assert!(state.frame().0.iter().any(|line| line.contains("task 12")));
     assert_eq!(state.editor.draft(), "keep jk");
     state.key(key(KeyCode::Esc));
-    assert!(!state.footer_list_focused);
-    state.key(key(KeyCode::Esc));
     assert!(state.footer.selected().is_none());
     assert!(state.status_area.is_open());
-    assert!(!state.footer_list_focused);
     state.key(key(KeyCode::Char('j')));
     state.key(key(KeyCode::Char('k')));
     assert_eq!(state.editor.draft(), "keep jkjk");
@@ -730,7 +724,6 @@ fn agent_layout_return_restores_reading_draft_and_focuses_the_editor() {
     let panels = state.status_area.available_panels().collect::<Vec<_>>();
     state.footer.update(panels);
     state.key(key(KeyCode::Down));
-    state.key(key(KeyCode::Down));
     state.key(key(KeyCode::Char('j')));
     state.scrollback.scroll(ScrollAction::First);
     let selected = state.status_area.selected_agent();
@@ -749,7 +742,6 @@ fn agent_layout_return_restores_reading_draft_and_focuses_the_editor() {
     assert!(!state.scrollback.is_following());
     assert_eq!(state.scrollback.frame(width, 16).lines, reading);
     assert_eq!(state.status_area.selected_agent(), selected);
-    assert!(!state.footer_list_focused);
     assert!(state.footer.selected().is_none());
     assert!(state.status_area.is_open());
     assert_eq!(
@@ -1022,7 +1014,7 @@ fn agent_layout_working_activity_scrolls_with_body_and_returns_to_bottom() {
     );
     let control = line_with(&reading, "Back to bottom").unwrap();
     assert!(
-        control.trim_end().trim_matches('─').ends_with("Esc"),
+        control.trim_end().trim_matches('─').ends_with("esc"),
         "{reading:#?}"
     );
     assert!(
@@ -1539,9 +1531,13 @@ fn agent_layout_status_configuration_uses_physical_rows_and_help_restores_them()
         .unwrap();
     let mut state = console.state.lock().unwrap();
     let frame = state.frame().0;
-    assert_eq!(frame.len(), 6);
-    assert!(frame.last().unwrap().contains("status-three"));
-    assert!(frame.last().unwrap().ends_with('…'));
+    assert_eq!(frame.len(), 7);
+    assert!(frame[5].contains("status-three"));
+    assert!(frame[5].ends_with('…'));
+    assert!(
+        frame.last().unwrap().contains("? help"),
+        "the key hints stay below configured status lines: {frame:#?}"
+    );
     assert!(!frame.iter().any(|line| line.contains("hidden-four")));
     state.key(key(KeyCode::Char('?')));
     assert!(state.frame().0.iter().all(|line| !line.contains("status-")));
@@ -1555,7 +1551,7 @@ fn agent_layout_status_configuration_uses_physical_rows_and_help_restores_them()
     );
     drop(state);
     console.set_status_lines(Some(Vec::new())).unwrap();
-    assert_eq!(console.state.lock().unwrap().frame().0.len(), 3);
+    assert_eq!(console.state.lock().unwrap().frame().0.len(), 4);
 }
 
 #[test]
@@ -2141,9 +2137,10 @@ fn agent_layout_real_pty_budget_and_focus_matrix() {
             );
             terminal.send(b"\r");
             terminal.wait_for("submit", |frame| frame.contains("Draft submitted"));
-            terminal.send(b"\x1b[B\x1b[B");
-            terminal.wait_for("Agents list focus", |frame| frame.contains("child one"));
-            terminal.send_and_wait(b"\x1b");
+            terminal.send(b"\x1b[B");
+            terminal.wait_for("Agents list focus", |frame| {
+                frame.contains("child one") && frame.contains("enter open")
+            });
             terminal.send_and_wait(b"\x1b");
             let output = Arc::clone(&terminal.output);
             terminal.wait_for("Esc restores the visible editor caret", |_| {
@@ -2166,14 +2163,14 @@ fn agent_layout_real_pty_budget_and_focus_matrix() {
                 frame.lines().any(|line| line.trim() == "❯")
             });
             terminal.send(b"?");
-            let frame = terminal.wait_for("help", |frame| frame.contains("Ctrl+J newline"));
+            let frame = terminal.wait_for("help", |frame| frame.contains("ctrl+j newline"));
             assert!(
                 !frame.contains("Shell 20") && !frame.contains("task 12"),
                 "{frame}"
             );
             let newline_help = frame
                 .lines()
-                .find(|line| line.contains("Ctrl+J newline"))
+                .find(|line| line.contains("ctrl+j newline"))
                 .unwrap();
             if width == 80 {
                 assert!(
@@ -2186,11 +2183,11 @@ fn agent_layout_real_pty_budget_and_focus_matrix() {
                     "{frame}"
                 );
             } else {
-                assert_eq!(newline_help.trim(), "Ctrl+J newline", "{frame}");
+                assert_eq!(newline_help.trim(), "ctrl+j newline", "{frame}");
             }
             terminal.send(b"\x1b");
             terminal.wait_for("help closed", |frame| {
-                !frame.contains("Shell 20") && !frame.contains("Ctrl+J newline")
+                !frame.contains("Shell 20") && !frame.contains("ctrl+j newline")
             });
             terminal.send(b"\x1b[D");
             let overview = terminal.wait_for("overview", |frame| {
@@ -2224,7 +2221,7 @@ fn agent_layout_real_pty_overview_help_preserves_focus_and_text() {
         terminal.wait_for("initial", |frame| frame.contains("history 99"));
         terminal.send(b"\x1b[D");
         terminal.wait_for("overview", |frame| {
-            frame.contains("Agents") && frame.contains("root one")
+            frame.lines().any(|line| line.starts_with("Agents")) && frame.contains("root one")
         });
         terminal.send(b"?");
         let mut help = terminal.wait_for("overview list help", |frame| {
@@ -2236,18 +2233,18 @@ fn agent_layout_real_pty_overview_help_preserves_focus_and_text() {
         }
         for action in [
             "w filter Workspace",
-            "Tab list / new Agent",
-            "Enter / → open Agent",
-            "Enter dispatch (input)",
+            "tab list / new Agent",
+            "enter / → open Agent",
+            "enter dispatch (input)",
             "r open history",
             "/cwd PATH",
-            "Esc / ? close help",
+            "esc / ? close help",
         ] {
             assert!(help.contains(action), "{height}×40: {help}");
         }
         terminal.send(b"\x1b");
         terminal.wait_for("help returns to the selected overview row", |frame| {
-            selected_row_contains(frame, "root one") && !frame.contains("Esc / ? close help")
+            selected_row_contains(frame, "root one") && !frame.contains("esc / ? close help")
         });
         terminal.send(b"\t?");
         terminal.wait_for("empty dispatch help", |frame| {
@@ -2255,7 +2252,7 @@ fn agent_layout_real_pty_overview_help_preserves_focus_and_text() {
         });
         terminal.send(b"\x1b");
         terminal.wait_for("dispatch help closes", |frame| {
-            !frame.contains("filter project") && !frame.contains("Esc / ? close help")
+            !frame.contains("filter project") && !frame.contains("esc / ? close help")
         });
         terminal.send(b"literal?jk");
         terminal.wait_for("dispatch punctuation and jk stay text", |frame| {
@@ -2324,16 +2321,16 @@ fn agent_layout_real_pty_narrow_overview_keeps_global_counts_and_help_reachable(
         }
         assert!(help.contains("approvals 12345678"), "{help}");
         assert!(help.contains("questions 87654321"), "{help}");
-        assert!(help.contains("Enter / → open Agent"), "{help}");
-        assert!(help.contains("Tab list / new Agent"), "{help}");
+        assert!(help.contains("enter / → open Agent"), "{help}");
+        assert!(help.contains("tab list / new Agent"), "{help}");
         terminal.send(b"\x1b");
         terminal.wait_for("counts help closes within the overview", |frame| {
-            frame.contains("New Agent · cwd") && !frame.contains("Esc / ? close help")
+            frame.contains("New Agent · cwd") && !frame.contains("esc / ? close help")
         });
         terminal.send_and_wait(b"\t");
         let dispatch = terminal.frame();
         assert!(dispatch.contains("? help"), "{dispatch}");
-        assert!(dispatch.contains("Enter dispatch"), "{dispatch}");
+        assert!(dispatch.contains("enter dispatch"), "{dispatch}");
     }
 }
 
@@ -2616,12 +2613,12 @@ fn agent_layout_real_pty_overview_candidates_handle_escape_before_leaving() {
         });
         terminal.send(b"\t!cat ./");
         terminal.wait_for("real shell path candidate", |frame| {
-            frame.contains("layout-candidate.txt") && frame.contains("!cat ./")
+            frame.contains("layout-candidate.txt") && frame.contains("!\u{a0}cat ./")
         });
         terminal.send_and_wait(b"\x1b");
         let dismissed = terminal.frame();
         assert!(dismissed.contains("New Agent · cwd"), "{dismissed}");
-        assert!(dismissed.contains("!cat ./"), "{dismissed}");
+        assert!(dismissed.contains("!\u{a0}cat ./"), "{dismissed}");
         assert!(!dismissed.contains("layout-candidate.txt"), "{dismissed}");
         terminal.send_and_wait(b"\x1b");
         terminal.wait_for("second Esc leaves the overview", |frame| {
@@ -2629,7 +2626,7 @@ fn agent_layout_real_pty_overview_candidates_handle_escape_before_leaving() {
         });
         terminal.send(b"\x1b[D\t");
         terminal.wait_for("Shell dispatch draft survives returning", |frame| {
-            frame.contains("New Agent · cwd") && frame.contains("!cat ./")
+            frame.contains("New Agent · cwd") && frame.contains("!\u{a0}cat ./")
         });
     }
 }
@@ -2642,7 +2639,7 @@ fn agent_layout_real_pty_overview_candidates_accept_tab_before_switching_focus()
         (
             "!cat ./l",
             "layout-candidate.txt",
-            "!cat ./layout-candidate.txtjk",
+            "!\u{a0}cat ./layout-candidate.txtjk",
         ),
         ("/cw", "/cwd", "/cwd jk"),
         (
@@ -2667,7 +2664,7 @@ fn agent_layout_real_pty_overview_candidates_accept_tab_before_switching_focus()
         terminal.send_and_wait(b"\t");
         let list = terminal.frame();
         assert!(selected_row_contains(&list, "root one"), "{list}");
-        assert!(list.contains("Enter open"), "{list}");
+        assert!(list.contains("enter open"), "{list}");
         terminal.send(b"\t?");
         terminal.wait_for(
             "Tab without candidates restores dispatch editing",
@@ -3269,7 +3266,7 @@ fn agent_layout_filter_hints_follow_the_focused_overview_region() {
         .unwrap();
     let frame = frame_lines(&console);
     assert!(
-        line_with(&frame, "Tab list · Esc back").is_some(),
+        line_with(&frame, "tab list · esc back").is_some(),
         "{frame:#?}"
     );
     assert!(
@@ -3316,7 +3313,7 @@ fn agent_layout_overview_help_hides_inactive_header_hints_and_restores_list_focu
     }
     let frame = frame_lines(&console);
     let header = line_with(&frame, "Project:").unwrap();
-    for hint in ["p/w filter", "r history", "Tab new Agent", "Esc back"] {
+    for hint in ["p/w filter", "r history", "tab new Agent", "esc back"] {
         assert!(!header.contains(hint), "help owns keys: {frame:#?}");
     }
     {
@@ -3342,7 +3339,7 @@ fn agent_layout_overview_help_hides_inactive_header_hints_and_restores_list_focu
     assert!(
         header.contains("p/w filter")
             && header.contains("r history")
-            && header.contains("Esc back"),
+            && header.contains("esc back"),
         "{frame:#?}"
     );
     assert!(matches!(
@@ -3366,10 +3363,10 @@ fn agent_layout_overview_help_with_a_leading_fact_offers_no_list_actions() {
     let frame = frame_lines(&console);
     let fact = line_with(&frame, "Disconnected").expect("the fact keeps its row");
     for inactive in [
-        "Enter open",
-        "Tab new Agent",
+        "enter open",
+        "tab new Agent",
         "? help",
-        "Enter dispatch",
+        "enter dispatch",
         "↑ list",
     ] {
         assert!(
@@ -3380,7 +3377,7 @@ fn agent_layout_overview_help_with_a_leading_fact_offers_no_list_actions() {
     assert!(
         frame
             .iter()
-            .any(|line| line.contains("Esc") && line.contains("close")),
+            .any(|line| line.contains("esc") && line.contains("close")),
         "help still says how to close it: {frame:#?}"
     );
     assert!(
@@ -3574,6 +3571,7 @@ fn fleet_row(
             handle: format!("child-{}", id.as_u128() % 1000),
             description: title.into(),
             created_at: tickloop_agent_base::private_fs::unix_time_milliseconds(),
+            color: Some(AgentColor::ALL[(id.as_u128() % 8) as usize]),
         }),
     }
 }
@@ -3802,7 +3800,7 @@ fn agent_layout_rows_arriving_above_keep_the_selection_on_its_screen_line() {
             line_with(&frame, "Needs input").is_none(),
             "the selection is in a scrolled list: {frame:#?}"
         );
-        screen_row(&frame, "› ✓ Done task 09").unwrap()
+        screen_row(&frame, "› ✔ Done task 09").unwrap()
     };
     let mut arrived = fleet_overview();
     let mut asking = fleet_row(
@@ -3822,7 +3820,7 @@ fn agent_layout_rows_arriving_above_keep_the_selection_on_its_screen_line() {
         Some(OverviewTarget::Agent(done_task(9)))
     );
     assert_eq!(
-        screen_row(&frame, "› ✓ Done task 09"),
+        screen_row(&frame, "› ✔ Done task 09"),
         Some(before),
         "{frame:#?}"
     );
@@ -3836,7 +3834,7 @@ fn agent_layout_rows_arriving_above_keep_the_selection_on_its_screen_line() {
         Some(OverviewTarget::Agent(done_task(9)))
     );
     assert!(
-        line_with(&frame, "› ✓ Done task 09").is_some(),
+        line_with(&frame, "› ✔ Done task 09").is_some(),
         "resize keeps the selection in view: {frame:#?}"
     );
     assert!(
@@ -3877,7 +3875,7 @@ fn agent_layout_a_visited_row_that_finishes_stays_listed_while_the_cursor_moves_
     console.set_global_overview(Some(finished)).unwrap();
     let mut state = console.state.lock().unwrap();
     let frame = drawn(&mut state);
-    assert!(line_with(&frame, "› ✓ Long scan").is_some(), "{frame:#?}");
+    assert!(line_with(&frame, "› ✔ Long scan").is_some(), "{frame:#?}");
     state.key(key(KeyCode::Char('k')));
     let frame = drawn(&mut state);
     assert!(
@@ -4175,7 +4173,7 @@ fn agent_layout_session_hints_name_the_action_of_the_focused_region() {
         !typing.contains("← Agents") && !typing.contains("? help"),
         "Left and ? edit a non-empty draft: {typing}"
     );
-    assert!(typing.contains("Enter send"), "{typing}");
+    assert!(typing.contains("enter send"), "{typing}");
 
     let mut state = State::new(true, 100, 32);
     state.prompt_enabled = true;
@@ -4188,46 +4186,26 @@ fn agent_layout_session_hints_name_the_action_of_the_focused_region() {
         .update(state.status_area.available_panels().collect::<Vec<_>>());
     let editor = hint_frame(&mut state);
     assert!(
-        !editor.contains("Enter/Space expand"),
+        !editor.contains("enter/space expand"),
         "Enter submits from the editor, so the summary cannot promise Enter: {editor}"
     );
     assert!(editor.contains("main"), "{editor}");
+    assert!(
+        editor.lines().last().unwrap().contains("? help"),
+        "the key hints end the screen: {editor}"
+    );
     assert!(state.footer.selected().is_none());
-    assert!(!state.footer_list_focused);
     state.insert("draft");
     state.key(key(KeyCode::Down));
-    let summary = hint_frame(&mut state);
-    assert!(
-        !summary.contains("Enter details") && !summary.contains("Enter open"),
-        "the first Enter only enters the list: {summary}"
-    );
-    assert!(summary.contains("Enter/Space hide"), "{summary}");
-    assert!(state.key(key(KeyCode::Down)).is_none());
-    assert!(state.footer_list_focused);
+    assert_eq!(state.footer.selected(), Some(FooterItemId::Agents));
     let list = hint_frame(&mut state);
-    assert!(list.contains("Enter open"), "{list}");
-    assert_eq!(state.editor.draft(), "draft");
-
-    let mut todo = State::new(true, 100, 32);
-    todo.prompt_enabled = true;
-    todo.status_area
-        .update("Ask".into(), "test model".into(), None, todo_items());
-    set_status_family(&mut todo.status_area);
-    todo.footer
-        .update(todo.status_area.available_panels().collect::<Vec<_>>());
-    todo.insert("draft");
-    todo.key(key(KeyCode::Down));
-    assert_eq!(todo.footer.selected(), Some(FooterItemId::Agents));
-    let summary = hint_frame(&mut todo);
+    let last = list.lines().last().unwrap();
     assert!(
-        summary.contains("Enter/Space hide"),
-        "the summary toggles the Agents list: {summary}"
+        last.contains("enter open") && last.contains("esc input"),
+        "the first Down enters the list, whose keys replace the input's: {list}"
     );
-    assert!(todo.key(key(KeyCode::Down)).is_none());
-    assert!(todo.footer_list_focused);
-    let list = hint_frame(&mut todo);
-    assert!(!list.contains("Enter list"), "{list}");
-    assert_eq!(todo.editor.draft(), "draft");
+    assert!(!list.contains("enter/space hide"), "{list}");
+    assert_eq!(state.editor.draft(), "draft");
 }
 
 #[test]
@@ -4237,25 +4215,27 @@ fn agent_layout_overview_hints_follow_the_selected_row_kind_and_draft() {
     let console = super::tests::console_with_state(state);
     console.set_global_overview(Some(fleet_overview())).unwrap();
     let mut state = console.state.lock().unwrap();
+    // `Workspace` in the filter also contains the lowercase key name.
+    let offers_space = |hint: &str| hint.contains("/space") || hint.contains("· space");
     select_agent(&mut state, FAILED_FAMILY);
     let frame = drawn(&mut state);
     assert!(
-        frame[1].contains("Enter open") && !frame[1].contains("Space"),
+        frame[1].contains("enter open") && !offers_space(&frame[1]),
         "{frame:#?}"
     );
     select_agent(&mut state, Uuid::from_u128(0x5500));
     let frame = drawn(&mut state);
     assert!(
-        frame[1].contains("Enter open") && !frame[1].contains("Space"),
+        frame[1].contains("enter open") && !offers_space(&frame[1]),
         "{frame:#?}"
     );
     select_target(&mut state, OverviewTarget::Disclosure(AttentionGroup::Done));
     let frame = drawn(&mut state);
-    assert!(frame[1].contains("Enter/Space show"), "{frame:#?}");
+    assert!(frame[1].contains("enter/space show"), "{frame:#?}");
     assert!(
         frame
             .last()
-            .is_some_and(|line| line.contains("Enter/Space show")),
+            .is_some_and(|line| line.contains("enter/space show")),
         "{frame:#?}"
     );
     state.key(key(KeyCode::Tab));
@@ -4271,7 +4251,7 @@ fn agent_layout_overview_hints_follow_the_selected_row_kind_and_draft() {
         !hint.contains("? help") && !hint.contains("Up list"),
         "{hint}"
     );
-    assert!(hint.contains("Enter dispatch"), "{hint}");
+    assert!(hint.contains("enter dispatch"), "{hint}");
 }
 
 fn role_of(line: &RoleLine, text: &str) -> Option<Role> {
@@ -4477,8 +4457,17 @@ fn agent_layout_conversation_occupancy_toggling_agents_avoids_whole_screen_redra
     state.scrollback.append("first line\n");
     state.insert("draft line");
     let expanded = super::tests::output_after_input_area_change(&mut state, |state| {
-        state.key(key(KeyCode::Down));
-        state.key(key(KeyCode::Enter));
+        let target = state.footer_bar_target.as_ref().unwrap();
+        let (row, column) = (target.row, target.inset + target.categories[0].0.start);
+        state.pointer(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: column as u16,
+                row: row as u16,
+                modifiers: KeyModifiers::NONE,
+            },
+            &mut io::sink(),
+        );
     });
     assert_eq!(
         state.status_area.selected_panel(),
@@ -4588,7 +4577,7 @@ fn agent_layout_low_priority_groups_fold_behind_selectable_headings() {
     assert!(idle_heading.contains('▸'), "{idle_heading}");
     let mut state = console.state.lock().unwrap();
     select_target(&mut state, OverviewTarget::Heading(AttentionGroup::Idle));
-    assert_eq!(state.overview.row_hints(), ["Enter/→ expand"]);
+    assert_eq!(state.overview.row_hints(), ["enter/→ expand"]);
     assert!(
         state.key(key(KeyCode::Enter)).is_none(),
         "Enter on a heading toggles it and opens no Agent"
@@ -5049,7 +5038,7 @@ fn agent_layout_known_age_ends_the_row_and_the_glyph_carries_the_state_role() {
                 .unwrap_or_else(|| panic!("{width} columns: {title} is listed: {screen:#?}"))
         };
         let content_columns = usize::from(width) - 1;
-        for (title, glyph, role) in [("Alpha", '✓', Role::Success), ("Bravo", '◆', Role::Warning)]
+        for (title, glyph, role) in [("Alpha", '✔', Role::Success), ("Bravo", '◆', Role::Warning)]
         {
             let text = screen_row(title);
             let line = lines

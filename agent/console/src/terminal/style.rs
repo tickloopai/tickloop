@@ -28,13 +28,53 @@ impl Rgb {
     }
 }
 
+/// One of the terminal's own palette colours. The user's terminal theme decides how it looks;
+/// Claude Code's `chalk.blue` and similar named colours are these, not fixed RGB values.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum AnsiColour {
+    Red,
+    Green,
+    Yellow,
+    Blue,
+    Cyan,
+    /// `chalk.grey`, the bright black of the sixteen-colour palette.
+    Grey,
+}
+
+impl AnsiColour {
+    const fn foreground_code(self) -> u8 {
+        match self {
+            Self::Red => 31,
+            Self::Green => 32,
+            Self::Yellow => 33,
+            Self::Blue => 34,
+            Self::Cyan => 36,
+            Self::Grey => 90,
+        }
+    }
+}
+
+/// A colour a theme sends: a literal RGB value, quantised to the terminal's depth when emitted,
+/// or a palette colour the terminal resolves itself.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Colour {
+    Rgb(Rgb),
+    Ansi(AnsiColour),
+}
+
+impl From<Rgb> for Colour {
+    fn from(colour: Rgb) -> Self {
+        Self::Rgb(colour)
+    }
+}
+
 /// Visual attributes of a span. The eight fields correspond one-to-one with the
 /// workbench client's `Property` set so that handing theme ownership to the
 /// Layout client later is a mechanical mapping rather than a translation.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) struct Style {
-    pub(super) foreground: Option<Rgb>,
-    pub(super) background: Option<Rgb>,
+    pub(super) foreground: Option<Colour>,
+    pub(super) background: Option<Colour>,
     pub(super) bold: bool,
     pub(super) dim: bool,
     pub(super) italic: bool,
@@ -57,14 +97,14 @@ impl Style {
 
     pub(super) const fn foreground(colour: Rgb) -> Self {
         Self {
-            foreground: Some(colour),
+            foreground: Some(Colour::Rgb(colour)),
             ..Self::PLAIN
         }
     }
 
     pub(super) const fn background(colour: Rgb) -> Self {
         Self {
-            background: Some(colour),
+            background: Some(Colour::Rgb(colour)),
             ..Self::PLAIN
         }
     }
@@ -144,6 +184,53 @@ pub(super) enum Role {
     QuoteBar,
     InProgressTodo,
     CompletedTodo,
+    /// The detailed transcript's `∴ Thinking…` label: dim and italic.
+    ThinkingHeading,
+    /// The detailed transcript's `Prompt:` and `Response:` labels of a Subagent call: bold in
+    /// the success colour.
+    AgentSection,
+    /// Agent Colors tell family members apart; they never express state. Values reproduce
+    /// Claude Code's `*_FOR_SUBAGENTS_ONLY` keys, the same in both themes.
+    AgentRed,
+    AgentBlue,
+    AgentGreen,
+    AgentYellow,
+    AgentPurple,
+    AgentOrange,
+    AgentPink,
+    AgentCyan,
+    /// State marks: the glyph that leads a Monitor or Subagents row and carries its state in the
+    /// accent, success, error or warning colour. A running row's mark blinks between
+    /// `RunningMark` and the dimmed `RunningMarkDim`.
+    RunningMark,
+    RunningMarkDim,
+    SuccessMark,
+    ErrorMark,
+    WarningMark,
+    /// A Markdown link label: the terminal's own blue, as Claude Code's `chalk.blue`.
+    Link,
+    /// Inline code inside strong text or a heading: the code colour, still bold.
+    StrongCode,
+    /// Bold secondary text, such as the counts in the task list heading.
+    MutedStrong,
+    /// Claude Code's colour-diff palette for a change shown in the conversation: whole changed
+    /// lines, the changed words inside them, and the `+`/`-` markers.
+    DiffLineAdded,
+    DiffLineRemoved,
+    DiffWordAdded,
+    DiffWordRemoved,
+    DiffMarkerAdded,
+    DiffMarkerRemoved,
+    /// Code block highlighting in cli-highlight's default theme, which uses the terminal's own
+    /// palette colours.
+    CodeKeyword,
+    CodeBuiltIn,
+    CodeType,
+    CodeNumber,
+    CodeString,
+    CodeFunction,
+    CodeComment,
+    CodeMeta,
 }
 
 impl Role {
@@ -190,10 +277,104 @@ impl Role {
         Self::QuoteBar,
         Self::InProgressTodo,
         Self::CompletedTodo,
+        Self::ThinkingHeading,
+        Self::AgentSection,
+        Self::AgentRed,
+        Self::AgentBlue,
+        Self::AgentGreen,
+        Self::AgentYellow,
+        Self::AgentPurple,
+        Self::AgentOrange,
+        Self::AgentPink,
+        Self::AgentCyan,
+        Self::RunningMark,
+        Self::RunningMarkDim,
+        Self::SuccessMark,
+        Self::ErrorMark,
+        Self::WarningMark,
+        Self::Link,
+        Self::StrongCode,
+        Self::MutedStrong,
+        Self::DiffLineAdded,
+        Self::DiffLineRemoved,
+        Self::DiffWordAdded,
+        Self::DiffWordRemoved,
+        Self::DiffMarkerAdded,
+        Self::DiffMarkerRemoved,
+        Self::CodeKeyword,
+        Self::CodeBuiltIn,
+        Self::CodeType,
+        Self::CodeNumber,
+        Self::CodeString,
+        Self::CodeFunction,
+        Self::CodeComment,
+        Self::CodeMeta,
     ];
+
+    /// Agent Colors and state marks only paint marks, such as the selection `›`, a member dot or a
+    /// row's state glyph, never the words of a row.
+    const fn is_mark(self) -> bool {
+        matches!(
+            self,
+            Self::AgentRed
+                | Self::AgentBlue
+                | Self::AgentGreen
+                | Self::AgentYellow
+                | Self::AgentPurple
+                | Self::AgentOrange
+                | Self::AgentPink
+                | Self::AgentCyan
+                | Self::RunningMark
+                | Self::RunningMarkDim
+                | Self::SuccessMark
+                | Self::ErrorMark
+                | Self::WarningMark
+        )
+    }
+
+    /// The role of a highlighting class of fenced code.
+    pub(super) const fn code(token: tickloop_ui::highlight::CodeToken) -> Self {
+        use tickloop_ui::highlight::CodeToken;
+        match token {
+            CodeToken::Keyword => Self::CodeKeyword,
+            CodeToken::BuiltIn => Self::CodeBuiltIn,
+            CodeToken::Type => Self::CodeType,
+            CodeToken::Number => Self::CodeNumber,
+            CodeToken::String => Self::CodeString,
+            CodeToken::Function => Self::CodeFunction,
+            CodeToken::Comment => Self::CodeComment,
+            CodeToken::Meta => Self::CodeMeta,
+        }
+    }
+
+    pub(super) const fn agent(color: tickloop_agent_protocol::AgentColor) -> Self {
+        use tickloop_agent_protocol::AgentColor;
+        match color {
+            AgentColor::Red => Self::AgentRed,
+            AgentColor::Blue => Self::AgentBlue,
+            AgentColor::Green => Self::AgentGreen,
+            AgentColor::Yellow => Self::AgentYellow,
+            AgentColor::Purple => Self::AgentPurple,
+            AgentColor::Orange => Self::AgentOrange,
+            AgentColor::Pink => Self::AgentPink,
+            AgentColor::Cyan => Self::AgentCyan,
+        }
+    }
 }
 
-const ROLE_COUNT: usize = 42;
+const ROLE_COUNT: usize = 74;
+
+/// `AgentRed` … `AgentCyan`, reproduced from Claude Code's agent palette (Tailwind 600).
+const AGENT_COLORS: [Style; 8] = [
+    fg(220, 38, 38),
+    fg(37, 99, 235),
+    fg(22, 163, 74),
+    fg(202, 138, 4),
+    fg(147, 51, 234),
+    fg(234, 88, 12),
+    fg(219, 39, 119),
+    fg(8, 145, 178),
+];
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) enum ThemeName {
@@ -220,8 +401,51 @@ impl ThemeName {
     }
 }
 
+/// Attributes only: the span keeps the terminal's own text colour, as a Claude Code `<Text>`
+/// without a colour does.
+const fn attributes(bold: bool, italic: bool, underline: bool, dim: bool) -> Style {
+    Style {
+        bold,
+        italic,
+        underline,
+        dim,
+        ..Style::PLAIN
+    }
+}
+
+const fn ansi(colour: AnsiColour) -> Style {
+    Style {
+        foreground: Some(Colour::Ansi(colour)),
+        ..Style::PLAIN
+    }
+}
+
+/// The code-highlighting roles, the same in both themes because the terminal palette decides
+/// them. Order matches the `Code*` roles in [`Role::ALL`].
+const CODE_COLOURS: [Style; 8] = [
+    ansi(AnsiColour::Blue),
+    ansi(AnsiColour::Cyan),
+    Style {
+        dim: true,
+        ..ansi(AnsiColour::Cyan)
+    },
+    ansi(AnsiColour::Green),
+    ansi(AnsiColour::Red),
+    ansi(AnsiColour::Yellow),
+    ansi(AnsiColour::Green),
+    ansi(AnsiColour::Grey),
+];
+
 const fn fg(red: u8, green: u8, blue: u8) -> Style {
     Style::foreground(Rgb::new(red, green, blue))
+}
+
+/// `style` drawn on a background.
+const fn on(style: Style, background: Rgb) -> Style {
+    Style {
+        background: Some(Colour::Rgb(background)),
+        ..style
+    }
 }
 
 const fn bg(red: u8, green: u8, blue: u8) -> Style {
@@ -238,27 +462,6 @@ const fn strong(red: u8, green: u8, blue: u8) -> Style {
 const fn italic(red: u8, green: u8, blue: u8) -> Style {
     Style {
         italic: true,
-        ..fg(red, green, blue)
-    }
-}
-
-const fn strong_italic(red: u8, green: u8, blue: u8) -> Style {
-    Style {
-        italic: true,
-        ..strong(red, green, blue)
-    }
-}
-
-const fn heading(red: u8, green: u8, blue: u8) -> Style {
-    Style {
-        underline: true,
-        ..strong_italic(red, green, blue)
-    }
-}
-
-const fn dim(red: u8, green: u8, blue: u8) -> Style {
-    Style {
-        dim: true,
         ..fg(red, green, blue)
     }
 }
@@ -297,23 +500,58 @@ const DARK_PALETTE: [Style; ROLE_COUNT] = [
     bg(179, 89, 107),  // DiffRemovedWord <- diffRemovedWord
     fg(153, 153, 153), // Border          <- Divider default: dimColor
     Style {
-        background: Some(Rgb::new(38, 49, 43)),
+        background: Some(Colour::Rgb(Rgb::new(38, 49, 43))),
         ..fg(153, 153, 153)
     }, // StatusBar
     fg(153, 153, 153), // ModeIndicator   <- footer text: dimColor
-    strong(255, 255, 255), // Title       <- <Text bold>
+    attributes(true, false, false, false), // Title <- <Text bold>
     strong(177, 185, 249), // DialogTitle <- Dialog: bold, permission
-    strong(255, 255, 255), // ToolName    <- <Text bold>
-    strong(255, 255, 255), // Strong         <- chalk.bold
-    italic(255, 255, 255), // Emphasis       <- chalk.italic
-    strong_italic(255, 255, 255), // StrongEmphasis <- chalk.bold.italic
-    heading(255, 255, 255), // Heading        <- chalk.bold.italic.underline
-    dim(255, 255, 255), // QuoteBar       <- chalk.dim
-    strong(215, 119, 87), // InProgressTodo <- accent + bold
+    attributes(true, false, false, false), // ToolName <- <Text bold>
+    attributes(true, false, false, false), // Strong <- chalk.bold
+    attributes(false, true, false, false), // Emphasis <- chalk.italic
+    attributes(true, true, false, false), // StrongEmphasis <- chalk.bold.italic
+    attributes(true, true, true, false), // Heading <- chalk.bold.italic.underline
+    attributes(false, false, false, true), // QuoteBar <- chalk.dim
+    fg(215, 119, 87),  // InProgressTodo <- claude
     Style {
         crossed_out: true,
         ..fg(153, 153, 153)
     },
+    italic(153, 153, 153), // ThinkingHeading <- dimColor italic
+    strong(78, 186, 101),  // AgentSection    <- success + bold
+    AGENT_COLORS[0],
+    AGENT_COLORS[1],
+    AGENT_COLORS[2],
+    AGENT_COLORS[3],
+    AGENT_COLORS[4],
+    AGENT_COLORS[5],
+    AGENT_COLORS[6],
+    AGENT_COLORS[7],
+    fg(215, 119, 87), // RunningMark     <- claude
+    Style {
+        dim: true,
+        ..fg(215, 119, 87)
+    }, // RunningMarkDim  <- claude, dimmed
+    fg(78, 186, 101), // SuccessMark     <- success
+    fg(255, 107, 128), // ErrorMark       <- error
+    fg(255, 193, 7),  // WarningMark     <- warning
+    ansi(AnsiColour::Blue), // Link            <- chalk.blue
+    strong(177, 185, 249), // StrongCode      <- permission + bold
+    strong(153, 153, 153), // MutedStrong     <- inactive + bold
+    bg(2, 40, 0),     // DiffLineAdded   <- colour-diff addLine
+    bg(61, 1, 0),     // DiffLineRemoved <- colour-diff deleteLine
+    bg(4, 71, 0),     // DiffWordAdded   <- colour-diff addWord
+    bg(92, 2, 0),     // DiffWordRemoved <- colour-diff deleteWord
+    on(fg(80, 200, 80), Rgb::new(2, 40, 0)), // DiffMarkerAdded <- addDecoration on addLine
+    on(fg(220, 90, 90), Rgb::new(61, 1, 0)), // DiffMarkerRemoved <- deleteDecoration on deleteLine
+    CODE_COLOURS[0],
+    CODE_COLOURS[1],
+    CODE_COLOURS[2],
+    CODE_COLOURS[3],
+    CODE_COLOURS[4],
+    CODE_COLOURS[5],
+    CODE_COLOURS[6],
+    CODE_COLOURS[7],
 ];
 
 /// Values reproduced from `lightTheme` in the Claude Code source.
@@ -349,23 +587,58 @@ const LIGHT_PALETTE: [Style; ROLE_COUNT] = [
     bg(209, 69, 75),   // DiffRemovedWord
     fg(102, 102, 102), // Border
     Style {
-        background: Some(Rgb::new(230, 237, 232)),
+        background: Some(Colour::Rgb(Rgb::new(230, 237, 232))),
         ..fg(102, 102, 102)
     }, // StatusBar
     fg(102, 102, 102), // ModeIndicator
-    strong(0, 0, 0),   // Title
+    attributes(true, false, false, false), // Title
     strong(87, 105, 247), // DialogTitle
-    strong(0, 0, 0),   // ToolName
-    strong(0, 0, 0),   // Strong
-    italic(0, 0, 0),   // Emphasis
-    strong_italic(0, 0, 0), // StrongEmphasis
-    heading(0, 0, 0),  // Heading
-    dim(0, 0, 0),      // QuoteBar
-    strong(215, 119, 87), // InProgressTodo
+    attributes(true, false, false, false), // ToolName
+    attributes(true, false, false, false), // Strong
+    attributes(false, true, false, false), // Emphasis
+    attributes(true, true, false, false), // StrongEmphasis
+    attributes(true, true, true, false), // Heading
+    attributes(false, false, false, true), // QuoteBar
+    fg(215, 119, 87),  // InProgressTodo
     Style {
         crossed_out: true,
         ..fg(102, 102, 102)
     },
+    italic(102, 102, 102), // ThinkingHeading
+    strong(44, 122, 57),   // AgentSection
+    AGENT_COLORS[0],
+    AGENT_COLORS[1],
+    AGENT_COLORS[2],
+    AGENT_COLORS[3],
+    AGENT_COLORS[4],
+    AGENT_COLORS[5],
+    AGENT_COLORS[6],
+    AGENT_COLORS[7],
+    fg(215, 119, 87), // RunningMark
+    Style {
+        dim: true,
+        ..fg(215, 119, 87)
+    }, // RunningMarkDim
+    fg(44, 122, 57),  // SuccessMark
+    fg(171, 43, 63),  // ErrorMark
+    fg(150, 108, 30), // WarningMark
+    ansi(AnsiColour::Blue), // Link
+    strong(87, 105, 247), // StrongCode
+    strong(102, 102, 102), // MutedStrong
+    bg(220, 255, 220), // DiffLineAdded
+    bg(255, 220, 220), // DiffLineRemoved
+    bg(178, 255, 178), // DiffWordAdded
+    bg(255, 199, 199), // DiffWordRemoved
+    on(fg(36, 138, 61), Rgb::new(220, 255, 220)), // DiffMarkerAdded
+    on(fg(207, 34, 46), Rgb::new(255, 220, 220)), // DiffMarkerRemoved
+    CODE_COLOURS[0],
+    CODE_COLOURS[1],
+    CODE_COLOURS[2],
+    CODE_COLOURS[3],
+    CODE_COLOURS[4],
+    CODE_COLOURS[5],
+    CODE_COLOURS[6],
+    CODE_COLOURS[7],
 ];
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -508,6 +781,9 @@ const fn manual_override(colour: Rgb) -> Option<u8> {
     match (colour.red, colour.green, colour.blue) {
         (44, 122, 57) => Some(29), // Success / light
         (34, 92, 43) => Some(22),  // DiffAdded / dark
+        // Claude Code's colour-diff sends these two indices itself below true colour.
+        (2, 40, 0) => Some(22), // DiffLineAdded / dark
+        (4, 71, 0) => Some(28), // DiffWordAdded / dark
         _ => None,
     }
 }
@@ -519,15 +795,19 @@ pub(super) const fn indexed(colour: Rgb) -> u8 {
     }
 }
 
-fn push_colour(sequence: &mut String, colour: Rgb, depth: ColourDepth, background: bool) {
+fn push_colour(sequence: &mut String, colour: Colour, depth: ColourDepth, background: bool) {
     let lead = if background { 48 } else { 38 };
-    match depth {
-        ColourDepth::None => {}
-        ColourDepth::TrueColour => sequence.push_str(&format!(
+    match (colour, depth) {
+        (_, ColourDepth::None) => {}
+        (Colour::Ansi(colour), _) => sequence.push_str(&format!(
+            "\x1b[{}m",
+            colour.foreground_code() + if background { 10 } else { 0 }
+        )),
+        (Colour::Rgb(colour), ColourDepth::TrueColour) => sequence.push_str(&format!(
             "\x1b[{lead};2;{};{};{}m",
             colour.red, colour.green, colour.blue
         )),
-        ColourDepth::Indexed256 => {
+        (Colour::Rgb(colour), ColourDepth::Indexed256) => {
             sequence.push_str(&format!("\x1b[{lead};5;{}m", indexed(colour)))
         }
     }
@@ -782,12 +1062,16 @@ impl RoleLine {
         self.spans = kept;
     }
 
-    /// Resolves roles against `theme`. Every span starts from the body text
-    /// role, as every Claude Code `<Text>` inherits the theme's text colour;
-    /// a filled row is padded to `width` so its background spans the row.
-    /// Text on the selection background is restyled to stay readable.
+    /// Resolves roles against `theme`. A span without a role keeps the
+    /// terminal's own text colour, as a Claude Code `<Text>` without a colour
+    /// does; `Role::Text` is the theme's text colour where Claude Code asks for
+    /// it. A filled row is padded to `width` so its background spans the row.
+    /// Text on the selection background is restyled to stay readable; an
+    /// Agent Color or a state mark keeps its hue and dimming there, because it
+    /// only paints marks such as the selection `›`, the member dot or a row's
+    /// state glyph, never the words of a row.
     pub(super) fn resolve(&self, theme: Theme, width: usize) -> StyledLine {
-        let mut base = theme.style(Role::Text);
+        let mut base = Style::default();
         if let Some(fill) = self.fill {
             base = base.patch(theme.style(fill));
         }
@@ -798,7 +1082,9 @@ impl RoleLine {
         let mut column = 0;
         for span in &self.spans {
             let mut style = span.role.map_or(base, |role| base.patch(theme.style(role)));
-            if self.fill == Some(Role::Selection) || span.role == Some(Role::Selection) {
+            if (self.fill == Some(Role::Selection) || span.role == Some(Role::Selection))
+                && !span.role.is_some_and(Role::is_mark)
+            {
                 style = theme.selected(style);
             }
             column += span
@@ -809,7 +1095,12 @@ impl RoleLine {
             line.push(Span::styled(span.text.clone(), style).linked(span.link.clone()));
         }
         if self.fill.is_some() && column < width {
-            line.push(Span::styled(" ".repeat(width - column), base));
+            let padding = if self.fill == Some(Role::Selection) {
+                theme.selected(base)
+            } else {
+                base
+            };
+            line.push(Span::styled(" ".repeat(width - column), padding));
         }
         line
     }
@@ -818,10 +1109,15 @@ impl RoleLine {
 /// WCAG 2 contrast ratio of the two colours the terminal is actually sent at
 /// `depth`, so tests can check emitted output rather than palette entries.
 #[cfg(test)]
-pub(super) fn emitted_contrast(foreground: Rgb, background: Rgb, depth: ColourDepth) -> f64 {
-    let sent = |colour: Rgb| match depth {
-        ColourDepth::Indexed256 => xterm_colour(indexed(colour)),
-        ColourDepth::TrueColour | ColourDepth::None => colour,
+pub(super) fn emitted_contrast(foreground: Colour, background: Colour, depth: ColourDepth) -> f64 {
+    let sent = |colour: Colour| {
+        let Colour::Rgb(colour) = colour else {
+            panic!("the terminal decides {colour:?}, so its contrast is unknown");
+        };
+        match depth {
+            ColourDepth::Indexed256 => xterm_colour(indexed(colour)),
+            ColourDepth::TrueColour | ColourDepth::None => colour,
+        }
     };
     let luminance = |colour: Rgb| {
         let channel = |value: u8| {
@@ -886,7 +1182,7 @@ mod tests {
 
     #[test]
     fn accent_reproduces_the_official_brand_colour_in_both_themes() {
-        let expected = Some(Rgb::new(215, 119, 87));
+        let expected = Some(Colour::Rgb(Rgb::new(215, 119, 87)));
         for name in ThemeName::ALL {
             assert_eq!(Theme::new(name).style(Role::Accent).foreground, expected);
         }
@@ -905,19 +1201,60 @@ mod tests {
         let theme = Theme::new(ThemeName::ClaudeCodeDark);
         assert_eq!(
             theme.style(Role::MutedText).foreground,
-            Some(Rgb::new(153, 153, 153))
+            Some(Colour::Rgb(Rgb::new(153, 153, 153)))
         );
         assert_eq!(
             theme.style(Role::Subtle).foreground,
-            Some(Rgb::new(80, 80, 80))
+            Some(Colour::Rgb(Rgb::new(80, 80, 80)))
         );
     }
 
     #[test]
-    fn plain_spans_inherit_the_body_text_colour() {
+    fn plain_spans_keep_the_terminal_text_colour_and_text_names_the_theme_colour() {
         let theme = Theme::new(ThemeName::ClaudeCodeLight);
-        let line = RoleLine::plain("body").resolve(theme, 10);
-        assert_eq!(line.spans[0].style.foreground, Some(Rgb::new(0, 0, 0)));
+        let line = RoleLine::plain("body")
+            .with(" prompt", Role::Text)
+            .resolve(theme, 20);
+        assert_eq!(line.spans[0].style.foreground, None);
+        assert_eq!(
+            line.spans[1].style.foreground,
+            Some(Colour::Rgb(Rgb::new(0, 0, 0)))
+        );
+        assert_eq!(line.render(ColourDepth::TrueColour).find("body"), Some(0));
+    }
+
+    #[test]
+    fn markdown_decorations_add_attributes_without_a_colour() {
+        let theme = Theme::new(ThemeName::ClaudeCodeDark);
+        for role in [
+            Role::Strong,
+            Role::Emphasis,
+            Role::StrongEmphasis,
+            Role::Heading,
+            Role::QuoteBar,
+            Role::ToolName,
+            Role::Title,
+        ] {
+            assert_eq!(theme.style(role).foreground, None, "{role:?}");
+        }
+    }
+
+    #[test]
+    fn palette_colours_use_the_terminal_palette_at_every_depth() {
+        let link = Theme::new(ThemeName::ClaudeCodeLight).style(Role::Link);
+        for depth in [ColourDepth::Indexed256, ColourDepth::TrueColour] {
+            assert_eq!(open(&link, depth), "\x1b[34m");
+        }
+        assert_eq!(open(&link, ColourDepth::None), "");
+        let code_type = Theme::new(ThemeName::ClaudeCodeDark).style(Role::CodeType);
+        assert_eq!(open(&code_type, ColourDepth::TrueColour), "\x1b[2m\x1b[36m");
+        assert_eq!(
+            open(
+                &Theme::new(ThemeName::ClaudeCodeDark).style(Role::CodeMeta),
+                ColourDepth::Indexed256
+            ),
+            "\x1b[90m"
+        );
     }
 
     #[test]
@@ -944,8 +1281,8 @@ mod tests {
         let theme = Theme::new(ThemeName::ClaudeCodeDark);
         let line = RoleLine::role("hello", Role::UserMessageBg).resolve(theme, 10);
         let style = line.spans[0].style;
-        assert_eq!(style.foreground, Some(Rgb::new(255, 255, 255)));
-        assert_eq!(style.background, Some(Rgb::new(55, 55, 55)));
+        assert_eq!(style.foreground, None);
+        assert_eq!(style.background, Some(Colour::Rgb(Rgb::new(55, 55, 55))));
     }
 
     #[test]
@@ -955,7 +1292,7 @@ mod tests {
             .with("中", Role::Text)
             .filled(Role::UserMessageBg)
             .resolve(theme, 8);
-        let background = Some(Rgb::new(55, 55, 55));
+        let background = Some(Colour::Rgb(Rgb::new(55, 55, 55)));
         assert!(
             line.spans
                 .iter()
@@ -995,6 +1332,38 @@ mod tests {
                         span.text
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn state_marks_keep_their_hue_and_blink_on_a_selected_row() {
+        for name in ThemeName::ALL {
+            let theme = Theme::new(name);
+            let line = RoleLine::role("› ", Role::Text)
+                .with("$", Role::RunningMarkDim)
+                .with(" tests", Role::Text)
+                .filled(Role::Selection)
+                .resolve(theme, 20);
+            let mark = &line.spans[1].style;
+            assert_eq!(
+                mark.foreground,
+                theme.style(Role::Accent).foreground,
+                "{name:?}"
+            );
+            assert!(mark.dim, "the dimmed blink phase survives the selection");
+            assert_eq!(mark.background, theme.style(Role::Selection).background);
+            assert_eq!(
+                line.spans[2].style.foreground,
+                theme.style(Role::Text).foreground
+            );
+            for (mark, state) in [
+                (Role::RunningMark, Role::Accent),
+                (Role::SuccessMark, Role::Success),
+                (Role::ErrorMark, Role::Error),
+                (Role::WarningMark, Role::Warning),
+            ] {
+                assert_eq!(theme.style(mark), theme.style(state), "{name:?} {mark:?}");
             }
         }
     }
@@ -1059,11 +1428,23 @@ mod tests {
                     style
                         .foreground
                         .or(style.background)
-                        .is_some_and(|colour| manual_override(colour).is_some())
+                        .is_some_and(|colour| {
+                            matches!(colour, Colour::Rgb(colour) if manual_override(colour).is_some())
+                        })
                 })
             })
             .collect();
-        assert_eq!(overridden, vec![Role::Success, Role::DiffAdded]);
+        assert_eq!(
+            overridden,
+            vec![
+                Role::Success,
+                Role::DiffAdded,
+                Role::AgentSection,
+                Role::SuccessMark,
+                Role::DiffLineAdded,
+                Role::DiffWordAdded,
+            ]
+        );
     }
 
     #[test]

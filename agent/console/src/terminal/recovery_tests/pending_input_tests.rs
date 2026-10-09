@@ -286,7 +286,7 @@ fn submit_two_pending(fixture: &mut RecoveryPty, directory: &std::path::Path) ->
     let proof = wait_queue_proof(fixture, directory, 1, 2);
     assert_eq!(proof["hello_messages"], 0);
     fixture.repaint_after_recovery("two pending messages", |frame| {
-        frame.contains("Queued 2") || frame.contains("Messages to be submitted (2)")
+        frame.contains("Queued 2") || screen::queued_inputs(frame).len() == 2
     })
 }
 
@@ -296,18 +296,18 @@ fn busy_messages_only_preview_until_the_actual_tool_boundary_consumes_them() {
     let frame = submit_two_pending(&mut fixture, directory.path());
     let (body, preview) = frame
         .split_once("Queued 2")
-        .or_else(|| frame.split_once("Messages to be submitted (2)"))
+        .or_else(|| screen::split_at_queue(&frame))
         .unwrap();
     assert_eq!(body.matches(QUEUED_MESSAGE).count(), 0, "{frame}");
     assert_eq!(preview.matches(QUEUED_MESSAGE).count(), 2, "{frame}");
-    assert!(frame.contains("Messages to be submitted (2)"), "{frame}");
+    assert_eq!(screen::queued_inputs(&frame).len(), 2, "{frame}");
     std::fs::write(directory.path().join(QUEUE_STAGE), "release-1").unwrap();
     let proof = wait_queue_proof(&fixture, directory.path(), 2, 0);
     assert_eq!(proof["hello_messages"], 2);
     assert_eq!(proof["request_hellos"], 2);
     let consumed = fixture.repaint_after_recovery("two messages consumed", |frame| {
         screen::message_flow(frame).matches(QUEUED_MESSAGE).count() == 2
-            && !frame.contains("Messages to be submitted")
+            && screen::queued_inputs(frame).is_empty()
     });
     assert_eq!(
         screen::message_flow(&consumed)
@@ -340,7 +340,7 @@ fn busy_messages_only_preview_until_the_actual_tool_boundary_consumes_them() {
     );
     let frame = fixture.repaint_after_recovery("second tool boundary input batch", |frame| {
         screen::message_flow(frame).matches(QUEUED_MESSAGE).count() == 4
-            && !frame.contains("Messages to be submitted")
+            && screen::queued_inputs(frame).is_empty()
     });
     assert_eq!(
         screen::message_flow(&frame).matches(QUEUED_MESSAGE).count(),
@@ -354,8 +354,7 @@ fn text_only_completion_consumes_pending_messages_in_one_follow_up_run() {
     let (mut fixture, directory) = start_queue_fixture("plain");
     let queued = submit_two_pending(&mut fixture, directory.path());
     assert_eq!(
-        queued
-            .split_once("Messages to be submitted (2)")
+        screen::split_at_queue(&queued)
             .unwrap()
             .0
             .matches(QUEUED_MESSAGE)
@@ -364,8 +363,7 @@ fn text_only_completion_consumes_pending_messages_in_one_follow_up_run() {
         "{queued}"
     );
     assert_eq!(
-        queued
-            .split_once("Messages to be submitted (2)")
+        screen::split_at_queue(&queued)
             .unwrap()
             .1
             .matches(QUEUED_MESSAGE)
@@ -390,7 +388,7 @@ fn text_only_completion_consumes_pending_messages_in_one_follow_up_run() {
     assert_eq!(second["merges"][0]["into"], receipts[0]["run"]);
     let frame = fixture.repaint_after_recovery("one follow-up consumes both messages", |frame| {
         screen::message_flow(frame).matches(QUEUED_MESSAGE).count() == 2
-            && !frame.contains("Messages to be submitted")
+            && screen::queued_inputs(frame).is_empty()
     });
     assert_eq!(
         screen::message_flow(&frame).matches(QUEUED_MESSAGE).count(),
@@ -401,7 +399,7 @@ fn text_only_completion_consumes_pending_messages_in_one_follow_up_run() {
     let frame = fixture.repaint_after_recovery("the batched follow-up is answered once", |frame| {
         frame.contains("Queue reply 2")
             && screen::message_flow(frame).matches(QUEUED_MESSAGE).count() == 2
-            && !frame.contains("Messages to be submitted")
+            && screen::queued_inputs(frame).is_empty()
     });
     assert_eq!(
         screen::message_flow(&frame).matches(QUEUED_MESSAGE).count(),
@@ -418,7 +416,7 @@ fn escape_interrupts_the_current_run_without_losing_or_double_echoing_the_queue(
     submit_two_pending(&mut fixture, directory.path());
     let before = wait_queue_proof(&fixture, directory.path(), 1, 2);
     let receipts = before["pending_receipts"].as_array().unwrap();
-    fixture.wait_for("Esc to interrupt");
+    fixture.wait_for("esc to interrupt");
     fixture.send(b"\x1b[27u");
     let proof = wait_queue_proof(&fixture, directory.path(), 2, 0);
     assert_eq!(proof["hello_messages"], 2);
@@ -433,7 +431,7 @@ fn escape_interrupts_the_current_run_without_losing_or_double_echoing_the_queue(
         "interrupt preserves and consumes the waiting batch",
         |frame| {
             screen::message_flow(frame).matches(QUEUED_MESSAGE).count() == 2
-                && !frame.contains("Messages to be submitted")
+                && screen::queued_inputs(frame).is_empty()
         },
     );
     assert_eq!(
@@ -451,7 +449,7 @@ fn up_takes_back_pending_messages_without_creating_sent_body_echoes() {
     let proof = wait_queue_proof(&fixture, directory.path(), 1, 0);
     assert_eq!(proof["hello_messages"], 0);
     let frame = fixture.repaint_after_recovery("pending messages restored for editing", |frame| {
-        frame.contains("Hello") && !frame.contains("Messages to be submitted")
+        frame.contains("Hello") && screen::queued_inputs(frame).is_empty()
     });
     let body = frame.split('─').next().unwrap();
     assert_eq!(body.matches(QUEUED_MESSAGE).count(), 0, "{frame}");
@@ -472,9 +470,9 @@ fn messages_submitted_by_another_view_echo_once_when_the_daemon_consumes_them() 
     let proof = wait_queue_proof(&fixture, directory.path(), 1, 2);
     assert_eq!(proof["hello_messages"], 0);
     let queued = fixture.repaint_after_recovery("another View's pending messages", |frame| {
-        frame.contains("Messages to be submitted (2)")
+        screen::queued_inputs(frame).len() == 2
     });
-    let (body, preview) = queued.split_once("Messages to be submitted (2)").unwrap();
+    let (body, preview) = screen::split_at_queue(&queued).unwrap();
     assert_eq!(body.matches(QUEUED_MESSAGE).count(), 0, "{queued}");
     assert_eq!(preview.matches(QUEUED_MESSAGE).count(), 2, "{queued}");
     std::fs::write(directory.path().join(QUEUE_STAGE), "release-1").unwrap();
@@ -482,7 +480,7 @@ fn messages_submitted_by_another_view_echo_once_when_the_daemon_consumes_them() 
     assert_eq!(proof["hello_messages"], 2);
     let consumed = fixture.repaint_after_recovery("another View's consumed messages", |frame| {
         screen::message_flow(frame).matches(QUEUED_MESSAGE).count() == 2
-            && !frame.contains("Messages to be submitted")
+            && screen::queued_inputs(frame).is_empty()
     });
     assert_eq!(
         screen::message_flow(&consumed)
@@ -512,7 +510,7 @@ fn reconnect_restores_consumed_messages_whose_snapshots_were_unavailable_at_the_
     fixture.wait_for("Disconnected");
     std::fs::remove_file(directory.path().join(QUEUE_DISCONNECTED)).unwrap();
     let frame = fixture.repaint_after_recovery("reconnected consumed input echoes", |frame| {
-        !frame.contains("Messages to be submitted")
+        screen::queued_inputs(frame).is_empty()
             && screen::message_flow(frame).matches(QUEUED_MESSAGE).count() == 2
     });
     assert_eq!(

@@ -1,7 +1,9 @@
 use super::{Agent, approval_context};
 use std::{sync::atomic::Ordering, time::Duration};
-use tickloop_agent_model::{ModelRequest, ReasoningEffortExt};
-use tickloop_agent_protocol::{ChatId, Content, Message, Role, short_chat_title};
+use tickloop_agent_model::{ModelOutput, ModelRequest, ReasoningEffortExt};
+use tickloop_agent_protocol::{
+    ChatId, Content, Message, ModelConfig, ReasoningEffort, Role, short_chat_title,
+};
 
 const TITLE_TIMEOUT: Duration = Duration::from_secs(15);
 const TITLE_PROMPT_CHARACTERS: usize = 1000;
@@ -46,18 +48,7 @@ impl Agent {
                     .rev()
                     .collect::<String>(),
                 original.message_id,
-                if tickloop_agent_model::validate_reasoning_effort(
-                    &chat.snapshot.model,
-                    Some(tickloop_agent_protocol::ReasoningEffort::Off),
-                )
-                .is_ok()
-                {
-                    Some(tickloop_agent_protocol::ReasoningEffort::Off)
-                } else {
-                    tickloop_agent_protocol::ReasoningEffort::choices(&chat.snapshot.model)
-                        .first()
-                        .copied()
-                },
+                side_request_effort(&chat.snapshot.model),
             )
         };
         pending.insert(chat_id);
@@ -96,25 +87,7 @@ impl Agent {
                 .ok()
                 .map(|response| response.output);
             cancel.cancel();
-            if let Some(output) = output.filter(|output| {
-                output.stop_reason == "end_turn"
-                    && !output
-                        .content
-                        .iter()
-                        .any(|content| matches!(content, Content::ToolUse { .. }))
-            }) {
-                let text = output
-                    .content
-                    .iter()
-                    .filter_map(|content| {
-                        if let Content::Text { text } = content {
-                            Some(text.as_str())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" ");
+            if let Some(text) = output.as_ref().and_then(side_request_text) {
                 let title = short_chat_title(text.trim().trim_matches('"'));
                 let mut chats = agent.inner.chats.lock().await;
                 if !title.is_empty()
@@ -139,4 +112,36 @@ impl Agent {
         });
         self.inner.tasks.lock().await.push(task);
     }
+}
+
+/// The cheapest reasoning effort the Chat's model accepts, for short side requests such as titles.
+pub(super) fn side_request_effort(model: &ModelConfig) -> Option<ReasoningEffort> {
+    if tickloop_agent_model::validate_reasoning_effort(model, Some(ReasoningEffort::Off)).is_ok() {
+        Some(ReasoningEffort::Off)
+    } else {
+        ReasoningEffort::choices(model).first().copied()
+    }
+}
+
+/// The text of a side request's answer, or `None` when it did not end its turn with plain text.
+pub(super) fn side_request_text(output: &ModelOutput) -> Option<String> {
+    if output.stop_reason != "end_turn"
+        || output
+            .content
+            .iter()
+            .any(|content| matches!(content, Content::ToolUse { .. }))
+    {
+        return None;
+    }
+    Some(
+        output
+            .content
+            .iter()
+            .filter_map(|content| match content {
+                Content::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
 }

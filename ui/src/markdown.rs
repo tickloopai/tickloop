@@ -14,7 +14,12 @@ use ratatui::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::{format::width, settings::AmbiguousWidth, styles::RendererStyles};
+use crate::{
+    format::width,
+    highlight::{CodeLine, CodeToken},
+    settings::AmbiguousWidth,
+    styles::RendererStyles,
+};
 
 const QUOTE_BAR: &str = "▎ ";
 const RULE: &str = "---";
@@ -43,6 +48,8 @@ pub struct Marks {
     pub link: bool,
     pub quote: bool,
     pub quote_bar: bool,
+    /// The highlighting class of fenced code.
+    pub code: Option<CodeToken>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -149,7 +156,24 @@ fn style_for(marks: Marks, renderer_styles: &RendererStyles) -> Style {
     if marks.quote_bar {
         style = style.patch(renderer_styles.muted_text);
     }
+    if let Some(token) = marks.code {
+        style = style.patch(code_style(token));
+    }
     style
+}
+
+/// cli-highlight's default theme, which Claude Code uses, in the terminal's palette colours.
+fn code_style(token: CodeToken) -> Style {
+    use ratatui::style::{Color, Modifier};
+    match token {
+        CodeToken::Keyword => Style::new().fg(Color::Blue),
+        CodeToken::BuiltIn => Style::new().fg(Color::Cyan),
+        CodeToken::Type => Style::new().fg(Color::Cyan).add_modifier(Modifier::DIM),
+        CodeToken::Number | CodeToken::Comment => Style::new().fg(Color::Green),
+        CodeToken::String => Style::new().fg(Color::Red),
+        CodeToken::Function => Style::new().fg(Color::Yellow),
+        CodeToken::Meta => Style::new().fg(Color::DarkGray),
+    }
 }
 
 /// Layout of a Markdown document that grows while it streams. Every top-level
@@ -241,7 +265,11 @@ struct Block {
 enum BlockKind {
     Paragraph(Vec<Piece>),
     Heading(Vec<Piece>),
-    Code(String),
+    Code {
+        text: String,
+        /// The fence's info string, whose first word names the language.
+        info: String,
+    },
     Rule,
     Quote(Vec<Block>),
     List {
@@ -318,6 +346,7 @@ enum Leaf {
     Code {
         start: usize,
         text: String,
+        info: String,
     },
     Table {
         start: usize,
@@ -412,9 +441,13 @@ impl TreeBuilder {
                 start: range.start,
                 pieces: Vec::new(),
             }),
-            Tag::CodeBlock(_) => self.open_leaf(Leaf::Code {
+            Tag::CodeBlock(kind) => self.open_leaf(Leaf::Code {
                 start: range.start,
                 text: String::new(),
+                info: match kind {
+                    pulldown_cmark::CodeBlockKind::Fenced(info) => info.to_string(),
+                    pulldown_cmark::CodeBlockKind::Indented => String::new(),
+                },
             }),
             Tag::Table(alignments) => self.open_leaf(Leaf::Table {
                 start: range.start,
@@ -469,11 +502,16 @@ impl TreeBuilder {
                 }
             }
             TagEnd::CodeBlock => {
-                if let Some(Leaf::Code { start, mut text }) = self.leaf.take() {
+                if let Some(Leaf::Code {
+                    start,
+                    mut text,
+                    info,
+                }) = self.leaf.take()
+                {
                     if text.ends_with('\n') {
                         text.pop();
                     }
-                    self.push_block(BlockKind::Code(text), start..range.end);
+                    self.push_block(BlockKind::Code { text, info }, start..range.end);
                 }
             }
             TagEnd::TableCell => {
@@ -699,7 +737,9 @@ impl Writer<'_> {
             BlockKind::Paragraph(pieces) | BlockKind::Heading(pieces) => {
                 self.write_inline(pieces, first, rest, block.range.start)
             }
-            BlockKind::Code(text) => self.write_code(text, first, rest, block.range.start),
+            BlockKind::Code { text, info } => {
+                self.write_code(text, info, first, rest, block.range.start)
+            }
             BlockKind::Rule => {
                 let cells = self.cells(RULE, Marks::default(), block.range.start);
                 self.write_rows(&cells, first, rest, block.range.start);
@@ -787,15 +827,55 @@ impl Writer<'_> {
         self.write_rows(&logical_line, prefix, rest, offset);
     }
 
-    fn write_code(&mut self, text: &str, first: &Prefix, rest: &Prefix, offset: usize) {
-        let marks = Marks::default();
+    fn write_code(&mut self, text: &str, info: &str, first: &Prefix, rest: &Prefix, offset: usize) {
+        let highlighted = crate::highlight::highlight_fenced(info, text);
         let mut line_offset = offset;
         for (index, line) in text.split('\n').enumerate() {
-            let cells = self.cells(&expand_tabs(line), marks, line_offset);
+            let cells = match highlighted.as_ref().and_then(|lines| lines.get(index)) {
+                Some(classes) => self.code_cells(line, classes, line_offset),
+                None => self.cells(&expand_tabs(line), Marks::default(), line_offset),
+            };
             let prefix = if index == 0 { first } else { rest };
             self.write_rows(&cells, prefix, rest, line_offset);
             line_offset += line.len() + 1;
         }
+    }
+
+    /// The cells of a highlighted code line: each grapheme marked with the class of the run it
+    /// came from, tabs expanded to spaces of the same class.
+    fn code_cells(&self, line: &str, classes: &CodeLine, offset: usize) -> Vec<Cell> {
+        let mut byte_classes = Vec::with_capacity(line.len());
+        for (text, class) in classes {
+            byte_classes.extend(std::iter::repeat_n(*class, text.len()));
+        }
+        byte_classes.resize(line.len(), None);
+        let mut cells = Vec::new();
+        let mut column = 0;
+        for (index, grapheme) in line.grapheme_indices(true) {
+            let marks = Marks {
+                code: byte_classes[index],
+                ..Marks::default()
+            };
+            if grapheme == "\t" {
+                let spaces = TAB_COLUMNS - column % TAB_COLUMNS;
+                cells.extend((0..spaces).map(|_| Cell {
+                    grapheme: " ".into(),
+                    marks,
+                    offset: offset + index,
+                    width: 1,
+                }));
+                column += spaces;
+            } else if !grapheme.chars().any(char::is_control) {
+                cells.push(Cell {
+                    grapheme: grapheme.to_owned(),
+                    marks,
+                    offset: offset + index,
+                    width: width(grapheme, self.ambiguous),
+                });
+                column += grapheme.chars().count();
+            }
+        }
+        cells
     }
 
     fn write_rows(&mut self, cells: &[Cell], first: &Prefix, rest: &Prefix, offset: usize) {

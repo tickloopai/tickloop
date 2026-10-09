@@ -104,22 +104,6 @@ pub(super) fn runs<'a>(
     runs
 }
 
-/// Writes `text` with each linked byte range wrapped in OSC 8.
-pub(super) fn apply(text: &str, links: &[(Range<usize>, Hyperlink)]) -> String {
-    let mut output = String::with_capacity(text.len());
-    for (run, link) in runs(text, links) {
-        match link {
-            Some(link) => {
-                output.push_str(&link.open());
-                output.push_str(run);
-                output.push_str(&Hyperlink::close());
-            }
-            None => output.push_str(run),
-        }
-    }
-    output
-}
-
 /// Whether the terminal described by `variable` shows OSC 8 links: Claude Code
 /// `supportsHyperlinks`, the `supports-hyperlinks` rules for an interactive stdout
 /// followed by the terminals that library misses.
@@ -232,11 +216,15 @@ mod tests {
     }
 
     #[test]
-    fn linked_ranges_are_wrapped_in_osc_8_and_the_rest_is_untouched() {
+    fn linked_ranges_become_their_own_runs_and_the_rest_is_untouched() {
         let link = Hyperlink::file(Path::new("/cache/1.png")).unwrap();
         assert_eq!(
-            apply("see [Image #1] now", &[(4..14, link)]),
-            "see \x1b]8;;file:///cache/1.png\x07[Image #1]\x1b]8;;\x07 now"
+            runs("see [Image #1] now", &[(4..14, link.clone())]),
+            [("see ", None), ("[Image #1]", Some(&link)), (" now", None)]
+        );
+        assert_eq!(
+            format!("{}[Image #1]{}", link.open(), Hyperlink::close()),
+            "\x1b]8;;file:///cache/1.png\x07[Image #1]\x1b]8;;\x07"
         );
     }
 

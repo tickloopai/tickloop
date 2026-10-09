@@ -56,6 +56,7 @@ mod request_failure_tests;
 mod request_race_tests;
 mod rewind;
 mod session_permissions;
+mod shell_description;
 mod shell_task_center;
 mod system_prompt;
 mod tool_execution;
@@ -99,12 +100,12 @@ use tickloop_agent_protocol::local_messages;
 use tickloop_agent_protocol::{
     AccessError, AccessErrorCode, AgentHostOptions, AgentMessageSource, ApprovalAssessmentDetails,
     ApprovalFailureKind, ApprovalFallbackReason, ApprovalOutcome, ApprovalPath,
-    ApprovalReviewerKind, AutoBlockKind, AutoReviewerHealth, AutoReviewerNotice, ChatId,
-    ChatSnapshot, CompactionMarker, Content, Decision, DelegationMetadata, DenialReference,
-    DirectedHumanSource, DirectoryTrustPolicy, Event, EventKind, EventSourceBinding, ExecutionMode,
-    HostCallContext, InputContext, LedgerError, LoopId, LoopSnapshot, LoopState, Message,
-    ModelConfig, ModelRequestKind, MonitorMembership, OperationRecord, OperationState,
-    PendingCommand, PendingInput, PermissionApprovalSource, PermissionExecution, PermissionPolicy,
+    ApprovalReviewerKind, AutoBlockKind, AutoReviewerHealth, ChatId, ChatSnapshot,
+    CompactionMarker, Content, Decision, DelegationMetadata, DenialReference, DirectedHumanSource,
+    DirectoryTrustPolicy, Event, EventKind, EventSourceBinding, ExecutionMode, HostCallContext,
+    InputContext, LedgerError, LoopId, LoopSnapshot, LoopState, Message, ModelConfig,
+    ModelRequestKind, MonitorMembership, OperationRecord, OperationState, PendingCommand,
+    PendingInput, PermissionApprovalSource, PermissionExecution, PermissionPolicy,
     PermissionRequest, PermissionRule, PermissionScope, PromptPolicy, ProposedToolCall,
     QueuedInput, QueuedInputKind, ReasoningEffort, Receipt, RequestOutcome, RequestUsageLedger,
     ResponseRejection, Role, RunId, SubagentRegistration, TICK_SUBSCRIPTION_SOURCE,
@@ -292,6 +293,12 @@ struct Inner {
     family_mailbox: Mutex<family_mailbox::FamilyMailbox>,
     input_wakeup: tokio::sync::watch::Sender<()>,
     title_requests: Mutex<HashSet<ChatId>>,
+    /// Display names generated for background Shells without a description of their own, by
+    /// task: `None` while pending or after a failed attempt. Each task gets one attempt in this
+    /// process, and model-facing text never uses them.
+    shell_descriptions: Mutex<HashMap<Uuid, Option<String>>>,
+    /// Announces a generated Shell description by task, for Shell task subscribers only.
+    shell_description_events: broadcast::Sender<Uuid>,
     subagent_registry: Mutex<HashMap<ChatId, Vec<SubagentRegistration>>>,
     chats: Mutex<HashMap<ChatId, Chat>>,
     events: broadcast::Sender<Event>,
@@ -339,6 +346,10 @@ struct ChatBookkeeping {
     unavailable_plan_versions: BTreeMap<LoopId, u64>,
     /// 本 Chat 中各 run 所属的 Loop，写入链上条目的 `loopId`；恢复时由条目重建。
     run_loops: BTreeMap<RunId, LoopId>,
+    /// Shells whose completion notification waits among the deferred messages.
+    deferred_notifications: Vec<tick_protocol::InstanceRef>,
+    /// Shells whose completion notification is in the conversation but no turn has read yet.
+    unread_notifications: Vec<tick_protocol::InstanceRef>,
 }
 
 impl ChatBookkeeping {
@@ -360,6 +371,9 @@ struct Chat {
     bookkeeping: ChatBookkeeping,
     todo_completion_graces: HashMap<LoopId, todo_lifecycle::CompletionGrace>,
     start_new_tool_result_message: bool,
+    /// Claude Code's `needsPlanModeExitAttachment`: the user left Plan mode without approving a
+    /// plan, so the next request owes the model the exited-plan-mode notice.
+    needs_plan_mode_exit_notice: bool,
     active: Option<CancellationToken>,
     active_run: Option<RunId>,
     parked: HashMap<RunId, ParkedRun>,
@@ -1086,26 +1100,14 @@ impl Agent {
             if let Some(failure) = run.failure {
                 fallback_failure = Some(failure);
                 fallback_reason = Some(ApprovalFallbackReason::TechnicalFailure(failure));
-                let first_fallback = self
-                    .inner
+                self.inner
                     .auto_health
                     .lock()
                     .await
                     .failure(permit, tokio::time::Instant::now());
-                if first_fallback {
-                    self.emit_auto_reviewer_notice(
-                        receipt,
-                        AutoReviewerNotice::Fallback { failure },
-                    )
-                    .await;
-                }
                 jev_attempts = run.attempts;
             } else {
-                let recovered = self.inner.auto_health.lock().await.success(permit);
-                if recovered {
-                    self.emit_auto_reviewer_notice(receipt, AutoReviewerNotice::Recovered)
-                        .await;
-                }
+                self.inner.auto_health.lock().await.success(permit);
                 if emit_permission {
                     self.emit_auto_review_check(receipt, &run.review).await;
                 }
@@ -1147,13 +1149,6 @@ impl Agent {
             }
         };
         self.emit_permission_check(receipt, decision, reason).await;
-    }
-
-    async fn emit_auto_reviewer_notice(&self, receipt: &Receipt, notice: AutoReviewerNotice) {
-        let mut chats = self.inner.chats.lock().await;
-        if let Some(chat) = chats.get_mut(&receipt.chat_id) {
-            self.emit(chat, receipt, EventKind::AutoReviewerNotice { notice });
-        }
     }
 
     async fn emit_permission_check(&self, receipt: &Receipt, decision: Decision, reason: String) {
@@ -1388,6 +1383,8 @@ impl Agent {
                 family_mailbox: Mutex::new(family_mailbox::FamilyMailbox::default()),
                 input_wakeup: tokio::sync::watch::channel(()).0,
                 title_requests: Mutex::new(HashSet::new()),
+                shell_descriptions: Mutex::new(HashMap::new()),
+                shell_description_events: broadcast::channel(256).0,
                 subagent_registry: Mutex::new(HashMap::new()),
                 chats: Mutex::new(HashMap::new()),
                 events: broadcast::channel(256).0,
@@ -1582,6 +1579,7 @@ impl Agent {
                 bookkeeping,
                 todo_completion_graces: HashMap::new(),
                 start_new_tool_result_message: false,
+                needs_plan_mode_exit_notice: false,
                 active: None,
                 active_run: None,
                 parked: HashMap::new(),
@@ -2186,6 +2184,7 @@ impl Agent {
         self.maybe_compact(receipt, cancel.clone()).await?;
         // After compaction, which may drop earlier notes; boxed to keep the run future small.
         Box::pin(self.announce_host_tool_changes(receipt, host_tools)).await?;
+        Box::pin(self.announce_plan_mode_exit(receipt)).await?;
         let workspace_host = crate::host_tools::current_workspace_host(
             self.inner.host_tools.read().unwrap().as_deref(),
         );
@@ -2620,6 +2619,7 @@ impl Agent {
                     return chat.snapshot.request_usage.run_conversation_usage(receipt.run_id).map_err(|error|error.to_string());
                 }
                 for ProposedToolCall {call_id:id,name,input} in calls {
+                    let read_target = monitor_members::ReadTarget::of(&name, &input);
                     let invocation = ToolInvocation::new(
                         id.clone(), name.clone(), input, registry.resolve(&name),
                     );
@@ -2675,6 +2675,9 @@ impl Agent {
                         };
                         if !matches!(operation.state,OperationState::Completed|OperationState::Failed) {operation.state=state;}
                         operation.result=Some(result.clone());
+                    }
+                    if !result.is_error && let Some(target) = read_target {
+                        self.mark_read_handled(chat, target);
                     }
                     if !result.is_error && host_call_status == Some(crate::host_tools::HostCallStatus::Completed) {
                         match &host_effect {
@@ -3254,6 +3257,7 @@ impl Agent {
             candidate.active = Some(cancel.clone());
             candidate.active_run = Some(pending.receipt.run_id);
             let receipt = pending.receipt.clone();
+            self.mark_run_inputs_handled(&mut candidate, &pending);
             self.append_input_message(&mut candidate, pending);
             let mut merged_receipts = Vec::with_capacity(merged_inputs.len());
             for queued in merged_inputs {
@@ -3461,6 +3465,13 @@ impl Agent {
         let _settings_gate = self.inner.settings_writes.lock().await;
         let mut chats = self.inner.chats.lock().await;
         let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
+        // Claude Code's `handlePlanModeTransition`: leaving Plan owes the model an exit notice, and
+        // returning to Plan before it is sent withdraws it.
+        match (chat.snapshot.policy.mode, mode) {
+            (_, ExecutionMode::Plan) => chat.needs_plan_mode_exit_notice = false,
+            (ExecutionMode::Plan, _) => chat.needs_plan_mode_exit_notice = true,
+            _ => {}
+        }
         chat.snapshot.policy.mode = mode;
         chat.snapshot.policy.revision += 1;
         self.save(&chat.snapshot);
@@ -4007,6 +4018,9 @@ impl Agent {
         loop_id: Option<LoopId>,
         notification: TaskNotification,
     ) -> Result<bool, AgentError> {
+        chat.bookkeeping
+            .deferred_notifications
+            .push(tick_protocol::InstanceRef::shell(notification.task_id));
         self.append_local_messages(chat, [local_messages::task_notification(&notification)])?;
         let _ = self.inner.task_notifications.send(notification);
         Ok(self.queue_task_continuation(chat, loop_id))
@@ -4086,6 +4100,13 @@ impl Agent {
         chat.snapshot
             .messages
             .extend(std::mem::take(&mut chat.deferred_messages));
+        let notified = std::mem::take(&mut chat.bookkeeping.deferred_notifications);
+        if chat.active.is_some() {
+            // Written between tool results, so the running turn reads them next.
+            self.mark_handled(chat, notified);
+        } else {
+            chat.bookkeeping.unread_notifications.extend(notified);
+        }
         self.save(&chat.snapshot);
         Ok(())
     }
@@ -4163,8 +4184,8 @@ pub(crate) fn validate_host_schema_input(
 pub(crate) fn reserved_host_tool_names() -> HashSet<String> {
     tickloop_agent_tools::Tools::definitions()
         .into_iter()
-        .chain(plan::definitions())
-        .chain(interaction::definitions())
+        .chain(plan::definitions(false))
+        .chain(interaction::definitions(false))
         .chain(tick_subscriptions::definitions())
         .chain(delegation::definitions())
         .chain(agent_messages::definitions(false))

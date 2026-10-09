@@ -244,7 +244,7 @@ async fn the_host_reserves_the_artifact_tool_names() {
         fn definitions(&self) -> Vec<ToolDefinition> {
             vec![ToolDefinition {
                 name: "ArtifactRead".into(),
-                description: "Not the Artifact Service".into(),
+                description: "Not Artifacts".into(),
                 input_schema: json!({"type":"object"}),
             }]
         }
@@ -272,7 +272,7 @@ async fn the_host_reserves_the_artifact_tool_names() {
     assert!(
         reads[0]
             .description
-            .starts_with("Read Tick Loop Docs you can access."),
+            .starts_with("Read Tick Loop Artifacts you can access."),
         "only the service directory provides an Artifact name"
     );
     agent
@@ -745,7 +745,9 @@ async fn model_tool_inventory_keeps_artifact_shell_and_herdr_names() {
     );
     assert!(prompt.contains("authentication is signed_out, call ArtifactLogin"));
     assert!(
-        prompt.contains("a doc, for writing") && prompt.contains("a design, for visual design")
+        prompt.contains("a doc, for writing")
+            && prompt.contains("a design, for anything visual: a prototype")
+            && prompt.contains("create a design artifact with ArtifactEdit")
     );
     assert!(!tool_names(&requests[0]).contains(&"ArtifactLogin"));
     for name in ["CallTickTool", "ReadTick"] {
@@ -1703,7 +1705,11 @@ async fn a_resumed_chat_is_told_once_which_host_tools_became_available() {
     }
     assert_eq!(snapshot.host_notes.len(), 1);
     let (index, announced) = snapshot.host_notes.iter().next().unwrap();
-    assert!(announced.contains("ArtifactRead"));
+    assert!(
+        announced
+            .announced_host_tools()
+            .is_some_and(|tools| tools.contains("ArtifactRead"))
+    );
     assert!(
         !snapshot.prompt_execution_modes.contains_key(index),
         "a host note is never a user prompt"

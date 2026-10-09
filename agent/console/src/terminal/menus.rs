@@ -24,7 +24,7 @@ use super::{
     console::{Console, Menu, PickerAction, PickerKind, RequestPresentation},
     conversation_picker::ConversationPicker,
     diff_view::{DiffNavigation, DiffViewport, render_diff, render_error},
-    display::{DisplayProfile, Glyph},
+    display::DisplayProfile,
     font_manager::{FontAction, FontOutcome, NerdFontManager, SystemFontAdapter},
     new_agent_draft::ConfigTarget,
     permissions_surface::PermissionsSubject,
@@ -44,14 +44,17 @@ use tickloop_agent_protocol::{
     UsageCounter, UsageCoverage, UsageSummary, chat_display_title,
 };
 
-pub(super) const REDUCE_MOTION_SETTING_INDEX: usize = 9;
-pub(super) const OUTPUT_STYLE_SETTING_INDEX: usize = 10;
-pub(super) const PERMISSIONS_SETTING_INDEX: usize = 11;
-const PROMPT_SUGGESTION_SETTING_INDEX: usize = 13;
+const SHIFT_TAB_MODES_SETTING_INDEX: usize = 4;
+pub(super) const REDUCE_MOTION_SETTING_INDEX: usize = 10;
+pub(super) const OUTPUT_STYLE_SETTING_INDEX: usize = 11;
+pub(super) const PERMISSIONS_SETTING_INDEX: usize = 12;
+const ARTIFACT_SIGN_OUT_SETTING_INDEX: usize = 13;
+const PROMPT_SUGGESTION_SETTING_INDEX: usize = 14;
 
 enum Selection {
     ArtifactSignOut {
         target: ConfigTarget,
+        return_to_settings: bool,
     },
     Locations {
         generation: u64,
@@ -142,6 +145,9 @@ enum Selection {
         target: ConfigTarget,
     },
     OutputStyle {
+        target: ConfigTarget,
+    },
+    ShiftTabModes {
         target: ConfigTarget,
     },
     Mode {
@@ -301,6 +307,7 @@ impl Selection {
                 settings_target: *settings_target,
             },
             Self::OutputStyle { target } => Self::OutputStyle { target: *target },
+            Self::ShiftTabModes { target } => Self::ShiftTabModes { target: *target },
             Self::GlyphSet {
                 target,
                 font_action,
@@ -316,7 +323,13 @@ impl Selection {
                 target: *target,
                 action: *action,
             },
-            Self::ArtifactSignOut { target } => Self::ArtifactSignOut { target: *target },
+            Self::ArtifactSignOut {
+                target,
+                return_to_settings,
+            } => Self::ArtifactSignOut {
+                target: *target,
+                return_to_settings: *return_to_settings,
+            },
             Self::Effort {
                 target,
                 choices,
@@ -412,10 +425,11 @@ impl Selection {
             | Self::ServiceAccount { target, .. }
             | Self::Model { target, .. }
             | Self::Effort { target, .. }
-            | Self::ArtifactSignOut { target }
+            | Self::ArtifactSignOut { target, .. }
             | Self::Settings { target }
             | Self::SettingsInfo { target }
             | Self::OutputStyle { target }
+            | Self::ShiftTabModes { target }
             | Self::GlyphSet { target, .. }
             | Self::GlyphSetConfirmation { target, .. }
             | Self::FontActionConfirmation { target, .. }
@@ -579,7 +593,7 @@ impl Menus {
         let points = rewind_points(snapshot);
         if points.is_empty() {
             let status =
-                "No prompts to rewind to yet. Open Transcript with Ctrl+O to read history.";
+                "No prompts to rewind to yet. Open Transcript with ctrl+o to read history.";
             console.set_status(status)?;
             return Ok(Some(status.into()));
         }
@@ -647,7 +661,7 @@ impl Menus {
                         point.message_index + 1,
                         point.prompt
                     ),
-                    "Summary actions use the selected Chat model. Tab adds optional guidance; a displayed number runs immediately without guidance.".into(),
+                    "Summary actions use the selected Chat model. tab adds optional guidance; a displayed number runs immediately without guidance.".into(),
                     point.file_history_description(),
                     "Only files changed by the Agent's file tools are restored; Shell and external side effects are not covered.".into(),
                 ],
@@ -949,6 +963,30 @@ impl Menus {
         }
     }
 
+    /// Asks before signing out of Artifacts; `/settings` reopens afterwards only when it asked.
+    pub(super) fn confirm_artifact_sign_out(
+        &mut self,
+        console: &Console,
+        target: ConfigTarget,
+        return_to_settings: bool,
+    ) -> Result<(), String> {
+        self.show(
+            console,
+            Menu {
+                id: Uuid::new_v4(),
+                title: "Sign out of Tick Loop Artifacts?".into(),
+                context: vec!["Stops feedback listening before revoking the credential.".into()],
+                options: vec!["Cancel".into(), "Sign out".into()],
+                selected: 0,
+                confirmation: true,
+            },
+            Selection::ArtifactSignOut {
+                target,
+                return_to_settings,
+            },
+        )
+    }
+
     fn show(&mut self, console: &Console, menu: Menu, selection: Selection) -> Result<(), String> {
         let discovery = (self.id() == Some(menu.id))
             .then(|| self.provider.discovery_flow.take())
@@ -1001,23 +1039,25 @@ impl Menus {
                     | Selection::Mode { .. }
                     | Selection::Theme { .. }
                     | Selection::OutputStyle { .. }
+                    | Selection::ShiftTabModes { .. }
                     | Selection::GlyphSet { .. }
                     | Selection::GlyphSetConfirmation { .. }
                     | Selection::FontActionConfirmation { .. }
                     | Selection::ArtifactSignOut { .. }
             ) {
                 let login_hint =
-                    format!("Enter start · {}", self.provider.provider_nav.escape_hint());
+                    format!("enter start · {}", self.provider.provider_nav.escape_hint());
                 let hint = match &selection {
-                    Selection::Settings { .. } => "Enter change · Esc close",
+                    Selection::Settings { .. } => "enter change · esc close",
                     Selection::Effort { .. }
                     | Selection::Mode { .. }
                     | Selection::Theme { .. }
-                    | Selection::OutputStyle { .. } => "Enter apply · Esc back",
-                    Selection::ConnectionConfirm { .. } => "Enter confirm · Esc Connection",
+                    | Selection::OutputStyle { .. } => "enter apply · esc back",
+                    Selection::ShiftTabModes { .. } => "space toggle · enter save · esc back",
+                    Selection::ConnectionConfirm { .. } => "enter confirm · esc Connection",
                     Selection::LoginMethods { .. } => &login_hint,
-                    Selection::CredentialDetails { .. } => "Enter back · Esc Connection",
-                    _ => "Enter open · Esc back",
+                    Selection::CredentialDetails { .. } => "enter back · esc Connection",
+                    _ => "enter open · esc back",
                 };
                 console.show_presented_picker_menu(
                     menu,
@@ -1081,9 +1121,9 @@ impl Menus {
                     }
                     row_hints.push(
                         if supports_discovery {
-                            "p Connection · r Refresh · Enter apply · Esc back"
+                            "p Connection · r Refresh · enter apply · esc back"
                         } else {
-                            "p Connection · Enter apply · Esc back"
+                            "p Connection · enter apply · esc back"
                         }
                         .into(),
                     );
@@ -1091,7 +1131,7 @@ impl Menus {
                 row_hints.extend(
                     actions
                         .iter()
-                        .map(|action| format!("Enter {} · Esc back", action.label())),
+                        .map(|action| format!("enter {} · esc back", action.label())),
                 );
                 console.show_presented_picker_menu(
                     menu,
@@ -1114,7 +1154,7 @@ impl Menus {
                             }))
                             .collect(),
                         connection_options: Some(choices.len()),
-                        hint: "p Connection · Enter apply · Esc back".into(),
+                        hint: "p Connection · enter apply · esc back".into(),
                         ..Default::default()
                     },
                 )?;
@@ -1457,7 +1497,7 @@ impl Menus {
                 title: "Thinking level".into(),
                 context: vec![
                     "Levels depend on the current model; auto uses its default. Use Settings to turn Thinking on or off. The choice is saved in user settings.".into(),
-                    "Thinking is collapsed in conversation; Ctrl+O opens the full archive.".into(),
+                    "Thinking is collapsed in conversation; ctrl+o opens the detailed transcript.".into(),
                 ],
                 options,
                 selected: choices
@@ -1486,7 +1526,7 @@ impl Menus {
             .await
             .map_err(|error| error.to_string())?;
         let mut context = vec![
-            "Model, Thinking, effort, persistent rules, output style, Glyph Set, reduced motion and prompt suggestions are saved in user settings; execution mode applies to this process.".into(),
+            "Model, Thinking, effort, persistent rules, shift+tab modes, output style, Glyph Set, reduced motion and prompt suggestions are saved in user settings; execution mode applies to this process.".into(),
             "Auto-scroll and Theme apply to this terminal session.".into(),
             safe_text(&format!(
                 "Current model: {}",
@@ -1560,6 +1600,15 @@ impl Menus {
                     } else {
                         "Execution mode".into()
                     },
+                    format!(
+                        "shift+tab modes: {}",
+                        console
+                            .shift_tab_modes()?
+                            .iter()
+                            .map(|mode| mode.label())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
                     "Session status".into(),
                     "Usage".into(),
                     format!(
@@ -1581,7 +1630,7 @@ impl Menus {
                     ),
                     format!("Output style: {}", self.saved_output_style().label()),
                     "Permissions".into(),
-                    format!("Artifact Service: {artifact_account}"),
+                    format!("Artifacts: {artifact_account}"),
                     format!(
                         "Prompt suggestions: {}",
                         if console.prompt_suggestion_enabled()? {
@@ -1602,6 +1651,53 @@ impl Menus {
         self.user_settings
             .as_ref()
             .map_or_else(OutputStyle::default, UserSettings::output_style)
+    }
+
+    /// The Shift+Tab modes as a checklist in their fixed order: `space` toggles one, keeping at
+    /// least one checked, and `enter` saves.
+    fn shift_tab_modes(
+        &mut self,
+        console: &Console,
+        target: ConfigTarget,
+        selected: usize,
+    ) -> Result<(), String> {
+        let enabled = console.shift_tab_modes()?;
+        let checks = ExecutionMode::CYCLE_ORDER
+            .into_iter()
+            .map(|mode| enabled.contains(&mode))
+            .collect::<Vec<_>>();
+        let options = ExecutionMode::CYCLE_ORDER
+            .into_iter()
+            .zip(&checks)
+            .map(|(mode, checked)| {
+                format!(
+                    "{}{}",
+                    if *checked {
+                        super::console::CHECKED_OPTION
+                    } else {
+                        super::console::UNCHECKED_OPTION
+                    },
+                    mode.label()
+                )
+            })
+            .collect();
+        let id = Uuid::new_v4();
+        self.show(
+            console,
+            Menu {
+                id,
+                title: "shift+tab modes".into(),
+                context: vec![
+                    "shift+tab cycles the checked modes in this order.".into(),
+                    "Entering or leaving Plan starts a new model cache.".into(),
+                ],
+                options,
+                selected,
+                confirmation: false,
+            },
+            Selection::ShiftTabModes { target },
+        )?;
+        console.set_menu_checks(id, checks)
     }
 
     fn output_styles(&mut self, console: &Console, target: ConfigTarget) -> Result<(), String> {
@@ -2410,6 +2506,19 @@ impl Menus {
         index: Option<usize>,
         comment: Option<String>,
     ) -> Result<MenuOutcome, String> {
+        // Every menu's handling lives in one state machine too large for a 2 MiB thread stack in
+        // debug builds; it runs on the heap so callers keep only a pointer.
+        Box::pin(self.choose_on_heap(agent, console, menu_id, index, comment)).await
+    }
+
+    async fn choose_on_heap(
+        &mut self,
+        agent: &Agent,
+        console: &Console,
+        menu_id: Uuid,
+        index: Option<usize>,
+        comment: Option<String>,
+    ) -> Result<MenuOutcome, String> {
         self.sync_dialog_chat(console)?;
         let menu_id = match self.provider.refreshed_picker_cancel {
             Some((previous, current))
@@ -2495,15 +2604,6 @@ impl Menus {
                         )
                         .await
                         .map_err(|error| error.to_string())?;
-                    let message = if allow {
-                        format!(
-                            "{} Entering plan mode. Continuing…\n",
-                            console.display_profile()?.glyph(Glyph::Success)
-                        )
-                    } else {
-                        "Staying in the current mode. Add instructions to continue.\n".into()
-                    };
-                    console.write(&message)?;
                     return Ok(MenuOutcome {
                         permission: Some(request.id),
                         ..Default::default()
@@ -2515,9 +2615,6 @@ impl Menus {
                     persistent,
                     ..
                 } => {
-                    let has_comment = comment
-                        .as_ref()
-                        .is_some_and(|comment| !comment.trim().is_empty());
                     let explicit_ask =
                         request.approval_source == PermissionApprovalSource::ExplicitAsk;
                     if !explicit_ask
@@ -2534,11 +2631,6 @@ impl Menus {
                             )
                             .await
                             .map_err(|error| error.to_string())?;
-                        console.write(&format!(
-                            "{} Permission rule added: {}. Continuing…\n",
-                            console.display_profile()?.glyph(Glyph::Success),
-                            exact.label
-                        ))?;
                         return Ok(MenuOutcome {
                             permission: Some(request.id),
                             ..Default::default()
@@ -2565,21 +2657,6 @@ impl Menus {
                         .answer_permission_with_comment(chat, request.id, allow, scope, comment)
                         .await
                         .map_err(|error| error.to_string())?;
-                    let message = match (allow, has_comment) {
-                        (true, true) => format!(
-                            "{} Permission accepted with your comment. Continuing…\n",
-                            console.display_profile()?.glyph(Glyph::Success)
-                        ),
-                        (true, false) => format!(
-                            "{} Permission accepted. Continuing…\n",
-                            console.display_profile()?.glyph(Glyph::Success)
-                        ),
-                        (false, true) => "Operation denied with your comment. Continuing…\n".into(),
-                        (false, false) => {
-                            "Operation denied. Add instructions to continue.\n".into()
-                        }
-                    };
-                    console.write(&message)?;
                     return Ok(MenuOutcome {
                         permission: Some(request.id),
                         ..Default::default()
@@ -2610,11 +2687,6 @@ impl Menus {
                         )
                         .await
                         .map_err(|error| error.to_string())?;
-                    console.write(&format!(
-                        "{} Permission rule added: {}. Continuing…\n",
-                        console.display_profile()?.glyph(Glyph::Success),
-                        candidate.label
-                    ))?;
                     return Ok(MenuOutcome {
                         permission: Some(request.id),
                         ..Default::default()
@@ -2956,8 +3028,6 @@ impl Menus {
                     let snapshot = agent.configuration(target).await.map_err(|error| error.to_string())?;
                     self.provider.current_connection = self.key_for_model(&snapshot.model);
                     self.provider.current_model = Some((snapshot.model.provider_id, snapshot.model.model_id));
-                    let updated = Uuid::new_v4();
-                    self.show_model_choices(console, target, choices, index, updated)?;
                 }
                 Selection::PermissionMode {
                     target,
@@ -2971,8 +3041,9 @@ impl Menus {
                 Selection::Effort { target, return_to_settings: true, .. }
                 | Selection::Mode { target, .. }
                 | Selection::OutputStyle { target }
+                | Selection::ShiftTabModes { target }
                 | Selection::GlyphSet { target, .. }
-                | Selection::ArtifactSignOut { target }
+                | Selection::ArtifactSignOut { target, return_to_settings: true }
                     if index.is_none() => self.settings(agent, console, target).await?,
                 Selection::GlyphSetConfirmation { target, glyph_set }
                     if index.is_none() => self.glyph_sets_with_focus(console, target, GlyphSet::ALL.into_iter().position(|candidate| candidate == glyph_set)).await?,
@@ -2983,7 +3054,7 @@ impl Menus {
                 _ if index.is_none() => {
                     console.write("Selection cancelled; configuration unchanged.\n")?
                 }
-                Selection::Effort { target, choices, return_to_settings } => {
+                Selection::Effort { target, choices, .. } => {
                     let effort = *choices
                         .get(index.unwrap())
                         .ok_or("effort option does not exist")?;
@@ -2996,21 +3067,17 @@ impl Menus {
                         effort.map_or("auto", ReasoningEffort::label),
                         change.staged_note()
                     ))?;
-                    if return_to_settings {
-                        self.settings(agent, console, target).await?;
-                    } else {
-                        self.show_efforts(agent, console, target, false).await?;
-                    }
                 }
-                Selection::ArtifactSignOut { target } => {
+                Selection::ArtifactSignOut { target, return_to_settings } => {
                     if index == Some(1) {
-                        let root = self.config_root.as_ref().ok_or("Artifact Service needs a state directory")?;
+                        let root = self.config_root.as_ref().ok_or("Tick Loop Artifacts needs a state directory")?;
                         agent.disable_event_sources().await.map_err(|error| error.to_string())?;
                         let client = tickloop_agent_artifacts::ArtifactClient::new(root).map_err(|error| error.to_string())?;
                         client.logout().await.map_err(|error| error.to_string())?;
-                        console.write("Artifact Service signed out.\n")?;
+                        console.write("Signed out of Tick Loop Artifacts.\n")?;
+                    } else if return_to_settings {
+                        self.settings(agent, console, target).await?;
                     }
-                    self.settings(agent, console, target).await?;
                 },
                 Selection::Settings { target } => match index {
                     Some(PROMPT_SUGGESTION_SETTING_INDEX) => {
@@ -3037,22 +3104,23 @@ impl Menus {
                     }
                     Some(2) => self.show_efforts(agent, console, target, true).await?,
                     Some(3) => self.modes(agent, console, target).await?,
-                    Some(4) => self.settings_info(agent, console, target, false).await?,
-                    Some(5) => self.settings_info(agent, console, target, true).await?,
-                    Some(6) => {
+                    Some(SHIFT_TAB_MODES_SETTING_INDEX) => self.shift_tab_modes(console, target, 0)?,
+                    Some(5) => self.settings_info(agent, console, target, false).await?,
+                    Some(6) => self.settings_info(agent, console, target, true).await?,
+                    Some(7) => {
                         console.set_auto_scroll(!console.auto_scroll()?)?;
                         self.settings(agent, console, target).await?;
                     }
-                    Some(7) => self.themes(console, Some(target))?,
-                    Some(8) => self.glyph_sets(console, target).await?,
+                    Some(8) => self.themes(console, Some(target))?,
+                    Some(9) => self.glyph_sets(console, target).await?,
                     Some(REDUCE_MOTION_SETTING_INDEX) => {
                         let mut preferences = console.display_preferences()?;
                         preferences.prefers_reduced_motion = !preferences.prefers_reduced_motion;
                         self.save_display_preferences(console, preferences)?;
                         self.settings(agent, console, target).await?;
                     }
-                    Some(12) => {
-                        self.show(console, Menu { id: Uuid::new_v4(), title: "Sign out of Artifact Service?".into(), context: vec!["Stops feedback listening before revoking the credential.".into()], options: vec!["Cancel".into(), "Sign out".into()], selected: 0, confirmation: true }, Selection::ArtifactSignOut { target })?;
+                    Some(ARTIFACT_SIGN_OUT_SETTING_INDEX) => {
+                        self.confirm_artifact_sign_out(console, target, true)?
                     }
                     Some(OUTPUT_STYLE_SETTING_INDEX) => self.output_styles(console, target)?,
                     Some(PERMISSIONS_SETTING_INDEX) => {
@@ -3069,17 +3137,34 @@ impl Menus {
                     }
                     _ => return Err("setting does not exist".into()),
                 },
-                Selection::Theme { settings_target } => {
+                Selection::Theme { .. } => {
                     let theme = *ThemeName::ALL
                         .get(index.unwrap())
                         .ok_or("theme option does not exist")?;
                     console.set_theme(theme)?;
-                    match settings_target {
-                        Some(target) => self.settings(agent, console, target).await?,
-                        None => console.write(&format!("Theme: {}\n", theme.label()))?,
-                    }
+                    console.write(&format!("Theme: {}\n", theme.label()))?;
                 }
-                Selection::OutputStyle { target } => {
+                Selection::ShiftTabModes { .. } => {
+                    let checks = console
+                        .menu_checks(menu_id)?
+                        .ok_or("the shift+tab modes checklist is no longer open")?;
+                    let modes = ExecutionMode::CYCLE_ORDER
+                        .into_iter()
+                        .zip(checks)
+                        .filter_map(|(mode, checked)| checked.then_some(mode))
+                        .collect::<Vec<_>>();
+                    self.user_settings
+                        .as_ref()
+                        .ok_or("cannot save shift+tab modes because the user settings directory is unavailable")?
+                        .save_shift_tab_modes(&modes)
+                        .map_err(|error| error.to_string())?;
+                    console.write(&format!(
+                        "shift+tab modes: {}\n",
+                        modes.iter().map(|mode| mode.label()).collect::<Vec<_>>().join(", ")
+                    ))?;
+                    console.set_shift_tab_modes(modes)?;
+                }
+                Selection::OutputStyle { .. } => {
                     let style = *OutputStyle::ALL
                         .get(index.unwrap())
                         .ok_or("output style option does not exist")?;
@@ -3088,7 +3173,7 @@ impl Menus {
                         .ok_or("cannot save the output style because the user settings directory is unavailable")?
                         .save_output_style(style)
                         .map_err(|error| error.to_string())?;
-                    self.settings(agent, console, target).await?;
+                    console.write(&format!("Output style: {}\n", style.label()))?;
                 }
                 Selection::GlyphSet { target, font_action } => {
                     let selected = index.unwrap();
@@ -3109,7 +3194,7 @@ impl Menus {
                         let mut preferences = console.display_preferences()?;
                         preferences.glyph_set = glyph_set;
                         self.save_display_preferences(console, preferences)?;
-                        self.settings(agent, console, target).await?;
+                        console.write(&format!("Glyph Set: {}\n", glyph_set.label()))?;
                     }
                     Some(1) => self.glyph_sets_with_focus(console, target, GlyphSet::ALL.into_iter().position(|candidate| candidate == glyph_set)).await?,
                     _ => return Err("glyph confirmation option does not exist".into()),
@@ -3150,7 +3235,6 @@ impl Menus {
                         "Execution mode: {mode}. Explicit deny rules remain effective.{}\n",
                         change.staged_note()
                     ))?;
-                    self.settings(agent, console, target).await?;
                 }
                 Selection::PermissionMode {
                     target: ConfigTarget::NewDraft,
@@ -3411,6 +3495,7 @@ fn request_kind_label(kind: ModelRequestKind) -> &'static str {
         ModelRequestKind::PermissionCheck => "Permission checks",
         ModelRequestKind::WebFetch => "WebFetch",
         ModelRequestKind::Title => "Chat titles",
+        ModelRequestKind::ShellDescription => "Shell descriptions",
         ModelRequestKind::AutoSetup => "Auto setup",
     }
 }

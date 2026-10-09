@@ -21,6 +21,9 @@ use super::{
 const TAB_COLUMNS: usize = 4;
 const DEFAULT_WIDTH: usize = 80;
 const DEFAULT_HEIGHT: usize = 22;
+/// Rows of a `⎿` response wrap under its content: two spaces, `⎿` and two spaces.
+const RESPONSE_HANG: usize = 5;
+const EXPAND_HINT: &str = " (ctrl+o to expand)";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ScrollAction {
@@ -75,6 +78,8 @@ pub(super) enum ToolCallState {
     Queued,
     Running,
     Finished,
+    /// Finished with an error result, including a call the user declined.
+    Failed,
     Stopped,
 }
 
@@ -83,14 +88,23 @@ impl ToolCallState {
         match self {
             Self::Queued => Self::Stopped,
             Self::Running => Self::Finished,
-            Self::Finished | Self::Stopped => self,
+            Self::Finished | Self::Failed | Self::Stopped => self,
         }
     }
     pub(super) fn suffix(self) -> &'static str {
         match self {
             Self::Queued => " · Queued",
             Self::Stopped => " · Stopped",
-            Self::Running | Self::Finished => "",
+            Self::Running | Self::Finished | Self::Failed => "",
+        }
+    }
+    /// The colour of the call's `⏺`, as Claude Code's `ToolUseLoader` paints it: muted until a
+    /// result arrives, then the success or the error colour.
+    fn dot_role(self) -> Role {
+        match self {
+            Self::Queued | Self::Running | Self::Stopped => Role::MutedText,
+            Self::Finished => Role::Success,
+            Self::Failed => Role::Error,
         }
     }
 }
@@ -98,8 +112,27 @@ impl ToolCallState {
 struct ToolCallHeader {
     run_id: Uuid,
     line: usize,
+    /// Where the call's next result row goes: under its header and the result rows it has.
+    results_end: usize,
     spans: Vec<(String, Option<Role>)>,
     state: ToolCallState,
+    /// What a read or search call adds to the collapsed group it joined.
+    collapse: Option<(CollapsedCall, usize)>,
+}
+
+/// A call that reads or searches. Consecutive ones share one collapsed row, as Claude Code's
+/// `CollapsedReadSearchContent` sums them up; Ctrl+O shows each of them.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum CollapsedCall {
+    Search,
+    Read { path: String },
+}
+
+/// One collapsed row standing for consecutive read and search calls.
+struct CollapsedGroup {
+    line: usize,
+    /// The `⏺ ` shown while one of its calls still works.
+    lead: String,
 }
 
 /// An assistant reply held as Markdown source and laid out again for each
@@ -168,6 +201,8 @@ pub(super) struct Scrollback {
     /// part of the logical lines, so it disappears once cleared.
     activity: Option<RoleLine>,
     activity_details: Vec<RoleLine>,
+    /// The latest output of a running `!` command, drawn under its echo until it ends.
+    shell_preview: Vec<RoleLine>,
     /// Header lines of tool calls still executing, by call id.
     running_tool_calls: HashMap<String, usize>,
     tool_call_headers: HashMap<String, ToolCallHeader>,
@@ -176,6 +211,9 @@ pub(super) struct Scrollback {
     /// Logical lines of each input echo, oldest first.
     inputs: Vec<(u64, Range<usize>)>,
     next_input: u64,
+    groups: Vec<CollapsedGroup>,
+    /// The collapsed group that ends the conversation, which the next read or search joins.
+    open_group: Option<usize>,
 }
 
 impl Default for Scrollback {
@@ -196,12 +234,15 @@ impl Default for Scrollback {
             unread: 0,
             activity: None,
             activity_details: Vec::new(),
+            shell_preview: Vec::new(),
             running_tool_calls: HashMap::new(),
             tool_call_headers: HashMap::new(),
             running_shimmer: RunningShimmer::default(),
             completion_notice: None,
             inputs: Vec::new(),
             next_input: 0,
+            groups: Vec::new(),
+            open_group: None,
         }
     }
 }
@@ -278,6 +319,7 @@ impl Scrollback {
         if text.is_empty() {
             return;
         }
+        self.open_group = None;
         if self.last_line_is_markdown() && !text.starts_with('\n') {
             self.start_line();
         }
@@ -303,20 +345,38 @@ impl Scrollback {
         self.close_segment(segment_start, role, link);
     }
 
+    /// [`Self::append_span`] with every line that receives text wrapping its continuation rows
+    /// under column `hang`, as Claude Code's message boxes indent wrapped content.
+    pub(super) fn append_hanging(
+        &mut self,
+        text: &str,
+        role: Option<Role>,
+        fill: Option<Role>,
+        link: Option<&Hyperlink>,
+        hang: usize,
+    ) {
+        let starts_line = text.starts_with('\n') || self.last_line_is_markdown();
+        let first_line = self.lines.len() - 1 + usize::from(starts_line);
+        self.append_span(text, role, fill, link);
+        if hang == 0 {
+            return;
+        }
+        let last_line = self.lines.len() - usize::from(text.ends_with('\n'));
+        for style in &mut self.line_styles[first_line.min(last_line)..last_line] {
+            style.hang = hang;
+        }
+    }
+
     /// Appends Markdown reply text. The text extends the reply on the last
     /// line unless `starts_message` is set or something else was written since,
-    /// in which case a new reply starts with `lead` in front of it.
+    /// in which case a new reply block starts with `lead` in front of it.
     pub(super) fn append_markdown(&mut self, text: &str, lead: &str, starts_message: bool) {
         if text.is_empty() {
             return;
         }
-        let continues_reply = !starts_message && self.last_line_is_markdown();
-        if !continues_reply {
-            if !self.lines.last().unwrap().is_empty() || self.last_line_is_markdown() {
-                self.start_line();
-            }
-            self.line_styles.last_mut().unwrap().markdown =
-                Some(Box::new(MarkdownBlock::new(lead)));
+        if starts_message || !self.last_line_is_markdown() {
+            self.start_block();
+            self.begin_markdown(lead);
         }
         self.mark_last_line_dirty();
         let block = self
@@ -329,22 +389,145 @@ impl Scrollback {
         block.source.push_str(text);
     }
 
-    /// Appends a run's completion notice, which must begin with a newline, and
-    /// hides the previous one so only the latest completion stays visible. The
-    /// empty line the notice closes is hidden with it, keeping the spacing a
-    /// conversation without notices would have.
+    /// Starts a reply laid out as Markdown behind `lead` on the line below, with no blank row
+    /// above it; [`Self::append_markdown`] extends it.
+    pub(super) fn begin_markdown(&mut self, lead: &str) {
+        if !self.lines.last().unwrap().is_empty() || self.last_line_is_markdown() {
+            self.start_line();
+        }
+        self.mark_last_line_dirty();
+        self.line_styles.last_mut().unwrap().markdown = Some(Box::new(MarkdownBlock::new(lead)));
+    }
+
+    /// Appends a run's completion notice as a block of its own and hides the previous one, so
+    /// only the latest completion stays visible.
     pub(super) fn append_completion_notice(&mut self, spans: &[(String, Option<Role>)]) {
         self.hide_completion_notice();
-        let last_line = self.lines.len() - 1;
-        let first_line = if self.lines[last_line].is_empty() && !self.last_line_is_markdown() {
-            last_line
-        } else {
-            last_line + 1
-        };
+        self.start_block();
+        let first_line = self.lines.len() - 1;
         for (text, role) in spans {
             self.append_as(text, *role, None);
         }
-        self.completion_notice = Some(first_line..self.lines.len() - 1);
+        let end = self.lines.len() - usize::from(self.lines.last().unwrap().is_empty());
+        self.completion_notice = Some(first_line..end.max(first_line));
+    }
+
+    /// Starts a block: later text begins on a line of its own with exactly one blank row above
+    /// it, as Claude Code gives every message a top margin, whatever hidden lines lie between it
+    /// and the visible content above.
+    pub(super) fn start_block(&mut self) {
+        self.open_group = None;
+        self.separate_block();
+    }
+
+    /// Appends `text` as a block that leaves an open read or search group open, as Claude Code
+    /// lets a thinking block pass a collapsed group without ending it.
+    pub(super) fn append_aside(&mut self, text: &str, role: Option<Role>) {
+        let open_group = self.open_group;
+        self.separate_block();
+        self.append_as(text, role, None);
+        self.open_group = open_group;
+    }
+
+    fn separate_block(&mut self) {
+        if !self.lines.last().unwrap().is_empty() || self.last_line_is_markdown() {
+            self.start_line();
+        }
+        let open_line = self.lines.len() - 1;
+        let follows_blank = self.lines[..open_line]
+            .iter()
+            .zip(&self.line_styles[..open_line])
+            .rev()
+            .find(|(_, style)| !style.hidden)
+            .is_some_and(|(text, style)| is_blank_line(text, style));
+        if !follows_blank {
+            self.start_line();
+        }
+    }
+
+    /// Appends `⎿` response rows at the end of the conversation, each wrapping under its
+    /// content.
+    pub(super) fn append_response(&mut self, runs: &[(String, Option<Role>)]) {
+        let first_line = self.lines.len() - 1 + usize::from(self.last_line_is_markdown());
+        for (text, role) in runs {
+            self.append_linked_runs(text, *role);
+        }
+        let last_line = self.lines.len() - usize::from(self.lines.last().unwrap().is_empty());
+        for style in &mut self.line_styles[first_line.min(last_line)..last_line] {
+            style.hang = RESPONSE_HANG;
+        }
+    }
+
+    /// Text whose error runs open the web addresses they name.
+    fn append_linked_runs(&mut self, text: &str, role: Option<Role>) {
+        if role == Some(Role::Error) {
+            let links = super::hyperlink::web_links(text);
+            for (run, link) in super::hyperlink::runs(text, &links) {
+                self.append_span(run, role, None, link);
+            }
+        } else {
+            self.append_as(text, role, None);
+        }
+    }
+
+    /// Draws a call's result under the call's own row and the result rows it already has, so
+    /// parallel calls each keep their results. A result of a collapsed read or search shows only
+    /// in the detailed transcript; one whose call is not shown goes to the end.
+    pub(super) fn append_tool_result(&mut self, call_id: &str, runs: &[(String, Option<Role>)]) {
+        let Some(header) = self.tool_call_headers.get(call_id) else {
+            self.append_response(runs);
+            return;
+        };
+        if header.collapse.is_some() {
+            return;
+        }
+        let at = header.results_end;
+        let mut result = Scrollback::new();
+        result.append_response(runs);
+        if result.lines.last().is_some_and(String::is_empty) && result.lines.len() > 1 {
+            result.lines.pop();
+            result.line_styles.pop();
+        }
+        self.insert_lines(at, result.lines, result.line_styles);
+    }
+
+    /// Inserts logical lines before line `at`, moving every recorded line position behind it.
+    fn insert_lines(&mut self, at: usize, lines: Vec<String>, styles: Vec<LineStyle>) {
+        let count = lines.len();
+        if count == 0 {
+            return;
+        }
+        let shift = |line: &mut usize| {
+            if *line >= at {
+                *line += count;
+            }
+        };
+        for header in self.tool_call_headers.values_mut() {
+            shift(&mut header.line);
+            shift(&mut header.results_end);
+        }
+        for line in self.running_tool_calls.values_mut() {
+            shift(line);
+        }
+        for group in &mut self.groups {
+            shift(&mut group.line);
+        }
+        let shift_range = |range: &mut Range<usize>| {
+            if range.start >= at {
+                range.start += count;
+                range.end += count;
+            }
+        };
+        if let Some(notice) = &mut self.completion_notice {
+            shift_range(notice);
+        }
+        for (_, range) in &mut self.inputs {
+            shift_range(range);
+        }
+        shift(&mut self.anchor.line);
+        self.lines.splice(at..at, lines);
+        self.line_styles.splice(at..at, styles);
+        self.dirty_from = Some(self.dirty_from.map_or(at, |existing| existing.min(at)));
     }
 
     /// Hides the latest completion notice, as when another run starts.
@@ -435,48 +618,67 @@ impl Scrollback {
         );
     }
 
+    /// Shows a call's row in `state`, adding it as a block when the call is new. A read or
+    /// search (`collapse`) joins the collapsed group that ends the conversation, or starts one.
     pub(super) fn set_tool_call(
         &mut self,
         run_id: Uuid,
         call_id: &str,
         spans: &[(String, Option<Role>)],
         state: ToolCallState,
+        collapse: Option<CollapsedCall>,
     ) {
-        let header_line = if let Some(header) = self.tool_call_headers.get(call_id) {
-            header.line
-        } else {
-            self.append("\n");
-            let line = self.lines.len() - 1;
-            self.append("\n");
-            line
+        let existing = self
+            .tool_call_headers
+            .get(call_id)
+            .map(|header| (header.line, header.results_end, header.collapse.clone()));
+        let (header_line, results_end, collapse) = match existing {
+            Some(existing) => existing,
+            None => match collapse {
+                Some(call) => {
+                    let group = self.open_group.unwrap_or_else(|| self.start_group(spans));
+                    let line = self.groups[group].line;
+                    (line, line + 1, Some((call, group)))
+                }
+                None => {
+                    let line = self.start_block_line();
+                    (line, line + 1, None)
+                }
+            },
         };
-        let line = &mut self.lines[header_line];
-        line.clear();
-        let style = &mut self.line_styles[header_line];
-        *style = LineStyle::default();
-        for (text, role) in spans.iter().chain(std::iter::once(&(
-            state.suffix().into(),
-            Some(Role::MutedText),
-        ))) {
-            let start = line.len();
-            line.push_str(text.trim_matches('\n'));
-            if let Some(role) = role {
-                style.marks.push((start..line.len(), *role));
-            }
-        }
-        self.dirty_from = Some(
-            self.dirty_from
-                .map_or(header_line, |existing| existing.min(header_line)),
-        );
         self.tool_call_headers.insert(
             call_id.to_owned(),
             ToolCallHeader {
                 run_id,
                 line: header_line,
+                results_end,
                 spans: spans.to_vec(),
                 state,
+                collapse: collapse.clone(),
             },
         );
+        if let Some((_, group)) = collapse {
+            self.running_tool_calls.remove(call_id);
+            self.draw_group(group);
+            return;
+        }
+        // The first styled span is the call's `⏺`; its colour follows the state.
+        let dot = spans.iter().position(|(_, role)| role.is_some());
+        let header_spans: Vec<_> = spans
+            .iter()
+            .map(|(text, role)| (text.trim_matches('\n'), *role))
+            .chain(std::iter::once((state.suffix(), Some(Role::MutedText))))
+            .enumerate()
+            .map(|(index, (text, role))| {
+                let role = if Some(index) == dot {
+                    Some(state.dot_role())
+                } else {
+                    role
+                };
+                (text, role)
+            })
+            .collect();
+        self.set_line(header_line, &header_spans);
         if state == ToolCallState::Running {
             self.running_tool_calls
                 .insert(call_id.to_owned(), header_line);
@@ -486,14 +688,125 @@ impl Scrollback {
         }
     }
 
-    pub(super) fn finish_tool_call(&mut self, run_id: Uuid, call_id: &str) {
+    /// Starts a block of one line, set later, and returns the line.
+    fn start_block_line(&mut self) -> usize {
+        self.start_block();
+        let line = self.lines.len() - 1;
+        self.start_line();
+        line
+    }
+
+    /// Adds a collapsed group as a new block led by the call's `⏺`.
+    fn start_group(&mut self, spans: &[(String, Option<Role>)]) -> usize {
+        let line = self.start_block_line();
+        let lead = spans
+            .iter()
+            .find(|(_, role)| role.is_some())
+            .map_or_else(String::new, |(text, _)| text.trim_matches('\n').to_owned());
+        self.groups.push(CollapsedGroup { line, lead });
+        self.open_group = Some(self.groups.len() - 1);
+        self.groups.len() - 1
+    }
+
+    /// Redraws a collapsed group's row from its calls: present tense behind a `⏺` while one of
+    /// them works, past tense and muted once all are done.
+    fn draw_group(&mut self, group: usize) {
+        let members: Vec<_> = self
+            .tool_call_headers
+            .values()
+            .filter_map(|header| {
+                let (call, member_group) = header.collapse.as_ref()?;
+                (*member_group == group).then_some((call, header.state))
+            })
+            .collect();
+        let active = members
+            .iter()
+            .any(|(_, state)| matches!(state, ToolCallState::Queued | ToolCallState::Running));
+        let failed = members
+            .iter()
+            .any(|(_, state)| *state == ToolCallState::Failed);
+        let searches = members
+            .iter()
+            .filter(|(call, _)| **call == CollapsedCall::Search)
+            .count();
+        let reads = members
+            .iter()
+            .filter_map(|(call, _)| match call {
+                CollapsedCall::Read { path } => Some(path.as_str()),
+                CollapsedCall::Search => None,
+            })
+            .collect::<HashSet<_>>()
+            .len();
+        let (text_role, count_role) = if active {
+            (None, Some(Role::Strong))
+        } else {
+            (Some(Role::MutedText), Some(Role::MutedStrong))
+        };
+        let mut spans: Vec<(String, Option<Role>)> = if active {
+            let dot = if failed { Role::Error } else { Role::MutedText };
+            vec![(self.groups[group].lead.clone(), Some(dot))]
+        } else {
+            vec![("  ".into(), None)]
+        };
+        for (count, verbs, noun) in [
+            (searches, ["Searching for", "Searched for"], "pattern"),
+            (reads, ["Reading", "Read"], "file"),
+        ] {
+            if count == 0 {
+                continue;
+            }
+            let verb = verbs[usize::from(!active)];
+            let verb = if spans.len() == 1 {
+                format!("{verb} ")
+            } else {
+                format!(", {} ", verb.to_lowercase())
+            };
+            let plural = if count == 1 { "" } else { "s" };
+            spans.push((verb, text_role));
+            spans.push((count.to_string(), count_role));
+            spans.push((format!(" {noun}{plural}"), text_role));
+        }
+        if active {
+            spans.push(("…".into(), text_role));
+        }
+        spans.push((EXPAND_HINT.into(), Some(Role::MutedText)));
+        let line = self.groups[group].line;
+        let spans: Vec<_> = spans
+            .iter()
+            .map(|(text, role)| (text.as_str(), *role))
+            .collect();
+        self.set_line(line, &spans);
+    }
+
+    /// Replaces line `line` with `spans`.
+    fn set_line(&mut self, line: usize, spans: &[(&str, Option<Role>)]) {
+        let text = &mut self.lines[line];
+        text.clear();
+        let style = &mut self.line_styles[line];
+        *style = LineStyle::default();
+        for (span, role) in spans {
+            let start = text.len();
+            text.push_str(span);
+            if let Some(role) = role {
+                style.marks.push((start..text.len(), *role));
+            }
+        }
+        self.dirty_from = Some(self.dirty_from.map_or(line, |existing| existing.min(line)));
+    }
+
+    pub(super) fn finish_tool_call(&mut self, run_id: Uuid, call_id: &str, failed: bool) {
         if let Some(header) = self
             .tool_call_headers
             .get(call_id)
             .filter(|header| header.run_id == run_id)
         {
             let spans = header.spans.clone();
-            self.set_tool_call(run_id, call_id, &spans, ToolCallState::Finished);
+            let state = if failed {
+                ToolCallState::Failed
+            } else {
+                ToolCallState::Finished
+            };
+            self.set_tool_call(run_id, call_id, &spans, state, None);
         }
     }
 
@@ -508,7 +821,7 @@ impl Scrollback {
             })
             .collect();
         for (id, spans, state) in unfinished {
-            self.set_tool_call(run_id, &id, &spans, state);
+            self.set_tool_call(run_id, &id, &spans, state, None);
         }
     }
 
@@ -523,6 +836,15 @@ impl Scrollback {
 
     pub(super) fn set_activity_details(&mut self, details: Vec<RoleLine>) {
         self.activity_details = details;
+    }
+
+    /// Returns whether the running command's preview changed.
+    pub(super) fn set_shell_preview(&mut self, rows: Vec<RoleLine>) -> bool {
+        if self.shell_preview == rows {
+            return false;
+        }
+        self.shell_preview = rows;
+        true
     }
 
     pub(super) fn remap_display(&mut self, previous: DisplayProfile, next: DisplayProfile) {
@@ -542,12 +864,21 @@ impl Scrollback {
             block.row_counts.clear();
         }
         let previous_call_glyph = format!("{} ", previous.glyph(Glyph::ToolCall));
+        let next_call_glyph = format!("{} ", next.glyph(Glyph::ToolCall));
         for header in self.tool_call_headers.values_mut() {
             for (text, role) in &mut header.spans {
                 if *role == Some(Role::MutedText) && *text == previous_call_glyph {
-                    *text = format!("{} ", next.glyph(Glyph::ToolCall));
+                    text.clone_from(&next_call_glyph);
                 }
             }
+        }
+        for group in &mut self.groups {
+            if group.lead == previous_call_glyph {
+                group.lead.clone_from(&next_call_glyph);
+            }
+        }
+        for group in 0..self.groups.len() {
+            self.draw_group(group);
         }
         for (line, style) in self.lines.iter_mut().zip(&mut self.line_styles) {
             remap_prefix(
@@ -643,6 +974,7 @@ impl Scrollback {
             style.hang = block.hang;
         }
         self.line_styles.push(style);
+        self.mark_last_line_dirty();
     }
 
     fn close_segment(&mut self, start: usize, role: Option<Role>, link: Option<&Hyperlink>) {
@@ -684,8 +1016,8 @@ impl Scrollback {
             self.unread = 0;
         }
         let running_tool_rows = self.running_tool_rows();
-        let styled: Vec<RoleLine> = self
-            .rows
+        let conversation_rows = self.conversation_rows();
+        let styled: Vec<RoleLine> = self.rows[..conversation_rows]
             .iter()
             .enumerate()
             .map(|(index, row)| {
@@ -706,7 +1038,7 @@ impl Scrollback {
                 }
                 styled
             })
-            .chain(self.activity_rows())
+            .chain(self.tail_rows())
             .skip(top)
             .take(height)
             .collect();
@@ -718,21 +1050,42 @@ impl Scrollback {
         }
     }
 
-    fn activity_rows(&self) -> Vec<RoleLine> {
-        if self.activity.is_none() && self.activity_details.is_empty() {
-            return Vec::new();
+    /// Rows of the conversation itself, without the blank rows that end it.
+    fn conversation_rows(&self) -> usize {
+        self.rows
+            .iter()
+            .rposition(|row| !row.is_blank())
+            .map_or(0, |last| last + 1)
+    }
+
+    /// The rows below the conversation: a running command's output under its echo, the live
+    /// activity and its details as a block of their own, then the blank row that keeps everything
+    /// above clear of the input.
+    fn tail_rows(&self) -> Vec<RoleLine> {
+        let mut rows: Vec<RoleLine> = self
+            .shell_preview
+            .iter()
+            .map(|row| {
+                let mut row = row.clone();
+                row.truncate(self.width);
+                row
+            })
+            .collect();
+        let has_conversation = self.conversation_rows() > 0 || !rows.is_empty();
+        if self.activity.is_some() || !self.activity_details.is_empty() {
+            if has_conversation {
+                rows.push(RoleLine::default());
+            }
+            if let Some(activity) = &self.activity {
+                let mut activity = activity.clone();
+                activity.truncate(self.width);
+                rows.push(activity);
+            }
+            rows.extend(self.activity_details.clone());
         }
-        let separated = self.rows.last().is_none_or(|row| row.text.is_empty());
-        let mut rows = Vec::with_capacity(2);
-        if !separated {
+        if has_conversation || !rows.is_empty() {
             rows.push(RoleLine::default());
         }
-        if let Some(activity) = &self.activity {
-            let mut activity = activity.clone();
-            activity.truncate(self.width);
-            rows.push(activity);
-        }
-        rows.extend(self.activity_details.clone());
         rows
     }
 
@@ -746,7 +1099,7 @@ impl Scrollback {
     }
 
     fn row_count(&self) -> usize {
-        self.rows.len() + self.activity_rows().len()
+        self.conversation_rows() + self.tail_rows().len()
     }
 
     fn running_tool_rows(&self) -> HashSet<usize> {
@@ -859,10 +1212,25 @@ impl Scrollback {
                 if line == first_line {
                     self.rows.truncate(first_row);
                 }
-                wrap_line(&mut self.rows, text, style, line, self.width);
+                // One blank row separates blocks, however many blank lines lie between them.
+                let repeats_blank =
+                    is_blank_line(text, style) && self.rows.last().is_some_and(Row::is_blank);
+                if !repeats_blank {
+                    wrap_line(&mut self.rows, text, style, line, self.width);
+                }
             }
         }
     }
+}
+
+impl Row {
+    fn is_blank(&self) -> bool {
+        self.text.is_empty() && self.styled.fill.is_none()
+    }
+}
+
+fn is_blank_line(text: &str, style: &LineStyle) -> bool {
+    text.is_empty() && style.markdown.is_none() && style.fill.is_none()
 }
 
 fn remap_prefix(
@@ -1011,9 +1379,15 @@ fn split_overflow(line: &MarkdownLine, width: usize) -> Vec<Vec<(String, Option<
 /// Maps Markdown semantics onto roles; `docs/design/agent-ui.md` records the
 /// precedence when a run carries several marks.
 fn markdown_role(marks: Marks) -> Option<Role> {
-    if marks.quote_bar {
+    if let Some(token) = marks.code {
+        Some(Role::code(token))
+    } else if marks.quote_bar {
         Some(Role::QuoteBar)
-    } else if marks.inline_code || marks.link {
+    } else if marks.link {
+        Some(Role::Link)
+    } else if marks.inline_code && (marks.strong || marks.heading.is_some()) {
+        Some(Role::StrongCode)
+    } else if marks.inline_code {
         Some(Role::Permission)
     } else if marks.heading == Some(1) {
         Some(Role::Heading)
@@ -1030,19 +1404,24 @@ fn markdown_role(marks: Marks) -> Option<Role> {
     }
 }
 
-fn wrap_line(rows: &mut Vec<Row>, text: &str, style: &LineStyle, line: usize, width: usize) {
-    let hang = if style.hang < width { style.hang } else { 0 };
-    let mut start = Position {
-        line,
-        byte: 0,
-        tab_cell: 0,
-    };
-    let mut output = String::new();
-    let mut styled = RoleLine {
-        fill: style.fill,
-        ..Default::default()
-    };
-    let mut columns = 0;
+/// One display cell of a logical line: a character, or one column of an expanded tab.
+struct Cell<'a> {
+    byte: usize,
+    tab_cell: usize,
+    character: char,
+    width: usize,
+    role: Option<Role>,
+    link: Option<&'a Hyperlink>,
+}
+
+impl Cell<'_> {
+    fn is_space(&self) -> bool {
+        self.character == ' '
+    }
+}
+
+fn line_cells<'a>(text: &str, style: &'a LineStyle, width: usize) -> Vec<Cell<'a>> {
+    let mut cells = Vec::with_capacity(text.len());
     let mut logical_column = 0;
     let mut marks = style.marks.iter().peekable();
     let mut links = style.links.iter().peekable();
@@ -1061,42 +1440,26 @@ fn wrap_line(rows: &mut Vec<Row>, text: &str, style: &LineStyle, line: usize, wi
             .peek()
             .filter(|(range, _)| range.contains(&byte))
             .map(|(_, link)| link);
-        let cells = if character == '\t' {
+        let cells_of_character = if character == '\t' {
             TAB_COLUMNS - logical_column % TAB_COLUMNS
         } else {
             1
         };
-        for tab_cell in 0..cells {
+        for tab_cell in 0..cells_of_character {
             let displayed = if character == '\t' { ' ' } else { character };
             let displayed = if displayed.width().unwrap_or(0) > width {
                 '�'
             } else {
                 displayed
             };
-            let character_width = displayed.width().unwrap_or(0);
-            if columns > 0 && columns + character_width > width {
-                rows.push(Row {
-                    start,
-                    text: std::mem::take(&mut output),
-                    styled: std::mem::take(&mut styled),
-                });
-                styled.fill = style.fill;
-                start = Position {
-                    line,
-                    byte,
-                    tab_cell,
-                };
-                columns = 0;
-                if hang > 0 && character_width + hang <= width {
-                    let indent = " ".repeat(hang);
-                    output.push_str(&indent);
-                    styled.push(indent, None);
-                    columns = hang;
-                }
-            }
-            output.push(displayed);
-            styled.push_linked(displayed.to_string(), role, link.cloned());
-            columns += character_width;
+            cells.push(Cell {
+                byte,
+                tab_cell,
+                character: displayed,
+                width: displayed.width().unwrap_or(0),
+                role,
+                link,
+            });
             logical_column += if character == '\t' {
                 1
             } else {
@@ -1104,9 +1467,132 @@ fn wrap_line(rows: &mut Vec<Row>, text: &str, style: &LineStyle, line: usize, wi
             };
         }
     }
+    cells
+}
+
+/// Lays one logical line out in rows of `width` columns. Rows break between words where they
+/// can, and wrapped rows start `hang` columns in, under the line's content; a break never falls
+/// inside that hanging lead. A word longer than a row breaks between characters.
+fn wrap_line(rows: &mut Vec<Row>, text: &str, style: &LineStyle, line: usize, width: usize) {
+    let hang = if style.hang < width { style.hang } else { 0 };
+    let cells = line_cells(text, style, width);
+    let mut row_start = 0;
+    let mut indent = 0;
+    let mut columns = 0;
+    // The first cell of the latest word in this row that follows a space past the hang.
+    let mut word_start: Option<usize> = None;
+    let mut after_word = false;
+    let mut after_space = false;
+    let mut index = 0;
+    let mut pushed = false;
+    while index < cells.len() {
+        let cell = &cells[index];
+        if columns > indent && columns + cell.width > width {
+            let (row_end, next) = if cell.is_space() {
+                let next = cells[index..]
+                    .iter()
+                    .position(|cell| !cell.is_space())
+                    .map_or(cells.len(), |offset| index + offset);
+                (index, next)
+            } else if let Some(word) = word_start.filter(|word| *word > row_start) {
+                (word, word)
+            } else {
+                (index, index)
+            };
+            let row_end = trim_trailing_spaces(&cells, row_start, row_end);
+            push_row(
+                rows,
+                &cells[row_start..row_end],
+                indent,
+                style,
+                line,
+                row_start == 0,
+            );
+            pushed = true;
+            if next >= cells.len() {
+                return;
+            }
+            row_start = next;
+            indent = if hang > 0 && cells[next].width + hang <= width {
+                hang
+            } else {
+                0
+            };
+            columns = indent
+                + cells[next..index.max(next)]
+                    .iter()
+                    .map(|cell| cell.width)
+                    .sum::<usize>();
+            word_start = None;
+            after_word = cells[next..index.max(next)]
+                .iter()
+                .any(|cell| !cell.is_space());
+            after_space = false;
+            index = index.max(next);
+            continue;
+        }
+        if cell.is_space() {
+            after_space = after_word;
+        } else {
+            if after_space && columns > hang {
+                word_start = Some(index);
+            }
+            after_space = false;
+            after_word = true;
+        }
+        columns += cell.width;
+        index += 1;
+    }
+    if row_start < cells.len() || !pushed {
+        push_row(
+            rows,
+            &cells[row_start..],
+            indent,
+            style,
+            line,
+            row_start == 0,
+        );
+    }
+}
+
+fn trim_trailing_spaces(cells: &[Cell], start: usize, end: usize) -> usize {
+    cells[start..end]
+        .iter()
+        .rposition(|cell| !cell.is_space())
+        .map_or(start, |last| start + last + 1)
+}
+
+fn push_row(
+    rows: &mut Vec<Row>,
+    cells: &[Cell],
+    indent: usize,
+    style: &LineStyle,
+    line: usize,
+    starts_line: bool,
+) {
+    let start = match cells.first() {
+        Some(cell) if !starts_line => Position {
+            line,
+            byte: cell.byte,
+            tab_cell: cell.tab_cell,
+        },
+        _ => Position {
+            line,
+            byte: 0,
+            tab_cell: 0,
+        },
+    };
+    let mut styled = RoleLine {
+        fill: style.fill,
+        ..Default::default()
+    };
+    styled.push(" ".repeat(indent), None);
+    for cell in cells {
+        styled.push_linked(cell.character.to_string(), cell.role, cell.link.cloned());
+    }
     rows.push(Row {
         start,
-        text: output,
+        text: styled.text(),
         styled,
     });
 }
@@ -1129,7 +1615,7 @@ mod tests {
         scrollback.append_as("tool", Some(Role::ToolName), None);
         scrollback.append("(x)\nnext");
         let frame = scrollback.frame(40, 5);
-        assert_eq!(frame.lines, ["plain tool(x)", "next"]);
+        assert_eq!(frame.lines, ["plain tool(x)", "next", ""]);
         assert_eq!(
             roles_of(&frame.styled[0]),
             [
@@ -1164,6 +1650,7 @@ mod tests {
                 "\u{f1064} tool",
                 "  \u{f060c} result",
                 "\u{f05e1} Done",
+                "",
             ]
         );
         let before_reduced_motion = scrollback.frame(80, 8).lines;
@@ -1194,9 +1681,9 @@ mod tests {
                 .collect::<Vec<_>>()
         };
 
-        assert_eq!(scrollback.frame(40, 5).lines, ["❯ see [Image #1] now"]);
+        assert_eq!(scrollback.frame(40, 5).lines, ["❯ see [Image #1] now", ""]);
         assert_eq!(linked_text(&mut scrollback, 40), ["[Image #1]"]);
-        assert_eq!(linked_text(&mut scrollback, 12), ["[Image", " #1]"]);
+        assert_eq!(linked_text(&mut scrollback, 12), ["[Image", "#1]"]);
 
         let nerd_font = DisplayProfile::new(tickloop_agent_config::DisplayPreferences {
             glyph_set: tickloop_agent_config::GlyphSet::NerdFont,
@@ -1214,8 +1701,8 @@ mod tests {
         scrollback.append("after");
         let frame = scrollback.frame(40, 6);
         let fills: Vec<_> = frame.styled.iter().map(|line| line.fill).collect();
-        assert_eq!(frame.lines, ["before", "", "❯ hi", "after"]);
-        assert_eq!(fills, [None, None, Some(Role::UserMessageBg), None]);
+        assert_eq!(frame.lines, ["before", "", "❯ hi", "after", ""]);
+        assert_eq!(fills, [None, None, Some(Role::UserMessageBg), None, None]);
     }
 
     #[test]
@@ -1227,7 +1714,7 @@ mod tests {
         scrollback.end_block();
         scrollback.append("\nout");
         let frame = scrollback.frame(6, 6);
-        assert_eq!(frame.lines, ["⏺ abcd", "  efgh", "  ij", "out"]);
+        assert_eq!(frame.lines, ["⏺ abcd", "  efgh", "  ij", "out", ""]);
     }
 
     #[test]
@@ -1249,7 +1736,8 @@ mod tests {
                 "  粗体 与 code",
                 "  wraps onto",
                 "  more rows",
-                "✓ Done"
+                "✓ Done",
+                ""
             ]
         );
         assert_eq!(
@@ -1269,17 +1757,22 @@ mod tests {
         assert_eq!(
             scrollback.frame(40, 10).lines,
             [
+                "",
                 "⏺ ┌─────┬─────┐",
                 "  │  a  │  b  │",
                 "  ├─────┼─────┤",
                 "  │ 1   │ 2   │",
                 "  └─────┴─────┘",
+                "",
             ]
         );
-        assert_eq!(scrollback.frame(12, 10).lines, ["⏺ a: 1", "  b: 2"]);
+        assert_eq!(scrollback.frame(12, 10).lines, ["", "⏺ a: 1", "  b: 2", ""]);
         scrollback.append_markdown("second", "⏺ ", true);
         scrollback.append_markdown(" reply", "⏺ ", false);
-        assert_eq!(scrollback.frame(40, 10).lines[5..], ["⏺ second reply"]);
+        assert_eq!(
+            scrollback.frame(40, 10).lines[6..],
+            ["", "⏺ second reply", ""]
+        );
     }
 
     #[test]
@@ -1305,12 +1798,11 @@ mod tests {
             prefers_reduced_motion: false,
         });
         scrollback.remap_display(DisplayProfile::default(), nerd_font);
-        assert_eq!(scrollback.frame(20, 4).lines, ["\u{f06a9} reply"]);
+        assert_eq!(scrollback.frame(20, 4).lines, ["", "\u{f06a9} reply", ""]);
     }
 
     fn done_notice(usage: &str) -> Vec<(String, Option<Role>)> {
         vec![
-            ("\n".into(), None),
             ("✓ Done".into(), Some(Role::Success)),
             (format!(" · {usage}"), Some(Role::MutedText)),
             ("\n".into(), None),
@@ -1385,13 +1877,13 @@ mod tests {
         assert!(scrollback.set_activity(Some(RoleLine::role("✢ Working", Role::Accent))));
         assert!(!scrollback.set_activity(Some(RoleLine::role("✢ Working", Role::Accent))));
         let working = scrollback.frame(20, 5);
-        assert_eq!(working.lines, ["⏺ reply", "", "✢ Working"]);
-        assert_eq!(working.styled[0].spans[0].role, Some(Role::Text));
+        assert_eq!(working.lines, ["", "⏺ reply", "", "✢ Working", ""]);
+        assert_eq!(working.styled[1].spans[0].role, Some(Role::Text));
 
         scrollback.set_activity(None);
         let finished = scrollback.frame(20, 5);
-        assert_eq!(finished.lines, ["⏺ reply"]);
-        assert_eq!(finished.styled[0].spans[0].role, Some(Role::Text));
+        assert_eq!(finished.lines, ["", "⏺ reply", ""]);
+        assert_eq!(finished.styled[1].spans[0].role, Some(Role::Text));
     }
 
     #[test]
@@ -1408,21 +1900,22 @@ mod tests {
                 ("\n".into(), None),
             ],
             ToolCallState::Running,
+            None,
         );
         scrollback.append_as("  ⎿ output\n", Some(Role::MutedText), None);
         let running = scrollback.frame_with_motion(20, 5, true);
-        assert_eq!(running.lines, ["before", "⏺ Shell", "  ⎿ output", ""]);
+        assert_eq!(running.lines, ["before", "", "⏺ Shell", "  ⎿ output", ""]);
         assert!(
-            running.styled[1]
+            running.styled[2]
                 .spans
                 .iter()
                 .any(|span| span.role == Some(Role::RunningShade0))
         );
-        assert_eq!(running.styled[2].spans[0].role, Some(Role::MutedText));
+        assert_eq!(running.styled[3].spans[0].role, Some(Role::MutedText));
 
-        scrollback.finish_tool_call(Uuid::from_u128(1), "call");
+        scrollback.finish_tool_call(Uuid::from_u128(1), "call", false);
         assert_eq!(
-            scrollback.frame(20, 5).styled[1]
+            scrollback.frame(20, 5).styled[2]
                 .spans
                 .iter()
                 .find(|span| span.text == "Shell")
@@ -1442,7 +1935,7 @@ mod tests {
     fn all_logical_lines_remain_available_beyond_one_thousand_rows() {
         let mut scrollback = Scrollback::new();
         scrollback.append(&numbered_lines(1501));
-        assert_eq!(scrollback.frame(80, 4).lines.last().unwrap(), "row 1500");
+        assert_eq!(scrollback.frame(80, 4).lines[2], "row 1500");
         scrollback.scroll(ScrollAction::First);
         assert_eq!(
             scrollback.frame(80, 4).lines,
@@ -1463,11 +1956,11 @@ mod tests {
         scrollback.scroll(ScrollAction::First);
         assert_eq!(
             scrollback.frame(5, 10).lines,
-            ["abcde", "fghij", "中文", "tail"]
+            ["abcde", "fghij", "中文", "tail", ""]
         );
         assert_eq!(
             scrollback.frame(12, 10).lines,
-            ["abcdefghij", "中文", "tail"]
+            ["abcdefghij", "中文", "tail", ""]
         );
     }
 
@@ -1499,13 +1992,21 @@ mod tests {
         assert_eq!(scrollback.frame(4, 2).lines[0], "丙丁");
         assert_eq!(scrollback.frame(6, 2).lines, before.lines);
 
+        // The spaces of a tab the row wraps at are dropped, so the next row starts after it.
         let mut tabs = Scrollback::new();
         tabs.append("\t中文\n后续内容");
         tabs.frame(1, 2);
         tabs.scroll(ScrollAction::First);
         tabs.scroll(ScrollAction::HalfPageDown);
         let tab_anchor = tabs.anchor;
-        assert_eq!(tab_anchor.tab_cell, 1);
+        assert_eq!(
+            tab_anchor,
+            Position {
+                line: 0,
+                byte: 1,
+                tab_cell: 0
+            }
+        );
         tabs.frame(3, 2);
         tabs.frame(1, 2);
         assert_eq!(tabs.anchor, tab_anchor);
@@ -1528,7 +2029,10 @@ mod tests {
                 );
             }
         }
-        assert_eq!(scrollback.frame(20, 100).lines, ["中  文�[31m", "    尾"]);
+        assert_eq!(
+            scrollback.frame(20, 100).lines,
+            ["中  文�[31m", "    尾", ""]
+        );
         assert_eq!(scrollback.lines[0], "中\t文�[31m");
     }
 
@@ -1536,19 +2040,19 @@ mod tests {
     fn half_page_scroll_pauses_and_reaching_the_bottom_resumes() {
         let mut scrollback = Scrollback::new();
         scrollback.append(&numbered_lines(20));
-        assert_eq!(scrollback.frame(40, 6).lines[0], "row 14");
+        assert_eq!(scrollback.frame(40, 6).lines[0], "row 15");
         scrollback.scroll(ScrollAction::HalfPageUp);
         let paused = scrollback.frame(40, 6);
-        assert_eq!(paused.lines[0], "row 11");
+        assert_eq!(paused.lines[0], "row 12");
         assert!(!paused.following);
         scrollback.append("\nrow 20");
-        assert_eq!(scrollback.frame(40, 6).lines[0], "row 11");
+        assert_eq!(scrollback.frame(40, 6).lines[0], "row 12");
         scrollback.scroll(ScrollAction::HalfPageDown);
         assert!(!scrollback.frame(40, 6).following);
         scrollback.scroll(ScrollAction::HalfPageDown);
         assert!(scrollback.frame(40, 6).following);
         scrollback.append("\nrow 21");
-        assert_eq!(scrollback.frame(40, 6).lines.last().unwrap(), "row 21");
+        assert_eq!(scrollback.frame(40, 6).lines[4], "row 21");
     }
 
     #[test]
@@ -1582,15 +2086,15 @@ mod tests {
         scrollback.set_auto_scroll(false);
         assert!(!scrollback.auto_scroll());
         scrollback.append("\nrow 20");
-        assert_eq!(scrollback.frame(40, 4).lines[0], "row 16");
+        assert_eq!(scrollback.frame(40, 4).lines[0], "row 17");
         scrollback.scroll(ScrollAction::Last);
         let manual_bottom = scrollback.frame(40, 4);
-        assert_eq!(manual_bottom.lines.last().unwrap(), "row 20");
+        assert_eq!(manual_bottom.lines[2], "row 20");
         assert!(!manual_bottom.following);
         scrollback.append("\nrow 21");
         scrollback.note_message("new reply".into());
         let paused = scrollback.frame(40, 4);
-        assert_eq!(paused.lines, manual_bottom.lines);
+        assert_eq!(paused.lines[0], manual_bottom.lines[0]);
         assert_eq!(paused.unread, 1);
         scrollback.set_auto_scroll(true);
         assert!(!scrollback.frame(40, 4).following);
@@ -1608,7 +2112,7 @@ mod tests {
         scrollback.note_message("second".into());
         let visible = scrollback.frame(40, 6);
         assert_eq!(visible.unread, 0);
-        assert_eq!(visible.lines, ["first", "second"]);
+        assert_eq!(visible.lines, ["first", "second", ""]);
         assert!(!visible.following);
         assert!(!scrollback.auto_scroll());
         scrollback.set_auto_scroll(true);
@@ -1625,5 +2129,229 @@ mod tests {
         scrollback.append("\nrow 10");
         assert!(!scrollback.frame(20, 3).following);
         assert_eq!(scrollback.frame(20, 3).lines[0], "row 0");
+    }
+
+    fn call_spans(name: &str) -> Vec<(String, Option<Role>)> {
+        vec![
+            ("\n".into(), None),
+            ("⏺ ".into(), Some(Role::MutedText)),
+            (name.into(), Some(Role::ToolName)),
+            ("\n".into(), None),
+        ]
+    }
+
+    fn result(text: &str) -> Vec<(String, Option<Role>)> {
+        vec![
+            ("  ".into(), None),
+            ("⎿".into(), Some(Role::MutedText)),
+            ("  ".into(), None),
+            (format!("{text}\n"), None),
+        ]
+    }
+
+    fn echo(scrollback: &mut Scrollback, text: &str) -> InputEcho {
+        scrollback.start_block();
+        let first_line = scrollback.line_count() - 1;
+        scrollback.append_as(&format!("❯ {text}\n"), None, Some(Role::UserMessageBg));
+        scrollback.mark_input(first_line..scrollback.line_count() - 1)
+    }
+
+    #[test]
+    fn every_block_has_exactly_one_blank_row_above_it() {
+        let run = Uuid::from_u128(1);
+        let mut scrollback = Scrollback::new();
+        echo(&mut scrollback, "first");
+        scrollback.append_markdown("A reply.", "⏺ ", true);
+        // A call right after a reply, which still ends on its Markdown line.
+        scrollback.set_tool_call(run, "a", &call_spans("Bash"), ToolCallState::Running, None);
+        scrollback.append_tool_result("a", &result("done"));
+        // Writers that open with several newlines still leave one blank row.
+        scrollback.append("\n\n\n");
+        scrollback.append_completion_notice(&[("✻ Done".into(), None), ("\n".into(), None)]);
+        scrollback.start_block();
+        scrollback.append("⚠ A warning\n");
+        assert_eq!(
+            scrollback.frame(40, 20).lines,
+            [
+                "",
+                "❯ first",
+                "",
+                "⏺ A reply.",
+                "",
+                "⏺ Bash",
+                "  ⎿  done",
+                "",
+                "✻ Done",
+                "",
+                "⚠ A warning",
+                "",
+            ]
+        );
+    }
+
+    #[test]
+    fn hidden_rows_between_blocks_leave_one_blank_row() {
+        let mut scrollback = Scrollback::new();
+        echo(&mut scrollback, "kept");
+        let withdrawn = echo(&mut scrollback, "withdrawn");
+        scrollback.append_completion_notice(&[("✻ Done".into(), None), ("\n".into(), None)]);
+        scrollback.hide_echo(withdrawn);
+        scrollback.hide_completion_notice();
+        echo(&mut scrollback, "next");
+        assert_eq!(
+            scrollback.frame(40, 20).lines,
+            ["", "❯ kept", "", "❯ next", ""]
+        );
+    }
+
+    #[test]
+    fn one_blank_row_ends_the_conversation_idle_or_working() {
+        let mut scrollback = Scrollback::new();
+        scrollback.append_markdown("Reply.", "⏺ ", true);
+        scrollback.append("\n\n");
+        assert_eq!(scrollback.frame(30, 10).lines, ["", "⏺ Reply.", ""]);
+
+        scrollback.set_activity(Some(RoleLine::plain("✢ Working")));
+        scrollback.set_activity_details(vec![RoleLine::plain("  ⎿  ◼ Task")]);
+        assert_eq!(
+            scrollback.frame(30, 10).lines,
+            ["", "⏺ Reply.", "", "✢ Working", "  ⎿  ◼ Task", ""]
+        );
+
+        scrollback.set_activity(None);
+        scrollback.set_activity_details(Vec::new());
+        echo(&mut scrollback, "!sleep 1");
+        assert!(scrollback.set_shell_preview(vec![RoleLine::plain("  ⎿  Running…")]));
+        assert_eq!(
+            scrollback.frame(30, 10).lines[3..],
+            ["❯ !sleep 1", "  ⎿  Running…", ""],
+            "a running command's output sits under its echo"
+        );
+    }
+
+    #[test]
+    fn each_result_stays_under_its_own_call() {
+        let run = Uuid::from_u128(1);
+        let mut scrollback = Scrollback::new();
+        scrollback.set_tool_call(run, "a", &call_spans("First"), ToolCallState::Running, None);
+        scrollback.set_tool_call(
+            run,
+            "b",
+            &call_spans("Second"),
+            ToolCallState::Running,
+            None,
+        );
+        scrollback.append_tool_result("b", &result("second result"));
+        scrollback.append_tool_result("a", &result("first result"));
+        scrollback.append_tool_result("a", &result("first again"));
+        scrollback.finish_tool_call(run, "a", false);
+        scrollback.finish_tool_call(run, "b", false);
+        scrollback.append_markdown("After both.", "⏺ ", true);
+        assert_eq!(
+            scrollback.frame(40, 20).lines,
+            [
+                "",
+                "⏺ First",
+                "  ⎿  first result",
+                "  ⎿  first again",
+                "",
+                "⏺ Second",
+                "  ⎿  second result",
+                "",
+                "⏺ After both.",
+                "",
+            ]
+        );
+    }
+
+    #[test]
+    fn consecutive_reads_and_searches_collapse_into_one_summary_row() {
+        let run = Uuid::from_u128(1);
+        let read = |path: &str| Some(CollapsedCall::Read { path: path.into() });
+        let mut scrollback = Scrollback::new();
+        let read_spans = call_spans("Read");
+        scrollback.set_tool_call(run, "a", &read_spans, ToolCallState::Running, read("a.txt"));
+        scrollback.set_tool_call(
+            run,
+            "b",
+            &call_spans("Grep"),
+            ToolCallState::Queued,
+            Some(CollapsedCall::Search),
+        );
+        assert_eq!(
+            scrollback.frame(80, 10).lines,
+            [
+                "",
+                "⏺ Searching for 1 pattern, reading 1 file… (ctrl+o to expand)",
+                ""
+            ]
+        );
+        scrollback.append_tool_result("a", &result("file content"));
+        scrollback.finish_tool_call(run, "a", false);
+        scrollback.finish_tool_call(run, "b", false);
+        // A thinking label passes the group; the same file read again counts once.
+        scrollback.append_aside("∴ Thinking\n", None);
+        scrollback.set_tool_call(run, "c", &read_spans, ToolCallState::Running, read("a.txt"));
+        scrollback.set_tool_call(run, "d", &read_spans, ToolCallState::Running, read("b.txt"));
+        scrollback.finish_tool_call(run, "c", false);
+        scrollback.finish_tool_call(run, "d", true);
+        scrollback.append_markdown("Text ends the group.", "⏺ ", true);
+        scrollback.set_tool_call(
+            run,
+            "e",
+            &read_spans,
+            ToolCallState::Finished,
+            read("c.txt"),
+        );
+        assert_eq!(
+            scrollback.frame(80, 20).lines,
+            [
+                "",
+                "  Searched for 1 pattern, read 2 files (ctrl+o to expand)",
+                "",
+                "∴ Thinking",
+                "",
+                "⏺ Text ends the group.",
+                "",
+                "  Read 1 file (ctrl+o to expand)",
+                "",
+            ]
+        );
+    }
+
+    #[test]
+    fn results_and_echoes_wrap_between_words_under_their_content() {
+        let run = Uuid::from_u128(1);
+        let mut scrollback = Scrollback::new();
+        scrollback.set_tool_call(run, "a", &call_spans("Bash"), ToolCallState::Running, None);
+        scrollback.append_tool_result("a", &result("alpha beta gamma delta epsilon"));
+        scrollback.start_block();
+        scrollback.append_hanging("! ", None, Some(Role::ShellMessageBg), None, 2);
+        scrollback.append_hanging(
+            "printf one two three\n",
+            None,
+            Some(Role::ShellMessageBg),
+            None,
+            2,
+        );
+        assert_eq!(
+            scrollback.frame(18, 20).lines,
+            [
+                "",
+                "⏺ Bash",
+                "  ⎿  alpha beta",
+                "     gamma delta",
+                "     epsilon",
+                "",
+                "! printf one two",
+                "  three",
+                "",
+            ]
+        );
+        assert_eq!(
+            scrollback.frame(8, 20).lines[2..5],
+            ["  ⎿  alp", "     ha", "     bet"],
+            "a word longer than the row breaks between characters"
+        );
     }
 }

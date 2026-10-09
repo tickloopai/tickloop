@@ -97,7 +97,7 @@ impl TerminalHost {
             tab_id: "tab".into(),
             cwd: None,
             foreground_cwd: None,
-            title: Some(pane_id.into()),
+            terminal_title_stripped: Some(pane_id.into()),
             tokens: if pane_id == "protocol" {
                 self.protocol
                     .lock()
@@ -785,6 +785,13 @@ async fn protocol_tick_update_after_registration_reaches_its_loop() {
     })
     .await
     .unwrap();
+    assert_eq!(
+        agent.tick_subscriptions(chat).await.unwrap()[0]
+            .title
+            .as_deref(),
+        Some("Counter"),
+        "a protocol subscription is named by the Tick's declaration"
+    );
     assert_eq!(
         model.requests.lock().unwrap().len(),
         2,

@@ -39,6 +39,10 @@ pub trait TickDetailView: Send + Any {
 
     fn id(&self) -> Uuid;
     fn chat(&self) -> Uuid;
+    /// The Monitor row this view shows; that row stays listed while the view is open.
+    fn instance(&self) -> Option<tick_protocol::InstanceRef> {
+        None
+    }
     /// Whether the view stays open while the Monitor has no rows, as the add picker does.
     fn keeps_empty_monitor(&self) -> bool {
         false
@@ -72,6 +76,28 @@ impl TickActionUi<'_> {
     pub(super) fn monitor_removed(&self) -> std::collections::BTreeSet<tick_protocol::InstanceRef> {
         self.state.monitor.removed()
     }
+    /// The subscriptions on `instance` as a Monitor detail starting with `operation`.
+    pub(super) fn subscription_detail(
+        &self,
+        instance: &tick_protocol::InstanceRef,
+        operation: crate::monitor_rows::SubscriptionOperation,
+    ) -> Result<super::subscription_detail::SubscriptionDetail, String> {
+        let chat = self.chat().ok_or("No selected Chat")?;
+        let monitor = &self.state.monitor;
+        let rows = crate::monitor_rows::subscriptions_on(&monitor.subscriptions, instance);
+        if rows.is_empty() {
+            return Err("No Loop subscribes to this Tick".into());
+        }
+        Ok(super::subscription_detail::SubscriptionDetail::open(
+            chat,
+            instance.clone(),
+            monitor.title_of(instance),
+            rows,
+            monitor.loop_goals(),
+            operation,
+            self.state.display,
+        ))
+    }
     pub(super) fn monitor_entry(
         &self,
         instance: &tick_protocol::InstanceRef,
@@ -96,6 +122,8 @@ pub struct PreparedTickAction {
     pub instance: String,
     pub key: char,
     pub(super) backend: Arc<dyn TickActionBackend>,
+    /// The Monitor row the user opened with this action; its updates so far become handled.
+    opened: Option<tick_protocol::InstanceRef>,
 }
 impl std::fmt::Debug for PreparedTickAction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -115,7 +143,14 @@ impl PreparedTickAction {
             instance: instance.into(),
             key,
             backend,
+            opened: None,
         }
+    }
+
+    /// Marks this as the user opening `row` in Monitor.
+    pub(super) fn opening(mut self, row: tick_protocol::InstanceRef) -> Self {
+        self.opened = Some(row);
+        self
     }
 }
 #[derive(Clone, Copy)]
@@ -141,9 +176,21 @@ impl TickActionContext<'_> {
     }
 }
 
+/// Runs the action. Opening a Monitor row counts as the user handling the instance's updates so
+/// far.
 pub(super) async fn execute(
     action: PreparedTickAction,
     context: TickActionContext<'_>,
 ) -> Result<(), String> {
-    action.backend.execute(context).await
+    let opened = action.opened.clone();
+    let (agent, console, chat) = (context.agent, context.console, context.chat);
+    action.backend.execute(context).await?;
+    if let Some(instance) = opened {
+        let membership = agent
+            .mark_monitor_handled(chat, instance)
+            .await
+            .map_err(|error| format!("Cannot mark the update as seen: {error}"))?;
+        console.update_monitor_membership(chat, membership)?;
+    }
+    Ok(())
 }

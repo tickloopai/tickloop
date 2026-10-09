@@ -260,7 +260,7 @@ fn control_g_opens_the_search_query_in_the_external_editor_and_never_the_draft()
     assert_eq!(picker.selection(), Some(1));
     let lines = screen(&mut state);
     assert!(lines[1].ends_with("1 of 2 matching"), "{lines:?}");
-    assert!(hint_row(&lines).contains("Ctrl+G editor"), "{lines:?}");
+    assert!(hint_row(&lines).contains("ctrl+g editor"), "{lines:?}");
 
     state.external_editor = ExternalEditorLauncher::Scripted {
         opened_drafts: Arc::clone(&opened),
@@ -283,7 +283,7 @@ fn dismissing_the_menu_clears_the_picker_and_returns_keys_to_the_editor() {
     state.conversation_picker = Some(picker);
     let tiny = screen(&mut state);
     assert_eq!(tiny.len(), 1);
-    assert_eq!(tiny[0], "Resize · Esc back");
+    assert_eq!(tiny[0], "Resize · esc back");
     assert!(!state.clear_menu(Uuid::new_v4()));
     assert!(state.conversation_picker.is_some());
     assert!(state.clear_menu(menu_id));

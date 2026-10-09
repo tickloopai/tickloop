@@ -293,7 +293,7 @@ impl TickDetailView for MonitorPicker {
         lines
     }
     fn hint(&self) -> String {
-        let mut hints = vec!["Enter add"];
+        let mut hints = vec!["enter add"];
         if self.has_next_page() {
             hints.push("n next page");
         }
@@ -302,11 +302,11 @@ impl TickDetailView for MonitorPicker {
         }
         if self.can_switch() {
             hints.push(match self.source {
-                Source::Workspace => "Tab removed",
-                Source::Removed => "Tab workspace",
+                Source::Workspace => "tab removed",
+                Source::Removed => "tab workspace",
             });
         }
-        hints.push("Esc back");
+        hints.push("esc back");
         hints.join(" · ")
     }
     fn key(&mut self, key: KeyEvent, _width: usize, _height: usize) -> TickDetailKey {
@@ -509,7 +509,7 @@ mod tests {
             shown.contains("Program 1 · Terminal · live · added"),
             "{shown}"
         );
-        assert_eq!(picker.hint(), "Enter add · n next page · Esc back");
+        assert_eq!(picker.hint(), "enter add · n next page · esc back");
 
         assert!(matches!(
             picker.key(key(KeyCode::Enter), 80, 40),
@@ -553,7 +553,7 @@ mod tests {
         let shown = text(&mut picker);
         assert!(shown.contains("Removed · page 1 · 1 Ticks"), "{shown}");
         assert!(shown.contains(shell.as_str()));
-        assert_eq!(picker.hint(), "Enter add · Esc back");
+        assert_eq!(picker.hint(), "enter add · esc back");
         assert!(matches!(
             picker.key(key(KeyCode::Tab), 80, 40),
             TickDetailKey::None
@@ -575,9 +575,9 @@ mod tests {
             [removed.clone()].into(),
             Some(Arc::new(NoDiscovery)),
         );
-        assert!(picker.hint().contains("Tab removed"));
+        assert!(picker.hint().contains("tab removed"));
         picker.key(key(KeyCode::Tab), 80, 40);
-        assert!(picker.hint().contains("Tab workspace"));
+        assert!(picker.hint().contains("tab workspace"));
         assert!(text(&mut picker).contains(removed.as_str()));
     }
 }

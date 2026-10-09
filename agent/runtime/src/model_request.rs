@@ -51,6 +51,17 @@ impl RequestContext {
         }
     }
 
+    pub(super) fn shell_description(chat_id: ChatId) -> Self {
+        Self {
+            owner: RequestOwner {
+                chat_id,
+                loop_id: None,
+                run_id: None,
+            },
+            kind: ModelRequestKind::ShellDescription,
+        }
+    }
+
     pub(super) fn auto_setup(chat_id: ChatId) -> Self {
         Self {
             owner: RequestOwner {
@@ -464,7 +475,9 @@ impl Agent {
             .filter(|_| {
                 matches!(
                     context.kind,
-                    ModelRequestKind::PermissionCheck | ModelRequestKind::AutoSetup
+                    ModelRequestKind::PermissionCheck
+                        | ModelRequestKind::AutoSetup
+                        | ModelRequestKind::ShellDescription
                 )
             })
             .map(|timeout| tokio::time::Instant::now() + timeout);
@@ -635,7 +648,11 @@ impl Agent {
         // The scope destroys the actual request future before the receiver is closed and drained.
         let mut result = {
             let response = async {
-                if context.kind == ModelRequestKind::Title {
+                // A Shell description is a short side label like a title, on the same channel.
+                if matches!(
+                    context.kind,
+                    ModelRequestKind::Title | ModelRequestKind::ShellDescription
+                ) {
                     return client
                         .generate_title(request, sender, request_cancel.clone())
                         .await;

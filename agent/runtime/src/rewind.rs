@@ -20,8 +20,9 @@ use crate::transcript::private_project_temp_directory;
 use tickloop_agent_base::private_fs::PrivateDirectory;
 use tickloop_agent_protocol::projection;
 use tickloop_agent_protocol::{
-    ChatId, ChatSnapshot, CodeRewind, Event, EventKind, LoopId, LoopSnapshot, LoopState,
-    RewindDraft, RewindMode, RewindOutcome, RewindPoint, RunId, UserShellRecord, UserShellState,
+    ChatId, ChatSnapshot, CodeRewind, Event, EventKind, HostNote, LoopId, LoopSnapshot, LoopState,
+    RewindDraft, RewindMode, RewindOutcome, RewindPoint, Role, RunId, UserShellRecord,
+    UserShellState,
 };
 
 impl Agent {
@@ -166,6 +167,16 @@ impl Agent {
             if let Some(recorder) = &self.inner.recorder {
                 recorder.truncate(&chat.snapshot, &chat.bookkeeping, point.message_index);
             }
+            // The kept history ends where the prompt was submitted, in the mode it restores. Only
+            // an exited-plan-mode notice the prompt's first request carried is owed again.
+            let first_reply = (point.message_index..chat.snapshot.messages.len())
+                .find(|index| chat.snapshot.messages[*index].role == Role::Assistant)
+                .unwrap_or(chat.snapshot.messages.len());
+            chat.needs_plan_mode_exit_notice = chat
+                .snapshot
+                .host_notes
+                .range(point.message_index..first_reply)
+                .any(|(_, note)| *note == HostNote::PlanModeExit);
             chat.snapshot = candidate;
             chat.bookkeeping = candidate_bookkeeping;
             self.reset_restored_todo_graces(chat);

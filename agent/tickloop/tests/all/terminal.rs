@@ -113,6 +113,12 @@ fn interactive_pty_trusts_the_directory_and_cycles_all_execution_modes() {
     for path in [&home, &scratch] {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
+    std::fs::create_dir(&config_root).unwrap();
+    std::fs::write(
+        config_root.join("settings.json"),
+        r#"{"shiftTabModes":["auto","acceptEdits","plan","fullAccess"]}"#,
+    )
+    .unwrap();
     let pty = native_pty_system()
         .openpty(PtySize {
             rows: 30,
@@ -166,7 +172,7 @@ fn interactive_pty_trusts_the_directory_and_cycles_all_execution_modes() {
     writer.write_all(b"j\r").unwrap();
     writer.flush().unwrap();
     wait_for_output("⏵⏵ Auto · deepseek-flash", 0);
-    for mode in ["Ask", "Full Access", "Auto"] {
+    for mode in ["Ask", "Plan", "Full Access", "Auto"] {
         let output_start = output.lock().unwrap().len();
         writer.write_all(b"\x1b[Z").unwrap();
         writer.flush().unwrap();
@@ -201,110 +207,6 @@ fn interactive_pty_trusts_the_directory_and_cycles_all_execution_modes() {
         "{output}"
     );
     assert!(UserSettings::in_root(&config_root).is_working_directory_trusted(directory.path()));
-}
-
-#[test]
-fn interactive_pty_opens_the_subscription_view_and_closes_it_with_escape() {
-    const TERMINAL_WIDTH: usize = 120;
-    const TERMINAL_HEIGHT: usize = 30;
-    const COMPLETED_FRAME_END: &str = "\x1b[?2026l";
-
-    let directory = tempfile::tempdir().unwrap();
-    let config_root = directory.path().join("config-root");
-    trust_working_directory(&config_root, &directory.path().canonicalize().unwrap());
-    let pty = native_pty_system()
-        .openpty(PtySize {
-            rows: TERMINAL_HEIGHT as u16,
-            cols: TERMINAL_WIDTH as u16,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .unwrap();
-    let reader = pty.master.try_clone_reader().unwrap();
-    let mut writer = pty.master.take_writer().unwrap();
-    let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_tickloop"));
-    command.env(
-        "TICKLOOP_DAEMON_RUNTIME_DIR",
-        support::cli_runtime::directory(),
-    );
-    command.cwd(directory.path());
-    command.env("TICKLOOP_CONFIG_DIR", &config_root);
-    command.env("TICKLOOP_AGENT_TUI", "inline");
-    command.arg("--no-session-persistence");
-    let mut child = pty.slave.spawn_command(command).unwrap();
-    drop(pty.slave);
-    let output = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-    let reader_output = output.clone();
-    let output_reader = thread::spawn(move || screen::capture_output(reader, reader_output));
-    let ansi = regex::Regex::new(r"\x1b\[[0-9;?]*[ -/]*[@-~]").unwrap();
-    let wait_for_output = |needle: &str, after: usize| {
-        let deadline = std::time::Instant::now() + INTERACTION_TIMEOUT;
-        loop {
-            let captured = output.lock().unwrap();
-            if captured
-                .get(after..)
-                .is_some_and(|suffix| suffix.contains(COMPLETED_FRAME_END))
-                && screen::visible_screen(&captured, TERMINAL_WIDTH, TERMINAL_HEIGHT)
-                    .contains(needle)
-            {
-                return;
-            }
-            if std::time::Instant::now() >= deadline {
-                // Release the output lock first, so the reader thread is not poisoned.
-                let text = captured.clone();
-                drop(captured);
-                panic!("PTY output did not contain {needle:?}: {text}");
-            }
-            drop(captured);
-            thread::sleep(Duration::from_millis(20));
-        }
-    };
-
-    wait_for_output("⏵⏵ Auto · deepseek-flash", 0);
-    let configured_at = output.lock().unwrap().len();
-    writer.write_all(b"/mode auto\r").unwrap();
-    writer.flush().unwrap();
-    wait_for_output("Execution mode: Auto", configured_at);
-    let created_at = output.lock().unwrap().len();
-    writer.write_all(b"!printf 'first-%s' input\r").unwrap();
-    writer.flush().unwrap();
-    wait_for_output("first-input", created_at);
-    let opened_at = output.lock().unwrap().len();
-    writer.write_all(b"/subscriptions\r").unwrap();
-    writer.flush().unwrap();
-    wait_for_output("Tick Subscriptions", opened_at);
-    wait_for_output("No Tick Subscription yet", opened_at);
-    wait_for_output("d cancel", opened_at);
-
-    let closed_at = output.lock().unwrap().len();
-    writer.write_all(b"jkd\x1b").unwrap();
-    writer.flush().unwrap();
-    wait_for_output("⏵⏵ Auto · deepseek-flash", closed_at);
-    assert!(
-        !ansi
-            .replace_all(&output.lock().unwrap()[closed_at..], "")
-            .contains("❯ jkd"),
-        "the open view owns its keys instead of typing them into the editor"
-    );
-
-    writer.write_all(b"/exit\r\r").unwrap();
-    writer.flush().unwrap();
-    let deadline = std::time::Instant::now() + INTERACTION_TIMEOUT;
-    let status = loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            break status;
-        }
-        if std::time::Instant::now() >= deadline {
-            child.kill().unwrap();
-            panic!("interactive Agent did not exit after /exit");
-        }
-        thread::sleep(Duration::from_millis(50));
-    };
-    drop(writer);
-    drop(pty.master);
-    output_reader.join().unwrap();
-    let transcript = output.lock().unwrap().replace('\r', "");
-    assert!(status.success(), "{status:?}\n{transcript}");
 }
 
 #[test]
@@ -551,7 +453,7 @@ async fn piped_provider_model_and_settings_menus_apply_numbered_choices() {
         .take()
         .unwrap()
         .write_all(
-            b"/provider\n1\n2\ncancel\ncancel\n/model\n2\ncancel\n/model\ncancel\n/settings\n4\n2\ncancel\n/settings\ncancel\n/exit\n",
+            b"/provider\n1\n2\n/model\n2\n/model\ncancel\n/settings\n4\n2\n/settings\ncancel\n/exit\n",
         )
         .await
         .unwrap();
@@ -771,7 +673,7 @@ async fn settings_preview_requires_confirmation_before_saving_nerd_font_glyphs()
         .stdin
         .take()
         .unwrap()
-        .write_all(b"/settings\n9\n2\n1\n/exit\n")
+        .write_all(b"/settings\n10\n2\n1\n/exit\n")
         .await
         .unwrap();
     let output = tokio::time::timeout(INTERACTION_TIMEOUT, child.wait_with_output())
@@ -2154,9 +2056,7 @@ async fn terminal_can_background_read_and_stop_the_same_shell_process() {
     .await
     .unwrap();
     input
-        .write_all(
-            format!("/tasks\n/command-output {operation}\n/stop-command {operation}\n").as_bytes(),
-        )
+        .write_all(format!("/command-output {operation}\n/stop-command {operation}\n").as_bytes())
         .await
         .unwrap();
     drop(input);

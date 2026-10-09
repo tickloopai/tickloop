@@ -216,14 +216,35 @@ async fn a_cadence_delivers_the_latest_update_and_counts_the_ones_it_dropped() {
         stream.push(update(7, sequence, phase));
     }
     settle().await;
-    assert_eq!(
-        agent.tick_subscriptions(chat).await.unwrap()[0].accumulated,
-        3
+    let waiting = agent.tick_subscriptions(chat).await.unwrap();
+    assert_eq!(waiting[0].accumulated, 3);
+    let updated = waiting[0]
+        .updated_at_ms
+        .expect("the subscription knows when the instance last updated");
+    assert!(
+        agent
+            .snapshot(chat)
+            .await
+            .unwrap()
+            .monitor
+            .handled_at(&fixture_instance(7))
+            .is_none_or(|handled| handled < updated),
+        "updates waiting for delivery are unread"
     );
 
     tokio::time::advance(CADENCE).await;
     wait_for_completion(&mut events).await;
 
+    assert!(
+        agent
+            .snapshot(chat)
+            .await
+            .unwrap()
+            .monitor
+            .handled_at(&fixture_instance(7))
+            .is_some_and(|handled| handled >= updated),
+        "the turn the delivery started handled the updates"
+    );
     assert_eq!(model.requests.lock().unwrap().len(), 3);
     let delivered = last_user_text(&model);
     assert!(delivered.contains("\"sequence\":3"), "{delivered}");

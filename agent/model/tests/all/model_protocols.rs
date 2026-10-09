@@ -681,6 +681,52 @@ async fn responses_round_trips_multiple_calls_and_protocol_specific_reasoning() 
     );
 }
 
+/// Parallel calls as GPT models stream them on the Codex backend: arguments only on completion.
+fn responses_tool_stream_without_argument_deltas() -> String {
+    responses_tool_stream()
+        .split_inclusive("\n\n")
+        .filter(|frame| !frame.contains("function_call_arguments.delta"))
+        .collect()
+}
+
+#[tokio::test]
+async fn responses_accepts_calls_whose_arguments_arrive_only_on_completion() {
+    let (base_url, _) = serve_response(200, responses_tool_stream_without_argument_deltas()).await;
+    let client = HttpModelClient::new(configuration(base_url, Protocol::Responses)).unwrap();
+    let (events, _) = mpsc::unbounded_channel();
+    let output = client
+        .complete(
+            ModelRequest {
+                history_sources: Vec::new(),
+                messages: vec![message(Role::User, "Read both")],
+                tools: vec![],
+                structured_output: None,
+                temperature: None,
+                reasoning_effort: None,
+            },
+            events,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(output.stop_reason, "tool_use");
+    assert_eq!(
+        output.content[1..],
+        [
+            Content::ToolUse {
+                id: "call-1".into(),
+                name: "Read".into(),
+                input: json!({"file_path":"first.md"})
+            },
+            Content::ToolUse {
+                id: "call-2".into(),
+                name: "Read".into(),
+                input: json!({"file_path":"second.md"})
+            }
+        ]
+    );
+}
+
 #[tokio::test]
 async fn responses_rejects_repeated_incomplete_mismatched_and_failed_streams() {
     let complete = responses_tool_stream();
@@ -689,7 +735,19 @@ async fn responses_rejects_repeated_incomplete_mismatched_and_failed_streams() {
         .split("\n\n")
         .find(|frame| frame.contains("function_call_arguments.delta"))
         .unwrap();
+    let conflicting_completions = responses_tool_stream_without_argument_deltas()
+        .split_inclusive("\n\n")
+        .map(|frame| {
+            if frame.contains("function_call_arguments.done") {
+                frame.replace("first.md", "other.md")
+            } else {
+                frame.to_owned()
+            }
+        })
+        .collect::<String>();
     let invalid = [
+        complete.replace(r#""delta":"{\"file_path\":""#, r#""delta":"{\"path\":""#),
+        conflicting_completions,
         complete[..last_frame].to_owned(),
         complete.replace("call-2", "call-1"),
         complete.replace("first.md\\\"}", "first.md"),

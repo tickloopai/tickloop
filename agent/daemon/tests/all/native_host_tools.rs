@@ -490,7 +490,7 @@ impl ControlledHerdr {
             } else {
                 "/tmp/project".into()
             }),
-            title: Some(pane_id.into()),
+            terminal_title_stripped: Some(pane_id.into()),
             tokens: if pane_id == "protocol" {
                 self.protocol_instance
                     .lock()

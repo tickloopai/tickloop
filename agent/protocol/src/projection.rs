@@ -61,12 +61,12 @@ impl ChatSnapshot {
         self.boundary_indexes().last().copied().unwrap_or(0)
     }
 
-    /// The host tool names the latest host note the model can still see announced.
+    /// The host tool names the latest host tool note the model can still see announced.
     pub fn visible_announced_host_tools(&self) -> Option<std::collections::BTreeSet<String>> {
         self.host_notes
             .range(self.active_start()..)
-            .next_back()
-            .map(|(_, announced)| announced.clone())
+            .rev()
+            .find_map(|(_, note)| note.announced_host_tools().cloned())
     }
 
     fn boundary_indexes(&self) -> Vec<usize> {

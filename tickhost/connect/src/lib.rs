@@ -5,5 +5,6 @@ pub mod herdr;
 pub mod host_error;
 pub mod hosted;
 pub mod launch;
+pub mod naming;
 pub mod page;
 pub mod session;

@@ -1400,6 +1400,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn codex_accepts_parallel_calls_whose_arguments_arrive_only_on_completion() {
+        let (_directory, state_dir) = state_with_credentials();
+        let config = ModelCatalog::defaults()
+            .profiles()
+            .into_iter()
+            .find(|profile| {
+                profile.model == "gpt-6.1-sol" && profile.provider == ModelProvider::OpenAiCodex
+            })
+            .unwrap();
+        // Shape recorded from gpt-6.1-sol: parallel calls stream no argument deltas, and the
+        // completed arguments are server-serialized JSON.
+        let calls = [
+            (
+                "fc_read",
+                "call_read",
+                "Read",
+                r#"{"file_path": "README.md"}"#,
+            ),
+            (
+                "fc_bash",
+                "call_bash",
+                "Bash",
+                r#"{"command": "ls", "description": "列出项目根目录"}"#,
+            ),
+        ];
+        let mut stream = vec![event(
+            "response.created",
+            0,
+            json!({"response":{"id":"resp_parallel","status":"in_progress"}}),
+        )];
+        let mut output = Vec::new();
+        let mut sequence = 1;
+        for (index, (id, call_id, name, arguments)) in calls.into_iter().enumerate() {
+            let item = json!({"type":"function_call","id":id,"call_id":call_id,"name":name,"arguments":arguments,"status":"completed"});
+            let mut started = item.clone();
+            started["arguments"] = json!("");
+            started["status"] = json!("in_progress");
+            for (kind, value) in [
+                (
+                    "response.output_item.added",
+                    json!({"output_index":index,"item":started}),
+                ),
+                (
+                    "response.function_call_arguments.done",
+                    json!({"output_index":index,"item_id":id,"arguments":arguments}),
+                ),
+                (
+                    "response.output_item.done",
+                    json!({"output_index":index,"item":item}),
+                ),
+            ] {
+                stream.push(event(kind, sequence, value));
+                sequence += 1;
+            }
+            output.push(item);
+        }
+        stream.push(event("response.completed", sequence, json!({"response":{"id":"resp_parallel","status":"completed","output":output,"usage":{"input_tokens":20,"output_tokens":9}}})));
+        let (endpoint, captured) = serve_scripted_responses(vec![(200, stream.concat())]).await;
+        let client = CodexModelClient::new(config, &state_dir)
+            .unwrap()
+            .with_loopback_test_endpoint(endpoint.as_str())
+            .unwrap();
+        let (events, _) = tokio::sync::mpsc::unbounded_channel();
+        let output = client
+            .complete(simple_request(), events, CancellationToken::new())
+            .await
+            .expect("completed arguments are authoritative when no delta was streamed");
+        captured.await.unwrap();
+        assert_eq!(output.stop_reason, "tool_use");
+        let calls = output
+            .content
+            .iter()
+            .map(|content| match content {
+                Content::ToolUse { id, name, input } => {
+                    (id.split('|').next().unwrap(), name.as_str(), input.clone())
+                }
+                other => panic!("unexpected content {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            calls,
+            [
+                ("call_read", "Read", json!({"file_path":"README.md"})),
+                (
+                    "call_bash",
+                    "Bash",
+                    json!({"command":"ls","description":"列出项目根目录"})
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn codex_sse_interruption_after_reasoning_is_terminal() {
         let (_directory, state_dir) = state_with_credentials();
         let config = ModelCatalog::defaults()

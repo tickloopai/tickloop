@@ -141,16 +141,16 @@ fn target_directory(target: &TickLocation) -> &str {
         .unwrap_or("")
 }
 
-/// The command line of a prepared open, used as the Monitor title until the Tick reports one.
-fn opened_program_title(operation: &PreparedOperation) -> Option<String> {
+/// The command of a prepared open, its program by file name.
+fn opened_command(operation: &PreparedOperation) -> Option<String> {
     (operation.name == "modify_tick" && operation.input["action"] == "open")
         .then(|| {
             operation.input["command"]
                 .as_array()?
                 .iter()
-                .map(Value::as_str)
+                .map(|word| word.as_str().map(str::to_owned))
                 .collect::<Option<Vec<_>>>()
-                .map(|words| words.join(" "))
+                .map(|words| tickhost_connect::naming::command_title(&words))
         })
         .flatten()
 }
@@ -274,7 +274,7 @@ impl HostToolProvider for NativeHostToolProvider {
                 "Native host operation has no prepared binding".into(),
             );
         };
-        let opened_title = opened_program_title(&binding.operation);
+        let opened_command = opened_command(&binding.operation);
         match self.access.execute(binding.operation, cancel).await {
             Ok(value)
                 if value["status"] == "created_not_placed"
@@ -295,14 +295,21 @@ impl HostToolProvider for NativeHostToolProvider {
                 if !is_opened {
                     return HostCallResult::Completed(result);
                 }
-                match serde_json::from_value(value["tick_instance_id"].clone()) {
-                    Ok(instance) => HostCallResult::CompletedWithEffect(
-                        result,
-                        Box::new(HostEffect::OpenedTick {
-                            instance,
-                            title: opened_title,
-                        }),
-                    ),
+                match serde_json::from_value::<tick_protocol::InstanceRef>(
+                    value["tick_instance_id"].clone(),
+                ) {
+                    Ok(instance) => {
+                        let title = match opened_command {
+                            Some(command) => {
+                                Some(self.access.opened_name(&instance, &command).await)
+                            }
+                            None => None,
+                        };
+                        HostCallResult::CompletedWithEffect(
+                            result,
+                            Box::new(HostEffect::OpenedTick { instance, title }),
+                        )
+                    }
                     // The program runs, but without a verifiable identity it cannot join Monitor.
                     Err(error) => HostCallResult::Completed(ToolResult {
                         is_error: true,

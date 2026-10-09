@@ -195,7 +195,8 @@ impl TickDeliveries {
                 }) {
                     subscription.kind = Some(metadata.kind.clone());
                     subscription.title = Some(metadata.title.clone());
-                    subscription.updated_at_ms = metadata.updated_at_ms;
+                    subscription.updated_at_ms =
+                        subscription.updated_at_ms.max(metadata.updated_at_ms);
                 }
             }
             TickStreamEvent::Ready { watch } => {
@@ -406,6 +407,9 @@ impl TickDeliveries {
                 .accumulated
                 .saturating_add(1 + observation.dropped);
             subscription.gap |= observation.gap;
+            subscription.updated_at_ms = subscription.updated_at_ms.max(Some(
+                tickloop_agent_base::private_fs::unix_time_milliseconds(),
+            ));
         }
     }
 
@@ -558,8 +562,8 @@ impl Agent {
             .collect())
     }
 
-    /// Changes one subscription's cadence or cancels it, from the Chat's subscription view or a
-    /// model tool. The change is written through the owning Loop's Trigger.
+    /// Changes one subscription's cadence or cancels it, from Monitor or a model tool. The change
+    /// is written through the owning Loop's Trigger.
     pub async fn update_tick_subscription(
         &self,
         chat_id: ChatId,

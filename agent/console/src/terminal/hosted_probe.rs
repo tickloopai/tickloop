@@ -51,6 +51,9 @@ impl TickProbe for HostedProbe {
                 HostedMemberState::Lost => MemberState::Lost,
             };
             findings.states.insert(instance.clone(), state);
+            if let Some(updated_at_ms) = member.updated_at_ms {
+                findings.updates.insert(instance.clone(), updated_at_ms);
+            }
             if let Some(sample) = &member.resources {
                 findings.resources.insert(
                     instance.clone(),

@@ -62,6 +62,39 @@ fn capture_output_preserves_utf8_characters_split_across_reads() {
     assert_eq!(*output.lock().unwrap(), "GLM · Context — ✓");
 }
 
+/// A row's text without the `⎿` connector or the indentation a response's rows have.
+#[allow(dead_code)]
+pub fn response_line(line: &str) -> &str {
+    line.trim().trim_start_matches('⎿').trim_start()
+}
+
+/// The queued inputs a frame lists above the input box, as Claude Code shows them: `  ❯ text`,
+/// or `  ! command` for a queued command.
+#[allow(dead_code)]
+pub fn queued_inputs(frame: &str) -> Vec<&str> {
+    frame.lines().filter(|line| is_queued_input(line)).collect()
+}
+
+/// `frame` split before its first queued input: the conversation, then the queue and the rows
+/// below it.
+#[allow(dead_code)]
+pub fn split_at_queue(frame: &str) -> Option<(&str, &str)> {
+    let mut offset = 0;
+    for line in frame.split_inclusive('\n') {
+        if is_queued_input(line) {
+            return Some(frame.split_at(offset));
+        }
+        offset += line.len();
+    }
+    None
+}
+
+/// Whether `line` lists a queued input rather than echoing a sent one.
+#[allow(dead_code)]
+pub fn is_queued_input(line: &str) -> bool {
+    line.starts_with("  ❯ ") || line.starts_with("  ! ")
+}
+
 #[allow(dead_code)]
 pub fn message_flow(frame: &str) -> &str {
     match frame.split_once('\n') {

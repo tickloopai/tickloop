@@ -359,7 +359,7 @@ fn builtin_key_replacement_cancel_and_commit_are_atomic_and_return_to_details() 
     let mark = terminal.mark();
     terminal.send(b"\x1b");
     terminal.wait_for_frame_after(mark, "replacement field closed", |frame| {
-        frame.contains("API key · DeepSeek") && frame.contains("Esc back")
+        frame.contains("API key · DeepSeek") && frame.contains("esc back")
     });
     let mark = terminal.mark();
     terminal.send(b"\x1b");
@@ -375,7 +375,7 @@ fn builtin_key_replacement_cancel_and_commit_are_atomic_and_return_to_details() 
     let mark = terminal.mark();
     terminal.select_row("Replace API key");
     terminal.wait_for_frame_after(mark, "replacement field reopened", |frame| {
-        frame.contains("API key · DeepSeek") && frame.contains("Esc close field")
+        frame.contains("API key · DeepSeek") && frame.contains("esc close field")
     });
     let mark = terminal.mark();
     terminal.send(b"committed-456-key\r");
@@ -557,8 +557,8 @@ fn builtin_provider_models_details_and_credentials_share_the_input_dialog() {
     );
     assert!(!frame.contains(TEST_KEY));
     assert!(!frame.contains("1. Save API key"));
-    assert!(frame.contains("Ctrl+G"));
-    change_page(&mut terminal, b"\x1b", "Tab edit");
+    assert!(frame.contains("ctrl+g"));
+    change_page(&mut terminal, b"\x1b", "tab edit");
     change_page(&mut terminal, b"\x1b", "Connection · DeepSeek");
     change_page(&mut terminal, b"\x1b", "Choose Provider");
     let mark = terminal.mark();
@@ -602,7 +602,7 @@ fn first_run_model_directory_and_settings_model_use_the_input_dialog() {
     let mark = terminal.mark();
     terminal.send(b"\x1b");
     terminal.wait_for_frame_after(mark, "model status click escape processed", |frame| {
-        frame.contains("Esc again") && frame.contains("rewind")
+        frame.contains("esc again") && frame.contains("rewind")
     });
     let frame = screen::visible_screen(&terminal.visible_output(), terminal.columns, terminal.rows);
     assert!(

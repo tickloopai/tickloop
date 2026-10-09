@@ -912,6 +912,10 @@ impl RecoveryPty {
             std::thread::sleep(Duration::from_millis(10));
         }
     }
+    fn wait_for_turn_summary(&mut self) {
+        self.wait_until_shown("the finished turn's summary", super::shows_turn_summary);
+    }
+
     fn wait_for(&mut self, marker: &str) -> String {
         let deadline = Instant::now() + self.timeout;
         while Instant::now() < deadline {
@@ -1600,7 +1604,7 @@ fn real_event_overflow_restores_known_completion_once_without_inventing_evicted_
     assert_eq!(proof["first_completion_evicted"], true);
     let restored = fixture
         .repaint_after_recovery("retained completion after real event overflow", |frame| {
-            frame.contains("Second retained report.") && frame.contains("✓ Done")
+            frame.contains("Second retained report.") && super::shows_turn_summary(frame)
         });
     assert!(restored.contains("First retained report."), "{restored}");
     assert!(
@@ -1609,27 +1613,25 @@ fn real_event_overflow_restores_known_completion_once_without_inventing_evicted_
             .contains("The saved event range changed"),
         "{restored}"
     );
-    assert_eq!(restored.matches("✓ Done").count(), 1, "{restored}");
+    assert_eq!(super::turn_summaries(&restored), 1, "{restored}");
+    assert!(restored.contains("↓ 29 tokens"), "{restored}");
+    assert!(!restored.contains("↓ 7 tokens"), "{restored}");
     assert!(
-        restored.contains("input tokens: 117, output tokens: 29"),
+        restored.find("Second retained report.").unwrap()
+            < super::turn_summary_position(&restored).unwrap(),
         "{restored}"
     );
-    assert!(!restored.contains("input tokens: 31"), "{restored}");
-    assert!(
-        restored.find("Second retained report.").unwrap() < restored.find("✓ Done").unwrap(),
-        "{restored}"
-    );
-    for (turn, reply, input_tokens, output_tokens) in [
-        (3, "Third retained report.", 211, 53),
-        (4, "Fourth retained report.", 331, 67),
+    for (turn, reply, output_tokens) in [
+        (3, "Third retained report.", 53),
+        (4, "Fourth retained report.", 67),
     ] {
         fixture.send(format!("Read retained report {turn}.\r").as_bytes());
         fixture.wait_for_phase(&phase_path, &format!("started-{turn}"));
         let running = fixture
             .repaint_after_recovery("a new Started hides the restored completion", |frame| {
-                frame.contains("Working (") && !frame.contains("✓ Done")
+                frame.contains("Working (") && !super::shows_turn_summary(frame)
             });
-        assert!(!running.contains("input tokens:"), "{running}");
+        assert!(!running.contains(" tokens"), "{running}");
         std::fs::write(
             directory.path().join(RETAINED_COMPLETION_STAGE),
             format!("finish-{turn}"),
@@ -1638,21 +1640,21 @@ fn real_event_overflow_restores_known_completion_once_without_inventing_evicted_
         fixture.wait_for_phase(&phase_path, &format!("completed-{turn}"));
         let completed =
             fixture.repaint_after_recovery("only the latest completion is visible", |frame| {
-                frame.contains(reply) && frame.contains("✓ Done") && !frame.contains("Working (")
+                frame.contains(reply)
+                    && super::shows_turn_summary(frame)
+                    && !frame.contains("Working (")
             });
-        assert_eq!(completed.matches("✓ Done").count(), 1, "{completed}");
+        assert_eq!(super::turn_summaries(&completed), 1, "{completed}");
         assert!(
-            completed.contains(&format!(
-                "input tokens: {input_tokens}, output tokens: {output_tokens}"
-            )),
+            completed.contains(&format!("↓ {output_tokens} tokens")),
             "{completed}"
         );
         assert!(
-            !completed.contains("input tokens: 117") && !completed.contains("input tokens: 31"),
+            !completed.contains("↓ 29 tokens") && !completed.contains("↓ 7 tokens"),
             "{completed}"
         );
         if turn == 4 {
-            assert!(!completed.contains("input tokens: 211"), "{completed}");
+            assert!(!completed.contains("↓ 53 tokens"), "{completed}");
         }
     }
     fixture.send(b"\x04\x04");
@@ -1765,7 +1767,7 @@ fn run_routine_restore_pty(route: &str) {
     fixture.wait_for("deepseek-flash");
     fixture.send(format!("{ROUTINE_INPUT}\r").as_bytes());
     let completed = fixture.wait_for_phase(&phase_path, "completed");
-    fixture.wait_for("✓ Done");
+    fixture.wait_for_turn_summary();
     let original = screen::visible_screen(&fixture.raw_output(), 80, 24);
     let body = |frame: &str| {
         frame
@@ -1793,7 +1795,7 @@ fn run_routine_restore_pty(route: &str) {
         fixture.send(b"\x1b[27u");
         let restored = fixture.wait_for_phase(&phase_path, &format!("restored-{pass}"));
         let frame = fixture.repaint_after_recovery("restored conversation", |frame| {
-            !frame.contains("Agents · local") && frame.contains("✓ Done")
+            !frame.contains("Agents · local") && super::shows_turn_summary(frame)
         });
         println!(
             "ROUTINE_RESTORE {restored}\nROUTINE_AFTER_{pass}_BEGIN\n{frame}\nROUTINE_AFTER_{pass}_END"
@@ -1830,9 +1832,8 @@ fn run_routine_restore_pty(route: &str) {
                 ),
                 "{frame}"
             );
-            assert_eq!(frame.matches("✓ Done").count(), 1, "{frame}");
-            assert!(frame.contains("input tokens: 31"), "{frame}");
-            assert!(frame.contains("output tokens: 7"), "{frame}");
+            assert_eq!(super::turn_summaries(&frame), 1, "{frame}");
+            assert!(frame.contains("↓ 7 tokens"), "{frame}");
         } else {
             assert_eq!(
                 body(&frame),
@@ -1847,7 +1848,9 @@ fn run_routine_restore_pty(route: &str) {
         );
         assert!(frame.contains("deadbeef /tmp/raw --resume"), "{frame}");
         if route == RAW_TOOL_ROUTE {
-            assert_eq!(frame.matches(RAW_TOOL_CONTENT).count(), 1, "{frame}");
+            // The read collapses into its summary row; its content stays in the detailed view.
+            assert!(frame.contains("Read 1 file (ctrl+o to expand)"), "{frame}");
+            assert_eq!(frame.matches(RAW_TOOL_CONTENT).count(), 0, "{frame}");
         }
     }
     fixture.send(b"\x04\x04");
@@ -2214,7 +2217,9 @@ fn run_merge_boundary_pty(route: &str) {
         fixture.send(format!("{input}\r").as_bytes());
         fixture.wait_for(input);
     }
-    fixture.wait_for("Messages to be submitted (3)");
+    fixture.wait_until_shown("three queued inputs", |frame| {
+        screen::queued_inputs(frame).len() == 3
+    });
     std::fs::write(directory.path().join("release-model"), "").unwrap();
     fixture.wait_for_phase(&phase_path, "merged-one");
     let restored_frame = if route == OVERVIEW_ROUTE {
@@ -2224,7 +2229,7 @@ fn run_merge_boundary_pty(route: &str) {
         let restored = fixture.wait_for_phase(&phase_path, "restored");
         let frame = fixture.repaint_after_recovery("Overview restore", |frame| {
             !frame.contains("Agents · local")
-                && !frame.contains("Transcript ·")
+                && !frame.contains("Showing detailed transcript")
                 && frame.contains("busy charlie")
         });
         println!(
@@ -2235,8 +2240,8 @@ fn run_merge_boundary_pty(route: &str) {
         // A real View action between the first merge and the rest: Ctrl+O loads the transcript.
         fixture.send(b"\x0f");
         fixture.wait_until_shown("the loaded transcript", |frame| {
-            frame.contains("Transcript ·")
-                && frame.contains("You: busy charlie")
+            frame.contains("Showing detailed transcript")
+                && frame.contains("❯ busy charlie")
                 && !frame.contains("Loading conversation")
         });
         None
@@ -2247,7 +2252,7 @@ fn run_merge_boundary_pty(route: &str) {
         fixture.send(b"\x1b");
     }
     fixture.wait_until_shown("the conversation again", |frame| {
-        !frame.contains("Transcript ·") && frame.contains("busy charlie")
+        !frame.contains("Showing detailed transcript") && frame.contains("busy charlie")
     });
     let frame = screen::visible_screen(&fixture.raw_output(), 80, 24);
     println!("MERGE_BOUNDARY_FRAME_BEGIN\n{frame}\nMERGE_BOUNDARY_FRAME_END");
@@ -2277,11 +2282,11 @@ fn run_merge_boundary_pty(route: &str) {
         assert_eq!(
             restored
                 .lines()
-                .filter(|line| !line.starts_with("• Working"))
+                .filter(|line| !line.contains("Working ("))
                 .collect::<Vec<_>>(),
             frame
                 .lines()
-                .filter(|line| !line.starts_with("• Working"))
+                .filter(|line| !line.contains("Working ("))
                 .collect::<Vec<_>>(),
             "late replayed merges must leave retained content unchanged as elapsed time advances"
         );

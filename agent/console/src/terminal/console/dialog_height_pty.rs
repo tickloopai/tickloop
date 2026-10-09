@@ -49,7 +49,7 @@ fn dialog_height_pty_fixture() {
             tokio::select! {
                 _ = poll.tick() => {
                     if directory.join("grow").exists() && !grown {
-                        console.show_presented_picker_menu(choices(80), PickerKind::Actions, PickerPresentation { hint: "Enter · Esc back".into(), ..Default::default() }).unwrap();
+                        console.show_presented_picker_menu(choices(80), PickerKind::Actions, PickerPresentation { hint: "enter · esc back".into(), ..Default::default() }).unwrap();
                         grown = true;
                     }
                     if directory.join("request").exists() && !requested {
@@ -73,7 +73,7 @@ fn dialog_height_pty_fixture() {
                 }
                 event = input.recv() => match event {
                     Some(InputEvent::Line(text) | InputEvent::Prompt { text, .. }) => match text.as_str() {
-                        "/short" | "/long" => console.show_presented_picker_menu(choices(if text == "/short" { 2 } else { 80 }), PickerKind::Actions, PickerPresentation { hint: "Enter · Esc back".into(), ..Default::default() }).unwrap(),
+                        "/short" | "/long" => console.show_presented_picker_menu(choices(if text == "/short" { 2 } else { 80 }), PickerKind::Actions, PickerPresentation { hint: "enter · esc back".into(), ..Default::default() }).unwrap(),
                         "/login" => console.show_login_menu(Menu { id: LOGIN, title: "Browser height".into(), context: vec!["https://fixture.test/authorize".into(), "Complete authorization".into()], options: vec!["Submit callback".into(), "Cancel login".into()], selected: 0, confirmation: false }, "https://fixture.test/authorize", true).unwrap(),
                         "/exit" => break,
                         _ => panic!("Unexpected fixture input"),
@@ -266,14 +266,14 @@ fn dialog_height_pty_grows_shrinks_resizes_and_restores_requests_in_both_rendere
         fixture.resize(40);
         fixture.wait(|frame| frame.contains("Height picker") && dialog_rows(frame) == 38);
         fixture.resize(5);
-        fixture.wait(|frame| frame.contains("Resize") && frame.contains("Esc"));
+        fixture.wait(|frame| frame.contains("Resize") && frame.contains("esc"));
         fixture.send(b"\r");
         std::thread::sleep(Duration::from_millis(100));
         assert!(!fixture.directory.path().join("choice").exists());
         fixture.resize(24);
         fixture.wait(|frame| frame.contains("Height picker") && dialog_rows(frame) == 22);
         fixture.send(b"\x1b");
-        fixture.wait(|frame| !frame.contains("Height picker") && frame.contains("Ctrl+G editor"));
+        fixture.wait(|frame| !frame.contains("Height picker") && frame.contains("ctrl+g editor"));
         fixture.send(b"/short\r");
         let shrunk =
             fixture.wait(|frame| frame.contains("Height picker") && dialog_rows(frame) == 6);
@@ -291,7 +291,7 @@ fn dialog_height_pty_background_login_retains_other_agent_draft_and_source_field
     let edited = fixture.wait(|frame| frame.contains("fixture callback draft"));
     assert!(dialog_rows(&edited) < 12);
     fixture.signal("switch-b");
-    fixture.wait(|frame| !frame.contains("Browser height") && frame.contains("Ctrl+G editor"));
+    fixture.wait(|frame| !frame.contains("Browser height") && frame.contains("ctrl+g editor"));
     fixture.send(b"Other Agent draft");
     fixture.wait(|frame| frame.contains("Other Agent draft"));
     fixture.signal("complete-login");
@@ -302,10 +302,10 @@ fn dialog_height_pty_background_login_retains_other_agent_draft_and_source_field
     fixture.wait(|frame| {
         frame.contains("Browser height")
             && frame.contains("fixture callback draft")
-            && frame.contains("Enter return")
+            && frame.contains("enter return")
     });
     fixture.send(b"\x1b");
-    fixture.wait(|frame| frame.contains("Browser height") && !frame.contains("Esc close field"));
+    fixture.wait(|frame| frame.contains("Browser height") && !frame.contains("esc close field"));
     fixture.send(b"\x1b");
-    fixture.wait(|frame| !frame.contains("Browser height") && frame.contains("Ctrl+G editor"));
+    fixture.wait(|frame| !frame.contains("Browser height") && frame.contains("ctrl+g editor"));
 }

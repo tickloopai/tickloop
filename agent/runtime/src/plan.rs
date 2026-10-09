@@ -32,7 +32,7 @@ use tickloop_agent_tools::{
 };
 
 mod prompts;
-pub(super) use prompts::{enter_plan_mode_declined, plan_mode_reminder};
+pub(super) use prompts::{enter_plan_mode_declined, plan_mode_exit_notice, plan_mode_reminder};
 
 /// 计划文件的目录与文件名 `<slug>-loop-<loopId>.md` 的组成部分。
 const PLANS_DIRECTORY: &str = "plans";
@@ -212,15 +212,19 @@ pub(super) struct PlanCheckpoint {
     pub progress: Option<Vec<TodoItem>>,
 }
 
-pub(super) fn definitions() -> Vec<ToolDefinition> {
-    vec![
-        ToolDefinition {
+/// Like Claude Code's `ALL_AGENT_DISALLOWED_TOOLS`, a delegated child gets neither
+/// `EnterPlanMode` nor `ExitPlanMode`: its mode is frozen, and in Plan it reports its findings or
+/// plan in its final reply for the parent to submit.
+pub(super) fn definitions(is_delegated: bool) -> Vec<ToolDefinition> {
+    let mut definitions = Vec::new();
+    if !is_delegated {
+        definitions.push(ToolDefinition {
             name: ENTER_PLAN_MODE_TOOL_NAME.into(),
             description: prompts::enter_plan_mode_description(),
             input_schema: json!({"type":"object","properties":{},"additionalProperties":false}),
-        },
+        });
         // 照 Claude Code 的 `.passthrough()`：不声明 additionalProperties，其他字段被接受并忽略。
-        ToolDefinition {
+        definitions.push(ToolDefinition {
             name: EXIT_PLAN_MODE_TOOL_NAME.into(),
             description: prompts::exit_plan_mode_description(),
             input_schema: json!({"type":"object","properties":{"allowedPrompts":{
@@ -231,21 +235,22 @@ pub(super) fn definitions() -> Vec<ToolDefinition> {
                     "prompt":{"type":"string","description":"Semantic description of the action, e.g. \"run tests\", \"install dependencies\""}
                 },"required":["tool","prompt"]}
             }}}),
-        },
-        ToolDefinition {
-            name: TODO_WRITE_TOOL_NAME.into(),
-            description: prompts::todo_write_description(),
-            input_schema: json!({"type":"object","properties":{"todos":{
-                "type":"array",
-                "description":"The updated todo list",
-                "items":{"type":"object","properties":{
-                    "content":{"type":"string","minLength":1},
-                    "status":{"type":"string","enum":["pending","in_progress","completed"]},
-                    "activeForm":{"type":"string","minLength":1}
-                },"required":["content","status","activeForm"],"additionalProperties":false}
-            }},"required":["todos"],"additionalProperties":false}),
-        },
-    ]
+        });
+    }
+    definitions.push(ToolDefinition {
+        name: TODO_WRITE_TOOL_NAME.into(),
+        description: prompts::todo_write_description(),
+        input_schema: json!({"type":"object","properties":{"todos":{
+            "type":"array",
+            "description":"The updated todo list",
+            "items":{"type":"object","properties":{
+                "content":{"type":"string","minLength":1},
+                "status":{"type":"string","enum":["pending","in_progress","completed"]},
+                "activeForm":{"type":"string","minLength":1}
+            },"required":["content","status","activeForm"],"additionalProperties":false}
+        }},"required":["todos"],"additionalProperties":false}),
+    });
+    definitions
 }
 
 pub(super) fn plans_directory(root: &Path) -> PathBuf {
@@ -654,6 +659,10 @@ pub(super) fn rebuild_plans_and_progress(
 }
 
 impl Agent {
+    /// Declines the reviewed version. A waiting ExitPlanMode receives the feedback, or the
+    /// cancellation that ends its Run. Without a waiting tool, feedback starts a planning
+    /// continuation, and a bare cancel only closes the review: the plan stays pending and the
+    /// execution mode stays as the user left it.
     pub async fn decline_plan(
         &self,
         chat_id: ChatId,
@@ -700,25 +709,24 @@ impl Agent {
             .await?;
             return Ok(None);
         }
+        let Some(feedback) = feedback else {
+            return Ok(None);
+        };
         if chat.active.is_some() {
             return Err(AgentError::Busy);
         }
-        plan.approval_pending = feedback.is_none();
+        plan.approval_pending = false;
         chat.snapshot.policy.mode = ExecutionMode::Plan;
         chat.snapshot.policy.revision += 1;
         self.save(&chat.snapshot);
         drop(chats);
-        match feedback {
-            Some(feedback) => self
-                .submit(
-                    chat_id,
-                    Some(loop_id),
-                    prompts::declined_plan(Some(&feedback)),
-                )
-                .await
-                .map(Some),
-            None => Ok(None),
-        }
+        self.submit(
+            chat_id,
+            Some(loop_id),
+            prompts::declined_plan(Some(&feedback)),
+        )
+        .await
+        .map(Some)
     }
 
     /// Approves the reviewed version and resumes its waiting tool. If that Run already ended,
@@ -825,6 +833,8 @@ impl Agent {
         snapshot.policy.revision += 1;
         self.save(&snapshot);
         chat.snapshot = snapshot;
+        // The approval result or continuation carries the approved plan; no exit notice follows.
+        chat.needs_plan_mode_exit_notice = false;
         if let Some(request) = request {
             let pending = approvals
                 .remove(&request.id)
@@ -855,10 +865,14 @@ impl Agent {
     }
 
     /// The plan mode section of a conversation request while the Chat is in Plan mode. It names
-    /// the Loop's plan file, choosing the Chat's plan file prefix on first use.
+    /// the Loop's plan file, choosing the Chat's plan file prefix on first use. A delegated child
+    /// has no plan file: it researches read-only and reports in its final reply.
     pub(super) fn plan_mode_section(&self, chat: &mut Chat, loop_id: LoopId) -> Option<String> {
         if chat.snapshot.policy.mode != ExecutionMode::Plan {
             return None;
+        }
+        if chat.snapshot.delegation.is_some() {
+            return Some(prompts::DELEGATED_PLAN_MODE_REMINDER.into());
         }
         let directory = self.plans_directory(&chat.snapshot.workdir);
         // The model's Write would create a missing plans directory with ordinary permissions, so

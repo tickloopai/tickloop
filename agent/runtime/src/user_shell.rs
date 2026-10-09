@@ -673,6 +673,11 @@ impl Agent {
             }
         };
         let _ = self.inner.user_shell_events.send(record.clone());
+        // A user's `!` command never has a description of its own.
+        if record.starts_in_background && !user_shell_state_is_terminal(&record.state) {
+            self.describe_background_shell(chat_id, record.id, &record.command)
+                .await;
+        }
         if continues_goal {
             self.start_next_agent_run(chat_id).await?;
         }

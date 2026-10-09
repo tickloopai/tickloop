@@ -403,3 +403,70 @@ async fn a_program_that_cannot_be_identified_counts_as_uncertain_not_absent() {
         "an unanswered program may still be the member"
     );
 }
+
+/// Three programs in one Workspace: `make dev` under a shell-prompt title, an idle shell, and a
+/// protocol Tick whose declaration cannot be read.
+struct NamedPanes;
+
+#[async_trait::async_trait]
+impl HerdrPort for NamedPanes {
+    async fn request(
+        &self,
+        method: &str,
+        params: Value,
+        _: CancellationToken,
+    ) -> Result<Value, tickhost_connect::host_error::HostError> {
+        let me = std::process::id();
+        let home = std::env::var("HOME").unwrap();
+        Ok(match method {
+            "pane.list" => json!({"panes":[
+                {"pane_id":"make","terminal_id":"t1","workspace_id":"w1","tab_id":"tab1","cwd":"/tmp","foreground_cwd":"/tmp","terminal_title_stripped":"me@host:~/project"},
+                {"pane_id":"idle","terminal_id":"t2","workspace_id":"w1","tab_id":"tab1","cwd":format!("{home}/work/tickloop/feat"),"foreground_cwd":format!("{home}/work/tickloop/feat"),"terminal_title_stripped":"me@host:~/work/tickloop/feat"},
+                {"pane_id":"quote","terminal_id":"t3","workspace_id":"w1","tab_id":"tab1","cwd":"/tmp","foreground_cwd":"/tmp","tokens":{"tickloop_instance":"herdr:quote-run"}},
+            ]}),
+            "pane.process_info" => match params["pane_id"].as_str().unwrap() {
+                "make" => {
+                    json!({"process_info":{"foreground_process_group_id":me,"shell_pid":1,"foreground_processes":[{"pid":me,"argv":["/usr/bin/make","dev"],"name":"gnumake"}]}})
+                }
+                "idle" => {
+                    json!({"process_info":{"foreground_process_group_id":me,"shell_pid":me,"foreground_processes":[{"pid":me,"argv":["-zsh"],"name":"zsh"}]}})
+                }
+                _ => {
+                    json!({"process_info":{"foreground_process_group_id":me,"shell_pid":1,"foreground_processes":[{"pid":me,"argv":["/opt/tickloop/bin/tick","longbridge","quote","AAPL.US"],"name":"tick"}]}})
+                }
+            },
+            method => panic!("unexpected Herdr method {method}"),
+        })
+    }
+}
+
+#[tokio::test]
+async fn workspace_discovery_names_programs_by_what_they_run() {
+    let access = TickAccess::with_host(
+        HerdrContext::without_view("/tmp/named-herdr.sock".into()),
+        std::sync::Arc::new(NamedPanes),
+    );
+    let listing = read_workspace(&access, json!({"workspace_id":"w1"}))
+        .await
+        .unwrap();
+    let titles = listing["ticks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tick| {
+            (
+                tick["pane_id"].as_str().unwrap().to_owned(),
+                tick["title"].as_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(
+        titles["make"], "make dev",
+        "a shell prompt title is not a name"
+    );
+    assert_eq!(titles["idle"], "zsh · ~/…/tickloop/feat");
+    assert_eq!(
+        titles["quote"], "tick longbridge quote AAPL.US",
+        "a protocol Tick whose declaration cannot be read keeps its command"
+    );
+}

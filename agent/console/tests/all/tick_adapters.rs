@@ -2,8 +2,8 @@ use serde_json::json;
 use std::{sync::Arc, time::Duration};
 use tick_protocol::InstanceRef;
 use tickloop_agent_console::monitor_rows::{
-    MonitorAction, MonitorContext, MonitorRows, MonitorRowsRegistry, TickDescriptor, TickGlyph,
-    TickGroup, TickIntent,
+    MonitorAction, MonitorContext, MonitorRows, MonitorRowsRegistry, SubscriptionOperation,
+    TickDescriptor, TickGlyph, TickGroup, TickIntent,
 };
 use tickloop_agent_protocol::{EventKind, ObservationKind, TickSubscriptionChange};
 use tickloop_agent_runtime::{
@@ -41,8 +41,11 @@ impl MonitorRows for CalendarRows {
             title: "Earnings calendar".into(),
             kind: "Calendar".into(),
             status: "live".into(),
+            notes: Vec::new(),
             owner: tickloop_agent_console::monitor_rows::TickOwner::Unknown,
+            tone: tickloop_agent_console::monitor_rows::StatusTone::Neutral,
             updated_at_ms: None,
+            update: None,
             resources: None,
             running: true,
             actions: vec![MonitorAction {
@@ -121,7 +124,8 @@ async fn a_registered_type_lists_subscribes_and_triggers_without_type_branches()
     });
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].group.name, "Calendars");
-    assert_eq!(rows[0].status, "live · 5s");
+    assert_eq!(rows[0].status, "live");
+    assert_eq!(rows[0].notes, ["⟳ 5s"]);
     tokio::time::advance(Duration::from_secs(5)).await;
     settle().await;
     assert_eq!(
@@ -227,7 +231,8 @@ async fn shell_baseline_output_and_final_exit_use_the_same_subscription_to_loop_
     });
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].group.name, "Shells");
-    assert_eq!(rows[0].status, "exit 7 · 5s");
+    assert_eq!(rows[0].status, "exit 7");
+    assert_eq!(rows[0].notes, ["7", "⟳ 5s"]);
     assert!(!rows[0].running);
     tokio::time::sleep(Duration::from_millis(5200)).await;
     assert_eq!(
@@ -344,6 +349,54 @@ async fn shell_output_changes_before_exit_and_a_late_watch_uses_a_new_baseline()
     agent.shutdown().await;
 }
 
+/// A subscription never runs out of sight: its instance keeps a row even when no Tick type lists
+/// it or the user removed it, until the subscription itself is cancelled.
+#[test]
+fn a_subscribed_instance_always_has_a_row_with_its_marker() {
+    let instance = InstanceRef::new("cal", "remote").unwrap();
+    let mut chat: tickloop_agent_protocol::ChatSnapshot = serde_json::from_value(
+        json!({"id":Uuid::new_v4(),"workdir":"/fixture","messages":[],"loops":[]}),
+    )
+    .unwrap();
+    chat.monitor.remove(instance.clone());
+    let subscription = |accumulated: u64| -> tickloop_agent_protocol::TickSubscriptionStatus {
+        serde_json::from_value(json!({"id":Uuid::new_v4(),"loop_id":Uuid::new_v4(),"loop_state":"WaitingTrigger","instance":instance,"every_seconds":60,"accumulated":accumulated,"last_delivery_ms":null,"last_delivery":null,"updated_at_ms":5_000,"link":"Live"})).unwrap()
+    };
+    let unread = |rows: &[tickloop_agent_console::monitor_rows::TickDescriptor]| {
+        rows[0]
+            .update
+            .as_ref()
+            .and_then(|update| update.unread)
+            .and_then(|unread| unread.count)
+    };
+    let listed = |subscriptions| {
+        MonitorRowsRegistry::builtin().list(&MonitorContext {
+            chat: Some(chat.clone()),
+            subscriptions,
+            ..Default::default()
+        })
+    };
+    assert!(listed(Vec::new()).is_empty(), "the removal hides the row");
+
+    let rows = listed(vec![subscription(2)]);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].instance, instance);
+    assert_eq!(rows[0].status, "live");
+    assert_eq!(rows[0].notes, ["⟳ 60s"]);
+    assert_eq!(unread(&rows), Some(2));
+
+    let rows = listed(vec![subscription(0), subscription(1)]);
+    assert_eq!(rows[0].notes, ["⟳ 2"]);
+    assert_eq!(unread(&rows), Some(1));
+
+    let mut stopped = subscription(0);
+    stopped.loop_state = tickloop_agent_protocol::LoopState::Stopped;
+    assert!(
+        listed(vec![stopped]).is_empty(),
+        "a stopped Loop delivers nothing"
+    );
+}
+
 /// Built-in rows only describe what each key means; the Console decides how to carry it out.
 #[test]
 fn built_in_rows_describe_their_actions_as_intents() {
@@ -358,6 +411,7 @@ fn built_in_rows_describe_their_actions_as_intents() {
         origin: ShellTaskOrigin::User,
         owner: ShellTaskOwner::User { chat_id: chat },
         command: "sleep 30".into(),
+        description: None,
         cwd: "/fixture".into(),
         state,
         was_background: true,
@@ -367,12 +421,14 @@ fn built_in_rows_describe_their_actions_as_intents() {
         reason: None,
         output_bytes: 0,
         updated_at_ms: None,
+        ended_at_ms: None,
         capabilities: ShellTaskCapabilities::default(),
     };
-    let (running, finished) = (
+    let (running, mut finished) = (
         shell(ShellTaskState::Background),
         shell(ShellTaskState::Completed),
     );
+    finished.updated_at_ms = Some(1_000);
     let subscription = |instance: &str| -> TickSubscriptionStatus {
         serde_json::from_value(json!({"id":Uuid::new_v4(),"loop_id":Uuid::new_v4(),"loop_state":"WaitingTrigger","instance":instance,"every_seconds":60,"accumulated":0,"last_delivery_ms":null,"last_delivery":null,"link":"Live"})).unwrap()
     };
@@ -387,6 +443,8 @@ fn built_in_rows_describe_their_actions_as_intents() {
             tasks: vec![running.clone(), finished.clone()],
         }),
         subscriptions: vec![pane.clone(), artifact.clone()],
+        // The finished Shell still shows its result.
+        now_ms: 1_000,
         ..Default::default()
     });
     let actions = |instance: &InstanceRef| {
@@ -397,6 +455,22 @@ fn built_in_rows_describe_their_actions_as_intents() {
             .clone()
     };
     let action = |key, label, intent| MonitorAction { key, label, intent };
+    let manage = |instance: &InstanceRef| {
+        [
+            ('e', "cadence", SubscriptionOperation::EditCadence),
+            ('u', "unsubscribe", SubscriptionOperation::Cancel),
+        ]
+        .map(|(key, label, operation)| {
+            action(
+                key,
+                label,
+                TickIntent::ManageSubscriptions {
+                    instance: instance.clone(),
+                    operation,
+                },
+            )
+        })
+    };
     assert_eq!(
         actions(&InstanceRef::shell(running.id)),
         [
@@ -420,35 +494,45 @@ fn built_in_rows_describe_their_actions_as_intents() {
             ),
         ]
     );
-    assert_eq!(
-        actions(&pane.instance),
-        [
-            action('o', "open", TickIntent::OpenSubscription { id: pane.id }),
-            action(
-                'x',
-                "remove",
-                TickIntent::RemoveFromMonitor(pane.instance.clone())
-            ),
-        ]
-    );
+    let mut pane_actions = vec![
+        action(
+            'o',
+            "subscriptions",
+            TickIntent::ManageSubscriptions {
+                instance: pane.instance.clone(),
+                operation: SubscriptionOperation::View,
+            },
+        ),
+        action(
+            'x',
+            "remove",
+            TickIntent::RemoveFromMonitor(pane.instance.clone()),
+        ),
+    ];
+    pane_actions.extend(manage(&pane.instance));
+    assert_eq!(actions(&pane.instance), pane_actions);
+    let mut artifact_actions = [
+        ('o', "open"),
+        ('x', "remove"),
+        ('c', "copy"),
+        ('f', "feedback"),
+    ]
+    .map(|(key, label)| {
+        action(
+            key,
+            label,
+            TickIntent::Artifact {
+                id: artifact.instance.to_string(),
+                key,
+            },
+        )
+    })
+    .to_vec();
+    artifact_actions.extend(manage(&artifact.instance));
     assert_eq!(
         actions(&artifact.instance),
-        [
-            ('o', "open"),
-            ('x', "remove"),
-            ('c', "copy"),
-            ('f', "feedback")
-        ]
-        .map(|(key, label)| {
-            action(
-                key,
-                label,
-                TickIntent::Artifact {
-                    id: artifact.instance.to_string(),
-                    key,
-                },
-            )
-        })
+        artifact_actions,
+        "a subscribed Artifact keeps opening on Enter"
     );
     let member = InstanceRef::new("cal", "member").unwrap();
     let member_row = tickloop_agent_console::monitor_rows::member_descriptor(&MonitorMember {
@@ -492,8 +576,12 @@ fn duplicate_instance_projection_keeps_the_newest_delivery_in_any_subscription_o
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].updated_at_ms, Some(2000));
         assert_eq!(rows[0].title, "Shared Tick");
-        assert!(rows[0].status.starts_with("live · "));
-        assert!(rows[0].status.contains("5s") && rows[0].status.contains("86400s"));
+        assert_eq!(rows[0].status, "live");
+        assert_eq!(
+            rows[0].notes,
+            ["⟳ 2"],
+            "two subscriptions show as a summary"
+        );
     }
 }
 
@@ -675,7 +763,13 @@ async fn artifact_rows_show_where_feedback_is_linked_and_the_newest_request() {
         MonitorRowsRegistry::builtin().list(&context).remove(0)
     };
     assert_eq!(row(None, None).status, "");
+    assert!(row(None, None).notes.is_empty());
     assert_eq!(row(None, Some(elsewhere)).status, "feedback elsewhere");
+    assert_eq!(
+        row(None, Some(elsewhere)).notes,
+        ["feedback elsewhere"],
+        "where feedback goes stays on the row"
+    );
     assert_eq!(row(Some(false), Some(elsewhere)).status, "feedback here");
     assert_eq!(row(Some(true), Some(here)).status, "feedback paused");
     assert_eq!(

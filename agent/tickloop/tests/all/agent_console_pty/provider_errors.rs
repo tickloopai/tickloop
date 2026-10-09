@@ -55,12 +55,12 @@ async fn kimi_http_refusal_shows_its_message_next_steps_and_clickable_link() {
         );
         view.send(b"\x0f");
         view.wait_for("Transcript preserves refusal", |frame| {
-            frame.contains("Full archive") && frame.contains("monthly usage limit")
+            frame.contains("Showing detailed transcript") && frame.contains("monthly usage limit")
         })
         .await;
         view.send(b"\x1b");
         view.wait_for("input returns after Transcript", |frame| {
-            !frame.contains("Full archive")
+            !frame.contains("Showing detailed transcript")
         })
         .await;
         view.send(b"/provider\r");

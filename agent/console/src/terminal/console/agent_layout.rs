@@ -79,15 +79,14 @@ impl AgentRow {
         }
     }
 
-    /// The row's own status word retains its state even when a child's request sets the group.
+    /// The row's own status word retains its state even when a child's request sets the group:
+    /// a failure is an error, while stopping, interrupting or expiring is only a warning.
     pub(in crate::terminal) fn status_role(&self) -> Role {
-        if matches!(
-            self.state,
-            LoopState::Failed | LoopState::Stopped | LoopState::Interrupted | LoopState::Expired
-        ) {
-            return Role::Error;
+        match self.state {
+            LoopState::Failed => Role::Error,
+            LoopState::Stopped | LoopState::Interrupted | LoopState::Expired => Role::Warning,
+            _ => group_role(self.group),
         }
-        group_role(self.group)
     }
 
     pub(in crate::terminal) fn state_glyph(
@@ -410,11 +409,11 @@ fn group_role(group: AttentionGroup) -> Role {
 pub(crate) fn status_glyph(group: AttentionGroup, completed: bool) -> Glyph {
     match group {
         AttentionGroup::NeedsInput => Glyph::AgentNeedsInput,
-        AttentionGroup::Errors => Glyph::Failure,
+        AttentionGroup::Errors => Glyph::AgentFailed,
         AttentionGroup::Working => Glyph::AgentRunning,
         AttentionGroup::Waiting => Glyph::AgentWaiting,
         AttentionGroup::Idle => Glyph::AgentIdle,
-        AttentionGroup::Done if completed => Glyph::Success,
+        AttentionGroup::Done if completed => Glyph::AgentCompleted,
         AttentionGroup::Done => Glyph::AgentStopped,
         AttentionGroup::Unknown => Glyph::AgentUnknown,
         AttentionGroup::Empty => Glyph::AgentEmpty,
@@ -1354,13 +1353,13 @@ impl OverviewState {
     /// What Enter and Space do on the selected line.
     pub(super) fn row_hints(&self) -> Vec<String> {
         match self.selected {
-            Some(OverviewTarget::CurrentDraft) => vec!["Enter/→ return".into()],
+            Some(OverviewTarget::CurrentDraft) => vec!["enter/→ return".into()],
             Some(OverviewTarget::Heading(group)) => vec![if self.is_group_folded(group) {
-                "Enter/→ expand".to_owned()
+                "enter/→ expand".to_owned()
             } else {
-                "Enter/→ collapse".to_owned()
+                "enter/→ collapse".to_owned()
             }],
-            Some(OverviewTarget::Agent(_)) => vec!["Enter open".to_owned()],
+            Some(OverviewTarget::Agent(_)) => vec!["enter open".to_owned()],
             Some(OverviewTarget::Disclosure(group)) => self
                 .entries()
                 .iter()
@@ -1370,9 +1369,9 @@ impl OverviewState {
                         hidden,
                         open,
                     } if *candidate == group => Some(if *open {
-                        "Enter/Space show fewer".to_owned()
+                        "enter/space show fewer".to_owned()
                     } else {
-                        format!("Enter/Space show {hidden}")
+                        format!("enter/space show {hidden}")
                     }),
                     _ => None,
                 })
@@ -1550,12 +1549,12 @@ impl OverviewState {
                 let hints = if help_open {
                     Vec::new()
                 } else if self.input_focused {
-                    vec!["Tab list".to_owned(), "Esc back".into()]
+                    vec!["tab list".to_owned(), "esc back".into()]
                 } else {
                     row_hints
                         .into_iter()
                         .chain(
-                            ["p/w filter", "r history", "Tab new Agent", "Esc back"]
+                            ["p/w filter", "r history", "tab new Agent", "esc back"]
                                 .map(String::from),
                         )
                         .collect()
@@ -1719,37 +1718,37 @@ pub(super) fn help_lines(
             format!("Q questions {questions}"),
             "p filter project".into(),
             "w filter Workspace".into(),
-            "Tab list / new Agent".into(),
-            "Enter / → open Agent (row)".into(),
-            "Enter / → / Space fold group (heading)".into(),
-            "Enter dispatch (input)".into(),
+            "tab list / new Agent".into(),
+            "enter / → open Agent (row)".into(),
+            "enter / → / space fold group (heading)".into(),
+            "enter dispatch (input)".into(),
             "r open history".into(),
             "/cwd PATH set dispatch directory".into(),
             "↑ list (empty input)".into(),
-            "Ctrl+G editor".into(),
+            "ctrl+g editor".into(),
         ]
     } else {
         [
             "← Agents (empty input)",
-            "Enter send",
-            "Ctrl+J newline",
-            "Ctrl+G editor",
+            "enter send",
+            "ctrl+j newline",
+            "ctrl+g editor",
             "A/Q approval/question",
-            "↓ Subagents entry (input end)",
-            "Enter/Space toggle Subagents (entry)",
-            "↓ Agent list (entry expanded)",
-            "Ctrl+N/P list/completion",
-            "Enter open Agent (list)",
-            "Space fold descendants (list)",
-            "Esc list → entry → input",
+            "↓ Subagents list (input end)",
+            "Click Subagents N fold list",
+            "ctrl+n/p list/completion",
+            "enter open Agent (list)",
+            "space fold descendants (list)",
+            "x dismiss finished (list)",
+            "esc list → input",
             "→ Monitor (empty, no suggestion)",
-            "Shift+↑/↓ Monitor Shells",
-            "Enter open Shell (Monitor)",
+            "shift+↑/↓ Monitor Shells",
+            "enter open Shell (Monitor)",
             "x remove from Monitor",
             "a add to Monitor",
             "j/k list navigation",
-            "PageUp/Down conversation",
-            "Ctrl+End latest",
+            "pgup/pgdn conversation",
+            "ctrl+end latest",
         ]
         .into_iter()
         .map(str::to_owned)
@@ -1782,6 +1781,6 @@ pub(super) fn help_lines(
             RoleLine::role(truncate_width(&text, width), Role::MutedText)
         })
         .collect::<Vec<_>>();
-    lines.push(RoleLine::role("Esc / ? close help", Role::MutedText));
+    lines.push(RoleLine::role("esc / ? close help", Role::MutedText));
     lines
 }

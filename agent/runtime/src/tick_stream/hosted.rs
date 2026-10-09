@@ -265,7 +265,7 @@ impl HostedFeed {
 
 #[async_trait::async_trait]
 impl ProtocolFeed for HostedFeed {
-    async fn recovery_tool(&self) -> Result<Option<String>, String> {
+    async fn descriptor(&self) -> Result<tick_protocol::TickDescriptor, String> {
         let mut connection = self
             .tools
             .data(self.chat, &self.instance)
@@ -275,7 +275,7 @@ impl ProtocolFeed for HostedFeed {
             .request("describe", json!({}), CONTROL_TIMEOUT)
             .await
             .map_err(|error| error.to_string())?;
-        Ok(descriptor["recover_with"].as_str().map(str::to_owned))
+        serde_json::from_value(descriptor).map_err(|error| error.to_string())
     }
 
     /// Registers a host watch: the reply carries the current content, then the host pushes

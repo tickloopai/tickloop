@@ -204,13 +204,17 @@ fn shell_tick_appears_can_be_focused_and_removed_in_an_isolated_pty() {
     session.wait_for_editor();
     assert!(!session.output.lock().unwrap().contains("Monitor 0"));
     session.send(b"!printf shell-tick-pty; while [ ! -f finish ]; do sleep 0.02; done\r");
-    session.wait("Shell running · Ctrl+B background");
+    session.wait("Shell running · ctrl+b background");
     session.send(b"\x02");
     session.wait("Shells (1)");
     std::fs::write(directory.path().join("finish"), "").unwrap();
-    session.wait("exit 0");
+    // A clean exit adds no words to the row; its unread end is the accent `●`.
+    session.wait("● ");
+    assert!(!session.frame().contains("exit 0"), "{}", session.frame());
     session.send(b"\x1b[Cx");
     session.wait_without("Shells (1)");
+    // The emptied column stays, so the conversation keeps its width; /monitor hides it.
+    session.wait("Nothing to monitor");
     session.wait_for_editor();
     session.send(b"/monitor\r\r");
     let settings_path = directory.path().join("state/settings.json");
@@ -228,7 +232,7 @@ fn shell_tick_appears_can_be_focused_and_removed_in_an_isolated_pty() {
         &std::fs::read(directory.path().join("state/settings.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!(saved["monitor"], "auto");
+    assert_eq!(saved["monitor"], "hidden");
 }
 
 #[test]
@@ -328,8 +332,8 @@ fn artifact_login_opens_picker_adds_tick_and_uses_a_substitute_browser() {
                 .any(|monitor| monitor.contains('›') && monitor.contains("PTY Research"))
                 && frame
                     .lines()
-                    .filter_map(|line| line.split_once('│').map(|(_, monitor)| monitor))
-                    .any(|monitor| monitor.contains("Enter open"))
+                    .last()
+                    .is_some_and(|hints| hints.contains("enter open"))
             {
                 break;
             }
@@ -401,7 +405,7 @@ fn a_saved_member_is_shown_detailed_removed_and_restored_across_restarts_in_a_re
     session.send(b"\x7f\x7f");
     session.wait_without("❯\u{a0}jk");
     session.send(b"\x1b[C");
-    session.wait("Enter details · x remove · Esc");
+    session.wait("enter details · x remove · esc");
     session.send(b"\r");
     session.wait("Owner     Herdr");
     session.wait("Resources unavailable");
@@ -427,7 +431,7 @@ fn a_saved_member_is_shown_detailed_removed_and_restored_across_restarts_in_a_re
     restarted.wait("Added to Monitor");
     restarted.send(b"\x1b");
     restarted.wait("Monitor 1");
-    restarted.wait("Enter details · x remove · Esc");
+    restarted.wait("enter details · x remove · esc");
     restarted.send(b"\x1b");
     restarted.exit();
 }

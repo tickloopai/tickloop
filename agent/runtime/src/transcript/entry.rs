@@ -118,6 +118,10 @@ pub(crate) struct ChainEntry {
     /// it was written.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_tools: Option<std::collections::BTreeSet<String>>,
+    /// Tick Loop extension: marks the host note telling the model that Plan mode ended, Claude
+    /// Code's `plan_mode_exit` attachment.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub plan_mode_exit: bool,
     /// The execution mode at a user checkpoint stays raw so an unknown legacy value cannot
     /// invalidate the entire Transcript entry.
     #[serde(

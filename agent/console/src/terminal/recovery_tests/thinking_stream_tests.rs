@@ -419,7 +419,7 @@ fn run_thinking_stream(route: &str) {
         fixture.wait_for("Read");
     }
     fixture.wait_for(STREAM_REPLY);
-    fixture.wait_for("Done");
+    fixture.wait_for_turn_summary();
     if route == "flood" {
         assert!(
             !fixture
@@ -442,7 +442,7 @@ fn run_thinking_stream(route: &str) {
         );
         fixture.send(b"\x0f");
         fixture.wait_until_shown("the complete Thinking archive", |frame| {
-            frame.contains("Transcript ·") && frame.contains("final preview")
+            frame.contains("Showing detailed transcript") && frame.contains("final preview")
         });
         fixture.send(b"\x1b");
         fixture.wait_for(STREAM_REPLY);
@@ -499,20 +499,20 @@ fn run_thinking_restore(fixture: &mut RecoveryPty, directory: &std::path::Path) 
     let thinking = frame.find("Thinking (ctrl+o to expand)").unwrap();
     let tool = frame.find("Read").unwrap();
     let text = frame.find(STREAM_REPLY).unwrap();
-    let done = frame
-        .find("Done · input tokens: 37, output tokens: 11")
-        .unwrap();
+    let done = frame.find("Done · ↓ 11 tokens").unwrap();
     assert!(
         input < thinking && thinking < tool && tool < text && text < done,
         "restored events changed order: {frame}"
     );
     fixture.send(b"\x0f");
     fixture.wait_until_shown("the full Thinking archive", |frame| {
-        frame.contains("Transcript ·") && frame.contains(HIDDEN_THINKING) && frame.contains('続')
+        frame.contains("Showing detailed transcript")
+            && frame.contains(HIDDEN_THINKING)
+            && frame.contains('続')
     });
     fixture.send(b"\x1b");
     fixture.wait_until_shown("the collapsed conversation again", |frame| {
-        !frame.contains("Transcript ·") && frame.contains(STREAM_REPLY)
+        !frame.contains("Showing detailed transcript") && frame.contains(STREAM_REPLY)
     });
     let after = screen::visible_screen(&fixture.raw_output(), 80, 24);
     assert!(!after.contains(HIDDEN_THINKING), "{after}");

@@ -70,7 +70,7 @@ fn artifact_client(agent: &Agent) -> Result<Arc<ArtifactClient>, AgentError> {
         .unwrap()
         .as_ref()
         .and_then(|provider| provider.artifact_client())
-        .ok_or_else(|| AgentError::Invalid("Artifact Service is unavailable".into()))
+        .ok_or_else(|| AgentError::Invalid("Tick Loop Artifacts is unavailable".into()))
 }
 
 trait EventSourceBindingExt {
@@ -180,10 +180,10 @@ impl Agent {
         let credential = client
             .credential_snapshot()
             .map_err(|error| AgentError::Invalid(error.to_string()))?
-            .ok_or_else(|| AgentError::Invalid("Artifact Service is signed out".into()))?;
+            .ok_or_else(|| AgentError::Invalid("Not signed in to Tick Loop Artifacts".into()))?;
         if credential.origin != tick.origin.trim_end_matches('/') {
             return Err(AgentError::Invalid(
-                "the artifact belongs to another Artifact Service".into(),
+                "the artifact belongs to another Tick Loop Artifacts origin".into(),
             ));
         }
         let (loop_id, creates_loop) = {
@@ -280,10 +280,10 @@ impl Agent {
         let credential = client
             .credential_snapshot()
             .map_err(|error| AgentError::Invalid(error.to_string()))?
-            .ok_or_else(|| AgentError::Invalid("Artifact Service is signed out".into()))?;
+            .ok_or_else(|| AgentError::Invalid("Not signed in to Tick Loop Artifacts".into()))?;
         if credential.origin != tick.origin {
             return Err(AgentError::Invalid(
-                "the artifact belongs to another Artifact Service".into(),
+                "the artifact belongs to another Tick Loop Artifacts origin".into(),
             ));
         }
         let binding = self

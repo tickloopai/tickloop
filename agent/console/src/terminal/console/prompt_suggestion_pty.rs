@@ -202,7 +202,7 @@ async fn prompt_suggestion_pty_generates_ghost_without_submitting_until_accepted
         .collect();
     assert!(conversation.contains("1 shell still running"), "{frame}");
     assert!(
-        regex::Regex::new(r"Done · \d+s · done \d{2}:\d{2}")
+        regex::Regex::new(r"✻ Worked for \d+s")
             .unwrap()
             .is_match(&conversation),
         "{frame}"
@@ -265,7 +265,9 @@ async fn prompt_suggestion_pty_chinese_bash_kimi_with_completed_child_shows_and_
     fixture.send("列出当前目录下的文件\r".as_bytes());
     let frame = fixture.wait(|frame| frame.contains("查看 README.md"));
     assert!(
-        frame.contains("Done") && frame.contains("Bash") && frame.contains("Subagents 1"),
+        super::super::shows_turn_summary(&frame)
+            && frame.contains("Bash")
+            && frame.contains("Subagents 1"),
         "{frame}"
     );
     let editor = || {
@@ -320,7 +322,8 @@ async fn prompt_suggestion_pty_delegated_chinese_bash_explains_suppression_witho
     );
     fixture.wait(|frame| frame.contains("Chat:") && frame.contains("kimi-k3"));
     fixture.send("列出当前目录下的文件\r".as_bytes());
-    let frame = fixture.wait(|frame| frame.contains("Done") && frame.contains("当前目录包含"));
+    let frame = fixture
+        .wait(|frame| super::super::shows_turn_summary(frame) && frame.contains("当前目录包含"));
     assert!(frame.contains("Bash"), "{frame}");
     assert!(
         tokio::time::timeout(Duration::from_millis(300), request)
@@ -364,7 +367,8 @@ async fn prompt_suggestion_pty_provider_failure_is_quiet_and_status_has_no_priva
     };
     fixture.wait(|_| editor()["pending"] == true);
     release.send(()).unwrap();
-    let frame = fixture.wait(|frame| frame.contains("Done") && editor()["pending"] == false);
+    let frame = fixture
+        .wait(|frame| super::super::shows_turn_summary(frame) && editor()["pending"] == false);
     assert!(editor()["suggestion"].is_null());
     assert!(
         !frame.contains("failed: Provider") && !frame.contains("private provider"),
@@ -401,11 +405,11 @@ async fn prompt_suggestion_pty_off_plan_and_failed_turns_make_no_model_request()
         fixture.wait(|frame| frame.contains("Chat:") && frame.contains("fixture"));
         fixture.send(b"check the fixture\r");
         fixture.wait(|frame| {
-            frame.contains(if suppression == "failed" {
-                "Failed:"
+            if suppression == "failed" {
+                frame.contains("Failed:")
             } else {
-                "Done"
-            })
+                super::super::shows_turn_summary(frame)
+            }
         });
         assert!(
             tokio::time::timeout(Duration::from_millis(300), request)

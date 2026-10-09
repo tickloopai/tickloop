@@ -35,9 +35,10 @@ async fn run_monitor_width(fixture: &PrivateFixture) {
     let mut view = PtyView::start(fixture);
     view.wait_for_editor("View ready", Some("")).await;
     // The command line names no word itself, so the last word on screen means the Shell printed.
+    // Eight words a line keep every word within a result's preview.
     view.send(
         format!(
-            "!for index in $(seq -w 0 {}); do printf 'word%s ' $index; done; echo\r",
+            "!for index in $(seq 0 {}); do printf 'word%02d ' $index; [ $((index % 8)) -eq 7 ] && echo; done\r",
             WORD_COUNT - 1
         )
         .as_bytes(),
@@ -48,7 +49,7 @@ async fn run_monitor_width(fixture: &PrivateFixture) {
     .await;
     view.wait_for_editor("echo finished", Some("")).await;
     view.send(b"!printf monitor-width; while [ ! -f finish ]; do sleep 0.02; done\r");
-    view.wait_for("running Shell", |frame| frame.contains("Ctrl+B background"))
+    view.wait_for("running Shell", |frame| frame.contains("ctrl+b background"))
         .await;
     view.send(b"\x02");
     for (terminal_columns, monitor_columns) in [(LAPTOP_WIDTH, 42), (MINIMUM_WIDTH, 32)] {

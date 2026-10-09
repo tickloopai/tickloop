@@ -378,6 +378,7 @@ mod tests {
                 invoked_skills: Vec::new(),
                 is_meta: false,
                 host_tools: None,
+                plan_mode_exit: false,
                 execution_mode: None,
                 is_inherited_prompt: false,
                 original_message_id: None,

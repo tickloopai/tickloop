@@ -46,6 +46,8 @@ mod model_dialog_pty;
 #[cfg(test)]
 #[path = "console/monitor_tests.rs"]
 mod monitor_tests;
+#[cfg(test)]
+mod plan_flow_pty;
 mod prompt_suggestion;
 #[cfg(test)]
 mod prompt_suggestion_pty;
@@ -90,7 +92,7 @@ use super::{
         AcceptedMention, FamilyMentionTarget, FileMentionAction, FileMentionIndex, FileMentionKey,
         FileMentionState, IndexGeneration, IndexReplacement, MentionTarget, draft_mentions_path,
     },
-    footer::{FooterAction, FooterEffect, FooterFrame, FooterItemId, FooterState},
+    footer::{FooterFrame, FooterItemId, FooterState},
     hyperlink,
     image_cache::{ImageCache, ImageLinks},
     input_history::{
@@ -106,7 +108,7 @@ use super::{
         PermissionsSurface,
     },
     renderer::{self, Renderer},
-    scrollback::{InputEcho, ScrollAction, Scrollback, ToolCallState},
+    scrollback::{CollapsedCall, InputEcho, ScrollAction, Scrollback, ToolCallState},
     selection::{Cell, Selection, line_width, split_columns},
     shell_input::{
         InputKind, ShellCompletionKey, ShellCompletionKind, ShellEmptyControl, ShellExecution,
@@ -114,14 +116,6 @@ use super::{
     },
     status_area::{BackgroundStatusNotice, StatusArea},
     style::{ColourDepth, Role, RoleLine, RoleSpan, Span, StyledLine, ThemeName},
-    subscription_surface::{
-        SubscriptionAction, SubscriptionEffect, SubscriptionFocus, SubscriptionSurface,
-        SubscriptionViewport,
-    },
-    task_surface::{
-        TaskOutputUpdate, TaskSurface, TaskSurfaceAction, TaskSurfaceEffect, TaskSurfaceFocus,
-        TaskViewport,
-    },
     transcript::{Transcript, TranscriptDocument, TranscriptEvent},
 };
 
@@ -131,12 +125,18 @@ const RESET_SCROLL_REGION: &str = "\x1b[r";
 pub(super) const MENU_SUBMISSION_PENDING_HINT: &str = "Working…";
 /// What a queued input names as its target when it starts a Loop of its own; one bound to an
 /// existing Loop of the shown Agent names nothing further.
-const NEW_LOOP_TARGET: &str = "new Loop";
 const MAX_PENDING_INPUT_ROWS: usize = 4;
 const DIVIDER_EDGE_RULE_COLUMNS: usize = 1;
 const DIVIDER_ENTRY_GAP_COLUMNS: usize = 1;
 const CREATION_ATTACH_UNAVAILABLE_PREFIX: &str = "New Agent created; local connection unavailable";
-const EXECUTION_CONNECTION_DETAILS_HINT: &str = "Ctrl+O details";
+const EXECUTION_CONNECTION_DETAILS_HINT: &str = "ctrl+o details";
+const SHELL_INPUT_PROMPT: &str = "!";
+pub(super) const CHECKED_OPTION: &str = "[x] ";
+pub(super) const UNCHECKED_OPTION: &str = "[ ] ";
+/// The input's identity label, at the right of its upper divider like Claude Code's agent name,
+/// takes at most this fraction of the border, as `width / N`.
+const IDENTITY_LABEL_WIDTH_DIVISOR: usize = 3;
+const MENU_WAITING_NOTICE: &str = "Menu waiting in conversation";
 
 /// Pairs the escape sequences that move between screen buffers with the record
 /// of which buffer the terminal is on, so the two cannot drift apart. The record
@@ -185,7 +185,7 @@ impl TerminalSurface {
 use super::monitor::MonitorEntry;
 use tickloop_agent_protocol::{
     ExecutionRef, Image, ImageContext, ImageOrigin, InputContext, QueuedInput, QueuedInputKind,
-    ShellTaskSnapshot, TickSubscriptionStatus, TodoItem,
+    TickSubscriptionStatus, TodoItem,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -202,10 +202,6 @@ const MIN_FOOTER_ITEMS_TERMINAL_ROWS: usize = FOOTER_ROWS + FOOTER_ITEMS_ROWS;
 const MIN_SCROLL_ROWS: usize = 2;
 const MIN_MENU_BODY_ROWS: usize = 5;
 const MIN_MENU_TERMINAL_ROWS: usize = FOOTER_ROWS + MIN_SCROLL_ROWS + MIN_MENU_BODY_ROWS;
-const TASK_SURFACE_HEADER_FOOTER_ROWS: usize = 2;
-/// The subscription view's own title row and footer row.
-const SUBSCRIPTION_SURFACE_HEADER_ROWS: usize = 1;
-const SUBSCRIPTION_SURFACE_FOOTER_ROWS: usize = 1;
 const EXIT_CONFIRMATION_WINDOW: Duration = Duration::from_millis(800);
 const ESCAPE_CONFIRMATION_WINDOW: Duration = Duration::from_millis(800);
 const SHELL_BACKGROUND_CHORD_WINDOW: Duration = Duration::from_millis(800);
@@ -233,16 +229,21 @@ pub(super) enum InputEvent {
     OpenOverview,
     CloseOverview,
     OpenAgent(Uuid),
+    /// Removes a finished subagent from the Subagents panel before its grace period ends.
+    DismissAgent(Uuid),
     ToggleMonitor {
         show: bool,
     },
+    /// The user finished dragging Monitor's separator; the width is saved for later Views.
+    SaveMonitorWidth {
+        columns: usize,
+    },
     ArtifactChoice(Box<super::artifacts_picker::ArtifactChoice>),
+    ArtifactSignOut,
     TickAction {
         chat: Uuid,
         action: super::tick_actions::PreparedTickAction,
     },
-    TaskSurface(TaskSurfaceEffect),
-    Subscription(SubscriptionEffect),
     Permissions(PermissionsEffect),
     Choice {
         menu_id: Uuid,
@@ -288,10 +289,15 @@ impl fmt::Debug for InputEvent {
                 .debug_struct("ToggleMonitor")
                 .field("show", show)
                 .finish(),
+            Self::SaveMonitorWidth { columns } => formatter
+                .debug_struct("SaveMonitorWidth")
+                .field("columns", columns)
+                .finish(),
             Self::ArtifactChoice(choice) => formatter
                 .debug_tuple("ArtifactChoice")
                 .field(choice)
                 .finish(),
+            Self::ArtifactSignOut => formatter.write_str("ArtifactSignOut"),
             Self::TickAction { chat, action } => formatter
                 .debug_struct("TickAction")
                 .field("chat", chat)
@@ -320,9 +326,8 @@ impl fmt::Debug for InputEvent {
             Self::OpenOverview => formatter.write_str("OpenOverview"),
             Self::CloseOverview => formatter.write_str("CloseOverview"),
             Self::OpenAgent(value) => formatter.debug_tuple("OpenAgent").field(value).finish(),
-            Self::TaskSurface(value) => formatter.debug_tuple("TaskSurface").field(value).finish(),
-            Self::Subscription(value) => {
-                formatter.debug_tuple("Subscription").field(value).finish()
+            Self::DismissAgent(value) => {
+                formatter.debug_tuple("DismissAgent").field(value).finish()
             }
             Self::Permissions(_) => formatter.write_str("Permissions"),
             Self::Choice {
@@ -552,10 +557,12 @@ pub(super) struct State {
     held_frames: usize,
     frame_deferred: bool,
     selection: Option<Selection>,
-    display: DisplayProfile,
+    pub(super) display: DisplayProfile,
     colour_depth: ColourDepth,
     prompt_enabled: bool,
     prompt_suggestion_enabled: bool,
+    /// The execution modes Shift+Tab visits, from the user's `shiftTabModes` setting.
+    shift_tab_modes: Vec<tickloop_agent_protocol::ExecutionMode>,
     prompt_suggestion: Option<String>,
     prompt_suggestion_request: Option<super::prompt_suggestion::SuggestionRequest>,
     foreground_shell: bool,
@@ -573,6 +580,9 @@ pub(super) struct State {
     back_to_bottom_pressed: bool,
     monitor_toggle_target: Option<BackToBottomTarget>,
     monitor_row_targets: Vec<MonitorRowTarget>,
+    /// When time alone next changes the drawn frame's Monitor or Subagents rows: a running glyph
+    /// blinking, a run time ticking or an age changing.
+    row_clock_at: Option<u64>,
     footer_bar_target: Option<FooterBarTarget>,
     pointer_input: Option<InputEvent>,
     completion: Completion,
@@ -614,7 +624,6 @@ pub(super) struct State {
     suspended_dialog: Option<input_dialog::DialogState>,
     dialog_cache:
         HashMap<Option<Uuid>, (input_dialog::DialogState, Option<input_dialog::DialogState>)>,
-    resumed_task_effect: Option<(Uuid, TaskSurfaceEffect)>,
     dialog_cursor_visible: bool,
     dialog_option_rows: Vec<(std::ops::Range<usize>, usize)>,
     request_queue_count: usize,
@@ -649,6 +658,13 @@ pub(super) struct State {
     diff_screen_cache: HashMap<Uuid, DiffDialog>,
     pub(super) monitor: Monitor,
     monitor_preference: tickloop_agent_config::MonitorPreference,
+    /// Monitor's column as the user last dragged it, its separator included.
+    monitor_width: Option<usize>,
+    /// Whether the left button holds Monitor's separator.
+    monitor_resizing: bool,
+    /// Where the last frame drew Monitor's `│` separator beside the conversation: its column and
+    /// rows.
+    monitor_separator: Option<(usize, std::ops::Range<usize>)>,
     /// Whether Monitor may float hosted Ticks in a Herdr popup, as the settings say.
     monitor_popup: tickloop_agent_config::MonitorPopup,
     /// The socket of the Herdr session this View runs inside, where Enter floats hosted Ticks.
@@ -665,9 +681,6 @@ pub(super) struct State {
     /// One probe per Tick type whose members' host state can be read.
     member_probes: Vec<Arc<dyn crate::monitor_rows::TickProbe>>,
     member_probe_running: bool,
-    task_surface: Option<TaskSurface<Uuid>>,
-    task_surface_cache: HashMap<Uuid, TaskSurface<Uuid>>,
-    subscription_surface: Option<SubscriptionSurface>,
     permissions_surface: Option<PermissionsSurface>,
     footer: FooterState,
     status_area: StatusArea,
@@ -678,7 +691,6 @@ pub(super) struct State {
     help_open: bool,
     help_offset: usize,
     last_input_edit: Option<Instant>,
-    footer_list_focused: bool,
     conversation_focused: bool,
     status: String,
     provider_failure: Option<String>,
@@ -693,6 +705,11 @@ pub(super) struct State {
     creation_notice: Option<String>,
     /// The visible Agent's daemon-reported delegation; reset whenever the visible Agent changes.
     visible_delegated: bool,
+    /// The viewed main Agent's task name, shown at the left of the input's top border.
+    task_title: Option<String>,
+    /// The open checklist menu and which of its options are checked: `space` toggles the
+    /// selected one, keeping at least one checked, and `enter` saves.
+    menu_checks: Option<(Uuid, Vec<bool>)>,
     /// The status explains why the last action did nothing; periodic refreshes keep it until the
     /// next key.
     status_held: bool,
@@ -805,7 +822,6 @@ struct ViewPresentation {
     help_open: bool,
     help_offset: usize,
     last_input_edit: Option<Instant>,
-    footer_list_focused: bool,
     conversation_focused: bool,
     status: String,
     execution_connection_notice: Option<ExecutionConnectionNotice>,
@@ -914,6 +930,59 @@ struct MonitorRowTarget {
     row: usize,
     columns: std::ops::Range<usize>,
     instance: tick_protocol::InstanceRef,
+}
+
+/// Paints the prompt glyph that leads the input's first line in `role`, leaving the rest as is.
+/// Ends the upper divider at `end` (columns) with ` label ─`, after `protected_end`, the end of
+/// any centred return control; a label that cannot fit, even shortened to `max_columns`, is left
+/// out.
+fn identity_badge(
+    line: &mut RoleLine,
+    text: &str,
+    role: Role,
+    border: Role,
+    (end, protected_end): (usize, usize),
+    max_columns: usize,
+) {
+    let room = end
+        .saturating_sub(protected_end + 2)
+        .min(max_columns)
+        .saturating_sub(2);
+    let text = super::conversation_picker::ellipsize(&super::safe_line(text), room);
+    if text.is_empty() {
+        return;
+    }
+    let badge = format!(" {text} ");
+    let start = end.saturating_sub(display_width(&badge) + 1);
+    if start <= protected_end {
+        return;
+    }
+    line.truncate(start);
+    line.push(badge, Some(role));
+    line.push("─", Some(border));
+}
+
+fn tint_prompt(line: &mut RoleLine, prompt: &str, role: Role) {
+    let Some(first) = line.spans.first_mut() else {
+        return;
+    };
+    let Some(rest) = first.text.strip_prefix(prompt).map(str::to_owned) else {
+        return;
+    };
+    let rest_role = first.role;
+    let link = first.link.clone();
+    first.text = prompt.to_owned();
+    first.role = Some(role);
+    if !rest.is_empty() {
+        line.spans.insert(
+            1,
+            super::style::RoleSpan {
+                text: rest,
+                role: rest_role,
+                link,
+            },
+        );
+    }
 }
 
 fn status_notice_line(
@@ -1268,8 +1337,16 @@ impl Console {
             findings
                 .resources
                 .retain(|instance, _| instance.tick_type() != tick_type);
+            findings
+                .titles
+                .retain(|instance, _| instance.tick_type() != tick_type);
+            findings
+                .updates
+                .retain(|instance, _| instance.tick_type() != tick_type);
             findings.states.extend(probed.states);
             findings.resources.extend(probed.resources);
+            findings.titles.extend(probed.titles);
+            findings.updates.extend(probed.updates);
         }
         if monitor.member_findings == findings {
             return Ok(());
@@ -1307,28 +1384,6 @@ impl Console {
         monitor.rebuild();
         Ok(())
     }
-    pub(super) fn show_subscriptions_at(
-        &self,
-        chat: Uuid,
-        rows: Vec<TickSubscriptionStatus>,
-        selected: Uuid,
-        cancel: bool,
-    ) -> Result<(), String> {
-        self.show_subscriptions(chat, rows)?;
-        let mut state = self.state.lock().map_err(|error| error.to_string())?;
-        if let Some(surface) = &mut state.subscription_surface {
-            surface.select(selected);
-            if cancel {
-                surface.apply(SubscriptionAction::RequestCancel);
-            }
-        }
-        state.monitor.focused = false;
-        state.monitor.overlay = false;
-        state
-            .draw(&mut io::stdout().lock())
-            .map_err(|error| error.to_string())
-    }
-
     pub(super) fn monitor_has_entries(&self) -> Result<bool, String> {
         Ok(self
             .state
@@ -1419,10 +1474,27 @@ impl Console {
             .draw(&mut io::stdout().lock())
             .map_err(|error| error.to_string())
     }
+    pub(super) fn set_monitor_width(&self, columns: Option<usize>) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        state.monitor_width = columns;
+        state.rendered_region = None;
+        state
+            .draw(&mut io::stdout().lock())
+            .map_err(|error| error.to_string())
+    }
+    /// Records when the Chat's running Shells started; their Monitor rows count from it.
+    pub(super) fn set_shell_starts(
+        &self,
+        chat: Uuid,
+        starts: HashMap<Uuid, u64>,
+    ) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        state.monitor_for_chat_mut(chat).shell_starts = starts;
+        Ok(())
+    }
     pub(super) fn open_monitor(&self) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
-        state.monitor.overlay =
-            state.monitor.total() > 0 && super::monitor::side_columns(state.width).is_none();
+        state.monitor.overlay = state.monitor.total() > 0 && state.monitor_side_columns().is_none();
         state.rendered_region = None;
         state
             .draw(&mut io::stdout().lock())
@@ -1730,6 +1802,52 @@ impl Console {
 
     /// The visible Agent's family; `visible` names the shown member, which also decides whether
     /// commands act on a child.
+    pub(super) fn shift_tab_modes(
+        &self,
+    ) -> Result<Vec<tickloop_agent_protocol::ExecutionMode>, String> {
+        Ok(self
+            .state
+            .lock()
+            .map_err(|error| error.to_string())?
+            .shift_tab_modes
+            .clone())
+    }
+
+    pub(super) fn set_shift_tab_modes(
+        &self,
+        modes: Vec<tickloop_agent_protocol::ExecutionMode>,
+    ) -> Result<(), String> {
+        self.state
+            .lock()
+            .map_err(|error| error.to_string())?
+            .shift_tab_modes = modes;
+        Ok(())
+    }
+
+    /// Makes the open menu `menu_id` a checklist; its options carry a `[x] `/`[ ] ` mark.
+    pub(super) fn set_menu_checks(&self, menu_id: Uuid, checks: Vec<bool>) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        state.menu_checks = Some((menu_id, checks));
+        Ok(())
+    }
+
+    pub(super) fn menu_checks(&self, menu_id: Uuid) -> Result<Option<Vec<bool>>, String> {
+        Ok(self
+            .state
+            .lock()
+            .map_err(|error| error.to_string())?
+            .menu_checks
+            .as_ref()
+            .filter(|(id, _)| *id == menu_id)
+            .map(|(_, checks)| checks.clone()))
+    }
+
+    pub(super) fn set_task_title(&self, title: Option<String>) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        state.task_title = title;
+        Ok(())
+    }
+
     pub(super) fn set_family_input_targets(
         &self,
         targets: Vec<FamilyMentionTarget>,
@@ -1798,8 +1916,6 @@ impl Console {
             && (state.input_dialog_visible()
                 || state.artifacts_picker.is_some()
                 || state.conversation_picker.is_some()
-                || state.task_surface.is_some()
-                || state.subscription_surface.is_some()
                 || state.permissions_surface.is_some()
                 || state
                     .last_input_edit
@@ -1945,6 +2061,16 @@ impl Console {
             .display)
     }
 
+    /// The viewed Chat's working directory, which paths in the conversation are relative to.
+    pub(super) fn working_directory(&self) -> Result<PathBuf, String> {
+        Ok(self
+            .state
+            .lock()
+            .map_err(|error| error.to_string())?
+            .working_directory()
+            .to_path_buf())
+    }
+
     pub fn set_footer_items(&self, items: Vec<FooterItemId>) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         state.footer.update(items);
@@ -1975,6 +2101,7 @@ impl Console {
         Ok(())
     }
 
+    /// Paints a changed status area at once, so it never waits for an unrelated frame.
     pub(super) fn update_status_area(
         &self,
         mode: String,
@@ -1983,10 +2110,29 @@ impl Console {
         todos: Vec<TodoItem>,
     ) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
-        state.status_area.update(mode, model, context, todos);
+        let changed = state.status_area.update(mode, model, context, todos);
         let panels = state.status_area.available_panels().collect::<Vec<_>>();
         state.footer.update(panels);
         state.clear_footer_selection_if_hidden();
+        if changed {
+            state
+                .draw(&mut io::stdout().lock())
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// Shows the execution mode a change just confirmed without reading the Agent again.
+    pub(super) fn show_execution_mode(
+        &self,
+        mode: tickloop_agent_protocol::ExecutionMode,
+    ) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        if state.status_area.set_mode(mode.to_string()) {
+            state
+                .draw(&mut io::stdout().lock())
+                .map_err(|error| error.to_string())?;
+        }
         Ok(())
     }
 
@@ -2160,8 +2306,11 @@ impl Console {
     pub(super) fn activate_agent(&self, chat: Uuid) -> Result<bool, String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         let restored = state.chat == Some(chat) || state.view_cache.contains_key(&Some(chat));
-        state.switch_view_chat(Some(chat));
-        state.clear_footer_selection();
+        // Opening the member already shown keeps any list focus taken since the request.
+        if state.chat != Some(chat) {
+            state.switch_view_chat(Some(chat));
+            state.clear_footer_selection();
+        }
         state.conversation_focused = false;
         Ok(restored)
     }
@@ -2257,23 +2406,11 @@ impl Console {
             .map_or(self._lifetime.interactive, |state| state.interactive)
     }
 
-    pub fn transcript_id(&self) -> Result<Option<Uuid>, String> {
-        Ok(self
-            .state
-            .lock()
-            .map_err(|error| error.to_string())?
-            .transcript
-            .as_ref()
-            .map(|(id, _)| *id))
-    }
-
     pub fn start_transcript(&self) -> Result<Uuid, String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         if !state.interactive {
             return Err("the transcript view requires a terminal".into());
         }
-        state.hide_task_surface();
-        state.hide_subscription_view();
         state.permissions_surface = None;
         let id = state.start_transcript();
         state
@@ -2304,24 +2441,22 @@ impl Console {
             && let Some(losses) = state.execution_losses.get(&chat)
         {
             for loss in losses {
-                document.lines.push(String::new());
-                document.lines.push("Execution connection details".into());
-                document
-                    .lines
-                    .extend(loss.technical.lines().map(display_text));
+                document.push_notice(
+                    std::iter::once("Execution connection details".to_owned())
+                        .chain(loss.technical.lines().map(display_text)),
+                );
             }
         }
         if let Some(chat) = state.chat
             && let Some(cause) = state.last_connection_diagnostics.get(&chat)
         {
-            document.lines.push(String::new());
-            document
-                .lines
-                .push("Last connection diagnostic (this View)".into());
-            document.lines.push(format!("Technical cause: {cause}"));
-            document.lines.push(format!(
-                "/resume {chat} loads saved history; continuing requires an explicit new input."
-            ));
+            document.push_notice([
+                "Last connection diagnostic (this View)".to_owned(),
+                format!("Technical cause: {cause}"),
+                format!(
+                    "/resume {chat} loads saved history; continuing requires an explicit new input."
+                ),
+            ]);
         }
         if let Some((current, transcript)) = &mut state.transcript
             && id == *current
@@ -2343,105 +2478,8 @@ impl Console {
             return Ok(());
         }
         state.open_diff_screen(chat_id, catalog);
-        state.hide_task_surface();
-        state.hide_subscription_view();
         state.permissions_surface = None;
         state.clear_footer_selection();
-        state.shell_background_chord_started_at = None;
-        state.rendered_region = None;
-        state
-            .draw(&mut io::stdout().lock())
-            .map_err(|error| error.to_string())
-    }
-
-    pub fn show_tasks_at(
-        &self,
-        snapshot: ShellTaskSnapshot,
-        selected_task: Option<Uuid>,
-    ) -> Result<TaskSurfaceEffect, String> {
-        self.show_task_surface(snapshot, selected_task)
-    }
-
-    fn show_task_surface(
-        &self,
-        snapshot: ShellTaskSnapshot,
-        selected_task: Option<Uuid>,
-    ) -> Result<TaskSurfaceEffect, String> {
-        let mut state = self.state.lock().map_err(|error| error.to_string())?;
-        if !state.interactive {
-            return Err("the Shell task center requires a terminal".into());
-        }
-        let chat_id = snapshot.chat_id;
-        if state.chat != Some(chat_id) {
-            return Ok(TaskSurfaceEffect::None);
-        }
-        let (mut surface, mut effect) =
-            if let Some(mut surface) = state.task_surface_cache.remove(&chat_id) {
-                surface.clear_action_error();
-                let effect = surface.reopen(snapshot);
-                (surface, effect)
-            } else {
-                let mut surface = TaskSurface::open(snapshot, chat_id);
-                let effect = surface.initial_effect();
-                (surface, effect)
-            };
-        if let Some(task_id) = selected_task {
-            let viewport = task_surface_content_viewport(
-                state.width,
-                state.input_dialog_body_height(),
-                TaskSurfaceFocus::Detail { task_id },
-            );
-            effect = surface.open_detail(task_id, viewport);
-        }
-        if state.request_layout.is_some() {
-            let mut dialog = input_dialog::DialogState::default();
-            dialog.task_surface = Some(surface);
-            state.install_user_dialog(Some(chat_id), dialog);
-            return Ok(TaskSurfaceEffect::None);
-        }
-        state.task_surface = Some(surface);
-
-        state.hide_subscription_view();
-        state.permissions_surface = None;
-        state.clear_footer_selection();
-        state.transcript = None;
-        state.hide_diff_screen();
-        state.menu_focused = false;
-        state.review_focused = false;
-        state.shell_background_chord_started_at = None;
-        state.rendered_region = None;
-        state
-            .draw(&mut io::stdout().lock())
-            .map_err(|error| error.to_string())?;
-        Ok(effect)
-    }
-
-    pub fn show_subscriptions(
-        &self,
-        chat_id: Uuid,
-        rows: Vec<TickSubscriptionStatus>,
-    ) -> Result<(), String> {
-        let mut state = self.state.lock().map_err(|error| error.to_string())?;
-        if !state.interactive {
-            return Err("the Tick Subscription view requires a terminal".into());
-        }
-        if state.chat != Some(chat_id) {
-            return Ok(());
-        }
-        if state.request_layout.is_some() {
-            let mut dialog = input_dialog::DialogState::default();
-            dialog.subscription_surface = Some(SubscriptionSurface::open(chat_id, rows));
-            state.install_user_dialog(Some(chat_id), dialog);
-            return Ok(());
-        }
-        state.subscription_surface = Some(SubscriptionSurface::open(chat_id, rows));
-        state.permissions_surface = None;
-        state.hide_task_surface();
-        state.clear_footer_selection();
-        state.transcript = None;
-        state.hide_diff_screen();
-        state.menu_focused = false;
-        state.review_focused = false;
         state.shell_background_chord_started_at = None;
         state.rendered_region = None;
         state
@@ -2503,8 +2541,6 @@ impl Console {
             return Ok(());
         }
         state.permissions_surface = Some(surface);
-        state.hide_task_surface();
-        state.hide_subscription_view();
         state.transcript = None;
         state.hide_diff_screen();
         state.clear_footer_selection();
@@ -2721,178 +2757,6 @@ impl Console {
         Ok(())
     }
 
-    pub fn subscription_view_chat(&self) -> Result<Option<Uuid>, String> {
-        Ok(self
-            .state
-            .lock()
-            .map_err(|error| error.to_string())?
-            .subscription_surface
-            .as_ref()
-            .map(SubscriptionSurface::chat_id))
-    }
-
-    pub(super) fn subscription_dialog_chats(&self) -> Result<Vec<Uuid>, String> {
-        let mut state = self.state.lock().map_err(|error| error.to_string())?;
-        Ok(state
-            .subscription_surfaces_mut()
-            .map(|surface| surface.chat_id())
-            .collect())
-    }
-
-    pub fn update_subscriptions(
-        &self,
-        chat_id: Uuid,
-        rows: Vec<TickSubscriptionStatus>,
-    ) -> Result<(), String> {
-        let mut state = self.state.lock().map_err(|error| error.to_string())?;
-        let Some(surface) = state
-            .subscription_surfaces_mut()
-            .find(|surface| surface.chat_id() == chat_id)
-        else {
-            return Ok(());
-        };
-        if !surface.update(rows) {
-            return Ok(());
-        }
-        state
-            .draw(&mut io::stdout().lock())
-            .map_err(|error| error.to_string())
-    }
-
-    pub fn subscription_change_failed(&self, chat: Uuid, message: String) -> Result<(), String> {
-        let mut state = self.state.lock().map_err(|error| error.to_string())?;
-        let Some(surface) = state
-            .subscription_surfaces_mut()
-            .find(|surface| surface.chat_id() == chat)
-        else {
-            return Ok(());
-        };
-        surface.report_error(message);
-        state
-            .draw(&mut io::stdout().lock())
-            .map_err(|error| error.to_string())
-    }
-
-    pub fn task_surface_chat(&self) -> Result<Option<Uuid>, String> {
-        Ok(self
-            .state
-            .lock()
-            .map_err(|error| error.to_string())?
-            .task_surface
-            .as_ref()
-            .map(|surface| *surface.restore()))
-    }
-
-    pub(super) fn task_dialog_chats(&self) -> Result<Vec<Uuid>, String> {
-        let state = self.state.lock().map_err(|error| error.to_string())?;
-        let mut chats = state
-            .task_surface
-            .iter()
-            .map(|surface| *surface.restore())
-            .collect::<Vec<_>>();
-        chats.extend(state.suspended_task_chats());
-        chats.sort_unstable();
-        chats.dedup();
-        Ok(chats)
-    }
-
-    pub(super) fn take_resumed_task_effect(
-        &self,
-    ) -> Result<Option<(Uuid, TaskSurfaceEffect)>, String> {
-        let mut state = self.state.lock().map_err(|error| error.to_string())?;
-        Ok(state.resumed_task_effect.take().filter(|(chat, _)| {
-            state
-                .task_surface
-                .as_ref()
-                .is_some_and(|surface| *surface.restore() == *chat)
-        }))
-    }
-
-    pub fn update_tasks(&self, snapshot: ShellTaskSnapshot) -> Result<TaskSurfaceEffect, String> {
-        let mut state = self.state.lock().map_err(|error| error.to_string())?;
-        let chat_id = snapshot.chat_id;
-        if let Some(surface) = state
-            .task_surface
-            .as_mut()
-            .filter(|surface| *surface.restore() == chat_id)
-        {
-            let effect = surface.update_snapshot(snapshot);
-            state
-                .draw(&mut io::stdout().lock())
-                .map_err(|error| error.to_string())?;
-            return Ok(effect);
-        }
-        if let Some(surface) = state.hidden_task_surface_mut(chat_id) {
-            surface.update_snapshot_hidden(snapshot);
-        }
-        Ok(TaskSurfaceEffect::None)
-    }
-
-    pub fn update_task_output(
-        &self,
-        chat: Uuid,
-        update: TaskOutputUpdate,
-    ) -> Result<TaskSurfaceEffect, String> {
-        let mut state = self.state.lock().map_err(|error| error.to_string())?;
-        let Some(surface) = state.task_surface_mut(chat) else {
-            return Ok(TaskSurfaceEffect::None);
-        };
-        let effect = surface.update_output(update);
-        let effect = if state
-            .task_surface
-            .as_ref()
-            .is_some_and(|surface| *surface.restore() == chat)
-        {
-            effect
-        } else {
-            TaskSurfaceEffect::None
-        };
-        state
-            .draw(&mut io::stdout().lock())
-            .map_err(|error| error.to_string())?;
-        Ok(effect)
-    }
-
-    pub fn task_action_failed(
-        &self,
-        chat: Uuid,
-        task_id: Uuid,
-        message: String,
-    ) -> Result<(), String> {
-        let mut state = self.state.lock().map_err(|error| error.to_string())?;
-        let Some(surface) = state.task_surface_mut(chat) else {
-            return Ok(());
-        };
-        surface.report_action_error(task_id, message);
-        state
-            .draw(&mut io::stdout().lock())
-            .map_err(|error| error.to_string())
-    }
-
-    pub fn clear_task_action_error(&self, chat: Uuid) -> Result<(), String> {
-        let mut state = self.state.lock().map_err(|error| error.to_string())?;
-        if let Some(surface) = state.task_surface_mut(chat) {
-            surface.clear_action_error();
-        }
-        Ok(())
-    }
-
-    pub fn task_updates_failed(&self, chat_id: Uuid, message: String) -> Result<(), String> {
-        let mut state = self.state.lock().map_err(|error| error.to_string())?;
-        if let Some(surface) = state
-            .task_surface
-            .as_mut()
-            .filter(|surface| *surface.restore() == chat_id)
-        {
-            surface.report_update_error(message);
-        } else if let Some(surface) = state.hidden_task_surface_mut(chat_id) {
-            surface.report_update_error(message);
-        }
-        state
-            .draw(&mut io::stdout().lock())
-            .map_err(|error| error.to_string())
-    }
-
     #[cfg(test)]
     pub fn start(interactive: bool) -> Result<(Self, mpsc::Receiver<InputEvent>), String> {
         Self::start_with_display(interactive, DisplayPreferences::default())
@@ -3076,43 +2940,49 @@ impl Console {
         if text.is_empty() {
             return Ok(());
         }
-        let mut state = self.state.lock().map_err(|error| error.to_string())?;
-        let mut output = io::stdout().lock();
-        if !state.interactive {
-            let separator = if own_line && state.plain_line_open && !text.starts_with('\n') {
-                "\n"
-            } else {
-                ""
-            };
-            output
-                .write_all(separator.as_bytes())
-                .and_then(|()| output.write_all(text.as_bytes()))
-                .and_then(|()| output.flush())
-                .map_err(|error| error.to_string())?;
-            state.plain_line_open = !text.ends_with('\n');
-            return Ok(());
+        {
+            let mut state = self.state.lock().map_err(|error| error.to_string())?;
+            if !state.interactive {
+                let separator = if own_line && state.plain_line_open && !text.starts_with('\n') {
+                    "\n"
+                } else {
+                    ""
+                };
+                let mut output = io::stdout().lock();
+                output
+                    .write_all(separator.as_bytes())
+                    .and_then(|()| output.write_all(text.as_bytes()))
+                    .and_then(|()| output.flush())
+                    .map_err(|error| error.to_string())?;
+                state.plain_line_open = !text.ends_with('\n');
+                return Ok(());
+            }
         }
-        state.scrollback.append(text);
-        if self.message_id.is_none() {
-            state.capture_creation_output(&[ConversationPiece::Styled(text.into(), None)]);
-        }
-        if let Some(id) = &self.message_id {
-            state.scrollback.note_message(id.clone());
-        }
-        if state.transcript.is_none() {
-            state.draw(&mut output).map_err(|error| error.to_string())?;
-        }
-        Ok(())
+        // In the conversation, text that begins with a newline is a block of its own.
+        self.write_pieces(&ConversationPiece::block_runs(&[(text.to_owned(), None)]))
     }
 
-    /// Writes runs of text, each carrying the role it plays in the
-    /// conversation. Non-interactive output receives the text alone.
+    /// Writes runs of text, each carrying the role it plays in the conversation; runs that begin
+    /// with a newline start a block of their own. Non-interactive output receives the text alone.
     pub(super) fn write_roles(&self, spans: &[(String, Option<Role>)]) -> Result<(), String> {
-        let pieces: Vec<ConversationPiece> = spans
-            .iter()
-            .map(|(text, role)| ConversationPiece::Styled(text.clone(), *role))
-            .collect();
-        self.write_pieces(&pieces)
+        self.write_pieces(&ConversationPiece::block_runs(spans))
+    }
+
+    /// Writes `⎿` response rows at the end of the conversation.
+    pub(super) fn write_response(&self, runs: &[(String, Option<Role>)]) -> Result<(), String> {
+        self.write_pieces(&[ConversationPiece::Response(runs.to_vec())])
+    }
+
+    /// Writes a call's result under the call's own row.
+    pub(super) fn write_tool_result(
+        &self,
+        call_key: &str,
+        runs: &[(String, Option<Role>)],
+    ) -> Result<(), String> {
+        self.write_pieces(&[ConversationPiece::ToolResult {
+            call_key: call_key.to_owned(),
+            runs: runs.to_vec(),
+        }])
     }
 
     /// Writes assistant reply text, shown as Markdown in the conversation.
@@ -3124,12 +2994,21 @@ impl Console {
         }])
     }
 
-    /// Writes a run's completion notice; in the conversation it replaces the
-    /// previous completion notice.
+    /// Writes a run's completion notice as a block of its own; in the conversation it replaces
+    /// the previous completion notice.
     pub(super) fn write_completion_notice(
         &self,
         spans: &[(String, Option<Role>)],
     ) -> Result<(), String> {
+        if !self.is_interactive() {
+            let mut pieces = vec![ConversationPiece::Block];
+            pieces.extend(
+                spans
+                    .iter()
+                    .map(|(text, role)| ConversationPiece::Styled(text.clone(), *role)),
+            );
+            return self.write_pieces(&pieces);
+        }
         self.write_scrollback_spans(spans, |scrollback| {
             scrollback.append_completion_notice(spans)
         })
@@ -3141,9 +3020,10 @@ impl Console {
         call_id: &str,
         spans: &[(String, Option<Role>)],
         state: ToolCallState,
+        collapse: Option<CollapsedCall>,
     ) -> Result<(), String> {
         self.write_scrollback_spans(spans, |scrollback| {
-            scrollback.set_tool_call(run_id, call_id, spans, state)
+            scrollback.set_tool_call(run_id, call_id, spans, state, collapse)
         })
     }
 
@@ -3170,14 +3050,16 @@ impl Console {
     }
 
     /// Ends one call or the remaining calls of the originating Run.
+    /// Marks one call of `run_id` finished, and whether it failed, or every unfinished call of
+    /// the run when the run ended.
     pub(super) fn finish_tool_call(
         &self,
         run_id: Uuid,
-        call_id: Option<&str>,
+        call: Option<(&str, bool)>,
     ) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
-        match call_id {
-            Some(call_id) => state.scrollback.finish_tool_call(run_id, call_id),
+        match call {
+            Some((call_id, failed)) => state.scrollback.finish_tool_call(run_id, call_id, failed),
             None => state.scrollback.finish_tool_calls(run_id),
         }
         Ok(())
@@ -3191,6 +3073,35 @@ impl Console {
         }
         state.scrollback.hide_completion_notice();
         if state.transcript.is_none() {
+            state
+                .draw(&mut io::stdout().lock())
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// Shows the latest output of the running `!` command under its echo, or clears it.
+    pub(super) fn set_shell_preview(&self, runs: &[(String, Option<Role>)]) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        if !state.interactive {
+            return Ok(());
+        }
+        let mut rows = Vec::new();
+        let mut row = RoleLine::default();
+        for (text, role) in runs {
+            let mut lines = text.split('\n');
+            if let Some(first) = lines.next() {
+                row.push(first, *role);
+            }
+            for line in lines {
+                rows.push(std::mem::take(&mut row));
+                row.push(line, *role);
+            }
+        }
+        if !row.spans.is_empty() {
+            rows.push(row);
+        }
+        if state.scrollback.set_shell_preview(rows) && state.transcript.is_none() {
             state
                 .draw(&mut io::stdout().lock())
                 .map_err(|error| error.to_string())?;
@@ -3266,23 +3177,21 @@ impl Console {
     }
 
     pub(super) fn write_pieces(&self, pieces: &[ConversationPiece]) -> Result<(), String> {
-        if pieces.iter().all(|piece| piece.text().is_empty()) {
+        if pieces
+            .iter()
+            .all(|piece| piece.text().is_empty() || matches!(piece, ConversationPiece::Block))
+        {
             return Ok(());
         }
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         let mut output = io::stdout().lock();
         if !state.interactive {
-            for piece in pieces {
-                output
-                    .write_all(piece.text().as_bytes())
-                    .map_err(|error| error.to_string())?;
-            }
-            if let Some(last) = pieces
-                .iter()
-                .map(|piece| piece.text())
-                .rfind(|text| !text.is_empty())
-            {
-                state.plain_line_open = !last.ends_with('\n');
+            let text: String = pieces.iter().map(|piece| piece.text()).collect();
+            output
+                .write_all(text.as_bytes())
+                .map_err(|error| error.to_string())?;
+            if !text.is_empty() {
+                state.plain_line_open = !text.ends_with('\n');
             }
             return output.flush().map_err(|error| error.to_string());
         }
@@ -3500,10 +3409,10 @@ impl Console {
                     refresh: false,
                     hint: match kind {
                         PickerKind::Provider => {
-                            "p Connection · f All/Configured · Enter models/setup · Esc close"
+                            "p Connection · f All/Configured · enter models/setup · esc close"
                         }
-                        PickerKind::Model => "p Connection · Enter apply · Esc back",
-                        PickerKind::Actions => "Enter open · Esc back",
+                        PickerKind::Model => "p Connection · enter apply · esc back",
+                        PickerKind::Actions => "enter open · esc back",
                     }
                     .into(),
                     ..Default::default()
@@ -3677,12 +3586,12 @@ impl Console {
         )
     }
 
+    /// With `feedback`, the last choice, "Keep planning", takes the user's feedback.
     pub(super) fn show_plan_menu(&self, menu: Menu, feedback: bool) -> Result<(), String> {
+        let keep_planning = menu.options.len().saturating_sub(1);
         self.show_menu_with_comments(
             menu,
-            feedback.then_some(vec![
-                super::workflows::PlanApprovalChoice::KeepPlanning.option_index(),
-            ]),
+            feedback.then_some(vec![keep_planning]),
             Vec::new(),
             "Feedback",
             None,
@@ -3748,7 +3657,7 @@ impl Console {
         let cursor = command.len();
         state.replace_draft(command, cursor);
         state.status =
-            "Edit timer command · Enter save · Ctrl+G external editor · Ctrl+C cancel".into();
+            "Edit timer command · enter save · ctrl+g external editor · ctrl+c cancel".into();
         state
             .draw(&mut io::stdout().lock())
             .map_err(|error| error.to_string())
@@ -3820,8 +3729,6 @@ impl Console {
                         current.selected,
                         state.menu_focused
                             && state.menu_is_visible()
-                            && state.task_surface.is_none()
-                            && state.subscription_surface.is_none()
                             && state.transcript.is_none()
                             && state.diff_screen.is_none()
                             && state.history_search.is_none(),
@@ -3838,19 +3745,17 @@ impl Console {
                 !matches!(focus, MenuFocus::Picker(..))
                     || state.request_layout.is_some()
                     || state.permissions_surface.is_some()
-                    || (state.task_surface.is_none()
-                        && state.subscription_surface.is_none()
-                        && match &focus {
-                            MenuFocus::WhenInputEmpty | MenuFocus::Question(_) => {
-                                state.editor.draft().is_empty()
-                            }
-                            MenuFocus::Menu
-                            | MenuFocus::Plan
-                            | MenuFocus::MenuWithLink(_)
-                            | MenuFocus::Secret(_)
-                            | MenuFocus::Input(_)
-                            | MenuFocus::Picker(..) => true,
-                        })
+                    || (match &focus {
+                        MenuFocus::WhenInputEmpty | MenuFocus::Question(_) => {
+                            state.editor.draft().is_empty()
+                        }
+                        MenuFocus::Menu
+                        | MenuFocus::Plan
+                        | MenuFocus::MenuWithLink(_)
+                        | MenuFocus::Secret(_)
+                        | MenuFocus::Input(_)
+                        | MenuFocus::Picker(..) => true,
+                    })
             },
             |(_, focused)| focused,
         );
@@ -3893,7 +3798,7 @@ impl Console {
         state.picker_presentation = match &focus {
             MenuFocus::Picker(_, presentation) => presentation.clone(),
             _ => PickerPresentation {
-                hint: "Enter confirm · Esc back".into(),
+                hint: "enter confirm · esc back".into(),
                 ..Default::default()
             },
         };
@@ -4443,10 +4348,18 @@ impl Drop for Lifetime {
 /// reply when `starts_message` is set.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum ConversationPiece {
+    /// Starts a block one blank row below the visible content above it.
+    Block,
+    /// A block that leaves an open read or search group open, such as a thinking label.
+    Aside(String, Option<Role>),
     Styled(String, Option<Role>),
+    /// `⎿` response rows at the end of the conversation, each wrapping under its content.
+    Response(Vec<(String, Option<Role>)>),
     Input {
         text: String,
         spans: Vec<RoleSpan>,
+        /// The background the input's rows are drawn on.
+        fill: Role,
         is_user_message: bool,
     },
     Markdown {
@@ -4459,6 +4372,12 @@ pub(super) enum ConversationPiece {
         call_key: String,
         spans: Vec<(String, Option<Role>)>,
         state: ToolCallState,
+        collapse: Option<CollapsedCall>,
+    },
+    /// The result of the call named `call_key`, drawn under the call's own row.
+    ToolResult {
+        call_key: String,
+        runs: Vec<(String, Option<Role>)>,
     },
 }
 
@@ -4469,15 +4388,42 @@ enum CreationPrefixEntry {
 }
 
 impl ConversationPiece {
+    /// Pieces for one write of `runs`: when the write begins with a newline and has text after
+    /// it, the newlines become the start of a block of its own. A write of newlines alone only
+    /// ends lines.
+    pub(super) fn block_runs(runs: &[(String, Option<Role>)]) -> Vec<Self> {
+        let has_text = runs
+            .iter()
+            .any(|(text, _)| text.chars().any(|character| character != '\n'));
+        let mut pieces = Vec::with_capacity(runs.len() + 1);
+        let mut runs = runs.iter().skip_while(|(text, _)| text.is_empty());
+        if has_text && let Some((first, role)) = runs.next() {
+            let text = first.trim_start_matches('\n');
+            if text.len() < first.len() {
+                pieces.push(Self::Block);
+            }
+            if !text.is_empty() {
+                pieces.push(Self::Styled(text.to_owned(), *role));
+            }
+        }
+        pieces.extend(runs.map(|(text, role)| Self::Styled(text.clone(), *role)));
+        pieces
+    }
+
     fn append_to(&self, scrollback: &mut Scrollback, display: DisplayProfile) {
         match self {
+            Self::Block => scrollback.start_block(),
+            Self::Aside(text, role) => scrollback.append_aside(text, *role),
             Self::ToolCall {
                 run_id,
                 call_key,
                 spans,
                 state,
+                collapse,
                 ..
-            } => scrollback.set_tool_call(*run_id, call_key, spans, *state),
+            } => scrollback.set_tool_call(*run_id, call_key, spans, *state, collapse.clone()),
+            Self::ToolResult { call_key, runs } => scrollback.append_tool_result(call_key, runs),
+            Self::Response(runs) => scrollback.append_response(runs),
             Self::Styled(text, role) if *role == Some(Role::Error) => {
                 let links = hyperlink::web_links(text);
                 for (run, link) in hyperlink::runs(text, &links) {
@@ -4487,13 +4433,11 @@ impl ConversationPiece {
             Self::Styled(text, role) => scrollback.append_as(text, *role, None),
             Self::Input {
                 spans,
+                fill,
                 is_user_message,
                 ..
             } => {
-                let first_line = scrollback.line_count();
-                for span in spans {
-                    scrollback.append_span(&span.text, span.role, None, span.link.as_ref());
-                }
+                let first_line = append_input_spans(scrollback, spans, *fill);
                 if *is_user_message {
                     scrollback.mark_input(first_line..scrollback.line_count() - 1);
                 }
@@ -4508,12 +4452,17 @@ impl ConversationPiece {
         }
     }
 
-    pub(super) fn text(&self) -> &str {
+    pub(super) fn text(&self) -> std::borrow::Cow<'_, str> {
         match self {
+            Self::Block => "\n".into(),
+            Self::Aside(text, _) => format!("\n{text}").into(),
             Self::Styled(text, _)
             | Self::Input { text, .. }
             | Self::Markdown { text, .. }
-            | Self::ToolCall { text, .. } => text,
+            | Self::ToolCall { text, .. } => text.as_str().into(),
+            Self::Response(runs) | Self::ToolResult { runs, .. } => {
+                runs.iter().map(|(text, _)| text.as_str()).collect()
+            }
         }
     }
 }
@@ -4542,6 +4491,62 @@ fn body_scroll(previous: &[String], current: &[String]) -> Option<usize> {
         .map(|(shift, _)| shift)
 }
 
+/// How a user input appears in the conversation, as Claude Code draws it: a prompt behind a
+/// subtle `❯` on the user-message background, or a `!` command behind a `!` in the shell colour
+/// on the shell-message background; the text itself in the theme's text colour. Each run carries
+/// its role, the row fill and the link it opens.
+pub(super) fn input_spans<'a>(
+    line: &'a str,
+    display: DisplayProfile,
+    links: &'a [(std::ops::Range<usize>, hyperlink::Hyperlink)],
+) -> (Role, Vec<RoleSpan>) {
+    if let Some(command) = line.strip_prefix('!') {
+        return (
+            Role::ShellMessageBg,
+            vec![
+                RoleSpan {
+                    text: "! ".into(),
+                    role: Some(Role::ShellBorder),
+                    link: None,
+                },
+                RoleSpan {
+                    text: command.trim_start().into(),
+                    role: Some(Role::Text),
+                    link: None,
+                },
+            ],
+        );
+    }
+    let mut spans = vec![RoleSpan {
+        text: format!("{} ", display.glyph(Glyph::Prompt)),
+        role: Some(Role::Subtle),
+        link: None,
+    }];
+    spans.extend(
+        hyperlink::runs(line, links)
+            .into_iter()
+            .map(|(run, link)| RoleSpan {
+                text: run.to_owned(),
+                role: Some(Role::Text),
+                link: link.cloned(),
+            }),
+    );
+    (Role::UserMessageBg, spans)
+}
+
+/// Appends an input's echo as a block of its own, its wrapped rows hanging under the text after
+/// the `❯ ` or `! ` lead. Returns the echo's first line.
+fn append_input_spans(scrollback: &mut Scrollback, spans: &[RoleSpan], fill: Role) -> usize {
+    scrollback.start_block();
+    let first_line = scrollback.line_count() - 1;
+    let hang = spans.first().map_or(0, |lead| display_width(&lead.text));
+    for span in spans {
+        scrollback.append_hanging(&span.text, span.role, Some(fill), span.link.as_ref(), hang);
+    }
+    scrollback.append("\n");
+    first_line
+}
+
 fn append_input_echo(
     scrollback: &mut Scrollback,
     line: &str,
@@ -4552,17 +4557,8 @@ fn append_input_echo(
     if input.is_empty() {
         return None;
     }
-    scrollback.append("\n");
-    let first_line = scrollback.line_count() - 1;
-    scrollback.append_as(
-        &format!("{} ", display.glyph(Glyph::Prompt)),
-        Some(Role::Subtle),
-        Some(Role::UserMessageBg),
-    );
-    for (run, link) in hyperlink::runs(line, links) {
-        scrollback.append_span(run, None, Some(Role::UserMessageBg), link);
-    }
-    scrollback.append("\n");
+    let (fill, spans) = input_spans(line, display, links);
+    let first_line = append_input_spans(scrollback, &spans, fill);
     let echo = scrollback.mark_input(first_line..scrollback.line_count() - 1);
     if !input.starts_with('/') {
         scrollback.note_message(Uuid::new_v4().to_string());
@@ -4573,54 +4569,53 @@ fn append_input_echo(
     Some(echo)
 }
 
-fn pending_input_lines(entries: &[QueuedInput], width: usize, rows: usize) -> Vec<RoleLine> {
+/// Queued inputs as Claude Code shows them above the input: each behind a subtle `❯`, or `!` for
+/// a command, then a blank row that keeps them clear of the input. When `rows` cannot hold them
+/// all, the last row counts the rest.
+fn pending_input_lines(
+    entries: &[QueuedInput],
+    width: usize,
+    rows: usize,
+    display: DisplayProfile,
+) -> Vec<RoleLine> {
     if entries.is_empty() || rows == 0 {
         return Vec::new();
     }
-    let title = format!("Messages to be submitted ({}) · ↑ edit", entries.len());
-    let title = if display_width(&title) <= width {
-        title
+    let entry_rows = rows.saturating_sub(1).max(1);
+    let shown = if entries.len() <= entry_rows {
+        entries.len()
     } else {
-        format!("Pending {} · ↑ edit", entries.len())
+        entry_rows.saturating_sub(1).max(1)
     };
-    let mut lines = vec![RoleLine::role(title, Role::MutedText)];
-    let available = rows.saturating_sub(1);
-    let preview_count = if entries.len() > available && available > 1 {
-        available - 1
-    } else {
-        available
-    };
-    for entry in entries.iter().take(preview_count) {
-        let kind = match entry.kind {
-            QueuedInputKind::Message => "message",
-            QueuedInputKind::Shell => "shell",
-            QueuedInputKind::Command => "command",
+    let omitted = entries.len() - shown;
+    let mut lines = Vec::with_capacity(rows);
+    for (index, entry) in entries.iter().take(shown).enumerate() {
+        let lead = match entry.kind {
+            QueuedInputKind::Shell => "  ! ".to_owned(),
+            QueuedInputKind::Message | QueuedInputKind::Command => {
+                format!("  {} ", display.glyph(Glyph::Prompt))
+            }
         };
-        let target = if entry.loop_id.is_some() {
+        let more = if omitted > 0 && entry_rows == 1 && index == 0 {
+            format!(" · … {omitted} more")
+        } else {
             String::new()
-        } else {
-            format!(" {NEW_LOOP_TARGET}")
         };
-        let text = format!(
-            "{kind}{target} · {}",
-            display_text(&entry.text).replace('\n', " ↵ ")
+        let text = display_text(&entry.text).replace('\n', " ↵ ");
+        let text = truncate_width(
+            &text,
+            width.saturating_sub(display_width(&lead) + display_width(&more)),
         );
-        let text = if available == 1 && entries.len() > 1 {
-            let more = format!(" · … {} more", entries.len() - 1);
-            format!(
-                "{}{more}",
-                truncate_width(&text, width.saturating_sub(display_width(&more)))
-            )
-        } else {
-            text
-        };
-        lines.push(RoleLine::role(text, Role::MutedText));
+        let mut line = RoleLine::role(lead, Role::Subtle);
+        line.push(format!("{text}{more}"), Some(Role::Subtle));
+        line.truncate(width);
+        lines.push(line);
     }
-    if entries.len() > preview_count && available > 1 {
-        lines.push(RoleLine::role(
-            format!("… {} more", entries.len() - preview_count),
-            Role::MutedText,
-        ));
+    if omitted > 0 && entry_rows > 1 {
+        lines.push(RoleLine::role(format!("  … {omitted} more"), Role::Subtle));
+    }
+    if rows > 1 {
+        lines.push(RoleLine::default());
     }
     lines
 }
@@ -4764,18 +4759,17 @@ impl State {
         let previous = self.replace_view(next);
         self.view_cache.insert(previous_chat, previous);
         self.hide_diff_screen();
-        self.hide_subscription_view();
         if let Some((dialog, suspended)) = self.dialog_cache.remove(&chat) {
             self.replace_dialog(dialog);
             self.suspended_dialog = suspended;
         }
-        self.reconcile_resumed_task();
         self.shell_background_chord_started_at = None;
         self.rendered_region = None;
     }
 
     fn replace_view(&mut self, mut next: ViewPresentation) -> ViewPresentation {
         next.status_area.agents_collapsed = self.status_area.agents_collapsed;
+        next.status_area.adopt_agent_selection(&self.status_area);
         ViewPresentation {
             monitor: std::mem::replace(&mut self.monitor, next.monitor),
             scrollback: std::mem::replace(&mut self.scrollback, next.scrollback),
@@ -4794,10 +4788,6 @@ impl State {
             help_open: std::mem::replace(&mut self.help_open, next.help_open),
             help_offset: std::mem::replace(&mut self.help_offset, next.help_offset),
             last_input_edit: std::mem::replace(&mut self.last_input_edit, next.last_input_edit),
-            footer_list_focused: std::mem::replace(
-                &mut self.footer_list_focused,
-                next.footer_list_focused,
-            ),
             conversation_focused: std::mem::replace(
                 &mut self.conversation_focused,
                 next.conversation_focused,
@@ -4879,8 +4869,6 @@ impl State {
             self.restored_contexts.clear();
         }
         self.hide_diff_screen();
-        self.hide_task_surface();
-        self.hide_subscription_view();
         self.permissions_surface = None;
         self.clear_footer_selection();
 
@@ -4920,6 +4908,7 @@ impl State {
             ),
             prompt_enabled: false,
             prompt_suggestion_enabled: true,
+            shift_tab_modes: tickloop_agent_config::DEFAULT_SHIFT_TAB_MODES.to_vec(),
             prompt_suggestion: None,
             prompt_suggestion_request: None,
             foreground_shell: false,
@@ -4936,6 +4925,7 @@ impl State {
             back_to_bottom_pressed: false,
             monitor_toggle_target: None,
             monitor_row_targets: Vec::new(),
+            row_clock_at: None,
             footer_bar_target: None,
             pointer_input: None,
             completion: Completion::default(),
@@ -4966,7 +4956,6 @@ impl State {
             mention_roots: None,
             suspended_dialog: None,
             dialog_cache: HashMap::new(),
-            resumed_task_effect: None,
             dialog_cursor_visible: false,
             dialog_option_rows: Vec::new(),
             request_queue_count: 0,
@@ -4999,6 +4988,9 @@ impl State {
             diff_screen_cache: HashMap::new(),
             monitor: Monitor::default(),
             monitor_preference: tickloop_agent_config::MonitorPreference::Auto,
+            monitor_width: None,
+            monitor_resizing: false,
+            monitor_separator: None,
             monitor_popup: tickloop_agent_config::MonitorPopup::default(),
             herdr_socket: None,
             popup_registration_offered: false,
@@ -5007,9 +4999,6 @@ impl State {
             tick_discovery: None,
             member_probes: Vec::new(),
             member_probe_running: false,
-            task_surface: None,
-            task_surface_cache: HashMap::new(),
-            subscription_surface: None,
             permissions_surface: None,
             footer: FooterState::default(),
             status_area: StatusArea::default(),
@@ -5020,7 +5009,6 @@ impl State {
             help_open: false,
             help_offset: 0,
             last_input_edit: None,
-            footer_list_focused: false,
             conversation_focused: false,
             status: String::new(),
             provider_failure: None,
@@ -5034,17 +5022,63 @@ impl State {
             rendered_execution_losses: HashSet::new(),
             creation_notice: None,
             visible_delegated: false,
+            task_title: None,
+            menu_checks: None,
             status_held: false,
             exit_confirmation: None,
             escape_confirmation: None,
         }
     }
 
+    /// Drags Monitor's separator: a press on it starts, motion resizes the column within its
+    /// bounds and the release asks to save the width. `None` leaves the event to other handling;
+    /// otherwise whether the frame changed.
+    fn resize_monitor(&mut self, kind: MouseEventKind, at: Cell) -> Option<bool> {
+        match kind {
+            MouseEventKind::Down(MouseButton::Left)
+                if !self.input_dialog_visible()
+                    && self
+                        .monitor_separator
+                        .as_ref()
+                        .is_some_and(|(column, rows)| {
+                            *column == at.column && rows.contains(&at.row)
+                        }) =>
+            {
+                self.clear_selection();
+                self.monitor_resizing = true;
+                Some(false)
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.monitor_resizing => {
+                let columns = super::monitor::dragged_columns(self.width, at.column)?;
+                if self.monitor_side_columns() == Some(columns) {
+                    return Some(false);
+                }
+                self.monitor_width = Some(columns);
+                self.rendered_region = None;
+                Some(true)
+            }
+            MouseEventKind::Up(MouseButton::Left) if self.monitor_resizing => {
+                self.monitor_resizing = false;
+                self.pointer_input = self
+                    .monitor_width
+                    .map(|columns| InputEvent::SaveMonitorWidth { columns });
+                Some(false)
+            }
+            _ => None,
+        }
+    }
+
     /// Pointer input scrolls the conversation, selects text and activates the return control.
     /// Other events are captured so the terminal does not translate the wheel into arrow keys.
     fn pointer(&mut self, event: MouseEvent, output: &mut impl Write) -> bool {
-        if self.transcript.is_some() {
-            return false;
+        if let Some((_, transcript)) = &mut self.transcript {
+            return match event.kind {
+                MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
+                    transcript.wheel(event.kind == MouseEventKind::ScrollDown);
+                    true
+                }
+                _ => false,
+            };
         }
         let height = self.input_dialog_height();
         let start = self.height.saturating_sub(height);
@@ -5141,11 +5175,7 @@ impl State {
                     }
                     return true;
                 }
-                if self.menu.is_none()
-                    && (self.permissions_surface.is_some()
-                        || self.subscription_surface.is_some()
-                        || self.task_surface.is_some())
-                {
+                if self.menu.is_none() && self.permissions_surface.is_some() {
                     match event.kind {
                         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                             let code = if event.kind == MouseEventKind::ScrollUp {
@@ -5164,32 +5194,6 @@ impl State {
                                 }
                                 if !matches!(effect, PermissionsEffect::None) {
                                     self.pointer_input = Some(InputEvent::Permissions(effect));
-                                }
-                            } else {
-                                let viewport = task_surface_content_viewport(
-                                    self.width,
-                                    self.input_dialog_body_height(),
-                                    self.task_surface
-                                        .as_ref()
-                                        .map_or(TaskSurfaceFocus::List, TaskSurface::focus),
-                                );
-                                let capacity = self.input_dialog_body_height();
-                                let selected = if let Some(surface) = &mut self.task_surface {
-                                    body_row
-                                        .checked_sub(1)
-                                        .is_some_and(|row| surface.select_at_row(row, viewport))
-                                } else {
-                                    body_row.checked_sub(1).is_some_and(|row| {
-                                        self.subscription_surface.as_mut().unwrap().select_at_row(
-                                            row,
-                                            capacity.saturating_sub(2).max(1),
-                                            self.display,
-                                        )
-                                    })
-                                };
-                                if selected {
-                                    self.pointer_input =
-                                        self.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
                                 }
                             }
                         }
@@ -5249,6 +5253,9 @@ impl State {
                 _ => {}
             }
         }
+        if let Some(resized) = self.resize_monitor(event.kind, at) {
+            return resized;
+        }
         match event.kind {
             MouseEventKind::ScrollUp => {
                 self.scroll_conversation(ScrollAction::LinesUp(renderer::WHEEL_SCROLL_LINES))
@@ -5304,19 +5311,11 @@ impl State {
                         })
                         .flatten()
                 });
-                if let Some(panel) = category {
+                if category.is_some() {
                     self.clear_selection();
-                    if self.task_surface.is_some() {
-                        if self.status_area.selected_panel() == Some(panel) {
-                            return true;
-                        }
-
-                        self.hide_task_surface();
-                        self.status_area.reconcile_panel();
-                    }
-                    self.footer.select(panel);
+                    // The label folds or unfolds the panel; the keys stay with the input.
                     self.status_area.toggle_agents();
-                    self.footer_list_focused = false;
+                    self.clear_footer_selection();
                     return true;
                 }
                 self.back_to_bottom_pressed = false;
@@ -5344,11 +5343,7 @@ impl State {
     }
 
     fn scroll_conversation(&mut self, action: ScrollAction) -> bool {
-        if self.transcript.is_some()
-            || self.task_surface.is_some()
-            || self.subscription_surface.is_some()
-            || self.diff_screen.is_some()
-        {
+        if self.transcript.is_some() || self.diff_screen.is_some() {
             return false;
         }
         self.clear_selection();
@@ -5439,13 +5434,14 @@ impl State {
 
     /// Whether a focused Monitor covers the conversation instead of sitting beside it.
     fn monitor_overlay(&self) -> bool {
-        super::monitor::side_columns(self.width).is_none()
+        self.monitor_side_columns().is_none()
             || self.monitor_preference == tickloop_agent_config::MonitorPreference::Hidden
     }
 
     fn monitor_visible(&self) -> bool {
         self.chat.is_some()
             && (self.monitor.total() > 0
+                || self.monitor.is_shown()
                 || self
                     .monitor
                     .detail
@@ -5459,14 +5455,12 @@ impl State {
                     && self.menu.is_none()
                     && self.conversation_picker.is_none()
                     && self.artifacts_picker.is_none()
-                    && self.task_surface.is_none()
-                    && self.permissions_surface.is_none()
-                    && self.subscription_surface.is_none())
+                    && self.permissions_surface.is_none())
             && self.transcript.is_none()
             && self.diff_screen.is_none()
             && !self.full_review
             && (self.monitor.overlay
-                || super::monitor::side_columns(self.width).is_some()
+                || self.monitor_side_columns().is_some()
                     && self.monitor_preference == tickloop_agent_config::MonitorPreference::Auto)
     }
 
@@ -5503,13 +5497,40 @@ impl State {
     /// width beside the conversation or over it wherever both fit, and its preferred width as the
     /// overlay of a terminal too narrow for both.
     fn monitor_columns(&self) -> usize {
-        super::monitor::side_columns(self.width)
+        self.monitor_side_columns()
             .unwrap_or(MONITOR_COLUMNS)
             .min(self.width)
     }
 
+    /// Monitor's column beside the conversation at the user's width, if both fit.
+    fn monitor_side_columns(&self) -> Option<usize> {
+        super::monitor::side_columns(self.width, self.monitor_width)
+    }
+
+    /// Rebuilds Monitor when time alone changed its rows, and says whether the screen needs a
+    /// frame: Monitor changed, or a drawn row's glyph is due to blink or its time to tick.
+    fn refresh_row_clocks(&mut self, now_ms: u64) -> bool {
+        let monitor_changed = self.monitor.refresh_due(now_ms) && self.monitor_visible();
+        monitor_changed || self.row_clock_at.is_some_and(|at| at <= now_ms)
+    }
+
+    /// When time alone next changes the Monitor or Subagents rows this frame draws.
+    fn next_row_clock(&self, now_ms: u64) -> Option<u64> {
+        let monitor = self
+            .monitor_visible()
+            .then(|| self.monitor.next_frame_ms(now_ms, self.display))
+            .flatten();
+        let panel = (!self.full_review && self.transcript.is_none())
+            .then(|| self.status_area.next_frame_ms(now_ms, self.display))
+            .flatten();
+        monitor.into_iter().chain(panel).min()
+    }
+
     fn draw_frame(&mut self, output: &mut impl Write) -> io::Result<()> {
         self.monitor_row_targets.clear();
+        self.monitor_separator = None;
+        self.row_clock_at =
+            self.next_row_clock(tickloop_agent_base::private_fs::unix_time_milliseconds());
         if self.full_review {
             let lines = self.full_review_frame();
             let rows = lines
@@ -5563,40 +5584,17 @@ impl State {
             return output.flush();
         }
         if let Some((_, transcript)) = &mut self.transcript {
-            let mut frame = transcript.frame(self.width, self.height);
-            if let Some(footer) = frame.lines.last_mut() {
-                *footer = self.display.navigation_hint(footer);
-            }
-            if self.menu.is_some()
-                && let Some(title) = frame.lines.first_mut()
-            {
-                *title = truncate_width(
-                    &format!("{title} · Menu waiting in conversation"),
-                    self.width,
-                );
-            }
+            transcript.set_notice(self.menu.is_some().then_some(MENU_WAITING_NOTICE));
+            let frame = transcript.frame(self.width, self.height);
             let rows: Vec<String> = frame
                 .lines
                 .iter()
-                .enumerate()
-                .map(|(row, line)| {
-                    let links = frame
-                        .links
-                        .iter()
-                        .filter(|link| link.line == row)
-                        .map(|link| (link.range.clone(), link.link.clone()))
-                        .collect::<Vec<_>>();
-                    hyperlink::apply(line, &links)
-                })
+                .map(|line| line.render(self.colour_depth))
                 .collect();
             write!(output, "{RESET_SCROLL_REGION}")?;
             self.paint_rows(output, RenderedView::Transcript, rows, 0)?;
-            if let Some((column, row)) = frame.cursor {
-                queue!(output, MoveTo(column as u16, row as u16), Show)?;
-            } else {
-                queue!(output, Hide)?;
-            }
-            self.rendered_screen = frame.lines;
+            queue!(output, Hide)?;
+            self.rendered_screen = frame.texts;
             return output.flush();
         }
         if let Some(diff_screen) = self.diff_screen.as_mut().filter(|_| self.menu.is_none()) {
@@ -5644,35 +5642,21 @@ impl State {
         let side_columns = self.monitor_columns();
         let monitor_lines = self.monitor_visible().then(|| {
             if let Some(detail) = &mut self.monitor.detail {
-                let width = side_columns.saturating_sub(2);
-                let hint = if self.monitor.focused {
-                    super::monitor::wrap_words(&detail.hint(), width)
-                } else {
-                    Vec::new()
-                };
-                let hint = if hint.len() < start { hint } else { Vec::new() };
-                let mut lines: Vec<RoleLine> = detail
+                return detail
                     .lines(
-                        width,
-                        start - hint.len(),
+                        side_columns.saturating_sub(2),
+                        start,
                         tickloop_agent_base::private_fs::unix_time_milliseconds(),
                     )
                     .into_iter()
                     .map(|line| line.line)
                     .collect();
-                lines.extend(hint.into_iter().map(|text| {
-                    let mut hint = RoleLine::role(text, Role::MutedText);
-                    hint.truncate(width);
-                    hint
-                }));
-                return lines;
             }
             let frame = self.monitor.frame(
                 side_columns.saturating_sub(2),
                 start,
                 self.display,
                 tickloop_agent_base::private_fs::unix_time_milliseconds(),
-                self.tick_discovery.is_some() || !self.monitor.removed().is_empty(),
             );
             if let Some(chat) = self.chat {
                 let columns = self.width.saturating_sub(side_columns) + 1..self.width;
@@ -5689,6 +5673,9 @@ impl State {
             }
             frame.lines
         });
+        if monitor_lines.is_some() && !self.monitor.overlay {
+            self.monitor_separator = Some((self.width.saturating_sub(side_columns), 0..start));
+        }
         let rows: Vec<String> = (0..start)
             .map(|row| {
                 let pinned = if row == 0 {
@@ -5800,9 +5787,7 @@ impl State {
         } else if ((self.menu_focused || self.review_focused) && !self.menu_comment_is_editing())
             || self.footer.selected().is_some()
             || self.help_open
-            || self.task_surface.is_some()
             || self.permissions_surface.is_some()
-            || self.subscription_surface.is_some()
             || (self.artifacts_picker.is_some() || self.conversation_picker.is_some())
                 && !self.dialog_cursor_visible
             || self.conversation_focused
@@ -6020,19 +6005,19 @@ impl State {
         }
         let hint = if self.input_menu_active() {
             format!(
-                "{} · Enter save · Ctrl+G external editor · Esc close field",
+                "{} · enter save · ctrl+g external editor · esc close field",
                 comment.label
             )
         } else if let Some(hint) = self.picker_presentation.editing_hint {
             hint.into()
         } else if self.menu_link.is_some() {
-            format!("{} · Enter submit · Esc close field", comment.label)
+            format!("{} · enter submit · esc close field", comment.label)
         } else if self.question_menu.is_some() {
-            "Type your answer · Enter submit · Esc close field".into()
+            "Type your answer · enter submit · esc close field".into()
         } else if comment.label == "Guidance" {
-            "add context (optional) · Enter submit · Tab close · Esc close".into()
+            "add context (optional) · enter submit · tab close · esc close".into()
         } else {
-            "Type a comment · Enter submit · Tab close · Esc close".into()
+            "Type a comment · enter submit · tab close · esc close".into()
         };
         if self.input_dialog_has_fixed_height() {
             return hint;
@@ -6048,16 +6033,16 @@ impl State {
     fn user_hint_parts(&self, hint: &str) -> Vec<(String, u8)> {
         hint.split(" · ")
             .map(|part| {
-                let part = if self.width < 48 && part.starts_with("Enter return") {
-                    "Enter return"
-                } else if self.width < 48 && part.starts_with("Ctrl+G") {
-                    "Ctrl+G editor"
+                let part = if self.width < 48 && part.starts_with("enter return") {
+                    "enter return"
+                } else if self.width < 48 && part.starts_with("ctrl+g") {
+                    "ctrl+g editor"
                 } else {
                     part
                 };
-                let priority = if part.contains("Esc") {
+                let priority = if part.split([' ', '/']).any(|key| key == "esc") {
                     12
-                } else if part.starts_with("Enter") {
+                } else if part.starts_with("enter") {
                     11
                 } else {
                     5
@@ -6095,7 +6080,7 @@ impl State {
     fn request_styled_frame(&mut self, capacity: usize) -> (Vec<RoleLine>, usize, usize) {
         if !self.menu_is_visible() {
             let mut lines = vec![RoleLine::role(
-                "Resize terminal to review · Esc cancel",
+                "Resize terminal to review · esc cancel",
                 Role::MutedText,
             )];
             lines.resize(capacity, RoleLine::default());
@@ -6377,7 +6362,7 @@ impl State {
         } else if hint_rows > 0 {
             let hint = if input_field && !editing {
                 format!(
-                    "Enter confirm · Esc back · Tab edit {}",
+                    "enter confirm · esc back · tab edit {}",
                     self.menu_comment.as_ref().unwrap().label
                 )
             } else if let Some(comment) = comment {
@@ -6385,22 +6370,22 @@ impl State {
             } else if picker && !self.review_focused {
                 self.picker_hint().unwrap_or_default().into()
             } else if self.review_focused {
-                "PageUp/Down review · Tab actions · Esc deny".into()
+                "pgup/pgdn review · tab actions · esc deny".into()
             } else if let Some(question) = &self.question_menu {
                 question_menu_hint(question, selected)
             } else if menu.confirmation {
                 if self.selected_menu_can_expand() {
-                    "Enter/y exact · Tab prefixes · n/Esc deny".into()
+                    "enter/y exact · tab prefixes · n/esc deny".into()
                 } else if self.selected_menu_accepts_comment() {
-                    "Enter/y · n/Esc deny · Tab comment".into()
+                    "enter/y · n/esc deny · tab comment".into()
                 } else {
-                    "Enter/y · n/Esc deny".into()
+                    "enter/y · n/esc deny".into()
                 }
             } else {
                 if self.selected_menu_accepts_comment() {
-                    "Tab comment".into()
+                    "tab comment".into()
                 } else if !self.input_dialog_has_fixed_height() {
-                    "Enter confirm · Esc back".into()
+                    "enter confirm · esc back".into()
                 } else {
                     String::new()
                 }
@@ -6424,14 +6409,14 @@ impl State {
             if self.menu_plan {
                 hints.push(("v full plan".into(), 12));
                 if !editing {
-                    hints.push(("PgUp/PgDn plan".into(), 10));
+                    hints.push(("pgup/pgdn plan".into(), 10));
                     if self.menu_comment.is_some() {
-                        hints.push(("Tab feedback".into(), 10));
+                        hints.push(("tab feedback".into(), 10));
                     }
                 }
             } else if self.menu_review.is_some() && comment.is_none() {
                 hints.push(("v full Diff".into(), 12));
-                hints.push(("Shift+Tab review".into(), 7));
+                hints.push(("shift+tab review".into(), 7));
             } else if menu
                 .context
                 .iter()
@@ -6441,7 +6426,7 @@ impl State {
                 .count()
                 > context_capacity
             {
-                hints.push(("PgUp/PgDn details".into(), 6));
+                hints.push(("pgup/pgdn details".into(), 6));
             }
             let hint = super::conversation_picker::fit_hint(&hints, self.width, self.display);
             lines.push(RoleLine::role(hint, Role::MutedText));
@@ -6608,30 +6593,22 @@ impl State {
             cursor,
             self.width,
             input_rows,
-            self.display.glyph(Glyph::Prompt),
+            self.input_prompt(),
         );
         input_rows = input.lines.len().max(1);
         let mut candidates = self.candidate_rows(agent_layout::MAX_CANDIDATE_ROWS);
         let mut queue = if !overview {
-            pending_input_lines(&self.queued_inputs, self.width, MAX_PENDING_INPUT_ROWS)
+            pending_input_lines(
+                &self.queued_inputs,
+                self.width,
+                MAX_PENDING_INPUT_ROWS,
+                self.display,
+            )
         } else {
             Vec::new()
         };
         let mut queue_merged = false;
-        let mut footer = self.footer.frame();
-        footer.list_focused = self.footer_list_focused;
-        if !self.footer_list_focused && !short {
-            footer.selected = None;
-        }
-        let footer_key_hint = (self.footer_items_are_visible()
-            && self.footer.selected() == Some(FooterItemId::Agents))
-        .then_some(if self.footer_list_focused {
-            "Enter open · Space fold · Esc entry"
-        } else if self.status_area.agents_collapsed {
-            "Enter/Space expand · Esc input"
-        } else {
-            "Enter/Space hide · ↓ list · Esc input"
-        });
+        let footer = self.footer.frame();
         let mut agents_entry = (!short
             && self.footer_items_are_visible()
             && footer
@@ -6697,6 +6674,8 @@ impl State {
                 leading_notice = compact;
             }
         }
+        // A necessary background fact that cannot share the hint row with the leading notice
+        // keeps a row of its own just above it rather than being cut.
         let separate_background_notice = self
             .background_status_notice
             .as_ref()
@@ -6766,29 +6745,26 @@ impl State {
         } else {
             0
         };
+        // The key hint row ends the screen and never leaves it; notices share it. Configured
+        // status lines, or the core status when the divider cannot hold it, sit between the
+        // Subagents list and the hints, so a notice never adds or removes a row.
+        let core_status_row = !short
+            && !overview
+            && !self.help_open
+            && !float_core_status
+            && configured_status.is_none()
+            && self.status_area.is_configured();
+        let separate_rows = usize::from(separate_background_notice.is_some());
         let mut status_rows = if self.help_open {
             usize::from(!leading_notice.is_empty() || required_status)
         } else {
-            configured_status
-                .as_ref()
-                .map_or(usize::from(!float_core_status), Vec::len)
-                .max(usize::from(!leading_notice.is_empty() || required_status))
+            1 + separate_rows
+                + configured_status
+                    .as_ref()
+                    .map_or(usize::from(core_status_row), Vec::len)
         };
-        if float_core_status {
-            status_rows = status_rows.max(usize::from(
-                command_feedback.is_none() && self.background_status_notice.is_some()
-                    || self.foreground_shell,
-            ));
-        }
-        if separate_background_notice.is_some() {
-            status_rows = status_rows.max(2);
-        }
         if self.height < agent_layout::TALL_LAYOUT_MIN_ROWS {
-            status_rows = status_rows.min(if separate_background_notice.is_some() {
-                2
-            } else {
-                1
-            });
+            status_rows = status_rows.min(2 + separate_rows);
         }
         let mut borders = if short { 1 } else { 2 };
         let directory_rows = usize::from(overview && !short);
@@ -6820,7 +6796,6 @@ impl State {
                 + feedback_rows
                 + borders
                 + directory_rows
-                + usize::from(footer_key_hint.is_some())
         };
         while total(
             input_rows,
@@ -6832,11 +6807,11 @@ impl State {
             borders,
         ) > cap
         {
-            if status_rows > 1 && (status_rows > 2 || separate_background_notice.is_none()) {
+            if status_rows > 1 + separate_rows {
                 status_rows -= 1;
             } else if queue.len() > 1 {
                 queue.pop();
-            } else if !self.footer_list_focused && panel_rows > 2 {
+            } else if self.footer.selected().is_none() && panel_rows > 2 {
                 panel_rows -= 1;
             } else if input_rows > 1 {
                 input_rows -= 1;
@@ -6862,13 +6837,13 @@ impl State {
                 break;
             }
         }
-        queue = pending_input_lines(&self.queued_inputs, self.width, queue.len());
+        queue = pending_input_lines(&self.queued_inputs, self.width, queue.len(), self.display);
         let mut input = InputView::frame_with_prompt_and_marks(
             &draft,
             cursor,
             self.width,
             input_rows,
-            self.display.glyph(Glyph::Prompt),
+            self.input_prompt(),
             &self.input_image_marks(),
         );
         if !candidates.is_empty() {
@@ -6902,11 +6877,6 @@ impl State {
             line.truncate(self.width);
             lines.push(line);
         }
-        let border = if self.shell_input.kind() == InputKind::Shell {
-            Role::ShellBorder
-        } else {
-            Role::PromptBorder
-        };
         let child_badge =
             (!overview && self.visible_delegated && self.shell_input.kind() != InputKind::Shell)
                 .then(|| {
@@ -6916,15 +6886,31 @@ impl State {
                                 .as_ref()
                                 .map_or("child", |registration| registration.handle.as_str())
                                 .to_owned(),
-                            super::subagent_panel::agent_color(
-                                row.subagent.as_ref().map_or(row.agent_id, |registration| {
-                                    registration.child_chat_id
-                                }),
-                            ),
+                            super::subagent_panel::agent_role(row),
                         )
                     })
                 })
                 .flatten();
+        // The viewed subagent's Agent Color frames the input it receives.
+        let child_identity = child_badge.as_ref().and_then(|(_, identity)| *identity);
+        let border = if self.shell_input.kind() == InputKind::Shell {
+            Role::ShellBorder
+        } else {
+            child_identity.unwrap_or(Role::PromptBorder)
+        };
+        let child_badge =
+            child_badge.map(|(handle, identity)| (handle, identity.unwrap_or(Role::Text)));
+        // Who receives the input, at the left of its top border: the viewed subagent's handle in
+        // its Agent Color, else the main Agent's task name.
+        let identity_label = child_badge
+            .as_ref()
+            .map(|(handle, role)| (format!("@{handle}"), *role))
+            .or_else(|| {
+                (!overview && self.shell_input.kind() != InputKind::Shell)
+                    .then(|| self.task_title.clone())
+                    .flatten()
+                    .map(|title| (title, Role::MutedText))
+            });
         if draft.is_empty()
             && self.prompt_enabled
             && let Some((handle, _)) = &child_badge
@@ -6957,22 +6943,28 @@ impl State {
                     .scrollback
                     .has_hidden_tail(content_columns, body_rows.saturating_sub(sticky_rows));
             let label = reading.then(|| self.back_to_bottom_label()).flatten();
-            if let Some(label) = label {
-                let label_width = display_width(&label);
-                let space = self.width.saturating_sub(label_width);
-                let column = space / 2;
-                let mut line = RoleLine::role("─".repeat(column), border);
-                line.push(label, Some(Role::Permission));
-                line.push("─".repeat(space - column), Some(border));
+            let return_column = label.as_ref().map(|label| {
+                (
+                    self.width.saturating_sub(display_width(label)) / 2,
+                    display_width(label),
+                )
+            });
+            let mut line = RoleLine::default();
+            if let (Some(label), Some((column, label_width))) = (label, return_column) {
+                line.push("─".repeat(column), Some(border));
                 return_control = Some((lines.len(), column..column + label_width));
-                lines.push(line);
-            } else {
-                lines.push(RoleLine::role("─".repeat(self.width), border));
+                line.push(label, Some(Role::Permission));
             }
+            line.push(
+                "─".repeat(self.width.saturating_sub(display_width(&line.text()))),
+                Some(border),
+            );
+            line.truncate(self.width);
+            lines.push(line);
             if self.chat.is_some()
                 && self.overview.projection.is_none()
                 && !self.help_open
-                && self.monitor.total() > 0
+                && (self.monitor.total() > 0 || self.monitor_visible())
             {
                 let label = format!(
                     "{} Monitor {}",
@@ -6996,14 +6988,17 @@ impl State {
                         self.width - label_width - monitor_edge_width - DIVIDER_ENTRY_GAP_COLUMNS;
                     let line = lines.last_mut().unwrap();
                     line.truncate(column);
-                    if let Some((handle, role)) = &child_badge {
-                        super::subagent_panel::child_badge(
+                    if let Some((text, role)) = &identity_label {
+                        identity_badge(
                             line,
-                            column.saturating_sub(1),
-                            handle,
+                            text,
                             *role,
                             border,
-                            return_control.as_ref().map_or(0, |(_, range)| range.end),
+                            (
+                                column,
+                                return_control.as_ref().map_or(0, |(_, range)| range.end),
+                            ),
+                            self.width / IDENTITY_LABEL_WIDTH_DIVISOR,
                         );
                     }
                     line.push(" ".repeat(DIVIDER_ENTRY_GAP_COLUMNS), None);
@@ -7032,20 +7027,35 @@ impl State {
                 }
             }
             if monitor_toggle.is_none()
-                && let Some((handle, role)) = &child_badge
+                && let Some((text, role)) = &identity_label
                 && let Some(line) = lines.last_mut()
             {
-                super::subagent_panel::child_badge(
+                let end = self.width.saturating_sub(DIVIDER_EDGE_RULE_COLUMNS);
+                line.truncate(end);
+                identity_badge(
                     line,
-                    self.width.saturating_sub(1),
-                    handle,
+                    text,
                     *role,
                     border,
-                    return_control.as_ref().map_or(0, |(_, range)| range.end),
+                    (
+                        end,
+                        return_control.as_ref().map_or(0, |(_, range)| range.end),
+                    ),
+                    self.width / IDENTITY_LABEL_WIDTH_DIVISOR,
+                );
+                line.push(
+                    "─".repeat(self.width.saturating_sub(display_width(&line.text()))),
+                    Some(border),
                 );
             }
         }
         let cursor_row = lines.len() + input.cursor_row;
+        if let Some(identity) = child_identity
+            && input.first_visual_row == 0
+            && let Some(line) = input.styled_lines.first_mut()
+        {
+            tint_prompt(line, self.display.glyph(Glyph::Prompt), identity);
+        }
         lines.extend(if self.prompt_enabled {
             input.styled_lines
         } else {
@@ -7095,8 +7105,9 @@ impl State {
             }
             lines.push(divider);
         }
+        let mut hint_row = None;
+        let mut status_lines = Vec::new();
         if status_rows > 0 {
-            let status_start = lines.len();
             let status = if command_feedback.is_some()
                 || self.status.starts_with(CREATION_ATTACH_UNAVAILABLE_PREFIX)
             {
@@ -7121,156 +7132,131 @@ impl State {
                     && !overview
                     && (background.necessary || !self.help_open)
             });
+            let above_rows = status_rows.saturating_sub(1 + separate_rows);
             if let Some(configured_status) = &configured_status {
-                let notice_line =
-                    self.connection_status_line(&notice, background, compact_pending.as_deref());
-                notice = notice_line.text();
-                if configured_status.is_empty() {
-                    lines.push(notice_line.clone());
-                }
-                for (index, configured) in configured_status
-                    .iter()
-                    .take(status_rows - usize::from(separate_background_notice.is_some()))
-                    .enumerate()
-                {
-                    let mut line = if index == 0 && !notice.is_empty() {
-                        if !leading_notice.is_empty()
-                            || required_status
-                            || compact_pending.is_some()
-                        {
-                            let mut line = notice_line.clone();
-                            line.push(" · ", Some(Role::MutedText));
-                            line.push(configured.clone(), Some(Role::StatusBar));
-                            line
-                        } else {
-                            let mut line = RoleLine::role(configured.clone(), Role::StatusBar);
-                            line.push(" · ", Some(Role::MutedText));
-                            line.spans.extend(notice_line.clone().spans);
-                            line
-                        }
-                    } else {
-                        RoleLine::role(configured.clone(), Role::StatusBar)
-                    };
-                    if index + 1 == status_rows
-                        && configured_status.len() > status_rows
-                        && (index != 0 || display_width(&notice) <= self.width.saturating_sub(2))
-                    {
+                for (index, configured) in configured_status.iter().take(above_rows).enumerate() {
+                    let mut line = RoleLine::role(configured.clone(), Role::StatusBar);
+                    if index + 1 == above_rows && configured_status.len() > above_rows {
                         line.truncate(self.width.saturating_sub(2));
                         line.push(" …", Some(Role::MutedText));
                     }
-                    lines.push(line.filled(Role::StatusBar));
+                    status_lines.push(line.filled(Role::StatusBar));
                 }
+            } else if core_status_row && above_rows > 0 {
+                status_lines.push(
+                    self.status_area
+                        .status_line_with_background(self.width, "", None),
+                );
+            }
+            // While a list owns the keys, its hints take the row instead.
+            let core_in_hint_row = short
+                && self.footer.selected().is_none()
+                && !(self.monitor_visible() && self.monitor.focused)
+                && self.status_area.is_configured()
+                && configured_status.is_none()
+                && !overview
+                && !self.help_open
+                && (leading_notice.is_empty()
+                    || self.execution_connection_notice.is_some()
+                        && self.connection_notice.is_none()
+                        && self.creation_notice.is_none())
+                && compact_pending.is_none();
+            let mut line = if core_in_hint_row {
+                // A short screen has room for one status row, and it keeps the core status.
+                self.status_area
+                    .status_line_with_background(self.width, &notice, background)
             } else {
-                lines.push(
-                    if self.status_area.is_configured()
-                        && !float_core_status
-                        && !overview
-                        && !self.help_open
-                        && (leading_notice.is_empty()
-                            || self.execution_connection_notice.is_some()
-                                && self.connection_notice.is_none()
-                                && self.creation_notice.is_none())
-                        && compact_pending.is_none()
-                    {
-                        let mut line = self
-                            .status_area
-                            .status_line_with_background(self.width, &notice, background);
-                        if self.execution_connection_notice.is_some() {
-                            let hint = EXECUTION_CONNECTION_DETAILS_HINT;
-                            if display_width(&line.text()) + 3 + display_width(hint) <= self.width {
-                                line.push(" · ", Some(Role::MutedText));
-                                line.push(hint, Some(Role::MutedText));
-                            }
-                        }
-                        line
-                    } else {
-                        let mut notice_line = self.connection_status_line(
-                            &notice,
-                            background,
-                            compact_pending.as_deref(),
-                        );
-                        notice = notice_line.text();
-                        let overview_list_hint;
-                        let return_hint;
-                        let monitor_hint;
-                        let hints = if self.confirmation_hint().is_some() || self.help_open {
-                            // Help is focused and draws its own close hint; only facts remain.
-                            ""
-                        } else if self.monitor_visible() && self.monitor.focused {
-                            monitor_hint = self.monitor.detail.as_ref().map_or_else(|| "Esc input".into(), |detail| detail.hint());
-                            monitor_hint.as_str()
-                        } else if self.foreground_shell {
-                            "Shell running · Ctrl+B background · Ctrl+C stop"
-                        } else if self.footer.selected().is_some() || float_core_status {
-                            ""
-                        } else if self.candidate_rows(1).is_empty()
-                            && self.clipboard_hint.is_visible()
-                        {
-                            CLIPBOARD_IMAGE_HINT
-                        } else if overview {
-                            if !self.overview.input_focused {
-                                overview_list_hint = format!(
-                                    "? help · {} · Tab new Agent",
-                                    self.overview.row_hints().join(" · ")
-                                );
-                                overview_list_hint.as_str()
-                            } else if self.editor.draft().is_empty() {
-                                "? help · Enter dispatch · ↑ list"
-                            } else {
-                                "Enter dispatch · Tab list"
-                            }
-                        } else if borders == 0
-                            && self.ordinary_input_is_visible()
-                            && !self.scrollback.is_at_bottom()
-                        {
-                            return_hint = self.back_to_bottom_label().unwrap_or_default();
-                            return_hint.as_str()
-                        } else if self.editor.draft().is_empty() {
-                            // A visible suggestion takes Tab and →, so → no longer opens Monitor.
-                            if self.visible_prompt_suggestion().is_some() { "← Agents · Tab/→ accept · ? help · Ctrl+O details · Ctrl+G editor · Ctrl+C interrupt" } else if self.monitor.total() == 0 { "← Agents · ? help · Ctrl+O details · Ctrl+G editor · Ctrl+C interrupt" } else { "← Agents · → Monitor · ? help · Ctrl+O details · Ctrl+G editor · Ctrl+C interrupt" }
-                        } else {
-                            "Enter send · Ctrl+G editor · Ctrl+C clear"
-                        };
-                        if notice.is_empty() {
-                            RoleLine::role(hints, Role::StatusBar)
-                        } else if hints.is_empty() {
-                            notice_line
-                        } else if overview && leading_notice.is_empty() && !self.status_held {
-                            RoleLine::role(format!("{hints} · {notice}"), Role::StatusBar)
-                        } else if overview {
-                            RoleLine::role(
-                                Some(format!("{notice} · {hints}"))
-                                    .filter(|text| display_width(text) <= self.width)
-                                    .unwrap_or(notice),
-                                Role::StatusBar,
+                let mut notice_line =
+                    self.connection_status_line(&notice, background, compact_pending.as_deref());
+                notice = notice_line.text();
+                let overview_list_hint;
+                let return_hint;
+                let monitor_hint;
+                let hints = if self.confirmation_hint().is_some() || self.help_open {
+                    // Help is focused and draws its own close hint; only facts remain.
+                    ""
+                } else if self.monitor_visible() && self.monitor.focused {
+                    monitor_hint = self.monitor.detail.as_ref().map_or_else(
+                        || {
+                            self.monitor.hint(
+                                self.tick_discovery.is_some() || !self.monitor.removed().is_empty(),
                             )
-                        } else {
-                            notice_line.push(" · ", Some(Role::MutedText));
-                            notice_line.push(hints, Some(Role::StatusBar));
-                            notice_line
-                        }
-                    },
-                );
-                if float_core_status
-                    && self.execution_connection_notice.is_some()
+                        },
+                        |detail| detail.hint(),
+                    );
+                    monitor_hint.as_str()
+                } else if self.foreground_shell {
+                    "Shell running · ctrl+b background · ctrl+c stop"
+                } else if self.footer.selected() == Some(FooterItemId::Agents) {
+                    if self.status_area.selected_dismissible().is_some() {
+                        "enter open · space fold · x dismiss · esc input"
+                    } else {
+                        "enter open · space fold · esc input"
+                    }
+                } else if self.candidate_rows(1).is_empty() && self.clipboard_hint.is_visible() {
+                    CLIPBOARD_IMAGE_HINT
+                } else if overview {
+                    if !self.overview.input_focused {
+                        overview_list_hint = format!(
+                            "? help · {} · tab new Agent",
+                            self.overview.row_hints().join(" · ")
+                        );
+                        overview_list_hint.as_str()
+                    } else if self.editor.draft().is_empty() {
+                        "? help · enter dispatch · ↑ list"
+                    } else {
+                        "enter dispatch · tab list"
+                    }
+                } else if borders == 0
                     && self.ordinary_input_is_visible()
-                    && !self.conversation_focused
-                    && let Some(line) = lines.last_mut()
-                    && display_width(&line.text())
-                        + 3
-                        + display_width(EXECUTION_CONNECTION_DETAILS_HINT)
-                        <= self.width
+                    && !self.scrollback.is_at_bottom()
                 {
-                    line.push(" · ", Some(Role::MutedText));
-                    line.push(EXECUTION_CONNECTION_DETAILS_HINT, Some(Role::MutedText));
+                    return_hint = self.back_to_bottom_label().unwrap_or_default();
+                    return_hint.as_str()
+                } else if self.editor.draft().is_empty() {
+                    // A visible suggestion takes Tab and →, so → no longer opens Monitor.
+                    if self.visible_prompt_suggestion().is_some() {
+                        "← Agents · tab/→ accept · ? help · ctrl+o details · ctrl+g editor · ctrl+c interrupt"
+                    } else if self.monitor.total() == 0 {
+                        "← Agents · ? help · ctrl+o details · ctrl+g editor · ctrl+c interrupt"
+                    } else {
+                        "← Agents · → Monitor · ? help · ctrl+o details · ctrl+g editor · ctrl+c interrupt"
+                    }
+                } else {
+                    "enter send · ctrl+g editor · ctrl+c clear"
+                };
+                if notice.is_empty() {
+                    RoleLine::role(hints, Role::StatusBar)
+                } else if hints.is_empty() {
+                    notice_line
+                } else if overview && leading_notice.is_empty() && !self.status_held {
+                    RoleLine::role(format!("{hints} · {notice}"), Role::StatusBar)
+                } else if overview {
+                    RoleLine::role(
+                        Some(format!("{notice} · {hints}"))
+                            .filter(|text| display_width(text) <= self.width)
+                            .unwrap_or(notice),
+                        Role::StatusBar,
+                    )
+                } else {
+                    notice_line.push(" · ", Some(Role::MutedText));
+                    notice_line.push(hints, Some(Role::StatusBar));
+                    notice_line
                 }
+            };
+            if self.execution_connection_notice.is_some()
+                && (core_in_hint_row
+                    || self.ordinary_input_is_visible() && !self.conversation_focused)
+                && !line.text().contains(EXECUTION_CONNECTION_DETAILS_HINT)
+                && display_width(&line.text())
+                    + 3
+                    + display_width(EXECUTION_CONNECTION_DETAILS_HINT)
+                    <= self.width
+            {
+                line.push(" · ", Some(Role::MutedText));
+                line.push(EXECUTION_CONNECTION_DETAILS_HINT, Some(Role::MutedText));
             }
-            if let Some(background) = separate_background_notice {
-                lines.insert(
-                    status_start + 1,
-                    background.line(self.width).filled(Role::StatusBar),
-                );
-            }
+            hint_row = Some(line);
         }
         let mut footer_bar_row = None;
         if panel_rows > 0 {
@@ -7278,7 +7264,6 @@ impl State {
                 if short
                     && panel_rows == 1
                     && footer.selected.is_some()
-                    && self.footer_list_focused
                     && self.status_area.is_open()
                 {
                     lines.extend(
@@ -7310,11 +7295,13 @@ impl State {
                 ));
             }
         }
-        if let Some(hint) = footer_key_hint {
-            let mut line = RoleLine::role(hint, Role::MutedText);
-            line.truncate(self.width);
-            lines.push(line);
+        lines.extend(status_lines);
+        if hint_row.is_some()
+            && let Some(background) = separate_background_notice
+        {
+            lines.push(background.line(self.width).filled(Role::StatusBar));
         }
+        lines.extend(hint_row);
         if !help.is_empty() {
             let all = agent_layout::help_lines(
                 self.width,
@@ -7492,9 +7479,17 @@ impl State {
         if self.shell_input.kind() == InputKind::Shell {
             debug_assert_eq!(self.shell_input.command(), self.editor.draft());
             debug_assert_eq!(self.shell_input.cursor(), self.editor.cursor());
-            (format!("!{}", projection.text), projection.cursor + 1)
+        }
+        (projection.text, projection.cursor)
+    }
+
+    /// The input's leading mark: `!` replaces the prompt glyph while the input runs a Shell
+    /// command, as in Claude Code's bash mode.
+    fn input_prompt(&self) -> &'static str {
+        if self.shell_input.kind() == InputKind::Shell {
+            SHELL_INPUT_PROMPT
         } else {
-            (projection.text, projection.cursor)
+            self.display.glyph(Glyph::Prompt)
         }
     }
 
@@ -7544,7 +7539,7 @@ impl State {
         lines.push(query);
         let mut hint = RoleLine::role(
             self.display
-                .navigation_hint("Ctrl+S scope · Enter/Tab insert · Esc cancel"),
+                .navigation_hint("ctrl+s scope · enter/tab insert · esc cancel"),
             Role::MutedText,
         );
         hint.truncate(self.width);
@@ -8102,8 +8097,6 @@ impl State {
             && self.history_search.is_none()
             && self.transcript.is_none()
             && self.diff_screen.is_none()
-            && self.task_surface.is_none()
-            && self.subscription_surface.is_none()
             && !self.foreground_shell
             && self.shell_input.kind() == InputKind::Prompt
             && !frame.items.is_empty()
@@ -8122,7 +8115,7 @@ impl State {
             display_cursor,
             self.width,
             agent_layout::editor_capacity(self.height),
-            self.display.glyph(Glyph::Prompt),
+            self.input_prompt(),
         );
         input.first_visual_row + input.cursor_row + 1 == input.total_visual_rows
     }
@@ -8135,10 +8128,7 @@ impl State {
     }
 
     fn clear_footer_selection(&mut self) {
-        if self.footer.selected().is_some() {
-            self.footer.apply(FooterAction::Clear);
-        }
-        self.footer_list_focused = false;
+        self.footer.clear();
     }
 
     fn clear_footer_selection_if_hidden(&mut self) {
@@ -8147,157 +8137,69 @@ impl State {
         }
     }
 
-    fn apply_footer_action(&mut self, action: FooterAction) -> Option<InputEvent> {
-        let was_open = self.status_area.is_open();
-        let effect = if action == FooterAction::Down
-            && self.footer.selected().is_none()
-            && let Some(panel) = self.status_area.selected_panel()
-        {
-            self.footer.select(panel);
-            FooterEffect::None
-        } else {
-            self.footer.apply(action)
-        };
-        if matches!(action, FooterAction::Clear) && self.status_area.is_configured() {
-            self.footer_list_focused = false;
+    /// Moves the keys from the input straight into the Subagents list, at the row remembered
+    /// from the last visit; a folded panel opens for it.
+    fn enter_agent_list(&mut self) {
+        self.footer.select(FooterItemId::Agents);
+        if self.footer.selected().is_none() {
+            return;
         }
-        if (was_open
-            || matches!(
-                action,
-                FooterAction::Down | FooterAction::Previous | FooterAction::Next
-            ))
-            && let Some(selected) = self.footer.selected()
-        {
-            self.status_area.select(selected);
-            if matches!(action, FooterAction::Previous | FooterAction::Next) {
-                self.footer_list_focused = false;
-            }
-        }
-        match effect {
-            FooterEffect::None
-            | FooterEffect::ReturnToEditor
-            | FooterEffect::Open(FooterItemId::Agents) => None,
-        }
+        self.status_area.agents_collapsed = false;
+        self.status_area.select(FooterItemId::Agents);
+        self.status_area.restore_agent_selection();
     }
 
+    /// Keys of the focused Subagents list. `None` hands the key back to the input.
     fn footer_key(&mut self, key: KeyEvent) -> Option<Option<InputEvent>> {
         if !self.status_area.is_open() {
-            self.footer_list_focused = false;
-        }
-        if self.footer.selected() == Some(FooterItemId::Agents) {
-            if key.code == KeyCode::Enter && key.modifiers != KeyModifiers::NONE {
-                return Some(None);
-            }
-            if !self.footer_list_focused
-                && key.modifiers == KeyModifiers::NONE
-                && matches!(key.code, KeyCode::Enter | KeyCode::Char(' '))
-            {
-                self.status_area.toggle_agents();
-                return Some(None);
-            }
-            if self.footer_list_focused && key.code == KeyCode::Esc {
-                self.footer_list_focused = false;
-                return Some(None);
-            }
-        }
-        if self.status_area.is_configured()
-            && self.status_area.is_open()
-            && let Some(selected) = self.footer.selected()
-        {
-            let amount = match (key.code, key.modifiers) {
-                (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE)
-                | (KeyCode::Char('n'), KeyModifiers::CONTROL) => Some(1),
-                (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE)
-                | (KeyCode::Char('p'), KeyModifiers::CONTROL) => Some(-1),
-                _ => None,
-            };
-            if let Some(amount) = amount {
-                if !self.footer_list_focused {
-                    if amount > 0 {
-                        self.footer_list_focused = self.status_area.is_open();
-                    } else {
-                        self.apply_footer_action(FooterAction::Clear);
-                    }
-                } else if amount < 0 && self.status_area.selection_at_start() {
-                    self.footer_list_focused = false;
-                } else {
-                    let capacity = agent_layout::panel_capacity(self.height);
-                    self.status_area.move_agent_selection(amount, capacity);
-                }
-                return Some(None);
-            }
-            if key.code == KeyCode::Enter && !self.footer_list_focused {
-                self.footer_list_focused = true;
-                return Some(None);
-            }
-            if key.code == KeyCode::Enter && selected == FooterItemId::Agents {
-                return Some(self.status_area.selected_agent().map(InputEvent::OpenAgent));
-            }
-            if key.code == KeyCode::Char(' ')
-                && selected == FooterItemId::Agents
-                && self.footer_list_focused
-            {
-                self.status_area.toggle_selected_agent();
-                return Some(None);
-            }
-        }
-        if self.status_area.is_configured()
-            && let Some(selected) = self.footer.selected()
-        {
-            match (key.code, key.modifiers) {
-                (KeyCode::Enter, _) if !self.status_area.is_open() => {
-                    self.status_area.select(selected);
-                    return Some(None);
-                }
-                (KeyCode::Char(' '), KeyModifiers::NONE) => {
-                    self.status_area.select(selected);
-                    self.clear_footer_selection();
-                    return Some(None);
-                }
-                _ => {}
-            }
-        }
-        let scroll = match (key.code, key.modifiers) {
-            (KeyCode::PageUp | KeyCode::Char('k'), KeyModifiers::NONE)
-            | (KeyCode::Char('p'), KeyModifiers::CONTROL) => Some(-1),
-            (KeyCode::PageDown | KeyCode::Char('j'), KeyModifiers::NONE)
-            | (KeyCode::Char('n'), KeyModifiers::CONTROL) => Some(1),
-            _ => None,
-        };
-        if self.status_area.is_configured()
-            && self.status_area.is_open()
-            && self.footer_list_focused
-            && let Some(amount) = scroll
-        {
-            let capacity = self.status_area.row_count(self.height).saturating_sub(1);
-            self.status_area.scroll(amount, capacity);
-            return Some(None);
-        }
-        let action = match (key.code, key.modifiers) {
-            (KeyCode::Left | KeyCode::Char('h'), KeyModifiers::NONE) => {
-                Some(FooterAction::Previous)
-            }
-            (KeyCode::Right | KeyCode::Char('l'), KeyModifiers::NONE) => Some(FooterAction::Next),
-            (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE)
-            | (KeyCode::Char('p'), KeyModifiers::CONTROL) => Some(FooterAction::Up),
-            (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE)
-            | (KeyCode::Char('n'), KeyModifiers::CONTROL) => Some(FooterAction::Down),
-            (KeyCode::Enter, _) => Some(FooterAction::Open),
-            (KeyCode::Esc, _) => Some(FooterAction::Clear),
-            _ => None,
-        };
-        if let Some(action) = action {
-            return Some(self.apply_footer_action(action));
-        }
-        if !key
-            .modifiers
-            .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL)
-            && matches!(key.code, KeyCode::Char(_))
-        {
             self.clear_footer_selection();
             return None;
         }
-        Some(None)
+        let capacity = agent_layout::panel_capacity(self.height);
+        let amount = match (key.code, key.modifiers) {
+            (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE)
+            | (KeyCode::Char('n'), KeyModifiers::CONTROL) => Some(1),
+            (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE)
+            | (KeyCode::Char('p'), KeyModifiers::CONTROL) => Some(-1),
+            (KeyCode::PageDown, _) => Some(capacity as isize),
+            (KeyCode::PageUp, _) => Some(-(capacity as isize)),
+            _ => None,
+        };
+        if let Some(amount) = amount {
+            if amount < 0 && self.status_area.selection_at_start() {
+                self.clear_footer_selection();
+            } else {
+                self.status_area.move_agent_selection(amount, capacity);
+            }
+            return Some(None);
+        }
+        match (key.code, key.modifiers) {
+            (KeyCode::Enter, KeyModifiers::NONE) => {
+                let agent = self.status_area.selected_agent();
+                self.clear_footer_selection();
+                Some(agent.map(InputEvent::OpenAgent))
+            }
+            (KeyCode::Char(' '), KeyModifiers::NONE) => {
+                self.status_area.toggle_selected_agent();
+                Some(None)
+            }
+            (KeyCode::Char('x'), KeyModifiers::NONE) => Some(
+                self.status_area
+                    .selected_dismissible()
+                    .map(InputEvent::DismissAgent),
+            ),
+            (KeyCode::Esc, _) => {
+                self.clear_footer_selection();
+                Some(None)
+            }
+            (KeyCode::Char(_), modifiers)
+                if !modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
+            {
+                self.clear_footer_selection();
+                None
+            }
+            _ => Some(None),
+        }
     }
 
     fn hide_diff_screen(&mut self) {
@@ -8390,121 +8292,6 @@ impl State {
         };
         if screen.dialog.apply(&screen.catalog, viewport, action) == DiffDialogOutcome::Close {
             self.hide_diff_screen();
-        }
-    }
-
-    fn subscription_key(&mut self, key: KeyEvent) -> Option<InputEvent> {
-        let focus = self.subscription_surface.as_ref()?.focus();
-        let action = match focus {
-            SubscriptionFocus::List => match (key.code, key.modifiers) {
-                (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE)
-                | (KeyCode::Char('p'), KeyModifiers::CONTROL) => SubscriptionAction::Previous,
-                (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE)
-                | (KeyCode::Char('n'), KeyModifiers::CONTROL) => SubscriptionAction::Next,
-                (KeyCode::Enter, _) => SubscriptionAction::EditCadence,
-                (KeyCode::Char('d'), KeyModifiers::NONE) => SubscriptionAction::RequestCancel,
-                (KeyCode::Left | KeyCode::Esc, _) => SubscriptionAction::Escape,
-                _ => return None,
-            },
-            SubscriptionFocus::Cadence => match (key.code, key.modifiers) {
-                (KeyCode::Char(digit), KeyModifiers::NONE | KeyModifiers::SHIFT)
-                    if digit.is_ascii_digit() =>
-                {
-                    SubscriptionAction::TypeDigit(digit)
-                }
-                (KeyCode::Backspace, _) => SubscriptionAction::DeleteDigit,
-                (KeyCode::Enter, _) => SubscriptionAction::Confirm,
-                (KeyCode::Esc, _) => SubscriptionAction::Escape,
-                _ => return None,
-            },
-            SubscriptionFocus::CancelConfirmation => match (key.code, key.modifiers) {
-                (KeyCode::Enter, _) | (KeyCode::Char('y'), KeyModifiers::NONE) => {
-                    SubscriptionAction::Confirm
-                }
-                (KeyCode::Esc, _) | (KeyCode::Char('n'), KeyModifiers::NONE) => {
-                    SubscriptionAction::Escape
-                }
-                _ => return None,
-            },
-        };
-        let effect = self.subscription_surface.as_mut()?.apply(action);
-        match effect {
-            SubscriptionEffect::None => None,
-            SubscriptionEffect::Close => {
-                self.hide_subscription_view();
-                self.menu_focused = self.menu.is_some() && self.editor.draft().is_empty();
-                None
-            }
-            effect => Some(InputEvent::Subscription(effect)),
-        }
-    }
-
-    fn task_surface_key(&mut self, key: KeyEvent) -> Option<InputEvent> {
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('o') {
-            self.hide_task_surface();
-            let id = self.start_transcript();
-            return Some(InputEvent::OpenTranscript { id });
-        }
-        let focus = self.task_surface.as_ref()?.focus();
-        let action = match focus {
-            TaskSurfaceFocus::List => match (key.code, key.modifiers) {
-                (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE)
-                | (KeyCode::Char('p'), KeyModifiers::CONTROL) => TaskSurfaceAction::Previous,
-                (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE)
-                | (KeyCode::Char('n'), KeyModifiers::CONTROL) => TaskSurfaceAction::Next,
-                (KeyCode::Enter, _) => TaskSurfaceAction::Open,
-                (KeyCode::Left | KeyCode::Esc, _) => TaskSurfaceAction::Close,
-                (KeyCode::Char('b'), KeyModifiers::NONE) => TaskSurfaceAction::Background,
-                (KeyCode::Char('x'), KeyModifiers::NONE) => TaskSurfaceAction::Stop,
-                _ => return None,
-            },
-            TaskSurfaceFocus::Detail { .. } => match (key.code, key.modifiers) {
-                (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE)
-                | (KeyCode::Char('p'), KeyModifiers::CONTROL) => TaskSurfaceAction::ScrollLines(-1),
-                (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE)
-                | (KeyCode::Char('n'), KeyModifiers::CONTROL) => TaskSurfaceAction::ScrollLines(1),
-                (KeyCode::PageUp, _) => TaskSurfaceAction::Page(-1),
-                (KeyCode::PageDown, _) => TaskSurfaceAction::Page(1),
-                (KeyCode::Home, _) => TaskSurfaceAction::Home,
-                (KeyCode::End, _) => TaskSurfaceAction::End,
-                (KeyCode::Left, _) => TaskSurfaceAction::Back,
-                (KeyCode::Esc | KeyCode::Enter, _) | (KeyCode::Char(' '), KeyModifiers::NONE) => {
-                    TaskSurfaceAction::Close
-                }
-                (KeyCode::Char('b'), KeyModifiers::NONE) => TaskSurfaceAction::Background,
-                (KeyCode::Char('x'), KeyModifiers::NONE) => TaskSurfaceAction::Stop,
-                _ => return None,
-            },
-        };
-        let viewport = task_surface_content_viewport(
-            self.width,
-            self.input_dialog_body_height(),
-            self.task_surface
-                .as_ref()
-                .map_or(TaskSurfaceFocus::List, TaskSurface::focus),
-        );
-        let effect = self.task_surface.as_mut()?.apply(action, viewport);
-        match effect {
-            TaskSurfaceEffect::None => None,
-            TaskSurfaceEffect::Close => {
-                self.hide_task_surface();
-                self.rendered_region = None;
-                self.menu_focused = self.menu.is_some() && self.editor.draft().is_empty();
-                None
-            }
-            effect => Some(InputEvent::TaskSurface(effect)),
-        }
-    }
-
-    fn hide_subscription_view(&mut self) {
-        self.subscription_surface = None;
-    }
-
-    fn hide_task_surface(&mut self) {
-        if let Some(surface) = self.task_surface.take() {
-            self.task_surface_cache.insert(*surface.restore(), surface);
-            self.status_area.reconcile_panel();
-            self.footer.update(self.status_area.available_panels());
         }
     }
 
@@ -8770,11 +8557,6 @@ impl State {
             surface.paste(text);
             return;
         }
-        if self.menu.is_none()
-            && (self.task_surface.is_some() || self.subscription_surface.is_some())
-        {
-            return;
-        }
         if self.menu.is_none() && self.history_search.is_some() {
             self.apply_history_search(HistorySearchInput::Insert(text.into()));
             return;
@@ -8926,7 +8708,7 @@ impl State {
         };
         self.hold_status(&super::completion::command_refusal(
             self.command_scope(),
-            "Shift+Tab mode",
+            "shift+tab mode",
             reason,
         ));
         true
@@ -8948,7 +8730,7 @@ impl State {
 
         self.transcript = Some((
             id,
-            Transcript::new(vec!["Loading conversation…".into()].into()),
+            Transcript::new(vec!["Loading conversation…".into()].into(), self.display),
         ));
         self.completion.dismiss();
         self.file_mentions.dismiss();
@@ -9299,14 +9081,14 @@ impl State {
     fn confirmation_hint(&self) -> Option<String> {
         if let Some(control) = self.pending_exit_control() {
             return Some(if control == 'C' {
-                "Press Ctrl+C again to exit".into()
+                "Press ctrl+c again to exit".into()
             } else {
-                "Press Ctrl+D again to exit".into()
+                "Press ctrl+d again to exit".into()
             });
         }
         self.pending_escape_action().map(|action| match action {
-            EscapeAction::ClearDraft => "Press Esc again to clear".into(),
-            EscapeAction::OpenRewind => "Press Esc again to rewind".into(),
+            EscapeAction::ClearDraft => "Press esc again to clear".into(),
+            EscapeAction::OpenRewind => "Press esc again to rewind".into(),
         })
     }
 
@@ -9334,14 +9116,14 @@ impl State {
             return full;
         }
         let compact_hint = if let Some(control) = self.pending_exit_control() {
-            format!("Ctrl+{control} again exit")
+            format!("ctrl+{} again exit", control.to_ascii_lowercase())
         } else if let Some(action) = self.pending_escape_action() {
             match action {
-                EscapeAction::ClearDraft => "Esc again clear".into(),
-                EscapeAction::OpenRewind => "Esc again rewind".into(),
+                EscapeAction::ClearDraft => "esc again clear".into(),
+                EscapeAction::OpenRewind => "esc again rewind".into(),
             }
         } else {
-            "Opening panel · Esc input".into()
+            "Opening panel · esc input".into()
         };
         if status.is_empty() {
             return compact_hint;
@@ -9355,7 +9137,10 @@ impl State {
             > available
             && let Some(control) = self.pending_exit_control()
         {
-            (self.width, format!("Ctrl+{control} exit"))
+            (
+                self.width,
+                format!("ctrl+{} exit", control.to_ascii_lowercase()),
+            )
         } else {
             (available, compact_hint)
         };
@@ -9421,7 +9206,7 @@ impl State {
         self.restored_contexts.clear();
         self.completion.dismiss();
         self.file_mentions.update_at("", 0, 15);
-        self.status = "Draft cleared · Up restores it".into();
+        self.status = "Draft cleared · up restores it".into();
     }
 
     fn main_escape(&mut self) -> Option<InputEvent> {
@@ -9459,9 +9244,7 @@ impl State {
             && self.menu.is_none()
             && self.conversation_picker.is_none()
             && self.transcript.is_none()
-            && self.task_surface.is_none()
             && self.diff_screen.is_none()
-            && self.subscription_surface.is_none()
             && self.permissions_surface.is_none()
             && self.history_search.is_none()
             && !self.help_open
@@ -9477,10 +9260,10 @@ impl State {
     fn back_to_bottom_label(&self) -> Option<String> {
         let arrow = self.display.glyph(Glyph::ScrollDown);
         [
-            format!("{arrow} Back to bottom · Esc"),
-            format!("{arrow} Bottom · Esc"),
-            format!("{arrow} Esc"),
-            "Esc".into(),
+            format!("{arrow} Back to bottom · esc"),
+            format!("{arrow} Bottom · esc"),
+            format!("{arrow} esc"),
+            "esc".into(),
         ]
         .into_iter()
         .find(|label| display_width(label) <= self.width)
@@ -9610,6 +9393,11 @@ impl State {
                     self.rendered_region = None;
                     None
                 }
+                super::artifacts_picker::ArtifactPickerEffect::SignOut => {
+                    self.artifacts_picker = None;
+                    self.rendered_region = None;
+                    Some(InputEvent::ArtifactSignOut)
+                }
                 super::artifacts_picker::ArtifactPickerEffect::EditQuery => {
                     let draft = picker.external_query();
                     match edit_prompt(&draft, &self.history_project) {
@@ -9680,9 +9468,14 @@ impl State {
                 return match result {
                     super::tick_actions::TickDetailKey::None => None,
                     super::tick_actions::TickDetailKey::Back => {
+                        let row = detail.instance();
                         self.monitor.close_detail();
                         self.rendered_region = None;
-                        None
+                        // The open detail showed the row live, so what it showed counts as seen.
+                        row.map(|row| InputEvent::TickAction {
+                            chat,
+                            action: super::tick_actions::builtin::seen(row),
+                        })
                     }
                     super::tick_actions::TickDetailKey::Action(action) => {
                         Some(InputEvent::TickAction { chat, action })
@@ -9732,6 +9525,12 @@ impl State {
                             .prepare(&mut super::tick_actions::TickActionUi { state: self })
                         {
                             Ok(action) => {
+                                let action = if action_key == crate::monitor_rows::MONITOR_ENTER_KEY
+                                {
+                                    action.opening(entry.instance.clone())
+                                } else {
+                                    action
+                                };
                                 return Some(InputEvent::TickAction { chat, action });
                             }
                             Err(error) => self.hold_status(&error),
@@ -9760,7 +9559,7 @@ impl State {
             && self.monitor.total() > 0
             && self.ordinary_input_is_visible()
             && !self.conversation_focused
-            && !self.footer_list_focused
+            && self.footer.selected().is_none()
             && (self.editor.draft().is_empty() || key.modifiers == KeyModifiers::SHIFT)
             && !self.completion.is_open()
             && !self.file_mentions.is_open()
@@ -9781,9 +9580,7 @@ impl State {
         }
         if self.menu.is_none()
             && self.transcript.is_none()
-            && self.task_surface.is_none()
             && self.diff_screen.is_none()
-            && self.subscription_surface.is_none()
             && self.permissions_surface.is_none()
             && self.history_search.is_none()
         {
@@ -9867,8 +9664,6 @@ impl State {
             && (!self.foreground_shell
                 || self.menu.is_some()
                 || self.diff_screen.is_some()
-                || self.task_surface.is_some()
-                || self.subscription_surface.is_some()
                 || self.permissions_surface.is_some()
                 || self.transcript.is_some()
                 || self.history_search.is_some())
@@ -9893,10 +9688,6 @@ impl State {
         #[cfg(unix)]
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('z') {
             return Some(InputEvent::Suspend);
-        }
-        if self.menu.is_none() && self.subscription_surface.is_some() {
-            self.escape_confirmation = None;
-            return self.subscription_key(key);
         }
         if self.menu.is_none() && self.permissions_surface.is_some() {
             self.escape_confirmation = None;
@@ -9924,10 +9715,6 @@ impl State {
                 }
                 effect => Some(InputEvent::Permissions(effect)),
             };
-        }
-        if self.menu.is_none() && self.task_surface.is_some() {
-            self.escape_confirmation = None;
-            return self.task_surface_key(key);
         }
         if let Some((_, transcript)) = &mut self.transcript {
             self.escape_confirmation = None;
@@ -10321,6 +10108,33 @@ impl State {
             }
             return None;
         }
+        if self.menu_focused
+            && key.code == KeyCode::Char(' ')
+            && key.modifiers == KeyModifiers::NONE
+            && let Some(menu) = &mut self.menu
+            && let Some((_, checks)) = self.menu_checks.as_mut().filter(|(id, _)| *id == menu.id)
+        {
+            let selected = menu.selected.min(checks.len().saturating_sub(1));
+            if checks[selected] && checks.iter().filter(|checked| **checked).count() == 1 {
+                self.hold_status("Keep at least one checked");
+            } else if let Some(option) = menu.options.get_mut(selected) {
+                checks[selected] = !checks[selected];
+                let label = option
+                    .strip_prefix(CHECKED_OPTION)
+                    .or_else(|| option.strip_prefix(UNCHECKED_OPTION))
+                    .unwrap_or(option)
+                    .to_owned();
+                *option = format!(
+                    "{}{label}",
+                    if checks[selected] {
+                        CHECKED_OPTION
+                    } else {
+                        UNCHECKED_OPTION
+                    }
+                );
+            }
+            return None;
+        }
         let direct_number_choices =
             self.picker_kind.is_none() && self.menu.as_ref().is_some_and(|menu| !menu.confirmation);
         let approval_review_available = self
@@ -10409,7 +10223,7 @@ impl State {
                     && (key.code == KeyCode::Enter || matches!(key.code, KeyCode::Char('y' | 'Y')))
                 {
                     self.status =
-                        "Cannot approve: the file change review is unavailable · Esc or n denies"
+                        "Cannot approve: the file change review is unavailable · esc or n denies"
                             .into();
                 }
                 if choice.is_some() {
@@ -10476,7 +10290,7 @@ impl State {
             return None;
         }
         if key.code == KeyCode::Down && self.can_enter_footer() {
-            self.apply_footer_action(FooterAction::Down);
+            self.enter_agent_list();
             return None;
         }
         if key.code == KeyCode::Esc && self.shell_input.kind() == InputKind::Shell {
@@ -10724,13 +10538,16 @@ fn read_keys(
     stop: &AtomicBool,
     sender: &mpsc::Sender<InputEvent>,
 ) -> io::Result<()> {
+    // A drag reports every cell it crosses; frames wait until the queued motion is read, so a
+    // resize or selection re-lays the conversation once per batch instead of once per cell.
+    let mut deferred_frame = false;
     while !stop.load(Ordering::Acquire) {
         let input_was_idle = !event::poll(Duration::ZERO)?;
         if input_was_idle {
             let mut state = state
                 .lock()
                 .map_err(|error| io::Error::other(error.to_string()))?;
-            if state.release_finished_submissions() {
+            if state.release_finished_submissions() || std::mem::take(&mut deferred_frame) {
                 state.draw(&mut io::stdout().lock())?;
             }
         }
@@ -10751,7 +10568,9 @@ fn read_keys(
                 .map_err(|error| io::Error::other(error.to_string()))?;
             state.expire_shell_background_chord();
             let confirmation_expired = state.expire_key_confirmations();
-            if state.poll_clipboard_hint(Instant::now()) || confirmation_expired {
+            let rows_changed =
+                state.refresh_row_clocks(tickloop_agent_base::private_fs::unix_time_milliseconds());
+            if state.poll_clipboard_hint(Instant::now()) || confirmation_expired || rows_changed {
                 state.draw(&mut io::stdout().lock())?;
             }
             continue;
@@ -10765,6 +10584,13 @@ fn read_keys(
         let submission_released = input_was_idle && state.release_finished_submissions();
         let mut output = io::stdout().lock();
         let mut redraw = true;
+        let dragging = matches!(
+            event,
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                ..
+            })
+        );
         let input = match event {
             Event::Key(key) => {
                 state.clear_selection();
@@ -10792,7 +10618,10 @@ fn read_keys(
                 None
             }
         };
-        if redraw || submission_released {
+        if (redraw || submission_released) && dragging && event::poll(Duration::ZERO)? {
+            deferred_frame = true;
+        } else if redraw || submission_released || std::mem::take(&mut deferred_frame) {
+            deferred_frame = false;
             state.draw(&mut output)?;
         }
         drop(output);
@@ -10936,142 +10765,6 @@ fn send_input(sender: &mpsc::Sender<InputEvent>, stop: &AtomicBool, mut input: I
     }
 }
 
-fn task_surface_content_viewport(
-    width: usize,
-    body_height: usize,
-    focus: TaskSurfaceFocus,
-) -> TaskViewport {
-    TaskViewport {
-        width: if focus == TaskSurfaceFocus::List {
-            width.saturating_sub(2).max(1)
-        } else {
-            width.max(1)
-        },
-        height: body_height.saturating_sub(TASK_SURFACE_HEADER_FOOTER_ROWS),
-    }
-}
-
-fn subscription_surface_lines(
-    surface: &mut SubscriptionSurface,
-    height: usize,
-    display: DisplayProfile,
-) -> Vec<String> {
-    if height == 0 {
-        return Vec::new();
-    }
-    let frame = surface.frame(
-        SubscriptionViewport {
-            height: height
-                .saturating_sub(SUBSCRIPTION_SURFACE_HEADER_ROWS + SUBSCRIPTION_SURFACE_FOOTER_ROWS)
-                .max(1),
-        },
-        display,
-    );
-    let mut lines = vec!["Tick Subscriptions".to_owned()];
-    lines.extend(frame.lines.into_iter().map(|line| {
-        format!(
-            "{} {}",
-            if line.selected {
-                display.glyph(Glyph::Prompt)
-            } else {
-                " "
-            },
-            line.text
-        )
-    }));
-    if height > SUBSCRIPTION_SURFACE_FOOTER_ROWS {
-        if lines.len() >= height {
-            lines.truncate(height - SUBSCRIPTION_SURFACE_FOOTER_ROWS);
-        }
-        lines.push(frame.footer);
-    }
-    lines
-}
-
-fn task_surface_lines(
-    surface: &mut TaskSurface<Uuid>,
-    width: usize,
-    height: usize,
-    pending_menu: Option<&str>,
-    display: DisplayProfile,
-) -> Vec<String> {
-    if height == 0 {
-        return Vec::new();
-    }
-    let focus = surface.focus();
-    let viewport = task_surface_content_viewport(width, height, focus);
-    let frame = surface.frame(viewport);
-    let action_error = frame.action_error.clone();
-    let selected_capabilities = frame.selected_capabilities;
-    let title = match frame.focus {
-        TaskSurfaceFocus::List => "Shell tasks".to_owned(),
-        TaskSurfaceFocus::Detail { .. } => "Shell task".to_owned(),
-    };
-    let mut header = title;
-    if let Some(menu) = pending_menu {
-        header.push_str(" · ");
-        header.push_str(&display_single_line(menu));
-        header.push_str(" waiting in Chat");
-    }
-    let mut lines = vec![header];
-    lines.extend(frame.lines.into_iter().map(|line| {
-        if frame.focus == TaskSurfaceFocus::List {
-            format!(
-                "{} {}",
-                if line.selected {
-                    display.glyph(Glyph::Prompt)
-                } else {
-                    " "
-                },
-                line.text
-            )
-        } else {
-            line.text
-        }
-    }));
-    if height > 1 {
-        let footer = if let Some(error) = action_error {
-            format!("Error: {} · Esc close", display_single_line(&error))
-        } else {
-            match frame.focus {
-                TaskSurfaceFocus::List => {
-                    let mut footer = "Enter open".to_owned();
-                    if selected_capabilities.can_background {
-                        footer.push_str(" · b background");
-                    }
-                    if selected_capabilities.can_stop {
-                        footer.push_str(" · x stop");
-                    }
-                    footer.push_str(" · Esc close");
-                    footer
-                }
-                TaskSurfaceFocus::Detail { .. } => {
-                    let unread = if frame.unread_bytes == 0 {
-                        String::new()
-                    } else {
-                        format!(" · {} unread bytes", frame.unread_bytes)
-                    };
-                    let mut footer = "← list · Esc/Enter/Space close".to_owned();
-                    if selected_capabilities.can_stop {
-                        footer.push_str(" · x stop");
-                    }
-                    if selected_capabilities.can_background {
-                        footer.push_str(" · b background");
-                    }
-                    footer.push_str(" · PgUp/PgDn · Home/End");
-                    footer.push_str(&unread);
-                    footer
-                }
-            }
-        };
-        if lines.len() >= height {
-            lines.truncate(height - 1);
-        }
-        lines.push(footer);
-    }
-    lines
-}
-
 fn diff_screen_lines(
     screen: &mut DiffScreen,
     width: usize,
@@ -11160,9 +10853,9 @@ fn diff_screen_lines(
     }
 
     let footer = if frame.mode == DiffDialogMode::Detail {
-        "PgUp/PgDn · Home/End · Esc back"
+        "pgup/pgdn · home/end · esc back"
     } else {
-        "Enter details · Esc close"
+        "enter details · esc close"
     };
     let content_rows = height.saturating_sub(1);
     lines.truncate(content_rows);
@@ -11222,13 +10915,13 @@ pub(super) fn display_single_line(text: &str) -> String {
 
 fn question_menu_hint(question: &QuestionMenu, selected: usize) -> String {
     let mut hint = String::from(if question.entry_option == Some(selected) {
-        "Enter type answer"
+        "enter type answer"
     } else if question.multi_select {
-        "Space/Enter toggle"
+        "space/enter toggle"
     } else {
-        "Enter select"
+        "enter select"
     });
-    hint.push_str(" · Esc answer later");
+    hint.push_str(" · esc answer later");
     hint
 }
 
@@ -11496,9 +11189,9 @@ mod tests {
                 "a add",
                 "e edit",
                 "d remove",
-                "Enter edit/preview",
-                "Ctrl+S save",
-                "Enter save",
+                "enter edit/preview",
+                "ctrl+s save",
+                "enter save",
             ] {
                 assert!(!lines.contains(editing), "{editing}: {lines}");
             }
@@ -11533,7 +11226,7 @@ mod tests {
         press(&mut state, KeyCode::Enter);
         let group = frame(&mut state);
         assert!(
-            group.contains("Enter details"),
+            group.contains("enter details"),
             "Auto rules stay browsable: {group}"
         );
         refuse_editing(&mut state);
@@ -11674,11 +11367,13 @@ mod tests {
             tasks: (0..count)
                 .map(|index| ShellTask {
                     updated_at_ms: None,
+                    ended_at_ms: None,
                     id: Uuid::from_u128(index as u128 + 1),
                     chat_id,
                     origin: ShellTaskOrigin::User,
                     owner: ShellTaskOwner::User { chat_id },
                     command: format!("printf task-{index}"),
+                    description: None,
                     cwd: PathBuf::from("/tmp"),
                     state: ShellTaskState::Running,
                     pid: Some(1000 + index as u32),
@@ -11715,109 +11410,8 @@ mod tests {
         }
     }
 
-    fn subscription_view(rows: usize) -> State {
-        let chat_id = Uuid::from_u128(77);
-        let mut state = State::new(true, 80, 24);
-        state.chat = Some(chat_id);
-        state.subscription_surface = Some(SubscriptionSurface::open(
-            chat_id,
-            (0..rows)
-                .map(|index| subscription_row(index as u64 + 3))
-                .collect(),
-        ));
-        state
-    }
-
     fn control(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::CONTROL)
-    }
-
-    #[test]
-    fn the_subscription_view_moves_with_j_k_keys_and_closes_on_escape() {
-        let mut state = subscription_view(3);
-
-        state.key(key(KeyCode::Char('j')));
-        state.key(control(KeyCode::Char('n')));
-        state.draw(&mut Vec::new()).unwrap();
-        assert!(
-            state
-                .rendered_screen
-                .iter()
-                .any(|line| line.contains("❯ ◉ Tick Instance herdr:fixture-run-5")),
-            "{:?}",
-            state.rendered_screen
-        );
-
-        state.key(key(KeyCode::Char('k')));
-        state.key(control(KeyCode::Char('p')));
-        state.draw(&mut Vec::new()).unwrap();
-        assert!(
-            state
-                .rendered_screen
-                .iter()
-                .any(|line| line.contains("❯ ◉ Tick Instance herdr:fixture-run-3")),
-            "{:?}",
-            state.rendered_screen
-        );
-
-        assert!(state.key(key(KeyCode::Esc)).is_none());
-        assert!(state.subscription_surface.is_none());
-    }
-
-    #[test]
-    fn the_subscription_view_edits_a_cadence_and_cancels_with_a_confirmation() {
-        let mut state = subscription_view(2);
-
-        state.key(key(KeyCode::Enter));
-        for _ in 0..2 {
-            state.key(key(KeyCode::Backspace));
-        }
-        state.key(key(KeyCode::Char('9')));
-        state.key(key(KeyCode::Char('0')));
-        assert!(matches!(
-            state.key(key(KeyCode::Enter)),
-            Some(InputEvent::Subscription(SubscriptionEffect::Change {
-                subscription,
-                change: tickloop_agent_protocol::TickSubscriptionChange::Cadence(90),
-            })) if subscription == Uuid::from_u128(3)
-        ));
-
-        state.key(key(KeyCode::Char('d')));
-        state.draw(&mut Vec::new()).unwrap();
-        assert!(
-            state
-                .rendered_screen
-                .last()
-                .is_some_and(|line| line.contains("Cancel the subscription")),
-            "{:?}",
-            state.rendered_screen.last()
-        );
-        assert!(
-            state.key(key(KeyCode::Esc)).is_none(),
-            "Esc keeps the subscription"
-        );
-        assert!(state.subscription_surface.is_some());
-
-        state.key(key(KeyCode::Char('d')));
-        assert!(matches!(
-            state.key(key(KeyCode::Char('y'))),
-            Some(InputEvent::Subscription(SubscriptionEffect::Change {
-                subscription,
-                change: tickloop_agent_protocol::TickSubscriptionChange::Cancel,
-            })) if subscription == Uuid::from_u128(3)
-        ));
-    }
-
-    #[test]
-    fn a_hidden_subscription_view_consumes_no_input() {
-        let mut state = State::new(true, 80, 24);
-        state.prompt_enabled = true;
-
-        for character in ['d', 'j', 'k'] {
-            state.key(key(KeyCode::Char(character)));
-        }
-
-        assert_eq!(state.editor.draft(), "djk");
     }
 
     fn diff_catalog(line_count: u64) -> ChangeCatalog {
@@ -12467,10 +12061,10 @@ mod tests {
         state.insert("keep this draft");
 
         assert!(state.key(key(KeyCode::BackTab)).is_none());
-        assert!(state.status.contains("Shift+Tab mode isn't available"));
+        assert!(state.status.contains("shift+tab mode isn't available"));
         state.refresh_status("Ready");
         assert!(
-            state.status.contains("Shift+Tab mode isn't available"),
+            state.status.contains("shift+tab mode isn't available"),
             "a periodic refresh keeps the reason"
         );
         assert_eq!(state.editor.draft(), "keep this draft");
@@ -13473,7 +13067,7 @@ mod tests {
 
         let mut state = console.state.lock().unwrap();
         assert!(state.menu_focused);
-        assert!(state.frame().0.join("\n").contains("Enter select"));
+        assert!(state.frame().0.join("\n").contains("enter select"));
         assert!(state.key(key(KeyCode::Right)).is_none());
         assert!(state.key(key(KeyCode::Char('l'))).is_none());
         assert!(state.key(key(KeyCode::Char(' '))).is_none());
@@ -13486,7 +13080,7 @@ mod tests {
         state.key(key(KeyCode::Char('k')));
         let frame = state.frame().0.join("\n");
         assert!(frame.contains("Answer: jk"), "{frame}");
-        assert!(frame.contains("Enter submit"));
+        assert!(frame.contains("enter submit"));
         assert!(state.key(key(KeyCode::Esc)).is_none());
         assert!(!state.menu_comment_is_editing());
         assert!(state.key(key(KeyCode::Enter)).is_none());
@@ -13523,7 +13117,7 @@ mod tests {
         let menu_id = show();
         {
             let mut state = console.state.lock().unwrap();
-            assert!(state.frame().0.join("\n").contains("Space/Enter toggle"));
+            assert!(state.frame().0.join("\n").contains("space/enter toggle"));
             assert!(matches!(
                 state.key(key(KeyCode::Char(' '))),
                 Some(InputEvent::Choice { menu_id: chosen, index: 0, comment: None })
@@ -15786,7 +15380,7 @@ mod tests {
         );
 
         state.request_exit('C');
-        assert!(status_line(&mut state).contains("Press Ctrl+C again to exit"));
+        assert!(status_line(&mut state).contains("Press ctrl+c again to exit"));
         assert!(!shows_clipboard_hint(&mut state));
         state.exit_confirmation = None;
 
@@ -15809,7 +15403,7 @@ mod tests {
         assert!(!state.request_escape(EscapeAction::OpenRewind));
         let (lines, input_row, _) = state.frame();
         let line = lines.last().unwrap();
-        assert!(line.contains("Press Esc again to rewind"), "{line:?}");
+        assert!(line.contains("Press esc again to rewind"), "{line:?}");
         let core = &lines[input_row + 1];
         assert!(
             core.starts_with('─')
@@ -15827,7 +15421,7 @@ mod tests {
         state.status = "Not saved: disk full".into();
         assert!(!state.request_exit('C'));
         assert!(
-            status_line(&mut state).contains("Not saved: disk full · Press Ctrl+C again to exit")
+            status_line(&mut state).contains("Not saved: disk full · Press ctrl+c again to exit")
         );
         state.exit_confirmation = None;
         let line = status_line(&mut state);
@@ -15979,35 +15573,6 @@ mod tests {
     }
 
     #[test]
-    fn a_task_panel_frame_repaints_only_the_rows_that_changed() {
-        let chat_id = Uuid::new_v4();
-        let mut state = State::new(true, 80, 24);
-        state.prompt_enabled = true;
-        state.chat = Some(chat_id);
-        state.scrollback.append("conversation above the panel\n");
-        let console = console_with_state(state);
-        console
-            .show_tasks_at(task_snapshot(chat_id, 3), None)
-            .unwrap();
-        let mut state = console.state.lock().unwrap();
-
-        assert_nothing_rewritten(&frame_output(&mut state), "printf task-0");
-
-        state.key(key(KeyCode::Down));
-        let moved = frame_output(&mut state);
-        assert!(!moved.contains("\x1b[2J"), "{moved:?}");
-        assert_eq!(
-            moved.matches("\x1b[2K").count(),
-            2,
-            "the row the selection left and the row it reached: {moved:?}"
-        );
-        assert!(
-            !moved.contains("conversation above the panel") && !moved.contains("Shell tasks"),
-            "{moved:?}"
-        );
-    }
-
-    #[test]
     fn transcript_and_diff_frames_are_not_rewritten_when_nothing_changed() {
         let chat_id = Uuid::new_v4();
         let mut state = State::new(true, 80, 24);
@@ -16015,7 +15580,10 @@ mod tests {
         state.chat = Some(chat_id);
         state.transcript = Some((
             Uuid::new_v4(),
-            Transcript::new(vec!["saved history row".into()].into()),
+            Transcript::new(
+                vec!["saved history row".into()].into(),
+                DisplayProfile::default(),
+            ),
         ));
         assert!(frame_output(&mut state).contains("\x1b[2J"));
         assert_nothing_rewritten(&frame_output(&mut state), "saved history row");
@@ -16035,7 +15603,10 @@ mod tests {
 
         state.transcript = Some((
             Uuid::new_v4(),
-            Transcript::new(vec!["saved history row".into()].into()),
+            Transcript::new(
+                vec!["saved history row".into()].into(),
+                DisplayProfile::default(),
+            ),
         ));
         let opened = frame_output(&mut state);
         assert!(
@@ -16137,12 +15708,18 @@ mod tests {
             state.interactive = true;
             let changed = frame_output(&mut state);
             assert!(!changed.contains("\x1b[2J"), "{change}: {changed:?}");
-            assert!(!changed.contains("first line"), "{change}: {changed:?}");
-            assert_eq!(
-                changed.matches("\x1b[2K").count(),
-                1,
-                "{change}: {changed:?}"
-            );
+            if change == "creation notice" {
+                assert!(!changed.contains("first line"), "{change}: {changed:?}");
+                assert_eq!(
+                    changed.matches("\x1b[2K").count(),
+                    1,
+                    "{change}: {changed:?}"
+                );
+            } else {
+                // A configured line takes a row above the key hints, which keep theirs.
+                assert!(changed.contains("custom status"), "{change}: {changed:?}");
+                assert!(!changed.contains("? help"), "{change}: {changed:?}");
+            }
         }
     }
 
@@ -16216,7 +15793,7 @@ mod tests {
                 frame_output(&mut state);
                 let blocked = state.rendered_screen.join("\n");
                 assert!(blocked.contains(notice_text), "{focus}: {blocked}");
-                assert!(!blocked.contains("Ctrl+O details"), "{focus}: {blocked}");
+                assert!(!blocked.contains("ctrl+o details"), "{focus}: {blocked}");
                 assert!(state.key(control(KeyCode::Char('o'))).is_none(), "{focus}");
                 assert!(state.transcript.is_none(), "{focus}");
                 assert_eq!(state.editor.draft(), "preserved draft", "{focus}");
@@ -16247,7 +15824,7 @@ mod tests {
                 let returned = state.rendered_screen.join("\n");
                 assert!(returned.contains(notice_text), "{focus}: {returned}");
                 assert_eq!(
-                    returned.matches("Ctrl+O details").count(),
+                    returned.matches("ctrl+o details").count(),
                     1,
                     "{focus}: {returned}"
                 );
@@ -16343,10 +15920,10 @@ mod tests {
             state.key(key(KeyCode::Backspace));
             state.key(key(KeyCode::Backspace));
         });
-        assert!(!grown.contains("Enter send"), "{grown:?}");
+        assert!(!grown.contains("enter send"), "{grown:?}");
 
         let shrunk = output_after_input_area_change(&mut state, |state| state.insert("mo"));
-        assert!(!shrunk.contains("Enter send"), "{shrunk:?}");
+        assert!(!shrunk.contains("enter send"), "{shrunk:?}");
     }
 
     #[test]
@@ -16360,7 +15937,7 @@ mod tests {
             state.insert("\nsecond draft line");
         });
         assert!(grown.contains("second draft line"), "{grown:?}");
-        assert!(!grown.contains("Enter send"), "{grown:?}");
+        assert!(!grown.contains("enter send"), "{grown:?}");
     }
 
     #[test]
@@ -16378,7 +15955,7 @@ mod tests {
         assert_eq!(state.styled_frame().0.len(), bottom_rows);
         assert!(arrived.contains("activity fixture"), "{arrived:?}");
         assert!(
-            !arrived.contains("draft line") && !arrived.contains("Enter send"),
+            !arrived.contains("draft line") && !arrived.contains("enter send"),
             "{arrived:?}"
         );
 
@@ -16390,7 +15967,7 @@ mod tests {
             assert!(!output.contains("\x1b[1;1H"), "{output:?}");
         }
         assert!(
-            !left.contains("draft line") && !left.contains("Enter send"),
+            !left.contains("draft line") && !left.contains("enter send"),
             "{left:?}"
         );
     }
@@ -16412,7 +15989,7 @@ mod tests {
             !grown.contains("S\x1b[r"),
             "the editor and footer rows must not be shifted with the history: {grown:?}"
         );
-        assert!(!grown.contains("Enter send"), "{grown:?}");
+        assert!(!grown.contains("enter send"), "{grown:?}");
 
         state.scrollback.append("line 40\n");
         let appended = frame_output(&mut state);
@@ -16444,6 +16021,30 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("held"))
         );
+    }
+
+    /// The New Agent's status refresh and a confirmed Shift+Tab change end with these calls, so
+    /// each paints its own change instead of waiting for the next periodic frame.
+    #[test]
+    fn a_changed_status_area_reaches_the_terminal_without_another_frame() {
+        let mut state = State::new(true, 80, 24);
+        state.prompt_enabled = true;
+        let console = InteractiveConsoleFixture::new(state);
+        let painted = |status: &str| {
+            console
+                .state
+                .lock()
+                .unwrap()
+                .rendered_screen
+                .iter()
+                .any(|line| line.contains(status))
+        };
+        console
+            .update_status_area("Auto".into(), "fixture".into(), None, Vec::new())
+            .unwrap();
+        assert!(painted("⏵⏵ Auto · fixture"));
+        console.show_execution_mode(ExecutionMode::Plan).unwrap();
+        assert!(painted("⏵⏵ Plan · fixture"));
     }
 
     #[test]
@@ -17444,7 +17045,7 @@ mod tests {
         state.key(key(KeyCode::Down));
         assert_eq!(state.footer.selected(), Some(FooterItemId::Agents));
 
-        state.apply_footer_action(FooterAction::Clear);
+        state.clear_footer_selection();
         state.replace_draft(String::new(), 0);
         state.insert("history item");
         assert!(matches!(
@@ -17574,7 +17175,6 @@ mod tests {
             .unwrap();
         let mut state = console.state.lock().unwrap();
         state.key(key(KeyCode::Esc));
-        assert!(state.task_surface.is_none());
         assert!(state.monitor.detail.is_none());
         assert_eq!(
             state.monitor.selected().unwrap().instance,
@@ -17595,9 +17195,7 @@ mod tests {
         super::layout_tests::set_status_family(&mut state.status_area);
         state.footer.update(state.status_area.available_panels());
         state.key(key(KeyCode::Down));
-        state.key(key(KeyCode::Char(' ')));
-        assert!(!state.status_area.is_open());
-        state.key(key(KeyCode::Char(' ')));
+        assert_eq!(state.footer.selected(), Some(FooterItemId::Agents));
         state.key(key(KeyCode::Esc));
         assert!(state.status_area.is_open());
         assert!(state.footer.selected().is_none());
@@ -17611,30 +17209,17 @@ mod tests {
         };
         assert!(state.pointer(event, &mut Vec::new()));
         assert!(!state.status_area.is_open());
+        assert!(state.footer.selected().is_none());
         state.key(key(KeyCode::Esc));
         assert!(!state.status_area.is_open());
-        assert!(state.footer.selected().is_none());
         assert_eq!(state.editor.draft(), "preserved draft");
         assert_eq!(state.editor.cursor(), cursor);
-    }
-
-    #[test]
-    fn task_center_opens_the_task_selected_in_the_footer() {
-        let chat_id = Uuid::new_v4();
-        let mut surface = TaskSurface::open(task_snapshot(chat_id, 2), chat_id);
-        surface.open_detail(
-            Uuid::from_u128(2),
-            TaskViewport {
-                width: 80,
-                height: 20,
-            },
+        state.key(key(KeyCode::Down));
+        assert!(
+            state.status_area.is_open(),
+            "Down unfolds the panel it enters"
         );
-        assert_eq!(
-            surface.focus(),
-            TaskSurfaceFocus::Detail {
-                task_id: Uuid::from_u128(2)
-            }
-        );
+        assert_eq!(state.footer.selected(), Some(FooterItemId::Agents));
     }
 
     #[test]
@@ -17683,75 +17268,6 @@ mod tests {
     }
 
     #[test]
-    fn task_detail_stays_below_the_conversation_at_the_bottom() {
-        let chat_id = Uuid::new_v4();
-        let mut state = State::new(true, 80, 24);
-        state.chat = Some(chat_id);
-        state.scrollback.append("conversation above task\n");
-        let mut surface = TaskSurface::open(task_snapshot(chat_id, 1), chat_id);
-        surface.open_detail(
-            Uuid::from_u128(1),
-            TaskViewport {
-                width: 80,
-                height: 10,
-            },
-        );
-        state.task_surface = Some(surface);
-
-        state.draw(&mut Vec::new()).unwrap();
-
-        assert_eq!(state.rendered_screen.len(), 24);
-        let conversation_row = state
-            .rendered_screen
-            .iter()
-            .position(|line| line.contains("conversation above task"))
-            .unwrap();
-        let detail_row = state
-            .rendered_screen
-            .iter()
-            .position(|line| line.trim() == "Shell task")
-            .unwrap();
-        assert!(
-            state
-                .rendered_screen
-                .iter()
-                .any(|line| line.contains("printf task-0"))
-        );
-        assert!(matches!(
-            state.task_surface.as_ref().unwrap().focus(),
-            TaskSurfaceFocus::Detail { task_id } if task_id == Uuid::from_u128(1)
-        ));
-        assert!(detail_row > conversation_row);
-        assert!(detail_row >= 12);
-        assert!(
-            state.rendered_screen[23].contains("Esc/Enter/Space close"),
-            "{:?}",
-            state.rendered_screen[23]
-        );
-    }
-
-    #[test]
-    fn task_detail_enter_and_space_close_to_the_chat() {
-        let chat_id = Uuid::new_v4();
-        for close_key in [KeyCode::Enter, KeyCode::Char(' ')] {
-            let mut state = State::new(true, 80, 24);
-            state.chat = Some(chat_id);
-            let mut surface = TaskSurface::open(task_snapshot(chat_id, 1), chat_id);
-            surface.open_detail(
-                Uuid::from_u128(1),
-                TaskViewport {
-                    width: 80,
-                    height: 10,
-                },
-            );
-            state.task_surface = Some(surface);
-
-            assert!(state.key(key(close_key)).is_none());
-            assert!(state.task_surface.is_none());
-        }
-    }
-
-    #[test]
     fn paste_leaves_footer_focus_and_preserves_the_original_text() {
         let mut state = State::new(true, 80, 24);
         state.prompt_enabled = true;
@@ -17773,7 +17289,7 @@ mod tests {
         state.footer.update([FooterItemId::Agents]);
         state.insert("/mo");
         assert!(state.completion.is_open());
-        state.footer.apply(FooterAction::Down);
+        state.footer.select(FooterItemId::Agents);
 
         state.key(key(KeyCode::Down));
 
@@ -17828,18 +17344,8 @@ mod tests {
         assert_eq!(state.editor.draft(), "preserved draft");
         state.mark_menu_submission_finished(pending_id);
         state.release_finished_submissions();
-        state.task_surface = Some(TaskSurface::open(task_snapshot(chat_id, 2), chat_id));
-        state.footer.apply(FooterAction::Down);
-        let event = state.key(key(KeyCode::Enter));
-        assert!(matches!(event, None | Some(InputEvent::TaskSurface(_))));
-        assert_eq!(state.footer.selected(), None);
-        assert!(matches!(
-            state.task_surface.as_ref().unwrap().focus(),
-            TaskSurfaceFocus::Detail { .. }
-        ));
-        state.hide_task_surface();
 
-        state.footer.apply(FooterAction::Down);
+        state.footer.select(FooterItemId::Agents);
         state.set_foreground_shell(true);
         assert_eq!(state.footer.selected(), None);
         assert!(state.key(key(KeyCode::Down)).is_none());
@@ -17853,7 +17359,7 @@ mod tests {
         let mut state = State::new(false, 80, 24);
         state.chat = Some(first_chat);
         state.footer.update([FooterItemId::Agents]);
-        state.footer.apply(FooterAction::Down);
+        state.footer.select(FooterItemId::Agents);
         let console = console_with_state(state);
 
         console.select_chat(Some(second_chat)).unwrap();
@@ -17926,12 +17432,12 @@ mod tests {
         state.key(key(KeyCode::PageUp));
         state.draw(&mut Vec::new()).unwrap();
 
-        let status = &state.rendered_screen[state.height - 1];
+        let status = &state.rendered_screen[state.height - 2];
         assert_eq!(status.matches("⏵⏵ Auto").count(), 1);
         assert_eq!(status.matches("deepseek-flash").count(), 1);
         assert_eq!(status.matches("Context 1% used").count(), 1);
         assert!(!status.contains("Scrolled up"));
-        assert!(!status.contains("Ctrl+End: latest"));
+        assert!(!status.contains("ctrl+end: latest"));
     }
 
     #[test]
@@ -18065,7 +17571,7 @@ mod tests {
             assert_eq!(state.editor.draft(), "preserved input");
             if height == 2 {
                 assert!(
-                    output.contains("Resize") && output.contains("Esc back"),
+                    output.contains("Resize") && output.contains("esc back"),
                     "{output}"
                 );
             }
@@ -18307,7 +17813,10 @@ mod tests {
         let current_id = Uuid::new_v4();
         console.state.lock().unwrap().transcript = Some((
             current_id,
-            Transcript::new(vec!["current history".into()].into()),
+            Transcript::new(
+                vec!["current history".into()].into(),
+                DisplayProfile::default(),
+            ),
         ));
         console
             .update_transcript(old_id, vec!["stale history".into()].into())
@@ -18317,13 +17826,13 @@ mod tests {
         let frame = transcript.frame(80, 24);
         assert!(
             frame
-                .lines
+                .texts
                 .iter()
                 .any(|line| line.contains("current history"))
         );
         assert!(
             !frame
-                .lines
+                .texts
                 .iter()
                 .any(|line| line.contains("stale history"))
         );
@@ -18332,7 +17841,7 @@ mod tests {
         console
             .update_transcript(current_id, vec!["late result".into()].into())
             .unwrap();
-        assert!(console.transcript_id().unwrap().is_none());
+        assert!(console.state.lock().unwrap().transcript.is_none());
     }
 
     #[test]
@@ -18384,7 +17893,7 @@ mod tests {
     }
 
     #[test]
-    fn queue_summary_and_previews_keep_the_captured_types_without_owner_hashes() {
+    fn queued_inputs_show_like_claude_code_above_the_input_without_owner_hashes() {
         let mut state = State::new(true, 80, 24);
         state.prompt_enabled = true;
         let message = queued_input(QueuedInputKind::Message, "check deadbeef exactly", 1);
@@ -18398,15 +17907,20 @@ mod tests {
         let divider = lines.iter().position(|line| line.starts_with('─')).unwrap();
         let message_row = lines
             .iter()
-            .position(|line| line.contains("message") && line.contains("check deadbeef exactly"))
+            .position(|line| line == "  ❯ check deadbeef exactly")
             .unwrap();
-        assert!(
-            lines
-                .iter()
-                .any(|line| line.contains("Messages to be submitted (2)"))
+        assert_eq!(lines[message_row + 1], "  ! printf exact-shell");
+        assert_eq!(
+            divider,
+            message_row + 3,
+            "one blank row separates the queue from the input: {lines:?}"
         );
-        assert!(lines.iter().any(|line| line.contains("printf exact-shell")));
-        assert!(message_row < divider);
+        assert!(lines[message_row + 2].is_empty());
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains("Messages to be submitted"))
+        );
         assert_eq!(state.queued_inputs.len(), 2);
         assert!(
             hashes.iter().all(|hash| !lines[message_row].contains(hash)),
@@ -18418,38 +17932,12 @@ mod tests {
         new_goal.loop_id = None;
         let chat = new_goal.chat_id.to_string()[..8].to_owned();
         state.queued_inputs = vec![new_goal];
-        state.help_open = true;
-        let help = state.frame().0;
-        state.help_open = false;
         let lines = state.frame().0;
         let row = lines
             .iter()
-            .chain(&help)
             .find(|line| line.contains("start fresh"))
             .unwrap();
-        assert!(row.contains("new Loop") && !row.contains(&chat), "{row}");
-    }
-
-    #[test]
-    fn a_task_of_another_agent_is_marked_without_its_chat_hash() {
-        let view_chat = Uuid::new_v4();
-        let other_chat = Uuid::new_v4();
-        let mut snapshot = task_snapshot(view_chat, 2);
-        snapshot.tasks[1].chat_id = other_chat;
-        snapshot.tasks[1].command = "git show deadbeef".into();
-        let mut state = State::new(true, 100, 24);
-        state.prompt_enabled = true;
-        state.task_surface = Some(TaskSurface::open(snapshot, view_chat));
-        state.draw(&mut std::io::sink()).unwrap();
-        let lines = state.rendered_screen.clone();
-        let row = lines
-            .iter()
-            .find(|line| line.contains("git show deadbeef"))
-            .unwrap_or_else(|| panic!("the other Agent's task is listed: {lines:#?}"));
-        assert!(
-            row.contains("other Agent") && !row.contains(&other_chat.simple().to_string()[..8]),
-            "{row}"
-        );
+        assert!(!row.contains(&chat), "{row}");
     }
 
     #[test]
@@ -18464,7 +17952,7 @@ mod tests {
         let lines = state.frame().0;
         let rendered = lines.join(" ");
         let compact = rendered.replace(' ', "");
-        assert!(compact.contains("message"));
+        assert!(compact.contains("firstcompleteline"));
         assert!(!compact.contains("secondcompleteline"));
         assert!(lines.iter().all(|line| display_width(line) <= state.width));
         assert!(lines.len() <= agent_layout::bottom_capacity(state.height));
@@ -18496,19 +17984,26 @@ mod tests {
                     })
                     .collect::<Vec<_>>();
                 for rows in 1..=MAX_PENDING_INPUT_ROWS {
-                    let lines = pending_input_lines(&entries, width, rows);
+                    let lines =
+                        pending_input_lines(&entries, width, rows, DisplayProfile::default());
                     assert!(lines.len() <= rows, "{width}/{count}/{rows}: {lines:?}");
-                    assert!(lines[0].text().contains(&count.to_string()), "{lines:?}");
-                    if count > rows.saturating_sub(1) && rows > 1 {
+                    let entry_rows = if rows > 1 {
+                        assert!(lines.last().unwrap().text().is_empty(), "{lines:?}");
+                        &lines[..lines.len() - 1]
+                    } else {
+                        &lines[..]
+                    };
+                    assert!(entry_rows[0].text().starts_with("  ❯ "), "{lines:?}");
+                    if count > entry_rows.len() {
                         assert!(
-                            lines.iter().any(|line| line.text().contains("more")),
+                            entry_rows.iter().any(|line| line.text().contains("more")),
                             "{lines:?}"
                         );
                     }
                     if rows == 4 && count <= 3 {
                         for sequence in 0..count {
                             assert!(
-                                lines.iter().any(|line| line
+                                entry_rows.iter().any(|line| line
                                     .text()
                                     .contains(&format!("message {sequence}"))),
                                 "{lines:?}"
@@ -18519,7 +18014,13 @@ mod tests {
                         lines
                             .iter()
                             .flat_map(|line| &line.spans)
-                            .all(|span| span.role == Some(Role::MutedText)),
+                            .all(|span| span.role == Some(Role::Subtle)),
+                        "{lines:?}"
+                    );
+                    assert!(
+                        lines
+                            .iter()
+                            .all(|line| display_width(&line.text()) <= width),
                         "{lines:?}"
                     );
                 }
@@ -18704,212 +18205,6 @@ mod tests {
         assert_eq!(state.shell_input.kind(), InputKind::Shell);
     }
 
-    #[test]
-    fn task_list_owns_j_k_navigation_and_control_keys() {
-        let chat_id = Uuid::new_v4();
-        let mut state = State::new(true, 80, 24);
-        state.prompt_enabled = true;
-        state.insert("draft stays here");
-        state.task_surface = Some(TaskSurface::open(task_snapshot(chat_id, 2), chat_id));
-
-        assert!(state.key(key(KeyCode::Char('j'))).is_none());
-        let frame = state.task_surface.as_mut().unwrap().frame(TaskViewport {
-            width: 80,
-            height: 22,
-        });
-        assert_eq!(frame.selected_task_id, Some(Uuid::from_u128(2)));
-        assert_eq!(state.editor.draft(), "draft stays here");
-
-        assert!(matches!(
-            state.key(key(KeyCode::Char('x'))),
-            Some(InputEvent::TaskSurface(TaskSurfaceEffect::Control {
-                task_id,
-                action: tickloop_agent_protocol::ShellTaskAction::Stop,
-            })) if task_id == Uuid::from_u128(2)
-        ));
-        assert_eq!(state.editor.draft(), "draft stays here");
-    }
-
-    #[test]
-    fn task_surface_footer_only_advertises_selected_task_capabilities() {
-        let chat_id = Uuid::new_v4();
-        let mut snapshot = task_snapshot(chat_id, 2);
-        snapshot.tasks[0].state = ShellTaskState::Completed;
-        snapshot.tasks[0].capabilities = ShellTaskCapabilities {
-            can_background: false,
-            can_stop: false,
-            can_read_output: true,
-        };
-        snapshot.tasks[1].capabilities = ShellTaskCapabilities {
-            can_background: false,
-            can_stop: true,
-            can_read_output: true,
-        };
-        let mut surface = TaskSurface::open(snapshot, chat_id);
-
-        let completed_lines =
-            task_surface_lines(&mut surface, 100, 10, None, DisplayProfile::default());
-        let completed_footer = completed_lines.last().unwrap();
-        assert!(!completed_footer.contains("b background"));
-        assert!(!completed_footer.contains("x stop"));
-
-        surface.apply(
-            TaskSurfaceAction::Next,
-            TaskViewport {
-                width: 98,
-                height: 8,
-            },
-        );
-        let stoppable_lines =
-            task_surface_lines(&mut surface, 100, 10, None, DisplayProfile::default());
-        let stoppable_footer = stoppable_lines.last().unwrap();
-        assert!(!stoppable_footer.contains("b background"));
-        assert!(stoppable_footer.contains("x stop"));
-
-        surface.apply(
-            TaskSurfaceAction::Open,
-            TaskViewport {
-                width: 98,
-                height: 8,
-            },
-        );
-        let detail_lines =
-            task_surface_lines(&mut surface, 100, 10, None, DisplayProfile::default());
-        let detail_footer = detail_lines.last().unwrap();
-        assert!(!detail_footer.contains("b background"));
-        assert!(detail_footer.contains("x stop"));
-    }
-
-    #[test]
-    fn single_task_opens_detail_and_left_then_escape_restores_chat() {
-        let chat_id = Uuid::new_v4();
-        let mut state = State::new(true, 80, 24);
-        state.prompt_enabled = true;
-        state.insert("kept draft");
-        let cursor = state.editor.cursor();
-        state.task_surface = Some(TaskSurface::open(task_snapshot(chat_id, 1), chat_id));
-        assert!(matches!(
-            state.task_surface.as_ref().unwrap().focus(),
-            TaskSurfaceFocus::Detail { .. }
-        ));
-
-        assert!(state.key(key(KeyCode::Left)).is_none());
-        assert_eq!(
-            state.task_surface.as_ref().unwrap().focus(),
-            TaskSurfaceFocus::List
-        );
-        assert!(state.key(key(KeyCode::Esc)).is_none());
-        assert!(state.task_surface.is_none());
-        assert_eq!(state.editor.draft(), "kept draft");
-        assert_eq!(state.editor.cursor(), cursor);
-    }
-
-    #[test]
-    fn visible_permission_menu_owns_keys_over_a_stale_task_surface() {
-        for code in [KeyCode::Enter, KeyCode::Esc] {
-            let chat_id = Uuid::new_v4();
-            let mut state = State::new(true, 80, 24);
-            state.prompt_enabled = true;
-            state.menu = Some(menu());
-            state.menu_focused = false;
-            state.task_surface = Some(TaskSurface::open(task_snapshot(chat_id, 2), chat_id));
-            let menu_id = state.menu.as_ref().unwrap().id;
-
-            state.paste("allow this");
-            assert!(state.editor.draft().is_empty());
-            let event = state.key(key(code));
-            if code == KeyCode::Enter {
-                assert!(
-                    matches!(event, Some(InputEvent::Choice { menu_id: id, index: 0, .. }) if id == menu_id)
-                );
-            } else {
-                assert!(matches!(event, Some(InputEvent::Cancel { menu_id: id }) if id == menu_id));
-            }
-            assert!(matches!(
-                state.task_surface.as_ref().unwrap().focus(),
-                TaskSurfaceFocus::List
-            ));
-            assert_eq!(state.menu.as_ref().unwrap().id, menu_id);
-
-            assert!(state.menu_focused);
-            assert_eq!(state.menu.as_ref().unwrap().id, menu_id);
-        }
-    }
-
-    #[test]
-    fn task_surface_cache_restores_detail_selection_and_unread_position() {
-        let chat_id = Uuid::new_v4();
-        let mut state = State::new(true, 80, 24);
-        state.task_surface = Some(TaskSurface::open(task_snapshot(chat_id, 2), chat_id));
-        state.key(key(KeyCode::Char('j')));
-        state.key(key(KeyCode::Enter));
-        state.key(key(KeyCode::Char('k')));
-        let mut updated = task_snapshot(chat_id, 2);
-        updated.live_revision = 2;
-        updated.tasks[1].output_bytes = 20;
-        state
-            .task_surface
-            .as_mut()
-            .unwrap()
-            .update_snapshot(updated.clone());
-        let before = state.task_surface.as_mut().unwrap().frame(TaskViewport {
-            width: 80,
-            height: 22,
-        });
-        assert_eq!(before.selected_task_id, Some(Uuid::from_u128(2)));
-        assert!(matches!(
-            before.focus,
-            TaskSurfaceFocus::Detail { task_id } if task_id == Uuid::from_u128(2)
-        ));
-        assert_eq!(before.unread_bytes, 20);
-
-        state.hide_task_surface();
-        let mut restored = state.task_surface_cache.remove(&chat_id).unwrap();
-        restored.update_snapshot(updated);
-        state.task_surface = Some(restored);
-        let after = state.task_surface.as_mut().unwrap().frame(TaskViewport {
-            width: 80,
-            height: 22,
-        });
-        assert_eq!(after.selected_task_id, before.selected_task_id);
-        assert_eq!(after.focus, before.focus);
-        assert_eq!(after.unread_bytes, before.unread_bytes);
-    }
-
-    #[test]
-    fn task_surface_control_o_opens_detailed_transcript_and_caches_position() {
-        let chat_id = Uuid::new_v4();
-        let mut state = State::new(true, 80, 24);
-        state.task_surface = Some(TaskSurface::open(task_snapshot(chat_id, 2), chat_id));
-        state.key(key(KeyCode::Char('j')));
-        assert!(matches!(
-            state.key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL)),
-            Some(InputEvent::OpenTranscript { .. })
-        ));
-        assert!(state.task_surface.is_none());
-        assert!(state.task_surface_cache.contains_key(&chat_id));
-        assert!(state.transcript.is_some());
-    }
-
-    #[test]
-    fn task_action_error_replaces_the_surface_footer_until_cleared() {
-        let chat_id = Uuid::new_v4();
-        let mut surface = TaskSurface::open(task_snapshot(chat_id, 1), chat_id);
-        surface.report_action_error(Uuid::from_u128(1), "owner mismatch".into());
-        let lines = task_surface_lines(&mut surface, 80, 24, None, DisplayProfile::default());
-        assert!(
-            lines
-                .last()
-                .unwrap()
-                .contains("Error: printf task-0: owner mismatch")
-        );
-        surface.clear_action_error();
-        let lines = task_surface_lines(&mut surface, 80, 24, None, DisplayProfile::default());
-        assert!(!lines.last().unwrap().contains("j/k/↑↓ scroll"));
-        assert!(lines.last().unwrap().contains("Esc/Enter/Space close"));
-        assert!(!lines.last().unwrap().contains("owner mismatch"));
-    }
-
     #[tokio::test]
     async fn rewind_menu_transitions_keep_keyboard_focus_and_the_insert_draft() {
         use crate::terminal::menus::Menus;
@@ -19079,6 +18374,7 @@ mod tests {
                         "Thinking",
                         "Thinking",
                         "Execution mode",
+                        "shift+tab modes",
                         "Session status",
                         "Usage",
                         "Auto-scroll",
@@ -19087,7 +18383,7 @@ mod tests {
                         "Reduce motion",
                         "Output style",
                         "Permissions",
-                        "Artifact Service",
+                        "Artifacts",
                         "Prompt suggestions",
                     ]
                 );
@@ -19103,19 +18399,91 @@ mod tests {
         }
 
         assert_eq!(
-            open_settings_and_choose(&mut menus, &agent, &console, chat, 7).await,
+            open_settings_and_choose(&mut menus, &agent, &console, chat, 8).await,
             "Choose theme"
         );
         assert_eq!(
-            open_settings_and_choose(&mut menus, &agent, &console, chat, 8).await,
+            open_settings_and_choose(&mut menus, &agent, &console, chat, 9).await,
             "Choose Glyph Set"
+        );
+        assert_eq!(
+            open_settings_and_choose(&mut menus, &agent, &console, chat, 4).await,
+            "shift+tab modes"
         );
         let auto_scroll = console.auto_scroll().unwrap();
         assert_eq!(
-            open_settings_and_choose(&mut menus, &agent, &console, chat, 6).await,
+            open_settings_and_choose(&mut menus, &agent, &console, chat, 7).await,
             "Settings"
         );
         assert_eq!(console.auto_scroll().unwrap(), !auto_scroll);
+        agent.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn shift_tab_modes_checklist_toggles_with_space_and_saves_with_enter() {
+        use crate::terminal::menus::Menus;
+        use tickloop_agent_config::UserSettings;
+        use tickloop_agent_protocol::ExecutionMode;
+        let directory = tempfile::tempdir().unwrap();
+        let settings = UserSettings::in_root(directory.path());
+        let agent = Agent::new_embedded(
+            tickloop_agent_test_support::config(),
+            Arc::new(tickloop_agent_test_support::ScriptedModel::new(Vec::new())),
+        );
+        let chat = agent.create_chat(directory.path().into()).await.unwrap();
+        let target = crate::terminal::ConfigTarget::Agent(chat);
+        let mut state = State::new(true, 100, 30);
+        state.prompt_enabled = true;
+        let console = InteractiveConsoleFixture::new(state);
+        let mut menus = Menus::new(Some(settings.clone()), Some(directory.path().into()));
+        menus.settings(&agent, &console, target).await.unwrap();
+        let id = console.state.lock().unwrap().menu.as_ref().unwrap().id;
+        menus
+            .choose(&agent, &console, id, Some(4), None)
+            .await
+            .unwrap();
+        let space = KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE);
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        let checklist = {
+            let mut state = console.state.lock().unwrap();
+            state.clear_finished_menu_submission();
+            state.menu_focused = true;
+            let menu = state.menu.as_ref().unwrap();
+            assert_eq!(
+                menu.options,
+                ["[x] Auto", "[ ] Ask", "[x] Plan", "[ ] Full Access"]
+            );
+            assert!(state.key(space).is_none(), "space toggles in place");
+            assert_eq!(state.menu.as_ref().unwrap().options[0], "[ ] Auto");
+            state.key(down);
+            state.key(down);
+            assert!(state.key(space).is_none());
+            assert_eq!(
+                state.menu.as_ref().unwrap().options[2],
+                "[x] Plan",
+                "the last checked mode stays checked"
+            );
+            state.key(down);
+            state.key(space);
+            assert_eq!(state.menu.as_ref().unwrap().options[3], "[x] Full Access");
+            assert!(
+                settings.load().shift_tab_modes() == [ExecutionMode::Auto, ExecutionMode::Plan],
+                "nothing is saved before enter"
+            );
+            state.menu.as_ref().unwrap().id
+        };
+        menus
+            .choose(&agent, &console, checklist, Some(3), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            settings.load().shift_tab_modes(),
+            [ExecutionMode::Plan, ExecutionMode::FullAccess]
+        );
+        assert_eq!(
+            console.shift_tab_modes().unwrap(),
+            [ExecutionMode::Plan, ExecutionMode::FullAccess]
+        );
         agent.shutdown().await;
     }
 
@@ -19265,7 +18633,7 @@ mod tests {
         }
         let rendered = state.frame().0.join("\n");
         assert!(
-            rendered.contains("p Connection · f All/Configured · Enter models/setup · Esc close")
+            rendered.contains("p Connection · f All/Configured · enter models/setup · esc close")
         );
         assert!(!rendered.contains("a Adapter"));
         assert!(state.key(key(KeyCode::Char('a'))).is_none());
@@ -19286,7 +18654,7 @@ mod tests {
                 PickerKind::Model,
                 PickerPresentation {
                     refresh: true,
-                    hint: "p Connection · r Refresh · Enter apply · Esc back".into(),
+                    hint: "p Connection · r Refresh · enter apply · esc back".into(),
                     ..Default::default()
                 },
             )
@@ -19310,7 +18678,7 @@ mod tests {
             ));
         }
         let rendered = state.frame().0.join("\n");
-        assert!(rendered.contains("p Connection · r Refresh · Enter apply · Esc back"));
+        assert!(rendered.contains("p Connection · r Refresh · enter apply · esc back"));
         assert!(!rendered.contains("←→ Thinking"));
         assert!(!rendered.contains("↑↓/j/k"));
         drop(state);
@@ -19588,7 +18956,7 @@ mod tests {
                     PickerKind::Provider,
                     PickerPresentation {
                         headers: vec![(0, "Zhipu GLM · 1/4 configured".into())],
-                        hint: "p Connection · f Configured · Enter models/setup · Esc close".into(),
+                        hint: "p Connection · f Configured · enter models/setup · esc close".into(),
                         refresh: false,
                         ..Default::default()
                     },

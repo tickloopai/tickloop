@@ -1792,6 +1792,13 @@ async fn instance_request(
             })?
             .map_err(session_error)
         }
+        // When the Tick last updated; reading this is not using the Tick and reads no content.
+        "status" => session(tick)
+            .await?
+            .status()
+            .await
+            .map(|status| json!(status))
+            .map_err(session_error),
         "snapshot" => Ok(json!(tick.screen.lock().unwrap().snapshot())),
         "resources" => {
             let Lifecycle::Live { business_pid, .. } = tick.lifecycle.borrow().clone() else {

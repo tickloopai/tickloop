@@ -175,7 +175,7 @@ fn lost_diagnostics_follow_the_chat_across_cache_reset_and_details() {
     }
     let id = console.start_transcript().unwrap();
     console
-        .update_transcript(id, vec!["Full archive".into()].into())
+        .update_transcript(id, vec!["Loaded conversation".into()].into())
         .unwrap();
     let details = console_frame(&console);
     assert!(

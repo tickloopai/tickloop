@@ -363,18 +363,26 @@ impl Drop for Fixture {
 }
 
 #[test]
-fn settings_ux_pty_change_several_values_without_closing() {
+fn settings_ux_pty_selections_close_and_toggles_stay_open() {
     let mut fixture = Fixture::start();
     fixture.send(b"/settings\r");
     fixture.wait(|frame| frame.contains("Settings"));
     fixture.send(b"jj\r");
     fixture.wait(|frame| frame.contains("Thinking level"));
     fixture.send(b"j\r");
+    fixture.wait(|frame| {
+        !frame.lines().any(|line| line == "Settings") && !frame.contains("Thinking level")
+    });
+    fixture.send(b"/settings\r");
     fixture.wait(|frame| frame.lines().any(|line| line == "Settings"));
     fixture.select("Execution mode");
     fixture.send(b"\r");
     fixture.wait(|frame| frame.contains("Choose execution mode"));
     fixture.send(b"j\r");
+    fixture.wait(|frame| {
+        !frame.lines().any(|line| line == "Settings") && !frame.contains("Choose execution mode")
+    });
+    fixture.send(b"/settings\r");
     fixture.wait(|frame| frame.lines().any(|line| line == "Settings"));
     fixture.select("Auto-scroll");
     fixture.send(b"\r");
@@ -421,7 +429,7 @@ fn settings_ux_pty_model_groups_signed_in_providers_and_switches_atomically() {
         "Unsigned Providers belong to /provider: {frame}"
     );
     fixture.send(b"\r");
-    fixture.wait(|frame| frame.contains("Choose model") && frame.contains("● MiniMax-M3"));
+    fixture.wait(|frame| !frame.contains("Choose model") && !frame.contains("Choose Provider"));
     let saved: serde_json::Value = serde_json::from_slice(
         &std::fs::read(fixture.directory.path().join("config/settings.json")).unwrap(),
     )
@@ -430,8 +438,6 @@ fn settings_ux_pty_model_groups_signed_in_providers_and_switches_atomically() {
         saved["defaultModel"],
         serde_json::json!({"provider":"minimax-global-api", "model":"MiniMax-M3"})
     );
-    fixture.send(b"\x1b");
-    fixture.wait(|frame| !frame.contains("Choose model") && !frame.contains("Choose Provider"));
 }
 
 #[test]
@@ -445,7 +451,7 @@ fn settings_ux_pty_settings_escape_returns_one_page_and_omits_numbers() {
         ("Theme:", "Choose theme"),
         ("Glyph Set:", "Choose Glyph Set"),
         ("Output style:", "Preferred output style"),
-        ("Artifact Service:", "Sign out of Artifact Service?"),
+        ("Artifacts:", "Sign out of Tick Loop Artifacts?"),
     ] {
         fixture.send(b"/settings\r");
         let frame = fixture.wait(|frame| frame.lines().any(|line| line == "Settings"));
@@ -474,7 +480,7 @@ fn settings_ux_pty_settings_escape_returns_one_page_and_omits_numbers() {
         });
         fixture.send(b"\x1b");
         fixture.wait(|frame| {
-            !frame.lines().any(|line| line == "Settings") && frame.contains("Ctrl+G editor")
+            !frame.lines().any(|line| line == "Settings") && frame.contains("ctrl+g editor")
         });
     }
     fixture.send(b"/settings\r");
@@ -549,7 +555,7 @@ fn settings_ux_pty_discovery_preserves_action_focus_and_settings_parent() {
     fixture.send(b"\x1b");
     fixture.wait(|frame| frame.lines().any(|line| line == "Settings"));
     fixture.send(b"\x1b");
-    fixture.wait(|frame| frame.contains("Ctrl+G editor") && !frame.contains("Choose model"));
+    fixture.wait(|frame| frame.contains("ctrl+g editor") && !frame.contains("Choose model"));
 }
 
 #[test]
@@ -562,12 +568,12 @@ fn settings_ux_pty_provider_credential_escape_leaves_field_then_pages() {
     fixture.send(b"p");
     fixture.wait(|frame| frame.contains("Connection · DeepSeek"));
     fixture.send(b"j\r");
-    fixture.wait(|frame| frame.contains("API key · DeepSeek") && frame.contains("Esc close field"));
+    fixture.wait(|frame| frame.contains("API key · DeepSeek") && frame.contains("esc close field"));
     fixture.send(b"candidate123");
     fixture.wait(|frame| frame.contains("****") && !frame.contains("candidate123"));
     fixture.send(b"\x1b");
     let frame = fixture
-        .wait(|frame| frame.contains("API key · DeepSeek") && frame.contains("Tab edit API key"));
+        .wait(|frame| frame.contains("API key · DeepSeek") && frame.contains("tab edit API key"));
     assert!(!frame.contains("1. Save API key"));
     fixture.send(b"\x1b");
     fixture.wait(|frame| frame.contains("Connection · DeepSeek"));
@@ -576,7 +582,7 @@ fn settings_ux_pty_provider_credential_escape_leaves_field_then_pages() {
     fixture.send(b"\x1b");
     fixture.wait(|frame| frame.contains("Choose Provider · All"));
     fixture.send(b"\x1b");
-    fixture.wait(|frame| !frame.contains("Choose Provider") && frame.contains("Ctrl+G editor"));
+    fixture.wait(|frame| !frame.contains("Choose Provider") && frame.contains("ctrl+g editor"));
     assert_eq!(
         tickloop_agent_model::credentials::load_api_key(
             &fixture
@@ -614,7 +620,7 @@ fn settings_ux_pty_login_completion_stays_open_until_enter_or_escape() {
     fixture.send(b"\x1b");
     fixture.wait(|frame| frame.contains("Choose Provider · All"));
     fixture.send(b"\x1b");
-    fixture.wait(|frame| frame.contains("Ctrl+G editor") && !frame.contains("Choose Provider"));
+    fixture.wait(|frame| frame.contains("ctrl+g editor") && !frame.contains("Choose Provider"));
 }
 
 #[test]
@@ -684,7 +690,7 @@ fn settings_ux_pty_manage_providers_hint_matches_model_parent() {
         fixture.send(b"\r");
         let frame = fixture.wait(|frame| frame.contains("Choose Provider"));
         assert!(
-            frame.contains("Esc back to models") && !frame.contains("Esc close"),
+            frame.contains("esc back to models") && !frame.contains("esc close"),
             "Manage Providers hint: {frame}"
         );
         fixture.send(b"\x1b");
@@ -694,16 +700,16 @@ fn settings_ux_pty_manage_providers_hint_matches_model_parent() {
             fixture.wait(|frame| frame.lines().any(|line| line == "Settings"));
             fixture.send(b"\x1b");
         }
-        fixture.wait(|frame| frame.contains("Ctrl+G editor") && !frame.contains("Choose model"));
+        fixture.wait(|frame| frame.contains("ctrl+g editor") && !frame.contains("Choose model"));
     }
     fixture.send(b"/provider\r");
     let frame = fixture.wait(|frame| frame.contains("Choose Provider"));
-    assert!(frame.contains("Esc close") && !frame.contains("Esc back to models"));
+    assert!(frame.contains("esc close") && !frame.contains("esc back to models"));
     fixture.select("Codex subscription");
     fixture.send(b"\r");
     let frame = fixture.wait(|frame| frame.contains("Sign in · OpenAI"));
     assert!(
-        frame.contains("Esc back to Providers"),
+        frame.contains("esc back to Providers"),
         "First-setup methods footer: {frame}"
     );
     fixture.send(b"\x1b");
@@ -714,7 +720,7 @@ fn settings_ux_pty_manage_providers_hint_matches_model_parent() {
     fixture.send(b"\r");
     let frame = fixture.wait(|frame| frame.contains("Sign in · OpenAI"));
     assert!(
-        frame.contains("Esc back to Connection"),
+        frame.contains("esc back to Connection"),
         "Connection methods footer: {frame}"
     );
     fixture.send(b"\x1b");
@@ -748,7 +754,7 @@ fn settings_scroll_pty_survives_a_successful_setting_change() {
 }
 
 #[test]
-fn settings_scroll_pty_restores_parent_context_after_child_confirm_and_cancel() {
+fn settings_scroll_pty_restores_parent_context_after_child_cancel_and_confirm_closes() {
     let mut fixture = Fixture::start_at("ordinary", 14);
     fixture.send(b"/settings\r");
     fixture.wait(|frame| frame.lines().any(|line| line == "Settings"));
@@ -762,10 +768,10 @@ fn settings_scroll_pty_restores_parent_context_after_child_confirm_and_cancel() 
         .iter()
         .map(|line| line.to_string())
         .collect();
-    for confirm in [false, true] {
-        fixture.send(b"\r");
-        fixture.wait(|frame| frame.contains("Choose theme"));
-        fixture.send(if confirm { b"j\r" } else { b"\x1b" });
+    fixture.send(b"\r");
+    fixture.wait(|frame| frame.contains("Choose theme"));
+    fixture.send(b"\x1b");
+    {
         let returned = fixture.wait(|frame| frame.lines().any(|line| line == "Settings"));
         let rows: Vec<_> = returned.lines().collect();
         let title = rows.iter().position(|line| *line == "Settings").unwrap();
@@ -780,4 +786,10 @@ fn settings_scroll_pty_restores_parent_context_after_child_confirm_and_cancel() 
                 .any(|line| line.starts_with('❯') && line.contains("Theme:"))
         );
     }
+    fixture.send(b"\r");
+    fixture.wait(|frame| frame.contains("Choose theme"));
+    fixture.send(b"j\r");
+    fixture.wait(|frame| {
+        !frame.lines().any(|line| line == "Settings") && !frame.contains("Choose theme")
+    });
 }

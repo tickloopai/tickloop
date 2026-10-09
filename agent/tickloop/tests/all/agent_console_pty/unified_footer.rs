@@ -79,8 +79,7 @@ async fn run_working_todo_list(fixture: &PrivateFixture) {
                 rows.iter()
                     .position(|line| {
                         // The first frames may not show the elapsed time yet.
-                        line.contains("Inspecting the source-owned footer behavior")
-                            && line.contains("s · Esc to interrupt)")
+                        line.contains("Working") && line.contains("s · esc to interrupt)")
                     })
                     .is_some_and(|activity| {
                         rows.get(activity + 1)
@@ -108,10 +107,9 @@ async fn run_working_todo_list(fixture: &PrivateFixture) {
             .any(|line| line.starts_with("     ◻ ") && line.contains(TODO_SECOND))
     );
     assert!(
-        working.lines().any(|line| {
-            line.contains("Inspecting the source-owned footer behavior")
-                && line.contains("s · Esc to interrupt)")
-        }),
+        working
+            .lines()
+            .any(|line| { line.contains("Working") && line.contains("s · esc to interrupt)") }),
         "{working}"
     );
     releases.remove(0).send(()).unwrap();
@@ -181,8 +179,10 @@ async fn run_working_todo_list(fixture: &PrivateFixture) {
         .await;
     select_overview_row(&mut pty, &main_title).await;
     pty.send(b"\r");
-    pty.wait_for(
+    // The completion grace is 30 seconds.
+    pty.wait_for_within(
         "grace expires while the third turn is still Working",
+        Duration::from_secs(40),
         |frame| {
             !frame.contains("Agents · local")
                 && frame.contains("Working")
@@ -208,7 +208,7 @@ async fn run_working_todo_list(fixture: &PrivateFixture) {
     pty.send(b"\x0f");
     let archive = pty
         .wait_for("TodoWrite stays model-only in Transcript", |frame| {
-            frame.contains("Transcript") && frame.contains("TODO-THIRD-REPLY")
+            frame.contains("Showing detailed transcript") && frame.contains("TODO-THIRD-REPLY")
         })
         .await;
     assert!(
@@ -223,15 +223,18 @@ async fn run_working_todo_list(fixture: &PrivateFixture) {
         frame.contains("TODO-IDLE-DONE") && frame.contains("IDLE-GRACE-TASK")
     })
     .await;
-    pty.wait_for(
+    pty.wait_for_within(
         "idle completed rows expire without another message",
+        Duration::from_secs(40),
         |frame| frame.contains("TODO-IDLE-DONE") && !frame.contains("IDLE-GRACE-TASK"),
     )
     .await;
     pty.send(b"Show a validation failure.\r");
     let failed = pty
         .wait_for("failed TodoWrite remains visible", |frame| {
-            frame.contains("TODO-ERROR-REPLY") && frame.contains("TodoWrite · Failed")
+            frame.contains("TODO-ERROR-REPLY")
+                && frame.contains("⏺ TodoWrite")
+                && frame.contains("⎿  Failed")
         })
         .await;
     assert!(!failed.contains("Todos have been modified successfully"));
@@ -302,17 +305,6 @@ pub(super) fn click_category(pty: &mut PtyView, label: &str) {
         row + 1
     );
     pty.send(click.as_bytes());
-}
-
-fn shell_panel(frame: &str) -> &str {
-    let mut offset = 0;
-    for line in frame.split_inclusive('\n') {
-        if line.trim() == "Shell task" || line.trim() == "Shell tasks" {
-            return &frame[offset..];
-        }
-        offset += line.len();
-    }
-    frame
 }
 
 async fn shell_tasks(client: &LocalAgentClient, execution: ExecutionRef) -> Vec<ShellTask> {
@@ -411,7 +403,7 @@ async fn run_shell_panel(fixture: &PrivateFixture) {
     pty.wait_for("first Shell output is visible", |frame| {
         frame
             .lines()
-            .any(|line| line.trim() == "shell-first-0123456789abcdef")
+            .any(|line| screen::response_line(line) == "shell-first-0123456789abcdef")
     })
     .await;
     pty.send(b"\x02");
@@ -481,7 +473,9 @@ async fn run_shell_panel(fixture: &PrivateFixture) {
     pty.wait_for_editor("draft cleared", Some("")).await;
     pty.send(b"!printf 'shell-second\\n'; while [ ! -f second-finish ]; do sleep 0.02; done\r");
     pty.wait_for("second Shell output", |frame| {
-        frame.lines().any(|line| line.trim() == "shell-second")
+        frame
+            .lines()
+            .any(|line| screen::response_line(line) == "shell-second")
     })
     .await;
     pty.send(b"\x02");
@@ -563,56 +557,18 @@ async fn run_shell_panel(fixture: &PrivateFixture) {
     );
     assert!(requests.try_recv().is_err());
     pty.send(b"\x1b");
-    pty.wait_for("stopped detail returns to Monitor", |frame| {
-        frame.contains("Shells (2)")
-    })
-    .await;
-    pty.send(b"\x1b");
-    pty.wait_for_editor("stopped detail closes to input", Some(""))
-        .await;
-    click_category(&mut pty, "Monitor 2");
-    pty.wait_for("Monitor opens after saved preference", |frame| {
-        frame.contains("Shells (2)")
-    })
-    .await;
-    pty.send(b"\x1b[C");
-    pty.wait_for("ended second Tick is ready to remove", |frame| {
-        let rows = frame.lines().collect::<Vec<_>>();
-        rows.iter().enumerate().any(|(index, line)| {
-            line.contains("›")
-                && line.contains("shell-second")
-                && rows.get(index + 1).is_some_and(|metadata| {
-                    ["exit", "signal", "stopped", "unknown"]
-                        .iter()
-                        .any(|state| metadata.contains(state))
-                })
-        })
-    })
-    .await;
-    pty.send(b"x");
     pty.wait_for(
-        "ended Tick can be removed without stopping its peer",
-        |frame| frame.contains("Shells (1)"),
+        "closing the detail marks the stopped Shell seen; it keeps its row for now",
+        |frame| {
+            frame.contains("Shells (2)")
+                && frame
+                    .lines()
+                    .any(|line| line.contains("SIGTERM") && !line.contains('●'))
+        },
     )
     .await;
     pty.send(b"\x1b");
     pty.wait_for_editor("Monitor closes to input", Some(""))
-        .await;
-    pty.send(b"/tasks\r");
-    pty.wait_for("Task Center retains the removed Tick's task", |frame| {
-        frame.contains("Shell task") && frame.contains("shell-second")
-    })
-    .await;
-    pty.send(b"\x1b[D");
-    pty.wait_for("Task Center still keeps completed records", |frame| {
-        let panel = shell_panel(frame);
-        ["prior-completed", "shell-first", "shell-second"]
-            .iter()
-            .all(|command| panel.contains(command))
-    })
-    .await;
-    pty.send(b"\x1b");
-    pty.wait_for_editor("task list closes before exit", Some(""))
         .await;
     std::fs::write(fixture.path("work/first-finish"), "done").unwrap();
     std::fs::write(fixture.path("work/second-finish"), "done").unwrap();

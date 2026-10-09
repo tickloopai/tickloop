@@ -62,7 +62,7 @@ fn request_question_descriptions_and_other_use_separate_physical_rows() {
         assert!(selected_row < description, "{text:?}");
         assert!(
             text.iter()
-                .any(|line| line == "Enter select · Esc answer later"),
+                .any(|line| line == "enter select · esc answer later"),
             "{text:?}"
         );
         for code in [KeyCode::Down, KeyCode::Up] {
@@ -116,7 +116,7 @@ fn request_question_wraps_within_the_row_budget_after_resize() {
             if capacity >= 3 && width >= 40 {
                 assert!(
                     text.iter()
-                        .any(|line| line.starts_with("Space/Enter toggle · Esc answer later")),
+                        .any(|line| line.starts_with("space/enter toggle · esc answer later")),
                     "{text:?}"
                 );
             }
@@ -142,7 +142,7 @@ fn request_other_field_wraps_and_keeps_its_cursor_and_submit_hint() {
         .collect::<Vec<_>>();
     assert!(
         text.iter()
-            .any(|line| line == "Enter type answer · Esc answer later"),
+            .any(|line| line == "enter type answer · esc answer later"),
         "{text:?}"
     );
     state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -155,7 +155,7 @@ fn request_other_field_wraps_and_keeps_its_cursor_and_submit_hint() {
     assert_eq!(column, "Second answer line".len());
     assert!(
         text.iter()
-            .any(|line| line == "Type your answer · Enter submit · Esc close field"),
+            .any(|line| line == "Type your answer · enter submit · esc close field"),
         "{text:?}"
     );
     assert_eq!(state.request_layout, Some(REQUEST));

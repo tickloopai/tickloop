@@ -48,8 +48,6 @@ pub(super) struct DialogState {
     review_focused: bool,
     context_offset: usize,
     history_search: Option<HistorySearch>,
-    pub(super) task_surface: Option<TaskSurface<Uuid>>,
-    pub(super) subscription_surface: Option<SubscriptionSurface>,
     pub(super) permissions_surface: Option<PermissionsSurface>,
     help_open: bool,
     help_offset: usize,
@@ -162,13 +160,13 @@ fn complete_login_menu(
     if menu.id != id {
         return false;
     }
-    presentation.hint = "Enter return to Provider · Esc back".into();
+    presentation.hint = "enter return to Provider · esc back".into();
     presentation.row_hints.clear();
-    presentation.editing_hint = Some("Callback URL · Enter return to Provider · Esc close field");
+    presentation.editing_hint = Some("Callback URL · enter return to Provider · esc close field");
     menu.title = format!("{} · {status}", menu.title);
     menu.context = vec![
         notice.into(),
-        "Enter returns to Provider; Esc leaves editing first, otherwise returns to Provider. Saved credentials remain applied.".into(),
+        "enter returns to Provider; esc leaves editing first, otherwise returns to Provider. Saved credentials remain applied.".into(),
     ];
     for option in &mut menu.options {
         *option = "Back to Provider".into();
@@ -177,24 +175,6 @@ fn complete_login_menu(
 }
 
 impl State {
-    pub(super) fn suspended_task_chats(&self) -> Vec<Uuid> {
-        self.suspended_dialog
-            .iter()
-            .chain(
-                self.dialog_cache.values().flat_map(|(active, suspended)| {
-                    std::iter::once(active).chain(suspended.iter())
-                }),
-            )
-            .filter_map(|dialog| {
-                dialog
-                    .task_surface
-                    .as_ref()
-                    .map(|surface| *surface.restore())
-            })
-            .chain(self.task_surface_cache.keys().copied())
-            .collect()
-    }
-
     pub(super) fn permissions_surfaces_mut(
         &mut self,
     ) -> impl Iterator<Item = &mut PermissionsSurface> {
@@ -213,29 +193,6 @@ impl State {
                             suspended
                                 .iter_mut()
                                 .filter_map(|dialog| dialog.permissions_surface.as_mut()),
-                        )
-                    }),
-            )
-    }
-
-    pub(super) fn subscription_surfaces_mut(
-        &mut self,
-    ) -> impl Iterator<Item = &mut SubscriptionSurface> {
-        self.subscription_surface
-            .iter_mut()
-            .chain(
-                self.suspended_dialog
-                    .iter_mut()
-                    .filter_map(|dialog| dialog.subscription_surface.as_mut()),
-            )
-            .chain(
-                self.dialog_cache
-                    .values_mut()
-                    .flat_map(|(active, suspended)| {
-                        active.subscription_surface.iter_mut().chain(
-                            suspended
-                                .iter_mut()
-                                .filter_map(|dialog| dialog.subscription_surface.as_mut()),
                         )
                     }),
             )
@@ -281,11 +238,6 @@ impl State {
             review_focused: std::mem::replace(&mut self.review_focused, next.review_focused),
             context_offset: std::mem::replace(&mut self.context_offset, next.context_offset),
             history_search: std::mem::replace(&mut self.history_search, next.history_search),
-            task_surface: std::mem::replace(&mut self.task_surface, next.task_surface),
-            subscription_surface: std::mem::replace(
-                &mut self.subscription_surface,
-                next.subscription_surface,
-            ),
             permissions_surface: std::mem::replace(
                 &mut self.permissions_surface,
                 next.permissions_surface,
@@ -322,45 +274,6 @@ impl State {
                 *active = next;
             }
         }
-    }
-
-    pub(super) fn hidden_task_surface_mut(&mut self, chat: Uuid) -> Option<&mut TaskSurface<Uuid>> {
-        if let Some(surface) = self
-            .suspended_dialog
-            .as_mut()
-            .and_then(|dialog| dialog.task_surface.as_mut())
-            .filter(|surface| *surface.restore() == chat)
-        {
-            return Some(surface);
-        }
-        for (active, suspended) in self.dialog_cache.values_mut() {
-            if let Some(surface) = active
-                .task_surface
-                .as_mut()
-                .filter(|surface| *surface.restore() == chat)
-            {
-                return Some(surface);
-            }
-            if let Some(surface) = suspended
-                .as_mut()
-                .and_then(|dialog| dialog.task_surface.as_mut())
-                .filter(|surface| *surface.restore() == chat)
-            {
-                return Some(surface);
-            }
-        }
-        self.task_surface_cache.get_mut(&chat)
-    }
-
-    pub(super) fn task_surface_mut(&mut self, chat: Uuid) -> Option<&mut TaskSurface<Uuid>> {
-        if self
-            .task_surface
-            .as_ref()
-            .is_some_and(|surface| *surface.restore() == chat)
-        {
-            return self.task_surface.as_mut();
-        }
-        self.hidden_task_surface_mut(chat)
     }
 
     pub(super) fn clear_artifact_picker(&mut self, id: Uuid) {
@@ -492,21 +405,12 @@ impl State {
     pub(super) fn suspend_dialog(&mut self) {
         if self.suspended_dialog.is_none() {
             self.suspended_dialog = Some(self.replace_dialog(DialogState::default()));
-            self.resumed_task_effect = None;
         }
-    }
-
-    pub(super) fn reconcile_resumed_task(&mut self) {
-        self.resumed_task_effect = self.task_surface.as_mut().and_then(|surface| {
-            let effect = surface.resume();
-            (effect != TaskSurfaceEffect::None).then(|| (*surface.restore(), effect))
-        });
     }
 
     pub(super) fn resume_dialog(&mut self) {
         if let Some(dialog) = self.suspended_dialog.take() {
             self.replace_dialog(dialog);
-            self.reconcile_resumed_task();
         }
     }
 
@@ -550,7 +454,7 @@ impl State {
             );
             lines.resize(self.height.saturating_sub(1), RoleLine::default());
             lines.push(RoleLine::role(
-                "v / Esc return to plan approval",
+                "v / esc return to plan approval",
                 Role::MutedText,
             ));
             lines.truncate(self.height);
@@ -587,7 +491,7 @@ impl State {
                 }),
         );
         lines.resize(self.height.saturating_sub(1), RoleLine::default());
-        lines.push(RoleLine::role("v / Esc return to request", Role::MutedText));
+        lines.push(RoleLine::role("v / esc return to request", Role::MutedText));
         lines.truncate(self.height);
         for line in &mut lines {
             line.truncate(self.width);
@@ -720,10 +624,6 @@ impl State {
                     picker.title()
                 } else if self.permissions_surface.is_some() {
                     "Permissions"
-                } else if self.subscription_surface.is_some() {
-                    "Tick Subscriptions"
-                } else if self.task_surface.is_some() {
-                    "Shell tasks"
                 } else if self.help_open {
                     "Help"
                 } else {
@@ -741,9 +641,9 @@ impl State {
             if self.user_menu_submission_is_unfinished() {
                 MENU_SUBMISSION_PENDING_HINT
             } else if self.menu_comment_is_editing() {
-                "Resize · Esc close field"
+                "Resize · esc close field"
             } else {
-                "Resize · Esc back"
+                "Resize · esc back"
             },
             Role::MutedText,
         ));
@@ -772,10 +672,6 @@ impl State {
             picker.content_rows()
         } else if let Some(surface) = &self.permissions_surface {
             surface.content_rows(self.width, maximum)
-        } else if let Some(surface) = &self.subscription_surface {
-            2 + surface.content_rows()
-        } else if let Some(surface) = &self.task_surface {
-            2 + surface.content_rows(self.width, maximum)
         } else if self.help_open {
             1 + agent_layout::help_lines(self.width, self.width + 1, None).len()
         } else if self.monitor.confirmation.is_some()
@@ -795,9 +691,7 @@ impl State {
     pub(super) fn input_dialog_visible(&self) -> bool {
         self.menu.is_some()
             || self.workspace_trust.is_some()
-            || self.task_surface.is_some()
             || self.permissions_surface.is_some()
-            || self.subscription_surface.is_some()
             || self.artifacts_picker.is_some()
             || self.conversation_picker.is_some()
             || self.help_open && self.overview.projection.is_none()
@@ -869,23 +763,10 @@ impl State {
                 column.min(self.width.saturating_sub(1)),
             );
         }
-        let mut surface_lines = if let Some(surface) = &mut self.permissions_surface {
-            Some(surface.styled_lines(self.width, capacity))
-        } else if let Some(surface) = &mut self.subscription_surface {
-            Some(
-                subscription_surface_lines(surface, capacity, self.display)
-                    .into_iter()
-                    .map(RoleLine::plain)
-                    .collect(),
-            )
-        } else {
-            self.task_surface.as_mut().map(|surface| {
-                task_surface_lines(surface, self.width, capacity, None, self.display)
-                    .into_iter()
-                    .map(RoleLine::plain)
-                    .collect()
-            })
-        };
+        let mut surface_lines = self
+            .permissions_surface
+            .as_mut()
+            .map(|surface| surface.styled_lines(self.width, capacity));
         if let Some(ref mut lines) = surface_lines {
             pad_dialog(lines, capacity);
             for line in lines.iter_mut() {
@@ -902,7 +783,7 @@ impl State {
             self.help_offset = self.help_offset.min(body.len().saturating_sub(available));
             lines.extend(body.into_iter().skip(self.help_offset).take(available));
             lines.resize(capacity.saturating_sub(1), RoleLine::default());
-            lines.push(RoleLine::role("Esc / ? close help", Role::MutedText));
+            lines.push(RoleLine::role("esc / ? close help", Role::MutedText));
         } else {
             let detail = self
                 .monitor
@@ -927,7 +808,7 @@ impl State {
             lines.push(RoleLine::role(format!("› {label}"), Role::Text).filled(Role::Selection));
             self.dialog_option_rows.push((2..3, 0));
             lines.resize(capacity.saturating_sub(1), RoleLine::default());
-            lines.push(RoleLine::role("Enter confirm · Esc back", Role::MutedText));
+            lines.push(RoleLine::role("enter confirm · esc back", Role::MutedText));
         }
         lines.truncate(capacity);
         for line in &mut lines {

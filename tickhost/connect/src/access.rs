@@ -16,12 +16,19 @@ use tick_protocol::InstanceRef;
 pub const TERMINAL_TEXT_LIMIT: usize = 64 * 1024;
 pub const TERMINAL_LINE_LIMIT: usize = 200;
 pub const INSTANCE_TOKEN: &str = "tickloop_instance";
+/// How long an open waits for a protocol Tick's declaration to name it; past it the Tick keeps
+/// its command as its name.
+const OPENED_NAME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TickLocation {
     pub instance: InstanceRef,
     pub pane: Pane,
     pub protocol: bool,
+    /// What a person calls the program: see [`crate::naming::pane_title`]. A protocol Tick is
+    /// named by its declaration instead, which identifying it never reads.
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -176,16 +183,10 @@ impl TickAccess {
                 instance,
                 pane,
                 protocol: true,
+                name: None,
             });
         }
-        let response = self
-            .host
-            .request(
-                "pane.process_info",
-                json!({"pane_id":pane.pane_id}),
-                CancellationToken::new(),
-            )
-            .await?;
+        let response = self.process_info(&pane.pane_id).await?;
         let process_info = response.get("process_info").unwrap_or(&response);
         let group = process_info["foreground_process_group_id"]
             .as_u64()
@@ -225,11 +226,79 @@ impl TickAccess {
             births.join("/")
         ))
         .map_err(|error| HostError::before("IdentityUncertain", error))?;
+        let name = crate::naming::pane_title(
+            &pane,
+            &crate::naming::PaneForeground::from_process_info(process_info),
+        );
         Ok(TickLocation {
             instance,
             pane,
             protocol: false,
+            name,
         })
+    }
+
+    async fn process_info(&self, pane_id: &str) -> Result<Value, HostError> {
+        self.host
+            .request(
+                "pane.process_info",
+                json!({"pane_id":pane_id}),
+                CancellationToken::new(),
+            )
+            .await
+    }
+
+    /// A protocol Tick's name from its declaration and the command its Pane runs; the command
+    /// alone while the declaration cannot be read.
+    async fn protocol_name(&self, pane: &Pane, descriptor: Option<&Value>) -> Option<String> {
+        let command = self
+            .process_info(&pane.pane_id)
+            .await
+            .ok()
+            .and_then(|response| {
+                crate::naming::PaneForeground::from_process_info(
+                    response.get("process_info").unwrap_or(&response),
+                )
+                .command_title()
+            });
+        match (descriptor, command) {
+            (Some(descriptor), command) => Some(crate::naming::tick_title(
+                descriptor["title"].as_str()?,
+                descriptor["tick_type"].as_str()?,
+                command.as_deref().unwrap_or_default(),
+            )),
+            (None, command) => command,
+        }
+    }
+
+    /// The name of an instance this access located, without asking the host again.
+    pub async fn located_name(&self, instance: &InstanceRef) -> Option<String> {
+        self.known.lock().await.get(instance)?.name.clone()
+    }
+
+    /// The name of an instance just opened with `command` (a [`crate::naming::command_title`]):
+    /// a protocol Tick by its declaration, any other program, or a Tick whose declaration does
+    /// not arrive in time, by the command.
+    pub async fn opened_name(&self, instance: &InstanceRef, command: &str) -> String {
+        let protocol = self
+            .known
+            .lock()
+            .await
+            .get(instance)
+            .is_some_and(|location| location.protocol);
+        if !protocol {
+            return command.to_owned();
+        }
+        let described = tokio::time::timeout(OPENED_NAME_TIMEOUT, async {
+            self.session(instance).await.ok()?.describe().await.ok()
+        })
+        .await;
+        match described {
+            Ok(Some(descriptor)) => {
+                crate::naming::tick_title(&descriptor.title, &descriptor.tick_type, command)
+            }
+            _ => command.to_owned(),
+        }
     }
 
     /// Identifies every running program once, without reading any Tick content. The second
@@ -259,19 +328,22 @@ impl TickAccess {
             match self.identify(pane.clone()).await {
                 Ok(location) => {
                     self.known.lock().await.insert(location.instance.clone(), location.clone());
-                    let mut tick = json!({"tick_instance_id":location.instance,"pane_id":pane.pane_id,"workspace_id":pane.workspace_id,"tab_id":pane.tab_id,"title":pane.title,"source":if location.protocol {"protocol"} else {"terminal"},"state":"live","capabilities":["read","send_input","subscribe"]});
+                    let mut tick = json!({"tick_instance_id":location.instance,"pane_id":pane.pane_id,"workspace_id":pane.workspace_id,"tab_id":pane.tab_id,"title":location.name,"source":if location.protocol {"protocol"} else {"terminal"},"state":"live","capabilities":["read","send_input","subscribe"]});
                     if location.protocol {
-                        match self.read(&location.instance).await {
+                        let descriptor = match self.read(&location.instance).await {
                             Ok(snapshot) => {
                                 tick["state"] = json!(if snapshot.initialized { "live" } else { "initializing" });
                                 tick["capabilities"] = json!(["read","call_tick_tool","subscribe"]);
+                                snapshot.descriptor
                             }
                             Err(error) => {
                                 tick["state"] = json!(if error.code == "TargetGone" { "gone" } else { "disconnected" });
                                 tick["capabilities"] = json!([]);
                                 tick["error"] = json!(error.to_string());
+                                None
                             }
-                        }
+                        };
+                        tick["title"] = json!(self.protocol_name(&pane, descriptor.as_ref()).await);
                     }
                     ticks.push(tick);
                 }
@@ -1611,11 +1683,17 @@ fn executable_identity(path: &std::path::Path) -> Result<(u64, u64, i64, i64), H
 }
 
 pub fn observed_now() -> String {
+    now_ms().to_string()
+}
+
+/// The current Unix time in milliseconds.
+pub fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
-        .to_string()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 fn invalid_host_response(error: serde_json::Error) -> HostError {

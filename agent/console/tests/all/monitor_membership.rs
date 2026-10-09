@@ -7,7 +7,9 @@ use tickloop_agent_console::monitor_rows::{
     MonitorAction, MonitorContext, MonitorRows, MonitorRowsRegistry, TickDescriptor, TickGlyph,
     TickGroup, TickIntent, TickOwner,
 };
-use tickloop_agent_protocol::{ChatId, EventKind, MonitorMemberSource, ToolDefinition, ToolResult};
+use tickloop_agent_protocol::{
+    ChatId, EventKind, MonitorMemberSource, TickSubscriptionChange, ToolDefinition, ToolResult,
+};
 use tickloop_agent_runtime::{
     Agent,
     host_tools::{
@@ -92,8 +94,11 @@ impl MonitorRows for CalendarRows {
                 title: row.instance.to_string(),
                 kind: "Calendar".into(),
                 status: "live".into(),
+                notes: Vec::new(),
                 owner: TickOwner::Unknown,
+                tone: tickloop_agent_console::monitor_rows::StatusTone::Neutral,
                 updated_at_ms: row.last_delivery_ms,
+                update: None,
                 running: true,
                 resources: None,
                 actions: vec![MonitorAction {
@@ -211,7 +216,7 @@ async fn an_unsubscribed_open_joins_only_its_chat_monitor_without_watch_or_model
 }
 
 #[tokio::test]
-async fn removal_outlives_subscription_projection_and_restart_until_explicit_add() {
+async fn removal_outlives_restart_until_explicit_add_but_never_hides_a_subscription() {
     let directory = tempfile::tempdir().unwrap();
     let store = directory.path().join("archive");
     let model = Arc::new(tickloop_agent_test_support::ScriptedModel::new(vec![
@@ -233,12 +238,22 @@ async fn removal_outlives_subscription_projection_and_restart_until_explicit_add
         .remove_monitor_member(chat, calendar("watched"))
         .await
         .unwrap();
-    assert!(monitor_rows(&agent, chat).await.is_empty());
+    let subscriptions = agent.tick_subscriptions(chat).await.unwrap();
     assert_eq!(
-        agent.tick_subscriptions(chat).await.unwrap().len(),
+        subscriptions.len(),
         1,
         "removal leaves the subscription in place"
     );
+    assert_eq!(
+        monitor_rows(&agent, chat).await.len(),
+        1,
+        "a subscription keeps its row in sight"
+    );
+    agent
+        .update_tick_subscription(chat, subscriptions[0].id, TickSubscriptionChange::Cancel)
+        .await
+        .unwrap();
+    assert!(monitor_rows(&agent, chat).await.is_empty());
     agent.shutdown().await;
     drop(agent);
 
@@ -363,10 +378,10 @@ async fn one_row_merges_every_source_and_frequency_and_pages_cover_the_full_set(
         .find(|row| row.instance == calendar("shared"))
         .unwrap();
     assert_eq!(shared.title, "Shared calendar");
-    assert!(
-        shared.status.contains("15s") && shared.status.contains("45s"),
-        "{}",
-        shared.status
+    assert_eq!(
+        shared.notes,
+        ["⟳ 2"],
+        "both subscriptions show as one summary"
     );
 
     let mut seen = Vec::new();

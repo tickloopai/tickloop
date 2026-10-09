@@ -4,13 +4,15 @@ use tickhost_connect::page::{MAX_PAGE_SIZE, PageCursor, PageError};
 
 use super::{
     display::{DisplayProfile, Glyph},
+    list_row::{self, ListRow},
     style::{Role, RoleLine},
+    subscription_detail::SubscriptionDetail,
 };
 
-/// Monitor's preferred column, its `│ ` separator included.
+/// Monitor's default column, its `│ ` separator included.
 pub(super) const MONITOR_COLUMNS: usize = 42;
 /// The narrowest Monitor column beside the conversation: 30 text columns still hold a row's
-/// indented kind · state · age line, such as `    Terminal · live · 60s · 2m`, whole.
+/// indented details line, such as `    feedback elsewhere · ● 59m`, whole.
 const MONITOR_MIN_COLUMNS: usize = 32;
 /// The narrowest conversation left beside Monitor: what the narrowest Monitor leaves of an
 /// 80-column terminal, the product's minimum, once the console's reserved last column is taken.
@@ -18,19 +20,31 @@ const MONITOR_MIN_COLUMNS: usize = 32;
 pub(super) const CONVERSATION_MIN_COLUMNS: usize = 47;
 const MILLISECONDS_PER_SECOND: f64 = 1000.0;
 const BYTES_PER_MIB: f64 = 1024.0 * 1024.0;
+const EMPTY_MONITOR_TEXT: &str = "Nothing to monitor";
 
-/// Monitor's column beside a content area `width` columns wide: as wide as preferred, narrowing
-/// so the conversation keeps its minimum, or `None` when even the narrowest Monitor leaves the
-/// conversation too little room and Monitor can only open as an overlay.
-pub(super) fn side_columns(width: usize) -> Option<usize> {
+/// Monitor's column beside a content area `width` columns wide: the user's preferred width or
+/// the default, narrowed so the conversation keeps its minimum, or `None` when even the narrowest
+/// Monitor leaves the conversation too little room and Monitor can only open as an overlay.
+pub(super) fn side_columns(width: usize, preferred: Option<usize>) -> Option<usize> {
     let spare = width.checked_sub(CONVERSATION_MIN_COLUMNS)?;
-    (spare >= MONITOR_MIN_COLUMNS).then(|| spare.min(MONITOR_COLUMNS))
+    (spare >= MONITOR_MIN_COLUMNS).then(|| {
+        preferred
+            .unwrap_or(MONITOR_COLUMNS)
+            .clamp(MONITOR_MIN_COLUMNS, spare)
+    })
+}
+
+/// The Monitor width a drag of its separator to `column` asks for, within the same bounds as
+/// [`side_columns`]; `None` when the terminal has no room for Monitor beside the conversation.
+pub(super) fn dragged_columns(width: usize, column: usize) -> Option<usize> {
+    side_columns(width, Some(width.saturating_sub(column)))
 }
 
 pub(super) use crate::monitor_rows::TickGroup;
 use crate::monitor_rows::{
-    MONITOR_ADD_KEY, MonitorAction, MonitorContext, MonitorRowsRegistry, TickDescriptor, TickGlyph,
-    TickOwner, TickResources, page_of,
+    GONE_DISPLAY_MS, MONITOR_ADD_KEY, MonitorAction, MonitorContext, MonitorRowsRegistry,
+    RowUpdate, StatusTone, TickDescriptor, TickGlyph, TickOwner, TickResources,
+    finished_shell_until, page_of,
 };
 use tick_protocol::InstanceRef;
 use tickloop_agent_protocol::{
@@ -44,11 +58,39 @@ pub(super) struct MonitorEntry {
     pub(super) glyph: Glyph,
     pub(super) title: String,
     pub(super) kind: String,
+    /// The state in words, for the detail; the row shows it only as its glyph's colour.
     pub(super) status: String,
+    /// The facts the row shows at its right before its latest update.
+    pub(super) notes: Vec<String>,
     pub(super) owner: TickOwner,
+    pub(super) tone: StatusTone,
     pub(super) updated_at_ms: Option<u64>,
+    /// The latest update that counts for unread, and whether this Chat still has to handle it.
+    pub(super) update: Option<RowUpdate>,
     pub(super) resources: Option<TickResources>,
     pub(super) actions: Vec<MonitorAction>,
+}
+
+impl MonitorEntry {
+    fn status_spans(&self, now_ms: u64) -> Vec<(String, Role)> {
+        list_row::status_spans(
+            self.tone,
+            &self.notes,
+            self.update.as_ref().map(|update| list_row::UpdateMark {
+                age: relative_time(Some(update.at_ms), now_ms),
+                unread: update.unread,
+            }),
+            now_ms,
+        )
+    }
+
+    fn state_label(&self) -> &str {
+        match (self.status.is_empty(), self.tone) {
+            (true, StatusTone::Running { .. }) => "running",
+            (true, _) => "—",
+            (false, _) => &self.status,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -76,8 +118,17 @@ pub(super) struct Monitor {
     rows: Option<MonitorRowsRegistry>,
     pub(super) chat_snapshot: Option<ChatSnapshot>,
     pub(super) shell_snapshot: Option<ShellTaskSnapshot>,
+    /// When each running Shell started, as far as the View knows.
+    pub(super) shell_starts: HashMap<uuid::Uuid, u64>,
     pub(super) focused: bool,
     pub(super) overlay: bool,
+    /// Whether the column has shown rows in this Chat; it then stays when empty, so the
+    /// conversation does not change width each time a background Shell starts or ends.
+    shown: bool,
+    /// When time alone next changes the list: a finished Shell or a gone Tick leaving.
+    refresh_at: Option<u64>,
+    /// Since when each instance has shown as gone, as this View saw it.
+    gone_since: HashMap<InstanceRef, u64>,
 }
 
 pub(super) struct MonitorFrame {
@@ -125,7 +176,22 @@ impl Monitor {
             .map(|chat| chat.monitor.removed.clone())
             .unwrap_or_default()
     }
+    /// Whether the column has shown rows in this Chat, so it stays on screen when empty.
+    pub(super) fn is_shown(&self) -> bool {
+        self.shown
+    }
+    /// Rebuilds the list when time alone changed it, and says whether it did.
+    pub(super) fn refresh_due(&mut self, now_ms: u64) -> bool {
+        if self.refresh_at.is_none_or(|at| at > now_ms) {
+            return false;
+        }
+        self.rebuild_at(now_ms);
+        true
+    }
     pub(super) fn rebuild(&mut self) {
+        self.rebuild_at(tickloop_agent_base::private_fs::unix_time_milliseconds());
+    }
+    fn rebuild_at(&mut self, now_ms: u64) {
         let context = MonitorContext {
             chat: self.chat_snapshot.clone(),
             shells: self.shell_snapshot.clone(),
@@ -134,11 +200,27 @@ impl Monitor {
             metadata_failures: self.metadata_failures.clone(),
             member_states: self.member_findings.states.clone(),
             member_resources: self.member_findings.resources.clone(),
+            member_titles: self.member_findings.titles.clone(),
+            member_updates: self.member_findings.updates.clone(),
+            gone_since: self.gone_since.clone(),
+            shell_starts: self.shell_starts.clone(),
+            retained: self.detail.as_ref().and_then(|detail| detail.instance()),
+            now_ms,
         };
         let listed = self
             .rows
             .get_or_insert_with(MonitorRowsRegistry::builtin)
             .list(&context);
+        // A row that left as gone stays out; one that shows again as anything else starts over.
+        for entry in &listed {
+            if entry.tone == StatusTone::Gone {
+                self.gone_since
+                    .entry(entry.instance.clone())
+                    .or_insert(now_ms);
+            } else {
+                self.gone_since.remove(&entry.instance);
+            }
+        }
         self.group_totals.clear();
         for entry in &listed {
             *self.group_totals.entry(entry.group).or_default() += 1;
@@ -157,8 +239,10 @@ impl Monitor {
             }
         };
         self.total = page.total;
+        self.shown |= self.total > 0;
         self.next_page = page.next;
         self.entries = page.items.into_iter().map(MonitorEntry::from).collect();
+        self.refresh_at = self.next_refresh_ms(now_ms);
         if let Some(detail) = self
             .detail
             .as_mut()
@@ -170,7 +254,62 @@ impl Monitor {
         {
             detail.entry = entry.clone();
         }
+        let goals = self.loop_goals();
+        if let Some(detail) = self
+            .detail
+            .as_mut()
+            .and_then(|detail| detail.as_any_mut().downcast_mut::<SubscriptionDetail>())
+        {
+            let instance = detail.instance().clone();
+            detail.update(
+                title_of(&self.entries, &instance),
+                crate::monitor_rows::subscriptions_on(&self.subscriptions, &instance),
+                goals,
+            );
+        }
         self.reconcile_selection();
+    }
+    /// When time alone next changes the list: the next finished Shell or gone Tick to leave.
+    fn next_refresh_ms(&self, now_ms: u64) -> Option<u64> {
+        let handled = |task: &tickloop_agent_protocol::ShellTask| {
+            self.chat_snapshot
+                .as_ref()
+                .and_then(|chat| chat.monitor.handled_at(&InstanceRef::shell(task.id)))
+        };
+        self.shell_snapshot
+            .iter()
+            .flat_map(|snapshot| &snapshot.tasks)
+            .filter_map(|task| finished_shell_until(task, handled(task)))
+            .chain(
+                self.gone_since
+                    .values()
+                    .map(|since| since.saturating_add(GONE_DISPLAY_MS)),
+            )
+            .filter(|until| *until > now_ms)
+            .min()
+    }
+    /// When time alone next changes the drawn list without changing its rows: a running row's
+    /// glyph blinking or its elapsed time ticking. `None` while nothing runs or a detail covers
+    /// the list.
+    pub(super) fn next_frame_ms(&self, now_ms: u64, display: DisplayProfile) -> Option<u64> {
+        (self.detail.is_none()
+            && self
+                .entries
+                .iter()
+                .any(|entry| matches!(entry.tone, StatusTone::Running { .. })))
+        .then(|| display.next_running_change_ms(now_ms))
+    }
+    /// The row's title, or the instance itself when no row shows it.
+    pub(super) fn title_of(&self, instance: &InstanceRef) -> String {
+        title_of(&self.entries, instance)
+    }
+    /// What each of the Chat's Loops is for, by Loop.
+    pub(super) fn loop_goals(&self) -> HashMap<uuid::Uuid, String> {
+        self.chat_snapshot
+            .iter()
+            .flat_map(|chat| &chat.loops)
+            .map(|goal| (goal.id, goal.goal.clone()))
+            .collect()
     }
     #[cfg(test)]
     pub(super) fn replace(&mut self, group: TickGroup, rows: Vec<MonitorEntry>) {
@@ -184,6 +323,7 @@ impl Monitor {
         });
         self.entries.dedup_by(|a, b| a.instance == b.instance);
         self.total = self.entries.len();
+        self.shown |= self.total > 0;
         self.group_totals.clear();
         for entry in &self.entries {
             *self.group_totals.entry(entry.group).or_default() += 1;
@@ -205,9 +345,16 @@ impl Monitor {
             self.selected = self.entries.first().map(|entry| entry.instance.clone());
         }
     }
-    /// Closes the open detail; an empty Monitor then releases focus back to the input.
+    /// Closes the open detail; an empty Monitor then releases focus back to the input. A finished
+    /// Shell the detail kept listed leaves on the next clock tick.
     pub(super) fn close_detail(&mut self) {
-        self.detail = None;
+        if self
+            .detail
+            .take()
+            .is_some_and(|detail| detail.instance().is_some())
+        {
+            self.refresh_at = Some(0);
+        }
         self.reconcile_selection();
     }
     pub(super) fn select(&mut self, instance: &InstanceRef) {
@@ -304,11 +451,11 @@ impl Monitor {
         display: DisplayProfile,
         now_ms: u64,
     ) -> Vec<RoleLine> {
-        self.frame(width, height, display, now_ms, false).lines
+        self.frame(width, height, display, now_ms).lines
     }
 
     /// The keys of the focused list: the selected row's actions, adding, and Esc.
-    fn hint(&self, can_add: bool) -> String {
+    pub(super) fn hint(&self, can_add: bool) -> String {
         let mut hints = self
             .selected()
             .map(|entry| {
@@ -319,7 +466,7 @@ impl Monitor {
                         format!(
                             "{} {}",
                             if action.key == crate::monitor_rows::MONITOR_ENTER_KEY {
-                                "Enter".into()
+                                "enter".into()
                             } else {
                                 action.key.to_string()
                             },
@@ -332,7 +479,7 @@ impl Monitor {
         if can_add {
             hints.push(format!("{MONITOR_ADD_KEY} add"));
         }
-        hints.push("Esc".into());
+        hints.push("esc input".into());
         hints.join(" · ")
     }
 
@@ -342,7 +489,6 @@ impl Monitor {
         height: usize,
         display: DisplayProfile,
         now_ms: u64,
-        can_add: bool,
     ) -> MonitorFrame {
         let heading = if self.total > self.entries.len() {
             let first = self.earlier_pages.len() * MAX_PAGE_SIZE + 1;
@@ -366,6 +512,23 @@ impl Monitor {
         let mut rows = Vec::new();
         let mut row_ids = Vec::new();
         let mut selected_row = 0;
+        let titles = self
+            .entries
+            .iter()
+            .map(|entry| super::safe_line(&entry.title))
+            .collect::<Vec<_>>();
+        let list_rows = self
+            .entries
+            .iter()
+            .zip(&titles)
+            .map(|(entry, title)| ListRow {
+                selected: self.focused && self.selected.as_ref() == Some(&entry.instance),
+                glyph: display.glyph(entry.glyph),
+                glyph_role: list_row::state_mark(entry.tone, display, now_ms),
+                name: title,
+                status: entry.status_spans(now_ms),
+            })
+            .collect::<Vec<_>>();
         let groups = self
             .entries
             .iter()
@@ -375,11 +538,9 @@ impl Monitor {
             let entries: Vec<_> = self
                 .entries
                 .iter()
-                .filter(|entry| entry.group == group)
+                .zip(&list_rows)
+                .filter(|(entry, _)| entry.group == group)
                 .collect();
-            if entries.is_empty() {
-                continue;
-            }
             rows.push(RoleLine::role(
                 format!(
                     "{} ({})",
@@ -392,51 +553,21 @@ impl Monitor {
                 Role::MutedText,
             ));
             row_ids.push(None);
-            for entry in entries {
-                let selected = self.focused && self.selected.as_ref() == Some(&entry.instance);
-                if selected {
+            for (entry, row) in entries {
+                if row.selected {
                     selected_row = rows.len();
                 }
-                rows.push(RoleLine::role(
-                    format!(
-                        "{}{} {}",
-                        if selected { "› " } else { "  " },
-                        display.glyph(entry.glyph),
-                        super::safe_line(&entry.title)
-                    ),
-                    if selected {
-                        Role::Text
-                    } else {
-                        Role::MutedText
-                    },
-                ));
-                row_ids.push(Some(entry.instance.clone()));
-                rows.push(RoleLine::role(
-                    format!(
-                        "    {}{}{} · {}",
-                        entry.kind,
-                        if entry.status.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" · {}", entry.status)
-                        },
-                        match entry.owner {
-                            TickOwner::ThisChat | TickOwner::Unknown => String::new(),
-                            ref owner => format!(" · {}", owner.label()),
-                        },
-                        relative_time(entry.updated_at_ms, now_ms)
-                    ),
-                    Role::MutedText,
-                ));
-                row_ids.push(Some(entry.instance.clone()));
+                for line in row.lines(width) {
+                    rows.push(line);
+                    row_ids.push(Some(entry.instance.clone()));
+                }
             }
         }
-        let hints = if self.focused && height > 2 {
-            wrap_words(&self.hint(can_add), width)
-        } else {
-            Vec::new()
-        };
-        let capacity = height.saturating_sub(1 + hints.len().max(1));
+        if self.entries.is_empty() {
+            rows.push(RoleLine::role(EMPTY_MONITOR_TEXT, Role::MutedText));
+            row_ids.push(None);
+        }
+        let capacity = height.saturating_sub(1);
         let offset = selected_row.saturating_sub(capacity.saturating_sub(2));
         let targets = row_ids
             .into_iter()
@@ -446,11 +577,6 @@ impl Monitor {
             .filter_map(|(row, id)| id.map(|id| (row + 1, id)))
             .collect();
         lines.extend(rows.into_iter().skip(offset).take(capacity));
-        lines.extend(
-            hints
-                .into_iter()
-                .map(|hint| RoleLine::role(hint, Role::MutedText)),
-        );
         lines.truncate(height);
         for line in &mut lines {
             line.truncate(width);
@@ -482,14 +608,7 @@ pub(super) fn member_facts(entry: &MonitorEntry, now_ms: u64) -> Vec<String> {
         super::safe_line(&entry.title),
         format!("Instance  {}", super::safe_line(entry.instance.as_str())),
         format!("Kind      {}", entry.kind),
-        format!(
-            "State     {}",
-            if entry.status.is_empty() {
-                "—"
-            } else {
-                &entry.status
-            }
-        ),
+        format!("State     {}", entry.state_label()),
         format!("Owner     {}", entry.owner.label()),
         format!("Updated   {}", relative_time(entry.updated_at_ms, now_ms)),
     ];
@@ -551,7 +670,7 @@ impl super::tick_actions::TickDetailView for MonitorDetail {
             .collect()
     }
     fn hint(&self) -> String {
-        "Esc back".into()
+        "esc back".into()
     }
     fn key(
         &mut self,
@@ -569,6 +688,13 @@ impl super::tick_actions::TickDetailView for MonitorDetail {
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
     }
+}
+
+fn title_of(entries: &[MonitorEntry], instance: &InstanceRef) -> String {
+    entries
+        .iter()
+        .find(|entry| &entry.instance == instance)
+        .map_or_else(|| instance.to_string(), |entry| entry.title.clone())
 }
 
 /// Breaks `text` between words so each line fits `width` columns; a longer word is cut later.
@@ -609,8 +735,8 @@ mod tests {
     #[test]
     fn hints_break_between_words_to_fit_the_monitor() {
         assert_eq!(
-            wrap_words("Enter open · s snapshot · x remove · Esc", 20),
-            ["Enter open · s", "snapshot · x remove", "· Esc"]
+            wrap_words("enter open · s snapshot · x remove · esc", 20),
+            ["enter open · s", "snapshot · x remove", "· esc"]
         );
     }
 
@@ -643,8 +769,11 @@ impl From<TickDescriptor> for MonitorEntry {
             title: row.title,
             kind: row.kind,
             status: row.status,
+            notes: row.notes,
             owner: row.owner,
+            tone: row.tone,
             updated_at_ms: row.updated_at_ms,
+            update: row.update,
             resources: row.resources,
             actions: row.actions,
         }
@@ -673,8 +802,11 @@ mod registered_rows_tests {
                 title: "Earnings calendar".into(),
                 kind: "Calendar".into(),
                 status: "waiting".into(),
+                notes: vec!["3 events".into()],
                 owner: crate::monitor_rows::TickOwner::Unknown,
+                tone: crate::monitor_rows::StatusTone::Neutral,
                 updated_at_ms: None,
+                update: None,
                 running: true,
                 resources: None,
                 actions: [('o', "inspect"), ('z', "expand")]
@@ -704,14 +836,15 @@ mod registered_rows_tests {
             .map(RoleLine::text)
             .collect::<Vec<_>>()
             .join("\n");
-        for expected in [
-            "Calendars (1)",
-            "Earnings calendar",
-            "Calendar · waiting · —",
-            "Enter inspect · z expand · Esc",
-        ] {
+        for expected in ["Calendars (1)", "Earnings calendar", "3 events"] {
             assert!(text.contains(expected), "{text}");
         }
+        assert!(
+            !text.contains("waiting"),
+            "the state is the glyph's colour: {text}"
+        );
         assert!(!text.contains("Subscribed"));
+        assert!(!text.contains("enter"), "keys are on the hint row: {text}");
+        assert_eq!(list.hint(false), "enter inspect · z expand · esc input");
     }
 }

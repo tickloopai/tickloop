@@ -647,8 +647,8 @@ const EDITING_HINTS: &[&str] = &[
     "a add",
     "e edit",
     "d remove",
-    "Enter edit/preview",
-    "Enter configure",
+    "enter edit/preview",
+    "enter configure",
 ];
 
 impl PermissionsSurface {
@@ -1970,7 +1970,7 @@ impl PermissionsSurface {
                 "Environment  ",
                 environment_source_label(&self.view.auto_policy.environment.source),
             ));
-            let footer = "Enter configure · Esc back";
+            let footer = "enter configure · esc back";
             return ListContent {
                 intro: body,
                 rows,
@@ -2053,9 +2053,9 @@ impl PermissionsSurface {
             }
         }
         let hint = if matches!(self.focus, Focus::Search(_)) {
-            "Search · Enter apply · Esc back"
+            "Search · enter apply · esc back"
         } else {
-            "Enter details · a add · / search · Esc back"
+            "enter details · a add · / search · esc back"
         };
         ListContent {
             intro: body,
@@ -2112,7 +2112,7 @@ impl PermissionsSurface {
                     self.view.working_directory.display()
                 )));
                 body.extend(setup.lines(width));
-                "j/k select · Enter toggle/continue · e edit · s scope · r descendants · Ctrl+G editor · Esc back"
+                "j/k select · enter toggle/continue · e edit · s scope · r descendants · ctrl+g editor · esc back"
             }
             Focus::Detail => {
                 if self.page == Page::Directories {
@@ -2149,9 +2149,9 @@ impl PermissionsSurface {
                     }
                 }
                 if self.selected_rule_editable() {
-                    "e edit · s scope · r descendants · Ctrl+G editor · Esc back"
+                    "e edit · s scope · r descendants · ctrl+g editor · esc back"
                 } else {
-                    "Esc back"
+                    "esc back"
                 }
             }
             Focus::RuleForm(draft) => {
@@ -2194,7 +2194,7 @@ impl PermissionsSurface {
                     draft.field == 3,
                 ));
                 body.push(selected_row("Save", draft.field == 4));
-                "Tab next · Enter next · Ctrl+S save · Esc back"
+                "tab next · enter next · ctrl+s save · esc back"
             }
             Focus::DirectoryForm(editor) => {
                 body.push(RoleLine::role(
@@ -2206,7 +2206,7 @@ impl PermissionsSurface {
                     "Path  ",
                     editor_window(editor, width.saturating_sub(7)),
                 ));
-                "Enter save · Esc back"
+                "enter save · esc back"
             }
             Focus::ConfirmDelete(_) => {
                 body.push(RoleLine::role(
@@ -2214,7 +2214,7 @@ impl PermissionsSurface {
                     Role::DialogTitle,
                 ));
                 body.push(muted_row("This removes the selected rule or directory."));
-                "Enter/y remove · Esc/n cancel"
+                "enter/y remove · esc/n cancel"
             }
             Focus::ReviewerChoice(selected) => {
                 body.push(RoleLine::role("Choose Auto reviewer", Role::DialogTitle));
@@ -2254,7 +2254,7 @@ impl PermissionsSurface {
                     "    Jev (TypeSafe) · key {}",
                     key_status_label(self.view.jev_key_status)
                 )));
-                "Enter select · Esc cancel"
+                "enter select · esc cancel"
             }
             Focus::AutoGroup(group) | Focus::AutoGroupSearch { group, .. } => {
                 self.styled_auto_group(width, height, group, body)
@@ -2277,13 +2277,13 @@ impl PermissionsSurface {
                     body.push(labelled_row("Source  ", auto_source_label(&rule.source)));
                     body.push(labelled_row("ID      ", &rule.id));
                     if rule.source == AutoRuleSource::User {
-                        "e edit · d remove · Esc back"
+                        "e edit · d remove · esc back"
                     } else {
-                        "Built-in read-only · Esc back"
+                        "Built-in read-only · esc back"
                     }
                 } else {
                     body.push(muted_row("Rule changed elsewhere"));
-                    "Esc back"
+                    "esc back"
                 }
             }
             Focus::AutoEnvironment { selected, .. } => {
@@ -2341,7 +2341,7 @@ impl PermissionsSurface {
                         .lines()
                         .map(plain_row),
                 );
-                "Enter edit · s scope · r descendants · d remove · Esc back"
+                "enter edit · s scope · r descendants · d remove · esc back"
             }
             Focus::AutoDraft(draft) => {
                 body.push(RoleLine::role(draft.purpose.title(), Role::DialogTitle));
@@ -2358,7 +2358,7 @@ impl PermissionsSurface {
                     "Text  ",
                     editor_window(&draft.editor, width.saturating_sub(8)),
                 ));
-                "Enter/Ctrl+S save · Esc cancel"
+                "enter/ctrl+s save · esc cancel"
             }
             Focus::AutoPreview {
                 title,
@@ -2423,7 +2423,7 @@ impl PermissionsSurface {
                 }
                 body.push(muted_row(format!("Will remove {} item(s)", removed.len())));
                 body.extend(removed.iter().map(|item| plain_row(format!("− {item}"))));
-                "Enter/y confirm · Esc/n cancel"
+                "enter/y confirm · esc/n cancel"
             }
             Focus::List | Focus::Search(_) => unreachable!(),
         }
@@ -2477,9 +2477,9 @@ impl PermissionsSurface {
             rows.push(selected);
         }
         let hint = if matches!(self.focus, Focus::AutoGroupSearch { .. }) {
-            "Search · Enter apply · Esc back"
+            "Search · enter apply · esc back"
         } else {
-            "Enter details · a add · e edit · d remove · / search · Esc back"
+            "enter details · a add · e edit · d remove · / search · esc back"
         };
         ListContent {
             intro: body,

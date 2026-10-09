@@ -39,7 +39,7 @@ pub enum TickLinkState {
     IdentityUncertain,
 }
 
-/// One row of the Chat's subscription view.
+/// One subscription of the Chat's Loops, as Monitor shows it on its Tick Instance's row.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TickSubscriptionStatus {
     pub id: Uuid,
@@ -55,6 +55,9 @@ pub struct TickSubscriptionStatus {
     pub kind: Option<ObservationKind>,
     #[serde(default)]
     pub title: Option<String>,
+    /// When the instance last updated, in Unix milliseconds: the latest Tick Update or
+    /// observation this subscription received, or the update time the instance's metadata
+    /// reports, whichever is later.
     #[serde(default)]
     pub updated_at_ms: Option<u64>,
     pub link: TickLinkState,

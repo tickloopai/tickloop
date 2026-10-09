@@ -91,10 +91,77 @@ fn monitor_membership_commands_cross_the_wire_unchanged() {
             execution,
             instance: instance.clone(),
         },
+        AgentCommand::MarkMonitorHandled {
+            execution,
+            instance: instance.clone(),
+        },
     ] {
         let wire = serde_json::to_value(&command).unwrap();
         let decoded: AgentCommand = serde_json::from_value(wire.clone()).unwrap();
         assert_eq!(serde_json::to_value(&decoded).unwrap(), wire);
         assert_eq!(decoded.execution(), Some(execution));
     }
+}
+
+#[test]
+fn subagent_colors_prefer_unused_members_and_older_registrations_decode_without_one() {
+    use tickloop_agent_protocol::{AgentColor, SubagentRegistration};
+    assert_eq!(AgentColor::next_for(&[]), AgentColor::Red);
+    assert_eq!(
+        AgentColor::next_for(&[Some(AgentColor::Red), None, Some(AgentColor::Green)]),
+        AgentColor::Blue
+    );
+    let mut taken = AgentColor::ALL.map(Some).to_vec();
+    assert_eq!(AgentColor::next_for(&taken), AgentColor::Red);
+    taken.push(Some(AgentColor::Red));
+    assert_eq!(AgentColor::next_for(&taken), AgentColor::Blue);
+
+    let older: SubagentRegistration = serde_json::from_value(serde_json::json!({
+        "child_chat_id": Uuid::nil(), "handle": "review", "description": "Review", "created_at": 1,
+    }))
+    .unwrap();
+    assert_eq!(older.color, None);
+    let colored = SubagentRegistration {
+        color: Some(AgentColor::Purple),
+        ..older
+    };
+    let wire = serde_json::to_value(&colored).unwrap();
+    assert_eq!(wire["color"], "purple");
+    let decoded: SubagentRegistration = serde_json::from_value(wire).unwrap();
+    assert_eq!(decoded.color, Some(AgentColor::Purple));
+}
+
+#[test]
+fn handled_marks_only_move_forward_and_stay_bounded() {
+    use tickloop_agent_protocol::MonitorMembership;
+    let mut membership = MonitorMembership::default();
+    let instance: InstanceRef = "herdr:counter".parse().unwrap();
+    assert!(membership.mark_handled(instance.clone(), 2_000));
+    assert!(!membership.mark_handled(instance.clone(), 1_000));
+    assert_eq!(membership.handled_at(&instance), Some(2_000));
+    for index in 0..600_u64 {
+        membership.mark_handled(
+            InstanceRef::native(format!("run-{index}")).unwrap(),
+            10_000 + index,
+        );
+    }
+    assert_eq!(membership.handled.len(), 512);
+    assert_eq!(
+        membership.handled_at(&instance),
+        None,
+        "the oldest mark goes first"
+    );
+    assert_eq!(
+        membership.for_new_chat().handled,
+        membership.handled,
+        "a Branch knows what its source already handled"
+    );
+    let marks_only = MonitorMembership {
+        handled: [(instance, 3_000)].into(),
+        ..Default::default()
+    };
+    assert!(
+        !marks_only.is_empty(),
+        "a Chat whose only Monitor facts are handled marks still sends them"
+    );
 }

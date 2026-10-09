@@ -1,4 +1,4 @@
-//! A controllable Artifact Service: device login, the `tickloop-docs` MCP tools and the Agent
+//! A controllable Tick Loop Artifacts service: device login, the `tickloop-docs` MCP tools and the Agent
 //! request lifecycle under `/api/v1/agent/*`.
 
 use std::{

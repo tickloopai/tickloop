@@ -577,7 +577,7 @@ async fn ordinary_progress_retires_completed_todos_and_restores_empty_state() {
     );
     if !retired {
         tokio::time::pause();
-        tokio::time::advance(std::time::Duration::from_secs(6)).await;
+        tokio::time::advance(std::time::Duration::from_secs(31)).await;
         loop {
             if let EventKind::ProgressUpdated { progress } = next_event(&mut events).await.kind
                 && progress.loop_id == receipt.loop_id
@@ -639,7 +639,7 @@ async fn all_done_rewrites_do_not_extend_the_completion_deadline() {
     let agent = Agent::new_embedded(config(), model);
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let first = finish_progress_turn(&agent, chat, None).await;
-    tokio::time::advance(std::time::Duration::from_secs(4)).await;
+    tokio::time::advance(std::time::Duration::from_secs(29)).await;
     finish_progress_turn(&agent, chat, Some(first.loop_id)).await;
     assert_eq!(
         agent.snapshot(chat).await.unwrap().progress[0].todos[0].content,
@@ -688,7 +688,7 @@ async fn incomplete_replacements_cancel_grace_and_explicit_empty_clears_immediat
             .todos
             .is_empty()
     );
-    tokio::time::advance(std::time::Duration::from_secs(6)).await;
+    tokio::time::advance(std::time::Duration::from_secs(31)).await;
     assert!(
         agent.snapshot(chat).await.unwrap().progress[0]
             .todos
@@ -720,7 +720,7 @@ async fn retirement_is_isolated_by_agent_and_loop_and_partial_lists_persist() {
     let other_loop = finish_progress_turn(&agent, first_chat, None).await;
     let other_agent = finish_progress_turn(&agent, second_chat, None).await;
     let mut events = agent.subscribe();
-    tokio::time::advance(std::time::Duration::from_secs(6)).await;
+    tokio::time::advance(std::time::Duration::from_secs(31)).await;
     loop {
         if let EventKind::ProgressUpdated { progress } = next_event(&mut events).await.kind
             && progress.loop_id == first.loop_id
@@ -780,7 +780,7 @@ async fn restoring_unretired_completed_progress_starts_a_fresh_grace() {
     .unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let receipt = finish_progress_turn(&agent, chat, None).await;
-    tokio::time::advance(std::time::Duration::from_secs(4)).await;
+    tokio::time::advance(std::time::Duration::from_secs(29)).await;
     agent.shutdown().await;
     drop(agent);
     let restored =
@@ -791,7 +791,7 @@ async fn restoring_unretired_completed_progress_starts_a_fresh_grace() {
             .len(),
         1
     );
-    tokio::time::advance(std::time::Duration::from_secs(4)).await;
+    tokio::time::advance(std::time::Duration::from_secs(29)).await;
     assert_eq!(
         restored.snapshot(chat).await.unwrap().progress[0]
             .todos
@@ -824,7 +824,8 @@ async fn retirement_checkpoint_precedes_later_todo_results_in_the_same_assistant
         Content::ToolUse {
             id: "wait".into(),
             name: "Bash".into(),
-            input: json!({"command":"sleep 6"}),
+            // Outlasts the 30-second completion grace, so the retirement lands mid-batch.
+            input: json!({"command":"sleep 31"}),
         },
         Content::ToolUse {
             id: "pending".into(),
@@ -843,7 +844,24 @@ async fn retirement_checkpoint_precedes_later_todo_results_in_the_same_assistant
         .set_execution_mode(chat, ExecutionMode::FullAccess)
         .await
         .unwrap();
-    let receipt = finish_progress_turn(&agent, chat, None).await;
+    let mut events = agent.subscribe();
+    let receipt = agent
+        .submit(chat, None, "Update progress".into())
+        .await
+        .unwrap();
+    loop {
+        match tickloop_agent_test_support::next_event_within(
+            &mut events,
+            std::time::Duration::from_secs(45),
+        )
+        .await
+        .kind
+        {
+            EventKind::Completed { .. } => break,
+            EventKind::Failed(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
     assert_eq!(
         agent.snapshot(chat).await.unwrap().progress[0].todos[0].content,
         "Later pending list"
@@ -898,7 +916,7 @@ async fn completed_todos_keep_five_seconds_across_turns_then_restore_an_empty_ch
         agent.snapshot(chat).await.unwrap().progress[0].todos[0].status,
         TodoStatus::Completed
     );
-    tokio::time::advance(std::time::Duration::from_secs(4)).await;
+    tokio::time::advance(std::time::Duration::from_secs(29)).await;
     agent
         .submit(chat, None, "A second real message".into())
         .await
@@ -1022,10 +1040,6 @@ async fn todo_write_takes_claude_code_todos_and_rejects_incomplete_ones() {
             status: TodoStatus::InProgress,
             active_form: "Drafting the report".into(),
         }
-    );
-    assert_eq!(
-        snapshot.progress[0].active_form(),
-        Some("Drafting the report")
     );
 
     let requests = model.requests.lock().unwrap().clone();

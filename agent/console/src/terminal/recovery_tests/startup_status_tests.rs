@@ -192,9 +192,9 @@ fn startup_status_configuration_help_and_removed_model_file_notice_survive_refre
         });
         assert_clean_startup_status(&frame, rows, STARTUP_MODEL);
         fixture.send(b"?");
-        fixture.wait_for("Esc / ? close help");
+        fixture.wait_for("esc / ? close help");
         let help = fixture
-            .repaint_after_recovery("startup help", |frame| frame.contains("Esc / ? close help"));
+            .repaint_after_recovery("startup help", |frame| frame.contains("esc / ? close help"));
         assert!(!help.contains("Ready"), "{rows}: {help}");
         fixture.send(b"?");
         fixture.send(b"/model model.json\r");

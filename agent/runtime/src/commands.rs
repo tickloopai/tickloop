@@ -264,6 +264,13 @@ impl Agent {
             },
         );
         drop(chats);
+        if command.was_background
+            && !command_state_is_terminal(&command.state)
+            && !super::shell_description::has_description(command.description.as_deref())
+        {
+            self.describe_background_shell(chat_id, command.operation_id, &command.command)
+                .await;
+        }
         if continues_goal {
             self.start_next_agent_run(chat_id).await?;
         }

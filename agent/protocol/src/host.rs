@@ -18,7 +18,7 @@ pub struct HerdrPane {
     #[serde(default)]
     pub foreground_cwd: Option<String>,
     #[serde(default)]
-    pub title: Option<String>,
+    pub terminal_title_stripped: Option<String>,
     #[serde(default)]
     pub tokens: BTreeMap<String, String>,
 }

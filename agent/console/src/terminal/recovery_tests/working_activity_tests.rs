@@ -299,7 +299,7 @@ fn working_activity_tracks_observed_runs_without_model_duplication_and_esc_inter
     fixture.wait_for("Enter a message to");
     fixture.send(b"Continue the same controlled activity\r");
     fixture.wait_until_shown("Working elapsed and actual Esc action", |frame| {
-        frame.contains("Working (0s · Esc to interrupt)")
+        frame.contains("Working (0s · esc to interrupt)")
     });
     let first = screen::visible_screen(&fixture.raw_output(), 80, 24);
     let activity = first
@@ -318,7 +318,7 @@ fn working_activity_tracks_observed_runs_without_model_duplication_and_esc_inter
     };
     let queries = count();
     fixture.wait_until_shown("elapsed advances locally", |frame| {
-        frame.contains("Working (2s · Esc to interrupt)")
+        frame.contains("Working (2s · esc to interrupt)")
     });
     println!(
         "ACTIVITY_ELAPSED seconds=2 total_task_queries={}",
@@ -353,11 +353,11 @@ fn working_activity_tracks_observed_runs_without_model_duplication_and_esc_inter
     });
     std::fs::write(directory.path().join(ACTIVITY_STAGE), "finish-1").unwrap();
     fixture.wait_for("Activity reply 1");
-    fixture.wait_for("Done");
+    fixture.wait_for_turn_summary();
     fixture.send(b"Second controlled activity\r");
     fixture.wait_for_phase(&directory.path().join(ACTIVITY_PHASE), "running-2");
     fixture.wait_until_shown("second run starts a new elapsed clock", |frame| {
-        frame.contains("Working (0s · Esc to interrupt)")
+        frame.contains("Working (0s · esc to interrupt)")
     });
     fixture.send(b"keep this draft");
     fixture.send(b"\x1b");
@@ -373,7 +373,7 @@ fn working_activity_tracks_observed_runs_without_model_duplication_and_esc_inter
 fn attached_working_activity_does_not_invent_a_run_start_time() {
     let (mut fixture, _directory) = start_activity_fixture("attach");
     fixture.wait_until_shown("attached run with unknown elapsed", |frame| {
-        frame.contains("Working (Esc to interrupt)")
+        frame.contains("Working (esc to interrupt)")
     });
     let frame = screen::visible_screen(&fixture.raw_output(), 80, 24);
     assert!(
@@ -426,13 +426,13 @@ fn overview_dispatch_records_a_live_observed_run_clock_before_opening_the_agent(
     fixture.open_overview_agent(&executions, "created");
     fixture.wait_until_shown("Overview-observed run elapsed survives opening", |frame| {
         frame.contains("Working (")
-            && frame.contains("s · Esc to interrupt)")
+            && frame.contains("s · esc to interrupt)")
             && !frame.contains("Working (0s")
             && !frame.contains("Working (1s")
     });
     std::fs::write(directory.path().join(ACTIVITY_STAGE), "finish-2").unwrap();
     fixture.wait_for("Activity reply 2");
-    fixture.wait_for("Done");
+    fixture.wait_for_turn_summary();
     fixture.send(b"\x04\x04");
 }
 
@@ -442,7 +442,7 @@ fn working_activity_without_loop_control_omits_the_action_and_esc_keeps_it_runni
     fixture.wait_for("Enter a message to");
     fixture.send(b"Activity without advertised control\r");
     fixture.wait_until_shown("Working without an unavailable Esc action", |frame| {
-        working_seconds(frame).is_some() && !frame.contains("Esc to interrupt")
+        working_seconds(frame).is_some() && !frame.contains("esc to interrupt")
     });
     // A loaded machine may draw the first frame or skip a reduced-motion tick a second late, so
     // the elapsed time is compared rather than matched.
@@ -453,13 +453,13 @@ fn working_activity_without_loop_control_omits_the_action_and_esc_keeps_it_runni
         "reduced-motion elapsed advances without interrupting",
         |frame| {
             working_seconds(frame).is_some_and(|seconds| seconds >= before_escape + 2)
-                && !frame.contains("Esc to interrupt")
+                && !frame.contains("esc to interrupt")
                 && !frame.contains("Interrupted")
         },
     );
     std::fs::write(directory.path().join(ACTIVITY_STAGE), "finish-1").unwrap();
     fixture.wait_for("Activity reply 1");
-    fixture.wait_for("Done");
+    fixture.wait_for_turn_summary();
     fixture.send(b"\x04\x04");
 }
 

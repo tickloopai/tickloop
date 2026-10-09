@@ -1,5 +1,8 @@
 use super::*;
-use crate::terminal::monitor::{MonitorEntry, TickGroup};
+use crate::terminal::{
+    monitor::{MonitorEntry, TickGroup},
+    task_surface::{TaskOutputUpdate, TaskSurfaceEffect},
+};
 use tickloop_agent_protocol::{
     ChatSnapshot, MonitorMember, MonitorMemberSource, MonitorMembership, ShellTaskOutputChunk,
     TickSubscriptionStatus,
@@ -13,8 +16,11 @@ fn shell(id: Uuid, title: &str) -> MonitorEntry {
         title: title.into(),
         kind: "Shell".into(),
         status: "exit 0".into(),
+        notes: Vec::new(),
         owner: crate::monitor_rows::TickOwner::Unknown,
+        tone: crate::monitor_rows::StatusTone::Neutral,
         updated_at_ms: Some(1000),
+        update: None,
         resources: None,
         actions: vec![
             crate::monitor_rows::MonitorAction {
@@ -39,6 +45,7 @@ fn chat_snapshot(chat: Uuid) -> ChatSnapshot {
 
 fn removed(instance: tick_protocol::InstanceRef) -> MonitorMembership {
     MonitorMembership {
+        handled: Default::default(),
         members: Vec::new(),
         removed: [instance].into(),
     }
@@ -53,11 +60,10 @@ fn shell_tick_enter_opens_inside_the_tick_panel() {
         Some(InputEvent::TickAction { .. })
     ));
     assert!(state.monitor.detail.is_some());
-    assert!(state.task_surface.is_none());
 }
 
 #[test]
-fn shell_ticks_only_list_background_executions_and_keep_them_until_removed() {
+fn shell_ticks_only_list_background_executions_and_x_removes_a_finished_one() {
     use tickloop_agent_protocol::{ShellTaskOrigin, ShellTaskOwner, ShellTaskState};
     for origin in [ShellTaskOrigin::Agent, ShellTaskOrigin::User] {
         let chat = Uuid::new_v4();
@@ -91,10 +97,12 @@ fn shell_ticks_only_list_background_executions_and_keep_them_until_removed() {
         );
         snapshot.tasks[0].was_background = true;
         snapshot.tasks[0].state = ShellTaskState::Completed;
+        snapshot.tasks[0].updated_at_ms =
+            Some(tickloop_agent_base::private_fs::unix_time_milliseconds());
         console.update_shell_ticks(&snapshot).unwrap();
         assert!(
             console.monitor_has_entries().unwrap(),
-            "finished background Shell must remain"
+            "a just finished background Shell still shows its result"
         );
         let task = tick_protocol::InstanceRef::shell(snapshot.tasks[0].id);
         {
@@ -218,8 +226,11 @@ fn tick_shell_detail_and_selection_restore_per_agent_and_ignore_obsolete_mouse_t
             title: "B".into(),
             kind: "Artifact".into(),
             status: String::new(),
+            notes: Vec::new(),
             owner: crate::monitor_rows::TickOwner::Unknown,
+            tone: crate::monitor_rows::StatusTone::Neutral,
             updated_at_ms: None,
+            update: None,
             resources: None,
             actions: crate::monitor_rows::artifact_actions("artifact:https://docs.example/b"),
         }],
@@ -238,7 +249,7 @@ fn tick_shell_detail_and_selection_restore_per_agent_and_ignore_obsolete_mouse_t
 }
 
 #[tokio::test]
-async fn shell_panel_live_subscription_updates_tail_without_covering_the_input() {
+async fn shell_panel_live_updates_tail_without_covering_the_input() {
     use crate::terminal::{execution::ConsoleExecution, task_access::ShellTaskCenter};
     let directory = tempfile::tempdir().unwrap();
     let core = tickloop_agent_runtime::Agent::new_embedded(
@@ -291,7 +302,6 @@ async fn shell_panel_live_subscription_updates_tail_without_covering_the_input()
         };
         action
     };
-    let mut subscription = center.subscribe(chat).await.unwrap();
     super::super::tick_actions::execute(
         action,
         super::super::tick_actions::TickActionContext {
@@ -306,7 +316,6 @@ async fn shell_panel_live_subscription_updates_tail_without_covering_the_input()
     std::fs::write(directory.path().join("release"), "").unwrap();
     let updated = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            subscription.recv().await.unwrap();
             let snapshot = center.snapshot(chat).await.unwrap();
             if snapshot
                 .tasks
@@ -315,6 +324,7 @@ async fn shell_panel_live_subscription_updates_tail_without_covering_the_input()
             {
                 break snapshot;
             }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
@@ -346,7 +356,6 @@ async fn shell_panel_live_subscription_updates_tail_without_covering_the_input()
                 .iter()
                 .any(|row| row.contains("live-tail"))
         );
-        assert!(state.task_surface.is_none());
         let (input, _, _) = state.styled_frame();
         let start = state.height - input.len();
         assert!(
@@ -364,9 +373,8 @@ async fn shell_panel_live_subscription_updates_tail_without_covering_the_input()
 }
 
 #[tokio::test]
-async fn shared_shell_effect_handler_recovers_output_errors_for_task_center_and_tick_panel() {
+async fn shell_detail_recovers_from_an_output_error() {
     use crate::terminal::{
-        apply_task_surface_effect,
         execution::ConsoleExecution,
         task_access::ShellTaskCenter,
         tick_actions::{TickActionContext, execute},
@@ -409,104 +417,56 @@ async fn shared_shell_effect_handler_recovers_output_errors_for_task_center_and_
         .unwrap()
         .output_ref
         .unwrap();
-    for panel_mode in [false, true] {
-        let mut state = State::new(true, 140, 25);
-        state.switch_view_chat(Some(chat));
-        state.prompt_enabled = true;
-        let console = tests::console_with_state(state);
-        let (action, effect) = if panel_mode {
-            console.update_shell_ticks(&snapshot).unwrap();
-            let action = {
-                let mut state = console.state.lock().unwrap();
-                state.monitor.focus(false, None);
-                let Some(InputEvent::TickAction { action, .. }) =
-                    state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-                else {
-                    panic!("missing panel");
-                };
-                action
-            };
-            (Some(action), None)
-        } else {
-            (
-                None,
-                Some(
-                    console
-                        .show_tasks_at(snapshot.clone(), Some(receipt.command_id))
-                        .unwrap(),
-                ),
-            )
+    let mut state = State::new(true, 140, 25);
+    state.switch_view_chat(Some(chat));
+    state.prompt_enabled = true;
+    let console = tests::console_with_state(state);
+    console.update_shell_ticks(&snapshot).unwrap();
+    let action = {
+        let mut state = console.state.lock().unwrap();
+        state.monitor.focus(false, None);
+        let Some(InputEvent::TickAction { action, .. }) =
+            state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("missing panel");
         };
-        let context = TickActionContext {
-            agent: &agent,
-            console: &console,
-            root: Some(directory.path()),
-            chat,
-        };
-        let unavailable = path.with_extension("held-by-test");
-        std::fs::rename(&path, &unavailable).unwrap();
-        if let Some(action) = action {
-            execute(action, context).await.unwrap();
-        } else {
-            apply_task_surface_effect(&center, &console, chat, effect.clone().unwrap())
-                .await
-                .unwrap();
-        }
-        {
-            let state = console.state.lock().unwrap();
-            if panel_mode {
-                let hint = state.monitor.detail.as_ref().unwrap().hint();
-                assert!(hint.contains("Esc back"));
-                assert_ne!(
-                    hint, "Esc back",
-                    "failed output must be surfaced in the panel"
-                );
-            } else {
-                assert!(
-                    state
-                        .task_surface
-                        .as_ref()
-                        .unwrap()
-                        .visible_error()
-                        .is_some()
-                );
-            }
-        }
-        std::fs::rename(&unavailable, &path).unwrap();
-        if panel_mode {
-            tokio::time::sleep(Duration::from_millis(260)).await;
-            let (_, action) = console
-                .poll_tick_detail()
-                .unwrap()
-                .expect("detail retry poll");
-            execute(action, context).await.unwrap();
-        } else {
-            apply_task_surface_effect(&center, &console, chat, effect.unwrap())
-                .await
-                .unwrap();
-        }
-        {
-            let mut state = console.state.lock().unwrap();
-            state.draw_frame(&mut Vec::new()).unwrap();
-            assert!(
-                state
-                    .rendered_screen
-                    .iter()
-                    .any(|row| row.contains("recovered-output"))
-            );
-            if panel_mode {
-                assert_eq!(state.monitor.detail.as_ref().unwrap().hint(), "Esc back");
-            } else {
-                assert!(
-                    state
-                        .task_surface
-                        .as_ref()
-                        .unwrap()
-                        .visible_error()
-                        .is_none()
-                );
-            }
-        }
+        action
+    };
+    let context = TickActionContext {
+        agent: &agent,
+        console: &console,
+        root: Some(directory.path()),
+        chat,
+    };
+    let unavailable = path.with_extension("held-by-test");
+    std::fs::rename(&path, &unavailable).unwrap();
+    execute(action, context).await.unwrap();
+    {
+        let state = console.state.lock().unwrap();
+        let hint = state.monitor.detail.as_ref().unwrap().hint();
+        assert!(hint.contains("esc back"));
+        assert_ne!(
+            hint, "esc back",
+            "failed output must be surfaced in the panel"
+        );
+    }
+    std::fs::rename(&unavailable, &path).unwrap();
+    tokio::time::sleep(Duration::from_millis(260)).await;
+    let (_, action) = console
+        .poll_tick_detail()
+        .unwrap()
+        .expect("detail retry poll");
+    execute(action, context).await.unwrap();
+    {
+        let mut state = console.state.lock().unwrap();
+        state.draw_frame(&mut Vec::new()).unwrap();
+        assert!(
+            state
+                .rendered_screen
+                .iter()
+                .any(|row| row.contains("recovered-output"))
+        );
+        assert_eq!(state.monitor.detail.as_ref().unwrap().hint(), "esc back");
     }
     core.shutdown().await;
 }
@@ -526,6 +486,9 @@ fn click_fixture(width: u16, overlay: bool, group: TickGroup) -> State {
         entry.kind = "Tick".into();
         entry.instance = "herdr:clickable".parse().unwrap();
         entry.actions = fixture_actions(&entry.instance);
+        let mut subscription = tests::subscription_row(1);
+        subscription.instance = entry.instance.clone();
+        state.monitor.subscriptions = vec![subscription];
     }
     state.monitor.replace(group, vec![entry]);
     state.monitor.overlay = overlay;
@@ -548,12 +511,21 @@ fn monitor_row_title_and_metadata_clicks_perform_the_same_enter_action() {
         for group in [TickGroup::Artifacts, TickGroup::Shells, TickGroup::Ticks] {
             for meta in [false, true] {
                 let mut state = click_fixture(width, overlay, group);
-                let row = state
-                    .rendered_screen
+                // A two-line row's status line is its last target; a one-line row has one.
+                let rows = state
+                    .monitor_row_targets
                     .iter()
-                    .position(|row| row.contains("Clickable row"))
-                    .unwrap()
-                    + usize::from(meta);
+                    .map(|target| target.row)
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    rows[0],
+                    state
+                        .rendered_screen
+                        .iter()
+                        .position(|row| row.contains("Clickable row"))
+                        .unwrap()
+                );
+                let row = if meta { *rows.last().unwrap() } else { rows[0] };
                 let column = state.width - state.monitor_columns() + 2;
                 assert!(!state.monitor.focused);
                 state.pointer(
@@ -590,7 +562,8 @@ fn pending_tick_removal_confirmation_cannot_be_approved_by_clicking_any_row() {
             });
             state.monitor.focus(false, None);
             state.draw_frame(&mut Vec::new()).unwrap();
-            let target = &state.monitor_row_targets[usize::from(metadata)];
+            let target = &state.monitor_row_targets
+                [usize::from(metadata).min(state.monitor_row_targets.len() - 1)];
             state.pointer(
                 MouseEvent {
                     kind: MouseEventKind::Down(MouseButton::Left),
@@ -1163,7 +1136,7 @@ fn monitor_columns_preserve_full_width_input_dividers_cursor_and_mouse_geometry(
             .as_ref()
             .map(|target| (target.row, target.columns.clone()));
         state.monitor_preference = tickloop_agent_config::MonitorPreference::Auto;
-        state.monitor.overlay = crate::terminal::monitor::side_columns(state.width).is_none();
+        state.monitor.overlay = state.monitor_side_columns().is_none();
         let (shown, shown_row, shown_column) = state.frame();
         assert_eq!(shown, hidden, "input rows changed at {width} columns");
         assert_eq!((shown_row, shown_column), (hidden_row, hidden_column));
@@ -1208,7 +1181,8 @@ fn subscribed_ticks_show_live_status_and_ignore_another_chats_refresh() {
     let mut state = console.state.lock().unwrap();
     assert_eq!(state.monitor.entries()[0].title, "Quote terminal");
     assert_eq!(state.monitor.entries()[0].kind, "Terminal");
-    assert_eq!(state.monitor.entries()[0].status, "live · 60s");
+    assert_eq!(state.monitor.entries()[0].status, "live");
+    assert_eq!(state.monitor.entries()[0].notes, ["⟳ 60s"]);
     let instance = state.monitor.entries()[0].instance.clone();
     state.switch_view_chat(Some(Uuid::new_v4()));
     state.update_tick_entries(chat, TickGroup::Ticks, vec![]);
@@ -1298,7 +1272,7 @@ fn background_rows_never_paint_past_the_left_column_or_hide_the_tick_separator()
             let mut state = State::new(true, width, 24);
             state.chat = Some(Uuid::new_v4());
             state.prompt_enabled = true;
-            state.monitor.overlay = crate::terminal::monitor::side_columns(state.width).is_none();
+            state.monitor.overlay = state.monitor_side_columns().is_none();
             state.monitor.replace(
                 TickGroup::Shells,
                 vec![shell(Uuid::new_v4(), "right column tick")],
@@ -1385,8 +1359,8 @@ fn tick_column_spans_content_top_through_working_and_generic_todo_rows() {
     );
 }
 
-/// The production row actions for a fixture instance: Artifact actions, or a subscription that
-/// opens on Enter with the shared Monitor removal.
+/// The production row actions for a fixture instance: Artifact actions, or a subscribed row whose
+/// Enter shows its subscriptions, with the shared Monitor removal.
 fn fixture_actions(
     instance: &tick_protocol::InstanceRef,
 ) -> Vec<crate::monitor_rows::MonitorAction> {
@@ -1396,8 +1370,11 @@ fn fixture_actions(
     vec![
         crate::monitor_rows::MonitorAction {
             key: 'o',
-            label: "open",
-            intent: crate::monitor_rows::TickIntent::OpenSubscription { id: Uuid::new_v4() },
+            label: "subscriptions",
+            intent: crate::monitor_rows::TickIntent::ManageSubscriptions {
+                instance: instance.clone(),
+                operation: crate::monitor_rows::SubscriptionOperation::View,
+            },
         },
         crate::monitor_rows::remove_from_monitor(instance),
     ]
@@ -1423,8 +1400,11 @@ fn a_newly_registered_row_intent_runs_through_enter_and_click() {
                 title: "Remote calendar".into(),
                 kind: "Calendar".into(),
                 status: "live".into(),
+                notes: Vec::new(),
                 owner: TickOwner::Unknown,
+                tone: crate::monitor_rows::StatusTone::Neutral,
                 updated_at_ms: None,
+                update: None,
                 resources: None,
                 running: true,
                 actions: vec![MonitorAction {
@@ -1541,7 +1521,7 @@ async fn shell_detail_confirmation_runs_the_production_adapter_control_callback(
                 .as_ref()
                 .unwrap()
                 .hint()
-                .contains("Enter confirm")
+                .contains("enter confirm")
         );
         let Some(InputEvent::TickAction { action, .. }) =
             state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
@@ -1598,7 +1578,7 @@ async fn shell_detail_confirmation_runs_the_production_adapter_control_callback(
             .as_ref()
             .unwrap()
             .hint(),
-        "Esc back"
+        "esc back"
     );
     core.shutdown().await;
 }
@@ -1633,7 +1613,7 @@ impl crate::monitor_rows::TickProbe for FixtureDiscovery {
                 .iter()
                 .map(|instance| (instance.clone(), crate::monitor_rows::MemberState::Gone))
                 .collect(),
-            resources: HashMap::new(),
+            ..Default::default()
         })
     }
 }
@@ -1658,6 +1638,7 @@ impl crate::monitor_rows::TickProbe for FixtureHostedProbe {
             ));
         }
         Ok(crate::monitor_rows::MemberFindings {
+            updates: Default::default(),
             states: instances
                 .iter()
                 .map(|instance| {
@@ -1682,6 +1663,7 @@ impl crate::monitor_rows::TickProbe for FixtureHostedProbe {
                     )
                 })
                 .collect(),
+            titles: HashMap::new(),
         })
     }
 }
@@ -1954,7 +1936,7 @@ fn member_details_show_the_recorded_owner_and_no_invented_resources() {
     state.monitor.rebuild();
     assert_eq!(state.monitor.entries().len(), 1);
     state.monitor.focus(false, None);
-    assert!(screen(&mut state).contains("Enter details · x remove"));
+    assert!(screen(&mut state).contains("enter details · x remove"));
     assert!(matches!(
         state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
         Some(InputEvent::TickAction { .. })
@@ -1972,4 +1954,792 @@ fn member_details_show_the_recorded_owner_and_no_invented_resources() {
     state.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
     assert!(state.monitor.detail.is_none());
     assert!(state.monitor.focused, "Esc only closes the detail");
+}
+
+fn monitor_state(width: u16, entries: Vec<MonitorEntry>) -> State {
+    let mut state = State::new(true, width, 25);
+    state.switch_view_chat(Some(Uuid::new_v4()));
+    state.prompt_enabled = true;
+    state.monitor.replace(TickGroup::Shells, entries);
+    state.draw_frame(&mut Vec::new()).unwrap();
+    state
+}
+
+fn separator_column(state: &State) -> Option<usize> {
+    state.rendered_screen[0]
+        .chars()
+        .position(|cell| cell == '│')
+}
+
+#[test]
+fn monitor_rows_take_one_line_when_the_status_fits_beside_the_name_and_two_otherwise() {
+    use crate::monitor_rows::{StatusTone, Unread};
+    let mut finished = shell(Uuid::new_v4(), "Run tests");
+    finished.status = "exit 101".into();
+    finished.notes = vec!["101".into()];
+    finished.tone = StatusTone::Failed;
+    let mut subscribed = shell(Uuid::new_v4(), "Quote board for the whole watchlist");
+    subscribed.group = TickGroup::Ticks;
+    subscribed.instance = "herdr:quotes".parse().unwrap();
+    subscribed.status = "live".into();
+    subscribed.notes = vec!["⟳ 60s".into()];
+    subscribed.tone = StatusTone::Live;
+    subscribed.update = Some(crate::monitor_rows::RowUpdate {
+        at_ms: 1000,
+        unread: Some(Unread { count: Some(3) }),
+    });
+    for (width, preferred, entry, details, two_lines) in [
+        (140, None, &finished, "101", false),
+        (80, None, &finished, "101", false),
+        (140, None, &subscribed, "⟳ 60s · ● 3", true),
+        (200, Some(80), &subscribed, "⟳ 60s · ● 3", false),
+    ] {
+        let mut state = State::new(true, width, 25);
+        state.switch_view_chat(Some(Uuid::new_v4()));
+        state.prompt_enabled = true;
+        state.monitor_width = preferred;
+        state.monitor.replace(entry.group, vec![entry.clone()]);
+        state.draw_frame(&mut Vec::new()).unwrap();
+        let screen = &state.rendered_screen;
+        let name = screen
+            .iter()
+            .position(|row| row.contains(&entry.title))
+            .unwrap();
+        let status = screen.iter().position(|row| row.contains(details)).unwrap();
+        assert_eq!(status - name, usize::from(two_lines), "{screen:#?}");
+        assert!(
+            !screen.iter().any(|row| row.contains("Shell ·")
+                || row.contains("Tick ·")
+                || row.contains(&entry.status)),
+            "the group names the kind and the glyph's colour the state: {screen:#?}"
+        );
+    }
+}
+
+#[test]
+fn a_monitor_row_glyph_carries_its_state_and_blinks_while_it_runs() {
+    use crate::monitor_rows::StatusTone;
+    let mut running = shell(Uuid::new_v4(), "Build");
+    running.tone = StatusTone::Running {
+        since_ms: Some(1_000),
+    };
+    let mut failed = shell(Uuid::new_v4(), "Lint");
+    failed.tone = StatusTone::Failed;
+    let mut monitor = Monitor::default();
+    monitor.replace(TickGroup::Shells, vec![running, failed]);
+    let glyph_role = |now_ms, display| {
+        monitor
+            .lines(40, 10, display, now_ms)
+            .iter()
+            .filter_map(|line| {
+                let title = line.text();
+                let role = line
+                    .spans
+                    .iter()
+                    .find(|span| span.text == "$")
+                    .and_then(|span| span.role)?;
+                Some((title.contains("Build"), role))
+            })
+            .collect::<Vec<_>>()
+    };
+    let display = DisplayProfile::default();
+    assert_eq!(
+        glyph_role(2_000, display),
+        [(true, Role::RunningMark), (false, Role::ErrorMark)]
+    );
+    assert_eq!(
+        glyph_role(2_500, display),
+        [(true, Role::RunningMarkDim), (false, Role::ErrorMark)]
+    );
+    assert_eq!(monitor.next_frame_ms(2_100, display), Some(2_500));
+    let still = DisplayProfile::new(tickloop_agent_config::DisplayPreferences {
+        prefers_reduced_motion: true,
+        ..Default::default()
+    });
+    assert_eq!(
+        glyph_role(2_500, still),
+        [(true, Role::RunningMark), (false, Role::ErrorMark)]
+    );
+    assert_eq!(
+        monitor.next_frame_ms(2_100, still),
+        Some(3_000),
+        "a steady glyph still ticks its elapsed time"
+    );
+}
+
+#[test]
+fn the_row_clock_redraws_while_a_visible_row_blinks_and_stops_when_none_runs() {
+    use crate::monitor_rows::StatusTone;
+    let mut running = shell(Uuid::new_v4(), "Build");
+    running.tone = StatusTone::Running { since_ms: None };
+    let mut state = monitor_state(140, vec![running]);
+    let clock = state.row_clock_at.expect("a running row schedules a frame");
+    assert!(!state.refresh_row_clocks(clock - 1));
+    assert!(state.refresh_row_clocks(clock));
+    state.monitor.replace(TickGroup::Shells, vec![]);
+    state.draw_frame(&mut Vec::new()).unwrap();
+    assert_eq!(state.row_clock_at, None, "nothing blinks");
+}
+
+#[test]
+fn running_background_shells_are_named_by_description_and_count_from_their_start() {
+    let chat = Uuid::new_v4();
+    let console = Console::test_for_chat(chat);
+    let now = tickloop_agent_base::private_fs::unix_time_milliseconds();
+    let mut snapshot = tests::task_snapshot(chat, 1);
+    snapshot.tasks[0].state = tickloop_agent_protocol::ShellTaskState::Background;
+    snapshot.tasks[0].description = Some("Run the console tests".into());
+    console
+        .set_shell_starts(
+            chat,
+            HashMap::from([(snapshot.tasks[0].id, now.saturating_sub(123_000))]),
+        )
+        .unwrap();
+    console.update_shell_ticks(&snapshot).unwrap();
+    let state = console.state.lock().unwrap();
+    let text = state
+        .monitor
+        .lines(40, 20, DisplayProfile::default(), now)
+        .iter()
+        .map(RoleLine::text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("Run the console tests"), "{text}");
+    assert!(text.contains(" 2m 3s"), "{text}");
+    assert!(!text.contains("printf"), "{text}");
+}
+
+#[test]
+fn a_finished_background_shell_leaves_once_handled_unless_its_detail_is_open() {
+    use crate::monitor_rows::FINISHED_SHELL_DISPLAY_MS;
+    let chat = Uuid::new_v4();
+    let console = Console::test_for_chat(chat);
+    let ended = tickloop_agent_base::private_fs::unix_time_milliseconds();
+    let mut snapshot = tests::task_snapshot(chat, 1);
+    snapshot.tasks[0].was_background = true;
+    snapshot.tasks[0].state = tickloop_agent_protocol::ShellTaskState::Completed;
+    snapshot.tasks[0].exit_code = Some(0);
+    snapshot.tasks[0].updated_at_ms = Some(ended);
+    console.update_shell_ticks(&snapshot).unwrap();
+    {
+        let mut state = console.state.lock().unwrap();
+        state
+            .monitor
+            .refresh_due(ended + 10 * FINISHED_SHELL_DISPLAY_MS);
+        assert_eq!(
+            state.monitor.entries().len(),
+            1,
+            "an end no one handled keeps its Shell"
+        );
+        let text = state
+            .monitor
+            .lines(60, 10, DisplayProfile::default(), ended + 1_000)
+            .iter()
+            .map(RoleLine::text)
+            .collect::<String>();
+        assert!(text.contains("● 1s"), "{text}");
+        assert!(
+            !text.contains("ended") && !text.contains("exit"),
+            "the glyph's colour tells how it ended: {text}"
+        );
+    }
+    let handled = ended + 2_000;
+    let mut chat_snapshot = chat_snapshot(chat);
+    chat_snapshot.monitor.mark_handled(
+        tick_protocol::InstanceRef::shell(snapshot.tasks[0].id),
+        handled,
+    );
+    console.update_monitor_chat(&chat_snapshot).unwrap();
+    let mut state = console.state.lock().unwrap();
+    let leaves = handled + FINISHED_SHELL_DISPLAY_MS;
+    assert!(!state.monitor.refresh_due(leaves - 1));
+    assert_eq!(state.monitor.entries().len(), 1);
+    state.monitor.detail = Some(Box::new(crate::terminal::tick_shell::TickShell::loading(
+        chat,
+        snapshot.tasks[0].id,
+    )));
+    assert!(state.monitor.refresh_due(leaves));
+    assert_eq!(
+        state.monitor.entries().len(),
+        1,
+        "the open detail keeps its Shell"
+    );
+    state.monitor.close_detail();
+    assert!(state.monitor.refresh_due(leaves));
+    assert!(state.monitor.entries().is_empty());
+}
+
+#[test]
+fn an_emptied_monitor_keeps_its_column_and_its_label_still_hides_it() {
+    let mut state = monitor_state(140, vec![shell(Uuid::new_v4(), "Short lived")]);
+    let conversation = state.content_columns();
+    assert!(conversation < state.width);
+    state.monitor.replace(TickGroup::Shells, Vec::new());
+    state.draw_frame(&mut Vec::new()).unwrap();
+    assert_eq!(state.content_columns(), conversation);
+    let screen = state.rendered_screen.join("\n");
+    assert!(screen.contains("Nothing to monitor"), "{screen}");
+    assert!(screen.contains("Monitor 0"), "{screen}");
+    let (row, column) = state
+        .monitor_toggle_target
+        .as_ref()
+        .map(|target| (target.row, target.columns.start))
+        .unwrap();
+    state.pointer(
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            row: row as u16,
+            column: column as u16,
+            modifiers: KeyModifiers::NONE,
+        },
+        &mut Vec::new(),
+    );
+    assert!(matches!(
+        state.pointer_input.take(),
+        Some(InputEvent::ToggleMonitor { show: false })
+    ));
+    state.monitor_preference = tickloop_agent_config::MonitorPreference::Hidden;
+    state.draw_frame(&mut Vec::new()).unwrap();
+    assert_eq!(state.content_columns(), state.width);
+    assert!(
+        !state
+            .rendered_screen
+            .join("\n")
+            .contains("Nothing to monitor")
+    );
+}
+
+#[test]
+fn dragging_the_separator_resizes_monitor_within_its_bounds_and_saves_on_release() {
+    let mut state = monitor_state(140, vec![shell(Uuid::new_v4(), "Drag target")]);
+    let mouse = |kind, column: usize| MouseEvent {
+        kind,
+        row: 2,
+        column: column as u16,
+        modifiers: KeyModifiers::NONE,
+    };
+    let start = separator_column(&state).unwrap();
+    assert_eq!(start, state.width - MONITOR_COLUMNS);
+    assert!(!state.pointer(
+        mouse(MouseEventKind::Down(MouseButton::Left), start),
+        &mut Vec::new()
+    ));
+    assert!(state.selection.is_none(), "the press does not select text");
+    assert!(state.pointer(
+        mouse(MouseEventKind::Drag(MouseButton::Left), 80),
+        &mut Vec::new()
+    ));
+    state.draw_frame(&mut Vec::new()).unwrap();
+    assert_eq!(separator_column(&state), Some(80));
+    assert!(
+        !state.pointer(
+            mouse(MouseEventKind::Drag(MouseButton::Left), 80),
+            &mut Vec::new()
+        ),
+        "motion within the same column costs no frame"
+    );
+    for (column, monitor) in [(10, state.width - 47), (state.width, 32)] {
+        state.pointer(
+            mouse(MouseEventKind::Drag(MouseButton::Left), column),
+            &mut Vec::new(),
+        );
+        assert_eq!(state.monitor_columns(), monitor);
+    }
+    state.pointer(
+        mouse(MouseEventKind::Up(MouseButton::Left), state.width),
+        &mut Vec::new(),
+    );
+    assert!(matches!(
+        state.pointer_input.take(),
+        Some(InputEvent::SaveMonitorWidth { columns: 32 })
+    ));
+    state.draw_frame(&mut Vec::new()).unwrap();
+    state.pointer(
+        mouse(MouseEventKind::Down(MouseButton::Left), 5),
+        &mut Vec::new(),
+    );
+    assert!(
+        state.selection.is_some(),
+        "a press elsewhere still selects text"
+    );
+}
+
+#[test]
+fn a_finished_background_shell_a_loop_subscribes_to_stays_as_its_shell_row() {
+    use crate::monitor_rows::FINISHED_SHELL_DISPLAY_MS;
+    let chat = Uuid::new_v4();
+    let console = Console::test_for_chat(chat);
+    let ended = tickloop_agent_base::private_fs::unix_time_milliseconds();
+    let mut snapshot = tests::task_snapshot(chat, 1);
+    snapshot.tasks[0].was_background = true;
+    snapshot.tasks[0].state = tickloop_agent_protocol::ShellTaskState::Completed;
+    snapshot.tasks[0].exit_code = Some(0);
+    snapshot.tasks[0].updated_at_ms = Some(ended);
+    let shell = tick_protocol::InstanceRef::shell(snapshot.tasks[0].id);
+    console.update_shell_ticks(&snapshot).unwrap();
+    let mut state = console.state.lock().unwrap();
+    let mut subscription = tests::subscription_row(3);
+    subscription.instance = shell.clone();
+    state.monitor.subscriptions = vec![subscription];
+    state.monitor.rebuild();
+    state
+        .monitor
+        .refresh_due(ended + FINISHED_SHELL_DISPLAY_MS + 1);
+    let entries = state.monitor.entries();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].instance, shell);
+    assert_eq!(
+        entries[0].group,
+        TickGroup::Shells,
+        "still the Shell row, not a generic Tick"
+    );
+}
+
+fn subscribed_fixture(subscriptions: usize) -> State {
+    let mut state = State::new(true, 140, 30);
+    state.switch_view_chat(Some(Uuid::from_u128(77)));
+    state.prompt_enabled = true;
+    state.monitor.subscriptions = (0..subscriptions)
+        .map(|index| {
+            let mut row = tests::subscription_row(3 + index as u64);
+            row.instance = tick_protocol::InstanceRef::native("fixture-run").unwrap();
+            row.loop_id = Uuid::from_u128(900 + index as u128);
+            row.accumulated = index as u64;
+            row
+        })
+        .collect();
+    state.monitor.rebuild();
+    state.monitor.focus(false, None);
+    state
+}
+
+fn monitor_text(state: &mut State) -> String {
+    state.draw_frame(&mut Vec::new()).unwrap();
+    state.rendered_screen.join("\n")
+}
+
+fn press(state: &mut State, code: KeyCode) -> Option<InputEvent> {
+    state.key(KeyEvent::new(code, KeyModifiers::NONE))
+}
+
+fn requested_key(event: Option<InputEvent>) -> char {
+    match event {
+        Some(InputEvent::TickAction { action, .. }) => action.key,
+        other => panic!("expected a Tick action, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_subscribed_row_shows_its_marker_and_manages_subscriptions_inside_monitor() {
+    let mut state = subscribed_fixture(1);
+    let text = monitor_text(&mut state);
+    assert!(text.contains("⟳ 60s") && !text.contains("live"), "{text}");
+    assert!(text.contains("enter subscriptions"), "{text}");
+    assert_eq!(
+        state
+            .monitor
+            .selected()
+            .unwrap()
+            .actions
+            .iter()
+            .map(|action| (action.key, action.label))
+            .collect::<Vec<_>>(),
+        [
+            ('o', "subscriptions"),
+            ('x', "remove"),
+            ('e', "cadence"),
+            ('u', "unsubscribe")
+        ]
+    );
+
+    assert_eq!(requested_key(press(&mut state, KeyCode::Enter)), 'o');
+    let text = monitor_text(&mut state);
+    assert!(text.contains("Tick Subscriptions 1"), "{text}");
+    assert!(text.contains("› ⟳ every 60s"), "{text}");
+    assert!(!state.input_dialog_visible(), "the detail stays in Monitor");
+
+    press(&mut state, KeyCode::Char('e'));
+    for _ in 0..2 {
+        press(&mut state, KeyCode::Backspace);
+    }
+    press(&mut state, KeyCode::Char('9'));
+    press(&mut state, KeyCode::Char('0'));
+    assert!(monitor_text(&mut state).contains("Every 90s"));
+    assert_eq!(requested_key(press(&mut state, KeyCode::Enter)), 'e');
+
+    press(&mut state, KeyCode::Char('u'));
+    let text = monitor_text(&mut state);
+    assert!(text.contains("Cancel Tick Subscription"), "{text}");
+    assert!(press(&mut state, KeyCode::Esc).is_none());
+    assert!(!monitor_text(&mut state).contains("Cancel Tick Subscription"));
+    press(&mut state, KeyCode::Char('u'));
+    assert_eq!(requested_key(press(&mut state, KeyCode::Enter)), 'u');
+
+    press(&mut state, KeyCode::Esc);
+    assert!(state.monitor.detail.is_none());
+    assert!(state.monitor.focused, "Esc only closes the detail");
+}
+
+#[test]
+fn several_subscriptions_on_one_row_show_a_summary_and_open_as_a_list() {
+    let mut state = subscribed_fixture(3);
+    let text = monitor_text(&mut state);
+    assert!(text.contains("⟳ 3"), "{text}");
+    assert!(
+        !text.contains('●'),
+        "a row with no update time shows no unread mark: {text}"
+    );
+
+    assert_eq!(requested_key(press(&mut state, KeyCode::Char('u'))), 'o');
+    let text = monitor_text(&mut state);
+    assert!(text.contains("Tick Subscriptions 3"), "{text}");
+    assert!(
+        !text.contains("Cancel Tick Subscription"),
+        "with several subscriptions the user picks one first: {text}"
+    );
+    press(&mut state, KeyCode::Char('j'));
+    press(&mut state, KeyCode::Char('u'));
+    assert!(monitor_text(&mut state).contains("Cancel Tick Subscription"));
+}
+
+#[tokio::test]
+async fn removing_a_subscribed_row_confirms_then_cancels_its_subscriptions() {
+    use crate::terminal::{
+        execution::ConsoleExecution,
+        tick_actions::{TickActionContext, TickActionUi, builtin, execute},
+    };
+    use tickloop_agent_runtime::{
+        tick_adapter::{TickAdapter, TickAdapters},
+        tick_stream::{InMemoryTickStream, TickStreamPort},
+    };
+    struct Calendar(InMemoryTickStream);
+    impl TickAdapter for Calendar {
+        fn tick_type(&self) -> &'static str {
+            "cal"
+        }
+        fn stream(&self) -> Option<Arc<dyn TickStreamPort>> {
+            Some(Arc::new(self.0.clone()))
+        }
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let core = tickloop_agent_runtime::Agent::new_embedded(
+        tickloop_agent_test_support::config(),
+        Arc::new(tickloop_agent_test_support::ScriptedModel::new(vec![
+            tickloop_agent_test_support::call(
+                "subscribe",
+                "SubscribeTick",
+                serde_json::json!({"tick_instance_id":"cal:watched","every_seconds":30}),
+            ),
+            tickloop_agent_test_support::text("watching"),
+        ])),
+    );
+    core.install_tick_stream(Arc::new(
+        TickAdapters::new([Arc::new(Calendar(InMemoryTickStream::new())) as Arc<dyn TickAdapter>])
+            .unwrap(),
+    ))
+    .await;
+    let agent =
+        ConsoleExecution::from_embedded(core.clone(), tickloop_agent_test_support::config());
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let mut events = core.subscribe();
+    core.submit(chat, None, "watch the calendar".into())
+        .await
+        .unwrap();
+    loop {
+        match tickloop_agent_test_support::next_event(&mut events)
+            .await
+            .kind
+        {
+            tickloop_agent_protocol::EventKind::Completed { .. } => break,
+            tickloop_agent_protocol::EventKind::Failed(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    let watched = tick_protocol::InstanceRef::new("cal", "watched").unwrap();
+    let console = Console::test_for_chat(chat);
+    console
+        .update_monitor_chat(&agent.snapshot(chat).await.unwrap())
+        .unwrap();
+    console
+        .update_subscribed_ticks(chat, &agent.tick_subscriptions(chat).await.unwrap())
+        .unwrap();
+    assert!(
+        console.monitor_has_entries().unwrap(),
+        "a subscription has a row even without a Tick type of its own"
+    );
+    let context = TickActionContext {
+        agent: &agent,
+        console: &console,
+        root: Some(directory.path()),
+        chat,
+    };
+    let removal = {
+        let mut state = console.state.lock().unwrap();
+        builtin::executor(&crate::monitor_rows::TickIntent::RemoveFromMonitor(
+            watched.clone(),
+        ))
+        .unwrap()
+        .prepare(&mut TickActionUi { state: &mut state })
+        .unwrap()
+    };
+    execute(removal, context).await.unwrap();
+    assert_eq!(
+        agent.tick_subscriptions(chat).await.unwrap().len(),
+        1,
+        "nothing changes before the user confirms"
+    );
+    let confirmed = {
+        let mut state = console.state.lock().unwrap();
+        assert!(
+            state
+                .monitor
+                .confirmation
+                .as_ref()
+                .is_some_and(|confirmation| confirmation
+                    .prompt
+                    .starts_with("Remove from Monitor and cancel its 1 Tick Subscription?"))
+        );
+        let Some(InputEvent::TickAction { action, .. }) =
+            state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("confirming did not run the removal");
+        };
+        action
+    };
+    execute(confirmed, context).await.unwrap();
+    assert!(agent.tick_subscriptions(chat).await.unwrap().is_empty());
+    assert!(
+        agent
+            .snapshot(chat)
+            .await
+            .unwrap()
+            .monitor
+            .is_removed(&watched)
+    );
+    assert!(!console.monitor_has_entries().unwrap());
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn opening_a_row_handles_its_updates_and_other_keys_do_not() {
+    use crate::terminal::{
+        execution::ConsoleExecution,
+        tick_actions::{TickActionContext, execute},
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let core = tickloop_agent_runtime::Agent::new_embedded(
+        tickloop_agent_test_support::config(),
+        Arc::new(tickloop_agent_test_support::ScriptedModel::new(Vec::new())),
+    );
+    let agent =
+        ConsoleExecution::from_embedded(core.clone(), tickloop_agent_test_support::config());
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let quotes = tick_protocol::InstanceRef::native("quotes-run").unwrap();
+    let added = agent
+        .add_monitor_member(chat, quotes.clone(), Some("Quotes".into()))
+        .await
+        .unwrap()
+        .handled_at(&quotes)
+        .unwrap();
+    let mut state = State::new(true, 140, 25);
+    state.switch_view_chat(Some(chat));
+    state.prompt_enabled = true;
+    let console = tests::console_with_state(state);
+    console
+        .update_monitor_chat(&agent.snapshot(chat).await.unwrap())
+        .unwrap();
+    let context = TickActionContext {
+        agent: &agent,
+        console: &console,
+        root: Some(directory.path()),
+        chat,
+    };
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let opened = {
+        let mut state = console.state.lock().unwrap();
+        state.monitor.focus(false, None);
+        let Some(InputEvent::TickAction { action, .. }) =
+            state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("Enter did not open the row");
+        };
+        action
+    };
+    execute(opened, context).await.unwrap();
+    let handled = agent
+        .snapshot(chat)
+        .await
+        .unwrap()
+        .monitor
+        .handled_at(&quotes)
+        .unwrap();
+    assert!(handled > added, "opening the row handled its updates");
+    assert_eq!(
+        console
+            .state
+            .lock()
+            .unwrap()
+            .monitor
+            .chat_snapshot
+            .as_ref()
+            .unwrap()
+            .monitor
+            .handled_at(&quotes),
+        Some(handled),
+        "the View shows the handled row at once"
+    );
+    core.shutdown().await;
+}
+
+#[test]
+fn a_gone_row_leaves_monitor_thirty_seconds_after_it_went() {
+    use crate::monitor_rows::{GONE_DISPLAY_MS, MemberFindings, MemberState};
+    let chat = Uuid::new_v4();
+    let console = Console::test_for_chat(chat);
+    let gone = tick_protocol::InstanceRef::native("gone-run").unwrap();
+    let mut snapshot = chat_snapshot(chat);
+    snapshot
+        .monitor
+        .record_opened(gone.clone(), Some("Quotes".into()));
+    console.update_monitor_chat(&snapshot).unwrap();
+    let went = tickloop_agent_base::private_fs::unix_time_milliseconds();
+    console
+        .update_member_findings(
+            chat,
+            vec![(
+                tick_protocol::HERDR_INSTANCE_TYPE,
+                Some(MemberFindings {
+                    states: [(gone.clone(), MemberState::Gone)].into(),
+                    ..Default::default()
+                }),
+            )],
+        )
+        .unwrap();
+    let mut state = console.state.lock().unwrap();
+    assert_eq!(state.monitor.entries().len(), 1, "a gone Tick shows first");
+    let leaves = went + GONE_DISPLAY_MS + 1_000;
+    assert!(state.monitor.refresh_due(leaves));
+    assert!(state.monitor.entries().is_empty(), "then it leaves");
+}
+
+#[tokio::test]
+async fn closing_the_detail_of_a_shell_stopped_from_it_marks_its_end_seen() {
+    use crate::terminal::{
+        execution::ConsoleExecution,
+        task_access::ShellTaskCenter,
+        tick_actions::{TickActionContext, execute},
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let core = tickloop_agent_runtime::Agent::new_embedded(
+        tickloop_agent_test_support::config(),
+        Arc::new(tickloop_agent_test_support::ScriptedModel::new(Vec::new())),
+    );
+    let agent =
+        ConsoleExecution::from_embedded(core.clone(), tickloop_agent_test_support::config());
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let gate = directory.path().join("release");
+    let receipt = agent
+        .submit_user_shell_for_goal(
+            chat,
+            None,
+            format!("while [ ! -e '{}' ]; do sleep 0.02; done", gate.display()),
+            true,
+        )
+        .await
+        .unwrap();
+    let center = ShellTaskCenter::new(agent.clone());
+    let running = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let snapshot = center.snapshot(chat).await.unwrap();
+            if snapshot
+                .tasks
+                .iter()
+                .any(|task| task.id == receipt.command_id && task.capabilities.can_stop)
+            {
+                break snapshot;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let shell = tick_protocol::InstanceRef::shell(receipt.command_id);
+    let mut state = State::new(true, 140, 25);
+    state.switch_view_chat(Some(chat));
+    state.prompt_enabled = true;
+    let console = tests::console_with_state(state);
+    console
+        .update_monitor_chat(&agent.snapshot(chat).await.unwrap())
+        .unwrap();
+    console.update_shell_ticks(&running).unwrap();
+    let context = TickActionContext {
+        agent: &agent,
+        console: &console,
+        root: Some(directory.path()),
+        chat,
+    };
+    let press = |code| {
+        console
+            .state
+            .lock()
+            .unwrap()
+            .key(KeyEvent::new(code, KeyModifiers::NONE))
+    };
+    console.state.lock().unwrap().monitor.focus(false, None);
+    let Some(InputEvent::TickAction { action, .. }) = press(KeyCode::Enter) else {
+        panic!("Enter did not open the Shell");
+    };
+    execute(action, context).await.unwrap();
+    console.update_shell_ticks(&running).unwrap();
+    assert!(press(KeyCode::Char('s')).is_none());
+    let Some(InputEvent::TickAction { action, .. }) = press(KeyCode::Enter) else {
+        panic!("confirming did not stop the Shell");
+    };
+    execute(action, context).await.unwrap();
+    let ended = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let snapshot = center.snapshot(chat).await.unwrap();
+            if snapshot
+                .tasks
+                .iter()
+                .any(|task| task.id == receipt.command_id && task.state.is_terminal())
+            {
+                break snapshot;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    console.update_shell_ticks(&ended).unwrap();
+    let closed = {
+        let mut state = console.state.lock().unwrap();
+        assert!(state.monitor.detail.is_some());
+        let Some(InputEvent::TickAction { action, .. }) =
+            state.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        else {
+            panic!("closing the detail reports what the user saw");
+        };
+        assert!(state.monitor.detail.is_none());
+        action
+    };
+    execute(closed, context).await.unwrap();
+    let end = ended
+        .tasks
+        .iter()
+        .find(|task| task.id == receipt.command_id)
+        .and_then(|task| task.ended_at_ms)
+        .expect("a stopped Shell knows when it ended");
+    let handled = agent
+        .snapshot(chat)
+        .await
+        .unwrap()
+        .monitor
+        .handled_at(&shell);
+    assert!(
+        handled.is_some_and(|handled| handled >= end),
+        "the end shown in the detail counts as seen: {handled:?} < {end}"
+    );
+    std::fs::write(&gate, "").unwrap();
+    core.shutdown().await;
 }

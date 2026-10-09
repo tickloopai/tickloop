@@ -248,6 +248,7 @@ impl Agent {
                 bookkeeping,
                 todo_completion_graces: Default::default(),
                 start_new_tool_result_message: false,
+                needs_plan_mode_exit_notice: false,
                 // 备份在锁外复制完成之前占住子 Chat，不能开始 Run 或 rewind。
                 active: Some(tokio_util::sync::CancellationToken::new()),
                 active_run: None,

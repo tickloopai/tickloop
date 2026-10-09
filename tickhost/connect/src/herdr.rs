@@ -62,8 +62,9 @@ pub struct Pane {
     pub cwd: Option<String>,
     #[serde(default)]
     pub foreground_cwd: Option<String>,
+    /// The title the Pane's program set, without Herdr's status marks.
     #[serde(default)]
-    pub title: Option<String>,
+    pub terminal_title_stripped: Option<String>,
     #[serde(default)]
     pub tokens: BTreeMap<String, String>,
 }

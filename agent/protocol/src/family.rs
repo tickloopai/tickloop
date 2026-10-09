@@ -152,6 +152,44 @@ pub struct SubagentRegistration {
     pub handle: String,
     pub description: String,
     pub created_at: u64,
+    /// Assigned once at creation; registrations recorded before colours existed have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<AgentColor>,
+}
+
+/// The colour that tells family members apart. It names a member, never a state.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentColor {
+    Red,
+    Blue,
+    Green,
+    Yellow,
+    Purple,
+    Orange,
+    Pink,
+    Cyan,
+}
+
+impl AgentColor {
+    pub const ALL: [Self; 8] = [
+        Self::Red,
+        Self::Blue,
+        Self::Green,
+        Self::Yellow,
+        Self::Purple,
+        Self::Orange,
+        Self::Pink,
+        Self::Cyan,
+    ];
+
+    /// The first colour no member uses yet; once all are taken, the next in turn.
+    pub fn next_for(used: &[Option<Self>]) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|color| !used.contains(&Some(*color)))
+            .unwrap_or(Self::ALL[used.len() % Self::ALL.len()])
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

@@ -68,7 +68,7 @@ fn workspace_trust_reserves_the_entire_wrapped_sanitized_path_before_prose() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(visible.contains("Yes, I trust this folder"));
-    assert!(visible.contains("Enter confirm · Esc cancel"));
+    assert!(visible.contains("enter confirm · esc cancel"));
     state.resize(30, 8);
     state.key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
     assert!(
@@ -99,8 +99,11 @@ fn workspace_trust_modal_owns_input_and_keeps_choices_visible_across_sizes() {
                 title: "hidden Shell Tick".into(),
                 kind: "Shell".into(),
                 status: "running".into(),
+                notes: Vec::new(),
                 owner: crate::monitor_rows::TickOwner::Unknown,
+                tone: crate::monitor_rows::StatusTone::Neutral,
                 updated_at_ms: None,
+                update: None,
                 resources: None,
                 actions: Vec::new(),
             }],

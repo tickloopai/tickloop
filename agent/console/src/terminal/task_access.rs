@@ -1,16 +1,13 @@
-use std::{
-    collections::{HashMap, VecDeque},
-    sync::Arc,
-};
+use std::{collections::HashMap, sync::Arc};
 
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use super::execution::ConsoleExecution;
 use tickloop_agent_protocol::{
-    AccessError, AgentCommand, Event, EventKind, ExecutionAvailability, ShellTask, ShellTaskAction,
-    ShellTaskCenterError, ShellTaskDelta, ShellTaskOrigin, ShellTaskOutputChunk, ShellTaskSnapshot,
-    ShellTaskSubscriptionEvent, TaskAction, TaskOrigin, TaskRef, UserShellRecord, UserShellState,
+    AccessError, AgentCommand, ChatSnapshot, EventKind, ExecutionAvailability, ShellTask,
+    ShellTaskAction, ShellTaskCenterError, ShellTaskOrigin, ShellTaskOutputChunk,
+    ShellTaskSnapshot, ShellTaskState, TaskAction, TaskOrigin, TaskRef, UserShellState,
 };
 
 #[derive(Clone)]
@@ -19,57 +16,69 @@ pub(super) struct ShellTaskCenter {
     revisions: Arc<Mutex<HashMap<Uuid, ShellTaskSnapshot>>>,
 }
 
-pub(super) struct ShellTaskSubscription {
-    center: ShellTaskCenter,
-    chat: Uuid,
-    events: broadcast::Receiver<Event>,
-    shells: broadcast::Receiver<UserShellRecord>,
-    facts: broadcast::Receiver<()>,
-    refresh_pending: bool,
-    previous: ShellTaskSnapshot,
-    pending: VecDeque<ShellTaskSubscriptionEvent>,
+/// When Shell `id` of the Chat started: its output file's creation, else its first recorded
+/// update, else when a running user Shell entered its state.
+pub(super) fn shell_started_at_ms(snapshot: &ChatSnapshot, id: Uuid) -> Option<u64> {
+    let command = snapshot
+        .commands
+        .iter()
+        .find(|command| command.operation_id == id);
+    let shell = snapshot.user_shells.iter().find(|shell| shell.id == id);
+    let path = command
+        .map(|command| command.output_ref.as_path())
+        .or_else(|| shell.and_then(|shell| shell.output_ref.as_deref()));
+    let creation = path.and_then(|path| {
+        std::fs::metadata(path)
+            .ok()?
+            .created()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_millis()
+            .try_into()
+            .ok()
+    });
+    creation
+        .or_else(|| {
+            snapshot
+                .events
+                .iter()
+                .filter_map(|event| match &event.kind {
+                    EventKind::CommandUpdated { command } if command.operation_id == id => {
+                        command.updated_at_ms
+                    }
+                    _ => None,
+                })
+                .min()
+        })
+        .or_else(|| {
+            shell
+                .filter(|shell| matches!(shell.state, UserShellState::Running))
+                .and_then(|shell| shell.state_since)
+        })
+}
+
+/// When each running background Shell in `tasks` started, for the elapsed time on its Monitor
+/// row.
+pub(super) fn shell_starts(
+    snapshot: &ChatSnapshot,
+    tasks: &ShellTaskSnapshot,
+) -> HashMap<Uuid, u64> {
+    tasks
+        .tasks
+        .iter()
+        .filter(|task| {
+            !task.state.is_terminal()
+                && (task.was_background || task.state == ShellTaskState::Background)
+        })
+        .filter_map(|task| Some((task.id, shell_started_at_ms(snapshot, task.id)?)))
+        .collect()
 }
 
 impl ShellTaskCenter {
     pub(super) async fn started_at_ms(&self, chat: Uuid, id: Uuid) -> Option<u64> {
         let snapshot = self.agent.snapshot(chat).await.ok()?;
-        let command = snapshot
-            .commands
-            .iter()
-            .find(|command| command.operation_id == id);
-        let shell = snapshot.user_shells.iter().find(|shell| shell.id == id);
-        let path = command
-            .map(|command| command.output_ref.as_path())
-            .or_else(|| shell.and_then(|shell| shell.output_ref.as_deref()));
-        let creation = path.and_then(|path| {
-            std::fs::metadata(path)
-                .ok()?
-                .created()
-                .ok()?
-                .duration_since(std::time::UNIX_EPOCH)
-                .ok()?
-                .as_millis()
-                .try_into()
-                .ok()
-        });
-        creation
-            .or_else(|| {
-                snapshot
-                    .events
-                    .iter()
-                    .filter_map(|event| match &event.kind {
-                        EventKind::CommandUpdated { command } if command.operation_id == id => {
-                            command.updated_at_ms
-                        }
-                        _ => None,
-                    })
-                    .min()
-            })
-            .or_else(|| {
-                shell
-                    .filter(|shell| matches!(shell.state, UserShellState::Running))
-                    .and_then(|shell| shell.state_since)
-            })
+        shell_started_at_ms(&snapshot, id)
     }
     pub(super) fn new(agent: ConsoleExecution) -> Self {
         Self {
@@ -77,41 +86,38 @@ impl ShellTaskCenter {
             revisions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
+    /// The Chat's Shell tasks. A lookup that fails because the Chat's execution was lost in the
+    /// meantime leaves the loss to the execution catalog; any other failure keeps the previous
+    /// tasks without their controls.
     pub(super) async fn snapshot(
         &self,
         chat: Uuid,
     ) -> Result<ShellTaskSnapshot, ShellTaskCenterError> {
-        let mut tasks = Vec::new();
-        let mut seen = std::collections::HashSet::new();
         let catalog = match self.agent.catalog().await {
             Ok(catalog) => catalog,
             Err(error) => return self.stale_snapshot(chat, runtime_error(error)).await,
         };
-        for entry in catalog {
-            if entry.availability == ExecutionAvailability::Lost {
-                continue;
-            }
-            let rows = match self.agent.task_rows(entry.chat_id).await {
-                Ok(rows) => rows,
-                Err(error) => {
-                    if self.agent.catalog().await.is_ok_and(|rows| {
-                        rows.iter().any(|current| {
-                            current.execution == entry.execution
-                                && current.availability == ExecutionAvailability::Lost
-                        })
-                    }) {
-                        continue;
+        let mut tasks = match catalog.into_iter().find(|entry| entry.chat_id == chat) {
+            Some(entry) if entry.availability != ExecutionAvailability::Lost => {
+                match self.agent.task_rows(chat).await {
+                    Ok(rows) => rows,
+                    Err(error) => {
+                        if !self.agent.catalog().await.is_ok_and(|rows| {
+                            rows.iter().any(|current| {
+                                current.execution == entry.execution
+                                    && current.availability == ExecutionAvailability::Lost
+                            })
+                        }) {
+                            return self.stale_snapshot(chat, runtime_error(error)).await;
+                        }
+                        Vec::new()
                     }
-                    return self.stale_snapshot(chat, runtime_error(error)).await;
-                }
-            };
-            for task in rows {
-                if seen.insert((task.chat_id, task.id)) {
-                    tasks.push(task);
                 }
             }
-        }
-        tasks.sort_by_key(|task| (task.chat_id != chat, task.state.is_terminal(), task.id));
+            _ => Vec::new(),
+        };
+        tasks.retain(|task| task.chat_id == chat);
+        tasks.sort_by_key(|task| (task.state.is_terminal(), task.id));
         let mut revisions = self.revisions.lock().await;
         let live_revision = revisions
             .get(&chat)
@@ -145,25 +151,6 @@ impl ShellTaskCenter {
         }
         snapshot.live_revision += u64::from(changed);
         Ok(snapshot.clone())
-    }
-    pub(super) async fn subscribe(
-        &self,
-        chat: Uuid,
-    ) -> Result<ShellTaskSubscription, ShellTaskCenterError> {
-        let events = self.agent.subscribe();
-        let shells = self.agent.subscribe_user_shells();
-        let facts = self.agent.subscribe_facts();
-        let previous = self.snapshot(chat).await?;
-        Ok(ShellTaskSubscription {
-            center: self.clone(),
-            chat,
-            events,
-            shells,
-            facts,
-            refresh_pending: false,
-            previous,
-            pending: VecDeque::new(),
-        })
     }
     async fn find(&self, chat: Uuid, id: Uuid) -> Result<ShellTask, ShellTaskCenterError> {
         self.snapshot(chat)
@@ -235,57 +222,6 @@ impl ShellTaskCenter {
             .await
             .map_err(runtime_error)?;
         self.find(chat, id).await
-    }
-}
-
-impl ShellTaskSubscription {
-    pub(super) async fn recv(
-        &mut self,
-    ) -> Result<ShellTaskSubscriptionEvent, ShellTaskCenterError> {
-        loop {
-            if let Some(update) = self.pending.pop_front() {
-                return Ok(update);
-            }
-            if !self.refresh_pending {
-                let lagged = tokio::select! {
-                event=self.events.recv()=>match event{Ok(_)=>false,Err(broadcast::error::RecvError::Lagged(_))=>true,Err(_)=>return Err(ShellTaskCenterError::EventStreamClosed)},
-                event=self.shells.recv()=>match event{Ok(_)=>false,Err(broadcast::error::RecvError::Lagged(_))=>true,Err(_)=>return Err(ShellTaskCenterError::EventStreamClosed)},
-                event=self.facts.recv()=>match event{Ok(_)=>false,Err(broadcast::error::RecvError::Lagged(_))=>true,Err(_)=>return Err(ShellTaskCenterError::EventStreamClosed)},
-                };
-                self.refresh_pending = true;
-                if lagged {
-                    return Ok(ShellTaskSubscriptionEvent::ResyncRequired {
-                        last_live_revision: self.previous.live_revision,
-                    });
-                }
-            }
-            let snapshot = self.center.snapshot(self.chat).await?;
-            for task in &snapshot.tasks {
-                let previous = self
-                    .previous
-                    .tasks
-                    .iter()
-                    .find(|old| old.id == task.id && old.chat_id == task.chat_id);
-                if previous != Some(task) {
-                    self.pending
-                        .push_back(ShellTaskSubscriptionEvent::Changed(ShellTaskDelta {
-                            live_revision: snapshot.live_revision,
-                            task: task.clone(),
-                            previous_state: previous.map(|old| old.state),
-                            previous_output_bytes: previous.map(|old| old.output_bytes),
-                        }));
-                }
-            }
-            self.previous = snapshot;
-            self.refresh_pending = false;
-        }
-    }
-    pub(super) async fn resync(&mut self) -> Result<ShellTaskSnapshot, ShellTaskCenterError> {
-        let snapshot = self.center.snapshot(self.chat).await?;
-        self.previous = snapshot.clone();
-        self.pending.clear();
-        self.refresh_pending = false;
-        Ok(snapshot)
     }
 }
 
@@ -381,6 +317,54 @@ mod timestamp_tests {
             assert!(task.updated_at_ms.is_some());
             assert!(task.updated_at_ms >= terminal.state_since);
         }
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_holds_only_its_own_chats_tasks() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = tickloop_agent_runtime::Agent::new_embedded(
+            tickloop_agent_test_support::config(),
+            Arc::new(tickloop_agent_test_support::ScriptedModel::new(Vec::new())),
+        );
+        let access = Arc::new(EmbeddedAgentAccess::new(runtime.clone()));
+        let agent = ConsoleExecution::from_access_for_test(
+            access.clone(),
+            access.daemon_epoch(),
+            ViewRef {
+                session_id: Uuid::new_v4(),
+                view_id: Uuid::new_v4(),
+            },
+            LaunchSpec::embedded(directory.path().into()),
+            None,
+        );
+        let chat = agent.create_chat(directory.path().into()).await.unwrap();
+        let peer = agent.create_chat(directory.path().into()).await.unwrap();
+        agent.display_chat(Some(peer)).await.unwrap();
+        let peer_task = agent
+            .submit_user_shell_for_goal(peer, None, "printf peer".into(), true)
+            .await
+            .unwrap()
+            .command_id;
+        agent.display_chat(Some(chat)).await.unwrap();
+        let center = ShellTaskCenter::new(agent.clone());
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !center
+                .snapshot(peer)
+                .await
+                .unwrap()
+                .tasks
+                .iter()
+                .any(|task| task.id == peer_task)
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let snapshot = center.snapshot(chat).await.unwrap();
+        assert_eq!(snapshot.chat_id, chat);
+        assert!(snapshot.tasks.is_empty(), "{:?}", snapshot.tasks);
         runtime.shutdown().await;
     }
 }

@@ -178,7 +178,7 @@ fn pane(id: &str, tab: &str, workspace: &str, instance: Option<&str>) -> Pane {
         tab_id: tab.into(),
         cwd: Some("/tmp".into()),
         foreground_cwd: None,
-        title: None,
+        terminal_title_stripped: None,
         tokens: instance
             .map(|instance| BTreeMap::from([("tickloop_instance".into(), instance.into())]))
             .unwrap_or_default(),

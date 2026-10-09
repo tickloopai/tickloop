@@ -164,7 +164,7 @@ fn captured_view_context(workdir: &Path, view: &str) -> HostCallContext {
                 tab_id: format!("tab-{view}"),
                 cwd: None,
                 foreground_cwd: None,
-                title: None,
+                terminal_title_stripped: None,
                 tokens: Default::default(),
             },
         }),

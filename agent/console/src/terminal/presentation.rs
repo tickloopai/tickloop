@@ -1,32 +1,38 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    path::Path,
+};
 use uuid::Uuid;
 
 use serde_json::Value;
 use tickloop_agent_tools::{
-    ASK_USER_QUESTION_TOOL_NAME, BASH_TOOL_NAME, EDIT_TOOL_NAME, TASK_STOP_TOOL_NAME,
-    TODO_WRITE_TOOL_NAME, WEB_FETCH_TOOL_NAME, WEB_SEARCH_TOOL_NAME, WRITE_TOOL_NAME,
+    ASK_USER_QUESTION_TOOL_NAME, BASH_TOOL_NAME, EDIT_TOOL_NAME, READ_TOOL_NAME,
+    TASK_STOP_TOOL_NAME, TODO_WRITE_TOOL_NAME, WEB_FETCH_TOOL_NAME, WEB_SEARCH_TOOL_NAME,
+    WRITE_TOOL_NAME,
+    file_change::{FileChangeLineKind, FileChangeReview, load_file_change_review},
 };
 use tickloop_ui::markdown;
 
 use super::{
     console::Console,
     conversation::{
-        AssistantState, ConversationBlock, ConversationBlockKind, ConversationOutcome,
-        ThinkingSource, project as project_conversation,
+        AssistantState, ConversationBlock, ConversationBlockId, ConversationBlockKind,
+        ConversationBlockMetadata, ConversationOutcome, ThinkingSource,
+        project as project_conversation,
     },
-    directed_summary,
     display::{DisplayProfile, Glyph},
+    hyperlink,
     image_cache::ImageLinks,
     safe_text,
-    scrollback::ToolCallState,
+    scrollback::{CollapsedCall, ToolCallState},
     style::Role,
-    transcript::{LineLink, TranscriptDocument},
+    transcript::{TranscriptDocument, TranscriptPiece},
 };
 use tickloop_agent_protocol::{
     ChatSnapshot, CommandState, Event, EventKind, FamilyCompletion, FamilyInputRecord,
     LocalMessage, LoopState, PermissionApprovalSource, PermissionRequest,
     SEND_AGENT_MESSAGE_TOOL_NAME, SUBAGENT_TOOL_NAME, SubagentNotificationDelivery,
-    TickDeliveryLine, ToolResult,
+    TaskNotificationStatus, TickDeliveryLine, ToolResult, UserShellRecord, UserShellState,
 };
 
 const RETAINED_TOOL_EVENTS: usize = 128;
@@ -34,6 +40,37 @@ const PREVIEW_LINES: usize = 5;
 const PREVIEW_LINE_CHARACTERS: usize = 200;
 const TOOL_SUMMARY_CHARACTERS: usize = 160;
 const BACKGROUND_RUNNING_STATUS: &str = "Running in background";
+/// Claude Code places a reply's model name this many columns before the right edge.
+const MODEL_RIGHT_MARGIN: usize = 8;
+/// Content under a `⎿` connector starts this many columns in: two spaces, `⎿` and two spaces.
+const RESULT_INDENT: usize = 5;
+/// A tool call's arguments and a thinking block wrap under this column, past the `⏺ ` gutter.
+const BLOCK_INDENT: usize = 2;
+const SUMMARY_HEADING: &str = "Summarized conversation";
+const SHELL_HEADING: &str = "Shell";
+const WAITING_RESPONSE_NOTICE: &str =
+    "A response is waiting. Return to the conversation to answer.";
+const NO_OUTPUT: &str = "(No output)";
+/// The hint under output that was cut short.
+const DETAILS_HINT: &str = "… ctrl+o for details";
+/// How the runtime's result starts when the user declined the call, with or without a reason.
+const REJECTION_PREFIXES: [&str; 2] = [
+    "permission denied; the requested operation was not executed",
+    "The user denied permission for this operation",
+];
+/// Lines of a written file shown under its result, as Claude Code's `MAX_LINES_TO_RENDER`.
+const WRITE_PREVIEW_LINES: usize = 10;
+/// Diff lines shown under an edit before the rest is left to Ctrl+O.
+const DIFF_PREVIEW_LINES: usize = 20;
+
+/// Styled runs of conversation output, each tagged with the role it plays.
+pub(super) type RoleRuns = Vec<(String, Option<Role>)>;
+
+pub(super) fn joined(runs: &[(String, Option<Role>)]) -> String {
+    runs.iter().map(|(text, _)| text.as_str()).collect()
+}
+
+type LinkRange = (std::ops::Range<usize>, hyperlink::Hyperlink);
 
 pub(super) fn is_model_only_tool(name: &str) -> bool {
     name == TODO_WRITE_TOOL_NAME
@@ -44,8 +81,11 @@ const BACKGROUND_LAUNCH_PREFIXES: [&str; 2] = [
 ];
 /// 照 Claude Code 的 `InterruptedByUser` 呈现中断标记。
 const RESPONSE_CONTINUATION: &str = "     ";
+const INTERRUPTED: &str = "Interrupted · What should the Agent do instead?";
 #[cfg(test)]
 const INTERRUPTED_NOTICE: &str = "  ⎿  Interrupted · What should the Agent do instead?";
+/// What a diff shows between two of its hunks, as Claude Code's `StructuredDiffList`.
+const HUNK_GAP: &str = "...";
 
 #[derive(Clone, Copy)]
 pub(super) enum OutputDetail {
@@ -97,259 +137,725 @@ impl MessageGroups {
     }
 }
 
+/// The conversation as Claude Code's detailed transcript shows it: every block expanded, each
+/// tool result under its call, the time and model above each reply and only the latest thinking
+/// of the current turn.
 pub(super) fn transcript_document(
     snapshot: &ChatSnapshot,
     display: DisplayProfile,
     image_links: &ImageLinks,
 ) -> TranscriptDocument {
-    let projection = project_conversation(snapshot);
-    let mut document = TranscriptDocument {
-        lines: vec![format!(
-            "Full archive · Conversation · {} · {:?}",
-            safe_text(&projection.current_model.model),
-            projection.current_model.protocol
-        )],
-        ..TranscriptDocument::default()
+    let blocks = project_conversation(snapshot).blocks;
+    let shown_thinking = current_turn_thinking(&blocks, snapshot);
+    let results = blocks
+        .iter()
+        .filter_map(|block| match &block.kind {
+            ConversationBlockKind::ToolResult { exchange, .. } => Some((exchange.clone(), block)),
+            _ => None,
+        })
+        .collect::<HashMap<_, _>>();
+    let mut writer = TranscriptWriter {
+        document: TranscriptDocument::default(),
+        display,
     };
-    let mut interaction_notice_rendered = false;
-    let mut command_heading_rendered = false;
-    let mut tool_names = HashMap::new();
-    for block in projection.blocks {
-        let ConversationBlock {
-            id: block_id,
-            metadata,
-            kind,
-        } = block;
-        let mut text = String::new();
-        let mut is_prompt = false;
-        let is_failure = matches!(
-            &kind,
-            ConversationBlockKind::Outcome(ConversationOutcome::Failed { .. })
-        );
-        match kind {
-            ConversationBlockKind::User { text: content } => {
-                let is_agent_message = match block_id {
-                    super::conversation::ConversationBlockId::MessageContent {
-                        message_index,
-                        ..
-                    } => snapshot
-                        .message_ids
-                        .get(&message_index)
-                        .is_some_and(|id| snapshot.agent_message_origins.contains_key(id)),
-                    _ => false,
-                };
-                if let Some(message) = typed_local_message(&content, is_agent_message) {
-                    text.push_str(&local_message_text(&message, OutputDetail::Full, display));
-                } else {
-                    document.prompts.push(document.lines.len() + 1);
-                    if let super::conversation::ConversationBlockId::MessageContent {
-                        message_index,
-                        ..
-                    } = block_id
-                        && let Some(origin) = snapshot
-                            .message_ids
-                            .get(&message_index)
-                            .and_then(|id| snapshot.human_family_origins.get(id))
-                    {
-                        text.push_str(&format!(
-                            "\nUser message · from @{} View\nOriginal input: {}\n",
-                            safe_text(&origin.source_handle),
-                            safe_text(&origin.original_submission)
-                        ));
+    let mut answered = HashSet::new();
+    let mut waiting_notice_written = false;
+    for (index, block) in blocks.iter().enumerate() {
+        match &block.kind {
+            ConversationBlockKind::User { text } => {
+                let is_agent_message = is_agent_message(&block.id, snapshot);
+                match typed_local_message(text, is_agent_message) {
+                    Some(LocalMessage::BashInput { command }) => writer.shell_input(&command),
+                    Some(message) => writer.block_text(
+                        local_message_text(&message, OutputDetail::Full, display),
+                        Some(Role::MutedText),
+                    ),
+                    None => {
+                        if let ConversationBlockId::MessageContent { message_index, .. } = &block.id
+                            && let Some(origin) = snapshot
+                                .message_ids
+                                .get(message_index)
+                                .and_then(|id| snapshot.human_family_origins.get(id))
+                        {
+                            writer.block_text(
+                                format!(
+                                    "\nUser message · from @{} View\nOriginal input: {}\n",
+                                    safe_text(&origin.source_handle),
+                                    safe_text(&origin.original_submission)
+                                ),
+                                Some(Role::MutedText),
+                            );
+                        }
+                        let text = safe_text(text);
+                        writer.prompt(&text, &image_links.in_text(snapshot.id, &text));
                     }
-                    text.push_str(&format!("\nYou: {}\n", safe_text(&content)));
-                    is_prompt = true;
                 }
             }
             ConversationBlockKind::CompactBoundary => {
-                text.push_str("\nConversation compacted\n");
+                writer.block_text("\n✻ Conversation compacted\n", Some(Role::MutedText));
             }
             ConversationBlockKind::CompactSummary { summary } => {
-                text.push_str(&directed_summary::history_marker(&summary));
+                writer.block();
+                writer.hanging(
+                    format!("{} ", display.glyph(Glyph::Assistant)),
+                    None,
+                    BLOCK_INDENT,
+                );
+                writer.hanging(SUMMARY_HEADING, None, BLOCK_INDENT);
+                writer.text("\n", None);
+                writer.result(text_lines(&safe_text(summary), Some(Role::MutedText)));
             }
+            // As in Claude Code, a reply still streaming is not part of the transcript.
             ConversationBlockKind::Assistant {
-                text: content,
-                state,
-            } => match state {
-                AssistantState::Complete => {
-                    text.push_str(&format!(
-                        "\nAssistant: {}\n",
-                        markdown::plain_text(&content)
-                    ));
-                }
-                AssistantState::Streaming => {
-                    text.push_str(&format!("\nAssistant: {}", markdown::plain_text(&content)));
-                }
-            },
-            ConversationBlockKind::Thinking {
-                text: content,
-                source,
-            } => {
-                let heading = match source {
-                    ThinkingSource::ModelText => "∴ Thinking…",
-                    ThinkingSource::Summary => "∴ Thinking summary",
-                };
-                text.push_str(&format!("\n{heading}\n\n"));
-                for line in markdown::plain_text(&safe_text(&content)).lines() {
-                    text.push_str("  ");
-                    text.push_str(line);
-                    text.push('\n');
-                }
+                text,
+                state: AssistantState::Complete,
+            } => writer.reply(text, &block.metadata),
+            ConversationBlockKind::Assistant { .. } => {}
+            ConversationBlockKind::Thinking { text, source } if shown_thinking == Some(index) => {
+                writer.thinking(text, *source)
             }
+            ConversationBlockKind::Thinking { .. } => {}
             ConversationBlockKind::ToolCall {
                 exchange,
                 name,
                 input,
             } => {
-                tool_names.insert(exchange.clone(), name.clone());
-                if is_model_only_tool(&name) {
+                answered.insert(exchange.clone());
+                let result = results.get(exchange).copied();
+                let failed = result.is_some_and(|result| {
+                    matches!(
+                        result.kind,
+                        ConversationBlockKind::ToolResult { is_error: true, .. }
+                    )
+                });
+                if is_model_only_tool(name) && !failed {
                     continue;
                 }
-                text.push_str(&format!(
-                    "\nTool {} · {}\n",
-                    safe_text(&exchange.call_id),
-                    tool_name(&name)
-                ));
-                append_transcript_value(&mut text, &input);
+                let dot = match result {
+                    None => Role::MutedText,
+                    Some(_) if failed => Role::Error,
+                    Some(_) => Role::Success,
+                };
+                writer.tool_call(dot, name, &transcript_arguments(name, input));
+                if let Some(result) = result
+                    && let ConversationBlockKind::ToolResult {
+                        content, is_error, ..
+                    } = &result.kind
+                {
+                    let elapsed = block
+                        .metadata
+                        .timestamp_ms
+                        .zip(result.metadata.timestamp_ms)
+                        .map(|(started, finished)| finished.saturating_sub(started));
+                    writer.result(transcript_result_lines(
+                        name,
+                        Some(input),
+                        content,
+                        *is_error,
+                        elapsed,
+                    ));
+                }
             }
             ConversationBlockKind::ToolResult {
                 exchange,
                 content,
                 is_error,
-                output_ref,
-            } => {
-                let _output_ref = output_ref;
-                if !is_error
-                    && tool_names
-                        .get(&exchange)
-                        .is_some_and(|name| is_model_only_tool(name))
-                {
-                    continue;
-                }
-                let result = ToolResult {
-                    content: content.clone(),
-                    is_error,
-                    output_ref: None,
-                };
-                let status = tool_result_status(
-                    tool_names
-                        .get(&exchange)
-                        .map(String::as_str)
-                        .unwrap_or("tool"),
-                    &result,
+                ..
+            } if !answered.contains(exchange) => {
+                writer.tool_call(
+                    if *is_error {
+                        Role::Error
+                    } else {
+                        Role::Success
+                    },
+                    "tool",
+                    "",
                 );
-                text.push_str(&format!(
-                    "\nResult {} · {}\n",
-                    safe_text(&exchange.call_id),
-                    status
+                writer.result(transcript_result_lines(
+                    "tool", None, content, *is_error, None,
                 ));
-                if let Ok(value) = serde_json::from_str::<Value>(&content) {
-                    append_transcript_value(&mut text, &value);
-                } else {
-                    text.push_str(&safe_text(&content));
-                    text.push('\n');
-                }
             }
-            ConversationBlockKind::Permission { request, exchange } => {
-                let (_request, _exchange) = (request, exchange);
-                if !interaction_notice_rendered {
-                    text.push_str(
-                        "\n\nA response is waiting. Return to the conversation to answer.\n",
+            ConversationBlockKind::ToolResult { .. } | ConversationBlockKind::Plan => {}
+            ConversationBlockKind::Permission | ConversationBlockKind::Question => {
+                if !waiting_notice_written {
+                    writer.block_text(
+                        format!("\n{WAITING_RESPONSE_NOTICE}\n"),
+                        Some(Role::MutedText),
                     );
-                    interaction_notice_rendered = true;
+                    waiting_notice_written = true;
                 }
             }
-            ConversationBlockKind::Question { request, exchange } => {
-                let (_request, _exchange) = (request, exchange);
-                if !interaction_notice_rendered {
-                    text.push_str(
-                        "\n\nA response is waiting. Return to the conversation to answer.\n",
-                    );
-                    interaction_notice_rendered = true;
-                }
+            ConversationBlockKind::FamilyInput { record } => writer.block_text(
+                family_input_text(record, OutputDetail::Full),
+                Some(Role::MutedText),
+            ),
+            ConversationBlockKind::FamilyCompletion { completion } => writer.block_text(
+                family_completion_text(completion, OutputDetail::Full),
+                Some(Role::MutedText),
+            ),
+            ConversationBlockKind::Outcome(ConversationOutcome::Failed { error }) => {
+                writer.block();
+                writer.hanging(
+                    format!("{} ", display.glyph(Glyph::ToolCall)),
+                    Some(Role::Error),
+                    BLOCK_INDENT,
+                );
+                writer.linked(&safe_text(error), Some(Role::Error), BLOCK_INDENT);
+                writer.text("\n", None);
             }
-            ConversationBlockKind::Plan { plan } => {
-                let _plan = plan;
+            ConversationBlockKind::Outcome(ConversationOutcome::Interrupted) => {
+                writer.text(
+                    format!("{}\n", interrupted_notice(display)),
+                    Some(Role::MutedText),
+                );
             }
-            ConversationBlockKind::FamilyInput { record } => {
-                text.push_str(&family_input_text(&record, OutputDetail::Full))
-            }
-            ConversationBlockKind::FamilyCompletion { completion } => {
-                text.push_str(&family_completion_text(&completion, OutputDetail::Full))
-            }
-            ConversationBlockKind::Outcome(outcome) => match outcome {
-                ConversationOutcome::Failed { error } => text.push_str(&format!(
-                    "\nFailed · goal {}: {}\n",
-                    metadata.loop_id.unwrap_or_default(),
-                    safe_text(&error)
-                )),
-                ConversationOutcome::Interrupted => text.push_str(&format!(
-                    "\nInterrupted · goal {}\n",
-                    metadata.loop_id.unwrap_or_default()
-                )),
-                ConversationOutcome::Completed { usage } => {
-                    let _usage = usage;
-                }
-                ConversationOutcome::GoalEnded { reason } => {
-                    let _reason = reason;
-                }
-            },
+            ConversationBlockKind::Outcome(
+                ConversationOutcome::Completed | ConversationOutcome::GoalEnded,
+            ) => {}
             ConversationBlockKind::Command { command } => {
-                if !command_heading_rendered {
-                    text.push_str("\nShell tasks:\n");
-                    command_heading_rendered = true;
-                }
-                text.push_str(&format!(
-                    "\n{} · {:?}{}\n{}\nDirectory: {}\nOutput: {} bytes\nFull output: {}\n",
-                    command.operation_id,
-                    command.state,
-                    command_status(command.exit_code, command.signal),
-                    safe_text(&command.command),
-                    safe_text(&command.cwd.to_string_lossy()),
-                    command.output_bytes,
-                    safe_text(&command.output_ref.to_string_lossy()),
-                ));
+                let dot = match command.state {
+                    CommandState::Completed if command.exit_code == Some(0) => Role::Success,
+                    CommandState::Completed | CommandState::Failed | CommandState::Unknown => {
+                        Role::Error
+                    }
+                    _ => Role::MutedText,
+                };
+                writer.tool_call(dot, SHELL_HEADING, &safe_text(&command.command));
+                let mut lines = vec![
+                    format!(
+                        "{:?}{}",
+                        command.state,
+                        command_status(command.exit_code, command.signal)
+                    ),
+                    format!("Directory: {}", safe_text(&command.cwd.to_string_lossy())),
+                    format!(
+                        "Output: {} bytes · {}",
+                        command.output_bytes,
+                        safe_text(&command.output_ref.to_string_lossy())
+                    ),
+                ];
                 if let Some(reason) = &command.reason {
-                    text.push_str(&format!("Reason: {}\n", safe_text(reason)));
+                    lines.push(format!("Reason: {}", safe_text(reason)));
                 }
-            }
-        }
-        let first_line = document.lines.len();
-        document.lines.extend(text.lines().map(str::to_owned));
-        if is_failure {
-            for (line, text) in document.lines.iter().enumerate().skip(first_line) {
-                document.links.extend(
-                    super::hyperlink::web_links(text)
+                writer.result(
+                    lines
                         .into_iter()
-                        .map(|(range, link)| LineLink { line, range, link }),
+                        .map(|line| ResultLine::new(line, Some(Role::MutedText)))
+                        .collect(),
                 );
-            }
-        }
-        if is_prompt {
-            for (line, text) in document.lines.iter().enumerate().skip(first_line) {
-                let links = image_links.in_text(snapshot.id, text);
-                document
-                    .links
-                    .extend(
-                        links
-                            .into_iter()
-                            .map(|(range, link)| LineLink { line, range, link }),
-                    );
             }
         }
     }
-    document
+    writer.document
 }
 
-fn append_transcript_value(text: &mut String, value: &Value) {
-    if let Value::Object(fields) = value {
-        for (key, value) in fields {
-            text.push_str(&format!("{}:\n{}\n", safe_text(key), display_value(value)));
+/// The thinking block the detailed transcript shows: the latest one after the last prompt.
+fn current_turn_thinking(blocks: &[ConversationBlock], snapshot: &ChatSnapshot) -> Option<usize> {
+    for (index, block) in blocks.iter().enumerate().rev() {
+        match &block.kind {
+            ConversationBlockKind::Thinking { .. } => return Some(index),
+            ConversationBlockKind::User { text }
+                if typed_local_message(text, is_agent_message(&block.id, snapshot)).is_none() =>
+            {
+                return None;
+            }
+            _ => {}
         }
-    } else {
-        text.push_str(&display_value(value));
-        text.push('\n');
     }
+    None
+}
+
+fn is_agent_message(id: &ConversationBlockId, snapshot: &ChatSnapshot) -> bool {
+    match id {
+        ConversationBlockId::MessageContent { message_index, .. } => snapshot
+            .message_ids
+            .get(message_index)
+            .is_some_and(|id| snapshot.agent_message_origins.contains_key(id)),
+        _ => false,
+    }
+}
+
+/// One row under a `⎿` result connector, painted with `fill` across the row.
+struct ResultLine {
+    spans: Vec<(String, Option<Role>)>,
+    fill: Option<Role>,
+}
+
+impl ResultLine {
+    fn new(text: impl Into<String>, role: Option<Role>) -> Self {
+        Self {
+            spans: vec![(text.into(), role)],
+            fill: None,
+        }
+    }
+
+    fn filled(text: impl Into<String>, fill: Role) -> Self {
+        Self {
+            spans: vec![(text.into(), None)],
+            fill: Some(fill),
+        }
+    }
+}
+
+fn text_lines(text: &str, role: Option<Role>) -> Vec<ResultLine> {
+    text.lines()
+        .map(|line| ResultLine::new(line, role))
+        .collect()
+}
+
+struct TranscriptWriter {
+    document: TranscriptDocument,
+    display: DisplayProfile,
+}
+
+impl TranscriptWriter {
+    fn text(&mut self, text: impl Into<String>, role: Option<Role>) {
+        self.document.push(TranscriptPiece::text(text, role));
+    }
+
+    fn block(&mut self) {
+        self.document.push(TranscriptPiece::Block);
+    }
+
+    /// `text` as one entry: when it begins with a newline it starts a block of its own.
+    fn block_text(&mut self, text: impl Into<String>, role: Option<Role>) {
+        let text = text.into();
+        let rest = text.trim_start_matches('\n');
+        if rest.len() < text.len() {
+            self.block();
+        }
+        self.text(rest, role);
+    }
+
+    fn hanging(&mut self, text: impl Into<String>, role: Option<Role>, hang: usize) {
+        self.document
+            .push(TranscriptPiece::hanging(text, role, hang));
+    }
+
+    fn filled(&mut self, text: &str, role: Option<Role>, fill: Role, links: &[LinkRange]) {
+        for (run, link) in hyperlink::runs(text, links) {
+            self.document.push(TranscriptPiece::Text {
+                text: run.to_owned(),
+                role,
+                fill: Some(fill),
+                hang: 0,
+                link: link.cloned(),
+            });
+        }
+    }
+
+    /// Text with each web address in it linked.
+    fn linked(&mut self, text: &str, role: Option<Role>, hang: usize) {
+        let links = hyperlink::web_links(text);
+        for (run, link) in hyperlink::runs(text, &links) {
+            self.document.push(TranscriptPiece::Text {
+                text: run.to_owned(),
+                role,
+                fill: None,
+                hang,
+                link: link.cloned(),
+            });
+        }
+    }
+
+    fn prompt(&mut self, text: &str, links: &[LinkRange]) {
+        self.block();
+        self.filled(
+            &format!("{} ", self.display.glyph(Glyph::Prompt)),
+            Some(Role::Subtle),
+            Role::UserMessageBg,
+            &[],
+        );
+        self.filled(text, Some(Role::Text), Role::UserMessageBg, links);
+        self.text("\n", None);
+    }
+
+    fn shell_input(&mut self, command: &str) {
+        self.block();
+        self.filled("! ", Some(Role::ShellBorder), Role::ShellMessageBg, &[]);
+        self.filled(
+            &safe_text(command),
+            Some(Role::Text),
+            Role::ShellMessageBg,
+            &[],
+        );
+        self.text("\n", None);
+    }
+
+    fn reply(&mut self, text: &str, metadata: &ConversationBlockMetadata) {
+        self.block();
+        let time = metadata.timestamp_ms.and_then(local_clock_time);
+        let model = metadata
+            .model
+            .as_ref()
+            .map(|model| super::safe_line(model))
+            .filter(|model| !model.is_empty());
+        if time.is_some() || model.is_some() {
+            let mut spans = Vec::new();
+            spans.extend(time.map(|time| (time, Some(Role::MutedText))));
+            if let Some(model) = &model {
+                if !spans.is_empty() {
+                    spans.push((" ".to_owned(), None));
+                }
+                spans.push((model.clone(), Some(Role::MutedText)));
+            }
+            self.document.push(TranscriptPiece::RightAligned {
+                spans,
+                right_margin: if model.is_some() {
+                    MODEL_RIGHT_MARGIN
+                } else {
+                    0
+                },
+            });
+        }
+        self.document.push(TranscriptPiece::Markdown {
+            text: safe_text(text),
+            lead: format!("{} ", self.display.glyph(Glyph::Assistant)),
+        });
+        self.text("\n", None);
+    }
+
+    fn thinking(&mut self, text: &str, source: ThinkingSource) {
+        let heading = match source {
+            ThinkingSource::ModelText => "∴ Thinking…",
+            ThinkingSource::Summary => "∴ Thinking summary",
+        };
+        self.block();
+        self.text(heading, Some(Role::ThinkingHeading));
+        self.text("\n\n", None);
+        let mut body = String::new();
+        for line in markdown::plain_text(&safe_text(text)).lines() {
+            body.push_str(&" ".repeat(BLOCK_INDENT));
+            body.push_str(line);
+            body.push('\n');
+        }
+        self.hanging(body, Some(Role::MutedText), BLOCK_INDENT);
+    }
+
+    fn tool_call(&mut self, dot: Role, name: &str, arguments: &str) {
+        self.block();
+        self.hanging(
+            format!("{} ", self.display.glyph(Glyph::ToolCall)),
+            Some(dot),
+            BLOCK_INDENT,
+        );
+        self.hanging(tool_name(name), Some(Role::ToolName), BLOCK_INDENT);
+        if !arguments.is_empty() {
+            let continuation = format!("\n{}", " ".repeat(BLOCK_INDENT));
+            self.hanging(
+                format!("({})", arguments.replace('\n', &continuation)),
+                None,
+                BLOCK_INDENT,
+            );
+        }
+        self.text("\n", None);
+    }
+
+    /// Rows under a `⎿` connector, every row and its wrapped continuation indented to the
+    /// content, as Claude Code's `MessageResponse` lays a result out.
+    fn result(&mut self, lines: Vec<ResultLine>) {
+        for (index, line) in lines.into_iter().enumerate() {
+            let lead = if index == 0 {
+                format!("  {}  ", self.display.glyph(Glyph::ToolResult))
+            } else {
+                " ".repeat(RESULT_INDENT)
+            };
+            self.document.push(TranscriptPiece::Text {
+                text: lead,
+                role: Some(Role::MutedText),
+                fill: line.fill,
+                hang: RESULT_INDENT,
+                link: None,
+            });
+            for (text, role) in line.spans {
+                if role == Some(Role::Error) {
+                    self.linked(&text, role, RESULT_INDENT);
+                } else {
+                    self.document.push(TranscriptPiece::Text {
+                        text,
+                        role,
+                        fill: line.fill,
+                        hang: RESULT_INDENT,
+                        link: None,
+                    });
+                }
+            }
+            self.text("\n", None);
+        }
+    }
+}
+
+/// A call's arguments as the detailed transcript shows them: whole commands and absolute paths
+/// where Claude Code's verbose rendering shows them, otherwise every field.
+fn transcript_arguments(name: &str, input: &Value) -> String {
+    let field = |key: &str| input[key].as_str().map(safe_text).unwrap_or_default();
+    match name {
+        BASH_TOOL_NAME => field("command"),
+        READ_TOOL_NAME => {
+            let path = field("file_path");
+            match (input["offset"].as_u64(), input["limit"].as_u64()) {
+                (Some(offset), Some(limit)) => format!(
+                    "{path} · lines {offset}-{}",
+                    offset.saturating_add(limit).saturating_sub(1)
+                ),
+                (Some(offset), None) => format!("{path} · from line {offset}"),
+                (None, Some(limit)) => format!("{path} · lines 1-{limit}"),
+                (None, None) => path,
+            }
+        }
+        WRITE_TOOL_NAME | EDIT_TOOL_NAME => field("file_path"),
+        SUBAGENT_TOOL_NAME => field("description"),
+        _ => match input {
+            Value::Object(fields) => fields
+                .iter()
+                .map(|(key, value)| {
+                    format!(
+                        "{}: {}",
+                        safe_text(key),
+                        safe_text(&serde_json::to_string(value).unwrap_or_default())
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
+            Value::Null => String::new(),
+            other => safe_text(&other.to_string()),
+        },
+    }
+}
+
+/// A result in full: no line limit and no expansion hint.
+fn transcript_result_lines(
+    name: &str,
+    input: Option<&Value>,
+    content: &str,
+    is_error: bool,
+    elapsed_ms: Option<u64>,
+) -> Vec<ResultLine> {
+    let value = serde_json::from_str::<Value>(content).ok();
+    if name == SUBAGENT_TOOL_NAME
+        && let Some(value) = &value
+    {
+        return subagent_result_lines(input, value, elapsed_ms);
+    }
+    if is_error {
+        let text = safe_text(content);
+        let text = if text.trim_start().to_lowercase().starts_with("error") {
+            text
+        } else {
+            format!("Error: {text}")
+        };
+        return text_lines(&text, Some(Role::Error));
+    }
+    let input = input.unwrap_or(&Value::Null);
+    match name {
+        READ_TOOL_NAME
+            if let Some(media_type) = value
+                .as_ref()
+                .and_then(|value| value["media_type"].as_str()) =>
+        {
+            let value = value.as_ref().unwrap();
+            return vec![ResultLine::new(
+                format!(
+                    "Read image · {} · {}×{} · {} bytes",
+                    safe_text(media_type),
+                    value["width"],
+                    value["height"],
+                    value["total_bytes"]
+                ),
+                None,
+            )];
+        }
+        READ_TOOL_NAME if !content.starts_with("<system-reminder>") => {
+            return vec![ResultLine {
+                spans: vec![
+                    ("Read ".into(), None),
+                    (content.lines().count().to_string(), Some(Role::Strong)),
+                    (" lines".into(), None),
+                ],
+                fill: None,
+            }];
+        }
+        WRITE_TOOL_NAME => return written_lines(input, "content"),
+        EDIT_TOOL_NAME if input["old_string"] == "" => return written_lines(input, "new_string"),
+        EDIT_TOOL_NAME => {
+            let removed = input["old_string"].as_str().unwrap_or_default();
+            let added = input["new_string"].as_str().unwrap_or_default();
+            let count = |text: &str, word: &str| {
+                let lines = text.lines().count();
+                format!("{lines} {word}{}", if lines == 1 { "" } else { "s" })
+            };
+            let mut lines = vec![ResultLine::new(
+                format!(
+                    "Updated {} with {} and {}",
+                    safe_text(input["file_path"].as_str().unwrap_or_default()),
+                    count(added, "addition"),
+                    count(removed, "removal")
+                ),
+                None,
+            )];
+            lines.extend(
+                safe_text(removed)
+                    .lines()
+                    .map(|line| ResultLine::filled(format!("- {line}"), Role::DiffRemoved)),
+            );
+            lines.extend(
+                safe_text(added)
+                    .lines()
+                    .map(|line| ResultLine::filled(format!("+ {line}"), Role::DiffAdded)),
+            );
+            return lines;
+        }
+        _ => {}
+    }
+    let text = match &value {
+        Some(Value::Object(fields)) => ["output", "text", "answer"]
+            .iter()
+            .find_map(|key| fields.get(*key).and_then(Value::as_str))
+            .map(safe_text)
+            .unwrap_or_else(|| display_value(value.as_ref().unwrap())),
+        Some(Value::String(text)) => safe_text(text),
+        _ => safe_text(content),
+    };
+    if text.trim().is_empty() {
+        return vec![ResultLine::new(NO_OUTPUT, Some(Role::MutedText))];
+    }
+    text_lines(&text, None)
+}
+
+fn written_lines(input: &Value, key: &str) -> Vec<ResultLine> {
+    let content = safe_text(input[key].as_str().unwrap_or_default());
+    let count = content.lines().count();
+    let mut lines = vec![ResultLine::new(
+        format!(
+            "Wrote {count} {} to {}",
+            if count == 1 { "line" } else { "lines" },
+            safe_text(input["file_path"].as_str().unwrap_or_default())
+        ),
+        None,
+    )];
+    lines.extend(text_lines(&content, None));
+    lines
+}
+
+/// Claude Code's expanded Agent result: the prompt, the response and how the run ended.
+fn subagent_result_lines(
+    input: Option<&Value>,
+    value: &Value,
+    elapsed_ms: Option<u64>,
+) -> Vec<ResultLine> {
+    let status = value["status"].as_str();
+    if status == Some("async_launched") {
+        return vec![ResultLine::new("Backgrounded agent", Some(Role::MutedText))];
+    }
+    let indented = |text: &str| {
+        safe_text(text)
+            .lines()
+            .map(|line| ResultLine::new(format!("{}{line}", " ".repeat(BLOCK_INDENT)), None))
+            .collect::<Vec<_>>()
+    };
+    let mut lines = Vec::new();
+    if let Some(prompt) = input
+        .and_then(|input| input["task"].as_str())
+        .filter(|prompt| !prompt.is_empty())
+    {
+        lines.push(ResultLine::new("Prompt:", Some(Role::AgentSection)));
+        lines.extend(indented(prompt));
+    }
+    if let Some(response) = value["result"]
+        .as_str()
+        .filter(|response| !response.is_empty())
+    {
+        lines.push(ResultLine::new("Response:", Some(Role::AgentSection)));
+        lines.extend(indented(response));
+    }
+    if status == Some("completed") {
+        let tokens = ["input_tokens", "output_tokens"]
+            .iter()
+            .filter_map(|key| value["usage"][*key].as_u64())
+            .sum::<u64>();
+        let details = [
+            (tokens > 0).then(|| format!("{} tokens", compact_count(tokens))),
+            elapsed_ms.map(compact_duration),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        lines.push(ResultLine::new(
+            if details.is_empty() {
+                "Done".to_owned()
+            } else {
+                format!("Done ({})", details.join(" · "))
+            },
+            None,
+        ));
+    } else {
+        let label = match status {
+            Some("interrupted") => "Interrupted",
+            Some("stopped") => "Stopped",
+            _ => "Failed",
+        };
+        let error = value["error"].as_str().unwrap_or_default();
+        lines.extend(text_lines(
+            &if error.is_empty() {
+                label.to_owned()
+            } else {
+                format!("{label}: {}", safe_text(error))
+            },
+            Some(Role::Error),
+        ));
+    }
+    lines
+}
+
+/// Claude Code's `formatNumber`: `950`, `12.3k`, `1.2m`.
+pub(super) fn compact_count(count: u64) -> String {
+    let scaled = |value: f64, suffix: &str| {
+        let text = format!("{value:.1}");
+        format!("{}{suffix}", text.strip_suffix(".0").unwrap_or(&text))
+    };
+    match count {
+        0..1_000 => count.to_string(),
+        1_000..1_000_000 => scaled(count as f64 / 1_000.0, "k"),
+        _ => scaled(count as f64 / 1_000_000.0, "m"),
+    }
+}
+
+/// Claude Code's `formatDuration`: `45s`, `1m 3s`, `2h 5m 0s`.
+fn compact_duration(milliseconds: u64) -> String {
+    let seconds = milliseconds / 1_000;
+    let (hours, minutes, seconds) = (seconds / 3_600, seconds % 3_600 / 60, seconds % 60);
+    if hours > 0 {
+        format!("{hours}h {minutes}m {seconds}s")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+/// `03:45 PM` in local time, as Claude Code stamps a reply.
+fn local_clock_time(milliseconds: u64) -> Option<String> {
+    let timestamp = libc::time_t::try_from(milliseconds / 1_000).ok()?;
+    let mut local = std::mem::MaybeUninit::<libc::tm>::uninit();
+    // localtime_r initializes the output only when its return pointer is non-null.
+    if unsafe { libc::localtime_r(&timestamp, local.as_mut_ptr()) }.is_null() {
+        return None;
+    }
+    let local = unsafe { local.assume_init() };
+    Some(twelve_hour_time(
+        u32::try_from(local.tm_hour).ok()?,
+        u32::try_from(local.tm_min).ok()?,
+    ))
+}
+
+fn twelve_hour_time(hour: u32, minute: u32) -> String {
+    let (hour, period) = match hour {
+        0 => (12, "AM"),
+        1..=11 => (hour, "AM"),
+        12 => (12, "PM"),
+        _ => (hour - 12, "PM"),
+    };
+    format!("{hour:02}:{minute:02} {period}")
 }
 
 pub(super) struct ToolPresentation {
@@ -358,15 +864,22 @@ pub(super) struct ToolPresentation {
 }
 
 impl ToolPresentation {
+    /// Shows `event` in the conversation: a call's row as it is queued, runs and ends, and its
+    /// result under the row. `review` is the recorded change of an edit the event completes.
     pub(super) fn present_event(
         &mut self,
         console: &Console,
         event: &Event,
+        review: Option<&FileChangeReview>,
     ) -> Result<bool, String> {
         self.record(event);
+        let display = console.display_profile()?;
+        let cwd = console.working_directory()?;
         match &event.kind {
-            EventKind::ToolCompleted { call_id, .. } => console
-                .finish_tool_call(event.run_id, Some(&tool_call_key(event.run_id, call_id)))?,
+            EventKind::ToolCompleted { call_id, result } => console.finish_tool_call(
+                event.run_id,
+                Some((&tool_call_key(event.run_id, call_id), result.is_error)),
+            )?,
             EventKind::Completed { .. } | EventKind::Failed(_) | EventKind::Interrupted => {
                 console.finish_tool_call(event.run_id, None)?
             }
@@ -380,14 +893,15 @@ impl ToolPresentation {
                     console.for_message(Some(key.clone())).write_tool_call(
                         event.run_id,
                         &key,
-                        &tool_call_roles(&call.name, &call.input, console.display_profile()?),
+                        &tool_call_roles(&call.name, &call.input, &cwd, display),
                         ToolCallState::Queued,
+                        self.collapse(&call.name, &call.input),
                     )?;
                 }
             }
             _ => {}
         }
-        let Some(rendered) = self.render_event_roles(event, console.display_profile()?) else {
+        let Some(rendered) = self.render_event_roles(event, display, &cwd, review) else {
             return Ok(false);
         };
         match &event.kind {
@@ -399,8 +913,9 @@ impl ToolPresentation {
                 console.write_tool_call(
                     event.run_id,
                     &tool_call_key(event.run_id, call_id),
-                    &tool_call_roles(name, input, console.display_profile()?),
+                    &tool_call_roles(name, input, &cwd, display),
                     ToolCallState::Running,
+                    self.collapse(name, input),
                 )?;
                 if self.is_detailed() {
                     console.write(&format!(
@@ -412,9 +927,61 @@ impl ToolPresentation {
                     ))?;
                 }
             }
+            EventKind::ToolCompleted { call_id, result } if !self.detailed => {
+                let key = tool_call_key(event.run_id, call_id);
+                // A model-only call shows no row of its own until it fails.
+                if let (name, Some(input)) = self.started_call(event, call_id)
+                    && result.is_error
+                    && is_model_only_tool(name)
+                    && console.is_interactive()
+                {
+                    console.write_tool_call(
+                        event.run_id,
+                        &key,
+                        &tool_call_roles(name, input, &cwd, display),
+                        ToolCallState::Failed,
+                        None,
+                    )?;
+                }
+                console.write_tool_result(&key, &rendered)?
+            }
             _ => console.write_roles(&rendered)?,
         }
         Ok(true)
+    }
+
+    /// How a call joins a collapsed group; detailed output shows every call on its own.
+    fn collapse(&self, name: &str, input: &Value) -> Option<CollapsedCall> {
+        (!self.detailed)
+            .then(|| collapsed_call(name, input))
+            .flatten()
+    }
+
+    /// Whether the latest result of `run` reports that the user declined the call, so the run's
+    /// interruption needs no line of its own.
+    pub(super) fn ended_with_rejection(&self, run: Uuid) -> bool {
+        self.events
+            .iter()
+            .rev()
+            .find_map(|event| match &event.kind {
+                EventKind::ToolCompleted { result, .. } if event.run_id == run => {
+                    Some(is_rejection(result))
+                }
+                _ => None,
+            })
+            .unwrap_or(false)
+    }
+
+    /// The call an edit result of `event` completes, whose recorded change its diff shows.
+    pub(super) fn completed_edit<'a>(&self, event: &'a Event) -> Option<&'a str> {
+        match &event.kind {
+            EventKind::ToolCompleted { call_id, result }
+                if !result.is_error && self.started_call(event, call_id).0 == EDIT_TOOL_NAME =>
+            {
+                Some(call_id)
+            }
+            _ => None,
+        }
     }
 
     pub(super) fn new(detailed: bool) -> Self {
@@ -469,42 +1036,22 @@ impl ToolPresentation {
             };
             return detailed_event(event, name);
         }
+        // A background command's end reaches the conversation as its task notification.
         match &event.kind {
             EventKind::ToolStarted { name, input, .. } => {
-                let summary = tool_summary(name, input);
+                let summary = tool_summary(name, input, Path::new(""));
                 Some(format!("\n● {}{summary}\n", tool_name(name)))
             }
             EventKind::ToolCompleted { call_id, result } => {
                 let (name, input) = self.started_call(event, call_id);
-                Some(compact_result(name, input, result))
-            }
-            EventKind::CommandUpdated { command } => {
-                // The Bash result already reports a foreground command's outcome and the start of
-                // a background one; only what happens to a background command afterwards is new.
-                if !command.was_background
-                    || matches!(
-                        command.state,
-                        CommandState::Running | CommandState::Background
-                    )
-                {
-                    return Some(String::new());
-                }
-                let mut text = format!(
-                    "\n  ↳ Shell · {:?}{} · {}\n",
-                    command.state,
-                    command_status(command.exit_code, command.signal),
-                    clipped(&command.command, TOOL_SUMMARY_CHARACTERS).0,
-                );
-                if let Some(reason) = &command.reason {
-                    text.push_str(&format!("  Reason: {}\n", safe_text(reason)));
-                }
-                if command.output_bytes > 0 {
-                    text.push_str(&format!(
-                        "  {} output bytes · Ctrl+O for details\n",
-                        command.output_bytes
-                    ));
-                }
-                Some(text)
+                Some(joined(&compact_result_runs(
+                    name,
+                    input,
+                    result,
+                    "↳",
+                    Path::new(""),
+                    None,
+                )))
             }
             _ => None,
         }
@@ -517,6 +1064,8 @@ impl ToolPresentation {
         &self,
         event: &Event,
         display: DisplayProfile,
+        cwd: &Path,
+        review: Option<&FileChangeReview>,
     ) -> Option<Vec<(String, Option<Role>)>> {
         if matches!(&event.kind, EventKind::ToolStarted { name, .. } if is_model_only_tool(name))
             || matches!(&event.kind, EventKind::ToolCompleted { call_id, result } if !result.is_error && is_model_only_tool(self.started_call(event, call_id).0))
@@ -528,19 +1077,22 @@ impl ToolPresentation {
                 .render_event(event)
                 .map(|rendered| vec![(rendered, None)]);
         }
-        let rendered = match &event.kind {
+        Some(match &event.kind {
+            EventKind::ToolStarted { name, input, .. } => {
+                tool_call_roles(name, input, cwd, display)
+            }
             EventKind::ToolCompleted { call_id, result } => {
                 let (name, input) = self.started_call(event, call_id);
-                compact_result_with_prefix(name, input, result, display.glyph(Glyph::ToolResult))
+                compact_result_runs(
+                    name,
+                    input,
+                    result,
+                    display.glyph(Glyph::ToolResult),
+                    cwd,
+                    review,
+                )
             }
-            _ => self.render_event(event)?,
-        };
-        Some(match &event.kind {
-            EventKind::ToolStarted { name, input, .. } => tool_call_roles(name, input, display),
-            EventKind::ToolCompleted { result, .. } if result.is_error => {
-                vec![(rendered, Some(Role::Error))]
-            }
-            _ => vec![(rendered, Some(Role::MutedText))],
+            _ => vec![(self.render_event(event)?, Some(Role::MutedText))],
         })
     }
 
@@ -574,10 +1126,10 @@ impl ToolPresentation {
     pub(super) fn toggle(&mut self) -> String {
         self.detailed = !self.detailed;
         if !self.detailed {
-            return "\nCompact tool output enabled. Ctrl+O shows details.\n".into();
+            return "\nCompact tool output enabled. ctrl+o shows details.\n".into();
         }
         let mut text =
-            "\nDetailed tool output enabled. Ctrl+O returns to compact output.\n".to_owned();
+            "\nDetailed tool output enabled. ctrl+o returns to compact output.\n".to_owned();
         if self.events.is_empty() {
             text.push_str("No tool activity in this view yet.\n");
         }
@@ -597,6 +1149,7 @@ pub(super) fn tool_call_key(run: Uuid, call_id: &str) -> String {
 pub(super) fn tool_call_roles(
     name: &str,
     input: &Value,
+    cwd: &Path,
     display: DisplayProfile,
 ) -> Vec<(String, Option<Role>)> {
     vec![
@@ -606,9 +1159,45 @@ pub(super) fn tool_call_roles(
             Some(Role::MutedText),
         ),
         (super::safe_line(&tool_name(name)), Some(Role::ToolName)),
-        (super::safe_line(&tool_summary(name, input)), None),
+        (super::safe_line(&tool_summary(name, input, cwd)), None),
         ("\n".into(), None),
     ]
+}
+
+/// How a read or search call counts in a collapsed group; other calls show their own row.
+pub(super) fn collapsed_call(name: &str, input: &Value) -> Option<CollapsedCall> {
+    match name {
+        READ_TOOL_NAME => Some(CollapsedCall::Read {
+            path: input["file_path"].as_str().unwrap_or_default().to_owned(),
+        }),
+        "Glob" | "Grep" => Some(CollapsedCall::Search),
+        _ => None,
+    }
+}
+
+/// A path as the conversation names it: relative to the working directory when inside it.
+fn display_path(path: &str, cwd: &Path) -> String {
+    match Path::new(path).strip_prefix(cwd) {
+        Ok(relative) if relative.as_os_str().is_empty() => ".".into(),
+        Ok(relative) => relative.display().to_string(),
+        Err(_) => path.to_owned(),
+    }
+}
+
+/// The change an edit made, as the review recorded when the call was prepared.
+pub(super) fn file_change_review(
+    snapshot: &ChatSnapshot,
+    run: Uuid,
+    call_id: &str,
+) -> Option<FileChangeReview> {
+    let prepared = snapshot
+        .operations
+        .iter()
+        .rev()
+        .find(|operation| operation.run_id == run && operation.call_id == call_id)?
+        .file_change
+        .as_ref()?;
+    load_file_change_review(&prepared.artifact).ok()
 }
 
 pub(super) fn tool_call_states(snapshot: &ChatSnapshot) -> HashMap<(Uuid, String), ToolCallState> {
@@ -654,15 +1243,24 @@ pub(super) fn tool_call_states(snapshot: &ChatSnapshot) -> HashMap<(Uuid, String
                             ToolCallState::Finished
                         });
                 }
-                Content::ToolResult { tool_use_id, .. } => {
+                Content::ToolResult {
+                    tool_use_id,
+                    is_error,
+                    ..
+                } => {
+                    let finished = if *is_error {
+                        ToolCallState::Failed
+                    } else {
+                        ToolCallState::Finished
+                    };
                     states
                         .entry((run, tool_use_id.clone()))
                         .and_modify(|state| {
                             if *state != ToolCallState::Stopped {
-                                *state = ToolCallState::Finished;
+                                *state = finished;
                             }
                         })
-                        .or_insert(ToolCallState::Finished);
+                        .or_insert(finished);
                 }
                 _ => {}
             }
@@ -692,8 +1290,15 @@ pub(super) fn tool_call_states(snapshot: &ChatSnapshot) -> HashMap<(Uuid, String
             EventKind::ToolStarted { call_id, .. } => {
                 states.insert((event.run_id, call_id.clone()), ToolCallState::Running);
             }
-            EventKind::ToolCompleted { call_id, .. } => {
-                states.insert((event.run_id, call_id.clone()), ToolCallState::Finished);
+            EventKind::ToolCompleted { call_id, result } => {
+                states.insert(
+                    (event.run_id, call_id.clone()),
+                    if result.is_error {
+                        ToolCallState::Failed
+                    } else {
+                        ToolCallState::Finished
+                    },
+                );
             }
             EventKind::Completed { .. } | EventKind::Failed(_) | EventKind::Interrupted => {
                 for ((run, _), state) in &mut states {
@@ -849,7 +1454,7 @@ fn detailed_event(event: &Event, name: &str) -> Option<String> {
     }
 }
 
-fn tool_summary(name: &str, input: &Value) -> String {
+fn tool_summary(name: &str, input: &Value, cwd: &Path) -> String {
     let asked_questions;
     let primary = match name {
         SEND_AGENT_MESSAGE_TOOL_NAME => input["message"].as_str(),
@@ -880,10 +1485,16 @@ fn tool_summary(name: &str, input: &Value) -> String {
     let Some(primary) = primary else {
         return String::new();
     };
-    let summary = if matches!(name, "Glob" | "Grep") {
-        format!("{primary} in {}", input["path"].as_str().unwrap_or("."))
-    } else {
-        primary.to_owned()
+    let summary = match name {
+        "Glob" | "Grep" => format!(
+            "{primary} in {}",
+            input["path"]
+                .as_str()
+                .map_or_else(|| ".".into(), |path| display_path(path, cwd))
+        ),
+        "Read" | "Write" | "Edit" => display_path(primary, cwd),
+        _ if input["path"].as_str() == Some(primary) => display_path(primary, cwd),
+        _ => primary.to_owned(),
     };
     format!(
         " · {}",
@@ -891,12 +1502,17 @@ fn tool_summary(name: &str, input: &Value) -> String {
     )
 }
 
-pub(super) fn archived_tool_call(name: &str, input: &Value, display: DisplayProfile) -> String {
+pub(super) fn archived_tool_call(
+    name: &str,
+    input: &Value,
+    cwd: &Path,
+    display: DisplayProfile,
+) -> String {
     format!(
         "\n{} {}{}\n",
         display.glyph(Glyph::ToolCall),
         tool_name(name),
-        tool_summary(name, input)
+        tool_summary(name, input, cwd)
     )
 }
 
@@ -904,9 +1520,18 @@ pub(super) fn archived_tool_result(
     name: &str,
     input: Option<&Value>,
     result: &ToolResult,
+    cwd: &Path,
     display: DisplayProfile,
-) -> String {
-    compact_result_with_prefix(name, input, result, display.glyph(Glyph::ToolResult))
+    review: Option<&FileChangeReview>,
+) -> RoleRuns {
+    compact_result_runs(
+        name,
+        input,
+        result,
+        display.glyph(Glyph::ToolResult),
+        cwd,
+        review,
+    )
 }
 
 /// 本地消息的对话呈现，照 Claude Code：`!` 命令、`⎿` 输出块、中断标记与任务通知。
@@ -921,6 +1546,21 @@ pub(super) fn local_message_text(
     detail: OutputDetail,
     display: DisplayProfile,
 ) -> String {
+    let (heading, response) = local_message_runs(message, detail, display);
+    joined(&heading) + &joined(&response)
+}
+
+/// A local message as the conversation styles it, as Claude Code draws each kind: a `!` command
+/// in the shell colours, its output in the terminal's colour with errors in the error colour, a
+/// background task's `⏺` in its outcome's colour, and the rest muted. The heading comes first,
+/// then the `⎿` response rows under it.
+pub(super) fn local_message_runs(
+    message: &LocalMessage,
+    detail: OutputDetail,
+    display: DisplayProfile,
+) -> (RoleRuns, RoleRuns) {
+    let mut runs = RoleRuns::new();
+    let mut response = RoleRuns::new();
     match message {
         LocalMessage::AgentCommunication {
             sender_handle,
@@ -930,10 +1570,14 @@ pub(super) fn local_message_text(
             is_result,
         } => {
             if matches!(detail, OutputDetail::Preview) {
-                return format!(
-                    "\nMessage from @{} · Ctrl+O to expand\n",
-                    safe_text(sender_handle)
-                );
+                runs.push((
+                    format!(
+                        "\nMessage from @{} · ctrl+o to expand\n",
+                        safe_text(sender_handle)
+                    ),
+                    Some(Role::MutedText),
+                ));
+                return (runs, response);
             }
             let body = if *is_result {
                 serde_json::from_str::<Value>(message)
@@ -955,9 +1599,9 @@ pub(super) fn local_message_text(
             } else {
                 format!(" · {}", safe_text(sender_label))
             };
-            let mut text = format!("\nMessage from @{}{label}:\n", safe_text(sender_handle));
+            let mut heading = format!("\nMessage from @{}{label}:\n", safe_text(sender_handle));
             if let Some(relay) = relay {
-                text.push_str(&format!(
+                heading.push_str(&format!(
                     "Verified user relay · {}\n{}\n",
                     if relay.forwarded_verbatim {
                         "verbatim"
@@ -967,50 +1611,75 @@ pub(super) fn local_message_text(
                     safe_text(&relay.original_text)
                 ));
             }
-            append_response_block(&mut text, &body, detail, display);
-            text
+            runs.push((heading, Some(Role::MutedText)));
+            push_response_block(&mut response, &body, detail, display, None);
         }
-        LocalMessage::BashInput { command } => format!("\n! {}\n", safe_text(command)),
+        LocalMessage::BashInput { command } => {
+            runs.push(("\n".into(), None));
+            runs.push(("! ".into(), Some(Role::ShellBorder)));
+            runs.push((format!("{}\n", safe_text(command)), Some(Role::Text)));
+        }
         LocalMessage::BashOutput { stdout, stderr } => {
-            let mut text = String::new();
             if matches!(detail, OutputDetail::Preview) && background_launch_id(stdout).is_some() {
-                append_response_block(&mut text, BACKGROUND_RUNNING_STATUS, detail, display);
-                return text;
+                return (runs, backgrounded_shell_runs(display));
             }
-            for output in [stdout, stderr] {
-                append_response_block(&mut text, output.trim_end(), detail, display);
+            push_response_block(&mut response, stdout.trim_end(), detail, display, None);
+            push_response_block(
+                &mut response,
+                stderr.trim_end(),
+                detail,
+                display,
+                Some(Role::Error),
+            );
+            if response.is_empty() {
+                push_response_block(
+                    &mut response,
+                    NO_OUTPUT,
+                    detail,
+                    display,
+                    Some(Role::MutedText),
+                );
             }
-            if text.is_empty() {
-                append_response_block(&mut text, "(No output)", detail, display);
-            }
-            text
         }
-        LocalMessage::Interrupted { .. } => format!("{}\n", interrupted_notice(display)),
+        LocalMessage::Interrupted { .. } => response.push((
+            format!("{}\n", interrupted_notice(display)),
+            Some(Role::MutedText),
+        )),
         LocalMessage::TaskNotification {
+            status,
             summary,
             result,
             usage,
-            ..
         } => {
-            let mut text = format!(
-                "\n{} {}\n",
-                display.glyph(Glyph::ToolCall),
-                safe_text(summary)
-            );
+            runs.push(("\n".into(), None));
+            runs.push((
+                display.glyph(Glyph::ToolCall).into(),
+                Some(match status {
+                    Some(TaskNotificationStatus::Completed) => Role::Success,
+                    Some(TaskNotificationStatus::Failed) => Role::Error,
+                    Some(TaskNotificationStatus::Killed) => Role::Warning,
+                    None => Role::Text,
+                }),
+            ));
+            runs.push((format!(" {}\n", safe_text(summary)), None));
             if matches!(detail, OutputDetail::Full) {
                 if let Some(result) = result {
-                    append_response_block(&mut text, result, detail, display);
+                    push_response_block(&mut response, result, detail, display, None);
                 }
                 if let Some(usage) = usage {
-                    text.push_str(&format!("Usage{}\n", super::usage_text(usage)));
+                    response.push((
+                        format!("Usage{}\n", super::usage_text(usage)),
+                        Some(Role::MutedText),
+                    ));
                 }
             }
-            text
         }
-        LocalMessage::TickDelivery { items, truncated } => {
-            tick_delivery_text(items, *truncated, display)
-        }
+        LocalMessage::TickDelivery { items, truncated } => runs.push((
+            tick_delivery_text(items, *truncated, display),
+            Some(Role::MutedText),
+        )),
     }
+    (runs, response)
 }
 
 /// One line per Tick Instance in a delivery: the Tick Instance, the Tick Update sequence and how
@@ -1039,76 +1708,204 @@ pub(super) fn tick_delivery_text(
     text
 }
 
-pub(super) fn interrupted_notice(display: DisplayProfile) -> String {
-    format!(
-        "  {}  Interrupted · What should the Agent do instead?",
-        display.glyph(Glyph::ToolResult)
+/// A finished `!` command as the conversation keeps it: the same local message the Agent records
+/// from its record and `output`.
+pub(super) fn user_shell_result(record: &UserShellRecord, output: &str) -> LocalMessage {
+    if record.reason.as_deref() == Some(tickloop_agent_tools::CANCELLED_COMMAND_REASON) {
+        return LocalMessage::Interrupted {
+            during_tool_use: false,
+        };
+    }
+    let output = output.trim_end().to_owned();
+    if record.state == UserShellState::Completed {
+        return LocalMessage::BashOutput {
+            stdout: output,
+            stderr: String::new(),
+        };
+    }
+    let failure = match (record.exit_code, &record.reason) {
+        (Some(code), _) => Some(format!("Exit code {code}")),
+        (None, Some(reason)) => Some(reason.clone()),
+        (None, None) => record.signal.map(|signal| format!("Signal {signal}")),
+    };
+    let stderr = [Some(output), failure]
+        .into_iter()
+        .flatten()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    LocalMessage::BashOutput {
+        stdout: String::new(),
+        stderr,
+    }
+}
+
+/// A running `!` command's latest output lines under a `⎿`, as Claude Code's shell progress
+/// shows them, or that it is running before it prints anything.
+pub(super) fn running_shell_runs(output: &str, display: DisplayProfile) -> RoleRuns {
+    let mut rows = ResponseRows::new(display.glyph(Glyph::ToolResult));
+    let output = safe_text(output);
+    let lines = output.lines().collect::<Vec<_>>();
+    if lines.is_empty() {
+        rows.row([("Running…".into(), Some(Role::MutedText))]);
+    }
+    for line in &lines[lines.len().saturating_sub(PREVIEW_LINES)..] {
+        rows.row([(clipped(line, PREVIEW_LINE_CHARACTERS).0, None)]);
+    }
+    rows.runs
+}
+
+/// The label a finished thinking block leaves in the conversation; Ctrl+O shows the thinking.
+pub(super) fn thinking_label() -> super::console::ConversationPiece {
+    super::console::ConversationPiece::Aside(
+        "∴ Thinking (ctrl+o to expand)\n".into(),
+        Some(Role::ThinkingHeading),
     )
 }
 
-fn append_response_block(
-    output: &mut String,
+pub(super) fn interrupted_notice(display: DisplayProfile) -> String {
+    format!("  {}  {INTERRUPTED}", display.glyph(Glyph::ToolResult))
+}
+
+/// Rows under a `⎿` connector as Claude Code's `MessageResponse` lays them out: the first row
+/// behind the muted connector, every later row under the first one's content.
+struct ResponseRows<'a> {
+    runs: RoleRuns,
+    glyph: &'a str,
+}
+
+impl<'a> ResponseRows<'a> {
+    fn new(glyph: &'a str) -> Self {
+        Self {
+            runs: RoleRuns::new(),
+            glyph,
+        }
+    }
+
+    fn row(&mut self, spans: impl IntoIterator<Item = (String, Option<Role>)>) {
+        if self.runs.is_empty() {
+            push_connector(&mut self.runs, self.glyph);
+        } else {
+            self.runs.push((RESPONSE_CONTINUATION.into(), None));
+        }
+        self.runs.extend(spans);
+        self.runs.push(("\n".into(), None));
+    }
+
+    /// One row per line of `text`.
+    fn lines(&mut self, text: &str, role: Option<Role>) {
+        for line in text.lines() {
+            self.row([(line.to_owned(), role)]);
+        }
+    }
+
+    /// The first lines of `content`, each cut to a preview's width, then the details hint when
+    /// anything was left out.
+    fn preview(&mut self, content: &str, source_truncated: bool, body: Option<Role>) {
+        let sanitized = safe_text(content);
+        let mut lines = sanitized.lines();
+        let mut truncated = source_truncated;
+        for line in lines.by_ref().take(PREVIEW_LINES) {
+            let (preview, clipped) = clipped(line, PREVIEW_LINE_CHARACTERS);
+            self.row([(preview, body)]);
+            truncated |= clipped;
+        }
+        truncated |= lines.next().is_some();
+        if truncated {
+            self.row([(DETAILS_HINT.into(), Some(Role::MutedText))]);
+        }
+    }
+}
+
+/// A `⎿` block as Claude Code's `MessageResponse` draws it: the connector and the hint muted,
+/// the content in `body`'s role.
+fn push_response_block(
+    runs: &mut RoleRuns,
     content: &str,
     detail: OutputDetail,
     display: DisplayProfile,
+    body: Option<Role>,
 ) {
     if content.is_empty() {
         return;
     }
-    let sanitized = safe_text(content);
-    let line_limit = match detail {
-        OutputDetail::Preview => PREVIEW_LINES,
-        OutputDetail::Full => usize::MAX,
-    };
-    let mut lines = sanitized.lines();
-    for (index, line) in lines.by_ref().take(line_limit).enumerate() {
-        let prefix = if index == 0 {
-            format!("  {}  ", display.glyph(Glyph::ToolResult))
-        } else {
-            RESPONSE_CONTINUATION.into()
-        };
-        let line = match detail {
-            OutputDetail::Preview => clipped(line, PREVIEW_LINE_CHARACTERS).0,
-            OutputDetail::Full => line.to_owned(),
-        };
-        output.push_str(&format!("{prefix}{line}\n"));
+    let mut rows = ResponseRows::new(display.glyph(Glyph::ToolResult));
+    match detail {
+        OutputDetail::Preview => rows.preview(content, false, body),
+        OutputDetail::Full => rows.lines(&safe_text(content), body),
     }
-    if lines.next().is_some() {
-        output.push_str(&format!("{RESPONSE_CONTINUATION}… Ctrl+O for details\n"));
-    }
+    runs.extend(rows.runs);
 }
 
+/// `  ⎿  ` with the connector muted, as Claude Code dims it.
+fn push_connector(runs: &mut RoleRuns, glyph: &str) {
+    runs.push(("  ".into(), None));
+    runs.push((glyph.into(), Some(Role::MutedText)));
+    runs.push(("  ".into(), None));
+}
+
+/// Whether a failed result only reports that the user declined the call.
+pub(super) fn is_rejection(result: &ToolResult) -> bool {
+    result.is_error
+        && REJECTION_PREFIXES
+            .iter()
+            .any(|prefix| result.content.starts_with(prefix))
+}
+
+#[cfg(test)]
 fn compact_result(name: &str, input: Option<&Value>, result: &ToolResult) -> String {
-    compact_result_with_prefix(name, input, result, "↳")
+    joined(&compact_result_runs(
+        name,
+        input,
+        result,
+        "↳",
+        Path::new(""),
+        None,
+    ))
 }
 
-fn compact_result_with_prefix(
+/// A tool result as the conversation shows it, under a `⎿` connector: a declined call as one
+/// muted line, a command's output from its first row, a file change as its summary and lines,
+/// and any other result as its status and details. Failures take the error colour.
+fn compact_result_runs(
     name: &str,
     input: Option<&Value>,
     result: &ToolResult,
-    prefix: &str,
-) -> String {
+    glyph: &str,
+    cwd: &Path,
+    review: Option<&FileChangeReview>,
+) -> RoleRuns {
+    let mut rows = ResponseRows::new(glyph);
+    let failure = |failed: bool| if failed { Role::Error } else { Role::MutedText };
+    let body = result.is_error.then_some(Role::Error);
+    if is_rejection(result) {
+        match input.and_then(|input| rejected_file_change(name, input, cwd)) {
+            Some((operation, path)) => rows.row([
+                (
+                    format!("User rejected {operation} to "),
+                    Some(Role::MutedText),
+                ),
+                (path, Some(Role::MutedStrong)),
+            ]),
+            None => rows.row([(INTERRUPTED.into(), Some(Role::MutedText))]),
+        }
+        return rows.runs;
+    }
     if !result.is_error
         && let Some(input) = input
-        && let Some(change) = file_change_summary(name, input)
+        && let Some(change) = file_change_runs(name, input, glyph, cwd, review)
     {
-        let mut text = format!("  {prefix} {} · Completed · {change}\n", tool_name(name));
-        if let Some(path) = input["file_path"].as_str() {
-            text.push_str(&format!("  {}\n", clipped(path, PREVIEW_LINE_CHARACTERS).0));
-        }
-        return text;
+        return change;
     }
     if name == BASH_TOOL_NAME {
-        let status = tool_result_status(name, result);
-        let mut text = format!("  {prefix} {} · {status}\n", tool_name(name));
-        if status == BACKGROUND_RUNNING_STATUS {
-            if let Some(command) = input.and_then(|input| input["command"].as_str()) {
-                text.push_str(&format!("  {}\n", background_shell_line(command)));
-            }
-            return text;
+        if tool_result_status(name, result) == BACKGROUND_RUNNING_STATUS {
+            rows.row([(BACKGROUND_RUNNING_STATUS.into(), Some(Role::MutedText))]);
+        } else if result.content.trim().is_empty() {
+            rows.row([(NO_OUTPUT.into(), Some(Role::MutedText))]);
+        } else {
+            rows.preview(&result.content, false, body);
         }
-        append_preview(&mut text, &result.content, false);
-        return text;
+        return rows.runs;
     }
     let value = serde_json::from_str::<Value>(&result.content).ok();
     if matches!(name, SUBAGENT_TOOL_NAME | SEND_AGENT_MESSAGE_TOOL_NAME)
@@ -1122,7 +1919,10 @@ fn compact_result_with_prefix(
             Some("interrupted") => "Child interrupted",
             other => other.unwrap_or("Completed"),
         };
-        let mut text = format!("  {prefix} {} · {status}\n", tool_name(name));
+        rows.row([(
+            safe_text(status),
+            Some(failure(result.is_error || value["status"] == "failed")),
+        )]);
         if name == SEND_AGENT_MESSAGE_TOOL_NAME
             && let Some(label) = value["target_label"].as_str()
         {
@@ -1131,18 +1931,21 @@ fn compact_result_with_prefix(
             } else {
                 "Child Agent"
             };
-            text.push_str(&format!(
-                "  {relationship} · {}\n",
-                clipped(label, PREVIEW_LINE_CHARACTERS).0
-            ));
+            rows.row([(
+                format!(
+                    "{relationship} · {}",
+                    clipped(label, PREVIEW_LINE_CHARACTERS).0
+                ),
+                Some(Role::MutedText),
+            )]);
         }
         if let Some(body) = value["result"].as_str().filter(|body| !body.is_empty()) {
-            append_preview(&mut text, body, false);
+            rows.preview(body, false, None);
         }
         if let Some(error) = value["error"].as_str().filter(|error| !error.is_empty()) {
-            append_preview(&mut text, error, false);
+            rows.preview(error, false, Some(Role::Error));
         }
-        return text;
+        return rows.runs;
     }
     let state = value
         .as_ref()
@@ -1158,7 +1961,7 @@ fn compact_result_with_prefix(
     } else {
         "Completed"
     });
-    let mut text = format!("  {prefix} {} · {}", tool_name(name), safe_text(status));
+    let mut text = safe_text(status);
     if let Some(value) = &value {
         text.push_str(&command_status(
             value["exit_code"]
@@ -1178,7 +1981,7 @@ fn compact_result_with_prefix(
             text.push_str(&format!(" · {bytes} bytes"));
         }
     }
-    text.push('\n');
+    rows.row([(text, Some(failure(result.is_error || status == "Failed")))]);
     let mut has_reason = false;
     if let Some(value) = &value {
         for key in ["reason", "error", "message"] {
@@ -1186,7 +1989,7 @@ fn compact_result_with_prefix(
                 continue;
             }
             if let Some(reason) = value.get(key).filter(|reason| !reason.is_null()) {
-                text.push_str(&format!("  Reason: {}\n", display_value(reason)));
+                rows.lines(&format!("Reason: {}", display_value(reason)), body);
                 has_reason = true;
             }
         }
@@ -1198,33 +2001,39 @@ fn compact_result_with_prefix(
             _ => None,
         };
         if let Some(reason) = reason {
-            text.push_str(&format!("  Reason: {}\n", safe_text(reason)));
+            rows.lines(&format!("Reason: {}", safe_text(reason)), body);
         }
     }
     if let Some(value) = &value {
         if let Some(source) = value["source"].as_str() {
-            text.push_str(&format!(
-                "  {}\n",
-                clipped(source, PREVIEW_LINE_CHARACTERS).0
-            ));
+            rows.row([(clipped(source, PREVIEW_LINE_CHARACTERS).0, None)]);
         }
         let preview = value["output"]
             .as_str()
             .or_else(|| value["text"].as_str())
             .or_else(|| value["answer"].as_str());
         if let Some(preview) = preview {
-            append_preview(
-                &mut text,
-                preview,
-                value["truncated"].as_bool() == Some(true),
-            );
+            rows.preview(preview, value["truncated"].as_bool() == Some(true), body);
         } else if value["truncated"].as_bool() == Some(true) {
-            text.push_str("  … Ctrl+O for details\n");
+            rows.row([(DETAILS_HINT.into(), Some(Role::MutedText))]);
         }
     } else if !result.is_error {
-        append_preview(&mut text, &result.content, false);
+        rows.preview(&result.content, false, None);
     }
-    text
+    rows.runs
+}
+
+/// What a declined file change would have done, as Claude Code's
+/// `FileEditToolUseRejectedMessage` names it, and the path it names.
+fn rejected_file_change(name: &str, input: &Value, cwd: &Path) -> Option<(&'static str, String)> {
+    let operation = match name {
+        WRITE_TOOL_NAME => "write",
+        EDIT_TOOL_NAME if input["old_string"] == "" => "write",
+        EDIT_TOOL_NAME => "update",
+        _ => return None,
+    };
+    let path = display_path(input["file_path"].as_str()?, cwd);
+    Some((operation, super::safe_line(&path)))
 }
 
 fn background_launch_id(content: &str) -> Option<Uuid> {
@@ -1248,34 +2057,17 @@ fn tool_result_status(name: &str, result: &ToolResult) -> &'static str {
     }
 }
 
-pub(super) fn background_shell_line(command: &str) -> String {
-    format!(
-        "{} · running in background",
-        clipped(&command.replace('\n', " ↵ "), TOOL_SUMMARY_CHARACTERS).0
-    )
-}
-
-/// What a successful `Write` or `Edit` changed, told from its input: Claude Code's result text
-/// names only the file. An `Edit` without `replace_all` matched exactly one occurrence.
-fn file_change_summary(name: &str, input: &Value) -> Option<String> {
-    let written_lines = |text: &str| {
-        let count = text.lines().count();
-        format!(
-            "{count} {} written",
-            if count == 1 { "line" } else { "lines" }
-        )
-    };
-    match name {
-        WRITE_TOOL_NAME => input["content"].as_str().map(written_lines),
-        EDIT_TOOL_NAME if input["old_string"] == "" => {
-            input["new_string"].as_str().map(written_lines)
-        }
-        EDIT_TOOL_NAME if input["replace_all"] == true || input["replace_all"] == "true" => {
-            Some("all occurrences replaced".into())
-        }
-        EDIT_TOOL_NAME => Some("1 occurrence replaced".into()),
-        _ => None,
-    }
+/// A `!` command moved to the background, as its saved output reads once it gets there.
+pub(super) fn backgrounded_shell_runs(display: DisplayProfile) -> RoleRuns {
+    let mut response = RoleRuns::new();
+    push_response_block(
+        &mut response,
+        BACKGROUND_RUNNING_STATUS,
+        OutputDetail::Preview,
+        display,
+        Some(Role::MutedText),
+    );
+    response
 }
 
 fn command_status(exit_code: Option<i32>, signal: Option<i32>) -> String {
@@ -1289,19 +2081,307 @@ fn command_status(exit_code: Option<i32>, signal: Option<i32>) -> String {
     status
 }
 
-fn append_preview(output: &mut String, content: &str, source_truncated: bool) {
-    let sanitized = safe_text(content);
-    let mut lines = sanitized.lines();
-    let mut truncated = source_truncated;
-    for line in lines.by_ref().take(PREVIEW_LINES) {
-        let (preview, clipped) = clipped(line, PREVIEW_LINE_CHARACTERS);
-        output.push_str(&format!("  {preview}\n"));
-        truncated |= clipped;
+/// A successful `Write` or `Edit` as Claude Code shows it: `Wrote N lines to path` over the first
+/// lines of the file, or `Added N lines, removed M lines` over the change as a coloured diff
+/// numbered with the file's lines from the edit's recorded review. Without the review the diff
+/// comes from the call's own strings and carries no line numbers.
+fn file_change_runs(
+    name: &str,
+    input: &Value,
+    glyph: &str,
+    cwd: &Path,
+    review: Option<&FileChangeReview>,
+) -> Option<RoleRuns> {
+    let path = super::safe_line(&display_path(input["file_path"].as_str()?, cwd));
+    match name {
+        WRITE_TOOL_NAME => Some(written_runs(&path, input["content"].as_str()?, glyph)),
+        EDIT_TOOL_NAME => {
+            let (old, new) = (input["old_string"].as_str()?, input["new_string"].as_str()?);
+            if old.is_empty() {
+                return Some(written_runs(&path, new, glyph));
+            }
+            let replace_all = input["replace_all"] == true || input["replace_all"] == "true";
+            let rows = match review {
+                Some(review) => review_diff_rows(review),
+                None => string_diff_rows(old, new),
+            };
+            Some(diff_runs(rows, replace_all, glyph))
+        }
+        _ => None,
     }
-    truncated |= lines.next().is_some();
-    if truncated {
-        output.push_str("  … Ctrl+O for details\n");
+}
+
+fn plural(count: usize, word: &str) -> String {
+    if count == 1 {
+        word.to_owned()
+    } else {
+        format!("{word}s")
     }
+}
+
+fn written_runs(path: &str, content: &str, glyph: &str) -> RoleRuns {
+    let count = content.lines().count();
+    let mut rows = ResponseRows::new(glyph);
+    rows.row([
+        ("Wrote ".into(), None),
+        (count.to_string(), Some(Role::Strong)),
+        (format!(" {} to ", plural(count, "line")), None),
+        (path.to_owned(), Some(Role::Strong)),
+    ]);
+    for line in code_lines(path, content)
+        .into_iter()
+        .take(WRITE_PREVIEW_LINES)
+    {
+        rows.row(clipped_runs(line, PREVIEW_LINE_CHARACTERS));
+    }
+    if count > WRITE_PREVIEW_LINES {
+        rows.row([(
+            format!(
+                "… +{} {} · ctrl+o for details",
+                count - WRITE_PREVIEW_LINES,
+                plural(count - WRITE_PREVIEW_LINES, "line")
+            ),
+            Some(Role::MutedText),
+        )]);
+    }
+    rows.runs
+}
+
+/// `content` as runs per line, coloured as code when the file type of `path` is known.
+fn code_lines(path: &str, content: &str) -> Vec<RoleRuns> {
+    match tickloop_ui::highlight::highlight_path(path, content) {
+        Some(lines) => lines
+            .iter()
+            .map(|line| {
+                line.iter()
+                    .map(|(text, token)| (safe_text(text), token.map(Role::code)))
+                    .collect()
+            })
+            .collect(),
+        None => content
+            .lines()
+            .map(|line| vec![(safe_text(line), None)])
+            .collect(),
+    }
+}
+
+/// One row of an edit's diff: a line of the file, or the gap between two hunks.
+struct DiffRow {
+    kind: DiffRowKind,
+    /// The line's number in the file before (removed lines) or after the edit.
+    number: Option<u64>,
+    /// The code, with changed words emphasized.
+    spans: RoleRuns,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum DiffRowKind {
+    Context,
+    Added,
+    Removed,
+    Gap,
+}
+
+/// The diff of an edit from its recorded review: each hunk's context and changed lines with
+/// their file line numbers, the hunks apart.
+fn review_diff_rows(review: &FileChangeReview) -> Vec<DiffRow> {
+    let mut rows = Vec::new();
+    for (index, hunk) in review.hunks.iter().enumerate() {
+        if index > 0 {
+            rows.push(DiffRow {
+                kind: DiffRowKind::Gap,
+                number: None,
+                spans: vec![(HUNK_GAP.into(), Some(Role::MutedText))],
+            });
+        }
+        let mut lines = hunk.lines.iter().peekable();
+        while let Some(line) = lines.next() {
+            if line.kind == FileChangeLineKind::Context {
+                rows.push(DiffRow {
+                    kind: DiffRowKind::Context,
+                    number: line.new_line,
+                    spans: vec![(safe_text(&line.text), None)],
+                });
+                continue;
+            }
+            let mut changed = vec![line];
+            while let Some(next) = lines.next_if(|next| next.kind != FileChangeLineKind::Context) {
+                changed.push(next);
+            }
+            let text_of = |kind| {
+                changed
+                    .iter()
+                    .filter(|line| line.kind == kind)
+                    .map(|line| format!("{}\n", line.text))
+                    .collect::<String>()
+            };
+            let mut removed_numbers = changed
+                .iter()
+                .filter(|line| line.kind == FileChangeLineKind::Removed)
+                .map(|line| line.old_line);
+            let mut added_numbers = changed
+                .iter()
+                .filter(|line| line.kind == FileChangeLineKind::Added)
+                .map(|line| line.new_line);
+            for mut row in string_diff_rows(
+                &text_of(FileChangeLineKind::Removed),
+                &text_of(FileChangeLineKind::Added),
+            ) {
+                row.number = match row.kind {
+                    DiffRowKind::Removed => removed_numbers.next().flatten(),
+                    DiffRowKind::Added => added_numbers.next().flatten(),
+                    DiffRowKind::Context => {
+                        removed_numbers.next();
+                        added_numbers.next().flatten()
+                    }
+                    DiffRowKind::Gap => None,
+                };
+                rows.push(row);
+            }
+        }
+    }
+    rows
+}
+
+/// The diff between two texts, changed words emphasized, without file line numbers.
+fn string_diff_rows(old: &str, new: &str) -> Vec<DiffRow> {
+    use similar::ChangeTag;
+    let diff = similar::TextDiff::from_lines(old, new);
+    let mut rows = Vec::new();
+    for operation in diff.ops() {
+        for change in diff.iter_inline_changes(operation) {
+            let (kind, line_role, word_role) = match change.tag() {
+                ChangeTag::Delete => (
+                    DiffRowKind::Removed,
+                    Some(Role::DiffLineRemoved),
+                    Some(Role::DiffWordRemoved),
+                ),
+                ChangeTag::Insert => (
+                    DiffRowKind::Added,
+                    Some(Role::DiffLineAdded),
+                    Some(Role::DiffWordAdded),
+                ),
+                ChangeTag::Equal => (DiffRowKind::Context, None, None),
+            };
+            let mut spans = RoleRuns::new();
+            for (emphasized, value) in change.iter_strings_lossy() {
+                let value = safe_text(value.trim_end_matches(['\n', '\r']));
+                if !value.is_empty() {
+                    spans.push((value, if emphasized { word_role } else { line_role }));
+                }
+            }
+            rows.push(DiffRow {
+                kind,
+                number: None,
+                spans,
+            });
+        }
+    }
+    rows
+}
+
+/// An edit as Claude Code shows it: the count of added and removed lines, then the diff rows,
+/// each led by its line number and its `+`/`-` marker right before the code, as Claude Code's
+/// `StructuredDiff` numbers them.
+fn diff_runs(diff: Vec<DiffRow>, replace_all: bool, glyph: &str) -> RoleRuns {
+    let added = diff
+        .iter()
+        .filter(|row| row.kind == DiffRowKind::Added)
+        .count();
+    let removed = diff
+        .iter()
+        .filter(|row| row.kind == DiffRowKind::Removed)
+        .count();
+    let mut summary = RoleRuns::new();
+    if added > 0 {
+        summary.push(("Added ".into(), None));
+        summary.push((added.to_string(), Some(Role::Strong)));
+        summary.push((format!(" {}", plural(added, "line")), None));
+    }
+    if added > 0 && removed > 0 {
+        summary.push((", ".into(), None));
+    }
+    if removed > 0 {
+        summary.push((
+            if added == 0 { "Removed " } else { "removed " }.into(),
+            None,
+        ));
+        summary.push((removed.to_string(), Some(Role::Strong)));
+        summary.push((format!(" {}", plural(removed, "line")), None));
+    }
+    if added == 0 && removed == 0 {
+        summary.push(("No lines changed".into(), Some(Role::MutedText)));
+    }
+    if replace_all {
+        summary.push((" · every occurrence".into(), Some(Role::MutedText)));
+    }
+    let mut rows = ResponseRows::new(glyph);
+    rows.row(summary);
+    // Claude Code pads numbers to one column more than the widest needs.
+    let number_width = diff
+        .iter()
+        .filter_map(|row| row.number)
+        .max()
+        .map_or(0, |widest| widest.to_string().len() + 1);
+    let hidden = diff.len().saturating_sub(DIFF_PREVIEW_LINES);
+    for row in diff.into_iter().take(DIFF_PREVIEW_LINES) {
+        let (marker, marker_role, gutter_role) = match row.kind {
+            DiffRowKind::Added => ("+", Some(Role::DiffMarkerAdded), Some(Role::DiffLineAdded)),
+            DiffRowKind::Removed => (
+                "-",
+                Some(Role::DiffMarkerRemoved),
+                Some(Role::DiffLineRemoved),
+            ),
+            DiffRowKind::Context => (" ", None, Some(Role::MutedText)),
+            DiffRowKind::Gap => {
+                rows.row(row.spans);
+                continue;
+            }
+        };
+        let mut spans = RoleRuns::new();
+        if number_width > 0 {
+            let number = row
+                .number
+                .map(|number| number.to_string())
+                .unwrap_or_default();
+            spans.push((format!("{number:>number_width$} "), gutter_role));
+        }
+        spans.push((marker.into(), marker_role));
+        spans.extend(row.spans);
+        rows.row(spans);
+    }
+    if hidden > 0 {
+        rows.row([(
+            format!(
+                "… +{hidden} {} · ctrl+o for details",
+                plural(hidden, "line")
+            ),
+            Some(Role::MutedText),
+        )]);
+    }
+    rows.runs
+}
+
+/// `runs` cut to `maximum` characters, with an ellipsis where text was cut.
+fn clipped_runs(runs: RoleRuns, maximum: usize) -> RoleRuns {
+    let mut left = maximum;
+    let mut clipped = RoleRuns::new();
+    for (text, role) in runs {
+        if left == 0 {
+            clipped.push(("…".into(), None));
+            break;
+        }
+        let count = text.chars().count();
+        if count <= left {
+            left -= count;
+            clipped.push((text, role));
+        } else {
+            clipped.push((text.chars().take(left).collect(), role));
+            clipped.push(("…".into(), None));
+            break;
+        }
+    }
+    clipped
 }
 
 fn clipped(text: &str, maximum: usize) -> (String, bool) {
@@ -1411,6 +2491,14 @@ mod tests {
     };
     use uuid::Uuid;
 
+    /// Wide enough that no fixture line wraps.
+    const TRANSCRIPT_WIDTH: usize = 1000;
+
+    fn transcript_text(snapshot: &ChatSnapshot) -> String {
+        transcript_document(snapshot, DisplayProfile::default(), &ImageLinks::default())
+            .plain_text(TRANSCRIPT_WIDTH)
+    }
+
     fn stream_pending_reply(snapshot: &mut ChatSnapshot, text: &str) {
         let loop_id = Uuid::new_v4();
         let run_id = Uuid::new_v4();
@@ -1498,10 +2586,7 @@ mod tests {
             ],"loops":[]
         })).unwrap();
         let compact = super::super::workflows::public_history(&snapshot, DisplayProfile::default());
-        let full =
-            transcript_document(&snapshot, DisplayProfile::default(), &ImageLinks::default())
-                .lines
-                .join("\n");
+        let full = transcript_text(&snapshot);
         for visible in [compact, full] {
             assert!(
                 !visible.contains("Todos have been modified successfully"),
@@ -1598,25 +2683,28 @@ mod tests {
             "messages":messages,"loops":[],"last_sequence":0
         })).unwrap();
         stream_pending_reply(&mut snapshot, "partial answer");
-        let document =
-            transcript_document(&snapshot, DisplayProfile::default(), &ImageLinks::default());
-        assert_eq!(document.prompts.len(), RETAINED_TOOL_EVENTS + 2);
-        for (index, &line) in document.prompts.iter().enumerate() {
-            assert_eq!(document.lines[line], format!("You: prompt-{index}"));
+        let text = transcript_text(&snapshot);
+        for index in 0..(RETAINED_TOOL_EVENTS + 2) {
+            assert!(text.contains(&format!("\n❯ prompt-{index}\n")), "{index}");
         }
-        let text = document.lines.join("\n");
         for required in [
-            "You: prompt-0",
-            "Tool call-0",
-            "Tool call-129",
-            "actual-0\n中文",
-            "/results/129.log",
-            "Assistant: partial answer",
+            "\n⏺ Bash(command-0)\n  ⎿  actual-0\n     中文\n     You: tool output is not a user prompt\n",
+            "⏺ Bash(command-129)",
             "∴ Thinking…\n\n  provider-private",
         ] {
             assert!(text.contains(required), "missing {required}");
         }
-        for hidden in ["system-only", "private-signature", "opaque-only"] {
+        assert_eq!(
+            text.matches("∴ Thinking…").count(),
+            1,
+            "only the current turn's latest thinking is shown"
+        );
+        for hidden in [
+            "system-only",
+            "private-signature",
+            "opaque-only",
+            "partial answer",
+        ] {
             assert!(!text.contains(hidden), "exposed {hidden}");
         }
     }
@@ -1648,18 +2736,8 @@ mod tests {
         let links = ImageLinks::new(Some(cache), true);
 
         let document = transcript_document(&snapshot, DisplayProfile::default(), &links);
-        let linked = document
-            .links
-            .iter()
-            .map(|line_link| {
-                (
-                    document.lines[line_link.line][line_link.range.clone()].to_owned(),
-                    line_link.link.clone(),
-                )
-            })
-            .collect::<Vec<_>>();
         assert_eq!(
-            linked,
+            document.links(TRANSCRIPT_WIDTH),
             [(
                 "[Image #1]".to_owned(),
                 super::super::hyperlink::Hyperlink::file(&cached).unwrap()
@@ -1668,12 +2746,15 @@ mod tests {
 
         std::fs::remove_dir_all(root.path().join("image-cache")).unwrap();
         let expired = transcript_document(&snapshot, DisplayProfile::default(), &links);
-        assert!(expired.links.is_empty());
-        assert_eq!(expired.lines, document.lines);
+        assert!(expired.links(TRANSCRIPT_WIDTH).is_empty());
+        assert_eq!(
+            expired.plain_text(TRANSCRIPT_WIDTH),
+            document.plain_text(TRANSCRIPT_WIDTH)
+        );
     }
 
     #[test]
-    fn transcript_renders_complete_and_streaming_assistant_markdown_without_ansi() {
+    fn transcript_lays_out_complete_markdown_replies_and_leaves_out_streaming_ones() {
         let mut snapshot: ChatSnapshot = serde_json::from_value(json!({
             "id":Uuid::new_v4(),"workdir":"/work",
             "model":{"name":"fixture","protocol":"messages","base_url":"http://127.0.0.1","model":"fixture","api_key_env":"","max_output_tokens":1024},
@@ -1686,12 +2767,14 @@ mod tests {
         .unwrap();
         stream_pending_reply(&mut snapshot, "Before\n```text\nunfinished\u{1b}[31m");
 
-        let text =
-            transcript_document(&snapshot, DisplayProfile::default(), &ImageLinks::default())
-                .lines
-                .join("\n");
-        assert!(text.contains("Assistant: Result\n\n- Docs (https://example.com)\nfn done() {}"));
-        assert!(text.contains("Assistant: Before\nunfinished[31m"));
+        let text = transcript_text(&snapshot);
+        assert!(text.contains("\n❯ show markdown\n\n⏺ Result\n"), "{text}");
+        assert!(text.contains("Docs"), "{text}");
+        assert!(text.contains("fn done() {}"), "{text}");
+        assert!(
+            !text.contains("Before") && !text.contains("unfinished"),
+            "{text}"
+        );
         assert!(!text.contains("```"));
         assert!(!text.contains('\u{1b}'));
     }
@@ -1709,10 +2792,7 @@ mod tests {
         .unwrap();
         snapshot.model.model = "deepseek-flash".into();
 
-        let text =
-            transcript_document(&snapshot, DisplayProfile::default(), &ImageLinks::default())
-                .lines
-                .join("\n");
+        let text = transcript_text(&snapshot);
         assert!(text.contains("∴ Thinking…\n\n  Compare the prices first."));
         assert!(text.contains("The first price is lower."));
         assert!(!text.contains("secret-signature"));
@@ -1733,10 +2813,7 @@ mod tests {
             ], "loops": []
         }))
         .unwrap();
-        let text =
-            transcript_document(&snapshot, DisplayProfile::default(), &ImageLinks::default())
-                .lines
-                .join("\n");
+        let text = transcript_text(&snapshot);
         assert!(text.contains("∴ Thinking…\n\n  Compare both filings."));
         assert!(text.contains("The figures differ."));
         assert!(!text.contains("opaque-state"));
@@ -1758,10 +2835,7 @@ mod tests {
         }))
         .unwrap();
 
-        let text =
-            transcript_document(&snapshot, DisplayProfile::default(), &ImageLinks::default())
-                .lines
-                .join("\n");
+        let text = transcript_text(&snapshot);
         assert!(text.contains("∴ Thinking summary\n\n  Checked the totals."));
         assert!(!text.contains("private raw reasoning"));
         assert!(!text.contains("opaque-state"));
@@ -1782,10 +2856,7 @@ mod tests {
             .pending_thinking
             .insert(run_id, "First check\nThen compare".into());
 
-        let text =
-            transcript_document(&snapshot, DisplayProfile::default(), &ImageLinks::default())
-                .lines
-                .join("\n");
+        let text = transcript_text(&snapshot);
         assert!(text.contains("∴ Thinking…\n\n  First check\n  Then compare"));
     }
 
@@ -1809,11 +2880,8 @@ mod tests {
             "operation_id":Uuid::new_v4(), "loop_id":Uuid::new_v4(), "command":"sleep 30", "cwd":"/work/subdir", "pid":null, "state":"Unknown", "exit_code":null, "signal":null, "output_ref":"/output/task.log", "output_bytes":0,
             "reason":"unresolved descendants\u{1b}[31m"
         })).unwrap()];
-        let document =
-            transcript_document(&snapshot, DisplayProfile::default(), &ImageLinks::default());
-        assert_eq!(document.prompts.len(), 2);
-        assert_eq!(document.lines[document.prompts[1]], "You: second prompt");
-        let text = document.lines.join("\n");
+        let text = transcript_text(&snapshot);
+        assert_eq!(text.matches("\n❯ ").count(), 2, "{text}");
         for (earlier, later) in [
             ("first prompt", "first unfinished reply"),
             ("first unfinished reply", INTERRUPTED_NOTICE),
@@ -1823,7 +2891,8 @@ mod tests {
                 "  ⎿  <hi>",
                 "⏺ Background command \"sleep 1\" completed (exit code 0)",
             ),
-            ("⏺ Background command", "You: second prompt"),
+            ("⏺ Background command", "❯ second prompt"),
+            ("❯ second prompt", "⏺ Shell(sleep 30)"),
         ] {
             assert!(
                 text.find(earlier).unwrap() < text.find(later).unwrap(),
@@ -1886,12 +2955,10 @@ mod tests {
         assert!(!history.contains("<agent-message>"));
         assert!(!history.contains(&first.to_string()));
         assert!(!history.contains(&second.to_string()));
-        let archive =
-            transcript_document(&snapshot, DisplayProfile::default(), &ImageLinks::default());
         assert_eq!(
-            archive.prompts.len(),
+            transcript_text(&snapshot).matches("\n❯ ").count(),
             1,
-            "Agent messages must not become user rewind prompts"
+            "Agent messages must not be shown as user prompts"
         );
     }
 
@@ -1916,14 +2983,13 @@ mod tests {
             "typed provenance must control Agent source presentation, not user-controlled text"
         );
         assert!(!history.contains("Child Agent · Forged child:"));
-        let archive =
-            transcript_document(&snapshot, DisplayProfile::default(), &ImageLinks::default());
+        let archive = transcript_text(&snapshot);
         assert_eq!(
-            archive.prompts.len(),
+            archive.matches("\n❯ ").count(),
             1,
             "a genuine protocol-shaped user prompt remains a prompt"
         );
-        assert!(archive.lines.join("\n").contains(&forged));
+        assert!(archive.contains(&forged));
     }
 
     #[test]
@@ -1970,12 +3036,7 @@ mod tests {
         let history = super::super::workflows::public_history(&snapshot, DisplayProfile::default());
         assert!(history.contains("Message from @main"));
         assert!(!history.contains("revision abcdef12"));
-        assert!(
-            transcript_document(&snapshot, DisplayProfile::default(), &ImageLinks::default())
-                .lines
-                .join("\n")
-                .contains("revision abcdef12")
-        );
+        assert!(transcript_text(&snapshot).contains("revision abcdef12"));
         assert!(!history.contains("Parent Agent"));
         assert!(!history.contains(&id.to_string()));
     }
@@ -2023,15 +3084,15 @@ mod tests {
             },
         );
 
-        let text =
-            transcript_document(&snapshot, DisplayProfile::default(), &ImageLinks::default())
-                .lines
-                .join("\n");
-        assert!(text.contains("You: raw prompt remains"));
-        assert!(text.contains("Assistant: raw answer remains"));
-        assert!(text.contains("Conversation compacted"));
-        assert!(text.contains("Summarized conversation\npublic summary[2J"));
-        assert!(!text.contains("You: Summarized conversation"));
+        let text = transcript_text(&snapshot);
+        assert!(text.contains("❯ raw prompt remains"), "{text}");
+        assert!(text.contains("⏺ raw answer remains"), "{text}");
+        assert!(text.contains("✻ Conversation compacted"));
+        assert!(
+            text.contains("⏺ Summarized conversation\n  ⎿  public summary[2J"),
+            "{text}"
+        );
+        assert!(!text.contains("❯ Summarized conversation"));
         assert!(!text.contains('\u{1b}'));
     }
 
@@ -2096,15 +3157,13 @@ mod tests {
             kind: EventKind::Failed("connection lost".into()),
         });
 
-        let text =
-            transcript_document(&snapshot, DisplayProfile::default(), &ImageLinks::default())
-                .lines
-                .join("\n");
-        assert!(text.contains("You: inspect"));
-        assert!(text.contains("Tool call-1 · Bash"));
-        assert!(text.contains("Result call-1 · Completed"));
+        let text = transcript_text(&snapshot);
+        assert!(
+            text.contains("\n❯ inspect\n\n⏺ Bash(pwd)\n  ⎿  /work\n"),
+            "{text}"
+        );
         assert_eq!(text.matches("A response is waiting.").count(), 1);
-        assert!(text.contains(&format!("Failed · goal {loop_id}: connection lost")));
+        assert!(text.ends_with("\n⏺ connection lost"), "{text}");
         assert!(!text.contains("private plan"));
         assert!(!text.contains("Continue?"));
     }
@@ -2221,11 +3280,13 @@ mod tests {
         view.record(&started);
         view.record(&completed);
         let rendered = view.render_event(&completed).unwrap();
-        assert!(rendered.contains("Bash · Completed"));
-        assert!(rendered.contains("actual-output"));
+        assert!(
+            rendered.starts_with("  ↳  actual-output\n     界"),
+            "the first line sits on the connector row: {rendered}"
+        );
         assert!(!rendered.contains("input-only"));
         assert!(!rendered.contains("sixth"));
-        assert!(rendered.contains("Ctrl+O"));
+        assert!(rendered.contains("ctrl+o"));
         assert!(rendered.chars().count() < 400);
         let detailed = view.toggle();
         assert!(detailed.contains("same-call"));
@@ -2265,20 +3326,14 @@ mod tests {
         view.record(&started);
         view.record(&launched);
         let shown = view.render_event(&launched).unwrap();
-        assert!(shown.contains("Bash · Running in background"), "{shown}");
-        assert!(shown.contains("sleep 30 · running in background"));
-        assert!(
-            !shown.contains("Completed")
-                && !shown.contains("private-background.log")
-                && !shown.contains(&operation.to_string())
-        );
+        assert_eq!(shown, "  ↳  Running in background\n");
         let command=serde_json::from_value(json!({"operation_id":operation,"loop_id":launched.loop_id,"command":"sleep 30","cwd":"/tmp","pid":null,"state":"Completed","was_background":true,"exit_code":0,"signal":null,"reason":null,"output_ref":path,"output_bytes":0})).unwrap();
         let ended = event(run, EventKind::CommandUpdated { command });
         view.record(&ended);
-        assert!(
-            view.render_event(&ended)
-                .unwrap()
-                .contains("Completed · exit 0")
+        assert_eq!(
+            view.render_event(&ended),
+            None,
+            "the command's end reaches the conversation as its task notification"
         );
         assert_eq!(view.render_event(&launched).unwrap(), shown);
         let replay: Vec<Event> = serde_json::from_str(
@@ -2291,15 +3346,17 @@ mod tests {
         let raw = restored.toggle();
         assert!(raw.contains(&result.content));
         assert!(raw.contains("Running in background"));
-        let archived = archived_tool_result(
+        let archived = joined(&archived_tool_result(
             BASH_TOOL_NAME,
             Some(&input),
             &ToolResult {
                 output_ref: None,
                 ..result
             },
+            Path::new(""),
             DisplayProfile::default(),
-        );
+            None,
+        ));
         assert!(
             archived.contains("Running in background")
                 && !archived.contains("private-background.log")
@@ -2338,15 +3395,11 @@ mod tests {
         })).unwrap();
         let restored: ChatSnapshot =
             serde_json::from_str(&serde_json::to_string(&snapshot).unwrap()).unwrap();
-        let document =
-            transcript_document(&restored, DisplayProfile::default(), &ImageLinks::default())
-                .lines
-                .join("\n");
+        let document = transcript_text(&restored);
         assert!(
-            document.contains("Result bg-call · Running in background"),
+            document.ends_with(&format!("\n⏺ Bash(sleep 30)\n  ⎿  {raw}")),
             "{document}"
         );
-        assert!(document.contains(&raw));
     }
 
     #[test]
@@ -2426,8 +3479,10 @@ mod tests {
         );
         view.record(&completed);
         let rendered = view.render_event(&completed).unwrap();
-        assert!(rendered.contains("WebFetch · Completed"), "{rendered}");
-        assert!(rendered.contains("Delivery is on Friday."), "{rendered}");
+        assert_eq!(
+            rendered, "  ↳  Completed\n     Delivery is on Friday.\n",
+            "the status sits on the connector row and the text under it"
+        );
     }
 
     #[test]
@@ -2464,7 +3519,7 @@ mod tests {
         view.record(&completed);
         let rendered = view.render_event(&completed).unwrap();
         assert!(
-            rendered.contains("AskUserQuestion · Completed"),
+            rendered.starts_with("  ↳  Completed\n     User has answered"),
             "{rendered}"
         );
         assert!(
@@ -2484,14 +3539,14 @@ mod tests {
                 "Write",
                 json!({"file_path":report,"content":"one\ntwo\nthree\n"}),
                 format!("File created successfully at: {report}"),
-                "Write · Completed · 3 lines written",
+                "Wrote 3 lines to report.md\n     one\n     two\n     three\n".to_owned(),
             ),
             (
                 "edit",
                 "Edit",
                 json!({"file_path":report,"old_string":"one","new_string":"1","replace_all":false}),
                 format!("The file {report} has been updated successfully."),
-                "Edit · Completed · 1 occurrence replaced",
+                "Added 1 line, removed 1 line\n     -one\n     +1\n".to_owned(),
             ),
             (
                 "replace-all",
@@ -2500,14 +3555,14 @@ mod tests {
                 format!(
                     "The file {report} has been updated. All occurrences were successfully replaced."
                 ),
-                "Edit · Completed · all occurrences replaced",
+                "Added 1 line, removed 1 line · every occurrence\n     -one\n     +1\n".to_owned(),
             ),
             (
                 "create-by-edit",
                 "Edit",
                 json!({"file_path":report,"old_string":"","new_string":"only line"}),
                 format!("The file {report} has been updated successfully."),
-                "Edit · Completed · 1 line written",
+                "Wrote 1 line to report.md\n     only line\n".to_owned(),
             ),
         ] {
             let started = event(
@@ -2531,14 +3586,14 @@ mod tests {
             );
             view.record(&started);
             view.record(&completed);
-            let expected = format!("  ↳ {expected}\n  {report}\n");
+            let expected = format!("  ↳  {expected}");
             assert_eq!(
                 view.render_event(&completed).unwrap(),
-                expected,
+                expected.replace("report.md", report),
                 "{call_id}"
             );
             assert_eq!(
-                archived_tool_result(
+                joined(&archived_tool_result(
                     name,
                     Some(&input),
                     &ToolResult {
@@ -2546,16 +3601,181 @@ mod tests {
                         is_error: false,
                         output_ref: None,
                     },
+                    Path::new("/work"),
                     DisplayProfile::default(),
-                ),
+                    None,
+                )),
                 expected.replace('↳', DisplayProfile::default().glyph(Glyph::ToolResult)),
-                "{call_id}"
+                "the path is relative to the working directory: {call_id}"
             );
         }
     }
 
     #[test]
-    fn only_background_commands_report_their_end_separately() {
+    fn an_edit_shows_its_change_in_the_colour_diff_palette_and_counts_in_bold() {
+        let runs = archived_tool_result(
+            "Edit",
+            Some(&json!({
+                "file_path":"/work/main.rs",
+                "old_string":"let total = 1;\nkeep();",
+                "new_string":"let total = 2;\nkeep();"
+            })),
+            &ToolResult {
+                content: "The file /work/main.rs has been updated successfully.".into(),
+                is_error: false,
+                output_ref: None,
+            },
+            Path::new(""),
+            DisplayProfile::default(),
+            None,
+        );
+        let role_of = |text: &str| {
+            runs.iter()
+                .find(|(run, _)| run == text)
+                .map(|(_, role)| *role)
+                .unwrap_or_else(|| panic!("{text:?} in {runs:?}"))
+        };
+        assert_eq!(role_of("1"), Some(Role::Strong), "the counts are bold");
+        assert_eq!(role_of("-"), Some(Role::DiffMarkerRemoved));
+        assert_eq!(role_of("+"), Some(Role::DiffMarkerAdded));
+        assert!(runs.contains(&("let total = ".into(), Some(Role::DiffLineRemoved))));
+        assert!(runs.contains(&("let total = ".into(), Some(Role::DiffLineAdded))));
+        assert!(
+            runs.iter()
+                .any(|(text, role)| text.contains('1') && *role == Some(Role::DiffWordRemoved)),
+            "{runs:?}"
+        );
+        assert!(
+            runs.iter()
+                .any(|(text, role)| text.contains('2') && *role == Some(Role::DiffWordAdded)),
+            "{runs:?}"
+        );
+        assert!(
+            runs.contains(&("keep();".into(), None)),
+            "context stays plain"
+        );
+        assert_eq!(
+            role_of(DisplayProfile::default().glyph(Glyph::ToolResult)),
+            Some(Role::MutedText)
+        );
+    }
+
+    #[test]
+    fn a_long_written_file_is_highlighted_and_cut_after_ten_lines() {
+        let content = (0..14)
+            .map(|index| format!("let value_{index} = {index};"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let runs = archived_tool_result(
+            "Write",
+            Some(&json!({"file_path":"/work/values.rs","content":content})),
+            &ToolResult {
+                content: "File created successfully at: /work/values.rs".into(),
+                is_error: false,
+                output_ref: None,
+            },
+            Path::new(""),
+            DisplayProfile::default(),
+            None,
+        );
+        let text = joined(&runs);
+        assert!(
+            text.contains("value_9") && !text.contains("value_10"),
+            "{text}"
+        );
+        assert!(text.contains("… +4 lines · ctrl+o for details\n"), "{text}");
+        assert!(
+            runs.contains(&("let".into(), Some(Role::CodeKeyword))),
+            "{runs:?}"
+        );
+        assert!(
+            runs.iter()
+                .any(|(text, role)| text == "9" && *role == Some(Role::CodeNumber)),
+            "{runs:?}"
+        );
+    }
+
+    #[test]
+    fn results_keep_the_terminal_colour_with_muted_connectors_and_red_failures() {
+        let bash = archived_tool_result(
+            BASH_TOOL_NAME,
+            Some(&json!({"command":"ls"})),
+            &ToolResult {
+                content: "a.txt\nb.txt".into(),
+                is_error: false,
+                output_ref: None,
+            },
+            Path::new(""),
+            DisplayProfile::default(),
+            None,
+        );
+        assert_eq!(joined(&bash), "  ⎿  a.txt\n     b.txt\n", "{bash:?}");
+        assert!(bash.contains(&("a.txt".into(), None)), "{bash:?}");
+        let failed = archived_tool_result(
+            BASH_TOOL_NAME,
+            Some(&json!({"command":"false"})),
+            &ToolResult {
+                content: "Exit code 1\nboom".into(),
+                is_error: true,
+                output_ref: None,
+            },
+            Path::new(""),
+            DisplayProfile::default(),
+            None,
+        );
+        assert_eq!(joined(&failed), "  ⎿  Exit code 1\n     boom\n");
+        assert!(
+            failed.contains(&("boom".into(), Some(Role::Error))),
+            "{failed:?}"
+        );
+        assert_eq!(
+            failed[1].1,
+            Some(Role::MutedText),
+            "the connector stays muted"
+        );
+        for content in [
+            "permission denied; the requested operation was not executed",
+            "The user denied permission for this operation and gave this reason: not now",
+        ] {
+            let declined = archived_tool_result(
+                "Read",
+                Some(&json!({"file_path":"/work/a.txt"})),
+                &ToolResult {
+                    content: content.into(),
+                    is_error: true,
+                    output_ref: None,
+                },
+                Path::new(""),
+                DisplayProfile::default(),
+                None,
+            );
+            assert_eq!(
+                joined(&declined),
+                format!("{INTERRUPTED_NOTICE}\n"),
+                "a declined call other than a file change reads as the interruption"
+            );
+            assert!(!declined.iter().any(|(_, role)| *role == Some(Role::Error)));
+            let declined_write = archived_tool_result(
+                "Write",
+                Some(&json!({"file_path":"/work/a.txt","content":"x"})),
+                &ToolResult {
+                    content: content.into(),
+                    is_error: true,
+                    output_ref: None,
+                },
+                Path::new("/work"),
+                DisplayProfile::default(),
+                None,
+            );
+            assert_eq!(
+                joined(&declined_write),
+                "  ⎿  User rejected write to a.txt\n"
+            );
+        }
+    }
+
+    #[test]
+    fn command_updates_stay_out_of_the_compact_conversation() {
         let view = ToolPresentation::new(false);
         let update = |state, was_background| {
             let command: tickloop_agent_protocol::CommandSnapshot = serde_json::from_value(json!({
@@ -2567,22 +3787,20 @@ mod tests {
             .unwrap();
             event(Uuid::new_v4(), EventKind::CommandUpdated { command })
         };
+        // A foreground command's result and a background command's task notification report
+        // what the conversation shows.
         for (state, was_background) in [
             ("Running", false),
             ("Completed", false),
             ("Background", true),
+            ("Completed", true),
         ] {
             assert_eq!(
-                view.render_event(&update(state, was_background)).unwrap(),
-                "",
+                view.render_event(&update(state, was_background)),
+                None,
                 "{state} {was_background}"
             );
         }
-        let finished = view.render_event(&update("Completed", true)).unwrap();
-        assert!(
-            finished.contains("Shell · Completed · exit 0 · npm test"),
-            "{finished}"
-        );
     }
 
     #[test]
@@ -2601,7 +3819,7 @@ mod tests {
         let view = ToolPresentation::new(true);
 
         let rendered = view
-            .render_event_roles(&completed, DisplayProfile::default())
+            .render_event_roles(&completed, DisplayProfile::default(), Path::new(""), None)
             .unwrap()
             .into_iter()
             .map(|(text, _)| text)
@@ -2639,7 +3857,7 @@ mod tests {
         );
         view.record(&completed);
         let rendered = view.render_event(&completed).unwrap();
-        assert!(rendered.contains("Read · Failed"));
+        assert!(rendered.starts_with("  ↳  Failed\n"), "{rendered}");
         assert!(rendered.contains("permission denied: protected.txt"));
         assert!(!rendered.contains("Bash"));
         assert!(!rendered.contains('\u{1b}'));
@@ -2736,11 +3954,10 @@ mod tests {
             output_ref: None,
         };
         let rendered = compact_result("Bash", None, &result);
-        assert!(rendered.contains("Bash · Failed"));
-        assert!(rendered.contains("Exit code 17"));
+        assert!(rendered.starts_with("  ↳  Exit code 17\n"), "{rendered}");
         assert!(rendered.contains("process result could not be confirmed"));
         assert!(rendered.contains("actual command output"));
-        assert!(rendered.contains("Ctrl+O"));
+        assert!(rendered.contains("ctrl+o"));
         assert!(rendered.len() < 500);
     }
 
@@ -2766,5 +3983,157 @@ mod tests {
         assert!(details.contains("Tool call-128 ·"));
         assert!(view.is_detailed());
         assert!(view.toggle().contains("Compact"));
+    }
+
+    #[test]
+    fn an_edit_numbers_its_diff_with_the_lines_its_review_recorded() {
+        let before = (1..=12)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        let after = before
+            .replace("line 2\n", "line two\n")
+            .replace("line 11\n", "line eleven\n");
+        let review = tickloop_agent_tools::file_change::build_file_change_review(
+            tickloop_agent_protocol::FileChangeAction::Edit,
+            PathBuf::from("/work/notes.txt"),
+            &before,
+            true,
+            None,
+            &after,
+            true,
+        );
+        let input = json!({
+            "file_path":"/work/notes.txt","old_string":"line 2","new_string":"line two"
+        });
+        let runs = archived_tool_result(
+            EDIT_TOOL_NAME,
+            Some(&input),
+            &ToolResult {
+                content: "The file /work/notes.txt has been updated successfully.".into(),
+                is_error: false,
+                output_ref: None,
+            },
+            Path::new("/work"),
+            DisplayProfile::default(),
+            Some(&review),
+        );
+        assert_eq!(
+            joined(&runs),
+            [
+                "  ⎿  Added 2 lines, removed 2 lines",
+                "       1  line 1",
+                "       2 -line 2",
+                "       2 +line two",
+                "       3  line 3",
+                "       4  line 4",
+                "       5  line 5",
+                "     ...",
+                "       8  line 8",
+                "       9  line 9",
+                "      10  line 10",
+                "      11 -line 11",
+                "      11 +line eleven",
+                "      12  line 12",
+                "",
+            ]
+            .join("\n"),
+            "line numbers are as wide as the widest needs plus one, the marker sits on the code"
+        );
+        assert!(runs.contains(&("  2 ".into(), Some(Role::DiffLineRemoved))));
+        assert!(runs.contains(&("+".into(), Some(Role::DiffMarkerAdded))));
+        assert!(
+            runs.iter()
+                .any(|(text, role)| text == "two" && *role == Some(Role::DiffWordAdded)),
+            "{runs:?}"
+        );
+    }
+
+    #[test]
+    fn calls_name_paths_relative_to_the_working_directory() {
+        let cwd = Path::new("/work");
+        let header = |name: &str, input: Value| {
+            joined(&tool_call_roles(
+                name,
+                &input,
+                cwd,
+                DisplayProfile::default(),
+            ))
+        };
+        assert_eq!(
+            header(WRITE_TOOL_NAME, json!({"file_path":"/work/logs/build.log"})),
+            "\n⏺ Write · logs/build.log\n"
+        );
+        assert_eq!(
+            header("Grep", json!({"pattern":"TODO","path":"/work"})),
+            "\n⏺ Grep · TODO in .\n"
+        );
+        assert_eq!(
+            header(EDIT_TOOL_NAME, json!({"file_path":"/elsewhere/notes.txt"})),
+            "\n⏺ Edit · /elsewhere/notes.txt\n",
+            "a path outside the working directory stays whole"
+        );
+        assert_eq!(
+            collapsed_call(READ_TOOL_NAME, &json!({"file_path":"/work/a.txt"})),
+            Some(CollapsedCall::Read {
+                path: "/work/a.txt".into()
+            })
+        );
+        assert_eq!(
+            collapsed_call("Glob", &json!({"pattern":"*.rs"})),
+            Some(CollapsedCall::Search)
+        );
+        assert_eq!(collapsed_call(BASH_TOOL_NAME, &json!({})), None);
+    }
+
+    #[test]
+    fn a_running_shell_shows_its_latest_lines_under_the_connector() {
+        let display = DisplayProfile::default();
+        assert_eq!(joined(&running_shell_runs("", display)), "  ⎿  Running…\n");
+        let output = (1..=7)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        assert_eq!(
+            joined(&running_shell_runs(&output, display)),
+            "  ⎿  line 3\n     line 4\n     line 5\n     line 6\n     line 7\n"
+        );
+    }
+
+    #[test]
+    fn a_finished_user_shell_reads_as_the_message_the_agent_records() {
+        let record = |state: &str, exit_code: Option<i32>, reason: Option<&str>| {
+            serde_json::from_value::<UserShellRecord>(json!({
+                "id":Uuid::new_v4(),"chat_id":Uuid::new_v4(),"command":"make","cwd":"/work",
+                "state":state,"pid":null,"exit_code":exit_code,"signal":null,"reason":reason,
+                "output_ref":null,"output_bytes":9,"submitted_at_message":0
+            }))
+            .unwrap()
+        };
+        assert_eq!(
+            user_shell_result(&record("Completed", Some(0), None), "one\ntwo\n\n"),
+            LocalMessage::BashOutput {
+                stdout: "one\ntwo".into(),
+                stderr: String::new()
+            }
+        );
+        assert_eq!(
+            user_shell_result(&record("Failed", Some(2), None), "boom\n"),
+            LocalMessage::BashOutput {
+                stdout: String::new(),
+                stderr: "boom\nExit code 2".into()
+            }
+        );
+        assert_eq!(
+            user_shell_result(
+                &record(
+                    "Failed",
+                    None,
+                    Some(tickloop_agent_tools::CANCELLED_COMMAND_REASON)
+                ),
+                "partial"
+            ),
+            LocalMessage::Interrupted {
+                during_tool_use: false
+            }
+        );
     }
 }

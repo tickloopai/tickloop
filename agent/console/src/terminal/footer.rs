@@ -12,23 +12,6 @@ impl FooterItemId {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum FooterAction {
-    Down,
-    Up,
-    Previous,
-    Next,
-    Clear,
-    Open,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum FooterEffect {
-    None,
-    ReturnToEditor,
-    Open(FooterItemId),
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct FooterFrameItem {
     pub(super) id: FooterItemId,
     pub(super) selected: bool,
@@ -37,9 +20,8 @@ pub(super) struct FooterFrameItem {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct FooterFrame {
     pub(super) items: Vec<FooterFrameItem>,
+    /// The list that owns the keys; `None` while the input does.
     pub(super) selected: Option<FooterItemId>,
-    /// Whether keys move within the open list rather than across the summary row.
-    pub(super) list_focused: bool,
 }
 
 #[derive(Default)]
@@ -66,10 +48,16 @@ impl FooterState {
         self.selected
     }
 
+    /// Gives `item`'s list the keys, when it is shown.
     pub(super) fn select(&mut self, item: FooterItemId) {
         if self.items.contains(&item) {
             self.selected = Some(item);
         }
+    }
+
+    /// Returns the keys to the input.
+    pub(super) fn clear(&mut self) {
+        self.selected = None;
     }
 
     pub(super) fn frame(&self) -> FooterFrame {
@@ -84,82 +72,7 @@ impl FooterState {
                 })
                 .collect(),
             selected: self.selected,
-            list_focused: false,
         }
-    }
-
-    pub(super) fn apply(&mut self, action: FooterAction) -> FooterEffect {
-        match action {
-            FooterAction::Down => self.move_next(true),
-            FooterAction::Up => self.move_up(),
-            FooterAction::Previous => self.move_previous(),
-            FooterAction::Next => self.move_next(false),
-            FooterAction::Clear => {
-                self.selected = None;
-                FooterEffect::ReturnToEditor
-            }
-            FooterAction::Open => self.open(),
-        }
-    }
-
-    fn move_next(&mut self, select_first: bool) -> FooterEffect {
-        let Some(selected) = self.selected else {
-            if select_first {
-                self.selected = self.items.first().copied();
-            }
-            return FooterEffect::None;
-        };
-        let Some(index) = self.items.iter().position(|item| *item == selected) else {
-            self.selected = None;
-            return FooterEffect::None;
-        };
-        if let Some(item) = self.items.get(index + 1) {
-            self.selected = Some(*item);
-        }
-        FooterEffect::None
-    }
-
-    fn move_up(&mut self) -> FooterEffect {
-        let Some(selected) = self.selected else {
-            return FooterEffect::ReturnToEditor;
-        };
-        let Some(index) = self.items.iter().position(|item| *item == selected) else {
-            self.selected = None;
-            return FooterEffect::ReturnToEditor;
-        };
-        if index == 0 {
-            self.selected = None;
-            FooterEffect::ReturnToEditor
-        } else {
-            self.selected = Some(self.items[index - 1]);
-            FooterEffect::None
-        }
-    }
-
-    fn move_previous(&mut self) -> FooterEffect {
-        let Some(selected) = self.selected else {
-            return FooterEffect::None;
-        };
-        let Some(index) = self.items.iter().position(|item| *item == selected) else {
-            self.selected = None;
-            return FooterEffect::None;
-        };
-        if let Some(index) = index.checked_sub(1) {
-            self.selected = Some(self.items[index]);
-        }
-        FooterEffect::None
-    }
-
-    fn open(&mut self) -> FooterEffect {
-        let Some(selected) = self.selected else {
-            return FooterEffect::None;
-        };
-        if !self.items.contains(&selected) {
-            self.selected = None;
-            return FooterEffect::None;
-        }
-        self.selected = None;
-        FooterEffect::Open(selected)
     }
 }
 
@@ -169,21 +82,18 @@ mod tests {
     #[test]
     fn the_only_footer_entry_is_subagents_and_hidden_entries_do_not_take_focus() {
         let mut footer = FooterState::default();
-        assert_eq!(footer.apply(FooterAction::Down), FooterEffect::None);
+        footer.select(FooterItemId::Agents);
         assert_eq!(footer.selected(), None);
         footer.update([FooterItemId::Agents, FooterItemId::Agents]);
-        footer.apply(FooterAction::Down);
+        footer.select(FooterItemId::Agents);
         assert_eq!(footer.selected(), Some(FooterItemId::Agents));
-        footer.apply(FooterAction::Down);
-        assert_eq!(footer.selected(), Some(FooterItemId::Agents));
+        assert_eq!(footer.frame().items.len(), 1);
         assert_eq!(FooterItemId::Agents.label(), "Subagents");
-        assert_eq!(
-            footer.apply(FooterAction::Open),
-            FooterEffect::Open(FooterItemId::Agents)
-        );
-        footer.apply(FooterAction::Down);
         footer.update([]);
         assert_eq!(footer.selected(), None);
-        assert_eq!(footer.apply(FooterAction::Up), FooterEffect::ReturnToEditor);
+        footer.update([FooterItemId::Agents]);
+        footer.select(FooterItemId::Agents);
+        footer.clear();
+        assert_eq!(footer.selected(), None);
     }
 }

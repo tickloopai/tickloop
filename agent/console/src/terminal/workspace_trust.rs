@@ -172,7 +172,7 @@ impl WorkspaceTrust {
                 match self.decision {
                     Some(TrustDecision::Accept) => "Preparing Agent…",
                     Some(TrustDecision::Cancel) => "Closing…",
-                    None => "Enter confirm · Esc cancel",
+                    None => "enter confirm · esc cancel",
                 },
                 wrap_width,
             )
@@ -199,7 +199,7 @@ impl WorkspaceTrust {
             let mut lines = error_lines;
             lines.extend(
                 wrap_text(
-                    "Resize terminal to review directory · Esc cancel",
+                    "Resize terminal to review directory · esc cancel",
                     wrap_width,
                 )
                 .into_iter()

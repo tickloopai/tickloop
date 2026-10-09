@@ -219,6 +219,7 @@ mod tests {
                         goal: request,
                         version: 1,
                         request: None,
+                        choices: Vec::new(),
                     },
                 ),
             )
@@ -1232,12 +1233,12 @@ pub(super) struct ProviderNavigator {
 impl ProviderNavigator {
     pub(super) fn escape_hint(&self) -> &'static str {
         match self.back_stack.last() {
-            Some(ProviderPage::Directory { .. }) => "Esc back to Providers",
-            Some(ProviderPage::Models { .. }) => "Esc back to models",
-            Some(ProviderPage::Settings) => "Esc back to Settings",
-            Some(ProviderPage::Details { .. }) => "Esc back to Connection",
-            Some(ProviderPage::LoginMethods { .. }) => "Esc back to sign-in",
-            None => "Esc close",
+            Some(ProviderPage::Directory { .. }) => "esc back to Providers",
+            Some(ProviderPage::Models { .. }) => "esc back to models",
+            Some(ProviderPage::Settings) => "esc back to Settings",
+            Some(ProviderPage::Details { .. }) => "esc back to Connection",
+            Some(ProviderPage::LoginMethods { .. }) => "esc back to sign-in",
+            None => "esc close",
         }
     }
 }
@@ -1469,11 +1470,11 @@ impl Menus {
         let toggle = if filter == "All" { "Configured" } else { "All" };
         let escape = self.provider.provider_nav.escape_hint();
         let mut row_hints =
-            vec![format!("p Connection · f Filter · Enter · {escape}"); rows.len()];
+            vec![format!("p Connection · f Filter · enter · {escape}"); rows.len()];
         if empty {
-            row_hints.push(format!("f {toggle} · Enter add connection · {escape}"));
+            row_hints.push(format!("f {toggle} · enter add connection · {escape}"));
         }
-        row_hints.push(format!("f {toggle} · Enter Judgment settings · {escape}"));
+        row_hints.push(format!("f {toggle} · enter Judgment settings · {escape}"));
         let context = if empty {
             vec!["No connections configured. Add a connection to browse models.".into()]
         } else {
@@ -1502,7 +1503,7 @@ impl Menus {
                     row_hints,
                     compact_rows,
                     hint: format!(
-                        "p Connection · f {} · Enter models/setup · {escape}",
+                        "p Connection · f {} · enter models/setup · {escape}",
                         if filter == "All" { "Configured" } else { "All" }
                     ),
                     ..Default::default()
@@ -2973,7 +2974,7 @@ fn directory_status(
 ) -> String {
     match directory {
         Err(error) if error == "Credentials require attention before account check" => "Review credentials in Connection Details before checking account access.".into(),
-        Err(error) if error == "Checking account models" => "Checking account models… Esc returns and cancels the check.".into(),
+        Err(error) if error == "Checking account models" => "Checking account models… esc returns and cancels the check.".into(),
         Ok(directory) if directory.complete => "Account directory checked.".into(),
         Ok(_) => "Account directory is incomplete; missing models remain unverified.".into(),
         Err(_)

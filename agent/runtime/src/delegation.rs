@@ -11,7 +11,7 @@ use crate::{
 };
 use tickloop_agent_protocol::local_messages;
 use tickloop_agent_protocol::{
-    AgentMessageSource, DelegationCeiling, DelegationMetadata, FamilyMessageRejection,
+    AgentColor, AgentMessageSource, DelegationCeiling, DelegationMetadata, FamilyMessageRejection,
     FamilyMessageRejectionCode, HostToolAuthority, Receipt, SUBAGENT_TOOL_NAME,
     SubagentRegistration, ToolDefinition, ToolResult,
 };
@@ -690,11 +690,12 @@ impl Agent {
                     if let Some(context) = &mut host_context {
                         context.interaction = None;
                     }
-                    let registration = SubagentRegistration {
+                    let mut registration = SubagentRegistration {
                         child_chat_id: Uuid::new_v4(),
                         handle: name,
                         description: description.clone(),
                         created_at: tickloop_agent_base::private_fs::unix_time_milliseconds(),
+                        color: None,
                     };
                     let trusted_user_inputs =
                         approval_context::originals_for_active_chain(&snapshot, &bookkeeping)
@@ -761,6 +762,8 @@ impl Agent {
                     {
                         let mut registry = self.inner.subagent_registry.lock().await;
                         let entries = registry.entry(parent.chat_id).or_default();
+                        let used = entries.iter().map(|entry| entry.color).collect::<Vec<_>>();
+                        registration.color = Some(AgentColor::next_for(&used));
                         entries.push(registration);
                         if let Some(recorder) = &self.inner.recorder {
                             recorder.record_subagents(parent.chat_id, entries.clone());

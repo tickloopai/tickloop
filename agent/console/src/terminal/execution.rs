@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::new_agent_draft::{
-    AgentConfiguration, ConfigTarget, FirstCreate, NewAgentDraft, ReplayStep,
+    AgentConfiguration, ConfigTarget, FirstCreate, NewAgentDraft, ReplayStep, unavailable_change,
 };
 use super::permissions_surface::{
     DraftPolicyRevision, PermissionsContent, PermissionsPage, PermissionsSubject,
@@ -136,7 +136,7 @@ impl CommandOutcome {
 /// What the receipt of an input whose acceptance was unknown proves.
 pub(super) enum InputResolution {
     /// The daemon accepted the original input; this is its result, so nothing is resent.
-    Accepted(CommandResult),
+    Accepted(Box<CommandResult>),
     Refused,
     Unknown,
     /// No unknown input with that id remains for the Agent.
@@ -283,6 +283,8 @@ struct Inner {
     event_delivery: Arc<tokio::sync::Mutex<HashMap<Uuid, (ExecutionRef, u64)>>>,
     shells: broadcast::Sender<UserShellRecord>,
     tasks: broadcast::Sender<TaskNotification>,
+    /// Signals that a pushed snapshot reached the cache, so recovery tests can wait for it.
+    #[cfg(test)]
     facts: broadcast::Sender<()>,
     cancel: CancellationToken,
     display: Mutex<DisplayState>,
@@ -449,6 +451,7 @@ impl ConsoleExecution {
                 event_delivery: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
                 shells: broadcast::channel(REPLAY_CAPACITY).0,
                 tasks: broadcast::channel(REPLAY_CAPACITY).0,
+                #[cfg(test)]
                 facts: broadcast::channel(REPLAY_CAPACITY).0,
                 cancel: CancellationToken::new(),
                 display: Mutex::new(DisplayState {
@@ -493,6 +496,13 @@ impl ConsoleExecution {
     #[cfg(test)]
     pub(super) fn hold_recovery_checkpoint(&self, gate: Arc<tokio::sync::Semaphore>) {
         *self.inner.recovery_checkpoint.lock().unwrap() = Some(gate);
+        self.stop_global_refresh();
+    }
+
+    /// Stops the View's periodic global refresh, which otherwise repaints and reads the visible
+    /// Chat on its own schedule.
+    #[cfg(test)]
+    pub(super) fn stop_global_refresh(&self) {
         self.inner
             .recovery_refresh
             .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -657,12 +667,18 @@ impl ConsoleExecution {
     }
 
     pub(super) fn cached_is_delegated(&self, chat: Uuid) -> bool {
+        self.cached_delegation(chat).unwrap_or(false)
+    }
+
+    /// Whether `chat` is a delegated child, from the latest snapshot this View received; `None`
+    /// before any. A Chat stays the root or child it was created as, so any snapshot answers.
+    fn cached_delegation(&self, chat: Uuid) -> Option<bool> {
         self.inner
             .snapshots
             .read()
             .unwrap()
             .get(&chat)
-            .is_some_and(|snapshot| snapshot.conversation.delegation.is_some())
+            .map(|snapshot| snapshot.conversation.delegation.is_some())
     }
 
     pub(super) fn cached_pending_plan_approvals(
@@ -963,7 +979,7 @@ impl ConsoleExecution {
         };
         let resolution = match self.read_receipt(epoch, command_id).await {
             CommandOutcome::Unknown => return InputResolution::Unknown,
-            CommandOutcome::Completed(result) => InputResolution::Accepted(result),
+            CommandOutcome::Completed(result) => InputResolution::Accepted(Box::new(result)),
             CommandOutcome::Refused { .. } | CommandOutcome::Undelivered(_) => {
                 InputResolution::Refused
             }
@@ -1220,6 +1236,7 @@ impl ConsoleExecution {
                     }) => {
                         if let Some(inner) = weak.upgrade() {
                             inner.cache_snapshot(snapshot, Some(execution));
+                            #[cfg(test)]
                             let _ = inner.facts.send(());
                         }
                     }
@@ -1246,6 +1263,7 @@ impl ConsoleExecution {
                             Ok(next) => {
                                 if let ObservationValue::Agent(snapshot) = next.initial {
                                     inner.cache_snapshot(snapshot, Some(execution));
+                                    #[cfg(test)]
                                     let _ = inner.facts.send(());
                                 }
                             }
@@ -1267,14 +1285,16 @@ impl ConsoleExecution {
         Ok(())
     }
 
-    pub(super) fn subscribe_facts(&self) -> broadcast::Receiver<()> {
-        self.inner.facts.subscribe()
-    }
     pub(super) async fn pause_event_delivery(&self) -> EventRecovery {
         EventRecovery {
             covered: self.inner.event_delivery.clone().lock_owned().await,
             inner: self.inner.clone(),
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn subscribe_facts(&self) -> broadcast::Receiver<()> {
+        self.inner.facts.subscribe()
     }
 
     pub(super) fn subscribe(&self) -> broadcast::Receiver<Event> {
@@ -2425,9 +2445,14 @@ impl ConsoleExecution {
         }
     }
 
-    /// Refuses a root-only change for a delegated Agent before any command is sent.
+    /// Refuses a root-only change for a delegated Agent before any command is sent. Only a Chat
+    /// this View has not read yet costs a snapshot.
     async fn preflight(&self, chat: Uuid, change: &ConfigurationChange) -> Result<(), AccessError> {
-        match AgentConfiguration::of(&self.snapshot(chat).await?).unavailable_change(change) {
+        let delegated = match self.cached_delegation(chat) {
+            Some(delegated) => delegated,
+            None => self.snapshot(chat).await?.delegation.is_some(),
+        };
+        match unavailable_change(delegated, change) {
             Some(reason) => Err(AccessError::invalid(format!("Unavailable: {reason}"))),
             None => Ok(()),
         }
@@ -2896,6 +2921,26 @@ impl ConsoleExecution {
         match self
             .command(
                 AgentCommand::RemoveMonitorMember {
+                    execution,
+                    instance,
+                },
+                None,
+            )
+            .await?
+        {
+            CommandResult::MonitorMembership(membership) => Ok(membership),
+            _ => Err(unexpected()),
+        }
+    }
+    pub(super) async fn mark_monitor_handled(
+        &self,
+        chat: Uuid,
+        instance: tick_protocol::InstanceRef,
+    ) -> Result<MonitorMembership, AccessError> {
+        let execution = self.reference(chat).await?;
+        match self
+            .command(
+                AgentCommand::MarkMonitorHandled {
                     execution,
                     instance,
                 },
@@ -3805,7 +3850,7 @@ mod tests {
             tab_id: "tab-first".into(),
             cwd: None,
             foreground_cwd: None,
-            title: None,
+            terminal_title_stripped: None,
             tokens: Default::default(),
         }));
         let served_pane = pane.clone();
@@ -4065,10 +4110,18 @@ mod tests {
         runtime.shutdown().await;
     }
 
+    /// Whole-Chat reads and commands, in the order they reached the daemon.
+    #[derive(Debug, PartialEq)]
+    enum Traffic {
+        Snapshot,
+        Command,
+    }
+
     /// Records every command this View sends and can refuse Create or one Configure kind.
     struct Recording {
         actual: EmbeddedAgentAccess,
         commands: Mutex<Vec<AgentCommand>>,
+        traffic: Mutex<Vec<Traffic>>,
         refuse_create: std::sync::atomic::AtomicBool,
         refuse_execution_mode: std::sync::atomic::AtomicBool,
         /// Agent observations fail, as when the daemon accepted work but this View cannot attach.
@@ -4113,6 +4166,15 @@ mod tests {
     #[async_trait]
     impl AgentAccess for Recording {
         async fn observe(&self, query: ObservationRequest) -> Result<Observation, AccessError> {
+            if matches!(
+                query,
+                ObservationRequest::Agent {
+                    detail: AgentDetailQuery::Snapshot,
+                    ..
+                }
+            ) {
+                self.traffic.lock().unwrap().push(Traffic::Snapshot);
+            }
             match &query {
                 ObservationRequest::Agent { .. } if flag(&self.refuse_agent_observation) => {
                     return Err(AccessError::unavailable("fixture View cannot attach"));
@@ -4135,6 +4197,7 @@ mod tests {
         async fn execute(&self, command: CommandEnvelope) -> Result<CommandReceipt, AccessError> {
             let mut command = command;
             self.commands.lock().unwrap().push(command.command.clone());
+            self.traffic.lock().unwrap().push(Traffic::Command);
             let loses_reply = match &command.command {
                 AgentCommand::Create { .. } => flag(&self.lose_replies),
                 AgentCommand::Configure { .. } => flag(&self.lose_configure_replies),
@@ -4206,6 +4269,7 @@ mod tests {
         let access = Arc::new(Recording {
             actual,
             commands: Mutex::default(),
+            traffic: Mutex::default(),
             refuse_create: false.into(),
             refuse_execution_mode: false.into(),
             refuse_agent_observation: false.into(),
@@ -4227,6 +4291,36 @@ mod tests {
             None,
         );
         (runtime, access, terminal)
+    }
+
+    /// Shift+Tab and the settings menus read the configuration before changing it; the change
+    /// then knows from that read whether the Agent is a delegated child, so it reads no second
+    /// snapshot of the whole Chat before its command.
+    #[tokio::test]
+    async fn a_change_after_reading_the_configuration_sends_its_command_without_another_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let (runtime, access, terminal) = recording_terminal(directory.path());
+        let chat = terminal.create_chat(directory.path().into()).await.unwrap();
+        let target = ConfigTarget::Agent(chat);
+        let mode = terminal
+            .configuration(target)
+            .await
+            .unwrap()
+            .execution_mode
+            .next_in(&ExecutionMode::CYCLE_ORDER)
+            .unwrap();
+        let read = access.traffic.lock().unwrap().len();
+        terminal
+            .change_configuration(target, ConfigurationChange::ExecutionMode { mode })
+            .await
+            .unwrap();
+        assert_eq!(
+            access.traffic.lock().unwrap().get(read),
+            Some(&Traffic::Command),
+            "the change went out without reading the Chat again"
+        );
+        assert_eq!(runtime.snapshot(chat).await.unwrap().policy.mode, mode);
+        runtime.shutdown().await;
     }
 
     #[tokio::test]

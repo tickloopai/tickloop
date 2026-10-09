@@ -41,13 +41,6 @@ pub enum TaskSurfaceFocus {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TaskSurfaceAction {
-    Previous,
-    Next,
-    Open,
-    Back,
-    Close,
-    Background,
-    Stop,
     ScrollLines(i32),
     Page(i32),
     Home,
@@ -57,7 +50,6 @@ pub enum TaskSurfaceAction {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TaskSurfaceEffect {
     None,
-    Close,
     Control {
         task_id: Uuid,
         action: ShellTaskAction,
@@ -108,9 +100,8 @@ pub struct TaskSurfaceFrame {
     pub action_error: Option<String>,
 }
 
-pub struct TaskSurface<Restore = ()> {
-    restore: Restore,
-    /// 打开任务中心的前台 Chat；其他 Chat 的任务在行内标注所属 Chat。
+pub struct TaskSurface {
+    /// 显示任务的 Chat；其他 Chat 的任务在行内标注所属 Chat。
     chat_id: Uuid,
     revision: u64,
     tasks: Vec<ShellTask>,
@@ -213,8 +204,8 @@ struct StoredOutputChunk {
     total_bytes: u64,
 }
 
-impl<Restore> TaskSurface<Restore> {
-    pub fn open(snapshot: ShellTaskSnapshot, restore: Restore) -> Self {
+impl TaskSurface {
+    pub fn open(snapshot: ShellTaskSnapshot) -> Self {
         let selected_task_id = snapshot.tasks.first().map(|task| task.id);
         let focus = if snapshot.tasks.len() == 1 {
             TaskSurfaceFocus::Detail {
@@ -238,7 +229,6 @@ impl<Restore> TaskSurface<Restore> {
             );
         }
         Self {
-            restore,
             chat_id: snapshot.chat_id,
             revision: snapshot.live_revision,
             tasks: snapshot.tasks,
@@ -253,25 +243,8 @@ impl<Restore> TaskSurface<Restore> {
         }
     }
 
-    pub fn focus(&self) -> TaskSurfaceFocus {
-        self.focus
-    }
-
     pub fn set_detail_metadata(&mut self, task_id: Uuid, lines: Vec<String>) {
         self.detail_states.entry(task_id).or_default().metadata = Some(lines);
-    }
-
-    pub fn open_detail(&mut self, task_id: Uuid, viewport: TaskViewport) -> TaskSurfaceEffect {
-        if self.task(task_id).is_none() {
-            return TaskSurfaceEffect::None;
-        }
-        self.selected_task_id = Some(task_id);
-        self.focus = TaskSurfaceFocus::List;
-        self.apply(TaskSurfaceAction::Open, viewport)
-    }
-
-    pub fn restore(&self) -> &Restore {
-        &self.restore
     }
 
     pub fn initial_effect(&mut self) -> TaskSurfaceEffect {
@@ -441,10 +414,6 @@ impl<Restore> TaskSurface<Restore> {
         self.action_error = Some(format!("{target}: {message}"));
     }
 
-    pub fn report_update_error(&mut self, message: String) {
-        self.action_error = Some(format!("Task updates: {message} · reopen /tasks to retry"));
-    }
-
     pub fn clear_action_error(&mut self) {
         self.action_error = None;
     }
@@ -567,7 +536,7 @@ impl<Restore> TaskSurface<Restore> {
         self.navigation_generation = self.navigation_generation.wrapping_add(1);
         self.normalize_selection(Some(viewport.height));
         let effect = match self.focus {
-            TaskSurfaceFocus::List => self.apply_list(action, viewport),
+            TaskSurfaceFocus::List => TaskSurfaceEffect::None,
             TaskSurfaceFocus::Detail { task_id } => self.apply_detail(task_id, action, viewport),
         };
         let current_navigation = match self.focus {
@@ -597,97 +566,12 @@ impl<Restore> TaskSurface<Restore> {
         effect
     }
 
-    pub fn select_at_row(&mut self, row: usize, viewport: TaskViewport) -> bool {
-        if self.focus != TaskSurfaceFocus::List {
-            return false;
-        }
-        let frame = self.frame(viewport);
-        let Some(task_id) = frame.lines.get(row).and_then(|line| line.task_id) else {
-            return false;
-        };
-        let Some(index) = self.tasks.iter().position(|task| task.id == task_id) else {
-            return false;
-        };
-        self.selected_task_id = Some(task_id);
-        self.fallback_task_index = index;
-        true
-    }
-
-    pub fn content_rows(&self, width: usize, limit: usize) -> usize {
-        match self.focus {
-            TaskSurfaceFocus::List => (self.tasks.len().max(1)
-                + usize::from(self.unavailable_task_id.is_some()))
-            .min(limit),
-            TaskSurfaceFocus::Detail { task_id } => {
-                let Some(task) = self.task(task_id) else {
-                    return 2.min(limit);
-                };
-                let empty = DetailState::default();
-                let detail = self.detail_states.get(&task_id).unwrap_or(&empty);
-                let layout = DetailLayout::new(task, self.chat_id, detail, width);
-                let mut rows = 0usize;
-                layout.visit(&mut |line| {
-                    rows = rows
-                        .saturating_add(
-                            measure_wrapped(line.bytes, layout.width, None).segment_count,
-                        )
-                        .min(limit);
-                    rows < limit
-                });
-                rows
-            }
-        }
-    }
-
     pub fn frame(&mut self, viewport: TaskViewport) -> TaskSurfaceFrame {
         self.normalize_selection(Some(viewport.height));
         match self.focus {
             TaskSurfaceFocus::List => self.list_frame(viewport),
             TaskSurfaceFocus::Detail { task_id } => self.detail_frame(task_id, viewport),
         }
-    }
-
-    fn apply_list(
-        &mut self,
-        action: TaskSurfaceAction,
-        viewport: TaskViewport,
-    ) -> TaskSurfaceEffect {
-        match action {
-            TaskSurfaceAction::Previous => self.move_selection(false, viewport.height),
-            TaskSurfaceAction::Next => self.move_selection(true, viewport.height),
-            TaskSurfaceAction::Open => {
-                let Some(task_id) = self.selected_task_id else {
-                    return TaskSurfaceEffect::None;
-                };
-                self.unavailable_task_id = None;
-                self.focus = TaskSurfaceFocus::Detail { task_id };
-                let output_bytes = self.task(task_id).map_or(0, |task| task.output_bytes);
-                let detail = self.detail_states.entry(task_id).or_default();
-                detail.known_total_bytes = detail.known_total_bytes.max(output_bytes);
-                if matches!(
-                    detail.pending_output_position,
-                    Some(PendingOutputPosition::Waiting { .. })
-                ) {
-                    return self.initial_effect();
-                }
-                if detail.output.is_none() {
-                    detail.navigation.follow_tail = true;
-                    return self.initial_effect();
-                }
-            }
-            TaskSurfaceAction::Back | TaskSurfaceAction::Close => {
-                return TaskSurfaceEffect::Close;
-            }
-            TaskSurfaceAction::Background => {
-                return self.control_effect(ShellTaskAction::Background);
-            }
-            TaskSurfaceAction::Stop => return self.control_effect(ShellTaskAction::Stop),
-            TaskSurfaceAction::ScrollLines(_)
-            | TaskSurfaceAction::Page(_)
-            | TaskSurfaceAction::Home
-            | TaskSurfaceAction::End => {}
-        }
-        TaskSurfaceEffect::None
     }
 
     fn apply_detail(
@@ -697,18 +581,6 @@ impl<Restore> TaskSurface<Restore> {
         viewport: TaskViewport,
     ) -> TaskSurfaceEffect {
         match action {
-            TaskSurfaceAction::Back => {
-                self.focus = TaskSurfaceFocus::List;
-                TaskSurfaceEffect::None
-            }
-            TaskSurfaceAction::Close => TaskSurfaceEffect::Close,
-            TaskSurfaceAction::Background => {
-                self.control_effect_for(task_id, ShellTaskAction::Background)
-            }
-            TaskSurfaceAction::Stop => self.control_effect_for(task_id, ShellTaskAction::Stop),
-            TaskSurfaceAction::Previous | TaskSurfaceAction::Next | TaskSurfaceAction::Open => {
-                TaskSurfaceEffect::None
-            }
             TaskSurfaceAction::ScrollLines(lines) => {
                 self.navigate_detail(task_id, viewport, lines as isize, false, false)
             }
@@ -887,28 +759,6 @@ impl<Restore> TaskSurface<Restore> {
         TaskSurfaceEffect::None
     }
 
-    fn control_effect(&self, action: ShellTaskAction) -> TaskSurfaceEffect {
-        self.selected_task_id
-            .map_or(TaskSurfaceEffect::None, |task_id| {
-                self.control_effect_for(task_id, action)
-            })
-    }
-
-    fn control_effect_for(&self, task_id: Uuid, action: ShellTaskAction) -> TaskSurfaceEffect {
-        let Some(task) = self.task(task_id) else {
-            return TaskSurfaceEffect::None;
-        };
-        let allowed = match action {
-            ShellTaskAction::Background => task.capabilities.can_background,
-            ShellTaskAction::Stop => task.capabilities.can_stop,
-        };
-        if allowed {
-            TaskSurfaceEffect::Control { task_id, action }
-        } else {
-            TaskSurfaceEffect::None
-        }
-    }
-
     fn list_frame(&mut self, viewport: TaskViewport) -> TaskSurfaceFrame {
         if viewport.width == 0 || viewport.height == 0 {
             return empty_frame(self.focus, self.selected_task_id, self.unavailable_task_id);
@@ -1043,27 +893,6 @@ impl<Restore> TaskSurface<Restore> {
                 viewport_height.saturating_sub(warning_rows),
             );
         }
-    }
-
-    fn move_selection(&mut self, forward: bool, viewport_height: usize) {
-        if self.tasks.is_empty() {
-            return;
-        }
-        self.fallback_task_index = if forward {
-            self.fallback_task_index
-                .saturating_add(1)
-                .min(self.tasks.len() - 1)
-        } else {
-            self.fallback_task_index.saturating_sub(1)
-        };
-        self.selected_task_id = Some(self.tasks[self.fallback_task_index].id);
-        self.unavailable_task_id = None;
-        keep_selected_visible(
-            &mut self.list_top,
-            self.fallback_task_index,
-            self.tasks.len(),
-            viewport_height,
-        );
     }
 }
 
@@ -1451,7 +1280,12 @@ impl<'a> DetailLayout<'a> {
         }
         for value in [
             self.task.exit_code.map(|value| format!("Exit: {value}")),
-            self.task.signal.map(|value| format!("Signal: {value}")),
+            self.task
+                .signal
+                .map(|value| match crate::monitor_rows::signal_name(value) {
+                    Some(name) => format!("Signal: {name} ({value})"),
+                    None => format!("Signal: {value}"),
+                }),
             self.task
                 .reason
                 .as_ref()
@@ -1878,6 +1712,7 @@ mod tests {
         };
         ShellTask {
             updated_at_ms: None,
+            ended_at_ms: None,
             id: Uuid::from_u128(id),
             chat_id: Uuid::from_u128(100),
             origin,
@@ -1890,6 +1725,7 @@ mod tests {
                 },
             },
             command: command.into(),
+            description: None,
             cwd: "/tmp/work".into(),
             state: status,
             pid: None,
@@ -1944,257 +1780,17 @@ mod tests {
     }
 
     #[test]
-    fn zero_and_multiple_tasks_open_list_while_one_opens_detail_with_a_latent_list() {
-        let mut empty = TaskSurface::open(snapshot(1, Vec::new()), "restore");
-        let frame = empty.frame(viewport(80, 4));
-        assert_eq!(frame.lines[0].kind, TaskFrameLineKind::Empty);
-        assert_eq!(frame.selected_task_id, None);
-        assert_eq!(
-            empty.apply(TaskSurfaceAction::Open, viewport(80, 4)),
-            TaskSurfaceEffect::None
-        );
-
-        let mut one = TaskSurface::open(
-            snapshot(1, vec![task(1, "printf one", ShellTaskState::Running, 0)]),
-            "restore",
-        );
-        assert_eq!(
-            one.focus(),
-            TaskSurfaceFocus::Detail {
-                task_id: Uuid::from_u128(1)
-            }
-        );
-        let effect = one.initial_effect();
-        assert!(
-            matches!(effect, TaskSurfaceEffect::ReadOutput { task_id, .. } if task_id == Uuid::from_u128(1))
-        );
-        assert_eq!(
-            one.apply(TaskSurfaceAction::Back, viewport(80, 4)),
-            TaskSurfaceEffect::None
-        );
-        assert_eq!(one.focus(), TaskSurfaceFocus::List);
-        assert_eq!(
-            one.frame(viewport(80, 4)).selected_task_id,
-            Some(Uuid::from_u128(1))
-        );
-        one.apply(TaskSurfaceAction::Open, viewport(80, 4));
-        assert_eq!(
-            one.focus(),
-            TaskSurfaceFocus::Detail {
-                task_id: Uuid::from_u128(1)
-            }
-        );
-
-        let mut many = TaskSurface::open(
-            snapshot(
-                1,
-                vec![
-                    task(1, "one", ShellTaskState::Running, 0),
-                    task(2, "two", ShellTaskState::Completed, 0),
-                    task(3, "three", ShellTaskState::Failed, 0),
-                ],
-            ),
-            "restore",
-        );
-        many.apply(TaskSurfaceAction::Next, viewport(80, 2));
-        let frame = many.frame(viewport(160, 2));
-        assert_eq!(frame.selected_task_id, Some(Uuid::from_u128(2)));
-        assert!(frame.lines[0].text.contains("0 B"));
-        assert!(frame.lines[0].text.contains("/tmp/work"));
-    }
-
-    #[test]
-    fn selection_tracks_task_id_across_reorder_and_nearest_neighbor_after_removal() {
-        let mut surface = TaskSurface::open(
-            snapshot(
-                1,
-                vec![
-                    task(1, "one", ShellTaskState::Running, 0),
-                    task(2, "two", ShellTaskState::Running, 0),
-                    task(3, "three", ShellTaskState::Running, 0),
-                ],
-            ),
-            (),
-        );
-        surface.apply(TaskSurfaceAction::Next, viewport(80, 2));
-        surface.update_snapshot(snapshot(
-            2,
-            vec![
-                task(3, "three", ShellTaskState::Running, 0),
-                task(2, "two", ShellTaskState::Running, 0),
-                task(1, "one", ShellTaskState::Running, 0),
-            ],
-        ));
-        assert_eq!(
-            surface.frame(viewport(80, 2)).selected_task_id,
-            Some(Uuid::from_u128(2))
-        );
-
-        surface.update_snapshot(snapshot(
-            3,
-            vec![
-                task(3, "three", ShellTaskState::Running, 0),
-                task(1, "one", ShellTaskState::Running, 0),
-            ],
-        ));
-        let frame = surface.frame(viewport(80, 2));
-        assert_eq!(frame.selected_task_id, Some(Uuid::from_u128(1)));
-        assert_eq!(frame.unavailable_task_id, Some(Uuid::from_u128(2)));
-        assert_eq!(frame.lines[0].kind, TaskFrameLineKind::Unavailable);
-    }
-
-    #[test]
-    fn disappearing_detail_stays_unavailable_instead_of_retargeting_actions() {
-        let mut surface = TaskSurface::open(
-            snapshot(
-                1,
-                vec![
-                    task(1, "one", ShellTaskState::Running, 0),
-                    task(2, "two", ShellTaskState::Running, 0),
-                ],
-            ),
-            (),
-        );
-        surface.apply(TaskSurfaceAction::Open, viewport(80, 10));
-        surface.update_snapshot(snapshot(
-            2,
-            vec![task(2, "two", ShellTaskState::Running, 0)],
-        ));
-        let frame = surface.frame(viewport(80, 10));
-        assert_eq!(
-            frame.focus,
-            TaskSurfaceFocus::Detail {
-                task_id: Uuid::from_u128(1)
-            }
-        );
-        assert!(
-            frame
-                .lines
-                .iter()
-                .any(|line| line.kind == TaskFrameLineKind::Unavailable)
-        );
-        assert_eq!(
-            surface.apply(TaskSurfaceAction::Stop, viewport(80, 10)),
-            TaskSurfaceEffect::None
-        );
-
-        surface.update_snapshot(snapshot(
-            3,
-            vec![
-                task(2, "two", ShellTaskState::Running, 0),
-                task(1, "one", ShellTaskState::Background, 0),
-            ],
-        ));
-        let restored = surface.frame(viewport(80, 10));
-        assert_eq!(restored.unavailable_task_id, None);
-        assert_eq!(restored.selected_task_id, Some(Uuid::from_u128(1)));
-        assert_eq!(
-            surface.apply(TaskSurfaceAction::Stop, viewport(80, 10)),
-            TaskSurfaceEffect::Control {
-                task_id: Uuid::from_u128(1),
-                action: ShellTaskAction::Stop,
-            }
-        );
-    }
-
-    #[test]
-    fn control_effects_preserve_task_id_and_capabilities() {
-        let mut surface = TaskSurface::open(
-            snapshot(1, vec![task(1, "one", ShellTaskState::Running, 0)]),
-            (),
-        );
-        assert_eq!(
-            surface.apply(TaskSurfaceAction::Stop, viewport(80, 10)),
-            TaskSurfaceEffect::Control {
-                task_id: Uuid::from_u128(1),
-                action: ShellTaskAction::Stop
-            }
-        );
-        surface.update_snapshot(snapshot(
-            2,
-            vec![task(1, "one", ShellTaskState::Completed, 0)],
-        ));
-        assert_eq!(
-            surface.apply(TaskSurfaceAction::Stop, viewport(80, 10)),
-            TaskSurfaceEffect::None
-        );
-    }
-
-    #[test]
-    fn refreshing_or_reopening_a_scrolled_list_preserves_its_viewport() {
-        let tasks = (1..=12)
-            .map(|id| task(id, &format!("task {id}"), ShellTaskState::Completed, 0))
-            .collect::<Vec<_>>();
-        let mut surface = TaskSurface::open(snapshot(1, tasks.clone()), ());
-        let size = viewport(80, 4);
-        for _ in 0..8 {
-            surface.apply(TaskSurfaceAction::Next, size);
-        }
-        for _ in 0..2 {
-            surface.apply(TaskSurfaceAction::Previous, size);
-        }
-        let before = surface.frame(size);
-        assert!(before.visible_tasks.start > 0);
-        surface.update_snapshot(snapshot(2, tasks.clone()));
-        let refreshed = surface.frame(size);
-        assert_eq!(refreshed.visible_tasks, before.visible_tasks);
-        assert_eq!(refreshed.selected_task_id, before.selected_task_id);
-        surface.apply(TaskSurfaceAction::Close, size);
-        surface.reopen(snapshot(3, tasks));
-        let reopened = surface.frame(size);
-        assert_eq!(reopened.visible_tasks, before.visible_tasks);
-        assert_eq!(reopened.selected_task_id, before.selected_task_id);
-    }
-
-    #[test]
-    fn list_frame_exposes_the_selected_tasks_capabilities() {
-        let mut surface = TaskSurface::open(
-            snapshot(
-                1,
-                vec![
-                    task(1, "one", ShellTaskState::Running, 0),
-                    task(2, "two", ShellTaskState::Completed, 0),
-                ],
-            ),
-            (),
-        );
-
-        let running = surface.frame(viewport(160, 10));
-        assert_eq!(
-            running.selected_capabilities,
-            ShellTaskCapabilities {
-                can_background: true,
-                can_stop: true,
-                can_read_output: true,
-            }
-        );
-        surface.apply(TaskSurfaceAction::Next, viewport(160, 10));
-        let completed = surface.frame(viewport(160, 10));
-        assert_eq!(
-            completed.selected_capabilities,
-            ShellTaskCapabilities {
-                can_background: false,
-                can_stop: false,
-                can_read_output: true,
-            }
-        );
-    }
-
-    #[test]
     fn scrolling_down_at_the_followed_tail_keeps_follow_enabled() {
         let output = b"one\ntwo\nthree\nfour\n";
-        let mut surface = TaskSurface::open(
-            snapshot(
+        let mut surface = TaskSurface::open(snapshot(
+            1,
+            vec![task(
                 1,
-                vec![task(
-                    1,
-                    "one",
-                    ShellTaskState::Background,
-                    output.len() as u64,
-                )],
-            ),
-            (),
-        );
+                "one",
+                ShellTaskState::Background,
+                output.len() as u64,
+            )],
+        ));
         deliver_output(
             &mut surface,
             output_chunk(1, 0, output, output.len() as u64, None),
@@ -2225,10 +1821,10 @@ mod tests {
             TaskSurfaceAction::ScrollLines(-1),
             TaskSurfaceAction::Page(-1),
         ] {
-            let mut surface = TaskSurface::open(
-                snapshot(1, vec![task(1, "one", ShellTaskState::Background, 8)]),
-                (),
-            );
+            let mut surface = TaskSurface::open(snapshot(
+                1,
+                vec![task(1, "one", ShellTaskState::Background, 8)],
+            ));
             let initial = surface.initial_effect();
             let effect = surface.apply(action, viewport(80, 22));
             let TaskSurfaceEffect::ReadOutput {
@@ -2269,18 +1865,15 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(tail.len(), OUTPUT_READ_LIMIT);
         let initial_viewport = viewport(40, 5);
-        let mut surface = TaskSurface::open(
-            snapshot(
+        let mut surface = TaskSurface::open(snapshot(
+            1,
+            vec![task(
                 1,
-                vec![task(
-                    1,
-                    "large output",
-                    ShellTaskState::Background,
-                    total_bytes,
-                )],
-            ),
-            (),
-        );
+                "large output",
+                ShellTaskState::Background,
+                total_bytes,
+            )],
+        ));
         let mut generations = Vec::new();
         for action in [
             TaskSurfaceAction::ScrollLines(-1),
@@ -2299,13 +1892,6 @@ mod tests {
             generations.push(generation);
             surface.frame(initial_viewport);
         }
-        assert!(matches!(
-            surface.apply(TaskSurfaceAction::Stop, initial_viewport),
-            TaskSurfaceEffect::Control {
-                action: ShellTaskAction::Stop,
-                ..
-            }
-        ));
         assert_eq!(surface.navigation_generation, *generations.last().unwrap());
         surface.frame(initial_viewport);
 
@@ -2342,39 +1928,11 @@ mod tests {
     }
 
     #[test]
-    fn task_controls_do_not_invalidate_a_pending_output_read() {
-        for action in [TaskSurfaceAction::Background, TaskSurfaceAction::Stop] {
-            let mut surface = TaskSurface::open(
-                snapshot(1, vec![task(1, "one", ShellTaskState::Running, 8)]),
-                (),
-            );
-            let TaskSurfaceEffect::ReadOutput { generation, .. } = surface.initial_effect() else {
-                unreachable!()
-            };
-            assert!(matches!(
-                surface.apply(action, viewport(80, 22)),
-                TaskSurfaceEffect::Control { .. }
-            ));
-            surface.update_output(TaskOutputUpdate::Chunk {
-                generation,
-                chunk: output_chunk(1, 0, b"accepted", 8, None),
-            });
-            assert!(
-                surface
-                    .frame(viewport(80, 22))
-                    .lines
-                    .iter()
-                    .any(|line| line.text.contains("accepted"))
-            );
-        }
-    }
-
-    #[test]
     fn no_op_tail_scroll_does_not_cancel_the_initial_output_read() {
-        let mut surface = TaskSurface::open(
-            snapshot(1, vec![task(1, "one", ShellTaskState::Background, 8)]),
-            (),
-        );
+        let mut surface = TaskSurface::open(snapshot(
+            1,
+            vec![task(1, "one", ShellTaskState::Background, 8)],
+        ));
         let initial = surface.initial_effect();
         let initial_generation = match initial {
             TaskSurfaceEffect::ReadOutput { generation, .. } => generation,
@@ -2399,11 +1957,10 @@ mod tests {
 
     #[test]
     fn tail_follow_and_paused_unread_are_independent_per_task() {
-        let mut surface = TaskSurface::open(
-            snapshot(1, vec![task(1, "one", ShellTaskState::Background, 12)]),
-            (),
-        );
-        surface.apply(TaskSurfaceAction::Open, viewport(12, 3));
+        let mut surface = TaskSurface::open(snapshot(
+            1,
+            vec![task(1, "one", ShellTaskState::Background, 12)],
+        ));
         deliver_output(
             &mut surface,
             output_chunk(1, 0, b"one\ntwo\nthree\n", 14, None),
@@ -2429,57 +1986,17 @@ mod tests {
     }
 
     #[test]
-    fn visited_detail_accumulates_unread_while_list_or_surface_is_hidden() {
-        let mut surface = TaskSurface::open(
-            snapshot(
-                1,
-                vec![
-                    task(1, "one", ShellTaskState::Background, 10),
-                    task(2, "two", ShellTaskState::Background, 20),
-                ],
-            ),
-            (),
-        );
-        surface.apply(TaskSurfaceAction::Open, viewport(40, 10));
-        surface.apply(TaskSurfaceAction::Back, viewport(40, 10));
-        surface.update_snapshot(snapshot(
-            2,
-            vec![
-                task(1, "one", ShellTaskState::Background, 15),
-                task(2, "two", ShellTaskState::Background, 20),
-            ],
-        ));
-        let detail = surface.detail_states.get(&Uuid::from_u128(1)).unwrap();
-        assert_eq!(detail.unread_bytes, 5);
-        assert!(!detail.navigation.follow_tail);
-
-        surface.update_snapshot_hidden(snapshot(
-            3,
-            vec![
-                task(1, "one", ShellTaskState::Background, 22),
-                task(2, "two", ShellTaskState::Background, 20),
-            ],
-        ));
-        let detail = surface.detail_states.get(&Uuid::from_u128(1)).unwrap();
-        assert_eq!(detail.unread_bytes, 12);
-        assert!(!detail.navigation.follow_tail);
-    }
-
-    #[test]
     fn reopen_with_loaded_output_preserves_anchor_and_records_unseen_growth() {
         let output = b"one\ntwo\nthree\nfour\nfive\nsix\n";
-        let mut surface = TaskSurface::open(
-            snapshot(
+        let mut surface = TaskSurface::open(snapshot(
+            1,
+            vec![task(
                 1,
-                vec![task(
-                    1,
-                    "one",
-                    ShellTaskState::Background,
-                    output.len() as u64,
-                )],
-            ),
-            (),
-        );
+                "one",
+                ShellTaskState::Background,
+                output.len() as u64,
+            )],
+        ));
         deliver_output(
             &mut surface,
             output_chunk(1, 0, output, output.len() as u64, None),
@@ -2514,10 +2031,10 @@ mod tests {
 
     #[test]
     fn action_errors_are_visible_without_changing_task_selection() {
-        let mut surface = TaskSurface::open(
-            snapshot(1, vec![task(1, "one", ShellTaskState::Running, 0)]),
-            (),
-        );
+        let mut surface = TaskSurface::open(snapshot(
+            1,
+            vec![task(1, "one", ShellTaskState::Running, 0)],
+        ));
         surface.report_action_error(Uuid::from_u128(1), "owner mismatch".into());
         let frame = surface.frame(viewport(80, 10));
         assert_eq!(frame.selected_task_id, Some(Uuid::from_u128(1)));
@@ -2528,14 +2045,10 @@ mod tests {
 
     #[test]
     fn detail_anchor_survives_resize_and_frame_memory_is_viewport_bounded() {
-        let mut surface = TaskSurface::open(
-            snapshot(
-                1,
-                vec![task(1, "one", ShellTaskState::Completed, 8 * 1024 * 1024)],
-            ),
-            (),
-        );
-        surface.apply(TaskSurfaceAction::Open, viewport(80, 5));
+        let mut surface = TaskSurface::open(snapshot(
+            1,
+            vec![task(1, "one", ShellTaskState::Completed, 8 * 1024 * 1024)],
+        ));
         deliver_output(
             &mut surface,
             output_chunk(1, 0, &vec![b'x'; 8 * 1024 * 1024], 8 * 1024 * 1024, None),
@@ -2554,18 +2067,15 @@ mod tests {
     #[test]
     fn paging_uses_artifact_offsets_and_can_move_backward_forward_and_to_tail() {
         let total_bytes = 200_000;
-        let mut surface = TaskSurface::open(
-            snapshot(
+        let mut surface = TaskSurface::open(snapshot(
+            1,
+            vec![task(
                 1,
-                vec![task(
-                    1,
-                    "long output",
-                    ShellTaskState::Background,
-                    total_bytes,
-                )],
-            ),
-            (),
-        );
+                "long output",
+                ShellTaskState::Background,
+                total_bytes,
+            )],
+        ));
         let lossy_page = vec![0xff; OUTPUT_READ_LIMIT];
         deliver_output(
             &mut surface,
@@ -2615,18 +2125,15 @@ mod tests {
             .flat_map(|_| [b'x', b'\n'])
             .collect::<Vec<_>>();
         let viewport = viewport(40, 5);
-        let mut surface = TaskSurface::open(
-            snapshot(
+        let mut surface = TaskSurface::open(snapshot(
+            1,
+            vec![task(
                 1,
-                vec![task(
-                    1,
-                    "paged output",
-                    ShellTaskState::Background,
-                    total_bytes,
-                )],
-            ),
-            (),
-        );
+                "paged output",
+                ShellTaskState::Background,
+                total_bytes,
+            )],
+        ));
         deliver_output(
             &mut surface,
             output_chunk(
@@ -2683,15 +2190,13 @@ mod tests {
 
     #[test]
     fn reopening_resumes_the_requested_page_instead_of_replacing_it_with_the_tail() {
-        for (has_loaded_tail, via_list) in
-            [(false, false), (true, false), (false, true), (true, true)]
-        {
+        for has_loaded_tail in [false, true] {
             let total = OUTPUT_READ_LIMIT as u64 + 8;
             let snapshot = snapshot(
                 1,
                 vec![task(1, "large output", ShellTaskState::Completed, total)],
             );
-            let mut surface = TaskSurface::open(snapshot.clone(), ());
+            let mut surface = TaskSurface::open(snapshot.clone());
             if has_loaded_tail {
                 deliver_output(
                     &mut surface,
@@ -2700,14 +2205,7 @@ mod tests {
             }
             let initial = surface.apply(TaskSurfaceAction::Home, viewport(80, 22));
             surface.frame(viewport(80, 22));
-            let resumed = if via_list {
-                surface.apply(TaskSurfaceAction::Back, viewport(80, 22));
-                surface.frame(viewport(80, 22));
-                surface.apply(TaskSurfaceAction::Open, viewport(80, 22))
-            } else {
-                surface.apply(TaskSurfaceAction::Close, viewport(80, 22));
-                surface.reopen(snapshot)
-            };
+            let resumed = surface.reopen(snapshot);
             let TaskSurfaceEffect::ReadOutput {
                 cursor, generation, ..
             } = resumed
@@ -2715,7 +2213,10 @@ mod tests {
                 panic!("reopen must resume pending read")
             };
             assert_eq!(cursor, 0);
-            assert_ne!(initial, resumed);
+            assert_eq!(
+                initial, resumed,
+                "reopening asks again for the requested page"
+            );
             surface.update_output(TaskOutputUpdate::Chunk {
                 generation,
                 chunk: output_chunk(1, 0, b"first-page\n", total, Some(11)),
@@ -2735,13 +2236,10 @@ mod tests {
     fn home_keeps_metadata_visible_after_the_first_output_page_arrives() {
         for has_loaded_tail in [false, true] {
             let total = OUTPUT_READ_LIMIT as u64 + 8;
-            let mut surface = TaskSurface::open(
-                snapshot(
-                    1,
-                    vec![task(1, "large output", ShellTaskState::Completed, total)],
-                ),
-                (),
-            );
+            let mut surface = TaskSurface::open(snapshot(
+                1,
+                vec![task(1, "large output", ShellTaskState::Completed, total)],
+            ));
             if has_loaded_tail {
                 deliver_output(
                     &mut surface,
@@ -2780,13 +2278,10 @@ mod tests {
 
     #[test]
     fn stale_output_does_not_replace_a_new_navigation_request() {
-        let mut surface = TaskSurface::open(
-            snapshot(
-                1,
-                vec![task(1, "growing output", ShellTaskState::Background, 8)],
-            ),
-            (),
-        );
+        let mut surface = TaskSurface::open(snapshot(
+            1,
+            vec![task(1, "growing output", ShellTaskState::Background, 8)],
+        ));
         let stale_generation = surface.navigation_generation;
         let replacement = surface.apply(TaskSurfaceAction::Home, viewport(20, 4));
         assert!(matches!(
@@ -2812,13 +2307,10 @@ mod tests {
 
     #[test]
     fn tail_follow_retargets_when_output_grows_during_a_read() {
-        let mut surface = TaskSurface::open(
-            snapshot(
-                1,
-                vec![task(1, "growing output", ShellTaskState::Background, 8)],
-            ),
-            (),
-        );
+        let mut surface = TaskSurface::open(snapshot(
+            1,
+            vec![task(1, "growing output", ShellTaskState::Background, 8)],
+        ));
         let effect = deliver_output(
             &mut surface,
             output_chunk(
@@ -2849,11 +2341,10 @@ mod tests {
 
     #[test]
     fn output_escapes_controls_tabs_and_invalid_utf8_without_ansi() {
-        let mut surface = TaskSurface::open(
-            snapshot(1, vec![task(1, "one", ShellTaskState::Completed, 9)]),
-            (),
-        );
-        surface.apply(TaskSurfaceAction::Open, viewport(40, 20));
+        let mut surface = TaskSurface::open(snapshot(
+            1,
+            vec![task(1, "one", ShellTaskState::Completed, 9)],
+        ));
         deliver_output(
             &mut surface,
             output_chunk(1, 0, b"a\tb\x1b]x\x07\xff\n\xe4\xb8\xad", 12, None),
@@ -2874,18 +2365,15 @@ mod tests {
 
     #[test]
     fn lossy_utf8_expansion_keeps_the_complete_raw_output_window() {
-        let mut surface = TaskSurface::open(
-            snapshot(
+        let mut surface = TaskSurface::open(snapshot(
+            1,
+            vec![task(
                 1,
-                vec![task(
-                    1,
-                    "invalid bytes",
-                    ShellTaskState::Completed,
-                    OUTPUT_READ_LIMIT as u64,
-                )],
-            ),
-            (),
-        );
+                "invalid bytes",
+                ShellTaskState::Completed,
+                OUTPUT_READ_LIMIT as u64,
+            )],
+        ));
         let raw = vec![0xff; OUTPUT_READ_LIMIT];
         deliver_output(
             &mut surface,
@@ -2902,16 +2390,12 @@ mod tests {
 
     #[test]
     fn unavailable_output_and_tiny_viewports_are_explicit_and_safe() {
-        let mut surface = TaskSurface::open(
-            snapshot(
-                1,
-                vec![task(1, "\nlong\tcommand", ShellTaskState::Unknown, 5)],
-            ),
-            (),
-        );
+        let mut surface = TaskSurface::open(snapshot(
+            1,
+            vec![task(1, "\nlong\tcommand", ShellTaskState::Unknown, 5)],
+        ));
         assert!(surface.frame(viewport(0, 0)).lines.is_empty());
         assert_eq!(surface.frame(viewport(1, 1)).lines.len(), 1);
-        surface.apply(TaskSurfaceAction::Open, viewport(1, 1));
         surface.update_output(TaskOutputUpdate::Unavailable {
             generation: surface.navigation_generation,
             task_id: Uuid::from_u128(1),
@@ -2931,17 +2415,16 @@ mod tests {
 
     #[test]
     fn stale_snapshots_do_not_rewind_selection_or_output_counts() {
-        let mut surface = TaskSurface::open(
-            snapshot(2, vec![task(1, "one", ShellTaskState::Running, 20)]),
-            (),
-        );
-        surface.apply(TaskSurfaceAction::Open, viewport(80, 10));
+        let mut surface = TaskSurface::open(snapshot(
+            2,
+            vec![task(1, "one", ShellTaskState::Running, 20)],
+        ));
         surface.update_snapshot(snapshot(
             1,
             vec![task(2, "stale", ShellTaskState::Running, 1)],
         ));
         assert_eq!(
-            surface.focus(),
+            surface.frame(viewport(80, 10)).focus,
             TaskSurfaceFocus::Detail {
                 task_id: Uuid::from_u128(1)
             }
@@ -2949,34 +2432,6 @@ mod tests {
         assert_eq!(
             surface.frame(viewport(80, 10)).selected_task_id,
             Some(Uuid::from_u128(1))
-        );
-    }
-
-    #[test]
-    fn close_preserves_the_opaque_chat_restore_token() {
-        #[derive(Debug, Eq, PartialEq)]
-        struct Restore {
-            draft: String,
-            cursor: usize,
-            follow: bool,
-        }
-        let restore = Restore {
-            draft: "draft".into(),
-            cursor: 3,
-            follow: false,
-        };
-        let mut surface = TaskSurface::open(snapshot(1, Vec::new()), restore);
-        assert_eq!(
-            surface.apply(TaskSurfaceAction::Close, viewport(80, 10)),
-            TaskSurfaceEffect::Close
-        );
-        assert_eq!(
-            surface.restore(),
-            &Restore {
-                draft: "draft".into(),
-                cursor: 3,
-                follow: false
-            }
         );
     }
 }

@@ -62,35 +62,11 @@ pub(super) async fn tick_action(
         refresh(agent, console, root, chat).await?;
         return Ok(());
     }
-    let mut subscribed_tick = None;
-    if let Ok(subscription_id) = Uuid::parse_str(&id) {
-        let rows = agent
-            .tick_subscriptions(chat)
-            .await
-            .map_err(|error| error.to_string())?;
-        let artifact = rows
-            .iter()
-            .find(|row| row.id == subscription_id)
-            .and_then(|row| crate::monitor_rows::artifact_target(&row.instance));
-        let Some((origin, artifact_id)) = artifact.filter(|_| matches!(action, 'o' | 'c' | 'f'))
-        else {
-            console.show_subscriptions_at(chat, rows, subscription_id, action == 'x')?;
-            return Ok(());
-        };
-        let root = root.ok_or("Artifact Service configuration is unavailable")?;
-        let client =
-            ArtifactClient::for_origin(root, &origin).map_err(|error| error.to_string())?;
-        let metadata = client
-            .read(&artifact_id)
-            .await
-            .map_err(|error| error.to_string())?;
-        subscribed_tick = Some(metadata.tick(&origin, 0));
-    }
     let ticks = agent
         .artifact_ticks(chat)
         .await
         .map_err(|error| error.to_string())?;
-    let tick = subscribed_tick.or_else(|| ticks.into_iter().find(|tick| tick.instance_id() == id));
+    let tick = ticks.into_iter().find(|tick| tick.instance_id() == id);
     let tick = if let Some(tick) = tick {
         tick
     } else {
@@ -114,7 +90,7 @@ pub(super) async fn tick_action(
             return Ok(());
         }
         let client = ArtifactClient::for_origin(
-            root.ok_or("Artifact Service configuration is unavailable")?,
+            root.ok_or("Tick Loop Artifacts configuration is unavailable")?,
             &origin,
         )
         .map_err(|error| error.to_string())?;
@@ -207,7 +183,7 @@ pub(super) async fn open(
         .status()
         .await
         .map_err(|error| error.to_string())?
-        .ok_or("Artifact Service is signed out")?;
+        .ok_or("Not signed in to Tick Loop Artifacts")?;
     if !interactive {
         let page = client
             .list("all", "", None)
@@ -532,7 +508,7 @@ mod tests {
             .await
             .unwrap();
         let (agent, core, remote, chat) = subscribed_fixture(directory.path(), &origin).await;
-        let id = remote.rows.lock().unwrap()[0].id.to_string();
+        let id = remote.rows.lock().unwrap()[0].instance.to_string();
         let console = Console::test_for_chat(chat);
         tick_action(&agent, &console, Some(&root), chat, id.clone(), 'o')
             .await
@@ -678,8 +654,8 @@ mod tests {
         )
         .await;
         assert!(
-            result.is_err_and(|error| error.contains("Artifact Service is unavailable")),
-            "linking needs the Artifact Service"
+            result.is_err_and(|error| error.contains("Tick Loop Artifacts is unavailable")),
+            "linking needs Tick Loop Artifacts"
         );
         assert!(agent.snapshot(chat).await.unwrap().loops.is_empty());
         core.shutdown().await;

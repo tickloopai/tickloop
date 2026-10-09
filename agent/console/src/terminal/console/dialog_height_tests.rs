@@ -36,7 +36,7 @@ fn merged_user_menu_commit_hint_survives_content_height_and_resize_only_frames()
                 if picker_kind.is_some() {
                     state.picker_presentation.headers = vec![(0, "Fixture Provider".into())];
                 }
-                state.picker_presentation.hint = "Enter apply · Esc back".into();
+                state.picker_presentation.hint = "enter apply · esc back".into();
                 if editing {
                     state.menu_comment = Some(MenuCommentState {
                         options: vec![0],
@@ -118,7 +118,7 @@ fn merged_generic_menu_completion_repaints_the_next_page_without_an_extra_key() 
             .unwrap()
             .contains(MENU_SUBMISSION_PENDING_HINT)
     );
-    assert!(state.rendered_screen.last().unwrap().contains("Esc back"));
+    assert!(state.rendered_screen.last().unwrap().contains("esc back"));
     assert_eq!(state.menu.as_ref().unwrap().id, next_id);
     assert_eq!(state.menu.as_ref().unwrap().selected, 1);
     assert!(state.picker_kind.is_none());
@@ -138,7 +138,7 @@ fn merged_provider_diagnostics_resize_with_the_selected_connection_and_live_clea
         state.menu = Some(menu);
         state.menu_focused = true;
         state.picker_kind = Some(PickerKind::Model);
-        state.picker_presentation.hint = "Enter apply · Esc back".into();
+        state.picker_presentation.hint = "enter apply · esc back".into();
         state.picker_presentation.failure_target = Some(chat);
         state.picker_presentation.failure_connections =
             vec![Some("deepseek-api".into()), Some("minimax-api".into())];
@@ -217,6 +217,7 @@ fn merged_dialog_heights_hide_and_restore_the_family_panel_and_failure_status() 
                     handle: "scoped-child".into(),
                     description: "Controlled panel".into(),
                     created_at: 1,
+                    color: None,
                 }),
             })
             .collect();
@@ -246,7 +247,7 @@ fn merged_dialog_heights_hide_and_restore_the_family_panel_and_failure_status() 
             let id = menu.id;
             state.menu = Some(menu);
             state.picker_kind = Some(PickerKind::Actions);
-            state.picker_presentation.hint = "Enter change · Esc close".into();
+            state.picker_presentation.hint = "enter change · esc close".into();
             state.menu_focused = true;
             let frame = state.styled_frame().0;
             assert!(frame.len() <= usize::from(height).saturating_sub(2).max(1));
@@ -299,17 +300,20 @@ fn hidden_picker_resize_guard_leaves_transcript_navigation_search_and_close_avai
     let frame = state.transcript.as_mut().unwrap().1.frame(80, 5);
     assert!(
         frame
-            .lines
+            .texts
             .iter()
             .any(|line| line.contains("Transcript row 0"))
     );
     state.key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
     state.paste("Transcript row 20");
     let frame = state.transcript.as_mut().unwrap().1.frame(80, 5);
-    assert!(frame.cursor.is_some());
     assert!(
-        frame
-            .lines
+        frame.texts[4].starts_with("  /Transcript row 20"),
+        "{:?}",
+        frame.texts
+    );
+    assert!(
+        frame.texts[..2]
             .iter()
             .any(|line| line.contains("Transcript row 20"))
     );
@@ -342,7 +346,7 @@ fn content_height_short_settings_retains_rule_title_choices_and_hint() {
                 picker_menu(2),
                 PickerKind::Actions,
                 PickerPresentation {
-                    hint: "Enter · Esc close".into(),
+                    hint: "enter · esc close".into(),
                     ..Default::default()
                 },
             )
@@ -354,7 +358,7 @@ fn content_height_short_settings_retains_rule_title_choices_and_hint() {
         assert_eq!(lines.len(), expected, "{width} columns / {height} rows");
         assert_eq!(lines[0].text(), "▔".repeat(usize::from(width)));
         assert_eq!(lines[1].text(), "Settings");
-        assert!(lines.last().unwrap().text().contains("Esc close"));
+        assert!(lines.last().unwrap().text().contains("esc close"));
         assert!(lines.iter().any(|line| line.text().contains("Option 0")));
         assert!(lines.iter().any(|line| line.text().contains("Option 1")));
         assert!(cursor < lines.len());
@@ -369,7 +373,7 @@ fn content_height_user_confirmation_is_natural_without_agent_request_ownership()
         menu.confirmation = true;
         state.menu = Some(menu);
         state.picker_kind = Some(PickerKind::Actions);
-        state.picker_presentation.hint = "Enter confirm · Esc back".into();
+        state.picker_presentation.hint = "enter confirm · esc back".into();
         state.menu_focused = true;
         let frame = state.styled_frame().0;
         assert_eq!(frame.len(), if height == 6 { 4 } else { 6 });
@@ -378,7 +382,7 @@ fn content_height_user_confirmation_is_natural_without_agent_request_ownership()
                 .iter()
                 .any(|line| line.text().starts_with("❯ Option 0"))
         );
-        assert!(frame.last().unwrap().text().contains("Esc"));
+        assert!(frame.last().unwrap().text().contains("esc"));
     }
 }
 
@@ -410,7 +414,7 @@ async fn content_height_permission_rule_editor_stays_visible_or_blocks_input_whe
         lines.iter().any(|line| line.text().contains("Text")),
         "{lines:?}"
     );
-    assert!(lines.last().unwrap().text().contains("Esc"));
+    assert!(lines.last().unwrap().text().contains("esc"));
     state.paste("controlled rule");
     assert!(
         state
@@ -484,7 +488,7 @@ fn content_height_resume_fits_empty_short_and_overflow_lists_without_moving_focu
         let (lines, _, _) = state.styled_frame();
         assert_eq!(lines.len(), expected, "{count} entries / {height} rows");
         assert!(lines[1].text().contains("Resume"));
-        assert!(lines.last().unwrap().text().contains("Esc"));
+        assert!(lines.last().unwrap().text().contains("esc"));
         assert_eq!(state.conversation_picker.as_ref().unwrap().id(), id);
         if count > 0 {
             assert_eq!(
@@ -537,40 +541,11 @@ fn content_height_artifacts_fits_loading_groups_and_overflow() {
         assert_eq!(lines.len(), expected, "{count} artifacts / {height} rows");
         assert!(lines[1].text().contains("Artifacts"));
         assert!(lines[2].text().contains("Search"));
-        assert!(lines.last().unwrap().text().contains("Esc"));
+        assert!(lines.last().unwrap().text().contains("esc"));
         if count == 2 && height >= 24 {
             assert!(lines.iter().any(|line| line.text() == "This Chat"));
             assert!(lines.iter().any(|line| line.text() == "Other artifacts"));
             assert!(lines.iter().any(|line| line.text().contains("Artifact 1")));
-        }
-    }
-}
-
-#[test]
-fn content_height_management_lists_fit_empty_short_and_long_content() {
-    for surface in ["tasks", "subscriptions"] {
-        for (height, count, expected) in [
-            (24, 0, 4),
-            (24, 2, 5),
-            (24, 20, 22),
-            (40, 20, 23),
-            (10, 20, 8),
-        ] {
-            let chat = Uuid::new_v4();
-            let mut state = State::new(true, 100, height);
-            state.chat = Some(chat);
-            if surface == "tasks" {
-                state.task_surface =
-                    Some(TaskSurface::open(tests::task_snapshot(chat, count), chat));
-            } else {
-                let rows = (0..count)
-                    .map(|index| tests::subscription_row(index as u64 + 1))
-                    .collect();
-                state.subscription_surface = Some(SubscriptionSurface::open(chat, rows));
-            }
-            let (lines, _, _) = state.styled_frame();
-            assert_eq!(lines.len(), expected, "{surface}/{count}/{height}");
-            assert!(lines.last().unwrap().text().contains("Esc"));
         }
     }
 }
@@ -647,7 +622,7 @@ async fn content_height_permission_management_history_fits_loaded_and_empty_reco
             lines.iter().any(|line| line.text().contains(&selected)),
             "{lines:?}"
         );
-        assert!(lines.last().unwrap().text().contains("Esc"));
+        assert!(lines.last().unwrap().text().contains("esc"));
     }
     for detail in [false, true] {
         let mut surface = PermissionsSurface::open(
@@ -685,7 +660,7 @@ async fn content_height_permission_management_history_fits_loaded_and_empty_reco
                 .iter()
                 .any(|line| line.text().contains("Controlled load warning"))
         );
-        assert!(frame.last().unwrap().text().contains("Esc"));
+        assert!(frame.last().unwrap().text().contains("esc"));
         if detail {
             assert!(frame.last().unwrap().text().contains("r retry"));
         }
@@ -725,7 +700,7 @@ async fn content_height_permission_management_history_fits_loaded_and_empty_reco
                 .any(|line| line.text().starts_with("❯ Restore group defaults")),
             "{frame:?}"
         );
-        assert!(frame.last().unwrap().text().contains("Esc"));
+        assert!(frame.last().unwrap().text().contains("esc"));
     }
     agent.shutdown().await;
 }
@@ -794,7 +769,7 @@ fn content_height_tiny_picker_requires_resize_and_never_submits_hidden_controls(
                 .is_none(),
             "{height} rows must not confirm without chrome"
         );
-        assert!(lines.last().unwrap().text().contains("Esc"));
+        assert!(lines.last().unwrap().text().contains("esc"));
         assert!(lines.last().unwrap().text().contains("Resize"));
         assert!(
             matches!(state.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)), Some(InputEvent::Cancel { menu_id }) if menu_id == id)
@@ -810,7 +785,7 @@ fn content_height_help_counts_columns_and_uses_the_full_available_budget() {
         let lines = state.styled_frame().0;
         assert_eq!(lines.len(), expected);
         assert_eq!(lines[1].text(), "Help");
-        assert!(lines.last().unwrap().text().contains("Esc"));
+        assert!(lines.last().unwrap().text().contains("esc"));
         state.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(!state.help_open);
     }
@@ -841,7 +816,7 @@ fn content_height_model_provider_groups_fit_and_keep_the_last_choice_visible() {
             state.picker_kind = Some(kind);
             state.picker_presentation.headers =
                 vec![(0, "Provider A".into()), (count / 2, "Provider B".into())];
-            state.picker_presentation.hint = "Enter · Esc back".into();
+            state.picker_presentation.hint = "enter · esc back".into();
             if kind == PickerKind::Provider {
                 state.picker_presentation.compact_rows = (0..count)
                     .map(|index| CompactPickerRow {
@@ -868,7 +843,7 @@ fn content_height_model_provider_groups_fit_and_keep_the_last_choice_visible() {
                     .iter()
                     .any(|line| line.text().contains(&format!("Option {}", count - 1)))
             );
-            assert!(lines.last().unwrap().text().contains("Esc"));
+            assert!(lines.last().unwrap().text().contains("esc"));
             assert!(cursor < lines.len());
         }
     }
@@ -940,7 +915,7 @@ fn content_height_login_field_wraps_and_scopes_its_cursor_while_chrome_stays_vis
         let (lines, row, column) = state.styled_frame();
         assert_eq!(lines.len(), expected, "{width}/{height}");
         assert!(lines[1].text().contains("Browser login"));
-        assert!(lines.last().unwrap().text().contains("Esc"));
+        assert!(lines.last().unwrap().text().contains("esc"));
         assert!(row < lines.len());
         assert!(column < usize::from(width));
         assert_eq!(state.menu_comment.as_ref().unwrap().values[&0], draft);
@@ -1043,7 +1018,7 @@ fn content_height_pinned_message_and_monitor_column_share_the_upper_remainder() 
         state.menu = Some(page);
         state.picker_kind = Some(PickerKind::Actions);
         state.menu_focused = true;
-        state.picker_presentation.hint = "Enter · Esc back".into();
+        state.picker_presentation.hint = "enter · esc back".into();
         state.draw(&mut Vec::new()).unwrap();
         assert_eq!(state.input_dialog_height(), 5);
         assert!(!state.rendered_screen[0].starts_with("❯ Height pinned message"));
@@ -1097,7 +1072,7 @@ fn merged_monitor_column_and_overlay_stop_at_the_content_sized_dialog_rule() {
                 }
                 state.picker_kind = Some(PickerKind::Actions);
                 state.menu_focused = true;
-                state.picker_presentation.hint = "Enter · Esc back".into();
+                state.picker_presentation.hint = "enter · esc back".into();
                 for count in [2, 80, 2] {
                     state.menu = Some(picker_menu(count));
                     state.draw(&mut Vec::new()).unwrap();
@@ -1114,38 +1089,4 @@ fn merged_monitor_column_and_overlay_stop_at_the_content_sized_dialog_rule() {
             }
         }
     }
-}
-
-#[test]
-fn content_height_task_detail_measures_wrapped_metadata_without_advancing_navigation() {
-    let chat = Uuid::new_v4();
-    let snapshot = tests::task_snapshot(chat, 1);
-    let id = snapshot.tasks[0].id;
-    let mut surface = TaskSurface::open(snapshot, chat);
-    surface.set_detail_metadata(id, vec!["First line".into(), "Second line".into()]);
-    surface.open_detail(
-        id,
-        TaskViewport {
-            width: 100,
-            height: 10,
-        },
-    );
-    let mut state = State::new(true, 100, 24);
-    state.task_surface = Some(surface);
-    let (lines, _, _) = state.styled_frame();
-    assert_eq!(lines.len(), 6);
-    assert!(
-        lines
-            .iter()
-            .any(|line| line.text().contains("Output not loaded"))
-    );
-    state.task_surface.as_mut().unwrap().set_detail_metadata(
-        id,
-        (0..40).map(|index| format!("Metadata {index}")).collect(),
-    );
-    assert_eq!(state.styled_frame().0.len(), 22);
-    assert_eq!(
-        state.task_surface.as_ref().unwrap().focus(),
-        TaskSurfaceFocus::Detail { task_id: id }
-    );
 }

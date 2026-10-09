@@ -109,10 +109,24 @@ pub struct SessionObservation {
     pub state: SessionLinkState,
 }
 
+/// When the session last received a Tick Update, without the update itself: what a Monitor
+/// shows of an instance nobody subscribes to.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionStatus {
+    /// Unix milliseconds of the latest Tick Update, by the session's clock.
+    pub updated_at_ms: Option<u64>,
+    /// How many Tick Updates the session has received.
+    pub received: u64,
+}
+
+/// The method that answers a [`SessionStatus`].
+const STATUS_METHOD: &str = "session/status";
+
 struct Content {
     protocol: TickProtocol,
     read: TickRead,
     observation: SessionObservation,
+    updated_at_ms: Option<u64>,
 }
 
 struct PendingCall {
@@ -234,6 +248,7 @@ impl TickSession {
                 protocol: TickProtocol::new(instance.to_string()),
                 read: initial,
                 observation,
+                updated_at_ms: None,
             }),
             observations,
             shutdown: CancellationToken::new(),
@@ -555,6 +570,7 @@ async fn read_child(stdout: tokio::process::ChildStdout, core: Arc<Core>) {
         };
         content.observation.update = Some(update);
         content.observation.received += 1;
+        content.updated_at_ms = Some(crate::access::now_ms());
         let _ = core.observations.send_replace(content.observation.clone());
     }
     link_state(&core, SessionLinkState::Gone).await;
@@ -675,6 +691,13 @@ async fn serve_connection(mut stream: UnixStream, core: Arc<Core>) -> Result<(),
             Err(SessionError::Busy)
         } else {
             match method {
+                STATUS_METHOD => {
+                    let content = core.content.lock().await;
+                    Ok(json!(SessionStatus {
+                        updated_at_ms: content.updated_at_ms,
+                        received: content.observation.received,
+                    }))
+                }
                 "session/hello" => Ok(
                     json!({"instance_id":core.instance.to_string(),"protocol":tick_protocol::NATIVE_PROTOCOL_VERSION,"backend":core.backend}),
                 ),
@@ -764,6 +787,11 @@ impl SessionClient {
         TickProtocol::new(self.instance.to_string())
             .descriptor(value)
             .map_err(SessionError::Protocol)
+    }
+    /// When the Tick last updated, without reading its content.
+    pub async fn status(&self) -> Result<SessionStatus, SessionError> {
+        let value = self.request(STATUS_METHOD, json!({}), None).await?;
+        serde_json::from_value(value).map_err(|error| SessionError::Protocol(error.to_string()))
     }
     pub async fn read(&self) -> Result<TickRead, SessionError> {
         let value = self

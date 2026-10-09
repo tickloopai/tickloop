@@ -21,7 +21,7 @@ slow-timeout = { period = "300s", terminate-after = 2 }
 [[profile.default.overrides]]
 filter = """
 test(/(^|[_:])pty($|[_:])/)
-| (kind(lib) & test(/^terminal::(recovery_tests|daemon_loss_tests|child_config_tests|late_receipt_tests)::/))
+| (kind(lib) & test(/^terminal::(recovery_tests|daemon_loss_tests|child_config_tests|late_receipt_tests|mode_cycle_tests)::/))
 | (kind(test)
     & test(/^(agent_startup_errors|codex_terminal|monitor_attach|monitor_popup|native_visible_stdio|provider_picker)::/))
 """

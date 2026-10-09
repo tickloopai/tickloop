@@ -540,7 +540,9 @@ fn actual_typed_background_wait_keeps_its_fact_when_short_pending_count_cannot_f
             "pending-preview",
         );
         assert_eq!(proof["proof"]["pending"], 2);
-        fixture.wait_for("Messages to be submitted (2)");
+        fixture.wait_until_shown("two queued inputs", |frame| {
+            screen::queued_inputs(frame).len() == 2
+        });
         let after = fixture.output.lock().unwrap().len();
         fixture
             ._master

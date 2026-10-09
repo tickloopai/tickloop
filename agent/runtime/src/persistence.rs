@@ -36,8 +36,8 @@ use tickloop_agent_protocol::{
     AgentMessageSource, ApprovalRecord, BranchOrigin, ChatId, ChatSnapshot, CompactBoundary,
     CompactTrigger, CompactionMarker, Content, DelegationMetadata, DenialRecord,
     DirectedHumanSource, Event, EventKind, ExecutionMode, FamilyCompletion, FamilyInputRecord,
-    InputContext, LocalMessage, LoopId, LoopSnapshot, LoopState, MAX_RECENT_DENIALS, Message,
-    ModelConfig, MonitorMembership, PrivateHistorySource, Role, RunId, SavedChat,
+    HostNote, InputContext, LocalMessage, LoopId, LoopSnapshot, LoopState, MAX_RECENT_DENIALS,
+    Message, ModelConfig, MonitorMembership, PrivateHistorySource, Role, RunId, SavedChat,
     SubagentRegistration, SummarizeMetadata, SummaryDirection, TodoItem, ToolCallRecovery, Trigger,
     Usage,
 };
@@ -1188,7 +1188,12 @@ fn chain_entry(
         message,
         invoked_skills: snapshot.invoked_skills.clone(),
         is_meta: snapshot.host_notes.contains_key(&index),
-        host_tools: snapshot.host_notes.get(&index).cloned(),
+        host_tools: snapshot
+            .host_notes
+            .get(&index)
+            .and_then(HostNote::announced_host_tools)
+            .cloned(),
+        plan_mode_exit: snapshot.host_notes.get(&index) == Some(&HostNote::PlanModeExit),
         execution_mode: snapshot
             .prompt_execution_modes
             .get(&index)
@@ -1348,6 +1353,7 @@ fn record_loop(
         invoked_skills: snapshot.invoked_skills.clone(),
         is_meta: false,
         host_tools: None,
+        plan_mode_exit: false,
         execution_mode: None,
         is_inherited_prompt: false,
         original_message_id: None,
@@ -1481,7 +1487,7 @@ struct RestoredChain {
     original_message_ids: BTreeMap<usize, Uuid>,
     prompt_execution_modes: BTreeMap<usize, ExecutionMode>,
     inherited_prompts: HashSet<usize>,
-    host_notes: BTreeMap<usize, BTreeSet<String>>,
+    host_notes: BTreeMap<usize, HostNote>,
     message_compactions: BTreeMap<usize, CompactionMarker>,
     message_usage: BTreeMap<usize, Usage>,
     message_sources: BTreeMap<usize, PrivateHistorySource>,
@@ -1607,7 +1613,11 @@ fn restore_chain(chain: &[ChainEntry]) -> (RestoredChain, Vec<String>) {
             restored.inherited_prompts.insert(index);
         }
         if let Some(announced) = &entry.host_tools {
-            restored.host_notes.insert(index, announced.clone());
+            restored
+                .host_notes
+                .insert(index, HostNote::HostTools(announced.clone()));
+        } else if entry.plan_mode_exit {
+            restored.host_notes.insert(index, HostNote::PlanModeExit);
         }
         if let Some(origin) = &entry.human_family_origin {
             restored
@@ -2721,6 +2731,7 @@ impl Agent {
                 bookkeeping,
                 todo_completion_graces: HashMap::new(),
                 start_new_tool_result_message: false,
+                needs_plan_mode_exit_notice: false,
                 active: None,
                 active_run: None,
                 parked: HashMap::new(),

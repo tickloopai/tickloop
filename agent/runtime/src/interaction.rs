@@ -99,8 +99,19 @@ fn answered_questions_result(questions: &[Question], answers: &[QuestionAnswer])
     )
 }
 
-fn ask_user_question_definition() -> ToolDefinition {
+/// Claude Code's `AskUserQuestion` prompt. Its plan mode note points at `ExitPlanMode`, which a
+/// delegated child does not have, so a child's description leaves the note out.
+fn ask_user_question_definition(is_delegated: bool) -> ToolDefinition {
     let plan_tool = EXIT_PLAN_MODE_TOOL_NAME;
+    let plan_mode_note = if is_delegated {
+        String::new()
+    } else {
+        format!(
+            "
+Plan mode note: In plan mode, use this tool to clarify requirements or choose between approaches BEFORE finalizing your plan. Do NOT use this tool to ask \"Is my plan ready?\" or \"Should I proceed?\" - use {plan_tool} for plan approval. IMPORTANT: Do not reference \"the plan\" in your questions (e.g., \"Do you have feedback about the plan?\", \"Does the plan look good?\") because the user cannot see the plan in the UI until you call {plan_tool}. If you need plan approval, use {plan_tool} instead.
+"
+        )
+    };
     ToolDefinition {
         name: ASK_USER_QUESTION_TOOL_NAME.into(),
         description: format!(
@@ -114,9 +125,7 @@ Usage notes:
 - Users will always be able to select \"Other\" to provide custom text input
 - Use multiSelect: true to allow multiple answers to be selected for a question
 - If you recommend a specific option, make that the first option in the list and add \"(Recommended)\" at the end of the label
-
-Plan mode note: In plan mode, use this tool to clarify requirements or choose between approaches BEFORE finalizing your plan. Do NOT use this tool to ask \"Is my plan ready?\" or \"Should I proceed?\" - use {plan_tool} for plan approval. IMPORTANT: Do not reference \"the plan\" in your questions (e.g., \"Do you have feedback about the plan?\", \"Does the plan look good?\") because the user cannot see the plan in the UI until you call {plan_tool}. If you need plan approval, use {plan_tool} instead.
-"
+{plan_mode_note}"
         ),
         input_schema: json!({
             "type": "object",
@@ -209,8 +218,8 @@ Plan mode note: In plan mode, use this tool to clarify requirements or choose be
     }
 }
 
-pub(super) fn definitions() -> Vec<ToolDefinition> {
-    vec![ask_user_question_definition(), ToolDefinition {
+pub(super) fn definitions(is_delegated: bool) -> Vec<ToolDefinition> {
+    vec![ask_user_question_definition(is_delegated), ToolDefinition {
         name: START_GOAL_TOOL_NAME.into(),
         description: "Create and queue a separate, explicitly requested independent user goal in this Chat. Follow-up requirements for the current goal stay on the current goal. Ask the user when attribution is unclear; do not execute this new goal's work in the current run.".into(),
         input_schema: json!({"type":"object","properties":{"goal":{"type":"string"}},"required":["goal"],"additionalProperties":false}),

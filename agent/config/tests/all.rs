@@ -6,3 +6,5 @@ mod builtin_catalog;
 mod builtin_skills;
 #[path = "all/model_configuration.rs"]
 mod model_configuration;
+#[path = "all/monitor_settings.rs"]
+mod monitor_settings;

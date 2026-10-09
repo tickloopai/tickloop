@@ -1,8 +1,6 @@
-use std::path::PathBuf;
-
 use tickloop_agent_protocol::{
     ChatSnapshot, CommandSnapshot, Content, Event, EventKind, FamilyCompletion, FamilyInputRecord,
-    PermissionRequest, Plan, Protocol, QuestionRequest, Role, Usage,
+    ModelRequestKind, Protocol, Role,
 };
 use uuid::Uuid;
 
@@ -86,16 +84,11 @@ pub(super) struct ToolExchangeId {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct ConversationModelMetadata {
-    pub(super) model: String,
-    pub(super) protocol: Protocol,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct ConversationBlockMetadata {
     pub(super) run_id: Option<Uuid>,
     pub(super) loop_id: Option<Uuid>,
-    pub(super) model: Option<ConversationModelMetadata>,
+    /// The model that wrote an assistant message, when this process recorded its run.
+    pub(super) model: Option<String>,
     pub(super) timestamp_ms: Option<u64>,
     pub(super) event_sequence: Option<u64>,
 }
@@ -114,10 +107,10 @@ pub(super) enum ThinkingSource {
 
 #[derive(Clone, Debug)]
 pub(super) enum ConversationOutcome {
-    Completed { usage: Usage },
+    Completed,
     Failed { error: String },
     Interrupted,
-    GoalEnded { reason: String },
+    GoalEnded,
 }
 
 #[derive(Clone, Debug)]
@@ -147,19 +140,10 @@ pub(super) enum ConversationBlockKind {
         exchange: ToolExchangeId,
         content: String,
         is_error: bool,
-        output_ref: Option<PathBuf>,
     },
-    Permission {
-        request: PermissionRequest,
-        exchange: ToolExchangeId,
-    },
-    Question {
-        request: QuestionRequest,
-        exchange: ToolExchangeId,
-    },
-    Plan {
-        plan: Plan,
-    },
+    Permission,
+    Question,
+    Plan,
     Outcome(ConversationOutcome),
     FamilyInput {
         record: FamilyInputRecord,
@@ -181,7 +165,6 @@ pub(super) struct ConversationBlock {
 
 #[derive(Clone, Debug)]
 pub(super) struct ConversationProjection {
-    pub(super) current_model: ConversationModelMetadata,
     pub(super) blocks: Vec<ConversationBlock>,
 }
 
@@ -211,8 +194,11 @@ pub(super) fn project(snapshot: &ChatSnapshot) -> ConversationProjection {
             continue;
         }
         let run_id = snapshot.message_runs.get(&message_index).copied();
+        let model = (message.role == Role::Assistant)
+            .then(|| run_model(snapshot, run_id))
+            .flatten();
         for (content_index, content) in message.content.iter().enumerate() {
-            if let Some(block) = message_block(
+            if let Some(mut block) = message_block(
                 snapshot.id,
                 message_index,
                 content_index,
@@ -220,6 +206,7 @@ pub(super) fn project(snapshot: &ChatSnapshot) -> ConversationProjection {
                 message.role,
                 content,
             ) {
+                block.metadata.model = model.clone();
                 blocks.push(block);
             }
         }
@@ -261,47 +248,36 @@ pub(super) fn project(snapshot: &ChatSnapshot) -> ConversationProjection {
         });
     }
 
-    blocks.extend(snapshot.permissions.iter().cloned().map(|request| {
-        let exchange = exchange(
-            snapshot.id,
-            request.execution.run_id(),
-            &request.execution.call_key(),
-        );
-        ConversationBlock {
-            id: ConversationBlockId::Permission {
-                chat_id: snapshot.id,
-                request_id: request.id,
-            },
-            metadata: metadata(request.execution.run_id(), Some(request.loop_id), None),
-            kind: ConversationBlockKind::Permission { request, exchange },
-        }
-    }));
-    blocks.extend(snapshot.questions.iter().cloned().map(|request| {
-        let exchange = exchange(snapshot.id, Some(request.run_id), &request.call_id);
-        ConversationBlock {
-            id: ConversationBlockId::Question {
-                chat_id: snapshot.id,
-                request_id: request.id,
-            },
-            metadata: metadata(Some(request.run_id), Some(request.loop_id), None),
-            kind: ConversationBlockKind::Question { request, exchange },
-        }
-    }));
     blocks.extend(
         snapshot
-            .plans
+            .permissions
             .iter()
-            .cloned()
-            .map(|plan| ConversationBlock {
-                id: ConversationBlockId::Plan {
+            .map(|request| ConversationBlock {
+                id: ConversationBlockId::Permission {
                     chat_id: snapshot.id,
-                    loop_id: plan.loop_id,
-                    version: plan.version,
+                    request_id: request.id,
                 },
-                metadata: metadata(None, Some(plan.loop_id), None),
-                kind: ConversationBlockKind::Plan { plan },
+                metadata: metadata(request.execution.run_id(), Some(request.loop_id), None),
+                kind: ConversationBlockKind::Permission,
             }),
     );
+    blocks.extend(snapshot.questions.iter().map(|request| ConversationBlock {
+        id: ConversationBlockId::Question {
+            chat_id: snapshot.id,
+            request_id: request.id,
+        },
+        metadata: metadata(Some(request.run_id), Some(request.loop_id), None),
+        kind: ConversationBlockKind::Question,
+    }));
+    blocks.extend(snapshot.plans.iter().map(|plan| ConversationBlock {
+        id: ConversationBlockId::Plan {
+            chat_id: snapshot.id,
+            loop_id: plan.loop_id,
+            version: plan.version,
+        },
+        metadata: metadata(None, Some(plan.loop_id), None),
+        kind: ConversationBlockKind::Plan,
+    }));
     let events = snapshot
         .events
         .iter()
@@ -376,13 +352,19 @@ pub(super) fn project(snapshot: &ChatSnapshot) -> ConversationProjection {
                 kind: ConversationBlockKind::FamilyCompletion { completion },
             }),
     );
-    ConversationProjection {
-        current_model: ConversationModelMetadata {
-            model: snapshot.model.model.clone(),
-            protocol: snapshot.model.protocol,
-        },
-        blocks,
-    }
+    ConversationProjection { blocks }
+}
+
+/// The model the conversation requests of `run` used, as far as this process recorded them.
+fn run_model(snapshot: &ChatSnapshot, run_id: Option<Uuid>) -> Option<String> {
+    let run_id = run_id?;
+    snapshot
+        .request_usage
+        .entries()
+        .iter()
+        .rev()
+        .find(|entry| entry.run_id == Some(run_id) && entry.kind == ModelRequestKind::Conversation)
+        .map(|entry| entry.model.requested_model.clone())
 }
 
 pub(super) fn project_event(event: &Event) -> Option<ConversationBlock> {
@@ -464,45 +446,28 @@ pub(super) fn project_event(event: &Event) -> Option<ConversationBlock> {
                     exchange,
                     content: result.content.clone(),
                     is_error: result.is_error,
-                    output_ref: result.output_ref.clone(),
                 },
             }
         }
-        EventKind::PermissionRequested { request } => {
-            let exchange = exchange(
-                event.chat_id,
-                request.execution.run_id(),
-                &request.execution.call_key(),
-            );
-            ConversationBlock {
-                id: ConversationBlockId::Permission {
-                    chat_id: event.chat_id,
-                    request_id: request.id,
-                },
-                metadata: ConversationBlockMetadata {
-                    run_id: request.execution.run_id(),
-                    ..event_metadata
-                },
-                kind: ConversationBlockKind::Permission {
-                    request: request.clone(),
-                    exchange,
-                },
-            }
-        }
-        EventKind::QuestionAsked { request } => {
-            let exchange = exchange(event.chat_id, Some(event.run_id), &request.call_id);
-            ConversationBlock {
-                id: ConversationBlockId::Question {
-                    chat_id: event.chat_id,
-                    request_id: request.id,
-                },
-                metadata: event_metadata,
-                kind: ConversationBlockKind::Question {
-                    request: request.clone(),
-                    exchange,
-                },
-            }
-        }
+        EventKind::PermissionRequested { request } => ConversationBlock {
+            id: ConversationBlockId::Permission {
+                chat_id: event.chat_id,
+                request_id: request.id,
+            },
+            metadata: ConversationBlockMetadata {
+                run_id: request.execution.run_id(),
+                ..event_metadata
+            },
+            kind: ConversationBlockKind::Permission,
+        },
+        EventKind::QuestionAsked { request } => ConversationBlock {
+            id: ConversationBlockId::Question {
+                chat_id: event.chat_id,
+                request_id: request.id,
+            },
+            metadata: event_metadata,
+            kind: ConversationBlockKind::Question,
+        },
         EventKind::PlanUpdated { plan } => ConversationBlock {
             id: ConversationBlockId::Plan {
                 chat_id: event.chat_id,
@@ -510,14 +475,9 @@ pub(super) fn project_event(event: &Event) -> Option<ConversationBlock> {
                 version: plan.version,
             },
             metadata: event_metadata,
-            kind: ConversationBlockKind::Plan { plan: plan.clone() },
+            kind: ConversationBlockKind::Plan,
         },
-        EventKind::Completed { usage } => outcome_block(
-            event,
-            ConversationOutcome::Completed {
-                usage: usage.clone(),
-            },
-        ),
+        EventKind::Completed { .. } => outcome_block(event, ConversationOutcome::Completed),
         EventKind::Failed(error) => outcome_block(
             event,
             ConversationOutcome::Failed {
@@ -525,12 +485,7 @@ pub(super) fn project_event(event: &Event) -> Option<ConversationBlock> {
             },
         ),
         EventKind::Interrupted => outcome_block(event, ConversationOutcome::Interrupted),
-        EventKind::GoalEnded { reason, .. } => outcome_block(
-            event,
-            ConversationOutcome::GoalEnded {
-                reason: reason.clone(),
-            },
-        ),
+        EventKind::GoalEnded { .. } => outcome_block(event, ConversationOutcome::GoalEnded),
         EventKind::CommandUpdated { command } => ConversationBlock {
             id: ConversationBlockId::Command {
                 chat_id: event.chat_id,
@@ -549,7 +504,6 @@ pub(super) fn project_event(event: &Event) -> Option<ConversationBlock> {
         | EventKind::AgentMessageQueued { .. }
         | EventKind::ConversationRewound { .. }
         | EventKind::ApprovalAssessed { .. }
-        | EventKind::AutoReviewerNotice { .. }
         | EventKind::PermissionChecked { .. }
         | EventKind::ContextCompaction { .. }
         | EventKind::ProgressUpdated { .. } => return None,
@@ -609,7 +563,6 @@ fn message_block(
                     exchange,
                     content: content.text().into_owned(),
                     is_error: *is_error,
-                    output_ref: None,
                 },
             });
         }
@@ -725,7 +678,9 @@ mod tests {
     use serde_json::json;
     use tickloop_agent_protocol::Message;
     use tickloop_agent_protocol::ToolResult;
-    use tickloop_agent_protocol::{Question, QuestionOption};
+    use tickloop_agent_protocol::{
+        HostNote, PermissionRequest, Plan, Question, QuestionOption, QuestionRequest,
+    };
 
     use super::*;
 
@@ -811,7 +766,7 @@ mod tests {
         ];
         snapshot
             .host_notes
-            .insert(1, ["ArtifactRead".to_owned()].into());
+            .insert(1, HostNote::HostTools(["ArtifactRead".to_owned()].into()));
 
         let texts = project(&snapshot)
             .blocks
@@ -893,8 +848,6 @@ mod tests {
         ));
 
         let projection = project(&snapshot);
-        assert_eq!(projection.current_model.model, "fixture-model");
-        assert_eq!(projection.current_model.protocol, Protocol::Messages);
         assert!(
             projection
                 .blocks
@@ -912,19 +865,19 @@ mod tests {
             projection
                 .blocks
                 .iter()
-                .any(|block| matches!(block.kind, ConversationBlockKind::Permission { .. }))
+                .any(|block| matches!(block.kind, ConversationBlockKind::Permission))
         );
         assert!(
             projection
                 .blocks
                 .iter()
-                .any(|block| matches!(block.kind, ConversationBlockKind::Question { .. }))
+                .any(|block| matches!(block.kind, ConversationBlockKind::Question))
         );
         assert!(
             projection
                 .blocks
                 .iter()
-                .any(|block| matches!(block.kind, ConversationBlockKind::Plan { .. }))
+                .any(|block| matches!(block.kind, ConversationBlockKind::Plan))
         );
         let outcome = projection
             .blocks

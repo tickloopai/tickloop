@@ -1,10 +1,14 @@
-//! Host notes: user-role messages the host writes for the model alone. The host tool set can change
-//! between requests (an Artifact sign-in, a resumed Chat in a newer host), and history may still
-//! claim the old set, so each change is announced once in the conversation.
+//! Host notes: user-role messages the host writes for the model alone, each announced once in the
+//! conversation and checkpointed so a resumed Chat does not announce it again. The host tool set
+//! can change between requests (an Artifact sign-in, a resumed Chat in a newer host) while history
+//! still claims the old set; and after the user leaves Plan mode without approving a plan, history
+//! may still hold the model to Plan's read-only rules.
 
 use std::collections::BTreeSet;
 
-use tickloop_agent_protocol::{Content, Message, Receipt, Role};
+use tickloop_agent_protocol::{
+    ChatSnapshot, Content, ExecutionMode, HostNote, Message, Receipt, Role,
+};
 use uuid::Uuid;
 
 use crate::{Agent, AgentError, Chat};
@@ -37,6 +41,54 @@ impl Agent {
             .await
             .map_err(AgentError::Storage)
     }
+
+    /// Claude Code's `plan_mode_exit` attachment: the first request after the user left Plan mode
+    /// without approving a plan tells the model once that plan mode ended. A Chat back in Plan by
+    /// then drops the notice.
+    pub(super) async fn announce_plan_mode_exit(
+        &self,
+        receipt: &Receipt,
+    ) -> Result<(), AgentError> {
+        let (snapshot, bookkeeping) = {
+            let mut chats = self.inner.chats.lock().await;
+            let chat = chats
+                .get_mut(&receipt.chat_id)
+                .ok_or(AgentError::NotFound)?;
+            if chat.active_run != Some(receipt.run_id)
+                || !std::mem::take(&mut chat.needs_plan_mode_exit_notice)
+                || chat.snapshot.policy.mode == ExecutionMode::Plan
+            {
+                return Ok(());
+            }
+            let plan_file = crate::plan::current_plan_file(
+                &chat.bookkeeping,
+                self.plans_directory(&chat.snapshot.workdir).path(),
+                receipt.loop_id,
+            )
+            .filter(|path| path.exists());
+            append_note(
+                &mut chat.snapshot,
+                receipt,
+                crate::plan::plan_mode_exit_notice(plan_file.as_deref()),
+                HostNote::PlanModeExit,
+            );
+            (chat.snapshot.clone(), chat.bookkeeping.clone())
+        };
+        self.checkpoint_transcript(&snapshot, &bookkeeping)
+            .await
+            .map_err(AgentError::Storage)
+    }
+}
+
+fn append_note(snapshot: &mut ChatSnapshot, receipt: &Receipt, text: String, note: HostNote) {
+    let index = snapshot.messages.len();
+    snapshot.message_runs.insert(index, receipt.run_id);
+    snapshot.message_ids.insert(index, Uuid::new_v4());
+    snapshot.host_notes.insert(index, note);
+    snapshot.messages.push(Message {
+        role: Role::User,
+        content: vec![Content::Text { text }],
+    });
 }
 
 /// Appends a note when `current` differs from the host tools this history was last told about,
@@ -68,14 +120,12 @@ fn announce_tool_changes(chat: &mut Chat, receipt: &Receipt, current: BTreeSet<S
     text.push_str(
         " This notice comes from the host, not the user, and does not authorize any new work.",
     );
-    let index = snapshot.messages.len();
-    snapshot.message_runs.insert(index, receipt.run_id);
-    snapshot.message_ids.insert(index, Uuid::new_v4());
-    snapshot.host_notes.insert(index, current.clone());
-    snapshot.messages.push(Message {
-        role: Role::User,
-        content: vec![Content::Text { text }],
-    });
+    append_note(
+        snapshot,
+        receipt,
+        text,
+        HostNote::HostTools(current.clone()),
+    );
     snapshot.announced_host_tools = Some(current);
     true
 }

@@ -165,6 +165,7 @@ impl HostedTickTools {
                 let mut command = words.clone();
                 command[0] = executable.to_string_lossy().into_owned();
                 let command_line = words.join(" ");
+                let command_title = tickhost_connect::naming::command_title(&words);
                 (
                     Operation::Open {
                         operation: Uuid::new_v4(),
@@ -172,7 +173,7 @@ impl HostedTickTools {
                         directory: FileIdentity::directory(&cwd)?,
                         command,
                         cwd: cwd.clone(),
-                        title: tickhost::host::display_title(&command_line),
+                        title: tickhost::host::display_title(&command_title),
                     },
                     HostToolPermission::Reviewable,
                     format!(
@@ -497,24 +498,35 @@ impl HostedTickTools {
                 ));
             }
         };
+        let binding = match (
+            opened["terminal"]["endpoint"].as_str(),
+            opened["data_token"].as_str(),
+        ) {
+            (Some(endpoint), Some(token)) => Some(DataBinding {
+                endpoint: endpoint.into(),
+                data_token: token.into(),
+            }),
+            _ => None,
+        };
         {
             let mut bindings = self.bindings.lock().await;
             if let Some(lost) = replaces {
                 bindings.remove(&(chat, lost.clone()));
             }
-            if let (Some(endpoint), Some(token)) = (
-                opened["terminal"]["endpoint"].as_str(),
-                opened["data_token"].as_str(),
-            ) {
-                bindings.insert(
-                    (chat, instance.clone()),
-                    DataBinding {
-                        endpoint: endpoint.into(),
-                        data_token: token.into(),
-                    },
-                );
+            if let Some(binding) = &binding {
+                bindings.insert((chat, instance.clone()), binding.clone());
             }
         }
+        // The command named the Tick until now; its declaration names it from here on. Only the
+        // binding this open received is asked, so naming never costs a lookup of the daemon.
+        let title = match (title, &binding) {
+            (Some(command), Some(binding)) => Some(
+                described_title(binding, &instance, &command)
+                    .await
+                    .unwrap_or(command),
+            ),
+            (title, _) => title,
+        };
         let mut result = json!({"status":"opened","host":HOSTED_HOST,"visibility":"hidden","tick_instance_id":instance});
         if opened["business_pid"].is_u64() {
             result["business_pid"] = opened["business_pid"].clone();
@@ -611,14 +623,27 @@ impl HostedTickTools {
                     endpoint: page.endpoint.clone(),
                     data_token,
                 };
-                let resources = match binding.connect(&instance).await {
-                    Ok(mut connection) => connection
-                        .request("resources", json!({}), CONTROL_TIMEOUT)
-                        .await
-                        .ok()
-                        .and_then(|resources| serde_json::from_value(resources).ok())
-                        .map(hosted_resources),
-                    Err(_) => None,
+                let (resources, updated_at_ms) = match binding.connect(&instance).await {
+                    Ok(mut connection) => {
+                        let resources = connection
+                            .request("resources", json!({}), CONTROL_TIMEOUT)
+                            .await
+                            .ok()
+                            .and_then(|resources| serde_json::from_value(resources).ok())
+                            .map(hosted_resources);
+                        let status = connection
+                            .request("status", json!({}), CONTROL_TIMEOUT)
+                            .await
+                            .ok()
+                            .and_then(|status| {
+                                serde_json::from_value::<tickhost_connect::session::SessionStatus>(
+                                    status,
+                                )
+                                .ok()
+                            });
+                        (resources, status.and_then(|status| status.updated_at_ms))
+                    }
+                    Err(_) => (None, None),
                 };
                 self.bindings
                     .lock()
@@ -629,6 +654,7 @@ impl HostedTickTools {
                     title: row.title,
                     state: HostedMemberState::Running,
                     resources,
+                    updated_at_ms,
                 });
             }
             members.extend(page.lost.into_iter().map(|lost| HostedMember {
@@ -636,6 +662,7 @@ impl HostedTickTools {
                 title: lost.title,
                 state: HostedMemberState::Lost,
                 resources: None,
+                updated_at_ms: None,
             }));
             match page.page.next {
                 Some(next) => cursor = Some(next),
@@ -858,6 +885,26 @@ impl DataBinding {
     }
 }
 
+/// A just opened Tick's name from its declaration and `command`, asked through the binding the
+/// open received; `None` when the declaration cannot be read that way.
+async fn described_title(
+    binding: &DataBinding,
+    instance: &InstanceRef,
+    command: &str,
+) -> Option<String> {
+    let mut connection = binding.connect(instance).await.ok()?;
+    let descriptor = connection
+        .request("describe", json!({}), CONTROL_TIMEOUT)
+        .await
+        .ok()?;
+    let descriptor: TickDescriptor = serde_json::from_value(descriptor).ok()?;
+    Some(tickhost_connect::naming::tick_title(
+        &descriptor.title,
+        &descriptor.tick_type,
+        command,
+    ))
+}
+
 fn hosted_target(input: &Value) -> Result<InstanceRef, String> {
     let instance: InstanceRef = input["tick_instance_id"]
         .as_str()
@@ -1048,7 +1095,7 @@ mod tests {
     }
 
     /// The approval names the whole command and the launch keeps it, while the title the Chat
-    /// keeps for its Monitor is bounded like the host's listing.
+    /// keeps for its Monitor names the program by file name, bounded like the host's listing.
     #[tokio::test]
     async fn an_open_keeps_its_whole_command_under_a_bounded_title() {
         let directory = tempfile::Builder::new()
@@ -1069,6 +1116,7 @@ mod tests {
             .unwrap();
         let whole = format!("/bin/echo {argument}");
         assert!(prepared.approval_summary().contains(&whole));
+        let named = format!("echo {argument}");
         let Some(HostedPrepared {
             operation: Operation::Open { command, title, .. },
         }) = prepared.payload::<HostedPrepared>()
@@ -1076,7 +1124,7 @@ mod tests {
             panic!("an open prepares an open");
         };
         assert_eq!(command, &["/bin/echo".to_owned(), argument]);
-        assert_eq!(title, &tickhost::host::display_title(&whole));
+        assert_eq!(title, &tickhost::host::display_title(&named));
     }
 
     /// A binding goes once its Tick is no longer listed running, is looked up as gone, or was

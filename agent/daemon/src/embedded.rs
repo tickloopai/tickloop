@@ -298,7 +298,7 @@ impl EmbeddedAgentAccess {
                         .ok_or_else(|| AccessError::invalid("interaction source has no Tab"))?,
                     cwd: None,
                     foreground_cwd: None,
-                    title: None,
+                    terminal_title_stripped: None,
                     tokens: Default::default(),
                 };
                 result = Some(HostCallContext {
@@ -488,6 +488,18 @@ impl EmbeddedAgentAccess {
                     self.inner
                         .agent
                         .remove_monitor_member(chat, instance)
+                        .await?,
+                ))
+            }
+            AgentCommand::MarkMonitorHandled {
+                execution,
+                instance,
+            } => {
+                let chat = self.chat(execution).await?;
+                Ok(CommandResult::MonitorMembership(
+                    self.inner
+                        .agent
+                        .mark_monitor_handled(chat, instance)
                         .await?,
                 ))
             }

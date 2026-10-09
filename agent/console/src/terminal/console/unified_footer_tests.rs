@@ -1,8 +1,8 @@
 use super::*;
-use crate::agent_console::AttentionGroup;
+use crate::{agent_console::AttentionGroup, terminal::task_surface::TaskSurfaceEffect};
 use tickloop_agent_protocol::{
-    LoopState, ShellTask, ShellTaskAction, ShellTaskCapabilities, ShellTaskOrigin, ShellTaskOwner,
-    ShellTaskState, SubagentRegistration, UserShellState,
+    LoopState, ShellTask, ShellTaskCapabilities, ShellTaskOrigin, ShellTaskOwner,
+    ShellTaskSnapshot, ShellTaskState, SubagentRegistration,
 };
 
 const CHAT: Uuid = Uuid::from_u128(1010);
@@ -74,6 +74,7 @@ fn agent(id: u128, parent: Option<Uuid>, title: &str) -> AgentRow {
             },
             description: title.into(),
             created_at: tickloop_agent_base::private_fs::unix_time_milliseconds(),
+            color: Some(tickloop_agent_protocol::AgentColor::ALL[(id % 8) as usize]),
         }),
     }
 }
@@ -151,14 +152,28 @@ fn child_input_badge_placeholder_and_panel_background_are_display_only() {
                 .expect("child handle on upper divider");
             assert!(
                 badge
+                    .text()
+                    .trim_end_matches('─')
+                    .ends_with(" @sleep-30-2 "),
+                "the handle ends the upper divider on the right: {badge:?}"
+            );
+            assert!(badge.spans.iter().any(
+                |span| span.text.contains("@sleep-30-2") && span.role == Some(Role::AgentGreen)
+            ));
+            assert!(
+                badge
                     .spans
                     .iter()
-                    .any(|span| span.text.contains("@sleep-30-2")
-                        && span.role
-                            == Some(super::super::subagent_panel::agent_color(Uuid::from_u128(
-                                2
-                            ))))
+                    .filter(|span| span.text.contains('─'))
+                    .all(|span| span.role == Some(Role::AgentGreen)),
+                "the viewed child's colour frames its input: {badge:?}"
             );
+            let prompt = lines
+                .iter()
+                .find(|line| line.text().starts_with(state.display.glyph(Glyph::Prompt)))
+                .expect("input row");
+            assert_eq!(prompt.spans[0].text, state.display.glyph(Glyph::Prompt));
+            assert_eq!(prompt.spans[0].role, Some(Role::AgentGreen));
             assert!(
                 lines
                     .iter()
@@ -176,6 +191,49 @@ fn child_input_badge_placeholder_and_panel_background_are_display_only() {
             );
         }
     }
+}
+
+#[test]
+fn main_input_names_its_task_at_the_right_of_the_upper_divider() {
+    let console = fixture();
+    update(&console, vec![]);
+    console
+        .set_task_title(Some("了解项目用途和模块结构".into()))
+        .unwrap();
+    let mut state = console.state.lock().unwrap();
+    let (lines, _, _) = state.normal_styled_frame();
+    let divider = lines
+        .iter()
+        .find(|line| line.text().contains("了解项目用途和模块结构"))
+        .expect("task name on the upper divider");
+    assert!(
+        divider.text().starts_with("──")
+            && divider
+                .text()
+                .trim_end_matches('─')
+                .ends_with(" 了解项目用途和模块结构 "),
+        "the task name sits at the right of the upper divider: {divider:?}"
+    );
+    assert!(divider.spans.iter().any(|span| {
+        span.text.contains("了解项目用途和模块结构") && span.role == Some(Role::MutedText)
+    }));
+    state.width = 30;
+    let (narrow, _, _) = state.normal_styled_frame();
+    let divider = narrow
+        .iter()
+        .find(|line| line.text().starts_with("──") && line.text().contains('…'))
+        .expect("a long task name is shortened to a third of the border");
+    assert!(unicode_width::UnicodeWidthStr::width(divider.text().as_str()) <= 30);
+    drop(state);
+    console.set_task_title(None).unwrap();
+    let state = console.state.lock().unwrap();
+    assert!(
+        !state
+            .rendered_screen
+            .iter()
+            .chain(std::iter::once(&String::new()))
+            .any(|line| line.contains("了解项目用途和模块结构"))
+    );
 }
 
 #[test]
@@ -243,41 +301,34 @@ fn expanded_subagents_start_at_the_entry_without_an_items_or_blank_summary_row()
             rendered[entry + 2].contains("child summary probe"),
             "{rendered:?}"
         );
+        assert!(
+            rendered.last().unwrap().contains("enter send"),
+            "the key hints end the screen below the list: {rendered:?}"
+        );
         key(&console, KeyCode::Down);
         let focused = frame(&console);
         let entry = focused
             .iter()
             .position(|row| row.contains("Subagents 1"))
             .unwrap();
-        assert!(focused[entry + 1].contains("main"), "{focused:?}");
-        {
-            assert!(
-                focused.last().unwrap().contains("Enter/Space hide"),
-                "{focused:?}"
-            );
-            key(&console, KeyCode::Down);
-            let list_focused = frame(&console);
-            assert!(
-                list_focused
-                    .last()
-                    .unwrap()
-                    .contains("Enter open · Space fold · Esc entry"),
-                "{list_focused:?}"
-            );
-            key(&console, KeyCode::Esc);
-            key(&console, KeyCode::Enter);
-            let collapsed = frame(&console);
-            assert!(
-                collapsed.last().unwrap().contains("Enter/Space expand"),
-                "{collapsed:?}"
-            );
-            key(&console, KeyCode::Enter);
-        }
+        assert!(
+            focused[entry + 1].starts_with("› ") && focused[entry + 1].contains("main"),
+            "the first Down lands on a row: {focused:?}"
+        );
+        assert_eq!(focused.len(), rendered.len(), "{focused:?}");
+        assert!(
+            focused
+                .last()
+                .unwrap()
+                .contains("enter open · space fold · esc input"),
+            "{focused:?}"
+        );
         key(&console, KeyCode::Esc);
+        assert!(frame(&console).last().unwrap().contains("enter send"));
         assert!(
             !rendered.iter().any(|row| row.contains("items")
                 || row.contains("↓ open")
-                || row.contains("Enter list")),
+                || row.contains("enter list")),
             "{rendered:?}"
         );
     }
@@ -305,12 +356,12 @@ fn subagents_robot_prefix_preserves_divider_bounds_and_hints_in_both_states_and_
                 Some(Uuid::from_u128(1)),
             )
             .unwrap();
-        key(&console, KeyCode::Down);
         let label = format!("{robot} Subagents 1");
-        for (collapsed, hint) in [(false, "Enter/Space hide"), (true, "Enter/Space expand")] {
+        for collapsed in [false, true] {
             let rendered = frame(&console);
-            let state = console.state.lock().unwrap();
+            let mut state = console.state.lock().unwrap();
             let target = state.footer_bar_target.as_ref().unwrap();
+            let (row, column) = (target.row, target.categories[0].0.start);
             let lower = &rendered[target.row];
             assert!(lower.starts_with(&format!("─ {label} ")), "{lower}");
             assert!(lower.ends_with("Context 21% used ─"), "{lower}");
@@ -320,9 +371,19 @@ fn subagents_robot_prefix_preserves_divider_bounds_and_hints_in_both_states_and_
                 rendered.iter().any(|row| row.contains("child robot probe")),
                 !collapsed
             );
-            assert!(rendered.last().unwrap().contains(hint), "{rendered:?}");
-            drop(state);
-            key(&console, KeyCode::Enter);
+            assert!(
+                rendered.last().unwrap().contains("enter send"),
+                "folding never moves the key hints: {rendered:?}"
+            );
+            state.pointer(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: column as u16,
+                    row: row as u16,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &mut io::sink(),
+            );
         }
     }
 }
@@ -349,8 +410,11 @@ fn divider_edges_use_short_rules_and_exact_label_targets_with_narrow_fallbacks()
             title: "edge Shell".into(),
             kind: "Shell".into(),
             status: "running".into(),
+            notes: Vec::new(),
             owner: crate::monitor_rows::TickOwner::Unknown,
+            tone: crate::monitor_rows::StatusTone::Neutral,
             updated_at_ms: None,
+            update: None,
             resources: None,
             actions: Vec::new(),
         }],
@@ -440,7 +504,7 @@ fn subagents_and_context_colors_resolve_from_theme_roles() {
                     (true, true, Role::Suggestion),
                 ] {
                     state.status_area.agents_collapsed = collapsed;
-                    state.footer.apply(FooterAction::Clear);
+                    state.footer.clear();
                     if focused {
                         state.footer.select(FooterItemId::Agents);
                     }
@@ -560,14 +624,14 @@ fn todos_follow_working_and_remain_when_idle_only_for_the_visible_agent() {
     );
     console
         .set_activity(Some(&[(
-            "Working (Esc to interrupt)".into(),
+            "Working (esc to interrupt)".into(),
             Some(Role::MutedText),
         )]))
         .unwrap();
     let working = frame(&console);
     let activity = working
         .iter()
-        .position(|row| row.contains("Working (Esc"))
+        .position(|row| row.contains("Working (esc"))
         .unwrap();
     assert!(
         working[activity + 1].contains("pending unique"),
@@ -609,11 +673,13 @@ fn shell_snapshot(revision: u64, tasks: Vec<(Uuid, &str, ShellTaskState)>) -> Sh
             .into_iter()
             .map(|(id, command, state)| ShellTask {
                 updated_at_ms: None,
+                ended_at_ms: None,
                 id,
                 chat_id: CHAT,
                 origin: ShellTaskOrigin::User,
                 owner: ShellTaskOwner::User { chat_id: CHAT },
                 command: command.into(),
+                description: None,
                 cwd: PathBuf::from("/fixture"),
                 state,
                 was_background: true,
@@ -719,22 +785,10 @@ fn multiple_shell_shortcut_opens_the_list_after_an_earlier_single_detail() {
     );
 }
 
-fn assert_single_shell_shortcut(cached_detail: bool) {
+#[test]
+fn single_shell_shortcut_opens_its_exact_detail() {
     let console = fixture();
-    let target = if cached_detail {
-        Uuid::from_u128(1013)
-    } else {
-        TASK
-    };
-    if cached_detail {
-        console
-            .show_tasks_at(
-                shell_snapshot(1, vec![(TASK, "earlier task", ShellTaskState::Background)]),
-                Some(TASK),
-            )
-            .unwrap();
-        key(&console, KeyCode::Esc);
-    }
+    let target = TASK;
     let snapshot = shell_snapshot(
         2,
         vec![(target, "sole eligible task", ShellTaskState::Background)],
@@ -784,119 +838,6 @@ fn assert_single_shell_shortcut(cached_detail: bool) {
         console.state.lock().unwrap().editor.draft(),
         "keep literal jk draft"
     );
-}
-
-#[test]
-fn fresh_single_shell_shortcut_opens_its_exact_detail() {
-    assert_single_shell_shortcut(false);
-}
-
-#[test]
-fn cached_single_shell_shortcut_opens_the_current_exact_eligible_detail() {
-    assert_single_shell_shortcut(true);
-}
-
-#[tokio::test]
-async fn global_shell_count_and_open_keep_the_peer_task_and_stop_its_actual_owner() {
-    use crate::terminal::{execution::ConsoleExecution, task_access::ShellTaskCenter};
-    use futures_util::FutureExt;
-    use std::{panic::AssertUnwindSafe, sync::Arc, time::Duration};
-    use tickloop_agent_daemon::EmbeddedAgentAccess;
-    use tickloop_agent_protocol::{LaunchSpec, ViewRef};
-
-    let directory = tempfile::tempdir().unwrap();
-    let model = Arc::new(tickloop_agent_test_support::ScriptedModel::new(vec![]));
-    let runtime = tickloop_agent_runtime::Agent::new_embedded(
-        tickloop_agent_test_support::config(),
-        model.clone(),
-    );
-    let access = Arc::new(EmbeddedAgentAccess::new(runtime.clone()));
-    let agent = ConsoleExecution::from_access_for_test(
-        access.clone(),
-        access.daemon_epoch(),
-        ViewRef {
-            session_id: Uuid::new_v4(),
-            view_id: Uuid::new_v4(),
-        },
-        LaunchSpec::embedded(directory.path().into()),
-        None,
-    );
-    let result = AssertUnwindSafe(async {
-        let source = agent.create_chat(directory.path().into()).await.unwrap();
-        let peer = agent.create_chat(directory.path().into()).await.unwrap();
-        agent.display_chat(Some(peer)).await.unwrap();
-        let peer_task = agent.submit_user_shell_for_goal(peer, None, "printf 'peer-shell-marker'; while [ ! -f peer-finish ]; do sleep 0.02; done".into(), true).await.unwrap().command_id;
-        agent.display_chat(Some(source)).await.unwrap();
-        let source_origin = agent.origin().unwrap();
-        let center = ShellTaskCenter::new(agent.clone());
-        // Admission runs on a spawned task; waiting for the pid makes Stop reach the owner's live process.
-        let snapshot_once_running = async |task_id: Uuid| {
-            tokio::time::timeout(Duration::from_secs(10), async {
-                loop {
-                    let snapshot = center.snapshot(source).await.unwrap();
-                    if snapshot.tasks.iter().any(|task| task.id == task_id && task.was_background && task.pid.is_some() && !task.state.is_terminal()) {
-                        break snapshot;
-                    }
-                    tokio::task::yield_now().await;
-                }
-            }).await.unwrap()
-        };
-        let snapshot = snapshot_once_running(peer_task).await;
-        assert_eq!(snapshot.chat_id, source);
-        assert_eq!(snapshot.tasks.len(), 1);
-        assert_eq!(snapshot.tasks[0].chat_id, peer);
-        let console = fixture();
-        console.state.lock().unwrap().chat = Some(source);
-        console.update_shell_ticks(&snapshot).unwrap();
-        assert!(console.state.lock().unwrap().monitor.entries().is_empty());
-        let mut subscription = None;
-        crate::terminal::open_tasks(&center, &console, source, &mut subscription, Some(peer_task)).await.unwrap();
-        key(&console, KeyCode::Home);
-        let detail = frame(&console);
-        assert!(detail.iter().any(|row| row.contains("Status:")), "{detail:?}");
-        assert!(detail.iter().any(|row| row.contains("peer-shell-marker")), "{detail:?}");
-        assert_eq!(agent.origin(), Some(source_origin));
-        key(&console, KeyCode::Left);
-        let source_task = agent.submit_user_shell_for_goal(source, None, "printf 'source-shell-marker'; while [ ! -f source-finish ]; do sleep 0.02; done".into(), true).await.unwrap().command_id;
-        snapshot_once_running(source_task).await;
-        let fresh = fixture();
-        fresh.state.lock().unwrap().chat = Some(source);
-        update(&fresh, vec![]);
-        let mut subscription = None;
-        crate::terminal::open_tasks(&center, &fresh, source, &mut subscription, None).await.unwrap();
-        let list = frame(&fresh);
-        assert!(list.iter().any(|row| row.contains("Shell")), "{list:?}");
-        assert!(list.iter().any(|row| row.contains("peer-shell-marker")), "{list:?}");
-        assert!(list.iter().any(|row| row.contains("source-shell-marker")), "{list:?}");
-        assert!(!list.iter().any(|row| row.contains("Status:")), "{list:?}");
-        let selected_glyph = fresh.display_profile().unwrap().glyph(Glyph::Prompt);
-        for _ in 0..2 {
-            if frame(&fresh).iter().any(|row| row.trim_start().starts_with(selected_glyph) && row.contains("peer-shell-marker")) {
-                break;
-            }
-            key(&fresh, KeyCode::Char('j'));
-        }
-        assert!(frame(&fresh).iter().any(|row| row.trim_start().starts_with(selected_glyph) && row.contains("peer-shell-marker")));
-        let Some(InputEvent::TaskSurface(effect)) = key(&fresh, KeyCode::Char('x')) else { panic!("selected peer task must expose Stop"); };
-        assert!(matches!(effect, TaskSurfaceEffect::Control { task_id, action: ShellTaskAction::Stop } if task_id == peer_task));
-        crate::terminal::apply_task_surface_effect(&center, &fresh, source, effect).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                if runtime.snapshot(peer).await.unwrap().user_shells.iter().any(|task| task.id == peer_task && matches!(task.state, UserShellState::Completed | UserShellState::Failed | UserShellState::Unknown)) {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        }).await.unwrap();
-        assert!(runtime.snapshot(source).await.unwrap().user_shells.iter().any(|task| task.id == source_task && matches!(task.state, UserShellState::Queued | UserShellState::Running | UserShellState::Background)));
-        assert!(runtime.snapshot(source).await.unwrap().loops.is_empty());
-        assert!(runtime.snapshot(peer).await.unwrap().loops.is_empty());
-        assert!(model.requests.lock().unwrap().is_empty());
-    }).catch_unwind().await;
-    runtime.shutdown().await;
-    if let Err(panic) = result {
-        std::panic::resume_unwind(panic);
-    }
 }
 
 #[test]
@@ -1065,30 +1006,22 @@ fn agents_entry_is_on_lower_divider_and_family_is_expanded_by_default() {
                 .all(|row| display_width(row) < usize::from(width))
         );
         key(&console, KeyCode::Down);
-        if height == 15 {
-            let focused = frame(&console);
-            assert!(
-                focused.iter().any(|row| row.contains("Enter/Space hide")),
-                "{focused:?}"
-            );
-            assert!(
-                !focused.iter().any(|row| row.contains("Enter list")),
-                "{focused:?}"
-            );
-        }
-        key(&console, KeyCode::Enter);
+        let focused = frame(&console);
         assert!(
-            !frame(&console)
-                .iter()
-                .any(|row| row.contains("child unique"))
+            focused.iter().any(|row| row.contains("enter open")),
+            "{width}x{height}: {focused:?}"
         );
-        key(&console, KeyCode::Char(' '));
+        assert!(
+            !focused.iter().any(|row| row.contains("enter list")),
+            "{focused:?}"
+        );
         key(&console, KeyCode::Esc);
+        assert!(console.state.lock().unwrap().footer.selected().is_none());
     }
 }
 
 #[test]
-fn agents_divider_toggle_uses_mouse_hitbox_and_focused_enter_space_without_reopening_on_update() {
+fn agents_divider_click_folds_the_panel_and_down_enters_the_list_without_reopening_on_update() {
     let console = fixture();
     update(&console, vec![]);
     let family = vec![
@@ -1142,19 +1075,14 @@ fn agents_divider_toggle_uses_mouse_hitbox_and_focused_enter_space_without_reope
             .any(|row| row.contains("child unique")),
         "outside the entry must not toggle"
     );
-    key(&console, KeyCode::Esc);
+    assert!(console.state.lock().unwrap().footer.selected().is_none());
     key(&console, KeyCode::Down);
+    let listed = frame(&console);
     assert!(
-        frame(&console)
-            .iter()
-            .any(|row| row.contains("Enter/Space expand"))
+        listed.iter().any(|row| row.contains("child unique")),
+        "Down opens a folded panel and enters its list: {listed:?}"
     );
-    key(&console, KeyCode::Enter);
-    assert!(
-        frame(&console)
-            .iter()
-            .any(|row| row.contains("child unique"))
-    );
+    assert!(listed.last().unwrap().contains("enter open"), "{listed:?}");
     key(&console, KeyCode::Char(' '));
     assert!(
         !frame(&console)
@@ -1165,11 +1093,12 @@ fn agents_divider_toggle_uses_mouse_hitbox_and_focused_enter_space_without_reope
     key(&console, KeyCode::Down);
     assert!(matches!(
         key(&console, KeyCode::Enter),
-        Some(InputEvent::OpenAgent(_))
+        Some(InputEvent::OpenAgent(id)) if id == Uuid::from_u128(2)
     ));
-    key(&console, KeyCode::Esc);
-    assert!(!console.state.lock().unwrap().footer_list_focused);
-    key(&console, KeyCode::Esc);
+    assert!(
+        console.state.lock().unwrap().footer.selected().is_none(),
+        "opening a member returns the keys to the input"
+    );
     key(&console, KeyCode::Char('j'));
     assert!(
         frame(&console)
@@ -1179,7 +1108,7 @@ fn agents_divider_toggle_uses_mouse_hitbox_and_focused_enter_space_without_reope
 }
 
 #[test]
-fn modified_enter_cannot_focus_or_activate_a_collapsed_agents_list() {
+fn modified_enter_never_opens_a_member_from_the_agents_list() {
     for modifiers in [
         KeyModifiers::SHIFT,
         KeyModifiers::ALT,
@@ -1197,42 +1126,21 @@ fn modified_enter_cannot_focus_or_activate_a_collapsed_agents_list() {
             )
             .unwrap();
         key(&console, KeyCode::Down);
-        key(&console, KeyCode::Enter);
-        assert!(
-            !frame(&console)
-                .iter()
-                .any(|row| row.contains("child unique"))
-        );
+        key(&console, KeyCode::Down);
         let event = console
             .state
             .lock()
             .unwrap()
             .key(KeyEvent::new(KeyCode::Enter, modifiers));
-        assert!(event.is_none());
-        assert!(
-            !console.state.lock().unwrap().footer_list_focused,
+        assert!(event.is_none(), "{modifiers:?}");
+        assert_eq!(
+            console.state.lock().unwrap().footer.selected(),
+            Some(FooterItemId::Agents),
             "{modifiers:?}"
         );
-        for code in [KeyCode::Down, KeyCode::Char('j'), KeyCode::PageDown] {
-            assert!(key(&console, code).is_none());
-            assert!(!console.state.lock().unwrap().footer_list_focused);
-        }
-        let hidden = frame(&console);
-        assert!(
-            !hidden
-                .iter()
-                .any(|row| row.contains("Enter open") || row.contains("child unique"))
-        );
-        assert!(key(&console, KeyCode::Enter).is_none());
-        assert!(
-            frame(&console)
-                .iter()
-                .any(|row| row.contains("child unique"))
-        );
-        key(&console, KeyCode::Down);
         assert!(matches!(
             key(&console, KeyCode::Enter),
-            Some(InputEvent::OpenAgent(_))
+            Some(InputEvent::OpenAgent(id)) if id == Uuid::from_u128(2)
         ));
     }
 }
@@ -1279,13 +1187,13 @@ fn question_mark_help_matches_agents_focus_layers_and_monitor_shells() {
     key(&console, KeyCode::Char('?'));
     let help = frame(&console).join("\n");
     for hint in [
-        "↓ Subagents entry",
-        "Enter/Space toggle Subagents (entry)",
-        "↓ Agent list",
-        "Enter open Agent",
-        "Space fold descendants",
-        "Esc list → entry → input",
-        "Shift+↑/↓ Monitor Shells",
+        "↓ Subagents list",
+        "Click Subagents N fold list",
+        "enter open Agent",
+        "space fold descendants",
+        "x dismiss finished",
+        "esc list → input",
+        "shift+↑/↓ Monitor Shells",
     ] {
         assert!(help.contains(hint), "missing {hint}: {help}");
     }

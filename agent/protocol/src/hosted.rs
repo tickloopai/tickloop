@@ -12,6 +12,10 @@ pub struct HostedMember {
     pub title: Option<String>,
     pub state: HostedMemberState,
     pub resources: Option<HostedResources>,
+    /// When the host last received a Tick Update from it, in Unix milliseconds. The host tracks
+    /// this without anyone subscribing and without reading the update's content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at_ms: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]

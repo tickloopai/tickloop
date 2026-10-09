@@ -176,11 +176,10 @@ impl Fixture {
     }
 
     pub(super) fn frame(&self) -> String {
-        screen::visible_screen(
-            &String::from_utf8_lossy(&self.output.lock().unwrap()),
-            self.width,
-            self.height,
-        )
+        // Copies the output first: the reader keeps draining the PTY while the screen is replayed,
+        // so a long replay cannot block the child's writes.
+        let output = String::from_utf8_lossy(&self.output.lock().unwrap()).into_owned();
+        screen::visible_screen(&output, self.width, self.height)
     }
 
     pub(super) fn wait(&self, predicate: impl Fn(&str) -> bool) -> String {
@@ -298,11 +297,18 @@ fn input_dialog_pty_preserves_search_and_draft_through_permission_preemption() {
                 "{frame}"
             );
         }
+        // The smallest layout keeps the activity and the blank row above the dialog.
+        let last_visible = if top > 4 {
+            "Visible reply before dialogs"
+        } else {
+            "Working fixture"
+        };
         assert!(
             frame
                 .lines()
                 .take(top)
-                .any(|line| line.contains("Visible reply before dialogs"))
+                .any(|line| line.contains(last_visible)),
+            "{frame}"
         );
         fixture.send(b"j\r");
         let frame = fixture.wait(|frame| {

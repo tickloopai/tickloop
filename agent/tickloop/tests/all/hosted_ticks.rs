@@ -1589,13 +1589,18 @@ for line in sys.stdin:
         assert_eq!(
             members
                 .iter()
-                .map(|member| (member.instance.as_str(), member.source))
+                .map(|member| (
+                    member.instance.as_str(),
+                    member.source,
+                    member.title.as_deref()
+                ))
                 .collect::<Vec<_>>(),
             vec![(
                 instance.as_str(),
-                tickloop_agent_protocol::MonitorMemberSource::Opened
+                tickloop_agent_protocol::MonitorMemberSource::Opened,
+                Some("Counter"),
             )],
-            "the hidden Tick joins this Chat's Monitor"
+            "the hidden Tick joins this Chat's Monitor under its declared title"
         );
         assert!(
             runtime.tick_subscriptions(chat).await.unwrap().is_empty(),
@@ -1857,7 +1862,11 @@ for line in sys.stdin:
             tickloop_agent_protocol::MonitorMemberSource::Opened
         );
         assert!(lost_title.is_string(), "the lost Tick keeps a title");
-        assert_eq!(json!(member.title), lost_title, "{member:?}");
+        assert_eq!(
+            member.title.as_deref(),
+            Some("Counter"),
+            "the reopened Tick is named by its declaration: {member:?}"
+        );
         assert!(
             runtime.tick_subscriptions(chat).await.unwrap().is_empty(),
             "no subscription follows a reopen"
@@ -2309,7 +2318,43 @@ for line in sys.stdin:
             let sample = member.resources.as_ref().expect("a process sample");
             assert_eq!(json!(sample.business_pid), opened["business_pid"]);
             assert!(sample.rss_bytes.is_some_and(|bytes| bytes > 0));
+            assert_eq!(member.updated_at_ms, None, "no Tick Update yet");
         }
+        run_tool(
+            &tools,
+            chat,
+            "CallTickTool",
+            json!({"tick_instance_id":kept["tick_instance_id"],"tool":"increment","args":{"amount":1}}),
+        )
+        .await;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let members = loop {
+            let CommandResult::HostedTicks(members) = daemon
+                .command(AgentCommand::ListHostedTicks { execution })
+                .await
+            else {
+                panic!("hosted Ticks expected");
+            };
+            let kept_updated = members.iter().any(|member| {
+                json!(member.instance) == kept["tick_instance_id"] && member.updated_at_ms.is_some()
+            });
+            if kept_updated || std::time::Instant::now() > deadline {
+                break members;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        let updated = |opened: &serde_json::Value| {
+            members
+                .iter()
+                .find(|member| json!(member.instance) == opened["tick_instance_id"])
+                .unwrap()
+                .updated_at_ms
+        };
+        assert!(
+            updated(&kept).is_some(),
+            "the host knows when a Tick nobody subscribes to last updated"
+        );
+        assert_eq!(updated(&closed), None);
         let instance = serde_json::from_value(closed["tick_instance_id"].clone()).unwrap();
         assert!(matches!(
             daemon

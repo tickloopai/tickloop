@@ -1,9 +1,9 @@
 ---
 name: artifact-draft
-description: Draft, write, build or edit one Tick Loop Docs artifact the user names by link (/artifact/<id>) or artifact_id, e.g. a pasted "用 Tick Loop Docs 打开 … 起草这篇 Docs / 做这个 Design 页面" or "Open … with Tick Loop Docs and draft …" prompt.
+description: Draft, write, build or edit one Tick Loop Artifacts artifact the user names by link (/artifact/<id>) or artifact_id, e.g. a pasted "用 Tick Loop Artifacts 打开 … 起草这篇 Doc / 做这个 Design 页面" or "Open … with Tick Loop Artifacts and draft …" prompt.
 ---
 
-# Draft into a Tick Loop Docs artifact
+# Draft into a Tick Loop Artifacts artifact
 
 The user created a doc or a design on the web page and wants you to write it. A doc is writing: reports, notes, plans. A design is a visual page: visual design, UI, prototypes, interactive pages. Work only on that artifact, with `ArtifactRead`, `ArtifactEdit` and `ArtifactComment`; this Skill grants no extra permissions, and each edit still goes through its normal approval.
 
@@ -19,7 +19,7 @@ The artifact's name is `title`, and a doc's first `# ` heading shows that same n
 
 ## 3. Write a doc (`format` `doc`)
 
-`read` returns `blocks`, each with `id`, `hash` and `text`, paged by `next_cursor`; read every page before an edit that depends on the whole document.
+`read` returns `blocks`, each with `id`, `hash` and `text`, paged by `next_cursor`; read every page before an edit that depends on the whole doc.
 
 Edit with `ArtifactEdit` `{"action":"patch","artifact_id":"…","patches":[…]}`. Each patch copies `target` (a block `id`) and `expected_hash` (that block's `hash`) from the latest read:
 

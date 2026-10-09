@@ -30,7 +30,7 @@ pub(super) enum LoginMethod {
 impl LoginMethod {
     pub(super) fn label(self) -> &'static str {
         match self {
-            Self::Artifact => "Artifact Service",
+            Self::Artifact => "Artifacts",
             Self::MiniMax(region) => region.label(),
             Self::Copilot => "GitHub Copilot",
             Self::Google => "Google OAuth",
@@ -405,17 +405,17 @@ impl LoginFlow {
     ) -> Result<(), String> {
         let mut context = vec![
             if matches!(self.method, LoginMethod::Artifact) {
-                "Open this Artifact Service link in your own browser:".into()
+                "Open this Tick Loop Artifacts link in your own browser:".into()
             } else {
                 "Opening your browser. If no page appears, open this link on your own device:"
                     .into()
             },
             safe_text(address),
-            "Use your terminal's link shortcut (often Ctrl/Cmd+click), or copy the URL.".into(),
+            "Use your terminal's link shortcut (often ctrl/cmd+click), or copy the URL.".into(),
             format!("Enter code: {}", safe_text(code)),
         ];
         if let LoginMethod::Artifact = self.method {
-            context.push("In your browser, sign in with Google and approve this device for your Artifact Service account.".into());
+            context.push("In your browser, sign in with Google and approve this device for your Tick Loop Artifacts account.".into());
         } else if let LoginMethod::MiniMax(_) = self.method {
             context.push("Approve access on the MiniMax Portal. The consent page identifies the registered Portal client.".into());
         } else if let LoginMethod::Subscription(provider) = self.method {
@@ -426,7 +426,7 @@ impl LoginFlow {
             context.push("If OpenAI asks you to enable device code authorization, enable it in ChatGPT Settings > Security and retry Device code sign-in from this Provider, or use Browser sign-in.".into());
         }
         context.push(format!(
-            "Waiting for {} authorization. Esc cancels.",
+            "Waiting for {} authorization. esc cancels.",
             self.method.label()
         ));
         Self::show(
@@ -466,7 +466,7 @@ impl LoginFlow {
             Some(Err(error)) => self.show_callback(console, Some(&error.to_string())),
             None => self.show_callback(
                 console,
-                Some("Press Tab to enter the full callback URL, including state, then Enter."),
+                Some("Press tab to enter the full callback URL, including state, then enter."),
             ),
         }
     }
@@ -482,13 +482,13 @@ impl LoginFlow {
         let mut context = vec![
             "Opening your browser. If no page appears, open this link:".into(),
             safe_text(address),
-            "Use your terminal's link shortcut (often Ctrl/Cmd+click), or copy the URL.".into(),
+            "Use your terminal's link shortcut (often ctrl/cmd+click), or copy the URL.".into(),
             if matches!(self.method, LoginMethod::Google) {
                 "Authorize your own Google Cloud client and project. For a remote terminal, paste the complete redirect URL here.".into()
             } else {
                 "Complete authorization in your browser. For a remote terminal, paste the full redirect URL here, or cancel and choose Device code sign-in from this Provider.".into()
             },
-            "Tab edits the callback field; Esc leaves editing, then cancels login.".into(),
+            "tab edits the callback field; esc leaves editing, then cancels login.".into(),
         ];
         if let Some(notice) = notice {
             context.push(safe_text(notice));
@@ -566,7 +566,7 @@ impl LogoutFlow {
         target: SignInTarget,
     ) -> Result<Self, String> {
         console.set_status(&format!(
-            "Removing {} login… Esc cancels; input will run afterward",
+            "Removing {} login… esc cancels; input will run afterward",
             target.label()
         ))?;
         let cancel = CancellationToken::new();
@@ -1242,13 +1242,7 @@ mod tests {
             loop {
                 let text = output.lock().unwrap().clone();
                 let visible = screen::visible_screen(&text, 150, 40);
-                let model_selection_ready = needle != "Model selection:"
-                    || (visible.contains("Enter apply")
-                        && !visible.contains(super::super::console::MENU_SUBMISSION_PENDING_HINT)
-                        && visible.lines().any(|line| {
-                            line.trim_start().starts_with('❯') && line.contains("Thinking ‹")
-                        }));
-                if visible.contains(needle) && model_selection_ready {
+                if visible.contains(needle) {
                     break;
                 }
                 assert!(
@@ -1413,7 +1407,7 @@ mod tests {
         );
         if manual_callback {
             assert!(
-                completed_frame.contains("Enter return"),
+                completed_frame.contains("enter return"),
                 "Completed callback footer: {completed_frame}"
             );
             input_dialog::record_frame("callback-completed", &completed_frame);
@@ -1532,17 +1526,12 @@ mod tests {
                 assert_eq!(saved.model, "gpt-5.6-sol");
             }
             if selected_model.is_none() {
+                // Choosing a model closes the picker.
+                let before_model_choice = output.lock().unwrap().len();
                 writer.write_all(b"\r").unwrap();
                 writer.flush().unwrap();
                 wait("Model selection:");
-                let before_model_back = output.lock().unwrap().len();
-                writer.write_all(TERMINAL_ESCAPE_KEY).unwrap();
-                writer.flush().unwrap();
-                wait_after("Choose Provider", before_model_back);
-                let before_model_cancel = output.lock().unwrap().len();
-                writer.write_all(TERMINAL_ESCAPE_KEY).unwrap();
-                writer.flush().unwrap();
-                wait_for_input_after(before_model_cancel);
+                wait_for_input_after(before_model_choice);
             } else {
                 let before_model_back = output.lock().unwrap().len();
                 writer.write_all(TERMINAL_ESCAPE_KEY).unwrap();

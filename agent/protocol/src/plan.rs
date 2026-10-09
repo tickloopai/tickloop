@@ -36,14 +36,3 @@ pub struct Progress {
     pub loop_id: LoopId,
     pub todos: Vec<TodoItem>,
 }
-
-impl Progress {
-    /// The `activeForm` of the first in-progress todo, which names the current activity like
-    /// Claude Code's spinner.
-    pub fn active_form(&self) -> Option<&str> {
-        self.todos
-            .iter()
-            .find(|todo| todo.status == TodoStatus::InProgress)
-            .map(|todo| todo.active_form.as_str())
-    }
-}

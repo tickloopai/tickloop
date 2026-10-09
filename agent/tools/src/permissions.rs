@@ -887,10 +887,46 @@ mod tests {
             serde_json::from_value::<ExecutionMode>(json!("fullAccess")).unwrap(),
             ExecutionMode::FullAccess
         );
-        assert_eq!(ExecutionMode::Auto.next(), ExecutionMode::AcceptEdits);
-        assert_eq!(ExecutionMode::AcceptEdits.next(), ExecutionMode::FullAccess);
-        assert_eq!(ExecutionMode::FullAccess.next(), ExecutionMode::Auto);
-        assert_eq!(ExecutionMode::Plan.next(), ExecutionMode::Auto);
+        let all = ExecutionMode::CYCLE_ORDER;
+        assert_eq!(
+            ExecutionMode::Auto.next_in(&all),
+            Some(ExecutionMode::AcceptEdits)
+        );
+        assert_eq!(
+            ExecutionMode::AcceptEdits.next_in(&all),
+            Some(ExecutionMode::Plan)
+        );
+        assert_eq!(
+            ExecutionMode::Plan.next_in(&all),
+            Some(ExecutionMode::FullAccess)
+        );
+        assert_eq!(
+            ExecutionMode::FullAccess.next_in(&all),
+            Some(ExecutionMode::Auto)
+        );
+        let default = [ExecutionMode::Auto, ExecutionMode::Plan];
+        assert_eq!(
+            ExecutionMode::Auto.next_in(&default),
+            Some(ExecutionMode::Plan)
+        );
+        assert_eq!(
+            ExecutionMode::Plan.next_in(&default),
+            Some(ExecutionMode::Auto)
+        );
+        assert_eq!(
+            ExecutionMode::AcceptEdits.next_in(&default),
+            Some(ExecutionMode::Plan),
+            "a mode outside the cycle moves to the next enabled one"
+        );
+        assert_eq!(
+            ExecutionMode::FullAccess.next_in(&default),
+            Some(ExecutionMode::Auto)
+        );
+        assert_eq!(ExecutionMode::Auto.next_in(&[ExecutionMode::Auto]), None);
+        assert_eq!(
+            ExecutionMode::Plan.next_in(&[ExecutionMode::Auto]),
+            Some(ExecutionMode::Auto)
+        );
     }
 
     #[test]

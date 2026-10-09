@@ -9,14 +9,13 @@ use unicode_width::UnicodeWidthChar;
 use uuid::Uuid;
 
 use crate::{
-    AgentMessageSource, ApprovalAssessmentDetails, ApprovalFailureKind, ArtifactTick, BranchOrigin,
-    ChatId, CommandSnapshot, CompactionMarker, CompactionStatus, Content, Decision,
-    DelegationMetadata, DenialReference, DirectedHumanSource, ExecutionMode, FamilyCompletion,
-    FamilyInputRecord, FileReadRecord, ImageContext, ImageOrigin, InputContext, InvokedSkill,
-    LoopSnapshot, Message, ModelConfig, ModelIdentity, ModelRequestKind, MonitorMembership,
-    PermissionPolicy, Plan, PreparedFileChange, PrivateHistorySource, Progress,
-    ProviderHttpFailure, QuestionRequest, ReasoningEffort, RequestUsageLedger, Role, ToolResult,
-    TriggerSource, Usage,
+    AgentMessageSource, ApprovalAssessmentDetails, ArtifactTick, BranchOrigin, ChatId,
+    CommandSnapshot, CompactionMarker, CompactionStatus, Content, Decision, DelegationMetadata,
+    DenialReference, DirectedHumanSource, ExecutionMode, FamilyCompletion, FamilyInputRecord,
+    FileReadRecord, ImageContext, ImageOrigin, InputContext, InvokedSkill, LoopSnapshot, Message,
+    ModelConfig, ModelIdentity, ModelRequestKind, MonitorMembership, PermissionPolicy, Plan,
+    PreparedFileChange, PrivateHistorySource, Progress, ProviderHttpFailure, QuestionRequest,
+    ReasoningEffort, RequestUsageLedger, Role, ToolResult, TriggerSource, Usage,
 };
 
 pub type LoopId = Uuid;
@@ -91,10 +90,10 @@ pub struct ChatSnapshot {
     /// Copied prompts in a Branch remain rewind points, but are not fresh child-Chat authorization.
     #[serde(default, skip_serializing_if = "HashSet::is_empty")]
     pub inherited_prompts: HashSet<usize>,
-    /// User-role messages the host wrote for the model, each with the host tool names announced
-    /// as available once it was written. History views skip them; they are never human input.
+    /// User-role messages the host wrote for the model. History views skip them; they are never
+    /// human input.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub host_notes: BTreeMap<usize, BTreeSet<String>>,
+    pub host_notes: BTreeMap<usize, HostNote>,
     /// Host tool names the model was last told about; `None` when this history has never been
     /// told, as in an older Transcript or after compaction dropped the notes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -362,9 +361,6 @@ pub enum EventKind {
     ApprovalAssessed {
         assessment: Box<ApprovalAssessmentDetails>,
     },
-    AutoReviewerNotice {
-        notice: AutoReviewerNotice,
-    },
     ContextCompaction {
         status: CompactionStatus,
         error: Option<String>,
@@ -380,17 +376,31 @@ pub enum EventKind {
     },
 }
 
+/// What a host note tells the model.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HostNote {
+    /// The host tool set changed; the names announced as available once the note was written.
+    HostTools(BTreeSet<String>),
+    /// Claude Code's `plan_mode_exit` attachment: the user left Plan mode without approving a
+    /// plan.
+    PlanModeExit,
+}
+
+impl HostNote {
+    pub fn announced_host_tools(&self) -> Option<&BTreeSet<String>> {
+        match self {
+            Self::HostTools(announced) => Some(announced),
+            Self::PlanModeExit => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ProposedToolCall {
     pub call_id: String,
     pub name: String,
     pub input: serde_json::Value,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub enum AutoReviewerNotice {
-    Fallback { failure: ApprovalFailureKind },
-    Recovered,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

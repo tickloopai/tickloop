@@ -30,7 +30,12 @@ async fn short_exchange_has_no_sticky_prompt(fixture: &PrivateFixture, renderer:
         .await;
     eprintln!("[short-exchange-frame {renderer}]\n{frame}\n[/short-exchange-frame]");
     assert!(!frame.lines().next().unwrap().contains(PROMPT), "{frame}");
-    assert_eq!(frame.matches(PROMPT).count(), 1, "{frame}");
+    // Until a title is generated, the short prompt also names the Agent on the composer's rule.
+    assert_eq!(
+        conversation_body(&frame).matches(PROMPT).count(),
+        1,
+        "{frame}"
+    );
     assert!(
         frame.find(PROMPT).unwrap() < frame.find(REPLY).unwrap(),
         "{frame}"
@@ -117,12 +122,13 @@ async fn reply_before_approval(fixture: &PrivateFixture, text: &str) {
     eprintln!("[reply-before-admission]\n{before}\n[/reply-before-admission]");
     view.send(b"\x0f");
     view.wait_for("archive has the same committed reply", |frame| {
-        frame.contains("Transcript") && frame.contains(REPLY)
+        frame.contains("Showing detailed transcript") && frame.contains(REPLY)
     })
     .await;
     view.send(b"\x0f");
     view.wait_for("main reply survives archive round trip", |frame| {
-        !frame.contains("Transcript") && conversation_body(frame).matches(REPLY).count() == 1
+        !frame.contains("Showing detailed transcript")
+            && conversation_body(frame).matches(REPLY).count() == 1
     })
     .await;
     release.send(()).unwrap();
@@ -179,7 +185,7 @@ async fn queued_batch(fixture: &PrivateFixture) {
                 && body.matches("Queued").count() == 2
         })
         .await;
-    assert!(!pending.contains("Esc answer later"));
+    assert!(!pending.contains("esc answer later"));
     assert!(!fixture.path("work/admission-marker").exists());
     let mut attached = PtyView::start(fixture);
     attached
@@ -203,12 +209,14 @@ async fn queued_batch(fixture: &PrivateFixture) {
         .await;
     view.send(b"\x0f");
     view.wait_for("batch Transcript has reply and question", |frame| {
-        frame.contains("Transcript") && frame.contains(REPLY) && frame.contains(QUESTION)
+        frame.contains("Showing detailed transcript")
+            && frame.contains(REPLY)
+            && frame.contains(QUESTION)
     })
     .await;
     view.send(b"\x0f");
     view.wait_for("batch main survives Transcript", |frame| {
-        !frame.contains("Transcript") && frame.matches("Queued").count() == 2
+        !frame.contains("Showing detailed transcript") && frame.matches("Queued").count() == 2
     })
     .await;
     release.send(()).unwrap();
@@ -220,7 +228,7 @@ async fn queued_batch(fixture: &PrivateFixture) {
         })
         .await;
     assert_eq!(conversation_body(&running).matches("Bash").count(), 1);
-    assert!(!running.contains("Esc answer later"));
+    assert!(!running.contains("esc answer later"));
     attached
         .wait_for("attached queued row also updates once", |frame| {
             conversation_body(frame).matches("Queued").count() == 1
@@ -229,7 +237,7 @@ async fn queued_batch(fixture: &PrivateFixture) {
         .await;
     std::fs::write(fixture.path("work/finish-command"), "").unwrap();
     view.wait_for("answer UI activates only after Bash finishes", |frame| {
-        frame.contains(QUESTION) && frame.contains("Esc answer later")
+        frame.contains(QUESTION) && frame.contains("esc answer later")
     })
     .await;
     view.send(b"\r");
@@ -431,7 +439,7 @@ async fn text_only_reply(fixture: &PrivateFixture) {
     view.send(b"Return a text-only response\r");
     let complete = view
         .wait_for("text-only tail appears once at completion", |frame| {
-            frame.contains(REPLY) && frame.contains("Done")
+            frame.contains(REPLY) && (frame.contains("✻ Worked for") || frame.contains("✻ Done"))
         })
         .await;
     assert_eq!(conversation_body(&complete).matches(REPLY).count(), 1);
@@ -469,7 +477,7 @@ async fn independent_question(fixture: &PrivateFixture) {
         .await;
     view.send(b"Ask an independent question\r");
     view.wait_for("independent answer menu and reply are visible", |frame| {
-        frame.contains(REPLY) && frame.contains(QUESTION) && frame.contains("Esc answer later")
+        frame.contains(REPLY) && frame.contains(QUESTION) && frame.contains("esc answer later")
     })
     .await;
     view.send(b"\r");

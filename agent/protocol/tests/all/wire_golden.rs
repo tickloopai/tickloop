@@ -362,6 +362,7 @@ fn chat_snapshot() -> ChatSnapshot {
             title: Some("Counter".into()),
         }],
         removed: [hosted_instance()].into(),
+        handled: [(herdr_instance(), 7_500)].into(),
     };
     snapshot.model = model_config();
     snapshot.policy = permission_policy();
@@ -422,12 +423,14 @@ fn hosted_members() -> Vec<HostedMember> {
                 rss_bytes: None,
                 sampled_at_ms: 9_000,
             }),
+            updated_at_ms: Some(8_000),
         },
         HostedMember {
             instance: InstanceRef::hosted(id(0x41)),
             title: None,
             state: HostedMemberState::Lost,
             resources: None,
+            updated_at_ms: None,
         },
     ]
 }
@@ -440,6 +443,7 @@ fn monitor_membership() -> MonitorMembership {
             title: Some("Quotes".into()),
         }],
         removed: [herdr_instance()].into(),
+        handled: [(hosted_instance(), 8_500)].into(),
     }
 }
 

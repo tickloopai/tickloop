@@ -24,12 +24,22 @@ impl ExecutionMode {
         }
     }
 
-    pub const fn next(self) -> Self {
-        match self {
-            Self::Auto => Self::AcceptEdits,
-            Self::AcceptEdits => Self::FullAccess,
-            Self::FullAccess | Self::Plan => Self::Auto,
-        }
+    /// Shift+Tab's fixed order, like Claude Code's: Plan follows Ask and precedes Full Access.
+    /// The user's `shiftTabModes` setting chooses which of these the cycle visits. Entering or
+    /// leaving Plan changes the system prompt and tools, so it starts a new prompt cache.
+    pub const CYCLE_ORDER: [Self; 4] =
+        [Self::Auto, Self::AcceptEdits, Self::Plan, Self::FullAccess];
+
+    /// The first of `enabled` after this mode in [`Self::CYCLE_ORDER`], wrapping around; a mode
+    /// outside `enabled` moves to the next enabled one. `None` when no other mode is enabled.
+    pub fn next_in(self, enabled: &[Self]) -> Option<Self> {
+        let start = Self::CYCLE_ORDER
+            .iter()
+            .position(|mode| *mode == self)
+            .expect("every execution mode is in the Shift+Tab order");
+        (1..=Self::CYCLE_ORDER.len())
+            .map(|offset| Self::CYCLE_ORDER[(start + offset) % Self::CYCLE_ORDER.len()])
+            .find(|mode| *mode != self && enabled.contains(mode))
     }
 }
 

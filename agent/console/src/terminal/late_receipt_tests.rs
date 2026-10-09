@@ -402,7 +402,11 @@ fn composer_row(frame: &str) -> &str {
 fn echoed(frame: &str, input: &str) -> usize {
     body_above_rules(frame)
         .iter()
-        .filter(|line| line.trim_start().starts_with('❯') && line.contains(input))
+        .filter(|line| {
+            let is_echo = !screen::is_queued_input(line);
+            let line = line.trim_start();
+            is_echo && (line.starts_with('❯') || line.starts_with("! ")) && line.contains(input)
+        })
         .count()
 }
 
@@ -858,7 +862,7 @@ fn an_edited_shell_command_held_behind_an_unknown_input_is_shown_only_once_it_ru
     std::fs::remove_file(flag("hide-receipts")).unwrap();
     view.send(b"\r");
     let frame = view.wait_for_rows("the Shell command ran", |frame| {
-        frame.lines().any(|line| line.trim() == "held-shell-ran")
+        frame.lines().any(|line| line.trim() == "⎿  held-shell-ran")
     });
     assert_eq!(echoed(&frame, FIRST), 1, "{frame}");
     assert_eq!(
@@ -921,16 +925,14 @@ fn a_busy_command_held_behind_an_unknown_input_is_queued_and_shown_once() {
     std::fs::remove_file(flag("hide-receipts")).unwrap();
     view.send(b"\r");
     let frame = view.wait_for_rows("the command queued behind the active turn", |frame| {
-        frame
-            .split_once("Messages to be submitted (1)")
-            .is_some_and(|(_, preview)| {
-                preview
-                    .lines()
-                    .take_while(|line| !line.starts_with('─'))
-                    .any(|line| line.contains(COMMAND))
-            })
+        screen::split_at_queue(frame).is_some_and(|(_, preview)| {
+            preview
+                .lines()
+                .take_while(|line| !line.starts_with('─'))
+                .any(|line| line.contains(COMMAND))
+        })
     });
-    let (body, preview) = frame.split_once("Messages to be submitted (1)").unwrap();
+    let (body, preview) = screen::split_at_queue(&frame).unwrap();
     let preview = preview
         .lines()
         .take_while(|line| !line.starts_with('─'))
@@ -975,7 +977,7 @@ fn a_busy_command_held_behind_an_unknown_input_is_queued_and_shown_once() {
 
     std::fs::remove_file(flag("hold-model")).unwrap();
     let frame = view.wait_for_rows("the queued command ran after the turn", |frame| {
-        frame.contains("edited reply") && !frame.contains("Messages to be submitted")
+        frame.contains("edited reply") && screen::queued_inputs(frame).is_empty()
     });
     assert_eq!(echoed(&frame, FIRST), 1, "{frame}");
     assert_eq!(

@@ -71,11 +71,11 @@ pub use auto_settings::{
 };
 pub use auto_setup::{AutoEnvironmentDraft, AutoSetupOptions, AutoSetupPurpose};
 pub use chat::{
-    AgentHostOptions, AutoReviewerNotice, ChatSnapshot, DirectoryTrustPolicy, Event, EventKind,
-    LoopId, OperationRecord, OperationState, PendingCommand, PendingInput,
-    PermissionApprovalSource, PermissionExecution, PermissionRequest, PromptPolicy,
-    ProposedToolCall, QueuedInput, QueuedInputKind, Receipt, RunId, SavedChat, ToolCallRecovery,
-    UserShellReceipt, UserShellRecord, UserShellState, chat_display_title, short_chat_title,
+    AgentHostOptions, ChatSnapshot, DirectoryTrustPolicy, Event, EventKind, HostNote, LoopId,
+    OperationRecord, OperationState, PendingCommand, PendingInput, PermissionApprovalSource,
+    PermissionExecution, PermissionRequest, PromptPolicy, ProposedToolCall, QueuedInput,
+    QueuedInputKind, Receipt, RunId, SavedChat, ToolCallRecovery, UserShellReceipt,
+    UserShellRecord, UserShellState, chat_display_title, short_chat_title,
 };
 pub use denials::{
     ApprovalHistoryView, ApprovalPath, ApprovalRecord, ApprovalResult, DenialAutoFinding,
@@ -84,7 +84,7 @@ pub use denials::{
     MAX_RECENT_DENIALS, render_reference,
 };
 pub use family::{
-    AgentMessageSource, DelegationCeiling, DelegationMetadata, DirectedHumanSource,
+    AgentColor, AgentMessageSource, DelegationCeiling, DelegationMetadata, DirectedHumanSource,
     FamilyCompletion, FamilyInputRecord, FamilyMessageRejection, FamilyMessageRejectionCode,
     MessageCause, SEND_AGENT_MESSAGE_TOOL_NAME, SUBAGENT_HANDBACK_TOOL_NAME, SUBAGENT_TOOL_NAME,
     SubagentNotificationDelivery, SubagentRegistration, SubagentReport, VerifiedUserRelay,

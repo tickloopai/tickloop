@@ -1,5 +1,6 @@
 use super::super::{
     artifact_ui, safe_text,
+    subscription_detail::{SubscriptionDetail, SubscriptionRequest},
     task_access::ShellTaskCenter,
     task_surface::{TaskOutputUpdate, TaskSurfaceEffect},
     tick_shell::{TickShell, TickShellKey},
@@ -13,7 +14,10 @@ pub(in crate::terminal) fn executor(intent: &TickIntent) -> Option<Arc<dyn TickA
     let executor: Arc<dyn TickActionExecutor> = match intent.clone() {
         TickIntent::Notify(_) => return None,
         TickIntent::ShowDetails(instance) => Arc::new(DetailsOpen { instance }),
-        TickIntent::RemoveFromMonitor(instance) => Arc::new(RemoveFromMonitor { instance }),
+        TickIntent::RemoveFromMonitor(instance) => Arc::new(RemoveFromMonitor {
+            instance,
+            is_confirmed: false,
+        }),
         TickIntent::OpenHosted(instance) => Arc::new(OpenHosted { instance }),
         TickIntent::ShowHostedSnapshot(instance) => Arc::new(SnapshotHosted { instance }),
         TickIntent::CloseHosted(instance) => Arc::new(CloseHosted {
@@ -27,7 +31,13 @@ pub(in crate::terminal) fn executor(intent: &TickIntent) -> Option<Arc<dyn TickA
         TickIntent::OpenShell { task } => Arc::new(ShellOpen { task }),
         TickIntent::Artifact { id, key } => artifact(&id, key),
         TickIntent::RefreshArtifacts => artifact("", 'r'),
-        TickIntent::OpenSubscription { id } => Arc::new(SubscriptionAction { id }),
+        TickIntent::ManageSubscriptions {
+            instance,
+            operation,
+        } => Arc::new(OpenSubscriptions {
+            instance,
+            operation,
+        }),
     };
     Some(executor)
 }
@@ -81,29 +91,67 @@ impl TickActionBackend for ArtifactAction {
         Ok(())
     }
 }
-struct SubscriptionAction {
-    id: Uuid,
+/// Opens the row's subscriptions inside Monitor, then reads them fresh from the Agent.
+struct OpenSubscriptions {
+    instance: tick_protocol::InstanceRef,
+    operation: crate::monitor_rows::SubscriptionOperation,
 }
-impl TickActionExecutor for SubscriptionAction {
-    fn prepare(&self, _ui: &mut TickActionUi<'_>) -> Result<PreparedTickAction, String> {
+impl TickActionExecutor for OpenSubscriptions {
+    fn prepare(&self, ui: &mut TickActionUi<'_>) -> Result<PreparedTickAction, String> {
+        let detail = ui.subscription_detail(&self.instance, self.operation)?;
+        ui.open_detail(Box::new(detail));
         Ok(PreparedTickAction::new(
-            self.id.to_string(),
-            'o',
-            Arc::new(SubscriptionAction { id: self.id }),
+            self.instance.to_string(),
+            crate::monitor_rows::MONITOR_ENTER_KEY,
+            Arc::new(RefreshSubscriptions),
         ))
     }
 }
+/// Reads the Chat's subscriptions again so Monitor and an open subscription detail show them.
+struct RefreshSubscriptions;
 #[async_trait]
-impl TickActionBackend for SubscriptionAction {
+impl TickActionBackend for RefreshSubscriptions {
     async fn execute(&self, ctx: TickActionContext<'_>) -> Result<(), String> {
-        let rows = ctx
+        refresh_subscriptions(&ctx).await
+    }
+}
+async fn refresh_subscriptions(ctx: &TickActionContext<'_>) -> Result<(), String> {
+    let rows = ctx
+        .agent
+        .tick_subscriptions(ctx.chat)
+        .await
+        .map_err(|error| format!("Cannot read Tick Subscriptions: {error}"))?;
+    ctx.console.update_subscribed_ticks(ctx.chat, &rows)
+}
+/// Changes or cancels one subscription for the subscription detail `panel`, which reports a
+/// refusal; either way Monitor then shows the subscriptions as the Agent holds them.
+pub(in crate::terminal) fn change_subscription(
+    panel: Uuid,
+    request: SubscriptionRequest,
+) -> Arc<dyn TickActionBackend> {
+    Arc::new(ChangeSubscription { panel, request })
+}
+struct ChangeSubscription {
+    panel: Uuid,
+    request: SubscriptionRequest,
+}
+#[async_trait]
+impl TickActionBackend for ChangeSubscription {
+    async fn execute(&self, ctx: TickActionContext<'_>) -> Result<(), String> {
+        if let Err(error) = ctx
             .agent
-            .tick_subscriptions(ctx.chat)
+            .update_tick_subscription(ctx.chat, self.request.subscription, self.request.change)
             .await
-            .map_err(|error| error.to_string())?;
-        ctx.console
-            .show_subscriptions_at(ctx.chat, rows, self.id, false)?;
-        Ok(())
+        {
+            ctx.update_detail(self.panel, |detail: &mut SubscriptionDetail| {
+                detail.report_error(format!(
+                    "Cannot update the Tick Subscription: {}",
+                    safe_text(&error.to_string())
+                ));
+                Some(())
+            })?;
+        }
+        refresh_subscriptions(&ctx).await
     }
 }
 struct DetailsOpen {
@@ -177,7 +225,7 @@ const REGISTER_POPUP_PROMPT: &str =
 const TURN_ON_POPUP_PROMPT: &str = "Turn Tick Loop's Herdr popup on? No other plugin is touched.";
 const REGISTER_THIS_TICKLOOP_PROMPT: &str =
     "Tick Loop's Herdr popup runs another tickloop. Register this one instead?";
-const HERDR_BUSY: &str = "Herdr is showing another view; close it and press Enter again";
+const HERDR_BUSY: &str = "Herdr is showing another view; close it and press enter again";
 
 /// Why a hosted Tick did not float in the Herdr popup.
 enum NotFloated {
@@ -413,8 +461,20 @@ impl TickActionBackend for NoBackend {
         Ok(())
     }
 }
+/// The user has seen `row` up to now, such as by closing its open detail.
+pub(in crate::terminal) fn seen(row: tick_protocol::InstanceRef) -> PreparedTickAction {
+    PreparedTickAction::new(
+        row.to_string(),
+        crate::monitor_rows::MONITOR_ENTER_KEY,
+        Arc::new(NoBackend),
+    )
+    .opening(row)
+}
+/// Hides a row in this Chat. A row its Loops subscribe to asks first, then cancels those
+/// subscriptions, so nothing keeps delivering from a Tick the user no longer sees.
 struct RemoveFromMonitor {
     instance: tick_protocol::InstanceRef,
+    is_confirmed: bool,
 }
 impl TickActionExecutor for RemoveFromMonitor {
     fn prepare(&self, _ui: &mut TickActionUi<'_>) -> Result<PreparedTickAction, String> {
@@ -423,6 +483,7 @@ impl TickActionExecutor for RemoveFromMonitor {
             'x',
             Arc::new(RemoveFromMonitor {
                 instance: self.instance.clone(),
+                is_confirmed: self.is_confirmed,
             }),
         ))
     }
@@ -430,6 +491,38 @@ impl TickActionExecutor for RemoveFromMonitor {
 #[async_trait]
 impl TickActionBackend for RemoveFromMonitor {
     async fn execute(&self, ctx: TickActionContext<'_>) -> Result<(), String> {
+        let subscriptions = crate::monitor_rows::subscriptions_on(
+            &ctx.agent
+                .tick_subscriptions(ctx.chat)
+                .await
+                .map_err(|error| format!("Cannot read Tick Subscriptions: {error}"))?,
+            &self.instance,
+        );
+        if !subscriptions.is_empty() && !self.is_confirmed {
+            ctx.console.confirm_tick_action(
+                ctx.chat,
+                self.instance.to_string(),
+                Arc::new(RemoveFromMonitor {
+                    instance: self.instance.clone(),
+                    is_confirmed: true,
+                }),
+                &remove_subscribed_prompt(subscriptions.len()),
+            )?;
+            return Ok(());
+        }
+        for subscription in &subscriptions {
+            ctx.agent
+                .update_tick_subscription(
+                    ctx.chat,
+                    subscription.id,
+                    tickloop_agent_protocol::TickSubscriptionChange::Cancel,
+                )
+                .await
+                .map_err(|error| format!("Cannot cancel the Tick Subscription: {error}"))?;
+        }
+        if !subscriptions.is_empty() {
+            refresh_subscriptions(&ctx).await?;
+        }
         let membership = ctx
             .agent
             .remove_monitor_member(ctx.chat, self.instance.clone())
@@ -440,9 +533,19 @@ impl TickActionBackend for RemoveFromMonitor {
         Ok(())
     }
 }
+fn remove_subscribed_prompt(subscriptions: usize) -> String {
+    format!(
+        "Remove from Monitor and cancel its {subscriptions} Tick {}? enter confirm · esc cancel",
+        if subscriptions == 1 {
+            "Subscription"
+        } else {
+            "Subscriptions"
+        }
+    )
+}
 const CLOSE_HOSTED_PROMPT: &str =
-    "Close this hosted Tick and end its process? Enter confirm · Esc cancel";
-const REOPEN_HOSTED_PROMPT: &str = "Start a new instance of this lost Tick? Its subscriptions do not follow. Enter confirm · Esc cancel";
+    "Close this hosted Tick and end its process? enter confirm · esc cancel";
+const REOPEN_HOSTED_PROMPT: &str = "Start a new instance of this lost Tick? Its subscriptions do not follow. enter confirm · esc cancel";
 
 /// Ends the hosted Tick at the user's request once confirmed; it stays in the Monitor, shown
 /// gone, until removed.
@@ -600,14 +703,7 @@ impl TickActionBackend for ShellRefresh {
                 }
             })?
             .unwrap_or(TaskSurfaceEffect::None);
-        apply_shell_effect(
-            &center,
-            ctx.console,
-            ctx.chat,
-            ShellEffectTarget::TickPanel(self.panel),
-            effect,
-        )
-        .await?;
+        apply_shell_effect(&center, ctx.console, ctx.chat, self.panel, effect).await?;
         Ok(())
     }
 }
@@ -623,100 +719,24 @@ impl TickActionBackend for ShellEffect {
             &center,
             ctx.console,
             ctx.chat,
-            ShellEffectTarget::TickPanel(self.panel),
+            self.panel,
             self.effect.clone(),
         )
         .await?;
         Ok(())
     }
 }
-#[derive(Clone, Copy)]
-enum ShellEffectTarget {
-    TaskCenter,
-    TickPanel(uuid::Uuid),
-}
-
-impl ShellEffectTarget {
-    fn snapshot(
-        self,
-        console: &Console,
-        chat: uuid::Uuid,
-        snapshot: tickloop_agent_protocol::ShellTaskSnapshot,
-    ) -> Result<TaskSurfaceEffect, String> {
-        match self {
-            Self::TaskCenter => console.update_tasks(snapshot),
-            Self::TickPanel(panel) => console.update_tick_shell(chat, panel, snapshot),
-        }
-    }
-    fn output(
-        self,
-        console: &Console,
-        chat: uuid::Uuid,
-        update: TaskOutputUpdate,
-    ) -> Result<TaskSurfaceEffect, String> {
-        match self {
-            Self::TaskCenter => console.update_task_output(chat, update),
-            Self::TickPanel(panel) => console.update_tick_shell_output(chat, panel, update),
-        }
-    }
-    fn action_failed(
-        self,
-        console: &Console,
-        chat: uuid::Uuid,
-        task: uuid::Uuid,
-        error: String,
-    ) -> Result<(), String> {
-        match self {
-            Self::TaskCenter => console.task_action_failed(chat, task, error),
-            Self::TickPanel(panel) => console.tick_shell_control_failed(chat, panel, error),
-        }
-    }
-    fn clear_action_error(self, console: &Console, chat: uuid::Uuid) -> Result<(), String> {
-        match self {
-            Self::TaskCenter => console.clear_task_action_error(chat),
-            Self::TickPanel(panel) => console.clear_tick_shell_control_error(chat, panel),
-        }
-    }
-    fn updates_failed(
-        self,
-        console: &Console,
-        chat: uuid::Uuid,
-        error: String,
-    ) -> Result<(), String> {
-        match self {
-            Self::TaskCenter => console.task_updates_failed(chat, error),
-            Self::TickPanel(panel) => console.tick_shell_failed(chat, panel, error),
-        }
-    }
-}
-
-pub(in crate::terminal) async fn apply_task_surface_effect(
-    task_center: &ShellTaskCenter,
-    console: &Console,
-    chat: uuid::Uuid,
-    effect: TaskSurfaceEffect,
-) -> Result<(), String> {
-    apply_shell_effect(
-        task_center,
-        console,
-        chat,
-        ShellEffectTarget::TaskCenter,
-        effect,
-    )
-    .await
-}
-
+/// Carries out a Monitor Shell detail's effect and shows the result in that detail `panel`.
 async fn apply_shell_effect(
     task_center: &ShellTaskCenter,
     console: &Console,
     chat: uuid::Uuid,
-    target: ShellEffectTarget,
+    panel: uuid::Uuid,
     mut effect: TaskSurfaceEffect,
 ) -> Result<(), String> {
     loop {
-        if matches!(target, ShellEffectTarget::TickPanel(_))
-            && let TaskSurfaceEffect::Control { task_id, .. }
-            | TaskSurfaceEffect::ReadOutput { task_id, .. } = &effect
+        if let TaskSurfaceEffect::Control { task_id, .. }
+        | TaskSurfaceEffect::ReadOutput { task_id, .. } = &effect
         {
             match task_center.snapshot(chat).await {
                 Ok(snapshot)
@@ -725,25 +745,24 @@ async fn apply_shell_effect(
                         .iter()
                         .any(|task| task.id == *task_id && task.chat_id == chat) =>
                 {
-                    target.snapshot(console, chat, snapshot)?;
+                    console.update_tick_shell(chat, panel, snapshot)?;
                     return Ok(());
                 }
                 Ok(_) => {}
                 Err(error) => {
-                    target.updates_failed(console, chat, safe_text(&error.to_string()))?;
+                    console.tick_shell_failed(chat, panel, safe_text(&error.to_string()))?;
                     return Ok(());
                 }
             }
         }
         match effect {
-            TaskSurfaceEffect::None | TaskSurfaceEffect::Close => return Ok(()),
+            TaskSurfaceEffect::None => return Ok(()),
             TaskSurfaceEffect::Control { task_id, action } => {
                 match task_center.dispatch(chat, task_id, action).await {
-                    Ok(_) => target.clear_action_error(console, chat)?,
-                    Err(error) => target.action_failed(
-                        console,
+                    Ok(_) => console.clear_tick_shell_control_error(chat, panel)?,
+                    Err(error) => console.tick_shell_control_failed(
                         chat,
-                        task_id,
+                        panel,
                         format!(
                             "Cannot update Shell task: {}",
                             safe_text(&error.to_string())
@@ -751,9 +770,9 @@ async fn apply_shell_effect(
                     )?,
                 }
                 match task_center.snapshot(chat).await {
-                    Ok(snapshot) => effect = target.snapshot(console, chat, snapshot)?,
+                    Ok(snapshot) => effect = console.update_tick_shell(chat, panel, snapshot)?,
                     Err(error) => {
-                        target.updates_failed(console, chat, safe_text(&error.to_string()))?;
+                        console.tick_shell_failed(chat, panel, safe_text(&error.to_string()))?;
                         return Ok(());
                     }
                 }
@@ -765,9 +784,9 @@ async fn apply_shell_effect(
                 generation,
             } => match task_center.read_output(chat, task_id, cursor, limit).await {
                 Ok(chunk) => {
-                    effect = target.output(
-                        console,
+                    effect = console.update_tick_shell_output(
                         chat,
+                        panel,
                         TaskOutputUpdate::Chunk { generation, chunk },
                     )?
                 }
@@ -780,9 +799,9 @@ async fn apply_shell_effect(
                             snapshot.tasks.into_iter().find(|task| task.id == task_id)
                         })
                         .map_or(0, |task| task.output_bytes);
-                    target.output(
-                        console,
+                    console.update_tick_shell_output(
                         chat,
+                        panel,
                         TaskOutputUpdate::Unavailable {
                             generation,
                             task_id,
@@ -810,6 +829,9 @@ impl TickDetailView for TickShell {
     }
     fn chat(&self) -> Uuid {
         self.chat
+    }
+    fn instance(&self) -> Option<tick_protocol::InstanceRef> {
+        Some(tick_protocol::InstanceRef::shell(self.task_id))
     }
     fn lines(&mut self, width: usize, height: usize, now: u64) -> Vec<TickDetailLine> {
         TickShell::lines(self, width, height, now)
@@ -862,7 +884,7 @@ impl Console {
             chat,
             id.clone(),
             artifact(&id, 'X'),
-            "Remove artifact and cancel its Tick subscriptions? Enter confirm · Esc cancel",
+            "Remove artifact and cancel its Tick subscriptions? enter confirm · esc cancel",
         )
     }
 }

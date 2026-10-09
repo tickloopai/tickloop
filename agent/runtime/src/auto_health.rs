@@ -71,24 +71,20 @@ impl AutoHealth {
         self.begin(connection, now)
     }
 
-    pub fn failure(&mut self, permit: AttemptPermit, now: Instant) -> bool {
+    pub fn failure(&mut self, permit: AttemptPermit, now: Instant) {
         if permit.generation != self.generation {
-            return false;
+            return;
         }
-        let first_fallback = self.cooldown_until.is_none();
         self.cooldown_until = Some(now + COOLDOWN);
         self.probe_in_flight = false;
-        first_fallback
     }
 
-    pub fn success(&mut self, permit: AttemptPermit) -> bool {
+    pub fn success(&mut self, permit: AttemptPermit) {
         if permit.generation != self.generation {
-            return false;
+            return;
         }
-        let recovered = self.cooldown_until.is_some();
         self.cooldown_until = None;
         self.probe_in_flight = false;
-        recovered
     }
 
     pub fn cancel(&mut self, permit: AttemptPermit) {
@@ -119,13 +115,16 @@ mod tests {
         let mut health = AutoHealth::default();
         let now = Instant::now();
         let first = health.begin(None, now).unwrap();
-        assert!(health.failure(first, now));
+        health.failure(first, now);
+        assert!(matches!(
+            health.status(now),
+            AutoReviewerHealth::CoolingDown { .. }
+        ));
         assert!(health.begin(None, now).is_none());
         tokio::time::advance(COOLDOWN).await;
         let probe = health.begin(None, Instant::now()).unwrap();
         assert!(health.begin(None, Instant::now()).is_none());
-        assert!(health.success(probe));
-        assert!(!health.success(first));
+        health.success(probe);
         assert_eq!(health.status(Instant::now()), AutoReviewerHealth::Ready);
     }
 
@@ -135,10 +134,14 @@ mod tests {
         let old = health.begin(None, Instant::now()).unwrap();
         health.reset();
         let new = health.begin(None, Instant::now()).unwrap();
-        assert!(!health.failure(old, Instant::now()));
-        assert!(!health.success(old));
+        health.failure(old, Instant::now());
+        health.success(old);
         assert_eq!(health.status(Instant::now()), AutoReviewerHealth::Ready);
-        assert!(health.failure(new, Instant::now()));
+        health.failure(new, Instant::now());
+        assert!(matches!(
+            health.status(Instant::now()),
+            AutoReviewerHealth::CoolingDown { .. }
+        ));
     }
 
     #[tokio::test(start_paused = true)]

@@ -595,21 +595,21 @@ impl ConversationPicker {
     /// Only the keys the current focus actually handles, each with the priority it keeps when
     /// the row is too narrow for all of them (higher stays longer).
     fn hint_parts(&self) -> Vec<(String, u8)> {
-        let open = format!("Enter {}", self.purpose.open_action());
+        let open = format!("enter {}", self.purpose.open_action());
         match self.focus {
             ConversationPickerFocus::List => vec![
                 (open, 3),
                 ("type to search".into(), 0),
-                ("Esc cancel".into(), 2),
+                ("esc cancel".into(), 2),
             ],
             ConversationPickerFocus::Search => vec![
                 (open, 3),
-                ("Ctrl+G editor".into(), 0),
+                ("ctrl+g editor".into(), 0),
                 (
                     if self.query().is_empty() {
-                        "Esc list".into()
+                        "esc list".into()
                     } else {
-                        "Esc clear search".into()
+                        "esc clear search".into()
                     },
                     2,
                 ),
@@ -1032,7 +1032,7 @@ mod tests {
                 assert!(lines[0].ends_with("18 of 30"), "{lines:?}");
             }
             if height >= HINT_MIN_HEIGHT {
-                assert!(lines[height - 1].contains("Esc cancel"), "{lines:?}");
+                assert!(lines[height - 1].contains("esc cancel"), "{lines:?}");
             }
         }
         let tall = texts(&picker.frame(32, 16, DisplayProfile::default()));
@@ -1055,18 +1055,18 @@ mod tests {
         );
         assert_eq!(
             hint_row(&list_lines),
-            "Enter open · type to search · Esc cancel"
+            "enter open · type to search · esc cancel"
         );
         assert_eq!(
             hint_row(&texts(&picker.frame(32, 8, DisplayProfile::default()))),
-            "Enter open · Esc cancel"
+            "enter open · esc cancel"
         );
         picker.paste("报\n告");
         let frame = picker.frame(40, 8, DisplayProfile::default());
         let lines = texts(&frame);
         assert_eq!(lines[1], "⌕ 报 告");
         assert_eq!(frame.cursor, Some((1, 7)));
-        assert!(hint_row(&lines).contains("Esc clear search"), "{lines:?}");
+        assert!(hint_row(&lines).contains("esc clear search"), "{lines:?}");
         assert_eq!(picker.selection(), None);
         picker.key(key(KeyCode::Left));
         picker.key(key(KeyCode::Left));
@@ -1097,7 +1097,7 @@ mod tests {
         let lines = texts(&picker.frame(80, 8, DisplayProfile::default()));
         assert_eq!(
             hint_row(&lines),
-            "Enter open · Ctrl+G editor · Esc clear search"
+            "enter open · ctrl+g editor · esc clear search"
         );
     }
 

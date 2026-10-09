@@ -693,7 +693,7 @@ fn inherited_auto_permissions_keep_judgment_read_only_and_root_key_settings_edit
     });
     view.send(b"\r");
     view.wait_for("the root Auto permissions", |frame| {
-        frame.contains("Enter configure")
+        frame.contains("enter configure")
     });
     view.send(b"\x1b[B\r");
     view.wait_for("the root Judgment settings", |frame| {
@@ -714,7 +714,7 @@ fn inherited_auto_permissions_keep_judgment_read_only_and_root_key_settings_edit
     let saved_settings = std::fs::read(&settings_file).ok();
     view.send(b"\x1b");
     view.wait_for("the root Auto permissions again", |frame| {
-        frame.contains("Enter configure") && !frame.contains("Judgment settings")
+        frame.contains("enter configure") && !frame.contains("Judgment settings")
     });
     view.send(b"\x1b");
     view.wait_for("the root mode list again", |frame| {
@@ -743,7 +743,7 @@ fn inherited_auto_permissions_keep_judgment_read_only_and_root_key_settings_edit
         frame.contains("Auto mode") && frame.contains("Jev (TypeSafe) key")
     });
     assert!(
-        !auto.contains("Enter configure"),
+        !auto.contains("enter configure"),
         "the child offers no editing: {auto}"
     );
     view.send(b"\x1b[B");
@@ -907,7 +907,7 @@ fn a_child_opened_in_place_refuses_root_only_changes_before_sending_and_keeps_it
     std::thread::sleep(Duration::from_millis(200));
     view.send(b"\x1b[Z");
     let deadline = Instant::now() + TIMEOUT;
-    while !view.frame().contains("Shift+Tab mode isn't available") {
+    while !view.frame().contains("shift+tab mode isn't available") {
         assert!(
             Instant::now() < deadline,
             "the refused Shift+Tab never showed: {}\n{:?}",
@@ -918,7 +918,7 @@ fn a_child_opened_in_place_refuses_root_only_changes_before_sending_and_keeps_it
     }
     std::thread::sleep(Duration::from_millis(2500));
     assert!(
-        view.frame().contains("Shift+Tab mode isn't available"),
+        view.frame().contains("shift+tab mode isn't available"),
         "status refreshes keep the reason: {}",
         view.frame()
     );
@@ -1011,7 +1011,7 @@ fn shift_tab_in_the_overview_changes_no_hidden_agent_and_the_root_keeps_its_key(
 
     view.send(b"\x1b[D");
     view.wait_for("the overview list", |frame| {
-        frame.contains("Agents · local") && frame.contains("Tab new Agent")
+        frame.contains("Agents · local") && frame.contains("tab new Agent")
     });
     view.send(b"p");
     let listed = view.wait_for("a Project filter", |frame| {
@@ -1024,7 +1024,7 @@ fn shift_tab_in_the_overview_changes_no_hidden_agent_and_the_root_keeps_its_key(
     view.send(b"\x1b[Z");
     view.send(b"\x1b[Z");
     let refused = view.wait_for("Shift+Tab refused in the dispatch input", |frame| {
-        frame.contains("Shift+Tab mode isn't available here: acts on an open Agent")
+        frame.contains("shift+tab mode isn't available here: acts on an open Agent")
     });
     view.assert_alive("Shift+Tab in the overview");
     assert!(
@@ -1046,19 +1046,19 @@ fn shift_tab_in_the_overview_changes_no_hidden_agent_and_the_root_keeps_its_key(
 
     view.send(b"\x1b");
     view.wait_for("the root with its periodic status", |frame| {
-        frame.contains("parent done") && !frame.contains("Shift+Tab mode isn't available")
+        frame.contains("parent done") && !frame.contains("shift+tab mode isn't available")
     });
     view.send(b"\x1b[D");
     view.wait_for("the overview list again", |frame| {
-        frame.contains("Agents · local") && frame.contains("Tab new Agent")
+        frame.contains("Agents · local") && frame.contains("tab new Agent")
     });
     view.send(b"\x1b[Z");
     view.wait_for("Shift+Tab refused in the list", |frame| {
-        frame.contains("Shift+Tab mode isn't available")
+        frame.contains("shift+tab mode isn't available")
     });
     view.send(b"\t");
     view.wait_for("the dispatch input", |frame| {
-        frame.contains("Enter dispatch")
+        frame.contains("enter dispatch")
     });
     // Advanced commands are never offered as completions; their reference shows each one's
     // meaning in the current scope.
@@ -1066,7 +1066,7 @@ fn shift_tab_in_the_overview_changes_no_hidden_agent_and_the_root_keeps_its_key(
     view.wait_for("the advanced reference over the overview", |frame| {
         frame.contains("Advanced commands")
             && frame.contains("/status")
-            && frame.contains("Esc back")
+            && frame.contains("esc back")
     });
     for _ in 0..30 {
         view.send(b"\x1b[6~");
@@ -1082,7 +1082,7 @@ fn shift_tab_in_the_overview_changes_no_hidden_agent_and_the_root_keeps_its_key(
     });
     view.send(b"\x1b");
     view.wait_for("the dispatch input after the reference", |frame| {
-        frame.contains("Enter dispatch") && !frame.contains("Choose an action")
+        frame.contains("enter dispatch") && !frame.contains("Choose an action")
     });
     view.send(b"\x1b");
     let overview_sent = commands(directory.path())[baseline..].to_vec();
@@ -1123,8 +1123,8 @@ fn shift_tab_in_the_overview_changes_no_hidden_agent_and_the_root_keeps_its_key(
         serde_json::from_slice(&std::fs::read(directory.path().join("final.json")).unwrap())
             .unwrap();
     assert_eq!(
-        final_state["root_mode"], "FullAccess",
-        "one cycle from Ask; the overview presses never reached the daemon"
+        final_state["root_mode"], "Plan",
+        "one cycle from Ask reaches Plan with the default Shift+Tab modes; the overview presses never reached the daemon"
     );
 }
 
@@ -1150,39 +1150,50 @@ fn a_child_request_uses_its_handle_and_never_offers_a_persistent_grant() {
         !dialog.contains("don't ask again"),
         "a child cannot save a grant as a rule: {dialog}"
     );
+    assert!(
+        !dialog.contains("Waiting for your confirmation"),
+        "the request asks in its dialog, not in the conversation: {dialog}"
+    );
     view.send(b"\r");
+    // The row's dot carries the child's state in colour only; the dismiss key below proves the
+    // row is a finished child.
+    let child_row = |line: &str| line.contains("○ review-notes") && line.contains(TASK);
     let finished = view.wait_for(
         "the parent finishing with the child's list state",
         |frame| {
-            frame.contains("Permission accepted")
-                && frame.contains("parent done")
+            frame.contains("parent done")
                 && !frame.contains("Permission required")
-                && frame
-                    .lines()
-                    .any(|line| line.contains(TASK) && line.contains("completed"))
+                && frame.lines().any(child_row)
         },
+    );
+    assert!(
+        !finished
+            .lines()
+            .any(|line| child_row(line) && ["done", "✔"].iter().any(|word| line.contains(word))),
+        "the row shows no state words: {finished}"
     );
     assert!(
         !finished.contains("reply completed"),
         "completion is already in the family list: {finished}"
     );
+    assert!(
+        !finished.contains("Permission accepted"),
+        "the decision stays out of the conversation: {finished}"
+    );
     view.send(b"\x1b[B");
     let focused = view.wait_for("the completed family entry remains usable", |frame| {
-        frame.contains("Enter/Space hide")
+        frame.contains("enter open · space fold")
     });
     assert!(!focused.contains("reply completed"), "{focused}");
-    view.send(b" ");
-    let hidden = view.wait_for(
-        "the collapsed family keeps completion out of the status area",
-        |frame| frame.contains("Enter/Space expand"),
-    );
-    assert!(!hidden.contains("reply completed"), "{hidden}");
-    view.send(b" ");
-    view.wait_for("family reopens", |frame| frame.contains("Enter/Space hide"));
-    view.send(b"\x1b");
-    view.wait_for("focus returns to input", |frame| {
-        !frame.contains("Enter/Space hide") && !frame.contains("Enter/Space expand")
+    view.send(b"\x1b[B");
+    view.wait_for("the finished child can be dismissed", |frame| {
+        frame.contains("x dismiss")
     });
+    view.send(b"x");
+    view.wait_for(
+        "the dismissed child leaving the panel and the keys returning to the input",
+        |frame| !frame.lines().any(child_row) && !frame.contains("enter open · space fold"),
+    );
 
     view.close();
     let decisions = commands(directory.path())

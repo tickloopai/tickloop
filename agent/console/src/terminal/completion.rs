@@ -54,7 +54,7 @@ const OVERVIEW_COMMANDS: &[(&str, &str)] = &[
 ];
 
 const OVERVIEW_AGENT_COMMAND: &str =
-    "acts on an open Agent; Enter opens the selected Agent, /clear starts a new draft";
+    "acts on an open Agent; enter opens the selected Agent, /clear starts a new draft";
 pub(super) const CHILD_HISTORY_FIXED: &str = "its history belongs to the delegation";
 pub(super) const CHILD_AUTHORIZATION_FIXED: &str = "its authorization is set by the parent";
 
@@ -255,12 +255,6 @@ const COMMANDS: &[CommandSpec] = &[
         menu_group: Some(CommandGroup::PlanAndExecution),
     },
     CommandSpec {
-        command: "/subscriptions",
-        arguments: "",
-        description: "Lists this Chat's Tick Subscriptions and changes or cancels one.",
-        menu_group: Some(CommandGroup::PlanAndExecution),
-    },
-    CommandSpec {
         command: "/interrupt",
         arguments: "",
         description: "Interrupts the current run.",
@@ -313,12 +307,6 @@ const COMMANDS: &[CommandSpec] = &[
         arguments: "FILE|off",
         description: "Configures or disables web search.",
         menu_group: Some(CommandGroup::Advanced),
-    },
-    CommandSpec {
-        command: "/tasks",
-        arguments: "",
-        description: "Manage Shell tasks across Chats in this Agent process.",
-        menu_group: Some(CommandGroup::ToolsAndPermissions),
     },
     CommandSpec {
         command: "/background",
@@ -618,8 +606,8 @@ mod tests {
     fn discovery_separates_public_commands_advanced_controls_and_skills() {
         let mut completion = Completion::default();
         completion.update("/");
-        assert_eq!(completion.candidates().len(), 24);
-        assert_eq!(builtin_commands().len(), 44);
+        assert_eq!(completion.candidates().len(), 22);
+        assert_eq!(builtin_commands().len(), 42);
         assert_eq!(
             builtin_commands()
                 .iter()
@@ -628,14 +616,7 @@ mod tests {
             20
         );
         assert_eq!(completion.selected_index(), None);
-        for command in [
-            "/help",
-            "/tasks",
-            "/cwd",
-            "/details",
-            "/tickloop",
-            "/artifacts",
-        ] {
+        for command in ["/help", "/cwd", "/details", "/tickloop", "/artifacts"] {
             assert!(command_names(&completion).contains(&command));
         }
         for command in ["/tui", "/allow", "/operations", "/interrupt"] {
@@ -668,6 +649,8 @@ mod tests {
             "/commands",
             "/bashes",
             "/subs",
+            "/tasks",
+            "/subscriptions",
             "/quit",
         ] {
             assert!(
@@ -685,10 +668,7 @@ mod tests {
     fn only_public_prefix_matches_are_returned() {
         let mut completion = Completion::default();
         completion.update("/s");
-        assert_eq!(
-            command_names(&completion),
-            vec!["/settings", "/stop", "/subscriptions"]
-        );
+        assert_eq!(command_names(&completion), vec!["/settings", "/stop"]);
         completion.update("/operations");
         assert!(!completion.is_open());
     }

@@ -161,12 +161,20 @@ pub(super) struct ResponsesStream {
 struct ResponseItem {
     initial: Value,
     final_item: Option<Value>,
-    arguments: String,
+    /// `None` until the stream carries a function argument fragment.
+    arguments: Option<String>,
     text: BTreeMap<u64, String>,
     summary_text: BTreeMap<u64, String>,
 }
 
 impl ResponseItem {
+    /// Codex can stream parallel tool calls without any argument delta and send the arguments
+    /// only on completion, so the first completion stands when nothing was streamed. Streamed
+    /// arguments, and every later completion, must match exactly.
+    fn complete_arguments(&mut self, completed: &str) -> bool {
+        self.arguments.get_or_insert_with(|| completed.into()) == completed
+    }
+
     fn recover_readable_reasoning(
         &mut self,
         value: &Value,
@@ -306,7 +314,10 @@ impl ResponsesStream {
                 let mut tracked = ResponseItem {
                     initial: item.clone(),
                     final_item: None,
-                    arguments: item["arguments"].as_str().unwrap_or_default().into(),
+                    arguments: item["arguments"]
+                        .as_str()
+                        .filter(|arguments| !arguments.is_empty())
+                        .map(Into::into),
                     text: BTreeMap::new(),
                     summary_text: BTreeMap::new(),
                 };
@@ -360,17 +371,14 @@ impl ResponsesStream {
                 let _ = events.send(ModelDelta::Thinking("\n\n".into()));
             }
             "response.function_call_arguments.delta" => {
-                let item = self.item_mut(&data)?;
-                if item.initial["type"] != "function_call" {
-                    return Err(invalid_response(
-                        "function arguments target a non-function item",
-                    ));
-                }
-                item.arguments.push_str(required_string(&data, "delta")?);
+                let item = self.function_call_mut(&data)?;
+                item.arguments
+                    .get_or_insert_default()
+                    .push_str(required_string(&data, "delta")?);
             }
             "response.function_call_arguments.done" => {
-                let item = self.item_mut(&data)?;
-                if item.arguments != required_string(&data, "arguments")? {
+                let item = self.function_call_mut(&data)?;
+                if !item.complete_arguments(required_string(&data, "arguments")?) {
                     return Err(invalid_response(
                         "completed function arguments differ from their stream",
                     ));
@@ -395,7 +403,9 @@ impl ResponsesStream {
                 if completed["type"] == "function_call" {
                     if completed["call_id"] != item.initial["call_id"]
                         || completed["name"] != item.initial["name"]
-                        || completed["arguments"] != item.arguments
+                        || !completed["arguments"]
+                            .as_str()
+                            .is_some_and(|arguments| item.complete_arguments(arguments))
                     {
                         return Err(invalid_response(
                             "completed tool call differs from its stream",
@@ -591,6 +601,16 @@ impl ResponsesStream {
         {
             return Err(invalid_response(
                 "delta targets a completed or different item",
+            ));
+        }
+        Ok(item)
+    }
+
+    fn function_call_mut(&mut self, data: &Value) -> Result<&mut ResponseItem, ModelError> {
+        let item = self.item_mut(data)?;
+        if item.initial["type"] != "function_call" {
+            return Err(invalid_response(
+                "function arguments target a non-function item",
             ));
         }
         Ok(item)

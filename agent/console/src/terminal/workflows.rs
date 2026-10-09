@@ -12,10 +12,8 @@ use super::{
     },
     directed_summary,
     display::DisplayProfile,
-    hyperlink,
     image_cache::ImageLinks,
     presentation, safe_text,
-    style::RoleSpan,
 };
 use tickloop_agent_protocol::{
     BranchPublicItem, BranchPublicSource, ChatSnapshot, CommandSnapshot, CommandState, Content,
@@ -35,6 +33,7 @@ pub(super) enum PlanApprovalChoice {
     KeepPlanning,
 }
 
+/// "Keep planning" is always the last choice; the plan dialog takes its feedback there.
 pub(super) const PLAN_APPROVAL_CHOICES: [PlanApprovalChoice; 4] = [
     PlanApprovalChoice::Auto,
     PlanApprovalChoice::Ask,
@@ -43,11 +42,14 @@ pub(super) const PLAN_APPROVAL_CHOICES: [PlanApprovalChoice; 4] = [
 ];
 
 impl PlanApprovalChoice {
-    pub(super) fn option_index(self) -> usize {
-        PLAN_APPROVAL_CHOICES
-            .iter()
-            .position(|choice| *choice == self)
-            .expect("every plan choice is listed")
+    /// The execution mode the approval starts with; keeping planning starts none.
+    fn mode(self) -> Option<ExecutionMode> {
+        match self {
+            Self::Auto => Some(ExecutionMode::Auto),
+            Self::Ask => Some(ExecutionMode::AcceptEdits),
+            Self::FullAccess => Some(ExecutionMode::FullAccess),
+            Self::KeepPlanning => None,
+        }
     }
 
     fn label(self) -> &'static str {
@@ -87,6 +89,7 @@ pub(super) enum Workflow {
         goal: Uuid,
         version: u64,
         request: Option<Uuid>,
+        choices: Vec<PlanApprovalChoice>,
     },
     PlanView {
         chat: Uuid,
@@ -353,13 +356,23 @@ impl Workflow {
                     && request.loop_id == goal
             })
             .map(|request| request.id);
+        // A delegated child keeps its parent's frozen mode; approval cannot choose another.
+        let delegated_mode = snapshot
+            .delegation
+            .as_ref()
+            .map(|delegation| delegation.ceiling.policy.mode);
+        let choices = PLAN_APPROVAL_CHOICES
+            .into_iter()
+            .filter(|choice| {
+                choice
+                    .mode()
+                    .is_none_or(|mode| delegated_mode.is_none_or(|fixed| fixed == mode))
+            })
+            .collect::<Vec<_>>();
         let mut menu = menu(
             "Plan approval",
             context,
-            PLAN_APPROVAL_CHOICES
-                .iter()
-                .map(|choice| choice.label().into())
-                .collect(),
+            choices.iter().map(|choice| choice.label().into()).collect(),
         );
         menu.confirmation = true;
         Ok((
@@ -369,6 +382,7 @@ impl Workflow {
                 goal,
                 version: plan.version,
                 request,
+                choices,
             },
         ))
     }
@@ -646,20 +660,16 @@ impl Workflow {
                 chat,
                 goal,
                 version,
+                choices,
                 ..
             } => {
-                let mode = match PLAN_APPROVAL_CHOICES.get(index) {
-                    Some(PlanApprovalChoice::Auto) => ExecutionMode::Auto,
-                    Some(PlanApprovalChoice::Ask) => ExecutionMode::AcceptEdits,
-                    Some(PlanApprovalChoice::FullAccess) => ExecutionMode::FullAccess,
-                    Some(PlanApprovalChoice::KeepPlanning) => {
-                        effect.receipt = agent
-                            .decline_plan(chat, goal, version, feedback)
-                            .await
-                            .map_err(|error| error.to_string())?;
-                        return Ok(effect);
-                    }
-                    _ => return Err("Invalid plan selection.".into()),
+                let choice = choices.get(index).ok_or("Invalid plan selection.")?;
+                let Some(mode) = choice.mode() else {
+                    effect.receipt = agent
+                        .decline_plan(chat, goal, version, feedback)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    return Ok(effect);
                 };
                 let approval = agent
                     .approve_plan(chat, goal, version, mode)
@@ -916,20 +926,39 @@ pub(super) fn pending_reply(snapshot: &ChatSnapshot) -> String {
         .collect()
 }
 
-#[derive(Default)]
-struct PublicHistoryBuilder {
+struct PublicHistoryBuilder<'a> {
+    chat: &'a ChatSnapshot,
     pieces: Vec<ConversationPiece>,
     image_links: ImageLinks,
     tool_states: HashMap<(Uuid, String), super::scrollback::ToolCallState>,
+    /// Set while the latest piece is a declined call's result, which already stands for the
+    /// interruption that follows it.
+    after_rejection: bool,
 }
 
-impl PublicHistoryBuilder {
+impl PublicHistoryBuilder<'_> {
     fn push_str(&mut self, text: &str) {
-        self.push(text.to_owned(), None);
+        self.push_runs(&[(text.to_owned(), None)]);
     }
 
     fn push_role(&mut self, text: String, role: super::style::Role) {
-        self.push(text, Some(role));
+        self.push_runs(&[(text, Some(role))]);
+    }
+
+    /// Runs written as one entry; a first run that begins with a newline starts a block.
+    fn push_runs(&mut self, runs: &[(String, Option<super::style::Role>)]) {
+        for piece in ConversationPiece::block_runs(runs) {
+            match piece {
+                ConversationPiece::Styled(text, role) => self.push(text, role),
+                piece => self.pieces.push(piece),
+            }
+        }
+    }
+
+    fn push_response(&mut self, runs: Vec<(String, Option<super::style::Role>)>) {
+        if !runs.is_empty() {
+            self.pieces.push(ConversationPiece::Response(runs));
+        }
     }
 
     /// Prompt text of `chat`, with each cached `[Image #N]` linked to its image.
@@ -941,26 +970,15 @@ impl PublicHistoryBuilder {
         is_user_message: bool,
     ) {
         let links = self.image_links.in_text(chat, text);
-        let mut spans = vec![RoleSpan {
-            text: format!("\n{} ", display.glyph(super::display::Glyph::Prompt)),
-            role: Some(super::style::Role::Subtle),
-            link: None,
-        }];
-        for (run, link) in hyperlink::runs(text, &links) {
-            spans.push(RoleSpan {
-                text: run.to_owned(),
-                role: None,
-                link: link.cloned(),
-            });
-        }
-        spans.push(RoleSpan {
-            text: "\n".into(),
-            role: None,
-            link: None,
-        });
+        let (fill, spans) = super::console::input_spans(text, display, &links);
+        let text = spans
+            .iter()
+            .map(|span| span.text.as_str())
+            .collect::<String>();
         self.pieces.push(ConversationPiece::Input {
-            text: spans.iter().map(|span| span.text.as_str()).collect(),
+            text: format!("\n{text}\n"),
             spans,
+            fill,
             is_user_message,
         });
     }
@@ -994,13 +1012,15 @@ fn public_history_pieces(
     image_links: ImageLinks,
 ) -> Vec<ConversationPiece> {
     let mut history = PublicHistoryBuilder {
+        chat,
         pieces: Vec::new(),
         image_links,
         tool_states: presentation::tool_call_states(chat),
+        after_rejection: false,
     };
     let Ok(projection) = chat.public_conversation_items() else {
         return vec![ConversationPiece::Styled(
-            "\nConversation view unavailable. Ctrl+O opens the full archive.\n".into(),
+            "\nConversation view unavailable. ctrl+o opens the detailed transcript.\n".into(),
             None,
         )];
     };
@@ -1008,8 +1028,8 @@ fn public_history_pieces(
     let mut answers_tick_delivery = false;
     for item in projection {
         match item {
-            BranchPublicItem::Summary { summary, .. } => {
-                history.push_str(&directed_summary::history_marker(&summary));
+            BranchPublicItem::Summary { .. } => {
+                history.push_runs(&directed_summary::history_marker(display));
                 answers_tick_delivery = false;
             }
             BranchPublicItem::Message {
@@ -1019,10 +1039,7 @@ fn public_history_pieces(
                 has_thinking,
             } => {
                 if has_thinking {
-                    history.push_role(
-                        "\n∴ Thinking (ctrl+o to expand)\n".into(),
-                        super::style::Role::MutedText,
-                    );
+                    history.pieces.push(presentation::thinking_label());
                 }
                 if let Some(origin) = source
                     .message_id
@@ -1052,7 +1069,6 @@ fn public_history_pieces(
     }
     let pending = pending_reply(chat);
     if !pending.is_empty() {
-        history.push_str("\n");
         history.push_reply(&safe_text(&pending));
     }
     for record in chat.family_inputs.values() {
@@ -1078,10 +1094,8 @@ pub(super) fn public_history(chat: &ChatSnapshot, display: DisplayProfile) -> St
     public_history_pieces(chat, display, ImageLinks::default())
         .iter()
         .map(|piece| match piece {
-            ConversationPiece::Styled(text, _)
-            | ConversationPiece::Input { text, .. }
-            | ConversationPiece::ToolCall { text, .. } => text.clone(),
             ConversationPiece::Markdown { text, .. } => format!("{assistant_lead}{text}"),
+            piece => piece.text().into_owned(),
         })
         .collect()
 }
@@ -1157,6 +1171,7 @@ fn append_public_message(
     let (source_chat_id, run_id) = (source.chat_id, source.run_id);
     append_input_contexts(history, contexts);
     for content in &message.content {
+        let follows_rejection = std::mem::take(&mut history.after_rejection);
         match content {
             Content::Text { text }
                 if conversation::is_interruption_placeholder(message.role, text) => {}
@@ -1165,14 +1180,25 @@ fn append_public_message(
                     && let Some(local_message) =
                         presentation::typed_local_message(text, source.is_agent_message) =>
             {
-                history.push_role(
-                    presentation::local_message_text(
-                        &local_message,
-                        presentation::OutputDetail::Preview,
+                if let LocalMessage::BashInput { command } = &local_message {
+                    history.push_prompt(
+                        source_chat_id,
+                        &format!("!{}", safe_text(command)),
                         display,
-                    ),
-                    super::style::Role::MutedText,
+                        false,
+                    );
+                    continue;
+                }
+                if matches!(local_message, LocalMessage::Interrupted { .. }) && follows_rejection {
+                    continue;
+                }
+                let (heading, response) = presentation::local_message_runs(
+                    &local_message,
+                    presentation::OutputDetail::Preview,
+                    display,
                 );
+                history.push_runs(&heading);
+                history.push_response(response);
             }
             Content::Text { text } => match message.role {
                 Role::User => {
@@ -1189,11 +1215,7 @@ fn append_public_message(
                         super::style::Role::MutedText,
                     );
                 }
-                Role::Assistant => {
-                    history.push_str("\n");
-                    history.push_reply(&safe_text(text));
-                    history.push_str("\n");
-                }
+                Role::Assistant => history.push_reply(&safe_text(text)),
                 Role::System => {}
             },
             Content::ToolUse { id, name, input } if message.role == Role::Assistant => {
@@ -1210,7 +1232,8 @@ fn append_public_message(
                         .get(&(run, id.clone()))
                         .copied()
                         .unwrap_or(super::scrollback::ToolCallState::Finished);
-                    let spans = presentation::tool_call_roles(name, input, display);
+                    let spans =
+                        presentation::tool_call_roles(name, input, &history.chat.workdir, display);
                     let mut text = spans
                         .iter()
                         .map(|(text, _)| text.as_str())
@@ -1224,10 +1247,16 @@ fn append_public_message(
                         call_key: presentation::tool_call_key(run, id),
                         spans,
                         state,
+                        collapse: presentation::collapsed_call(name, input),
                     });
                 } else {
                     history.push_role(
-                        presentation::archived_tool_call(name, input, display),
+                        presentation::archived_tool_call(
+                            name,
+                            input,
+                            &history.chat.workdir,
+                            display,
+                        ),
                         super::style::Role::MutedText,
                     );
                 }
@@ -1241,26 +1270,54 @@ fn append_public_message(
                 let (name, input) = call
                     .as_ref()
                     .map_or(("tool", None), |(name, input)| (name.as_str(), Some(input)));
-                if !*is_error && presentation::is_model_only_tool(name) {
-                    continue;
+                if presentation::is_model_only_tool(name) {
+                    // A model-only call shows no row of its own until it fails.
+                    if !*is_error {
+                        continue;
+                    }
+                    if let (Some(run), Some(input)) = (run_id, input) {
+                        let spans = presentation::tool_call_roles(
+                            name,
+                            input,
+                            &history.chat.workdir,
+                            display,
+                        );
+                        history.pieces.push(ConversationPiece::ToolCall {
+                            run_id: run,
+                            text: spans.iter().map(|(text, _)| text.as_str()).collect(),
+                            call_key: presentation::tool_call_key(run, tool_use_id),
+                            spans,
+                            state: super::scrollback::ToolCallState::Failed,
+                            collapse: None,
+                        });
+                    }
                 }
-                history.push_role(
-                    presentation::archived_tool_result(
-                        name,
-                        input,
-                        &ToolResult {
-                            content: content.text().into_owned(),
-                            is_error: *is_error,
-                            output_ref: None,
-                        },
-                        display,
-                    ),
-                    if *is_error {
-                        super::style::Role::Error
-                    } else {
-                        super::style::Role::MutedText
-                    },
+                let result = ToolResult {
+                    content: content.text().into_owned(),
+                    is_error: *is_error,
+                    output_ref: None,
+                };
+                let review = run_id
+                    .filter(|_| name == tickloop_agent_tools::EDIT_TOOL_NAME && !*is_error)
+                    .and_then(|run| {
+                        presentation::file_change_review(history.chat, run, tool_use_id)
+                    });
+                let runs = presentation::archived_tool_result(
+                    name,
+                    input,
+                    &result,
+                    &history.chat.workdir,
+                    display,
+                    review.as_ref(),
                 );
+                match run_id {
+                    Some(run) => history.pieces.push(ConversationPiece::ToolResult {
+                        call_key: presentation::tool_call_key(run, tool_use_id),
+                        runs,
+                    }),
+                    None => history.push_response(runs),
+                }
+                history.after_rejection = presentation::is_rejection(&result);
             }
             Content::ToolUse { .. }
             | Content::ToolResult { .. }
@@ -1667,7 +1724,7 @@ mod tests {
             linked_runs(),
             [(
                 "[Image #1]".to_owned(),
-                hyperlink::Hyperlink::file(&cached).unwrap()
+                super::super::hyperlink::Hyperlink::file(&cached).unwrap()
             )],
             "only the prompt's cached image is linked"
         );
@@ -1780,8 +1837,7 @@ mod tests {
                 DisplayProfile::default(),
                 &ImageLinks::default(),
             )
-            .lines
-            .join("\n"),
+            .plain_text(200),
         );
 
         let base64_prefix = &BASE64.encode(&bytes)[..32];
@@ -1807,10 +1863,14 @@ mod tests {
             "! prefix-shell",
             "⎿  prefix shell output",
             "prefix answer",
-            "suffix summary",
+            "Summarized conversation (ctrl+o to expand)",
         ] {
             assert!(history.contains(retained), "missing {retained}: {history}");
         }
+        assert!(
+            !history.contains("suffix summary"),
+            "the summary itself is in the detailed transcript: {history}"
+        );
         for summarized in [
             "selected prompt",
             "printf tail",
@@ -1845,7 +1905,7 @@ mod tests {
         assert!(history.contains("\u{f0142} prefix prompt"), "{history}");
         assert!(history.contains("\u{f06a9} prefix answer"), "{history}");
         assert!(history.contains("\u{f1064} Read"), "{history}");
-        assert!(history.contains("\u{f060c} Read"), "{history}");
+        assert!(history.contains("\u{f060c}  Completed"), "{history}");
         assert!(
             history.contains("\u{f060c}  prefix shell output"),
             "{history}"
@@ -1858,8 +1918,12 @@ mod tests {
             &directed_history_fixture(SummaryDirection::UpToHere),
             DisplayProfile::default(),
         );
+        assert!(
+            !history.contains("prefix summary"),
+            "the summary itself is in the detailed transcript: {history}"
+        );
         for retained in [
-            "prefix summary",
+            "Summarized conversation (ctrl+o to expand)",
             "selected prompt",
             "Bash · printf tail",
             "tail tool output",
@@ -1938,8 +2002,8 @@ mod tests {
             .message_compactions
             .insert(boundary_index + 1, summary_marker(None));
         let projected = public_history(&summarized, DisplayProfile::default());
-        assert!(projected.contains("Summarized conversation"));
-        assert!(projected.contains("Retained summary\nwith controls[31m"));
+        assert!(projected.contains("Summarized conversation (ctrl+o to expand)"));
+        assert!(!projected.contains("Retained summary"));
         assert!(!projected.contains("read the notes"));
         assert!(!projected.contains("public answer"));
         assert!(!projected.contains('\u{1b}'));

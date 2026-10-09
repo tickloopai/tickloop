@@ -97,7 +97,7 @@ fn the_footer_hint_names_what_right_does_while_a_suggestion_is_visible() {
     assert!(hint(&console).contains("→ Monitor"));
     show(&console, "run the tests");
     let shown = hint(&console);
-    assert!(shown.contains("Tab/→ accept"), "{shown}");
+    assert!(shown.contains("tab/→ accept"), "{shown}");
     assert!(!shown.contains("→ Monitor"), "{shown}");
 }
 

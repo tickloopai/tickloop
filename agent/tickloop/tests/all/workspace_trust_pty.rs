@@ -269,7 +269,7 @@ fn startup_trust_requires_the_complete_directory_before_confirmation_after_resiz
         assert_eq!(fs::read_dir(fixture.path("runtime")).unwrap().count(), 0);
         terminal.resize(80, 24);
         terminal.wait(fixture.path("work").to_str().unwrap());
-        terminal.wait("Enter confirm");
+        terminal.wait("enter confirm");
         terminal.send(b"\r");
         terminal.wait("⏵⏵ ");
         assert!(
@@ -340,7 +340,7 @@ fn startup_trust_real_input_pty_eof_is_quiet_without_persisting_trust() {
         let captured = output.clone();
         let reader = thread::spawn(move || screen::capture_output(output_master, captured));
         let deadline = Instant::now() + TIMEOUT;
-        while !output.lock().unwrap().contains("Enter confirm") && Instant::now() < deadline {
+        while !output.lock().unwrap().contains("enter confirm") && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
         }
         let displayed = output

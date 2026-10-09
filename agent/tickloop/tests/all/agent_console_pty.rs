@@ -275,7 +275,16 @@ impl PtyView {
     }
 
     async fn wait_for(&mut self, label: &str, matches: impl Fn(&str) -> bool) -> String {
-        let deadline = Instant::now() + UI_TIMEOUT;
+        self.wait_for_within(label, UI_TIMEOUT, matches).await
+    }
+
+    async fn wait_for_within(
+        &mut self,
+        label: &str,
+        timeout: Duration,
+        matches: impl Fn(&str) -> bool,
+    ) -> String {
+        let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
             let frame = self.frame();
             if matches(&frame) {
@@ -553,7 +562,7 @@ async fn run_lifecycle(fixture: &PrivateFixture) {
     reopened.send(b"?");
     reopened
         .wait_for("help replaces the real Task summary", |frame| {
-            frame.contains("Ctrl+J newline") && !frame.contains("Monitor 1")
+            frame.contains("ctrl+j newline") && !frame.contains("Monitor 1")
         })
         .await;
     reopened.send(b"\x1b");
@@ -687,12 +696,12 @@ async fn run_shell_external_editor(fixture: &PrivateFixture) {
     let client = fixture.client().await;
     view.send(b"!printf original");
     view.wait_for("unsubmitted Shell draft", |frame| {
-        frame.contains("!printf original")
+        frame.contains("!\u{a0}printf original")
     })
     .await;
     view.send(b"\x07");
     view.wait_for("Shell editor returns to the focused Shell draft", |frame| {
-        frame.contains("!printf 'edited 中文'")
+        frame.contains("!\u{a0}printf 'edited 中文'")
     })
     .await;
     assert_eq!(
@@ -715,7 +724,7 @@ async fn run_shell_external_editor(fixture: &PrivateFixture) {
     assert!(catalog(&client).await.is_empty());
     view.send(b"j");
     view.wait_for("ordinary typing remains in edited Shell input", |frame| {
-        frame.contains("!printf 'edited 中文'j")
+        frame.contains("!\u{a0}printf 'edited 中文'j")
     })
     .await;
     view.send(b"\x7f\r");
@@ -739,10 +748,17 @@ async fn run_shell_external_editor(fixture: &PrivateFixture) {
     assert_eq!(completed.user_shells.len(), 1);
     assert_eq!(completed.user_shells[0].command, "printf 'edited 中文'");
     assert!(completed.last_model_run.is_none());
-    view.wait_for("edited Shell output", |frame| {
-        frame.lines().any(|line| line.trim() == "edited 中文")
-    })
-    .await;
+    let shown = view
+        .wait_for("edited Shell output", |frame| {
+            frame
+                .lines()
+                .any(|line| screen::response_line(line) == "edited 中文")
+        })
+        .await;
+    assert!(
+        shown.contains("  ⎿  edited 中文") && !shown.contains("⏺ Shell"),
+        "a `!` command shows its echo and its output only: {shown}"
+    );
     view.close().await;
 }
 
@@ -928,7 +944,11 @@ async fn run_resize_matrix(fixture: &PrivateFixture) {
             );
             assert!(borders[0] >= 6, "{height}×{width}: {frame}");
             assert!(
-                rows.last().unwrap().contains("deepseek-flash"),
+                rows[rows.len() - 2].contains("deepseek-flash"),
+                "{height}×{width}: the core status sits right above the key hints: {frame}"
+            );
+            assert!(
+                rows.last().unwrap().contains("enter send"),
                 "{height}×{width}: {frame}"
             );
             view.send(b"\x03");
@@ -939,7 +959,7 @@ async fn run_resize_matrix(fixture: &PrivateFixture) {
             view.send(b"?");
             let help = view
                 .wait_for("OS-sized help remains reachable", |frame| {
-                    frame.contains("Ctrl+J newline") && frame.contains("Ctrl+G editor")
+                    frame.contains("ctrl+j newline") && frame.contains("ctrl+g editor")
                 })
                 .await;
             assert!(
@@ -947,9 +967,11 @@ async fn run_resize_matrix(fixture: &PrivateFixture) {
                 "{height}×{width}: {help}"
             );
             view.send(b"\x1b");
-            view.wait_for("help restores actual status", |frame| {
-                !frame.contains("Ctrl+J newline")
-                    && frame.lines().last().unwrap().contains("deepseek-flash")
+            view.wait_for("help restores actual status and key hints", |frame| {
+                let rows = frame.lines().collect::<Vec<_>>();
+                !frame.contains("ctrl+j newline")
+                    && rows[rows.len() - 2].contains("deepseek-flash")
+                    && rows[rows.len() - 1].contains("? help")
             })
             .await;
             view.send(b"\x1b[D");
@@ -1021,9 +1043,9 @@ async fn run_sustained_daemon_loss(
         |frame| {
             frame
                 .lines()
-                .any(|line| line.trim() == "cached shell output")
+                .any(|line| screen::response_line(line) == "cached shell output")
                 && frame.lines().any(|line| line.trim() == "❯")
-                && !frame.contains("Shell running · Ctrl+B background · Ctrl+C stop")
+                && !frame.contains("Shell running · ctrl+b background · ctrl+c stop")
         },
     )
     .await;
@@ -1047,7 +1069,7 @@ async fn run_sustained_daemon_loss(
     view.wait_for("running Shell output is ready to background", |frame| {
         frame
             .lines()
-            .any(|line| line.trim() == "background shell began")
+            .any(|line| screen::response_line(line) == "background shell began")
     })
     .await;
     view.send(b"\x02");
@@ -1094,7 +1116,7 @@ async fn run_sustained_daemon_loss(
             frame
                 .lines()
                 .filter_map(|line| line.split('│').next())
-                .any(|conversation| conversation.trim() == "cached shell output"),
+                .any(|conversation| screen::response_line(conversation) == "cached shell output"),
             "the cached output stays in the conversation beside Monitor: {frame}"
         );
         assert!(
@@ -1198,21 +1220,17 @@ fn request_dialog_visible(frame: &str, question: &str, requester: &str) -> bool 
         && frame
             .lines()
             .any(|line| line.contains("Goal:") && line.contains(requester))
-        && frame.contains("Enter select · Esc answer later")
+        && frame.contains("enter select · esc answer later")
 }
 
 async fn open_family_child(pty: &mut PtyView, task: &str) {
     pty.send(b"\x1b[1;5F\x1b[B");
-    pty.wait_for("family entry receives focus", |frame| {
-        frame.contains("Subagents 1")
-            && frame.contains(task)
-            && frame.contains("Enter/Space hide · ↓ list · Esc input")
-    })
-    .await;
-    pty.send(b"\x1b[B");
     let list = pty
         .wait_for("family list receives focus", |frame| {
-            frame.lines().any(|line| line.starts_with('›'))
+            frame.contains("Subagents 1")
+                && frame.contains(task)
+                && frame.contains("enter open · space fold")
+                && frame.lines().any(|line| line.starts_with('›'))
         })
         .await;
     if !list
@@ -1607,13 +1625,16 @@ async fn run_child_views(fixture: &PrivateFixture) {
     assert!(!independent.contains("CHILD-DRAFT-ONE"));
     first.send(b"\x1b[B");
     first
-        .wait_for("real family expands below input", |frame| {
+        .wait_for("real family list focuses the remembered child", |frame| {
             frame.contains("Subagents 1")
                 && family_panel_has_viewing_row(frame)
-                && frame.contains("Enter/Space hide")
+                && frame.contains("enter open · space fold")
+                && frame
+                    .lines()
+                    .any(|line| line.starts_with('›') && line.contains("cadence"))
         })
         .await;
-    first.send(b"\x1b[B\r");
+    first.send(b"k\r");
     first
         .wait_for("lower family enters real parent", |frame| {
             frame.contains("Delegate bounded cadence.") && !frame.contains("CHILD-DRAFT-ONE")
@@ -1628,15 +1649,15 @@ async fn run_child_views(fixture: &PrivateFixture) {
     first.send(b"\x1b[B");
     first
         .wait_for(
-            "parent family expands without consuming its draft",
+            "parent family list focuses without consuming its draft",
             |frame| {
                 family_panel_has_viewing_row(frame)
                     && frame.contains("PARENT-DRAFT-ONE")
-                    && frame.contains("Enter/Space hide")
+                    && frame.contains("enter open · space fold")
             },
         )
         .await;
-    first.send(b"\x1b[Bj\r");
+    first.send(b"j\r");
     first
         .wait_for(
             "lower family returns to real child with its cached draft",
@@ -2682,7 +2703,7 @@ async fn run_stashed_shell_mode(fixture: &PrivateFixture) {
     let client = fixture.client().await;
     view.send(format!("!{COMMAND}").as_bytes());
     view.wait_for("unsubmitted Shell draft before stash", |frame| {
-        frame.contains("!printf 'SHELL-MODE-RESTORED")
+        frame.contains("!\u{a0}printf 'SHELL-MODE-RESTORED")
     })
     .await;
     view.send(b"\x13");
@@ -2704,7 +2725,7 @@ async fn run_stashed_shell_mode(fixture: &PrivateFixture) {
     .await;
     view.send(b"\x13");
     view.wait_for("unstash restores the original Shell mode", |frame| {
-        frame.contains("!printf 'SHELL-MODE-RESTORED")
+        frame.contains("!\u{a0}printf 'SHELL-MODE-RESTORED")
     })
     .await;
     view.send(b"\r");
@@ -2735,10 +2756,10 @@ async fn run_stashed_shell_mode(fixture: &PrivateFixture) {
     view.wait_for("restored Shell output reaches the same View", |frame| {
         frame
             .lines()
-            .any(|line| line.trim() == "SHELL-MODE-RESTORED")
+            .any(|line| screen::response_line(line) == "SHELL-MODE-RESTORED")
             && frame
                 .lines()
-                .any(|line| line.trim() == expected_directory.to_string_lossy())
+                .any(|line| screen::response_line(line) == expected_directory.to_string_lossy())
     })
     .await;
     view.close().await;
@@ -3152,50 +3173,10 @@ async fn run_filter_hidden_dispatch(fixture: &PrivateFixture) {
     })
     .await
     .expect("the View must register on the created execution");
-    view.send(b"/tasks\r");
-    view.wait_for(
-        "the created Agent exposes its real completed Shell",
-        |frame| {
-            frame.lines().any(|line| line.trim() == "Shell tasks")
-                && frame
-                    .lines()
-                    .last()
-                    .is_some_and(|line| line.contains("Enter open"))
-                && frame.lines().any(|line| {
-                    line.starts_with('❯') && line.contains("pwd") && !line.contains("other Agent")
-                })
-        },
-    )
-    .await;
-    view.send(b"\r");
-    let output_frame = view
-        .wait_for(
-            "the created Agent's Shell output is actually visible",
-            |frame| {
-                frame.lines().any(|line| line.trim() == "Shell task")
-                    && frame
-                        .lines()
-                        .filter(|line| line.trim() == launch.to_str().unwrap())
-                        .count()
-                        == 2
-            },
-        )
-        .await;
     eprintln!(
-        "W3 execution {:?} cue {label} selected and bound; actual Shell output:\n{output_frame}",
+        "W3 execution {:?} cue {label} selected and bound",
         created.execution
     );
-    let captured_output = Arc::clone(&view.output);
-    view.send(b"\x1b");
-    view.wait_for("Shell list returns to ordinary input", |frame| {
-        let captured = captured_output.lock().unwrap();
-        let terminal = String::from_utf8_lossy(&captured);
-        !frame.lines().any(|line| line.trim() == "Shell tasks")
-            && !frame.lines().any(|line| line.trim() == "Shell task")
-            && frame.lines().any(|line| line.trim() == "❯")
-            && terminal.rfind("\x1b[?25h") > terminal.rfind("\x1b[?25l")
-    })
-    .await;
     view.close().await;
 }
 
@@ -3536,7 +3517,9 @@ async fn run_legacy_dense_overview(fixture: &PrivateFixture) {
     for (width, height) in [(40, 16), (80, 24), (120, 48)] {
         view.resize(width, height).await;
         let frame = view
-            .wait_for("legacy overview", |frame| frame.contains("Agents"))
+            .wait_for("legacy overview", |frame| {
+                frame.lines().any(|line| line.starts_with("Agents"))
+            })
             .await;
         let unknown = frame
             .lines()
@@ -3615,6 +3598,9 @@ async fn actual_cli_legacy_dense_overview_preserves_unknown_work_facts() {
     }
 }
 
+/// What the composer's first row starts with: `❯`, or `!` while it takes a Shell command.
+const COMPOSER_PROMPTS: [&str; 2] = ["❯", "!\u{a0}"];
+
 /// Rows above the composer's upper rule; a sent prompt must be echoed there, not only left in the
 /// editor or the provider request.
 fn conversation_body(frame: &str) -> String {
@@ -3622,7 +3608,12 @@ fn conversation_body(frame: &str) -> String {
     let lines: Vec<&str> = frame.lines().collect();
     let composer = lines
         .iter()
-        .rposition(|line| line.trim_start().starts_with('❯'))
+        .rposition(|line| {
+            let line = line.trim_start();
+            COMPOSER_PROMPTS
+                .iter()
+                .any(|prompt| line.starts_with(prompt))
+        })
         .expect("the composer prompt is painted");
     lines[..composer.saturating_sub(1)].join("\n")
 }
@@ -3927,13 +3918,11 @@ async fn run_busy_inputs(fixture: &PrivateFixture, shape: BusyShape) {
         );
         let queued_frame = view
             .wait_for("all waiting inputs are only in the queue", |frame| {
-                frame.contains("Messages to be submitted (3)")
+                screen::queued_inputs(frame).len() == 3
                     && BUSY_INPUTS.iter().all(|input| frame.contains(input))
             })
             .await;
-        let (body, preview) = queued_frame
-            .split_once("Messages to be submitted (3)")
-            .unwrap();
+        let (body, preview) = screen::split_at_queue(&queued_frame).unwrap();
         for input in BUSY_INPUTS {
             assert!(
                 !body.contains(input),
@@ -4183,12 +4172,10 @@ async fn run_busy_skill_barrier(fixture: &PrivateFixture) {
     view.send(b"/tickloop busy skill\r");
     let pending_frame = view
         .wait_for("the Skill waits behind the turn", |frame| {
-            frame.contains("Messages to be submitted (2)")
+            screen::queued_inputs(frame).len() == 2
         })
         .await;
-    let (pending_body, pending_preview) = pending_frame
-        .split_once("Messages to be submitted (2)")
-        .unwrap();
+    let (pending_body, pending_preview) = screen::split_at_queue(&pending_frame).unwrap();
     assert!(
         !pending_body.contains("busy alpha") && !pending_body.contains("/tickloop busy skill"),
         "{pending_frame}"
@@ -4226,7 +4213,7 @@ async fn run_busy_skill_barrier(fixture: &PrivateFixture) {
     let consumed = view
         .wait_for("the consumed Skill is echoed before its reply", |frame| {
             conversation_body(frame).contains("/tickloop busy skill")
-                && !frame.contains("Messages to be submitted")
+                && screen::queued_inputs(frame).is_empty()
         })
         .await;
     let body = conversation_body(&consumed);

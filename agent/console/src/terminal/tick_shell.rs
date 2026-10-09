@@ -72,7 +72,7 @@ impl TickShell {
         if self.surface.is_some() {
             return self.update(snapshot);
         }
-        let mut surface = TaskSurface::open(snapshot, ());
+        let mut surface = TaskSurface::open(snapshot);
         let effect = surface.initial_effect();
         self.surface = Some(surface);
         Some(effect)
@@ -244,17 +244,17 @@ impl TickShell {
 
     pub(super) fn hint(&self) -> String {
         if self.confirm_stop {
-            "Stop this Shell? Enter confirm · Esc cancel".into()
+            "Stop this Shell? enter confirm · esc cancel".into()
         } else if let Some(error) = self
             .error
             .as_deref()
             .or_else(|| self.surface.as_ref().and_then(TaskSurface::visible_error))
         {
-            format!("{} · Esc back", super::safe_line(error))
+            format!("{} · esc back", super::safe_line(error))
         } else if self.can_stop() {
-            "s stop · Esc back".into()
+            "s stop · esc back".into()
         } else {
-            "Esc back".into()
+            "esc back".into()
         }
     }
 }
@@ -319,7 +319,7 @@ mod tests {
             "Working directory",
             "/tmp/测试目录",
             "final",
-            "s stop · Esc back",
+            "s stop · esc back",
         ] {
             assert!(text.contains(expected), "{text}");
         }
@@ -406,7 +406,7 @@ mod tests {
                 ),
                 TickShellKey::None
             ));
-            assert_eq!(detail.hint().contains("Enter confirm"), can_stop);
+            assert_eq!(detail.hint().contains("enter confirm"), can_stop);
             let result = detail.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), 40, 10);
             assert_eq!(
                 matches!(

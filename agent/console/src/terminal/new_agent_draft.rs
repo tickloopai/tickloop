@@ -67,22 +67,30 @@ impl AgentConfiguration {
         }
     }
 
-    /// Why `change` cannot apply to this Agent, known before anything is sent. The daemon still
-    /// validates every change it receives; model, effort, Thinking, context window and search stay
-    /// available to a child.
+    /// Why `change` cannot apply to this Agent, known before anything is sent.
     pub(super) fn unavailable_change(&self, change: &ConfigurationChange) -> Option<&'static str> {
-        let root_only = matches!(
-            change,
-            ConfigurationChange::ExecutionMode { .. }
-                | ConfigurationChange::Directories { .. }
-                | ConfigurationChange::PermissionChange { .. }
-                | ConfigurationChange::GenerateAutoEnvironment { .. }
-                | ConfigurationChange::ReplaceRules { .. }
-                | ConfigurationChange::ProjectConstraints { .. }
-                | ConfigurationChange::ManagedConstraints { .. }
-        );
-        (self.delegated && root_only).then_some(CHILD_AUTHORIZATION_FIXED)
+        unavailable_change(self.delegated, change)
     }
+}
+
+/// Why `change` cannot apply to a root (`delegated` false) or a delegated child, known before
+/// anything is sent. The daemon still validates every change it receives; model, effort, Thinking,
+/// context window and search stay available to a child.
+pub(super) fn unavailable_change(
+    delegated: bool,
+    change: &ConfigurationChange,
+) -> Option<&'static str> {
+    let root_only = matches!(
+        change,
+        ConfigurationChange::ExecutionMode { .. }
+            | ConfigurationChange::Directories { .. }
+            | ConfigurationChange::PermissionChange { .. }
+            | ConfigurationChange::GenerateAutoEnvironment { .. }
+            | ConfigurationChange::ReplaceRules { .. }
+            | ConfigurationChange::ProjectConstraints { .. }
+            | ConfigurationChange::ManagedConstraints { .. }
+    );
+    (delegated && root_only).then_some(CHILD_AUTHORIZATION_FIXED)
 }
 
 /// What the first input needs: the Create launch, then changes in replay order.

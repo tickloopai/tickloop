@@ -80,7 +80,7 @@ async fn incompatible_startup_confirmation_opens_the_new_daemon_with_original_op
         view.wait_for("new daemon runs the original View", |frame| {
             frame
                 .lines()
-                .any(|line| line.trim() == "restarted-in-original-directory")
+                .any(|line| screen::response_line(line) == "restarted-in-original-directory")
         })
         .await;
         let agents = catalog(&client).await;
@@ -233,7 +233,7 @@ async fn explicit_daemon_stop_stays_stopped_with_a_live_view_until_a_new_launch(
             |frame| {
                 frame
                     .lines()
-                    .any(|line| line.trim() == "after-stop-reconnected")
+                    .any(|line| screen::response_line(line) == "after-stop-reconnected")
             },
         )
         .await;

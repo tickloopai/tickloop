@@ -13,7 +13,10 @@ impl Agent {
         {
             return;
         }
+        let instance = tick_protocol::InstanceRef::artifact(&tick.origin, &tick.artifact_id).ok();
         upsert_artifact_tick(chat, tick);
+        // What the artifact went through before it joined is no news for this Chat.
+        self.mark_handled(chat, instance);
         self.record_artifact_ticks(
             chat.snapshot.id,
             &chat.snapshot.workdir,
@@ -32,7 +35,9 @@ impl Agent {
         chat.snapshot
             .removed_artifact_ticks
             .remove(&tick.instance_id());
+        let instance = tick_protocol::InstanceRef::artifact(&tick.origin, &tick.artifact_id).ok();
         upsert_artifact_tick(chat, tick);
+        self.mark_handled(chat, instance);
         let ticks = chat.snapshot.artifact_ticks.clone();
         self.record_artifact_ticks(
             chat_id,

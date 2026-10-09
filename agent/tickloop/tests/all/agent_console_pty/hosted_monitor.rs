@@ -75,7 +75,7 @@ const RETIRED_NOTICES: [&str; 4] = [
 
 /// The Monitor list is back without a notice on how the Tick was opened or closed.
 fn quietly_back_in_monitor(frame: &str) -> bool {
-    frame.contains("Enter open") && !RETIRED_NOTICES.iter().any(|notice| frame.contains(notice))
+    frame.contains("enter open") && !RETIRED_NOTICES.iter().any(|notice| frame.contains(notice))
 }
 
 /// Waits until the Console has taken the terminal back from a full-screen Tick, whose screen
@@ -84,7 +84,7 @@ async fn back_in_monitor_quietly(view: &PtyView) -> String {
     tokio::time::timeout(UI_TIMEOUT, async {
         loop {
             let screen = terminal_screen(view);
-            if screen.contains("Enter open") && !screen.contains("size 100x32") {
+            if screen.contains("enter open") && !screen.contains("size 100x32") {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -122,7 +122,7 @@ async fn actual_cli_enter_opens_a_hosted_tick_full_screen_outside_herdr_and_esc_
         view.send(b"\x1b[C");
         let first = view
             .wait_for("Monitor focused", |frame| {
-                frame.contains("Enter open") && frame.contains("s snapshot")
+                frame.contains("enter open") && frame.contains("s snapshot")
             })
             .await;
         let first_row = first
@@ -161,7 +161,7 @@ async fn actual_cli_enter_opens_a_hosted_tick_full_screen_outside_herdr_and_esc_
         .await;
         view.send(b"\x1b");
         view.wait_for("back in the Monitor list", |frame| {
-            frame.contains("Enter open") && !frame.contains("r refresh")
+            frame.contains("enter open") && !frame.contains("r refresh")
         })
         .await;
         view.send(b"\x1b");
@@ -200,7 +200,7 @@ async fn actual_cli_monitor_shows_a_hosted_tick_snapshot_and_attaches_it_full_sc
         let stream = thinking_delta.repeat(THINKING_DELTAS) + &chat_reply(None, ATTACHED_REPLY);
         let mut view = view_with_keys_ticks(&fixture, &[], 1, Some(stream)).await;
         view.send(b"\x1b[C");
-        view.wait_for("Monitor focused", |frame| frame.contains("Enter open"))
+        view.wait_for("Monitor focused", |frame| frame.contains("enter open"))
             .await;
         view.send(b"\r");
         terminal_shows(&view, "size 100x32").await;
@@ -262,7 +262,7 @@ async fn actual_cli_monitor_shows_a_hosted_tick_snapshot_and_attaches_it_full_sc
         .await;
         view.send(b"\x1b");
         view.wait_for("back in the Monitor list", |frame| {
-            frame.contains("Enter open") && !frame.contains("r refresh")
+            frame.contains("enter open") && !frame.contains("r refresh")
         })
         .await;
         view.send(b"\x1b");
@@ -318,11 +318,11 @@ async fn actual_cli_enter_opens_a_hosted_tick_in_a_herdr_popup_after_a_one_key_r
         )
         .await;
         view.send(b"\x1b[C");
-        view.wait_for("Monitor focused", |frame| frame.contains("Enter open"))
+        view.wait_for("Monitor focused", |frame| frame.contains("enter open"))
             .await;
         view.send(b"\r");
         view.wait_for("the one-key registration offer", |frame| {
-            frame.contains("Register Tick Loop") && frame.contains("Enter confirm")
+            frame.contains("Register Tick Loop") && frame.contains("enter confirm")
         })
         .await;
         assert!(
@@ -474,11 +474,11 @@ async fn actual_cli_enter_re_registers_a_popup_plugin_another_tickloop_linked() 
         )
         .await;
         view.send(b"\x1b[C");
-        view.wait_for("Monitor focused", |frame| frame.contains("Enter open"))
+        view.wait_for("Monitor focused", |frame| frame.contains("enter open"))
             .await;
         view.send(b"\r");
         view.wait_for("the offer to register this tickloop", |frame| {
-            frame.contains("runs another tickloop") && frame.contains("Enter confirm")
+            frame.contains("runs another tickloop") && frame.contains("enter confirm")
         })
         .await;
         assert_eq!(
@@ -542,7 +542,7 @@ async fn actual_cli_enter_without_a_usable_popup_opens_full_screen() {
         )
         .await;
         view.send(b"\x1b[C");
-        view.wait_for("Monitor focused", |frame| frame.contains("Enter open"))
+        view.wait_for("Monitor focused", |frame| frame.contains("enter open"))
             .await;
         view.send(b"\r");
         view.wait_for("the one-key registration offer", |frame| {
@@ -551,7 +551,7 @@ async fn actual_cli_enter_without_a_usable_popup_opens_full_screen() {
         .await;
         view.send(b"\x1b");
         view.wait_for("the offer declined", |frame| {
-            !frame.contains("Register Tick Loop") && frame.contains("Enter open")
+            !frame.contains("Register Tick Loop") && frame.contains("enter open")
         })
         .await;
         assert!(herdr.plugins().is_empty(), "declining links nothing");

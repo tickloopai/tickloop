@@ -5,7 +5,7 @@ use tokio::time::Instant;
 use super::{Agent, Chat};
 use tickloop_agent_protocol::{ChatId, EventKind, LoopId, Progress, Receipt, TodoItem, TodoStatus};
 
-const TODO_COMPLETION_GRACE: Duration = Duration::from_secs(5);
+const TODO_COMPLETION_GRACE: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub(super) struct CompletionGrace {

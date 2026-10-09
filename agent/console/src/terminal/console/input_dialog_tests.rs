@@ -11,7 +11,7 @@ fn input_dialog_top_rule_matches_claude_code_in_both_themes() {
             state.display.set_theme(theme);
             state.menu = Some(menu(Uuid::new_v4()));
             state.picker_kind = Some(PickerKind::Actions);
-            state.picker_presentation.hint = "Enter open · Esc close".into();
+            state.picker_presentation.hint = "enter open · esc close".into();
             let capacity = state.input_dialog_height();
             let lines = state.styled_frame().0;
             assert_eq!(lines.len(), capacity);
@@ -53,9 +53,7 @@ async fn input_dialog_top_rule_covers_every_surface_with_semantic_theme_roles() 
             "help",
             "resume",
             "artifacts",
-            "tasks",
             "permissions",
-            "subscriptions",
             "trust",
             "tick confirmation",
         ] {
@@ -110,11 +108,6 @@ async fn input_dialog_top_rule_covers_every_surface_with_semantic_theme_roles() 
                         HashSet::new(),
                     ))
                     .unwrap(),
-                "tasks" => {
-                    console
-                        .show_tasks_at(tests::task_snapshot(chat, 2), None)
-                        .unwrap();
-                }
                 "permissions" => {
                     console.state.lock().unwrap().permissions_surface =
                         Some(PermissionsSurface::open(
@@ -122,9 +115,6 @@ async fn input_dialog_top_rule_covers_every_surface_with_semantic_theme_roles() 
                             PermissionsReturn::ModePicker { settings: false },
                         ))
                 }
-                "subscriptions" => console
-                    .show_subscriptions(chat, vec![tests::subscription_row(1)])
-                    .unwrap(),
                 "trust" => {
                     console.state.lock().unwrap().workspace_trust =
                         Some(WorkspaceTrust::new(PathBuf::from("/fixture/project")))
@@ -153,8 +143,8 @@ async fn input_dialog_top_rule_covers_every_surface_with_semantic_theme_roles() 
                 "permission" | "question" | "plan" | "plan feedback" | "trust" => 12,
                 "help" => 13,
                 "settings" | "login" | "resume" => 6,
-                "artifacts" | "tasks" | "tick confirmation" => 5,
-                "subscriptions" | "permissions" => 4,
+                "artifacts" | "tick confirmation" => 5,
+                "permissions" => 4,
                 _ => unreachable!(),
             };
             assert_eq!(lines.len(), expected, "{surface}/{theme:?}");
@@ -246,8 +236,11 @@ pub(super) fn fixture_ticks() -> Vec<MonitorEntry> {
             title: format!("Fixture Tick {index}"),
             kind: "Document".into(),
             status: "read".into(),
+            notes: Vec::new(),
             owner: crate::monitor_rows::TickOwner::Unknown,
+            tone: crate::monitor_rows::StatusTone::Neutral,
             updated_at_ms: None,
+            update: None,
             resources: None,
             actions: vec![MonitorAction {
                 key: 'o',
@@ -335,52 +328,6 @@ fn review_regression_focused_ticks_do_not_swallow_request_field_paste() {
 }
 
 #[tokio::test]
-async fn review_regression_one_task_event_refreshes_every_cached_or_suspended_center() {
-    use crate::terminal::{
-        execution::ConsoleExecution, refresh_task_dialogs, task_access::ShellTaskCenter,
-    };
-    let directory = tempfile::tempdir().unwrap();
-    let agent = ConsoleExecution::new_embedded(
-        tickloop_agent_test_support::config(),
-        Arc::new(tickloop_agent_test_support::ScriptedModel::new(Vec::new())),
-    );
-    let first = agent.create_chat(directory.path().into()).await.unwrap();
-    let second = agent.create_chat(directory.path().into()).await.unwrap();
-    let center = ShellTaskCenter::new(agent.clone());
-    let console = tests::console_with_state(State::new(true, 80, 24));
-    for chat in [first, second] {
-        console.select_chat(Some(chat)).unwrap();
-        console
-            .show_tasks_at(tests::task_snapshot(chat, 2), None)
-            .unwrap();
-    }
-    let request = Uuid::new_v4();
-    console.set_request_layout(Some(request)).unwrap();
-    console.show_focused_menu(menu(request)).unwrap();
-    refresh_task_dialogs(&center, &console).await.unwrap();
-    assert_eq!(console.dialog_menu_id().unwrap(), Some(request));
-    console.clear_menu(request).unwrap();
-    for chat in [second, first] {
-        console.select_chat(Some(chat)).unwrap();
-        let frame = console
-            .state
-            .lock()
-            .unwrap()
-            .styled_frame()
-            .0
-            .iter()
-            .map(RoleLine::text)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            !frame.contains("printf task"),
-            "stale tasks for {chat}: {frame}"
-        );
-    }
-    agent.shutdown().await;
-}
-
-#[tokio::test]
 async fn review_regression_management_loads_finish_behind_the_visible_request() {
     use crate::terminal::execution::ConsoleExecution;
     let directory = tempfile::tempdir().unwrap();
@@ -390,43 +337,21 @@ async fn review_regression_management_loads_finish_behind_the_visible_request() 
     );
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let view = agent.permissions_view(chat).await.unwrap();
-    for surface in ["tasks", "subscriptions", "permissions"] {
-        let console = tests::console_with_state(State::new(true, 80, 24));
-        console.select_chat(Some(chat)).unwrap();
-        let request = Uuid::new_v4();
-        console.set_request_layout(Some(request)).unwrap();
-        console.show_focused_menu(menu(request)).unwrap();
-        match surface {
-            "tasks" => {
-                console
-                    .show_tasks_at(tests::task_snapshot(chat, 2), None)
-                    .unwrap();
-            }
-            "subscriptions" => console
-                .show_subscriptions(chat, vec![tests::subscription_row(1)])
-                .unwrap(),
-            "permissions" => console
-                .show_permissions(view.clone(), Err("fixture history".into()), false, true)
-                .unwrap(),
-            _ => unreachable!(),
-        }
-        assert_eq!(console.dialog_menu_id().unwrap(), Some(request));
-        assert!(
-            matches!(console.state.lock().unwrap().key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), Some(InputEvent::Choice { menu_id, .. }) if menu_id == request)
-        );
-        console.finish_menu_submission(request).unwrap();
-        console.state.lock().unwrap().release_finished_submissions();
-        let state = console.state.lock().unwrap();
-        assert!(
-            match surface {
-                "tasks" => state.task_surface.is_some(),
-                "subscriptions" => state.subscription_surface.is_some(),
-                "permissions" => state.permissions_surface.is_some(),
-                _ => false,
-            },
-            "{surface}"
-        );
-    }
+    let console = tests::console_with_state(State::new(true, 80, 24));
+    console.select_chat(Some(chat)).unwrap();
+    let request = Uuid::new_v4();
+    console.set_request_layout(Some(request)).unwrap();
+    console.show_focused_menu(menu(request)).unwrap();
+    console
+        .show_permissions(view.clone(), Err("fixture history".into()), false, true)
+        .unwrap();
+    assert_eq!(console.dialog_menu_id().unwrap(), Some(request));
+    assert!(
+        matches!(console.state.lock().unwrap().key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), Some(InputEvent::Choice { menu_id, .. }) if menu_id == request)
+    );
+    console.finish_menu_submission(request).unwrap();
+    console.state.lock().unwrap().release_finished_submissions();
+    assert!(console.state.lock().unwrap().permissions_surface.is_some());
     agent.shutdown().await;
 }
 
@@ -504,123 +429,6 @@ fn review_regression_login_and_picker_updates_do_not_change_the_visible_request(
     }
 }
 
-#[test]
-fn review_regression_restored_task_detail_reconciles_an_unfinished_output_read() {
-    for cached in [false, true] {
-        let chat = Uuid::new_v4();
-        let console = tests::console_with_state(State::new(true, 80, 24));
-        console.select_chat(Some(chat)).unwrap();
-        let mut snapshot = tests::task_snapshot(chat, 1);
-        let task = snapshot.tasks[0].id;
-        snapshot.tasks[0].capabilities.can_read_output = true;
-        snapshot.tasks[0].output_bytes = 20;
-        console.show_tasks_at(snapshot, None).unwrap();
-        console
-            .state
-            .lock()
-            .unwrap()
-            .task_surface
-            .as_mut()
-            .unwrap()
-            .open_detail(
-                task,
-                TaskViewport {
-                    width: 80,
-                    height: 10,
-                },
-            );
-        let request = Uuid::new_v4();
-        console.set_request_layout(Some(request)).unwrap();
-        console.show_focused_menu(menu(request)).unwrap();
-        assert!(console.take_resumed_task_effect().unwrap().is_none());
-        if cached {
-            console.select_chat(Some(Uuid::new_v4())).unwrap();
-        }
-        if cached {
-            console.select_chat(Some(chat)).unwrap();
-        }
-        assert!(console.take_resumed_task_effect().unwrap().is_none());
-        console.clear_menu(request).unwrap();
-        assert!(
-            matches!(console.take_resumed_task_effect().unwrap(), Some((owner, TaskSurfaceEffect::ReadOutput { task_id, .. })) if owner == chat && task_id == task)
-        );
-        assert!(console.take_resumed_task_effect().unwrap().is_none());
-    }
-}
-
-#[test]
-fn review_regression_task_output_and_action_results_reach_hidden_dialogs() {
-    for cached in [false, true] {
-        let chat = Uuid::new_v4();
-        let console = tests::console_with_state(State::new(true, 80, 24));
-        console.select_chat(Some(chat)).unwrap();
-        let mut snapshot = tests::task_snapshot(chat, 1);
-        let task = snapshot.tasks[0].id;
-        snapshot.tasks[0].capabilities.can_read_output = true;
-        snapshot.tasks[0].output_bytes = 20;
-        console.show_tasks_at(snapshot, None).unwrap();
-        let generation = {
-            let mut state = console.state.lock().unwrap();
-            let TaskSurfaceEffect::ReadOutput { generation, .. } =
-                state.task_surface.as_mut().unwrap().open_detail(
-                    task,
-                    TaskViewport {
-                        width: 80,
-                        height: 10,
-                    },
-                )
-            else {
-                panic!("output read expected")
-            };
-            generation
-        };
-        for action_result in [false, true] {
-            let request = Uuid::new_v4();
-            console.set_request_layout(Some(request)).unwrap();
-            console.show_focused_menu(menu(request)).unwrap();
-            if cached {
-                console.select_chat(Some(Uuid::new_v4())).unwrap();
-            }
-            if action_result {
-                console
-                    .task_action_failed(chat, task, "hidden action result".into())
-                    .unwrap();
-            } else {
-                console
-                    .update_task_output(
-                        chat,
-                        TaskOutputUpdate::Unavailable {
-                            generation,
-                            task_id: task,
-                            total_bytes: 20,
-                            message: "hidden output result".into(),
-                        },
-                    )
-                    .unwrap();
-            }
-            if cached {
-                console.select_chat(Some(chat)).unwrap();
-            }
-            console.clear_menu(request).unwrap();
-            let state = console.state.lock().unwrap();
-            let error = state
-                .task_surface
-                .as_ref()
-                .unwrap()
-                .visible_error()
-                .unwrap_or("");
-            assert!(
-                error.contains(if action_result {
-                    "hidden action result"
-                } else {
-                    "hidden output result"
-                }),
-                "{error}"
-            );
-        }
-    }
-}
-
 #[tokio::test]
 async fn review_regression_management_updates_reach_suspended_and_cached_dialogs() {
     use crate::terminal::execution::ConsoleExecution;
@@ -631,60 +439,38 @@ async fn review_regression_management_updates_reach_suspended_and_cached_dialogs
     );
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     for cached in [false, true] {
-        for permissions in [false, true] {
-            let console = tests::console_with_state(State::new(true, 80, 24));
-            console.select_chat(Some(chat)).unwrap();
-            let mut view = agent.permissions_view(chat).await.unwrap();
-            if permissions {
-                let mut surface = PermissionsSurface::open(
-                    view.clone(),
-                    PermissionsReturn::ModePicker { settings: false },
-                );
-                surface.open_auto();
-                console.state.lock().unwrap().permissions_surface = Some(surface);
-            } else {
-                console
-                    .show_subscriptions(chat, vec![tests::subscription_row(1)])
-                    .unwrap();
-            }
-            let request = Uuid::new_v4();
-            console.set_request_layout(Some(request)).unwrap();
-            console.show_focused_menu(menu(request)).unwrap();
-            if cached {
-                console.select_chat(Some(Uuid::new_v4())).unwrap();
-            }
-            if permissions {
-                view.warnings.push("updated suspended policy".into());
-                console.permissions_refreshed(view).unwrap();
-            } else {
-                assert!(console.subscription_dialog_chats().unwrap().contains(&chat));
-                let mut row = tests::subscription_row(1);
-                row.every_seconds = 321;
-                console.update_subscriptions(chat, vec![row]).unwrap();
-            }
-            if cached {
-                console.select_chat(Some(chat)).unwrap();
-            }
-            console.clear_menu(request).unwrap();
-            let frame = console
-                .state
-                .lock()
-                .unwrap()
-                .styled_frame()
-                .0
-                .iter()
-                .map(RoleLine::text)
-                .collect::<Vec<_>>()
-                .join("\n");
-            assert!(
-                frame.contains(if permissions {
-                    "updated suspended policy"
-                } else {
-                    "321s"
-                }),
-                "{frame}"
-            );
+        let console = tests::console_with_state(State::new(true, 80, 24));
+        console.select_chat(Some(chat)).unwrap();
+        let mut view = agent.permissions_view(chat).await.unwrap();
+        let mut surface = PermissionsSurface::open(
+            view.clone(),
+            PermissionsReturn::ModePicker { settings: false },
+        );
+        surface.open_auto();
+        console.state.lock().unwrap().permissions_surface = Some(surface);
+        let request = Uuid::new_v4();
+        console.set_request_layout(Some(request)).unwrap();
+        console.show_focused_menu(menu(request)).unwrap();
+        if cached {
+            console.select_chat(Some(Uuid::new_v4())).unwrap();
         }
+        view.warnings.push("updated suspended policy".into());
+        console.permissions_refreshed(view).unwrap();
+        if cached {
+            console.select_chat(Some(chat)).unwrap();
+        }
+        console.clear_menu(request).unwrap();
+        let frame = console
+            .state
+            .lock()
+            .unwrap()
+            .styled_frame()
+            .0
+            .iter()
+            .map(RoleLine::text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(frame.contains("updated suspended policy"), "{frame}");
     }
     agent.shutdown().await;
 }
@@ -709,8 +495,6 @@ async fn review_regression_only_the_displayed_request_consumes_input() {
             "resume",
             "artifacts",
             "login",
-            "tasks",
-            "subscriptions",
             "permissions",
             "help",
             "foreground shell",
@@ -756,17 +540,6 @@ async fn review_regression_only_the_displayed_request_consumes_input() {
                         .unwrap(),
                     "login" => console
                         .show_login_menu(menu(Uuid::new_v4()), "https://example.test/device", false)
-                        .unwrap(),
-                    "tasks" => {
-                        console
-                            .show_tasks_at(tests::task_snapshot(chat, 2), None)
-                            .unwrap();
-                    }
-                    "subscriptions" => console
-                        .show_subscriptions(
-                            chat,
-                            vec![tests::subscription_row(1), tests::subscription_row(2)],
-                        )
                         .unwrap(),
                     "permissions" => {
                         console.state.lock().unwrap().permissions_surface =
@@ -931,45 +704,6 @@ async fn review_regression_permissions_click_opens_an_unselected_option_like_ent
             .collect::<Vec<_>>()
     );
     agent.shutdown().await;
-}
-
-#[test]
-fn review_regression_task_snapshots_reach_suspended_and_cached_dialogs() {
-    use tickloop_agent_protocol::ShellTaskState;
-    for cached in [false, true] {
-        let chat = Uuid::new_v4();
-        let console = tests::console_with_state(State::new(true, 80, 24));
-        console.select_chat(Some(chat)).unwrap();
-        let mut snapshot = tests::task_snapshot(chat, 2);
-        console.show_tasks_at(snapshot.clone(), None).unwrap();
-        let request = Uuid::new_v4();
-        console.set_request_layout(Some(request)).unwrap();
-        console.show_focused_menu(menu(request)).unwrap();
-        if cached {
-            console.select_chat(Some(Uuid::new_v4())).unwrap();
-        }
-        snapshot.live_revision += 1;
-        snapshot.tasks[0].state = ShellTaskState::Completed;
-        snapshot.tasks[0].exit_code = Some(0);
-        console.update_tasks(snapshot).unwrap();
-        console
-            .task_updates_failed(chat, "scoped update error".into())
-            .unwrap();
-        if cached {
-            console.select_chat(Some(chat)).unwrap();
-        }
-        console.clear_menu(request).unwrap();
-        let mut state = console.state.lock().unwrap();
-        let frame = state
-            .styled_frame()
-            .0
-            .iter()
-            .map(RoleLine::text)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(frame.contains("completed"), "{frame}");
-        assert!(frame.contains("scoped update error"), "{frame}");
-    }
 }
 
 #[test]
@@ -1240,15 +974,10 @@ fn artifact_load_returns_to_its_hidden_agent_without_changing_the_visible_dialog
 }
 
 #[test]
-fn workspace_trust_stays_fixed_and_subscriptions_fit_their_content() {
+fn workspace_trust_stays_fixed() {
     let mut state = State::new(true, 80, 24);
     state.workspace_trust = Some(WorkspaceTrust::new(PathBuf::from("/fixture/project")));
     assert_eq!(state.styled_frame().0.len(), 12);
-    let console = tests::console_with_state(State::new(true, 120, 40));
-    let chat = Uuid::new_v4();
-    console.select_chat(Some(chat)).unwrap();
-    console.show_subscriptions(chat, Vec::new()).unwrap();
-    assert_eq!(console.state.lock().unwrap().styled_frame().0.len(), 4);
 }
 
 #[test]
@@ -1291,8 +1020,13 @@ fn sticky_prompt_short_conversation_keeps_the_full_content_height() {
     );
     assert_eq!(state.input_dialog_height(), 6);
     let dialog_top = state.height - state.input_dialog_height();
-    assert!(state.rendered_screen[dialog_top - 1].starts_with("Trailing boundary"));
-    assert!(state.rendered_screen[dialog_top - 1].contains('│'));
+    assert!(state.rendered_screen[dialog_top - 2].starts_with("Trailing boundary"));
+    assert!(
+        state.rendered_screen[dialog_top - 1]
+            .trim_start()
+            .starts_with('│'),
+        "one blank row separates the conversation from the dialog"
+    );
     assert_eq!(state.rendered_screen[dialog_top], "▔".repeat(state.width));
     assert!(
         state.rendered_screen[dialog_top + input_dialog::INPUT_DIALOG_RULE_ROWS]
@@ -1352,8 +1086,11 @@ fn latest_user_message_stays_at_the_top_left_with_ticks_and_an_input_dialog() {
             title: "Fixture Shell".into(),
             kind: "Shell".into(),
             status: "running".into(),
+            notes: Vec::new(),
             owner: crate::monitor_rows::TickOwner::Unknown,
+            tone: crate::monitor_rows::StatusTone::Neutral,
             updated_at_ms: None,
+            update: None,
             resources: None,
             actions: Vec::new(),
         }],
@@ -1703,7 +1440,7 @@ fn provider_model_and_connection_dialogs_fit_their_content_and_isolate_input() {
                             (0, "DeepSeek · 1/10 configured".into()),
                             (10, "OpenAI · 2/10 configured".into()),
                         ],
-                        hint: "Enter apply · Esc back".into(),
+                        hint: "enter apply · esc back".into(),
                         ..Default::default()
                     },
                 )
@@ -1763,7 +1500,7 @@ fn provider_credential_dialog_hides_ordinals_and_keeps_secret_editing_hints() {
     assert_eq!(lines.len(), 7);
     assert!(!text.contains("secret-value"));
     assert!(!text.contains("1. Save API key"), "{text}");
-    assert!(text.contains("Ctrl+G"), "{text}");
+    assert!(text.contains("ctrl+g"), "{text}");
     state.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
     let closed = state
         .styled_frame()
@@ -1776,7 +1513,7 @@ fn provider_credential_dialog_hides_ordinals_and_keeps_secret_editing_hints() {
         closed.contains(&format!("API key: {}", "*".repeat("secret-value".len()))),
         "{closed}"
     );
-    assert!(closed.contains("Esc back"), "{closed}");
+    assert!(closed.contains("esc back"), "{closed}");
     state.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
     state.key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
     state.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
@@ -1815,7 +1552,7 @@ fn provider_dialog_preemption_restores_headers_focus_context_and_private_field()
                     PickerKind::Model,
                     PickerPresentation {
                         headers: vec![(0, "Builtin family".into())],
-                        hint: "p Connection · Enter apply · Esc back".into(),
+                        hint: "p Connection · enter apply · esc back".into(),
                         ..Default::default()
                     },
                 )
@@ -1885,7 +1622,7 @@ fn provider_vendor_headers_never_submit_and_model_rows_keep_mouse_identity() {
             PickerKind::Provider,
             PickerPresentation {
                 headers: vec![(0, "Vendor · 1/2 configured".into())],
-                hint: "Enter models · Esc close".into(),
+                hint: "enter models · esc close".into(),
                 ..Default::default()
             },
         )
@@ -1992,10 +1729,8 @@ async fn exit_plan_mode_automatically_opens_the_agent_dialog_and_preserves_it_ac
             Some(Role::PlanMode)
         );
         assert!(state.menu_plan);
-        assert_eq!(
-            state.menu_comment.as_ref().unwrap().options,
-            [super::super::workflows::PlanApprovalChoice::KeepPlanning.option_index()]
-        );
+        assert_eq!(state.menu.as_ref().unwrap().options[3], "No, keep planning");
+        assert_eq!(state.menu_comment.as_ref().unwrap().options, [3]);
         assert_eq!(
             state.input_dialog_frame().0.len(),
             input_dialog::FIXED_INPUT_DIALOG_ROWS
@@ -2473,11 +2208,12 @@ fn a_child_can_request_an_existing_plan_without_unlocking_mode_changes() {
     }
 }
 
+/// A child gets no plan mode tools, so it never has a plan to review, and `/plan` cannot move it
+/// into Plan mode.
 #[tokio::test]
-async fn a_child_reopens_its_dismissed_approval_but_cannot_enter_plan_mode_without_a_plan() {
+async fn a_child_has_no_plan_to_review_and_cannot_enter_plan_mode() {
     use crate::terminal::{execution::ConsoleExecution, menus::Menus, open_current_plan};
-    use tickloop_agent_protocol::EventKind;
-    use tickloop_agent_protocol::{ExecutionMode, PermissionScope};
+    use tickloop_agent_protocol::{EventKind, ExecutionMode};
     let directory = tempfile::tempdir().unwrap();
     let model = Arc::new(tickloop_agent_test_support::ScriptedModel::new(vec![
         tickloop_agent_test_support::call(
@@ -2485,16 +2221,8 @@ async fn a_child_reopens_its_dismissed_approval_but_cannot_enter_plan_mode_witho
             "Subagent",
             serde_json::json!({"task":"Plan the delegated task."}),
         ),
-        tickloop_agent_test_support::call("enter", "EnterPlanMode", serde_json::json!({})),
-        tickloop_agent_test_support::submit_plan("plan", "Child plan to review."),
-        tickloop_agent_test_support::text("The parent observed the interrupted child."),
-        tickloop_agent_test_support::call(
-            "execute",
-            "Write",
-            serde_json::json!({"file_path":"child-executed.txt","content":"approved child implementation"}),
-        ),
-        tickloop_agent_test_support::text("Approved child implementation started."),
-        tickloop_agent_test_support::text("The parent observed completion."),
+        tickloop_agent_test_support::text("Child plan: write child-plan.txt."),
+        tickloop_agent_test_support::text("The parent observed the child plan."),
     ]));
     let core = tickloop_agent_runtime::Agent::new_embedded(
         tickloop_agent_test_support::config(),
@@ -2512,125 +2240,36 @@ async fn a_child_reopens_its_dismissed_approval_but_cannot_enter_plan_mode_witho
         .submit(parent, None, "Delegate a plan".into())
         .await
         .unwrap();
-    let (child, enter) = loop {
+    let mut child = None;
+    loop {
         let event = tickloop_agent_test_support::next_event(&mut events).await;
         match event.kind {
-            EventKind::PermissionRequested { request } => break (event.chat_id, request),
-            EventKind::ToolCompleted { result, .. } if result.is_error => {
-                panic!("child setup failed: {}", result.content)
+            EventKind::Completed { .. } if event.chat_id == parent => break,
+            EventKind::Completed { .. } => child = Some(event.chat_id),
+            EventKind::PermissionRequested { request } => {
+                panic!("unexpected {} request", request.name)
             }
-            EventKind::Completed { .. } => panic!("parent completed before child approval request"),
-            EventKind::Failed(error) => panic!("child setup failed: {error}"),
+            EventKind::Failed(error) => panic!("{error}"),
             _ => {}
         }
-    };
+    }
+    let child = child.expect("the child completed before its parent");
+    let goal = agent.snapshot(child).await.unwrap().loops[0].id;
     let console = tests::console_with_state(State::new(true, 80, 24));
     console.select_chat(Some(child)).unwrap();
     console.set_visible_delegation(true).unwrap();
     let mut menus = Menus::default();
+    let refusal = open_current_plan(&agent, &console, &mut menus, Some(child), Some(goal))
+        .await
+        .unwrap_err();
     assert!(
-        open_current_plan(
-            &agent,
-            &console,
-            &mut menus,
-            Some(child),
-            Some(enter.loop_id)
-        )
-        .await
-        .is_err()
+        refusal.starts_with("/plan isn't available in a child Agent"),
+        "{refusal}"
     );
-    assert_eq!(
-        agent.snapshot(child).await.unwrap().policy.mode,
-        ExecutionMode::FullAccess
-    );
-    agent
-        .answer_permission_with_comment(child, enter.id, true, PermissionScope::Once, None)
-        .await
-        .unwrap();
-    let approval = loop {
-        if let EventKind::PermissionRequested { request } =
-            tickloop_agent_test_support::next_event(&mut events)
-                .await
-                .kind
-        {
-            break request;
-        }
-    };
-    assert_eq!(approval.name, "ExitPlanMode");
-    agent
-        .decline_plan(child, approval.loop_id, 1, None)
-        .await
-        .unwrap();
-    loop {
-        let event = tickloop_agent_test_support::next_event(&mut events).await;
-        if event.chat_id == child && matches!(event.kind, EventKind::Interrupted) {
-            break;
-        }
-    }
-    loop {
-        let event = tickloop_agent_test_support::next_event(&mut events).await;
-        if event.chat_id == parent && matches!(event.kind, EventKind::Completed { .. }) {
-            break;
-        }
-    }
-    assert!(
-        crate::terminal::completion::unavailable_command("/plan", console.command_scope())
-            .is_none()
-    );
-    open_current_plan(
-        &agent,
-        &console,
-        &mut menus,
-        Some(child),
-        Some(approval.loop_id),
-    )
-    .await
-    .unwrap();
-    let id = console
-        .dialog_menu_id()
-        .unwrap()
-        .expect("child pending approval must reopen");
-    assert_eq!(
-        console.state.lock().unwrap().menu.as_ref().unwrap().title,
-        "Plan approval"
-    );
-    assert_eq!(
-        agent.snapshot(child).await.unwrap().policy.mode,
-        ExecutionMode::Plan
-    );
-    assert!(!directory.path().join("child-executed.txt").exists());
-    menus
-        .choose(&agent, &console, id, Some(2), None)
-        .await
-        .unwrap();
-    loop {
-        let event = tickloop_agent_test_support::next_event(&mut events).await;
-        if event.chat_id == child && matches!(event.kind, EventKind::Completed { .. }) {
-            break;
-        }
-    }
-    assert!(!agent.snapshot(child).await.unwrap().plans[0].approval_pending);
-    assert_eq!(
-        agent.snapshot(child).await.unwrap().policy.mode,
-        ExecutionMode::FullAccess
-    );
-    assert_eq!(
-        agent.snapshot(parent).await.unwrap().policy.mode,
-        ExecutionMode::FullAccess
-    );
-    let child_snapshot = core.snapshot(child).await.unwrap();
-    let parent_snapshot = core.snapshot(parent).await.unwrap();
-    assert_eq!(
-        std::fs::read_to_string(directory.path().join("child-executed.txt")).unwrap_or_else(
-            |error| panic!(
-                "{error}: child operations {:?}; parent operations {:?}; model requests {}",
-                child_snapshot.operations,
-                parent_snapshot.operations,
-                model.requests.lock().unwrap().len()
-            )
-        ),
-        "approved child implementation"
-    );
+    assert!(console.dialog_menu_id().unwrap().is_none());
+    let snapshot = agent.snapshot(child).await.unwrap();
+    assert_eq!(snapshot.policy.mode, ExecutionMode::FullAccess);
+    assert!(snapshot.plans.is_empty());
     agent.shutdown().await;
 }
 
@@ -2848,7 +2487,7 @@ fn input_dialog_login_updates_keep_callback_editing_and_origin() {
             .unwrap()
             .context
             .iter()
-            .any(|line| line.contains("Esc leaves editing first"))
+            .any(|line| line.contains("esc leaves editing first"))
     );
     assert_eq!(
         state
@@ -2865,7 +2504,7 @@ fn input_dialog_login_updates_keep_callback_editing_and_origin() {
             .last()
             .unwrap()
             .text()
-            .contains("Enter return")
+            .contains("enter return")
     );
     assert_eq!(
         state.selected_menu_comment().as_deref(),

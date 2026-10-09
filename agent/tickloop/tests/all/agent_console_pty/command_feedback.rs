@@ -46,21 +46,7 @@ impl LocalCommand {
             })
             .await;
             view.send(b"\r");
-            // The applied choice finishes after its feedback; Esc counts once the hint is back.
-            view.wait_for("model application keeps its picker and feedback", |frame| {
-                frame.contains(title)
-                    && body_shows_once_in_order(frame, &[self.input(), self.result_prefix()])
-                    && frame.contains("Enter apply · Esc back")
-            })
-            .await;
-            view.send(b"\x1b");
-            if matches!(self, Self::Provider) {
-                view.wait_for("model Escape returns to the Provider directory", |frame| {
-                    frame.contains("Choose Provider · All")
-                })
-                .await;
-                view.send(b"\x1b");
-            }
+            // Applying a choice closes the picker and leaves the feedback in the conversation.
         }
         view.wait_for_editor("local command restores the composer", Some(""))
             .await;
@@ -168,7 +154,7 @@ async fn run_new_agent_command_feedback(fixture: &PrivateFixture, command: Local
         .wait_for("another Agent displays its own Shell result", |frame| {
             conversation_body(frame)
                 .lines()
-                .any(|line| line.trim() == OTHER_OUTPUT)
+                .any(|line| screen::response_line(line) == OTHER_OUTPUT)
         })
         .await;
     assert!(!conversation_body(&other).contains(command.input()));
@@ -273,7 +259,7 @@ async fn run_background_event_reset(fixture: &PrivateFixture) {
         |frame| {
             conversation_body(frame)
                 .lines()
-                .any(|line| line.trim() == OTHER_OUTPUT)
+                .any(|line| screen::response_line(line) == OTHER_OUTPUT)
         },
     )
     .await;

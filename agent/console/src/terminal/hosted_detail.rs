@@ -97,7 +97,7 @@ impl TickDetailView for HostedDetail {
     }
 
     fn hint(&self) -> String {
-        format!("{REFRESH_KEY} refresh · Esc back")
+        format!("{REFRESH_KEY} refresh · esc back")
     }
 
     fn key(&mut self, key: KeyEvent, _width: usize, _height: usize) -> TickDetailKey {
@@ -172,8 +172,11 @@ mod tests {
             title: "Keys".into(),
             kind: "Tick".into(),
             status: "live".into(),
+            notes: Vec::new(),
             owner: crate::monitor_rows::TickOwner::ThisChat,
+            tone: crate::monitor_rows::StatusTone::Neutral,
             updated_at_ms: None,
+            update: None,
             resources: None,
             actions: Vec::new(),
         }
@@ -192,7 +195,7 @@ mod tests {
     fn a_snapshot_says_when_it_was_taken_and_that_older_lines_were_cut() {
         let mut detail = detail();
         assert!(text(&mut detail).contains("Screen    loading…"));
-        assert_eq!(detail.hint(), "r refresh · Esc back");
+        assert_eq!(detail.hint(), "r refresh · esc back");
         detail.show(Ok(HostedSnapshot {
             screen: tickloop_agent_protocol::HostedScreenSnapshot {
                 lines: vec!["newest".into()],

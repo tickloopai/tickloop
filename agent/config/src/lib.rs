@@ -53,7 +53,11 @@ const GLYPH_SET_KEY: &str = "glyphSet";
 const PREFERS_REDUCED_MOTION_KEY: &str = "prefersReducedMotion";
 const MONITOR_KEY: &str = "monitor";
 const MONITOR_POPUP_KEY: &str = "monitorPopup";
+const MONITOR_WIDTH_KEY: &str = "monitorWidth";
 const PROMPT_SUGGESTION_ENABLED_KEY: &str = "promptSuggestionEnabled";
+/// The execution modes Shift+Tab visits, in Claude Code's order; at least one.
+const SHIFT_TAB_MODES_KEY: &str = "shiftTabModes";
+pub const DEFAULT_SHIFT_TAB_MODES: [ExecutionMode; 2] = [ExecutionMode::Auto, ExecutionMode::Plan];
 /// Claude Code's `outputStyle` setting.
 const OUTPUT_STYLE_KEY: &str = "outputStyle";
 /// 照 Claude Code `cleanupPeriodDays` 的名称与取值，但只有 0 有含义：不写 Transcript。Tick Loop 不按
@@ -391,12 +395,48 @@ impl LoadedSettings {
             .unwrap_or_default()
     }
 
+    /// Monitor's column as the user last dragged it, its separator included. A View narrows it
+    /// to keep the conversation readable.
+    pub fn monitor_width(&mut self) -> Option<u16> {
+        let value = self.settings.get(MONITOR_WIDTH_KEY)?;
+        let columns = value
+            .as_u64()
+            .and_then(|columns| u16::try_from(columns).ok())
+            .filter(|columns| *columns > 0);
+        if columns.is_none() {
+            self.warn(format!(
+                "`{MONITOR_WIDTH_KEY}` is not a positive column count and is ignored"
+            ));
+        }
+        columns
+    }
+
     pub fn monitor_popup(&self) -> MonitorPopup {
         self.settings
             .get(MONITOR_POPUP_KEY)
             .cloned()
             .and_then(|value| serde_json::from_value(value).ok())
             .unwrap_or_default()
+    }
+
+    /// The modes Shift+Tab visits, in [`ExecutionMode::CYCLE_ORDER`]. An empty or invalid list
+    /// falls back to Auto and Plan.
+    pub fn shift_tab_modes(&mut self) -> Vec<ExecutionMode> {
+        let Some(value) = self.settings.get(SHIFT_TAB_MODES_KEY) else {
+            return DEFAULT_SHIFT_TAB_MODES.to_vec();
+        };
+        match serde_json::from_value::<Vec<ExecutionMode>>(value.clone()) {
+            Ok(modes) if !modes.is_empty() => ExecutionMode::CYCLE_ORDER
+                .into_iter()
+                .filter(|mode| modes.contains(mode))
+                .collect(),
+            _ => {
+                self.warn(format!(
+                    "`{SHIFT_TAB_MODES_KEY}` is not a nonempty list of `auto`, `acceptEdits`, `plan` and `fullAccess`; shift+tab uses Auto and Plan"
+                ));
+                DEFAULT_SHIFT_TAB_MODES.to_vec()
+            }
+        }
     }
 
     pub fn prompt_suggestion_enabled(&mut self) -> bool {
@@ -860,11 +900,33 @@ impl UserSettings {
         })
     }
 
+    pub fn save_monitor_width(&self, columns: u16) -> Result<(), SettingsError> {
+        self.update(|settings| {
+            settings.insert(MONITOR_WIDTH_KEY.into(), columns.into());
+            Ok(())
+        })
+    }
+
     pub fn save_monitor_popup(&self, popup: MonitorPopup) -> Result<(), SettingsError> {
         self.update(|settings| {
             settings.insert(
                 MONITOR_POPUP_KEY.into(),
                 serde_json::to_value(popup).expect("Monitor popup setting serializes to JSON"),
+            );
+            Ok(())
+        })
+    }
+
+    pub fn save_shift_tab_modes(&self, modes: &[ExecutionMode]) -> Result<(), SettingsError> {
+        let ordered = ExecutionMode::CYCLE_ORDER
+            .into_iter()
+            .filter(|mode| modes.contains(mode))
+            .collect::<Vec<_>>();
+        debug_assert!(!ordered.is_empty(), "Shift+Tab keeps at least one mode");
+        self.update(|settings| {
+            settings.insert(
+                SHIFT_TAB_MODES_KEY.into(),
+                serde_json::to_value(ordered).expect("execution modes serialize to JSON"),
             );
             Ok(())
         })

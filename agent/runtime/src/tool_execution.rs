@@ -80,6 +80,7 @@ impl ToolRegistry {
         tick_stream_installed: bool,
         prompt_policy: PromptPolicy,
     ) -> Self {
+        let is_delegated = chat.snapshot.delegation.is_some();
         let mut tools = tickloop_agent_tools::Tools::definitions()
             .into_iter()
             .map(|definition| RegisteredTool {
@@ -88,7 +89,7 @@ impl ToolRegistry {
             })
             .collect::<Vec<_>>();
         tools.extend(
-            plan::definitions()
+            plan::definitions(is_delegated)
                 .into_iter()
                 .map(|definition| RegisteredTool {
                     definition,
@@ -96,14 +97,14 @@ impl ToolRegistry {
                 }),
         );
         tools.extend(
-            interaction::definitions()
+            interaction::definitions(is_delegated)
                 .into_iter()
                 .map(|definition| RegisteredTool {
                     definition,
                     route: ToolRoute::Interaction,
                 }),
         );
-        if chat.snapshot.delegation.is_none() {
+        if !is_delegated {
             tools.extend(
                 delegation::definitions()
                     .into_iter()
@@ -114,7 +115,7 @@ impl ToolRegistry {
             );
         }
         tools.extend(
-            agent_messages::definitions(chat.snapshot.delegation.is_some())
+            agent_messages::definitions(is_delegated)
                 .into_iter()
                 .map(|definition| RegisteredTool {
                     definition,

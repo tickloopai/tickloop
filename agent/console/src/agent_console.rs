@@ -450,6 +450,22 @@ impl AgentConsole {
         }
     }
 
+    /// Drops a finished child from the family panel now instead of after its grace period. The
+    /// member being viewed and unfinished members stay.
+    pub fn dismiss(&mut self, execution: ExecutionRef) -> bool {
+        if self.visible == Some(execution) {
+            return false;
+        }
+        let now = (self.clock)();
+        match self.retirements.get_mut(&execution) {
+            Some(retirement) if retirement.completion.is_some() => {
+                retirement.deadline = Some(now);
+                true
+            }
+            _ => false,
+        }
+    }
+
     pub fn family_members(&self, visible: ExecutionRef) -> Vec<AgentSummary> {
         let root = self.family_root(visible);
         self.rows

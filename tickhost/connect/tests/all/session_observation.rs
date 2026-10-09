@@ -108,6 +108,33 @@ async fn later_subscriber_gets_its_own_baseline_and_actual_received_count() {
 }
 
 #[tokio::test]
+async fn status_reports_the_latest_update_time_without_a_watcher_or_its_content() {
+    let (session, _directory) = counter().await;
+    let client = session.client();
+    let before = client.status().await.unwrap();
+    assert_eq!(before.updated_at_ms, None);
+    assert_eq!(before.received, 0);
+    let called = tickhost_connect::access::now_ms();
+    client
+        .call("increment", json!({}), CancellationToken::new())
+        .await
+        .unwrap();
+    let after = client.status().await.unwrap();
+    assert_eq!(after.received, 1);
+    assert!(
+        after.updated_at_ms.is_some_and(|at| at >= called),
+        "{after:?}"
+    );
+    let wire = serde_json::to_value(after).unwrap();
+    assert_eq!(
+        wire.as_object().unwrap().len(),
+        2,
+        "status carries no update content: {wire}"
+    );
+    session.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn slow_subscriber_sees_latest_content_and_all_received_frames_counted() {
     let (session, _directory) = counter().await;
     let client = session.client();

@@ -74,13 +74,8 @@ async fn open_family_member(
         row.execution == target && row.views.iter().any(|location| location.view == view)
     });
     pty.send(b"\x1b[B");
-    pty.wait_for("family list expands", |frame| {
-        family_rows_are_visible(frame)
-    })
-    .await;
-    pty.send(b"\x1b[B");
     pty.wait_for("family list receives focus", |frame| {
-        frame.lines().any(|line| line.starts_with('›'))
+        family_rows_are_visible(frame) && frame.lines().any(|line| line.starts_with('›'))
     })
     .await;
     for _ in 0..6 {
@@ -358,44 +353,33 @@ async fn run_family_navigation(fixture: &PrivateFixture) {
     let captured = Arc::clone(&pty.output);
     pty.wait_for("Main completed editor and family summary", |frame| {
         frame.contains(MAIN_REPLY)
-            && frame.contains("✓ Done")
+            && (frame.contains("✻ Worked for") || frame.contains("✻ Done"))
             && frame.contains("⏺ Subagents 2")
             && editor_has_focus(&captured)
     })
     .await;
     pty.resize(38, 24).await;
     pty.send(b"\x1b[B");
-    let entry_focused = pty
-        .wait_for("fallback entry hint follows family members", |frame| {
+    let list_focused = pty
+        .wait_for("fallback list hint follows the list focus", |frame| {
             frame
                 .lines()
                 .last()
-                .is_some_and(|line| line.contains("Enter/Space hide"))
+                .is_some_and(|line| line.contains("enter open · space fold"))
         })
         .await;
-    let rows = entry_focused.lines().collect::<Vec<_>>();
+    let rows = list_focused.lines().collect::<Vec<_>>();
     let entry = rows
         .iter()
         .position(|line| line.contains("Subagents 2"))
         .unwrap();
-    let core_rows = usize::from(rows[entry + 1].contains("⏵⏵ Auto"));
     assert!(
-        rows[entry + 1 + core_rows].contains("main"),
-        "{entry_focused}"
+        rows[entry + 1].starts_with("› ") && rows[entry + 1].contains("main"),
+        "the first Down lands on the viewed member: {list_focused}"
     );
-    assert!(!entry_focused.contains("items"));
-    pty.send(b"\x1b[B");
-    let list_focused = pty
-        .wait_for("fallback list hint matches its focus", |frame| {
-            frame
-                .lines()
-                .last()
-                .is_some_and(|line| line.contains("Enter open · Space fold · Esc entry"))
-        })
-        .await;
-    assert!(!list_focused.contains("Enter/Space hide"));
+    assert!(!list_focused.contains("items"));
     eprintln!("[fallback-family-focused]\n{list_focused}\n[/fallback-family-focused]");
-    pty.send(b"\x1b\x1b");
+    pty.send(b"\x1b");
     pty.wait_for("fallback focus returns to input", |_| {
         editor_has_focus(&captured)
     })
@@ -403,39 +387,33 @@ async fn run_family_navigation(fixture: &PrivateFixture) {
     pty.resize(TERMINAL_WIDTH, TERMINAL_HEIGHT).await;
     super::unified_footer::click_category(&mut pty, "Subagents 2");
     pty.wait_for("mouse collapses the completed family", |frame| {
-        frame.contains("Enter/Space expand")
-            && frame.contains("⏺ Subagents 2")
-            && !family_rows_are_visible(frame)
+        frame.contains("⏺ Subagents 2") && !family_rows_are_visible(frame)
     })
     .await;
     assert!(!pty.frame().contains("reply completed"));
-    pty.send(b"\r");
-    pty.wait_for("focused Enter expands the family", |frame| {
+    pty.send(b"\x1b[B");
+    pty.wait_for("Down unfolds the family and enters its list", |frame| {
         family_rows_are_visible(frame)
             && frame
                 .lines()
                 .rfind(|line| !line.trim().is_empty())
-                .is_some_and(|line| line.contains("Enter/Space hide"))
+                .is_some_and(|line| line.contains("enter open · space fold"))
     })
     .await;
-    pty.send(b" ");
-    pty.wait_for("focused Space collapses the family", |frame| {
-        frame.contains("Enter/Space expand")
-            && frame.contains("⏺ Subagents 2")
-            && !family_rows_are_visible(frame)
+    pty.send(b"\x1b");
+    pty.wait_for("Esc returns editor focus", |_| editor_has_focus(&captured))
+        .await;
+    super::unified_footer::click_category(&mut pty, "Subagents 2");
+    pty.wait_for("mouse collapses the family again", |frame| {
+        frame.contains("⏺ Subagents 2") && !family_rows_are_visible(frame)
     })
     .await;
     super::unified_footer::click_category(&mut pty, "Subagents 2");
     pty.wait_for("mouse reopens the same family", |frame| {
-        family_rows_are_visible(frame)
-            && frame
-                .lines()
-                .rfind(|line| !line.trim().is_empty())
-                .is_some_and(|line| line.contains("Enter/Space hide"))
+        family_rows_are_visible(frame) && !frame.contains("enter open · space fold")
     })
     .await;
-    pty.send(b"\x1b");
-    pty.wait_for("toggle returns editor focus", |_| {
+    pty.wait_for("the click leaves editor focus", |_| {
         editor_has_focus(&captured)
     })
     .await;

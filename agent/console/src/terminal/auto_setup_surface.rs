@@ -209,7 +209,7 @@ impl AutoSetupSurface {
     pub fn lines(&self, width: usize) -> Vec<RoleLine> {
         let mut lines = vec![plain_row("Auto Environment setup · nothing applied")];
         if self.generation.is_some() {
-            lines.push(muted_row("Generating draft… Esc discards the result"));
+            lines.push(muted_row("Generating draft… esc discards the result"));
             return lines;
         }
         if let Some(editor) = &self.editor {

@@ -114,7 +114,10 @@ impl State {
             || self.request_layout.is_some()
         {
             Some("suppressed: input hidden or Input Dialog active")
-        } else if self.conversation_focused || self.footer_list_focused || self.monitor.focused {
+        } else if self.conversation_focused
+            || self.footer.selected().is_some()
+            || self.monitor.focused
+        {
             Some("suppressed: input unfocused")
         } else if !self.editor.draft().is_empty()
             || !self.restored_contexts.is_empty()

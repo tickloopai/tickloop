@@ -28,10 +28,10 @@ use crate::{
     UserShellReceipt, UserShellRecord,
 };
 
-/// Business 15.0 adds the Auto setup request kind to the usage ledger.
+/// Business 16.0 adds the Shell description request kind to the usage ledger.
 /// Older business majors are refused before dispatch;
 /// the frozen daemon management protocol remains independent.
-pub const PROTOCOL_MAJOR: u16 = 15;
+pub const PROTOCOL_MAJOR: u16 = 16;
 pub const PROTOCOL_MINOR: u16 = 0;
 
 pub const REPLAY_CAPACITY: usize = 4096;
@@ -242,6 +242,11 @@ pub enum AgentCommand {
         execution: ExecutionRef,
         instance: InstanceRef,
     },
+    /// The user opened the instance's Monitor row: its updates so far count as handled.
+    MarkMonitorHandled {
+        execution: ExecutionRef,
+        instance: InstanceRef,
+    },
     /// The Chat's running hosted Ticks with a resource sample of each, for its Monitor.
     ListHostedTicks {
         execution: ExecutionRef,
@@ -357,6 +362,7 @@ impl AgentCommand {
             | Self::ListArtifactTicks { execution }
             | Self::AddMonitorMember { execution, .. }
             | Self::RemoveMonitorMember { execution, .. }
+            | Self::MarkMonitorHandled { execution, .. }
             | Self::ListHostedTicks { execution }
             | Self::CloseHostedTick { execution, .. }
             | Self::ReopenHostedTick { execution, .. }

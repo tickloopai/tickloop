@@ -52,11 +52,15 @@ pub struct ShellTaskCapabilities {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ShellTask {
     pub id: Uuid,
-    /// 任务所属的 Chat；Task Center 列出本进程全部 Chat 的任务。
+    /// 任务所属的 Chat。
     pub chat_id: ChatId,
     pub origin: ShellTaskOrigin,
     pub owner: ShellTaskOwner,
     pub command: String,
+    /// What the command does: the Bash call's description, or one generated once the task moved
+    /// to background without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     pub cwd: PathBuf,
     pub state: ShellTaskState,
     pub was_background: bool,
@@ -67,6 +71,10 @@ pub struct ShellTask {
     pub output_bytes: u64,
     #[serde(default)]
     pub updated_at_ms: Option<u64>,
+    /// When the task ended, in Unix milliseconds. Unlike `updated_at_ms`, later output-file or
+    /// record changes never move it, so it dates the end a Monitor row reports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at_ms: Option<u64>,
     pub capabilities: ShellTaskCapabilities,
 }
 
@@ -125,7 +133,7 @@ pub struct ShellTaskDelta {
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ShellTaskSubscriptionEvent {
-    Changed(ShellTaskDelta),
+    Changed(Box<ShellTaskDelta>),
     ResyncRequired { last_live_revision: u64 },
 }
 
@@ -427,11 +435,13 @@ mod tests {
         let chat_id = Uuid::new_v4();
         ShellTask {
             updated_at_ms: None,
+            ended_at_ms: None,
             id: Uuid::new_v4(),
             chat_id,
             origin: ShellTaskOrigin::User,
             owner: ShellTaskOwner::User { chat_id },
             command: "interactive-command".into(),
+            description: None,
             cwd: PathBuf::from("/tmp"),
             state: ShellTaskState::Background,
             was_background: true,

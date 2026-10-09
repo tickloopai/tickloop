@@ -760,11 +760,11 @@ impl ConnectionBudget {
     }
 }
 
-/// A protocol Tick as a watch sees it: its declared recovery tool, and a registration that
-/// yields the current content and then latest-only updates.
+/// A protocol Tick as a watch sees it: its declaration, which names it and its recovery tool,
+/// and a registration that yields the current content and then latest-only updates.
 #[async_trait::async_trait]
 trait ProtocolFeed: Send + Sync {
-    async fn recovery_tool(&self) -> Result<Option<String>, String>;
+    async fn descriptor(&self) -> Result<tick_protocol::TickDescriptor, String>;
 
     async fn watch(
         &self,
@@ -780,11 +780,8 @@ trait ProtocolFeed: Send + Sync {
 
 #[async_trait::async_trait]
 impl ProtocolFeed for tickhost_connect::session::SessionClient {
-    async fn recovery_tool(&self) -> Result<Option<String>, String> {
-        self.describe()
-            .await
-            .map(|descriptor| descriptor.recover_with)
-            .map_err(|error| error.to_string())
+    async fn descriptor(&self) -> Result<tick_protocol::TickDescriptor, String> {
+        self.describe().await.map_err(|error| error.to_string())
     }
 
     async fn watch(
@@ -1092,7 +1089,10 @@ async fn observe_terminal(
                     instance.clone(),
                     targets.iter().copied(),
                     TickMetadata {
-                        title: instance.to_string(),
+                        title: access
+                            .located_name(instance)
+                            .await
+                            .unwrap_or_else(|| instance.to_string()),
                         kind: ObservationKind::Terminal {
                             truncated: snapshot.truncated,
                         },
@@ -1214,8 +1214,8 @@ async fn observe_protocol(
     if attempted.is_empty() {
         return true;
     }
-    let recovery_tool = match feed.recovery_tool().await {
-        Ok(recovery_tool) => recovery_tool,
+    let descriptor = match feed.descriptor().await {
+        Ok(descriptor) => descriptor,
         Err(_) => {
             publisher.state_to(
                 instance.clone(),
@@ -1248,11 +1248,12 @@ async fn observe_protocol(
         instance.clone(),
         scope.admitted(&wanted.borrow().clone(), instance, publisher),
         TickMetadata {
-            title: instance.to_string(),
+            title: descriptor.title,
             kind: ObservationKind::Protocol,
             updated_at_ms: None,
         },
     );
+    let recovery_tool = descriptor.recover_with;
     let mut latest_sequence = baseline.sequence;
     let baseline_targets = scope.admitted(&wanted.borrow_and_update().clone(), instance, publisher);
     for watch in baseline_targets.iter().copied() {

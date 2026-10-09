@@ -98,6 +98,8 @@ mod model_live;
 mod model_stream_replay;
 #[path = "all/module_boundaries_live.rs"]
 mod module_boundaries_live;
+#[path = "all/monitor_updates.rs"]
+mod monitor_updates;
 #[path = "all/native_observation.rs"]
 mod native_observation;
 #[path = "all/observers.rs"]
@@ -134,6 +136,8 @@ mod rewind_points;
 mod rewind_restore;
 #[path = "all/session_permission_branching.rs"]
 mod session_permission_branching;
+#[path = "all/shell_descriptions.rs"]
+mod shell_descriptions;
 #[path = "all/shell_read_only.rs"]
 mod shell_read_only;
 #[path = "all/shell_tools.rs"]

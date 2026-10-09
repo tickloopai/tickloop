@@ -1,4 +1,4 @@
-//! Client of the independent Artifact Service: device login, stored credentials and the catalog.
+//! Client of the independent Tick Loop Artifacts service: device login, stored credentials and the catalog.
 
 use std::{
     fs::{File, OpenOptions},
@@ -30,7 +30,7 @@ pub use agent_requests::{
 pub use catalog::{AgentLinkMetadata, ArtifactMetadata, ArtifactOperation, ArtifactPage};
 
 pub const DEFAULT_ORIGIN: &str = "https://tickloop.ai";
-/// Every page, API route and the MCP endpoint of the Artifact Service live under this path of its origin.
+/// Every page, API route and the MCP endpoint of Tick Loop Artifacts live under this path of its origin.
 pub const APP_BASE_PATH: &str = "/artifact";
 const BASE62_ALPHABET: &[u8; 62] =
     b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
@@ -53,34 +53,36 @@ const USER_AGENT: &str = concat!(
 #[derive(Debug, thiserror::Error)]
 pub enum ArtifactError {
     #[error(
-        "invalid Artifact Service origin; use an HTTPS origin or an HTTP loopback test endpoint"
+        "invalid Tick Loop Artifacts origin; use an HTTPS origin or an HTTP loopback test endpoint"
     )]
     InvalidOrigin,
-    #[error("Artifact Service connection failed")]
+    #[error("Tick Loop Artifacts connection failed")]
     Connection,
-    #[error("Artifact Service returned an invalid response")]
+    #[error("Tick Loop Artifacts returned an invalid response")]
     InvalidResponse,
-    #[error("Artifact Service authorization was denied")]
+    #[error("Tick Loop Artifacts authorization was denied")]
     AccessDenied,
-    #[error("Artifact Service device code expired")]
+    #[error("Tick Loop Artifacts device code expired")]
     Expired,
-    #[error("Artifact Service login cancelled")]
+    #[error("Tick Loop Artifacts login cancelled")]
     Cancelled,
     #[error("Artifact credentials changed while verifying the account")]
     AccountChanged,
-    #[error("Artifact Service credential storage is unavailable or unsafe")]
+    #[error("Tick Loop Artifacts credential storage is unavailable or unsafe")]
     Storage,
-    #[error("Artifact Service returned HTTP {status}: {code}")]
+    #[error("Tick Loop Artifacts returned HTTP {status}: {code}")]
     Service { status: u16, code: String },
-    #[error("Artifact Service modification outcome unknown; operation {operation_id}: {outcome}")]
+    #[error(
+        "Tick Loop Artifacts modification outcome unknown; operation {operation_id}: {outcome}"
+    )]
     OutcomeUnknown {
         operation_id: String,
         outcome: String,
     },
-    #[error("Artifact Service returned HTTP {0}")]
+    #[error("Tick Loop Artifacts returned HTTP {0}")]
     Http(u16),
     #[error(
-        "Artifact Service remote revocation is unconfirmed; local credential is retained for an explicit retry"
+        "Tick Loop Artifacts remote revocation is unconfirmed; local credential is retained for an explicit retry"
     )]
     RevocationUnknown,
 }
@@ -521,7 +523,7 @@ impl ArtifactClient {
             },
         )
         .map_err(|_| ArtifactError::Storage)?;
-        verify_private_directory(&path, "Artifact Service credential directory")
+        verify_private_directory(&path, "Tick Loop Artifacts credential directory")
             .map_err(|_| ArtifactError::Storage)?;
         Ok(path)
     }

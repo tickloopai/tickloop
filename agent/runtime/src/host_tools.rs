@@ -19,7 +19,7 @@ pub fn herdr_adapter_pane(pane: HerdrPane) -> tickhost_connect::herdr::Pane {
         tab_id,
         cwd,
         foreground_cwd,
-        title,
+        terminal_title_stripped,
         tokens,
     } = pane;
     tickhost_connect::herdr::Pane {
@@ -29,7 +29,7 @@ pub fn herdr_adapter_pane(pane: HerdrPane) -> tickhost_connect::herdr::Pane {
         tab_id,
         cwd,
         foreground_cwd,
-        title,
+        terminal_title_stripped,
         tokens,
     }
 }
@@ -363,7 +363,7 @@ impl HostCallResult {
 pub trait HostToolProvider: Send + Sync {
     fn definitions(&self) -> Vec<ToolDefinition>;
 
-    /// The Artifact Service client whose account the MCP tools act for; it also carries the
+    /// The Tick Loop Artifacts client whose account the MCP tools act for; it also carries the
     /// feedback request lifecycle.
     fn artifact_client(&self) -> Option<std::sync::Arc<tickloop_agent_artifacts::ArtifactClient>> {
         None

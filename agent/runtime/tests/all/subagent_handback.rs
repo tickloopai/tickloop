@@ -1,11 +1,75 @@
 use serde_json::json;
 use std::sync::Arc;
-use tickloop_agent_protocol::{EventKind, ExecutionMode};
+use tickloop_agent_protocol::{AgentColor, EventKind, ExecutionMode};
 use tickloop_agent_runtime::Agent;
 use tickloop_agent_test_support::routed::{RoutedModel, has_tool_result, state};
 use tickloop_agent_test_support::{
     ScriptedModel, auto_classification, call, config, next_event, text,
 };
+
+#[tokio::test]
+async fn each_new_subagent_gets_a_color_no_family_member_uses() {
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(RoutedModel::new(|request| {
+        if !state(request)["delegation"].is_null() {
+            return text("child idle");
+        }
+        for (call_id, name) in [("first", "alpha"), ("second", "beta")] {
+            if !has_tool_result(request, call_id) {
+                return call(
+                    call_id,
+                    "Subagent",
+                    json!({"task":"Wait","name":name,"run_in_background":true}),
+                );
+            }
+        }
+        text("root done")
+    }));
+    let agent = Agent::new_embedded(config(), model);
+    agent
+        .set_auto_reviewer(Arc::new(ScriptedModel::new(vec![
+            text(&auto_classification(false).to_string()),
+            text(&auto_classification(false).to_string()),
+        ])))
+        .await;
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::Auto)
+        .await
+        .unwrap();
+    let mut events = agent.subscribe();
+    let receipt = agent
+        .submit(chat, None, "Delegate two background tasks".into())
+        .await
+        .unwrap();
+    loop {
+        let event = next_event(&mut events).await;
+        if event.run_id != receipt.run_id {
+            continue;
+        }
+        match event.kind {
+            EventKind::Completed { .. } => break,
+            EventKind::PermissionRequested { .. } => panic!("unexpected approval"),
+            EventKind::Failed(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    let colors = agent
+        .subagents(chat)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|registration| (registration.handle, registration.color))
+        .collect::<Vec<_>>();
+    agent.shutdown().await;
+    assert_eq!(
+        colors,
+        [
+            ("alpha".to_owned(), Some(AgentColor::Red)),
+            ("beta".to_owned(), Some(AgentColor::Blue)),
+        ]
+    );
+}
 
 #[tokio::test]
 async fn auto_plain_final_text_is_not_forwarded_without_handback() {

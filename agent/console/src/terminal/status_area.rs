@@ -12,10 +12,13 @@ use super::{
     footer::{FooterFrame, FooterItemId},
     style::{Role, RoleLine},
 };
-use tickloop_agent_protocol::{TodoItem, TodoStatus};
+use tickloop_agent_protocol::{LoopState, TodoItem, TodoStatus};
 
 const MAX_PANEL_ITEMS: usize = 8;
 const TODO_CONTINUATION_INDENT: &str = "     ";
+/// A list shown on its own sits under its header, two columns in, as Claude Code's standalone
+/// `TaskListV2`.
+const TODO_STANDALONE_INDENT: &str = "  ";
 const TODO_ROW_PREFIX_COLUMNS: usize = 7;
 const TODO_STATUS_MARK_COLUMNS: usize = 2;
 const TODO_SUBJECT_MARGIN_COLUMNS: usize = 15;
@@ -127,16 +130,22 @@ impl StatusArea {
         !self.todo_completed_at.is_empty()
     }
 
+    /// Returns whether anything the status area shows changed.
     pub(super) fn update(
         &mut self,
         mode: String,
         model: String,
         context: Option<(u64, usize)>,
         todos: Vec<TodoItem>,
-    ) {
+    ) -> bool {
+        let context = context.filter(|(_, limit)| *limit > 0);
+        let changed = self.mode != mode
+            || self.model != model
+            || self.context != context
+            || self.todos != todos;
         self.mode = mode;
         self.model = model;
-        self.context = context.filter(|(_, limit)| *limit > 0);
+        self.context = context;
         let now = Instant::now();
         if !self.todos.is_empty() {
             for (index, todo) in todos
@@ -162,6 +171,14 @@ impl StatusArea {
 
         self.reconcile_panel();
         self.clamp_offset();
+        changed
+    }
+
+    /// Returns whether the shown mode changed.
+    pub(super) fn set_mode(&mut self, mode: String) -> bool {
+        let changed = self.mode != mode;
+        self.mode = mode;
+        changed
     }
 
     pub(super) fn available_panels(&self) -> impl Iterator<Item = FooterItemId> + '_ {
@@ -193,23 +210,46 @@ impl StatusArea {
     /// Replaces the visible family rows.
     pub(super) fn update_agents(&mut self, rows: Vec<AgentRow>, visible: Option<Uuid>) {
         self.visible_agent = visible;
-        let selected_index = self
-            .agents
-            .iter()
-            .position(|row| Some(row.agent_id) == self.selected_agent)
-            .unwrap_or(0);
         self.agents = rows;
-        if self
-            .selected_agent
-            .is_none_or(|id| !self.agents.iter().any(|row| row.agent_id == id))
-        {
-            self.selected_agent = self
-                .agents
-                .get(selected_index.min(self.agents.len().saturating_sub(1)))
-                .map(|row| row.agent_id);
-        }
+        self.restore_agent_selection();
         self.reconcile_panel();
         self.clamp_offset();
+    }
+
+    /// Keeps the remembered row while the list shows it; otherwise falls back to the viewed
+    /// member, then to the first row.
+    pub(super) fn restore_agent_selection(&mut self) {
+        let agents = self.visible_agents();
+        let shown = |id: Option<Uuid>| id.filter(|id| agents.iter().any(|row| row.agent_id == *id));
+        self.selected_agent = shown(self.selected_agent)
+            .or(shown(self.visible_agent))
+            .or_else(|| agents.first().map(|row| row.agent_id));
+    }
+
+    /// Carries the remembered row into another member's View, so switching members keeps it.
+    pub(super) fn adopt_agent_selection(&mut self, other: &Self) {
+        if other.selected_agent.is_some() {
+            self.selected_agent = other.selected_agent;
+        }
+    }
+
+    /// The selected member when it is a finished subagent the panel may drop now.
+    pub(super) fn selected_dismissible(&self) -> Option<Uuid> {
+        self.selected_agent()
+            .filter(|id| Some(*id) != self.visible_agent)
+            .and_then(|id| self.agents.iter().find(|row| row.agent_id == id))
+            .filter(|row| {
+                row.parent_id.is_some()
+                    && matches!(
+                        row.state,
+                        LoopState::Completed
+                            | LoopState::Failed
+                            | LoopState::Stopped
+                            | LoopState::Interrupted
+                            | LoopState::Expired
+                    )
+            })
+            .map(|row| row.agent_id)
     }
 
     pub(super) fn selected_agent(&self) -> Option<Uuid> {
@@ -304,14 +344,9 @@ impl StatusArea {
         self.agents_collapsed = !self.agents_collapsed;
     }
 
+    #[cfg(test)]
     pub(super) fn selected_panel(&self) -> Option<FooterItemId> {
         self.visible
-    }
-
-    pub(super) fn scroll(&mut self, amount: isize, capacity: usize) {
-        let count = self.visible.map_or(0, |_| self.family_row_count());
-        let max_offset = count.saturating_sub(capacity);
-        self.offset = self.offset.saturating_add_signed(amount).min(max_offset);
     }
 
     pub(super) fn row_count(&self, height: usize) -> usize {
@@ -473,40 +508,50 @@ impl StatusArea {
         let mut lines = Vec::new();
         if !has_activity {
             let mut header = RoleLine::role("  ", Role::MutedText);
-            header.push(self.todos.len().to_string(), Some(Role::Strong));
+            header.push(self.todos.len().to_string(), Some(Role::MutedStrong));
             header.push(" tasks (", Some(Role::MutedText));
-            header.push(completed.to_string(), Some(Role::Strong));
+            header.push(completed.to_string(), Some(Role::MutedStrong));
             header.push(" done, ", Some(Role::MutedText));
             if in_progress > 0 {
-                header.push(in_progress.to_string(), Some(Role::Strong));
+                header.push(in_progress.to_string(), Some(Role::MutedStrong));
                 header.push(" in progress, ", Some(Role::MutedText));
             }
-            header.push(pending.to_string(), Some(Role::Strong));
+            header.push(pending.to_string(), Some(Role::MutedStrong));
             header.push(" open)", Some(Role::MutedText));
             header.truncate(width);
             lines.push(header);
         }
-        let has_tree_indent = width > TODO_ROW_PREFIX_COLUMNS;
+        // Under the Working line the list hangs from `⎿`; on its own it has no connector.
+        let has_tree_indent = has_activity && width > TODO_ROW_PREFIX_COLUMNS;
+        let standalone_indent = if has_activity || width <= TODO_ROW_PREFIX_COLUMNS {
+            ""
+        } else {
+            TODO_STANDALONE_INDENT
+        };
         let prefix_columns = if has_tree_indent {
             TODO_ROW_PREFIX_COLUMNS
         } else {
-            TODO_STATUS_MARK_COLUMNS
+            standalone_indent.len() + TODO_STATUS_MARK_COLUMNS
         };
         let subject_columns = width
             .saturating_sub(TODO_SUBJECT_MARGIN_COLUMNS)
             .max(TODO_SUBJECT_MARGIN_COLUMNS)
             .min(width.saturating_sub(prefix_columns));
         for (index, (_, todo)) in todos.iter().take(capacity).enumerate() {
+            // Claude Code's `TaskListV2`: a green tick and dim struck-through text when done, an
+            // orange square and bold text in progress, plain text still open.
             let (glyph, icon_role, text_role) = match todo.status {
-                TodoStatus::Completed => {
-                    (Glyph::TodoCompleted, Role::MutedText, Role::CompletedTodo)
-                }
+                TodoStatus::Completed => (
+                    Glyph::TodoCompleted,
+                    Some(Role::Success),
+                    Some(Role::CompletedTodo),
+                ),
                 TodoStatus::InProgress => (
                     Glyph::TodoInProgress,
-                    Role::InProgressTodo,
-                    Role::InProgressTodo,
+                    Some(Role::InProgressTodo),
+                    Some(Role::Strong),
                 ),
-                TodoStatus::Pending => (Glyph::TodoPending, Role::Text, Role::Text),
+                TodoStatus::Pending => (Glyph::TodoPending, None, None),
             };
             let mut title = super::safe_text(&todo.content).replace(['\n', '\t'], " ");
             if UnicodeWidthStr::width(title.as_str()) > subject_columns {
@@ -516,15 +561,15 @@ impl StatusArea {
                 );
             }
             let prefix = if !has_tree_indent {
-                String::new()
+                standalone_indent.to_owned()
             } else if index == 0 {
                 format!("  {}  ", display.glyph(Glyph::TodoBranch))
             } else {
                 TODO_CONTINUATION_INDENT.to_owned()
             };
             let mut line = RoleLine::role(prefix, Role::MutedText);
-            line.push(format!("{} ", display.glyph(glyph)), Some(icon_role));
-            line.push(title, Some(text_role));
+            line.push(format!("{} ", display.glyph(glyph)), icon_role);
+            line.push(title, text_role);
             line.truncate(width);
             lines.push(line);
         }
@@ -547,7 +592,7 @@ impl StatusArea {
             let indent = if has_tree_indent {
                 TODO_CONTINUATION_INDENT
             } else {
-                ""
+                standalone_indent
             };
             let mut summary =
                 RoleLine::role(format!("{indent}… +{}", parts.join(", ")), Role::MutedText);
@@ -555,6 +600,18 @@ impl StatusArea {
             lines.push(summary);
         }
         lines
+    }
+
+    /// When time alone next changes the open Subagents list: a working member's dot blinking or
+    /// its run time ticking, or another member's age. `None` while the list is closed.
+    pub(super) fn next_frame_ms(&self, now: u64, display: DisplayProfile) -> Option<u64> {
+        if !self.is_open() {
+            return None;
+        }
+        self.visible_agents()
+            .into_iter()
+            .filter_map(|row| super::subagent_panel::next_change_ms(row, display, now))
+            .min()
     }
 
     pub(super) fn panel_lines_with_rows(
@@ -633,8 +690,7 @@ impl StatusArea {
             .max()
             .unwrap_or(4);
         for row in agents.iter().skip(offset).take(capacity) {
-            let selected = footer.list_focused
-                && footer.selected == Some(FooterItemId::Agents)
+            let selected = footer.selected == Some(FooterItemId::Agents)
                 && Some(row.agent_id) == self.selected_agent;
             let line = super::subagent_panel::family_line(
                 row,
@@ -725,6 +781,7 @@ mod tests {
                 handle: title.into(),
                 description: title.into(),
                 created_at: tickloop_agent_base::private_fs::unix_time_milliseconds(),
+                color: None,
             }),
         };
         let mut area = StatusArea::default();
@@ -738,7 +795,6 @@ mod tests {
         let footer = FooterFrame {
             items: Vec::new(),
             selected: None,
-            list_focused: false,
         };
         let lines = area.panel_lines_with_rows(&footer, 48, 3, DisplayProfile::default());
         assert_eq!(lines[0].text(), "  ● main");
@@ -775,6 +831,7 @@ mod tests {
                 handle: title.into(),
                 description: "Run sleep 30".into(),
                 created_at: 100_000,
+                color: Some(tickloop_agent_protocol::AgentColor::Cyan),
             }),
         };
         let mut area = StatusArea::default();
@@ -793,13 +850,21 @@ mod tests {
                 let footer = FooterFrame {
                     items: Vec::new(),
                     selected: None,
-                    list_focused: false,
                 };
                 let lines = area.panel_lines_at(&footer, 80, 3, display, 161_000);
                 assert!(lines[1].text().ends_with("1m 1s"), "{lines:?}");
                 assert!(lines[1].text().contains("Run sleep 30"));
                 assert!(lines.iter().all(|line| line.fill.is_none()));
-                assert_eq!(lines[1].spans[0].role, Some(Role::Title));
+                assert_eq!(lines[1].spans[0].role, Some(Role::AgentCyan));
+                assert!(
+                    lines[1]
+                        .spans
+                        .iter()
+                        .any(|span| span.text.contains("sleep-30")
+                            && span.role == Some(Role::AgentCyan)),
+                    "the name wears the member's Agent Color: {:?}",
+                    lines[1]
+                );
                 assert_eq!(lines[0].spans[0].role, Some(Role::MutedText));
                 for width in [1, 8, 16, 32, 80] {
                     assert!(
@@ -811,7 +876,6 @@ mod tests {
                 let focused = FooterFrame {
                     items: Vec::new(),
                     selected: Some(FooterItemId::Agents),
-                    list_focused: true,
                 };
                 let selected = area.panel_lines_at(&focused, 80, 3, display, 161_000);
                 assert_eq!(
@@ -833,12 +897,22 @@ mod tests {
         let unfocused = FooterFrame {
             items: Vec::new(),
             selected: None,
-            list_focused: false,
         };
         assert!(
             area.panel_lines_at(&unfocused, 80, 3, DisplayProfile::default(), 161_000)[1]
                 .text()
                 .ends_with("1m 1s")
+        );
+        let dot = |now| {
+            area.panel_lines_at(&unfocused, 80, 3, DisplayProfile::default(), now)[1].spans[1]
+                .clone()
+        };
+        assert_eq!(dot(161_000).text, "●", "the viewed member's dot is filled");
+        assert_eq!(dot(161_000).role, Some(Role::RunningMark));
+        assert_eq!(dot(161_500).role, Some(Role::RunningMarkDim), "it blinks");
+        assert_eq!(
+            area.next_frame_ms(161_100, DisplayProfile::default()),
+            Some(161_500)
         );
         rows[1].group = AttentionGroup::Waiting;
         rows[1].state = tickloop_agent_protocol::LoopState::WaitingTrigger;
@@ -854,11 +928,12 @@ mod tests {
                 display.glyph(Glyph::AgentWaiting),
                 display.glyph(Glyph::AgentIdle)
             );
+            let waiting = &area.panel_lines_at(&unfocused, 80, 3, display, 181_000)[1];
             assert!(
-                area.panel_lines_at(&unfocused, 80, 3, display, 181_000)[1]
-                    .text()
-                    .ends_with("waiting · trigger")
+                waiting.text().ends_with(" 1m") && !waiting.text().contains("waiting"),
+                "a waiting member shows how long ago it changed: {waiting:?}"
             );
+            assert_eq!(waiting.spans[1].role, Some(Role::MutedText));
         }
         rows[1].group = AttentionGroup::Idle;
         rows[1].state = tickloop_agent_protocol::LoopState::Idle;
@@ -868,12 +943,11 @@ mod tests {
         let footer = FooterFrame {
             items: Vec::new(),
             selected: None,
-            list_focused: false,
         };
+        let idle = &area.panel_lines_at(&footer, 80, 3, DisplayProfile::default(), 181_000)[1];
         assert!(
-            area.panel_lines_at(&footer, 80, 3, DisplayProfile::default(), 181_000)[1]
-                .text()
-                .ends_with("idle")
+            idle.text().ends_with(" 1m") && !idle.text().contains("idle"),
+            "{idle:?}"
         );
         rows[1].group = AttentionGroup::Working;
         rows[1].state = tickloop_agent_protocol::LoopState::Running;
@@ -982,11 +1056,29 @@ mod tests {
                 let theme = display.theme();
                 let rows = area.todo_lines(80, 24, display, true, Instant::now());
                 let mut rendered_rows = Vec::new();
-                for (row, (title, glyph, colour, bold, crossed_out)) in rows.iter().zip([
-                    ("pending", Glyph::TodoPending, Role::Text, false, false),
-                    ("active", Glyph::TodoInProgress, Role::Accent, true, false),
-                    ("done", Glyph::TodoCompleted, Role::MutedText, false, true),
-                ]) {
+                // Claude Code's task list: plain while open, an orange square and bold text in
+                // progress, a green tick and muted struck-through text when done.
+                for (row, (title, glyph, icon_colour, text_colour, bold, crossed_out)) in
+                    rows.iter().zip([
+                        ("pending", Glyph::TodoPending, None, None, false, false),
+                        (
+                            "active",
+                            Glyph::TodoInProgress,
+                            Some(Role::Accent),
+                            None,
+                            true,
+                            false,
+                        ),
+                        (
+                            "done",
+                            Glyph::TodoCompleted,
+                            Some(Role::Success),
+                            Some(Role::MutedText),
+                            false,
+                            true,
+                        ),
+                    ])
+                {
                     let resolved = row.resolve(theme, 80);
                     let icon = resolved
                         .spans
@@ -1000,15 +1092,15 @@ mod tests {
                         .unwrap();
                     assert_eq!(
                         icon.style.foreground,
-                        theme.style(colour).foreground,
+                        icon_colour.and_then(|role| theme.style(role).foreground),
                         "{glyph_set:?} {name:?} {title} icon"
                     );
                     assert_eq!(
                         text.style.foreground,
-                        theme.style(colour).foreground,
+                        text_colour.and_then(|role| theme.style(role).foreground),
                         "{glyph_set:?} {name:?} {title} text"
                     );
-                    assert_eq!(icon.style.bold, bold);
+                    assert!(!icon.style.bold);
                     assert!(!icon.style.crossed_out);
                     assert_eq!(text.style.bold, bold);
                     assert_eq!(text.style.crossed_out, crossed_out);
@@ -1022,10 +1114,16 @@ mod tests {
                 );
                 themed_rows.push(rendered_rows);
             }
-            assert_ne!(
-                themed_rows[0][0], themed_rows[1][0],
-                "pending row must recolour when switching themes"
-            );
+            for rows in &themed_rows {
+                assert!(
+                    rows[0].ends_with(&format!(
+                        "\x1b[0m{} pending",
+                        display.glyph(Glyph::TodoPending)
+                    )),
+                    "an open task keeps the terminal's own colours: {:?}",
+                    rows[0]
+                );
+            }
             assert_ne!(
                 themed_rows[0][2], themed_rows[1][2],
                 "completed row must recolour when switching themes"
@@ -1204,6 +1302,29 @@ mod tests {
     }
 
     #[test]
+    fn an_idle_todo_list_sits_under_its_header_without_a_connector() {
+        let mut area = StatusArea::default();
+        let mut todos = vec![todo("Back up"), todo("Migrate"), todo("Verify")];
+        todos[0].status = TodoStatus::Completed;
+        todos[1].status = TodoStatus::InProgress;
+        todos[2].status = TodoStatus::Pending;
+        area.update("Auto".into(), "fixture".into(), None, todos);
+        let idle = area.todo_lines(80, 24, DisplayProfile::default(), false, Instant::now());
+        assert_eq!(
+            idle.iter().map(RoleLine::text).collect::<Vec<_>>(),
+            [
+                "  3 tasks (1 done, 1 in progress, 1 open)",
+                "  ✔ Back up",
+                "  ◼ Migrate",
+                "  ◻ Verify",
+            ]
+        );
+        let working = area.todo_lines(80, 24, DisplayProfile::default(), true, Instant::now());
+        assert_eq!(working[0].text(), "  ⎿  ✔ Back up");
+        assert_eq!(working[1].text(), "     ◼ Migrate");
+    }
+
+    #[test]
     fn context_segment_shows_zero_before_usage_with_a_known_window() {
         let mut area = StatusArea::default();
         area.update("Auto".into(), "model".into(), Some((0, 200_000)), vec![]);
@@ -1356,5 +1477,101 @@ mod tests {
 
         area.update("Full Access".into(), "model".into(), None, vec![]);
         assert_eq!(area.status_line(80, "").spans[0].role, Some(Role::Error));
+    }
+
+    #[test]
+    fn subagent_panel_marks_finished_states_and_remembers_the_selection() {
+        use crate::agent_console::AttentionGroup;
+        use tickloop_agent_protocol::{AgentColor, SubagentRegistration};
+        let root = Uuid::from_u128(1);
+        let row = |id: u128, state: LoopState, group: AttentionGroup, completed: bool| AgentRow {
+            agent_id: Uuid::from_u128(id),
+            parent_id: (id != 1).then_some(root),
+            title: format!("member-{id}"),
+            status: format!("{state:?}"),
+            state,
+            project: String::new(),
+            workspace: None,
+            approvals: 0,
+            questions: 0,
+            group,
+            glyph: super::super::console::status_glyph(group, completed),
+            preview: None,
+            updated_at: Some(64_000),
+            subagent: (id != 1).then(|| SubagentRegistration {
+                child_chat_id: Uuid::from_u128(id),
+                handle: format!("member-{id}"),
+                description: "work".into(),
+                created_at: 1_000,
+                color: Some(AgentColor::ALL[id as usize % 8]),
+            }),
+        };
+        let mut area = StatusArea::default();
+        area.update("Auto".into(), "model".into(), None, Vec::new());
+        area.update_agents(
+            vec![
+                row(1, LoopState::Idle, AttentionGroup::Idle, false),
+                row(2, LoopState::Completed, AttentionGroup::Done, true),
+                row(3, LoopState::Failed, AttentionGroup::Errors, false),
+                row(4, LoopState::Stopped, AttentionGroup::Done, false),
+                row(5, LoopState::Interrupted, AttentionGroup::Done, false),
+            ],
+            Some(root),
+        );
+        let footer = FooterFrame {
+            items: Vec::new(),
+            selected: None,
+        };
+        let lines = area.panel_lines_at(&footer, 60, 6, DisplayProfile::default(), 70_000);
+        assert_eq!(lines[0].spans[1].role, Some(Role::MutedText), "idle main");
+        for (index, dot) in [
+            (1, Role::SuccessMark),
+            (2, Role::ErrorMark),
+            (3, Role::WarningMark),
+            (4, Role::WarningMark),
+        ] {
+            let line = &lines[index];
+            assert_eq!(line.spans[1].text, "○");
+            assert_eq!(line.spans[1].role, Some(dot), "{line:?}");
+            assert!(line.text().ends_with(" 6s"), "only the age: {line:?}");
+            assert_eq!(line.spans.last().unwrap().role, Some(Role::MutedText));
+            for word in ["done", "failed", "stopped", "✔", "✖"] {
+                assert!(!line.text().contains(word), "{line:?}");
+            }
+        }
+        assert_eq!(
+            area.next_frame_ms(70_000, DisplayProfile::default()),
+            Some(71_000),
+            "the ages tick each second"
+        );
+
+        area.select(FooterItemId::Agents);
+        area.restore_agent_selection();
+        assert_eq!(area.selected_agent(), Some(root), "the viewed member first");
+        area.move_agent_selection(2, 6);
+        assert_eq!(area.selected_dismissible(), Some(Uuid::from_u128(3)));
+        let mut next = StatusArea::default();
+        next.adopt_agent_selection(&area);
+        next.update_agents(area.agents.clone(), Some(Uuid::from_u128(2)));
+        next.select(FooterItemId::Agents);
+        assert_eq!(
+            next.selected_agent(),
+            Some(Uuid::from_u128(3)),
+            "switching members keeps the remembered row"
+        );
+        next.update_agents(
+            area.agents
+                .iter()
+                .filter(|row| row.agent_id != Uuid::from_u128(3))
+                .cloned()
+                .collect(),
+            Some(Uuid::from_u128(2)),
+        );
+        assert_eq!(
+            next.selected_agent(),
+            Some(Uuid::from_u128(2)),
+            "a departed row falls back to the viewed member"
+        );
+        assert_eq!(next.selected_dismissible(), None, "the viewed member stays");
     }
 }

@@ -1,17 +1,29 @@
 //! Plan mode and todo list texts the model reads, adapted from Claude Code's `EnterPlanModeTool`,
-//! `ExitPlanModeTool` and `TodoWriteTool` prompts and results and the plan mode reminders of
-//! `utils/messages.ts`. The planning reminder uses direct Read, Glob and Grep exploration.
+//! `ExitPlanModeTool` and `TodoWriteTool` prompts and results and the plan mode reminders and
+//! `plan_mode_exit` attachment of `utils/messages.ts`. Tick Loop has no Explore or Plan agent
+//! types: the planning reminder explores with Read, Glob and Grep, and delegates read-only
+//! research or design to Subagent children, which report in their final reply.
 
 use std::path::Path;
 
 use crate::mcp_tools::ARTIFACT_EDIT_TOOL;
 
+use tickloop_agent_protocol::SUBAGENT_TOOL_NAME;
 use tickloop_agent_tools::{
     ASK_USER_QUESTION_TOOL_NAME, EDIT_TOOL_NAME, ENTER_PLAN_MODE_TOOL_NAME,
     EXIT_PLAN_MODE_TOOL_NAME, GLOB_TOOL_NAME, GREP_TOOL_NAME, READ_TOOL_NAME, WRITE_TOOL_NAME,
 };
 
 pub(super) const NOT_IN_PLAN_MODE: &str = "You are not in plan mode. This tool is only for exiting plan mode after writing a plan. If your plan was already approved, continue with implementation.";
+
+/// Claude Code's subagent plan mode reminder (`getPlanModeV2SubAgentInstructions`) for a child
+/// frozen in Plan. Tick Loop gives the child no plan file: its final reply carries the findings or
+/// plan to the parent, which submits the plan.
+pub(super) const DELEGATED_PLAN_MODE_REMINDER: &str = "# Plan mode
+
+Plan mode is active. The user indicated that they do not want you to execute yet -- you MUST NOT make any edits, run any non-readonly tools (including changing configs or making commits), or otherwise make any changes to the system. This supersedes any other instructions you have received (for example, to make edits). Your delegated authorization stays in Plan mode, and you do not submit plans for approval.
+
+Instead, research the task with read-only tools and answer it comprehensively in your final reply: your findings, or the approach you recommend with the files to change, the existing code to reuse and how to verify it. Your parent Agent writes the plan and submits it for the user's approval. Use AskUserQuestion if you need to ask the user clarifying questions; if you do, ask all of them before proceeding.";
 
 pub(super) const TODO_WRITE_RESULT: &str = "Todos have been modified successfully. Ensure that you continue to use the todo list to track your progress. Please proceed with the current tasks if applicable";
 
@@ -209,7 +221,25 @@ You can refer back to it if needed during implementation.
     )
 }
 
-/// The plan mode section of every conversation request while the Chat is in Plan mode.
+/// Claude Code's `plan_mode_exit` attachment, sent once after the user leaves Plan mode without
+/// approving a plan.
+pub(crate) fn plan_mode_exit_notice(plan_file: Option<&Path>) -> String {
+    let plan_reference = plan_file
+        .map(|path| {
+            format!(
+                " The plan file is located at {} if you need to reference it.",
+                path.display()
+            )
+        })
+        .unwrap_or_default();
+    format!(
+        "## Exited Plan Mode
+
+You have exited plan mode. You can now make edits, run tools, and take actions.{plan_reference}"
+    )
+}
+
+/// The plan mode section of every conversation request while a root Chat is in Plan mode.
 pub(crate) fn plan_mode_reminder(plan_file: &Path, plan_exists: bool) -> String {
     let plan_file = plan_file.display();
     let plan_file_info = if plan_exists {
@@ -238,7 +268,7 @@ You are pair-planning with the user. Explore the code to build context, ask the 
 
 Repeat this cycle until the plan is complete:
 
-1. **Explore** — Use {READ_TOOL_NAME}, {GLOB_TOOL_NAME}, {GREP_TOOL_NAME} to read code. Look for existing functions, utilities, and patterns to reuse.
+1. **Explore** — Use {READ_TOOL_NAME}, {GLOB_TOOL_NAME}, {GREP_TOOL_NAME} to read code. Look for existing functions, utilities, and patterns to reuse. You can use {SUBAGENT_TOOL_NAME} to parallelize complex searches or to design an approach without filling your context, though for straightforward queries direct tools are simpler. Children you create while planning stay read-only and return their findings or proposed design in their final reply; only you write the plan file and call {EXIT_PLAN_MODE_TOOL_NAME}.
 2. **Update the plan file** — After each discovery, immediately capture what you learned. Don't wait until the end.
 3. **Ask the user** — When you hit an ambiguity or decision you can't resolve from code alone, use {ASK_USER_QUESTION_TOOL_NAME}. Then go back to step 1.
 
@@ -484,6 +514,29 @@ mod tests {
             assert!(
                 reminder.contains("- Calling ExitPlanMode when the plan is ready for approval")
             );
+            assert!(reminder.contains(
+                "Children you create while planning stay read-only and return their findings or proposed design in their final reply; only you write the plan file and call ExitPlanMode."
+            ));
         }
+    }
+
+    #[test]
+    fn a_delegated_child_reports_its_plan_instead_of_submitting_it() {
+        assert!(DELEGATED_PLAN_MODE_REMINDER.contains("you MUST NOT make any edits"));
+        assert!(DELEGATED_PLAN_MODE_REMINDER.contains("in your final reply"));
+        assert!(!DELEGATED_PLAN_MODE_REMINDER.contains(EXIT_PLAN_MODE_TOOL_NAME));
+        assert!(!DELEGATED_PLAN_MODE_REMINDER.contains("plan file"));
+    }
+
+    #[test]
+    fn the_exit_notice_references_an_existing_plan_file() {
+        let notice = "## Exited Plan Mode\n\nYou have exited plan mode. You can now make edits, run tools, and take actions.";
+        assert_eq!(plan_mode_exit_notice(None), notice);
+        assert_eq!(
+            plan_mode_exit_notice(Some(Path::new("/root/plans/calm-baking-aurora-loop-x.md"))),
+            format!(
+                "{notice} The plan file is located at /root/plans/calm-baking-aurora-loop-x.md if you need to reference it."
+            )
+        );
     }
 }

@@ -30,6 +30,7 @@ pub struct ShellTaskSubscription {
     chat_id: ChatId,
     agent_events: broadcast::Receiver<Event>,
     user_events: broadcast::Receiver<UserShellRecord>,
+    description_events: broadcast::Receiver<Uuid>,
     pending_task_id: Option<Uuid>,
     known_tasks: HashMap<Uuid, ShellTask>,
     last_live_revision: u64,
@@ -85,6 +86,11 @@ impl ShellTaskCenter {
             };
             tasks.extend(project_tasks(&chat, live_agent_commands));
         }
+        let generated = self.agent.inner.shell_descriptions.lock().await;
+        for task in tasks.iter_mut().filter(|task| task.description.is_none()) {
+            task.description = generated.get(&task.id).cloned().flatten();
+        }
+        drop(generated);
         // 各 Chat 内部顺序不变；活动任务整体排在已结束任务之前，同类中前台 Chat 优先。
         tasks.sort_by_key(|task| (task.state.is_terminal(), task.chat_id != chat_id));
         let live_revision = match revisions.get_mut(&chat_id) {
@@ -119,12 +125,14 @@ impl ShellTaskCenter {
     ) -> Result<ShellTaskSubscription, ShellTaskCenterError> {
         let agent_events = self.agent.subscribe();
         let user_events = self.agent.subscribe_user_shells();
+        let description_events = self.agent.inner.shell_description_events.subscribe();
         let initial = self.snapshot(chat_id).await?;
         Ok(ShellTaskSubscription {
             center: self.clone(),
             chat_id,
             agent_events,
             user_events,
+            description_events,
             pending_task_id: None,
             known_tasks: task_map(&initial.tasks),
             last_live_revision: initial.live_revision,
@@ -245,6 +253,17 @@ impl ShellTaskSubscription {
                             return Err(ShellTaskCenterError::EventStreamClosed);
                         }
                     },
+                    event = self.description_events.recv() => match event {
+                        Ok(task_id) => Some(task_id),
+                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                            return Ok(ShellTaskSubscriptionEvent::ResyncRequired {
+                                last_live_revision: self.last_live_revision,
+                            });
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            return Err(ShellTaskCenterError::EventStreamClosed);
+                        }
+                    },
                 };
                 self.pending_task_id = task_id;
             }
@@ -269,12 +288,14 @@ impl ShellTaskSubscription {
             if previous.as_ref() == Some(&task) {
                 continue;
             }
-            return Ok(ShellTaskSubscriptionEvent::Changed(ShellTaskDelta {
-                live_revision: snapshot.live_revision,
-                task,
-                previous_state: previous.as_ref().map(|task| task.state),
-                previous_output_bytes: previous.map(|task| task.output_bytes),
-            }));
+            return Ok(ShellTaskSubscriptionEvent::Changed(Box::new(
+                ShellTaskDelta {
+                    live_revision: snapshot.live_revision,
+                    task,
+                    previous_state: previous.as_ref().map(|task| task.state),
+                    previous_output_bytes: previous.map(|task| task.output_bytes),
+                },
+            )));
         }
     }
 
@@ -347,6 +368,8 @@ fn agent_task(chat_id: ChatId, command: CommandSnapshot) -> ShellTask {
             None,
             Some(&command.output_ref),
         ),
+        // A command stamps its record when it finishes; output written later does not count.
+        ended_at_ms: command.updated_at_ms.filter(|_| state.is_terminal()),
         id: command.operation_id,
         chat_id,
         origin: ShellTaskOrigin::Agent,
@@ -354,6 +377,9 @@ fn agent_task(chat_id: ChatId, command: CommandSnapshot) -> ShellTask {
             loop_id: command.loop_id,
         },
         command: command.command,
+        description: command
+            .description
+            .filter(|description| !description.trim().is_empty()),
         cwd: command.cwd,
         state,
         was_background: command.was_background,
@@ -374,6 +400,10 @@ fn user_task(record: &UserShellRecord) -> ShellTask {
             record.state_since,
             record.output_ref.as_deref(),
         ),
+        ended_at_ms: record
+            .state_since
+            .or(record.updated_at_ms)
+            .filter(|_| state.is_terminal()),
         id: record.id,
         chat_id: record.chat_id,
         origin: ShellTaskOrigin::User,
@@ -381,6 +411,7 @@ fn user_task(record: &UserShellRecord) -> ShellTask {
             chat_id: record.chat_id,
         },
         command: record.command.clone(),
+        description: None,
         cwd: record.cwd.clone(),
         state,
         was_background: record.starts_in_background,
@@ -697,6 +728,8 @@ mod tests {
         let (updates, receiver) = broadcast::channel(1);
         subscription.user_events = receiver;
         subscription.agent_events = agent.subscribe();
+        // A fresh receiver keeps a background description arriving meanwhile from racing the lag.
+        subscription.description_events = agent.inner.shell_description_events.subscribe();
         updates.send(terminal.clone()).unwrap();
         updates.send(terminal).unwrap();
         assert!(matches!(

@@ -438,7 +438,7 @@ fn lost_execution_has_one_readable_notice_and_keeps_the_core_status() {
     view.writer.write_all(b"\x1b").unwrap();
     view.writer.flush().unwrap();
     let returned = wait_for_lost_presentation(&mut view, |frame| {
-        !frame.contains("Full archive") && frame.contains("nothing was resent")
+        !frame.contains("Showing detailed transcript") && frame.contains("nothing was resent")
     });
     assert_eq!(
         returned.matches("Execution connection was lost").count(),
@@ -467,7 +467,7 @@ fn completed_cached_execution_keeps_its_known_outcome_and_exposes_connection_det
             && frame.contains("Context unknown"),
         "{frame}"
     );
-    assert!(frame.contains("Ctrl+O details"), "{frame}");
+    assert!(frame.contains("ctrl+o details"), "{frame}");
     assert!(
         !frame.contains(LOST_RAW_ERROR) && !frame.contains("outcome unknown"),
         "{frame}"
@@ -582,7 +582,7 @@ fn an_unavailable_daemon_catalog_preserves_the_live_worker_core_and_connection_d
     view.writer.flush().unwrap();
     std::fs::remove_file(directory.path().join(DAEMON_UNAVAILABLE_FLAG)).unwrap();
     let recovered = wait_for_lost_presentation(&mut view, |frame| {
-        !frame.contains("Transcript ·")
+        !frame.contains("Showing detailed transcript")
             && !frame.contains("Disconnected")
             && frame.contains("Working")
             && frame.contains(LOST_MODEL)

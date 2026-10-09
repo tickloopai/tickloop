@@ -48,6 +48,7 @@ pub(super) enum ArtifactPickerEffect {
     Close,
     Choice(Box<ArtifactChoice>),
     EditQuery,
+    SignOut,
 }
 
 pub(super) struct ArtifactsPicker {
@@ -266,6 +267,9 @@ impl ArtifactsPicker {
             if key.code == KeyCode::Char('r') && key.modifiers == KeyModifiers::NONE {
                 self.reload(false);
                 return ArtifactPickerEffect::None;
+            }
+            if key.code == KeyCode::Char('s') && key.modifiers == KeyModifiers::NONE {
+                return ArtifactPickerEffect::SignOut;
             }
             if let Some(artifact) = self.selected().cloned() {
                 match (key.code, key.modifiers) {
@@ -496,21 +500,22 @@ impl ArtifactsPicker {
             lines.push(line);
         }
         let hint = if self.delete.is_some() {
-            "Delete permanently · 无法撤销 · Enter confirm · Esc cancel".into()
+            "Delete permanently · 无法撤销 · enter confirm · esc cancel".into()
         } else if self.rename.is_some() {
-            "Rename · Enter save · Ctrl+G editor · Esc cancel".into()
+            "Rename · enter save · ctrl+g editor · esc cancel".into()
         } else if let Some(error) = &self.error {
             format!("{error} · r retry")
         } else if self.loading {
-            "Loading… · Esc close".into()
+            "Loading… · esc close".into()
         } else {
             fit_hint(
                 &[
-                    ("Enter add".into(), 10),
+                    ("enter add".into(), 10),
                     ("/ search".into(), 7),
                     ("o open · c copy · p pin".into(), 5),
-                    ("Ctrl+R rename · d delete · r refresh".into(), 4),
-                    ("Esc close".into(), 9),
+                    ("ctrl+r rename · d delete · r refresh".into(), 4),
+                    ("s sign out".into(), 3),
+                    ("esc close".into(), 9),
                 ],
                 width,
                 display,
@@ -552,6 +557,28 @@ mod tests {
                 .iter()
                 .any(|line| line.text().contains("←/→ tabs"))
         );
+    }
+    #[test]
+    fn s_in_the_list_asks_to_sign_out_while_search_keeps_typing_it() {
+        let mut picker = ArtifactsPicker::new(None, "owner@example.test".into(), HashSet::new());
+        load(&mut picker, vec![artifact("a", "Research", "owner")]);
+        assert!(
+            picker
+                .frame(180, 20, DisplayProfile::default())
+                .lines
+                .last()
+                .is_some_and(|hint| hint.text().contains("s sign out"))
+        );
+        assert!(matches!(
+            picker.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE)),
+            ArtifactPickerEffect::SignOut
+        ));
+        picker.key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        assert!(matches!(
+            picker.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE)),
+            ArtifactPickerEffect::None
+        ));
+        assert_eq!(picker.picker.query(), "s");
     }
     fn artifact(id: &str, title: &str, role: &str) -> ArtifactMetadata {
         serde_json::from_value(serde_json::json!({"id":id,"title":title,"format":"markdown","access_role":role,"url":format!("https://docs.example/a/{id}"),"updated_at":"2026-10-06T00:00:00Z"})).unwrap()

@@ -542,9 +542,9 @@ fn run_hidden_view_pty(route: &str) {
     fixture.wait_for("Agents");
     if matches!(route, INTERRUPT_OVERVIEW_ROUTE | EXIT_OVERVIEW_ROUTE) {
         fixture.send(b"\t");
-        fixture.wait_for("Enter dispatch");
+        fixture.wait_for("enter dispatch");
         fixture.send(b"\x03");
-        let overview_frame = fixture.wait_for("Press Ctrl+C again to exit");
+        let overview_frame = fixture.wait_for("Press ctrl+c again to exit");
         assert!(
             !overview_frame.contains(FIRST_LINE)
                 && !overview_frame.contains(SECOND_LINE)

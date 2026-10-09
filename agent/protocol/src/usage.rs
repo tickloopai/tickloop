@@ -27,6 +27,8 @@ pub enum ModelRequestKind {
     PermissionCheck,
     /// `WebFetch` asking the Chat model about a fetched page (Claude Code `web_fetch_apply`).
     WebFetch,
+    /// Names a background Shell that has no description of its own.
+    ShellDescription,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -286,7 +288,10 @@ impl RequestUsageLedger {
             ModelRequestKind::CompactionManual
             | ModelRequestKind::CompactionDirected
             | ModelRequestKind::AutoSetup
-            | ModelRequestKind::Title => owner.loop_id.is_none() && owner.run_id.is_none(),
+            | ModelRequestKind::Title
+            | ModelRequestKind::ShellDescription => {
+                owner.loop_id.is_none() && owner.run_id.is_none()
+            }
             _ => owner.loop_id.is_some() && owner.run_id.is_some(),
         };
         if !valid_owner {

@@ -2,7 +2,7 @@
   {
     "Hello": {
       "process_id": 4242,
-      "major": 15,
+      "major": 16,
       "minor": 0,
       "daemon_epoch": "00000000-0000-0000-0000-0000000000e0",
       "session_id": "00000000-0000-0000-0000-000000000051",
@@ -148,7 +148,8 @@
                 "cpu_time_ms": 1500,
                 "rss_bytes": null,
                 "sampled_at_ms": 9000
-              }
+              },
+              "updated_at_ms": 8000
             },
             {
               "instance": "hosted:00000000-0000-0000-0000-000000000041",

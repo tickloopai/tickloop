@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use tokio::task::{Id, JoinSet};
 use uuid::Uuid;
 
-use super::{console::Console, safe_line, safe_text, workflows};
+use super::{console::Console, safe_line, workflows};
 use tickloop_agent_protocol::{
     AccessError, AccessErrorCode, ChatSnapshot, DirectedSummaryOutcome, DirectedSummaryRequest,
     SummaryDirection,
@@ -100,7 +100,7 @@ pub(super) fn finish_success(
     console.reset_chat(chat)?;
     workflows::write_public_history(console, &outcome.snapshot)?;
     console.write(&format!(
-        "Conversation summarized {}. Ctrl+O opens the full archive.\n",
+        "Conversation summarized {}. ctrl+o opens the detailed transcript.\n",
         direction_phrase(direction)
     ))?;
     let clear_goal = if let Some(draft) = outcome.draft {
@@ -153,8 +153,22 @@ pub(super) fn direction_phrase(direction: SummaryDirection) -> &'static str {
     }
 }
 
-pub(super) fn history_marker(summary: &str) -> String {
-    format!("\nSummarized conversation\n{}\n", safe_text(summary))
+/// Where earlier messages were summarized, as Claude Code's `CompactSummary` marks it: the `⏺`,
+/// a bold label and a muted hint; the summary itself is in the detailed transcript.
+pub(super) fn history_marker(
+    display: super::display::DisplayProfile,
+) -> Vec<(String, Option<super::style::Role>)> {
+    use super::style::Role;
+    vec![
+        ("\n".into(), None),
+        (
+            display.glyph(super::display::Glyph::Assistant).into(),
+            Some(Role::Text),
+        ),
+        (" ".into(), None),
+        ("Summarized conversation".into(), Some(Role::Strong)),
+        (" (ctrl+o to expand)\n".into(), Some(Role::MutedText)),
+    ]
 }
 
 #[cfg(test)]

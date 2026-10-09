@@ -10,7 +10,8 @@
           "cpu_time_ms": 1500,
           "rss_bytes": null,
           "sampled_at_ms": 9000
-        }
+        },
+        "updated_at_ms": 8000
       },
       {
         "instance": "hosted:00000000-0000-0000-0000-000000000041",
@@ -48,7 +49,10 @@
         ],
         "removed": [
           "herdr:session/workspace/pane/counter"
-        ]
+        ],
+        "handled": {
+          "hosted:00000000-0000-0000-0000-000000000040": 8500
+        }
       }
     }
   },
@@ -110,7 +114,10 @@
             ],
             "removed": [
               "hosted:00000000-0000-0000-0000-000000000040"
-            ]
+            ],
+            "handled": {
+              "herdr:session/workspace/pane/counter": 7500
+            }
           },
           "id": "00000000-0000-0000-0000-0000000000c1",
           "branch_origin": null,
@@ -191,7 +198,7 @@
                     "tab_id": "t1",
                     "cwd": "/work/project",
                     "foreground_cwd": null,
-                    "title": null,
+                    "terminal_title_stripped": null,
                     "tokens": {
                       "agent": "tickloop"
                     }
