@@ -48,6 +48,8 @@ fn settings_ux_pty_fixture() {
             console.select_chat(Some(chat)).unwrap();
             console.set_prompt_enabled(true).unwrap();
             let mut menus = Menus::new(Some(settings), Some(root));
+            // Keep navigation fixtures independent of the host's font-management tools.
+            menus.font_manager = None;
             std::fs::write(directory.join("ready"), "ready").unwrap();
             let mut login: Option<super::super::login::LoginFlow> = None;
             let mut login_sender = None;
@@ -196,6 +198,8 @@ struct Fixture {
     output: Arc<Mutex<Vec<u8>>>,
     _master: Box<dyn portable_pty::MasterPty + Send>,
     directory: tempfile::TempDir,
+    height: usize,
+    timeout: Duration,
 }
 
 impl Fixture {
@@ -204,10 +208,14 @@ impl Fixture {
     }
 
     fn start_with_mode(mode: &str) -> Self {
+        Self::start_at(mode, 24)
+    }
+
+    fn start_at(mode: &str, height: u16) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let pair = native_pty_system()
             .openpty(PtySize {
-                rows: 24,
+                rows: height,
                 cols: 100,
                 pixel_width: 0,
                 pixel_height: 0,
@@ -254,6 +262,8 @@ impl Fixture {
             output,
             _master: pair.master,
             directory,
+            height: height as usize,
+            timeout: TIMEOUT,
         };
         fixture
             .wait(|frame| frame.contains("❯") && fixture.directory.path().join("ready").exists());
@@ -268,16 +278,32 @@ impl Fixture {
     /// Waits for a settled frame: keys are ignored while a submitted choice is still being
     /// applied, so a frame showing that state never satisfies a wait.
     fn wait(&self, predicate: impl Fn(&str) -> bool) -> String {
-        let deadline = Instant::now() + TIMEOUT;
+        let deadline = Instant::now() + self.timeout;
         loop {
-            let frame = screen::visible_screen(
+            let mut frame = screen::visible_screen(
                 &String::from_utf8_lossy(&self.output.lock().unwrap()),
                 100,
-                24,
+                self.height,
+            );
+            assert!(
+                Instant::now() < deadline,
+                "PTY did not reach expected settings state:\n{frame}\nEvents: {}",
+                std::fs::read_to_string(self.directory.path().join("trace")).unwrap_or_default()
             );
             if predicate(&frame)
                 && !frame.contains(super::super::console::MENU_SUBMISSION_PENDING_HINT)
             {
+                thread::sleep(Duration::from_millis(30));
+                frame = screen::visible_screen(
+                    &String::from_utf8_lossy(&self.output.lock().unwrap()),
+                    100,
+                    self.height,
+                );
+                if !predicate(&frame)
+                    || frame.contains(super::super::console::MENU_SUBMISSION_PENDING_HINT)
+                {
+                    continue;
+                }
                 if let Some(root) = std::env::var_os("TICKLOOP_SETTINGS_UX_EVIDENCE_DIR") {
                     static FRAME: std::sync::atomic::AtomicUsize =
                         std::sync::atomic::AtomicUsize::new(0);
@@ -292,11 +318,6 @@ impl Fixture {
                 }
                 return frame;
             }
-            assert!(
-                Instant::now() < deadline,
-                "PTY did not reach expected settings state:\n{frame}\nEvents: {}",
-                std::fs::read_to_string(self.directory.path().join("trace")).unwrap_or_default()
-            );
             thread::sleep(Duration::from_millis(15));
         }
     }
@@ -315,6 +336,25 @@ impl Fixture {
         }
         panic!("option {label} was unreachable");
     }
+}
+
+#[test]
+fn settings_ux_pty_unstable_frames_cannot_extend_the_wait_deadline() {
+    let mut fixture = Fixture::start();
+    fixture.timeout = Duration::from_millis(150);
+    let started = Instant::now();
+    let calls = std::cell::Cell::new(0);
+    let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        fixture.wait(|_| {
+            calls.set(calls.get() + 1);
+            started.elapsed() < Duration::from_millis(700) && calls.get() % 2 == 1
+        });
+    }));
+    assert!(failure.is_err(), "unstable frames must time out");
+    assert!(
+        started.elapsed() < Duration::from_millis(600),
+        "stability retries extended the deadline"
+    );
 }
 
 impl Drop for Fixture {
@@ -685,7 +725,7 @@ fn settings_ux_pty_manage_providers_hint_matches_model_parent() {
 
 #[test]
 fn settings_scroll_pty_survives_a_successful_setting_change() {
-    let mut fixture = Fixture::start();
+    let mut fixture = Fixture::start_at("ordinary", 14);
     fixture.send(b"/settings\r");
     fixture.wait(|frame| frame.lines().any(|line| line == "Settings"));
     fixture.select("Reduce motion");
@@ -711,7 +751,7 @@ fn settings_scroll_pty_survives_a_successful_setting_change() {
 
 #[test]
 fn settings_scroll_pty_restores_parent_context_after_child_confirm_and_cancel() {
-    let mut fixture = Fixture::start();
+    let mut fixture = Fixture::start_at("ordinary", 14);
     fixture.send(b"/settings\r");
     fixture.wait(|frame| frame.lines().any(|line| line == "Settings"));
     fixture.select("Theme:");

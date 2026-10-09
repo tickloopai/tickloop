@@ -26,7 +26,9 @@ use crate::instance::InstanceRef;
 pub const MANAGEMENT_MAJOR: u16 = 1;
 pub const MANAGEMENT_MINOR: u16 = 0;
 pub const MANAGEMENT_FRAME_BYTES: usize = 64 * 1024;
-pub const BUSINESS_MAJOR: u16 = 1;
+/// 2.0: owner revisions on open, listings that name their host epoch, owner reconcile/end and
+/// Watch-intent leases, and explicit or automatic reads; a 1.0 host is refused at hello.
+pub const BUSINESS_MAJOR: u16 = 2;
 pub const BUSINESS_MINOR: u16 = 0;
 /// A complete business frame, large enough for one legal 8 MiB Tick Tool response.
 pub const BUSINESS_FRAME_BYTES: usize = 8 * 1024 * 1024 + 64 * 1024;

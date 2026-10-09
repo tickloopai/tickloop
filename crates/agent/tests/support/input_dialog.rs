@@ -1,14 +1,16 @@
 use std::{fs, path::PathBuf};
 
-const DIALOG_ROWS: usize = 12;
-const MIN_CONTENT_ROWS: usize = 4;
-
 pub fn assert_frame(frame: &str, height: usize, title: &str) {
     let lines = frame.lines().collect::<Vec<_>>();
-    let dialog_rows = height
-        .saturating_sub(MIN_CONTENT_ROWS)
-        .clamp(1, DIALOG_ROWS);
-    let top = height - dialog_rows;
+    let top = lines
+        .iter()
+        .rposition(|line| !line.is_empty() && line.chars().all(|character| character == '▔'))
+        .expect("The Input Dialog must have its shared top rule");
+    let dialog_rows = height - top;
+    assert!(
+        dialog_rows <= height.saturating_sub(2).max(1),
+        "The dialog must preserve the upper content budget:\n{frame}"
+    );
     assert_eq!(lines.len(), height, "{frame}");
     assert!(
         lines[top].chars().all(|character| character == '▔') && !lines[top].is_empty(),

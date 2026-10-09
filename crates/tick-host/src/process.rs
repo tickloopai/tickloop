@@ -108,29 +108,41 @@ mod tests {
         assert!(sample.cpu_time_ms.is_some());
     }
 
-    #[test]
-    fn cpu_time_counts_real_milliseconds() {
-        let started = std::time::Instant::now();
-        let mut spin = 0u64;
-        while started.elapsed() < std::time::Duration::from_millis(400) {
-            spin = std::hint::black_box(spin.wrapping_add(1));
-        }
-        let measured = super::sample(std::process::id())
-            .unwrap()
-            .cpu_time_ms
-            .unwrap();
+    fn kernel_cpu_time_ms() -> u64 {
         let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
         assert_eq!(
             unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) },
             0
         );
         let usage = unsafe { usage.assume_init() };
-        let rusage_ms =
+        let milliseconds =
             |time: libc::timeval| time.tv_sec as u64 * 1000 + time.tv_usec as u64 / 1000;
-        let expected = rusage_ms(usage.ru_utime) + rusage_ms(usage.ru_stime);
-        assert!(measured >= 300, "{measured} ms after a 400 ms busy loop");
+        milliseconds(usage.ru_utime) + milliseconds(usage.ru_stime)
+    }
+
+    #[test]
+    fn cpu_time_counts_real_milliseconds() {
+        const MINIMUM_CPU_WORK_MS: u64 = 400;
+        const MINIMUM_SAMPLED_CPU_MS: u64 = 300;
+        const CPU_SAMPLE_TOLERANCE_DIVISOR: u64 = 5;
+        const CPU_SAMPLE_TOLERANCE_MS: u64 = 50;
+        let started = kernel_cpu_time_ms();
+        let mut spin = 0u64;
+        while kernel_cpu_time_ms().saturating_sub(started) < MINIMUM_CPU_WORK_MS {
+            spin = std::hint::black_box(spin.wrapping_add(1));
+        }
+        let measured = super::sample(std::process::id())
+            .unwrap()
+            .cpu_time_ms
+            .unwrap();
+        let expected = kernel_cpu_time_ms();
         assert!(
-            measured.abs_diff(expected) <= expected / 5 + 50,
+            measured >= MINIMUM_SAMPLED_CPU_MS,
+            "{measured} ms after {MINIMUM_CPU_WORK_MS} ms of kernel-accounted CPU work"
+        );
+        assert!(
+            measured.abs_diff(expected)
+                <= expected / CPU_SAMPLE_TOLERANCE_DIVISOR + CPU_SAMPLE_TOLERANCE_MS,
             "sampled {measured} ms, the kernel reports {expected} ms"
         );
     }

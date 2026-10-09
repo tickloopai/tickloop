@@ -604,6 +604,12 @@ impl From<PermissionsView> for PermissionsPage {
     }
 }
 
+struct ListContent {
+    intro: Vec<RoleLine>,
+    rows: Vec<RoleLine>,
+    hint: &'static str,
+}
+
 pub(super) struct PermissionsSurface {
     subject: PermissionsSubject,
     view: PermissionsContent,
@@ -1683,12 +1689,8 @@ impl PermissionsSurface {
         self.scroll = 0;
     }
 
-    fn styled_overview(
-        &mut self,
-        width: usize,
-        height: usize,
-        body: &mut Vec<RoleLine>,
-    ) -> &'static str {
+    fn overview_content(&self, width: usize) -> ListContent {
+        let mut body = Vec::new();
         if self.page == Page::Auto {
             body.push(labelled_row("Mode  ", self.view.execution_mode.to_string()));
             let status = match self.view.preferred_reviewer {
@@ -1742,8 +1744,11 @@ impl PermissionsSurface {
                 environment_source_label(&self.view.auto_policy.environment.source),
             ));
             let footer = "Enter configure · Esc back";
-            self.push_selected_rows(rows, width, height, body);
-            return footer;
+            return ListContent {
+                intro: body,
+                rows,
+                hint: footer,
+            };
         }
 
         let search = match &self.focus {
@@ -1820,12 +1825,28 @@ impl PermissionsSurface {
                 rows.push(row);
             }
         }
-        self.push_selected_rows(rows, width, height, body);
-        if matches!(self.focus, Focus::Search(_)) {
+        let hint = if matches!(self.focus, Focus::Search(_)) {
             "Search · Enter apply · Esc back"
         } else {
             "Enter details · a add · / search · Esc back"
+        };
+        ListContent {
+            intro: body,
+            rows,
+            hint,
         }
+    }
+
+    fn styled_overview(
+        &mut self,
+        width: usize,
+        height: usize,
+        body: &mut Vec<RoleLine>,
+    ) -> &'static str {
+        let content = self.overview_content(width);
+        body.extend(content.intro);
+        self.push_selected_rows(content.rows, width, height, body);
+        content.hint
     }
 
     fn push_selected_rows(
@@ -2080,13 +2101,8 @@ impl PermissionsSurface {
         }
     }
 
-    fn styled_auto_group(
-        &self,
-        width: usize,
-        height: usize,
-        group: &AutoGroupState,
-        body: &mut Vec<RoleLine>,
-    ) -> &'static str {
+    fn auto_group_content(&self, width: usize, group: &AutoGroupState) -> ListContent {
+        let mut body = Vec::new();
         let settings = self.view.auto_rule_settings.group(group.kind);
         body.push(RoleLine::role(
             auto_kind_label(group.kind),
@@ -2111,17 +2127,8 @@ impl PermissionsSurface {
         let rules = self.auto_group_rules(group);
         let replace_row = rules.len() + 1;
         let restore_row = replace_row + 1;
-        let available = height
-            .saturating_sub(body.len() + 2 + usize::from(self.has_status_row()))
-            .max(1);
-        let start = group
-            .scroll
-            .max(group.selected.saturating_sub(available.saturating_sub(1)))
-            .min(group.selected);
-        for index in start..=restore_row {
-            if body.len() >= height.saturating_sub(2) || index >= start + available {
-                break;
-            }
+        let mut rows = Vec::new();
+        for index in 0..=restore_row {
             let mut row = if index == 0 {
                 RoleLine::role("+ Add custom rule", Role::Permission)
             } else if index == replace_row {
@@ -2139,13 +2146,38 @@ impl PermissionsSurface {
             };
             let mut selected = selected_row("", index == group.selected);
             selected.spans.append(&mut row.spans);
-            body.push(selected);
+            rows.push(selected);
         }
-        if matches!(self.focus, Focus::AutoGroupSearch { .. }) {
+        let hint = if matches!(self.focus, Focus::AutoGroupSearch { .. }) {
             "Search · Enter apply · Esc back"
         } else {
             "Enter details · a add · e edit · d remove · / search · Esc back"
+        };
+        ListContent {
+            intro: body,
+            rows,
+            hint,
         }
+    }
+
+    fn styled_auto_group(
+        &self,
+        width: usize,
+        height: usize,
+        group: &AutoGroupState,
+        body: &mut Vec<RoleLine>,
+    ) -> &'static str {
+        let content = self.auto_group_content(width, group);
+        body.extend(content.intro);
+        let available = height
+            .saturating_sub(body.len() + 2 + usize::from(self.has_status_row()))
+            .max(1);
+        let start = group
+            .scroll
+            .max(group.selected.saturating_sub(available.saturating_sub(1)))
+            .min(group.selected);
+        body.extend(content.rows.into_iter().skip(start).take(available));
+        content.hint
     }
 
     fn finish_styled_frame(
@@ -2194,15 +2226,13 @@ impl PermissionsSurface {
             Focus::AutoRuleDetail { scroll, .. } | Focus::AutoPreview { scroll, .. } => {
                 (*scroll).min(max_scroll)
             }
-            Focus::ReviewerChoice(_) | Focus::AutoEnvironment { .. } => rows
+            Focus::ReviewerChoice(_) | Focus::AutoEnvironment { .. } | Focus::RuleForm(_) => rows
                 .iter()
                 .position(|line| line.fill == Some(Role::Selection))
                 .unwrap_or_default()
                 .saturating_sub(body_height.saturating_sub(2))
                 .min(max_scroll),
-            Focus::RuleForm(draft) => (draft.field + 2)
-                .saturating_sub(body_height)
-                .min(max_scroll),
+            Focus::DirectoryForm(_) | Focus::AutoDraft(_) => max_scroll,
             _ => 0,
         };
         self.detail_scroll = start;
@@ -2257,6 +2287,64 @@ impl PermissionsSurface {
             self.key(KeyEvent::new(direction, KeyModifiers::NONE));
         }
         self.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+    }
+
+    pub(super) fn minimum_frame_rows(&self, width: usize) -> usize {
+        let intro = match &self.focus {
+            _ if self.page == Page::RecentlyDenied => return 1 + self.denials.minimum_frame_rows(),
+            Focus::List | Focus::Search(_) => self.overview_content(width).intro.len(),
+            Focus::AutoGroup(group) | Focus::AutoGroupSearch { group, .. } => {
+                self.auto_group_content(width, group).intro.len()
+            }
+            Focus::RuleForm(_) | Focus::DirectoryForm(_) | Focus::AutoDraft(_) => {
+                let mut body = Vec::new();
+                self.styled_detail(width, usize::MAX, &mut body);
+                let field = if matches!(self.focus, Focus::RuleForm(_)) {
+                    body.into_iter()
+                        .find(|line| line.fill == Some(Role::Selection))
+                } else {
+                    body.pop()
+                };
+                let rows = field.map_or(1, |mut line| {
+                    for span in &mut line.spans {
+                        span.text = super::safe_line(&span.text);
+                    }
+                    wrap_role_line(line, width).len()
+                });
+                return 2 + rows + usize::from(self.has_status_row());
+            }
+            _ => 0,
+        };
+        3 + intro + usize::from(self.has_status_row())
+    }
+
+    pub(super) fn content_rows(&self, width: usize, limit: usize) -> usize {
+        if self.page == Page::RecentlyDenied {
+            return (1 + self.denials.content_rows(width)).min(limit);
+        }
+        let body = match &self.focus {
+            Focus::List | Focus::Search(_) => {
+                let content = self.overview_content(width);
+                content.intro.len() + content.rows.len()
+            }
+            Focus::AutoGroup(group) | Focus::AutoGroupSearch { group, .. } => {
+                let content = self.auto_group_content(width, group);
+                content.intro.len() + content.rows.len()
+            }
+            _ => {
+                let mut body = Vec::new();
+                self.styled_detail(width, limit, &mut body);
+                body.into_iter()
+                    .map(|mut line| {
+                        for span in &mut line.spans {
+                            span.text = super::safe_line(&span.text);
+                        }
+                        wrap_role_line(line, width).len()
+                    })
+                    .sum()
+            }
+        };
+        (body + 2 + usize::from(self.has_status_row())).min(limit)
     }
 
     pub(super) fn styled_lines(&mut self, width: usize, height: usize) -> Vec<RoleLine> {

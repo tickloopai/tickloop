@@ -18,11 +18,11 @@ use crate::{
     tools::{CommandSnapshot, SearchConfig},
 };
 
-/// Business 7.0 adds the Monitor's hosted Ticks (`ListHostedTicks`, `CloseHostedTick`,
-/// `ReopenHostedTick`) to 6.0's
-/// Monitor membership and 5.0's family messaging; peers of another major are refused before
-/// dispatch.
-pub const PROTOCOL_MAJOR: u16 = 7;
+/// Business 8.0 adds the Monitor's hosted Ticks (`ListHostedTicks`, `CloseHostedTick`,
+/// `ReopenHostedTick`) to 7.0's Monitor membership and push-completion delivery and usage. A 7.0
+/// peer cannot decode those commands and would drop the whole connection, so other majors are
+/// refused at hello; there are no minor feature gates.
+pub const PROTOCOL_MAJOR: u16 = 8;
 pub const PROTOCOL_MINOR: u16 = 0;
 
 pub const MAX_FRAME_BYTES: usize = 128 * 1024 * 1024;
@@ -1216,6 +1216,74 @@ pub(crate) enum ServerMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn monitor_members_and_required_push_completion_fields_share_one_snapshot_wire() {
+        use runtime::{
+            FamilyCompletion, MonitorMember, MonitorMemberSource, SubagentNotificationDelivery,
+        };
+        let execution = ExecutionRef {
+            owner_epoch: Uuid::new_v4(),
+            agent_id: Uuid::new_v4(),
+            generation: 1,
+        };
+        let instance: tick_connect::instance::InstanceRef = "herdr:counter".parse().unwrap();
+        for notification in [
+            SubagentNotificationDelivery::Foreground,
+            SubagentNotificationDelivery::Pending,
+            SubagentNotificationDelivery::Queued,
+            SubagentNotificationDelivery::Rejected(runtime::FamilyMessageRejection {
+                code: runtime::FamilyMessageRejectionCode::StaleTarget,
+                message: "The receiving parent is stopped".into(),
+            }),
+        ] {
+            let mut snapshot: ChatSnapshot = serde_json::from_value(serde_json::json!({
+                "id":execution.agent_id, "workdir":"/test", "messages":[], "loops":[],
+            }))
+            .unwrap();
+            snapshot.monitor.members.push(MonitorMember {
+                instance: instance.clone(),
+                source: MonitorMemberSource::Added,
+                title: Some("Counter".into()),
+            });
+            snapshot.family_completions.push(FamilyCompletion {
+                notification,
+                usage: crate::model::Usage {
+                    input_tokens: Some(11),
+                    output_tokens: Some(7),
+                    ..Default::default()
+                },
+                child_chat_id: Uuid::new_v4(),
+                child_loop_id: Uuid::new_v4(),
+                child_run_id: Uuid::new_v4(),
+                handle: "audit".into(),
+                state: runtime::LoopState::Completed,
+                result: "Actual child report".into(),
+                error: None,
+                started_at: Some(1),
+                finished_at: 2,
+                triggering_message_ids: vec![],
+            });
+            let response = CommandResult::Loaded {
+                execution,
+                snapshot: Box::new(LiveChatSnapshot::from_snapshot(execution, snapshot, vec![])),
+            };
+            let wire = serde_json::to_value(response).unwrap();
+            let decoded: CommandResult = serde_json::from_value(wire.clone()).unwrap();
+            assert_eq!(serde_json::to_value(decoded).unwrap(), wire);
+            for required in ["notification", "usage"] {
+                let mut missing = wire.clone();
+                missing["Loaded"]["snapshot"]["conversation"]["family_completions"][0]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove(required);
+                assert!(
+                    serde_json::from_value::<CommandResult>(missing).is_err(),
+                    "{required} is part of the single required wire shape"
+                );
+            }
+        }
+    }
 
     #[test]
     fn monitor_membership_commands_cross_the_wire_unchanged() {

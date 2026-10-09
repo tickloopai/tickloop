@@ -3459,7 +3459,7 @@ async fn delegated_chat_inherits_native_artifact_mcp_tools() {
     let model = Arc::new(ScriptedModel::new(vec![
         call(
             "delegate",
-            "DelegateAgent",
+            "Subagent",
             json!({"task":"Inspect available Artifact tools"}),
         ),
         text("Child inspected tools."),
@@ -3515,7 +3515,7 @@ async fn delegated_artifact_calls_obey_frozen_allow_ask_and_deny() {
         let model = Arc::new(ScriptedModel::new(vec![
             call(
                 "delegate",
-                "DelegateAgent",
+                "Subagent",
                 json!({"task":"Publish the authorized fixture document"}),
             ),
             call(
@@ -3702,7 +3702,7 @@ impl ModelClient for GatedDelegatedMcpModel {
         } else if self.parent_turns.fetch_add(1, Ordering::SeqCst) == 0 {
             call(
                 "delegate",
-                "DelegateAgent",
+                "Subagent",
                 json!({"task":"Publish fixture under inherited authority"}),
             )
         } else {

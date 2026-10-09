@@ -32,6 +32,7 @@ use super::{
     controller::{HostController, LIFECYCLE_TIMEOUT},
     registry::{
         LaunchIdentity, LaunchRecord, LaunchState, OwnerState, Registry, RootRegistry, TARGET_GONE,
+        Transition,
     },
     tools::MODIFY_TICK,
 };
@@ -132,7 +133,7 @@ pub enum WorkerRequest {
         instance: InstanceRef,
         watches: BTreeSet<Uuid>,
     },
-    /// Root Chat `chat` stopped its direct child `child` with StopAgent.
+    /// Root Chat `chat` stopped its direct child `child` with StopSubagent.
     EndStoppedChild {
         chat: Uuid,
         child: Uuid,
@@ -401,7 +402,13 @@ impl WorkerControl {
                 ..
             } => {
                 let _lifecycle = registry.lifecycle(chat).await;
-                let owner_revision = opening_revision(&registry, chat, snapshot.as_deref()).await?;
+                let owner_revision = opening_revision(
+                    &self.controller,
+                    &registry,
+                    &tick_owner,
+                    snapshot.as_deref(),
+                )
+                .await?;
                 let record = LaunchRecord::opening(operation, chat, command, cwd, title)?;
                 self.launch(&registry, tick_owner, owner_revision, record, environment)
                     .await
@@ -434,11 +441,34 @@ impl WorkerControl {
                     match self.controller.receipt(by, &tick_owner).await? {
                         Some(Receipt::Opened(opened)) => return Ok(json!(opened)),
                         Some(Receipt::Failed(failure)) if !failure.dispatched => {
-                            lost.state = LaunchState::Lost {
+                            let restored = LaunchState::Lost {
                                 instance: instance.clone(),
                                 host_epoch,
                             };
+                            registry
+                                .transition_launch(chat, lost.operation, move |mut current| {
+                                    if matches!(current.state, LaunchState::Reopened { by: earlier, .. } if earlier == by)
+                                    {
+                                        current.state = restored;
+                                        Transition::Write(Box::new(current))
+                                    } else {
+                                        Transition::Keep
+                                    }
+                                })
+                                .await?;
                             registry.remove_launch(chat, by).await?;
+                            // The claim below compares against the record as it is now.
+                            lost = registry
+                                .launches(chat)
+                                .await?
+                                .into_iter()
+                                .find(|record| record.operation == lost.operation)
+                                .ok_or_else(|| {
+                                    HostError::before(
+                                        TARGET_GONE,
+                                        "this Chat recorded no such hosted Tick",
+                                    )
+                                })?;
                         }
                         _ => {
                             return Err(HostError::after(
@@ -462,14 +492,38 @@ impl WorkerControl {
                         "its program or working directory changed since it was opened; open it again",
                     ));
                 }
-                let owner_revision = opening_revision(&registry, chat, snapshot.as_deref()).await?;
+                let owner_revision = opening_revision(
+                    &self.controller,
+                    &registry,
+                    &tick_owner,
+                    snapshot.as_deref(),
+                )
+                .await?;
                 let lost_state = lost.state.clone();
-                lost.state = LaunchState::Reopened {
+                let reopened = LaunchState::Reopened {
                     instance: instance.clone(),
                     host_epoch,
                     by: operation,
                 };
-                registry.record_launch(&lost).await?;
+                // The lost record turns Reopened only as it was judged: a settlement or another
+                // reopen in between leaves it alone and nothing starts.
+                let judged = lost.clone();
+                let is_claimed = registry
+                    .transition_launch(chat, lost.operation, move |mut current| {
+                        if current == judged {
+                            current.state = reopened;
+                            Transition::Write(Box::new(current))
+                        } else {
+                            Transition::Keep
+                        }
+                    })
+                    .await?;
+                if !is_claimed {
+                    return Err(HostError::before(
+                        "InvalidState",
+                        "the lost hosted Tick changed meanwhile; list it again",
+                    ));
+                }
                 let record = LaunchRecord::opening(
                     operation,
                     chat,
@@ -483,8 +537,17 @@ impl WorkerControl {
                 {
                     Ok(opened) => Ok(json!(opened)),
                     Err(error) if !error.dispatched => {
-                        lost.state = lost_state;
-                        registry.record_launch(&lost).await?;
+                        registry
+                            .transition_launch(chat, lost.operation, move |mut current| {
+                                if matches!(current.state, LaunchState::Reopened { by, .. } if by == operation)
+                                {
+                                    current.state = lost_state;
+                                    Transition::Write(Box::new(current))
+                                } else {
+                                    Transition::Keep
+                                }
+                            })
+                            .await?;
                         Err(error)
                     }
                     Err(error) => Err(error),
@@ -540,23 +603,22 @@ impl WorkerControl {
             }
             WorkerRequest::GetHostedOperationReceipt { operation, .. } => {
                 let receipt = self.controller.receipt(operation, &tick_owner).await?;
-                if let Some(mut record) =
-                    registry.launches(chat).await?.into_iter().find(|record| {
-                        record.operation == operation && record.state == LaunchState::Opening
-                    })
-                {
-                    match &receipt {
-                        Some(Receipt::Opened(opened)) => {
-                            record.state = LaunchState::Live {
-                                instance: opened.instance.clone(),
-                                host_epoch: opened.terminal.epoch,
-                            };
-                            registry.record_launch(&record).await?;
+                let settled = receipt.clone();
+                registry
+                    .transition_launch(chat, operation, move |mut current| {
+                        match (&current.state, settled) {
+                            (LaunchState::Opening, Some(Receipt::Opened(opened))) => {
+                                current.state = LaunchState::Live {
+                                    instance: opened.instance,
+                                    host_epoch: opened.terminal.epoch,
+                                };
+                                Transition::Write(Box::new(current))
+                            }
+                            (LaunchState::Opening, Some(Receipt::Failed(_))) => Transition::Remove,
+                            _ => Transition::Keep,
                         }
-                        Some(Receipt::Failed(_)) => registry.remove_launch(chat, operation).await?,
-                        _ => {}
-                    }
-                }
+                    })
+                    .await?;
                 Ok(json!({"operation":operation,"receipt":receipt}))
             }
             WorkerRequest::BeginChatDeletion { operation, .. } => {
@@ -606,10 +668,12 @@ impl WorkerControl {
 /// The registry revision a new launch of `chat` is fenced with, making the Chat Active again when
 /// that is what its state means.
 async fn opening_revision(
+    controller: &HostController,
     registry: &RootRegistry,
-    chat: Uuid,
+    owner: &TickOwner,
     snapshot: Option<&LiveChatSnapshot>,
 ) -> Result<u64, HostError> {
+    let chat = owner.chat;
     match registry.owner_state(chat).await? {
         OwnerState::Active => registry.revision().await,
         // The Chat runs here, so it holds its retention lock and no cleanup is removing its
@@ -618,11 +682,15 @@ async fn opening_revision(
             registry.set_owner_state(chat, &OwnerState::Active).await?;
             registry.revision().await
         }
-        // Only an explicit Continue after StopAgent makes a stopped Chat own Ticks again, under
-        // a revision later than the one its end fenced, even if that end never completed.
-        OwnerState::Stopping { .. } | OwnerState::Stopped { .. }
+        // Only an explicit Continue after StopSubagent makes a stopped Chat own Ticks again, under
+        // a revision later than the one its end fenced. An end that never completed finishes
+        // first: the Continue restores the Chat, not its earlier Ticks.
+        stopped @ (OwnerState::Stopping { .. } | OwnerState::Stopped { .. })
             if snapshot.is_some_and(continued_after_stop) =>
         {
+            if let OwnerState::Stopping { operation } = stopped {
+                registry.finish_stop(controller, owner, operation).await?;
+            }
             registry.set_owner_state(chat, &OwnerState::Active).await?;
             registry.next_revision().await
         }
@@ -633,7 +701,7 @@ async fn opening_revision(
     }
 }
 
-/// A stopped Chat has continued once one of its Loops is live again: StopAgent leaves every
+/// A stopped Chat has continued once one of its Loops is live again: StopSubagent leaves every
 /// Loop Stopped or Expired, and only an explicit Continue or new input revives one.
 fn continued_after_stop(snapshot: &LiveChatSnapshot) -> bool {
     snapshot
@@ -651,14 +719,15 @@ impl WorkerControl {
         registry: &RootRegistry,
         owner: TickOwner,
         owner_revision: u64,
-        mut record: LaunchRecord,
+        record: LaunchRecord,
         environment: Vec<(String, String)>,
     ) -> Result<tick_host::host::OpenedTick, HostError> {
         registry.record_launch(&record).await?;
+        let (chat, operation) = (record.chat, record.operation);
         let opened = self
             .controller
             .open(OpenRequest {
-                operation: record.operation,
+                operation,
                 owner,
                 owner_revision,
                 command: record.command.clone(),
@@ -669,20 +738,36 @@ impl WorkerControl {
             .await;
         match opened {
             Ok(opened) => {
-                record.state = LaunchState::Live {
+                let live = LaunchState::Live {
                     instance: opened.instance.clone(),
                     host_epoch: opened.terminal.epoch,
                 };
-                registry
-                    .record_launch(&record)
+                let moved_on = live.clone();
+                let is_recorded = registry
+                    .transition_launch(chat, operation, move |mut current| {
+                        if current.state == LaunchState::Opening {
+                            current.state = moved_on;
+                            Transition::Write(Box::new(current))
+                        } else {
+                            Transition::Keep
+                        }
+                    })
                     .await
                     .map_err(|error| HostError::after(&error.code, error.message))?;
+                // A settlement that gave up on the record while the open was slow is undone: the
+                // Tick runs, so it keeps a record.
+                if !is_recorded {
+                    let mut record = record;
+                    record.state = live;
+                    registry
+                        .record_launch(&record)
+                        .await
+                        .map_err(|error| HostError::after(&error.code, error.message))?;
+                }
                 Ok(opened)
             }
             Err(error) if !error.dispatched => {
-                registry
-                    .remove_launch(record.chat, record.operation)
-                    .await?;
+                registry.remove_launch(chat, operation).await?;
                 Err(error)
             }
             Err(error) => Err(error),
@@ -743,8 +828,8 @@ impl WorkerControl {
         Ok(snapshot)
     }
 
-    /// StopAgent's end hook is believed only for a direct child of `root` that runs in the same
-    /// worker and whose Loops StopAgent actually stopped, read through the owner's own route.
+    /// StopSubagent's end hook is believed only for a direct child of `root` that runs in the same
+    /// worker and whose Loops StopSubagent actually stopped, read through the owner's own route.
     async fn verify_stopped_child(
         &self,
         owner: &OwnerServer,

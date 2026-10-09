@@ -97,7 +97,18 @@ impl ShellTaskCenter {
             }
             let rows = match self.agent.task_rows(entry.chat_id).await {
                 Ok(rows) => rows,
-                Err(error) => return self.stale_snapshot(chat, runtime_error(error)).await,
+                Err(error) => {
+                    if self.agent.catalog().await.is_ok_and(|rows| {
+                        rows.iter().any(|current| {
+                            current.execution == entry.execution
+                                && current.availability
+                                    == crate::agent_access::ExecutionAvailability::Lost
+                        })
+                    }) {
+                        continue;
+                    }
+                    return self.stale_snapshot(chat, runtime_error(error)).await;
+                }
             };
             for task in rows {
                 if seen.insert((task.chat_id, task.id)) {
@@ -376,5 +387,118 @@ mod timestamp_tests {
             assert!(task.updated_at_ms >= terminal.state_since);
         }
         runtime.shutdown().await;
+    }
+}
+
+#[cfg(test)]
+mod availability_tests {
+    use super::*;
+    use crate::agent_access::*;
+    use crate::terminal::test_support;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[derive(Clone, Copy)]
+    enum FailureProjection {
+        Lost,
+        Live,
+        Replaced,
+        Unavailable,
+    }
+
+    struct FailedTaskLookup {
+        actual: EmbeddedAgentAccess,
+        failed: AtomicBool,
+        projection: FailureProjection,
+    }
+    #[async_trait::async_trait]
+    impl AgentAccess for FailedTaskLookup {
+        async fn observe(&self, request: ObservationRequest) -> Result<Observation, AccessError> {
+            if matches!(
+                &request,
+                ObservationRequest::Agent {
+                    detail: AgentDetailQuery::Tasks,
+                    ..
+                }
+            ) {
+                self.failed.store(true, Ordering::SeqCst);
+                return Err(AccessError::unavailable("fixture worker no longer running"));
+            }
+            if self.failed.load(Ordering::SeqCst)
+                && matches!(&request, ObservationRequest::Overview { .. })
+                && matches!(self.projection, FailureProjection::Unavailable)
+            {
+                return Err(AccessError::unavailable("fixture catalog unavailable"));
+            }
+            let mut observation = self.actual.observe(request).await?;
+            if self.failed.load(Ordering::SeqCst)
+                && let ObservationValue::Overview(rows) = &mut observation.initial
+            {
+                for row in rows {
+                    match self.projection {
+                        FailureProjection::Live | FailureProjection::Unavailable => {}
+                        FailureProjection::Lost => row.availability = ExecutionAvailability::Lost,
+                        FailureProjection::Replaced => {
+                            row.availability = ExecutionAvailability::Lost;
+                            row.execution.generation += 1;
+                        }
+                    }
+                }
+            }
+            Ok(observation)
+        }
+        async fn execute(&self, command: CommandEnvelope) -> Result<CommandReceipt, AccessError> {
+            self.actual.execute(command).await
+        }
+        async fn show_view(&self, update: DisplayUpdate) -> Result<DisplayReceipt, AccessError> {
+            self.actual.show_view(update).await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_worker_lost_between_catalog_and_tasks_does_not_abort_passive_observation() {
+        for projection in [
+            FailureProjection::Lost,
+            FailureProjection::Live,
+            FailureProjection::Replaced,
+            FailureProjection::Unavailable,
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let runtime = crate::runtime::Agent::new_embedded(
+                test_support::config(),
+                Arc::new(test_support::ScriptedModel::new(vec![])),
+            );
+            let actual = EmbeddedAgentAccess::new(runtime.clone());
+            let epoch = actual.owner_epoch();
+            let access = Arc::new(FailedTaskLookup {
+                actual,
+                failed: AtomicBool::new(false),
+                projection,
+            });
+            let agent = ConsoleExecution::from_access_for_test(
+                access,
+                epoch,
+                ViewRef {
+                    session_id: Uuid::new_v4(),
+                    view_id: Uuid::new_v4(),
+                },
+                LaunchSpec::embedded(directory.path().into()),
+                None,
+            );
+            let chat = agent.create_chat(directory.path().into()).await.unwrap();
+            let result = ShellTaskCenter::new(agent).snapshot(chat).await;
+            runtime.shutdown().await;
+            match projection {
+                FailureProjection::Lost => assert!(
+                    result.unwrap().tasks.is_empty(),
+                    "confirmed lost task owner must leave loss reporting to the execution catalog"
+                ),
+                FailureProjection::Live
+                | FailureProjection::Replaced
+                | FailureProjection::Unavailable => assert!(
+                    result.is_err(),
+                    "unconfirmed loss or another generation must not hide the task lookup failure"
+                ),
+            }
+        }
     }
 }

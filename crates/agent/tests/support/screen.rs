@@ -75,8 +75,10 @@ pub fn visible_screen(output: &str, width: usize, height: usize) -> String {
     let end = output
         .rfind("\x1b[?2026l")
         .map_or(output.len(), |end| end + "\x1b[?2026l".len());
-    let controls =
-        regex::Regex::new(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07]*(?:\x07|\x1b\\)").unwrap();
+    static CONTROLS: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let controls = CONTROLS.get_or_init(|| {
+        regex::Regex::new(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07]*?(?:\x07|\x1b\\)").unwrap()
+    });
     let mut rows = vec![vec![' '; width]; height];
     let (mut row, mut column) = (0usize, 0usize);
     let (mut top, mut bottom) = (0usize, height - 1);
@@ -160,4 +162,20 @@ fn retained_rows_and_cleared_rows_are_both_reflected_in_the_screen() {
     assert_eq!(visible_screen(output, 20, 3), "Provider\nModel\nFooter");
     let scrolled = format!("{output}\x1b[?2026h\x1b[1;2r\x1b[1S\x1b[r\x1b[?2026l");
     assert_eq!(visible_screen(&scrolled, 20, 3), "Model\n\nFooter");
+}
+
+#[test]
+fn osc_hyperlinks_preserve_labels_and_later_frame_updates() {
+    for end in ["\x07", "\x1b\\"] {
+        let first = format!(
+            "\x1b[?2026h\x1b[2J\x1b[1;1HBrowser login\x1b[3;1HCancel login\x1b[2;1H\x1b]8;;https://first.test{end}First link\x1b]8;;{end}\x1b[?2026l"
+        );
+        let second = format!(
+            "\x1b[?2026h\x1b[3;1H\x1b[2KSubmit callback\x1b[2;1H\x1b[2K\x1b]8;;https://second.test{end}Second link\x1b]8;;{end}\x1b[?2026l"
+        );
+        assert_eq!(
+            visible_screen(&format!("{first}{second}"), 40, 3),
+            "Browser login\nSecond link\nSubmit callback"
+        );
+    }
 }

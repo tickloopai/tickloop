@@ -120,7 +120,7 @@ async fn run_child_config_fixture() {
     };
     let replies = if requester {
         vec![
-            test_support::call("delegate", "DelegateAgent", json!({"task":TASK})),
+            test_support::call("delegate", "Subagent", json!({"task":TASK})),
             test_support::call(
                 "child-question",
                 "AskUserQuestion",
@@ -136,7 +136,7 @@ async fn run_child_config_fixture() {
         ]
     } else {
         vec![
-            test_support::call("delegate", "DelegateAgent", json!({"task":TASK})),
+            test_support::call("delegate", "Subagent", json!({"task":TASK})),
             test_support::text("child reviewed"),
             test_support::text("parent done"),
             test_support::text("child follow-up done"),
@@ -1034,7 +1034,9 @@ fn shift_tab_in_the_overview_changes_no_hidden_agent_and_the_root_keeps_its_key(
     // meaning in the current scope.
     view.send(b"\x15/help advanced\r");
     view.wait_for("the advanced reference over the overview", |frame| {
-        frame.contains("Advanced commands") && frame.contains("PgUp/PgDn")
+        frame.contains("Advanced commands")
+            && frame.contains("/status")
+            && frame.contains("Esc back")
     });
     for _ in 0..30 {
         view.send(b"\x1b[6~");

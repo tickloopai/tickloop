@@ -118,7 +118,7 @@ async fn only_the_owner_key_controls_and_incompatible_or_mixed_requests_are_refu
 
     let (_, _, future_major) = raw(
         &socket,
-        json!({"channel":"business","major":2,"minor":0,"required":[],"role":{"kind":"controller","controller_key":fixture.key,"owner_epoch":uuid::Uuid::new_v4()}}),
+        json!({"channel":"business","major":tick_connect::hosted::BUSINESS_MAJOR + 1,"minor":0,"required":[],"role":{"kind":"controller","controller_key":fixture.key,"owner_epoch":uuid::Uuid::new_v4()}}),
     )
     .await;
     assert_eq!(future_major["error"]["code"], "IncompatibleHost");

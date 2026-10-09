@@ -181,24 +181,66 @@ async fn continue_waiting(
                 && current.events.iter().any(|event| {
                     matches!(&event.kind,
                 tickloop_agent::runtime::EventKind::ToolStarted { name, .. }
-                    if name == "ReceiveAgentMessage")
+                    if name == "Bash")
                 })
         },
     )
     .await
 }
 
+async fn release_family_boundary(path: &std::path::Path) {
+    use std::os::fd::FromRawFd;
+    let path = std::ffi::CString::new(path.to_string_lossy().as_bytes()).unwrap();
+    tokio::time::timeout(UI_TIMEOUT, async {
+        loop {
+            let descriptor =
+                unsafe { libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
+            if descriptor >= 0 {
+                let mut file = unsafe { std::fs::File::from_raw_fd(descriptor) };
+                file.write_all(b"Released owned tool boundary\n").unwrap();
+                break;
+            }
+            let error = std::io::Error::last_os_error();
+            assert_eq!(error.raw_os_error(), Some(libc::ENXIO), "{error}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the test-owned command must open its FIFO");
+}
+
 async fn run_family_navigation(fixture: &PrivateFixture) {
     let waiting_reply = |id: &str, text: &str| {
         chat_reply(
-            Some(("ReceiveAgentMessage", id, json!({"timeout_ms":300_000}))),
+            Some((
+                "Bash",
+                id,
+                json!({"command":format!("cat {id}.pipe"),"timeout":300_000,"description":"Hold the controlled read-only tool boundary"}),
+            )),
             text,
         )
     };
+    for id in [
+        "main-context-wait",
+        "first-context-wait",
+        "second-context-wait",
+        "second-follow-up-wait",
+        "main-follow-up-wait",
+        "first-follow-up-wait",
+    ] {
+        let path = std::ffi::CString::new(
+            fixture
+                .path(&format!("work/{id}.pipe"))
+                .to_string_lossy()
+                .as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    }
     let responses = vec![
         chat_reply(
             Some((
-                "DelegateAgent",
+                "Subagent",
                 "family-first-child",
                 json!({"task":FIRST_CHILD_TASK,"name":"family-one","description":FIRST_CHILD_TASK}),
             )),
@@ -207,7 +249,7 @@ async fn run_family_navigation(fixture: &PrivateFixture) {
         chat_reply(None, FIRST_CHILD_REPLY),
         chat_reply(
             Some((
-                "DelegateAgent",
+                "Subagent",
                 "family-second-child",
                 json!({"task":SECOND_CHILD_TASK,"name":"family-two","description":SECOND_CHILD_TASK}),
             )),
@@ -460,7 +502,7 @@ async fn run_family_navigation(fixture: &PrivateFixture) {
     assert!(
         initial_requests[0]["tools"]
             .to_string()
-            .contains("DelegateAgent")
+            .contains("Subagent")
     );
     assert!(
         initial_requests[1]["messages"]
@@ -570,6 +612,18 @@ async fn run_family_navigation(fixture: &PrivateFixture) {
                 open_family_member(&mut pty, &client, target, title, reply, view, version).await;
         }
         pty.send(format!("\x15{follow_up}\r").as_bytes());
+        let id = if target == main_execution {
+            "main-context-wait"
+        } else if target == first_execution {
+            "first-context-wait"
+        } else {
+            "second-context-wait"
+        };
+        wait_snapshot(&client,target,"follow-up is admitted before releasing the tool",|current| {
+            current.pending_inputs.iter().any(|input|input.input == follow_up)
+                || current.conversation.messages.iter().flat_map(|message|&message.content).any(|content|matches!(content,tickloop_agent::model::Content::Text {text} if text==follow_up))
+        }).await;
+        release_family_boundary(&fixture.path(&format!("work/{id}.pipe"))).await;
         let (_, request) = tokio::time::timeout(UI_TIMEOUT, requests.recv())
             .await
             .unwrap()

@@ -334,7 +334,7 @@ async fn overview_prioritizes_a_waiting_child_family_before_an_independent_runni
             ),
             support::call(
                 "delegate",
-                "DelegateAgent",
+                "Subagent",
                 serde_json::json!({
                     "task":"Ask the user which bounded cadence to use.",
                 }),

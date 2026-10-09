@@ -377,7 +377,7 @@ mod channel {
     use uuid::Uuid;
 
     /// Workers in this process, each holding the grant the owner would hand a real worker and,
-    /// as a real worker with a config root does, telling the owner when StopAgent stops a child.
+    /// as a real worker with a config root does, telling the owner when StopSubagent stops a child.
     struct GrantedWorkers {
         control: Arc<WorkerControl>,
         model: Arc<dyn ModelClient>,
@@ -1077,7 +1077,7 @@ for line in sys.stdin:
         );
     }
 
-    /// A real root stops its direct child with StopAgent; the worker's hook tells the owner, which
+    /// A real root stops its direct child with StopSubagent; the worker's hook tells the owner, which
     /// checks the family itself and ends only the child's Ticks.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_root_stopping_its_direct_child_ends_only_the_childs_ticks() {
@@ -1107,22 +1107,18 @@ for line in sys.stdin:
                         json!({"to":"parent","message":"Child is ready to wait"}),
                     )
                 } else {
-                    super::support::call(
-                        "wait",
-                        "ReceiveAgentMessage",
-                        json!({"timeout_ms":600000}),
-                    )
+                    super::support::text("Awaiting family context.")
                 }
             } else if !has_tool_result(request, "delegate") {
                 super::support::call(
                     "delegate",
-                    "DelegateAgent",
+                    "Subagent",
                     json!({"task":"Wait to be stopped","name":"waiter"}),
                 )
             } else if history_text(request).contains(STOP_PROMPT)
                 && !has_tool_result(request, "stop")
             {
-                super::support::call("stop", "StopAgent", json!({"to":"waiter"}))
+                super::support::call("stop", "StopSubagent", json!({"to":"waiter"}))
             } else {
                 super::support::text("Done")
             }
@@ -1197,6 +1193,72 @@ for line in sys.stdin:
             panic!("a stopped child opens nothing before it continues");
         };
         assert!(refused.contains("OwnerEnded"), "{refused}");
+    }
+
+    /// A stop whose end never reached the host leaves the Chat Stopping while its Tick runs on.
+    /// Continuing the Chat restores only the Chat: the earlier Tick ends before it owns a new one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn continuing_a_chat_whose_stop_never_reached_the_host_ends_its_earlier_ticks_first() {
+        use tickloop_agent::runtime::EventKind;
+        let model = Arc::new(super::support::ScriptedModel::new(vec![
+            super::support::text("Continued"),
+        ]));
+        let owner = Owner::start_with(model, tick_host::host::DEFAULT_IDLE_TIMEOUT, 1).await;
+        let (runtime, chat) = (owner.runtimes[0].clone(), owner.chats[0]);
+        let tools = HostedTickTools::new(
+            OwnerControl::new(owner.grants[0].clone()),
+            vec![("PATH".into(), "/usr/bin:/bin".into())],
+        );
+        let earlier = run_tool(&tools, chat, "ModifyTick", counter_command(&owner)).await;
+        let earlier_pid = earlier["business_pid"].as_u64().unwrap() as u32;
+        std::fs::write(
+            owner
+                .config_root
+                .join("tick-host/chats")
+                .join(chat.to_string())
+                .join("owner.json"),
+            serde_json::to_vec(&json!({"state":"stopping","operation":Uuid::new_v4()})).unwrap(),
+        )
+        .unwrap();
+        let prepared = tools
+            .prepare_call(
+                chat,
+                "ModifyTick",
+                &counter_command(&owner),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let HostCallResult::NotDispatched(refused) = tools
+            .execute_prepared(chat, prepared, CancellationToken::new())
+            .await
+        else {
+            panic!("a stopped Chat opens nothing before it continues");
+        };
+        assert!(refused.contains("OwnerEnded"), "{refused}");
+        assert!(super::alive(earlier_pid), "the end never reached the host");
+
+        let mut events = runtime.subscribe();
+        runtime.submit(chat, None, "Continue".into()).await.unwrap();
+        loop {
+            match super::support::next_event(&mut events).await.kind {
+                EventKind::Completed { .. } => break,
+                EventKind::Failed(error) => panic!("{error}"),
+                _ => {}
+            }
+        }
+        let reopened = run_tool(&tools, chat, "ModifyTick", counter_command(&owner)).await;
+        assert!(
+            super::gone(earlier_pid).await,
+            "the Tick of the stopped Chat ends"
+        );
+        assert!(super::alive(
+            reopened["business_pid"].as_u64().unwrap() as u32
+        ));
+        let records = launch_records(&owner.root, chat);
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(records[0]["instance"], reopened["tick_instance_id"]);
+        assert_eq!(owner.owner_state(chat).unwrap()["state"], "active");
     }
 
     /// A Chat's Watch intents go through its owner, which records them with the launch and
@@ -1980,7 +2042,7 @@ for line in sys.stdin:
             host_epoch: kept.terminal.epoch,
         };
         root.record_launch(&kept_record).await.unwrap();
-        // A Tick whose Chat the registry no longer lists; one whose StopAgent end was decided
+        // A Tick whose Chat the registry no longer lists; one whose StopSubagent end was decided
         // but not carried out when the previous owner stopped; and deletions whose finish was
         // lost: Transcript gone, Transcript still there, cleanup still holding the lock.
         let orphan = controller.open(open_for(Uuid::new_v4())).await.unwrap();

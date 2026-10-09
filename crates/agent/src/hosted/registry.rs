@@ -8,6 +8,7 @@ use std::{
     fs::File,
     io,
     os::fd::AsRawFd,
+    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -23,7 +24,7 @@ use super::controller::{HostController, LIFECYCLE_TIMEOUT, OwnerListing};
 use crate::{
     private_fs::{
         PRIVATE_FILE_MODE, create_private_directory, replace_file_atomically,
-        unix_time_milliseconds,
+        unix_time_milliseconds, verify_private_directory,
     },
     transcript::retention::RetentionGuard,
 };
@@ -41,7 +42,7 @@ const DELETION_SETTLE_POLL: std::time::Duration = std::time::Duration::from_secs
 pub const TARGET_GONE: &str = "TargetGone";
 
 /// Whether a Chat may own hosted Ticks. Retention deletion of its Transcript and an explicit
-/// StopAgent end it; nothing else does. A deleted Chat leaves no state behind once its Ticks end.
+/// StopSubagent end it; nothing else does. A deleted Chat leaves no state behind once its Ticks end.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum OwnerState {
@@ -50,7 +51,7 @@ pub enum OwnerState {
     /// A cleanup holding the Chat's retention lock is about to remove its Transcript. The Chat
     /// keeps its Ticks until the outcome is known; it opens none meanwhile.
     Deleting { operation: Uuid },
-    /// StopAgent stopped this child Chat; its host cleanup is not yet confirmed.
+    /// StopSubagent stopped this child Chat; its host cleanup is not yet confirmed.
     Stopping { operation: Uuid },
     /// Only an explicit Continue lets this Chat own Ticks again.
     Stopped { operation: Uuid },
@@ -180,6 +181,13 @@ struct Manifest {
     revision: u64,
 }
 
+/// What a transition does with the record as it is now.
+pub enum Transition {
+    Keep,
+    Write(Box<LaunchRecord>),
+    Remove,
+}
+
 /// The registries of every config root this owner serves, opened on first use.
 #[derive(Default)]
 pub struct Registry {
@@ -237,12 +245,16 @@ struct RegistryFiles {
 impl RegistryFiles {
     fn open(config_root: &Path) -> io::Result<Self> {
         let directory = config_root.join(REGISTRY_DIRECTORY);
-        create_private_directory(&directory)?;
-        create_private_directory(&directory.join(CHATS_DIRECTORY))?;
+        for private in [directory.clone(), directory.join(CHATS_DIRECTORY)] {
+            create_private_directory(&private)?;
+            verify_private_directory(&private, "hosted Tick registry directory")?;
+        }
         let lease = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
+            .mode(PRIVATE_FILE_MODE)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(directory.join(LEASE_FILE))?;
         if unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             return Err(io::Error::new(
@@ -276,17 +288,18 @@ impl RegistryFiles {
     fn write(&self, path: &Path, value: &impl Serialize) -> Result<(), HostError> {
         let parent = path.parent().expect("registry files live in a directory");
         create_private_directory(parent).map_err(|error| failed(&error))?;
+        verify_private_directory(parent, "hosted Tick registry directory")
+            .map_err(|error| failed(&error))?;
         let bytes = serde_json::to_vec(value).map_err(|error| failed(&error))?;
         replace_file_atomically(path, &bytes, PRIVATE_FILE_MODE).map_err(|error| failed(&error))
     }
 
     fn revision(&self) -> Result<u64, HostError> {
-        match std::fs::read(self.directory.join(MANIFEST_FILE)) {
-            Ok(bytes) => serde_json::from_slice::<Manifest>(&bytes)
+        match read_unlinked(&self.directory.join(MANIFEST_FILE)).map_err(|error| failed(&error))? {
+            Some(bytes) => serde_json::from_slice::<Manifest>(&bytes)
                 .map(|manifest| manifest.revision)
                 .map_err(|error| failed(&error)),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(0),
-            Err(error) => Err(failed(&error)),
+            None => Ok(0),
         }
     }
 
@@ -298,10 +311,12 @@ impl RegistryFiles {
     }
 
     fn owner_state(&self, chat: Uuid) -> Result<OwnerState, HostError> {
-        match std::fs::read(self.chat_directory(chat).join(OWNER_FILE)) {
-            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|error| failed(&error)),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(OwnerState::Active),
-            Err(error) => Err(failed(&error)),
+        let Some(directory) = self.existing_chat_directory(chat)? else {
+            return Ok(OwnerState::Active);
+        };
+        match read_unlinked(&directory.join(OWNER_FILE)).map_err(|error| failed(&error))? {
+            Some(bytes) => serde_json::from_slice(&bytes).map_err(|error| failed(&error)),
+            None => Ok(OwnerState::Active),
         }
     }
 
@@ -318,10 +333,46 @@ impl RegistryFiles {
 
     fn remove_launch(&self, chat: Uuid, operation: Uuid) -> Result<(), HostError> {
         let _written = self.written();
+        if self.existing_chat_directory(chat)?.is_none() {
+            return Ok(());
+        }
         match std::fs::remove_file(self.launch_path(chat, operation)) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(failed(&error)),
+        }
+    }
+
+    /// Changes one record as it is now: the current record is read and the change applied and
+    /// stored under the write guard, so a decision made on an earlier reading never overwrites
+    /// or revives what happened meanwhile. Returns whether anything changed.
+    fn transition_launch(
+        &self,
+        chat: Uuid,
+        operation: Uuid,
+        change: impl FnOnce(LaunchRecord) -> Transition,
+    ) -> Result<bool, HostError> {
+        let _written = self.written();
+        let Some(current) = self
+            .launches(chat)?
+            .into_iter()
+            .find(|record| record.operation == operation)
+        else {
+            return Ok(false);
+        };
+        let path = self.launch_path(chat, operation);
+        match change(current) {
+            Transition::Keep => Ok(false),
+            Transition::Write(record) => {
+                let mut record = *record;
+                record.updated_ms = unix_time_milliseconds();
+                self.write(&path, &record).map(|()| true)
+            }
+            Transition::Remove => match std::fs::remove_file(&path) {
+                Ok(()) => Ok(true),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+                Err(error) => Err(failed(&error)),
+            },
         }
     }
 
@@ -334,22 +385,49 @@ impl RegistryFiles {
         }
     }
 
+    /// `chat`'s directory once it is verified as a private real directory; `None` while it does
+    /// not exist.
+    fn existing_chat_directory(&self, chat: Uuid) -> Result<Option<PathBuf>, HostError> {
+        let directory = self.chat_directory(chat);
+        match std::fs::symlink_metadata(&directory) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(failed(&error)),
+            Ok(_) => verify_private_directory(&directory, "hosted Tick registry directory")
+                .map(|()| Some(directory))
+                .map_err(|error| failed(&error)),
+        }
+    }
+
     fn launches(&self, chat: Uuid) -> Result<Vec<LaunchRecord>, HostError> {
-        let entries = match std::fs::read_dir(self.chat_directory(chat)) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(error) => return Err(failed(&error)),
+        let Some(directory) = self.existing_chat_directory(chat)? else {
+            return Ok(Vec::new());
         };
+        let entries = std::fs::read_dir(&directory).map_err(|error| failed(&error))?;
         let mut records = Vec::new();
         for entry in entries {
             let entry = entry.map_err(|error| failed(&error))?;
             let name = entry.file_name();
-            let Some(name) = name.to_str() else { continue };
-            if !(name.starts_with(LAUNCH_PREFIX) && name.ends_with(RECORD_EXTENSION)) {
+            let Some(operation) = name
+                .to_str()
+                .and_then(|name| name.strip_prefix(LAUNCH_PREFIX))
+                .and_then(|name| name.strip_suffix(RECORD_EXTENSION))
+            else {
                 continue;
+            };
+            // A record removed since the directory was listed is simply gone.
+            let Some(bytes) = read_unlinked(&entry.path()).map_err(|error| failed(&error))? else {
+                continue;
+            };
+            let record: LaunchRecord =
+                serde_json::from_slice(&bytes).map_err(|error| failed(&error))?;
+            // The file's place, not its content, says whose record it is.
+            if record.chat != chat || record.operation.to_string() != operation {
+                return Err(failed(&format!(
+                    "launch record {} does not belong to Chat {chat}",
+                    name.to_string_lossy()
+                )));
             }
-            let bytes = std::fs::read(entry.path()).map_err(|error| failed(&error))?;
-            records.push(serde_json::from_slice(&bytes).map_err(|error| failed(&error))?);
+            records.push(record);
         }
         Ok(records)
     }
@@ -363,11 +441,13 @@ impl RegistryFiles {
         let mut chats = Vec::new();
         for entry in entries {
             let entry = entry.map_err(|error| failed(&error))?;
-            if let Some(chat) = entry
-                .file_name()
-                .to_str()
-                .and_then(|name| name.parse().ok())
-            {
+            // Only the name a Chat's directory is written under counts, so listing and access
+            // always mean the same directory.
+            if let Some(chat) = entry.file_name().to_str().and_then(|name| {
+                name.parse::<Uuid>()
+                    .ok()
+                    .filter(|chat| chat.to_string() == name)
+            }) {
                 chats.push(chat);
             }
         }
@@ -437,6 +517,17 @@ impl RootRegistry {
             .await
     }
 
+    /// See [`RegistryFiles::transition_launch`].
+    pub async fn transition_launch(
+        &self,
+        chat: Uuid,
+        operation: Uuid,
+        change: impl FnOnce(LaunchRecord) -> Transition + Send + 'static,
+    ) -> Result<bool, HostError> {
+        self.on_files(move |files| files.transition_launch(chat, operation, change))
+            .await
+    }
+
     pub async fn remove_launch(&self, chat: Uuid, operation: Uuid) -> Result<(), HostError> {
         self.on_files(move |files| files.remove_launch(chat, operation))
             .await
@@ -468,26 +559,13 @@ impl RootRegistry {
                 root: root.to_owned(),
                 chat,
             };
-            if !self.launches(chat).await?.is_empty() {
-                let listing = controller.owner_listing(&owner).await?;
-                self.settle_launches(controller, &owner, &listing).await?;
-            }
-            match self.owner_state(chat).await? {
-                OwnerState::Active => owners.push(chat),
-                OwnerState::Deleting { operation } => {
-                    // A cleanup still holding the retention lock has not finished; until it
-                    // has, the Chat keeps its Ticks.
-                    let finished = self
-                        .on_files(move |files| Ok(files.deletion_finished(chat)))
-                        .await?;
-                    if !finished || !self.settle_deletion(controller, &owner, operation).await? {
-                        owners.push(chat);
-                    }
-                }
-                OwnerState::Stopping { operation } => {
-                    self.end_stopped(controller, &owner, operation).await?;
-                }
-                OwnerState::Stopped { .. } => {}
+            // A Chat whose records cannot be read keeps its Ticks and never holds up the others.
+            if self
+                .reconcile_chat(controller, &owner)
+                .await
+                .unwrap_or(true)
+            {
+                owners.push(chat);
             }
         }
         let Some(host_epoch) = host_epoch else {
@@ -500,7 +578,10 @@ impl RootRegistry {
                 root: root.to_owned(),
                 chat,
             };
-            for record in self.launches(chat).await? {
+            let Ok(records) = self.launches(chat).await else {
+                continue;
+            };
+            for record in records {
                 if let LaunchState::Live {
                     instance,
                     host_epoch: epoch,
@@ -521,6 +602,35 @@ impl RootRegistry {
         Ok(())
     }
 
+    /// Settles one Chat's records and decided end; returns whether it still owns Ticks.
+    async fn reconcile_chat(
+        &self,
+        controller: &HostController,
+        owner: &TickOwner,
+    ) -> Result<bool, HostError> {
+        let chat = owner.chat;
+        if !self.launches(chat).await?.is_empty() {
+            let listing = controller.owner_listing(owner).await?;
+            self.settle_launches(controller, owner, &listing).await?;
+        }
+        match self.owner_state(chat).await? {
+            OwnerState::Active => Ok(true),
+            OwnerState::Deleting { operation } => {
+                // A cleanup still holding the retention lock has not finished; until it has, the
+                // Chat keeps its Ticks.
+                let finished = self
+                    .on_files(move |files| Ok(files.deletion_finished(chat)))
+                    .await?;
+                Ok(!finished || !self.settle_deletion(controller, owner, operation).await?)
+            }
+            OwnerState::Stopping { operation } => {
+                self.end_stopped(controller, owner, operation).await?;
+                Ok(false)
+            }
+            OwnerState::Stopped { .. } => Ok(false),
+        }
+    }
+
     /// Settles `owner`'s records against the host. A live instance its host still runs stays;
     /// one that host no longer runs, or whose host exited after all its Ticks ended, exited,
     /// idled out or was closed and leaves no record; one whose host died with it is Lost and
@@ -534,11 +644,12 @@ impl RootRegistry {
         listing: &OwnerListing,
     ) -> Result<(), HostError> {
         let chat = owner.chat;
-        for mut record in self.launches(chat).await? {
+        for record in self.launches(chat).await? {
             if record.updated_ms >= listing.started_ms {
                 continue;
             }
-            match &record.state {
+            let mut next = record.clone();
+            let transition = match &record.state {
                 LaunchState::Opening => {
                     let age = unix_time_milliseconds().saturating_sub(record.updated_ms);
                     if age < LIFECYCLE_TIMEOUT.as_millis() as u64 {
@@ -546,16 +657,14 @@ impl RootRegistry {
                     }
                     match controller.receipt(record.operation, owner).await? {
                         Some(Receipt::Opened(opened)) => {
-                            record.state = LaunchState::Live {
+                            next.state = LaunchState::Live {
                                 instance: opened.instance,
                                 host_epoch: opened.terminal.epoch,
                             };
-                            self.record_launch(&record).await?;
+                            Transition::Write(Box::new(next))
                         }
-                        Some(Receipt::Failed(_)) | None => {
-                            self.remove_launch(chat, record.operation).await?;
-                        }
-                        Some(_) => {}
+                        Some(Receipt::Failed(_)) | None => Transition::Remove,
+                        Some(_) => continue,
                     }
                 }
                 LaunchState::Live {
@@ -563,23 +672,31 @@ impl RootRegistry {
                     host_epoch,
                 } => match &listing.running {
                     Some(running) if running.epoch == *host_epoch => {
-                        if !running.live.contains(instance) {
-                            self.remove_launch(chat, record.operation).await?;
+                        if running.live.contains(instance) {
+                            continue;
                         }
+                        Transition::Remove
                     }
-                    _ if controller.was_emptied(*host_epoch) => {
-                        self.remove_launch(chat, record.operation).await?;
-                    }
+                    _ if controller.was_emptied(*host_epoch) => Transition::Remove,
                     _ => {
-                        record.state = LaunchState::Lost {
+                        next.state = LaunchState::Lost {
                             instance: instance.clone(),
                             host_epoch: *host_epoch,
                         };
-                        self.record_launch(&record).await?;
+                        Transition::Write(Box::new(next))
                     }
                 },
-                LaunchState::Lost { .. } | LaunchState::Reopened { .. } => {}
-            }
+                LaunchState::Lost { .. } | LaunchState::Reopened { .. } => continue,
+            };
+            // Applied only to the record exactly as it was judged.
+            self.transition_launch(chat, record.operation, move |current| {
+                if current == record {
+                    transition
+                } else {
+                    Transition::Keep
+                }
+            })
+            .await?;
         }
         Ok(())
     }
@@ -593,21 +710,34 @@ impl RootRegistry {
         watches: BTreeSet<Uuid>,
     ) -> Result<(), HostError> {
         let _intents = self.intents.lock().await;
-        let mut record = self
+        let is_live = |record: &LaunchRecord| matches!(&record.state, LaunchState::Live { instance: live, .. } if live == instance);
+        let gone = || HostError::before(TARGET_GONE, "this Chat has no such live hosted Tick");
+        let record = self
             .launches(owner.chat)
             .await?
             .into_iter()
-            .find(|record| {
-                matches!(&record.state, LaunchState::Live { instance: live, .. } if live == instance)
-            })
-            .ok_or_else(|| {
-                HostError::before(TARGET_GONE, "this Chat has no such live hosted Tick")
-            })?;
-        record.watches = watches;
-        self.record_launch(&record).await?;
-        controller
-            .set_intents(owner, instance, &record.watches)
-            .await
+            .find(|record| is_live(record))
+            .ok_or_else(gone)?;
+        // A renewal of the same Watches changes nothing durable.
+        if record.watches != watches {
+            let committed = watches.clone();
+            let live = instance.clone();
+            let is_changed = self
+                .transition_launch(owner.chat, record.operation, move |mut current| {
+                    if matches!(&current.state, LaunchState::Live { instance, .. } if *instance == live)
+                    {
+                        current.watches = committed;
+                        Transition::Write(Box::new(current))
+                    } else {
+                        Transition::Keep
+                    }
+                })
+                .await?;
+            if !is_changed {
+                return Err(gone());
+            }
+        }
+        controller.set_intents(owner, instance, &watches).await
     }
 
     /// Records that a cleanup holding `chat`'s retention lock is about to remove its Transcript.
@@ -677,7 +807,7 @@ impl RootRegistry {
         }
     }
 
-    /// Ends the Ticks of a child Chat StopAgent stopped. The decision is durable before the host
+    /// Ends the Ticks of a child Chat StopSubagent stopped. The decision is durable before the host
     /// is asked, so a lost answer is carried out by the next reconcile. Idempotent.
     pub async fn end_stopped(
         &self,
@@ -686,6 +816,17 @@ impl RootRegistry {
         operation: Uuid,
     ) -> Result<(), HostError> {
         let _lifecycle = self.lifecycle(owner.chat).await;
+        self.finish_stop(controller, owner, operation).await
+    }
+
+    /// Ends the Ticks of `owner`, stopped by `operation`, and forgets their records. The caller
+    /// holds the Chat's lifecycle lock.
+    pub(crate) async fn finish_stop(
+        &self,
+        controller: &HostController,
+        owner: &TickOwner,
+        operation: Uuid,
+    ) -> Result<(), HostError> {
         self.set_owner_state(owner.chat, &OwnerState::Stopping { operation })
             .await?;
         controller
@@ -697,6 +838,23 @@ impl RootRegistry {
         self.set_owner_state(owner.chat, &OwnerState::Stopped { operation })
             .await
     }
+}
+
+/// A registry file's bytes, refusing a symbolic link in its place; `None` when it is missing.
+fn read_unlinked(path: &Path) -> io::Result<Option<Vec<u8>>> {
+    use std::io::Read;
+    let mut file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(Some(bytes))
 }
 
 fn unavailable(message: String) -> HostError {
@@ -773,6 +931,104 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o700);
+    }
+
+    /// One validator decides which files are records: a launch file whose name or content names
+    /// another operation or Chat is refused, a Chat directory not named by its canonical id is
+    /// not a Chat, and a symbolic link is never followed.
+    #[tokio::test]
+    async fn only_canonical_unlinked_records_of_their_own_chat_are_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = Registry::default().root(directory.path()).await.unwrap();
+        let chats = directory
+            .path()
+            .join(REGISTRY_DIRECTORY)
+            .join(CHATS_DIRECTORY);
+        let (chat, other) = (Uuid::new_v4(), Uuid::new_v4());
+        let foreign = record(other, LaunchState::Opening);
+        let chat_directory = chats.join(chat.to_string());
+        std::fs::create_dir_all(&chat_directory).unwrap();
+        std::fs::write(
+            chat_directory.join(format!(
+                "{LAUNCH_PREFIX}{}{RECORD_EXTENSION}",
+                foreign.operation
+            )),
+            serde_json::to_vec(&foreign).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            root.launches(chat).await.is_err(),
+            "a record naming another Chat is refused"
+        );
+
+        let uppercase = Uuid::new_v4();
+        std::fs::create_dir_all(chats.join(uppercase.to_string().to_uppercase())).unwrap();
+        assert!(
+            !root.chats().await.unwrap().contains(&uppercase),
+            "only a canonical id names a Chat"
+        );
+
+        let linked = Uuid::new_v4();
+        let elsewhere = directory.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, chats.join(linked.to_string())).unwrap();
+        assert!(
+            root.launches(linked).await.is_err(),
+            "a linked Chat directory is refused"
+        );
+        assert!(
+            root.record_launch(&record(linked, LaunchState::Opening))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read_dir(&elsewhere).unwrap().count(),
+            0,
+            "nothing written through it"
+        );
+
+        let target = Uuid::new_v4();
+        let real = record(target, LaunchState::Opening);
+        root.record_launch(&real).await.unwrap();
+        let path = chats.join(target.to_string()).join(format!(
+            "{LAUNCH_PREFIX}{}{RECORD_EXTENSION}",
+            real.operation
+        ));
+        let decoy = directory.path().join("decoy.json");
+        std::fs::rename(&path, &decoy).unwrap();
+        std::os::unix::fs::symlink(&decoy, &path).unwrap();
+        assert!(
+            root.launches(target).await.is_err(),
+            "a linked record is refused"
+        );
+    }
+
+    /// A record is changed only as it is now: a change decided on an earlier reading of a record
+    /// that was removed or changed meanwhile writes nothing.
+    #[tokio::test]
+    async fn a_transition_applies_only_to_the_record_as_it_is_now() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = Registry::default().root(directory.path()).await.unwrap();
+        let chat = Uuid::new_v4();
+        let instance = InstanceRef::hosted(Uuid::new_v4());
+        let live = record(
+            chat,
+            LaunchState::Live {
+                instance: instance.clone(),
+                host_epoch: Uuid::new_v4(),
+            },
+        );
+        root.record_launch(&live).await.unwrap();
+        root.remove_launch(chat, live.operation).await.unwrap();
+        let changed = root
+            .transition_launch(chat, live.operation, |mut current| {
+                current.watches.insert(Uuid::new_v4());
+                Transition::Write(Box::new(current))
+            })
+            .await
+            .unwrap();
+        assert!(!changed, "a removed record is not brought back");
+        assert!(root.launches(chat).await.unwrap().is_empty());
     }
 
     #[tokio::test]

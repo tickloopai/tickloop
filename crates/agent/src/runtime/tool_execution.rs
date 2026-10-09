@@ -423,7 +423,7 @@ impl Agent {
                 .await
             }
             ToolRoute::Delegation => {
-                self.delegation_tool(receipt, &operation.call_id, &operation.input, cancel)
+                self.subagent_tool(receipt, &operation.call_id, &operation.input, cancel)
                     .await
             }
             ToolRoute::Skill => self.skill_tool(receipt, &operation.input).await,
@@ -631,7 +631,7 @@ impl Agent {
         };
         let prepared_family_message = if matches!(
             name.as_str(),
-            SEND_AGENT_MESSAGE_TOOL_NAME | agent_messages::STOP_AGENT_TOOL_NAME
+            SEND_AGENT_MESSAGE_TOOL_NAME | agent_messages::STOP_SUBAGENT_TOOL_NAME
         ) && matches!(
             registration.as_ref().map(|registered| &registered.route),
             Some(ToolRoute::AgentMessage)

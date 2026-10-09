@@ -1,5 +1,5 @@
 //! The worker's side of the Chat ends that end hosted Ticks: retention deleting an expired
-//! Transcript, and StopAgent stopping a direct child. Both reach the owner over the worker-control
+//! Transcript, and StopSubagent stopping a direct child. Both reach the owner over the worker-control
 //! channel; the owner checks each claim itself before it ends anything.
 
 use tokio::runtime::Handle;

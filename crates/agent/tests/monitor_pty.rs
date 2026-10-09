@@ -297,6 +297,30 @@ fn artifact_login_opens_picker_adds_tick_and_uses_a_substitute_browser() {
         session.send(b"\r");
         session.wait("Artifacts (1)");
         session.wait("Monitor 1");
+        let focus_deadline = Instant::now() + TIMEOUT;
+        loop {
+            let frame = screen::visible_screen(
+                &session.output.lock().unwrap(),
+                TERMINAL_WIDTH,
+                TERMINAL_HEIGHT,
+            );
+            if frame
+                .lines()
+                .filter_map(|line| line.split_once('│').map(|(_, monitor)| monitor))
+                .any(|monitor| monitor.contains('›') && monitor.contains("PTY Research"))
+                && frame
+                    .lines()
+                    .filter_map(|line| line.split_once('│').map(|(_, monitor)| monitor))
+                    .any(|monitor| monitor.contains("Enter open"))
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < focus_deadline,
+                "added artifact must receive Monitor focus before opening: {frame}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
         session.send(b"\r");
         let deadline = Instant::now() + TIMEOUT;
         let log = directory.path().join("browser.log");

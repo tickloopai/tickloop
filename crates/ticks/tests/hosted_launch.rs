@@ -7,9 +7,9 @@ use std::{path::Path, time::Duration};
 
 use serde_json::{Value, json};
 use tick_connect::hosted::{
-    ATTACH_INPUT_BYTES, ATTACH_REQUEST_FRAME_BYTES, BUSINESS_FRAME_BYTES, CALL_TIMEOUT,
-    CAPABILITY_DATA, CAPABILITY_LIFECYCLE, CONTROL_TIMEOUT, HostConnection, Role, read_frame,
-    write_frame,
+    ATTACH_INPUT_BYTES, ATTACH_REQUEST_FRAME_BYTES, BUSINESS_FRAME_BYTES, BUSINESS_MAJOR,
+    CALL_TIMEOUT, CAPABILITY_DATA, CAPABILITY_LIFECYCLE, CONTROL_TIMEOUT, HostConnection, Role,
+    read_frame, write_frame,
 };
 use tick_host::{host, paths::HostPaths};
 use tokio::{
@@ -611,26 +611,22 @@ async fn a_stalled_view_loses_its_lease_after_two_seconds_and_the_tick_keeps_run
         .unwrap();
     let attached_at = std::time::Instant::now();
     let mut reader = fixture.reader(&opened).await;
-    let mut released = None;
-    for _ in 0..60 {
-        reader
-            .request("call", json!({"tool":"flood","args":{}}), CALL_TIMEOUT)
-            .await
-            .unwrap();
-        let mut probe = fixture.reader(&opened).await;
-        match probe.request("attach", json!({}), CONTROL_TIMEOUT).await {
-            Ok(_) => {
-                released = Some(probe);
-                break;
+    let released = tokio::time::timeout(CONTROL_TIMEOUT, async {
+        loop {
+            reader
+                .request("call", json!({"tool":"flood","args":{}}), CALL_TIMEOUT)
+                .await
+                .unwrap();
+            let mut probe = fixture.reader(&opened).await;
+            match probe.request("attach", json!({}), CONTROL_TIMEOUT).await {
+                Ok(_) => break probe,
+                Err(error) if error.code == "Busy" => tokio::task::yield_now().await,
+                Err(error) => panic!("attach failed: {error:?}"),
             }
-            Err(error) if error.code == "Busy" => {}
-            Err(error) => panic!("attach failed: {error:?}"),
         }
-    }
-    assert!(
-        released.is_some(),
-        "a view that stops reading loses its lease"
-    );
+    })
+    .await
+    .expect("a view that stops reading loses its lease");
     assert!(attached_at.elapsed() >= host::STREAM_WRITE_TIMEOUT);
     let called = reader
         .request(
@@ -641,6 +637,7 @@ async fn a_stalled_view_loses_its_lease_after_two_seconds_and_the_tick_keeps_run
         .await
         .unwrap();
     assert_eq!(called["value"], 1, "the Tick keeps running");
+    drop(released);
     drop(stalled);
     shutdown(&fixture).await;
 }
@@ -1105,7 +1102,7 @@ def connect():
     channel = socket.socket(socket.AF_UNIX)
     channel.connect(binding['terminal']['endpoint'])
     stream = channel.makefile('rw')
-    stream.write(json.dumps({'channel':'business','major':1,'minor':0,'required':['launch'],'role':{'kind':'launcher','operation':binding['operation'],'launch_token':binding['launch_token']}}) + '\n')
+    stream.write(json.dumps({'channel':'business','major':int(sys.argv[2]),'minor':0,'required':['launch'],'role':{'kind':'launcher','operation':binding['operation'],'launch_token':binding['launch_token']}}) + '\n')
     stream.flush()
     return channel, stream, json.loads(stream.readline())
 channel, stream, hello = connect()
@@ -1134,6 +1131,7 @@ async fn a_launch_token_works_once_and_only_after_a_proven_foreground() {
                 "-c".into(),
                 PROBE_LAUNCHER.into(),
                 results.to_string_lossy().into_owned(),
+                BUSINESS_MAJOR.to_string(),
             ],
             fixture.directory.path(),
         )

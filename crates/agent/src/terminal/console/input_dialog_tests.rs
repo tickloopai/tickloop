@@ -149,11 +149,15 @@ async fn input_dialog_top_rule_covers_every_surface_with_semantic_theme_roles() 
                 _ => Role::Permission,
             };
             let (lines, row, _) = state.styled_frame();
-            assert_eq!(
-                lines.len(),
-                input_dialog::INPUT_DIALOG_ROWS,
-                "{surface}/{theme:?}"
-            );
+            let expected = match surface {
+                "permission" | "question" | "plan" | "plan feedback" | "trust" => 12,
+                "help" => 13,
+                "settings" | "login" | "resume" => 6,
+                "artifacts" | "tasks" | "tick confirmation" => 5,
+                "subscriptions" | "permissions" => 4,
+                _ => unreachable!(),
+            };
+            assert_eq!(lines.len(), expected, "{surface}/{theme:?}");
             assert_eq!(lines[0].text(), "▔".repeat(state.width));
             assert_eq!(lines[0].spans[0].role, Some(role), "{surface}/{theme:?}");
             assert_eq!(
@@ -1036,8 +1040,8 @@ fn menu(id: Uuid) -> Menu {
 }
 
 #[test]
-fn input_dialog_replaces_the_footer_with_a_fixed_height_and_preserves_the_draft() {
-    for (width, height, expected) in [(80, 24, 12), (120, 40, 12), (30, 10, 6)] {
+fn input_dialog_replaces_the_footer_with_content_height_and_preserves_the_draft() {
+    for (width, height, expected) in [(80, 24, 6), (120, 40, 6), (30, 10, 6)] {
         let mut state = State::new(true, width, height);
         state.prompt_enabled = true;
         state.insert("draft jk");
@@ -1166,7 +1170,7 @@ fn resume_picker_uses_the_bottom_container_and_keeps_the_conversation_visible() 
     let mut state = console.state.lock().unwrap();
     state.draw(&mut Vec::new()).unwrap();
     assert!(
-        state.rendered_screen[..12]
+        state.rendered_screen[..state.height - state.input_dialog_height()]
             .iter()
             .any(|line| line.contains("conversation remains visible"))
     );
@@ -1175,7 +1179,7 @@ fn resume_picker_uses_the_bottom_container_and_keeps_the_conversation_visible() 
             [state.height - state.input_dialog_height() + input_dialog::INPUT_DIALOG_RULE_ROWS]
             .starts_with("Resume Chat")
     );
-    assert_eq!(state.styled_frame().0.len(), 12);
+    assert_eq!(state.styled_frame().0.len(), 6);
 }
 
 #[test]
@@ -1256,7 +1260,7 @@ fn artifact_load_returns_to_its_hidden_agent_without_changing_the_visible_dialog
 }
 
 #[test]
-fn workspace_trust_and_subscriptions_use_the_fixed_dialog_height() {
+fn workspace_trust_stays_fixed_and_subscriptions_fit_their_content() {
     let mut state = State::new(true, 80, 24);
     state.workspace_trust = Some(WorkspaceTrust::new(PathBuf::from("/fixture/project")));
     assert_eq!(state.styled_frame().0.len(), 12);
@@ -1264,7 +1268,7 @@ fn workspace_trust_and_subscriptions_use_the_fixed_dialog_height() {
     let chat = Uuid::new_v4();
     console.select_chat(Some(chat)).unwrap();
     console.show_subscriptions(chat, Vec::new()).unwrap();
-    assert_eq!(console.state.lock().unwrap().styled_frame().0.len(), 12);
+    assert_eq!(console.state.lock().unwrap().styled_frame().0.len(), 4);
 }
 
 #[test]
@@ -1281,14 +1285,22 @@ fn sticky_prompt_short_conversation_keeps_the_full_content_height() {
     }
     state.scrollback.append("Trailing boundary");
     state.draw(&mut Vec::new()).unwrap();
-    assert!(state.rendered_screen[0].starts_with("Leading boundary"));
+    assert!(
+        state.rendered_screen[..state.height - state.input_dialog_height()]
+            .iter()
+            .any(|line| line.starts_with("Leading boundary"))
+    );
     assert!(state.rendered_screen[0].contains('│'));
     assert!(
         state.rendered_screen[..12]
             .iter()
             .any(|row| row.contains("Fixture Tick 0"))
     );
-    assert!(state.rendered_screen[1].starts_with("❯ Short user request"));
+    assert!(
+        state.rendered_screen[..state.height - state.input_dialog_height()]
+            .iter()
+            .any(|line| line.starts_with("❯ Short user request"))
+    );
     assert_eq!(
         state
             .rendered_screen
@@ -1297,7 +1309,7 @@ fn sticky_prompt_short_conversation_keeps_the_full_content_height() {
             .count(),
         1
     );
-    assert_eq!(state.input_dialog_height(), input_dialog::INPUT_DIALOG_ROWS);
+    assert_eq!(state.input_dialog_height(), 6);
     let dialog_top = state.height - state.input_dialog_height();
     assert!(state.rendered_screen[dialog_top - 1].starts_with("Trailing boundary"));
     assert!(state.rendered_screen[dialog_top - 1].contains('│'));
@@ -1429,7 +1441,7 @@ fn latest_user_message_is_scoped_to_its_agent_and_falls_back_on_short_screens() 
 
 #[test]
 fn sticky_prompt_first_line_boundary_is_stable_on_scroll_and_resize() {
-    let console = tests::console_with_state(State::new(true, 80, 24));
+    let console = tests::console_with_state(State::new(true, 80, 18));
     console.select_chat(Some(Uuid::new_v4())).unwrap();
     console.show_focused_menu(menu(Uuid::new_v4())).unwrap();
     let mut state = console.state.lock().unwrap();
@@ -1453,14 +1465,14 @@ fn sticky_prompt_first_line_boundary_is_stable_on_scroll_and_resize() {
     state.scrollback.append("Reply 9\n");
     state.draw(&mut Vec::new()).unwrap();
     assert!(state.rendered_screen[0].starts_with("❯ Boundary request continuation visible"));
-    state.resize(80, 25);
+    state.resize(80, 19);
     for _ in 0..3 {
         state.draw(&mut Vec::new()).unwrap();
         assert!(state.rendered_screen[0].starts_with("❯ Boundary request"));
         assert!(!state.rendered_screen[0].contains("continuation visible"));
         assert!(state.rendered_screen[1].contains("continuation visible"));
     }
-    state.resize(80, 24);
+    state.resize(80, 18);
     state.draw(&mut Vec::new()).unwrap();
     state.scroll_conversation(ScrollAction::First);
     state.scroll_conversation(ScrollAction::LinesDown(2));
@@ -1502,7 +1514,7 @@ fn sticky_prompt_latest_message_below_the_viewport_has_no_header() {
 
 #[test]
 fn sticky_prompt_reflows_with_width_and_respects_auto_scroll_switches() {
-    let console = tests::console_with_state(State::new(true, 80, 24));
+    let console = tests::console_with_state(State::new(true, 80, 18));
     console.select_chat(Some(Uuid::new_v4())).unwrap();
     console.show_focused_menu(menu(Uuid::new_v4())).unwrap();
     let mut state = console.state.lock().unwrap();
@@ -1520,7 +1532,7 @@ fn sticky_prompt_reflows_with_width_and_respects_auto_scroll_switches() {
             .count(),
         1
     );
-    state.resize(40, 24);
+    state.resize(40, 18);
     state.draw(&mut Vec::new()).unwrap();
     assert!(state.rendered_screen[0].starts_with("❯ Reflow request"));
     state.scrollback.set_auto_scroll(false);
@@ -1535,7 +1547,7 @@ fn sticky_prompt_reflows_with_width_and_respects_auto_scroll_switches() {
     state.scroll_conversation(ScrollAction::Last);
     state.draw(&mut Vec::new()).unwrap();
     assert!(state.rendered_screen[0].starts_with("❯ Reflow request"));
-    state.resize(80, 24);
+    state.resize(80, 18);
     state.draw(&mut Vec::new()).unwrap();
     assert!(!state.rendered_screen[0].contains("Reflow request"));
     assert_eq!(
@@ -1682,9 +1694,9 @@ fn a_completed_artifact_selection_closes_its_original_picker_without_switching_a
 }
 
 #[test]
-fn provider_model_and_connection_dialogs_have_one_fixed_container_and_isolate_input() {
+fn provider_model_and_connection_dialogs_fit_their_content_and_isolate_input() {
     for kind in [PickerKind::Provider, PickerKind::Model, PickerKind::Actions] {
-        for (width, height, expected) in [(80, 24, 12), (120, 40, 12), (32, 10, 6)] {
+        for (width, height, expected) in [(80, 24, 22), (120, 40, 26), (32, 10, 8)] {
             let mut state = State::new(true, width, height);
             state.chat = Some(Uuid::new_v4());
             state.prompt_enabled = true;
@@ -1768,7 +1780,7 @@ fn provider_credential_dialog_hides_ordinals_and_keeps_secret_editing_hints() {
         .map(RoleLine::text)
         .collect::<Vec<_>>()
         .join("\n");
-    assert_eq!(lines.len(), input_dialog::INPUT_DIALOG_ROWS);
+    assert_eq!(lines.len(), 7);
     assert!(!text.contains("secret-value"));
     assert!(!text.contains("1. Save API key"), "{text}");
     assert!(text.contains("Ctrl+G"), "{text}");
@@ -1999,7 +2011,7 @@ async fn exit_plan_mode_automatically_opens_the_agent_dialog_and_preserves_it_ac
         );
         assert_eq!(
             state.input_dialog_frame().0.len(),
-            input_dialog::INPUT_DIALOG_ROWS
+            input_dialog::FIXED_INPUT_DIALOG_ROWS
         );
         let frame = state
             .input_dialog_frame()
@@ -2465,7 +2477,7 @@ async fn a_child_reopens_its_dismissed_approval_but_cannot_enter_plan_mode_witho
     let model = Arc::new(test_support::ScriptedModel::new(vec![
         test_support::call(
             "delegate",
-            "DelegateAgent",
+            "Subagent",
             serde_json::json!({"task":"Plan the delegated task."}),
         ),
         test_support::call("enter", "EnterPlanMode", serde_json::json!({})),

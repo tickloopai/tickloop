@@ -29,7 +29,7 @@ fn prompt_suggestion_pty_fixture() {
                     model.api_key_env.clear();
                     let replies = if user_case {
                         vec![
-                            crate::terminal::test_support::call("delegate", "DelegateAgent", serde_json::json!({"task":"Complete the fixture child"})),
+                            crate::terminal::test_support::call("delegate", "Subagent", serde_json::json!({"task":"Complete the fixture child"})),
                             crate::terminal::test_support::text("Child completed."),
                             crate::terminal::test_support::text("Parent completed."),
                             crate::terminal::test_support::call("ls", "Bash", serde_json::json!({"command":"ls", "description":"List files in current directory"})),
