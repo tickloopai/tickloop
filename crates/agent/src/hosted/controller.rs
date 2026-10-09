@@ -38,7 +38,8 @@ pub const OPEN_TIMEOUT: Duration = Duration::from_secs(2 * CONTROL_TIMEOUT.as_se
 pub const LIFECYCLE_TIMEOUT: Duration =
     Duration::from_secs(START_ATTEMPTS as u64 * START_WAIT.as_secs() + OPEN_TIMEOUT.as_secs());
 const DISCONNECTED: &str = "Disconnected";
-/// Chat ids per owner snapshot chunk, keeping each chunk well under 1 MiB.
+/// Chat ids per owner snapshot chunk, keeping each chunk well under one registry record
+/// ([`SHARD_BYTES`](super::registry::SHARD_BYTES)).
 const SNAPSHOT_CHUNK_OWNERS: usize = 16 * 1024;
 const CONNECT_INTERVAL: Duration = Duration::from_millis(25);
 /// Only an open starts a host; other requests find that no hosted Tick exists.
@@ -54,6 +55,25 @@ pub struct HostedViewGrant {
     pub host_epoch: Uuid,
     pub instance: tick_connect::instance::InstanceRef,
     pub view: Uuid,
+}
+
+/// One Tick's approved Watch intents as the request that hands them to the host, never larger
+/// than one registry record.
+pub struct WatchIntents(Value);
+
+impl WatchIntents {
+    pub fn new(
+        owner: &TickOwner,
+        instance: &tick_connect::instance::InstanceRef,
+        watches: &std::collections::BTreeSet<Uuid>,
+    ) -> Result<Self, HostError> {
+        let request = json!({"owner":owner,"instance":instance,"watches":watches});
+        super::registry::within_shard(
+            format_args!("the Watch intents of {instance}"),
+            request.to_string().len(),
+        )?;
+        Ok(Self(request))
+    }
 }
 
 /// What the host ran for an owner when a listing began.
@@ -249,18 +269,13 @@ impl HostController {
         Ok(())
     }
 
-    /// Replaces and renews the approved Watch intents of one of `owner`'s Ticks. Without a
+    /// Replaces and renews the approved Watch intents of one of an owner's Ticks. Without a
     /// running host there is nothing to protect.
-    pub async fn set_intents(
-        &self,
-        owner: &TickOwner,
-        instance: &tick_connect::instance::InstanceRef,
-        watches: &std::collections::BTreeSet<Uuid>,
-    ) -> Result<(), HostError> {
+    pub async fn set_intents(&self, intents: &WatchIntents) -> Result<(), HostError> {
         match self
             .request(
                 "set_intents",
-                json!({"owner":owner,"instance":instance,"watches":watches}),
+                intents.0.clone(),
                 CONTROL_TIMEOUT,
                 Start::Never,
             )
@@ -476,7 +491,7 @@ impl HostController {
                 key
             }
         };
-        let mut last = HostError::before("HostUnavailable", "the Tick host did not start");
+        let mut last_failure = String::new();
         for _ in 0..START_ATTEMPTS {
             self.spawn(&key)
                 .map_err(|error| HostError::before("HostUnavailable", error.to_string()))?;
@@ -485,12 +500,18 @@ impl HostController {
                 match self.connect(&key).await {
                     Ok(connection) => return Ok(connection),
                     Err(error) if is_definite_refusal(&error) => return Err(error),
-                    Err(error) => last = error,
+                    Err(error) => last_failure = error.to_string(),
                 }
                 tokio::time::sleep(CONNECT_INTERVAL).await;
             }
         }
-        Err(last)
+        Err(HostError::before(
+            "HostUnavailable",
+            format!(
+                "the Tick host did not start in {START_ATTEMPTS} attempts of {}s each (last: {last_failure})",
+                START_WAIT.as_secs()
+            ),
+        ))
     }
 
     async fn connect_running(&self) -> Result<HostConnection, HostError> {
