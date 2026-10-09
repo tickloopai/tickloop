@@ -42,6 +42,20 @@ pub async fn connect_or_start(executable: PathBuf) -> Result<LocalAgentClient, S
     connect_or_start_at(runtime_directory(), executable).await
 }
 
+/// Reconnects to an already-running daemon without undoing an explicit daemon stop.
+pub async fn connect_to_running_daemon(executable: PathBuf) -> Result<LocalAgentClient, String> {
+    let directory = runtime_directory();
+    validate_directory(&directory)?;
+    let directory = directory
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
+    let endpoint = directory.join(SOCKET_NAME);
+    check_socket_length(&endpoint)?;
+    connect_existing(&endpoint, &executable, false)
+        .await?
+        .ok_or_else(|| "Agent daemon is not running; launch tickloop to start it.".into())
+}
+
 #[doc(hidden)]
 pub async fn connect_or_start_at(
     directory: PathBuf,

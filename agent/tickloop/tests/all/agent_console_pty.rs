@@ -6,6 +6,7 @@ use tickloop_agent_test_support::model_http_support;
 mod artifact_attachment;
 mod auto_review;
 mod command_feedback;
+mod daemon_shutdown;
 mod family_messaging;
 mod family_navigation;
 mod hosted_monitor;

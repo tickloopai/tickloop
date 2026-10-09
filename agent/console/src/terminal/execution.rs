@@ -418,7 +418,13 @@ impl ConsoleExecution {
         let recovery = RecoveringAgentClient::new(
             client,
             Arc::new(|| {
-                Box::pin(async { connect_daemon().await.map_err(AccessError::unavailable) })
+                Box::pin(async {
+                    let executable = std::env::current_exe()
+                        .map_err(|error| AccessError::unavailable(error.to_string()))?;
+                    tickloop_agent_client::connect_to_running_daemon(executable)
+                        .await
+                        .map_err(AccessError::unavailable)
+                })
             }),
         );
         let mut execution =
