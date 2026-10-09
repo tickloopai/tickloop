@@ -18,6 +18,13 @@ use uuid::Uuid;
 
 pub type WatchId = Uuid;
 const STREAM_CAPACITY: usize = 128;
+/// A watch connects to its Tick once and reconnects at most this often in an Agent process;
+/// then it stays Disconnected until it is subscribed again, which makes a new watch.
+pub const RECONNECTS_PER_WATCH: u32 = 3;
+/// How long a watch waits after a failed or lost connection before it connects again.
+pub const RECONNECT_PAUSE: Duration = Duration::from_secs(5);
+/// How often an ordinary terminal is sampled while it is watched.
+const TERMINAL_SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ObservationKind {
@@ -569,6 +576,7 @@ impl TickStreamPort for InMemoryTickStream {
 pub struct NativeTickStream {
     provider: Arc<crate::native_host::NativeHostToolProvider>,
     authorities: watch::Sender<BTreeMap<WatchId, crate::host_tools::HostToolAuthority>>,
+    budget: ConnectionBudget,
 }
 
 impl NativeTickStream {
@@ -576,6 +584,15 @@ impl NativeTickStream {
         Self {
             provider,
             authorities: watch::channel(BTreeMap::new()).0,
+            budget: ConnectionBudget::default(),
+        }
+    }
+
+    fn scope(&self) -> NativeWatchScope {
+        NativeWatchScope {
+            provider: self.provider.clone(),
+            authorities: self.authorities.subscribe(),
+            budget: self.budget.clone(),
         }
     }
 }
@@ -584,6 +601,7 @@ impl NativeTickStream {
 struct NativeWatchScope {
     provider: Arc<crate::native_host::NativeHostToolProvider>,
     authorities: watch::Receiver<BTreeMap<WatchId, crate::host_tools::HostToolAuthority>>,
+    budget: ConnectionBudget,
 }
 impl NativeWatchScope {
     fn revalidate(
@@ -632,12 +650,17 @@ impl WatchAdmission for NativeWatchScope {
                     None
                 }
             })
+            .filter(|watch| self.budget.admit_or_disconnect(*watch, instance, publisher))
             .collect()
     }
 }
 
 #[async_trait::async_trait]
 impl InstanceObserver for NativeWatchScope {
+    fn budget(&self) -> &ConnectionBudget {
+        &self.budget
+    }
+
     async fn authorities_changed(&mut self) -> bool {
         self.authorities.changed().await.is_ok()
     }
@@ -667,6 +690,9 @@ trait WatchAdmission: Send + Sync {
 /// watches that want it.
 #[async_trait::async_trait]
 trait InstanceObserver: WatchAdmission + Clone + 'static {
+    /// The connection attempts of this stream's watches.
+    fn budget(&self) -> &ConnectionBudget;
+
     /// Waits until the admitted watch authorities change; false once they never will again.
     async fn authorities_changed(&mut self) -> bool;
 
@@ -676,6 +702,79 @@ trait InstanceObserver: WatchAdmission + Clone + 'static {
         wanted: watch::Receiver<BTreeSet<WatchId>>,
         publisher: EventPublisher,
     );
+}
+
+/// The connection attempts each watch of a stream made in this Agent process.
+#[derive(Clone, Default)]
+struct ConnectionBudget {
+    attempts: Arc<Mutex<BTreeMap<WatchId, Attempts>>>,
+}
+
+#[derive(Clone, Copy)]
+enum Attempts {
+    /// Attempts so far: the first connects, the others reconnect.
+    Made(u32),
+    /// The watch was refused another attempt.
+    Spent,
+}
+
+impl ConnectionBudget {
+    /// Takes one connection attempt for each of `watches` that has one left; a watch without
+    /// one is told it is Disconnected and stays so.
+    fn take(
+        &self,
+        watches: &BTreeSet<WatchId>,
+        instance: &InstanceRef,
+        publisher: &EventPublisher,
+    ) -> BTreeSet<WatchId> {
+        let mut attempts = self.attempts.lock().unwrap_or_else(PoisonError::into_inner);
+        watches
+            .iter()
+            .copied()
+            .filter(|watch| {
+                let attempt = attempts.entry(*watch).or_insert(Attempts::Made(0));
+                match attempt {
+                    Attempts::Made(made) if *made < 1 + RECONNECTS_PER_WATCH => {
+                        *made += 1;
+                        true
+                    }
+                    _ => {
+                        *attempt = Attempts::Spent;
+                        publisher.state_to(
+                            instance.clone(),
+                            TickConnectionState::Disconnected,
+                            [*watch],
+                        );
+                        false
+                    }
+                }
+            })
+            .collect()
+    }
+
+    /// Admits `watch` while it may still follow its Tick; a watch refused another attempt is
+    /// told instead that it stays Disconnected.
+    fn admit_or_disconnect(
+        &self,
+        watch: WatchId,
+        instance: &InstanceRef,
+        publisher: &EventPublisher,
+    ) -> bool {
+        let attempts = self.attempts.lock().unwrap_or_else(PoisonError::into_inner);
+        if matches!(attempts.get(&watch), Some(Attempts::Spent)) {
+            publisher.state_to(instance.clone(), TickConnectionState::Disconnected, [watch]);
+            return false;
+        }
+        true
+    }
+
+    /// Forgets the attempts of watches no longer wanted.
+    fn retain(&self, desired: &BTreeMap<WatchId, InstanceRef>) {
+        self.attempts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|watch, _| desired.contains_key(watch));
+    }
 }
 
 /// A protocol Tick as a watch sees it: its declared recovery tool, and a registration that
@@ -763,11 +862,7 @@ impl TickStreamPort for NativeTickStream {
         if instance.tick_type() != "herdr" {
             return Err("Native watch requires a Herdr instance".into());
         }
-        NativeWatchScope {
-            provider: self.provider.clone(),
-            authorities: self.authorities.subscribe(),
-        }
-        .revalidate(authority)
+        self.scope().revalidate(authority)
     }
     async fn read_current(
         &self,
@@ -786,10 +881,7 @@ impl TickStreamPort for NativeTickStream {
     fn open(&self) -> TickStreamHandle {
         let (desired, wanted) = watch::channel(BTreeMap::new());
         let (publisher, events) = EventPublisher::channel();
-        let scope = NativeWatchScope {
-            provider: self.provider.clone(),
-            authorities: self.authorities.subscribe(),
-        };
+        let scope = self.scope();
         tokio::spawn(async move { follow_instances(scope, wanted, publisher).await });
         TickStreamHandle { desired, events }
     }
@@ -839,6 +931,7 @@ async fn follow_instances<O: InstanceObserver>(
             .map(|(watch, instance)| (*watch, instance.clone()))
             .collect();
         publisher.retain(&wanted);
+        scope.budget().retain(&wanted);
         let mut groups: BTreeMap<InstanceRef, BTreeSet<WatchId>> = BTreeMap::new();
         for (watch, instance) in eligible {
             let admitted = scope.admitted(&BTreeSet::from([watch]), &instance, &publisher);
@@ -909,7 +1002,8 @@ async fn observe_native_instance(
         if wanted.borrow().is_empty() {
             return;
         }
-        let attempted = scope.admitted(&wanted.borrow_and_update().clone(), &instance, &publisher);
+        let admitted = scope.admitted(&wanted.borrow_and_update().clone(), &instance, &publisher);
+        let attempted = scope.budget.take(&admitted, &instance, &publisher);
         if attempted.is_empty() {
             return;
         }
@@ -964,10 +1058,8 @@ async fn observe_native_instance(
         if wanted.borrow().is_empty() {
             return;
         }
-        let pause = tokio::time::sleep(Duration::from_secs(5));
-        tokio::pin!(pause);
         tokio::select! {
-            _ = &mut pause => {}
+            _ = tokio::time::sleep(RECONNECT_PAUSE) => {}
             changed = wanted.changed() => if changed.is_err() { return; },
         }
     }
@@ -995,7 +1087,7 @@ async fn observe_terminal(
     let mut last_text: Option<String> = None;
     let mut sequence = 0_u64;
     let mut lost_host_events = false;
-    let mut cadence = tokio::time::interval(Duration::from_secs(5));
+    let mut cadence = tokio::time::interval(TERMINAL_SAMPLE_INTERVAL);
     cadence.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         if wanted.borrow().is_empty() {

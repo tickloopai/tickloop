@@ -1,17 +1,18 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde_json::json;
 use tick_connect::protocol::descriptor_digest;
 use tick_connect::session::{
-    SessionClient, SessionError, SessionLaunch, SessionLinkState, TickSession,
+    SessionBackend, SessionClient, SessionError, SessionLaunch, SessionLinkState, TickSession,
 };
 use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 
-async fn counter() -> (TickSession, tempfile::TempDir) {
-    let directory = tempfile::tempdir().unwrap();
-    let script = directory.path().join("counter.py");
-    std::fs::write(&script, r#"
+const HERDR_SOCKET: &str = "/tmp/example-herdr.sock";
+const COUNTER_PANE: &str = "counter-pane";
+
+/// Publishes an update for each `increment` shortly before answering it.
+const COUNTER: &str = r#"
 import json, os, sys, time
 instance = os.environ['TICKLOOP_INSTANCE_ID']
 value = 0
@@ -31,22 +32,36 @@ for line in sys.stdin:
     else:
         raise RuntimeError(method)
     print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}),flush=True)
-"#).unwrap();
-    let session = TickSession::spawn(SessionLaunch {
+"#;
+
+fn herdr_backend(terminal_id: &str) -> SessionBackend {
+    SessionBackend::Herdr {
+        socket: PathBuf::from(HERDR_SOCKET),
+        terminal_id: terminal_id.into(),
+    }
+}
+
+/// Runs the Python Tick `source` as `{name}.py` in `directory`, in the Herdr pane `{name}-pane`.
+async fn spawn_tick(directory: &Path, name: &str, source: &str) -> TickSession {
+    let script = directory.join(format!("{name}.py"));
+    std::fs::write(&script, source).unwrap();
+    TickSession::spawn(SessionLaunch {
         command: vec![
             "python3".into(),
             "-u".into(),
             script.to_string_lossy().into_owned(),
         ],
-        cwd: directory.path().into(),
-        backend: tick_connect::session::SessionBackend::Herdr {
-            socket: PathBuf::from("/tmp/example-herdr.sock"),
-            terminal_id: "counter-pane".into(),
-        },
-        runtime_dir: Some(directory.path().join("sessions")),
+        cwd: directory.into(),
+        backend: herdr_backend(&format!("{name}-pane")),
+        runtime_dir: Some(directory.join("sessions")),
     })
     .await
-    .unwrap();
+    .unwrap()
+}
+
+async fn counter() -> (TickSession, tempfile::TempDir) {
+    let directory = tempfile::tempdir().unwrap();
+    let session = spawn_tick(directory.path(), "counter", COUNTER).await;
     (session, directory)
 }
 
@@ -55,10 +70,7 @@ async fn later_subscriber_gets_its_own_baseline_and_actual_received_count() {
     let (session, directory) = counter().await;
     let client = SessionClient::connect(
         session.instance().clone(),
-        tick_connect::session::SessionBackend::Herdr {
-            socket: PathBuf::from("/tmp/example-herdr.sock"),
-            terminal_id: "counter-pane".into(),
-        },
+        herdr_backend(COUNTER_PANE),
         Some(directory.path().join("sessions")),
     )
     .await
@@ -119,20 +131,14 @@ async fn concurrent_clients_with_identical_calls_receive_their_own_responses() {
     let (session, directory) = counter().await;
     let first = SessionClient::connect(
         session.instance().clone(),
-        tick_connect::session::SessionBackend::Herdr {
-            socket: PathBuf::from("/tmp/example-herdr.sock"),
-            terminal_id: "counter-pane".into(),
-        },
+        herdr_backend(COUNTER_PANE),
         Some(directory.path().join("sessions")),
     )
     .await
     .unwrap();
     let second = SessionClient::connect(
         session.instance().clone(),
-        tick_connect::session::SessionBackend::Herdr {
-            socket: PathBuf::from("/tmp/example-herdr.sock"),
-            terminal_id: "counter-pane".into(),
-        },
+        herdr_backend(COUNTER_PANE),
         Some(directory.path().join("sessions")),
     )
     .await
@@ -333,8 +339,10 @@ async fn shutdown_does_not_remove_a_replacement_at_the_endpoint_path() {
 #[tokio::test]
 async fn malformed_child_response_after_dispatch_is_unknown() {
     let directory = tempfile::tempdir().unwrap();
-    let script = directory.path().join("broken.py");
-    std::fs::write(&script, r#"
+    let session = spawn_tick(
+        directory.path(),
+        "broken",
+        r#"
 import json, os, sys
 instance = os.environ['TICKLOOP_INSTANCE_ID']
 for line in sys.stdin:
@@ -347,22 +355,9 @@ for line in sys.stdin:
         print('not-json', flush=True)
         break
     print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}), flush=True)
-"#).unwrap();
-    let session = TickSession::spawn(SessionLaunch {
-        command: vec![
-            "python3".into(),
-            "-u".into(),
-            script.to_string_lossy().into_owned(),
-        ],
-        cwd: directory.path().into(),
-        backend: tick_connect::session::SessionBackend::Herdr {
-            socket: PathBuf::from("/tmp/example-herdr.sock"),
-            terminal_id: "broken-pane".into(),
-        },
-        runtime_dir: Some(directory.path().join("sessions")),
-    })
-    .await
-    .unwrap();
+"#,
+    )
+    .await;
     let result = session
         .client()
         .call("increment", json!({}), CancellationToken::new())
@@ -392,14 +387,95 @@ async fn ninth_connection_is_busy_without_dispatching_an_action() {
     session.shutdown().await.unwrap();
 }
 
+/// A Tick that holds its first eight `hold` calls until a `release` file appears, then answers
+/// each with a response of almost the 8 MiB limit.
+const HOLDING_TICK: &str = r#"
+import json, os, sys, time
+instance = os.environ['TICKLOOP_INSTANCE_ID']
+held = []
+calls = 0
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request['method']
+    if method == 'tick/describe':
+        result = {'protocol':2,'tick_type':'example.holding','title':'Holding','description':'Fixture','recover_with':'calls','tools':[{'name':'hold','description':'Hold','params':{'type':'object'},'mutates':False},{'name':'calls','description':'Count','params':{'type':'object'},'mutates':False}]}
+    elif method == 'tick/read':
+        result = {'version':3,'tick_instance_id':instance,'initialized':True,'sequence':0,'observed_at':'2026-10-08T00:00:00Z','data':{}}
+    elif request['params']['tool'] == 'hold':
+        calls += 1
+        held.append(request['id'])
+        open('received', 'w').write(str(calls))
+        if len(held) < 8:
+            continue
+        while not os.path.exists('release'):
+            time.sleep(0.02)
+        for id in held:
+            print(json.dumps({'jsonrpc':'2.0','id':id,'result':{'payload':'x' * (8 * 1024 * 1024 - 4096)}}), flush=True)
+        held = []
+        continue
+    else:
+        result = {'calls': calls}
+    print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}), flush=True)
+"#;
+
+/// Eight calls in flight hold all eight connections and, with answers of almost 8 MiB each,
+/// the whole 64 MiB response budget; a ninth call is Busy before it reaches the Tick, and the
+/// eight answers all arrive.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_ninth_call_in_flight_is_busy_before_dispatch_while_eight_fill_the_response_budget() {
+    let directory = tempfile::tempdir().unwrap();
+    let session = spawn_tick(directory.path(), "holding", HOLDING_TICK).await;
+    let mut held = tokio::task::JoinSet::new();
+    for _ in 0..8 {
+        let client = session.client();
+        held.spawn(async move {
+            client
+                .call("hold", json!({}), CancellationToken::new())
+                .await
+        });
+    }
+    let received = directory.path().join("received");
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while std::fs::read_to_string(&received).ok().as_deref() != Some("8") {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("eight calls reach the Tick");
+    let ninth = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        session
+            .client()
+            .call("hold", json!({}), CancellationToken::new()),
+    )
+    .await
+    .expect("a ninth call is refused at once");
+    assert!(matches!(ninth, Err(SessionError::Busy)), "{ninth:?}");
+    std::fs::write(directory.path().join("release"), "").unwrap();
+    let mut answered = 0;
+    while let Some(answer) = held.join_next().await {
+        let payload = answer.unwrap().unwrap()["payload"].as_str().unwrap().len();
+        assert!(payload > tick_connect::protocol::MAX_TOOL_RESPONSE_BYTES - 8192);
+        answered += payload;
+    }
+    assert!(answered > 8 * (tick_connect::protocol::MAX_TOOL_RESPONSE_BYTES - 8192));
+    let calls = session
+        .client()
+        .call("calls", json!({}), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(calls["calls"], 8, "the ninth call never reached the Tick");
+    session.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn client_binding_rejects_a_different_host_or_terminal() {
     let (session, directory) = counter().await;
     let wrong_host = SessionClient::connect(
         session.instance().clone(),
-        tick_connect::session::SessionBackend::Herdr {
+        SessionBackend::Herdr {
             socket: PathBuf::from("/tmp/wrong-herdr.sock"),
-            terminal_id: "counter-pane".into(),
+            terminal_id: COUNTER_PANE.into(),
         },
         Some(directory.path().join("sessions")),
     )
@@ -407,10 +483,7 @@ async fn client_binding_rejects_a_different_host_or_terminal() {
     assert!(matches!(wrong_host, Err(SessionError::Protocol(_))));
     let wrong_terminal = SessionClient::connect(
         session.instance().clone(),
-        tick_connect::session::SessionBackend::Herdr {
-            socket: PathBuf::from("/tmp/example-herdr.sock"),
-            terminal_id: "other-pane".into(),
-        },
+        herdr_backend("other-pane"),
         Some(directory.path().join("sessions")),
     )
     .await;
@@ -425,8 +498,10 @@ async fn client_binding_rejects_a_different_host_or_terminal() {
 #[tokio::test]
 async fn oversized_child_response_is_never_reported_as_success() {
     let directory = tempfile::tempdir().unwrap();
-    let script = directory.path().join("oversized.py");
-    std::fs::write(&script, r#"
+    let session = spawn_tick(
+        directory.path(),
+        "oversized",
+        r#"
 import json, os, sys
 instance = os.environ['TICKLOOP_INSTANCE_ID']
 for line in sys.stdin:
@@ -438,22 +513,9 @@ for line in sys.stdin:
     else:
         result = {'text':'x' * (8 * 1024 * 1024)}
     print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}), flush=True)
-"#).unwrap();
-    let session = TickSession::spawn(SessionLaunch {
-        command: vec![
-            "python3".into(),
-            "-u".into(),
-            script.to_string_lossy().into_owned(),
-        ],
-        cwd: directory.path().into(),
-        backend: tick_connect::session::SessionBackend::Herdr {
-            socket: PathBuf::from("/tmp/example-herdr.sock"),
-            terminal_id: "large-pane".into(),
-        },
-        runtime_dir: Some(directory.path().join("sessions")),
-    })
-    .await
-    .unwrap();
+"#,
+    )
+    .await;
     let result = session
         .client()
         .call("large", json!({}), CancellationToken::new())
@@ -465,8 +527,10 @@ for line in sys.stdin:
 #[tokio::test]
 async fn child_that_stops_reading_stdin_expires_and_exits_instead_of_hanging_session() {
     let directory = tempfile::tempdir().unwrap();
-    let script = directory.path().join("nonreader.py");
-    std::fs::write(&script, r#"
+    let session = spawn_tick(
+        directory.path(),
+        "nonreader",
+        r#"
 import json, os, sys, time
 instance = os.environ['TICKLOOP_INSTANCE_ID']
 for line in sys.stdin:
@@ -480,29 +544,16 @@ for line in sys.stdin:
     print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}), flush=True)
     if request['method'] == 'tick/read':
         time.sleep(60)
-"#).unwrap();
-    let session = TickSession::spawn(SessionLaunch {
-        command: vec![
-            "python3".into(),
-            "-u".into(),
-            script.to_string_lossy().into_owned(),
-        ],
-        cwd: directory.path().into(),
-        backend: tick_connect::session::SessionBackend::Herdr {
-            socket: PathBuf::from("/tmp/example-herdr.sock"),
-            terminal_id: "nonreader-pane".into(),
-        },
-        runtime_dir: Some(directory.path().join("sessions")),
-    })
-    .await
-    .unwrap();
+"#,
+    )
+    .await;
     let (_, _, mut observations) = session.client().watch().await.unwrap();
     let mut stream = tokio::net::UnixStream::connect(session.endpoint())
         .await
         .unwrap();
     let request = json!({
         "jsonrpc":"2.0", "id":1, "method":"tick/describe",
-        "binding":{"instance_id":session.instance().to_string(),"backend":{"kind":"herdr","socket":"/tmp/example-herdr.sock","terminal_id":"nonreader-pane"}},
+        "binding":{"instance_id":session.instance().to_string(),"backend":{"kind":"herdr","socket":HERDR_SOCKET,"terminal_id":"nonreader-pane"}},
         "params":{"padding":"x".repeat(400_000)}
     });
     stream

@@ -79,6 +79,8 @@ impl TickAdapter for HerdrAdapter {
     }
 }
 
+/// Shows a hosted Tick's screen as a text snapshot detail.
+pub(crate) const HOSTED_SNAPSHOT_KEY: char = 's';
 /// Ends a hosted Tick from its Monitor row after confirmation; the row stays until removed.
 pub(crate) const HOSTED_CLOSE_KEY: char = 'c';
 /// Starts a new instance in place of a hosted Tick lost with its host, after confirmation.
@@ -125,19 +127,30 @@ impl TickAdapter for HostedAdapter {
     /// one lost with its host can be reopened as a new instance.
     fn member(&self, member: &MonitorMember, context: &MonitorContext) -> TickDescriptor {
         let mut row = super::member_descriptor(member);
-        if let Some(enter) = row
-            .actions
-            .iter_mut()
-            .find(|action| action.key == MONITOR_ENTER_KEY)
-        {
-            *enter = MonitorAction {
-                key: MONITOR_ENTER_KEY,
-                label: "show",
-                operation: MonitorOperation::Execute(
-                    crate::terminal::tick_actions::builtin::present_hosted(member.instance.clone()),
-                ),
-            };
-        }
+        row.actions.retain(|action| action.key != MONITOR_ENTER_KEY);
+        row.actions.splice(
+            0..0,
+            [
+                MonitorAction {
+                    key: MONITOR_ENTER_KEY,
+                    label: "open",
+                    operation: MonitorOperation::Execute(
+                        crate::terminal::tick_actions::builtin::open_hosted(
+                            member.instance.clone(),
+                        ),
+                    ),
+                },
+                MonitorAction {
+                    key: HOSTED_SNAPSHOT_KEY,
+                    label: "snapshot",
+                    operation: MonitorOperation::Execute(
+                        crate::terminal::tick_actions::builtin::snapshot_hosted(
+                            member.instance.clone(),
+                        ),
+                    ),
+                },
+            ],
+        );
         row.resources = context.member_resources.get(&member.instance).cloned();
         row.actions.push(MonitorAction {
             key: HOSTED_CLOSE_KEY,

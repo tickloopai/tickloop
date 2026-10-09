@@ -42,7 +42,7 @@ for line in sys.stdin:
     if method == 'tick/describe':
         result = {'protocol':2,'tick_type':'example.counter','title':'Counter','description':'Counter','recover_with':'current','tools':[{'name':'increment','description':'Increment','params':{'type':'object'},'mutates':True},{'name':'current','description':'Read','params':{'type':'object'},'mutates':False},{'name':'flood','description':'Print many lines','params':{'type':'object'},'mutates':False},{'name':'slow','description':'Answer after 16 seconds','params':{'type':'object'},'mutates':False},{'name':'large','description':'Answer with almost 8 MiB','params':{'type':'object'},'mutates':False},{'name':'oversized_update','description':'Send an update beyond the limit','params':{'type':'object'},'mutates':False}]}
     elif method == 'tick/read':
-        result = {'version':3,'tick_instance_id':instance,'initialized':True,'sequence':value,'observed_at':'2026-10-07T00:00:00Z','data':{'value':value,'note':open('note.txt').read(),'sees_launch_token':'TICKLOOP_TICK_HOST_LAUNCH' in os.environ}}
+        result = {'version':3,'tick_instance_id':instance,'initialized':True,'sequence':value,'observed_at':'2026-10-07T00:00:00Z','data':{'value':value,'note':open('note.txt').read(),'sees_launch_token':'TICKLOOP_TICK_HOST_LAUNCH' in os.environ,'argument_bytes':sum(len(argument) for argument in sys.argv[1:])}}
     elif method == 'tool/call':
         if request['params']['tool'] == 'increment':
             value += 1
@@ -479,6 +479,93 @@ async fn host_shutdown_ends_every_tick_and_removes_its_endpoint() {
     assert!(!fixture.paths.socket().exists());
 }
 
+/// A listed title stays within its bound however long the command it names, so a page of rows
+/// never outgrows its frame, while the Tick itself starts with every argument.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_long_command_is_listed_under_a_bounded_title_and_launches_whole() {
+    const ARGUMENTS: usize = 4;
+    const ARGUMENT_BYTES: usize = 64 * 1024;
+    let fixture = Fixture::start().await;
+    let mut controller = fixture.controller().await;
+    let (mut command, work) = fixture.counter();
+    command.extend((0..ARGUMENTS).map(|_| "x".repeat(ARGUMENT_BYTES)));
+    let title = command.join(" ");
+    let opened = controller
+        .request(
+            "open",
+            json!({
+                "operation": uuid::Uuid::new_v4(),
+                "owner": fixture.owner,
+                "owner_revision": 0,
+                "command": command,
+                "cwd": work,
+                "environment": std::env::vars().collect::<Vec<_>>(),
+                "title": title,
+            }),
+            CONTROL_TIMEOUT + Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+    let listed = controller
+        .request("list", json!({"owner":fixture.owner}), CONTROL_TIMEOUT)
+        .await
+        .unwrap();
+    assert_eq!(listed["items"][0]["instance"], opened["instance"]);
+    let listed_title = listed["items"][0]["title"].as_str().unwrap();
+    assert_eq!(listed_title.chars().count(), host::TITLE_CHARACTERS);
+    let kept = listed_title
+        .strip_suffix(host::TITLE_ELLIPSIS)
+        .expect("a cut title ends with the ellipsis");
+    assert!(title.starts_with(kept), "{listed_title}");
+    let mut reader = fixture.reader(&opened).await;
+    let read = reader
+        .request("read", json!({"activity":"explicit"}), CONTROL_TIMEOUT)
+        .await
+        .unwrap();
+    assert_eq!(
+        read["data"]["argument_bytes"],
+        ARGUMENTS * ARGUMENT_BYTES,
+        "the launch keeps every argument"
+    );
+    shutdown(&fixture).await;
+}
+
+/// An idle reader connection keeps nothing of its Tick alive: once the Tick is reaped the host
+/// closes it, while the host and its other Ticks continue.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_idle_reader_connection_is_closed_once_its_tick_is_reaped() {
+    let fixture = Fixture::start().await;
+    let mut controller = fixture.controller().await;
+    let (command, work) = fixture.counter();
+    let survivor = fixture
+        .open(&mut controller, command.clone(), &work)
+        .await
+        .unwrap();
+    let closing = fixture.open(&mut controller, command, &work).await.unwrap();
+    let (mut replies, _requests) = fixture.reader(&closing).await.into_parts();
+    controller
+        .request(
+            "close",
+            json!({"operation":uuid::Uuid::new_v4(),"owner":fixture.owner,"instance":closing["instance"]}),
+            CONTROL_TIMEOUT,
+        )
+        .await
+        .unwrap();
+    let ended = tokio::time::timeout(
+        Duration::from_secs(5),
+        read_frame(&mut replies, BUSINESS_FRAME_BYTES),
+    )
+    .await
+    .expect("the host closes an idle reader of a reaped Tick");
+    assert_eq!(ended.unwrap(), None);
+    let mut reader = fixture.reader(&survivor).await;
+    reader
+        .request("read", json!({"activity":"explicit"}), CONTROL_TIMEOUT)
+        .await
+        .unwrap();
+    shutdown(&fixture).await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_launcher_outside_the_foreground_is_refused_before_its_tick_starts() {
     let fixture = Fixture::start().await;
@@ -721,6 +808,261 @@ async fn a_stalled_view_loses_its_lease_after_two_seconds_and_the_tick_keeps_run
     drop(released);
     drop(stalled);
     shutdown(&fixture).await;
+}
+
+/// A resize outside 2–300 rows or 2–500 columns is refused: an attach asking for one gets an
+/// error, an attached view sending one ends with it, and the terminal keeps its size while the
+/// Tick keeps running.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_invalid_resize_is_refused_and_leaves_the_terminal_and_the_tick_unchanged() {
+    let fixture = Fixture::start().await;
+    let mut controller = fixture.controller().await;
+    let (command, work) = fixture.counter();
+    let opened = fixture.open(&mut controller, command, &work).await.unwrap();
+    let mut reader = fixture.reader(&opened).await;
+    screen_contains(&mut reader, "120x30").await;
+    let terminal_size = |snapshot: &Value| (snapshot["rows"].clone(), snapshot["columns"].clone());
+    let invalid = [
+        json!({"rows":1,"columns":80}),
+        json!({"rows":301,"columns":80}),
+        json!({"rows":24,"columns":1}),
+        json!({"rows":24,"columns":501}),
+    ];
+    for size in &invalid {
+        let refused = fixture
+            .reader(&opened)
+            .await
+            .request("attach", json!({"size":size}), CONTROL_TIMEOUT)
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code, "InvalidArguments", "{size}");
+
+        let (mut events, mut requests) = attach_when_released(&fixture, &opened).await.into_parts();
+        send(
+            &mut requests,
+            json!({"method":"resize","params":{"size":size}}),
+        )
+        .await;
+        let ended = view_end(&mut events).await.unwrap();
+        assert_eq!(
+            ended["error"]["code"], "InvalidArguments",
+            "{size}: {ended}"
+        );
+        let snapshot = reader
+            .request("snapshot", json!({}), CONTROL_TIMEOUT)
+            .await
+            .unwrap();
+        assert_eq!(terminal_size(&snapshot), (json!(30), json!(120)), "{size}");
+    }
+    let called = reader
+        .request(
+            "call",
+            json!({"tool":"increment","args":{}}),
+            CONTROL_TIMEOUT,
+        )
+        .await
+        .unwrap();
+    assert_eq!(called["value"], 1, "the Tick keeps running");
+    let snapshot = screen_contains(&mut reader, "Counter 1 in work 120x30").await;
+    assert_eq!(terminal_size(&snapshot), (json!(30), json!(120)));
+    attach_when_released(&fixture, &opened).await;
+    shutdown(&fixture).await;
+}
+
+/// A reply its reader leaves unread is given up after the 10-second control bound: the host
+/// closes that connection instead of holding the reply, and the Tick keeps serving others.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reply_left_unread_past_the_control_bound_closes_only_its_connection() {
+    let fixture = Fixture::start().await;
+    let mut controller = fixture.controller().await;
+    let (command, work) = fixture.counter();
+    let opened = fixture.open(&mut controller, command, &work).await.unwrap();
+    let (mut replies, mut requests) = fixture.reader(&opened).await.into_parts();
+    write_frame(
+        &mut requests,
+        &json!({"id":1,"method":"call","params":{"tool":"large","args":{}}}),
+        BUSINESS_FRAME_BYTES,
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(CONTROL_TIMEOUT + Duration::from_secs(5)).await;
+    let left = tokio::time::timeout(
+        CONTROL_TIMEOUT,
+        read_frame(&mut replies, BUSINESS_FRAME_BYTES),
+    )
+    .await
+    .expect("the host closed the stalled connection");
+    assert!(
+        !matches!(left, Ok(Some(_))),
+        "the stalled reply never arrives whole after the bound"
+    );
+    let current = fixture
+        .reader(&opened)
+        .await
+        .request("call", json!({"tool":"current","args":{}}), CONTROL_TIMEOUT)
+        .await
+        .unwrap();
+    assert_eq!(current["value"], 0, "the Tick keeps serving");
+    shutdown(&fixture).await;
+}
+
+/// Ending an idle Tick whose launcher ignores SIGTERM takes the whole 3-second grace before
+/// SIGKILL; the host keeps accepting connections meanwhile.
+#[tokio::test(flavor = "multi_thread")]
+async fn ending_a_stubborn_idle_tick_never_pauses_new_connections() {
+    let fixture = Fixture::with_idle_timeout(Duration::from_secs(2)).await;
+    let mut controller = fixture.controller().await;
+    let (command, work) = fixture.counter();
+    let stubborn = fixture
+        .open(&mut controller, command.clone(), &work)
+        .await
+        .unwrap();
+    // An attached view keeps the other Tick, so the host never empties during the test.
+    let kept = fixture.open(&mut controller, command, &work).await.unwrap();
+    let (mut view_events, view_requests) = attach_when_released(&fixture, &kept).await.into_parts();
+    let drain = tokio::spawn(async move {
+        while let Ok(Some(_)) = read_frame(&mut view_events, BUSINESS_FRAME_BYTES).await {}
+    });
+    let business = stubborn["business_pid"].as_u64().unwrap() as u32;
+    let launcher = tick_host::process::sample(business).unwrap().parent;
+    // A stopped launcher leaves SIGTERM pending, so only SIGKILL after the grace ends it.
+    unsafe { libc::kill(launcher as libc::pid_t, libc::SIGSTOP) };
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut slowest = Duration::ZERO;
+    while alive(launcher) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the idle Tick never ended"
+        );
+        let connecting = std::time::Instant::now();
+        drop(fixture.controller().await);
+        slowest = slowest.max(connecting.elapsed());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        slowest < Duration::from_secs(1),
+        "a new connection waited {slowest:?} while an idle Tick was ending"
+    );
+    assert!(gone(business).await);
+    let mut reaped = Vec::new();
+    for _ in 0..200 {
+        let diagnostics = controller
+            .request("diagnostics", json!({}), CONTROL_TIMEOUT)
+            .await
+            .unwrap();
+        reaped = diagnostics["reaped"].as_array().unwrap().clone();
+        if !reaped.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(reaped.len(), 1, "{reaped:?}");
+    assert_eq!(reaped[0]["reason"], "idle");
+    drop(view_requests);
+    drain.abort();
+    shutdown(&fixture).await;
+}
+
+/// A launcher that binds its Tick Session socket in the directory the host gives it, ignores
+/// SIGTERM and never registers.
+const STUBBORN_LAUNCHER: &str = r#"
+import os, signal, socket, time, uuid
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+sessions = os.environ['TICKLOOP_TICK_RUNTIME_DIR']
+os.makedirs(sessions, exist_ok=True)
+listener = socket.socket(socket.AF_UNIX)
+listener.bind(os.path.join(sessions, f'{uuid.uuid4()}.sock'))
+listener.listen()
+time.sleep(60)
+"#;
+
+/// Every Tick Session socket under the host's session directory.
+fn session_sockets(fixture: &Fixture) -> Vec<std::path::PathBuf> {
+    fn walk(directory: &Path, sockets: &mut Vec<std::path::PathBuf>) {
+        use std::os::unix::fs::FileTypeExt;
+        for entry in std::fs::read_dir(directory).unwrap().flatten() {
+            let kind = entry.file_type().unwrap();
+            if kind.is_dir() {
+                walk(&entry.path(), sockets);
+            } else if kind.is_socket() {
+                sockets.push(entry.path());
+            }
+        }
+    }
+    let mut sockets = Vec::new();
+    walk(&fixture.paths.sessions(), &mut sockets);
+    sockets
+}
+
+/// The host removes the Tick Session sockets of the Ticks it reaps, including those of a
+/// launcher killed before it could remove its own: by kill -9, or by SIGKILL once it ignored
+/// SIGTERM for the whole grace while it never finished starting.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_session_sockets_of_killed_launchers_go_with_their_ticks() {
+    let fixture = Fixture::start().await;
+    let mut controller = fixture.controller().await;
+    let (command, work) = fixture.counter();
+    let kept = fixture
+        .open(&mut controller, command.clone(), &work)
+        .await
+        .unwrap();
+    let killed = fixture.open(&mut controller, command, &work).await.unwrap();
+    let socket_of = |opened: &Value| {
+        let run = opened["instance"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("hosted:")
+            .unwrap()
+            .to_owned();
+        format!("{run}.sock")
+    };
+    let named = |sockets: &[std::path::PathBuf], name: &str| {
+        sockets
+            .iter()
+            .filter(|socket| socket.file_name().unwrap() == name)
+            .count()
+    };
+    let sockets = session_sockets(&fixture);
+    assert_eq!(named(&sockets, &socket_of(&killed)), 1, "{sockets:?}");
+
+    let business = killed["business_pid"].as_u64().unwrap() as u32;
+    let launcher = tick_host::process::sample(business).unwrap().parent;
+    unsafe { libc::kill(launcher as libc::pid_t, libc::SIGKILL) };
+    assert!(gone(business).await);
+    for _ in 0..200 {
+        let listed = controller
+            .request("list", json!({}), CONTROL_TIMEOUT)
+            .await
+            .unwrap();
+        if listed["total"] == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let stubborn = controller
+        .request(
+            "open",
+            json!({
+                "operation": uuid::Uuid::new_v4(),
+                "owner": fixture.owner,
+                "owner_revision": 0,
+                "command": [which("python3"), "-c", STUBBORN_LAUNCHER],
+                "cwd": fixture.directory.path(),
+                "environment": std::env::vars().collect::<Vec<_>>(),
+                "title": null,
+            }),
+            CONTROL_TIMEOUT + host::TERMINATE_GRACE + Duration::from_secs(2),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(stubborn.code, "LaunchFailed", "{stubborn:?}");
+
+    let sockets = session_sockets(&fixture);
+    assert_eq!(sockets.len(), 1, "{sockets:?}");
+    assert_eq!(named(&sockets, &socket_of(&kept)), 1, "{sockets:?}");
+    shutdown(&fixture).await;
+    assert_eq!(session_sockets(&fixture), Vec::<std::path::PathBuf>::new());
 }
 
 /// Opens a counter for `chat` of the fixture root at `owner_revision`.

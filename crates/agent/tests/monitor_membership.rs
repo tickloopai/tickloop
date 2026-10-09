@@ -521,7 +521,7 @@ async fn hosted_members_show_their_probed_state_and_sample_and_offer_close() {
             .iter()
             .map(|action| action.key)
             .collect::<String>();
-        assert_eq!(keys, "oxc", "details, remove and close");
+        assert_eq!(keys, "osxc", "open, snapshot, remove and close");
     }
     let recoverable = row(&lost);
     assert_eq!(recoverable.status, "lost");
@@ -530,6 +530,6 @@ async fn hosted_members_show_their_probed_state_and_sample_and_offer_close() {
         .iter()
         .map(|action| action.key)
         .collect::<String>();
-    assert_eq!(keys, "oxcn", "a lost Tick can also be reopened as new");
+    assert_eq!(keys, "osxcn", "a lost Tick can also be reopened as new");
     agent.shutdown().await;
 }

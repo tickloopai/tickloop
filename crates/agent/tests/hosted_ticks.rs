@@ -5,7 +5,6 @@
 mod support;
 
 use std::{
-    path::Path,
     process::Stdio,
     sync::{
         Arc, Mutex,
@@ -15,54 +14,13 @@ use std::{
 };
 
 use serde_json::{Value, json};
+use support::hosted::{counter_program, launch_command};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
 };
 
 const FIXTURE_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// An open of `program` for `owner`, started through the CLI's Tick launcher.
-fn tick_request(
-    owner: tick_host::host::TickOwner,
-    cwd: &Path,
-    program: Vec<String>,
-) -> tick_host::host::OpenRequest {
-    let mut command = vec![
-        support::fixture_cli::executable()
-            .to_string_lossy()
-            .into_owned(),
-        "--tick-launch".into(),
-        "--".into(),
-    ];
-    command.extend(program);
-    tick_host::host::OpenRequest {
-        operation: uuid::Uuid::new_v4(),
-        owner,
-        owner_revision: 0,
-        command,
-        cwd: cwd.to_path_buf(),
-        environment: vec![("PATH".into(), "/usr/bin:/bin".into())],
-        title: None,
-    }
-}
-
-/// An open of the example counter Tick for `owner`.
-fn counter_request(owner: tick_host::host::TickOwner, cwd: &Path) -> tick_host::host::OpenRequest {
-    let counter = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../examples/ticks/counter.py")
-        .canonicalize()
-        .unwrap();
-    tick_request(
-        owner,
-        cwd,
-        vec![
-            "/usr/bin/python3".into(),
-            "-u".into(),
-            counter.to_string_lossy().into_owned(),
-        ],
-    )
-}
 
 fn alive(pid: u32) -> bool {
     unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
@@ -185,20 +143,12 @@ async fn a_worker_opens_reads_calls_and_closes_a_hidden_tick_through_its_owner()
         .tempdir_in("/private/tmp")
         .unwrap();
     let root = directory.path().canonicalize().unwrap();
-    let counter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/ticks/counter.py");
     let launcher = support::fixture_cli::executable();
     let observed = Arc::new(Observed::default());
     let server_observed = observed.clone();
     let host_runtime = root.join("h");
     let server_host_runtime = host_runtime.clone();
-    let open_command = json!([
-        launcher.to_string_lossy(),
-        "--tick-launch",
-        "--",
-        "/usr/bin/python3",
-        "-u",
-        counter.canonicalize().unwrap().to_string_lossy(),
-    ]);
+    let open_command = json!(launch_command(counter_program()));
     let server = tokio::spawn(async move {
         while let Ok((mut stream, _)) = listener.accept().await {
             let observed = server_observed.clone();
@@ -321,10 +271,11 @@ async fn a_worker_opens_reads_calls_and_closes_a_hidden_tick_through_its_owner()
 }
 
 mod channel {
-    use std::{sync::Arc, time::Duration};
+    use std::{collections::BTreeMap, path::Path, sync::Arc, time::Duration};
 
     use async_trait::async_trait;
     use serde_json::{Value, json};
+    use tick_connect::hosted::{CAPABILITY_DATA, CONTROL_TIMEOUT, HostConnection, Role};
     use tickloop_agent::{
         agent_access::{
             AccessError, AgentAccess, AgentCommand, CommandEnvelope, CommandResult,
@@ -343,16 +294,31 @@ mod channel {
             },
         },
         model::ModelClient,
-        runtime::Agent,
+        runtime::{Agent, EventKind, TickLinkState, TickSubscriptionChange},
         tick_adapter::TickAdapters,
+        tick_stream::{
+            HostedTickStream, RECONNECT_PAUSE, RECONNECTS_PER_WATCH, TickConnectionState,
+            TickStreamEvent, TickStreamPort,
+        },
         tick_tool_router::TickToolRouter,
+        tools::ToolResult,
     };
-    use tokio::sync::Mutex;
+    use tokio::sync::{Mutex, mpsc};
+    use tokio_util::sync::CancellationToken;
+    use uuid::Uuid;
+
+    use super::support::{
+        CONNECTS_PER_WATCH,
+        hosted::{
+            counter_program, counter_request, launch_command, python_program, tick_environment,
+        },
+    };
 
     /// The Herdr Workspace a Herdr worker's Chats work in.
     const HERDR_WORKSPACE: &str = "workspace-a";
-    use tokio_util::sync::CancellationToken;
-    use uuid::Uuid;
+    /// How long a hosted test waits for its next event. It outlasts SubscribeTick's 10-second
+    /// wait for a Watch to become ready, during which a run emits nothing.
+    const HOSTED_EVENT_WAIT: Duration = Duration::from_secs(30);
 
     /// Workers in this process, each holding the grant the owner would hand a real worker and,
     /// as a real worker with a config root does, telling the owner when StopSubagent stops a child.
@@ -395,7 +361,7 @@ mod channel {
                         .install_stopped_child_hook(Arc::new(OwnerLifecycle::new(grant.clone())));
                     let tools = Arc::new(HostedTickTools::new(
                         OwnerControl::new(grant.clone()),
-                        vec![("PATH".into(), "/usr/bin:/bin".into())],
+                        tick_environment(),
                     ));
                     runtime
                         .install_host_tools(Arc::new(TickToolRouter::new(
@@ -591,7 +557,7 @@ mod channel {
         /// the owner's first-use reconcile of the root so the Tick is not taken for an orphan.
         async fn open_counter(&self, chat: Uuid) -> tick_host::host::OpenedTick {
             self.controller
-                .open(super::counter_request(self.tick_owner(chat), &self.root))
+                .open(counter_request(self.tick_owner(chat), &self.root))
                 .await
                 .unwrap()
         }
@@ -607,11 +573,101 @@ mod channel {
                 .ok()
                 .map(|bytes| serde_json::from_slice(&bytes).unwrap())
         }
+
+        /// Hosted Tick tools of the first worker, as a separate client of its grant.
+        fn tools(&self) -> HostedTickTools {
+            HostedTickTools::new(
+                OwnerControl::new(self.grants[0].clone()),
+                tick_environment(),
+            )
+        }
+
+        /// A data connection of the first Chat's running `instance`, with the token its owner
+        /// lists.
+        async fn data_connection(&self, instance: &Value) -> HostConnection {
+            let listed = OwnerControl::new(self.grants[0].clone())
+                .request(list(self.chats[0]))
+                .await
+                .unwrap();
+            let row = listed["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| &row["instance"] == instance)
+                .unwrap();
+            HostConnection::connect(
+                Path::new(listed["endpoint"].as_str().unwrap()),
+                Role::Instance {
+                    instance: serde_json::from_value(instance.clone()).unwrap(),
+                    data_token: row["data_token"].as_str().unwrap().to_owned(),
+                },
+                &[CAPABILITY_DATA],
+            )
+            .await
+            .unwrap()
+        }
     }
 
     impl Drop for Owner {
         fn drop(&mut self) {
             super::support::stop_tick_host(&self.root.join("h"), &self.root.join("tick-host.key"));
+        }
+    }
+
+    /// Prepares and executes one hosted Tick tool for `chat` the way an approved model call
+    /// would.
+    async fn call_tool(
+        tools: &HostedTickTools,
+        chat: Uuid,
+        name: &str,
+        input: Value,
+    ) -> HostCallResult {
+        let prepared = tools
+            .prepare_call(chat, name, &input, CancellationToken::new())
+            .await
+            .unwrap();
+        tools
+            .execute_prepared(chat, prepared, CancellationToken::new())
+            .await
+    }
+
+    /// Runs one hosted Tick tool for `chat` that must complete, and returns its answer.
+    async fn run_tool(tools: &HostedTickTools, chat: Uuid, name: &str, input: Value) -> Value {
+        match call_tool(tools, chat, name, input).await {
+            HostCallResult::Completed(result) | HostCallResult::CompletedWithEffect(result, _) => {
+                serde_json::from_str(&result.content).unwrap()
+            }
+            HostCallResult::NotDispatched(error) | HostCallResult::OutcomeUnknown(error) => {
+                panic!("hosted {name} failed: {error}")
+            }
+        }
+    }
+
+    /// The ModifyTick input that opens `program` hidden in the owner's Tick host.
+    fn open_command(owner: &Owner, program: Vec<String>) -> Value {
+        json!({"action":"open","command":launch_command(program),"cwd":owner.root,"placement":{"type":"hidden"}})
+    }
+
+    fn counter_command(owner: &Owner) -> Value {
+        open_command(owner, counter_program())
+    }
+
+    /// Submits `text` to `chat` and, once its run completes, returns by call id the tool results
+    /// of that run and of any child it delegated to in the foreground.
+    async fn run_turn(runtime: &Agent, chat: Uuid, text: &str) -> BTreeMap<String, ToolResult> {
+        let mut events = runtime.subscribe();
+        let receipt = runtime.submit(chat, None, text.into()).await.unwrap();
+        let mut results = BTreeMap::new();
+        loop {
+            let event = super::support::next_event_within(&mut events, HOSTED_EVENT_WAIT).await;
+            match event.kind {
+                EventKind::ToolCompleted { call_id, result } => {
+                    results.insert(call_id, result);
+                }
+                EventKind::Completed { .. } if event.run_id == receipt.run_id => return results,
+                EventKind::Failed(error) if event.run_id == receipt.run_id => panic!("{error}"),
+                _ => {}
+            }
         }
     }
 
@@ -837,18 +893,13 @@ mod channel {
             requests
         });
         let tools = HostedTickTools::new(OwnerControl::new(grant), Vec::new());
-        let open = tools
-            .prepare_call(
-                chat,
-                "ModifyTick",
-                &json!({"action":"open","command":["/bin/sh"],"cwd":"/private/tmp","placement":{"type":"hidden"}}),
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-        let settled = tools
-            .execute_prepared(chat, open, CancellationToken::new())
-            .await;
+        let settled = call_tool(
+            &tools,
+            chat,
+            "ModifyTick",
+            json!({"action":"open","command":["/bin/sh"],"cwd":"/private/tmp","placement":{"type":"hidden"}}),
+        )
+        .await;
         let HostCallResult::CompletedWithEffect(result, _) = settled else {
             panic!("the opened receipt settles the open");
         };
@@ -857,18 +908,13 @@ mod channel {
             "{}",
             result.content
         );
-        let close = tools
-            .prepare_call(
-                chat,
-                "ModifyTick",
-                &json!({"action":"close","tick_instance_id":instance}),
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-        let unknown = tools
-            .execute_prepared(chat, close, CancellationToken::new())
-            .await;
+        let unknown = call_tool(
+            &tools,
+            chat,
+            "ModifyTick",
+            json!({"action":"close","tick_instance_id":instance}),
+        )
+        .await;
         let HostCallResult::OutcomeUnknown(message) = unknown else {
             panic!("a receipt still dispatched leaves the close unknown");
         };
@@ -919,45 +965,18 @@ for line in sys.stdin:
     print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}), flush=True)
 "#;
 
-    fn completed(result: HostCallResult) -> Value {
-        match result {
-            HostCallResult::Completed(result) | HostCallResult::CompletedWithEffect(result, _) => {
-                serde_json::from_str(&result.content).unwrap()
-            }
-            HostCallResult::NotDispatched(error) | HostCallResult::OutcomeUnknown(error) => {
-                panic!("hosted call failed: {error}")
-            }
-        }
-    }
-
     #[tokio::test(flavor = "multi_thread")]
     async fn a_call_approved_before_its_catalog_changed_is_never_dispatched() {
         let owner = Owner::start(1).await;
         let chat = owner.chats[0];
-        let tools = HostedTickTools::new(
-            OwnerControl::new(owner.grants[0].clone()),
-            vec![("PATH".into(), "/usr/bin:/bin".into())],
-        );
+        let tools = owner.tools();
         let script = owner.root.join("evolving.py");
         std::fs::write(&script, EVOLVING).unwrap();
-        let launcher = super::support::fixture_cli::executable();
-        let run = |name: &'static str, input: Value| {
-            let tools = &tools;
-            async move {
-                let prepared = tools
-                    .prepare_call(chat, name, &input, CancellationToken::new())
-                    .await
-                    .unwrap();
-                completed(
-                    tools
-                        .execute_prepared(chat, prepared, CancellationToken::new())
-                        .await,
-                )
-            }
-        };
-        let opened = run(
+        let opened = run_tool(
+            &tools,
+            chat,
             "ModifyTick",
-            json!({"action":"open","command":[launcher, "--tick-launch", "--", "/usr/bin/python3", "-u", script],"cwd":owner.root,"placement":{"type":"hidden"}}),
+            open_command(&owner, python_program(&script, &[])),
         )
         .await;
         let instance = opened["tick_instance_id"].clone();
@@ -974,7 +993,9 @@ for line in sys.stdin:
             )
             .await
             .unwrap();
-        run(
+        run_tool(
+            &tools,
+            chat,
             "CallTickTool",
             json!({"tick_instance_id":instance,"tool":"evolve","args":{}}),
         )
@@ -990,27 +1011,30 @@ for line in sys.stdin:
                 .await,
             HostCallResult::NotDispatched(_)
         ));
-        let read = run("ReadTick", json!({"tick_instance_id":instance})).await;
+        let read = run_tool(
+            &tools,
+            chat,
+            "ReadTick",
+            json!({"tick_instance_id":instance}),
+        )
+        .await;
         assert_eq!(read["content"]["value"], 0, "the stale approval never ran");
         let other_chat = Uuid::new_v4();
-        let foreign = tools
-            .prepare_call(
-                other_chat,
-                "ReadTick",
-                &json!({"tick_instance_id":instance}),
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-        let HostCallResult::NotDispatched(refused) = tools
-            .execute_prepared(other_chat, foreign, CancellationToken::new())
-            .await
+        let HostCallResult::NotDispatched(refused) = call_tool(
+            &tools,
+            other_chat,
+            "ReadTick",
+            json!({"tick_instance_id":instance}),
+        )
+        .await
         else {
             panic!("another Chat of this worker never reuses the owner's binding");
         };
         assert!(refused.contains("Forbidden"), "{refused}");
         assert!(read["tools"].to_string().contains("decrement"));
-        let closed = run(
+        let closed = run_tool(
+            &tools,
+            chat,
             "ModifyTick",
             json!({"action":"close","tick_instance_id":instance}),
         )
@@ -1121,7 +1145,7 @@ for line in sys.stdin:
         use super::support::routed::{
             RoutedModel, has_tool_result, history_text, state, tool_result,
         };
-        use tickloop_agent::runtime::{Event, EventKind, Receipt};
+        use tickloop_agent::runtime::{Event, Receipt};
         const STOP_PROMPT: &str = "Stop the waiter now";
         async fn finished(events: &mut tokio::sync::broadcast::Receiver<Event>, receipt: &Receipt) {
             loop {
@@ -1210,22 +1234,9 @@ for line in sys.stdin:
         );
         assert_eq!(owner.owner_state(child).unwrap()["state"], "stopped");
         assert_eq!(owner.owner_state(root), None);
-        let tools = HostedTickTools::new(
-            OwnerControl::new(owner.grants[0].clone()),
-            vec![("PATH".into(), "/usr/bin:/bin".into())],
-        );
-        let prepared = tools
-            .prepare_call(
-                child,
-                "ModifyTick",
-                &counter_command(&owner),
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-        let HostCallResult::NotDispatched(refused) = tools
-            .execute_prepared(child, prepared, CancellationToken::new())
-            .await
+        let tools = owner.tools();
+        let HostCallResult::NotDispatched(refused) =
+            call_tool(&tools, child, "ModifyTick", counter_command(&owner)).await
         else {
             panic!("a stopped child opens nothing before it continues");
         };
@@ -1236,16 +1247,12 @@ for line in sys.stdin:
     /// Continuing the Chat restores only the Chat: the earlier Tick ends before it owns a new one.
     #[tokio::test(flavor = "multi_thread")]
     async fn continuing_a_chat_whose_stop_never_reached_the_host_ends_its_earlier_ticks_first() {
-        use tickloop_agent::runtime::EventKind;
         let model = Arc::new(super::support::ScriptedModel::new(vec![
             super::support::text("Continued"),
         ]));
         let owner = Owner::start_with(model, tick_host::host::DEFAULT_IDLE_TIMEOUT, 1).await;
         let (runtime, chat) = (owner.runtimes[0].clone(), owner.chats[0]);
-        let tools = HostedTickTools::new(
-            OwnerControl::new(owner.grants[0].clone()),
-            vec![("PATH".into(), "/usr/bin:/bin".into())],
-        );
+        let tools = owner.tools();
         let earlier = run_tool(&tools, chat, "ModifyTick", counter_command(&owner)).await;
         let earlier_pid = earlier["business_pid"].as_u64().unwrap() as u32;
         std::fs::write(
@@ -1257,18 +1264,8 @@ for line in sys.stdin:
             serde_json::to_vec(&json!({"state":"stopping","operation":Uuid::new_v4()})).unwrap(),
         )
         .unwrap();
-        let prepared = tools
-            .prepare_call(
-                chat,
-                "ModifyTick",
-                &counter_command(&owner),
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-        let HostCallResult::NotDispatched(refused) = tools
-            .execute_prepared(chat, prepared, CancellationToken::new())
-            .await
+        let HostCallResult::NotDispatched(refused) =
+            call_tool(&tools, chat, "ModifyTick", counter_command(&owner)).await
         else {
             panic!("a stopped Chat opens nothing before it continues");
         };
@@ -1311,29 +1308,8 @@ for line in sys.stdin:
         )
         .await;
         let (chat, other_chat) = (owner.chats[0], owner.chats[1]);
-        let tools = HostedTickTools::new(
-            OwnerControl::new(owner.grants[0].clone()),
-            vec![("PATH".into(), "/usr/bin:/bin".into())],
-        );
-        let launcher = super::support::fixture_cli::executable();
-        let counter = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../examples/ticks/counter.py")
-            .canonicalize()
-            .unwrap();
-        let prepared = tools
-            .prepare_call(
-                chat,
-                "ModifyTick",
-                &json!({"action":"open","command":[launcher, "--tick-launch", "--", "/usr/bin/python3", "-u", counter],"cwd":owner.root,"placement":{"type":"hidden"}}),
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-        let opened = completed(
-            tools
-                .execute_prepared(chat, prepared, CancellationToken::new())
-                .await,
-        );
+        let tools = owner.tools();
+        let opened = run_tool(&tools, chat, "ModifyTick", counter_command(&owner)).await;
         let instance: tick_connect::instance::InstanceRef =
             serde_json::from_value(opened["tick_instance_id"].clone()).unwrap();
         let business_pid = opened["business_pid"].as_u64().unwrap() as u32;
@@ -1399,40 +1375,15 @@ for line in sys.stdin:
         );
     }
 
-    /// Runs one hosted Tick tool for `chat` the way an approved model call would.
-    async fn run_tool(tools: &HostedTickTools, chat: Uuid, name: &str, input: Value) -> Value {
-        let prepared = tools
-            .prepare_call(chat, name, &input, CancellationToken::new())
-            .await
-            .unwrap();
-        completed(
-            tools
-                .execute_prepared(chat, prepared, CancellationToken::new())
-                .await,
-        )
-    }
-
-    fn counter_command(owner: &Owner) -> Value {
-        let counter = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../examples/ticks/counter.py")
-            .canonicalize()
-            .unwrap();
-        json!({"action":"open","command":[super::support::fixture_cli::executable(), "--tick-launch", "--", "/usr/bin/python3", "-u", counter],"cwd":owner.root,"placement":{"type":"hidden"}})
-    }
-
     /// A Loop subscribed to a hosted Tick: the quiet Tick costs no model call, its Watch keeps it
     /// from idling, an update wakes the Loop with the new content, and stopping the Loop ends
     /// the Watch so the Tick idles out.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_hosted_tick_update_reaches_the_loop_subscribed_to_it() {
-        use tickloop_agent::runtime::EventKind;
         let model = Arc::new(super::support::ScriptedModel::new(Vec::new()));
         let owner = Owner::start_with(model.clone(), Duration::from_secs(2), 1).await;
         let (runtime, chat) = (owner.runtimes[0].clone(), owner.chats[0]);
-        let tools = HostedTickTools::new(
-            OwnerControl::new(owner.grants[0].clone()),
-            vec![("PATH".into(), "/usr/bin:/bin".into())],
-        );
+        let tools = owner.tools();
         let opened = run_tool(&tools, chat, "ModifyTick", counter_command(&owner)).await;
         let instance = opened["tick_instance_id"].clone();
         let business_pid = opened["business_pid"].as_u64().unwrap() as u32;
@@ -1569,30 +1520,6 @@ for line in sys.stdin:
         }
     }
 
-    /// Submits `text` to `chat` and, once its run completes, returns by call id the tool results
-    /// of that run and of any child it delegated to in the foreground.
-    async fn run_turn(
-        runtime: &Agent,
-        chat: Uuid,
-        text: &str,
-    ) -> std::collections::BTreeMap<String, tickloop_agent::tools::ToolResult> {
-        use tickloop_agent::runtime::EventKind;
-        let mut events = runtime.subscribe();
-        let receipt = runtime.submit(chat, None, text.into()).await.unwrap();
-        let mut results = std::collections::BTreeMap::new();
-        loop {
-            let event = super::support::next_event(&mut events).await;
-            match event.kind {
-                EventKind::ToolCompleted { call_id, result } => {
-                    results.insert(call_id, result);
-                }
-                EventKind::Completed { .. } if event.run_id == receipt.run_id => return results,
-                EventKind::Failed(error) if event.run_id == receipt.run_id => panic!("{error}"),
-                _ => {}
-            }
-        }
-    }
-
     /// A worker in a Herdr View opens a Tick hidden in the Tick host unless asked for a
     /// placement: the Tick joins the Chat's Monitor without a subscription or any Herdr layout,
     /// streams to the Loop that subscribes to it, and closes through its host. Only an explicit
@@ -1669,10 +1596,7 @@ for line in sys.stdin:
         let mut events = runtime.subscribe();
         model.enqueue(super::support::text("update observed"));
         run_tool(
-            &HostedTickTools::new(
-                OwnerControl::new(owner.grants[0].clone()),
-                vec![("PATH".into(), "/usr/bin:/bin".into())],
-            ),
+            &owner.tools(),
             chat,
             "CallTickTool",
             json!({"tick_instance_id":instance,"tool":"increment","args":{"amount":7}}),
@@ -1745,10 +1669,7 @@ for line in sys.stdin:
                 },
             })
             .await;
-        let parents = HostedTickTools::new(
-            OwnerControl::new(owner.grants[0].clone()),
-            vec![("PATH".into(), "/usr/bin:/bin".into())],
-        );
+        let parents = owner.tools();
         let opened = run_tool(&parents, chat, "ModifyTick", counter_command(&owner)).await;
         let instance = opened["tick_instance_id"].clone();
         let mut child_open = counter_command(&owner);
@@ -1839,15 +1760,11 @@ for line in sys.stdin:
     /// the Chat's Monitor under the lost Tick's title without any subscription.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_model_reopens_a_lost_tick_only_after_approval_as_a_new_instance() {
-        use tickloop_agent::runtime::EventKind;
         let model = Arc::new(super::support::ScriptedModel::new(Vec::new()));
         let owner =
             Owner::start_with(model.clone(), tick_host::host::DEFAULT_IDLE_TIMEOUT, 1).await;
         let (runtime, chat) = (owner.runtimes[0].clone(), owner.chats[0]);
-        let tools = HostedTickTools::new(
-            OwnerControl::new(owner.grants[0].clone()),
-            vec![("PATH".into(), "/usr/bin:/bin".into())],
-        );
+        let tools = owner.tools();
         let opened = run_tool(&tools, chat, "ModifyTick", counter_command(&owner)).await;
         let lost = opened["tick_instance_id"].as_str().unwrap().to_owned();
         let business_pid = opened["business_pid"].as_u64().unwrap() as u32;
@@ -1940,15 +1857,11 @@ for line in sys.stdin:
     /// and never rebinding to a later host.
     #[tokio::test(flavor = "multi_thread")]
     async fn cancelling_one_hosted_watch_keeps_the_other_and_a_dead_host_fails_closed() {
-        use tickloop_agent::runtime::{EventKind, TickLinkState, TickSubscriptionChange};
         let model = Arc::new(super::support::ScriptedModel::new(Vec::new()));
         let owner =
             Owner::start_with(model.clone(), tick_host::host::DEFAULT_IDLE_TIMEOUT, 1).await;
         let (runtime, chat) = (owner.runtimes[0].clone(), owner.chats[0]);
-        let tools = HostedTickTools::new(
-            OwnerControl::new(owner.grants[0].clone()),
-            vec![("PATH".into(), "/usr/bin:/bin".into())],
-        );
+        let tools = owner.tools();
         let opened = run_tool(&tools, chat, "ModifyTick", counter_command(&owner)).await;
         let instance = opened["tick_instance_id"].clone();
         let mut events = runtime.subscribe();
@@ -2047,16 +1960,311 @@ for line in sys.stdin:
         );
     }
 
+    /// Answers `tick/describe` with an error while `refuse-describe` exists in its working
+    /// directory, and logs every describe it receives as `refused` or `served`.
+    const REFUSING_TICK: &str = r#"
+import json, os, sys
+instance = os.environ['TICKLOOP_INSTANCE_ID']
+for line in sys.stdin:
+    request = json.loads(line)
+    if request['method'] == 'tick/describe':
+        refused = os.path.exists('refuse-describe')
+        with open('describes', 'a') as log:
+            log.write('refused\n' if refused else 'served\n')
+        if refused:
+            print(json.dumps({'jsonrpc':'2.0','id':request['id'],'error':{'code':-32000,'message':'describe refused'}}), flush=True)
+            continue
+        result = {'protocol':2,'tick_type':'test.refusing','title':'Refusing','description':'Refuses describe on request','recover_with':None,'tools':[]}
+    else:
+        result = {'version':3,'tick_instance_id':instance,'initialized':True,'sequence':0,'observed_at':'2026-10-08T00:00:00Z','data':{}}
+    print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}), flush=True)
+"#;
+
+    const REFUSE_DESCRIBE: &str = "refuse-describe";
+
+    fn logged(log: &Path, outcome: &str) -> usize {
+        std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| *line == outcome)
+            .count()
+    }
+
+    /// A hosted Watch whose registration keeps failing connects once and reconnects three times
+    /// in this Agent process, then stays Disconnected even after its Tick can be watched again;
+    /// nothing wakes the Loop meanwhile. Only subscribing again admits a new Watch that reaches
+    /// the Tick.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_watch_that_used_its_reconnects_stays_disconnected_until_subscribed_again() {
+        assert_eq!(
+            (RECONNECTS_PER_WATCH, RECONNECT_PAUSE),
+            (3, Duration::from_secs(5)),
+            "the production reconnect budget"
+        );
+        let model = Arc::new(super::support::ScriptedModel::new(Vec::new()));
+        let owner =
+            Owner::start_with(model.clone(), tick_host::host::DEFAULT_IDLE_TIMEOUT, 1).await;
+        let (runtime, chat) = (owner.runtimes[0].clone(), owner.chats[0]);
+        let script = owner.root.join("refusing.py");
+        std::fs::write(&script, REFUSING_TICK).unwrap();
+        let opened = run_tool(
+            &owner.tools(),
+            chat,
+            "ModifyTick",
+            open_command(&owner, python_program(&script, &[])),
+        )
+        .await;
+        let instance = opened["tick_instance_id"].clone();
+        let business_pid = opened["business_pid"].as_u64().unwrap() as u32;
+        let describes = owner.root.join("describes");
+        let served_before = logged(&describes, "served");
+        std::fs::write(owner.root.join(REFUSE_DESCRIBE), "").unwrap();
+
+        model.enqueue(super::support::call(
+            "subscribe",
+            "SubscribeTick",
+            json!({"tick_instance_id":instance,"every_seconds":5}),
+        ));
+        model.enqueue(super::support::text("watching"));
+        let results = run_turn(&runtime, chat, "Watch it").await;
+        let subscribed: Value = serde_json::from_str(&results["subscribe"].content).unwrap();
+        assert_eq!(subscribed["ready"], false, "{subscribed}");
+        let _ = tokio::time::timeout(HOSTED_EVENT_WAIT, async {
+            while logged(&describes, "refused") < CONNECTS_PER_WATCH {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        })
+        .await;
+        std::fs::remove_file(owner.root.join(REFUSE_DESCRIBE)).unwrap();
+        tokio::time::sleep(RECONNECT_PAUSE + Duration::from_secs(2)).await;
+
+        assert_eq!(
+            logged(&describes, "refused"),
+            CONNECTS_PER_WATCH,
+            "the Watch connects once and reconnects three times"
+        );
+        assert_eq!(
+            logged(&describes, "served"),
+            served_before,
+            "a Watch out of reconnects never tries the recovered Tick"
+        );
+        let rows = runtime.tick_subscriptions(chat).await.unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].link, TickLinkState::Disconnected);
+        assert_eq!(model.requests.lock().unwrap().len(), 2, "nothing woke");
+        assert!(super::alive(business_pid), "the Tick keeps running");
+
+        runtime
+            .update_tick_subscription(chat, rows[0].id, TickSubscriptionChange::Cancel)
+            .await
+            .unwrap();
+        model.enqueue(super::support::call(
+            "again",
+            "SubscribeTick",
+            json!({"tick_instance_id":instance,"every_seconds":5}),
+        ));
+        model.enqueue(super::support::text("watching again"));
+        let results = run_turn(&runtime, chat, "Watch it again").await;
+        let again: Value = serde_json::from_str(&results["again"].content).unwrap();
+        assert_eq!(again["ready"], true, "{again}");
+        assert_eq!(
+            logged(&describes, "served"),
+            served_before + 1,
+            "the new Watch registered at once"
+        );
+        let rows = runtime.tick_subscriptions(chat).await.unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].link, TickLinkState::Live);
+    }
+
+    /// Numbers in the update `grow` publishes: written as `1e15` the update line stays within
+    /// the 512 KiB Tick Update limit, while each re-encodes as `1000000000000000.0`, far over it.
+    const GROWN_VALUES: usize = 100_000;
+
+    const GROWING_TICK: &str = r#"
+import json, os, sys
+instance = os.environ['TICKLOOP_INSTANCE_ID']
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request['method']
+    if method == 'tick/describe':
+        result = {'protocol':2,'tick_type':'test.growing','title':'Growing','description':'Publishes one large update','recover_with':None,'tools':[{'name':'grow','description':'Publish a large update','params':{'type':'object'},'mutates':False}]}
+    elif method == 'tick/read':
+        result = {'version':3,'tick_instance_id':instance,'initialized':True,'sequence':0,'observed_at':'2026-10-08T00:00:00Z','data':{}}
+    else:
+        values = ','.join(['1e15'] * int(sys.argv[1]))
+        sys.stdout.write('{"jsonrpc":"2.0","method":"tick/update","params":{"version":3,"tick_instance_id":"%s","source":"test.growing","sequence":1,"observed_at":"2026-10-08T00:00:01Z","data":{"values":[%s]}}}\n' % (instance, values))
+        result = {'grown':True}
+    print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}), flush=True)
+"#;
+
+    /// The position in `seen` of the first event from `since` on that `wanted` matches; events
+    /// are received into `seen` until one does.
+    async fn wait_for(
+        events: &mut mpsc::Receiver<TickStreamEvent>,
+        seen: &mut Vec<TickStreamEvent>,
+        since: usize,
+        what: &str,
+        wanted: impl Fn(&TickStreamEvent) -> bool,
+    ) -> usize {
+        if let Some(position) = seen[since..].iter().position(&wanted) {
+            return since + position;
+        }
+        tokio::time::timeout(HOSTED_EVENT_WAIT, async {
+            loop {
+                let event = events.recv().await.expect("the stream stays open");
+                let found = wanted(&event);
+                seen.push(event);
+                if found {
+                    return seen.len() - 1;
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{what} never arrived: {seen:#?}"))
+    }
+
+    fn is_ready(event: &TickStreamEvent, watch: Uuid) -> bool {
+        matches!(event, TickStreamEvent::Ready { watch: ready } if *ready == watch)
+    }
+
+    fn is_state(event: &TickStreamEvent, watch: Uuid, wanted: TickConnectionState) -> bool {
+        matches!(event, TickStreamEvent::State { state, audience, .. } if *state == wanted && audience.contains(&watch))
+    }
+
+    /// An update over the 512 KiB limit once encoded, though its line is within it, is a
+    /// protocol violation of its own Tick: the host never forwards it, the call that published
+    /// it has an unknown outcome, and that Tick's Watch becomes IdentityUncertain without
+    /// delivering it, while the Watch of another Tick in the same stream keeps delivering its
+    /// updates and that Tick keeps running.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_update_over_the_limit_once_encoded_ends_only_its_own_ticks_link() {
+        let owner = Owner::start(1).await;
+        let chat = owner.chats[0];
+        let tools = Arc::new(owner.tools());
+        let script = owner.root.join("growing.py");
+        std::fs::write(&script, GROWING_TICK).unwrap();
+        let growing = run_tool(
+            &tools,
+            chat,
+            "ModifyTick",
+            open_command(&owner, python_program(&script, &[GROWN_VALUES.to_string()])),
+        )
+        .await;
+        let counter = run_tool(&tools, chat, "ModifyTick", counter_command(&owner)).await;
+        let (large, small) = (Uuid::new_v4(), Uuid::new_v4());
+        let stream = HostedTickStream::new(tools.clone());
+        let authority = tools
+            .tool_authorities("ReadTick")
+            .unwrap()
+            .pop_first()
+            .unwrap();
+        stream.set_watch_chats(BTreeMap::from([(large, chat), (small, chat)]));
+        stream.set_watch_authorities(BTreeMap::from([
+            (large, authority.clone()),
+            (small, authority),
+        ]));
+        let mut handle = stream.open();
+        handle.desired.send_replace(BTreeMap::from([
+            (
+                large,
+                serde_json::from_value(growing["tick_instance_id"].clone()).unwrap(),
+            ),
+            (
+                small,
+                serde_json::from_value(counter["tick_instance_id"].clone()).unwrap(),
+            ),
+        ]));
+        let mut seen = Vec::new();
+        for watch in [large, small] {
+            wait_for(
+                &mut handle.events,
+                &mut seen,
+                0,
+                "a Watch's baseline",
+                |event| is_ready(event, watch),
+            )
+            .await;
+        }
+        let mut raw = owner.data_connection(&growing["tick_instance_id"]).await;
+        raw.request("watch", json!({}), CONTROL_TIMEOUT)
+            .await
+            .unwrap();
+
+        let grown = seen.len();
+        assert!(
+            matches!(
+                call_tool(
+                    &tools,
+                    chat,
+                    "CallTickTool",
+                    json!({"tick_instance_id":growing["tick_instance_id"],"tool":"grow","args":{}}),
+                )
+                .await,
+                HostCallResult::OutcomeUnknown(_)
+            ),
+            "the call whose Tick broke the protocol mid-call has an unknown outcome"
+        );
+        let forwarded = tokio::time::timeout(HOSTED_EVENT_WAIT, raw.next_event())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(
+            forwarded["observation"]["state"]["ProtocolError"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("once encoded")),
+            "the host refuses the update as its Tick's protocol violation: {}",
+            forwarded["observation"]["state"]
+        );
+        assert!(
+            forwarded["observation"]["update"]["data"]["values"].is_null(),
+            "the refused update is never forwarded"
+        );
+        drop(raw);
+        let refused = wait_for(
+            &mut handle.events,
+            &mut seen,
+            grown,
+            "the large Watch losing its Tick's identity",
+            |event| is_state(event, large, TickConnectionState::IdentityUncertain),
+        )
+        .await;
+
+        run_tool(
+            &tools,
+            chat,
+            "CallTickTool",
+            json!({"tick_instance_id":counter["tick_instance_id"],"tool":"increment","args":{"amount":1}}),
+        )
+        .await;
+        wait_for(
+            &mut handle.events,
+            &mut seen,
+            refused,
+            "the other Tick's update",
+            |event| {
+                matches!(event, TickStreamEvent::Observation { audience, value } if audience.contains(&small) && value.data["value"] == 1)
+            },
+        )
+        .await;
+        assert!(
+            !seen.iter().any(|event| matches!(event, TickStreamEvent::Observation { audience, .. } if audience.contains(&large))),
+            "the refused update is never delivered: {seen:#?}"
+        );
+        assert!(
+            super::alive(counter["business_pid"].as_u64().unwrap() as u32),
+            "the other Tick keeps running"
+        );
+    }
+
     /// A View's Monitor lists its Chat's hosted Ticks with a process sample of each and closes
     /// the one its user picks; the other keeps running.
     #[tokio::test(flavor = "multi_thread")]
     async fn the_monitor_lists_hosted_ticks_with_samples_and_closes_the_one_picked() {
         let owner = Owner::start(1).await;
         let (chat, execution) = (owner.chats[0], owner.executions[0]);
-        let tools = HostedTickTools::new(
-            OwnerControl::new(owner.grants[0].clone()),
-            vec![("PATH".into(), "/usr/bin:/bin".into())],
-        );
+        let tools = owner.tools();
         let closed = run_tool(&tools, chat, "ModifyTick", counter_command(&owner)).await;
         let kept = run_tool(&tools, chat, "ModifyTick", counter_command(&owner)).await;
         let CommandResult::HostedTicks(members) = owner
@@ -2092,6 +2300,92 @@ for line in sys.stdin:
         assert_eq!(records[0]["instance"], kept["tick_instance_id"]);
     }
 
+    /// More hosted Ticks than one page holds list completely and exactly once: the owner hands
+    /// its worker the host's listing at most 128 rows a page, and the worker and a View's Monitor
+    /// walk every page.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn more_hosted_ticks_than_a_page_list_completely_through_owner_and_worker() {
+        use std::collections::HashSet;
+        use tick_connect::page::MAX_PAGE_SIZE;
+        use tickloop_agent::hosted::{tools::HostedMemberState, worker_control::HostedTickPage};
+        const TICKS: usize = MAX_PAGE_SIZE + 2;
+        const OPENS_AT_ONCE: usize = 26;
+        let owner = Owner::start(1).await;
+        let (chat, execution) = (owner.chats[0], owner.executions[0]);
+        let control = OwnerControl::new(owner.grants[0].clone());
+        control.request(list(chat)).await.unwrap();
+        let mut opened = Vec::new();
+        while opened.len() < TICKS {
+            let mut opens = tokio::task::JoinSet::new();
+            for _ in 0..OPENS_AT_ONCE.min(TICKS - opened.len()) {
+                let controller = owner.controller.clone();
+                let request = counter_request(owner.tick_owner(chat), &owner.root);
+                opens.spawn(async move { controller.open(request).await });
+            }
+            while let Some(result) = opens.join_next().await {
+                opened.push(result.unwrap().unwrap());
+            }
+        }
+        let expected = opened
+            .iter()
+            .map(|tick| tick.instance.clone())
+            .collect::<HashSet<_>>();
+        assert_eq!(expected.len(), TICKS);
+
+        let mut paged = Vec::new();
+        let mut pages = 0;
+        let mut cursor = None;
+        loop {
+            let page: HostedTickPage = serde_json::from_value(
+                control
+                    .request(WorkerRequest::ListHostedTicks { chat, cursor })
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            pages += 1;
+            assert!(page.page.items.len() <= MAX_PAGE_SIZE);
+            assert_eq!(page.page.total, TICKS, "every page counts the full set");
+            paged.extend(page.page.items.into_iter().filter_map(|row| row.instance));
+            match page.page.next {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        assert_eq!(pages, 2);
+        assert_eq!(paged.len(), TICKS, "no row is listed twice");
+        assert_eq!(paged.into_iter().collect::<HashSet<_>>(), expected);
+
+        let tools = owner.tools();
+        let members = tools.members(chat).await.unwrap();
+        let CommandResult::HostedTicks(viewed) = owner
+            .command(AgentCommand::ListHostedTicks { execution })
+            .await
+        else {
+            panic!("hosted Ticks expected");
+        };
+        for listed in [members, viewed] {
+            assert_eq!(listed.len(), TICKS, "no member is listed twice");
+            assert!(
+                listed
+                    .iter()
+                    .all(|member| member.state == HostedMemberState::Running)
+            );
+            assert_eq!(
+                listed
+                    .into_iter()
+                    .map(|member| member.instance)
+                    .collect::<HashSet<_>>(),
+                expected
+            );
+        }
+
+        super::support::stop_tick_host(&owner.root.join("h"), &owner.root.join("tick-host.key"));
+        for tick in &opened {
+            assert!(super::gone(tick.business_pid).await, "every Tick ends");
+        }
+    }
+
     /// A View reads its Chat's hosted Tick as a screen snapshot and attaches through a one-time
     /// view grant from the owner; neither hands it the Tick's data token, and another Chat's Tick
     /// is refused.
@@ -2100,10 +2394,7 @@ for line in sys.stdin:
         use tick_connect::hosted::{CAPABILITY_DATA, CONTROL_TIMEOUT, HostConnection, Role};
         let owner = Owner::start(2).await;
         let (chat, execution, other) = (owner.chats[0], owner.executions[0], owner.executions[1]);
-        let tools = HostedTickTools::new(
-            OwnerControl::new(owner.grants[0].clone()),
-            vec![("PATH".into(), "/usr/bin:/bin".into())],
-        );
+        let tools = owner.tools();
         let opened = run_tool(&tools, chat, "ModifyTick", counter_command(&owner)).await;
         let instance: tick_connect::instance::InstanceRef =
             serde_json::from_value(opened["tick_instance_id"].clone()).unwrap();
@@ -2197,10 +2488,7 @@ for line in sys.stdin:
             owner.chats[0],
             owner.executions[0],
         );
-        let tools = HostedTickTools::new(
-            OwnerControl::new(owner.grants[0].clone()),
-            vec![("PATH".into(), "/usr/bin:/bin".into())],
-        );
+        let tools = owner.tools();
         let opened = run_tool(&tools, chat, "ModifyTick", counter_command(&owner)).await;
         let lost: tick_connect::instance::InstanceRef =
             serde_json::from_value(opened["tick_instance_id"].clone()).unwrap();
@@ -2367,13 +2655,15 @@ for line in sys.stdin:
         );
         drop(cleanup);
         assert!(super::gone(tick.business_pid).await);
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while owner.owner_state(deleted).is_some() {
-                tokio::time::sleep(Duration::from_millis(20)).await;
+        // The state goes once the host confirms the end, which can come just after the Tick
+        // itself is gone.
+        for _ in 0..200 {
+            if owner.owner_state(deleted).is_none() {
+                break;
             }
-        })
-        .await
-        .expect("the owner must finish durable deletion after the process exits");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(owner.owner_state(deleted), None);
     }
 
     /// A lost Tick whose working directory was replaced after it opened is not reopened: the
@@ -2382,10 +2672,7 @@ for line in sys.stdin:
     async fn a_lost_tick_whose_launch_changed_is_not_reopened() {
         let owner = Owner::start(1).await;
         let (chat, execution) = (owner.chats[0], owner.executions[0]);
-        let tools = HostedTickTools::new(
-            OwnerControl::new(owner.grants[0].clone()),
-            vec![("PATH".into(), "/usr/bin:/bin".into())],
-        );
+        let tools = owner.tools();
         let work = owner.root.join("work");
         std::fs::create_dir(&work).unwrap();
         let mut command = counter_command(&owner);
@@ -2432,7 +2719,10 @@ for line in sys.stdin:
 mod lifecycle {
     use std::{sync::Arc, time::Duration};
 
-    use super::{alive, gone, hold_retention};
+    use super::{
+        alive, gone, hold_retention,
+        support::hosted::{counter_request, tick_request},
+    };
 
     use serde_json::json;
     use tick_connect::hosted::{CAPABILITY_DATA, CONTROL_TIMEOUT, HostConnection, Role};
@@ -2440,7 +2730,7 @@ mod lifecycle {
         host::{OpenRequest, OpenedTick, Receipt, TickOwner},
         paths::HostPaths,
     };
-    use tickloop_agent::hosted::controller::HostController;
+    use tickloop_agent::hosted::controller::{HostController, WatchIntents};
     use uuid::Uuid;
 
     const FLOOD: &str = r#"
@@ -2510,11 +2800,11 @@ for line in sys.stdin:
         }
 
         fn request(&self, program: Vec<String>) -> OpenRequest {
-            super::tick_request(self.owner.clone(), self.directory.path(), program)
+            tick_request(self.owner.clone(), self.directory.path(), program)
         }
 
         fn counter(&self) -> OpenRequest {
-            super::counter_request(self.owner.clone(), self.directory.path())
+            counter_request(self.owner.clone(), self.directory.path())
         }
 
         async fn reader(&self, opened: &OpenedTick) -> HostConnection {
@@ -2716,14 +3006,13 @@ for line in sys.stdin:
         for committed in [BTreeSet::new(), BTreeSet::from([Uuid::new_v4()])] {
             let request = fixture.counter();
             let opened = controller.open(request.clone()).await.unwrap();
-            controller
-                .set_intents(
-                    &fixture.owner,
-                    &opened.instance,
-                    &BTreeSet::from([Uuid::new_v4()]),
-                )
-                .await
-                .unwrap();
+            let intents = WatchIntents::new(
+                &fixture.owner,
+                &opened.instance,
+                &BTreeSet::from([Uuid::new_v4()]),
+            )
+            .unwrap();
+            controller.set_intents(&intents).await.unwrap();
             let mut record = LaunchRecord::opening(
                 request.operation,
                 fixture.owner.chat,

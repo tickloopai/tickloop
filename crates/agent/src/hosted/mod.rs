@@ -5,6 +5,7 @@
 pub mod attach;
 pub mod controller;
 pub mod lifecycle;
+pub mod popup;
 pub mod registry;
 pub mod tools;
 pub mod worker_control;

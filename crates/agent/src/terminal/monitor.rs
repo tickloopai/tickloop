@@ -289,6 +289,35 @@ impl Monitor {
         self.frame(width, height, display, now_ms, false).lines
     }
 
+    /// The keys of the focused list: the selected row's actions, adding, and Esc.
+    fn hint(&self, can_add: bool) -> String {
+        let mut hints = self
+            .selected()
+            .map(|entry| {
+                entry
+                    .actions
+                    .iter()
+                    .map(|action| {
+                        format!(
+                            "{} {}",
+                            if action.key == crate::tick_adapter::MONITOR_ENTER_KEY {
+                                "Enter".into()
+                            } else {
+                                action.key.to_string()
+                            },
+                            action.label
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if can_add {
+            hints.push(format!("{MONITOR_ADD_KEY} add"));
+        }
+        hints.push("Esc".into());
+        hints.join(" · ")
+    }
+
     pub(super) fn frame(
         &self,
         width: usize,
@@ -384,7 +413,12 @@ impl Monitor {
                 row_ids.push(Some(entry.instance.clone()));
             }
         }
-        let capacity = height.saturating_sub(2);
+        let hints = if self.focused && height > 2 {
+            wrap_words(&self.hint(can_add), width)
+        } else {
+            Vec::new()
+        };
+        let capacity = height.saturating_sub(1 + hints.len().max(1));
         let offset = selected_row.saturating_sub(capacity.saturating_sub(2));
         let targets = row_ids
             .into_iter()
@@ -394,33 +428,11 @@ impl Monitor {
             .filter_map(|(row, id)| id.map(|id| (row + 1, id)))
             .collect();
         lines.extend(rows.into_iter().skip(offset).take(capacity));
-        if self.focused && height > 2 {
-            let mut hints = self
-                .selected()
-                .map(|entry| {
-                    entry
-                        .actions
-                        .iter()
-                        .map(|action| {
-                            format!(
-                                "{} {}",
-                                if action.key == crate::tick_adapter::MONITOR_ENTER_KEY {
-                                    "Enter".into()
-                                } else {
-                                    action.key.to_string()
-                                },
-                                action.label
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            if can_add {
-                hints.push(format!("{MONITOR_ADD_KEY} add"));
-            }
-            hints.push("Esc".into());
-            lines.push(RoleLine::role(hints.join(" · "), Role::MutedText));
-        }
+        lines.extend(
+            hints
+                .into_iter()
+                .map(|hint| RoleLine::role(hint, Role::MutedText)),
+        );
         lines.truncate(height);
         for line in &mut lines {
             line.truncate(width);
@@ -541,6 +553,24 @@ impl super::tick_actions::TickDetailView for MonitorDetail {
     }
 }
 
+/// Breaks `text` between words so each line fits `width` columns; a longer word is cut later.
+pub(super) fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    use unicode_width::UnicodeWidthStr;
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in text.split(' ') {
+        if !line.is_empty() && line.width() + 1 + word.width() > width {
+            lines.push(std::mem::take(&mut line));
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    lines.push(line);
+    lines
+}
+
 pub(super) fn relative_time(updated: Option<u64>, now: u64) -> String {
     let Some(updated) = updated else {
         return "—".into();
@@ -558,6 +588,14 @@ pub(super) fn relative_time(updated: Option<u64>, now: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn hints_break_between_words_to_fit_the_monitor() {
+        assert_eq!(
+            wrap_words("Enter open · s snapshot · x remove · Esc", 20),
+            ["Enter open · s", "snapshot · x remove", "· Esc"]
+        );
+    }
+
     #[test]
     fn elapsed_update_time_uses_the_specified_units() {
         for (updated, expected) in [

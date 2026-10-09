@@ -56,9 +56,16 @@ const CONFIG_BYTES: u64 = 1024;
 const EMPTIED_MARK_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// Polite termination before SIGKILL.
 pub const TERMINATE_GRACE: Duration = Duration::from_secs(3);
+/// The receipts kept; one of an unfinished operation, or of an open whose Tick still runs, is
+/// kept even beyond it.
 pub const RECEIPT_CAPACITY: usize = 4096;
 pub const REAPED_RING: usize = 32;
 pub const DIAGNOSTIC_CHARACTERS: usize = 256;
+/// The longest title the host keeps and lists, so a page of rows stays within its frame however
+/// long the commands it names. The launch itself always gets the whole command.
+pub const TITLE_CHARACTERS: usize = 256;
+/// Ends a title that was cut.
+pub const TITLE_ELLIPSIS: char = '…';
 /// A stalled stream reader or attached view loses its connection and lease; the Tick and other
 /// readers continue.
 pub const STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -195,6 +202,15 @@ enum Lifecycle {
     Closing,
 }
 
+impl Lifecycle {
+    fn live_instance(&self) -> Option<&InstanceRef> {
+        match self {
+            Self::Live { instance, .. } => Some(instance),
+            _ => None,
+        }
+    }
+}
+
 struct HostedTick {
     terminal: Uuid,
     operation: Uuid,
@@ -204,6 +220,8 @@ struct HostedTick {
     /// Set by the first launcher connection: the launch token works once.
     launcher_claimed: AtomicBool,
     data_token: String,
+    /// Where its launcher binds the Tick Session socket.
+    session_directory: PathBuf,
     pty: Pty,
     screen: std::sync::Mutex<Screen>,
     launcher: Mutex<Child>,
@@ -268,6 +286,12 @@ impl HostedTick {
         }
     }
 
+    /// Removes the session directory once the launcher is gone, with any socket it could not
+    /// remove itself.
+    fn remove_session_directory(&self) {
+        let _ = std::fs::remove_dir_all(&self.session_directory);
+    }
+
     fn is_idle(&self, now_ms: u64, idle_timeout: Duration) -> bool {
         matches!(*self.lifecycle.borrow(), Lifecycle::Live { .. })
             && !self.attached.load(Ordering::SeqCst)
@@ -277,14 +301,24 @@ impl HostedTick {
     }
 }
 
-/// Operation receipts, newest kept, each readable only by the owner it was made for.
+/// Operation receipts, each readable only by the owner it was made for. An expired receipt
+/// cannot tell whether its operation ran, so one of an unfinished operation, or of an open whose
+/// Tick still runs, never expires; beyond [`RECEIPT_CAPACITY`] the oldest others do.
 #[derive(Default)]
 struct Receipts {
     entries: VecDeque<(Uuid, TickOwner, Receipt)>,
 }
 
 impl Receipts {
-    fn record(&mut self, operation: Uuid, owner: &TickOwner, receipt: Receipt) {
+    /// Records `receipt`; `running` names the instances still running, asked only when an
+    /// older receipt has to expire.
+    fn record(
+        &mut self,
+        operation: Uuid,
+        owner: &TickOwner,
+        receipt: Receipt,
+        running: impl FnOnce() -> HashSet<InstanceRef>,
+    ) {
         if let Some(entry) = self
             .entries
             .iter_mut()
@@ -293,8 +327,21 @@ impl Receipts {
             entry.2 = receipt;
             return;
         }
-        if self.entries.len() == RECEIPT_CAPACITY {
-            self.entries.pop_front();
+        if self.entries.len() >= RECEIPT_CAPACITY {
+            let running = running();
+            let mut expiring = self.entries.len() + 1 - RECEIPT_CAPACITY;
+            self.entries.retain(|(_, _, kept)| {
+                let still_matters = match kept {
+                    Receipt::Dispatched => true,
+                    Receipt::Opened(opened) => running.contains(&opened.instance),
+                    _ => false,
+                };
+                if expiring == 0 || still_matters {
+                    return true;
+                }
+                expiring -= 1;
+                false
+            });
         }
         self.entries.push_back((operation, owner.clone(), receipt));
     }
@@ -340,9 +387,33 @@ pub struct HostState {
     controller_epoch: Option<Uuid>,
     /// Per config root: the last applied owner snapshot revision and one being received.
     snapshots: HashMap<String, RootSnapshots>,
-    /// Owners ended at a registry revision; their opens at that revision or earlier fail.
+    /// Owners ended at a registry revision; their opens at that revision or earlier fail. An
+    /// entry goes once a complete snapshot of its root at a later revision is applied.
     ended: HashMap<TickOwner, u64>,
     diagnostics: Diagnostics,
+}
+
+impl HostState {
+    fn record_receipt(&mut self, operation: Uuid, owner: &TickOwner, receipt: Receipt) {
+        let ticks = &self.ticks;
+        self.receipts.record(operation, owner, receipt, || {
+            ticks
+                .values()
+                .filter_map(|tick| tick.lifecycle.borrow().live_instance().cloned())
+                .collect()
+        });
+    }
+
+    /// Refuses a controller connection that a newer Agent owner fenced.
+    fn ensure_current_controller(&self, generation: u64) -> Result<(), HostError> {
+        if self.controller_generation != generation {
+            return Err(HostError::before(
+                "Fenced",
+                "a newer Agent owner controls this Tick host",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Default)]
@@ -388,6 +459,8 @@ pub struct Host {
     controller_key: String,
     idle_timeout: Duration,
     started: Instant,
+    /// Names each Tick's session directory.
+    session_serial: AtomicU64,
     state: Mutex<HostState>,
     shutdown: CancellationToken,
     /// The operations that asked this host to shut down.
@@ -410,14 +483,6 @@ impl Host {
             .map_or(0, |elapsed| elapsed.as_millis() as u64)
     }
 
-    async fn record_receipt(&self, operation: Uuid, owner: &TickOwner, receipt: Receipt) {
-        self.state
-            .lock()
-            .await
-            .receipts
-            .record(operation, owner, receipt);
-    }
-
     async fn receipt(&self, operation: Uuid, owner: &TickOwner) -> Option<Receipt> {
         self.state.lock().await.receipts.get(operation, owner)
     }
@@ -427,9 +492,7 @@ impl Host {
         state
             .ticks
             .values()
-            .find(|tick| {
-                matches!(&*tick.lifecycle.borrow(), Lifecycle::Live { instance: live, .. } if live == instance)
-            })
+            .find(|tick| tick.lifecycle.borrow().live_instance() == Some(instance))
             .cloned()
     }
 
@@ -441,7 +504,11 @@ impl Host {
         }
     }
 
-    async fn open(self: &Arc<Self>, request: OpenRequest) -> Result<OpenedTick, HostError> {
+    async fn open(
+        self: &Arc<Self>,
+        request: OpenRequest,
+        generation: u64,
+    ) -> Result<OpenedTick, HostError> {
         // One lock covers the receipt lookup, the exit decision and the dispatch record, so a
         // repeated operation never launches twice and no open starts in a host that is leaving.
         {
@@ -465,11 +532,9 @@ impl Host {
             validate_launch(&request)?;
             state.pending_opens += 1;
             state.ever_used = true;
-            state
-                .receipts
-                .record(request.operation, &request.owner, Receipt::Dispatched);
+            state.record_receipt(request.operation, &request.owner, Receipt::Dispatched);
         }
-        let result = self.launch(&request).await;
+        let result = self.launch(&request, generation).await;
         self.state.lock().await.pending_opens -= 1;
         let receipt = match &result {
             Ok(opened) => Receipt::Opened(opened.clone()),
@@ -482,13 +547,22 @@ impl Host {
                 Receipt::Failed(error.clone())
             }
         };
-        self.record_receipt(request.operation, &request.owner, receipt)
-            .await;
+        self.state
+            .lock()
+            .await
+            .record_receipt(request.operation, &request.owner, receipt);
         result
     }
 
-    async fn launch(self: &Arc<Self>, request: &OpenRequest) -> Result<OpenedTick, HostError> {
+    async fn launch(
+        self: &Arc<Self>,
+        request: &OpenRequest,
+        generation: u64,
+    ) -> Result<OpenedTick, HostError> {
         let terminal = Uuid::new_v4();
+        let session_directory = self
+            .paths
+            .tick_session_directory(self.session_serial.fetch_add(1, Ordering::Relaxed));
         let size = TerminalSize::default();
         let (pty, slave) = Pty::open(size)
             .map_err(|error| HostError::before("TerminalUnavailable", error.to_string()))?;
@@ -517,18 +591,16 @@ impl Host {
                 hosted::LAUNCH_ENV,
                 serde_json::to_string(&binding).expect("launch binding serializes"),
             )
-            .env(
-                tick_connect::session::RUNTIME_DIR_ENV,
-                self.paths.sessions(),
-            )
+            .env(tick_connect::session::RUNTIME_DIR_ENV, &session_directory)
             .env("TERM", "xterm-256color");
         slave
             .attach(&mut command)
             .map_err(|error| HostError::before("TerminalUnavailable", error.to_string()))?;
-        // The registry guard covers the owner fence, the spawn and the publication of the launch
-        // token: an owner end either comes first and refuses this launch, or comes after the
-        // Tick is registered and ends it with the rest.
+        // The registry guard covers the controller and owner fences, the spawn and the publication
+        // of the launch token: a newer controller or an owner end either comes first and refuses
+        // this launch, or comes after the Tick is registered and finds it with the rest.
         let mut state = self.state.lock().await;
+        state.ensure_current_controller(generation)?;
         if state
             .ended
             .get(&request.owner)
@@ -549,10 +621,11 @@ impl Host {
             terminal,
             operation: request.operation,
             owner: request.owner.clone(),
-            title: request.title.clone(),
+            title: request.title.as_deref().map(display_title),
             launch_token,
             launcher_claimed: AtomicBool::new(false),
             data_token: random_token(),
+            session_directory,
             pty,
             screen: std::sync::Mutex::new(Screen::new(size)),
             launcher: Mutex::new(launcher),
@@ -645,14 +718,19 @@ impl Host {
                 "the Tick belongs to another owner",
             ));
         }
-        self.record_receipt(operation, owner, Receipt::Dispatched)
-            .await;
+        self.state
+            .lock()
+            .await
+            .record_receipt(operation, owner, Receipt::Dispatched);
         if let Some(tick) = tick {
             self.terminate(&tick).await;
             self.reap(tick.terminal, ReapReason::Closed).await;
         }
         let receipt = Receipt::Closed { instance };
-        self.record_receipt(operation, owner, receipt.clone()).await;
+        self.state
+            .lock()
+            .await
+            .record_receipt(operation, owner, receipt.clone());
         Ok(receipt)
     }
 
@@ -706,6 +784,12 @@ impl Host {
             let alive = std::mem::take(&mut staged.owners);
             snapshots.staged = None;
             snapshots.applied_revision = Some(revision);
+            // An owner ended before this revision needs no fence any more: an older controller's
+            // open is refused at spawn, and an owner serves a root only after reconciling it, so
+            // its opens carry this revision or a later one.
+            state
+                .ended
+                .retain(|owner, ended| owner.root != root || *ended >= revision);
             state
                 .ticks
                 .values()
@@ -737,9 +821,7 @@ impl Host {
             }
             let ended = state.ended.entry(owner.clone()).or_default();
             *ended = (*ended).max(revision);
-            state
-                .receipts
-                .record(operation, &owner, Receipt::Dispatched);
+            state.record_receipt(operation, &owner, Receipt::Dispatched);
             state
                 .ticks
                 .values()
@@ -752,8 +834,10 @@ impl Host {
             owner: owner.clone(),
             instances,
         };
-        self.record_receipt(operation, &owner, receipt.clone())
-            .await;
+        self.state
+            .lock()
+            .await
+            .record_receipt(operation, &owner, receipt.clone());
         Ok(receipt)
     }
 
@@ -762,11 +846,12 @@ impl Host {
         let mut ended = Vec::new();
         let mut stopping = tokio::task::JoinSet::new();
         for tick in &ticks {
-            if let Lifecycle::Live { instance, .. } =
-                tick.lifecycle.send_replace(Lifecycle::Closing)
-            {
-                ended.push(instance);
-            }
+            ended.extend(
+                tick.lifecycle
+                    .send_replace(Lifecycle::Closing)
+                    .live_instance()
+                    .cloned(),
+            );
             let tick = tick.clone();
             stopping.spawn(async move { stop_launcher(&tick).await });
         }
@@ -782,10 +867,7 @@ impl Host {
         let Some(tick) = state.ticks.remove(&terminal) else {
             return;
         };
-        let instance = match &*tick.lifecycle.borrow() {
-            Lifecycle::Live { instance, .. } => Some(instance.clone()),
-            _ => None,
-        };
+        let instance = tick.lifecycle.borrow().live_instance().cloned();
         state.diagnostics.note_reaped(ReapedTick {
             terminal,
             instance,
@@ -793,6 +875,7 @@ impl Host {
         });
         drop(state);
         tick.terminal_closed.cancel();
+        tick.remove_session_directory();
     }
 
     /// Lets one view attach to `owner`'s Tick `instance`, replacing any earlier grant for it.
@@ -842,9 +925,11 @@ impl Host {
         Ok(json!({"instance":instance,"watches":count}))
     }
 
-    /// Reaps Ticks whose launcher exited or that stayed idle, and reports whether the host
-    /// should exit as empty.
-    async fn sweep(&self) -> bool {
+    /// Reaps Ticks whose launcher exited, starts ending those that stayed idle, and reports
+    /// whether the host should exit as empty. Idle Ticks stop in the background, so one that
+    /// ignores SIGTERM never pauses accepting connections; until reaped it keeps the host from
+    /// exiting.
+    async fn sweep(self: &Arc<Self>) -> bool {
         let ticks = self
             .state
             .lock()
@@ -855,6 +940,10 @@ impl Host {
             .collect::<Vec<_>>();
         let mut idle = Vec::new();
         for tick in ticks {
+            // A closing Tick is reaped by whatever is closing it, under its own reason.
+            if matches!(*tick.lifecycle.borrow(), Lifecycle::Closing) {
+                continue;
+            }
             let exited = tick
                 .launcher
                 .try_lock()
@@ -865,10 +954,15 @@ impl Host {
             }
             tick.lapse_stale_intents(Self::now_ms(), self.idle_timeout);
             if tick.is_idle(Self::now_ms(), self.idle_timeout) {
+                // Closing at once, so no later sweep picks it again while it stops.
+                tick.lifecycle.send_replace(Lifecycle::Closing);
                 idle.push(tick);
             }
         }
-        self.end_ticks(idle, ReapReason::Idle).await;
+        if !idle.is_empty() {
+            let host = Arc::clone(self);
+            tokio::spawn(async move { host.end_ticks(idle, ReapReason::Idle).await });
+        }
         let mut state = self.state.lock().await;
         state.exiting = state.ticks.is_empty()
             && state.pending_opens == 0
@@ -893,10 +987,7 @@ impl Host {
             .map(|tick| {
                 let lifecycle = tick.lifecycle.borrow().clone();
                 TickRow {
-                    instance: match &lifecycle {
-                        Lifecycle::Live { instance, .. } => Some(instance.clone()),
-                        _ => None,
-                    },
+                    instance: lifecycle.live_instance().cloned(),
                     terminal: tick.terminal,
                     data_token: matches!(lifecycle, Lifecycle::Live { .. })
                         .then(|| tick.data_token.clone()),
@@ -953,6 +1044,7 @@ impl Host {
             closing.spawn(async move {
                 stop_launcher(&tick).await;
                 tick.terminal_closed.cancel();
+                tick.remove_session_directory();
             });
         }
         while closing.join_next().await.is_some() {}
@@ -1039,6 +1131,17 @@ fn validate_launch(request: &OpenRequest) -> Result<(), HostError> {
     Ok(())
 }
 
+/// `title` as it is kept and listed: at most [`TITLE_CHARACTERS`] characters, the last one
+/// [`TITLE_ELLIPSIS`] when anything was cut.
+pub fn display_title(title: &str) -> String {
+    if title.chars().nth(TITLE_CHARACTERS).is_none() {
+        return title.to_owned();
+    }
+    let mut shown = title.chars().take(TITLE_CHARACTERS - 1).collect::<String>();
+    shown.push(TITLE_ELLIPSIS);
+    shown
+}
+
 pub fn random_token() -> String {
     let mut bytes = [0u8; TOKEN_BYTES];
     let file = std::fs::File::open("/dev/urandom").and_then(|mut file| {
@@ -1081,6 +1184,7 @@ pub async fn serve(paths: HostPaths, config: HostConfig) -> std::io::Result<()> 
         std::fs::remove_file(&socket)?;
     }
     paths.prune_emptied(EMPTIED_MARK_RETENTION);
+    paths.clear_sessions();
     let listener = UnixListener::bind(&socket)?;
     std::fs::set_permissions(&socket, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
     let identity = paths::file_identity(&socket)?;
@@ -1090,6 +1194,7 @@ pub async fn serve(paths: HostPaths, config: HostConfig) -> std::io::Result<()> 
         controller_key: config.controller_key,
         idle_timeout: config.idle_timeout,
         started: Instant::now(),
+        session_serial: AtomicU64::new(0),
         state: Mutex::new(HostState {
             ticks: HashMap::new(),
             receipts: Receipts::default(),
@@ -1160,10 +1265,11 @@ async fn connection(stream: UnixStream, host: Arc<Host>) -> Result<(), HostError
         Ok(hello) => hello,
         Err(error) => {
             let error = HostError::before("InvalidHello", error.to_string());
-            let _ = hosted::write_frame(
+            let _ = write_within(
                 &mut writer,
                 &hosted::error(&Value::Null, &error),
                 MANAGEMENT_FRAME_BYTES,
+                CONTROL_TIMEOUT,
             )
             .await;
             return Err(error);
@@ -1180,15 +1286,16 @@ async fn connection(stream: UnixStream, host: Arc<Host>) -> Result<(), HostError
                     "Forbidden",
                     "management requires the frozen 1.0 protocol and the owner's controller key",
                 );
-                let _ = hosted::write_frame(
+                let _ = write_within(
                     &mut writer,
                     &hosted::error(&Value::Null, &error),
                     MANAGEMENT_FRAME_BYTES,
+                    CONTROL_TIMEOUT,
                 )
                 .await;
                 return Err(error);
             }
-            hosted::write_frame(
+            write_within(
                 &mut writer,
                 &hosted::ok(
                     &Value::Null,
@@ -1201,6 +1308,7 @@ async fn connection(stream: UnixStream, host: Arc<Host>) -> Result<(), HostError
                     }),
                 ),
                 MANAGEMENT_FRAME_BYTES,
+                CONTROL_TIMEOUT,
             )
             .await?;
             management(reader, writer, host).await
@@ -1234,16 +1342,17 @@ async fn connection(stream: UnixStream, host: Arc<Host>) -> Result<(), HostError
             let session = match session {
                 Ok(session) => session,
                 Err(error) => {
-                    let _ = hosted::write_frame(
+                    let _ = write_within(
                         &mut writer,
                         &hosted::error(&Value::Null, &error),
                         BUSINESS_FRAME_BYTES,
+                        CONTROL_TIMEOUT,
                     )
                     .await;
                     return Err(error);
                 }
             };
-            hosted::write_frame(
+            write_within(
                 &mut writer,
                 &hosted::ok(
                     &Value::Null,
@@ -1259,6 +1368,7 @@ async fn connection(stream: UnixStream, host: Arc<Host>) -> Result<(), HostError
                     }),
                 ),
                 BUSINESS_FRAME_BYTES,
+                CONTROL_TIMEOUT,
             )
             .await?;
             business(reader, writer, host, session).await
@@ -1365,7 +1475,7 @@ async fn management(
             Ok(result) => hosted::ok(&id, result),
             Err(error) => hosted::error(&id, &error),
         };
-        hosted::write_frame(&mut writer, &frame, MANAGEMENT_FRAME_BYTES).await?;
+        write_within(&mut writer, &frame, MANAGEMENT_FRAME_BYTES, CONTROL_TIMEOUT).await?;
     }
     Ok(())
 }
@@ -1418,19 +1528,30 @@ async fn business(
     host: Arc<Host>,
     mut authority: Authority,
 ) -> Result<(), HostError> {
+    // A connection bound to one Tick closes when that Tick ends, so an idle one never keeps the
+    // reaped Tick's terminal; a controller's token never ends.
+    let tick_ended = match &authority {
+        Authority::Controller { .. } => CancellationToken::new(),
+        Authority::Instance(tick) | Authority::Viewer(tick) | Authority::Launcher { tick, .. } => {
+            tick.terminal_closed.clone()
+        }
+    };
     loop {
         let request = tokio::select! {
-            request = hosted::read_frame(&mut reader, BUSINESS_FRAME_BYTES) => request,
+            biased;
             _ = host.shutdown.cancelled() => return Ok(()),
+            _ = tick_ended.cancelled() => return Ok(()),
+            request = hosted::read_frame(&mut reader, BUSINESS_FRAME_BYTES) => request,
         };
         let request = match request {
             Ok(Some(request)) => request,
             Ok(None) => return Ok(()),
             Err(error) => {
-                let _ = hosted::write_frame(
+                let _ = write_within(
                     &mut writer,
                     &hosted::error(&Value::Null, &error),
                     BUSINESS_FRAME_BYTES,
+                    CONTROL_TIMEOUT,
                 )
                 .await;
                 return Err(error);
@@ -1447,10 +1568,11 @@ async fn business(
                 "attach" => match AttachLease::acquire(tick, params) {
                     Ok(lease) => return attach_view(reader, writer, &host, lease, &id).await,
                     Err(error) => {
-                        hosted::write_frame(
+                        write_within(
                             &mut writer,
                             &hosted::error(&id, &error),
                             BUSINESS_FRAME_BYTES,
+                            CONTROL_TIMEOUT,
                         )
                         .await?;
                         continue;
@@ -1476,7 +1598,7 @@ async fn business(
             Ok(result) => hosted::ok(&id, result),
             Err(error) => hosted::error(&id, &error),
         };
-        hosted::write_frame(&mut writer, &frame, BUSINESS_FRAME_BYTES).await?;
+        write_within(&mut writer, &frame, BUSINESS_FRAME_BYTES, CONTROL_TIMEOUT).await?;
     }
 }
 
@@ -1491,15 +1613,13 @@ async fn controller_request(
     method: &str,
     params: Value,
 ) -> Result<Value, HostError> {
-    if host.state.lock().await.controller_generation != generation {
-        return Err(HostError::before(
-            "Fenced",
-            "a newer Agent owner controls this Tick host",
-        ));
-    }
+    host.state
+        .lock()
+        .await
+        .ensure_current_controller(generation)?;
     match method {
         "open" => host
-            .open(parameters(params)?)
+            .open(parameters(params)?, generation)
             .await
             .map(|opened| json!(opened)),
         "receipt" => {
@@ -1747,7 +1867,7 @@ async fn launcher_request(
             let client = SessionClient::connect(
                 instance.clone(),
                 SessionBackend::Hosted(host.terminal_binding(tick.terminal)),
-                Some(host.paths.sessions()),
+                Some(tick.session_directory.clone()),
             )
             .await
             .map_err(session_error)?;
@@ -1791,10 +1911,11 @@ async fn stream_observations(
     use tokio::io::AsyncBufReadExt;
     let client = session(&tick).await?;
     let (read, received, mut observations) = client.watch().await.map_err(session_error)?;
-    hosted::write_frame(
+    write_within(
         &mut writer,
         &hosted::ok(id, json!({"read":read,"received":received})),
         BUSINESS_FRAME_BYTES,
+        CONTROL_TIMEOUT,
     )
     .await?;
     loop {
@@ -1802,22 +1923,19 @@ async fn stream_observations(
             changed = observations.changed() => if changed.is_err() { return Ok(()) },
             _ = reader.fill_buf() => return Ok(()),
             _ = tick.terminal_closed.cancelled() => {
-                let _ = hosted::write_frame(&mut writer, &json!({"event":"gone"}), BUSINESS_FRAME_BYTES).await;
+                let _ = write_within(&mut writer, &json!({"event":"gone"}), BUSINESS_FRAME_BYTES, STREAM_WRITE_TIMEOUT).await;
                 return Ok(());
             }
             _ = host.shutdown.cancelled() => return Ok(()),
         }
         let observation = observations.borrow_and_update().clone();
-        tokio::time::timeout(
+        write_within(
+            &mut writer,
+            &json!({"event":"observation","observation":observation}),
+            BUSINESS_FRAME_BYTES,
             STREAM_WRITE_TIMEOUT,
-            hosted::write_frame(
-                &mut writer,
-                &json!({"event":"observation","observation":observation}),
-                BUSINESS_FRAME_BYTES,
-            ),
         )
-        .await
-        .map_err(|_| HostError::after("SlowReader", "the stream reader fell behind"))??;
+        .await?;
     }
 }
 
@@ -1900,10 +2018,11 @@ async fn attach_view(
     let tick = lease.tick.clone();
     request_send_buffer(&writer, ATTACH_SEND_BUFFER_BYTES);
     let mut changes = tick.screen_changes.subscribe();
-    hosted::write_frame(
+    write_within(
         &mut writer,
         &hosted::ok(id, json!({"attached":true})),
         BUSINESS_FRAME_BYTES,
+        CONTROL_TIMEOUT,
     )
     .await?;
     let output = async {
@@ -1913,16 +2032,13 @@ async fn attach_view(
             let (bytes, screen) = tick.screen.lock().unwrap().frame_since(shown.as_ref());
             shown = Some(screen);
             if !bytes.is_empty() {
-                tokio::time::timeout(
+                write_within(
+                    &mut writer,
+                    &json!({"event":"frame","data":String::from_utf8_lossy(&bytes)}),
+                    BUSINESS_FRAME_BYTES,
                     STREAM_WRITE_TIMEOUT,
-                    hosted::write_frame(
-                        &mut writer,
-                        &json!({"event":"frame","data":String::from_utf8_lossy(&bytes)}),
-                        BUSINESS_FRAME_BYTES,
-                    ),
                 )
-                .await
-                .map_err(|_| HostError::after("SlowReader", "the attached view fell behind"))??;
+                .await?;
             }
             if changes.changed().await.is_err() {
                 return Ok(());
@@ -1963,13 +2079,28 @@ async fn attach_view(
         } else {
             json!({"event":"error","error":error})
         };
-        let _ = tokio::time::timeout(
+        let _ = write_within(
+            &mut writer,
+            &event,
+            BUSINESS_FRAME_BYTES,
             STREAM_WRITE_TIMEOUT,
-            hosted::write_frame(&mut writer, &event, BUSINESS_FRAME_BYTES),
         )
         .await;
     }
     outcome
+}
+
+/// Writes one frame unless its reader leaves it unread for `limit`; a stalled reader then loses
+/// its connection instead of holding this task.
+async fn write_within(
+    writer: &mut OwnedWriteHalf,
+    frame: &Value,
+    frame_bytes: usize,
+    limit: Duration,
+) -> Result<(), HostError> {
+    tokio::time::timeout(limit, hosted::write_frame(writer, frame, frame_bytes))
+        .await
+        .map_err(|_| HostError::after("SlowReader", "the reader stopped reading"))?
 }
 
 fn request_send_buffer(writer: &OwnedWriteHalf, bytes: usize) {
@@ -2058,6 +2189,7 @@ mod tests {
             controller_key: random_token(),
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
             started: Instant::now(),
+            session_serial: AtomicU64::new(0),
             state: Mutex::new(HostState {
                 ticks: HashMap::new(),
                 receipts: Receipts::default(),
@@ -2096,7 +2228,7 @@ mod tests {
         let registry = host.state.lock().await;
         let launching = {
             let host = Arc::clone(&host);
-            tokio::spawn(async move { host.launch(&request).await })
+            tokio::spawn(async move { host.launch(&request, 0).await })
         };
         tokio::task::yield_now().await;
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -2136,7 +2268,7 @@ mod tests {
         let launching = {
             let host = Arc::clone(&host);
             let request = request.clone();
-            tokio::spawn(async move { host.launch(&request).await })
+            tokio::spawn(async move { host.launch(&request, 0).await })
         };
         tokio::time::sleep(Duration::from_millis(100)).await;
         registry.ended.insert(request.owner.clone(), 3);
@@ -2161,20 +2293,30 @@ mod tests {
         }
     }
 
+    fn nothing_running() -> HashSet<InstanceRef> {
+        HashSet::new()
+    }
+
+    fn closed() -> Receipt {
+        Receipt::Closed {
+            instance: InstanceRef::hosted(Uuid::new_v4()),
+        }
+    }
+
     #[test]
     fn receipts_keep_the_newest_operations_for_their_own_owner() {
         let mut receipts = Receipts::default();
         let (mine, other) = (owner(), owner());
         let first = Uuid::new_v4();
-        receipts.record(first, &mine, Receipt::Dispatched);
+        receipts.record(first, &mine, closed(), nothing_running);
         assert_eq!(
             receipts.get(first, &other),
             None,
             "another owner sees nothing"
         );
-        receipts.record(first, &other, Receipt::Dispatched);
+        receipts.record(first, &other, Receipt::Dispatched, nothing_running);
         let failed = Receipt::Failed(HostError::before("LaunchFailed", "no"));
-        receipts.record(first, &mine, failed.clone());
+        receipts.record(first, &mine, failed.clone(), nothing_running);
         assert_eq!(receipts.get(first, &mine), Some(failed));
         assert_eq!(
             receipts.get(first, &other),
@@ -2182,14 +2324,144 @@ mod tests {
             "the same operation id of another owner is its own receipt"
         );
         for _ in 0..RECEIPT_CAPACITY - 1 {
-            receipts.record(Uuid::new_v4(), &mine, Receipt::Dispatched);
+            receipts.record(Uuid::new_v4(), &mine, closed(), nothing_running);
         }
         assert_eq!(receipts.entries.len(), RECEIPT_CAPACITY);
         assert_eq!(
             receipts.get(first, &mine),
             None,
-            "the oldest receipt expired"
+            "the oldest finished receipt expired"
         );
+    }
+
+    /// An expired receipt cannot tell whether its operation ran, so a receipt outlives newer ones
+    /// while its operation is unfinished or the Tick it opened still runs.
+    #[test]
+    fn receipts_of_unfinished_operations_and_running_ticks_outlive_newer_ones() {
+        let opened = |instance: &InstanceRef| {
+            Receipt::Opened(OpenedTick {
+                instance: instance.clone(),
+                terminal: HostedTerminal {
+                    endpoint: PathBuf::from("/host.sock"),
+                    epoch: Uuid::new_v4(),
+                    terminal: Uuid::new_v4(),
+                },
+                business_pid: 1,
+                data_token: String::new(),
+            })
+        };
+        let (running, ended) = (
+            InstanceRef::hosted(Uuid::new_v4()),
+            InstanceRef::hosted(Uuid::new_v4()),
+        );
+        let still_running = || HashSet::from([running.clone()]);
+        let mut receipts = Receipts::default();
+        let mine = owner();
+        let (unfinished, running_open, ended_open) =
+            (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        receipts.record(unfinished, &mine, Receipt::Dispatched, still_running);
+        let running_receipt = opened(&running);
+        receipts.record(running_open, &mine, running_receipt.clone(), still_running);
+        receipts.record(ended_open, &mine, opened(&ended), still_running);
+        let newest = (0..RECEIPT_CAPACITY)
+            .map(|_| Uuid::new_v4())
+            .collect::<Vec<_>>();
+        for operation in &newest {
+            receipts.record(*operation, &mine, closed(), still_running);
+        }
+        assert_eq!(receipts.entries.len(), RECEIPT_CAPACITY);
+        assert_eq!(receipts.get(unfinished, &mine), Some(Receipt::Dispatched));
+        assert_eq!(receipts.get(running_open, &mine), Some(running_receipt));
+        assert_eq!(receipts.get(ended_open, &mine), None);
+        assert_eq!(receipts.get(newest[1], &mine), None);
+        assert!(receipts.get(newest[2], &mine).is_some());
+    }
+
+    #[tokio::test]
+    async fn an_open_of_a_fenced_controller_that_reaches_the_registry_late_never_starts() {
+        let directory = tempfile::tempdir().unwrap();
+        let host = test_host(&directory);
+        let request = OpenRequest {
+            operation: Uuid::new_v4(),
+            owner: owner(),
+            owner_revision: 0,
+            command: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "printf started > started".into(),
+            ],
+            cwd: directory.path().to_path_buf(),
+            environment: Vec::new(),
+            title: None,
+        };
+        let mut registry = host.state.lock().await;
+        let launching = {
+            let host = Arc::clone(&host);
+            tokio::spawn(async move { host.launch(&request, 0).await })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // A newer owner takes over while the open waits for the registry.
+        registry.controller_generation += 1;
+        drop(registry);
+        let outcome = tokio::time::timeout(CONTROL_TIMEOUT, launching)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome.unwrap_err().code, "Fenced");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !directory.path().join("started").exists(),
+            "nothing spawned"
+        );
+        assert!(host.state.lock().await.ticks.is_empty());
+    }
+
+    /// Once a complete snapshot of a root at revision S is applied, every open that can still
+    /// start for that root comes from its sender at S or later, so owners ended before S no
+    /// longer need a fence; later ends and other roots keep theirs.
+    #[tokio::test]
+    async fn a_complete_newer_snapshot_forgets_the_owners_its_root_ended_before_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let host = test_host(&directory);
+        let elsewhere = TickOwner {
+            root: "elsewhere".into(),
+            chat: Uuid::new_v4(),
+        };
+        let (before, after) = (owner(), owner());
+        for (ended, revision) in [(&before, 4), (&after, 5), (&elsewhere, 2)] {
+            host.end_owner(ended.clone(), revision, Uuid::new_v4())
+                .await
+                .unwrap();
+        }
+        let chunk = |chunk| OwnerSnapshotChunk {
+            root: "root".into(),
+            revision: 5,
+            chunk,
+            chunks: 2,
+            owners: Vec::new(),
+        };
+        host.reconcile_owners(chunk(0)).await.unwrap();
+        assert_eq!(
+            host.state.lock().await.ended.len(),
+            3,
+            "a partial snapshot forgets nothing"
+        );
+        host.reconcile_owners(chunk(1)).await.unwrap();
+        assert_eq!(
+            host.state.lock().await.ended,
+            HashMap::from([(after, 5), (elsewhere, 2)])
+        );
+    }
+
+    #[test]
+    fn a_display_title_is_cut_to_its_bound_on_a_character_boundary() {
+        let fitting = "界".repeat(TITLE_CHARACTERS);
+        assert_eq!(display_title(&fitting), fitting);
+        let kept = format!("{}界", "x".repeat(TITLE_CHARACTERS - 2));
+        let shown = display_title(&format!("{kept}界界 and the rest"));
+        assert_eq!(shown, format!("{kept}{TITLE_ELLIPSIS}"));
+        assert_eq!(shown.chars().count(), TITLE_CHARACTERS);
+        assert_eq!(display_title(&shown), shown, "a shown title stays as it is");
     }
 
     #[test]
